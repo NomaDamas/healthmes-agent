@@ -1,0 +1,13 @@
+# HealthMes Agent License
+
+Copyright (c) 2026 HealthMes Agent project owner.
+
+Permission is granted to use, copy, modify, and distribute this software for non-commercial purposes only, subject to the following conditions:
+
+1. The copyright notice, this license, and applicable third-party notices must be included in all copies or substantial portions of the software.
+2. Commercial use is not permitted without a separate written commercial license from the project owner.
+3. Commercial use includes, but is not limited to, selling the software, offering hosted or managed services based on the software, using the software in a revenue-generating product or service, or using the software for internal business operations.
+4. A commercial license requires payment of license fees to the project owner under separately agreed terms.
+5. This software is provided "as is", without warranty of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, and noninfringement. In no event shall the authors or copyright holders be liable for any claim, damages, or other liability arising from or related to the software or its use.
+
+Third-party components may be governed by their own licenses. Code derived from Hermes Agent by Nous Research remains subject to the original MIT License notice preserved in `THIRD_PARTY_NOTICES.md`.
