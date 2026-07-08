@@ -1,0 +1,274 @@
+---
+title: "Health Data Types API Reference"
+sidebarTitle: "Data Types"
+description: "Reference for all supported health data types, units, and formats. Covers timeseries metrics, sleep stages, workout fields, and activity data."
+keywords: ["health data types api", "wearable data types", "health metrics api reference", "timeseries health data"]
+"og:title": "Health Data Types API Reference | Open Wearables"
+"og:description": "All supported health data types, units, and formats. Timeseries, sleep, workouts, and activity. Provider coverage included."
+"og:url": "https://docs.openwearables.io/architecture/data-types"
+"og:type": "article"
+"twitter:title": "Health Data Types API Reference | Open Wearables"
+"twitter:description": "All supported health data types, units, and formats. Timeseries, sleep, workouts, and activity. Provider coverage included."
+"twitter:card": "summary_large_image"
+---
+
+This page lists all supported data types, units, and formats. For provider-specific availability, see the [Provider Coverage Matrix](/providers/coverage).
+
+<Tip>
+  Not all providers support all data types. Check the [Provider Coverage Matrix](/providers/coverage) to see which metrics are available from each wearable device.
+</Tip>
+
+## Timeseries Types
+
+The `types` parameter in the timeseries endpoint accepts the following values:
+
+### Heart & Cardiovascular
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `heart_rate` | bpm | Heart rate |
+| `resting_heart_rate` | bpm | Resting heart rate |
+| `heart_rate_variability_sdnn` | ms | HRV (SDNN method) |
+| `heart_rate_variability_rmssd` | ms | HRV (RMSSD method) |
+| `heart_rate_recovery_one_minute` | bpm | HR recovery after 1 minute |
+| `walking_heart_rate_average` | bpm | Average HR while walking |
+| `recovery_score` | score | Recovery score |
+
+### Blood & Respiratory
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `oxygen_saturation` | % | SpO2 blood oxygen |
+| `blood_glucose` | mg/dL | Blood glucose level |
+| `blood_pressure_systolic` | mmHg | Systolic blood pressure |
+| `blood_pressure_diastolic` | mmHg | Diastolic blood pressure |
+| `respiratory_rate` | brpm | Breathing rate |
+| `sleeping_breathing_disturbances` | count | Sleep breathing disturbances |
+| `blood_alcohol_content` | mg/dL | Blood alcohol content |
+| `peripheral_perfusion_index` | score | Peripheral perfusion index |
+| `forced_vital_capacity` | liters | Forced vital capacity |
+| `forced_expiratory_volume_1` | liters | Forced expiratory volume (1s) |
+| `peak_expiratory_flow_rate` | L/min | Peak expiratory flow rate |
+
+### Body Composition
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `height` | cm | Height |
+| `weight` | kg | Weight |
+| `body_fat_percentage` | % | Body fat percentage |
+| `body_mass_index` | kg/m² | BMI |
+| `lean_body_mass` | kg | Lean body mass |
+| `body_temperature` | °C | Body temperature |
+| `skin_temperature` | °C | Skin temperature |
+| `waist_circumference` | cm | Waist circumference |
+| `body_fat_mass` | kg | Body fat mass |
+| `skeletal_muscle_mass` | kg | Skeletal muscle mass |
+
+### Fitness Metrics
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `vo2_max` | mL/kg/min | VO2 max |
+| `six_minute_walk_test_distance` | meters | 6-minute walk test |
+
+### Activity - Basic
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `steps` | count | Step count |
+| `energy` | kcal | Active energy burned |
+| `basal_energy` | kcal | Basal/resting energy |
+| `stand_time` | minutes | Time spent standing |
+| `exercise_time` | minutes | Exercise duration |
+| `physical_effort` | score | Physical effort score |
+| `flights_climbed` | count | Floors/flights climbed |
+| `average_met` | MET | Average metabolic equivalent |
+| `active_time` | minutes | Provider-reported daily active (non-sedentary) time |
+
+### Activity - Distance
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `distance_walking_running` | meters | Walking/running distance |
+| `distance_cycling` | meters | Cycling distance |
+| `distance_swimming` | meters | Swimming distance |
+| `distance_downhill_snow_sports` | meters | Skiing/snowboarding distance |
+| `distance_other` | meters | Other distance |
+
+### Activity - Walking Metrics
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `walking_step_length` | cm | Average step length |
+| `walking_speed` | m/s | Walking speed |
+| `walking_double_support_percentage` | % | Double support time |
+| `walking_asymmetry_percentage` | % | Gait asymmetry |
+| `walking_steadiness` | % | Walking steadiness score |
+| `stair_descent_speed` | m/s | Stair descent speed |
+| `stair_ascent_speed` | m/s | Stair ascent speed |
+
+### Activity - Running Metrics
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `running_power` | watts | Running power |
+| `running_speed` | m/s | Running speed |
+| `running_vertical_oscillation` | cm | Vertical oscillation |
+| `running_ground_contact_time` | ms | Ground contact time |
+| `running_stride_length` | cm | Stride length |
+
+### Activity - Swimming
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `swimming_stroke_count` | count | Swimming strokes |
+| `underwater_depth` | meters | Underwater depth |
+
+### Activity - Generic
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `cadence` | rpm | Cadence (cycling, etc.) |
+| `power` | watts | Power output |
+| `speed` | m/s | Speed |
+| `workout_effort_score` | score | Workout effort score |
+| `estimated_workout_effort_score` | score | Estimated workout effort score |
+
+### Environmental
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `environmental_audio_exposure` | dB | Environmental noise |
+| `headphone_audio_exposure` | dB | Headphone volume |
+| `uv_exposure` | count | UV exposure |
+| `inhaler_usage` | count | Inhaler usage |
+| `weather_temperature` | °C | Weather temperature |
+| `weather_humidity` | % | Weather humidity |
+
+<Note>
+  Additional environmental types (`environmental_sound_reduction`, `time_in_daylight`, `water_temperature`) are defined but not currently supported by any provider.
+</Note>
+
+### Garmin-Specific
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `garmin_stress_level` | score | Stress score (1-100) |
+| `garmin_skin_temperature` | °C | Skin temperature deviation from baseline |
+| `garmin_fitness_age` | years | Fitness age estimate |
+| `garmin_body_battery` | % | Body battery (0-100) |
+
+### Other
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `electrodermal_activity` | count | Electrodermal activity |
+| `push_count` | count | Push count (wheelchair) |
+| `atrial_fibrillation_burden` | count | Atrial fibrillation burden |
+| `insulin_delivery` | count | Insulin delivery |
+| `number_of_times_fallen` | count | Fall count |
+| `number_of_alcoholic_beverages` | count | Alcoholic beverages |
+| `nike_fuel` | count | Nike Fuel |
+| `hydration` | mL | Hydration |
+
+---
+
+## Workout Types
+
+Common workout types returned by the events/workouts endpoint. This is not an exhaustive list - the API supports 80+ workout types:
+
+| Type | Description |
+|------|-------------|
+| `running` | Running/jogging |
+| `trail_running` | Trail running |
+| `treadmill` | Treadmill running |
+| `cycling` | Cycling/biking |
+| `mountain_biking` | Mountain biking |
+| `indoor_cycling` | Indoor/stationary cycling |
+| `swimming` | Swimming (generic) |
+| `pool_swimming` | Pool swimming |
+| `open_water_swimming` | Open water swimming |
+| `walking` | Walking |
+| `hiking` | Hiking |
+| `mountaineering` | Mountaineering |
+| `strength_training` | Weight/resistance training |
+| `cardio_training` | Cardio training |
+| `yoga` | Yoga |
+| `pilates` | Pilates |
+| `meditation` | Meditation |
+| `elliptical` | Elliptical trainer |
+| `rowing` | Rowing |
+| `cross_country_skiing` | Cross-country skiing |
+| `alpine_skiing` | Alpine skiing |
+| `downhill_skiing` | Downhill skiing |
+| `snowboarding` | Snowboarding |
+| `soccer` | Soccer |
+| `basketball` | Basketball |
+| `tennis` | Tennis |
+| `golf` | Golf |
+| `boxing` | Boxing |
+| `martial_arts` | Martial arts |
+| `rock_climbing` | Rock climbing |
+| `surfing` | Surfing |
+| `kayaking` | Kayaking |
+| `triathlon` | Triathlon |
+| `e_biking` | E-biking |
+| `dance` | Dance |
+| `other` | Other/unknown activity |
+
+<Note>
+  Workout types are normalized from provider-specific values. The original provider type is preserved in the raw data.
+</Note>
+
+---
+
+## Resolution Options
+
+The `resolution` parameter for timeseries aggregation:
+
+| Resolution | Description |
+|------------|-------------|
+| `raw` | Original data points as recorded |
+| `1min` | Aggregated to 1-minute intervals |
+| `5min` | Aggregated to 5-minute intervals |
+| `15min` | Aggregated to 15-minute intervals |
+| `1hour` | Aggregated to 1-hour intervals |
+
+---
+
+## Example: Fetching Multiple Types
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/users/{user_id}/timeseries?start_time=2025-01-01T00:00:00Z&end_time=2025-01-31T00:00:00Z&types=heart_rate&types=steps&types=energy&resolution=1hour" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+```
+
+<Tip>
+  Leave `types` empty to fetch all available data types for the user.
+</Tip>
+
+---
+
+## Provider Support
+
+Data availability varies by provider. Here's a quick summary:
+
+| Provider | Timeseries | Workouts | Sleep | Best For |
+|----------|:-----------:|:--------:|:-----:|----------|
+| Apple Health | ✅ | ✅ | 🔜 | Comprehensive health data |
+| Garmin | ◐ | ✅ | 🔜 | Fitness activities |
+| Polar | ◐ | ✅ | ❌ | Heart rate training |
+| Suunto | ✅ | ✅ | ✅ | Outdoor sports + 24/7 data |
+| Whoop | ❌ | ✅ | ✅ | Recovery, sleep & workouts |
+
+<Accordion title="Legend">
+  - ✅ **Full support** — Fully implemented
+  - ◐ **Partial** — Limited data (e.g., workouts only)
+  - 🔜 **Coming soon** — API supports, processing not yet implemented
+  - ❌ **Not available** — Not supported
+</Accordion>
+
+<Card title="Full Provider Coverage Matrix" icon="table" href="/providers/coverage">
+  See detailed breakdown of which data types each provider supports, including provider-specific quirks and normalization details.
+</Card>

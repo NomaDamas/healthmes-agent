@@ -1,0 +1,240 @@
+---
+title: "Wearable Provider Setup and Sync Guide"
+sidebarTitle: "Provider Setup"
+description: "Provider configuration and sync parameters for Garmin, Polar, Suunto, Whoop, and Apple Health. API path conventions and provider name rules included."
+keywords: ["wearable provider setup", "garmin sync configuration", "health api provider config", "open wearables provider params"]
+"og:title": "Wearable Provider Setup and Sync Guide | Open Wearables"
+"og:description": "Configuration and sync parameters for Garmin, Polar, Suunto, Whoop, and Apple Health. API path conventions included."
+"og:url": "https://docs.openwearables.io/api-reference/guides/provider-setup"
+"og:type": "article"
+"twitter:title": "Wearable Provider Setup and Sync Guide | Open Wearables"
+"twitter:description": "Configuration and sync parameters for Garmin, Polar, Suunto, Whoop, and Apple Health. API path conventions included."
+"twitter:card": "summary_large_image"
+---
+
+## Overview
+
+Each wearable provider has different requirements and parameters for syncing data. This guide covers the specifics for each supported provider.
+
+<Warning>
+  Provider names in API paths must be **lowercase**: `garmin`, `polar`, `suunto`, `whoop`, `apple`
+</Warning>
+
+## Garmin
+
+Garmin uses a **webhook-only** delivery model — there is no REST polling path. It implements two capability flags:
+
+- **`webhook_stream`** — Garmin pushes the complete data payload to your webhook endpoint in real time as the user syncs their device.
+- **`webhook_callback`** — For historical backfill, a backfill task is dispatched asynchronously; Garmin delivers the results to your webhook callback URL.
+
+Because Garmin has no `rest_pull` capability, `live_sync_configurable` is `false` and `live_sync_mode` is fixed at `"webhook"`.
+
+### Historical backfill
+
+To trigger a historical backfill (up to 30 days), call the dedicated endpoint:
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/providers/garmin/users/{user_id}/sync/historical" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+```
+
+The server enqueues the backfill task and Garmin delivers the data asynchronously to your registered webhook endpoint — no time-range parameters are accepted or required.
+
+<Warning>
+  Do **not** use the generic `/sync` REST endpoint for Garmin — Garmin has no server-side REST pull path. All data arrives via webhook push.
+</Warning>
+
+---
+
+## Polar
+
+Polar uses the AccessLink API with simpler sync requirements.
+
+### Sync Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `samples` | `false` | Include detailed sample data (HR samples, etc.) |
+| `zones` | `false` | Include heart rate zone information |
+| `route` | `false` | Include GPS route data |
+
+### Example
+
+```bash
+# Basic sync
+curl -X POST "http://localhost:8000/api/v1/providers/polar/users/{user_id}/sync" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+
+# With additional data
+curl -X POST "http://localhost:8000/api/v1/providers/polar/users/{user_id}/sync?samples=true&zones=true&route=true" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+```
+
+<Note>
+  Enabling `samples`, `zones`, and `route` increases sync time but provides more detailed workout data.
+</Note>
+
+---
+
+## Suunto
+
+Suunto supports both workouts and 24/7 data (sleep, recovery, activity samples).
+
+### Sync Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `since` | `0` | Unix timestamp to sync from (0 = all available) |
+| `limit` | `50` | Items per request (max: 100) |
+| `offset` | `0` | Pagination offset |
+| `filter_by_modification_time` | `true` | Filter by modification vs creation time |
+
+### Data Types
+
+| Value | Description |
+|-------|-------------|
+| `workouts` | Workout/exercise sessions |
+| `247` | 24/7 data: sleep, recovery, activity samples |
+| `all` | Both workouts and 24/7 data |
+
+### Example
+
+```bash
+# Sync all data from last 30 days
+THIRTY_DAYS_AGO=$(date -v-30d +%s)
+curl -X POST "http://localhost:8000/api/v1/providers/suunto/users/{user_id}/sync?data_type=all&since=${THIRTY_DAYS_AGO}&limit=100" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+
+# Sync only workouts
+curl -X POST "http://localhost:8000/api/v1/providers/suunto/users/{user_id}/sync?data_type=workouts" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+```
+
+---
+
+## Whoop
+
+Whoop uses OAuth 2.0 and supports both workouts and 24/7 data (sleep, recovery, body measurements).
+
+### Setup
+
+1. Create an application at [developer.whoop.com](https://developer.whoop.com)
+2. Set your redirect URI to `http://localhost:8000/api/v1/oauth/whoop/callback`
+3. Configure environment variables:
+
+```bash
+WHOOP_CLIENT_ID=your-client-id
+WHOOP_CLIENT_SECRET=your-client-secret
+WHOOP_REDIRECT_URI=http://localhost:8000/api/v1/oauth/whoop/callback
+WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout
+```
+
+### Sync Parameters
+
+Whoop does not require provider-specific query parameters. Use the standard `data_type` parameter to control what gets synced.
+
+| `data_type` Value | Description |
+|-------------------|-------------|
+| `workouts` | Workout/exercise sessions |
+| `247` | Sleep sessions, recovery metrics, body measurements |
+| `all` | Both workouts and 24/7 data |
+
+<Note>
+  When no date range is specified, Whoop defaults to syncing the last 30 days of data.
+</Note>
+
+### Data Collected
+
+**Workouts:** heart rate (avg/max), energy burned, distance, elevation gain, duration.
+
+**Sleep (247):** total duration, time in bed, efficiency score, sleep stages (deep, light, REM, awake), nap detection.
+
+**Recovery (247):** recovery score, resting heart rate, HRV (RMSSD), SpO2 percentage, skin temperature.
+
+**Body measurements (247):** height, weight.
+
+### Example
+
+```bash
+# Sync all Whoop data
+curl -X POST "http://localhost:8000/api/v1/providers/whoop/users/{user_id}/sync?data_type=all" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+
+# Sync only workouts
+curl -X POST "http://localhost:8000/api/v1/providers/whoop/users/{user_id}/sync?data_type=workouts" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+
+# Sync only sleep & recovery data
+curl -X POST "http://localhost:8000/api/v1/providers/whoop/users/{user_id}/sync?data_type=247" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+```
+
+---
+
+## Apple Health
+
+Apple Health data is imported via the mobile SDK rather than cloud API sync.
+
+<Note>
+  Apple Health requires the Open Wearables mobile SDK. Cloud sync is not available for Apple Health.
+</Note>
+
+---
+
+## Checking Connection Status
+
+Before syncing, verify the user has an active connection:
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/users/{user_id}/connections" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+```
+
+**Response:**
+```json
+[
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "user_id": "user-uuid",
+    "provider": "garmin",
+    "status": "active",
+    "last_synced_at": "2025-01-15T12:00:00Z",
+    "created_at": "2025-01-15T10:00:00Z",
+    "updated_at": "2025-01-15T12:00:00Z"
+  }
+]
+```
+
+Connection status can be: `active`, `revoked`, or `expired`.
+
+If no connection exists for a provider, the user needs to complete OAuth first.
+
+---
+
+## Available Providers
+
+Check which providers are enabled in your instance:
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/oauth/providers?enabled_only=true" \
+  -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+```
+
+**Response:**
+```json
+[
+  {
+    "provider": "garmin",
+    "name": "Garmin",
+    "has_cloud_api": true,
+    "is_enabled": true,
+    "icon_url": "/static/provider-icons/garmin.svg",
+    "live_sync_mode": "webhook",
+    "live_sync_configurable": false
+  }
+]
+```
+
+<Note>
+  `icon_url` is a **relative URL** (e.g., `/static/provider-icons/garmin.svg`). Resolve it against your API base URL to get the full path - for example, `https://your-api.example.com/static/provider-icons/garmin.svg`.
+</Note>

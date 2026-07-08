@@ -1,0 +1,206 @@
+# Series type configuration for seed data generation.
+#
+# Each entry defines:
+#   cadence:       how samples are spaced in time. One of:
+#                    - intraday            -> every `interval_seconds`, 24h
+#                    - daily               -> one sample per day at a random hour
+#                    - daily_morning       -> one sample per day shortly after wake (06-09)
+#                    - weekly              -> one sample every ~7 days
+#                    - workout_bound       -> only during workouts, filtered by `workout_types`
+#                    - paired              -> emits multiple series at the same recorded_at
+#                                             (used for blood pressure)
+#   interval_seconds:  only for cadence=intraday
+#   min_value / max_value:  uniform sample range
+#   workout_types:     only for cadence=workout_bound - list of WorkoutType values
+#   members:           only for cadence=paired - mapping of SeriesType -> {min_value, max_value}
+#
+# Adding a new type: pick a cadence, give realistic min/max, done.
+
+series_types:
+  # -------------------------------------------------------------------------
+  # Intraday continuous (24/7)
+  # -------------------------------------------------------------------------
+  heart_rate:
+    cadence: intraday
+    interval_seconds: 300
+    min_value: 55
+    max_value: 110
+
+  steps:
+    cadence: intraday
+    interval_seconds: 600
+    min_value: 0
+    max_value: 200
+
+  energy:
+    cadence: intraday
+    interval_seconds: 600
+    min_value: 1
+    max_value: 20
+
+  basal_energy:
+    cadence: intraday
+    interval_seconds: 900
+    min_value: 0.5
+    max_value: 1.5
+
+  respiratory_rate:
+    cadence: intraday
+    interval_seconds: 1800
+    min_value: 12
+    max_value: 20
+
+  distance_walking_running:
+    cadence: intraday
+    interval_seconds: 600
+    min_value: 0
+    max_value: 150
+
+  flights_climbed:
+    cadence: intraday
+    interval_seconds: 1800
+    min_value: 0
+    max_value: 3
+
+  environmental_audio_exposure:
+    cadence: intraday
+    interval_seconds: 1800
+    min_value: 40
+    max_value: 85
+
+  headphone_audio_exposure:
+    cadence: intraday
+    interval_seconds: 1800
+    min_value: 50
+    max_value: 95
+
+  # -------------------------------------------------------------------------
+  # Daily morning (resting / overnight metrics)
+  # -------------------------------------------------------------------------
+  resting_heart_rate:
+    cadence: daily_morning
+    min_value: 50
+    max_value: 75
+
+  heart_rate_variability_sdnn:
+    cadence: daily_morning
+    min_value: 25
+    max_value: 80
+
+  oxygen_saturation:
+    cadence: daily_morning
+    min_value: 95
+    max_value: 100
+
+  skin_temperature:
+    cadence: daily_morning
+    min_value: 33.5
+    max_value: 36.9
+
+  # -------------------------------------------------------------------------
+  # Daily (anytime)
+  # -------------------------------------------------------------------------
+  stand_time:
+    cadence: daily
+    min_value: 120
+    max_value: 720
+
+  exercise_time:
+    cadence: daily
+    min_value: 10
+    max_value: 120
+
+  time_in_daylight:
+    cadence: daily
+    min_value: 15
+    max_value: 240
+
+  blood_glucose:
+    cadence: daily
+    min_value: 80
+    max_value: 160
+
+  body_temperature:
+    cadence: daily
+    min_value: 36.1
+    max_value: 37.2
+
+  # -------------------------------------------------------------------------
+  # Paired daily (always emitted together at same timestamp)
+  # -------------------------------------------------------------------------
+  blood_pressure:
+    cadence: paired
+    frequency: daily
+    members:
+      blood_pressure_systolic:
+        min_value: 105
+        max_value: 135
+      blood_pressure_diastolic:
+        min_value: 65
+        max_value: 88
+
+  # -------------------------------------------------------------------------
+  # Weekly
+  # -------------------------------------------------------------------------
+  weight:
+    cadence: weekly
+    min_value: 60
+    max_value: 95
+
+  body_fat_percentage:
+    cadence: weekly
+    min_value: 12
+    max_value: 32
+
+  vo2_max:
+    cadence: weekly
+    min_value: 35
+    max_value: 65
+
+  # -------------------------------------------------------------------------
+  # Workout-bound (only during matching workouts)
+  # -------------------------------------------------------------------------
+  running_power:
+    cadence: workout_bound
+    interval_seconds: 30
+    min_value: 200
+    max_value: 400
+    workout_types: [running, trail_running, treadmill]
+
+  running_speed:
+    cadence: workout_bound
+    interval_seconds: 30
+    min_value: 2.0
+    max_value: 6.0
+    workout_types: [running, trail_running, treadmill]
+
+  cadence:
+    cadence: workout_bound
+    interval_seconds: 30
+    min_value: 60
+    max_value: 200
+    workout_types:
+      - running
+      - trail_running
+      - treadmill
+      - cycling
+      - indoor_cycling
+      - mountain_biking
+      - cyclocross
+      - e_biking
+      - rowing
+      - rowing_machine
+
+  power:
+    cadence: workout_bound
+    interval_seconds: 30
+    min_value: 100
+    max_value: 300
+    workout_types: [cycling, indoor_cycling, mountain_biking, cyclocross, e_biking, rowing_machine]
+
+  swimming_stroke_count:
+    cadence: workout_bound
+    interval_seconds: 60
+    min_value: 5
+    max_value: 20
+    workout_types: [swimming, pool_swimming, open_water_swimming]

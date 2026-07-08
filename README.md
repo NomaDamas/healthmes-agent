@@ -11,6 +11,12 @@ The project is designed to collect, organize, and reuse personalized information
 - Convert repeated health and lifestyle workflows into reusable skills.
 - Support future integrations with wearable data sources and open wearable research tooling.
 
+## Repository layout
+
+- `vendor/hermes-agent/` contains the imported Hermes Agent base.
+- `vendor/open-wearables/` contains the imported open-wearables reference implementation.
+- Root-level project files describe the HealthMes Agent purpose, licensing, and third-party notices.
+
 ## References
 
 This project is based on and references:
@@ -18,7 +24,7 @@ This project is based on and references:
 - Hermes Agent: https://github.com/NousResearch/hermes-agent
 - open-wearables: https://github.com/the-momentum/open-wearables
 
-The open-wearables code has not been imported yet. It is listed here as a planned reference for future wearable data integration work.
+The open-wearables code is kept in a separate folder so wearable data integration work can be developed without mixing it into the Hermes runtime base.
 
 ## License
 
@@ -26,4 +32,4 @@ HealthMes Agent is available for non-commercial use under the project license in
 
 Commercial use requires a separate paid commercial license from the project owner. See `LICENSE` for details.
 
-This repository includes code derived from Hermes Agent by Nous Research, which was released under the MIT License. The original notice is preserved in `THIRD_PARTY_NOTICES.md`.
+This repository includes code derived from Hermes Agent by Nous Research and open-wearables by Momentum, both released under the MIT License. Original notices are preserved in `THIRD_PARTY_NOTICES.md`.

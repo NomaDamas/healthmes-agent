@@ -1,0 +1,203 @@
+from datetime import datetime, timedelta, timezone
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
+
+from app.config import settings
+from app.database import DbSession
+from app.schemas.enums import ProviderName
+from app.schemas.model_crud.credentials import AuthorizationURLResponse
+from app.schemas.model_crud.data_priority import (
+    BulkProviderSettingsUpdate,
+    ProviderSettingRead,
+    ProviderSettingUpdate,
+)
+from app.services import DeveloperDep, user_connection_service
+from app.services.provider_settings_service import ProviderSettingsService
+from app.services.providers.base_strategy import BaseProviderStrategy
+from app.services.providers.factory import ProviderFactory
+
+router = APIRouter()
+factory = ProviderFactory()
+settings_service = ProviderSettingsService()
+
+
+def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
+    """Helper to get provider strategy and ensure it supports OAuth."""
+    strategy = factory.get_provider(provider.value)
+
+    if not strategy.oauth:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Provider '{provider.value}' does not support OAuth",
+        )
+    return strategy
+
+
+@router.get(
+    "/{provider}/authorize",
+    summary="Get Provider Authorization URL",
+    status_code=status.HTTP_200_OK,
+    response_model=AuthorizationURLResponse,
+    tags=["External: Providers"],
+)
+def authorize_provider(
+    provider: ProviderName,
+    user_id: Annotated[UUID, Query(description="User ID to connect")],
+    redirect_uri: Annotated[str | None, Query(description="Optional redirect URI after authorization")] = None,
+):
+    """
+    Initiate OAuth flow for a provider.
+
+    Returns authorization URL where user should be redirected to log in.
+    """
+    strategy = get_oauth_strategy(provider)
+
+    assert strategy.oauth
+    auth_url, state = strategy.oauth.get_authorization_url(user_id, redirect_uri)
+    return AuthorizationURLResponse(authorization_url=auth_url, state=state)
+
+
+@router.get("/{provider}/callback", tags=["System: OAuth"])
+def oauth_callback(
+    provider: ProviderName,
+    db: DbSession,
+    code: Annotated[str | None, Query(description="Authorization code from provider")] = None,
+    state: Annotated[str | None, Query(description="State parameter for CSRF protection")] = None,
+    error: Annotated[str | None, Query()] = None,
+    error_description: Annotated[str | None, Query()] = None,
+):
+    """
+    OAuth callback endpoint.
+
+    Provider redirects here after user authorizes. Exchanges code for tokens.
+    """
+    if error:
+        return RedirectResponse(
+            url=f"/api/v1/oauth/error?message={error}:+{error_description or 'Unknown+error'}",
+            status_code=303,
+        )
+
+    if not code or not state:
+        return RedirectResponse(
+            url="/api/v1/oauth/error?message=Missing+OAuth+parameters",
+            status_code=303,
+        )
+
+    strategy = get_oauth_strategy(provider)
+
+    assert strategy.oauth
+    oauth_state = strategy.oauth.handle_callback(db, code, state)
+
+    # Stamp last_synced_at=now so the first periodic sync uses the connection
+    # timestamp as its live-sync cursor and won't attempt to pull all history.
+    user_connection_service.stamp_last_synced_at(db, oauth_state.user_id, provider.value)
+
+    # Grace-period flag: automatically kick off a historical sync so integrators
+    # who haven't yet adopted the explicit /sync/historical call still get backfill.
+    # Controlled by HISTORICAL_SYNC_ON_CONNECT (default: true).
+    if settings.historical_sync_on_connect:
+        caps = strategy.capabilities
+        if caps.webhook_callback:
+            # this code is going to be removed later, so leave inner imports heres
+            from app.integrations.celery.tasks import start_garmin_full_backfill
+
+            start_garmin_full_backfill.delay(str(oauth_state.user_id))
+        elif caps.rest_pull:
+            from app.integrations.celery.tasks import sync_vendor_data
+
+            now = datetime.now(timezone.utc)
+            start_date = (now - timedelta(days=90)).isoformat()
+            sync_vendor_data.delay(
+                user_id=str(oauth_state.user_id),
+                start_date=start_date,
+                end_date=now.isoformat(),
+                providers=[provider.value],
+                is_historical=True,
+            )
+
+    # If a specific redirect_uri was requested (e.g. by frontend), redirect there
+    if oauth_state.redirect_uri:
+        return RedirectResponse(url=oauth_state.redirect_uri, status_code=303)
+
+    # Otherwise, redirect to internal success page
+    return RedirectResponse(
+        url=f"/api/v1/oauth/success?provider={provider.value}&user_id={oauth_state.user_id}",
+        status_code=303,
+    )
+
+
+@router.get("/success", tags=["System: OAuth"])
+def oauth_success(
+    provider: Annotated[str, Query()],
+    user_id: Annotated[str, Query()],
+) -> dict:
+    """Simple success page after OAuth completion."""
+    return {
+        "success": True,
+        "message": f"Successfully connected to {provider}",
+        "user_id": user_id,
+        "provider": provider,
+    }
+
+
+@router.get("/error", tags=["System: OAuth"])
+def oauth_error(
+    message: Annotated[str, Query()] = "OAuth authentication failed",
+) -> dict:
+    """OAuth error page."""
+    return {
+        "success": False,
+        "message": message,
+    }
+
+
+@router.get("/providers", response_model=list[ProviderSettingRead], tags=["External: Providers"])
+def get_providers(
+    db: DbSession,
+    enabled_only: Annotated[bool, Query(description="Return only enabled providers")] = False,
+    cloud_only: Annotated[bool, Query(description="Return only cloud (OAuth) providers")] = False,
+):
+    """
+    Get providers with their configuration and metadata.
+
+    Query params:
+    - enabled_only: Filter to only enabled providers (default: False, returns all)
+    - cloud_only: Filter to only providers with cloud OAuth API (default: False)
+
+    Returns full provider details including name, icon_url, has_cloud_api, is_enabled.
+    """
+    all_providers = settings_service.get_all_providers(db)
+
+    return [p for p in all_providers if (not enabled_only or p.is_enabled) and (not cloud_only or p.has_cloud_api)]
+
+
+@router.put("/providers/{provider}", response_model=ProviderSettingRead, tags=["Internal: Providers"])
+def update_provider_setting(
+    provider: str,
+    update: ProviderSettingUpdate,
+    db: DbSession,
+    _developer: DeveloperDep,
+):
+    """Update is_enabled and/or live_sync_mode for a single provider."""
+    try:
+        return settings_service.update_provider_setting(db, provider, update)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.put("/providers", response_model=list[ProviderSettingRead], tags=["Internal: Providers"])
+def bulk_update_providers(
+    updates: BulkProviderSettingsUpdate,
+    db: DbSession,
+    _developer: DeveloperDep,
+):
+    """
+    Bulk update provider settings.
+
+    Accepts a map of provider_id -> is_enabled and updates all providers at once.
+    This is the primary endpoint for the admin UI to save checkbox states.
+    """
+    return settings_service.bulk_update_providers(db, updates.providers)

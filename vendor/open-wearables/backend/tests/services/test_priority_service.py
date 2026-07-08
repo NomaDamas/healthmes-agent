@@ -1,0 +1,251 @@
+"""
+Tests for PriorityService.
+
+Tests cover:
+- Getting provider priorities
+- Updating individual provider priority
+- Bulk updating provider priorities
+- Getting device type priorities
+- Updating individual device type priority
+- Bulk updating device type priorities
+"""
+
+from logging import getLogger
+
+import pytest
+from sqlalchemy.orm import Session
+
+from app.schemas.enums import DeviceType, ProviderName
+from app.schemas.model_crud.data_priority import (
+    DeviceTypePriorityBase,
+    DeviceTypePriorityBulkUpdate,
+    ProviderPriorityBase,
+    ProviderPriorityBulkUpdate,
+)
+from app.services.priority_service import PriorityService
+from tests.factories import DataSourceFactory, UserFactory
+
+
+@pytest.fixture
+def priority_service() -> PriorityService:
+    """Create PriorityService instance."""
+    return PriorityService(log=getLogger(__name__))
+
+
+class TestPriorityServiceGetProviderPriorities:
+    """Test getting provider priorities."""
+
+    def test_get_provider_priorities_empty(self, db: Session, priority_service: PriorityService) -> None:
+        """Should return empty list when no priorities exist."""
+        result = priority_service.get_provider_priorities(db)
+        assert result.items == []
+
+    def test_get_provider_priorities_ordered(self, db: Session, priority_service: PriorityService) -> None:
+        """Should return priorities ordered by priority value."""
+        # Arrange - create priorities in non-sequential order
+        priority_service.update_provider_priority(db, ProviderName.GARMIN, 2)
+        priority_service.update_provider_priority(db, ProviderName.APPLE, 1)
+        priority_service.update_provider_priority(db, ProviderName.POLAR, 3)
+
+        # Act
+        result = priority_service.get_provider_priorities(db)
+
+        # Assert
+        assert len(result.items) == 3
+        assert result.items[0].provider == ProviderName.APPLE
+        assert result.items[0].priority == 1
+        assert result.items[1].provider == ProviderName.GARMIN
+        assert result.items[1].priority == 2
+        assert result.items[2].provider == ProviderName.POLAR
+        assert result.items[2].priority == 3
+
+
+class TestPriorityServiceUpdateProviderPriority:
+    """Test updating individual provider priority."""
+
+    def test_update_provider_priority_creates_new(self, db: Session, priority_service: PriorityService) -> None:
+        """Should create new priority if it doesn't exist."""
+        result = priority_service.update_provider_priority(db, ProviderName.APPLE, 1)
+
+        assert result.provider == ProviderName.APPLE
+        assert result.priority == 1
+
+    def test_update_provider_priority_updates_existing(self, db: Session, priority_service: PriorityService) -> None:
+        """Should update existing priority."""
+        # Arrange
+        priority_service.update_provider_priority(db, ProviderName.APPLE, 1)
+
+        # Act
+        result = priority_service.update_provider_priority(db, ProviderName.APPLE, 5)
+
+        # Assert
+        assert result.provider == ProviderName.APPLE
+        assert result.priority == 5
+
+
+class TestPriorityServiceBulkUpdateProviderPriorities:
+    """Test bulk updating provider priorities."""
+
+    def test_bulk_update_creates_new_priorities(self, db: Session, priority_service: PriorityService) -> None:
+        """Should create new priorities for all items."""
+        update = ProviderPriorityBulkUpdate(
+            priorities=[
+                ProviderPriorityBase(provider=ProviderName.APPLE, priority=1),
+                ProviderPriorityBase(provider=ProviderName.GARMIN, priority=2),
+                ProviderPriorityBase(provider=ProviderName.POLAR, priority=3),
+            ]
+        )
+
+        result = priority_service.bulk_update_priorities(db, update)
+
+        assert len(result.items) == 3
+
+    def test_bulk_update_persists_to_database(self, db: Session, priority_service: PriorityService) -> None:
+        """Should update existing priorities and persist changes to database."""
+        # Arrange - create initial priorities
+        initial_update = ProviderPriorityBulkUpdate(
+            priorities=[
+                ProviderPriorityBase(provider=ProviderName.APPLE, priority=1),
+                ProviderPriorityBase(provider=ProviderName.GARMIN, priority=2),
+            ]
+        )
+        priority_service.bulk_update_priorities(db, initial_update)
+
+        # Act - swap priorities
+        swap_update = ProviderPriorityBulkUpdate(
+            priorities=[
+                ProviderPriorityBase(provider=ProviderName.APPLE, priority=2),
+                ProviderPriorityBase(provider=ProviderName.GARMIN, priority=1),
+            ]
+        )
+        priority_service.bulk_update_priorities(db, swap_update)
+
+        # Clear session cache to force re-fetch from database
+        db.expire_all()
+
+        # Assert - verify updated data persisted correctly
+        result = priority_service.get_provider_priorities(db)
+        assert len(result.items) == 2
+        assert result.items[0].provider == ProviderName.GARMIN
+        assert result.items[0].priority == 1
+        assert result.items[1].provider == ProviderName.APPLE
+        assert result.items[1].priority == 2
+
+
+class TestPriorityServiceGetUserDataSources:
+    """Test listing user data sources with display names."""
+
+    def test_get_user_data_sources_after_fresh_load(self, db: Session, priority_service: PriorityService) -> None:
+        """Display name must build from rows reloaded from the database.
+
+        Reloaded rows return provider as a plain str (the column is a String,
+        not a native enum), so the service must not assume an enum instance.
+        """
+        user = UserFactory()
+        DataSourceFactory(user=user, provider=ProviderName.GARMIN, device_model="Forerunner 955")
+        db.expire_all()
+
+        result = priority_service.get_user_data_sources(db, user.id)
+
+        assert result.total == 1
+        assert result.items[0].display_name == "Garmin - Forerunner 955"
+
+    def test_get_user_data_sources_in_session_objects(self, db: Session, priority_service: PriorityService) -> None:
+        """Same call must also work on identity-mapped objects that still hold enum members."""
+        user = UserFactory()
+        DataSourceFactory(user=user, provider=ProviderName.APPLE, device_model="Watch7,1")
+
+        result = priority_service.get_user_data_sources(db, user.id)
+
+        assert result.total == 1
+        assert result.items[0].display_name == "Apple - Watch7,1"
+
+
+class TestPriorityServiceGetDeviceTypePriorities:
+    """Test getting device type priorities."""
+
+    def test_get_device_type_priorities_empty(self, db: Session, priority_service: PriorityService) -> None:
+        """Should return empty list when no priorities exist."""
+        result = priority_service.get_device_type_priorities(db)
+        assert result.items == []
+
+    def test_get_device_type_priorities_ordered(self, db: Session, priority_service: PriorityService) -> None:
+        """Should return priorities ordered by priority value."""
+        # Arrange
+        priority_service.update_device_type_priority(db, DeviceType.BAND, 2)
+        priority_service.update_device_type_priority(db, DeviceType.WATCH, 1)
+        priority_service.update_device_type_priority(db, DeviceType.RING, 3)
+
+        # Act
+        result = priority_service.get_device_type_priorities(db)
+
+        # Assert
+        assert len(result.items) == 3
+        assert result.items[0].device_type == DeviceType.WATCH
+        assert result.items[0].priority == 1
+        assert result.items[1].device_type == DeviceType.BAND
+        assert result.items[1].priority == 2
+        assert result.items[2].device_type == DeviceType.RING
+        assert result.items[2].priority == 3
+
+
+class TestPriorityServiceUpdateDeviceTypePriority:
+    """Test updating individual device type priority."""
+
+    def test_update_device_type_priority_creates_new(self, db: Session, priority_service: PriorityService) -> None:
+        """Should create new priority if it doesn't exist."""
+        result = priority_service.update_device_type_priority(db, DeviceType.WATCH, 1)
+
+        assert result.device_type == DeviceType.WATCH
+        assert result.priority == 1
+
+
+class TestPriorityServiceBulkUpdateDeviceTypePriorities:
+    """Test bulk updating device type priorities."""
+
+    def test_bulk_update_device_types_creates_new(self, db: Session, priority_service: PriorityService) -> None:
+        """Should create new priorities for all items."""
+        update = DeviceTypePriorityBulkUpdate(
+            priorities=[
+                DeviceTypePriorityBase(device_type=DeviceType.WATCH, priority=1),
+                DeviceTypePriorityBase(device_type=DeviceType.BAND, priority=2),
+                DeviceTypePriorityBase(device_type=DeviceType.RING, priority=3),
+            ]
+        )
+
+        result = priority_service.bulk_update_device_type_priorities(db, update)
+
+        assert len(result.items) == 3
+
+    def test_bulk_update_device_types_persists_to_database(
+        self, db: Session, priority_service: PriorityService
+    ) -> None:
+        """Should update existing priorities and persist changes to database."""
+        # Arrange - create initial priorities
+        initial_update = DeviceTypePriorityBulkUpdate(
+            priorities=[
+                DeviceTypePriorityBase(device_type=DeviceType.WATCH, priority=1),
+                DeviceTypePriorityBase(device_type=DeviceType.RING, priority=2),
+            ]
+        )
+        priority_service.bulk_update_device_type_priorities(db, initial_update)
+
+        # Act - swap priorities
+        swap_update = DeviceTypePriorityBulkUpdate(
+            priorities=[
+                DeviceTypePriorityBase(device_type=DeviceType.WATCH, priority=2),
+                DeviceTypePriorityBase(device_type=DeviceType.RING, priority=1),
+            ]
+        )
+        priority_service.bulk_update_device_type_priorities(db, swap_update)
+
+        # Clear session cache
+        db.expire_all()
+
+        # Verify updated data persisted
+        result = priority_service.get_device_type_priorities(db)
+        assert len(result.items) == 2
+        assert result.items[0].device_type == DeviceType.RING
+        assert result.items[0].priority == 1
+        assert result.items[1].device_type == DeviceType.WATCH
+        assert result.items[1].priority == 2

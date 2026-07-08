@@ -1,0 +1,91 @@
+---
+title: "Cursor MCP Server for Health Data"
+sidebarTitle: "Cursor"
+description: "Configure the Open Wearables MCP server with Cursor IDE. Query sleep, workouts, and activity data via natural language without leaving your editor."
+keywords: ["cursor mcp health data", "cursor wearable integration", "mcp cursor health", "cursor health data ide"]
+"og:title": "Cursor MCP Server for Health Data | Open Wearables"
+"og:description": "Configure Open Wearables MCP with Cursor IDE. Query sleep, workouts, and activity in natural language from your editor."
+"og:url": "https://docs.openwearables.io/mcp-server/cursor"
+"og:type": "article"
+"twitter:title": "Cursor MCP Server for Health Data | Open Wearables"
+"twitter:description": "Configure Open Wearables MCP with Cursor IDE. Query sleep, workouts, and activity in natural language from your editor."
+"twitter:card": "summary_large_image"
+---
+
+## Configuration
+
+Add the following to your Cursor MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "open-wearables": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--frozen",
+        "--directory",
+        "/path/to/open-wearables/mcp",
+        "start"
+      ]
+    }
+  }
+}
+```
+
+<Warning>
+  Replace `/path/to/open-wearables/mcp` with the actual path to the MCP directory on your system.
+</Warning>
+
+<Tip>
+  If the server fails to start, you may need to use the full path to `uv` instead of just `"uv"`. You can find it by running:
+  ```bash
+  which uv
+  # e.g. /Users/bart/.local/bin/uv
+  ```
+  Then replace `"command": "uv"` with the full path, e.g. `"command": "/Users/bart/.local/bin/uv"`.
+</Tip>
+
+## Verifying the Connection
+
+After configuring Cursor:
+
+1. Restart Cursor
+2. Open the AI chat panel
+3. Try asking: "Who can I query health data for?"
+
+If configured correctly, the AI will use the `get_users` tool to fetch available users from your Open Wearables instance.
+
+## Testing with MCPJam
+
+[MCPJam](https://www.mcpjam.com/) is a local inspector for testing MCP servers. It provides a UI to explore tools, test calls, and debug responses.
+
+```bash
+npx @mcpjam/inspector@latest
+```
+
+Then configure the connection:
+- **Command**: `uv`
+- **Arguments**: `run --frozen --directory /path/to/open-wearables/mcp start`
+
+## Troubleshooting
+
+### "Invalid API key" error
+
+Ensure your `OPEN_WEARABLES_API_KEY` in `config/.env` is valid. You can get an API key from:
+1. The Open Wearables developer portal
+2. Or via the backend admin panel at `/api/v1/developer/api-keys`
+
+### "Connection refused" error
+
+Make sure the backend is running at the URL specified in `OPEN_WEARABLES_API_URL`.
+
+For local development:
+```bash
+# From project root
+docker compose up -d
+```
+
+### No users found
+
+Make sure `OPEN_WEARABLES_API_URL` in `mcp/config/.env` points to the **API base URL** (e.g. `https://api.openwearables.io` or `http://localhost:8000`), not the URL of your Open Wearables dashboard/frontend. The MCP server calls `GET /api/v1/users` on this URL - if it points to the wrong service, you'll get a 404 ("Resource not found").

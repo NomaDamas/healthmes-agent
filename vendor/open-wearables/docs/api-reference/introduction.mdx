@@ -1,0 +1,218 @@
+---
+title: "Open Wearables API Reference"
+sidebarTitle: "Introduction"
+description: "REST API reference for managing users, connecting wearable providers, and retrieving health data. 3rd-party integration endpoints. Auth via API key."
+keywords: ["open wearables api reference", "wearable rest api docs", "health data api endpoints", "open wearables endpoints"]
+"og:title": "Open Wearables API Reference | REST API Docs"
+"og:description": "REST endpoints for managing users, connecting providers, and fetching health data. Authentication via API key."
+"og:url": "https://docs.openwearables.io/api-reference/introduction"
+"og:type": "article"
+"twitter:title": "Open Wearables API Reference | REST API Docs"
+"twitter:description": "REST endpoints for managing users, connecting providers, and fetching health data. Authentication via API key."
+"twitter:card": "summary_large_image"
+---
+
+## About this reference
+
+This API Reference covers endpoints for **3rd party integrations** - everything you need to manage users, connect wearable providers, and retrieve health data.
+
+Internal endpoints (dashboard management, team settings, webhook receivers) are not listed here. For the full API including internal endpoints, use Swagger UI.
+
+<CardGroup cols={2}>
+  <Card
+    title="Swagger UI (full API)"
+    icon="terminal"
+    href="https://api.openwearables.io/docs"
+  >
+    Interactive API explorer with all endpoints, including internal
+  </Card>
+  <Card
+    title="OpenAPI JSON"
+    icon="file-code"
+    href="https://api.openwearables.io/openapi.json"
+  >
+    Machine-readable OpenAPI 3.1 specification
+  </Card>
+</CardGroup>
+
+## Overview
+
+The Open Wearables API provides a unified REST interface to access health data from multiple wearable devices and fitness platforms. All endpoints are versioned under `/api/v1` and follow RESTful conventions.
+
+## Base URL
+
+When running locally:
+```
+http://localhost:8000/api/v1
+```
+
+For production deployments, replace with your server URL.
+
+## Quick Reference
+
+| Operation | Method | Endpoint |
+|-----------|--------|----------|
+| List users | GET | `/api/v1/users` |
+| Create user | POST | `/api/v1/users` |
+| Get user | GET | `/api/v1/users/{user_id}` |
+| Get connections | GET | `/api/v1/users/{user_id}/connections` |
+| Get activity summary | GET | `/api/v1/users/{user_id}/summaries/activity` |
+| Get sleep summary | GET | `/api/v1/users/{user_id}/summaries/sleep` |
+| Get body summary | GET | `/api/v1/users/{user_id}/summaries/body` |
+| Get recovery summary | GET | `/api/v1/users/{user_id}/summaries/recovery` |
+| Get timeseries | GET | `/api/v1/users/{user_id}/timeseries` |
+| Get workouts | GET | `/api/v1/users/{user_id}/events/workouts` |
+| Delete workout | DELETE | `/api/v1/users/{user_id}/events/workouts/{workout_id}` |
+| Get sleep sessions | GET | `/api/v1/users/{user_id}/events/sleep` |
+| Delete sleep session | DELETE | `/api/v1/users/{user_id}/events/sleep/{sleep_id}` |
+| Get menstrual cycles | GET | `/api/v1/users/{user_id}/events/menstrual-cycles` |
+| Delete menstrual cycle | DELETE | `/api/v1/users/{user_id}/events/menstrual-cycles/{cycle_id}` |
+| Get data sources | GET | `/api/v1/users/{user_id}/data-sources` |
+| Get health scores | GET | `/api/v1/users/{user_id}/health-scores` |
+| List providers | GET | `/api/v1/oauth/providers` |
+| OAuth authorize | GET | `/api/v1/oauth/{provider}/authorize?user_id={user_id}` |
+| Sync data | POST | `/api/v1/providers/{provider}/users/{user_id}/sync` |
+| Historical sync | POST | `/api/v1/providers/{provider}/users/{user_id}/sync/historical` |
+| Get provider workouts | GET | `/api/v1/providers/{provider}/users/{user_id}/workouts` |
+| List event types | GET | `/api/v1/webhooks/event-types` |
+| Register webhook endpoint | POST | `/api/v1/webhooks/endpoints` |
+| List webhook endpoints | GET | `/api/v1/webhooks/endpoints` |
+| Update webhook endpoint | PATCH | `/api/v1/webhooks/endpoints/{endpoint_id}` |
+| Delete webhook endpoint | DELETE | `/api/v1/webhooks/endpoints/{endpoint_id}` |
+| Get endpoint secret | GET | `/api/v1/webhooks/endpoints/{endpoint_id}/secret` |
+
+## Authentication
+
+All API endpoints require authentication using API keys. Include your API key in the `X-Open-Wearables-API-Key` header:
+
+```http
+X-Open-Wearables-API-Key: YOUR_API_KEY
+```
+
+<Warning>
+  **Do not use Bearer token format.** The API uses a custom header, not the standard Authorization header.
+</Warning>
+
+### Getting an API Key
+
+1. Access the Open Wearables Platform at `http://localhost:3000`
+2. Log in
+3. Navigate to the API Keys section in the Settings tab
+4. Generate a new API key
+5. Copy and securely store the key
+
+<Warning>
+  Keep your API keys secure. Never commit them to version control or expose them in client-side code.
+</Warning>
+
+## Response Formats
+
+The API uses different response formats depending on the endpoint type:
+
+### Resource Lists (Users)
+
+```json
+{
+  "items": [...],
+  "total": 50,
+  "page": 1,
+  "limit": 20,
+  "pages": 3,
+  "has_next": true,
+  "has_prev": false
+}
+```
+
+### Data Endpoints (Timeseries, Workouts, Sleep)
+
+```json
+{
+  "data": [...],
+  "pagination": {
+    "next_cursor": "abc123...",
+    "previous_cursor": null,
+    "has_more": true
+  },
+  "metadata": {
+    "resolution": null,
+    "sample_count": 100,
+    "start_time": "2025-01-01T00:00:00Z",
+    "end_time": "2025-01-31T00:00:00Z"
+  }
+}
+```
+
+### Error Response
+
+```json
+{
+  "detail": "Error message describing what went wrong"
+}
+```
+
+## HTTP Status Codes
+
+- `200 OK` - Request succeeded
+- `201 Created` - Resource created successfully
+- `204 No Content` - Request succeeded, no content to return
+- `400 Bad Request` - Invalid request parameters
+- `401 Unauthorized` - Authentication required or invalid
+- `404 Not Found` - Resource not found
+- `500 Internal Server Error` - Server error
+
+## Pagination
+
+The API uses two pagination styles depending on the endpoint:
+
+### Offset Pagination (Users)
+
+```http
+GET /api/v1/users?page=2&limit=50
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `page` | 1 | Page number |
+| `limit` | 20 | Items per page (max: 100) |
+
+### Cursor Pagination (Timeseries, Workouts, Sleep)
+
+```http
+GET /api/v1/users/{user_id}/timeseries?cursor=abc123&limit=50
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `cursor` | null | Cursor from previous response |
+| `limit` | 50 | Items per page (max: 100) |
+
+Use the `next_cursor` from the response to fetch the next page.
+
+## Date & Time Parameters
+
+Endpoints that accept date range parameters (`start_date`, `end_date`, `start_time`, `end_time`) support the following input formats:
+
+| Format | Example | Notes |
+|--------|---------|-------|
+| ISO 8601 datetime with timezone | `2023-11-07T05:31:56Z` | Recommended |
+| ISO 8601 datetime with offset | `2023-11-07T06:31:56+01:00` | |
+| Date-only | `2023-11-07` | Normalized to midnight UTC (`2023-11-07T00:00:00Z`) |
+| Unix timestamp (seconds) | `1699332716` | UTC |
+
+<Note>
+  When a date-only value (e.g. `2023-11-07`) is provided as an **end date**, it is treated as midnight UTC at the start of that day. Depending on the endpoint, this may be extended to include the full day — use an explicit time component (e.g. `2023-11-07T23:59:59Z`) to avoid ambiguity.
+</Note>
+
+## Filtering & Sorting
+
+Many endpoints support filtering and sorting. Check individual endpoint documentation for available options.
+
+## OpenAPI Specification
+
+The complete OpenAPI specification is available at:
+- **Swagger UI:** `https://api.openwearables.io/docs`
+- **OpenAPI JSON:** `https://api.openwearables.io/openapi.json`
+
+<Tip>
+  The OpenAPI specification is auto-generated from the API code and is always the most accurate reference.
+</Tip>

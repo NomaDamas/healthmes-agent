@@ -1,0 +1,993 @@
+import contextlib
+from datetime import datetime, timedelta
+from uuid import UUID
+
+from sqlalchemy import UUID as SQL_UUID
+from sqlalchemy import (
+    Date,
+    Integer,
+    Interval,
+    String,
+    and_,
+    asc,
+    case,
+    cast,
+    desc,
+    func,
+    lateral,
+    literal,
+    select,
+    text,
+    true,
+    tuple_,
+)
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Query, selectinload
+
+from app.database import DbSession
+from app.models import DataPointSeries, DataSource, EventRecord, SleepDetails
+from app.models.workout_details import WorkoutDetails
+from app.repositories.data_source_repository import DataSourceRepository
+from app.repositories.repositories import CrudRepository
+from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
+from app.schemas.model_crud.activities import (
+    EventRecordCreate,
+    EventRecordQueryParams,
+    EventRecordUpdate,
+)
+from app.utils.exceptions import handle_exceptions
+from app.utils.pagination import decode_cursor
+
+# Identity tuple: (user_id, device_model, source)
+DataSourceIdentity = tuple[UUID, str | None, str | None]
+
+
+class EventRecordRepository(
+    CrudRepository[EventRecord, EventRecordCreate, EventRecordUpdate],
+):
+    def __init__(self, model: type[EventRecord]):
+        super().__init__(model)
+        self.data_source_repo = DataSourceRepository()
+
+    def _build_creation(self, db_session: DbSession, creator: EventRecordCreate) -> tuple[UUID, EventRecord]:
+        """Resolve the data source and build the ORM object without touching the session."""
+        if creator.data_source_id:
+            data_source_id = creator.data_source_id
+        else:
+            provider = self.data_source_repo.infer_provider_from_source(creator.source)
+            if creator.provider:
+                with contextlib.suppress(ValueError):
+                    provider = ProviderName(creator.provider)
+            data_source = self.data_source_repo.ensure_data_source(
+                db_session,
+                user_id=creator.user_id,
+                provider=provider,
+                user_connection_id=creator.user_connection_id,
+                device_model=creator.device_model,
+                source=creator.source,
+                software_version=creator.software_version,
+            )
+            data_source_id = data_source.id
+
+        creation_data = creator.model_dump()
+        creation_data["data_source_id"] = data_source_id
+        for redundant_key in (
+            "user_id",
+            "source",
+            "device_model",
+            "provider",
+            "user_connection_id",
+            "software_version",
+        ):
+            creation_data.pop(redundant_key, None)
+        return data_source_id, self.model(**creation_data)
+
+    def _fetch_existing(self, db_session: DbSession, data_source_id: UUID, creation: EventRecord) -> EventRecord | None:
+        return (
+            db_session.query(self.model)
+            .filter(
+                self.model.data_source_id == data_source_id,
+                self.model.start_datetime == creation.start_datetime,
+                self.model.end_datetime == creation.end_datetime,
+            )
+            .one_or_none()
+        )
+
+    def get_by_external_id(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_id: str,
+        source: str | None = None,
+        provider: str | None = None,
+    ) -> EventRecord | None:
+        """Find a single EventRecord by its provider-assigned external_id."""
+        query = (
+            db_session.query(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user_id, self.model.external_id == external_id)
+        )
+        if source is not None:
+            query = query.filter(DataSource.source == source)
+        if provider is not None:
+            query = query.filter(DataSource.provider == provider)
+        return query.one_or_none()
+
+    def delete_by_external_id(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_id: str,
+        source: str | None = None,
+        provider: str | None = None,
+    ) -> int:
+        """Delete EventRecord(s) matching external_id for a user in a single query.
+
+        Returns the number of rows deleted.
+        """
+        source_ids_query = db_session.query(DataSource.id).filter(DataSource.user_id == user_id)
+        if source is not None:
+            source_ids_query = source_ids_query.filter(DataSource.source == source)
+        if provider is not None:
+            source_ids_query = source_ids_query.filter(DataSource.provider == provider)
+
+        deleted = (
+            db_session.query(self.model)
+            .filter(
+                self.model.external_id == external_id,
+                self.model.data_source_id.in_(source_ids_query.scalar_subquery()),
+            )
+            .delete(synchronize_session=False)
+        )
+        db_session.commit()
+        return deleted
+
+    @handle_exceptions
+    def create(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord:
+        data_source_id, creation = self._build_creation(db_session, creator)
+        try:
+            db_session.add(creation)
+            db_session.commit()
+            db_session.refresh(creation)
+            return creation
+        except IntegrityError:
+            db_session.rollback()
+            if existing := self._fetch_existing(db_session, data_source_id, creation):
+                return existing
+            raise
+
+    def create_and_flush(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord:
+        """Like create() but flushes instead of committing; caller is responsible for the commit.
+
+        Uses a savepoint for IntegrityError handling so a conflict rolls back only
+        the INSERT and leaves the outer transaction intact.
+        """
+        data_source_id, creation = self._build_creation(db_session, creator)
+        nested = db_session.begin_nested()
+        try:
+            db_session.add(creation)
+            db_session.flush()
+            nested.commit()
+            return creation
+        except IntegrityError:
+            nested.rollback()
+            if existing := self._fetch_existing(db_session, data_source_id, creation):
+                return existing
+            raise
+
+    @handle_exceptions
+    def bulk_create(
+        self,
+        db_session: DbSession,
+        creators: list[EventRecordCreate],
+    ) -> list[UUID]:
+        if not creators:
+            return []
+
+        # Group by provider for batch processing
+        by_provider: dict[ProviderName, list[EventRecordCreate]] = {}
+        for c in creators:
+            provider = self.data_source_repo.infer_provider_from_source(c.source)
+            if c.provider:
+                with contextlib.suppress(ValueError):
+                    provider = ProviderName(c.provider)
+            by_provider.setdefault(provider, []).append(c)
+
+        identity_to_source_id: dict[DataSourceIdentity, UUID] = {}
+
+        for provider, provider_creators in by_provider.items():
+            unique_identities: set[DataSourceIdentity] = set()
+            user_connection_id = provider_creators[0].user_connection_id if provider_creators else None
+            for c in provider_creators:
+                unique_identities.add((c.user_id, c.device_model, c.source))
+
+            batch_result = self.data_source_repo.batch_ensure_data_sources(
+                db_session, provider, user_connection_id, unique_identities
+            )
+            identity_to_source_id.update(batch_result)
+
+        values_list = []
+        for creator in creators:
+            identity: DataSourceIdentity = (creator.user_id, creator.device_model, creator.source)
+            source_id = identity_to_source_id.get(identity)
+
+            if not source_id:
+                continue
+
+            values_list.append(
+                {
+                    "id": creator.id,
+                    "external_id": creator.external_id,
+                    "data_source_id": source_id,
+                    "category": creator.category,
+                    "type": creator.type,
+                    "source_name": creator.source_name,
+                    "duration_seconds": creator.duration_seconds,
+                    "start_datetime": creator.start_datetime,
+                    "end_datetime": creator.end_datetime,
+                    "zone_offset": creator.zone_offset,
+                }
+            )
+
+        if not values_list:
+            return []
+
+        # 3. Batch insert with ON CONFLICT DO NOTHING
+        # Chunk to stay under PostgreSQL's 65535 parameter limit (10 params/row → max ~6553 rows)
+        chunk_size = 6_500
+        inserted_ids: set[UUID] = set()
+        for i in range(0, len(values_list), chunk_size):
+            chunk = values_list[i : i + chunk_size]
+            stmt = (
+                insert(self.model)
+                .values(chunk)
+                .on_conflict_do_nothing(index_elements=["data_source_id", "start_datetime", "end_datetime"])
+            )
+            result = db_session.execute(stmt.returning(self.model.id))
+            inserted_ids.update(row[0] for row in result.fetchall())
+        # NOTE: Caller should commit - allows batching multiple operations
+
+        return list(inserted_ids)
+
+    def get_record_with_details(
+        self,
+        db_session: DbSession,
+        record_id: UUID,
+        category: str,
+    ) -> EventRecord | None:
+        return (
+            db_session.query(EventRecord)
+            .options(selectinload(EventRecord.detail))
+            .filter(EventRecord.id == record_id, EventRecord.category == category)
+            .first()
+        )
+
+    def get_records_with_filters(
+        self,
+        db_session: DbSession,
+        query_params: EventRecordQueryParams,
+        user_id: str,
+        restrict_to_record_ids: Query | None = None,
+    ) -> tuple[list[tuple[EventRecord, DataSource]], int]:
+        query: Query = (
+            db_session.query(EventRecord, DataSource)
+            .join(
+                DataSource,
+                EventRecord.data_source_id == DataSource.id,
+            )
+            .options(selectinload(EventRecord.detail))
+        )
+
+        filters = [DataSource.user_id == UUID(user_id)]
+
+        # Optional allow-list of record ids as a subquery (e.g. priority-deduplicated
+        # sleep sessions). Inlined as `id IN (<subquery>)` before count/cursor/limit so
+        # pagination operates on the restricted set in a single statement.
+        if restrict_to_record_ids is not None:
+            filters.append(EventRecord.id.in_(restrict_to_record_ids))
+
+        if query_params.category:
+            filters.append(EventRecord.category == query_params.category)
+
+        if query_params.record_type:
+            filters.append(EventRecord.type.ilike(f"%{query_params.record_type}%"))
+
+        if query_params.source_name:
+            filters.append(EventRecord.source_name.ilike(f"%{query_params.source_name}%"))
+
+        if query_params.device_model:
+            filters.append(DataSource.device_model == query_params.device_model)
+
+        if getattr(query_params, "source", None):
+            filters.append(DataSource.source == query_params.source)
+
+        if getattr(query_params, "data_source_id", None):
+            filters.append(EventRecord.data_source_id == query_params.data_source_id)
+
+        if query_params.start_datetime:
+            filters.append(EventRecord.start_datetime >= query_params.start_datetime)
+
+        if query_params.end_datetime:
+            filters.append(EventRecord.end_datetime < query_params.end_datetime)
+
+        if query_params.min_duration is not None:
+            filters.append(EventRecord.duration_seconds >= query_params.min_duration)
+
+        if query_params.max_duration is not None:
+            filters.append(EventRecord.duration_seconds <= query_params.max_duration)
+
+        if filters:
+            query = query.filter(and_(*filters))
+
+        # Determine sort column and direction
+        sort_by = query_params.sort_by or "start_datetime"
+        sort_column = getattr(EventRecord, sort_by)
+        is_asc = query_params.sort_order == "asc"
+
+        # Calculate total count BEFORE applying cursor filters
+        # This gives us the total matching records (after all other filters)
+        total_count = query.count()
+
+        # Cursor pagination (keyset)
+        if query_params.cursor:
+            cursor_ts, cursor_id, direction = decode_cursor(query_params.cursor)
+
+            if direction == "prev":
+                # Backward pagination: get items BEFORE cursor
+                if sort_by == "start_datetime":
+                    comparison = (
+                        tuple_(EventRecord.start_datetime, EventRecord.id) < (cursor_ts, cursor_id)
+                        if is_asc
+                        else tuple_(EventRecord.start_datetime, EventRecord.id) > (cursor_ts, cursor_id)
+                    )
+                    query = query.filter(comparison)
+                else:
+                    query = query.filter(EventRecord.id < cursor_id if is_asc else EventRecord.id > cursor_id)
+
+                # Reverse sort order for backward pagination
+                sort_order = desc if is_asc else asc
+                query = query.order_by(sort_order(sort_column), sort_order(EventRecord.id))
+
+                # Limit + 1 to check for previous page
+                limit = query_params.limit or 20
+                results = query.limit(limit + 1).all()
+                # Reverse to get correct order
+                return list(reversed(results)), total_count  # ty:ignore[invalid-return-type]
+
+            # Forward pagination: get items AFTER cursor
+            if sort_by == "start_datetime":
+                comparison = (
+                    tuple_(EventRecord.start_datetime, EventRecord.id) > (cursor_ts, cursor_id)
+                    if is_asc
+                    else tuple_(EventRecord.start_datetime, EventRecord.id) < (cursor_ts, cursor_id)
+                )
+                query = query.filter(comparison)
+            else:
+                query = query.filter(EventRecord.id > cursor_id if is_asc else EventRecord.id < cursor_id)
+
+        # Apply ordering (ID as secondary sort for deterministic pagination)
+        sort_order = asc if is_asc else desc
+        query = query.order_by(sort_order(sort_column), sort_order(EventRecord.id))
+
+        # Limit + 1 to check for next page (cursor pagination)
+        limit = query_params.limit or 20
+
+        # When using cursor, we don't use offset (keyset pagination)
+        if not query_params.cursor and query_params.offset:
+            query = query.offset(query_params.offset)
+
+        return query.limit(limit + 1).all(), total_count  # ty:ignore[invalid-return-type]
+
+    def winning_sleep_record_ids(
+        self,
+        db_session: DbSession,
+        user_id: str,
+        query_params: EventRecordQueryParams,
+        provider_order: dict,
+        device_type_order: dict,
+    ) -> Query:
+        """Subquery of sleep record ids belonging to the top-priority source per night.
+
+        For each local sleep date, sources are ranked by provider priority, then
+        device-type priority, then device_model (lower value = higher priority;
+        anything absent from the order dicts falls through to 99 — matching the
+        priority service). The winning source's sessions (dense_rank == 1, so all of
+        its rows for that night, naps included) are returned.
+
+        Returned as an unexecuted Query so callers can inline it as `id IN (...)`
+        and keep dedup + pagination in a single SQL statement.
+        """
+        local_sleep_date = cast(
+            EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
+            Date,
+        )
+        provider_rank = (
+            case(*[(DataSource.provider == p, r) for p, r in provider_order.items()], else_=99)
+            if provider_order
+            else literal(99)
+        )
+        device_rank = (
+            case(*[(DataSource.device_type == dt.value, r) for dt, r in device_type_order.items()], else_=99)
+            if device_type_order
+            else literal(99)
+        )
+
+        filters = [
+            DataSource.user_id == UUID(user_id),
+            EventRecord.category == "sleep",
+        ]
+        if query_params.start_datetime:
+            filters.append(EventRecord.start_datetime >= query_params.start_datetime)
+        if query_params.end_datetime:
+            filters.append(EventRecord.end_datetime < query_params.end_datetime)
+
+        ranked = (
+            db_session.query(
+                EventRecord.id.label("record_id"),
+                func.dense_rank()
+                .over(
+                    partition_by=local_sleep_date,
+                    order_by=(provider_rank, device_rank, func.coalesce(DataSource.device_model, "")),
+                )
+                .label("source_rank"),
+            )
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(and_(*filters))
+            .subquery()
+        )
+        return db_session.query(ranked.c.record_id).filter(ranked.c.source_rank == 1)
+
+    def get_user_event_counts_by_provider(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_datetime: datetime | None = None,
+        end_datetime: datetime | None = None,
+    ) -> list[tuple[str, str, str | None, int]]:
+        """Get event record counts for a user grouped by provider, category, and type.
+
+        When ``start_datetime`` and/or ``end_datetime`` are provided, only events whose
+        ``start_datetime`` falls in the half-open interval ``[start, end)`` are counted. When both
+        are omitted, all-time counts are returned (unchanged behaviour).
+
+        Returns list of (provider, category, type, count) tuples ordered by provider, then count descending.
+        """
+        query = (
+            db_session.query(
+                DataSource.provider,
+                self.model.category,
+                self.model.type,
+                func.count(self.model.id).label("count"),
+            )
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user_id)
+        )
+        if start_datetime is not None:
+            query = query.filter(self.model.start_datetime >= start_datetime)
+        if end_datetime is not None:
+            query = query.filter(self.model.start_datetime < end_datetime)
+
+        results = (
+            query.group_by(DataSource.provider, self.model.category, self.model.type)
+            .order_by(DataSource.provider, func.count(self.model.id).desc())
+            .all()
+        )
+        return [(provider, category, event_type, count) for provider, category, event_type, count in results]
+
+    def get_count_by_workout_type(self, db_session: DbSession) -> list[tuple[str | None, int]]:
+        """Get count of workouts grouped by workout type.
+
+        Returns list of (workout_type, count) tuples ordered by count descending.
+        Only includes records with category='workout'.
+        """
+
+        results = (
+            db_session.query(self.model.type, func.count(self.model.id).label("count"))
+            .filter(self.model.category == "workout")
+            .group_by(self.model.type)
+            .order_by(func.count(self.model.id).desc())
+            .all()
+        )
+        return [(workout_type, count) for workout_type, count in results]
+
+    def get_sleep_stage_stats_via_json(self, db_session: DbSession, record_id: UUID) -> list[dict]:
+        """
+        Calculates sleep stage statistics directly from the JSONB column using SQL/JSON standard.
+        Demonstrates the power of PostgreSQL 17+ JSON_TABLE for analytic queries without application-side processing.
+        """
+        # Using JSON_TABLE to expand the array and aggregate in SQL
+        # This requires PostgreSQL 17+ (or 16 with extensions, but we target 18 per instructions)
+        stmt = text("""
+            SELECT
+                jt.stage,
+                count(*) as segment_count,
+                sum(extract(epoch from (jt.end_time - jt.start_time))) as total_seconds
+            FROM sleep_details sd,
+            JSON_TABLE(
+                sd.sleep_stages, '$[*]'
+                COLUMNS (
+                    stage text PATH '$.stage',
+                    start_time timestamp PATH '$.start_time',
+                    end_time timestamp PATH '$.end_time'
+                )
+            ) jt
+            WHERE sd.record_id = :record_id
+            GROUP BY jt.stage
+        """)
+
+        try:
+            result = db_session.execute(stmt, {"record_id": record_id}).fetchall()
+            return [
+                {"stage": row.stage, "segment_count": row.segment_count, "total_seconds": row.total_seconds}
+                for row in result
+            ]
+        except Exception:
+            # Fallback for older PG versions or tests running on sqlite/older docker images
+            return []
+
+    def get_records_containing_stage(self, db_session: DbSession, user_id: UUID, stage_name: str) -> list[EventRecord]:
+        """
+        Finds all sleep records that contain at least one occurrence of the specified stage.
+        Uses the highly efficient JSONB containment operator (@>).
+        """
+        # Efficient checking: SleepDetails.sleep_stages @> '[{"stage": "deep"}]'
+        # SQLAlchemy expr: SleepDetails.sleep_stages.contains([{'stage': stage_name}])
+        return (
+            db_session.query(EventRecord)
+            .join(EventRecord.detail.of_type(SleepDetails))
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                EventRecord.category == "sleep",
+                SleepDetails.sleep_stages.contains([{"stage": stage_name}]),
+            )
+            .order_by(desc(EventRecord.start_datetime))
+            .limit(10)
+            .all()
+        )
+
+    def get_sleep_summaries(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_date: datetime,
+        end_date: datetime,
+        cursor: str | None,
+        limit: int,
+    ) -> list[dict]:
+        """Get daily sleep summaries aggregated by date, source, and device_model.
+
+        Returns list of dicts with keys:
+        - sleep_date, min_start_time, max_end_time, total_duration_minutes
+        - source, device_model, record_id
+        - time_in_bed_minutes, efficiency_percent
+        - deep_minutes, light_minutes, rem_minutes, awake_minutes
+        - nap_count, nap_duration_minutes
+        """
+        # Helper: condition for "is NOT a nap" (main sleep)
+        # is_nap can be True, False, or NULL - we treat NULL as "not a nap"
+        is_main_sleep = func.coalesce(SleepDetails.is_nap, False) == False  # noqa: E712
+
+        # Local calendar date the session ended (wake-up date) — mirrors score
+        # date logic in fill_missing_sleep_scores_task so chart, score, and
+        # session list all key on the same date.
+        local_sleep_date = cast(
+            EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
+            Date,
+        )
+
+        # Build base aggregated query as subquery
+        # Join with SleepDetails to get sleep stage data
+        # Cast UUID to text for min() since PostgreSQL doesn't support min() on UUID directly
+        subquery = (
+            db_session.query(
+                local_sleep_date.label("sleep_date"),
+                # Main sleep times (exclude naps)
+                func.min(case((is_main_sleep, EventRecord.start_datetime), else_=None)).label("min_start_time"),
+                func.max(case((is_main_sleep, EventRecord.end_datetime), else_=None)).label("max_end_time"),
+                # Main sleep duration (exclude naps) — prefer net sleep time over
+                # wall-clock duration.  Oura (and some other providers) store
+                # time_in_bed in duration_seconds; sleep_total_duration_minutes
+                # holds the actual sleep time and should be used when available.
+                func.sum(
+                    case(
+                        (
+                            is_main_sleep,
+                            func.coalesce(
+                                SleepDetails.sleep_total_duration_minutes * 60,
+                                EventRecord.duration_seconds,
+                                0,
+                            ),
+                        ),
+                        else_=0,
+                    )
+                ).label("total_duration"),
+                DataSource.provider,
+                DataSource.source,
+                DataSource.device_model,
+                func.min(cast(EventRecord.id, String)).label("record_id_text"),
+                # Sleep details aggregations - main sleep only (minutes stored, convert to seconds later)
+                func.sum(case((is_main_sleep, SleepDetails.sleep_time_in_bed_minutes), else_=None)).label(
+                    "time_in_bed_minutes"
+                ),
+                func.sum(case((is_main_sleep, SleepDetails.sleep_deep_minutes), else_=None)).label("deep_minutes"),
+                func.sum(case((is_main_sleep, SleepDetails.sleep_light_minutes), else_=None)).label("light_minutes"),
+                func.sum(case((is_main_sleep, SleepDetails.sleep_rem_minutes), else_=None)).label("rem_minutes"),
+                func.sum(case((is_main_sleep, SleepDetails.sleep_awake_minutes), else_=None)).label("awake_minutes"),
+                # Weighted average for efficiency - main sleep only (weight by duration)
+                func.sum(
+                    case(
+                        (is_main_sleep, SleepDetails.sleep_efficiency_score * EventRecord.duration_seconds),
+                        else_=None,
+                    )
+                ).label("efficiency_weighted_sum"),
+                func.sum(
+                    case(
+                        (
+                            and_(is_main_sleep, SleepDetails.sleep_efficiency_score != None),  # noqa: E711
+                            EventRecord.duration_seconds,
+                        ),
+                        else_=0,
+                    )
+                ).label("efficiency_duration_sum"),
+                # Nap aggregations
+                func.sum(
+                    cast(SleepDetails.is_nap == True, Integer)  # noqa: E712
+                ).label("nap_count"),
+                func.sum(
+                    case((SleepDetails.is_nap == True, EventRecord.duration_seconds), else_=0)  # noqa: E712
+                ).label("nap_duration"),
+            )
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
+            .filter(
+                DataSource.user_id == user_id,
+                EventRecord.category == "sleep",
+                EventRecord.end_datetime >= start_date - timedelta(days=1),
+                local_sleep_date >= cast(start_date, Date),
+                local_sleep_date < cast(end_date, Date),
+            )
+            .group_by(
+                local_sleep_date,
+                DataSource.provider,
+                DataSource.source,
+                DataSource.device_model,
+            )
+        ).subquery()
+
+        hr_id = get_series_type_id(SeriesType.heart_rate)
+        sdnn_id = get_series_type_id(SeriesType.heart_rate_variability_sdnn)
+        rmssd_id = get_series_type_id(SeriesType.heart_rate_variability_rmssd)
+        resp_id = get_series_type_id(SeriesType.respiratory_rate)
+        spo2_id = get_series_type_id(SeriesType.oxygen_saturation)
+
+        # Lateral subquery: for each sleep row, average physio data within
+        # [min_start_time, max_end_time) — exact window, no date-grouping mismatch.
+        physio_lateral = lateral(
+            select(
+                func.avg(case((DataPointSeries.series_type_definition_id == hr_id, DataPointSeries.value))).label(
+                    "avg_hr"
+                ),
+                func.avg(case((DataPointSeries.series_type_definition_id == sdnn_id, DataPointSeries.value))).label(
+                    "avg_hrv_sdnn"
+                ),
+                func.avg(case((DataPointSeries.series_type_definition_id == rmssd_id, DataPointSeries.value))).label(
+                    "avg_hrv_rmssd"
+                ),
+                func.avg(case((DataPointSeries.series_type_definition_id == resp_id, DataPointSeries.value))).label(
+                    "avg_resp"
+                ),
+                func.avg(case((DataPointSeries.series_type_definition_id == spo2_id, DataPointSeries.value))).label(
+                    "avg_spo2"
+                ),
+            )
+            .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+            .where(
+                DataSource.user_id == user_id,
+                DataPointSeries.series_type_definition_id.in_([hr_id, sdnn_id, rmssd_id, resp_id, spo2_id]),
+                DataPointSeries.recorded_at >= subquery.c.min_start_time,
+                DataPointSeries.recorded_at < subquery.c.max_end_time,
+            )
+        )
+
+        # Build main query from subquery, casting record_id back to UUID
+        record_id_col = cast(subquery.c.record_id_text, SQL_UUID).label("record_id")
+        query = db_session.query(
+            subquery.c.sleep_date,
+            subquery.c.min_start_time,
+            subquery.c.max_end_time,
+            subquery.c.total_duration,
+            subquery.c.provider,
+            subquery.c.source,
+            subquery.c.device_model,
+            record_id_col,
+            subquery.c.time_in_bed_minutes,
+            subquery.c.deep_minutes,
+            subquery.c.light_minutes,
+            subquery.c.rem_minutes,
+            subquery.c.awake_minutes,
+            subquery.c.efficiency_weighted_sum,
+            subquery.c.efficiency_duration_sum,
+            subquery.c.nap_count,
+            subquery.c.nap_duration,
+            physio_lateral.c.avg_hr,
+            physio_lateral.c.avg_hrv_sdnn,
+            physio_lateral.c.avg_hrv_rmssd,
+            physio_lateral.c.avg_resp,
+            physio_lateral.c.avg_spo2,
+        ).outerjoin(physio_lateral, true())
+
+        # Handle cursor pagination
+        if cursor:
+            cursor_ts, cursor_id, direction = decode_cursor(cursor)
+            cursor_date = cursor_ts.date()
+
+            if direction == "prev":
+                # Backward pagination: get items BEFORE cursor
+                query = query.filter(tuple_(subquery.c.sleep_date, record_id_col) < (cursor_date, cursor_id))
+                query = query.order_by(desc(subquery.c.sleep_date), desc(record_id_col))
+            else:
+                # Forward pagination: get items AFTER cursor
+                query = query.filter(tuple_(subquery.c.sleep_date, record_id_col) > (cursor_date, cursor_id))
+                query = query.order_by(asc(subquery.c.sleep_date), asc(record_id_col))
+        else:
+            # No cursor: default ordering
+            query = query.order_by(asc(subquery.c.sleep_date), asc(record_id_col))
+
+        # Limit + 1 to check for has_more
+        results = query.limit(limit + 1).all()
+
+        # Transform results to dict format
+        summaries = []
+        for row in results:
+            # Calculate weighted average efficiency
+            efficiency_percent = None
+            if row.efficiency_duration_sum and row.efficiency_duration_sum > 0:
+                efficiency_percent = float(row.efficiency_weighted_sum) / float(row.efficiency_duration_sum)
+
+            summaries.append(
+                {
+                    "sleep_date": row.sleep_date,
+                    "min_start_time": row.min_start_time,
+                    "max_end_time": row.max_end_time,
+                    "total_duration_minutes": int(row.total_duration or 0) // 60,
+                    "provider": row.provider,
+                    "source": row.source,
+                    "device_model": row.device_model,
+                    "record_id": row.record_id,
+                    "time_in_bed_minutes": int(row.time_in_bed_minutes)
+                    if row.time_in_bed_minutes is not None
+                    else None,
+                    "deep_minutes": int(row.deep_minutes) if row.deep_minutes is not None else None,
+                    "light_minutes": int(row.light_minutes) if row.light_minutes is not None else None,
+                    "rem_minutes": int(row.rem_minutes) if row.rem_minutes is not None else None,
+                    "awake_minutes": int(row.awake_minutes) if row.awake_minutes is not None else None,
+                    "efficiency_percent": efficiency_percent,
+                    # Nap tracking
+                    "nap_count": int(row.nap_count) if row.nap_count is not None else None,
+                    "nap_duration_minutes": int(row.nap_duration) // 60 if row.nap_duration is not None else None,
+                    # Physio averages from data_point_series
+                    "avg_hr": float(row.avg_hr) if row.avg_hr is not None else None,
+                    "avg_hrv_sdnn": float(row.avg_hrv_sdnn) if row.avg_hrv_sdnn is not None else None,
+                    "avg_hrv_rmssd": float(row.avg_hrv_rmssd) if row.avg_hrv_rmssd is not None else None,
+                    "avg_resp": float(row.avg_resp) if row.avg_resp is not None else None,
+                    "avg_spo2": float(row.avg_spo2) if row.avg_spo2 is not None else None,
+                }
+            )
+
+        # Attach per-session breakdown (individual sleep/nap records) for each summary,
+        # keyed by the same (date, provider, source, device_model) grouping identity.
+        sessions_by_key = self._get_sleep_sessions(db_session, user_id, start_date, end_date)
+        for summary in summaries:
+            key = (
+                summary["sleep_date"],
+                summary["provider"],
+                summary["source"],
+                summary["device_model"],
+            )
+            summary["sessions"] = sessions_by_key.get(key, [])
+
+        return summaries
+
+    def _get_sleep_sessions(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> dict[tuple, list[dict]]:
+        """Get individual sleep/nap sessions keyed by (sleep_date, provider, source, device_model).
+
+        Mirrors the date filter and grouping identity of ``get_sleep_summaries`` but returns one
+        entry per underlying EventRecord instead of collapsing them. Per-session duration prefers
+        net sleep time (SleepDetails.sleep_total_duration_minutes) and falls back to wall-clock
+        duration, matching the aggregate duration logic. Sessions are sorted by start time.
+        """
+        local_sleep_date = cast(
+            EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
+            Date,
+        )
+        is_nap_expr = func.coalesce(SleepDetails.is_nap, False)
+        duration_seconds = case(
+            (is_nap_expr, EventRecord.duration_seconds),
+            else_=func.coalesce(
+                SleepDetails.sleep_total_duration_minutes * 60,
+                EventRecord.duration_seconds,
+                0,
+            ),
+        )
+
+        rows = (
+            db_session.query(
+                local_sleep_date.label("sleep_date"),
+                EventRecord.start_datetime.label("start_time"),
+                EventRecord.end_datetime.label("end_time"),
+                EventRecord.zone_offset.label("zone_offset"),
+                duration_seconds.label("duration_seconds"),
+                func.coalesce(SleepDetails.is_nap, False).label("is_nap"),
+                DataSource.provider,
+                DataSource.source,
+                DataSource.device_model,
+            )
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
+            .filter(
+                DataSource.user_id == user_id,
+                EventRecord.category == "sleep",
+                EventRecord.end_datetime >= start_date - timedelta(days=1),
+                local_sleep_date >= cast(start_date, Date),
+                local_sleep_date < cast(end_date, Date),
+            )
+            .order_by(asc(local_sleep_date), asc(EventRecord.start_datetime))
+            .all()
+        )
+
+        sessions_by_key: dict[tuple, list[dict]] = {}
+        for row in rows:
+            key = (row.sleep_date, row.provider, row.source, row.device_model)
+            sessions_by_key.setdefault(key, []).append(
+                {
+                    "start_time": row.start_time,
+                    "end_time": row.end_time,
+                    "zone_offset": row.zone_offset,
+                    "duration_minutes": int(row.duration_seconds) // 60 if row.duration_seconds is not None else None,
+                    "is_nap": bool(row.is_nap),
+                }
+            )
+        return sessions_by_key
+
+    def get_daily_workout_aggregates(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> list[dict]:
+        """Get daily workout aggregates including elevation, distance, and energy.
+
+        Aggregates WorkoutDetails data by date for activity summaries.
+
+        Returns list of dicts with keys:
+        - workout_date, source, device_model
+        - elevation_meters, distance_meters, energy_burned_kcal
+        """
+        local_workout_date = cast(
+            self.model.end_datetime + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
+            Date,
+        )
+
+        results = (
+            db_session.query(
+                local_workout_date.label("workout_date"),
+                DataSource.source,
+                DataSource.device_model,
+                # Sum elevation gain for all workouts on that day
+                func.sum(WorkoutDetails.total_elevation_gain).label("elevation_sum"),
+                # Sum distance for all workouts
+                func.sum(WorkoutDetails.distance).label("distance_sum"),
+                # Sum energy burned
+                func.sum(WorkoutDetails.energy_burned).label("energy_sum"),
+            )
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            # Use outerjoin since WorkoutDetails is optional - some workouts may not have details
+            .outerjoin(WorkoutDetails, self.model.id == WorkoutDetails.record_id)
+            .filter(
+                DataSource.user_id == user_id,
+                self.model.category == "workout",
+                self.model.end_datetime >= start_date - timedelta(days=1),
+                local_workout_date >= cast(start_date, Date),
+                local_workout_date < cast(end_date, Date),
+            )
+            .group_by(
+                local_workout_date,
+                DataSource.source,
+                DataSource.device_model,
+            )
+            .order_by(asc(local_workout_date))
+            .all()
+        )
+
+        aggregates = []
+        for row in results:
+            aggregates.append(
+                {
+                    "workout_date": row.workout_date,
+                    "source": row.source,
+                    "device_model": row.device_model,
+                    "elevation_meters": float(row.elevation_sum) if row.elevation_sum is not None else None,
+                    "distance_meters": float(row.distance_sum) if row.distance_sum is not None else None,
+                    "energy_burned_kcal": float(row.energy_sum) if row.energy_sum is not None else None,
+                }
+            )
+        return aggregates
+
+    @handle_exceptions
+    def find_adjacent_sleep_record(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+        threshold_minutes: int,
+        source: str | None = None,
+        provider: str | None = None,
+    ) -> EventRecord | None:
+        """Return the most-recent sleep session adjacent to [start_time, end_time].
+
+        A record is adjacent when its window overlaps or is within
+        *threshold_minutes* of the candidate window.  The detail relationship
+        is eagerly loaded so callers can read ``sleep_stages`` without an extra
+        query.
+
+        When *provider* is provided the query is restricted to records whose
+        DataSource has the same provider, preventing cross-provider merges
+        (e.g. Oura sessions being merged with Garmin sessions).
+        When *source* is provided an additional filter on DataSource.source is applied.
+        """
+        threshold = timedelta(minutes=threshold_minutes)
+        filters = [
+            DataSource.user_id == user_id,
+            self.model.category == "sleep",
+            self.model.type == "sleep_session",
+            self.model.start_datetime <= end_time + threshold,
+            self.model.end_datetime >= start_time - threshold,
+        ]
+        if provider is not None:
+            filters.append(DataSource.provider == provider)
+        if source is not None:
+            filters.append(DataSource.source == source)
+        return (
+            db_session.query(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .options(selectinload(self.model.detail))
+            .filter(*filters)
+            .order_by(self.model.start_datetime.desc())
+            .with_for_update()
+            .first()
+        )
+
+    def get_sleep_records_with_details(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[tuple[EventRecord, SleepDetails | None]]:
+        """Return sleep EventRecords with their SleepDetails that overlap [start_dt, end_dt).
+
+        Uses an outerjoin so sessions with no stage data are still included.
+        """
+        rows = (
+            db_session.query(EventRecord, SleepDetails)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
+            .filter(
+                DataSource.user_id == user_id,
+                EventRecord.category == "sleep",
+                EventRecord.end_datetime >= start_dt,
+                EventRecord.start_datetime < end_dt,
+            )
+            .all()
+        )
+        return [(event_record, sleep_details) for event_record, sleep_details in rows]

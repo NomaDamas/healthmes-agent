@@ -1,0 +1,281 @@
+---
+title: "Whoop API Integration"
+description: "Connect Whoop via OAuth 2.0. Syncs workouts, sleep with stages, recovery scores, HRV, SpO2, and body measurements in real time via webhooks. Requires an active Whoop membership."
+keywords: ["whoop api", "whoop data integration", "whoop health data", "whoop api open source"]
+"og:title": "Whoop API Integration | Open Wearables"
+"og:description": "Connect Whoop via OAuth 2.0. Syncs workouts, sleep, recovery scores, HRV, and SpO2. Requires Whoop membership."
+"og:url": "https://docs.openwearables.io/providers/whoop-api-integration"
+"og:type": "article"
+"twitter:title": "Whoop API Integration | Open Wearables"
+"twitter:description": "Connect Whoop via OAuth 2.0. Syncs workouts, sleep, recovery scores, HRV, and SpO2. Requires Whoop membership."
+"twitter:card": "summary_large_image"
+---
+
+<Note>
+**Need help with your Whoop integration?** Pop into our [Discord](https://discord.gg/qrcfFnNE6H) if you have questions or want to discover how Open Wearables can solve your problems.
+</Note>
+
+## Overview
+
+Whoop provides access to workout, sleep, recovery, and body measurement data through their REST API. The integration uses OAuth 2.0 for authentication and pull-based syncing to fetch data.
+
+### Supported data types
+
+| Data Type | Support |
+|-----------|---------|
+| Workouts / Activities | Yes |
+| Sleep (with stages) | Yes |
+| Recovery (score, resting HR, HRV, SpO2, skin temp) | Yes |
+| Body measurements (height, weight) | Yes |
+| Continuous heart rate / activity samples | No (not available via API) |
+
+### Data delivery
+
+| Method | Description |
+|--------|-------------|
+| **Polling (pull)** | Open Wearables periodically fetches workout, sleep, recovery, and body measurement data via the Whoop API (default: every hour via Celery Beat) |
+| **Webhooks (push)** | Whoop notifies Open Wearables in real time when workout, sleep, or recovery data is created, updated, or deleted. The handler fetches the specific resource by ID and saves it immediately. |
+
+## What you need by the end
+
+- **App credentials**: Client ID + Client Secret
+- **OAuth scopes** configured
+- **Redirect URI** registered in the Whoop Developer Dashboard
+- **Webhook URL** registered in the Whoop Developer Dashboard (optional, for real-time updates)
+
+## Prerequisites
+
+- A Whoop account with an active membership
+
+## Application walkthrough
+
+<Steps>
+  <Step title="Sign up for Whoop">
+    You must have a Whoop membership to develop on the Whoop Developer Platform. Your Whoop account is also your developer login.
+
+    If you don't have one yet, [join Whoop here](https://www.whoop.com/).
+  </Step>
+
+  <Step title="Create a Team in the Developer Dashboard">
+    Go to the [Whoop Developer Dashboard](https://developer-dashboard.whoop.com/) and sign in with your Whoop account credentials.
+
+    Before creating an app, you'll be prompted to create a **Team**. Choose a name for your team and click **Create Team**.
+
+    <Note>
+    You can invite other developers to your team later from the Team section of the Developer Dashboard. They'll need a Whoop account to be added.
+    </Note>
+  </Step>
+
+  <Step title="Create an App">
+    In the Developer Dashboard, go to the app creation flow:
+
+    - **App Name**: Your application name
+    - **Scopes**: Select the scopes your app needs (see table below)
+    - **Redirect URIs**: Add your OAuth callback URL (e.g. `http://localhost:8000/api/v1/oauth/whoop/callback` for local development)
+
+    After creating the app, you'll receive:
+    - **Client ID**
+    - **Client Secret**
+
+    <Warning>
+    Your Client Secret should never be logged or shared. It should only be used server-side and never exposed in client, web, or mobile applications.
+    </Warning>
+  </Step>
+
+  <Step title="Configure credentials in Open Wearables">
+    Add the following to your `.env` file:
+
+```bash
+#--- Whoop ---#
+WHOOP_CLIENT_ID=your-whoop-client-id
+WHOOP_CLIENT_SECRET=your-whoop-client-secret
+WHOOP_REDIRECT_URI=http://localhost:8000/api/v1/oauth/whoop/callback
+WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout read:body_measurement read:profile
+```
+
+    **Configuration details:**
+
+    | Variable | Description |
+    |----------|-------------|
+    | `WHOOP_CLIENT_ID` | Client ID from the Whoop Developer Dashboard |
+    | `WHOOP_CLIENT_SECRET` | Client Secret from the Whoop Developer Dashboard |
+    | `WHOOP_REDIRECT_URI` | Must match a redirect URI registered in the Developer Dashboard. For local dev: `http://localhost:8000/api/v1/oauth/whoop/callback` |
+    | `WHOOP_DEFAULT_SCOPE` | OAuth scopes requested during authorization. The `offline` scope is required for refresh tokens |
+
+  </Step>
+
+  <Step title="Connect a user via OAuth">
+    With credentials configured and your Open Wearables instance running, initiate the OAuth flow to connect a user's Whoop account.
+
+    **1. Get the authorization URL:**
+
+    ```bash
+    curl -X GET "http://localhost:8000/api/v1/oauth/whoop/authorize?user_id={user_id}&redirect_uri=http://localhost:3000/users/{user_id}" \
+      -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+    ```
+
+    **Response:**
+    ```json
+    {
+      "authorization_url": "https://api.prod.whoop.com/oauth/oauth2/auth?client_id=...&redirect_uri=...&response_type=code&scope=offline+read%3Acycles+read%3Asleep+read%3Arecovery+read%3Aworkout&state=...",
+      "state": "abc123..."
+    }
+    ```
+
+    **2. Redirect the user** to the `authorization_url`. They will log in to Whoop and authorize your app.
+
+    **3. Whoop redirects back** to the callback URI configured in your `.env` (`WHOOP_REDIRECT_URI`). Open Wearables automatically exchanges the authorization code for access and refresh tokens.
+
+    **4. Verify the connection** was created:
+
+    ```bash
+    curl -X GET "http://localhost:8000/api/v1/users/{user_id}/connections" \
+      -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+    ```
+
+    You should see a connection with `"provider": "whoop"` and `"status": "active"`.
+
+    <Note>
+      The `redirect_uri` parameter in the authorize call is where the **user** is sent after the flow completes (e.g., back to your app). This is separate from `WHOOP_REDIRECT_URI` in your `.env`, which is the **server-side** OAuth callback that Whoop sends the authorization code to.
+    </Note>
+  </Step>
+
+  <Step title="Set up webhooks (optional)">
+    Webhooks give you real-time updates instead of waiting for the next polling cycle. When Whoop records a new workout, sleep session, or recovery, it immediately notifies Open Wearables, which fetches and saves the record.
+
+    **1. Register the webhook URL in the Whoop Developer Dashboard:**
+
+    Go to your app in the [Whoop Developer Dashboard](https://developer-dashboard.whoop.com/), navigate to **Webhooks**, and add your callback URL:
+
+    ```
+    https://your-domain/api/v1/providers/whoop/webhooks
+    ```
+
+    For local development, use a tunnel such as [ngrok](/dev-guides/ngrok-setup):
+
+    ```
+    https://your-ngrok-subdomain.ngrok.io/api/v1/providers/whoop/webhooks
+    ```
+
+    Select **payload version v2** (uses UUID resource IDs).
+
+    **2. Set the webhook secret:**
+
+    Whoop uses your app's **Client Secret** (`WHOOP_CLIENT_SECRET`) to sign webhook requests — no additional secret is needed. Ensure it is set in your `.env`.
+
+    **Supported events:**
+
+    | Event | Action |
+    |-------|--------|
+    | `workout.updated` | Fetches the workout by ID and saves it |
+    | `workout.deleted` | Deletes the workout record by external ID |
+    | `sleep.updated` | Fetches the sleep session by ID and saves it |
+    | `sleep.deleted` | Deletes the sleep record by external ID |
+    | `recovery.updated` | Fetches the recovery record by cycle ID and saves it |
+    | `recovery.deleted` | Logged but not actioned (recovery stored as time-series, no external ID index) |
+
+    <Note>
+    Webhook registration is manual — there is no API to register subscriptions programmatically. All configuration is done through the Developer Dashboard.
+    </Note>
+  </Step>
+
+  <Step title="Sync data">
+    An initial sync is triggered automatically after a successful OAuth connection. To manually sync or fetch historical data:
+
+    ```bash
+    # Sync all data types
+    curl -X POST "http://localhost:8000/api/v1/providers/whoop/users/{user_id}/sync?data_type=all" \
+      -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+    ```
+
+    You can also sync specific data types:
+
+    ```bash
+    # Sync only workouts
+    curl -X POST "http://localhost:8000/api/v1/providers/whoop/users/{user_id}/sync?data_type=workouts" \
+      -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+
+    # Sync only sleep & recovery
+    curl -X POST "http://localhost:8000/api/v1/providers/whoop/users/{user_id}/sync?data_type=247" \
+      -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+    ```
+
+    <Note>
+      When no date range is specified, Whoop defaults to syncing the last 30 days of data.
+    </Note>
+  </Step>
+
+  <Step title="Verify the integration">
+    Once data has synced, fetch it via the Open Wearables API:
+
+    ```bash
+    # Fetch workouts
+    curl -X GET "http://localhost:8000/api/v1/users/{user_id}/events/workouts?start_date=2026-01-01T00:00:00Z&end_date=2026-02-01T00:00:00Z" \
+      -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+
+    # Fetch sleep sessions
+    curl -X GET "http://localhost:8000/api/v1/users/{user_id}/events/sleep?start_date=2026-01-01T00:00:00Z&end_date=2026-02-01T00:00:00Z" \
+      -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
+    ```
+
+    If data is returned, your Whoop integration is working end-to-end.
+  </Step>
+
+  <Step title="Submit your app for production (when ready)">
+    While developing, your app works in development mode. When you're ready to launch:
+
+    1. Go to the Developer Dashboard
+    2. Submit your app for approval
+  </Step>
+</Steps>
+
+## Rate Limits
+
+Whoop applies two rate limits by default:
+
+| Limit | Value |
+|-------|-------|
+| Per minute | 100 requests |
+| Per day | 10,000 requests |
+
+**How Open Wearables uses the quota:** Each sync cycle per user makes ~4-7 API requests (workouts, sleep, recovery, and body measurements — each paginated at 25 items per page). With the default polling interval of 1 hour, that's roughly **~120 requests per user per day**. This means the default rate limits comfortably support **~60-80 connected users** per app.
+
+If you need to support more users right now, you can request increased rate limits from Whoop via the [Developer Dashboard](https://developer-dashboard.whoop.com/).
+
+<Info>
+With webhooks enabled, most data arrives in real time and the polling cycle only acts as a fallback.
+</Info>
+
+## OAuth Scopes Reference
+
+| Scope | Description |
+|-------|-------------|
+| `offline` | Required to receive refresh tokens for long-lived access |
+| `read:cycles` | Read physiological cycle data |
+| `read:sleep` | Read sleep data (sessions, stages, efficiency) |
+| `read:recovery` | Read recovery data (score, resting HR, HRV, SpO2, skin temp) |
+| `read:workout` | Read workout/activity data |
+| `read:body_measurement` | Read body measurements (height, weight) |
+| `read:profile` | Read user profile information |
+
+The default scope `offline read:cycles read:sleep read:recovery read:workout read:body_measurement read:profile` covers all data types currently processed by Open Wearables.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="API Reference" icon="terminal" href="/api-reference/introduction">
+    Explore the Open Wearables API endpoints.
+  </Card>
+  <Card title="Architecture" icon="diagram" href="/architecture/system-overview">
+    Understand the overall system architecture.
+  </Card>
+</CardGroup>
+
+## Support
+
+<Note>
+**Need Help?**
+- Join our [Discord](https://discord.gg/qrcfFnNE6H) and ask a question.
+- Check [GitHub Discussions](https://github.com/the-momentum/open-wearables/discussions).
+- Check the [Whoop Developer Documentation](https://developer.whoop.com/docs/developing/getting-started).
+</Note>
