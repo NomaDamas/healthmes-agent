@@ -1,0 +1,21 @@
+<resources>
+    <string name="app_name">HealthMes</string>
+    <string name="tile_label">HealthMes briefing</string>
+    <string name="complication_label">Energy score</string>
+
+    <string name="intro">Pair with your HealthMes instance, then add the briefing tile
+        or the energy complication.</string>
+    <string name="hint_server_url">Server URL</string>
+    <string name="hint_token">API token (optional)</string>
+    <string name="save_pairing">Save</string>
+    <string name="fetch_now">Fetch now</string>
+    <string name="status_not_paired">Not paired.</string>
+    <string name="status_saved">Pairing saved.</string>
+    <string name="status_fetching">Fetching…</string>
+    <string name="error_invalid_url">Enter a valid http(s) URL</string>
+
+    <string name="tile_energy_label">Energy</string>
+    <string name="tile_not_paired">Open HealthMes to pair</string>
+    <string name="tile_no_blocks">No upcoming blocks</string>
+    <string name="tile_alerts_none">No alerts</string>
+</resources>

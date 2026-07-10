@@ -62,6 +62,8 @@ from healthmes.backup.provider import (
 from healthmes.config import Settings
 
 __all__ = [
+    "PROVIDER_LOCAL",
+    "PROVIDER_REMOTE_VAULT",
     "SCHEMA_VERSION",
     "SNAPSHOT_PREFIX",
     "SNAPSHOT_SUFFIX",
@@ -73,6 +75,7 @@ __all__ = [
     "parse_snapshot_name",
     "read_manifest",
     "resolve_backup_dir",
+    "resolve_backup_provider_name",
     "resolve_data_locations",
     "resolve_passphrase",
     "restore_snapshot",
@@ -154,6 +157,40 @@ def resolve_passphrase(settings: Settings) -> str | None:
     if configured:
         return configured
     return _unwrap_secret(os.environ.get("HEALTHMES_BACKUP_PASSPHRASE"))
+
+
+PROVIDER_LOCAL = "local"
+PROVIDER_REMOTE_VAULT = "remote_vault"
+# "remote" is accepted as a convenience alias (it is what the CLI flag uses).
+_PROVIDER_ALIASES = {
+    "local": PROVIDER_LOCAL,
+    "remote_vault": PROVIDER_REMOTE_VAULT,
+    "remote": PROVIDER_REMOTE_VAULT,
+}
+
+
+def resolve_backup_provider_name(settings: Settings) -> str:
+    """The configured backup provider: ``local`` (default) or ``remote_vault``.
+
+    Reads ``Settings.backup_provider`` first, then the
+    ``HEALTHMES_BACKUP_PROVIDER`` env var. Unknown values raise
+    :class:`BackupError` — a typo must never silently fall back to a
+    different storage destination. Lives here (not in
+    healthmes/backup/remote_vault.py) so resolving the selector never
+    imports boto3.
+    """
+    raw = _unwrap_secret(getattr(settings, "backup_provider", None)) or _unwrap_secret(
+        os.environ.get("HEALTHMES_BACKUP_PROVIDER")
+    )
+    if raw is None:
+        return PROVIDER_LOCAL
+    normalized = _PROVIDER_ALIASES.get(raw.lower())
+    if normalized is None:
+        raise BackupError(
+            f"unknown backup provider {raw!r}: expected 'local' or 'remote_vault' "
+            "(set via HEALTHMES_BACKUP_PROVIDER or the backup_provider setting)"
+        )
+    return normalized
 
 
 def resolve_data_locations(settings: Settings) -> DataLocations:

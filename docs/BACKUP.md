@@ -3,11 +3,13 @@
 Local-first with an encrypted backup *seam* (docs/PLAN.md §9): all HealthMes
 data leaves the live stores only as an **age-encrypted snapshot envelope**
 moving through the `BackupProvider` protocol
-(`healthmes/backup/provider.py`). The MVP ships `LocalDirectoryProvider`;
-the future paid remote vault implements the same protocol against
-S3-compatible storage. **Exporting data around this interface is
-forbidden** — that rule is what makes the remote vault a viable business:
-the server only ever stores ciphertext.
+(`healthmes/backup/provider.py`). `LocalDirectoryProvider` is the default;
+`RemoteVaultProvider` (`healthmes/backup/remote_vault.py`) implements the
+same protocol against any S3-compatible storage (AWS S3, Cloudflare R2,
+MinIO, …) — self-hostable today, and the exact seam the future paid vault
+service runs on. **Exporting data around this interface is forbidden** —
+that rule is what makes the remote vault a viable business: the server only
+ever stores ciphertext.
 
 ## 1. Snapshot envelope format (schema_version 1)
 
@@ -112,6 +114,9 @@ uv run python -m healthmes backup restore healthmes-backup-20260709T033000Z.tar.
 uv run python -m healthmes backup restore healthmes-backup-20260709T033000Z.tar.gz.age --yes  # applies (destructive)
 ```
 
+Remote-vault replication (`--provider remote` on the commands above, plus
+`backup push <name>`): see §3.
+
 Configuration (Settings fields / env fallbacks — see `resolve_*` in
 `healthmes/backup/snapshot.py`):
 
@@ -133,23 +138,31 @@ locations, run `backup restore <file> --yes`, start the stack, and re-run
 the Phase-0 demo query. Opening a snapshot without the passphrase must fail
 (`WrongPassphraseError`).
 
-## 3. RemoteVaultProvider contract (the business seam — no code yet)
+## 3. RemoteVault (the business seam — implemented)
 
-A future paid service implements `BackupProvider` against an S3-compatible
-vault. This section is the contract; MVP intentionally ships **no**
-implementation beyond the protocol.
+`RemoteVaultProvider` (`healthmes/backup/remote_vault.py`) implements
+`BackupProvider` against any S3-compatible endpoint. It is **self-hostable
+today** (your own AWS/R2/MinIO bucket, your keys, your bill) and is the
+exact provider the future paid vault service runs on — the paid offering is
+this seam plus managed storage, retention and billing on top; nothing about
+the data path changes. Because the seam is the product, the invariants
+below are enforced in code, not just documented.
 
-**Storage model**
+### What the server can and cannot see
 
-- One object per snapshot, key `vaults/{vault_id}/{snapshot_name}`; the
-  object body is byte-identical to the local `*.tar.gz.age` file.
-- Objects are immutable: no overwrite, no rename; deletion only through an
-  explicit retention/pruning call. Server-side versioning + object lock
-  (compliance mode) recommended.
-- `list_snapshots()` maps to a key listing; `SnapshotInfo` derives from the
-  key name and object size — identical semantics to the local provider.
+The vault operator (whether that is AWS, Cloudflare, your own MinIO box, or
+a future HealthMes-run service) stores **ciphertext only**. Snapshots are
+age-encrypted *before the provider ever sees them* — there is no plaintext
+moment on the upload path, and no key material is ever transmitted.
 
-**Privacy invariants (non-negotiable)**
+| The server sees | The server can NEVER see |
+|---|---|
+| Snapshot name → creation timestamp | Any plaintext (databases, media, Hermes state) |
+| Ciphertext size | The manifest / file listing inside the envelope |
+| Upload time, source IP, credentials/account identity | The passphrase or any derived key |
+| A SHA-256 of the **ciphertext** (integrity metadata) | Any health-domain metadata usable for analytics |
+
+**Privacy invariants (non-negotiable, enforced)**
 
 1. **Client-side encryption only.** The envelope is encrypted with the
    user's passphrase *before* upload; the vault stores ciphertext it can
@@ -158,24 +171,119 @@ implementation beyond the protocol.
 2. **The passphrase (or any derived key) never leaves the client.** No
    key escrow, no server-side recovery. Losing the passphrase loses the
    vault — the product communicates this loudly at setup.
-3. **Metadata minimalism.** The server may see: snapshot name (creation
-   timestamp), ciphertext size, upload time, account/billing identity.
-   It must never receive the manifest, file listings, or any health-domain
-   metadata; nothing about the plaintext is used for analytics.
+3. **Metadata minimalism.** Exactly the left column above; nothing about
+   the plaintext is used for analytics.
 4. **Same seam, no side doors.** The vault client is a `BackupProvider`;
    sync/telemetry/"insights" uploads that bypass `export_snapshot()` are
    architecture violations (PLAN §9: "이 인터페이스를 우회한 데이터 반출 금지").
+   The provider **refuses to upload anything that is not a snapshot
+   envelope**: the file name must be the canonical
+   `healthmes-backup-<UTC stamp>.tar.gz.age` form *and* the content must
+   carry the age v1 header. Renaming a raw database to `*.tar.gz.age` is
+   refused — the vault client cannot be repurposed as a generic uploader
+   for health data.
 
-**Operational contract**
+### Local-first semantics
 
-- `export_snapshot()` uploads with content-integrity protection (e.g.
-  SHA-256 checksum header / multipart ETag verification) and must be
-  all-or-nothing: a failed upload leaves no partial object visible.
-- `restore(path)` downloads to a temp file, then reuses the exact local
-  verification pipeline (decrypt → extract → inventory check → replace).
-- Recommended extras (not in the protocol): retention policy, bandwidth
-  limits, resumable uploads, a `verify` endpoint that re-checks stored
-  object checksums — all operate on ciphertext only.
+The vault is a **replication target**, never the primary store:
+
+- `backup create --provider remote` writes the local snapshot first, then
+  uploads a byte-identical copy. The local file stays unless you pass the
+  explicit `--remote-only` flag (then the vault holds the only copy and the
+  CLI says so on stderr).
+- `backup push <name>` uploads an already-existing local snapshot.
+- `backup restore <name> --provider remote` uses a local copy when present;
+  otherwise it downloads the envelope into the backup dir and runs the
+  exact local pipeline (decrypt → extract → inventory verify → replace).
+- `backup list --provider remote` shows the union of both sides, labeled
+  `local` / `remote` / `both` (plus a loud `size mismatch!` marker that
+  should never appear — snapshots are immutable).
+- The weekly scheduler job replicates to the vault when
+  `HEALTHMES_BACKUP_PROVIDER=remote_vault`; a failed upload only logs — the
+  local snapshot is already safe on disk.
+
+### Storage model
+
+- One object per snapshot, key `{HEALTHMES_VAULT_PREFIX}/{snapshot_name}`
+  (default prefix `healthmes-vault`; a hosted multi-tenant vault uses
+  `vaults/{vault_id}` as the prefix); the object body is byte-identical to
+  the local `*.tar.gz.age` file.
+- Objects are treated as immutable: no overwrite, no rename; the provider
+  never deletes remote objects except to clean up its own failed upload.
+  Server-side versioning + object lock (compliance mode) recommended for
+  hosted deployments.
+- `list_snapshots()` maps to a key listing; `SnapshotInfo` derives from the
+  key name and object size — identical semantics to the local provider,
+  and like it, **listing never needs the passphrase**.
+
+### Operational contract (as implemented)
+
+- Uploads are verified (single-part ETag vs local MD5 where the gateway
+  provides it, object size otherwise) and all-or-nothing: S3 PUT semantics
+  never expose a partial object, and a failed verification deletes the
+  object before raising. The ciphertext SHA-256 travels as object metadata
+  (`healthmes-sha256`) and is re-checked on download.
+- Downloads land atomically (`.part` + rename); corruption is additionally
+  caught by age's authenticated encryption and the manifest inventory
+  check during restore.
+- botocore's flexible-checksum negotiation is pinned to `when_required`
+  for compatibility with non-AWS gateways; integrity comes from the checks
+  above, not from AWS-only headers.
+- Errors (wrong credentials, missing bucket, unreachable endpoint, missing
+  object) surface as single-line actionable `BackupError`s naming the env
+  var to fix — never a traceback.
+- Recommended extras for a hosted service (not in the protocol): retention
+  policy, bandwidth limits, resumable multipart uploads, a `verify`
+  endpoint that re-checks stored object checksums — all operate on
+  ciphertext only.
+
+### Configuration matrix
+
+Resolution is Settings-attribute first, then the env var (same pattern as
+the other backup knobs); everything works from env vars alone.
+
+| Env var | Required | Meaning | Example |
+|---|---|---|---|
+| `HEALTHMES_VAULT_BUCKET` | yes (turns the vault on) | Bucket name | `my-healthmes-vault` |
+| `HEALTHMES_VAULT_ENDPOINT` | non-AWS | S3 API endpoint URL | `https://<account>.r2.cloudflarestorage.com` |
+| `HEALTHMES_VAULT_ACCESS_KEY_ID` | usually | Access key (unset → boto3 default chain: env/profile/role) | `AKIA…` |
+| `HEALTHMES_VAULT_SECRET_ACCESS_KEY` | usually | Secret key (paired with the above) | — |
+| `HEALTHMES_VAULT_REGION` | provider-specific | Region (`auto` for R2; any value for MinIO) | `us-east-1` |
+| `HEALTHMES_VAULT_PREFIX` | no | Key prefix, default `healthmes-vault` | `vaults/minseong` |
+| `HEALTHMES_BACKUP_PROVIDER` | no | `local` (default) or `remote_vault` — default provider when no `--provider` flag is given (weekly job included) | `remote_vault` |
+
+### Examples
+
+Cloudflare R2:
+
+```sh
+export HEALTHMES_VAULT_ENDPOINT="https://<account-id>.r2.cloudflarestorage.com"
+export HEALTHMES_VAULT_BUCKET="healthmes-vault"
+export HEALTHMES_VAULT_ACCESS_KEY_ID="<r2-access-key-id>"
+export HEALTHMES_VAULT_SECRET_ACCESS_KEY="<r2-secret>"
+export HEALTHMES_VAULT_REGION="auto"
+
+uv run healthmes backup create --provider remote   # local write + upload
+uv run healthmes backup list --provider remote     # merged view with origins
+```
+
+Self-hosted MinIO:
+
+```sh
+export HEALTHMES_VAULT_ENDPOINT="http://localhost:9000"
+export HEALTHMES_VAULT_BUCKET="healthmes"
+export HEALTHMES_VAULT_ACCESS_KEY_ID="minioadmin"
+export HEALTHMES_VAULT_SECRET_ACCESS_KEY="minioadmin"
+export HEALTHMES_VAULT_REGION="us-east-1"          # MinIO accepts any region
+
+uv run healthmes backup push healthmes-backup-20260709T033000Z.tar.gz.age
+uv run healthmes backup restore healthmes-backup-20260709T033000Z.tar.gz.age \
+    --provider remote --yes                        # downloads when not local
+```
+
+AWS S3 needs no endpoint — just bucket, credentials and region. To make the
+vault the default for every `backup` invocation and the weekly job, set
+`HEALTHMES_BACKUP_PROVIDER=remote_vault` in `.env`.
 
 ## 4. Compatibility & versioning rules
 

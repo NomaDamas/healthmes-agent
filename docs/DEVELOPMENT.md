@@ -32,10 +32,12 @@ curl http://localhost:8100/health   # -> {"status":"ok"}
 make mac-test             # uv run pytest -q
 ```
 
-The service exposes `/health`, the REST surface under `/v1/*`, the
-cognitive-energy forecast at `/cognitive-energy/forecast`, the decision
-viewer at `/decisions` + `/decisions/{id}` (Mermaid, served fully locally),
-and the Layer-B MCP server (Streamable HTTP) at exactly `/mcp`.
+The service exposes `/health`, the REST surface under `/v1/*` (including the
+companion-app glance briefing at `/v1/briefing/glance`), the cognitive-energy
+forecast at `/cognitive-energy/forecast`, the decision viewer at `/decisions`
++ `/decisions/{id}` (Mermaid, served fully locally), the weekly report at
+`/reports/weekly` (+ `.json` twin), and the Layer-B MCP server (Streamable
+HTTP) at exactly `/mcp`.
 
 Background jobs (the 10-minute trigger sweep, the hourly cognitive-energy
 persist and the weekly encrypted backup) are all registered at startup but
@@ -108,7 +110,10 @@ installs the briefing state-snapshot script
 07:00, evening 21:30, weekly Sunday 18:00) in `$HERMES_HOME/cron/jobs.json`
 — each with `script:` set so the vendor scheduler pre-injects a compact
 state snapshot into the briefing prompt (docs/PLAN.md §4), saving MCP
-round-trips at run time.
+round-trips at run time. The snapshot also carries the server-built weekly
+report link (`weekly_report.url`, token-embedded via
+`healthmes.api.reports.weekly_report_url`); the Sunday prompt instructs the
+agent to include it verbatim — the agent never constructs viewer URLs.
 
 ```bash
 uv run python scripts/bootstrap.py --dry-run     # show what would change
@@ -188,10 +193,34 @@ backup job (Sunday 03:30) runs when the scheduler is enabled; without a
 passphrase it skips with a warning. **Losing the passphrase means losing the
 backups** — there is no recovery path by design.
 
+### Remote vault (S3-compatible, ciphertext-only)
+
+`RemoteVaultProvider` (docs/PLAN.md §9 business seam) replicates the same
+age-encrypted envelopes to any S3-compatible bucket — AWS S3, Cloudflare R2
+or MinIO. The vault never sees plaintext: snapshots are encrypted before
+upload and the provider refuses to upload anything that is not an age
+envelope. Configure `HEALTHMES_VAULT_BUCKET` (+ `HEALTHMES_VAULT_ENDPOINT` /
+`_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` / `_REGION` / `_PREFIX`; see
+`.env.example`), then:
+
+```bash
+uv run healthmes backup push <name>               # replicate one snapshot
+uv run healthmes backup create --provider remote  # create locally + replicate
+uv run healthmes backup list --provider remote    # merged local/remote view
+uv run healthmes backup restore <name> --provider remote --yes
+```
+
+`HEALTHMES_BACKUP_PROVIDER=remote_vault` makes the selector the default for
+the CLI **and** the weekly job (which keeps the local snapshot even when
+replication fails). Local-first always: restore prefers the local copy and
+only downloads when it is missing. Full contract, privacy table and
+R2/MinIO/AWS examples: `docs/BACKUP.md` §3.
+
 ## Android usage collector
 
-`apps/android-usage/` is the minimal Kotlin companion app (docs/PLAN.md §7)
-that feeds `POST /v1/app-usage/batch` — pairing + toggle UI, hourly
+`apps/android-usage/` hosts the Android apps. The original `:app` module is
+the minimal usage collector (docs/PLAN.md §7) that feeds
+`POST /v1/app-usage/batch` — pairing + toggle UI, hourly
 `UsageStatsManager` buckets, WorkManager uploads every 30 minutes. It builds
 with its own vendored Gradle wrapper (JDK 17+ and Android SDK platform 35
 required; not part of the Python test suite or CI). Build, pairing and
@@ -201,6 +230,59 @@ the service must listen on the LAN: set `HEALTHMES_HOST=0.0.0.0` **and**
 token — the surface carries medical data), then enter the same token in the
 app. The fragmentation term of the energy engine activates automatically
 once samples arrive; iOS is deliberately not collected.
+
+## Companion apps (glance surfaces, issue #7)
+
+The glanceable-briefing companions render `GET /v1/briefing/glance` on lock
+screens, home widgets and watches. They are **local-first**: each app pairs
+with your own healthmes instance (base URL + bearer token) and talks to
+nothing else; polling only (ETag/304, 5-minute cache floor), no APNs/FCM
+relay. All rendering is deliberately placeholder — the watch/notification UX
+design belongs to the healthcare domain expert
+(`docs/design/WATCH-NOTIFICATIONS.ko.md`; the PLAN §8.5 notification grammar
+is the design system). None of this is part of the Python suite or CI, and a
+real-device pass is still owed on both platforms.
+
+**Android / Wear OS** — three additional modules in `apps/android-usage/`
+(same Gradle wrapper as the collector): `:shared` (glance contract parser,
+ETag-aware client, encrypted pairing prefs), `:companion` (phone app —
+home/keyguard Glance widget, 15-minute WorkManager refresh, notification
+channel rendering the §8.5 grammar with stub Apply/Adjust/Keep actions) and
+`:wear` (standalone Wear OS app — ProtoLayout tile + energy complication,
+on-watch pairing). Per-module docs, build matrix and device caveats:
+`apps/android-usage/README.md`.
+
+```bash
+cd apps/android-usage
+./gradlew assembleDebug   # all four APKs (:app, :companion, :wear + lib)
+./gradlew test            # all JVM unit tests (contract fixtures included)
+```
+
+**iOS / watchOS** — `apps/ios-companion/`, an XcodeGen-generated project
+(five targets: SwiftUI pairing app, iOS WidgetKit extension with home +
+lock-screen families, watchOS app, watchOS widget/complication extension,
+XCTest bundle). Requires Xcode with the iOS **and watchOS** simulator
+platforms (`xcodebuild -downloadPlatform watchOS` once, ~3.6 GB) and
+`brew install xcodegen`. Simulator-only builds, never signed:
+
+```bash
+cd apps/ios-companion
+xcodegen generate
+xcodebuild -project HealthMesCompanion.xcodeproj -scheme HealthMesCompanion \
+  -destination "generic/platform=iOS Simulator" build CODE_SIGNING_ALLOWED=NO
+xcodebuild -project HealthMesCompanion.xcodeproj -scheme HealthMesWatchApp \
+  -destination "generic/platform=watchOS Simulator" build CODE_SIGNING_ALLOWED=NO
+```
+
+Contract tests, simulator smoke run and the honest not-verified list:
+`apps/ios-companion/README.md`. Both companions pin the glance response
+schema in fixture JSON — a server-side change to
+`healthmes/api/briefing.py` must update
+`apps/android-usage/companion/src/test/resources/glance_*.json` and
+`apps/ios-companion/Tests/Fixtures/glance.json` in the same PR. This rule is
+enforced by the Python suite (`tests/api/test_glance_fixtures.py` validates
+every in-repo fixture against the server's `GlanceOut` model), so a contract
+drift fails CI even though the companion suites themselves do not run there.
 
 ## Real credentials — what needs what
 
@@ -218,6 +300,8 @@ corresponding integrations stay inactive.
 | Apple Calendar (iCloud CalDAV) mirror | app-specific password from appleid.apple.com | `HEALTHMES_CALDAV_USERNAME` + `HEALTHMES_CALDAV_APP_PASSWORD`; set `HEALTHMES_CALDAV_ENABLED=true` (polled every `HEALTHMES_CALDAV_POLL_MINUTES` — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
 | Proactive alert push (HealthMes -> Hermes) | shared HMAC secret | `HEALTHMES_HERMES_WEBHOOK_SECRET` — generated into `.env` by `scripts/bootstrap.py` |
 | Encrypted backups (CLI + weekly job) | a passphrase you choose (and must not lose) | `HEALTHMES_BACKUP_PASSPHRASE` in `.env`, or `--passphrase-file` |
+| Remote vault replication (ciphertext-only, optional) | S3-compatible bucket + access keys (AWS S3 / Cloudflare R2 / MinIO) | `HEALTHMES_VAULT_BUCKET` (+ `HEALTHMES_VAULT_ENDPOINT`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`/`_REGION`/`_PREFIX`); opt in with `HEALTHMES_BACKUP_PROVIDER=remote_vault` or `--provider remote` |
+| Companion apps (Android/Wear/iOS/watchOS glance widgets) | the service's `HEALTHMES_API_TOKEN` (same LAN rule as the collector) | entered in each app's pairing screen together with the base URL |
 | Android usage collector | the service's `HEALTHMES_API_TOKEN` (verified server-side; required whenever the service binds beyond loopback) | entered in the app UI; sent as `Authorization: Bearer ...` |
 | API/MCP surface auth | bearer token you mint (`python3 -c "import secrets; print(secrets.token_urlsafe(32))"`) | `HEALTHMES_API_TOKEN` in `.env`; required for `HEALTHMES_HOST=0.0.0.0` and for docker compose |
 
@@ -303,13 +387,18 @@ healthmes/            service package (FastAPI composition root in app.py, setti
                       cognitive-energy engine, scheduler)
   calendars/          Google / iCloud CalDAV sync backends + mirror service
   mcp_server/         fastmcp Layer-B tools (14), served at exactly /mcp
-  api/                REST routes (/v1/*), error envelope, energy forecast,
-                      decision viewer (templates/ + vendored Mermaid in static/)
+  api/                REST routes (/v1/*, incl. the glance briefing), error
+                      envelope, energy forecast, decision viewer + weekly
+                      report (templates/ + vendored Mermaid in static/)
   backup/             local-first encrypted backup seam (age via pyrage) + CLI
+                      + S3-compatible remote vault replication
 alembic/              migrations for the healthmes DB (alembic.ini at repo root)
-apps/android-usage/   Kotlin companion app feeding /v1/app-usage/batch (own README)
+apps/android-usage/   usage collector (:app) + Android/Wear companions
+                      (:shared/:companion/:wear) — own README
+apps/ios-companion/   iOS/watchOS companion (XcodeGen project, own README)
 config/               templates + service env files (rendered copies gitignored)
-docs/                 PLAN.md (architecture), BACKUP.md (snapshot format), this guide
+docs/                 PLAN.md (architecture), BACKUP.md (snapshot format),
+                      design/ (domain-expert worksheets, .ko.md), this guide
 scripts/              dev_mac.sh (mac-native tooling), initdb/ (compose),
                       bootstrap.py (hermes), vendor_sync_check.sh (drift report)
 skills/               hermes skills (copied into HERMES_HOME by bootstrap):

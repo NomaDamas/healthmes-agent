@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-feature android:name="android.hardware.type.watch" />
+
+    <!-- Fetch the glance briefing from the user's own HealthMes instance. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.DeviceDefault"
+        android:usesCleartextTraffic="true"
+        tools:ignore="UsesCleartextTraffic">
+        <!-- Cleartext HTTP stays enabled because the typical pairing target is
+             a HealthMes instance on the same LAN (http://192.168.x.x:8100). -->
+
+        <!-- Standalone Wear app: pairs with the HealthMes instance directly
+             (base URL + token), no phone-app dependency. -->
+        <meta-data
+            android:name="com.google.android.wearable.standalone"
+            android:value="true" />
+
+        <activity
+            android:name=".WearPairingActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Briefing tile: energy score + next block (placeholder visuals;
+             final UX: docs/design/WATCH-NOTIFICATIONS.ko.md). -->
+        <service
+            android:name=".tile.BriefingTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_launcher"
+            android:label="@string/tile_label"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+
+        <!-- Energy-score complication (SHORT_TEXT + RANGED_VALUE). -->
+        <service
+            android:name=".complication.EnergyComplicationService"
+            android:exported="true"
+            android:icon="@drawable/ic_launcher"
+            android:label="@string/complication_label"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data
+                android:name="android.support.wearable.complications.SUPPORTED_TYPES"
+                android:value="SHORT_TEXT,RANGED_VALUE" />
+            <!-- 15 min, matching the phone widget cadence (platform floor 300 s). -->
+            <meta-data
+                android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
+                android:value="900" />
+        </service>
+    </application>
+
+</manifest>

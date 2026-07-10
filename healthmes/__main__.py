@@ -5,6 +5,15 @@
 ``python -m healthmes backup create``            → write one encrypted snapshot
 ``python -m healthmes backup list``              → list snapshots (no passphrase)
 ``python -m healthmes backup restore <snapshot>``→ inspect; add --yes to apply
+``python -m healthmes backup push <snapshot>``   → upload one snapshot to the vault
+
+``create``/``list``/``restore`` accept ``--provider {local,remote}``
+(default: the HEALTHMES_BACKUP_PROVIDER selector, then local). The remote
+vault (docs/BACKUP.md) is a replication target for the age-encrypted
+envelopes: ``create --provider remote`` writes locally first and then
+uploads; ``list`` shows the merged view labeled by origin; ``restore``
+downloads the envelope when it is not already local. The local copy is only
+skipped with the explicit ``--remote-only`` flag.
 
 Backup commands read Settings from the environment/.env like the service
 does; the passphrase comes from HEALTHMES_BACKUP_PASSPHRASE or
@@ -15,11 +24,21 @@ and process listings).
 import argparse
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from healthmes.backup.local import LocalDirectoryProvider
 from healthmes.backup.provider import BackupError
-from healthmes.backup.snapshot import read_manifest, resolve_passphrase
+from healthmes.backup.snapshot import (
+    PROVIDER_LOCAL,
+    PROVIDER_REMOTE_VAULT,
+    read_manifest,
+    resolve_backup_provider_name,
+    resolve_passphrase,
+)
 from healthmes.config import Settings, get_settings, is_loopback_host
+
+if TYPE_CHECKING:  # pragma: no cover — typing only; runtime import stays lazy
+    from healthmes.backup.remote_vault import RemoteVaultProvider
 
 
 def check_bind_safety(settings: Settings) -> str | None:
@@ -83,6 +102,29 @@ def _provider(args: argparse.Namespace, settings: Settings) -> LocalDirectoryPro
     )
 
 
+def _selected_provider(args: argparse.Namespace, settings: Settings) -> str:
+    """Effective provider name: --provider flag first, then Settings/env selector."""
+    flag = getattr(args, "provider", None)
+    if flag is not None:
+        return PROVIDER_REMOTE_VAULT if flag == "remote" else PROVIDER_LOCAL
+    return resolve_backup_provider_name(settings)
+
+
+def _vault_provider(
+    args: argparse.Namespace, settings: Settings, *, keep_local: bool = True
+) -> "RemoteVaultProvider":
+    """Vault provider for the CLI; errors cleanly when no vault is configured.
+
+    The passphrase is resolved the same way as for the local provider (push
+    and list never use it; create/restore do).
+    """
+    from healthmes.backup.remote_vault import RemoteVaultProvider
+
+    return RemoteVaultProvider.from_settings(
+        settings, passphrase=_passphrase_from(args, settings), keep_local=keep_local
+    )
+
+
 def _human_size(size_bytes: int) -> str:
     size = float(size_bytes)
     for unit in ("B", "KiB", "MiB", "GiB"):
@@ -94,21 +136,59 @@ def _human_size(size_bytes: int) -> str:
 
 def _cmd_backup_create(args: argparse.Namespace) -> int:
     settings = _cli_settings()
-    info = _provider(args, settings).export_snapshot()
-    print(f"snapshot written: {info.path} ({_human_size(info.size_bytes)})")
+    provider_name = _selected_provider(args, settings)
+    if provider_name == PROVIDER_LOCAL:
+        if args.remote_only:
+            raise BackupError("--remote-only requires --provider remote")
+        info = _provider(args, settings).export_snapshot()
+        print(f"snapshot written: {info.path} ({_human_size(info.size_bytes)})")
+        return 0
+    vault = _vault_provider(args, settings, keep_local=not args.remote_only)
+    local_info, remote_info = vault.create_and_replicate()
+    print(f"snapshot written: {local_info.path} ({_human_size(local_info.size_bytes)})")
+    print(f"uploaded to vault: {vault.object_uri(remote_info.name)}")
+    if args.remote_only:
+        print(
+            "local copy removed (--remote-only): the vault now holds the only copy",
+            file=sys.stderr,
+        )
     return 0
 
 
 def _cmd_backup_list(args: argparse.Namespace) -> int:
     settings = _cli_settings()
+    provider_name = _selected_provider(args, settings)
     provider = LocalDirectoryProvider.from_settings(settings)
-    snapshots = provider.list_snapshots()
-    if not snapshots:
-        print(f"no snapshots in {provider.backup_dir}")
+    if provider_name == PROVIDER_LOCAL:
+        snapshots = provider.list_snapshots()
+        if not snapshots:
+            print(f"no snapshots in {provider.backup_dir}")
+            return 0
+        for info in snapshots:
+            stamp = info.created_at.isoformat().replace("+00:00", "Z")
+            print(f"{info.name}\t{stamp}\t{_human_size(info.size_bytes)}")
         return 0
-    for info in snapshots:
+    vault = _vault_provider(args, settings)
+    merged = vault.list_merged()
+    if not merged:
+        print(f"no snapshots in {provider.backup_dir} or {vault.vault_uri}")
+        return 0
+    for entry in merged:
+        info = entry.info
         stamp = info.created_at.isoformat().replace("+00:00", "Z")
-        print(f"{info.name}\t{stamp}\t{_human_size(info.size_bytes)}")
+        origin = entry.origin + (" (size mismatch!)" if entry.size_mismatch else "")
+        print(f"{info.name}\t{stamp}\t{_human_size(info.size_bytes)}\t{origin}")
+    return 0
+
+
+def _cmd_backup_push(args: argparse.Namespace) -> int:
+    settings = _cli_settings()
+    vault = _vault_provider(args, settings)
+    remote_info = vault.push(args.snapshot)
+    print(
+        f"pushed: {remote_info.name} -> {vault.object_uri(remote_info.name)} "
+        f"({_human_size(remote_info.size_bytes)})"
+    )
     return 0
 
 
@@ -138,7 +218,15 @@ def _summarize_manifest(manifest: dict) -> list[str]:
 def _cmd_backup_restore(args: argparse.Namespace) -> int:
     settings = _cli_settings()
     provider = _provider(args, settings)
-    snapshot_path = provider.resolve_snapshot_path(args.snapshot)
+    if _selected_provider(args, settings) == PROVIDER_LOCAL:
+        snapshot_path = provider.resolve_snapshot_path(args.snapshot)
+    else:
+        # Local-first: an existing local copy wins; otherwise the envelope is
+        # downloaded into the backup dir and the restore path is identical.
+        vault = _vault_provider(args, settings)
+        snapshot_path, downloaded = vault.ensure_local_copy(args.snapshot)
+        if downloaded:
+            print(f"downloaded from vault: {vault.object_uri(snapshot_path.name)}")
     if not args.yes:
         passphrase = _passphrase_from(args, settings)
         if passphrase is None:
@@ -171,6 +259,17 @@ def _add_passphrase_file(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_provider_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--provider",
+        choices=("local", "remote"),
+        default=None,
+        help="Backup provider: 'local' (directory only) or 'remote' (replicate "
+        "to the S3-compatible vault, HEALTHMES_VAULT_*). Default: the "
+        "HEALTHMES_BACKUP_PROVIDER selector, then 'local'.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="healthmes",
@@ -188,11 +287,19 @@ def build_parser() -> argparse.ArgumentParser:
         "create", help="Snapshot databases + media + Hermes state into an age-encrypted archive."
     )
     _add_passphrase_file(create)
+    _add_provider_flag(create)
+    create.add_argument(
+        "--remote-only",
+        action="store_true",
+        help="With --provider remote: delete the local copy after a verified "
+        "upload — the vault then holds the ONLY copy (local-first is the default).",
+    )
     create.set_defaults(func=_cmd_backup_create)
 
     list_parser = backup_sub.add_parser(
         "list", help="List snapshots in the backup directory (needs no passphrase)."
     )
+    _add_provider_flag(list_parser)
     list_parser.set_defaults(func=_cmd_backup_list)
 
     restore = backup_sub.add_parser(
@@ -206,7 +313,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Actually apply the restore (it replaces live data).",
     )
     _add_passphrase_file(restore)
+    _add_provider_flag(restore)
     restore.set_defaults(func=_cmd_backup_restore)
+
+    push = backup_sub.add_parser(
+        "push",
+        help="Upload one existing local snapshot to the remote vault "
+        "(refuses anything that is not an age-encrypted snapshot envelope).",
+    )
+    push.add_argument("snapshot", help="Snapshot file path, or bare name in the backup dir.")
+    push.set_defaults(func=_cmd_backup_push)
 
     return parser
 

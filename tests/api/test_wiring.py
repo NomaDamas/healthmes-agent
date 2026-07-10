@@ -25,11 +25,14 @@ EXPECTED_PATHS = [
     "/decisions/{decision_id}",
     "/v1/app-usage/batch",
     "/cognitive-energy/forecast",
+    "/v1/briefing/glance",
+    "/reports/weekly",
+    "/reports/weekly.json",
 ]
 
 
 def test_routers_list_covers_all_modules():
-    assert len(routers) == 9
+    assert len(routers) == 11
 
 
 def test_openapi_schema_generates_with_all_paths(client):

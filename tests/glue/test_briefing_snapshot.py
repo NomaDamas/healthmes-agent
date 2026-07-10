@@ -102,6 +102,14 @@ def fake_fetch():
                     },
                 ],
             }
+        if "/reports/weekly.json" in url:
+            # The server builds report_url from its *public* base URL + the
+            # derived viewer token (healthmes/api/reports.py::weekly_report_url)
+            # — deliberately a different host than the fetch base URL here.
+            return {
+                "generated_at": "2026-07-09T07:00:00+00:00",
+                "report_url": "http://healthmes.public:8100/reports/weekly?token=deadbeef",
+            }
         raise AssertionError(f"unexpected url: {url}")
 
     return fetch
@@ -140,6 +148,12 @@ def test_collect_snapshot_shape(snapshot_script, fake_fetch):
     assert snap["energy_forecast"] == {
         "status": "ok",
         "windows": [{"start": "2026-07-09T09:00:00+00:00", "score": 78}],
+    }
+    # The Sunday briefing link is lifted verbatim from the server payload
+    # (public host + derived viewer credential) — never rebuilt from the
+    # possibly cluster-internal fetch base URL.
+    assert snap["weekly_report"] == {
+        "url": "http://healthmes.public:8100/reports/weekly?token=deadbeef"
     }
 
 
@@ -183,7 +197,25 @@ def test_all_sections_down_is_unavailable_not_a_crash(snapshot_script):
         "events",
         "pending_proposals",
         "energy_forecast",
+        "weekly_report",
     }
+
+
+def test_weekly_report_link_is_never_hand_built(snapshot_script, fake_fetch):
+    """A payload without ``report_url`` degrades the section; the script must
+    not fall back to constructing base_url + /reports/weekly itself — the
+    fetch base may be cluster-internal and carries no viewer credential
+    (server code builds credentialed viewer links, healthmes/api/auth.py)."""
+
+    def no_url(url: str):
+        if "/reports/weekly.json" in url:
+            return {"generated_at": "2026-07-09T07:00:00+00:00"}
+        return fake_fetch(url)
+
+    snap = snapshot_script.collect_snapshot("http://x", fetch=no_url, now=NOW)
+    assert snap["status"] == "partial"
+    assert "weekly_report" not in snap
+    assert "ValueError" in snap["errors"]["weekly_report"]
 
 
 def test_base_url_resolution_order(snapshot_script, tmp_path):

@@ -202,12 +202,62 @@ class Settings(BaseSettings):
         "skips the section.",
     )
 
+    # Remote vault replication of encrypted snapshots (docs/PLAN.md §9 business
+    # seam; healthmes/backup/remote_vault.py). Resolution in the backup module
+    # is attribute-first with HEALTHMES_VAULT_* env fallback, so these typed
+    # fields are optional sugar — the module works from env vars alone. The
+    # None defaults keep the env fallback reachable for Settings objects built
+    # before the variables were set (tests construct Settings early).
+    backup_provider: str | None = Field(
+        default=None,
+        description="Backup provider selector: 'local' (default when unset) or "
+        "'remote_vault' ('remote' is accepted as an alias). remote_vault keeps "
+        "the local snapshot AND replicates the age-encrypted envelope to the "
+        "S3-compatible vault below; the weekly job follows the same selector.",
+    )
+    vault_endpoint: str | None = Field(
+        default=None,
+        description="S3-compatible endpoint URL of the remote vault (R2/MinIO). "
+        "None means AWS S3 proper (region-derived endpoint).",
+    )
+    vault_bucket: str | None = Field(
+        default=None,
+        description="Bucket the encrypted snapshot envelopes are replicated to. "
+        "Unset disables the remote vault (provider 'remote_vault' then errors "
+        "with a pointer to this setting).",
+    )
+    vault_access_key_id: str | None = Field(
+        default=None,
+        description="Vault access key id; unset falls back to the boto3 default "
+        "credential chain (env vars, shared config, instance roles).",
+    )
+    vault_secret_access_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="Vault secret access key (paired with vault_access_key_id).",
+    )
+    vault_region: str | None = Field(
+        default=None,
+        description="Vault region (e.g. 'us-east-1'; R2 uses 'auto').",
+    )
+    vault_prefix: str | None = Field(
+        default=None,
+        description="Key prefix inside the bucket snapshots live under; "
+        "None uses the module default ('healthmes-vault', "
+        "healthmes/backup/remote_vault.py::DEFAULT_VAULT_PREFIX).",
+    )
+
     @field_validator(
         "ow_user_id",
         "timezone",
         "backup_dir",
         "ow_database_url",
         "hermes_home",
+        "backup_provider",
+        "vault_endpoint",
+        "vault_bucket",
+        "vault_access_key_id",
+        "vault_region",
+        "vault_prefix",
         mode="before",
     )
     @classmethod

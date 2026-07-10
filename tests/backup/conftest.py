@@ -19,6 +19,25 @@ PASSPHRASE = "test-passphrase-42"
 # Deterministic binary payload with non-UTF8 bytes (a fake photo).
 FAKE_JPEG = b"\xff\xd8\xff\xe0" + bytes(range(256)) * 3
 
+# Remote-vault env vars that must never leak from the developer's shell into
+# the suite (a stray HEALTHMES_BACKUP_PROVIDER=remote_vault would flip every
+# CLI test onto the vault path).
+_VAULT_ENV_VARS = (
+    "HEALTHMES_BACKUP_PROVIDER",
+    "HEALTHMES_VAULT_ENDPOINT",
+    "HEALTHMES_VAULT_BUCKET",
+    "HEALTHMES_VAULT_ACCESS_KEY_ID",
+    "HEALTHMES_VAULT_SECRET_ACCESS_KEY",
+    "HEALTHMES_VAULT_REGION",
+    "HEALTHMES_VAULT_PREFIX",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_vault_env(monkeypatch):
+    for name in _VAULT_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
 
 @dataclass(frozen=True)
 class SourceEnv:

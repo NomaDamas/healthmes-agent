@@ -1,0 +1,14 @@
+<!-- Placeholder tile-picker preview (a real screenshot-style preview is part
+     of the final UX pass: docs/design/WATCH-NOTIFICATIONS.ko.md). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="192dp"
+    android:height="192dp"
+    android:viewportWidth="192"
+    android:viewportHeight="192">
+    <path
+        android:fillColor="#14211B"
+        android:pathData="M96,4 a92,92 0 1,0 0.001,0 z" />
+    <path
+        android:fillColor="#63C79E"
+        android:pathData="M108,40 L66,104 h26 l-12,48 L126,86 h-28 z" />
+</vector>

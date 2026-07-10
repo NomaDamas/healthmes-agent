@@ -1,0 +1,35 @@
+<resources>
+    <string name="app_name">HealthMes Companion</string>
+    <string name="widget_label">HealthMes briefing</string>
+    <string name="widget_description">Energy score, next block, and unresolved alerts from your HealthMes instance.</string>
+
+    <string name="intro">Pair this device with your own HealthMes instance, then add the
+        briefing widget to your home screen. It refreshes every 15 minutes and raises a
+        notification when new alerts fire.</string>
+
+    <string name="hint_server_url">Server URL (e.g. http://192.168.1.20:8100)</string>
+    <string name="hint_token">API token (optional, sent as Bearer)</string>
+    <string name="save_pairing">Save pairing</string>
+    <string name="refresh_now">Refresh now</string>
+    <string name="clear_pairing">Clear pairing</string>
+    <string name="no_refresh_yet">No refresh yet.</string>
+    <string name="status_not_paired">Not paired.</string>
+
+    <string name="error_invalid_url">Enter a valid http(s) URL, e.g. http://192.168.1.20:8100</string>
+    <string name="toast_pairing_saved">Pairing saved. Refreshing…</string>
+    <string name="toast_pair_first">Save the server URL first.</string>
+    <string name="toast_refresh_scheduled">Refresh scheduled.</string>
+    <string name="toast_pairing_cleared">Pairing cleared.</string>
+    <string name="toast_action_stub">Not wired to the agent yet — reply in Telegram. (Real actions arrive with server push.)</string>
+
+    <string name="notification_channel_name">HealthMes briefing alerts</string>
+    <string name="notification_channel_description">Proactive alerts from your HealthMes instance in the observation / evidence / proposal grammar.</string>
+    <string name="notification_action_apply">✅ Apply</string>
+    <string name="notification_action_adjust">✏️ Adjust</string>
+    <string name="notification_action_keep">❌ Keep as is</string>
+
+    <string name="widget_not_paired">Open to pair with your HealthMes instance</string>
+    <string name="widget_energy_label">Energy</string>
+    <string name="widget_no_data">No briefing data yet</string>
+    <string name="widget_alerts_none">No alerts</string>
+</resources>

@@ -106,6 +106,42 @@ Telegram (phone + watch)          decision viewer (web)
 - Hardening: restore drills, trigger-flood tests, CI (linux + macos),
   vendor-drift report (`scripts/vendor_sync_check.sh`).
 
+**Glanceable surfaces & companion apps (Phase 5–7, pre-device plumbing)**
+- `GET /v1/briefing/glance`: the compact briefing contract widgets and
+  watch faces poll — energy score + 24h curve + freshness confidence, next
+  blocks (≤3), alert summary, latest decision link. Strong ETag / 304
+  revalidation with a 5-minute cache; bearer-authed like the rest of `/v1`.
+- Android companion ([`apps/android-usage/`](apps/android-usage/)): beside
+  the `:app` usage collector, `:shared` (contract parser + ETag client +
+  encrypted pairing), `:companion` (home/lock-screen Glance widget, 15-min
+  WorkManager refresh, a notification channel rendering the PLAN §8.5
+  grammar) and `:wear` (Wear OS tile + energy complication, on-watch
+  pairing).
+- iOS/watchOS companion ([`apps/ios-companion/`](apps/ios-companion/)):
+  XcodeGen project — SwiftUI pairing app (Keychain token, WatchConnectivity
+  push to the watch), WidgetKit home + lock-screen widgets, watchOS app and
+  accessory complications. Simulator-verified builds and tests; no signing.
+- Local-first throughout: the apps pair with **your own** healthmes instance
+  (base URL + bearer token) and talk to nothing else; polling only, no
+  APNs/FCM relay — Telegram remains the reliable push channel. All
+  widget/watch rendering is deliberately placeholder: the notification/watch
+  UX design is reserved for the healthcare domain expert
+  (worksheet: `docs/design/WATCH-NOTIFICATIONS.ko.md`, issue #7).
+- Weekly report at `/reports/weekly` (+ `.json`): energy trend sparkline,
+  insights with confidence badges, schedule adherence, alert digest vs
+  budget, the week's decisions — shareable via the same derived read-only
+  `?token=` link as the decision viewer; the Sunday briefing points at it.
+- Cognitive-energy v2 factors: menstrual phase, daylight, noise exposure,
+  alcohol, hydration join the engine under the same
+  missing-signal-renormalizes rule; weights and thresholds are explicit
+  placeholders for the domain expert to tune.
+- Remote vault backups (`RemoteVaultProvider`, PLAN §9 business seam):
+  replicate age-encrypted snapshot envelopes to any S3-compatible bucket
+  (AWS S3 / Cloudflare R2 / MinIO). The vault only ever sees ciphertext —
+  the provider refuses to upload anything that is not an age envelope.
+  `healthmes backup push` / `--provider remote` / weekly-job selector
+  (`HEALTHMES_BACKUP_PROVIDER`) — see [`docs/BACKUP.md`](docs/BACKUP.md).
+
 **Skills** (`skills/`, copied into the Hermes home by bootstrap):
 `healthmes-planner` (goal dump → task breakdown → energy-aware block
 proposals → decision recording), `healthmes-capture` (food + medical),
@@ -176,11 +212,22 @@ uv run healthmes backup list
 uv run healthmes backup restore <name>     # dry-run; add --yes to apply
 ```
 
+With `HEALTHMES_VAULT_*` configured (S3-compatible bucket — AWS/R2/MinIO),
+snapshots can also replicate off-machine as ciphertext only:
+
+```bash
+uv run healthmes backup push <name>              # replicate one snapshot
+uv run healthmes backup create --provider remote # create + replicate
+export HEALTHMES_BACKUP_PROVIDER=remote_vault    # weekly job replicates too
+```
+
 ## Repository layout
 
 - `healthmes/` — the glue service: `store/`, `engine/`, `calendars/`,
   `mcp_server/`, `api/`, `backup/`
-- `skills/` — Hermes skills; `apps/android-usage/` — usage collector
+- `skills/` — Hermes skills
+- `apps/android-usage/` — usage collector + Android/Wear OS companion
+  modules; `apps/ios-companion/` — iOS/watchOS companion
 - `config/`, `scripts/`, `alembic/`, `tests/`, `docs/`
 - `vendor/hermes-agent/`, `vendor/open-wearables/` — read-only upstreams,
   never modified

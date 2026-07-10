@@ -2,10 +2,12 @@
 
 Route module conventions follow
 ``vendor/open-wearables/backend/app/api/routes/v1/``. Domain routes live under
-``/v1/...``; two plan-verbatim paths additionally live outside the prefix:
-the human-facing decision pages at ``/decisions`` (linked from alerts,
-docs/PLAN.md §8.5) and the energy forecast at ``/cognitive-energy/forecast``
-(docs/PLAN.md §3 — each also has a ``/v1`` twin).
+``/v1/...``; human-facing paths additionally live outside the prefix:
+the decision pages at ``/decisions`` (linked from alerts, docs/PLAN.md §8.5),
+the energy forecast at ``/cognitive-energy/forecast`` (docs/PLAN.md §3 — each
+also has a ``/v1`` twin), and the weekly report at ``/reports/weekly``
+(docs/PLAN.md §8.5). The companion-app glance briefing is at
+``/v1/briefing/glance`` (issue #7).
 
 Wiring: the app factory calls :func:`include_all`, which installs the shared
 error-envelope handlers and every router below.
@@ -15,12 +17,14 @@ from fastapi import APIRouter, FastAPI
 
 from healthmes.api import (
     app_usage,
+    briefing,
     decisions,
     energy,
     food,
     goals,
     insights,
     medical,
+    reports,
     schedule,
     tasks,
 )
@@ -39,6 +43,8 @@ routers: list[APIRouter] = [
     energy.router,
     decisions.router,
     app_usage.router,
+    briefing.router,
+    reports.router,
 ]
 
 

@@ -243,3 +243,49 @@ MVP는 클라우드가 아닌 **시임(인터페이스)만** 정의:
 - `vendor/open-wearables/backend/app/api/routes/v1/summaries.py`, `health_scores.py`, `timeseries.py`, `events.py` — Layer B 도구가 프록시할 REST 표면
 - `vendor/open-wearables/backend/app/schemas/enums/series_types.py` — 통합 SeriesType 어휘 (~100+ 타입)
 - `vendor/open-wearables/backend/app/models/` — `healthmes/store/`가 따를 모델 컨벤션
+
+## Phase 4–7 로드맵
+
+Phase 0–3 완료 이후의 확장 단계. issue #7(컴패니언 앱 글랜스 표면)이 Phase 5–7의
+사전 실기기 작업 범위를 정의했고, 이 브랜치(feat/phase5-7-glance-vault)에서 그
+서버/앱 플럼빙이 구현됐다. **원칙 유지: vendor 무수정, 로컬 first, 알림 문법(§8.5)이
+디자인 시스템, 워치 알림 UX 최종 설계는 헬스케어 도메인 전문가 몫.**
+
+**Phase 4 — 실사용 안정화 (전부 남음 — 실기기·실크리덴셜 필요)**
+- 실크리덴셜 가동: Telegram 봇 + Claude API + open-wearables 프로바이더 OAuth +
+  캘린더 자격증명을 실제로 연결하고 Phase-0 데모 쿼리부터 알림 루프까지 라이브 통과
+- 알림 소음 튜닝: 실사용 데이터로 트리거 임계값·쿨다운·일일 예산 보정 (§11 최대 리스크)
+- 전문가 스킬 온보딩: `docs/EXPERT-ONBOARDING.ko.md` 프로토콜대로 도메인 전문가가
+  스킬/지표를 실기기 QA와 함께 반입
+
+**Phase 5 — 글랜스 표면 (잠금화면·홈 위젯·워치)**
+- 이번에 구현: ① `GET /v1/briefing/glance` — 위젯/컴플리케이션용 경량 브리핑 계약
+  (에너지 점수+24h 커브+confidence, 다음 블록 ≤3, 알림 요약, 최신 결정 링크; ETag/304,
+  5분 캐시, bearer 인증) ② Android 컴패니언(`apps/android-usage/` — :shared 계약
+  모듈, :companion 홈/잠금 위젯+§8.5 문법 알림 채널, :wear Wear OS 타일+컴플리케이션)
+  ③ iOS/watchOS 컴패니언(`apps/ios-companion/` — WidgetKit 홈/잠금 위젯, watchOS 앱+
+  컴플리케이션, WatchConnectivity 페어링) — 모두 base-url+bearer 페어링으로 자기
+  healthmes 인스턴스에만 접속(로컬 first) ④ 전문가 설계 워크시트
+  `docs/design/WATCH-NOTIFICATIONS.ko.md`
+- 남음: 전문가 UX 설계 반영(현재 렌더링은 명시적 플레이스홀더 — 워크시트 Q1–Q6 결정
+  대기), 실기기/에뮬레이터 검증(위젯·타일·컴플리케이션·알림은 아직 실하드웨어 미확인),
+  푸시 경로(현재 폴링 전용 — APNs/FCM 릴레이 없음, 신뢰 푸시는 여전히 Telegram),
+  진행형 표면(iOS Live Activities/Dynamic Island·Wear OS Ongoing Activity —
+  현재 집중 블록 상시 표시 — 미착수)
+
+**Phase 6 — 장기 맥락**
+- 이번에 구현: ① 인지에너지 v2 요인 5종 — 생리주기 단계·햇빛 노출·소음 노출·음주·
+  수분 (§1.5에서 예약한 v2 요인; 신호 없으면 항이 빠지고 재정규화되는 v1 규칙 유지,
+  가중치·임계값은 전문가 튜닝용 플레이스홀더로 명시) ② 주간 리포트
+  `GET /reports/weekly`(+`.json`) — 에너지 추이 스파크라인, 인사이트, 일정 수용률,
+  알림 다이제스트, 결정 목록; 일요일 주간 계획 브리핑이 링크 안내
+- 남음: `compare_impact` 축적 활용 심화 (태그 이벤트가 쌓인 뒤의 장기 상관 리뷰 절차,
+  주간 리포트와의 연결)
+
+**Phase 7 — 비즈니스 레이어 (§9 시임의 구현)**
+- 이번에 구현: `RemoteVaultProvider` — 동일 `BackupProvider` 프로토콜로 S3 호환
+  엔드포인트(AWS/R2/MinIO)에 age 암호문 스냅샷만 복제(평문·비-age 업로드 거부, 서버는
+  암호문만 보관), 로컬 스냅샷 우선 + 업로드 무결성 검증, `healthmes backup push`/
+  `--provider remote` CLI, 주간 잡 셀렉터 연동 (`docs/BACKUP.md` §3)
+- 남음: 과금/멀티테넌트 서비스화 (호스팅 vault 상품화, 키·테넌트 관리, SLA — 시임
+  뒤편의 서버 사이드 사업 영역)

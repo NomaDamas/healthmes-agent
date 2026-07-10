@@ -1,0 +1,250 @@
+{% extends "_base.html.j2" %}
+{# Weekly report page — second viewer surface (docs/PLAN.md §8.5). Context:
+   report          WeeklyReportOut (healthmes/api/reports.py) — the exact
+                   payload GET /reports/weekly.json returns
+   spark           SparklineView | None (None = no energy data this week)
+   json_url        absolute href of the JSON twin (derived viewer token
+                   embedded when an API token is configured)
+   format_created  callable datetime -> display string #}
+
+{% block title %}Weekly report — HealthMes{% endblock %}
+
+{% block crumb %} <span class="crumb">/ weekly report</span>{% endblock %}
+
+{% block head %}
+<style>
+  section.card {
+    border: 1px solid #e7e5e4;
+    border-radius: 10px;
+    background: #ffffff;
+    padding: 0.8rem 1rem 1rem;
+    margin: 0.9rem 0;
+  }
+  section.card h2 { margin: 0 0 0.6rem; }
+  .stats { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.4rem 0; }
+  .stat {
+    flex: 1 1 6.5rem;
+    border: 1px solid #e7e5e4;
+    border-radius: 8px;
+    padding: 0.45rem 0.6rem;
+    background: #fafaf9;
+  }
+  .stat .value {
+    display: block;
+    font-size: 1.25rem;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat .label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #78716c;
+  }
+  table.plain { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  table.plain th, table.plain td {
+    text-align: left;
+    padding: 0.3rem 0.45rem;
+    border-bottom: 1px solid #f5f5f4;
+  }
+  table.plain th {
+    color: #78716c;
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  table.plain .num { text-align: right; font-variant-numeric: tabular-nums; }
+  svg.spark {
+    display: block;
+    width: 100%;
+    max-width: 26rem;
+    height: auto;
+    margin: 0.2rem 0 0.6rem;
+  }
+  ul.report-list { list-style: none; margin: 0.4rem 0 0; padding: 0; }
+  ul.report-list > li { padding: 0.55rem 0; border-bottom: 1px solid #f5f5f4; }
+  ul.report-list > li:last-child { border-bottom: none; }
+  .statement { overflow-wrap: anywhere; margin-top: 0.25rem; }
+  ul.decision-list { list-style: none; margin: 0.4rem 0 0; padding: 0; }
+  ul.decision-list li { margin: 0; }
+  ul.decision-list a.row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 0.7rem;
+    align-items: baseline;
+    padding: 0.65rem 0.8rem;
+    border: 1px solid #e7e5e4;
+    border-radius: 10px;
+    background: #fafaf9;
+    margin-bottom: 0.5rem;
+    color: inherit;
+    text-decoration: none;
+  }
+  ul.decision-list a.row:hover { border-color: #a8a29e; }
+  ul.decision-list .when { color: #78716c; font-size: 0.8rem; white-space: nowrap; }
+  ul.decision-list .row-summary { flex: 1 1 100%; overflow-wrap: anywhere; }
+  @media (min-width: 640px) {
+    ul.decision-list .row-summary { flex: 1 1 auto; }
+  }
+  /* Confidence badge ladder — placeholder thresholds (domain expert to refine). */
+  .conf-high { background: #dcfce7; border-color: #86efac; color: #14532d; }
+  .conf-medium { background: #fef3c7; border-color: #fcd34d; color: #78350f; }
+  .conf-low { background: #fee2e2; border-color: #fca5a5; color: #7f1d1d; }
+  .conf-none { background: #f4f4f5; border-color: #d4d4d8; color: #3f3f46; }
+  /* Decision-kind palette — keep in sync with decision_list.html.j2. */
+  .kind-schedule_change { background: #dbeafe; border-color: #93c5fd; color: #1e3a8a; }
+  .kind-alert { background: #fee2e2; border-color: #fca5a5; color: #7f1d1d; }
+  .kind-insight { background: #fef3c7; border-color: #fcd34d; color: #78350f; }
+  .kind-capture { background: #dcfce7; border-color: #86efac; color: #14532d; }
+</style>
+{% endblock %}
+
+{% block content %}
+<h1>Weekly report</h1>
+<p class="muted">
+  {{ report.week_start.isoformat() }} → {{ report.week_end.isoformat() }} ({{ report.timezone }})
+  · generated {{ format_created(report.generated_at) }}
+  · <a href="{{ json_url }}">JSON view</a>
+</p>
+
+<section class="card" id="energy">
+  <h2>Energy trend</h2>
+  {% if spark %}
+  <svg class="spark" viewBox="0 0 {{ spark.width }} {{ spark.height }}" role="img"
+       aria-label="Daily average cognitive energy over the last {{ report.energy.days | length }} days"
+       xmlns="http://www.w3.org/2000/svg">
+    {% for y in spark.gridlines %}
+    <line x1="0" y1="{{ y }}" x2="{{ spark.width }}" y2="{{ y }}" stroke="#e7e5e4" stroke-width="1"></line>
+    {% endfor %}
+    {% for seg in spark.segments %}
+    <polyline points="{{ seg }}" fill="none" stroke="#1d4ed8" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round"></polyline>
+    {% endfor %}
+    {% for p in spark.points %}
+    <circle cx="{{ p.x }}" cy="{{ p.y }}" r="3" fill="#1d4ed8"><title>{{ p.label }}</title></circle>
+    {% endfor %}
+  </svg>
+  <p class="muted">
+    Week average <strong id="energy-overall">{{ report.energy.overall_avg }}</strong> (0–100)
+    over {{ report.energy.samples }} hourly window{{ "s" if report.energy.samples != 1 else "" }}.
+    Gaps are days without persisted estimates.
+  </p>
+  <table class="plain">
+    <thead>
+      <tr><th>Day</th><th class="num">Avg</th><th class="num">Min</th><th class="num">Max</th><th class="num">Windows</th></tr>
+    </thead>
+    <tbody>
+      {% for day in report.energy.days %}
+      <tr>
+        <td>{{ day.date.strftime("%a") }} {{ day.date.isoformat() }}</td>
+        <td class="num">{{ day.avg_score if day.avg_score is not none else "—" }}</td>
+        <td class="num">{{ day.min_score if day.min_score is not none else "—" }}</td>
+        <td class="num">{{ day.max_score if day.max_score is not none else "—" }}</td>
+        <td class="num">{{ day.samples }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No energy data recorded this week.</p>
+  {% endif %}
+</section>
+
+<section class="card" id="insights">
+  <h2>Insights</h2>
+  <p class="muted">
+    <span id="insights-count">{{ report.insights.count }}</span>
+    insight{{ "s" if report.insights.count != 1 else "" }} recorded this week.
+  </p>
+  {% if report.insights.items %}
+  <ul class="report-list">
+    {% for insight in report.insights.items %}
+    <li>
+      <span class="badge conf-{{ insight.confidence_level }}">
+        {{ "n/a" if insight.confidence_level == "none" else insight.confidence_level }}
+        {%- if insight.confidence is not none %} · {{ (insight.confidence * 100) | round | int }}%{% endif %}
+      </span>
+      <span class="badge">{{ insight.kind }}</span>
+      <div class="statement">{{ insight.statement }}</div>
+      <div class="muted">{{ insight.period }} · {{ format_created(insight.created_at) }}</div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% if report.insights.count > report.insights.items | length %}
+  <p class="muted">Showing the newest {{ report.insights.items | length }}.</p>
+  {% endif %}
+  {% endif %}
+</section>
+
+<section class="card" id="schedule">
+  <h2>Schedule adherence</h2>
+  <div class="stats">
+    <div class="stat"><span class="value" id="schedule-accepted">{{ report.schedule.accepted }}</span><span class="label">accepted</span></div>
+    <div class="stat"><span class="value" id="schedule-pushed">{{ report.schedule.pushed }}</span><span class="label">pushed</span></div>
+    <div class="stat"><span class="value" id="schedule-declined">{{ report.schedule.declined }}</span><span class="label">declined</span></div>
+    <div class="stat"><span class="value" id="schedule-proposed">{{ report.schedule.proposed }}</span><span class="label">pending</span></div>
+  </div>
+  <p class="muted">
+    {% if report.schedule.acceptance_pct is not none %}
+    <span id="schedule-acceptance">{{ report.schedule.acceptance_pct }}</span>% of the
+    {{ report.schedule.decided }} decided proposal{{ "s" if report.schedule.decided != 1 else "" }}
+    this week were accepted or pushed to the calendar.
+    {% else %}
+    No proposals were decided this week.
+    {% endif %}
+  </p>
+</section>
+
+<section class="card" id="alerts">
+  <h2>Alert digest</h2>
+  <div class="stats">
+    <div class="stat"><span class="value" id="alerts-fired">{{ report.alerts.fired }}</span><span class="label">fired</span></div>
+    <div class="stat"><span class="value" id="alerts-delivered">{{ report.alerts.delivered }}</span><span class="label">delivered</span></div>
+    <div class="stat"><span class="value" id="alerts-budget">{{ report.alerts.weekly_budget }}</span><span class="label">weekly budget</span></div>
+  </div>
+  <p class="muted">
+    Budget = {{ report.alerts.daily_budget }} alert{{ "s" if report.alerts.daily_budget != 1 else "" }}/day
+    × {{ report.energy.days | length }} days. Fired-but-undelivered triggers were
+    deduplicated, rate-limited, in quiet hours, or over budget.
+  </p>
+  {% if report.alerts.by_rule %}
+  <table class="plain">
+    <thead><tr><th>Rule</th><th class="num">Fired</th><th class="num">Delivered</th></tr></thead>
+    <tbody>
+      {% for rule in report.alerts.by_rule %}
+      <tr><td>{{ rule.rule_id }}</td><td class="num">{{ rule.fired }}</td><td class="num">{{ rule.delivered }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<section class="card" id="decisions">
+  <h2>Decisions</h2>
+  <p class="muted">
+    <span id="decisions-count">{{ report.decisions.count }}</span>
+    decision{{ "s" if report.decisions.count != 1 else "" }} recorded this week
+    ({% for kind, n in report.decisions.kind_counts.items() %}{{ kind }} {{ n }}{{ ", " if not loop.last else "" }}{% endfor %}).
+  </p>
+  {% if report.decisions.items %}
+  <ul class="decision-list">
+    {% for d in report.decisions.items %}
+    <li>
+      <a class="row" href="{{ d.url }}">
+        <span class="badge kind-{{ d.kind.value }}">{{ d.kind.value }}</span>
+        <span class="when">{{ format_created(d.created_at) }}</span>
+        <span class="row-summary">{{ d.summary }}</span>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+  {% if report.decisions.count > report.decisions.items | length %}
+  <p class="muted">Showing the newest {{ report.decisions.items | length }} —
+    <a href="/decisions">full decision log</a>.</p>
+  {% endif %}
+  {% else %}
+  <p><em>No decisions recorded this week.</em></p>
+  {% endif %}
+</section>
+{% endblock %}
