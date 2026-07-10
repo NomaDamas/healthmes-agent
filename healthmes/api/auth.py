@@ -11,13 +11,13 @@ reconciliation is a single shared bearer token (``Settings.api_token``):
   collector already sends this header (apps/android-usage .../IngestClient.kt).
 - ``GET /health`` stays open (compose healthcheck / liveness probe; it leaks
   nothing).
-- Human-facing decision-viewer pages (``GET /decisions...`` and the vendored
-  ``/static/mermaid.min.js`` they load) additionally accept
-  ``?token=<viewer token>`` where the viewer token is *derived* from the API
-  token (:func:`viewer_token`). Alert links must be tappable from a phone
-  browser, which cannot attach headers — embedding the derived read-only
-  credential keeps links working without ever putting the full-access API
-  token into Telegram messages or browser history.
+- Human-facing viewer pages (``GET /decisions...``, the weekly report under
+  ``GET /reports/...`` and the vendored ``/static/mermaid.min.js`` they load)
+  additionally accept ``?token=<viewer token>`` where the viewer token is
+  *derived* from the API token (:func:`viewer_token`). Alert/briefing links
+  must be tappable from a phone browser, which cannot attach headers —
+  embedding the derived read-only credential keeps links working without ever
+  putting the full-access API token into Telegram messages or browser history.
 - When no token is configured the middleware is not installed (the zero-setup
   loopback dev path); ``python -m healthmes serve`` refuses to bind a
   non-loopback host in that state (see ``healthmes/__main__.py``).
@@ -40,6 +40,7 @@ __all__ = [
     "BearerTokenMiddleware",
     "install_auth",
     "viewer_token",
+    "viewer_url",
 ]
 
 # Paths that must stay reachable without credentials (liveness only).
@@ -47,7 +48,7 @@ OPEN_PATHS = frozenset({"/health"})
 
 # Path prefixes of the human-facing viewer surface that may authenticate via
 # the derived ?token= query credential (browser links cannot carry headers).
-VIEWER_PATH_PREFIXES = ("/decisions", "/static/")
+VIEWER_PATH_PREFIXES = ("/decisions", "/static/", "/reports")
 
 _VIEWER_TOKEN_CONTEXT = b"healthmes-viewer:"
 
@@ -61,6 +62,25 @@ def viewer_token(api_token: str) -> str:
     """
     digest = hashlib.sha256(_VIEWER_TOKEN_CONTEXT + api_token.encode("utf-8"))
     return digest.hexdigest()[:32]
+
+
+def viewer_url(settings: Settings, path: str) -> str:
+    """Absolute browser-tappable link to a viewer-surface page.
+
+    The single construction point for every credentialed viewer link the
+    system emits — decision pages (REST + the MCP ``record_decision`` tool),
+    glance alert deep links, and the weekly report: ``{public_base_url}``
+    ``{path}`` plus ``?token=`` from :func:`viewer_token` when an API token is
+    configured. Links open in a phone browser, which cannot attach
+    Authorization headers, and must never carry the full-access API token —
+    server code builds these links, never the LLM (one copy here so the
+    credential scheme can only evolve in lockstep).
+    """
+    url = f"{settings.public_base_url.rstrip('/')}{path}"
+    api_token = settings.api_token.get_secret_value().strip()
+    if api_token:
+        url = f"{url}?token={viewer_token(api_token)}"
+    return url
 
 
 def _header(scope: Scope, name: bytes) -> str | None:

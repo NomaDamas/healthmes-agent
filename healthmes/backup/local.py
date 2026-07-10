@@ -19,11 +19,13 @@ from pathlib import Path
 
 from healthmes.backup.provider import BackupError, SnapshotInfo
 from healthmes.backup.snapshot import (
+    PROVIDER_REMOTE_VAULT,
     SNAPSHOT_SUFFIX,
     DataLocations,
     create_snapshot,
     parse_snapshot_name,
     resolve_backup_dir,
+    resolve_backup_provider_name,
     resolve_data_locations,
     resolve_passphrase,
     restore_snapshot,
@@ -170,7 +172,22 @@ def build_backup_job(settings: Settings) -> Callable[[], None]:
 
     Skips (with a warning) when no passphrase is configured and logs — never
     raises — on failure, so the APScheduler thread stays healthy.
+
+    When the backup provider selector (``HEALTHMES_BACKUP_PROVIDER`` /
+    ``Settings.backup_provider``) is ``remote_vault``, the local snapshot is
+    additionally replicated to the configured S3-compatible vault. Local
+    first: the local write happens (and is kept) regardless; a failed
+    replication only logs. The remote_vault module is imported lazily so the
+    default local path never pays the boto3 import.
     """
+
+    def _replicate_to_vault(snapshot_path: Path) -> None:
+        if resolve_backup_provider_name(settings) != PROVIDER_REMOTE_VAULT:
+            return
+        from healthmes.backup.remote_vault import RemoteVaultProvider
+
+        remote_info = RemoteVaultProvider.from_settings(settings).push(snapshot_path)
+        logger.info("Weekly backup replicated to vault: %s", remote_info.path)
 
     def run_weekly_backup() -> None:
         if resolve_passphrase(settings) is None:
@@ -185,5 +202,10 @@ def build_backup_job(settings: Settings) -> Callable[[], None]:
             logger.exception("Weekly backup failed.")
             return
         logger.info("Weekly backup written: %s (%d bytes)", info.path, info.size_bytes)
+        try:
+            _replicate_to_vault(info.path)
+        except Exception:
+            # The local snapshot exists and stays valid; only replication failed.
+            logger.exception("Weekly backup vault replication failed (local copy kept).")
 
     return run_weekly_backup

@@ -200,6 +200,23 @@ def _energy_section(fetch: FetchFn, base_url: str) -> dict[str, Any]:
     return {"status": payload.get("status"), "windows": scored}
 
 
+def _weekly_report_section(fetch: FetchFn, base_url: str) -> dict[str, Any]:
+    """The server-built weekly report link (Sunday briefing, PLAN §8.5).
+
+    Only the server knows the *public* base URL and the derived read-only
+    viewer credential (healthmes/api/auth.py — server code builds
+    credentialed viewer links, never the LLM), so the link is lifted verbatim
+    from the report payload's ``report_url``. The snapshot's own ``base_url``
+    may be cluster-internal (docker: http://healthmes:8100) and must never
+    leak into a phone-tappable message.
+    """
+    payload = fetch(f"{base_url}/reports/weekly.json")
+    url = payload.get("report_url") if isinstance(payload, dict) else None
+    if not isinstance(url, str) or not url:
+        raise ValueError("weekly report payload carried no report_url")
+    return {"url": url}
+
+
 def collect_snapshot(
     base_url: str,
     *,
@@ -227,6 +244,7 @@ def collect_snapshot(
         ("events", lambda: _events_section(fetch, base_url, window_start, window_end)),
         ("pending_proposals", lambda: _proposals_section(fetch, base_url)),
         ("energy_forecast", lambda: _energy_section(fetch, base_url)),
+        ("weekly_report", lambda: _weekly_report_section(fetch, base_url)),
     )
     for name, build in builders:
         try:

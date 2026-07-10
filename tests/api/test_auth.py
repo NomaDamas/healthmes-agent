@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from healthmes.__main__ import check_bind_safety
-from healthmes.api.auth import viewer_token
+from healthmes.api.auth import viewer_token, viewer_url
 from healthmes.app import create_app
 from healthmes.store import Base
 from healthmes.store.session import get_engine
@@ -128,6 +128,21 @@ class TestViewerLinks:
         assert viewer_token(TOKEN) == viewer_token(TOKEN)
         assert viewer_token(TOKEN) != viewer_token("other")
         assert TOKEN not in viewer_token(TOKEN)
+
+    def test_viewer_url_is_the_single_construction_point(self, settings) -> None:
+        # Tokenless (loopback dev): plain public-base link, no query credential.
+        assert viewer_url(settings, "/decisions/abc") == (
+            "http://healthmes.test:8100/decisions/abc"
+        )
+        # Token configured: the derived read-only credential is embedded —
+        # never the API token itself. Every emitter (decision viewer, glance
+        # deep links, weekly report, MCP record_decision) goes through here.
+        secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
+        url = viewer_url(secured, "/reports/weekly")
+        assert url == (
+            f"http://healthmes.test:8100/reports/weekly?token={viewer_token(TOKEN)}"
+        )
+        assert TOKEN not in url
 
 
 class TestNoTokenConfigured:

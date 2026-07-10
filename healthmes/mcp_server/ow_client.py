@@ -297,6 +297,39 @@ class OWClient:
         )
         return rows
 
+    async def get_menstrual_cycles(
+        self,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+        *,
+        cursor: str | None = None,
+        limit: int = EVENTS_MAX_LIMIT,
+    ) -> dict[str, Any]:
+        """GET /api/v1/users/{user_id}/events/menstrual-cycles — per-cycle records.
+
+        Both date params are required by the vendor route (events.py::
+        list_menstrual_cycles); server-side only ``start_date`` filters (cycles
+        can end in the future, so the service drops the end filter). Rows are
+        ``MenstrualCycleRecord`` shapes: start/end times plus current_phase_type,
+        day_in_cycle, cycle_length, period_length, pregnancy_snapshot, ...
+        """
+        params: dict[str, Any] = {"start_date": start_date, "end_date": end_date, "limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        return await self._get(f"/api/v1/users/{user_id}/events/menstrual-cycles", params=params)
+
+    async def collect_menstrual_cycles(
+        self, user_id: str, start_date: str, end_date: str
+    ) -> list[dict[str, Any]]:
+        """All menstrual-cycle records in a window, following cursor pagination."""
+        rows, _ = await self._collect_cursor(
+            lambda cursor: self.get_menstrual_cycles(
+                user_id, start_date, end_date, cursor=cursor
+            )
+        )
+        return rows
+
     async def get_sleep_sessions(
         self,
         user_id: str,

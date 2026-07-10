@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Briefing widget metadata. updatePeriodMillis stays 0: refresh cadence is
+     owned by the 15-minute WorkManager job (ETag-honoring), not by the
+     AppWidget host. keyguard is included so hosts that support lock-screen
+     widgets (issue #7 "glanceable surfaces") can offer it. -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/widget_description"
+    android:initialLayout="@layout/glance_default_loading_layout"
+    android:maxResizeWidth="360dp"
+    android:maxResizeHeight="200dp"
+    android:minWidth="110dp"
+    android:minHeight="40dp"
+    android:resizeMode="horizontal|vertical"
+    android:targetCellWidth="2"
+    android:targetCellHeight="1"
+    android:updatePeriodMillis="0"
+    android:widgetCategory="home_screen|keyguard" />

@@ -169,8 +169,13 @@ BRIEFING_JOBS: tuple[dict[str, Any], ...] = (
             "Weekly planning session. Using the injected HealthMes state "
             "snapshot as context, review this week's goals and completion, "
             "surface one evidence-backed health/schedule pattern, then ask "
-            "for next week's goal dump. One message in the standard "
-            "notification grammar."
+            "for next week's goal dump. Include the weekly report link so "
+            "the full week's numbers are one tap away: use the snapshot's "
+            "weekly_report.url verbatim — it is server-built with the "
+            "read-only viewer credential embedded, exactly like the "
+            "decision-viewer links. Never construct or edit /reports/weekly "
+            "URLs yourself; if the snapshot has no weekly_report.url, omit "
+            "the link. One message in the standard notification grammar."
         ),
         "skills": ["healthmes-planner"],
         "deliver": "telegram",

@@ -50,6 +50,8 @@ __all__ = [
     "TreeNode",
     "DecisionTreeView",
     "escape_mermaid_label",
+    "format_created",
+    "template_environment",
     "tree_to_mermaid",
     "render_decision_html",
     "render_decision_list_html",
@@ -244,8 +246,13 @@ def tree_to_mermaid(tree: Any) -> DecisionTreeView:
 
 
 @lru_cache(maxsize=1)
-def _environment() -> Environment:
-    """Jinja environment over ``healthmes/api/templates/`` (autoescape on)."""
+def template_environment() -> Environment:
+    """Jinja environment over ``healthmes/api/templates/`` (autoescape on).
+
+    Public on purpose: the weekly report (healthmes/api/reports.py) renders
+    from the same templates/ directory — sibling modules import this, never a
+    private name (one copy, public names).
+    """
     return Environment(
         loader=FileSystemLoader(TEMPLATES_DIR),
         autoescape=True,
@@ -254,8 +261,12 @@ def _environment() -> Environment:
     )
 
 
-def _format_created(value: Any) -> str:
-    """Display string for ``created_at`` (naive sqlite values are UTC by contract)."""
+def format_created(value: Any) -> str:
+    """Display string for ``created_at`` (naive sqlite values are UTC by contract).
+
+    Shared with the weekly report template — public for the same reason as
+    :func:`template_environment`.
+    """
     if value is None:
         return "—"
     return value.strftime("%Y-%m-%d %H:%M UTC")
@@ -264,11 +275,11 @@ def _format_created(value: Any) -> str:
 def render_decision_html(record: DecisionRecord) -> str:
     """Render the full Mermaid viewer page for one decision record."""
     graph = tree_to_mermaid(record.tree)
-    template = _environment().get_template("decision.html.j2")
+    template = template_environment().get_template("decision.html.j2")
     return template.render(
         record=record,
         graph=graph,
-        created_display=_format_created(record.created_at),
+        created_display=format_created(record.created_at),
         short_id=str(record.id)[:8],
         node_types=[*KNOWN_NODE_TYPES, FALLBACK_NODE_TYPE],
     )
@@ -293,7 +304,7 @@ def render_decision_list_html(
             href += f"&kind={kind}"
         return href
 
-    template = _environment().get_template("decision_list.html.j2")
+    template = template_environment().get_template("decision_list.html.j2")
     return template.render(
         records=records,
         meta=meta,
@@ -301,11 +312,11 @@ def render_decision_list_html(
         newer_offset=newer_offset,
         older_offset=older_offset,
         page_href=page_href,
-        format_created=_format_created,
+        format_created=format_created,
     )
 
 
 def render_not_found_html(decision_id: str | uuid.UUID) -> str:
     """Small 404 page so alert links never dump a JSON envelope on a human."""
-    template = _environment().get_template("decision_not_found.html.j2")
+    template = template_environment().get_template("decision_not_found.html.j2")
     return template.render(decision_id=str(decision_id))

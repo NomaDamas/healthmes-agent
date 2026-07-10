@@ -1982,20 +1982,16 @@ def record_decision(
         session.add(row)
         session.flush()
         decision_id = str(row.id)
-    settings = _active_settings()
-    base_url = settings.public_base_url.rstrip("/")
-    url = f"{base_url}/decisions/{decision_id}"
-    api_token = settings.api_token.get_secret_value().strip()
-    if api_token:
-        # Viewer pages are opened from the phone browser (no headers); embed
-        # the derived read-only credential — never the API token itself.
-        from healthmes.api.auth import viewer_token
+    # Viewer pages are opened from the phone browser (no headers); the shared
+    # construction point embeds the derived read-only credential — never the
+    # API token itself. (Function-local import keeps healthmes.api off this
+    # module's import path.)
+    from healthmes.api.auth import viewer_url
 
-        url = f"{url}?token={viewer_token(api_token)}"
     return {
         "status": "ok",
         "decision_id": decision_id,
-        "viewer_url": url,
+        "viewer_url": viewer_url(_active_settings(), f"/decisions/{decision_id}"),
     }
 
 

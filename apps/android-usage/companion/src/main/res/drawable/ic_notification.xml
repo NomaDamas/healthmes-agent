@@ -1,0 +1,10 @@
+<!-- Status-bar small icon: must be flat/monochrome (alpha-only). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M13.5,2 L6,13 h4.5 l-2,9 L18,10 h-5 z" />
+</vector>

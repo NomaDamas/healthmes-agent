@@ -18,6 +18,36 @@ The score for one hourly window is::
                                  switches inside the window)
       - fragmentation_penalty   (app_usage_sample: distracting-app launches in the
                                  trailing hour — only when usage data exists)
+      ± v2 factors              (PLAN §1.5 reserved these as v2 energy factors —
+                                 "commonly ignored but correlated with cognitive
+                                 energy"):
+      - menstrual_phase_adjustment  (cycle phase from the open-wearables
+                                 menstrual-cycle records, routes/v1/events.py
+                                 ``/events/menstrual-cycles``; downward-only
+                                 placeholder severities per phase)
+      + sunlight_bonus          (``time_in_daylight`` series, minutes vs a
+                                 daily target; most recent complete day)
+      - noise_penalty           (``environmental_audio_exposure`` series, mean
+                                 dB mapped linearly between a floor and ceiling)
+      - alcohol_penalty         (``number_of_alcoholic_beverages`` series summed
+                                 over the previous evening)
+      - hydration_penalty       (``hydration`` series, yesterday's intake vs the
+                                 personal 14-day trailing-median baseline)
+
+All v2 series names are grounded in
+``vendor/open-wearables/backend/app/schemas/enums/series_types.py`` (never
+invented). Sum-vs-mean day aggregation follows the vendor's
+``aggregation_method.py`` where that map has an entry — ``time_in_daylight``
+and ``number_of_alcoholic_beverages`` are SUM, ``environmental_audio_exposure``
+is AVG; ``hydration`` has *no* entry there (the vendor helper would default an
+unmapped type to AVG), so its per-day sum is this engine's own choice for an
+amount-like mL series. A provider daily-total row replaces that day's intraday
+samples, mirroring ``daily_total_flag``.
+
+**v2 thresholds are documented placeholders**: per GitHub issue #7 the
+healthcare domain expert owns the final phase/threshold design; these defaults
+only make the plumbing real and every constant is named so the expert can
+retune one line.
 
 Design contract (all plan-mandated):
 
@@ -81,12 +111,18 @@ __all__ = [
     "StoreDayContext",
     "OwEnergyReader",
     "CognitiveEnergyEngine",
+    "SeriesPoint",
     "sleep_debt_signal",
     "stress_signal",
     "hrv_signal",
     "charge_signal",
     "meeting_load_signal",
     "fragmentation_signal",
+    "menstrual_phase_signal",
+    "sunlight_signal",
+    "noise_signal",
+    "alcohol_signal",
+    "hydration_signal",
     "compute_estimate",
     "digest_ow_rows",
     "load_store_day_context",
@@ -100,11 +136,24 @@ STATUS_INSUFFICIENT = interpret.STATUS_INSUFFICIENT
 
 WINDOW_MINUTES = 60
 
-# --- factor weight policy (fractions of the full six-signal set) -------------
+# --- factor weight policy -----------------------------------------------------
+# ``base_weight`` values are *relative* weights: a factor's realized share is
+# always ``base_weight / sum(base_weight of present factors)``, so only ratios
+# matter. The v1 six are kept at their original values (summing to exactly
+# 1.0) as a backward-compatibility anchor: any estimate computed from v1
+# signals only keeps byte-identical shares and scores. The v2 factors carry
+# small weights on the same scale (0.25 combined ≈ one-fifth of the full set)
+# — they are adjunct context, never allowed to dominate the physiological
+# core.
+#
 # Rationale: sleep is the strongest single predictor of next-day cognition;
 # stress and HRV split the autonomic picture; the charge score is partly
 # redundant with them (Garmin derives body battery from stress/HRV) so it gets
 # a modest share; calendar load and app fragmentation are behavioral terms.
+# Among the v2 factors, the menstrual phase and previous-evening alcohol get
+# the larger shares (strong, well-replicated next-day effects); daylight,
+# noise and hydration are milder modulators. All five are placeholder values
+# for the healthcare domain expert to retune (issue #7).
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,10 +163,10 @@ class FactorSpec:
     key: str  # internal signal key
     term: str  # component name (the plan's term name)
     kind: str  # "penalty" | "bonus"
-    base_weight: float  # share of the full six-signal set
+    base_weight: float  # relative weight (share = base_weight / present total)
 
 
-FACTOR_SPECS: tuple[FactorSpec, ...] = (
+_V1_FACTOR_SPECS: tuple[FactorSpec, ...] = (
     FactorSpec("sleep_debt", "sleep_debt_penalty", "penalty", 0.30),
     FactorSpec("stress", "stress_penalty", "penalty", 0.20),
     FactorSpec("hrv_deviation", "hrv_deviation_penalty", "penalty", 0.15),
@@ -125,9 +174,24 @@ FACTOR_SPECS: tuple[FactorSpec, ...] = (
     FactorSpec("meeting_load", "meeting_load_penalty", "penalty", 0.15),
     FactorSpec("fragmentation", "fragmentation_penalty", "penalty", 0.10),
 )
+_V2_FACTOR_SPECS: tuple[FactorSpec, ...] = (
+    FactorSpec("menstrual_phase", "menstrual_phase_adjustment", "penalty", 0.06),
+    FactorSpec("sunlight", "sunlight_bonus", "bonus", 0.05),
+    FactorSpec("noise", "noise_penalty", "penalty", 0.04),
+    FactorSpec("alcohol", "alcohol_penalty", "penalty", 0.06),
+    FactorSpec("hydration", "hydration_penalty", "penalty", 0.04),
+)
+FACTOR_SPECS: tuple[FactorSpec, ...] = _V1_FACTOR_SPECS + _V2_FACTOR_SPECS
 FACTORS: dict[str, FactorSpec] = {spec.key: spec for spec in FACTOR_SPECS}
-assert abs(sum(spec.base_weight for spec in FACTOR_SPECS) - 1.0) < 1e-9
+# v1 anchor invariant: the original six weights still sum to 1.0 so estimates
+# without any v2 signal are bit-identical to the v1 engine (persisted history
+# and hand-computed test vectors stay valid).
+assert abs(sum(spec.base_weight for spec in _V1_FACTOR_SPECS) - 1.0) < 1e-9
+assert all(spec.base_weight > 0 for spec in FACTOR_SPECS)
 
+# Still version 1 with the v2 factors: the item schema
+# (name/kind/weight/raw/contribution, exact-sum invariant) is unchanged —
+# only new item names appear, which every consumer looks up tolerantly.
 COMPONENTS_VERSION = 1
 
 # HRV deviation: a nocturnal HRV z-score of -HRV_Z_FLOOR vs the personal
@@ -162,6 +226,64 @@ FRAGMENTATION_LOOKBACK_MINUTES = 60
 FRAGMENTATION_MAX_LAUNCHES = 12
 USAGE_PRESENCE_LOOKBACK_HOURS = 24
 DISTRACTING_CATEGORIES = frozenset({"game", "social", "news", "video"})
+
+# --- v2 factor policy (documented placeholders — issue #7 reserves the final
+# --- healthcare design for the domain expert; every knob is one named line) ---
+
+# Menstrual phase: downward-only severities per phase. Textbook-default cycle
+# geometry is used only when the record lacks its own lengths; the luteal
+# phase is anchored to the *end* of the cycle (physiologically ~14 days).
+# The provider-reported ``current_phase_type`` is trusted only while its
+# ``day_in_cycle`` snapshot still matches the recomputed current day —
+# otherwise the phase is derived from cycle geometry.
+MENSTRUAL_PHASE_SEVERITY: dict[str, float] = {
+    "menstrual": 0.6,
+    "luteal": 0.35,
+    "follicular": 0.0,
+    "ovulation": 0.0,
+}
+DEFAULT_CYCLE_LENGTH_DAYS = 28
+DEFAULT_PERIOD_LENGTH_DAYS = 5
+LUTEAL_PHASE_DAYS = 14
+CYCLE_FETCH_DAYS = 60  # cycles *start* within this lookback (route filters by start only)
+
+# Sunlight: bonus = daylight minutes / target, on the most recent *complete*
+# day (as_of - 1, falling back one more day) — today's partial total would
+# systematically depress morning windows, and yesterday's light exposure is
+# what anchors today's circadian rhythm.
+DAYLIGHT_TARGET_MINUTES = 120.0
+DAYLIGHT_COMPLETE_DAY_OFFSETS = (1, 2)  # days before as_of that may anchor the factor
+
+# Noise: mean environmental dB for the freshest of today/yesterday, mapped
+# linearly from no-penalty floor to max-severity ceiling (a mean over partial
+# days is unbiased for a level metric, so today may anchor).
+NOISE_DB_FLOOR = 55.0
+NOISE_DB_CEIL = 80.0
+NOISE_DAY_OFFSETS = (0, 1)
+
+# Alcohol: drinks over the "previous evening" — all of yesterday (UTC) plus
+# the small hours of today (post-midnight logging counts toward this
+# morning's state). Severity = drinks / max; absence of logs is only a zero
+# when the user demonstrably tracks alcohol (any log in the fetched history),
+# otherwise the factor honestly drops.
+ALCOHOL_MAX_DRINKS = 4.0  # heavy-episodic threshold = maximal severity
+ALCOHOL_MORNING_CUTOFF_HOUR = 6
+
+# Hydration: yesterday's total intake vs the personal 14-day trailing-median
+# baseline (interpret.metric_baseline — never duplicated); severity = relative
+# deficit / floor, so 50%+ below the personal baseline is maximal severity.
+HYDRATION_DEFICIT_FLOOR = 0.5
+HYDRATION_MAX_STALE_DAYS = 2  # freshest complete day may be as_of-1 or as_of-2
+
+# v2 series vocabulary — grounded in vendor series_types.py (never invented).
+DAYLIGHT_SERIES = "time_in_daylight"  # minutes, SUM-aggregated
+NOISE_SERIES = "environmental_audio_exposure"  # dB, AVG-aggregated
+ALCOHOL_SERIES = "number_of_alcoholic_beverages"  # count, SUM-aggregated
+HYDRATION_SERIES = "hydration"  # mL, amount-like samples (summed per day)
+
+# Reader fetch windows for the v2 signals.
+V2_SHORT_FETCH_DAYS = 2  # daylight + noise: as_of-2 .. as_of
+V2_LONG_FETCH_DAYS = interpret.BASELINE_WINDOW_DAYS + HYDRATION_MAX_STALE_DAYS  # 16
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +696,303 @@ def fragmentation_signal(
 
 
 # ---------------------------------------------------------------------------
+# v2 factor builders (pure) — PLAN §1.5 "reserved as v2 factors"
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesPoint:
+    """One timeseries sample reduced to what the v2 factors need.
+
+    ``is_daily_total`` mirrors the vendor ``TimeSeriesSample.is_daily_total``:
+    True = a provider daily total that *replaces* that day's intraday samples
+    (vendor ``daily_total_flag``: "a daily total must not be added to its own
+    intraday samples"); False/None = a summable/average-able sample.
+    """
+
+    recorded_at: datetime
+    value: float
+    is_daily_total: bool = False
+
+
+def _normalize_phase(raw: Any) -> str | None:
+    """Map a provider ``current_phase_type`` string onto the severity table.
+
+    Garmin passes ``currentPhaseType`` through verbatim (vendor
+    providers/garmin/data_247.py lowercases it only for the record ``type``),
+    so matching is substring-based and case-insensitive. Returns one of the
+    ``MENSTRUAL_PHASE_SEVERITY`` keys, ``"pregnancy"``, or None (unknown).
+    """
+    text = str(raw or "").lower()
+    if not text:
+        return None
+    if "pregnan" in text:
+        return "pregnancy"
+    if "menstrua" in text or "period" in text:
+        return "menstrual"
+    if "ovul" in text or "fertile" in text:
+        return "ovulation"
+    if "follic" in text:
+        return "follicular"
+    if "luteal" in text:
+        return "luteal"
+    return None
+
+
+def _as_int(value: Any) -> int | None:
+    parsed = interpret.as_float(value)
+    return int(parsed) if parsed is not None and parsed > 0 else None
+
+
+def menstrual_phase_signal(
+    cycle_rows: Sequence[Mapping[str, Any]],
+    as_of: date,
+) -> FactorSignal | MissingSignal:
+    """Cycle-phase adjustment from open-wearables menstrual-cycle records.
+
+    Rows are ``MenstrualCycleRecord`` shapes from
+    ``GET /api/v1/users/{id}/events/menstrual-cycles``. The current cycle is
+    the record with the latest ``start_time`` on or before ``as_of``; the
+    current day-in-cycle is recomputed from that start (the ingested
+    ``day_in_cycle`` is a snapshot at provider-update time). The reported
+    ``current_phase_type`` is used while its snapshot is still current —
+    including days past ``cycle_length`` (a period running late is normal
+    variance; the provider keeps reporting on the open cycle). Otherwise the
+    phase derives from cycle geometry: days 1..period_length = menstrual, the
+    last ``LUTEAL_PHASE_DAYS`` of the cycle = luteal, in between = follicular
+    (the ovulation boundary shares the follicular severity of 0); a day
+    beyond ``cycle_length`` without a current snapshot is honestly
+    ``cycle_record_stale``. Pregnancy is out of scope for the placeholder
+    table — the factor drops.
+    """
+    key = "menstrual_phase"
+    candidates: list[tuple[date, Mapping[str, Any]]] = []
+    for row in cycle_rows:
+        started_at = interpret.parse_recorded_at(row.get("start_time"))
+        if started_at is not None and started_at.date() <= as_of:
+            candidates.append((started_at.date(), row))
+    if not candidates:
+        return MissingSignal(key, "no_cycle_data")
+    cycle_start, row = max(candidates, key=lambda item: item[0])
+
+    reported_phase = _normalize_phase(row.get("current_phase_type"))
+    if row.get("pregnancy_snapshot") or reported_phase == "pregnancy":
+        return MissingSignal(key, "pregnancy_not_modeled")
+
+    cycle_length = (
+        _as_int(row.get("cycle_length"))
+        or _as_int(row.get("predicted_cycle_length"))
+        or DEFAULT_CYCLE_LENGTH_DAYS
+    )
+    day_in_cycle = (as_of - cycle_start).days + 1
+    # The module policy above: a reported phase whose ``day_in_cycle``
+    # snapshot matches the recomputed current day is provider-fresh — trusted
+    # even when the real cycle overruns ``cycle_length`` (a late period is
+    # normal variance, not a stale record). The stale gate only applies when
+    # geometry would have to classify a day beyond the cycle it describes.
+    snapshot_current = _as_int(row.get("day_in_cycle")) == day_in_cycle
+    provider_trusted = reported_phase is not None and snapshot_current
+    if day_in_cycle > cycle_length and not provider_trusted:
+        return MissingSignal(key, "cycle_record_stale")
+
+    period_length = _as_int(row.get("period_length")) or DEFAULT_PERIOD_LENGTH_DAYS
+    if day_in_cycle <= period_length:
+        derived_phase = "menstrual"
+    elif day_in_cycle > cycle_length - LUTEAL_PHASE_DAYS:
+        derived_phase = "luteal"
+    else:
+        derived_phase = "follicular"
+
+    if provider_trusted:
+        phase, phase_source = reported_phase, "provider_reported"
+    else:
+        phase, phase_source = derived_phase, "derived_from_cycle_geometry"
+
+    severity = _clamp01(MENSTRUAL_PHASE_SEVERITY[phase])
+    return FactorSignal(
+        key,
+        severity,
+        {
+            "source": "ow_menstrual_cycle_records",
+            "phase": phase,
+            "phase_source": phase_source,
+            "day_in_cycle": day_in_cycle,
+            "cycle_start": cycle_start.isoformat(),
+            "cycle_length_days": cycle_length,
+            "period_length_days": period_length,
+            "reported_phase_type": row.get("current_phase_type"),
+            "severity_table": dict(MENSTRUAL_PHASE_SEVERITY),
+            "note": "placeholder severities — final mapping owned by the healthcare domain expert",
+            "severity": severity,
+        },
+    )
+
+
+def sunlight_signal(
+    daylight_by_day: Mapping[date, float],
+    as_of: date,
+) -> FactorSignal | MissingSignal:
+    """Daylight-exposure bonus from the ``time_in_daylight`` series.
+
+    Uses the most recent *complete* day (``DAYLIGHT_COMPLETE_DAY_OFFSETS``):
+    today's partial total would systematically depress morning windows, while
+    yesterday's exposure is what anchors today's circadian rhythm. The bonus
+    charge is ``minutes / DAYLIGHT_TARGET_MINUTES`` clamped to [0, 1].
+    """
+    for offset in DAYLIGHT_COMPLETE_DAY_OFFSETS:
+        day = as_of - timedelta(days=offset)
+        minutes = daylight_by_day.get(day)
+        if minutes is None:
+            continue
+        charge = _clamp01(float(minutes) / DAYLIGHT_TARGET_MINUTES)
+        return FactorSignal(
+            "sunlight",
+            charge,
+            {
+                "source": f"{DAYLIGHT_SERIES} series",
+                "daylight_minutes": round(float(minutes), 1),
+                "target_minutes": DAYLIGHT_TARGET_MINUTES,
+                "observed_on": day.isoformat(),
+                "stale_days": offset,
+                "policy": "most recent complete day (never today's partial total)",
+                "charge": charge,
+            },
+        )
+    return MissingSignal("sunlight", "no_recent_daylight_data")
+
+
+def noise_signal(
+    noise_db_by_day: Mapping[date, float],
+    as_of: date,
+) -> FactorSignal | MissingSignal:
+    """Environmental-noise penalty from ``environmental_audio_exposure`` (dB).
+
+    Takes the freshest daily mean of today/yesterday (a mean over a partial
+    day is unbiased for a level metric) and maps it linearly:
+    <= ``NOISE_DB_FLOOR`` -> 0, >= ``NOISE_DB_CEIL`` -> 1.
+    """
+    for offset in NOISE_DAY_OFFSETS:
+        day = as_of - timedelta(days=offset)
+        level = noise_db_by_day.get(day)
+        if level is None:
+            continue
+        severity = _clamp01((float(level) - NOISE_DB_FLOOR) / (NOISE_DB_CEIL - NOISE_DB_FLOOR))
+        return FactorSignal(
+            "noise",
+            severity,
+            {
+                "source": f"{NOISE_SERIES} series",
+                "mean_db": round(float(level), 1),
+                "floor_db": NOISE_DB_FLOOR,
+                "ceiling_db": NOISE_DB_CEIL,
+                "observed_on": day.isoformat(),
+                "stale_days": offset,
+                "severity": severity,
+            },
+        )
+    return MissingSignal("noise", "no_recent_noise_data")
+
+
+def alcohol_signal(
+    drink_points: Sequence[SeriesPoint],
+    as_of: date,
+) -> FactorSignal | MissingSignal:
+    """Previous-evening alcohol penalty from ``number_of_alcoholic_beverages``.
+
+    The evening window is all of yesterday (UTC) plus today's small hours
+    (before ``ALCOHOL_MORNING_CUTOFF_HOUR``) so post-midnight logging still
+    counts toward this morning's state. Per day inside the window a provider
+    daily total replaces intraday samples (vendor ``daily_total_flag`` rule)
+    — except a daily total for *today*: providers stamp day-level rows at day
+    start (inside the small-hours window), but the row covers the whole
+    current day including drinks after the cutoff, so counting it would
+    attribute tonight's drinking to the previous evening (the sibling
+    factors' "never today's partial total" rule; today's intraday small-hour
+    samples still count). ``drink_points`` empty means the user does not
+    track alcohol at all in the fetched history — the factor drops instead of
+    faking a sober evening.
+    """
+    if not drink_points:
+        return MissingSignal("alcohol", "no_alcohol_logs_in_lookback")
+    window_start = datetime.combine(as_of - timedelta(days=1), time.min, tzinfo=UTC)
+    window_end = datetime.combine(
+        as_of, time(hour=ALCOHOL_MORNING_CUTOFF_HOUR), tzinfo=UTC
+    )
+    by_day: dict[date, list[SeriesPoint]] = {}
+    for point in drink_points:
+        if not (window_start <= point.recorded_at < window_end):
+            continue
+        if point.is_daily_total and point.recorded_at.date() == as_of:
+            continue  # whole-day total for today — not previous-evening data
+        by_day.setdefault(point.recorded_at.date(), []).append(point)
+    drinks = 0.0
+    for points in by_day.values():
+        totals = [p.value for p in points if p.is_daily_total]
+        drinks += max(totals) if totals else sum(p.value for p in points)
+    severity = _clamp01(drinks / ALCOHOL_MAX_DRINKS)
+    return FactorSignal(
+        "alcohol",
+        severity,
+        {
+            "source": f"{ALCOHOL_SERIES} series",
+            "drinks": round(drinks, 2),
+            "max_drinks": ALCOHOL_MAX_DRINKS,
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "logs_in_lookback": len(drink_points),
+            "presence_basis": "any alcohol log in the fetched history marks the user as tracking",
+            "severity": severity,
+        },
+    )
+
+
+def hydration_signal(
+    hydration_by_day: Mapping[date, float],
+    as_of: date,
+) -> FactorSignal | MissingSignal:
+    """Low-water-intake penalty: yesterday's total vs the personal baseline.
+
+    Anchors on the most recent complete day (``as_of - 1``; today's partial
+    total never counts) and reuses :func:`interpret.metric_baseline` — the
+    14-day trailing-median baseline strictly before the anchored day. Severity
+    is the relative deficit divided by ``HYDRATION_DEFICIT_FLOOR`` (50%+ below
+    the personal baseline = maximal severity); intake above baseline is never
+    rewarded.
+    """
+    key = "hydration"
+    block = interpret.metric_baseline(hydration_by_day, as_of - timedelta(days=1))
+    if block.get("status") != STATUS_OK:
+        return MissingSignal(key, str(block.get("reason", "insufficient_hydration_baseline")))
+    current_day = date.fromisoformat(block["current"]["date"])
+    if (as_of - current_day).days > HYDRATION_MAX_STALE_DAYS:
+        return MissingSignal(key, "no_recent_hydration_data")
+    baseline = float(block["baseline_median"])
+    if baseline <= 0:
+        return MissingSignal(key, "zero_hydration_baseline")
+    deficit_fraction = max(0.0, -float(block["delta"])) / baseline
+    severity = _clamp01(deficit_fraction / HYDRATION_DEFICIT_FLOOR)
+    return FactorSignal(
+        key,
+        severity,
+        {
+            "source": f"{HYDRATION_SERIES} series",
+            "unit": "mL",
+            "current": block["current"],
+            "baseline_median": block["baseline_median"],
+            "delta": block["delta"],
+            "delta_pct": block["delta_pct"],
+            "deficit_fraction": round(deficit_fraction, 4),
+            "deficit_floor": HYDRATION_DEFICIT_FLOOR,
+            "n_days": block["n_days"],
+            "window_days": block["window_days"],
+            "confidence": block["confidence"],
+            "policy": "most recent complete day vs 14-day trailing median",
+            "severity": severity,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Score composition (pure)
 # ---------------------------------------------------------------------------
 
@@ -630,7 +1049,10 @@ def compute_estimate(
     by_key = {signal.key: signal for signal in signals}
     ordered = [spec for spec in FACTOR_SPECS if spec.key in by_key]
     total_weight = sum(spec.base_weight for spec in ordered)
-    renormalized = len(ordered) < len(FACTOR_SPECS)
+    # True when the realized shares differ from the declared base weights,
+    # i.e. the present factors' weights do not already sum to 1 (the v1 six
+    # alone sum to exactly 1.0 — their full-set estimates stay unflagged).
+    renormalized = abs(total_weight - 1.0) > 1e-9
 
     bonus_budget = sum(
         spec.base_weight / total_weight * 100.0 for spec in ordered if spec.kind == "bonus"
@@ -695,7 +1117,13 @@ def compute_estimate(
 
 @dataclass(frozen=True, slots=True)
 class OwDigest:
-    """Daily series digested from raw open-wearables REST rows."""
+    """Daily series digested from raw open-wearables REST rows.
+
+    The v2 fields are ``None`` when their rows were not fetched (legacy
+    v1-shaped :class:`OwRows`, or a reader whose v2 fetch degraded) — the
+    corresponding factors are then skipped entirely instead of being reported
+    missing, so pre-v2 fixtures and persisted flows are byte-identical.
+    """
 
     sleep_scores_by_day: dict[date, float]
     sleep_score_source: str | None
@@ -704,18 +1132,69 @@ class OwDigest:
     rmssd_by_day: dict[date, float]
     sdnn_by_day: dict[date, float]
     charge_points: dict[str, tuple[tuple[datetime, float, str | None], ...]]
+    # v2 (PLAN §1.5): None = not fetched; empty containers = fetched, no data.
+    daylight_by_day: dict[date, float] | None = None
+    noise_db_by_day: dict[date, float] | None = None
+    alcohol_points: tuple[SeriesPoint, ...] | None = None
+    hydration_by_day: dict[date, float] | None = None
+    cycles: tuple[dict[str, Any], ...] | None = None
+
+
+def _series_points(
+    series_rows: Sequence[Mapping[str, Any]], series_type: str
+) -> list[SeriesPoint]:
+    """``TimeSeriesSample`` rows of one type as parsed points (bad rows skipped)."""
+    points: list[SeriesPoint] = []
+    for row in series_rows:
+        if row.get("type") != series_type:
+            continue
+        recorded_at = interpret.parse_recorded_at(row.get("timestamp"))
+        value = interpret.as_float(row.get("value"))
+        if recorded_at is None or value is None:
+            continue
+        points.append(SeriesPoint(recorded_at, value, bool(row.get("is_daily_total"))))
+    return points
+
+
+def _daily_sum_series(points: Sequence[SeriesPoint]) -> dict[date, float]:
+    """Daily totals for an amount-like series (vendor SUM aggregation).
+
+    A provider daily-total row replaces that day's intraday samples (max of
+    the totals when several sources report one) — the vendor
+    ``daily_total_flag`` rule, never re-summed on top of its own samples.
+    """
+    by_day: dict[date, list[SeriesPoint]] = {}
+    for point in points:
+        by_day.setdefault(point.recorded_at.date(), []).append(point)
+    out: dict[date, float] = {}
+    for day, day_points in by_day.items():
+        totals = [p.value for p in day_points if p.is_daily_total]
+        out[day] = max(totals) if totals else sum(p.value for p in day_points)
+    return out
+
+
+def _daily_mean_series(points: Sequence[SeriesPoint]) -> dict[date, float]:
+    """Daily means for a level-like series (vendor AVG aggregation, e.g. dB)."""
+    return interpret.daily_series(
+        [(p.recorded_at, p.value) for p in points], how="mean"
+    )
 
 
 def digest_ow_rows(
     score_rows: Sequence[Mapping[str, Any]],
     sleep_rows: Sequence[Mapping[str, Any]],
     as_of: date,
+    *,
+    series_rows: Sequence[Mapping[str, Any]] | None = None,
+    cycle_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> OwDigest:
     """Digest health-score + sleep-summary rows into the engine's daily series.
 
     Row digestion is the shared pure-function layer of
     :mod:`healthmes.mcp_server.interpret` (one copy, public names — never
-    another module's privates).
+    another module's privates). ``series_rows`` (v2 timeseries samples) and
+    ``cycle_rows`` (menstrual-cycle records) are optional: omitted, the v2
+    digest fields stay ``None`` and the v2 factors are skipped.
     """
     sleep_scores, sleep_source = interpret.sleep_score_series(score_rows)
     garmin_stress = interpret.daily_series(
@@ -741,6 +1220,16 @@ def digest_ow_rows(
             (recorded_at, value, str(provider) if provider is not None else None)
         )
 
+    daylight_by_day: dict[date, float] | None = None
+    noise_db_by_day: dict[date, float] | None = None
+    alcohol_points: tuple[SeriesPoint, ...] | None = None
+    hydration_by_day: dict[date, float] | None = None
+    if series_rows is not None:
+        daylight_by_day = _daily_sum_series(_series_points(series_rows, DAYLIGHT_SERIES))
+        noise_db_by_day = _daily_mean_series(_series_points(series_rows, NOISE_SERIES))
+        alcohol_points = tuple(_series_points(series_rows, ALCOHOL_SERIES))
+        hydration_by_day = _daily_sum_series(_series_points(series_rows, HYDRATION_SERIES))
+
     return OwDigest(
         sleep_scores_by_day=sleep_scores,
         sleep_score_source=sleep_source,
@@ -749,6 +1238,11 @@ def digest_ow_rows(
         rmssd_by_day=rmssd,
         sdnn_by_day=sdnn,
         charge_points={key: tuple(points) for key, points in charge.items()},
+        daylight_by_day=daylight_by_day,
+        noise_db_by_day=noise_db_by_day,
+        alcohol_points=alcohol_points,
+        hydration_by_day=hydration_by_day,
+        cycles=tuple(dict(row) for row in cycle_rows) if cycle_rows is not None else None,
     )
 
 
@@ -833,12 +1327,21 @@ OW_STATUS_UNAVAILABLE = "unavailable"
 
 @dataclass(frozen=True, slots=True)
 class OwRows:
-    """Raw open-wearables rows for one compute (empty when unavailable)."""
+    """Raw open-wearables rows for one compute (empty when unavailable).
+
+    ``series_rows`` (v2 timeseries) and ``cycle_rows`` (menstrual-cycle
+    records) are ``None`` when not fetched — a v1-shaped construction or a
+    degraded v2 fetch — which skips the v2 factors instead of listing them
+    missing. A tuple (possibly empty) means "fetched": the v2 factors run and
+    drop with explicit reasons when the data is insufficient.
+    """
 
     score_rows: tuple[dict[str, Any], ...] = ()
     sleep_rows: tuple[dict[str, Any], ...] = ()
     status: str = OW_STATUS_OK
     detail: str | None = None
+    series_rows: tuple[dict[str, Any], ...] | None = None
+    cycle_rows: tuple[dict[str, Any], ...] | None = None
 
 
 class EnergyDataReader(Protocol):
@@ -861,6 +1364,8 @@ class OwEnergyReader:
         self._client = client
         self._user_id: str | None = None
         self._warned = False
+        self._v2_series_warned = False
+        self._v2_cycles_warned = False
 
     def _ensure_client(self) -> Any:
         if self._client is None:
@@ -886,7 +1391,13 @@ class OwEnergyReader:
         return self._user_id
 
     async def read(self, as_of: date) -> OwRows:
-        """Health-score + sleep-summary rows covering the baseline history."""
+        """Health-score + sleep-summary rows covering the baseline history.
+
+        The v2 fetches (timeseries + menstrual cycles) degrade *individually*:
+        a backend that predates those routes, or a partial outage, costs only
+        the affected v2 factors (fields stay ``None`` and skip) — never the
+        whole read.
+        """
         fetch_start = as_of - timedelta(days=OW_FETCH_DAYS)
         end_exclusive = as_of + timedelta(days=1)
         try:
@@ -900,8 +1411,16 @@ class OwEnergyReader:
             sleep_rows = await client.collect_sleep_summaries(
                 user_id, fetch_start.isoformat(), end_exclusive.isoformat()
             )
+            series_rows = await self._read_v2_series(client, user_id, as_of, end_exclusive)
+            cycle_rows = await self._read_v2_cycles(client, user_id, as_of, end_exclusive)
             self._warned = False
-            return OwRows(tuple(score_rows), tuple(sleep_rows), OW_STATUS_OK)
+            return OwRows(
+                tuple(score_rows),
+                tuple(sleep_rows),
+                OW_STATUS_OK,
+                series_rows=series_rows,
+                cycle_rows=cycle_rows,
+            )
         except Exception as exc:  # degrade, never break the loop
             if not self._warned:
                 logger.warning(
@@ -913,12 +1432,75 @@ class OwEnergyReader:
                 self._warned = True
             return OwRows(status=OW_STATUS_UNAVAILABLE, detail=f"{type(exc).__name__}: {exc}")
 
+    async def _read_v2_series(
+        self, client: Any, user_id: str, as_of: date, end_exclusive: date
+    ) -> tuple[dict[str, Any], ...] | None:
+        """v2 timeseries rows, or None when the fetch degrades.
+
+        Two calls keep volumes small: a short window for the fresh
+        environmental signals and a long one for the baseline-anchored
+        (hydration) and presence-anchored (alcohol) amounts.
+        """
+        try:
+            short_start = as_of - timedelta(days=V2_SHORT_FETCH_DAYS)
+            long_start = as_of - timedelta(days=V2_LONG_FETCH_DAYS)
+            short_rows = await client.collect_timeseries(
+                user_id,
+                short_start.isoformat(),
+                end_exclusive.isoformat(),
+                [DAYLIGHT_SERIES, NOISE_SERIES],
+            )
+            long_rows = await client.collect_timeseries(
+                user_id,
+                long_start.isoformat(),
+                end_exclusive.isoformat(),
+                [HYDRATION_SERIES, ALCOHOL_SERIES],
+            )
+            self._v2_series_warned = False
+            return tuple(short_rows) + tuple(long_rows)
+        except Exception as exc:
+            if not self._v2_series_warned:
+                logger.info(
+                    "open-wearables timeseries unavailable for the v2 energy "
+                    "factors (%s: %s); sunlight/noise/alcohol/hydration skip.",
+                    type(exc).__name__,
+                    exc,
+                )
+                self._v2_series_warned = True
+            return None
+
+    async def _read_v2_cycles(
+        self, client: Any, user_id: str, as_of: date, end_exclusive: date
+    ) -> tuple[dict[str, Any], ...] | None:
+        """Menstrual-cycle records, or None when the fetch degrades."""
+        try:
+            cycle_start = as_of - timedelta(days=CYCLE_FETCH_DAYS)
+            rows = await client.collect_menstrual_cycles(
+                user_id, cycle_start.isoformat(), end_exclusive.isoformat()
+            )
+            self._v2_cycles_warned = False
+            return tuple(rows)
+        except Exception as exc:
+            if not self._v2_cycles_warned:
+                logger.info(
+                    "open-wearables menstrual-cycle records unavailable for the "
+                    "v2 energy factors (%s: %s); the phase adjustment skips.",
+                    type(exc).__name__,
+                    exc,
+                )
+                self._v2_cycles_warned = True
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Engine service (on-demand compute + hourly persist + day forecast)
 # ---------------------------------------------------------------------------
 
-# Factors that come from open-wearables (dropped together when it is down).
+# v1 health factors that come from open-wearables (dropped together, each with
+# an explicit "ow_unavailable" reason, when the backend is down). The v2 keys
+# are deliberately not listed: their rows are simply never fetched in that
+# case, which the snapshot's ow.v2 block records (and the pinned v1 missing
+# payload stays stable for consumers).
 _OW_FACTOR_KEYS = ("sleep_debt", "stress", "hrv_deviation", "body_battery")
 
 
@@ -954,7 +1536,13 @@ class CognitiveEnergyEngine:
         day = start.date()
 
         ow = _run_maybe_async(self._reader.read(day))
-        digest = digest_ow_rows(ow.score_rows, ow.sleep_rows, day)
+        digest = digest_ow_rows(
+            ow.score_rows,
+            ow.sleep_rows,
+            day,
+            series_rows=ow.series_rows,
+            cycle_rows=ow.cycle_rows,
+        )
         with session_scope(self._session_factory) as session:
             ctx = load_store_day_context(session, day)
         return self._estimate_window(digest, ow, ctx, start, end, now)
@@ -1026,7 +1614,13 @@ class CognitiveEnergyEngine:
         ow = OwRows()
         if need_compute:
             ow = _run_maybe_async(self._reader.read(day))
-            digest = digest_ow_rows(ow.score_rows, ow.sleep_rows, day)
+            digest = digest_ow_rows(
+                ow.score_rows,
+                ow.sleep_rows,
+                day,
+                series_rows=ow.series_rows,
+                cycle_rows=ow.cycle_rows,
+            )
 
         slots: list[WindowSlot] = []
         for start, end in windows:
@@ -1078,7 +1672,23 @@ class CognitiveEnergyEngine:
             take(stress_signal(digest.garmin_stress_by_day, digest.resilience_by_day, as_of))
             take(hrv_signal(digest.rmssd_by_day, digest.sdnn_by_day, as_of))
             take(charge_signal(digest.charge_points, as_of))
+            # v2 factors run only when their rows were actually fetched (None =
+            # not fetched -> skipped entirely, keeping v1-shaped flows
+            # byte-identical); fetched-but-thin data drops with a reason.
+            if digest.cycles is not None:
+                take(menstrual_phase_signal(digest.cycles, as_of))
+            if digest.daylight_by_day is not None:
+                take(sunlight_signal(digest.daylight_by_day, as_of))
+            if digest.noise_db_by_day is not None:
+                take(noise_signal(digest.noise_db_by_day, as_of))
+            if digest.alcohol_points is not None:
+                take(alcohol_signal(digest.alcohol_points, as_of))
+            if digest.hydration_by_day is not None:
+                take(hydration_signal(digest.hydration_by_day, as_of))
         else:
+            # v1 contract pin: only the four v1 health factors are listed when
+            # the backend is down (the v2 factors were never fetched, which the
+            # snapshot's ow.v2 block records).
             missing.extend(MissingSignal(key, "ow_unavailable") for key in _OW_FACTOR_KEYS)
 
         take(
@@ -1102,6 +1712,20 @@ class CognitiveEnergyEngine:
                 "hrv_days": {"rmssd": len(digest.rmssd_by_day), "sdnn": len(digest.sdnn_by_day)},
                 "charge_readings": {
                     category: len(points) for category, points in digest.charge_points.items()
+                },
+                # v2 fetch provenance: which optional row sets this estimate saw.
+                "v2": {
+                    "series_rows": "not_fetched"
+                    if digest.daylight_by_day is None
+                    else {
+                        "daylight_days": len(digest.daylight_by_day),
+                        "noise_days": len(digest.noise_db_by_day or {}),
+                        "alcohol_logs": len(digest.alcohol_points or ()),
+                        "hydration_days": len(digest.hydration_by_day or {}),
+                    },
+                    "cycle_rows": "not_fetched"
+                    if digest.cycles is None
+                    else {"cycle_records": len(digest.cycles)},
                 },
             },
             "store": {

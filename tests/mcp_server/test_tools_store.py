@@ -9,8 +9,13 @@ import uuid
 
 import pytest
 from fastmcp.exceptions import ToolError
+from pydantic import SecretStr
 from sqlalchemy import select
 
+from healthmes.api.auth import viewer_token
+from healthmes.api.briefing import decision_viewer_url
+from healthmes.config import Settings
+from healthmes.mcp_server import server as server_module
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
@@ -331,6 +336,33 @@ class TestCaptureTools:
             assert row is not None
             assert row.tree["children"][0]["label"] == "sleep_debt=20"
             assert row.llm_model == "claude-x"
+
+    async def test_record_decision_viewer_url_embeds_the_derived_token(
+        self, mcp_client, call_tool, tmp_path
+    ):
+        """Token-configured instance: the MCP link must stay byte-identical to
+        the API construction (healthmes.api.auth.viewer_url is the single
+        copy) — derived read-only credential embedded, never the API token."""
+        token = "mcp-viewer-link-test-token"
+        secured = Settings(
+            database_url="sqlite+pysqlite:///:memory:",
+            public_base_url="http://healthmes.test:8100",
+            api_token=SecretStr(token),
+            data_dir=tmp_path / "data-secured",
+            scheduler_enabled=False,
+            _env_file=None,
+        )
+        server_module.set_settings(secured)  # mcp_env teardown resets this
+
+        result = await call_tool(
+            mcp_client,
+            "record_decision",
+            {"kind": "alert", "summary": "tokenized viewer link", "tree": TREE},
+        )
+        decision_id = result["decision_id"]
+        assert result["viewer_url"] == decision_viewer_url(secured, decision_id)
+        assert result["viewer_url"].endswith(f"?token={viewer_token(token)}")
+        assert token not in result["viewer_url"]
 
     async def test_record_decision_links_to_proposals(self, mcp_client, call_tool):
         decision = await call_tool(

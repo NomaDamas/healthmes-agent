@@ -1,0 +1,69 @@
+{
+  "generated_at": "2026-07-09T14:23:00Z",
+  "timezone": "UTC",
+  "energy": {
+    "score": 58,
+    "confidence": "high",
+    "curve_24h": [
+      {"hour": 0, "score": null},
+      {"hour": 1, "score": null},
+      {"hour": 2, "score": null},
+      {"hour": 3, "score": null},
+      {"hour": 4, "score": null},
+      {"hour": 5, "score": null},
+      {"hour": 6, "score": null},
+      {"hour": 7, "score": null},
+      {"hour": 8, "score": 71},
+      {"hour": 9, "score": null},
+      {"hour": 10, "score": null},
+      {"hour": 11, "score": null},
+      {"hour": 12, "score": null},
+      {"hour": 13, "score": 64},
+      {"hour": 14, "score": 58},
+      {"hour": 15, "score": null},
+      {"hour": 16, "score": null},
+      {"hour": 17, "score": null},
+      {"hour": 18, "score": null},
+      {"hour": 19, "score": null},
+      {"hour": 20, "score": null},
+      {"hour": 21, "score": null},
+      {"hour": 22, "score": null},
+      {"hour": 23, "score": null}
+    ]
+  },
+  "next_blocks": [
+    {
+      "start": "2026-07-09T14:00:00Z",
+      "end": "2026-07-09T15:00:00Z",
+      "title": "Deep work block",
+      "energy_demand": "high",
+      "source": "calendar"
+    },
+    {
+      "start": "2026-07-09T15:00:00Z",
+      "end": "2026-07-09T15:45:00Z",
+      "title": "Write weekly report",
+      "energy_demand": "med",
+      "source": "proposal"
+    },
+    {
+      "start": "2026-07-09T16:00:00Z",
+      "end": "2026-07-09T16:30:00Z",
+      "title": null,
+      "energy_demand": null,
+      "source": "calendar"
+    }
+  ],
+  "alerts": {
+    "unresolved_count": 2,
+    "top": {
+      "rule_id": "stress_spike_vs_baseline",
+      "summary": "Stress 82 vs baseline 55",
+      "decision_url": "http://192.168.1.20:8100/decisions/1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10?token=hm-ro-3q2b8d1f7c6e5a4"
+    }
+  },
+  "latest_decision": {
+    "id": "7e6a1b2c-93d4-4f58-a1c0-5b8e2f7d9a34",
+    "url": "http://192.168.1.20:8100/decisions/7e6a1b2c-93d4-4f58-a1c0-5b8e2f7d9a34?token=hm-ro-3q2b8d1f7c6e5a4"
+  }
+}
