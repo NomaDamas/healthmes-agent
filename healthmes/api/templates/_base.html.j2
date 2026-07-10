@@ -1,0 +1,68 @@
+{# Shared shell for the decision viewer pages (docs/PLAN.md §5, §8.5).
+   Mobile-first, system fonts only, no external assets — local-first. #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{% block title %}HealthMes{% endblock %}</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    color: #1c1917;
+    background: #fafaf9;
+    line-height: 1.55;
+    -webkit-text-size-adjust: 100%;
+  }
+  header.site {
+    padding: 0.7rem 1rem;
+    border-bottom: 1px solid #e7e5e4;
+    background: #ffffff;
+    font-size: 0.95rem;
+  }
+  header.site a { color: inherit; text-decoration: none; font-weight: 650; }
+  header.site a:hover { text-decoration: underline; }
+  header.site .crumb { color: #78716c; font-weight: 400; }
+  main { max-width: 64rem; margin: 0 auto; padding: 1rem 1rem 3rem; }
+  h1 { font-size: 1.35rem; margin: 0.4rem 0 0.6rem; }
+  h2 { font-size: 1rem; margin: 1.4rem 0 0.5rem; color: #44403c; }
+  a { color: #1d4ed8; }
+  .muted { color: #78716c; font-size: 0.85rem; overflow-wrap: anywhere; }
+  .error { color: #b91c1c; font-size: 0.9rem; }
+  .badge {
+    display: inline-block;
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-radius: 999px;
+    padding: 0.05rem 0.55rem;
+    border: 1px solid #d4d4d8;
+    background: #f4f4f5;
+    color: #3f3f46;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+  /* Node-type palette — keep in sync with _CLASS_DEFS in decision_html.py. */
+  .type-input { background: #dbeafe; border-color: #93c5fd; color: #1e3a8a; }
+  .type-rule { background: #ede9fe; border-color: #c4b5fd; color: #4c1d95; }
+  .type-llm_step { background: #fef3c7; border-color: #fcd34d; color: #78350f; }
+  .type-option { background: #ccfbf1; border-color: #5eead4; color: #134e4a; }
+  .type-action { background: #dcfce7; border-color: #86efac; color: #14532d; }
+  .type-other { background: #f4f4f5; border-color: #d4d4d8; color: #3f3f46; }
+</style>
+{% block head %}{% endblock %}
+</head>
+<body>
+<header class="site">
+  <a href="/decisions">HealthMes · decisions</a>{% block crumb %}{% endblock %}
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+{% block scripts %}{% endblock %}
+</body>
+</html>

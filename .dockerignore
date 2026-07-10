@@ -1,0 +1,20 @@
+# Build context filter for Dockerfile.healthmes (repo-root context).
+# The vendored upstreams build from their own contexts and keep their own
+# .dockerignore files; excluding vendor/ here keeps this context small.
+vendor/
+.git/
+.venv/
+data/
+docs/
+tests/
+skills/
+node_modules/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.DS_Store
+docker-compose.yml
+Dockerfile.healthmes
+.dockerignore

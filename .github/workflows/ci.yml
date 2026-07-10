@@ -1,0 +1,133 @@
+# HealthMes Agent CI (docs/PLAN.md §11: compose boot + demo-query surfaces are
+# the vendor-coupling smoke; docs/DEVELOPMENT.md "Tests and lint").
+#
+# Three jobs mirror the run targets:
+#   - linux: lint + full offline test suite + docker-compose validation +
+#     alembic offline SQL render for both dialects (no database needed).
+#   - macos: the mac-native path exactly as developers run it — `make mac-test`
+#     (uv + repo-local sqlite; no Homebrew services, no postgres/redis).
+#   - compose-smoke: actually boots the token-free core of the compose stack
+#     (postgres + redis + healthmes) and curls :8100/health — the live half of
+#     the PLAN §11 "compose boot + Phase-0 demo query" smoke. The demo-query
+#     half needs real Telegram/Anthropic/wearable credentials, which CI does
+#     not have; its contracts (webhook signing, MCP registration, config
+#     render) are pinned by the offline pytest suite instead.
+#
+# The two test jobs run offline: the suite is network-free by convention
+# (tests/conftest.py), `docker compose config` needs no daemon pulls, and
+# alembic renders SQL without connecting.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Tests must never read a developer .env; CI has none, this documents it.
+  UV_NO_PROGRESS: "1"
+
+jobs:
+  linux:
+    name: lint, tests, compose + alembic render (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv (python pinned by .python-version)
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: uv sync
+        run: uv sync --frozen
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: pytest
+        run: uv run pytest -q
+
+      - name: docker compose config (no daemon required)
+        run: docker compose config -q
+
+      - name: alembic offline render (postgres + sqlite dialects)
+        # Renders the full migration chain to SQL without a database
+        # (alembic/env.py offline mode; URL injected via -x db_url=...).
+        # Grepping for a known table catches an empty/broken render.
+        run: |
+          uv run alembic -x db_url="postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes" upgrade head --sql > /tmp/upgrade-postgres.sql
+          uv run alembic -x db_url="sqlite:///offline-render.db" upgrade head --sql > /tmp/upgrade-sqlite.sql
+          grep -q "CREATE TABLE trigger_event" /tmp/upgrade-postgres.sql
+          grep -q "CREATE TABLE trigger_event" /tmp/upgrade-sqlite.sql
+          echo "rendered $(grep -c 'CREATE TABLE' /tmp/upgrade-postgres.sql) tables (postgres), $(grep -c 'CREATE TABLE' /tmp/upgrade-sqlite.sql) tables (sqlite)"
+
+  macos:
+    name: make mac-test (macos, sqlite path)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv (python pinned by .python-version)
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: uv sync
+        run: uv sync --frozen
+
+      # The exact developer entrypoint (Makefile -> scripts/dev_mac.sh test ->
+      # uv run pytest -q). Tests default to sqlite/in-memory stores, so no
+      # brew services (postgres/redis) are needed on the runner.
+      - name: make mac-test
+        run: make mac-test
+
+  compose-smoke:
+    # Live-boot smoke (PLAN §11): the services that need no external secrets —
+    # postgres (with the healthmes DB init script), redis, and the healthmes
+    # service built from Dockerfile.healthmes (its compose command runs
+    # `alembic upgrade head` against postgres before serving). hermes/ow-*
+    # stay down: they need real tokens/provider keys to do anything
+    # meaningful. HEALTHMES_API_TOKEN is minted inline: compose binds 0.0.0.0
+    # inside the container and the service refuses an unauthenticated
+    # non-loopback bind (medical data). /health stays token-free by design.
+    name: compose boot smoke (postgres+redis+healthmes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HEALTHMES_API_TOKEN: ci-smoke-token
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Boot the core of the stack
+        run: docker compose up -d --build postgres redis healthmes
+
+      - name: Wait for /health (migrations + uvicorn behind it)
+        run: |
+          curl --fail --silent --show-error --output /dev/null \
+            --retry 60 --retry-delay 2 --retry-connrefused --retry-all-errors \
+            http://localhost:8100/health
+          curl -fsS http://localhost:8100/health | grep -q '"status":"ok"'
+          # The bearer gate is live: /v1 without the token is 401, with it 200.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8100/v1/tasks)" = "401"
+          curl -fsS -H "Authorization: Bearer ${HEALTHMES_API_TOKEN}" \
+            http://localhost:8100/v1/tasks > /dev/null
+          docker compose ps
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose logs --no-color postgres redis healthmes
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans

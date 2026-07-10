@@ -1,0 +1,79 @@
+[project]
+name = "healthmes"
+version = "0.1.0"
+description = "HealthMes Agent - proactive health-aware personal assistant glue plane"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = [
+    # Service skeleton
+    "fastapi",
+    "uvicorn[standard]",
+    # Domain store (healthmes database)
+    "sqlalchemy>=2.0",
+    "alembic",
+    "psycopg[binary]",
+    # MCP server mounted at /mcp (Streamable HTTP)
+    "fastmcp",
+    # REST client for open-wearables + webhook push to Hermes
+    "httpx",
+    # In-service scheduler (triggers / cognitive-energy persist)
+    "apscheduler>=3.10,<4",
+    # Settings / schemas
+    "pydantic>=2",
+    "pydantic-settings",
+    # Config rendering (hermes-config.yaml.tmpl) + decision viewer pages
+    "jinja2",
+    "pyyaml",
+    # Calendar sync backends
+    "caldav",
+    "icalendar",
+    "google-api-python-client",
+    "google-auth-oauthlib",
+    # Cron-expression support: lets scripts/bootstrap.py import the vendor
+    # cron/jobs.py create_job directly instead of the payload fallback.
+    "croniter",
+    # age encryption for the Phase-3 local-first backup module
+    "pyrage",
+]
+
+[project.scripts]
+# `uv run healthmes ...` — serve (default) or `backup create/list/restore`.
+healthmes = "healthmes.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "freezegun",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["healthmes"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# importlib mode lets multiple tests/<area>/ dirs use identical file names
+# without __init__.py files or module-name collisions.
+addopts = ["--import-mode=importlib"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# vendor/ is read-only upstream reference code with its own lint configs.
+extend-exclude = ["vendor"]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "UP", # pyupgrade
+]

@@ -1,0 +1,14 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <!-- Green disc -->
+    <path
+        android:fillColor="#1B7F5C"
+        android:pathData="M24,4 a20,20 0 1,0 0.001,0 z" />
+    <!-- White "H" -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M15,14 h5 v7 h8 v-7 h5 v20 h-5 v-8 h-8 v8 h-5 z" />
+</vector>

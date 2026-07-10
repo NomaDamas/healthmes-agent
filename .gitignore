@@ -10,6 +10,16 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime state (media, hermes home, backups, pg/redis data) — never committed
+data/
+*.pid
+*.log
+
+# Rendered service config (only *.example / *.tmpl are tracked)
+config/open-wearables.env
 
 # Node
 node_modules/

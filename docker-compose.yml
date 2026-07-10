@@ -1,0 +1,234 @@
+# HealthMes Agent stack — three planes on one bridge network (docs/PLAN.md §1).
+#
+#   data plane   : postgres (+ dedicated healthmes DB), redis,
+#                  open-wearables backend + celery worker + its MCP server
+#   healthmes    : glue service (FastAPI + fastmcp) built from Dockerfile.healthmes
+#   agent plane  : hermes gateway (Telegram + webhook + MCP client)
+#
+# Service definitions for the vendored upstreams are grounded in
+# vendor/open-wearables/docker-compose.yml and vendor/hermes-agent/docker-compose.yml
+# (images, build contexts, commands, and env names reused verbatim where possible).
+# vendor/ is never modified: open-wearables config lives in ./config/open-wearables.env
+# (compose-injected env vars take precedence over the image's config/.env lookup),
+# and the Hermes home directory is a bind mount at ./data/hermes.
+#
+# Quick start:
+#   cp .env.example .env                                  # fill in tokens/keys
+#   cp config/open-wearables.env.example config/open-wearables.env
+#   docker compose up -d
+
+name: healthmes-agent
+
+services:
+  postgres:
+    # Task-pinned postgres:16 (vendor compose runs postgres:18; the init-script
+    # contract and env names are identical). PG16 keeps PGDATA at
+    # /var/lib/postgresql/data.
+    image: postgres:16
+    environment:
+      # Verbatim from vendor/open-wearables/docker-compose.yml so the
+      # open-wearables backend defaults keep working.
+      POSTGRES_DB: open-wearables
+      POSTGRES_USER: open-wearables
+      POSTGRES_PASSWORD: open-wearables
+      # Consumed by scripts/initdb/01-create-healthmes-db.sh on first boot to
+      # create the second database next to the open-wearables one.
+      HEALTHMES_DB_NAME: healthmes
+      HEALTHMES_DB_USER: healthmes
+      HEALTHMES_DB_PASSWORD: healthmes
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U open-wearables -d open-wearables"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
+
+  redis:
+    image: redis:8
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+
+  ow-backend:
+    # Mirrors the `app` service of vendor/open-wearables/docker-compose.yml.
+    build:
+      context: ./vendor/open-wearables/backend
+      dockerfile: Dockerfile
+    image: open-wearables-platform:latest
+    pull_policy: never
+    command: scripts/start/app.sh
+    env_file:
+      # Root-owned copy of vendor/open-wearables/backend/config/.env.example —
+      # vendor/ stays untouched. Optional so `docker compose config` validates
+      # before the file exists; create it before `up`.
+      - path: ./config/open-wearables.env
+        required: false
+    environment:
+      # Env names verbatim from the vendor compose; values point at this
+      # stack's service names.
+      - DB_HOST=postgres
+      - REDIS_HOST=redis
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: on-failure
+
+  ow-worker:
+    # Mirrors the `celery-worker` service of the vendor compose.
+    image: open-wearables-platform:latest
+    pull_policy: never
+    command: scripts/start/worker.sh
+    env_file:
+      - path: ./config/open-wearables.env
+        required: false
+    environment:
+      - DB_HOST=postgres
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+      - postgres
+      - ow-backend
+    restart: on-failure
+
+  # Periodic sync scheduling (vendor `celery-beat`) is not part of the Phase 0
+  # scaffold; uncomment to enable automatic provider syncs.
+  # ow-beat:
+  #   image: open-wearables-platform:latest
+  #   pull_policy: never
+  #   command: scripts/start/beat.sh
+  #   env_file:
+  #     - path: ./config/open-wearables.env
+  #       required: false
+  #   environment:
+  #     - DB_HOST=postgres
+  #     - REDIS_HOST=redis
+  #   depends_on:
+  #     - redis
+  #     - postgres
+  #     - ow-backend
+  #   restart: on-failure
+
+  ow-mcp:
+    # vendor/open-wearables/mcp has no Dockerfile and its entrypoint
+    # (app/main.py -> mcp.run()) defaults to stdio, so we mount the vendor dir
+    # read-only into the official uv image and use the fastmcp CLI to serve the
+    # same server object over Streamable HTTP — zero vendor modification.
+    # Dependencies resolve from the mounted uv.lock into a container-local venv
+    # on each start (UV_PROJECT_ENVIRONMENT keeps the mount read-only).
+    #
+    # NOTE: the primary integration path in docs/PLAN.md registers this MCP
+    # server as a *stdio* subprocess inside the hermes container (see the
+    # vendor mount on the `hermes` service + config/hermes-config.yaml.tmpl).
+    # This service is the HTTP alternative and a compose-level smoke surface.
+    image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+    working_dir: /srv/ow-mcp
+    command:
+      [
+        "uv", "run", "--frozen",
+        "fastmcp", "run", "app/main.py:mcp",
+        "--transport", "http",
+        "--host", "0.0.0.0",
+        "--port", "8200",
+      ]
+    environment:
+      - UV_PROJECT_ENVIRONMENT=/opt/venv
+      - UV_CACHE_DIR=/opt/uv-cache
+      # Env names verbatim from vendor/open-wearables/mcp/app/config.py.
+      - OPEN_WEARABLES_API_URL=http://ow-backend:8000
+      - OPEN_WEARABLES_API_KEY=${OPEN_WEARABLES_API_KEY:-}
+    volumes:
+      - ./vendor/open-wearables/mcp:/srv/ow-mcp:ro
+    ports:
+      - "${OW_MCP_PORT:-8200}:8200"
+    depends_on:
+      - ow-backend
+    restart: on-failure
+
+  healthmes:
+    build:
+      context: .
+      dockerfile: Dockerfile.healthmes
+    image: healthmes:latest
+    pull_policy: never
+    env_file:
+      # Optional root .env for secrets (HEALTHMES_OW_API_KEY,
+      # HEALTHMES_HERMES_WEBHOOK_SECRET, ...). In-cluster endpoints below
+      # take precedence over any host-oriented values in .env.
+      - path: ./.env
+        required: false
+    # The image CMD is just `python -m healthmes`; migrations run here so the
+    # container owns its schema (scripts/dev_mac.sh does the same natively).
+    command: ["sh", "-c", "alembic upgrade head && exec python -m healthmes"]
+    environment:
+      - HEALTHMES_DATABASE_URL=postgresql+psycopg://healthmes:healthmes@postgres:5432/healthmes
+      - HEALTHMES_OW_BASE_URL=http://ow-backend:8000
+      - HEALTHMES_HERMES_WEBHOOK_URL=http://hermes:8644/webhooks/healthmes-alerts
+      - HEALTHMES_DATA_DIR=/data
+      - HEALTHMES_PORT=8100
+      # Inside the container the service must bind all interfaces for the
+      # port mapping to work; the serve entrypoint therefore REQUIRES
+      # HEALTHMES_API_TOKEN (set it in .env) — the surface carries medical
+      # data and the published port is reachable from the LAN.
+      - HEALTHMES_HOST=0.0.0.0
+      - HEALTHMES_API_TOKEN=${HEALTHMES_API_TOKEN:-}
+      # Container clocks are UTC; forward the user's IANA timezone from .env /
+      # the shell so local-day joins and alert quiet hours stay correct
+      # (empty = fall back to UTC).
+      - HEALTHMES_TIMEZONE=${HEALTHMES_TIMEZONE:-}
+    volumes:
+      - healthmes_data:/data
+    ports:
+      - "${HEALTHMES_PORT:-8100}:8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  hermes:
+    # Grounded in vendor/hermes-agent/docker-compose.yml (`gateway` service):
+    # same build context/Dockerfile, image name, command, and HERMES_UID/GID
+    # envs. Deviation: the vendor file uses `network_mode: host` +
+    # `~/.hermes:/opt/data`; here the service joins the stack's bridge network
+    # (host networking breaks service DNS and does not work on macOS), and
+    # HERMES_HOME is the repo-local bind mount ./data/hermes so
+    # scripts/bootstrap.py can render config.yaml into it from the host.
+    build:
+      context: ./vendor/hermes-agent
+    image: hermes-agent
+    restart: unless-stopped
+    volumes:
+      - ./data/hermes:/opt/data
+      # Read-only vendor MCP server for the stdio `mcp_servers` entry rendered
+      # from config/hermes-config.yaml.tmpl (uv is on PATH in this image; the
+      # venv is redirected to $HERMES_HOME via UV_PROJECT_ENVIRONMENT).
+      - ./vendor/open-wearables/mcp:/opt/vendor/open-wearables-mcp:ro
+      # HealthMes skills, symlinked into $HERMES_HOME/skills by bootstrap.
+      - ./skills:/opt/vendor/healthmes-skills:ro
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      # Gateway env overrides (vendor gateway/config.py) — set in root .env.
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    ports:
+      # Webhook platform (gateway/platforms/webhook.py, default port 8644):
+      # healthmes reaches it in-cluster at hermes:8644; published for local
+      # smoke tests.
+      - "${HERMES_WEBHOOK_PORT:-8644}:8644"
+    depends_on:
+      - healthmes
+    command: ["gateway", "run"]
+
+volumes:
+  postgres_data:
+  redis_data:
+  healthmes_data:

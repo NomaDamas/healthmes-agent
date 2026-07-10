@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.HealthMesUsage" parent="Theme.Material3.DayNight" />
+</resources>

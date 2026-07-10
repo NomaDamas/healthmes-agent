@@ -1,0 +1,102 @@
+# Hermes gateway config template (Jinja2).
+#
+# Rendered by scripts/bootstrap.py into $HERMES_HOME/config.yaml
+# (./data/hermes/config.yaml in the docker-compose stack).
+#
+# Structure is grounded in the vendor parsers — keep keys in sync with:
+#   vendor/hermes-agent/gateway/config.py                (platforms.*, home_channel)
+#   vendor/hermes-agent/plugins/platforms/telegram/       (extra.allow_from)
+#   vendor/hermes-agent/gateway/platforms/webhook.py      (platforms.webhook.extra.routes)
+#   vendor/hermes-agent/tools/mcp_tool.py                 (mcp_servers stdio/url transports)
+#
+# Cron briefings are NOT part of this file: vendor cron jobs live in
+# $HERMES_HOME/cron/jobs.json and are registered by scripts/bootstrap.py
+# against vendor/hermes-agent/cron/jobs.py::create_job.
+
+platforms:
+  telegram:
+    enabled: true
+    # Bot token from @BotFather. May also be injected via the
+    # TELEGRAM_BOT_TOKEN env var (gateway/config.py env override).
+    token: "{{ telegram_bot_token }}"
+    {%- if telegram_home_chat_id %}
+    # Default delivery target for cron briefings and webhook alerts.
+    home_channel:
+      platform: telegram
+      chat_id: "{{ telegram_home_chat_id }}"
+      name: "{{ telegram_home_chat_name | default('Home', true) }}"
+    {%- endif %}
+    extra:
+      # Telegram user-id allowlist; when set it is the sole authority
+      # (plugins/platforms/telegram/adapter.py). ["*"] allows everyone.
+      allow_from: {{ telegram_allowed_user_ids | default(['*'], true) | tojson }}
+
+  webhook:
+    enabled: true
+    extra:
+      host: "0.0.0.0"
+      port: {{ hermes_webhook_port | default(8644, true) }}
+      routes:
+        # Proactive alert route — healthmes/engine/triggers.py POSTs here
+        # (HMAC-signed) at /webhooks/healthmes-alerts. Placeholders in
+        # `prompt` are {dot.path} lookups into the webhook JSON payload
+        # (gateway/platforms/webhook.py::_render_prompt). The default reads
+        # the payload's `prompt` field — the full agent instruction built by
+        # healthmes/engine/webhook.py::build_alert_prompt (observation /
+        # evidence / proposal + record_decision steps). String placeholders
+        # substitute uncapped; {__raw__} is deliberately NOT used because the
+        # gateway truncates that indent-2 payload dump at 4000 chars, which
+        # can clip the evidence of large fires.
+        healthmes-alerts:
+          secret: "{{ hermes_webhook_secret }}"
+          {# The default literal uses \n escapes so no template-source
+             indentation leaks into the prompt body; indent(12) re-indents
+             continuation lines to the block scalar's baseline. #}
+          prompt: |
+            {{ healthmes_alert_prompt | default('HealthMes trigger {rule_id} fired: {summary}\n\n{prompt}', true) | indent(12) }}
+          skills:
+            - healthmes-planner
+          deliver: telegram
+          {%- if telegram_home_chat_id %}
+          deliver_extra:
+            chat_id: "{{ telegram_home_chat_id }}"
+          {%- endif %}
+
+mcp_servers:
+  # Layer A — vendored open-wearables MCP server, registered as-is over stdio
+  # (docs/PLAN.md §1.5). `start` is the [project.scripts] entry of
+  # vendor/open-wearables/mcp/pyproject.toml. The uv venv/cache are always
+  # redirected outside the read-only vendor tree; the directory defaults below
+  # are the docker-compose mount points — a mac-native bootstrap MUST pass
+  # absolute repo-local paths (e.g. <repo>/vendor/open-wearables/mcp and
+  # <repo>/data/ow-mcp-venv) since relative paths would resolve into vendor/.
+  # URL defaults are localhost-native; the compose bootstrap passes the
+  # in-cluster values (http://ow-backend:8000, http://healthmes:8100/mcp).
+  open_wearables:
+    command: "uv"
+    args:
+      - "run"
+      - "--directory"
+      - "{{ ow_mcp_dir | default('/opt/vendor/open-wearables-mcp', true) }}"
+      - "--frozen"
+      - "start"
+    env:
+      OPEN_WEARABLES_API_URL: "{{ ow_base_url | default('http://localhost:8000', true) }}"
+      OPEN_WEARABLES_API_KEY: "{{ ow_api_key }}"
+      UV_PROJECT_ENVIRONMENT: "{{ ow_mcp_venv_dir | default('/opt/data/ow-mcp-venv', true) }}"
+      UV_CACHE_DIR: "{{ ow_mcp_uv_cache_dir | default('/opt/data/uv-cache', true) }}"
+    timeout: 120
+    connect_timeout: 120
+
+  # Layer B — HealthMes interpreted-context tools, served by the healthmes
+  # service at /mcp over Streamable HTTP (url transport in mcp_tool.py).
+  # When the healthmes surface is token-protected (HEALTHMES_API_TOKEN), the
+  # bearer header is rendered too — mcp_tool.py url transports support a
+  # `headers:` mapping (see its own config example).
+  healthmes:
+    url: "{{ healthmes_mcp_url | default('http://localhost:8100/mcp', true) }}"
+    {%- if healthmes_api_token %}
+    headers:
+      Authorization: "Bearer {{ healthmes_api_token }}"
+    {%- endif %}
+    timeout: 120

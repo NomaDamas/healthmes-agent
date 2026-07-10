@@ -1,0 +1,406 @@
+"""Phase-2 decision viewer tests (docs/PLAN.md §5).
+
+Covers the tree -> Mermaid transform on a 3-level fixture, hostile-string
+escaping into both the Mermaid source and the HTML page, the list endpoints
+(paginated, newest first), the ``.json`` suffix view, and HTTP render smoke
+including the locally served Mermaid bundle.
+"""
+
+import json
+import re
+from datetime import datetime
+
+from healthmes.api.decision_html import (
+    FALLBACK_NODE_TYPE,
+    KNOWN_NODE_TYPES,
+    MAX_TREE_DEPTH,
+    MAX_TREE_NODES,
+    escape_mermaid_label,
+    tree_to_mermaid,
+)
+from healthmes.store import DecisionKind, DecisionRecord
+
+# --- fixtures -------------------------------------------------------------
+
+# Three levels: rule -> (input, llm_step) -> (option, action).
+THREE_LEVEL_TREE = {
+    "id": "root",
+    "type": "rule",
+    "label": "stress_spike rule fired",
+    "detail": "stress 82 vs baseline 55",
+    "children": [
+        {
+            "id": "in-hrv",
+            "type": "input",
+            "label": "night HRV below baseline",
+            "detail": "rmssd 34 vs 41",
+            "children": [],
+        },
+        {
+            "id": "llm-1",
+            "type": "llm_step",
+            "label": "assessed afternoon load",
+            "detail": "3h of meetings after 14:00",
+            "children": [
+                {
+                    "id": "opt-1",
+                    "type": "option",
+                    "label": "move focus block to morning",
+                    "children": [],
+                },
+                {
+                    "id": "act-1",
+                    "type": "action",
+                    "label": "proposed schedule change",
+                    "detail": "focus block 14:00 to 10:00",
+                    "children": [],
+                },
+            ],
+        },
+    ],
+}
+
+HOSTILE_LABEL = (
+    'end"] click n0 href "javascript:alert(1)" <script>alert(`x`)</script>'
+    " 100% [a](b) {c} |d| \\ #quot; \nsecond%%line;'"
+)
+
+HOSTILE_TREE = {
+    "id": 'r"]; click n0 "javascript:alert(1)"',
+    "type": 'rule"]:::evil',
+    "label": HOSTILE_LABEL,
+    "detail": "<img src=x onerror=alert(1)>",
+    "children": [
+        {
+            "id": "c1",
+            "type": "input",
+            "label": 'line1\nline2 `code` --> n99 %% comment "quoted"',
+            "detail": 'he said "hi" & <b>bold</b>',
+            "children": [],
+        }
+    ],
+}
+
+_ISLAND_RE = re.compile(r'<script type="application/json" id="node-data">(.*?)</script>', re.S)
+
+
+def _seed_decision(
+    session,
+    *,
+    summary: str = "Moved focus block to tomorrow",
+    tree=None,
+    kind: DecisionKind = DecisionKind.SCHEDULE_CHANGE,
+    created_at: datetime | None = None,
+    llm_model: str | None = "claude-test-1",
+    tokens: int | None = 321,
+) -> DecisionRecord:
+    record = DecisionRecord(
+        kind=kind,
+        tree=THREE_LEVEL_TREE if tree is None else tree,
+        summary=summary,
+        llm_model=llm_model,
+        tokens=tokens,
+    )
+    if created_at is not None:
+        record.created_at = created_at
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+    return record
+
+
+# --- tree -> mermaid transform ---------------------------------------------
+
+
+def test_tree_to_mermaid_three_level_fixture():
+    view = tree_to_mermaid(THREE_LEVEL_TREE)
+    lines = view.source.splitlines()
+
+    assert lines[0] == "flowchart TD"
+    # Preorder generated ids with type-specific shapes and classes.
+    assert '  n0{{"stress_spike rule fired"}}:::type_rule' in lines
+    assert '  n1(["night HRV below baseline"]):::type_input' in lines
+    assert '  n2["assessed afternoon load"]:::type_llm_step' in lines
+    assert '  n3("move focus block to morning"):::type_option' in lines
+    assert '  n4[["proposed schedule change"]]:::type_action' in lines
+    # Edges follow the tree structure.
+    for edge in ("  n0 --> n1", "  n0 --> n2", "  n2 --> n3", "  n2 --> n4"):
+        assert edge in lines
+    # A classDef exists for every palette entry.
+    for node_type in (*KNOWN_NODE_TYPES, FALLBACK_NODE_TYPE):
+        assert any(line.startswith(f"  classDef type_{node_type} ") for line in lines)
+
+    # The node index carries full data for the click-to-inspect panel.
+    assert set(view.node_index) == {"n0", "n1", "n2", "n3", "n4"}
+    assert view.node_index["n0"]["source_id"] == "root"
+    assert view.node_index["n0"]["detail"] == "stress 82 vs baseline 55"
+    assert view.node_index["n4"]["label"] == "proposed schedule change"
+    assert not view.truncated
+    assert view.root is not None
+    assert view.root.children[1].children[0].gid == "n3"
+
+
+def test_tree_to_mermaid_normalises_malformed_nodes():
+    tree = {
+        "id": 7,  # non-string id
+        "type": "Robot<>",  # unknown type
+        # no label at all
+        "children": [
+            "just a string",  # skipped, consumes no gid
+            42,  # skipped
+            {"id": "k", "type": "INPUT", "label": "case-insensitive type", "children": "nope"},
+        ],
+    }
+
+    view = tree_to_mermaid(tree)
+
+    assert set(view.node_index) == {"n0", "n1"}
+    assert view.node_index["n0"]["type"] == "other"
+    assert view.node_index["n0"]["raw_type"] == "Robot<>"
+    assert view.node_index["n0"]["label"] == "(untitled)"
+    assert view.node_index["n0"]["source_id"] == "7"
+    assert view.node_index["n1"]["type"] == "input"
+    assert not view.truncated
+
+
+def test_tree_to_mermaid_without_renderable_tree():
+    for tree in (None, [], "not a tree", 5):
+        view = tree_to_mermaid(tree)
+        assert view.root is None
+        assert view.source == ""
+        assert view.node_index == {}
+
+
+def test_tree_to_mermaid_depth_cap_truncates():
+    tree = {"id": "leaf", "type": "action", "label": "leaf"}
+    for i in range(30):
+        tree = {"id": f"d{i}", "type": "rule", "label": f"level {i}", "children": [tree]}
+
+    view = tree_to_mermaid(tree)
+
+    assert view.truncated
+    assert len(view.node_index) == MAX_TREE_DEPTH + 1
+
+
+def test_tree_to_mermaid_node_cap_truncates():
+    tree = {
+        "id": "root",
+        "type": "rule",
+        "label": "wide",
+        "children": [
+            {"id": f"c{i}", "type": "input", "label": f"child {i}", "children": []}
+            for i in range(MAX_TREE_NODES + 50)
+        ],
+    }
+
+    view = tree_to_mermaid(tree)
+
+    assert view.truncated
+    assert len(view.node_index) == MAX_TREE_NODES
+
+
+# --- hostile-string escaping ------------------------------------------------
+
+
+def test_escape_mermaid_label_hostile_characters():
+    out = escape_mermaid_label(HOSTILE_LABEL)
+
+    for ch in "&<>\"'`%{}[]()|\\":
+        assert ch not in out, f"raw {ch!r} leaked into mermaid label"
+    assert "\n" not in out and "\r" not in out and "\t" not in out
+    # '#' and ';' may only appear as part of a '#<decimal>;' escape.
+    assert not re.search(r"#(?!\d+;)", out)
+    assert out.count("#") == len(re.findall(r"#\d+;", out)) == out.count(";")
+
+
+def test_escape_mermaid_label_exact_mappings():
+    assert escape_mermaid_label('a "b" c') == "a #34;b#34; c"
+    assert escape_mermaid_label("<b>") == "#60;b#62;"
+    # User text that already looks like a mermaid entity is neutralised.
+    assert escape_mermaid_label("#quot;") == "#35;quot#59;"
+    assert escape_mermaid_label("one\ntwo") == "one two"
+
+
+_NODE_LINE_RE = re.compile(
+    r'^  n\d+(?:\(\[|\[\[|\{\{|\(|\[)"[^"]*"(?:\]\)|\]\]|\}\}|\)|\])'
+    r":::type_(?:input|rule|llm_step|option|action|other)$"
+)
+_EDGE_LINE_RE = re.compile(r"^  n\d+ --> n\d+$")
+_CLASSDEF_LINE_RE = re.compile(r"^  classDef type_\w+ [#\w:,]+$")
+
+
+def test_mermaid_source_grammar_survives_hostile_labels():
+    view = tree_to_mermaid(HOSTILE_TREE)
+    lines = view.source.splitlines()
+
+    assert lines[0] == "flowchart TD"
+    # Every statement matches the whitelist grammar we emit — hostile labels
+    # cannot add statements, click handlers, comments, or extra nodes.
+    for line in lines[1:]:
+        assert (
+            _NODE_LINE_RE.match(line) or _EDGE_LINE_RE.match(line) or _CLASSDEF_LINE_RE.match(line)
+        ), f"unexpected statement in mermaid source: {line!r}"
+    # Quoting stays balanced: exactly one quoted label per node line.
+    for line in lines:
+        assert line.count('"') in (0, 2)
+    assert not any(line.lstrip().startswith("click") for line in lines)
+    assert "%%" not in view.source
+    assert "<script>" not in view.source
+    assert "alert(1)" not in view.source
+    # The attempted edge injection ("--> n99") stayed inside the label text.
+    assert not re.search(r"-->\s*n99", view.source)
+    # Hostile type string fell back to the safe class.
+    assert view.node_index["n0"]["type"] == "other"
+    assert view.node_index["n0"]["raw_type"] == 'rule"]:::evil'
+
+
+def test_decision_page_escapes_hostile_strings(client, session):
+    summary = 'Sum <script>window.__pwned__ = 1</script> "quoted"'
+    record = _seed_decision(session, summary=summary, tree=HOSTILE_TREE)
+
+    response = client.get(f"/decisions/{record.id}")
+
+    assert response.status_code == 200
+    html = response.text
+    # Raw payloads never reach the page...
+    assert "<script>window.__pwned__" not in html
+    assert "<img src=x onerror=" not in html
+    assert 'href="javascript:' not in html
+    # ...their escaped forms do.
+    assert "&lt;script&gt;window.__pwned__" in html
+    # The JSON island is angle-bracket free (no </script> breakout possible)
+    # while the data survives intact for the detail panel.
+    island = _ISLAND_RE.search(html)
+    assert island
+    assert "<" not in island.group(1)
+    data = json.loads(island.group(1))
+    assert data["n0"]["detail"] == "<img src=x onerror=alert(1)>"
+    assert data["n1"]["label"] == 'line1\nline2 `code` --> n99 %% comment "quoted"'
+
+
+# --- HTTP render smoke -------------------------------------------------------
+
+
+def test_decision_page_render_smoke(client, session):
+    record = _seed_decision(session)
+
+    response = client.get(f"/decisions/{record.id}")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    html = response.text
+    assert 'id="decision-tree"' in html
+    assert 'class="mermaid"' in html
+    assert "flowchart TD" in html
+    # Mermaid loads from this service, never a CDN.
+    assert 'src="/static/mermaid.min.js"' in html
+    assert "cdn" not in html.lower()
+    # The outline fallback carries the tree labels (also the no-JS view).
+    assert "stress_spike rule fired" in html
+    assert "proposed schedule change" in html
+    # The JSON island parses and matches the tree.
+    island = _ISLAND_RE.search(html)
+    assert island
+    data = json.loads(island.group(1))
+    assert len(data) == 5
+    assert data["n0"]["source_id"] == "root"
+    # Cross-links to the JSON view and the index.
+    assert f"/decisions/{record.id}.json" in html
+
+
+def test_decision_page_without_renderable_tree(client, session):
+    record = _seed_decision(session, tree=[])  # runtime JSON value, not a dict
+
+    response = client.get(f"/decisions/{record.id}")
+
+    assert response.status_code == 200
+    assert "No tree recorded" in response.text
+    assert 'class="mermaid"' not in response.text
+
+
+def test_mermaid_asset_served_locally(client):
+    response = client.get("/static/mermaid.min.js")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/javascript")
+    assert "max-age" in response.headers.get("cache-control", "")
+    assert "mermaid" in response.text
+
+
+# --- list endpoints (weekly-report entry point) ------------------------------
+
+
+def test_decisions_list_page_paginates_newest_first(client, session):
+    _seed_decision(session, summary="oldest entry", created_at=datetime(2026, 1, 1, 9, 0))
+    _seed_decision(
+        session,
+        summary="middle entry",
+        created_at=datetime(2026, 1, 2, 9, 0),
+        kind=DecisionKind.ALERT,
+    )
+    newest = _seed_decision(session, summary="newest entry", created_at=datetime(2026, 1, 3, 9, 0))
+
+    response = client.get("/decisions")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    html = response.text
+    assert html.index("newest entry") < html.index("middle entry") < html.index("oldest entry")
+    assert f"/decisions/{newest.id}" in html
+
+    page1 = client.get("/decisions", params={"limit": 2, "offset": 0}).text
+    assert "newest entry" in page1 and "middle entry" in page1
+    assert "oldest entry" not in page1
+    assert "/decisions?limit=2&amp;offset=2" in page1  # Older link (autoescaped &)
+
+    page2 = client.get("/decisions", params={"limit": 2, "offset": 2}).text
+    assert "oldest entry" in page2
+    assert "newest entry" not in page2
+    assert "/decisions?limit=2&amp;offset=0" in page2  # Newer link
+
+
+def test_v1_decisions_list_json_newest_first(client, session):
+    _seed_decision(session, summary="first", created_at=datetime(2026, 1, 1, 9, 0))
+    _seed_decision(
+        session,
+        summary="second",
+        created_at=datetime(2026, 1, 2, 9, 0),
+        kind=DecisionKind.ALERT,
+    )
+    _seed_decision(session, summary="third", created_at=datetime(2026, 1, 3, 9, 0))
+
+    response = client.get("/v1/decisions")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pagination"]["total_count"] == 3
+    assert [item["summary"] for item in body["data"]] == ["third", "second", "first"]
+    # List items omit the tree payload.
+    assert "tree" not in body["data"][0]
+
+    paged = client.get("/v1/decisions", params={"limit": 1, "offset": 1}).json()
+    assert [item["summary"] for item in paged["data"]] == ["second"]
+    assert paged["pagination"]["has_more"] is True
+
+    filtered = client.get("/v1/decisions", params={"kind": "alert"}).json()
+    assert [item["summary"] for item in filtered["data"]] == ["second"]
+    assert filtered["pagination"]["total_count"] == 1
+
+
+def test_decision_json_suffix_matches_v1(client, session):
+    record = _seed_decision(session)
+
+    suffix = client.get(f"/decisions/{record.id}.json")
+    v1 = client.get(f"/v1/decisions/{record.id}")
+
+    assert suffix.status_code == 200
+    assert v1.status_code == 200
+    assert suffix.json() == v1.json()
+    assert suffix.json()["tree"] == THREE_LEVEL_TREE
+
+
+def test_decision_json_suffix_404_envelope(client):
+    response = client.get("/decisions/00000000-0000-0000-0000-000000000000.json")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
