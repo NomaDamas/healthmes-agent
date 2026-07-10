@@ -32,6 +32,9 @@ FULL_CONTEXT = {
     "ow_mcp_uv_cache_dir": "/opt/data/uv-cache",
     "healthmes_mcp_url": "http://healthmes:8100/mcp",
     "healthmes_api_token": "hm-bearer-token",
+    "hermes_model": "gpt-5.4",
+    "hermes_provider": "openai-codex",
+    "hermes_model_base_url": "",
 }
 
 MINIMAL_CONTEXT = {
@@ -128,6 +131,20 @@ def test_native_localhost_defaults() -> None:
     ow_env = cfg["mcp_servers"]["open_wearables"]["env"]
     assert ow_env["OPEN_WEARABLES_API_URL"] == "http://localhost:8000"
     assert cfg["mcp_servers"]["healthmes"]["url"] == "http://localhost:8100/mcp"
+
+
+def test_model_block_only_rendered_when_selected() -> None:
+    """LLM selection is optional: omitted -> no `model:` key (vendor
+    auto-defaults to Anthropic); set -> root model.default/provider per
+    vendor hermes_cli/config.py::_normalize_root_model_keys."""
+    minimal = render(dict(MINIMAL_CONTEXT))
+    assert "model" not in minimal
+
+    full = render(dict(FULL_CONTEXT))
+    assert full["model"] == {"default": "gpt-5.4", "provider": "openai-codex"}
+
+    with_base = render(dict(FULL_CONTEXT, hermes_model_base_url="http://localhost:11434/v1"))
+    assert with_base["model"]["base_url"] == "http://localhost:11434/v1"
 
 
 def test_default_alert_prompt_renders_clean() -> None:

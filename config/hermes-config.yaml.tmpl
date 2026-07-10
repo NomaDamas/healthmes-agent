@@ -13,6 +13,24 @@
 # $HERMES_HOME/cron/jobs.json and are registered by scripts/bootstrap.py
 # against vendor/hermes-agent/cron/jobs.py::create_job.
 
+{%- if hermes_model or hermes_provider %}
+# LLM selection — optional. Omit to let the vendor auto-default (Anthropic).
+# Any plugin under vendor/hermes-agent/plugins/model-providers/ works here
+# (anthropic, openai-codex, gemini, openrouter, ollama-cloud, bedrock,
+# vertex, deepseek, xai, …); provider API keys come from their usual env
+# vars. Keys per hermes_cli/config.py::_normalize_root_model_keys.
+model:
+  {%- if hermes_model %}
+  default: "{{ hermes_model }}"
+  {%- endif %}
+  {%- if hermes_provider %}
+  provider: "{{ hermes_provider }}"
+  {%- endif %}
+  {%- if hermes_model_base_url %}
+  base_url: "{{ hermes_model_base_url }}"
+  {%- endif %}
+{%- endif %}
+
 platforms:
   telegram:
     enabled: true

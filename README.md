@@ -146,6 +146,22 @@ container clocks are UTC. The compose path also **requires**
 `HEALTHMES_API_TOKEN` (the container binds 0.0.0.0 and publishes the port;
 the service refuses to start unauthenticated on a non-loopback bind).
 
+### CLI chat & choosing your LLM
+
+The same agent is available from the terminal (no Telegram needed) via the
+vendor CLI, against the same skills and MCP tools — see the CLI section of
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). Claude is only the default
+model: any of the ~29 vendor provider plugins (OpenAI, Gemini, OpenRouter,
+Ollama, Bedrock, …) can be selected with `HERMES_MODEL`/`HERMES_PROVIDER` in
+`.env` — all HealthMes glue is provider-agnostic.
+
+### Extending with domain knowledge
+
+Healthcare experts can add judgment procedures as **skills** (one markdown
+file, no code), new metrics as **Layer B MCP tools**, and correlation
+reports as **insight templates** — plus a local QA workflow to challenge the
+agent's decisions. See [`docs/EXTENDING.md`](docs/EXTENDING.md).
+
 ### Backups
 
 ```bash

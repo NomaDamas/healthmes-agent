@@ -137,6 +137,32 @@ vendor tree (setuptools metadata, ignored by git) — harmless, delete it if
 you want the vendor tree pristine; the venv itself stays outside via
 `UV_PROJECT_ENVIRONMENT`.
 
+### CLI chat (same agent, no Telegram needed)
+
+The vendor CLI reads the same `$HERMES_HOME` config bootstrap renders, so the
+terminal agent has the identical MCP tools and skills as the Telegram bot:
+
+```bash
+cd vendor/hermes-agent && \
+  HERMES_HOME=~/.hermes UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
+  uv run --frozen --no-dev --extra messaging hermes            # interactive
+# one-shot:
+#   ... hermes chat -q "How was my sleep this week?"
+```
+
+### Choosing the LLM (not just Claude)
+
+The vendor ships ~29 model-provider plugins
+(`vendor/hermes-agent/plugins/model-providers/`: anthropic, openai-codex,
+gemini, openrouter, ollama-cloud, bedrock, vertex, deepseek, xai, …).
+Selection is config, not code: set `HERMES_MODEL` / `HERMES_PROVIDER`
+(optionally `HERMES_MODEL_BASE_URL` for OpenAI-compatible self-hosted
+endpoints) in `.env`, re-run bootstrap, and export the matching provider API
+key. Omitting both keeps the vendor default (Anthropic Claude). The same
+selection drives the gateway, cron briefings, and `hermes chat`; per-run
+override: `hermes chat --model … --provider …`. All HealthMes glue
+(webhook prompts, skills, MCP tools) is provider-agnostic.
+
 ## Backups (local-first, encrypted)
 
 Snapshots bundle the healthmes DB dump, an optional open-wearables pg_dump,

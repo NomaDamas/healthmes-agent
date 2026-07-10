@@ -112,6 +112,9 @@ TEMPLATE_KEYS = (
     "hermes_webhook_port",
     "hermes_webhook_secret",
     "healthmes_alert_prompt",
+    "hermes_model",
+    "hermes_provider",
+    "hermes_model_base_url",
     "ow_mcp_dir",
     "ow_base_url",
     "ow_api_key",
@@ -309,6 +312,15 @@ def build_context(
         "hermes_webhook_port": env.get("HERMES_WEBHOOK_PORT", "").strip(),
         "hermes_webhook_secret": webhook_secret,
         "healthmes_alert_prompt": env.get("HEALTHMES_ALERT_PROMPT", "").strip(),
+        # LLM selection (optional). Omitted -> the vendor auto-defaults to
+        # Anthropic/Claude. Any of the ~29 vendor model-provider plugins
+        # (vendor/hermes-agent/plugins/model-providers/) can be selected;
+        # keys land in the root `model:` section that both the gateway and
+        # the `hermes chat` CLI resolve (hermes_cli/config.py
+        # ::_normalize_root_model_keys — model.default/provider/base_url).
+        "hermes_model": env.get("HERMES_MODEL", "").strip(),
+        "hermes_provider": env.get("HERMES_PROVIDER", "").strip(),
+        "hermes_model_base_url": env.get("HERMES_MODEL_BASE_URL", "").strip(),
         "ow_mcp_dir": env.get("OW_MCP_DIR", "").strip() or defaults["ow_mcp_dir"],
         "ow_base_url": env.get("OW_BASE_URL", "").strip() or defaults["ow_base_url"],
         "ow_api_key": (
