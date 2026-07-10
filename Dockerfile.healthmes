@@ -1,0 +1,42 @@
+# HealthMes service image (FastAPI + fastmcp glue plane, docs/PLAN.md).
+# Two-stage uv build modeled on vendor/open-wearables/backend/Dockerfile.
+# Build context is the repo root; .dockerignore excludes vendor/ etc.
+
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /srv/healthmes
+
+ENV VIRTUAL_ENV=/opt/venv
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+RUN uv venv "$VIRTUAL_ENV"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Install dependencies first (cached unless lock/pyproject change)
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --no-install-project
+
+# Copy source and install the project itself (fast, deps already cached)
+COPY . .
+RUN uv sync --locked --no-dev --no-editable
+
+FROM python:3.12-slim
+
+WORKDIR /srv/healthmes
+
+COPY --from=builder /opt/venv /opt/venv
+# Project tree kept in the image for alembic migrations / config templates.
+COPY --from=builder /srv/healthmes /srv/healthmes
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
+
+# Media/export storage; docker-compose mounts a volume here.
+ENV HEALTHMES_DATA_DIR=/data
+RUN mkdir -p /data
+
+EXPOSE 8100
+
+# healthmes/__main__.py starts uvicorn on HEALTHMES_PORT (default 8100).
+CMD ["python", "-m", "healthmes"]

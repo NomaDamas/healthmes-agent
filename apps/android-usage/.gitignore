@@ -1,0 +1,12 @@
+# Gradle / Android build state (never committed)
+.gradle/
+build/
+.kotlin/
+local.properties
+
+# IDE state
+.idea/
+*.iml
+captures/
+
+.DS_Store

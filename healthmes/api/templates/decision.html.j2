@@ -1,0 +1,222 @@
+{% extends "_base.html.j2" %}
+{# Mermaid decision-tree viewer (docs/PLAN.md §5). Context:
+   record            DecisionRecord ORM row
+   graph             DecisionTreeView (source / node_index / root / truncated)
+   created_display   preformatted created_at string
+   short_id          first 8 chars of the record id (crumb)
+   node_types        legend order (known types + "other")
+   All user-derived values are autoescaped here; the Mermaid source was made
+   inert by escape_mermaid_label() before it reached this template. #}
+
+{% block title %}Decision {{ short_id }} — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb"> / {{ short_id }}</span>{% endblock %}
+
+{% block head %}
+<style>
+  #decision-tree { display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 960px) {
+    #decision-tree { grid-template-columns: minmax(0, 1fr) 21rem; align-items: start; }
+    #node-detail { position: sticky; top: 1rem; }
+    #graph-wrap { grid-column: 1; }
+    #outline-wrap { grid-column: 1; }
+    #node-detail { grid-column: 2; grid-row: 1 / span 2; }
+  }
+  #graph-wrap { min-width: 0; }
+  pre.mermaid {
+    margin: 0;
+    padding: 0.6rem;
+    background: #ffffff;
+    border: 1px solid #e7e5e4;
+    border-radius: 10px;
+    overflow-x: auto;
+  }
+  /* Hidden until mermaid.run() swaps the source text for the SVG; without
+     JavaScript the outline below is the visible representation. */
+  pre.mermaid:not([data-processed]) { display: none; }
+  pre.mermaid svg { max-width: 100%; height: auto; }
+  #decision-graph g.node { cursor: pointer; }
+  #decision-graph g.node:focus { outline: none; }
+  #decision-graph g.node.selected { filter: drop-shadow(0 0 4px #f59e0b); }
+  #node-detail {
+    background: #ffffff;
+    border: 1px solid #e7e5e4;
+    border-radius: 10px;
+    padding: 0.8rem 1rem 1rem;
+  }
+  #node-detail h2 { margin: 0 0 0.6rem; }
+  #node-detail-label { font-weight: 600; overflow-wrap: anywhere; margin-top: 0.4rem; }
+  #node-detail-detail {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: #44403c;
+    font-size: 0.9rem;
+    margin-top: 0.4rem;
+  }
+  #node-detail-source { margin-top: 0.6rem; }
+  .legend { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.7rem 0 0; padding: 0; list-style: none; }
+  .summary { font-size: 1.02rem; overflow-wrap: anywhere; }
+  ul.outline, ul.outline ul { padding-left: 1.1rem; list-style: none; }
+  ul.outline li { margin: 0.35rem 0; border-left: 2px solid #e7e5e4; padding-left: 0.6rem; }
+  .outline-label { overflow-wrap: anywhere; }
+  .outline-detail { color: #57534e; font-size: 0.85rem; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .foot-links { margin-top: 1.5rem; }
+</style>
+{% endblock %}
+
+{% block content %}
+<h1>Why this decision?</h1>
+<p class="muted">
+  kind: {{ record.kind.value }}
+  · id: {{ record.id }}
+  · created: {{ created_display }}
+  {% if record.llm_model %} · model: {{ record.llm_model }}{% endif %}
+  {% if record.tokens is not none %} · tokens: {{ record.tokens }}{% endif %}
+</p>
+<p class="summary">{{ record.summary }}</p>
+
+<section id="decision-tree">
+{% if graph.root %}
+  <div id="graph-wrap">
+    <pre id="decision-graph" class="mermaid">{{ graph.source }}</pre>
+    <noscript>
+      <p class="muted">JavaScript is off, so the interactive diagram is disabled — the outline below shows the same tree.</p>
+    </noscript>
+    <p id="graph-error" class="error" hidden></p>
+    <p id="graph-hint" class="muted" hidden>Tap or click a node to inspect it.</p>
+    {% if graph.truncated %}
+    <p class="muted">Diagram truncated to the first {{ graph.node_index | length }} nodes — the full tree is in the <a href="/decisions/{{ record.id }}.json">JSON view</a>.</p>
+    {% endif %}
+    <ul class="legend">
+      {% for t in node_types %}
+      <li><span class="badge type-{{ t }}">{{ t }}</span></li>
+      {% endfor %}
+    </ul>
+  </div>
+  <aside id="node-detail" hidden aria-live="polite">
+    <h2>Node detail</h2>
+    <span id="node-detail-type" class="badge"></span>
+    <div id="node-detail-label"></div>
+    <div id="node-detail-detail"></div>
+    <p id="node-detail-source" class="muted"></p>
+  </aside>
+  <section id="outline-wrap">
+    <h2>Outline</h2>
+    <ul class="outline">
+      {% for node in [graph.root] recursive %}
+      <li>
+        <span class="badge type-{{ node.type }}">{{ node.raw_type or node.type }}</span>
+        <span class="outline-label">{{ node.label }}</span>
+        {% if node.detail %}
+        <div class="outline-detail">{{ node.detail }}</div>
+        {% endif %}
+        {% if node.children %}
+        <ul>{{ loop(node.children) }}</ul>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+{% else %}
+  <p><em>No tree recorded.</em></p>
+{% endif %}
+</section>
+
+<p class="muted foot-links">
+  <a href="/decisions/{{ record.id }}.json">JSON view</a> · <a href="/decisions">All decisions</a>
+</p>
+{% endblock %}
+
+{% block scripts %}
+{% if graph.root %}
+<script type="application/json" id="node-data">{{ graph.node_index | tojson }}</script>
+<script src="/static/mermaid.min.js"></script>
+<script>
+(function () {
+  "use strict";
+  var nodeData = {};
+  try {
+    nodeData = JSON.parse(document.getElementById("node-data").textContent || "{}");
+  } catch (err) {
+    nodeData = {};
+  }
+
+  var graphEl = document.getElementById("decision-graph");
+  var panel = document.getElementById("node-detail");
+  var panelType = document.getElementById("node-detail-type");
+  var panelLabel = document.getElementById("node-detail-label");
+  var panelDetail = document.getElementById("node-detail-detail");
+  var panelSource = document.getElementById("node-detail-source");
+  var hint = document.getElementById("graph-hint");
+  var errorEl = document.getElementById("graph-error");
+  var selected = null;
+
+  function fail(message) {
+    if (graphEl) { graphEl.hidden = true; }
+    if (errorEl) { errorEl.hidden = false; errorEl.textContent = message; }
+  }
+
+  function gidFromDomId(domId) {
+    if (!domId) { return null; }
+    var m = /(?:^|-)(n\d+)-\d+$/.exec(domId);
+    if (!m) { m = /(?:^|-)(n\d+)$/.exec(domId); }
+    return m ? m[1] : null;
+  }
+
+  function showNode(gid, el) {
+    var info = nodeData[gid];
+    if (!info) { return; }
+    if (selected) { selected.classList.remove("selected"); }
+    selected = el || null;
+    if (selected) { selected.classList.add("selected"); }
+    /* info.type is server-side whitelisted; all fields set via textContent. */
+    panelType.className = "badge type-" + info.type;
+    panelType.textContent = info.raw_type || info.type;
+    panelLabel.textContent = info.label;
+    panelDetail.textContent = info.detail || "(no detail recorded)";
+    panelSource.textContent = info.source_id ? "node id: " + info.source_id : "";
+    panel.hidden = false;
+  }
+
+  function bindClicks() {
+    var nodes = graphEl.querySelectorAll("g.node");
+    var bound = 0;
+    nodes.forEach(function (el) {
+      var gid = gidFromDomId(el.id);
+      if (!gid || !nodeData[gid]) { return; }
+      bound += 1;
+      el.setAttribute("tabindex", "0");
+      el.setAttribute("role", "button");
+      el.addEventListener("click", function () { showNode(gid, el); });
+      el.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          showNode(gid, el);
+        }
+      });
+    });
+    if (bound > 0 && hint) { hint.hidden = false; }
+  }
+
+  if (!window.mermaid) {
+    fail("Diagram library failed to load — the outline below shows the same tree.");
+    return;
+  }
+  try {
+    window.mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      theme: "neutral",
+      suppressErrorRendering: true,
+      fontFamily: "ui-sans-serif, system-ui, sans-serif",
+      flowchart: { useMaxWidth: true, htmlLabels: true }
+    });
+    window.mermaid.run({ nodes: [graphEl] }).then(bindClicks).catch(function () {
+      fail("Diagram failed to render — the outline below shows the same tree.");
+    });
+  } catch (err) {
+    fail("Diagram failed to render — the outline below shows the same tree.");
+  }
+})();
+</script>
+{% endif %}
+{% endblock %}

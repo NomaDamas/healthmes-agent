@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Upload batches to the user's own HealthMes instance. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Special access: cannot be granted at runtime, only via the
+         "Usage access" screen in system settings (deep-linked from the app). -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Needed on API 30+ so PackageManager.getApplicationInfo can resolve the
+         ApplicationInfo.category of *other* packages seen in usage events.
+         Fine for a sideloaded personal tool; would need justification on Play. -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.HealthMesUsage"
+        android:usesCleartextTraffic="true"
+        tools:ignore="UsesCleartextTraffic">
+        <!-- Cleartext HTTP stays enabled because the typical pairing target is a
+             HealthMes instance on the same LAN (http://192.168.x.x:8100). -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
