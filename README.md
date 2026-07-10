@@ -58,7 +58,7 @@ Telegram (phone + watch)          decision viewer (web)
   Alert hygiene built in: per-rule cooldown, daily budget, quiet hours,
   dedup keys, per-rule crash isolation.
 - Hermes bootstrap (`scripts/bootstrap.py`): renders the gateway config,
-  symlinks `skills/`, registers morning/evening/weekly cron briefings.
+  copy-installs `skills/`, registers morning/evening/weekly cron briefings.
 
 **Cognitive energy & explainability (Phase 2)**
 - Rule-based, fully explainable energy engine (`healthmes/engine/
@@ -106,7 +106,7 @@ Telegram (phone + watch)          decision viewer (web)
 - Hardening: restore drills, trigger-flood tests, CI (linux + macos),
   vendor-drift report (`scripts/vendor_sync_check.sh`).
 
-**Skills** (`skills/`, symlinked into the Hermes home by bootstrap):
+**Skills** (`skills/`, copied into the Hermes home by bootstrap):
 `healthmes-planner` (goal dump → task breakdown → energy-aware block
 proposals → decision recording), `healthmes-capture` (food + medical),
 `doctor-visit-summary`.

@@ -12,10 +12,16 @@ directory outside the vendor tree) and the repo-root ``.env``:
    read. If a config.yaml already exists, the rendered mapping is
    deep-merged over it (rendered keys win, unrelated user keys survive) and
    the previous file is backed up once.
-2. Symlink each ``skills/<name>/`` directory (must contain SKILL.md) into
+2. Copy each ``skills/<name>/`` directory (must contain SKILL.md) into
    ``$HERMES_HOME/skills/<name>`` — the discovery path scanned by
-   vendor/hermes-agent/tools/skills_tool.py (SKILLS_DIR = HERMES_HOME/skills;
-   the scanner follows symlinks).
+   vendor/hermes-agent/tools/skills_tool.py (SKILLS_DIR = HERMES_HOME/skills).
+   A copy, not a symlink: the vendor trust check resolves symlinks
+   (skills_tool.py ``skill_md.resolve().relative_to(trusted)``) and logs a
+   "skill file is outside the trusted skills directory" security warning on
+   every skill load — every alert and briefing. Copies inside $HERMES_HOME
+   resolve as trusted, and they work identically in docker mode where
+   ./data/hermes is the only path mounted into the hermes container.
+   Legacy symlinks from earlier bootstraps are migrated to copies.
 3. Generate missing secrets into ``.env`` (currently the webhook HMAC
    secret shared between healthmes triggers and the Hermes webhook route).
 4. Install the briefing state-snapshot script (scripts/
@@ -50,7 +56,6 @@ no docker service hostname is ever hardcoded for the native path:
   OW_MCP_UV_CACHE_DIR          <repo>/data/uv-cache              /opt/data/uv-cache
   OW_BASE_URL                  http://localhost:8000             http://ow-backend:8000
   HEALTHMES_MCP_URL            http://localhost:<port>/mcp       http://healthmes:8100/mcp
-  HEALTHMES_SKILLS_MOUNT       <repo>/skills                     /opt/vendor/healthmes-skills
 
 Usage:
   uv run python scripts/bootstrap.py [--dry-run] [--mode native|docker]
@@ -64,6 +69,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sys
 import tempfile
 import uuid
@@ -395,7 +401,7 @@ def _chmod_quiet(path: Path, mode: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Skills symlinks
+# Skills install (copies into $HERMES_HOME/skills/)
 # ---------------------------------------------------------------------------
 
 
@@ -411,48 +417,62 @@ def discover_skill_dirs(repo_root: Path) -> list[Path]:
     )
 
 
-def link_skills(
-    repo_root: Path, hermes_home: Path, mode: str, env: dict[str, str], plan: Plan
-) -> list[Path]:
-    """Symlink repo skills into ``$HERMES_HOME/skills/`` (idempotent).
+def _dir_snapshot(root: Path) -> dict[str, bytes]:
+    """Relative-path -> content map for regular files under root."""
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
-    In docker mode the link target is the path where docker-compose.yml
-    mounts ./skills inside the hermes container (/opt/vendor/healthmes-skills)
-    — the link may dangle on the host but resolves inside the container.
+
+def install_skills(repo_root: Path, hermes_home: Path, plan: Plan) -> list[Path]:
+    """Copy repo skills into ``$HERMES_HOME/skills/`` (idempotent by content).
+
+    Copies, not symlinks: the vendor trust check resolves symlinks
+    (vendor/hermes-agent/tools/skills_tool.py, ``skill_md.resolve()
+    .relative_to(trusted)``) and logs a security warning for every skill
+    load of a symlinked skill — on every alert and briefing. Copies inside
+    $HERMES_HOME resolve as trusted and are the only layout that works
+    unchanged in docker mode (./data/hermes is mounted; the repo is not).
+    Symlinks left by earlier bootstrap versions are migrated to copies;
+    content drift (edits in either direction) is resynced from the repo.
     """
-    target_root_default = (
-        "/opt/vendor/healthmes-skills" if mode == "docker" else str(repo_root / "skills")
-    )
-    target_root = Path(env.get("HEALTHMES_SKILLS_MOUNT", "").strip() or target_root_default)
     skills_home = hermes_home / "skills"
-    linked: list[Path] = []
+    installed: list[Path] = []
 
     for skill_dir in discover_skill_dirs(repo_root):
-        link_path = skills_home / skill_dir.name
-        target = target_root / skill_dir.name
-        if link_path.is_symlink():
-            if os.readlink(link_path) == str(target):
-                plan.act(f"keep symlink {link_path} -> {target} (already correct)")
-                linked.append(link_path)
-                continue
-            plan.act(f"replace symlink {link_path} -> {target}")
+        dest = skills_home / skill_dir.name
+        if dest.is_symlink():
+            plan.act(f"migrate symlink {dest} to a copy of {skill_dir}")
             if not plan.dry_run:
-                link_path.unlink()
-                link_path.symlink_to(target, target_is_directory=True)
-            linked.append(link_path)
+                dest.unlink()
+                shutil.copytree(skill_dir, dest)
+            installed.append(dest)
             continue
-        if link_path.exists():
+        if dest.exists() and not dest.is_dir():
             plan.warn(
-                f"{link_path} exists and is not a symlink; leaving it untouched "
+                f"{dest} exists and is not a directory; leaving it untouched "
                 f"(remove it manually to let bootstrap manage this skill)"
             )
             continue
-        plan.act(f"symlink {link_path} -> {target}")
+        if dest.is_dir():
+            if _dir_snapshot(dest) == _dir_snapshot(skill_dir):
+                plan.act(f"keep skill copy {dest} (content up to date)")
+                installed.append(dest)
+                continue
+            plan.act(f"resync skill copy {dest} from {skill_dir}")
+            if not plan.dry_run:
+                shutil.rmtree(dest)
+                shutil.copytree(skill_dir, dest)
+            installed.append(dest)
+            continue
+        plan.act(f"copy skill {skill_dir} -> {dest}")
         if not plan.dry_run:
             skills_home.mkdir(parents=True, exist_ok=True)
-            link_path.symlink_to(target, target_is_directory=True)
-        linked.append(link_path)
-    return linked
+            shutil.copytree(skill_dir, dest)
+        installed.append(dest)
+    return installed
 
 
 # ---------------------------------------------------------------------------
@@ -890,7 +910,7 @@ def run(args: argparse.Namespace) -> int:
         print(rendered)
 
     write_config(hermes_home, rendered, plan)
-    link_skills(REPO_ROOT, hermes_home, args.mode, env, plan)
+    install_skills(REPO_ROOT, hermes_home, plan)
     # Before cron registration: the jobs reference this script by name and
     # create_job's lifecycle guard reads it from $HERMES_HOME/scripts/.
     install_snapshot_script(hermes_home, context, plan)

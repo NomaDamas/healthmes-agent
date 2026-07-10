@@ -1,13 +1,12 @@
 """Tests for scripts/bootstrap.py.
 
-Covers: template rendering into a tmp HERMES_HOME, skill symlinking into the
-Hermes discovery path, secret generation into .env, cron briefing
+Covers: template rendering into a tmp HERMES_HOME, skill copy-install into
+the Hermes discovery path, secret generation into .env, cron briefing
 registration, idempotency of the whole pipeline, --dry-run inertness, and
 docker-mode defaults. Everything runs against tmp paths — the developer's
 real ~/.hermes is never touched.
 """
 
-import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -69,12 +68,15 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     assert ow["env"]["OPEN_WEARABLES_API_KEY"] == "ow-test-key"
     assert str(REPO_ROOT / "vendor" / "open-wearables" / "mcp") in ow["args"]
 
-    # 2. Skills symlinked into the discovery path (SKILLS_DIR = home/skills).
+    # 2. Skills copied into the discovery path (SKILLS_DIR = home/skills).
+    # Copies, not symlinks: the vendor trust check resolves symlinks and
+    # would log a security warning on every skill load (skills_tool.py).
     for skill in ("healthmes-planner", "healthmes-capture", "doctor-visit-summary"):
-        link = hermes_home / "skills" / skill
-        assert link.is_symlink()
-        assert (link / "SKILL.md").is_file()  # resolves through the link
-        assert os.readlink(link) == str(REPO_ROOT / "skills" / skill)
+        dest = hermes_home / "skills" / skill
+        assert dest.is_dir() and not dest.is_symlink()
+        assert (dest / "SKILL.md").read_text() == (
+            REPO_ROOT / "skills" / skill / "SKILL.md"
+        ).read_text()
 
     # 3. Briefing snapshot script + base-url sidecar installed into the
     # scheduler's only allowed script location ($HERMES_HOME/scripts/).
@@ -229,10 +231,11 @@ def test_docker_mode_defaults(bootstrap, hermes_home, env_file):
     assert "/opt/vendor/open-wearables-mcp" in ow["args"]
     assert ow["env"]["UV_PROJECT_ENVIRONMENT"] == "/opt/data/ow-mcp-venv"
 
-    # Skill links target the in-container mount (dangling on the host is OK).
-    link = hermes_home / "skills" / "healthmes-planner"
-    assert link.is_symlink()
-    assert os.readlink(link) == "/opt/vendor/healthmes-skills/healthmes-planner"
+    # Skills are copied into $HERMES_HOME/skills, which is the bind mount
+    # (./data/hermes) the hermes container sees — same layout as native mode.
+    dest = hermes_home / "skills" / "healthmes-planner"
+    assert dest.is_dir() and not dest.is_symlink()
+    assert (dest / "SKILL.md").is_file()
 
     # The snapshot sidecar carries the in-cluster healthmes endpoint; the
     # script itself stays byte-identical to the repo copy (URL via sidecar,
@@ -275,7 +278,7 @@ def test_api_token_flows_into_mcp_headers_and_sidecar(
 
 
 # ---------------------------------------------------------------------------
-# Skill discovery / symlink repair
+# Skill discovery / copy repair
 # ---------------------------------------------------------------------------
 
 
@@ -284,7 +287,8 @@ def test_repo_skills_are_discovered(bootstrap):
     assert names == ["doctor-visit-summary", "healthmes-capture", "healthmes-planner"]
 
 
-def test_wrong_symlink_is_repaired(bootstrap, hermes_home, env_file, tmp_path):
+def test_legacy_symlink_is_migrated_to_copy(bootstrap, hermes_home, env_file, tmp_path):
+    """Symlinks left by earlier bootstrap versions become real copies."""
     skills_home = hermes_home / "skills"
     skills_home.mkdir(parents=True)
     stale_target = tmp_path / "elsewhere"
@@ -292,9 +296,25 @@ def test_wrong_symlink_is_repaired(bootstrap, hermes_home, env_file, tmp_path):
     (skills_home / "healthmes-planner").symlink_to(stale_target)
 
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    assert os.readlink(skills_home / "healthmes-planner") == str(
-        REPO_ROOT / "skills" / "healthmes-planner"
-    )
+    dest = skills_home / "healthmes-planner"
+    assert dest.is_dir() and not dest.is_symlink()
+    assert (dest / "SKILL.md").read_text() == (
+        REPO_ROOT / "skills" / "healthmes-planner" / "SKILL.md"
+    ).read_text()
+
+
+def test_drifted_skill_copy_is_resynced(bootstrap, hermes_home, env_file):
+    """An edited installed copy is resynced from the repo on re-run."""
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    dest = hermes_home / "skills" / "healthmes-planner"
+    (dest / "SKILL.md").write_text("tampered\n", encoding="utf-8")
+    (dest / "stale-extra.md").write_text("leftover\n", encoding="utf-8")
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    assert (dest / "SKILL.md").read_text() == (
+        REPO_ROOT / "skills" / "healthmes-planner" / "SKILL.md"
+    ).read_text()
+    assert not (dest / "stale-extra.md").exists()
 
 
 # ---------------------------------------------------------------------------

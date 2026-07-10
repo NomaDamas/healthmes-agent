@@ -211,8 +211,6 @@ services:
       # from config/hermes-config.yaml.tmpl (uv is on PATH in this image; the
       # venv is redirected to $HERMES_HOME via UV_PROJECT_ENVIRONMENT).
       - ./vendor/open-wearables/mcp:/opt/vendor/open-wearables-mcp:ro
-      # HealthMes skills, symlinked into $HERMES_HOME/skills by bootstrap.
-      - ./skills:/opt/vendor/healthmes-skills:ro
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
