@@ -1,0 +1,38 @@
+name: Skill proposal
+description: Propose a new judgment procedure (skill) over existing tools (domain experts — no code required)
+title: "[skill] "
+labels: ["domain", "skill"]
+body:
+  - type: input
+    id: question
+    attributes:
+      label: Clinical question
+      description: One skill per clinical question. What situation should trigger this judgment?
+      placeholder: e.g. Screen weekly data for overtraining risk
+    validations:
+      required: true
+  - type: textarea
+    id: tools
+    attributes:
+      label: Tools it reads
+      description: Which existing MCP tools supply the facts (mcp__healthmes__* / mcp__open_wearables__*)? If a needed fact has no tool yet, file a Metric proposal first and link it here.
+    validations:
+      required: true
+  - type: textarea
+    id: procedure
+    attributes:
+      label: Judgment procedure sketch
+      description: The if/then advice logic, in plain language. Include what to say when confidence is low (categorical advice is forbidden on low confidence).
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where it runs
+      multiple: true
+      options:
+        - On-demand (user asks in chat)
+        - Proactive alert route
+        - Morning/evening/weekly briefing
+    validations:
+      required: true

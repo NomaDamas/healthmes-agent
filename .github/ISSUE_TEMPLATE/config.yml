@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Domain expert onboarding (한국어)
+    url: https://github.com/NomaDamas/healthmes-agent/blob/main/docs/EXPERT-ONBOARDING.ko.md
+    about: 지표 카탈로그, 스킬 작성법, 실기기 QA 프로토콜, 기여 절차

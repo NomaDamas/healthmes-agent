@@ -160,7 +160,12 @@ Ollama, Bedrock, …) can be selected with `HERMES_MODEL`/`HERMES_PROVIDER` in
 Healthcare experts can add judgment procedures as **skills** (one markdown
 file, no code), new metrics as **Layer B MCP tools**, and correlation
 reports as **insight templates** — plus a local QA workflow to challenge the
-agent's decisions. See [`docs/EXTENDING.md`](docs/EXTENDING.md).
+agent's decisions. See [`docs/EXTENDING.md`](docs/EXTENDING.md), the Korean
+expert onboarding guide
+[`docs/EXPERT-ONBOARDING.ko.md`](docs/EXPERT-ONBOARDING.ko.md) (metric
+catalog, skill authoring, real-device QA protocol), and
+[`CONTRIBUTING.md`](CONTRIBUTING.md). Proposals go through the
+`Metric proposal` / `Skill proposal` issue forms.
 
 ### Backups
 

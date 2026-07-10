@@ -1,0 +1,42 @@
+name: Metric proposal
+description: Propose a new health indicator / derived metric (domain experts — no code required)
+title: "[metric] "
+labels: ["domain", "metric"]
+body:
+  - type: input
+    id: question
+    attributes:
+      label: Decision question
+      description: The clinical/coaching question this metric answers ("오늘 무리해도 되나?" 단위). Tools are built per decision question, not per raw signal.
+      placeholder: e.g. Is this user's glucose stability deteriorating this week?
+    validations:
+      required: true
+  - type: textarea
+    id: inputs
+    attributes:
+      label: Input signals
+      description: Which series/scores it needs (see docs/EXPERT-ONBOARDING.ko.md §1 for the catalog), incl. minimum days/samples. Note provider coverage limits.
+      placeholder: |
+        - glucose (series), 14 days, ≥96 samples/day
+        - internal sleep score, 7 nights
+    validations:
+      required: true
+  - type: textarea
+    id: interpretation
+    attributes:
+      label: Interpretation rule (deterministic)
+      description: How raw inputs become the interpreted output — thresholds, baseline comparison (e.g. vs 14-day trailing median), aggregation. Write it so an engineer can implement it as a pure function with a hand-computed test vector.
+    validations:
+      required: true
+  - type: textarea
+    id: confidence
+    attributes:
+      label: Confidence & insufficient-data conditions
+      description: When is the result trustworthy (measurement conditions, coverage), and when must it return insufficient_data instead of a number?
+    validations:
+      required: true
+  - type: textarea
+    id: references
+    attributes:
+      label: Clinical references (optional)
+      description: Guidelines/papers backing the rule, if any.
