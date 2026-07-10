@@ -98,7 +98,9 @@ uv run uvicorn healthmes.app:create_app --factory --reload --port 8100
 
 The Hermes gateway is configured entirely from outside `vendor/`:
 `scripts/bootstrap.py` renders `config/hermes-config.yaml.tmpl` into
-`$HERMES_HOME/config.yaml`, symlinks `skills/` into `$HERMES_HOME/skills/`,
+`$HERMES_HOME/config.yaml`, copies `skills/` into `$HERMES_HOME/skills/`
+(copies, not symlinks — the vendor skill trust check resolves symlinks and
+would log a security warning on every skill load; re-runs resync content),
 generates a `HEALTHMES_HERMES_WEBHOOK_SECRET` into `.env` when missing,
 installs the briefing state-snapshot script
 (`scripts/healthmes_briefing_snapshot.py` + a base-URL sidecar) into
@@ -115,9 +117,25 @@ uv run python scripts/bootstrap.py --mode docker # compose paths (HERMES_HOME=./
 ```
 
 It is idempotent: re-runs deep-merge the config (your manual keys win, one
-backup is kept) and skip already-registered jobs/symlinks. `HERMES_HOME`,
-`TELEGRAM_HOME_CHAT_ID`, and the other inputs come from the environment or
-`.env` (see the bootstrap section of `.env.example`).
+backup is kept), resync skill copies, and skip already-registered jobs.
+`HERMES_HOME`, `TELEGRAM_HOME_CHAT_ID`, and the other inputs come from the
+environment or `.env` (see the bootstrap section of `.env.example`).
+
+Running the gateway natively (verified live on macOS with dummy creds):
+
+```bash
+cd vendor/hermes-agent && \
+  HERMES_HOME=... UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
+  uv run --frozen --no-dev --extra messaging hermes gateway run
+```
+
+Two caveats from live verification: (1) if a supervised hermes service is
+installed on the machine (launchd), `hermes gateway run` refuses to start
+even for a different `HERMES_HOME` — add `--force`; (2) `uv run` inside
+`vendor/hermes-agent` drops a `hermes_agent.egg-info/` directory into the
+vendor tree (setuptools metadata, ignored by git) — harmless, delete it if
+you want the vendor tree pristine; the venv itself stays outside via
+`UV_PROJECT_ENVIRONMENT`.
 
 ## Backups (local-first, encrypted)
 
@@ -268,7 +286,7 @@ config/               templates + service env files (rendered copies gitignored)
 docs/                 PLAN.md (architecture), BACKUP.md (snapshot format), this guide
 scripts/              dev_mac.sh (mac-native tooling), initdb/ (compose),
                       bootstrap.py (hermes), vendor_sync_check.sh (drift report)
-skills/               hermes skills (symlinked into HERMES_HOME by bootstrap):
+skills/               hermes skills (copied into HERMES_HOME by bootstrap):
                       healthmes-planner, healthmes-capture, doctor-visit-summary
 tests/                pytest suite (network-free)
 data/                 runtime state (gitignored): pg, redis, sqlite, media, hermes home

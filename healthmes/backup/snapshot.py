@@ -22,10 +22,11 @@ Design points:
   Homebrew keg fallback (``brew --prefix postgresql@16`` etc.) because macOS
   keeps keg-only postgres binaries off PATH.
 - **Symlinks**: links that stay inside the copied tree are preserved as
-  links; links escaping the tree (e.g. ``$HERMES_HOME/skills/*`` symlinks
-  into this repo, re-created by ``scripts/bootstrap.py``) are recorded in the
-  manifest and skipped — the archive never references paths outside itself,
-  so extraction is safe under ``tarfile``'s ``data`` filter.
+  links; links escaping the tree (e.g. legacy ``$HERMES_HOME/skills/*``
+  symlinks left by pre-copy-install bootstraps, re-creatable by
+  ``scripts/bootstrap.py``) are recorded in the manifest and skipped — the
+  archive never references paths outside itself, so extraction is safe
+  under ``tarfile``'s ``data`` filter.
 - **Restore verifies before it writes**: the archive is extracted to a
   scratch directory and checked against the manifest inventory (SHA-256)
   before any live target is replaced.
