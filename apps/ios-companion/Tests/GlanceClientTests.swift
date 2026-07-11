@@ -112,6 +112,22 @@ final class GlanceContractDecodingTests: XCTestCase {
         XCTAssertNil(GlanceJSON.parseISO8601("not a datetime"))
     }
 
+    func testAcceptsNaiveUTCTimestamps() {
+        // Store-backed endpoints (schedule proposals, food logs) emit
+        // sqlite's naive datetimes with no zone designator; the store
+        // contract says they are UTC. Proven against a live instance.
+        let base = GlanceJSON.parseISO8601("2026-07-09T14:23:00Z")
+        XCTAssertEqual(GlanceJSON.parseISO8601("2026-07-09T14:23:00"), base)
+        let naiveFractional = GlanceJSON.parseISO8601("2026-07-09T14:23:00.355753")
+        XCTAssertNotNil(naiveFractional)
+        XCTAssertEqual(
+            naiveFractional!.timeIntervalSince1970,
+            base!.timeIntervalSince1970 + 0.355,
+            accuracy: 0.01
+        )
+        XCTAssertNil(GlanceJSON.parseISO8601("2026-07-09"))
+    }
+
     func testNextBlockLineRendersServerTimezone() throws {
         let payload = try GlanceJSON.decodePayload(fixtureData())
         XCTAssertEqual(GlanceFormat.nextBlockLine(payload), "14:00 Deep work block [high]")

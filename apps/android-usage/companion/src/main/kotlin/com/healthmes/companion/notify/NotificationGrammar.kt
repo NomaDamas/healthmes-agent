@@ -1,5 +1,6 @@
 package com.healthmes.companion.notify
 
+import com.healthmes.api.AlertItem
 import com.healthmes.briefing.BriefingDisplayState
 import com.healthmes.briefing.GlanceBriefing
 
@@ -10,17 +11,20 @@ import com.healthmes.briefing.GlanceBriefing
  * [observation, 1 line]
  * [evidence, 1 line]
  * [proposal, 1 line]
- * [buttons]  Apply / Adjust / Keep as is   (stubs for now)
+ * [buttons]  Apply / Adjust / Keep as is   (real schedule-proposal actions)
  * [link]     Why this? -> decision viewer URL
  * ```
  *
- * Pure Kotlin so the mapping from a glance payload is JVM unit-testable.
+ * Pure Kotlin so the mapping from server payloads is JVM unit-testable.
  *
- * PLACEHOLDER CONTENT: the glance endpoint only carries the alert summary +
- * counts, so evidence/proposal below are honest fillers proving the rendering
- * path. The real copy arrives with server-push alerts, and the wording rules
- * are the healthcare domain expert's deliverable
- * (docs/design/WATCH-NOTIFICATIONS.ko.md).
+ * Two sources, in preference order:
+ * - [fromAlert] — a `GET /v1/alerts` item carrying the REAL grammar lines the
+ *   trigger recorded at fire time (observation `summary`, `evidence` facts,
+ *   `proposal`).
+ * - [fromGlance] — fallback from the glance payload alone (only the
+ *   observation is real there; evidence/proposal are honest fillers proving
+ *   the rendering path). Wording rules stay the healthcare domain expert's
+ *   deliverable (docs/design/WATCH-NOTIFICATIONS.ko.md).
  */
 data class NotificationGrammar(
     val observation: String,
@@ -33,6 +37,15 @@ data class NotificationGrammar(
     fun bigText(): String = "$observation\n$evidence\n$proposal"
 
     companion object {
+
+        /** Real grammar lines from an alert-history item (issue #10). */
+        fun fromAlert(alert: AlertItem): NotificationGrammar = NotificationGrammar(
+            observation = alert.summary,
+            evidence = alert.evidenceLine() ?: "Rule ${alert.ruleId} fired",
+            proposal = alert.proposal
+                ?: "Open the decision record for the reasoning, or adjust in the app.",
+            decisionUrl = alert.decisionUrl,
+        )
 
         /** Null when the payload has no top alert to phrase. */
         fun fromGlance(briefing: GlanceBriefing): NotificationGrammar? {

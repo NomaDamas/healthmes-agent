@@ -1,4 +1,4 @@
-# XcodeGen spec for the HealthMes iOS/watchOS companion (GitHub issue #7).
+# XcodeGen spec for the HealthMes iOS/watchOS companion (issues #7 + #10).
 #
 # Regenerate the project after editing this file or adding sources:
 #   brew install xcodegen        # once
@@ -8,10 +8,17 @@
 # CODE_SIGNING_ALLOWED=NO and never configure signing identities in this
 # repo (see README.md). The generated .xcodeproj and Support/ files are
 # derived artifacts and gitignored.
+#
+# Source layout rule (issue #11 prep): Sources/Shared is platform-agnostic
+# (Foundation+Security only — models, clients, formatting, pairing; NO
+# UIKit/SwiftUI/ActivityKit imports) so the macOS glance surface can compile
+# those files verbatim. Sources/SharedActivity is the iOS-only ActivityKit
+# attributes shared between the app and its widget extension.
 name: HealthMesCompanion
 options:
   bundleIdPrefix: com.healthmes
   createIntermediateGroups: true
+  developmentLanguage: en
   deploymentTarget:
     iOS: "17.0"
     watchOS: "10.0"
@@ -19,19 +26,24 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "0.2.0"
     CURRENT_PROJECT_VERSION: "1"
 
 targets:
   # ---------------------------------------------------------------- iOS app
-  # One pairing screen: base URL + bearer token of the user's own healthmes
-  # instance. Local-first: that URL is the only network destination.
+  # Full companion app (issue #10): briefing home, weekly report, capture
+  # shortcuts, real proposal actions, native notifications (BGAppRefreshTask
+  # + UNUserNotificationCenter), focus-block Live Activity, in-app decision
+  # viewer. Local-first: the paired base URL is the only network destination.
   HealthMesCompanion:
     type: application
     platform: iOS
     sources:
       - Sources/Shared
+      - Sources/SharedActivity
       - Sources/App
+      - path: Resources
+        buildPhase: resources
     dependencies:
       - target: HealthMesWidgets
     settings:
@@ -45,11 +57,38 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         ITSAppUsesNonExemptEncryption: false
-        # Same rationale as apps/android-usage usesCleartextTraffic: the
-        # typical pairing target is http://<LAN-IP>:8100 on the user's own
-        # network. Prefer HTTPS for anything reachable beyond the LAN.
+        CFBundleLocalizations: [en, ko]
+        # Deep links from widgets / Live Activity / notification routing:
+        # healthmes://decision?url=…, healthmes://proposal?id=…,
+        # healthmes://capture, healthmes://report (AppRouter validates the
+        # decision host against the pairing).
+        CFBundleURLTypes:
+          - CFBundleURLName: com.healthmes.companion
+            CFBundleURLSchemes: [healthmes]
+        # Native alert loop: BGAppRefreshTask polls /v1/alerts (OS-throttled;
+        # README documents the honesty story — Telegram stays guaranteed).
+        UIBackgroundModes: [fetch]
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.healthmes.companion.refresh
+        # Capture shortcuts (photos re-encoded to JPEG, voice memos to m4a;
+        # bytes go only to the paired instance's POST /v1/media).
+        NSCameraUsageDescription: >-
+          Photos of meals or medication are uploaded only to your own
+          HealthMes instance.
+        NSMicrophoneUsageDescription: >-
+          Voice memos are uploaded only to your own HealthMes instance.
+        # Focus-block Live Activity (polling-updated; no push channel).
+        NSSupportsLiveActivities: true
+        NSSupportsLiveActivitiesFrequentUpdates: false
+        # LAN-HTTP exception SCOPED to local networking instead of disabling
+        # ATS globally: the typical pairing target is http://<LAN-IP>:8100 —
+        # ATS never applies to IP-literal URLs anyway, and
+        # NSAllowsLocalNetworking covers .local / unqualified hostnames
+        # (localhost included). Plain HTTP to a qualified public DNS name
+        # fails CLOSED (use HTTPS there) — the bearer token / tokenized
+        # viewer URLs must never cross an untrusted network in clear text.
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
     entitlements:
       path: Support/HealthMesCompanion.entitlements
       properties:
@@ -57,11 +96,14 @@ targets:
           - group.com.healthmes.companion
 
   # ------------------------------------------- iOS home + lock-screen widgets
+  # Also hosts the focus-block Live Activity UI (ActivityKit renders live
+  # activities from the widget extension).
   HealthMesWidgets:
     type: app-extension
     platform: iOS
     sources:
       - Sources/Shared
+      - Sources/SharedActivity
       - Sources/SharedWidget
       - Sources/Widgets
     settings:
@@ -75,8 +117,10 @@ targets:
         CFBundleDisplayName: HealthMes Glance
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        NSSupportsLiveActivities: true
+        # Scoped like the app target: LAN/.local HTTP only, no global ATS off.
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
     entitlements:
       path: Support/HealthMesWidgets.entitlements
       properties:
@@ -108,8 +152,9 @@ targets:
         WKApplication: true
         WKCompanionAppBundleIdentifier: com.healthmes.companion
         WKRunsIndependentlyOfCompanionApp: true
+        # Scoped like the app target: LAN/.local HTTP only, no global ATS off.
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
     entitlements:
       path: Support/HealthMesWatchApp.entitlements
       properties:
@@ -135,8 +180,9 @@ targets:
         CFBundleDisplayName: HealthMes Energy
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        # Scoped like the app target: LAN/.local HTTP only, no global ATS off.
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
     entitlements:
       path: Support/HealthMesWatchWidgets.entitlements
       properties:
@@ -145,13 +191,15 @@ targets:
 
   # ------------------------------------------------------------------ tests
   # Host-less unit-test bundle: compiles Sources/Shared directly, so the
-  # GlanceClient contract tests run without launching any app.
+  # contract/request-builder/grammar tests run without launching any app.
   HealthMesCompanionTests:
     type: bundle.unit-test
     platform: iOS
     sources:
       - Sources/Shared
-      - path: Tests/GlanceClientTests.swift
+      - path: Tests
+        excludes:
+          - Fixtures
       - path: Tests/Fixtures
         buildPhase: resources
     settings:
@@ -159,6 +207,25 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.tests
     info:
       path: Support/HealthMesCompanionTests-Info.plist
+      properties: {}
+
+  # End-to-end UI tests (daily-loop acceptance): launch the app, tab through
+  # briefing/report/capture, apply a proposal against the REAL endpoints.
+  # They XCTSkip themselves when no paired live instance answers, so plain
+  # CI runs stay green without a server (see README "Live smoke test").
+  HealthMesCompanionUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - UITests
+    dependencies:
+      - target: HealthMesCompanion
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.uitests
+        TEST_TARGET_NAME: HealthMesCompanion
+    info:
+      path: Support/HealthMesCompanionUITests-Info.plist
       properties: {}
 
 schemes:
@@ -169,6 +236,7 @@ schemes:
     test:
       targets:
         - HealthMesCompanionTests
+        - HealthMesCompanionUITests
   HealthMesWatchApp:
     build:
       targets:

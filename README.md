@@ -116,11 +116,13 @@ Telegram (phone + watch)          decision viewer (web)
   encrypted pairing), `:companion` (home/lock-screen Glance widget, 15-min
   WorkManager refresh, a notification channel rendering the PLAN §8.5
   grammar) and `:wear` (Wear OS tile + energy complication, on-watch
-  pairing).
+  pairing) — `:companion` has since been promoted to the full phone app
+  (issue #10, matrix below).
 - iOS/watchOS companion ([`apps/ios-companion/`](apps/ios-companion/)):
   XcodeGen project — SwiftUI pairing app (Keychain token, WatchConnectivity
   push to the watch), WidgetKit home + lock-screen widgets, watchOS app and
   accessory complications. Simulator-verified builds and tests; no signing.
+  Since grown into the full iOS app (issue #10, matrix below).
 - Local-first throughout: the apps pair with **your own** healthmes instance
   (base URL + bearer token) and talk to nothing else; polling only, no
   APNs/FCM relay — Telegram remains the reliable push channel. All
@@ -141,6 +143,34 @@ Telegram (phone + watch)          decision viewer (web)
   the provider refuses to upload anything that is not an age envelope.
   `healthmes backup push` / `--provider remote` / weekly-job selector
   (`HEALTHMES_BACKUP_PROVIDER`) — see [`docs/BACKUP.md`](docs/BACKUP.md).
+
+**Full native apps & desktop glance surfaces (issues #10–#11)**
+
+The glance plumbing above grew into five surfaces, all speaking the same
+contracts (`GET /v1/briefing/glance` with ETag/304, `GET /v1/alerts`,
+`/reports/weekly.json`, the §8.5 notification grammar, capture via
+`POST /v1/media` + food/medical endpoints) against the **paired instance
+only** — no third-party SDKs, no analytics, no push relay (polling only;
+Telegram stays the guaranteed-delivery channel). Visuals stay
+placeholder-labeled for the domain expert
+(`docs/design/WATCH-NOTIFICATIONS.ko.md`); information architecture and
+plumbing are real and tested.
+
+| Surface | Where | What | Build & test |
+|---|---|---|---|
+| Android phone + Wear OS | [`apps/android-usage/`](apps/android-usage/) | full Compose app — briefing home + 24h curve, weekly report, camera/voice capture, real ✅/✏️/❌ proposal actions, focus-block ongoing notification bridged to the watch; widgets, Wear tile/complication, `:app` usage collector | `cd apps/android-usage && ./gradlew assembleDebug test` |
+| iOS + watchOS | [`apps/ios-companion/`](apps/ios-companion/) | full SwiftUI app — briefing home, weekly report, in-app decision viewer, capture, §8.5 notifications with real actions (BGAppRefreshTask), focus-block Live Activity; home/lock widgets, watch app + complications | `cd apps/ios-companion && xcodegen generate && xcodebuild test …` (README) |
+| macOS | [`apps/macos-companion/`](apps/macos-companion/) | menu bar score + popover briefing with real proposal actions, WidgetKit widgets, ambient screensaver (`.saver`) with privacy toggle | `cd apps/macos-companion && xcodegen generate && xcodebuild test …` (README) |
+| Windows | [`apps/windows-companion/`](apps/windows-companion/) | tray icon + flyout + §8.5 toasts, screensaver (`.scr`) with privacy toggle, widgets-board card builder (provider deferred — needs MSIX signing) | `dotnet build HealthMes.Companion.sln && dotnet test …` (windows-latest CI) |
+| Web (no new UI) | served by healthmes + vendored Hermes web console | decision-viewer flowcharts + weekly report page (the tokenized links every app opens), chat/admin console | part of the Python service (`make mac-test`) |
+
+Accessibility (VoiceOver / TalkBack / keyboard+Narrator basics, Dynamic
+Type) and Korean + English localization ship on every surface. Contract
+drift is pinned server-side: `tests/api/test_glance_fixtures.py` validates
+each platform's glance/alerts/weekly fixtures against the live pydantic
+models, so a schema change fails CI before any app breaks. Per-surface
+honest verification status (proven by build/test vs. still needs real
+hardware) lives in each app's README.
 
 **Skills** (`skills/`, copied into the Hermes home by bootstrap):
 `healthmes-planner` (goal dump → task breakdown → energy-aware block
@@ -226,8 +256,10 @@ export HEALTHMES_BACKUP_PROVIDER=remote_vault    # weekly job replicates too
 - `healthmes/` — the glue service: `store/`, `engine/`, `calendars/`,
   `mcp_server/`, `api/`, `backup/`
 - `skills/` — Hermes skills
-- `apps/android-usage/` — usage collector + Android/Wear OS companion
-  modules; `apps/ios-companion/` — iOS/watchOS companion
+- `apps/` — native companions: `android-usage/` (usage collector + phone/
+  Wear OS apps), `ios-companion/` (iOS/watchOS), `macos-companion/` (menu
+  bar + widgets + screensaver), `windows-companion/` (tray + screensaver,
+  .NET 8)
 - `config/`, `scripts/`, `alembic/`, `tests/`, `docs/`
 - `vendor/hermes-agent/`, `vendor/open-wearables/` — read-only upstreams,
   never modified

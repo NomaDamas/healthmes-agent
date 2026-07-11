@@ -8,9 +8,9 @@ that phone home.
 | Module | What it is | Docs |
 |---|---|---|
 | `:app` | Usage collector (docs/PLAN.md §7): hourly app-usage buckets → `POST /v1/app-usage/batch` | [below](#app--usage-collector) |
-| `:companion` | Phone briefing surfaces (issue #7): Glance home-screen widget + §8.5-grammar alert notifications from `GET /v1/briefing/glance` | [below](#companion--briefing-widget--alert-notifications) |
+| `:companion` | Full phone companion app (issue #10, promoted from the issue #7 widget host): Compose briefing home + weekly report + capture + proposal actions, plus the Glance widget and §8.5-grammar alert notifications with REAL buttons | [below](#companion--full-companion-app) |
 | `:wear` | Wear OS briefing surfaces (issue #7): ProtoLayout tile + energy-score complication from the same endpoint | [below](#wear--wear-os-tile--complication) |
-| `:shared` | Library used by `:companion`/`:wear`: glance contract parser, ETag-aware fetch client, display-state mapper, encrypted pairing prefs | — |
+| `:shared` | Library used by `:companion`/`:wear`: glance contract parser, ETag-aware fetch client, display-state mapper, encrypted pairing prefs, plus the issue #10 app-surface contracts (alerts page, weekly report, proposals, media upload/capture bodies) and the bearer `HealthmesApi` client | — |
 
 `:app` predates the briefing work and stays self-contained; `:shared`
 deliberately *duplicates* its pairing-prefs pattern instead of importing it.
@@ -26,7 +26,7 @@ via `ANDROID_HOME` or `local.properties`.
 |---|---|---|---|---|---|
 | `:app` | phone app | 26 | WorkManager 2.9.1, security-crypto | `:app:assembleDebug` | `:app:testDebugUnitTest` (hourly bucketing) |
 | `:shared` | library | 26 | security-crypto, org.json (platform) | `:shared:assembleDebug` | tested via `:companion` |
-| `:companion` | phone app | 26 | Glance 1.1.1, WorkManager 2.9.1 | `:companion:assembleDebug` | `:companion:testDebugUnitTest` (contract parser, state mapper, notification grammar) |
+| `:companion` | phone app | 26 | Compose BOM 2024.10.01 (material3), activity-compose 1.9.3, browser 1.8.0, Glance 1.1.1, WorkManager 2.9.1 | `:companion:assembleDebug` | `:companion:testDebugUnitTest` (glance/alerts/report/proposals contract parsers, state mapper, notification grammar + action plan, proposal-action logic, multipart upload bodies, curve geometry, focus-block selection) |
 | `:wear` | Wear OS app | 30 | tiles 1.4.1, protolayout 1.2.1, watchface-complications-data-source 1.2.1 | `:wear:assembleDebug` | — (logic lives in `:shared`, tested via `:companion`) |
 
 ```bash
@@ -38,38 +38,75 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 # wear-debug.apk installs to a Wear OS emulator/watch the same way
 ```
 
-## `:companion` — briefing widget + alert notifications
+## `:companion` — full companion app
 
-Glanceable surfaces for the agent's briefing (issue #7), fed by
-`GET /v1/briefing/glance` (`healthmes/api/briefing.py` — energy score +
-confidence + 24 h curve, up to 3 next blocks, unresolved-alert digest,
-decision-viewer URLs):
+The full phone app of issue #10 (single-activity Compose, five tabs), grown
+from the issue #7 widget host. Every network call still goes to the paired
+HealthMes instance only; there is no push relay by design (notifications are
+derived from 15-minute polling — Telegram stays the guaranteed-delivery
+channel).
 
-- **Home-screen widget** (Glance/AppWidget, `widgetCategory` includes
-  `keyguard` for hosts that offer lock-screen widgets). Small (2x1) shows the
-  energy score, confidence, and alert count; resized larger it adds the next
-  block and the top alert summary. Rendering is cache-only — it never fetches.
-- **15-minute refresh** (WorkManager periodic, network-constrained,
-  exponential backoff) that honors the endpoint's caching contract: it sends
-  `If-None-Match` with the cached strong ETag and keeps the cached payload on
-  `304` (`Cache-Control: private, max-age=300`).
-- **Alert notifications** on a dedicated channel, rendered in the docs/PLAN.md
-  §8.5 grammar: observation (title) / evidence / proposal (BigText), stub
-  action buttons (Apply / Adjust / Keep as is), and a tap-through deep link to
-  the decision viewer URL (viewer token already embedded by the server).
-  **Placeholder trigger logic**: a notification fires when
-  `alerts.unresolved_count` rises between two polls (first fetch only sets the
-  baseline — PLAN.md §11 treats alert noise as the top product risk). Real
-  server-push alerts and real button actions are future work, and the wording
-  rules belong to the healthcare domain expert
-  (docs/design/WATCH-NOTIFICATIONS.ko.md).
-- **Pairing screen** = the launcher activity: server URL + token, refresh now,
-  clear pairing, and a status readout.
+- **Briefing home**: energy score + confidence + relative freshness, the 24 h
+  curve drawn from `curve_24h` with real gaps for `null` hours (never
+  interpolated), the next blocks (≤3, with energy demand + proposal tag), the
+  24 h alert history from `GET /v1/alerts` rendered in §8.5 slots
+  (observation / evidence facts / proposal / "why this?" link), and the
+  latest-decision link.
+- **Weekly report**: native rendering of `GET /reports/weekly.json`
+  (energy per-day trend with honest "—" days, insights with confidence
+  badges, schedule adherence, alert digest per rule, decision links), plus an
+  "open web version" button on the tokenized `report_url`.
+- **Decision viewer**: tokenized viewer URLs open in Custom Tabs
+  (native back/share); on browserless devices an in-app WebView screen with
+  back + share takes over. JavaScript stays on for the Mermaid trees.
+- **Capture**: photo (ACTION_IMAGE_CAPTURE via FileProvider, or the photo
+  picker — deliberately no CameraX/no CAMERA permission) and voice memo
+  (MediaRecorder → audio/mp4) → `POST /v1/media` (multipart `file` field) →
+  `POST /v1/food-logs` or `POST /v1/medical-records` with an editable
+  description — the same contracts the Telegram capture skill uses. The
+  medical health-context snapshot is attached **server-side**; the app sends
+  capture metadata only (`context.source = "android-companion"`).
+- **Real §8.5 notification actions**: ✅ Apply / ❌ Keep as is enqueue a
+  one-shot WorkManager job that resolves the pending schedule proposal and
+  calls `POST /v1/schedule/proposals/{id}/accept|decline` with the bearer
+  client. Because alerts carry no proposal id yet (server-side linkage gap),
+  the worker acts only when exactly ONE proposal is pending; zero or 2+ route
+  into the app instead of guessing (PLAN.md §11). Second taps render the
+  server's 409 `invalid_transition` as "already resolved". ✏️ Adjust
+  deep-links into the proposals screen; notification content tap opens the
+  decision viewer in-app. Notification *content* prefers the real fire-time
+  grammar lines from `GET /v1/alerts` over the glance-derived filler.
+- **Ongoing focus block**: while a `next_blocks` entry is active, a quiet
+  ongoing notification shows the block title and counts down to its end.
+  Battery-honest: no foreground service — the 15-minute poll posts it, the
+  OS chronometer ticks it, and `setTimeoutAfter` clears it at block end even
+  if no poll runs. Wear OS bridges it to the watch by default, which is the
+  current wrist story for the running block (see the Wear section).
+- **Alert *trigger* still placeholder**: a notification fires when
+  `alerts.unresolved_count` rises between two polls (first fetch only sets
+  the baseline — PLAN.md §11 treats alert noise as the top product risk).
+- **Widget + refresh** unchanged from issue #7: cache-only Glance widget,
+  15-minute ETag-honoring WorkManager refresh (`If-None-Match`, 304 keeps
+  the cache).
+- **Settings tab** = the old pairing screen (server URL + token in
+  `EncryptedSharedPreferences`, refresh now, clear pairing, status readout).
+- **Accessibility & i18n**: TalkBack contentDescriptions on the score
+  ("Cognitive energy 72 out of 100, confidence medium"), curve, day rows and
+  icon buttons; sp-based Material3 typography follows system font scaling;
+  full English (default) + Korean (`values-ko`) string resources.
+- **Placeholder visuals**: layout/colors/thresholds are engineering defaults
+  labeled in code — the final glanceable grammar belongs to the healthcare
+  domain expert (docs/design/WATCH-NOTIFICATIONS.ko.md).
 
-The wire contract is pinned by fixtures
-(`companion/src/test/resources/glance_full.json` / `glance_empty.json`) that
-mirror the server tests' payload shape; `GlanceBriefingParserTest`,
-`BriefingDisplayStateTest`, and `NotificationGrammarTest` run on the JVM.
+The wire contracts are pinned by fixtures that mirror the server tests'
+payload shapes (`glance_full.json`/`glance_empty.json`, `alerts_page.json`,
+`weekly_report.json`) — `alerts_page.json`'s top item deliberately agrees
+with `glance_full.json`'s top alert, mirroring the server-side pin that
+`alerts[0]` and glance `alerts.top` never disagree. JVM suites:
+`GlanceBriefingParserTest`, `BriefingDisplayStateTest`,
+`NotificationGrammarTest`, `AlertsFeedParserTest`, `WeeklyReportParserTest`,
+`ProposalActionLogicTest`, `NotificationActionPlanTest`,
+`MultipartEncodingTest`, `FocusBlockLogicTest`, `CurveGeometryTest`.
 
 ## `:wear` — Wear OS tile + complication
 
@@ -113,22 +150,34 @@ haptics — is deliberately reserved for the healthcare domain expert:
 
 ## Device caveats (honest status)
 
-- **Widgets/tiles/complications have not been exercised on real hardware
-  yet.** `assembleDebug` compiles all modules and the JVM tests pass, but
-  adding the widget to a launcher, tile/complication rendering on a watch,
-  OEM battery-manager behavior toward the 15-min job, and a live fetch against
-  a real instance still need a manual pass (phone + Wear OS emulator or
-  device).
+- **The app/widget/tile/complication surfaces have not been exercised on
+  real hardware yet.** `assembleDebug` compiles all modules and the JVM
+  tests pass, but adding the widget to a launcher, the Compose flows
+  (capture launchers, MediaRecorder, Custom Tabs), tile/complication
+  rendering on a watch, OEM battery-manager behavior toward the 15-min job,
+  and a live fetch against a real instance still need a manual pass (phone +
+  Wear OS emulator or device).
 - Lock-screen widget availability depends on the host (Android 15+ / certain
   hosts); `home_screen` placement is the baseline.
-- Notifications need `POST_NOTIFICATIONS` (requested by the pairing screen on
-  API 33+); the §8.5 buttons are stubs that dismiss and point to Telegram.
+- Notifications need `POST_NOTIFICATIONS` (requested by the Settings tab on
+  API 33+). The §8.5 buttons are REAL now (schedule-proposal
+  accept/decline), but because alerts carry no proposal id yet the buttons
+  act only on an unambiguous single pending proposal — otherwise they route
+  into the app. The alert *trigger* remains the rising-count polling
+  heuristic; there is deliberately no push relay (Telegram = guaranteed
+  channel).
+- The ongoing focus-block notification relies on `setTimeoutAfter` +
+  chronometer countdown; some OEM skins render chronometer countdowns
+  inconsistently — needs the hardware pass.
 - Wear OS enforces its own budgets: complication updates are throttled to the
   manifest period at best, and tile freshness is at the renderer's discretion.
 - Issue #7's Wear scope item **"ongoing activity for the current focus
-  block"** is not implemented yet (no `androidx.wear.ongoing` usage) —
-  deferred, like its iOS twin (Live Activities / Dynamic Island), until the
-  domain expert's watch UX pass (docs/design/WATCH-NOTIFICATIONS.ko.md).
+  block"** is now covered at the interaction level by the phone's ongoing
+  focus-block notification, which Wear OS bridges to the watch by default
+  (no `setLocalOnly` is set on it). A *native* on-watch
+  `androidx.wear.ongoing` OngoingActivity (watch-face chip etc.) remains
+  deferred to the domain expert's watch UX pass, like its iOS twin
+  (docs/design/WATCH-NOTIFICATIONS.ko.md).
 - Cleartext HTTP is enabled in all modules because the typical target is
   `http://<LAN-IP>:8100` on your own network; prefer HTTPS beyond your LAN.
 
@@ -286,11 +335,22 @@ shared/src/main/kotlin/com/healthmes/briefing/
 ├── BriefingDisplayState.kt   # payload → glanceable state (JVM unit-tested)
 └── PairingPrefs.kt           # base URL + token + payload cache (encrypted)
 
+shared/src/main/kotlin/com/healthmes/api/     # issue #10 app surface
+├── HealthmesApi.kt           # bearer client (GET / POST json / multipart) + Multipart encoder
+├── ApiContracts.kt           # error envelope, Page meta, media-upload result
+├── AlertsFeed.kt             # GET /v1/alerts page (§8.5 grammar lines)
+├── WeeklyReport.kt           # GET /reports/weekly.json model + parser
+├── Proposals.kt              # GET /v1/schedule/proposals + action paths
+└── CaptureRequests.kt        # POST /v1/food-logs & /v1/medical-records bodies
+
 companion/src/main/kotlin/com/healthmes/companion/
-├── PairingActivity.kt        # pairing + status screen
+├── MainActivity.kt           # THE activity (singleTask; deep-link extras)
+├── ui/                       # Compose app: home / report / capture /
+│                             #   proposals / settings, curve, decision viewer
 ├── widget/                   # Glance widget (small/medium) + receiver
-├── work/                     # 15-min WorkManager refresh (ETag-honoring)
-└── notify/                   # §8.5 grammar channel + stub action buttons
+├── work/                     # 15-min refresh + one-shot proposal actions
+└── notify/                   # §8.5 alert channel (real buttons), action
+                              #   results, ongoing focus block
 
 wear/src/main/kotlin/com/healthmes/wear/
 ├── WearPairingActivity.kt    # on-watch pairing
@@ -310,16 +370,22 @@ app/src/main/kotlin/com/healthmes/usagecollector/
 ## Verification status
 
 - **Compiles & unit tests pass**: `./gradlew clean :companion:assembleDebug
-  :wear:assembleDebug :companion:testDebugUnitTest :app:assembleDebug
-  :app:testDebugUnitTest` was run at authoring time (Gradle 8.9, AGP 8.7.3,
-  Kotlin 2.0.21, JDK 21, SDK platform 35) — all four APKs build,
-  `HourlyBucketerTest` 13/13 and the `:companion` contract/mapper/grammar
-  suites 20/20 green.
+  :companion:testDebugUnitTest :wear:assembleDebug :app:assembleDebug
+  :app:testDebugUnitTest` was run at authoring time of the issue #10 wave
+  (Gradle 8.9, AGP 8.7.3, Kotlin 2.0.21, Compose BOM 2024.10.01, JDK 21,
+  SDK platform 35) — all four APKs build, `HourlyBucketerTest` 13/13 and the
+  ten `:companion` JVM suites (62 tests: contract parsers for
+  glance/alerts/report/proposals, display mapper, notification grammar +
+  action plan, proposal-action logic, multipart upload bodies, curve
+  geometry, focus-block selection) green.
 - **Server contracts covered**: the ingest payload example above is replayed
   against the real endpoint by `tests/api/test_android_readme_contract.py`;
-  the glance fixtures mirror `tests/api/test_briefing.py`.
+  the glance fixtures mirror `tests/api/test_briefing.py`; the alerts/report
+  fixtures mirror the `GET /v1/alerts` and `GET /reports/weekly.json`
+  contracts (healthmes/api/alerts.py, healthmes/api/reports.py), including
+  the alerts[0]-equals-glance-top pin.
 - **Not exercised on a device**: see
-  [Device caveats](#device-caveats-honest-status) for the widget/tile/
+  [Device caveats](#device-caveats-honest-status) for the app/widget/tile/
   complication/notification hardware pass that is still owed, plus the
   collector's usage-access onboarding flow and WorkManager behavior under OEM
   battery managers.

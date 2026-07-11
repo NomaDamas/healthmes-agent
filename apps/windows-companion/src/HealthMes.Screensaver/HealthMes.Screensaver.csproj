@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Ambient briefing screensaver (issue #11): energy score + 24h curve +
+    next block + gentle alert count, with an honest "not paired / no data"
+    state and the privacy toggle (hide health numbers) read from the shared
+    settings file on every refresh.
+
+    A Windows screensaver is just an exe renamed to .scr that honors the
+    /s /p /c argument contract (ScreensaverLaunch in HealthMes.Glance.Core).
+    The renamed apphost still finds HealthMes.Screensaver.dll because the
+    managed entry path is embedded at build time — CI publishes the folder
+    and renames the exe (see .github/workflows/windows-apps.yml); install by
+    right-clicking the .scr next to its DLLs and choosing "Install".
+  -->
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <RootNamespace>HealthMes.Screensaver</RootNamespace>
+    <AssemblyName>HealthMes.Screensaver</AssemblyName>
+    <!-- Only for the [LibraryImport] source-generated marshalling stubs
+         (SetParent/GetClientRect) — no hand-written unsafe code here. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../HealthMes.Glance.Core/HealthMes.Glance.Core.csproj" />
+    <ProjectReference Include="../HealthMes.Windows.Common/HealthMes.Windows.Common.csproj" />
+  </ItemGroup>
+
+</Project>

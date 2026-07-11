@@ -7,7 +7,8 @@ the decision pages at ``/decisions`` (linked from alerts, docs/PLAN.md §8.5),
 the energy forecast at ``/cognitive-energy/forecast`` (docs/PLAN.md §3 — each
 also has a ``/v1`` twin), and the weekly report at ``/reports/weekly``
 (docs/PLAN.md §8.5). The companion-app glance briefing is at
-``/v1/briefing/glance`` (issue #7).
+``/v1/briefing/glance`` (issue #7); the native capture upload/serve pair is
+``/v1/media`` and the alert history ``/v1/alerts`` (issue #10).
 
 Wiring: the app factory calls :func:`include_all`, which installs the shared
 error-envelope handlers and every router below.
@@ -16,6 +17,7 @@ error-envelope handlers and every router below.
 from fastapi import APIRouter, FastAPI
 
 from healthmes.api import (
+    alerts,
     app_usage,
     briefing,
     decisions,
@@ -23,6 +25,7 @@ from healthmes.api import (
     food,
     goals,
     insights,
+    media,
     medical,
     reports,
     schedule,
@@ -39,11 +42,13 @@ routers: list[APIRouter] = [
     schedule.router,
     food.router,
     medical.router,
+    media.router,
     insights.router,
     energy.router,
     decisions.router,
     app_usage.router,
     briefing.router,
+    alerts.router,
     reports.router,
 ]
 

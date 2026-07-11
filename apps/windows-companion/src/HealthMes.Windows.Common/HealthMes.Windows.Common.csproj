@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Windows-only glue shared by the tray app and the screensaver: the
+    DPAPI-protected pairing store, the on-disk glance snapshot cache, the
+    shared settings file (privacy toggle) and the ko/en string resources.
+    Compiles on any OS (EnableWindowsTargeting); runs only on Windows.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>HealthMes.Windows.Common</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- DPAPI (ProtectedData) — Microsoft-published compatibility package. -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../HealthMes.Glance.Core/HealthMes.Glance.Core.csproj" />
+  </ItemGroup>
+
+</Project>

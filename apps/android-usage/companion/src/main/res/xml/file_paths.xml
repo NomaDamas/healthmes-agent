@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider paths for camera capture output. cache-path only: captures
+     are staged in cacheDir/captures/, uploaded to the paired instance
+     (POST /v1/media), and left for the OS to evict. -->
+<paths>
+    <cache-path
+        name="captures"
+        path="captures/" />
+</paths>

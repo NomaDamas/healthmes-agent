@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    System tray glance surface (issue #11): tray icon with the energy score
+    badge, a briefing flyout, §8.5-grammar toast notifications with the
+    decision deep link, DPAPI-protected pairing and 15-minute ETag polling.
+
+    Plain WinForms on purpose — no WinUI/MSIX so the app stays a single
+    unpackaged exe that CI can build and a user can run from anywhere.
+    Compiles on any OS (EnableWindowsTargeting); RUNS only on Windows.
+  -->
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
+    <RootNamespace>HealthMes.Tray</RootNamespace>
+    <AssemblyName>HealthMes.Tray</AssemblyName>
+    <!-- Only for the [LibraryImport] source-generated marshalling stubs
+         (DestroyIcon) — no hand-written unsafe code in this project. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../HealthMes.Glance.Core/HealthMes.Glance.Core.csproj" />
+    <ProjectReference Include="../HealthMes.Windows.Common/HealthMes.Windows.Common.csproj" />
+  </ItemGroup>
+
+</Project>

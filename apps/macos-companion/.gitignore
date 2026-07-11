@@ -1,0 +1,5 @@
+# Derived artifacts — regenerate with `xcodegen generate` (see README.md).
+*.xcodeproj/
+Support/
+build/
+DerivedData/

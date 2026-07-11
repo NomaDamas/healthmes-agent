@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-07-09T14:23:00Z",
+  "timezone": "Asia/Seoul",
+  "week_start": "2026-07-06",
+  "week_end": "2026-07-12",
+  "report_url": "http://192.168.1.20:8100/reports/weekly?token=hm-ro-3q2b8d1f7c6e5a4",
+  "energy": {"note": "deep sections intentionally untyped for the desktop envelope parser"},
+  "insights": {},
+  "schedule": {},
+  "alerts": {},
+  "decisions": {}
+}

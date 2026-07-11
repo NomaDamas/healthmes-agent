@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <!--
+    UI chrome strings (English default; Korean satellite in Strings.ko.resx).
+    NOTE: grammar-line CONTENT (observation/evidence/proposal) comes from the
+    server / NotificationGrammar placeholders and is not translated here —
+    final wording is the domain expert's deliverable
+    (docs/design/WATCH-NOTIFICATIONS.ko.md).
+  -->
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms</value>
+  </resheader>
+  <data name="Menu_OpenBriefing" xml:space="preserve">
+    <value>Open briefing</value>
+  </data>
+  <data name="Menu_Refresh" xml:space="preserve">
+    <value>Refresh now</value>
+  </data>
+  <data name="Menu_OpenWeeklyReport" xml:space="preserve">
+    <value>Open weekly report</value>
+  </data>
+  <data name="Menu_Pairing" xml:space="preserve">
+    <value>Pairing settings…</value>
+  </data>
+  <data name="Menu_HideNumbers" xml:space="preserve">
+    <value>Hide health numbers on screensaver</value>
+  </data>
+  <data name="Menu_Quit" xml:space="preserve">
+    <value>Quit</value>
+  </data>
+  <data name="Pairing_Title" xml:space="preserve">
+    <value>Pair with your healthmes instance</value>
+  </data>
+  <data name="Pairing_BaseUrlLabel" xml:space="preserve">
+    <value>Base URL</value>
+  </data>
+  <data name="Pairing_TokenLabel" xml:space="preserve">
+    <value>API token (optional for loopback)</value>
+  </data>
+  <data name="Pairing_Save" xml:space="preserve">
+    <value>Save</value>
+  </data>
+  <data name="Pairing_Cancel" xml:space="preserve">
+    <value>Cancel</value>
+  </data>
+  <data name="Pairing_InvalidUrl" xml:space="preserve">
+    <value>Enter a valid http(s) URL, e.g. http://192.168.1.20:8100</value>
+  </data>
+  <data name="Pairing_LocalFirstNote" xml:space="preserve">
+    <value>This app only ever talks to the instance you pair here.</value>
+  </data>
+  <data name="Flyout_Title" xml:space="preserve">
+    <value>HealthMes briefing</value>
+  </data>
+  <data name="Flyout_BlocksSection" xml:space="preserve">
+    <value>Next blocks</value>
+  </data>
+  <data name="Flyout_AlertsSection" xml:space="preserve">
+    <value>Alerts</value>
+  </data>
+  <data name="Flyout_WhyThis" xml:space="preserve">
+    <value>Why this?</value>
+  </data>
+  <data name="Flyout_LatestDecision" xml:space="preserve">
+    <value>Latest decision</value>
+  </data>
+  <data name="Flyout_NoBlocks" xml:space="preserve">
+    <value>No upcoming blocks</value>
+  </data>
+  <data name="Flyout_NotPaired" xml:space="preserve">
+    <value>Not paired — open pairing settings.</value>
+  </data>
+  <data name="Flyout_Unauthorized" xml:space="preserve">
+    <value>Token rejected — check pairing settings.</value>
+  </data>
+  <data name="Flyout_Offline" xml:space="preserve">
+    <value>Instance unreachable — showing cached data.</value>
+  </data>
+  <data name="Flyout_UpdatedAt" xml:space="preserve">
+    <value>Updated {0}</value>
+  </data>
+  <data name="Saver_NotPaired" xml:space="preserve">
+    <value>Not paired — no briefing data.</value>
+  </data>
+  <data name="Saver_PrivacyHidden" xml:space="preserve">
+    <value>Health numbers hidden (privacy)</value>
+  </data>
+  <data name="Saver_NextBlockLabel" xml:space="preserve">
+    <value>Next</value>
+  </data>
+  <data name="Settings_Title" xml:space="preserve">
+    <value>HealthMes screensaver settings</value>
+  </data>
+  <data name="Settings_HideNumbers" xml:space="preserve">
+    <value>Hide health numbers (shared spaces / screen sharing)</value>
+  </data>
+  <data name="Settings_PairedWith" xml:space="preserve">
+    <value>Paired with: {0}</value>
+  </data>
+  <data name="Settings_NotPaired" xml:space="preserve">
+    <value>Not paired. Pair from the HealthMes tray app.</value>
+  </data>
+  <data name="Settings_OK" xml:space="preserve">
+    <value>OK</value>
+  </data>
+  <data name="Settings_Cancel" xml:space="preserve">
+    <value>Cancel</value>
+  </data>
+  <data name="Toast_WhyThisLink" xml:space="preserve">
+    <value>Why this? Click to open the decision record.</value>
+  </data>
+  <data name="Confidence_High" xml:space="preserve">
+    <value>high</value>
+  </data>
+  <data name="Confidence_Medium" xml:space="preserve">
+    <value>medium</value>
+  </data>
+  <data name="Confidence_Low" xml:space="preserve">
+    <value>low</value>
+  </data>
+  <data name="Ax_EnergyScore" xml:space="preserve">
+    <value>Cognitive energy {0}, confidence {1}</value>
+  </data>
+  <data name="Ax_EnergyScoreMissing" xml:space="preserve">
+    <value>Cognitive energy unknown, confidence {0}</value>
+  </data>
+  <data name="Ax_Sparkline" xml:space="preserve">
+    <value>24-hour energy curve; hours without data are blank</value>
+  </data>
+  <data name="Ax_TrayIcon" xml:space="preserve">
+    <value>HealthMes briefing tray icon</value>
+  </data>
+</root>

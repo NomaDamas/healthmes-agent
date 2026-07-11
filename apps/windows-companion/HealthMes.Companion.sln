@@ -1,0 +1,64 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{60C9E02C-5A99-4904-8D5A-D290F9FC5A6B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HealthMes.Glance.Core", "src\HealthMes.Glance.Core\HealthMes.Glance.Core.csproj", "{FC2B4596-4BC6-424B-981D-D1240FAC59B0}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HealthMes.Windows.Common", "src\HealthMes.Windows.Common\HealthMes.Windows.Common.csproj", "{F8615FB5-CF28-43F9-8F4F-84582B57AD6D}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HealthMes.Widgets", "src\HealthMes.Widgets\HealthMes.Widgets.csproj", "{8D474A24-35FE-4413-AEB9-F79B75A80E4C}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{F350ACA8-2CDC-4B2B-B219-6CA20F36C4A3}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HealthMes.Glance.Core.Tests", "tests\HealthMes.Glance.Core.Tests\HealthMes.Glance.Core.Tests.csproj", "{AE3C6FCA-5642-4A5F-9CC2-8306A7508BAD}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HealthMes.Tray", "src\HealthMes.Tray\HealthMes.Tray.csproj", "{DDB17D89-02F5-42C4-8114-B1A50A7A3D76}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HealthMes.Screensaver", "src\HealthMes.Screensaver\HealthMes.Screensaver.csproj", "{0707E351-F358-4DF9-99E8-D862915017CA}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{FC2B4596-4BC6-424B-981D-D1240FAC59B0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{FC2B4596-4BC6-424B-981D-D1240FAC59B0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{FC2B4596-4BC6-424B-981D-D1240FAC59B0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{FC2B4596-4BC6-424B-981D-D1240FAC59B0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F8615FB5-CF28-43F9-8F4F-84582B57AD6D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F8615FB5-CF28-43F9-8F4F-84582B57AD6D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F8615FB5-CF28-43F9-8F4F-84582B57AD6D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F8615FB5-CF28-43F9-8F4F-84582B57AD6D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8D474A24-35FE-4413-AEB9-F79B75A80E4C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8D474A24-35FE-4413-AEB9-F79B75A80E4C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8D474A24-35FE-4413-AEB9-F79B75A80E4C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8D474A24-35FE-4413-AEB9-F79B75A80E4C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AE3C6FCA-5642-4A5F-9CC2-8306A7508BAD}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AE3C6FCA-5642-4A5F-9CC2-8306A7508BAD}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AE3C6FCA-5642-4A5F-9CC2-8306A7508BAD}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AE3C6FCA-5642-4A5F-9CC2-8306A7508BAD}.Release|Any CPU.Build.0 = Release|Any CPU
+		{DDB17D89-02F5-42C4-8114-B1A50A7A3D76}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DDB17D89-02F5-42C4-8114-B1A50A7A3D76}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DDB17D89-02F5-42C4-8114-B1A50A7A3D76}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DDB17D89-02F5-42C4-8114-B1A50A7A3D76}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0707E351-F358-4DF9-99E8-D862915017CA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0707E351-F358-4DF9-99E8-D862915017CA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0707E351-F358-4DF9-99E8-D862915017CA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0707E351-F358-4DF9-99E8-D862915017CA}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{FC2B4596-4BC6-424B-981D-D1240FAC59B0} = {60C9E02C-5A99-4904-8D5A-D290F9FC5A6B}
+		{F8615FB5-CF28-43F9-8F4F-84582B57AD6D} = {60C9E02C-5A99-4904-8D5A-D290F9FC5A6B}
+		{8D474A24-35FE-4413-AEB9-F79B75A80E4C} = {60C9E02C-5A99-4904-8D5A-D290F9FC5A6B}
+		{AE3C6FCA-5642-4A5F-9CC2-8306A7508BAD} = {F350ACA8-2CDC-4B2B-B219-6CA20F36C4A3}
+		{DDB17D89-02F5-42C4-8114-B1A50A7A3D76} = {60C9E02C-5A99-4904-8D5A-D290F9FC5A6B}
+		{0707E351-F358-4DF9-99E8-D862915017CA} = {60C9E02C-5A99-4904-8D5A-D290F9FC5A6B}
+	EndGlobalSection
+EndGlobal

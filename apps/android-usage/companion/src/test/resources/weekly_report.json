@@ -1,0 +1,74 @@
+{
+  "generated_at": "2026-07-09T05:30:00Z",
+  "timezone": "Asia/Seoul",
+  "week_start": "2026-07-03",
+  "week_end": "2026-07-09",
+  "report_url": "http://192.168.1.20:8100/reports/weekly?token=viewer-abc123",
+  "energy": {
+    "days": [
+      {"date": "2026-07-03", "avg_score": 61, "min_score": 44, "max_score": 78, "samples": 10},
+      {"date": "2026-07-04", "avg_score": 66, "min_score": 52, "max_score": 80, "samples": 12},
+      {"date": "2026-07-05", "avg_score": null, "min_score": null, "max_score": null, "samples": 0},
+      {"date": "2026-07-06", "avg_score": 58, "min_score": 40, "max_score": 71, "samples": 9},
+      {"date": "2026-07-07", "avg_score": 63, "min_score": 51, "max_score": 77, "samples": 11},
+      {"date": "2026-07-08", "avg_score": 70, "min_score": 55, "max_score": 84, "samples": 12},
+      {"date": "2026-07-09", "avg_score": 72, "min_score": 64, "max_score": 78, "samples": 4}
+    ],
+    "overall_avg": 65,
+    "samples": 58
+  },
+  "insights": {
+    "count": 2,
+    "items": [
+      {
+        "id": "9a1a7c2e-4b8d-4f0a-9c7e-5b2d1a0f9e8d",
+        "period": "week",
+        "kind": "correlation",
+        "statement": "Afternoon focus dips follow nights with under 40 minutes of deep sleep.",
+        "confidence": 0.82,
+        "confidence_level": "high",
+        "created_at": "2026-07-08T21:00:00Z"
+      },
+      {
+        "id": "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e",
+        "period": "week",
+        "kind": "pattern",
+        "statement": "Stress peaks around 14:00 on meeting-heavy days.",
+        "confidence": null,
+        "confidence_level": "none",
+        "created_at": "2026-07-07T21:00:00Z"
+      }
+    ]
+  },
+  "schedule": {
+    "proposed": 2,
+    "accepted": 3,
+    "pushed": 1,
+    "declined": 1,
+    "decided": 5,
+    "acceptance_pct": 80
+  },
+  "alerts": {
+    "fired": 9,
+    "delivered": 6,
+    "daily_budget": 8,
+    "weekly_budget": 56,
+    "by_rule": [
+      {"rule_id": "stress_spike_vs_baseline", "fired": 4, "delivered": 3},
+      {"rule_id": "deadline_risk", "fired": 5, "delivered": 3}
+    ]
+  },
+  "decisions": {
+    "count": 3,
+    "kind_counts": {"alert": 2, "schedule_change": 1},
+    "items": [
+      {
+        "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "kind": "alert",
+        "summary": "Moved deep work off a low-recovery afternoon",
+        "created_at": "2026-07-09T05:00:00Z",
+        "url": "http://192.168.1.20:8100/decisions/7c9e6679-7425-40de-944b-e07fc1f90ae7?token=viewer-abc123"
+      }
+    ]
+  }
+}

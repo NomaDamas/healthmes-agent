@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Platform-neutral core of the Windows glance surfaces (issue #11):
+    server-contract models + strict JSON parsing, the ETag-aware HTTP client,
+    the pairing model and the PLAN.md §8.5 notification-grammar text builder.
+
+    Deliberately net8.0 with ZERO Windows dependencies so it builds and its
+    xunit suite runs on any OS — including the macOS machine this repo is
+    developed on. Everything Windows-specific (WinForms, DPAPI) lives in
+    HealthMes.Windows.Common / HealthMes.Tray / HealthMes.Screensaver.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>HealthMes.Glance.Core</RootNamespace>
+    <AssemblyName>HealthMes.Glance.Core</AssemblyName>
+  </PropertyGroup>
+
+</Project>

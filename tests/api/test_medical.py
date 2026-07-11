@@ -1,7 +1,19 @@
-"""Tests for the medical-record router (local viewing only, no writes)."""
+"""Tests for the medical-record router: viewing + the issue #10 native capture.
+
+``POST /v1/medical-records`` is the REST twin of the ``create_medical_record``
+MCP tool (the Telegram capture path): it must attach the same server-computed
+health-context snapshot under the record's ``health`` context key and must
+never fail a capture because open-wearables is unreachable.
+"""
 
 from datetime import UTC, datetime
 
+import httpx
+import pytest
+from sqlalchemy import select
+
+from healthmes.mcp_server import server as server_module
+from healthmes.mcp_server.ow_client import OWClient
 from healthmes.store import MedicalRecord, MedicalRecordKind
 
 
@@ -127,14 +139,120 @@ def test_get_unknown_record_returns_error_envelope(client):
     assert response.json()["error"]["code"] == "not_found"
 
 
-def test_rest_surface_is_read_only(client):
-    """Writes happen only through the create_medical_record MCP tool."""
-    response = client.post("/v1/medical-records", json={"kind": "medication", "description": "x"})
-    assert response.status_code == 405
-
-
 def test_list_rejects_unknown_kind(client):
     response = client.get("/v1/medical-records", params={"kind": "allergy"})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/medical-records — the issue #10 native capture write path
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stub_snapshot(monkeypatch):
+    """Pin the server-side health snapshot (no open-wearables round trip)."""
+    stub = {"status": "ok", "confidence": "high", "stubbed": True}
+
+    async def _snapshot() -> dict:
+        return dict(stub)
+
+    # The REST handler resolves the helper through the module object at call
+    # time, so patching the mcp_server attribute covers both write paths.
+    monkeypatch.setattr(server_module, "_capture_health_context", _snapshot)
+    return stub
+
+
+def test_create_accepts_uploaded_media_path_round_trip(client, session, stub_snapshot):
+    uploaded = client.post(
+        "/v1/media", files={"file": ("pills.heic", b"heic-bytes" * 8, "image/heic")}
+    )
+    assert uploaded.status_code == 201
+    media_path = uploaded.json()["media_path"]
+
+    response = client.post(
+        "/v1/medical-records",
+        json={
+            "kind": "medication",
+            "description": "Tylenol 500mg, 2 tablets after lunch",
+            "media_path": media_path,
+            "context": {"source": "ios-app-photo"},
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["kind"] == "medication"
+    assert body["media_path"] == media_path
+    # Server-attached snapshot + caller capture metadata, MCP-tool layout.
+    assert body["context"]["health"] == stub_snapshot
+    assert body["context"]["capture"] == {"source": "ios-app-photo"}
+
+    row = session.scalars(select(MedicalRecord)).one()
+    assert str(row.id) == body["id"]
+    assert row.media_path == media_path
+
+    # The stored path serves back through the media route (capture loop).
+    fetched = client.get(f"/v1/media/{media_path}")
+    assert fetched.status_code == 200
+    assert fetched.headers["content-type"] == "image/heic"
+
+
+def test_create_without_context_stores_snapshot_only(client, stub_snapshot):
+    response = client.post(
+        "/v1/medical-records",
+        json={"kind": "symptom", "description": "Red rash on left forearm"},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["media_path"] is None
+    assert body["transcript"] is None
+    assert set(body["context"]) == {"health"}
+
+
+def test_create_survives_unreachable_open_wearables(client):
+    """The capture is the priority: OW down degrades the snapshot only."""
+
+    def _refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    server_module.set_ow_client(
+        OWClient(
+            base_url="http://open-wearables.test",
+            api_key="test-key",
+            transport=httpx.MockTransport(_refuse),
+        )
+    )
+    server_module.set_ow_user_id("7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e")
+    try:
+        response = client.post(
+            "/v1/medical-records",
+            json={"kind": "symptom", "description": "Rash, ~2cm, left forearm"},
+        )
+    finally:
+        server_module.set_ow_client(None)
+        server_module.set_ow_user_id(None)
+
+    assert response.status_code == 201
+    health = response.json()["context"]["health"]
+    assert health["status"] == "unavailable"
+    assert "open-wearables" in health["reason"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"kind": "allergy", "description": "x"},  # unknown kind
+        {"kind": "medication", "description": ""},  # empty description
+        {"kind": "medication", "description": "   "},  # blank description
+        {"kind": "medication"},  # missing description
+    ],
+)
+def test_create_rejects_invalid_bodies(client, body):
+    response = client.post("/v1/medical-records", json=body)
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "validation_error"

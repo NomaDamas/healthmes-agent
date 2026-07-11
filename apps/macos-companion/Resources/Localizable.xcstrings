@@ -1,0 +1,503 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "a11y.curve %lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Energy curve, %lld hours with data" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "에너지 곡선, 데이터 있는 시간 %lld개" } }
+      }
+    },
+    "alert.why" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Why this? →" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "왜 이 판단? →" } }
+      }
+    },
+    "alerts.count %lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "%lld recent" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "최근 %lld건" } }
+      }
+    },
+    "alerts.none" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No recent alerts" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "최근 알림이 없습니다" } }
+      }
+    },
+    "block.source.proposal" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Proposed" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "제안됨" } }
+      }
+    },
+    "blocks.empty" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No upcoming blocks" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "예정된 블록이 없습니다" } }
+      }
+    },
+    "confidence.high" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "High confidence" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "신뢰도 높음" } }
+      }
+    },
+    "confidence.low" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Low confidence" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "신뢰도 낮음" } }
+      }
+    },
+    "confidence.medium" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Medium confidence" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "신뢰도 중간" } }
+      }
+    },
+    "decision.open" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Open decision viewer →" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "결정 뷰어 열기 →" } }
+      }
+    },
+    "energy.noScore" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No energy data today" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "오늘 에너지 데이터가 없습니다" } }
+      }
+    },
+    "error.unauthorized" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Token rejected — check Settings" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "토큰이 거부됨 — 설정을 확인하세요" } }
+      }
+    },
+    "error.unreachable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Instance unreachable" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "인스턴스에 연결할 수 없습니다" } }
+      }
+    },
+    "footer.quit" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Quit HealthMes" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes 종료" } }
+      }
+    },
+    "menubar.a11y.energy %@ %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes energy %@, %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes 에너지 %@, %@" } }
+      }
+    },
+    "menubar.a11y.energyAlerts %@ %@ %lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes energy %@, %@, %lld recent alerts" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes 에너지 %@, %@, 최근 알림 %lld건" } }
+      }
+    },
+    "menubar.a11y.notPaired" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes: not paired" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes: 페어링되지 않음" } }
+      }
+    },
+    "popover.loading" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Loading briefing…" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "브리핑 불러오는 중…" } }
+      }
+    },
+    "popover.notPaired.body" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Connect your own HealthMes instance (base URL + API token) in Settings." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "설정에서 내 HealthMes 인스턴스(베이스 URL + API 토큰)를 연결하세요." } }
+      }
+    },
+    "popover.notPaired.title" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Not paired" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "페어링되지 않음" } }
+      }
+    },
+    "popover.openSettings" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Open Settings…" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "설정 열기…" } }
+      }
+    },
+    "popover.refresh" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Refresh" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "새로고침" } }
+      }
+    },
+    "popover.stale" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cached" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "캐시됨" } }
+      }
+    },
+    "popover.updated %lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Updated %lld min ago" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "%lld분 전 업데이트" } }
+      }
+    },
+    "proposal.actionFailed" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Action failed — try again" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "처리 실패 — 다시 시도하세요" } }
+      }
+    },
+    "proposal.adjust" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "✏️ Adjust" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "✏️ 수정" } }
+      }
+    },
+    "proposal.adjust.hint" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Adjust via chat or the decision viewer — a native editor is not built yet." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "수정은 채팅 또는 결정 뷰어에서 — 네이티브 편집기는 아직 없습니다." } }
+      }
+    },
+    "proposal.alreadyResolved %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Already resolved (%@)" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이미 처리됨 (%@)" } }
+      }
+    },
+    "proposal.applied" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Applied ✓" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "적용됨 ✓" } }
+      }
+    },
+    "proposal.apply" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "✅ Apply" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "✅ 적용" } }
+      }
+    },
+    "proposal.declined" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Kept as is" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "그대로 유지됨" } }
+      }
+    },
+    "proposal.keep" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "❌ Keep as is" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "❌ 오늘은 그대로" } }
+      }
+    },
+    "section.alerts" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Alerts" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "알림" } }
+      }
+    },
+    "section.blocks" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Next blocks" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "다음 블록" } }
+      }
+    },
+    "section.curve" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Today's energy" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "오늘의 에너지" } }
+      }
+    },
+    "section.decision" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Latest decision" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "최근 결정" } }
+      }
+    },
+    "section.proposals" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Pending proposals" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "대기 중인 제안" } }
+      }
+    },
+    "settings.baseURL" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Base URL" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "베이스 URL" } }
+      }
+    },
+    "settings.localFirst" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Local-first: this app only ever talks to your paired instance. No analytics, no cloud relay." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "로컬 우선: 이 앱은 페어링된 인스턴스에만 연결합니다. 분석 도구·클라우드 릴레이 없음." } }
+      }
+    },
+    "settings.notifications.denied" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Notifications are denied in System Settings → Notifications." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "시스템 설정 → 알림에서 이 앱의 알림이 꺼져 있습니다." } }
+      }
+    },
+    "settings.notifications.honesty" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Polling-based (up to ~5 min late). Telegram remains the guaranteed alert channel." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "폴링 기반(최대 약 5분 지연). 확실한 전달 채널은 여전히 Telegram입니다." } }
+      }
+    },
+    "settings.notifications.title" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Notifications" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "알림" } }
+      }
+    },
+    "settings.notifications.toggle" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Native alert notifications" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "네이티브 알림" } }
+      }
+    },
+    "settings.pairing.title" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Instance pairing" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "인스턴스 페어링" } }
+      }
+    },
+    "settings.save" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Save & test" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "저장 후 테스트" } }
+      }
+    },
+    "settings.test.invalidURL" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Enter a valid http(s) URL, e.g. http://192.168.1.20:8100" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "올바른 http(s) URL을 입력하세요. 예: http://192.168.1.20:8100" } }
+      }
+    },
+    "settings.test.ok" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Connected ✓" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "연결됨 ✓" } }
+      }
+    },
+    "settings.token" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "API token" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "API 토큰" } }
+      }
+    },
+    "settings.token.prompt" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "empty for loopback-open instances" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "루프백 개방 인스턴스는 비워 두세요" } }
+      }
+    },
+    "settings.unpair" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Unpair" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "페어링 해제" } }
+      }
+    },
+    "widget.description" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Energy, next blocks and alerts from your own HealthMes instance." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "내 HealthMes 인스턴스의 에너지·다음 블록·알림." } }
+      }
+    },
+    "widget.name" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes briefing" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes 브리핑" } }
+      }
+    },
+    "widget.notPaired" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Open HealthMes to pair" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes 앱에서 페어링하세요" } }
+      }
+    },
+    "widget.stale" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cached" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "캐시됨" } }
+      }
+    },
+    "saver.alerts.format" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "%ld recent alerts" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "최근 알림 %ld건" } }
+      }
+    },
+    "saver.block.untitled" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Untitled block" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "제목 없는 블록" } }
+      }
+    },
+    "saver.confidence.high" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "high confidence" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "신뢰도 높음" } }
+      }
+    },
+    "saver.confidence.low" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "low confidence" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "신뢰도 낮음" } }
+      }
+    },
+    "saver.confidence.medium" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "medium confidence" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "신뢰도 중간" } }
+      }
+    },
+    "saver.config.done" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Done" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "완료" } }
+      }
+    },
+    "saver.config.hideNumbers" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Hide health numbers" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "건강 수치 숨기기" } }
+      }
+    },
+    "saver.config.note" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "For shared spaces and screen sharing: the score, curve and alert details disappear entirely. The next schedule block stays visible." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "공용 공간·화면 공유용: 점수·곡선·알림 내용이 완전히 사라집니다. 다음 일정 블록은 계속 표시됩니다." } }
+      }
+    },
+    "saver.config.title" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes Briefing options" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes 브리핑 옵션" } }
+      }
+    },
+    "saver.nextBlock.format" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Next: %@ %@" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "다음: %@ %@" } }
+      }
+    },
+    "saver.noData.body" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Keep the HealthMes menu bar app running so the briefing stays fresh." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes 메뉴 막대 앱을 켜 두면 브리핑이 최신으로 유지됩니다." } }
+      }
+    },
+    "saver.noData.title" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No briefing data yet" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "아직 브리핑 데이터가 없습니다" } }
+      }
+    },
+    "saver.notPaired.body" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Open the HealthMes menu bar app and pair your instance in Settings." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "HealthMes 메뉴 막대 앱을 열고 설정에서 인스턴스를 페어링하세요." } }
+      }
+    },
+    "saver.notPaired.title" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Not paired" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "페어링되지 않음" } }
+      }
+    },
+    "saver.privacy.hidden" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Health numbers hidden" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "건강 수치 숨김" } }
+      }
+    },
+    "saver.updated.hours" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Updated %ld h ago" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "%ld시간 전 업데이트" } }
+      }
+    },
+    "saver.updated.minutes" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Updated %ld min ago" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "%ld분 전 업데이트" } }
+      }
+    }
+  },
+  "version" : "1.0"
+}

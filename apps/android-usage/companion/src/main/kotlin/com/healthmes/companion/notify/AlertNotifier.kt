@@ -5,18 +5,24 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
-import com.healthmes.companion.PairingActivity
+import com.healthmes.companion.MainActivity
 import com.healthmes.companion.R
 
 /**
  * Dedicated channel + renderer for the §8.5 grammar (see
  * [NotificationGrammar]): observation as the title, the three grammar lines
- * as BigText, three stub action buttons, and a "why this?" deep link into the
- * decision viewer (`decision_url` is browser-tappable as-is — any viewer
- * token is already embedded by the server).
+ * as BigText, REAL action buttons (issue #10) and a "why this?" tap-through:
+ *
+ * - ✅ Apply / ❌ Keep as is → [com.healthmes.companion.work.ProposalActionWorker]
+ *   via the broadcast receiver → the schedule-proposal accept/decline
+ *   endpoints (bearer client, one-shot WorkManager).
+ * - ✏️ Adjust → the in-app proposals screen.
+ * - Content tap → the in-app decision viewer on `decision_url` (viewer token
+ *   already embedded by the server), or the briefing home without one.
+ *
+ * The intent wiring follows [NotificationActionPlan] (JVM-tested mapping).
  */
 object AlertNotifier {
 
@@ -25,20 +31,26 @@ object AlertNotifier {
 
     fun notify(context: Context, grammar: NotificationGrammar) {
         ensureChannel(context)
+        val plan = NotificationActionPlan.from(grammar)
 
-        val contentIntent = grammar.decisionUrl?.let { url ->
-            PendingIntent.getActivity(
-                context,
-                0,
-                Intent(Intent.ACTION_VIEW, Uri.parse(url)),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
-        } ?: PendingIntent.getActivity(
-            context,
-            0,
-            Intent(context, PairingActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+        // Dedicated request code (never 0): see the registry note on
+        // NotificationActionPlan — a shared code would let other notifiers'
+        // FLAG_UPDATE_CURRENT updates clobber the decision-URL extras here.
+        val contentIntent = when (val tap = plan.contentTap) {
+            is NotificationActionPlan.ContentTap.Decision ->
+                activityIntent(
+                    context,
+                    NotificationActionPlan.REQUEST_ALERT_CONTENT_TAP,
+                    MainActivity.decisionIntent(context, tap.url),
+                )
+
+            is NotificationActionPlan.ContentTap.Home ->
+                activityIntent(
+                    context,
+                    NotificationActionPlan.REQUEST_ALERT_CONTENT_TAP,
+                    MainActivity.homeIntent(context),
+                )
+        }
 
         val notification = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
@@ -49,11 +61,25 @@ object AlertNotifier {
             .setAutoCancel(true)
             .setCategory(NotificationCompat.CATEGORY_RECOMMENDATION)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            // Grammar buttons — stubs until server push + action endpoints
-            // exist (the receiver explains that on tap).
-            .addAction(0, context.getString(R.string.notification_action_apply), actionStub(context, "apply"))
-            .addAction(0, context.getString(R.string.notification_action_adjust), actionStub(context, "adjust"))
-            .addAction(0, context.getString(R.string.notification_action_keep), actionStub(context, "keep"))
+            .addAction(
+                0,
+                context.getString(R.string.notification_action_apply),
+                broadcastIntent(context, plan.accept),
+            )
+            .addAction(
+                0,
+                context.getString(R.string.notification_action_adjust),
+                activityIntent(
+                    context,
+                    NotificationActionPlan.REQUEST_ADJUST,
+                    MainActivity.destinationIntent(context, plan.adjustDestination),
+                ),
+            )
+            .addAction(
+                0,
+                context.getString(R.string.notification_action_keep),
+                broadcastIntent(context, plan.decline),
+            )
             .build()
 
         val manager = NotificationManagerCompat.from(context)
@@ -67,12 +93,24 @@ object AlertNotifier {
         }
     }
 
-    private fun actionStub(context: Context, action: String): PendingIntent =
+    private fun broadcastIntent(
+        context: Context,
+        spec: NotificationActionPlan.ActionSpec,
+    ): PendingIntent =
         PendingIntent.getBroadcast(
             context,
-            action.hashCode(),
+            spec.requestCode,
             Intent(context, NotificationActionReceiver::class.java)
-                .putExtra(NotificationActionReceiver.EXTRA_ACTION, action),
+                .putExtra(NotificationActionReceiver.EXTRA_ACTION, spec.wireAction)
+                .putExtra(NotificationActionReceiver.EXTRA_PROPOSAL_ID, spec.proposalId),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+    private fun activityIntent(context: Context, requestCode: Int, intent: Intent): PendingIntent =
+        PendingIntent.getActivity(
+            context,
+            requestCode,
+            intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 

@@ -119,4 +119,21 @@ class BriefingDisplayStateTest {
             BriefingDisplayState.parseIsoInstant("2026-07-09T05:23:11.123456Z"),
         )
     }
+
+    @Test
+    fun `parses sqlite-naive store datetimes as UTC`() {
+        // Store-backed endpoints (GET /v1/schedule/proposals, food logs) on
+        // the default sqlite deployment serialize naive datetimes with NO
+        // zone designator; they are UTC by store contract. This is the exact
+        // shape a real instance emitted (proposals crashed without support).
+        assertEquals(
+            Instant.parse("2026-07-11T14:51:20.497821Z"),
+            BriefingDisplayState.parseIsoInstant("2026-07-11T14:51:20.497821"),
+        )
+        // Whole-second naive variant (no fractional part).
+        assertEquals(
+            Instant.parse("2026-07-11T14:51:20Z"),
+            BriefingDisplayState.parseIsoInstant("2026-07-11T14:51:20"),
+        )
+    }
 }

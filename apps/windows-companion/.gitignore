@@ -1,0 +1,7 @@
+# .NET build outputs (dotnet CLI and Visual Studio)
+bin/
+obj/
+artifacts/
+*.user
+.vs/
+TestResults/

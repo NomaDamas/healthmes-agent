@@ -49,6 +49,26 @@ def test_create_food_log_rejects_unknown_meal_type(client):
     assert response.json()["error"]["code"] == "validation_error"
 
 
+def test_create_food_log_accepts_uploaded_media_path(client):
+    """Issue #10 capture loop: upload → log with the returned token → serve."""
+    uploaded = client.post(
+        "/v1/media", files={"file": ("meal.jpg", b"\xff\xd8fake-jpeg", "image/jpeg")}
+    )
+    assert uploaded.status_code == 201
+    media_path = uploaded.json()["media_path"]
+
+    created = client.post(
+        "/v1/food-logs",
+        json={"description": "Kimchi stew with rice", "media_path": media_path},
+    )
+
+    assert created.status_code == 201
+    assert created.json()["media_path"] == media_path
+    listed = client.get("/v1/food-logs").json()["data"][0]
+    assert listed["media_path"] == media_path
+    assert client.get(f"/v1/media/{media_path}").status_code == 200
+
+
 def test_list_food_logs_range_filter_newest_first(client):
     for day, description in ((7, "Older"), (8, "Middle"), (9, "Newest")):
         client.post(

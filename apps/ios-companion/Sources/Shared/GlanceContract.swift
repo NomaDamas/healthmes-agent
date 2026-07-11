@@ -145,7 +145,24 @@ public enum GlanceJSON {
         if let date = plain.date(from: raw) { return date }
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: raw)
+        if let date = fractional.date(from: raw) { return date }
+        return parseNaiveUTC(raw)
+    }
+
+    /// Store-backed endpoints (schedule proposals, food logs) serialize
+    /// sqlite's naive datetimes verbatim — `2026-07-11T14:23:10.355753`,
+    /// no zone designator. Every persisted datetime in the healthmes store
+    /// is UTC by contract, so naive parses as UTC. (Found live: the
+    /// proposals list failed to decode against a real instance without
+    /// this; glance/alerts always send "Z".)
+    private static func parseNaiveUTC(_ raw: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+        if let date = formatter.date(from: raw) { return date }
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return formatter.date(from: raw)
     }
 
     public static func decodePayload(_ data: Data) throws -> GlancePayload {

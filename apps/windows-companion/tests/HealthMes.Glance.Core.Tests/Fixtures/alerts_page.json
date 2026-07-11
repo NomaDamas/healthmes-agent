@@ -1,0 +1,28 @@
+{
+  "data": [
+    {
+      "id": "3b2f4a68-1c5d-4e7f-9a0b-6d8c2e4f1a35",
+      "rule_id": "stress_spike_vs_baseline",
+      "fired_at": "2026-07-09T13:50:00Z",
+      "summary": "Stress 82 vs baseline 55",
+      "proposal": "Move the 14:00 block to tomorrow.",
+      "evidence": {"hrv_delta_pct": -18, "baseline_days": 14},
+      "decision_url": "http://192.168.1.20:8100/decisions/1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10?token=hm-ro-3q2b8d1f7c6e5a4"
+    },
+    {
+      "id": "9c1e7d20-4f3a-4b58-8e6d-0a2b5c7f9d41",
+      "rule_id": "legacy_rule",
+      "fired_at": "2026-07-09T09:00:00Z",
+      "summary": "legacy_rule",
+      "proposal": null,
+      "evidence": null,
+      "decision_url": null
+    }
+  ],
+  "pagination": {
+    "total_count": 2,
+    "limit": 20,
+    "offset": 0,
+    "has_more": false
+  }
+}

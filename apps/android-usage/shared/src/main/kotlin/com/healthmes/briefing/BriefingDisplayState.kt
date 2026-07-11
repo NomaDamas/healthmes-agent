@@ -1,8 +1,10 @@
 package com.healthmes.briefing
 
 import java.time.Instant
+import java.time.LocalDateTime
 import java.time.OffsetDateTime
 import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 
 /**
@@ -74,11 +76,18 @@ data class BriefingDisplayState(
 
         /**
          * Parses the ISO-8601 instants the server emits. Pydantic serializes
-         * aware UTC datetimes with a `Z` suffix, but any explicit offset
-         * (`+00:00`) is accepted too.
+         * aware UTC datetimes with a `Z` suffix and any explicit offset
+         * (`+00:00`) is accepted too — but store-backed endpoints (schedule
+         * proposals, food logs) serialize sqlite's NAIVE datetimes verbatim:
+         * `2026-07-11T14:51:20.497821`, no zone designator. Every persisted
+         * datetime in the healthmes store is UTC by contract, so naive parses
+         * as UTC (same rule as the iOS client's `parseNaiveUTC` — found live:
+         * the proposals list crashed against a real sqlite instance without
+         * this; glance/alerts always send `Z`).
          */
         fun parseIsoInstant(iso: String): Instant =
             runCatching { Instant.parse(iso) }
-                .getOrElse { OffsetDateTime.parse(iso).toInstant() }
+                .recoverCatching { OffsetDateTime.parse(iso).toInstant() }
+                .getOrElse { LocalDateTime.parse(iso).toInstant(ZoneOffset.UTC) }
     }
 }

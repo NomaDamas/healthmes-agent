@@ -3,10 +3,106 @@
     <string name="widget_label">HealthMes briefing</string>
     <string name="widget_description">Energy score, next block, and unresolved alerts from your HealthMes instance.</string>
 
-    <string name="intro">Pair this device with your own HealthMes instance, then add the
-        briefing widget to your home screen. It refreshes every 15 minutes and raises a
-        notification when new alerts fire.</string>
+    <!-- Navigation tabs -->
+    <string name="tab_home">Briefing</string>
+    <string name="tab_report">Report</string>
+    <string name="tab_capture">Capture</string>
+    <string name="tab_proposals">Proposals</string>
+    <string name="tab_settings">Settings</string>
 
+    <!-- Briefing home -->
+    <string name="home_energy_label">Cognitive energy</string>
+    <string name="home_confidence">confidence %1$s</string>
+    <string name="home_generated_at">Updated %1$s</string>
+    <string name="home_not_paired">Not paired yet. Open Settings and enter your HealthMes server URL.</string>
+    <string name="home_go_to_settings">Open Settings</string>
+    <string name="home_refresh">Refresh</string>
+    <string name="home_curve_title">Today, hour by hour</string>
+    <string name="home_curve_a11y">24-hour energy curve. Current score %1$s of 100, confidence %2$s. Hours without data are blank.</string>
+    <string name="home_next_blocks">Next blocks</string>
+    <string name="home_no_blocks">Nothing scheduled next.</string>
+    <string name="home_block_demand">demand %1$s</string>
+    <string name="home_block_source_proposal">proposal</string>
+    <string name="home_alerts_title">Alerts · last 24h</string>
+    <string name="home_no_alerts">No alerts in the last 24 hours.</string>
+    <string name="home_alerts_error">Couldn\'t load alerts: %1$s</string>
+    <string name="home_alert_why">Why this?</string>
+    <string name="home_latest_decision">Latest decision</string>
+    <string name="home_open_decision">Open decision viewer</string>
+    <string name="home_no_data">No briefing data yet — refresh once paired.</string>
+    <string name="score_a11y">Cognitive energy %1$s out of 100, confidence %2$s</string>
+    <string name="score_a11y_missing">Cognitive energy unknown, confidence %1$s</string>
+
+    <!-- Weekly report -->
+    <string name="report_title">Weekly report</string>
+    <string name="report_week">Week %1$s – %2$s</string>
+    <string name="report_loading">Loading the weekly report…</string>
+    <string name="report_error">Couldn\'t load the report: %1$s</string>
+    <string name="report_retry">Retry</string>
+    <string name="report_open_html">Open web version</string>
+    <string name="report_energy_section">Energy trend</string>
+    <string name="report_energy_overall">Week average %1$s · %2$d samples</string>
+    <string name="report_energy_none">No energy data recorded this week.</string>
+    <string name="report_day_a11y">%1$s: average %2$s, range %3$s to %4$s, %5$d samples</string>
+    <string name="report_day_a11y_empty">%1$s: no data</string>
+    <string name="report_insights_section">Insights (%1$d)</string>
+    <string name="report_no_insights">No insights recorded this week.</string>
+    <string name="report_schedule_section">Schedule adherence</string>
+    <string name="report_schedule_line">%1$d accepted · %2$d pushed · %3$d declined · %4$d pending</string>
+    <string name="report_schedule_acceptance">Acceptance %1$d%%</string>
+    <string name="report_schedule_acceptance_none">Nothing decided this week.</string>
+    <string name="report_alerts_section">Alerts</string>
+    <string name="report_alerts_line">%1$d fired · %2$d delivered · budget %3$d/day</string>
+    <string name="report_decisions_section">Decisions (%1$d)</string>
+    <string name="report_no_decisions">No decisions recorded this week.</string>
+    <string name="confidence_high">high</string>
+    <string name="confidence_medium">medium</string>
+    <string name="confidence_low">low</string>
+    <string name="confidence_none">n/a</string>
+
+    <!-- Capture -->
+    <string name="capture_title">Capture</string>
+    <string name="capture_kind_label">What is this?</string>
+    <string name="capture_kind_food">Food</string>
+    <string name="capture_kind_medication">Medication</string>
+    <string name="capture_kind_symptom">Symptom</string>
+    <string name="capture_take_photo">Take photo</string>
+    <string name="capture_pick_photo">Pick photo</string>
+    <string name="capture_record_voice">Record voice</string>
+    <string name="capture_stop_recording">Stop recording</string>
+    <string name="capture_recording">Recording… tap “Stop recording” when done.</string>
+    <string name="capture_description_hint">Description (edit before saving)</string>
+    <string name="capture_transcript_hint">Transcript (optional, voice notes)</string>
+    <string name="capture_attached">Attached: %1$s · %2$d KB</string>
+    <string name="capture_remove_attachment">Remove attachment</string>
+    <string name="capture_save">Save to HealthMes</string>
+    <string name="capture_saving">Saving…</string>
+    <string name="capture_saved_food">Food log saved.</string>
+    <string name="capture_saved_medical">Medical record saved (health snapshot attached server-side).</string>
+    <string name="capture_error_description_required">Add a description first.</string>
+    <string name="capture_error_not_paired">Pair with your HealthMes instance first (Settings tab).</string>
+    <string name="capture_upload_failed">Upload failed: %1$s</string>
+    <string name="capture_create_failed">Save failed: %1$s</string>
+    <string name="capture_photo_failed">Couldn\'t stage the photo: %1$s</string>
+    <string name="capture_mic_permission">Microphone permission is needed to record a voice note.</string>
+    <string name="capture_note">Captures go only to your paired instance. Medical records get today\'s health snapshot attached by the server.</string>
+
+    <!-- Proposals -->
+    <string name="proposals_title">Schedule proposals</string>
+    <string name="proposals_pending_only">Pending only</string>
+    <string name="proposals_empty">No proposals.</string>
+    <string name="proposals_empty_pending">No pending proposals.</string>
+    <string name="proposals_accept">Accept</string>
+    <string name="proposals_decline">Decline</string>
+    <string name="proposals_error">Couldn\'t load proposals: %1$s</string>
+    <string name="proposals_already_resolved">Already resolved — status is now “%1$s”.</string>
+    <string name="proposals_action_failed">Action failed: %1$s</string>
+    <string name="proposals_accepted">Proposal accepted.</string>
+    <string name="proposals_declined">Proposal declined.</string>
+    <string name="proposals_status_a11y">Proposal %1$s, status %2$s</string>
+
+    <!-- Settings / pairing -->
+    <string name="settings_title">Settings</string>
     <string name="hint_server_url">Server URL (e.g. http://192.168.1.20:8100)</string>
     <string name="hint_token">API token (optional, sent as Bearer)</string>
     <string name="save_pairing">Save pairing</string>
@@ -14,20 +110,43 @@
     <string name="clear_pairing">Clear pairing</string>
     <string name="no_refresh_yet">No refresh yet.</string>
     <string name="status_not_paired">Not paired.</string>
-
+    <string name="settings_status">Status</string>
+    <string name="settings_privacy_note">Local-first: this app talks only to the HealthMes instance you pair here. No third-party endpoints, no analytics. Notifications are derived from 15-minute polling — Telegram remains the guaranteed-delivery channel.</string>
     <string name="error_invalid_url">Enter a valid http(s) URL, e.g. http://192.168.1.20:8100</string>
     <string name="toast_pairing_saved">Pairing saved. Refreshing…</string>
     <string name="toast_pair_first">Save the server URL first.</string>
     <string name="toast_refresh_scheduled">Refresh scheduled.</string>
     <string name="toast_pairing_cleared">Pairing cleared.</string>
-    <string name="toast_action_stub">Not wired to the agent yet — reply in Telegram. (Real actions arrive with server push.)</string>
 
+    <!-- Alert notifications (§8.5 grammar) -->
     <string name="notification_channel_name">HealthMes briefing alerts</string>
     <string name="notification_channel_description">Proactive alerts from your HealthMes instance in the observation / evidence / proposal grammar.</string>
     <string name="notification_action_apply">✅ Apply</string>
     <string name="notification_action_adjust">✏️ Adjust</string>
     <string name="notification_action_keep">❌ Keep as is</string>
+    <string name="action_channel_name">HealthMes action results</string>
+    <string name="action_channel_description">Outcome of Apply / Keep-as-is taps on alert notifications.</string>
+    <string name="action_result_applied">Applied — schedule proposal accepted.</string>
+    <string name="action_result_declined">Kept as is — schedule proposal declined.</string>
+    <string name="action_result_already">Already resolved — proposal is “%1$s”.</string>
+    <string name="action_result_gone">That proposal no longer exists.</string>
+    <string name="action_result_none">No pending proposal right now — open the app to review.</string>
+    <string name="action_result_ambiguous">%1$d proposals are pending — choose one in the app.</string>
+    <string name="action_result_retrying">Couldn\'t reach your instance — will retry shortly.</string>
+    <string name="action_result_failed">Action failed: %1$s</string>
 
+    <!-- Ongoing focus-block notification -->
+    <string name="focus_channel_name">Current focus block</string>
+    <string name="focus_channel_description">Quiet ongoing notification while a scheduled block is running.</string>
+    <string name="focus_until">Until %1$s</string>
+    <string name="focus_untitled">(untitled block)</string>
+
+    <!-- Decision viewer -->
+    <string name="viewer_title">Decision viewer</string>
+    <string name="viewer_share">Share link</string>
+    <string name="viewer_back">Back</string>
+
+    <!-- Widget (cache-only rendering) -->
     <string name="widget_not_paired">Open to pair with your HealthMes instance</string>
     <string name="widget_energy_label">Energy</string>
     <string name="widget_no_data">No briefing data yet</string>
