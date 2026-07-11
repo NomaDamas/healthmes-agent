@@ -185,7 +185,7 @@ ephemeral and repo-local (no `brew services`, no autostart).
 ```bash
 make mac-setup            # brew postgresql@16 + redis if missing, initdb,
                           # create DBs, uv sync
-cp .env.example .env      # optional: sqlite works with zero config
+install -m 600 .env.example .env  # optional: sqlite works with zero config
 make mac-run              # alembic upgrade head + service on :8100
 curl http://localhost:8100/health
 make mac-test             # full offline test suite
@@ -201,8 +201,8 @@ With no `.env` at all, the service runs against a repo-local sqlite file —
 ### Docker alternative
 
 ```bash
-cp .env.example .env
-cp config/open-wearables.env.example config/open-wearables.env
+install -m 600 .env.example .env
+install -m 600 config/open-wearables.env.example config/open-wearables.env
 docker compose up -d --build     # postgres, redis, open-wearables (+worker,
                                  # +mcp), healthmes, hermes gateway
 ```
