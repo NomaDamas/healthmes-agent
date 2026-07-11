@@ -3,8 +3,13 @@ namespace HealthMes.Glance.Core.Tests;
 /// <summary>Loads the pinned contract fixtures copied next to the test binary.</summary>
 public static class Fixtures
 {
+    // Normalize to LF: Windows checkouts rewrite the fixtures to CRLF
+    // (core.autocrlf), which silently breaks tests that splice the fixture
+    // text with "\n"-terminated fragments (seen live on the first
+    // windows-apps.yml run: ShortCurveIsAContractBreak never matched).
     public static string Read(string name) =>
-        File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", name));
+        File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", name))
+            .Replace("\r\n", "\n");
 
     /// <summary>iOS reference payload (apps/ios-companion/Tests/Fixtures/glance.json).</summary>
     public static string GlanceIos() => Read("glance.json");
