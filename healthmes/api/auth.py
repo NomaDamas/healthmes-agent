@@ -12,7 +12,8 @@ reconciliation is a single shared bearer token (``Settings.api_token``):
 - ``GET /health`` stays open (compose healthcheck / liveness probe; it leaks
   nothing).
 - Human-facing viewer pages (``GET /decisions...``, the weekly report under
-  ``GET /reports/...`` and the vendored ``/static/mermaid.min.js`` they load)
+  ``GET /reports/...``, the vendored ``/static/mermaid.min.js`` they load, and
+  the stored media files under ``GET /v1/media/...`` those pages embed)
   additionally accept ``?token=<viewer token>`` where the viewer token is
   *derived* from the API token (:func:`viewer_token`). Alert/briefing links
   must be tappable from a phone browser, which cannot attach headers —
@@ -48,7 +49,12 @@ OPEN_PATHS = frozenset({"/health"})
 
 # Path prefixes of the human-facing viewer surface that may authenticate via
 # the derived ?token= query credential (browser links cannot carry headers).
-VIEWER_PATH_PREFIXES = ("/decisions", "/static/", "/reports")
+# "/v1/media/" is the one /v1 namespace included — read-only media serving
+# (GET/HEAD only; the middleware never applies the query credential to other
+# methods), so decision/report pages and in-app web views can embed captured
+# photos/voice notes via <img>/<audio> tags. Uploading (POST /v1/media, no
+# trailing slash — not matched by the prefix) stays bearer-only.
+VIEWER_PATH_PREFIXES = ("/decisions", "/static/", "/reports", "/v1/media/")
 
 _VIEWER_TOKEN_CONTEXT = b"healthmes-viewer:"
 

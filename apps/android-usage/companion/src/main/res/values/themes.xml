@@ -1,3 +1,4 @@
 <resources>
-    <style name="Theme.HealthMesCompanion" parent="Theme.Material3.DayNight" />
+    <!-- Compose owns all chrome; NoActionBar keeps the platform bar away. -->
+    <style name="Theme.HealthMesCompanion" parent="Theme.Material3.DayNight.NoActionBar" />
 </resources>

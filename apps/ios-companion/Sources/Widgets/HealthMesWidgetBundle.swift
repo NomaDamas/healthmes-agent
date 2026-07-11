@@ -15,6 +15,9 @@ import WidgetKit
 struct HealthMesWidgetBundle: WidgetBundle {
     var body: some Widget {
         GlanceWidget()
+        #if canImport(ActivityKit)
+            FocusBlockLiveActivity()
+        #endif
     }
 }
 

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    STUB — Windows 11 Widgets Board provider (issue #11), implementation
+    DEFERRED: a Widgets Board provider must ship as a PACKAGED (MSIX) app
+    with a COM-activated IWidgetProvider declared in Package.appxmanifest;
+    that drags signing + packaging into CI for every PR. See
+    apps/windows-companion/DEFERRED.md for the full rationale and the exact
+    implementation path. The data half is already real: the Adaptive Card
+    JSON the provider would return is built and unit-tested in
+    HealthMes.Glance.Core (WidgetCard).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>HealthMes.Widgets</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../HealthMes.Glance.Core/HealthMes.Glance.Core.csproj" />
+  </ItemGroup>
+
+</Project>

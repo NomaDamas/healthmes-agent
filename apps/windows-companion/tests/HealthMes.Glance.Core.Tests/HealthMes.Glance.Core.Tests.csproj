@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    xunit suite for the platform-neutral core. Runs on ANY OS (`dotnet test`)
+    — including the macOS dev machine — and on windows-latest in CI.
+
+    Fixtures/glance.json, glance_full.json and glance_empty.json are
+    byte-identical copies of the iOS (apps/ios-companion/Tests/Fixtures) and
+    Android (apps/android-usage/companion/src/test/resources) contract
+    fixtures; the server suite pins all of them against the live schema in
+    tests/api/test_glance_fixtures.py, so one glance contract = one fixture
+    set across every platform (issue #11 "Shared" scope).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/HealthMes.Glance.Core/HealthMes.Glance.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Fixtures/**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

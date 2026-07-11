@@ -105,6 +105,16 @@ class Settings(BaseSettings):
         "docker containers run UTC clocks, so compose forwards HEALTHMES_TIMEZONE).",
     )
 
+    # Native capture uploads (issue #10 companion apps; healthmes/api/media.py).
+    media_max_upload_bytes: int = Field(
+        default=15 * 1024 * 1024,
+        ge=1,
+        description="Maximum accepted size in bytes of one media upload "
+        "(POST /v1/media). Uploads beyond the cap are rejected with 413 and "
+        "nothing is stored. Default 15 MiB — plenty for phone photos and "
+        "voice memos while keeping a LAN peer from filling the disk.",
+    )
+
     # Alert hygiene (docs/PLAN.md §11: a noisy assistant gets muted within a
     # week). Consumed by healthmes/engine/triggers.py before any webhook push.
     quiet_hours_start: datetime.time = Field(

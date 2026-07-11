@@ -1,0 +1,40 @@
+{
+  "generated_at": "2026-07-09T05:23:11Z",
+  "timezone": "UTC",
+  "energy": {
+    "score": null,
+    "confidence": "low",
+    "curve_24h": [
+      {"hour": 0, "score": null},
+      {"hour": 1, "score": null},
+      {"hour": 2, "score": null},
+      {"hour": 3, "score": null},
+      {"hour": 4, "score": null},
+      {"hour": 5, "score": null},
+      {"hour": 6, "score": null},
+      {"hour": 7, "score": null},
+      {"hour": 8, "score": null},
+      {"hour": 9, "score": null},
+      {"hour": 10, "score": null},
+      {"hour": 11, "score": null},
+      {"hour": 12, "score": null},
+      {"hour": 13, "score": null},
+      {"hour": 14, "score": null},
+      {"hour": 15, "score": null},
+      {"hour": 16, "score": null},
+      {"hour": 17, "score": null},
+      {"hour": 18, "score": null},
+      {"hour": 19, "score": null},
+      {"hour": 20, "score": null},
+      {"hour": 21, "score": null},
+      {"hour": 22, "score": null},
+      {"hour": 23, "score": null}
+    ]
+  },
+  "next_blocks": [],
+  "alerts": {
+    "unresolved_count": 0,
+    "top": null
+  },
+  "latest_decision": null
+}

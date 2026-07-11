@@ -1,0 +1,21 @@
+<!--
+  Shared build settings for every project under apps/windows-companion.
+
+  EnableWindowsTargeting lets the net8.0-windows (WinForms) projects COMPILE
+  on non-Windows hosts too (reference assemblies restore from NuGet), so the
+  whole solution is `dotnet build`-able on the macOS dev machine; running the
+  tray/screensaver still requires Windows. CI compiles + tests on
+  windows-latest (.github/workflows/windows-apps.yml).
+-->
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!-- Timezone rendering uses IANA ids from the server payload (ICU). -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+</Project>

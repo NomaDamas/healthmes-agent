@@ -2,12 +2,36 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Fetch the glance briefing from the user's own HealthMes instance. -->
+    <!-- Everything network goes to the user's own HealthMes instance only. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- API 33+: local alert notifications (PLAN.md §8.5 grammar) need this
-         runtime permission; the pairing screen requests it. -->
+         runtime permission; the settings screen requests it. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Voice-memo capture (recorded on-device, uploaded only to the paired
+         instance via POST /v1/media). Requested just-in-time on first use. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Photo capture goes through ACTION_IMAGE_CAPTURE / the photo picker,
+         so no CAMERA permission is required. -->
+    <queries>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+        <!-- Custom Tabs browser discovery for the decision viewer (viewer
+             URLs on the LAN are typically http). -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="http" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="false"
@@ -21,9 +45,14 @@
              a HealthMes instance on the same LAN (http://192.168.x.x:8100),
              matching the :app collector. -->
 
+        <!-- The whole app (issue #10): briefing home, weekly report, capture,
+             proposals, settings/pairing. singleTask so notification deep
+             links (adjust → proposals, tap → decision viewer) land in the
+             existing instance via onNewIntent. -->
         <activity
-            android:name=".PairingActivity"
-            android:exported="true">
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -44,10 +73,23 @@
                 android:resource="@xml/briefing_widget_info" />
         </receiver>
 
-        <!-- Stub handler for the §8.5 notification action buttons. -->
+        <!-- §8.5 notification buttons: enqueues the one-shot WorkManager call
+             against the schedule-proposal accept/decline endpoints. -->
         <receiver
             android:name=".notify.NotificationActionReceiver"
             android:exported="false" />
+
+        <!-- Camera capture output (cache-only; uploaded to the paired
+             instance, then disposable). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

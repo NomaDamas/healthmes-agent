@@ -1,0 +1,178 @@
+# XcodeGen spec for the HealthMes macOS glance surfaces (issue #11).
+#
+# Regenerate the project after editing this file or adding sources:
+#   brew install xcodegen        # once
+#   cd apps/macos-companion && xcodegen generate
+#
+# Everything builds unsigned (CODE_SIGNING_ALLOWED=NO); never configure
+# signing identities in this repo. The generated .xcodeproj and Support/
+# plists are derived artifacts and gitignored.
+#
+# Source reuse (issue #11 by design): ../ios-companion/Sources/Shared is the
+# platform-agnostic contract/client layer (Foundation+Security only) and is
+# compiled VERBATIM into every target here — one glance contract, one client,
+# one pairing store across iOS/watchOS/macOS. ../ios-companion/Sources/
+# SharedWidget is the cross-platform WidgetKit provider (timeline policy +
+# gauge), reused by the macOS widget extension. Files under this directory
+# never duplicate Shared code unless a platform guard is impossible — any
+# such copy carries a "DUPLICATED FROM" header for the integrator.
+name: HealthMesMac
+options:
+  bundleIdPrefix: com.healthmes
+  createIntermediateGroups: true
+  developmentLanguage: en
+  deploymentTarget:
+    macOS: "14.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  # -------------------------------------------------------- menu bar app
+  # SwiftUI MenuBarExtra (LSUIElement — no Dock icon): energy score in the
+  # status item, briefing popover (curve / next blocks / alerts / decision
+  # links that open the browser), pairing Settings window (token in the
+  # Keychain via the shared PairingStore), 5-minute ETag polling through the
+  # shared GlanceClient, and optional UNUserNotificationCenter notifications
+  # rendering the §8.5 grammar with real accept/decline actions.
+  HealthMesMac:
+    type: application
+    platform: macOS
+    sources:
+      - ../ios-companion/Sources/Shared
+      - Sources/MacCore
+      - Sources/MacUI
+      - Sources/MenuBar
+      - path: Resources
+        buildPhase: resources
+    dependencies:
+      - target: HealthMesMacWidgets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.mac
+    info:
+      path: Support/HealthMesMac-Info.plist
+      properties:
+        CFBundleDisplayName: HealthMes
+        # Menu bar app: no Dock icon, no app switcher entry.
+        LSUIElement: true
+        CFBundleLocalizations: [en, ko]
+        ITSAppUsesNonExemptEncryption: false
+        # LAN-HTTP exception SCOPED to local networking instead of disabling
+        # ATS globally: the typical pairing target is http://<LAN-IP>:8100 —
+        # ATS never applies to IP-literal URLs anyway, and
+        # NSAllowsLocalNetworking covers .local / unqualified hostnames.
+        # Plain HTTP to a qualified public DNS name now fails CLOSED (use
+        # HTTPS there) — a tokenized viewer URL must never cross an
+        # untrusted network in clear text.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+
+  # ------------------------------------------------- WidgetKit extension
+  # Desktop / Notification Center widgets (systemSmall/Medium/Large) reusing
+  # the shared GlanceTimelineProvider: server Cache-Control drives the
+  # timeline, every poll is a conditional GET (ETag/304), stale cache renders
+  # honestly instead of blanking.
+  HealthMesMacWidgets:
+    type: app-extension
+    platform: macOS
+    sources:
+      - ../ios-companion/Sources/Shared
+      - ../ios-companion/Sources/SharedWidget
+      - Sources/MacCore
+      - Sources/MacUI
+      - Sources/MacWidgets
+      - path: Resources
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.mac.widgets
+        SKIP_INSTALL: true
+    info:
+      path: Support/HealthMesMacWidgets-Info.plist
+      properties:
+        CFBundleDisplayName: HealthMes Glance
+        CFBundleLocalizations: [en, ko]
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        # Scoped like the app target: LAN/.local HTTP only, no global ATS off.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+
+  # ------------------------------------------------------- screensaver
+  # .saver bundle (ScreenSaverView subclass, AppKit drawing — SwiftUI hosting
+  # inside legacyScreenSaver is known-fragile). Ambient briefing: big score,
+  # 24h curve, next block, gentle alert count; honest not-paired / no-data
+  # states; and the issue-#11 privacy toggle (hide health numbers) persisted
+  # via ScreenSaverDefaults. Data comes from the shared on-disk glance
+  # snapshot the menu bar app / widget keep warm — the saver process never
+  # touches the Keychain (legacyScreenSaver keychain reads can pop a password
+  # prompt behind the saver window).
+  HealthMesSaver:
+    type: bundle
+    platform: macOS
+    sources:
+      - ../ios-companion/Sources/Shared
+      - Sources/MacCore
+      - Sources/Saver
+      - path: Resources
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.saver
+        WRAPPER_EXTENSION: saver
+        GENERATE_INFOPLIST_FILE: false
+    info:
+      path: Support/HealthMesSaver-Info.plist
+      properties:
+        CFBundleDisplayName: HealthMes Briefing
+        CFBundleLocalizations: [en, ko]
+        # @objc(HealthMesSaverView) pins the unmangled ObjC runtime name.
+        NSPrincipalClass: HealthMesSaverView
+
+  # ------------------------------------------------------------- tests
+  # Host-less unit-test bundle running NATIVELY on macOS: proves the shared
+  # contract layer (glance/alerts/report decoding, cache, curve geometry)
+  # links and behaves on this platform, plus the mac-only logic (status-item
+  # text, saver privacy redaction, ScreenSaverDefaults persistence).
+  # Fixtures are referenced from ../ios-companion/Tests/Fixtures — one
+  # fixture set across platforms (issue #11), already pinned server-side by
+  # tests/api/test_glance_fixtures.py.
+  HealthMesMacTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - ../ios-companion/Sources/Shared
+      - Sources/MacCore
+      - Sources/Saver
+      - path: Tests
+      - path: ../ios-companion/Tests/Fixtures
+        buildPhase: resources
+      - path: Resources
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.mac.tests
+    info:
+      path: Support/HealthMesMacTests-Info.plist
+      properties: {}
+
+schemes:
+  HealthMesMac:
+    build:
+      targets:
+        HealthMesMac: all
+    test:
+      targets:
+        - HealthMesMacTests
+  HealthMesMacWidgets:
+    build:
+      targets:
+        HealthMesMacWidgets: all
+  HealthMesSaver:
+    build:
+      targets:
+        HealthMesSaver: all

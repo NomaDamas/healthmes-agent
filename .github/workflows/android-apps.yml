@@ -1,0 +1,58 @@
+# Android companion apps CI (issue #10) — assembles every APK and runs the
+# JVM unit-test suites for apps/android-usage (usage collector :app, phone
+# companion :companion, Wear OS :wear, contract library :shared via their
+# dependencies). No emulator and no signing: this is the compile + unit-test
+# proof; device passes stay a documented manual step (the app README's
+# "Device caveats" section).
+#
+# Independent from ci.yml on purpose (like windows-apps.yml / apple-apps.yml):
+# it only wakes up when the Android tree (or this workflow) changes. The exact
+# gradle invocation mirrors the locally-proven matrix in
+# apps/android-usage/README.md. ubuntu-latest ships the Android SDK with
+# licenses accepted; AGP resolves the pinned platform/build-tools itself.
+
+name: Android apps
+
+on:
+  pull_request:
+    paths:
+      - "apps/android-usage/**"
+      - ".github/workflows/android-apps.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/android-usage/**"
+      - ".github/workflows/android-apps.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: gradle assembleDebug + JVM unit tests (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: apps/android-usage
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Build all modules + run JVM unit tests
+        run: >
+          ./gradlew --no-daemon
+          :app:assembleDebug :app:testDebugUnitTest
+          :companion:assembleDebug :companion:testDebugUnitTest
+          :wear:assembleDebug

@@ -19,6 +19,9 @@ EXPECTED_PATHS = [
     "/v1/food-logs",
     "/v1/medical-records",
     "/v1/medical-records/{record_id}",
+    "/v1/media",
+    "/v1/media/{media_path}",
+    "/v1/alerts",
     "/v1/insights",
     "/v1/insights/recompute",
     "/v1/decisions/{decision_id}",
@@ -32,7 +35,7 @@ EXPECTED_PATHS = [
 
 
 def test_routers_list_covers_all_modules():
-    assert len(routers) == 11
+    assert len(routers) == 13
 
 
 def test_openapi_schema_generates_with_all_paths(client):

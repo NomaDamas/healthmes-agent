@@ -34,7 +34,8 @@ class FoodLogCreate(BaseModel):
     media_path: str | None = Field(
         default=None,
         max_length=500,
-        description="Path of the captured photo, relative to HEALTHMES_DATA_DIR/media/.",
+        description="Path of the captured photo relative to HEALTHMES_DATA_DIR, "
+        "as returned by POST /v1/media (e.g. 'media/2026/07/<uuid>.jpg').",
     )
     meal_type: MealType | None = None
     source: str | None = Field(

@@ -231,26 +231,33 @@ token — the surface carries medical data), then enter the same token in the
 app. The fragmentation term of the energy engine activates automatically
 once samples arrive; iOS is deliberately not collected.
 
-## Companion apps (glance surfaces, issue #7)
+## Companion & desktop apps (issues #7 · #10 · #11)
 
-The glanceable-briefing companions render `GET /v1/briefing/glance` on lock
-screens, home widgets and watches. They are **local-first**: each app pairs
-with your own healthmes instance (base URL + bearer token) and talks to
-nothing else; polling only (ETag/304, 5-minute cache floor), no APNs/FCM
-relay. All rendering is deliberately placeholder — the watch/notification UX
-design belongs to the healthcare domain expert
-(`docs/design/WATCH-NOTIFICATIONS.ko.md`; the PLAN §8.5 notification grammar
-is the design system). None of this is part of the Python suite or CI, and a
-real-device pass is still owed on both platforms.
+Five native surfaces render the briefing: Android phone (+ Wear OS), iOS
+(+ watchOS), a macOS menu bar app (+ widgets + screensaver), a Windows tray
+app (+ screensaver), and the web pages the service itself serves (decision
+viewer, weekly report). All are **local-first**: each app pairs with your
+own healthmes instance (base URL + bearer token) and talks to nothing else;
+polling only (ETag/304, 5-minute cache floor), no APNs/FCM/WNS relay —
+Telegram remains the guaranteed-delivery channel. Visual design stays
+deliberately placeholder-labeled — the notification/watch UX belongs to the
+healthcare domain expert (`docs/design/WATCH-NOTIFICATIONS.ko.md`; the PLAN
+§8.5 notification grammar is the design system). The apps are not part of
+the Python suite, but each platform has its own path-filtered CI workflow
+(see "Continuous integration"); real-device passes are still owed everywhere
+(each README keeps an honest not-verified list).
 
-**Android / Wear OS** — three additional modules in `apps/android-usage/`
-(same Gradle wrapper as the collector): `:shared` (glance contract parser,
-ETag-aware client, encrypted pairing prefs), `:companion` (phone app —
-home/keyguard Glance widget, 15-minute WorkManager refresh, notification
-channel rendering the §8.5 grammar with stub Apply/Adjust/Keep actions) and
-`:wear` (standalone Wear OS app — ProtoLayout tile + energy complication,
-on-watch pairing). Per-module docs, build matrix and device caveats:
-`apps/android-usage/README.md`.
+**Android / Wear OS** — `apps/android-usage/` (same Gradle wrapper as the
+collector): `:shared` (contracts: glance, alerts page, weekly report,
+proposals, capture requests; ETag-aware client; encrypted pairing),
+`:companion` (the full phone app of issue #10 — single-activity Compose:
+briefing home + 24h curve, alert history, weekly report, camera/photo/voice
+capture, proposal accept/decline with 409 → "already resolved", settings;
+plus the home/keyguard widget, §8.5 notifications with real WorkManager
+actions and the ongoing focus-block notification that Wear OS bridges to the
+wrist) and `:wear` (standalone Wear OS app — ProtoLayout tile + energy
+complication, on-watch pairing). Per-module docs, build matrix and device
+caveats: `apps/android-usage/README.md`.
 
 ```bash
 cd apps/android-usage
@@ -258,11 +265,14 @@ cd apps/android-usage
 ./gradlew test            # all JVM unit tests (contract fixtures included)
 ```
 
-**iOS / watchOS** — `apps/ios-companion/`, an XcodeGen-generated project
-(five targets: SwiftUI pairing app, iOS WidgetKit extension with home +
-lock-screen families, watchOS app, watchOS widget/complication extension,
-XCTest bundle). Requires Xcode with the iOS **and watchOS** simulator
-platforms (`xcodebuild -downloadPlatform watchOS` once, ~3.6 GB) and
+**iOS / watchOS** — `apps/ios-companion/`, an XcodeGen-generated project:
+the full iOS app of issue #10 (briefing home, weekly report view, in-app
+decision viewer, camera/photos/voice capture, §8.5 local notifications from
+BGAppRefreshTask with real accept/decline actions, focus-block Live
+Activity), WidgetKit home/lock widgets, watchOS app + complications, XCTest
++ XCUITest bundles (UI tests self-skip without a live paired instance).
+Requires Xcode with the iOS **and watchOS** simulator platforms
+(`xcodebuild -downloadPlatform watchOS` once, ~3.6 GB) and
 `brew install xcodegen`. Simulator-only builds, never signed:
 
 ```bash
@@ -272,17 +282,90 @@ xcodebuild -project HealthMesCompanion.xcodeproj -scheme HealthMesCompanion \
   -destination "generic/platform=iOS Simulator" build CODE_SIGNING_ALLOWED=NO
 xcodebuild -project HealthMesCompanion.xcodeproj -scheme HealthMesWatchApp \
   -destination "generic/platform=watchOS Simulator" build CODE_SIGNING_ALLOWED=NO
+xcodebuild test -project HealthMesCompanion.xcodeproj -scheme HealthMesCompanion \
+  -destination "platform=iOS Simulator,name=iPhone 17 Pro" CODE_SIGNING_ALLOWED=NO
 ```
 
-Contract tests, simulator smoke run and the honest not-verified list:
-`apps/ios-companion/README.md`. Both companions pin the glance response
-schema in fixture JSON — a server-side change to
-`healthmes/api/briefing.py` must update
-`apps/android-usage/companion/src/test/resources/glance_*.json` and
-`apps/ios-companion/Tests/Fixtures/glance.json` in the same PR. This rule is
-enforced by the Python suite (`tests/api/test_glance_fixtures.py` validates
-every in-repo fixture against the server's `GlanceOut` model), so a contract
-drift fails CI even though the companion suites themselves do not run there.
+**macOS** — `apps/macos-companion/` (issue #11), XcodeGen project reusing
+`apps/ios-companion/Sources/Shared` verbatim (one contract/client across
+Apple platforms): `HealthMesMac` menu bar app (status-item score, popover
+briefing with real proposal actions, optional §8.5 notifications),
+`HealthMesMacWidgets` WidgetKit extension, `HealthMesSaver` screensaver
+bundle with the privacy toggle (hide health numbers — redaction is a tested
+data rule). Native, unsigned:
+
+```bash
+cd apps/macos-companion
+xcodegen generate
+xcodebuild -project HealthMesMac.xcodeproj -scheme HealthMesMac \
+  -destination "platform=macOS" build CODE_SIGNING_ALLOWED=NO   # + Widgets/Saver schemes
+xcodebuild test -project HealthMesMac.xcodeproj -scheme HealthMesMac \
+  -destination "platform=macOS" CODE_SIGNING_ALLOWED=NO
+```
+
+**Windows** — `apps/windows-companion/` (issue #11), a .NET 8 solution:
+`HealthMes.Glance.Core` (portable contracts + ETag client + §8.5 grammar,
+xunit-tested on any OS), `HealthMes.Tray` (WinForms tray icon + flyout +
+toast balloons), `HealthMes.Screensaver` (`.scr` honoring `/s`, `/p`, `/c`
+with the privacy toggle), a widgets-board card builder (the board provider
+itself is deferred — MSIX/signing; see `DEFERRED.md`), DPAPI-protected
+pairing. There is no Windows toolchain on this Mac: the compile-and-test
+proof on real Windows is the `windows-apps.yml` CI job. Locally (any OS —
+but the WinForms projects need the **official** .NET 8 SDK, not Homebrew's
+`dotnet@8`, which lacks the WindowsDesktop targets):
+
+```bash
+cd apps/windows-companion
+dotnet build HealthMes.Companion.sln -c Release
+dotnet test tests/HealthMes.Glance.Core.Tests -c Release
+```
+
+**Cross-platform contract pinning** — every companion pins the app-facing
+response schemas in fixture JSON, and a server-side contract change must
+update **all platforms' fixtures in the same PR**:
+
+- glance (`healthmes/api/briefing.py` → `GlanceOut`):
+  `apps/android-usage/companion/src/test/resources/glance_*.json`,
+  `apps/ios-companion/Tests/Fixtures/glance.json`, and their byte-identical
+  Windows twins under
+  `apps/windows-companion/tests/HealthMes.Glance.Core.Tests/Fixtures/`
+- alerts (`healthmes/api/alerts.py` → `Page[AlertOut]`): `alerts_page.json`
+  (Android, Windows), `alerts.json` (iOS)
+- weekly report (`healthmes/api/reports.py` → `WeeklyReportOut`):
+  `weekly_report.json` (Android, iOS; the Windows copy is envelope-only by
+  design — its desktop parser types just the envelope)
+
+The rule is enforced by the Python suite: `tests/api/test_glance_fixtures.py`
+validates every in-repo fixture against the live server models, so contract
+drift fails CI even where the companion suites themselves do not run.
+
+### App-facing REST contracts (issue #10)
+
+Endpoints the apps consume beyond the glance briefing (full request/response
+shapes are pinned in `tests/api/`):
+
+| Endpoint | Auth | Contract |
+|---|---|---|
+| `POST /v1/media` | bearer **only** | `multipart/form-data`, field name exactly `file`; client filename ignored. `Content-Length` **required** (`411` without one — chunked bodies are refused; the size cap is enforced off the header BEFORE the body is received/spooled). Content-type allowlist (jpeg/png/heic/webp images, m4a/mp3/ogg/wav audio; aliases normalized). `201 → {media_path, content_type, bytes}`; `415` (detail.allowed), `413` (cap = `HEALTHMES_MEDIA_MAX_UPLOAD_BYTES`, default 15 MiB; declared length beyond cap + 64 KiB envelope allowance is refused unread), `422` missing `file` field or empty file. Files land under `{data_dir}/media/YYYY/MM/` (UTC sharding). |
+| `GET /v1/media/{media_path}` | bearer **or** derived viewer `?token=` (GET/HEAD only) | Serves the upload back (real content type, `Cache-Control: private, max-age=86400, immutable`); decision/report pages and in-app web views can embed via `<img>`/`<audio>`. All path tricks → uniform 404. |
+| `POST /v1/medical-records` | bearer | REST twin of the `create_medical_record` MCP tool (the Telegram capture-skill contract): `{kind: medication\|symptom, description, media_path?, transcript?, context?}`. The server attaches the deterministic health snapshot under `context.health` (degrades to `{status: unavailable}` when open-wearables is down — capture never fails for infra reasons); caller context is stored under `context.capture`. |
+| `GET /v1/alerts` | bearer | Alert history in glance semantics ("unresolved == recently pushed"): `?hours=1..168` (default 24), paginated `Page` envelope, newest first. Items carry the §8.5 grammar recorded at fire time (`summary`/`evidence`/`proposal`) + `decision_url`; `alerts[0]` agrees verbatim with the glance top alert (test-pinned). |
+| `POST /v1/schedule/proposals/{id}/accept` / `/decline` | bearer | The apps' ✅/❌ actions. Second tap → `409 invalid_transition` with `detail {current, requested}` (render "already resolved"); unknown id → 404. |
+| `POST /v1/food-logs` | bearer | Accepts `media_path` from `POST /v1/media` (≤500 chars). |
+
+Client caveats worth knowing (all handled by the shipped apps):
+
+- **Timestamp quirk**: store-backed endpoints (schedule proposals,
+  food-logs) serialize naive-UTC datetimes (no `Z`), while glance/alerts
+  serialize timezone-aware — clients must parse both (the shared parsers
+  treat naive as UTC).
+- **No alert→proposal linkage yet**: alert items carry no
+  `schedule_proposal` id, so notification action buttons act only when
+  exactly one proposal is pending (the no-guessing policy of PLAN §11);
+  otherwise they route into the app. Lifting this needs a server-side
+  linkage field.
+- Push relay (APNs/FCM/WNS) is out of scope **by design** — notification
+  delivery is OS-budgeted polling; Telegram is the guaranteed channel.
 
 ## Real credentials — what needs what
 
@@ -301,7 +384,7 @@ corresponding integrations stay inactive.
 | Proactive alert push (HealthMes -> Hermes) | shared HMAC secret | `HEALTHMES_HERMES_WEBHOOK_SECRET` — generated into `.env` by `scripts/bootstrap.py` |
 | Encrypted backups (CLI + weekly job) | a passphrase you choose (and must not lose) | `HEALTHMES_BACKUP_PASSPHRASE` in `.env`, or `--passphrase-file` |
 | Remote vault replication (ciphertext-only, optional) | S3-compatible bucket + access keys (AWS S3 / Cloudflare R2 / MinIO) | `HEALTHMES_VAULT_BUCKET` (+ `HEALTHMES_VAULT_ENDPOINT`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`/`_REGION`/`_PREFIX`); opt in with `HEALTHMES_BACKUP_PROVIDER=remote_vault` or `--provider remote` |
-| Companion apps (Android/Wear/iOS/watchOS glance widgets) | the service's `HEALTHMES_API_TOKEN` (same LAN rule as the collector) | entered in each app's pairing screen together with the base URL |
+| Companion & desktop apps (Android/Wear/iOS/watchOS/macOS/Windows) | the service's `HEALTHMES_API_TOKEN` (same LAN rule as the collector) | entered in each app's pairing screen together with the base URL |
 | Android usage collector | the service's `HEALTHMES_API_TOKEN` (verified server-side; required whenever the service binds beyond loopback) | entered in the app UI; sent as `Authorization: Bearer ...` |
 | API/MCP surface auth | bearer token you mint (`python3 -c "import secrets; print(secrets.token_urlsafe(32))"`) | `HEALTHMES_API_TOKEN` in `.env`; required for `HEALTHMES_HOST=0.0.0.0` and for docker compose |
 
@@ -396,6 +479,10 @@ alembic/              migrations for the healthmes DB (alembic.ini at repo root)
 apps/android-usage/   usage collector (:app) + Android/Wear companions
                       (:shared/:companion/:wear) — own README
 apps/ios-companion/   iOS/watchOS companion (XcodeGen project, own README)
+apps/macos-companion/ macOS menu bar app + widgets + screensaver (XcodeGen,
+                      reuses ios-companion/Sources/Shared — own README)
+apps/windows-companion/ Windows tray app + screensaver + contract core
+                      (.NET 8 solution, windows-latest CI — own README)
 config/               templates + service env files (rendered copies gitignored)
 docs/                 PLAN.md (architecture), BACKUP.md (snapshot format),
                       design/ (domain-expert worksheets, .ko.md), this guide
@@ -448,6 +535,26 @@ tests under `tests/hardening/` add a restore drill (backup snapshot →
 destroy → restore → reopen the store) and trigger-flood tests pinning the
 alert-hygiene guarantees of `docs/PLAN.md` §11 (daily budget, dedup storms,
 quiet-hours no-redelivery).
+
+The native apps have their own **path-filtered** workflows (they only run
+when the corresponding `apps/` tree or the workflow itself changes; all
+support `workflow_dispatch`; nothing is ever signed):
+
+- **`android-apps.yml`** (ubuntu) — `./gradlew` assembles every APK
+  (`:app`, `:companion`, `:wear`) and runs the JVM unit-test suites, exactly
+  the locally-proven matrix from `apps/android-usage/README.md`. No emulator.
+- **`apple-apps.yml`** (macos) — two jobs. `ios`: XcodeGen + unsigned
+  simulator builds of the iOS and watchOS schemes, then the XCTest/XCUITest
+  suite on an iPhone simulator picked from the runner's newest installed iOS
+  runtime (UI tests self-skip without a live paired instance). `macos`:
+  XcodeGen + unsigned native builds of the menu bar app, widget extension
+  and screensaver schemes, then the XCTest suite. Both jobs run when either
+  Apple directory changes, because the macOS targets compile
+  `apps/ios-companion/Sources/Shared` verbatim.
+- **`windows-apps.yml`** (windows) — the compile-and-test proof for
+  `apps/windows-companion` (no Windows toolchain exists on the dev machine):
+  `dotnet build` (Release, warnings as errors) + the xunit contract suite +
+  publish of the tray app and the `.scr` screensaver as build artifacts.
 
 ## Vendor upstream sync drill
 

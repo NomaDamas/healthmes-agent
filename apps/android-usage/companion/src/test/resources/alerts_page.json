@@ -1,0 +1,32 @@
+{
+  "data": [
+    {
+      "id": "3f6a1c2e-8d4b-4f0a-9c7e-5b2d1a0f9e8d",
+      "rule_id": "stress_spike",
+      "fired_at": "2026-07-09T04:55:00Z",
+      "summary": "Stress spiked 45% above your 14-day baseline",
+      "proposal": "Move the 14:00 deep-work block to tomorrow morning and keep the afternoon light.",
+      "evidence": {
+        "hrv_delta_pct": -18,
+        "window_hours": 24,
+        "baseline": "14-day"
+      },
+      "decision_url": "http://192.168.1.20:8100/decisions/0b8f3e0a-2b9f-4c47-a9d4-2f2b7f6f3a11?token=viewer-abc123"
+    },
+    {
+      "id": "56b7a1de-9f7d-4f1e-8f7a-6d2f2b7f6f3a",
+      "rule_id": "schedule_changed",
+      "fired_at": "2026-07-08T22:10:00Z",
+      "summary": "schedule_changed",
+      "proposal": null,
+      "evidence": null,
+      "decision_url": null
+    }
+  ],
+  "pagination": {
+    "total_count": 2,
+    "limit": 50,
+    "offset": 0,
+    "has_more": false
+  }
+}

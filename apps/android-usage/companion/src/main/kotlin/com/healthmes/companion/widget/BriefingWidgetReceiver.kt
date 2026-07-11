@@ -21,5 +21,5 @@ class BriefingWidgetReceiver : GlanceAppWidgetReceiver() {
 
     // onDisabled intentionally does NOT cancel the periodic refresh: the
     // alert notification channel keeps working without any widget placed.
-    // "Clear pairing" in PairingActivity is the explicit off switch.
+    // "Clear pairing" in the app's Settings tab is the explicit off switch.
 }

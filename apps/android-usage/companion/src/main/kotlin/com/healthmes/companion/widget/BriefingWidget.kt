@@ -28,7 +28,7 @@ import androidx.glance.text.TextStyle
 import androidx.glance.unit.ColorProvider
 import com.healthmes.briefing.BriefingDisplayState
 import com.healthmes.briefing.BriefingRepository
-import com.healthmes.companion.PairingActivity
+import com.healthmes.companion.MainActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -85,9 +85,9 @@ private fun WidgetContent(state: WidgetUiState) {
             .fillMaxSize()
             .background(bg)
             .padding(12.dp)
-            // Tap-through to the pairing/status screen; decision-viewer deep
-            // links stay on the notification path where the URL is fresh.
-            .clickable(actionStartActivity<PairingActivity>()),
+            // Tap-through to the briefing home; decision-viewer deep links
+            // stay on the notification/alert-list paths where URLs are fresh.
+            .clickable(actionStartActivity<MainActivity>()),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         when {

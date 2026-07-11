@@ -247,9 +247,10 @@ MVP는 클라우드가 아닌 **시임(인터페이스)만** 정의:
 ## Phase 4–7 로드맵
 
 Phase 0–3 완료 이후의 확장 단계. issue #7(컴패니언 앱 글랜스 표면)이 Phase 5–7의
-사전 실기기 작업 범위를 정의했고, 이 브랜치(feat/phase5-7-glance-vault)에서 그
-서버/앱 플럼빙이 구현됐다. **원칙 유지: vendor 무수정, 로컬 first, 알림 문법(§8.5)이
-디자인 시스템, 워치 알림 UX 최종 설계는 헬스케어 도메인 전문가 몫.**
+사전 실기기 작업 범위를 정의했고(feat/phase5-7-glance-vault에서 서버/앱 플럼빙 구현),
+issue #10(풀 네이티브 폰 앱)·#11(macOS/Windows 데스크톱 글랜스)이 Phase 5를 실앱
+수준으로 확장했다(feat/native-apps-desktop). **원칙 유지: vendor 무수정, 로컬 first,
+알림 문법(§8.5)이 디자인 시스템, 워치 알림 UX 최종 설계는 헬스케어 도메인 전문가 몫.**
 
 **Phase 4 — 실사용 안정화 (전부 남음 — 실기기·실크리덴셜 필요)**
 - 실크리덴셜 가동: Telegram 봇 + Claude API + open-wearables 프로바이더 OAuth +
@@ -258,20 +259,48 @@ Phase 0–3 완료 이후의 확장 단계. issue #7(컴패니언 앱 글랜스 
 - 전문가 스킬 온보딩: `docs/EXPERT-ONBOARDING.ko.md` 프로토콜대로 도메인 전문가가
   스킬/지표를 실기기 QA와 함께 반입
 
-**Phase 5 — 글랜스 표면 (잠금화면·홈 위젯·워치)**
-- 이번에 구현: ① `GET /v1/briefing/glance` — 위젯/컴플리케이션용 경량 브리핑 계약
-  (에너지 점수+24h 커브+confidence, 다음 블록 ≤3, 알림 요약, 최신 결정 링크; ETag/304,
-  5분 캐시, bearer 인증) ② Android 컴패니언(`apps/android-usage/` — :shared 계약
-  모듈, :companion 홈/잠금 위젯+§8.5 문법 알림 채널, :wear Wear OS 타일+컴플리케이션)
-  ③ iOS/watchOS 컴패니언(`apps/ios-companion/` — WidgetKit 홈/잠금 위젯, watchOS 앱+
-  컴플리케이션, WatchConnectivity 페어링) — 모두 base-url+bearer 페어링으로 자기
-  healthmes 인스턴스에만 접속(로컬 first) ④ 전문가 설계 워크시트
+**Phase 5 — 글랜스 표면 → 네이티브 컴패니언/데스크톱 앱 (issue #7 → #10·#11)**
+- 이번에 구현(#7 — 글랜스 플럼빙): ① `GET /v1/briefing/glance` — 위젯/컴플리케이션용
+  경량 브리핑 계약(에너지 점수+24h 커브+confidence, 다음 블록 ≤3, 알림 요약, 최신 결정
+  링크; ETag/304, 5분 캐시, bearer 인증) ② Android 컴패니언(`apps/android-usage/` —
+  :shared 계약 모듈, :companion 홈/잠금 위젯+§8.5 문법 알림 채널, :wear Wear OS 타일+
+  컴플리케이션) ③ iOS/watchOS 컴패니언(`apps/ios-companion/` — WidgetKit 홈/잠금 위젯,
+  watchOS 앱+컴플리케이션, WatchConnectivity 페어링) — 모두 base-url+bearer 페어링으로
+  자기 healthmes 인스턴스에만 접속(로컬 first) ④ 전문가 설계 워크시트
   `docs/design/WATCH-NOTIFICATIONS.ko.md`
-- 남음: 전문가 UX 설계 반영(현재 렌더링은 명시적 플레이스홀더 — 워크시트 Q1–Q6 결정
-  대기), 실기기/에뮬레이터 검증(위젯·타일·컴플리케이션·알림은 아직 실하드웨어 미확인),
-  푸시 경로(현재 폴링 전용 — APNs/FCM 릴레이 없음, 신뢰 푸시는 여전히 Telegram),
-  진행형 표면(iOS Live Activities/Dynamic Island·Wear OS Ongoing Activity —
-  현재 집중 블록 상시 표시 — 미착수)
+- 이번에 구현(#10 — 풀 네이티브 폰 앱): ⑤ 서버 확장 — `POST /v1/media`(멀티파트 업로드,
+  타입 화이트리스트+용량 캡), `GET /v1/media/{path}`(bearer 또는 파생 뷰어 토큰),
+  `POST /v1/medical-records`(Telegram capture 스킬과 동일 계약의 REST — 건강 스냅샷은
+  서버가 부착, 인프라 사유로 캡처가 실패하지 않음), `GET /v1/alerts`(§8.5 문법 알림
+  이력 — glance top-alert와 동일 결정 링크 휴리스틱을 테스트로 핀) ⑥ iOS 풀 앱 —
+  브리핑 홈(24h 커브·다음 블록·제안 승인/수정/유지·알림 이력), 주간 리포트 네이티브 뷰,
+  결정 뷰어(SFSafariViewController), 카메라/음성 캡처→media→food/medical,
+  BGAppRefreshTask+UNUserNotificationCenter §8.5 알림(실제 accept/decline 액션), 집중
+  블록 Live Activity, en+ko 로컬라이즈+VoiceOver — 시뮬레이터 빌드+유닛/UI 테스트+라이브
+  E2E로 증명 ⑦ Android :companion 풀 앱 승격 — Compose 단일 액티비티(브리핑·리포트·
+  캡처·제안·설정 5탭), §8.5 알림 실제 액션(WorkManager, 409→"이미 처리됨"), 진행형
+  집중블록 알림(포그라운드 서비스 없이 OS 크로노미터+자기소멸)+Wear 브리징,
+  values-ko+TalkBack — gradle 빌드+JVM 테스트로 증명
+- 이번에 구현(#11 — 데스크톱 글랜스): ⑧ macOS(`apps/macos-companion/`) — 메뉴바 앱
+  (상태 아이템 점수+팝오버 브리핑+§8.5 알림/실제 액션), WidgetKit 위젯, 앰비언트
+  스크린세이버 .saver(프라이버시 토글 — 숨김=부재가 테스트된 데이터 규칙), iOS Shared
+  소스를 그대로 컴파일(계약/클라이언트 단일화) — 네이티브 빌드+XCTest+라이브 E2E로 증명
+  ⑨ Windows(`apps/windows-companion/`) — 트레이 앱(플라이아웃·§8.5 토스트), .scr
+  스크린세이버(/s·/p·/c+프라이버시 토글), 위젯 Adaptive Card 빌더(보드 프로바이더는
+  MSIX 서명 요구로 유예 — DEFERRED.md), DPAPI 페어링, en+ko .resx — macOS에서
+  크로스컴파일+xunit으로 증명, 실빌드 증명은 windows-latest CI 잡 ⑩ 크로스플랫폼 픽스처
+  핀 확장 — `tests/api/test_glance_fixtures.py`가 glance·alerts·weekly 픽스처를 세
+  플랫폼 사본 전부 서버 모델로 검증 ⑪ 앱 CI 신설 — `windows-apps.yml`·`apple-apps.yml`·
+  `android-apps.yml`(경로 필터, 전부 무서명)
+- 남음: 실기기/실OS 검증(시뮬레이터·JVM·크로스컴파일 증명까지 완료 — BG 태스크 실행
+  주기·알림 배너 전달·Live Activity 실표시·카메라·Wear/워치 하드웨어·Windows 실기기,
+  그리고 신설 windows/apple/android CI 잡의 첫 PR 실행이 곧 컴파일 증명), 전문가 UX
+  설계 반영(시각 요소는 여전히 명시적 플레이스홀더 — 워크시트 Q1–Q6 대기, watch 앱
+  심화도 함께), 푸시 릴레이는 설계상 제외 유지(폴링 전용, 보장 전달은 Telegram —
+  APNs/FCM/WNS 미구축), alert→schedule_proposal 연결 필드(알림 액션 버튼이 특정 제안을
+  겨냥하게 — 현재는 보류 제안이 정확히 1건일 때만 동작하는 무추측 정책), 제안 거절
+  노트(store 컬럼+마이그레이션 필요 — 계약은 서버 에이전트 기록 참조), Windows 위젯
+  보드 프로바이더(MSIX+서명 파이프라인)
 
 **Phase 6 — 장기 맥락**
 - 이번에 구현: ① 인지에너지 v2 요인 5종 — 생리주기 단계·햇빛 노출·소음 노출·음주·

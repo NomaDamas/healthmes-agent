@@ -1,0 +1,86 @@
+# Windows companion CI (issue #11) — the compile-and-test proof for
+# apps/windows-companion, which has no Windows toolchain on the dev machine.
+# Independent from ci.yml on purpose: it only wakes up when the Windows app
+# (or this workflow) changes.
+#
+# What runs where:
+#   - build: the whole solution (core lib + WinForms tray/screensaver +
+#     widgets stub) compiles Release on windows-latest.
+#   - test: the HealthMes.Glance.Core xunit suite — the same fixtures the
+#     iOS/Android apps pin (and tests/api/test_glance_fixtures.py validates
+#     server-side).
+#   - publish: framework-dependent win-x64 folders for the tray app and the
+#     screensaver (exe renamed to .scr — the apphost embeds its managed dll
+#     path, so the rename is safe), uploaded as a build artifact.
+
+name: Windows apps
+
+on:
+  pull_request:
+    paths:
+      - "apps/windows-companion/**"
+      - ".github/workflows/windows-apps.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/windows-companion/**"
+      - ".github/workflows/windows-apps.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  windows:
+    name: dotnet build + test + publish (windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/windows-companion
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore HealthMes.Companion.sln
+
+      - name: Build (Release, warnings are errors)
+        run: dotnet build HealthMes.Companion.sln --no-restore -c Release
+
+      - name: Test HealthMes.Glance.Core
+        run: >
+          dotnet test tests/HealthMes.Glance.Core.Tests --no-build -c Release
+          --logger "console;verbosity=normal"
+
+      - name: Publish tray app (framework-dependent, win-x64)
+        run: >
+          dotnet publish src/HealthMes.Tray -c Release -r win-x64
+          --self-contained false -o artifacts/tray
+
+      - name: Publish screensaver and rename to .scr
+        run: |
+          dotnet publish src/HealthMes.Screensaver -c Release -r win-x64 --self-contained false -o artifacts/screensaver
+          Copy-Item artifacts/screensaver/HealthMes.Screensaver.exe artifacts/screensaver/HealthMes.Screensaver.scr
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: healthmes-windows-companion
+          path: |
+            apps/windows-companion/artifacts/tray
+            apps/windows-companion/artifacts/screensaver
+          if-no-files-found: error
+          retention-days: 14

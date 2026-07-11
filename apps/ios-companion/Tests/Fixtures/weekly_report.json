@@ -1,0 +1,91 @@
+{
+  "generated_at": "2026-07-09T14:23:00Z",
+  "timezone": "UTC",
+  "week_start": "2026-07-03",
+  "week_end": "2026-07-09",
+  "report_url": "http://192.168.1.20:8100/reports/weekly?token=hm-ro-3q2b8d1f7c6e5a4",
+  "energy": {
+    "days": [
+      {"date": "2026-07-03", "avg_score": 61, "min_score": 48, "max_score": 74, "samples": 10},
+      {"date": "2026-07-04", "avg_score": 55, "min_score": 41, "max_score": 70, "samples": 9},
+      {"date": "2026-07-05", "avg_score": null, "min_score": null, "max_score": null, "samples": 0},
+      {"date": "2026-07-06", "avg_score": 63, "min_score": 52, "max_score": 78, "samples": 11},
+      {"date": "2026-07-07", "avg_score": 59, "min_score": 44, "max_score": 71, "samples": 8},
+      {"date": "2026-07-08", "avg_score": 52, "min_score": 39, "max_score": 66, "samples": 7},
+      {"date": "2026-07-09", "avg_score": 58, "min_score": 47, "max_score": 71, "samples": 7}
+    ],
+    "overall_avg": 58,
+    "samples": 52
+  },
+  "insights": {
+    "count": 3,
+    "items": [
+      {
+        "id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+        "period": "2026-W28",
+        "kind": "stress_by_hour",
+        "statement": "Stress peaks between 14:00 and 16:00 on weekdays.",
+        "confidence": 0.82,
+        "confidence_level": "high",
+        "created_at": "2026-07-08T06:00:00Z"
+      },
+      {
+        "id": "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e",
+        "period": "2026-W28",
+        "kind": "activity_vs_stress",
+        "statement": "Days with a morning walk show lower afternoon stress.",
+        "confidence": 0.55,
+        "confidence_level": "medium",
+        "created_at": "2026-07-07T06:00:00Z"
+      },
+      {
+        "id": "3c4d5e6f-7a8b-4c9d-0e1f-2a3b4c5d6e7f",
+        "period": "2026-W28",
+        "kind": "calendar_keyword",
+        "statement": "Not enough data to relate meeting keywords to stress.",
+        "confidence": null,
+        "confidence_level": "none",
+        "created_at": "2026-07-06T06:00:00Z"
+      }
+    ]
+  },
+  "schedule": {
+    "proposed": 1,
+    "accepted": 4,
+    "pushed": 1,
+    "declined": 1,
+    "decided": 6,
+    "acceptance_pct": 83
+  },
+  "alerts": {
+    "fired": 9,
+    "delivered": 6,
+    "daily_budget": 8,
+    "weekly_budget": 56,
+    "by_rule": [
+      {"rule_id": "stress_spike_vs_baseline", "fired": 5, "delivered": 4},
+      {"rule_id": "low_recovery_heavy_afternoon", "fired": 3, "delivered": 2},
+      {"rule_id": "schedule_changed", "fired": 1, "delivered": 0}
+    ]
+  },
+  "decisions": {
+    "count": 4,
+    "kind_counts": {"alert": 2, "schedule_change": 2},
+    "items": [
+      {
+        "id": "7e6a1b2c-93d4-4f58-a1c0-5b8e2f7d9a34",
+        "kind": "alert",
+        "summary": "Moved the 14:00 deep-work block after low recovery",
+        "created_at": "2026-07-09T13:55:00Z",
+        "url": "http://192.168.1.20:8100/decisions/7e6a1b2c-93d4-4f58-a1c0-5b8e2f7d9a34?token=hm-ro-3q2b8d1f7c6e5a4"
+      },
+      {
+        "id": "9f8e7d6c-5b4a-4392-8171-605f4e3d2c1b",
+        "kind": "schedule_change",
+        "summary": "Accepted Tuesday morning writing block",
+        "created_at": "2026-07-07T09:12:00Z",
+        "url": "http://192.168.1.20:8100/decisions/9f8e7d6c-5b4a-4392-8171-605f4e3d2c1b?token=hm-ro-3q2b8d1f7c6e5a4"
+      }
+    ]
+  }
+}

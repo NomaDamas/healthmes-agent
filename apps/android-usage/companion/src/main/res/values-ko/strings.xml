@@ -1,0 +1,154 @@
+<resources>
+    <string name="app_name">HealthMes 컴패니언</string>
+    <string name="widget_label">HealthMes 브리핑</string>
+    <string name="widget_description">내 HealthMes 인스턴스의 에너지 점수, 다음 블록, 미해결 알림.</string>
+
+    <!-- Navigation tabs -->
+    <string name="tab_home">브리핑</string>
+    <string name="tab_report">리포트</string>
+    <string name="tab_capture">캡처</string>
+    <string name="tab_proposals">제안</string>
+    <string name="tab_settings">설정</string>
+
+    <!-- Briefing home -->
+    <string name="home_energy_label">인지에너지</string>
+    <string name="home_confidence">신뢰도 %1$s</string>
+    <string name="home_generated_at">업데이트 %1$s</string>
+    <string name="home_not_paired">아직 페어링되지 않았습니다. 설정에서 HealthMes 서버 URL을 입력하세요.</string>
+    <string name="home_go_to_settings">설정 열기</string>
+    <string name="home_refresh">새로고침</string>
+    <string name="home_curve_title">오늘 시간대별</string>
+    <string name="home_curve_a11y">24시간 에너지 커브. 현재 점수 100점 중 %1$s, 신뢰도 %2$s. 데이터 없는 시간대는 비어 있습니다.</string>
+    <string name="home_next_blocks">다음 블록</string>
+    <string name="home_no_blocks">예정된 블록이 없습니다.</string>
+    <string name="home_block_demand">요구 에너지 %1$s</string>
+    <string name="home_block_source_proposal">제안</string>
+    <string name="home_alerts_title">알림 · 최근 24시간</string>
+    <string name="home_no_alerts">최근 24시간 알림이 없습니다.</string>
+    <string name="home_alerts_error">알림을 불러오지 못했습니다: %1$s</string>
+    <string name="home_alert_why">왜 이 판단?</string>
+    <string name="home_latest_decision">최근 결정</string>
+    <string name="home_open_decision">의사결정 뷰어 열기</string>
+    <string name="home_no_data">브리핑 데이터가 아직 없습니다 — 페어링 후 새로고침하세요.</string>
+    <string name="score_a11y">인지에너지 100점 중 %1$s점, 신뢰도 %2$s</string>
+    <string name="score_a11y_missing">인지에너지 값 없음, 신뢰도 %1$s</string>
+
+    <!-- Weekly report -->
+    <string name="report_title">주간 리포트</string>
+    <string name="report_week">%1$s – %2$s 주간</string>
+    <string name="report_loading">주간 리포트를 불러오는 중…</string>
+    <string name="report_error">리포트를 불러오지 못했습니다: %1$s</string>
+    <string name="report_retry">다시 시도</string>
+    <string name="report_open_html">웹 버전 열기</string>
+    <string name="report_energy_section">에너지 추이</string>
+    <string name="report_energy_overall">주 평균 %1$s · 샘플 %2$d개</string>
+    <string name="report_energy_none">이번 주 기록된 에너지 데이터가 없습니다.</string>
+    <string name="report_day_a11y">%1$s: 평균 %2$s, 범위 %3$s–%4$s, 샘플 %5$d개</string>
+    <string name="report_day_a11y_empty">%1$s: 데이터 없음</string>
+    <string name="report_insights_section">인사이트 (%1$d)</string>
+    <string name="report_no_insights">이번 주 기록된 인사이트가 없습니다.</string>
+    <string name="report_schedule_section">일정 이행</string>
+    <string name="report_schedule_line">수락 %1$d · 반영 %2$d · 거절 %3$d · 대기 %4$d</string>
+    <string name="report_schedule_acceptance">수락률 %1$d%%</string>
+    <string name="report_schedule_acceptance_none">이번 주 결정된 제안이 없습니다.</string>
+    <string name="report_alerts_section">알림</string>
+    <string name="report_alerts_line">발화 %1$d · 전달 %2$d · 예산 %3$d/일</string>
+    <string name="report_decisions_section">결정 (%1$d)</string>
+    <string name="report_no_decisions">이번 주 기록된 결정이 없습니다.</string>
+    <string name="confidence_high">높음</string>
+    <string name="confidence_medium">중간</string>
+    <string name="confidence_low">낮음</string>
+    <string name="confidence_none">없음</string>
+
+    <!-- Capture -->
+    <string name="capture_title">캡처</string>
+    <string name="capture_kind_label">무엇인가요?</string>
+    <string name="capture_kind_food">음식</string>
+    <string name="capture_kind_medication">약</string>
+    <string name="capture_kind_symptom">증상</string>
+    <string name="capture_take_photo">사진 촬영</string>
+    <string name="capture_pick_photo">사진 선택</string>
+    <string name="capture_record_voice">음성 녹음</string>
+    <string name="capture_stop_recording">녹음 중지</string>
+    <string name="capture_recording">녹음 중… 끝나면 “녹음 중지”를 누르세요.</string>
+    <string name="capture_description_hint">설명 (저장 전에 수정 가능)</string>
+    <string name="capture_transcript_hint">전사 텍스트 (선택, 음성 메모)</string>
+    <string name="capture_attached">첨부됨: %1$s · %2$d KB</string>
+    <string name="capture_remove_attachment">첨부 제거</string>
+    <string name="capture_save">HealthMes에 저장</string>
+    <string name="capture_saving">저장 중…</string>
+    <string name="capture_saved_food">음식 기록을 저장했습니다.</string>
+    <string name="capture_saved_medical">의료 기록을 저장했습니다 (건강 스냅샷은 서버가 첨부).</string>
+    <string name="capture_error_description_required">설명을 먼저 입력하세요.</string>
+    <string name="capture_error_not_paired">먼저 설정 탭에서 HealthMes 인스턴스와 페어링하세요.</string>
+    <string name="capture_upload_failed">업로드 실패: %1$s</string>
+    <string name="capture_create_failed">저장 실패: %1$s</string>
+    <string name="capture_photo_failed">사진을 준비하지 못했습니다: %1$s</string>
+    <string name="capture_mic_permission">음성 메모 녹음에는 마이크 권한이 필요합니다.</string>
+    <string name="capture_note">캡처는 페어링된 인스턴스로만 전송됩니다. 의료 기록에는 서버가 오늘의 건강 스냅샷을 첨부합니다.</string>
+
+    <!-- Proposals -->
+    <string name="proposals_title">일정 제안</string>
+    <string name="proposals_pending_only">대기 중만</string>
+    <string name="proposals_empty">제안이 없습니다.</string>
+    <string name="proposals_empty_pending">대기 중인 제안이 없습니다.</string>
+    <string name="proposals_accept">수락</string>
+    <string name="proposals_decline">거절</string>
+    <string name="proposals_error">제안을 불러오지 못했습니다: %1$s</string>
+    <string name="proposals_already_resolved">이미 처리됨 — 현재 상태 “%1$s”.</string>
+    <string name="proposals_action_failed">처리 실패: %1$s</string>
+    <string name="proposals_accepted">제안을 수락했습니다.</string>
+    <string name="proposals_declined">제안을 거절했습니다.</string>
+    <string name="proposals_status_a11y">제안 %1$s, 상태 %2$s</string>
+
+    <!-- Settings / pairing -->
+    <string name="settings_title">설정</string>
+    <string name="hint_server_url">서버 URL (예: http://192.168.1.20:8100)</string>
+    <string name="hint_token">API 토큰 (선택, Bearer로 전송)</string>
+    <string name="save_pairing">페어링 저장</string>
+    <string name="refresh_now">지금 새로고침</string>
+    <string name="clear_pairing">페어링 해제</string>
+    <string name="no_refresh_yet">아직 새로고침 기록이 없습니다.</string>
+    <string name="status_not_paired">페어링되지 않음.</string>
+    <string name="settings_status">상태</string>
+    <string name="settings_privacy_note">로컬 우선: 이 앱은 여기서 페어링한 HealthMes 인스턴스와만 통신합니다. 제3자 엔드포인트·분석도구 없음. 알림은 15분 폴링에서 파생되며, 즉시성이 필요한 알림의 신뢰 채널은 Telegram입니다.</string>
+    <string name="error_invalid_url">올바른 http(s) URL을 입력하세요. 예: http://192.168.1.20:8100</string>
+    <string name="toast_pairing_saved">페어링을 저장했습니다. 새로고침 중…</string>
+    <string name="toast_pair_first">먼저 서버 URL을 저장하세요.</string>
+    <string name="toast_refresh_scheduled">새로고침을 예약했습니다.</string>
+    <string name="toast_pairing_cleared">페어링을 해제했습니다.</string>
+
+    <!-- Alert notifications (§8.5 grammar) -->
+    <string name="notification_channel_name">HealthMes 브리핑 알림</string>
+    <string name="notification_channel_description">관찰 / 근거 / 제안 문법으로 전달되는 HealthMes 선제 알림.</string>
+    <string name="notification_action_apply">✅ 적용</string>
+    <string name="notification_action_adjust">✏️ 수정</string>
+    <string name="notification_action_keep">❌ 오늘은 그대로</string>
+    <string name="action_channel_name">HealthMes 처리 결과</string>
+    <string name="action_channel_description">알림의 적용 / 그대로 두기 버튼 처리 결과.</string>
+    <string name="action_result_applied">적용됨 — 일정 제안을 수락했습니다.</string>
+    <string name="action_result_declined">그대로 유지 — 일정 제안을 거절했습니다.</string>
+    <string name="action_result_already">이미 처리됨 — 제안 상태는 “%1$s”입니다.</string>
+    <string name="action_result_gone">해당 제안이 더 이상 존재하지 않습니다.</string>
+    <string name="action_result_none">지금 대기 중인 제안이 없습니다 — 앱에서 확인하세요.</string>
+    <string name="action_result_ambiguous">대기 중인 제안이 %1$d건입니다 — 앱에서 선택하세요.</string>
+    <string name="action_result_retrying">인스턴스에 연결하지 못했습니다 — 곧 다시 시도합니다.</string>
+    <string name="action_result_failed">처리 실패: %1$s</string>
+
+    <!-- Ongoing focus-block notification -->
+    <string name="focus_channel_name">현재 집중 블록</string>
+    <string name="focus_channel_description">예정된 블록이 진행 중일 때 조용히 표시되는 상시 알림.</string>
+    <string name="focus_until">%1$s까지</string>
+    <string name="focus_untitled">(제목 없는 블록)</string>
+
+    <!-- Decision viewer -->
+    <string name="viewer_title">의사결정 뷰어</string>
+    <string name="viewer_share">링크 공유</string>
+    <string name="viewer_back">뒤로</string>
+
+    <!-- Widget (cache-only rendering) -->
+    <string name="widget_not_paired">열어서 HealthMes 인스턴스와 페어링</string>
+    <string name="widget_energy_label">에너지</string>
+    <string name="widget_no_data">브리핑 데이터가 아직 없습니다</string>
+    <string name="widget_alerts_none">알림 없음</string>
+</resources>
