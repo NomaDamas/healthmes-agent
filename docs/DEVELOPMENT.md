@@ -26,7 +26,7 @@ a full one-command stack.
 make mac-setup            # brew install postgresql@16 + redis (if missing),
                           # initdb ./data/pg, start pg+redis, create the
                           # open-wearables + healthmes databases, uv sync
-cp .env.example .env      # optional: tweak HEALTHMES_* values
+install -m 600 .env.example .env  # optional: tweak HEALTHMES_* values
 make mac-run              # alembic upgrade head + uvicorn :8100
 curl http://localhost:8100/health   # -> {"status":"ok"}
 make mac-test             # uv run pytest -q
@@ -82,6 +82,91 @@ Notes:
   worker the OW API still serves, but no background syncs happen.
 - postgresql@16 is keg-only; the scripts call binaries via
   `$(brew --prefix postgresql@16)/bin` — no PATH changes needed.
+
+### Oura OAuth dogfooding (mac-native)
+
+Create an OAuth application in the
+[Oura Cloud developer portal](https://cloud.ouraring.com/oauth/applications).
+The registered redirect URI must match this value exactly:
+
+```text
+http://localhost:8000/api/v1/oauth/oura/callback
+```
+
+Copy the root example and put the Oura credentials only in the ignored local
+file:
+
+```bash
+install -m 600 config/open-wearables.env.example config/open-wearables.env
+```
+
+```dotenv
+OURA_CLIENT_ID=replace-with-client-id
+OURA_CLIENT_SECRET=replace-with-client-secret
+OURA_DEFAULT_SCOPE="personal daily heartrate workout session spo2 ring_configuration heart_health"
+API_BASE_URL=http://localhost:8000
+HISTORICAL_SYNC_ON_CONNECT=false
+```
+
+`daily` includes Oura's daily sleep, activity, and readiness summaries. Do not
+add the legacy separate `activity` scope when the Oura application UI does not
+offer it. Never paste the client secret into Git, screenshots, issue comments,
+or chat logs. Setting `HISTORICAL_SYNC_ON_CONNECT=false` disables the vendored
+grace-period backfill so the explicit historical task below is the single sync
+run being verified.
+
+Start the data plane in separate terminals so the API and its background sync
+worker are both present:
+
+```bash
+make mac-services-start
+make mac-ow
+```
+
+```bash
+make mac-ow-worker
+```
+
+Open <http://localhost:8000/docs> and use the OpenAPI operations in this order:
+
+1. Click **Authorize** and enter the developer email and password from the local
+   `ADMIN_EMAIL` and `ADMIN_PASSWORD` settings. The OpenAPI UI calls
+   `POST /api/v1/auth/login` for the bearer token; do not copy the token into
+   notes or logs.
+2. Select or create the local test user with `GET /api/v1/users` or
+   `POST /api/v1/users`.
+3. Call `GET /api/v1/oauth/{provider}/authorize` with `provider=oura` and the
+   selected `user_id`, then open the returned `authorization_url`. Complete
+   consent in Oura; Oura redirects to the registered concrete callback URI and
+   the callback should report a successful connection.
+4. Confirm `GET /api/v1/users/{user_id}/connections` contains an `oura`
+   connection with `status: active`.
+5. Queue `POST /api/v1/providers/{provider}/users/{user_id}/sync/historical`
+   with `provider=oura` and `days=90`. A successful request returns
+   `success: true` and a task ID.
+6. Confirm the corresponding Oura run reaches `status: success` in
+   `GET /api/v1/users/{user_id}/sync/runs`. This proves the Celery worker
+   completed the historical task, not merely that the API accepted it.
+7. Query `GET /api/v1/users/{user_id}/summaries/sleep` and
+   `GET /api/v1/users/{user_id}/health-scores?provider=oura&category=readiness`
+   with a date range that covers days present in the Oura account. At least one
+   non-empty response proves the personal-date sleep/readiness data path.
+
+Record only sanitized evidence:
+
+```text
+repo commit: <commit>
+Oura connection: active | blocked
+sync: success | failed
+sleep/readiness data: returned | empty
+first blocker: <first failure or none>
+screenshot/log: <redacted path or summary>
+```
+
+Do not record credentials, bearer/refresh tokens, authorization codes, email
+addresses, user IDs, task IDs, or raw health payloads. A `200` from `/docs`
+proves only that the API is serving; it does not prove provider sync unless the
+Celery task also completes.
 
 ## Run the healthmes service directly
 
@@ -411,8 +496,8 @@ real credentials.
 ## Full stack (docker compose, alternative path)
 
 ```bash
-cp .env.example .env                                       # tokens/keys
-cp config/open-wearables.env.example config/open-wearables.env
+install -m 600 .env.example .env                           # tokens/keys
+install -m 600 config/open-wearables.env.example config/open-wearables.env
 docker compose config -q      # validate
 docker compose up -d --build
 ```
