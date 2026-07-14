@@ -194,6 +194,67 @@
   .tree-caption { margin: 0.15rem 0 0.8rem; }
   .empty-note { color: var(--ink-2); }
   .foot-links { margin-top: 1.6rem; }
+
+  /* ---- three zones: 입력 / 결정과정 / 실행 -------------------------------- */
+  .zone-head { display: flex; align-items: baseline; gap: 0.5rem; margin: 0 0 0.5rem; }
+  .zone-head h2 { margin: 0; }
+  .zone-head code.k { color: var(--ink-3); font-weight: 500; font-size: 0.72rem; }
+  #zone-inputs { margin-bottom: 1rem; }
+  ul.input-chips {
+    list-style: none; margin: 0.2rem 0 0; padding: 0;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+    gap: 0.5rem;
+  }
+  button.input-chip {
+    display: block; width: 100%; text-align: left; cursor: pointer;
+    font: inherit; color: inherit;
+    background: var(--surface-2); border: 1px solid var(--line-soft);
+    border-left: 3px solid #7fa3dd; border-radius: 10px;
+    padding: 0.5rem 0.7rem;
+  }
+  button.input-chip:hover { border-color: var(--brand); }
+  .input-chip-label { display: block; font-weight: 600; font-size: 0.86rem;
+    overflow-wrap: anywhere; line-height: 1.5; }
+  .input-chip-detail { display: block; color: var(--ink-2); font-size: 0.76rem;
+    overflow-wrap: anywhere; margin-top: 0.12rem; }
+  #zone-process { margin-bottom: 0.4rem; }
+  .empty-process {
+    background: var(--surface-2); border: 1px dashed var(--line);
+    border-radius: var(--radius-sm); padding: 0.7rem 0.9rem;
+    color: var(--ink-2); font-size: 0.9rem; margin: 0.4rem 0 0.8rem;
+  }
+  .outcome-connector {
+    width: 0; height: 1.5rem; margin: -0.2rem auto 0;
+    border-left: 3px solid var(--brand); position: relative;
+  }
+  .outcome-connector::after {
+    content: ""; position: absolute; bottom: -3px; left: -7.5px;
+    border: 6px solid transparent; border-top: 7px solid var(--brand);
+    border-bottom: 0;
+  }
+  ul.outcome-list { list-style: none; margin: 0.2rem 0 0; padding: 0;
+    display: flex; flex-direction: column; gap: 0.5rem; }
+  button.outcome-card {
+    display: block; width: 100%; text-align: left; cursor: pointer;
+    font: inherit; color: inherit;
+    background: var(--surface-2); border: 1px solid var(--line-soft);
+    border-left: 3px solid #6cbf76; border-radius: 10px;
+    padding: 0.55rem 0.75rem;
+  }
+  button.outcome-card:hover { border-color: var(--brand); }
+  .outcome-label { display: block; font-weight: 650; overflow-wrap: anywhere; line-height: 1.5; }
+  .outcome-status {
+    display: inline-block; margin-top: 0.25rem;
+    background: var(--glass-solid); border: 1px solid var(--line);
+    border-radius: 999px; padding: 0.06rem 0.6rem;
+    color: var(--ink-2); font-size: 0.78rem; overflow-wrap: anywhere;
+  }
+  .rail-zone-title {
+    font-size: 0.72rem; font-weight: 750; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--ink-3);
+    margin: 0.9rem 0 0.25rem 0.3rem;
+  }
+  .rail-zone-title:first-child { margin-top: 0.1rem; }
 </style>
 {% endblock %}
 
@@ -218,7 +279,7 @@
 <section id="decision-tree">
 {% if graph.root %}
   {% macro tnode(node) %}
-    {% if node.children or node.detail %}
+    {% if node.process_children or node.detail %}
   <details class="tnode type-{{ node.type }}{% if node.chosen %} chosen{% endif %}{% if node.rejected %} rejected{% endif %}" open data-gid="{{ node.gid }}">
     <summary>
       <span class="caret" aria-hidden="true"></span>
@@ -230,9 +291,9 @@
     {% if node.detail %}
     <div class="tnode-detail">{{ node.detail }}</div>
     {% endif %}
-    {% if node.children %}
+    {% if node.process_children %}
     <ul class="tnode-children">
-      {% for child in node.children %}
+      {% for child in node.process_children %}
       <li>{{ tnode(child) }}</li>
       {% endfor %}
     </ul>
@@ -248,6 +309,47 @@
     {% endif %}
   {% endmacro %}
 
+  {% macro zone_rail() %}
+    {% if graph.inputs %}
+    <p class="rail-zone-title">입력</p>
+    <ul class="tnode-root">
+      {% for n in graph.inputs %}<li>{{ tnode(n) }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if graph.process_roots %}
+    <p class="rail-zone-title">결정과정</p>
+    <ol class="tnode-root">
+      {% for r in graph.process_roots %}<li>{{ tnode(r) }}</li>{% endfor %}
+    </ol>
+    {% endif %}
+    {% if graph.actions %}
+    <p class="rail-zone-title">실행</p>
+    <ul class="tnode-root">
+      {% for n in graph.actions %}<li>{{ tnode(n) }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+  {% endmacro %}
+
+  {% if graph.inputs %}
+  <section id="zone-inputs" class="card" aria-label="고려한 입력">
+    <div class="zone-head"><h2>고려한 입력</h2><code class="k">type=input</code></div>
+    <ul class="input-chips">
+      {% for n in graph.inputs %}
+      <li>
+        <button type="button" class="input-chip" data-zone-gid="{{ n.gid }}"
+                title="{{ n.detail or n.label }}">
+          <span class="input-chip-label">{{ n.label }}</span>
+          {% if n.detail %}<span class="input-chip-detail">{{ n.detail }}</span>{% endif %}
+        </button>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
+  <div id="zone-process" aria-label="결정과정">
+  <div class="zone-head"><h2>결정과정</h2><code class="k">type=rule · llm_step · option</code></div>
+  {% if graph.process_roots %}
   <div id="viewer-controls" class="controls no-print" hidden>
     <div class="seg" role="group" aria-label="보기 전환">
       <button type="button" id="btn-view-forest" data-view="forest" aria-pressed="true">트리</button>
@@ -266,7 +368,8 @@
         <div class="card">
           <div class="forest-stage" id="forest-stage">
             <svg id="forest-svg" xmlns="http://www.w3.org/2000/svg" role="group"
-                 aria-label="결정 트리 다이어그램 — 루트(트리거)에서 아래로 입력, 판단, 옵션, 실행이 이어집니다"></svg>
+                 data-process-roots="{{ graph.process_root_gids }}"
+                 aria-label="결정과정 트리 — 규칙과 판단에서 옵션 분기가 갈라지고, 채택된 경로가 강조됩니다"></svg>
           </div>
           <ul class="tree-legend" aria-label="노드 유형 범례">
             {% for t in node_types %}
@@ -290,9 +393,7 @@
 
       <section id="list-view" aria-label="결정 트리 — 리스트 보기">
         <div class="card">
-          <ol class="tnode-root">
-            <li>{{ tnode(graph.root) }}</li>
-          </ol>
+          {{ zone_rail() }}
         </div>
       </section>
 
@@ -316,6 +417,35 @@
     <p class="muted">JavaScript 없이도 위 리스트 보기는 그대로 읽을 수 있습니다 —
       트리와 플로차트 보기만 비활성화됩니다.</p>
   </noscript>
+  {% else %}
+  {# 결정 분기가 없는 기록 (예: 입력만 담긴 트리) — 리스트 폴백만 제공 #}
+  <p class="empty-process">결정 분기 없음 — 이 기록에는 분기하는 판단 과정이 남아 있지 않습니다.</p>
+  <section id="list-view" aria-label="결정 기록 — 리스트 보기">
+    <div class="card">
+      {{ zone_rail() }}
+    </div>
+  </section>
+  {% endif %}
+  </div>
+
+  {% if graph.actions %}
+  <section id="zone-outcome" aria-label="실행">
+    {% if graph.process_roots %}<div class="outcome-connector" aria-hidden="true"></div>{% endif %}
+    <div class="card">
+      <div class="zone-head"><h2>실행</h2><code class="k">type=action</code></div>
+      <ul class="outcome-list">
+        {% for n in graph.actions %}
+        <li>
+          <button type="button" class="outcome-card" data-zone-gid="{{ n.gid }}">
+            <span class="outcome-label">{{ n.label }}</span>
+            {% if n.detail %}<span class="outcome-status">{{ n.detail }}</span>{% endif %}
+          </button>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+  </section>
+  {% endif %}
 {% else %}
   <p class="empty-note"><em>기록된 결정 트리가 없습니다.</em> 이 결정은 요약만 저장되어 있습니다.</p>
 {% endif %}
@@ -344,7 +474,6 @@
   }
   var nodeData = islandJSON("node-data");
   var typeLabels = islandJSON("type-labels");
-  var ROOT = "n0";
   var SVGNS = "http://www.w3.org/2000/svg";
 
   var controls = document.getElementById("viewer-controls");
@@ -374,9 +503,28 @@
   var mermaidStarted = false;
   var selectedEl = null;
   var selectedGid = null;
+  /* 결정과정 roots come from the server as generated ids on the svg tag. */
+  var roots = svg
+    ? (svg.getAttribute("data-process-roots") || "").split(/\s+/).filter(function (gid) {
+        return !!nodeData[gid];
+      })
+    : [];
+  var rootSet = {};
+  roots.forEach(function (gid) { rootSet[gid] = true; });
 
-  if (!nodeData[ROOT]) { return; }
-  if (controls) { controls.hidden = false; }
+  /* 입력 chips + 실행 cards open the shared detail panel (textContent only). */
+  if (panel) {
+    document.querySelectorAll("[data-zone-gid]").forEach(function (chip) {
+      chip.addEventListener("click", function () {
+        showNode(chip.getAttribute("data-zone-gid"), null);
+      });
+    });
+  }
+
+  /* 결정 분기 없음: the grouped list fallback is server-rendered; nothing to
+     boot beyond the zone chips. */
+  if (!controls || !svg || !roots.length) { return; }
+  controls.hidden = false;
 
   /* ---------- shared node-detail panel (textContent only) ---------- */
   function showNode(gid, el) {
@@ -395,10 +543,10 @@
     panel.hidden = false;
   }
 
-  /* ---------- 트리: vanilla top-down tidy decision tree ---------- */
+  /* ---------- 트리: vanilla top-down tidy tree over the 결정과정 ---------- */
   var parentOf = {};
   Object.keys(nodeData).forEach(function (gid) {
-    (nodeData[gid].children || []).forEach(function (c) { parentOf[c] = gid; });
+    (nodeData[gid].process_children || []).forEach(function (c) { parentOf[c] = gid; });
   });
   var onChosenPath = {};
   Object.keys(nodeData).forEach(function (gid) {
@@ -413,7 +561,7 @@
 
   function countSubtree(gid) {
     var n = 1;
-    (nodeData[gid].children || []).forEach(function (c) {
+    (nodeData[gid].process_children || []).forEach(function (c) {
       if (nodeData[c]) { n += countSubtree(c); }
     });
     return n;
@@ -424,7 +572,7 @@
     function walk(gid, depth, inheritedRejected) {
       var info = nodeData[gid];
       var rejected = inheritedRejected || !!info.rejected;
-      var kids = (info.children || []).filter(function (c) { return nodeData[c]; });
+      var kids = (info.process_children || []).filter(function (c) { return nodeData[c]; });
       var isCollapsed = !!collapsed[gid] && kids.length > 0;
       var node = {
         gid: gid, depth: depth, info: info, rejected: rejected,
@@ -445,7 +593,7 @@
       nodes.push(node);
       return node;
     }
-    walk(ROOT, 0, false);
+    roots.forEach(function (gid) { walk(gid, 0, false); });
     var H = TOP_PAD + BOTTOM_PAD + maxDepth * DY + PILL_H;
     var W = Math.max(SIDE_PAD * 2 + Math.max(leafCount - 1, 0) * DX, 360);
     nodes.forEach(function (n) { n.y = TOP_PAD + PILL_H / 2 + n.depth * DY; });
@@ -459,7 +607,7 @@
 
   function onNodeActivate(gid, g) {
     showNode(gid, g);
-    var kids = nodeData[gid].children || [];
+    var kids = nodeData[gid].process_children || [];
     if (kids.length) {
       collapsed[gid] = !collapsed[gid];
       renderForest();
@@ -603,7 +751,9 @@
   document.getElementById("collapse-all").addEventListener("click", function () {
     if (currentView === "forest") {
       Object.keys(nodeData).forEach(function (gid) {
-        if (gid !== ROOT && (nodeData[gid].children || []).length) { collapsed[gid] = true; }
+        if (!rootSet[gid] && (nodeData[gid].process_children || []).length) {
+          collapsed[gid] = true;
+        }
       });
       renderForest();
     } else { setAllList(false); }

@@ -69,6 +69,7 @@ __all__ = [
     "MAX_DIAGRAM_LABEL_CHARS",
     "TreeNode",
     "DecisionTreeView",
+    "partition_tree",
     "escape_mermaid_label",
     "format_created",
     "format_created_local",
@@ -237,18 +238,41 @@ class TreeNode:
     rejected: bool = False
     """Display heuristic: option whose detail starts with a rejection marker."""
     children: list["TreeNode"] = field(default_factory=list)
+    """Original tree structure (all zones), exactly as recorded."""
+    process_children: list["TreeNode"] = field(default_factory=list)
+    """Partitioned 결정과정 structure: rule/llm_step/option/other children
+    with removed input/action nodes spliced out (their children reattach
+    here, order preserved)."""
 
 
 @dataclass(frozen=True)
 class DecisionTreeView:
-    """Everything the decision page needs, derived once from ``record.tree``."""
+    """Everything the decision page needs, derived once from ``record.tree``.
+
+    The tree is partitioned into three zones (입력은 입력, 결정과정은
+    결정과정, 실행은 실행): ``inputs`` and ``actions`` are flat preorder
+    lists rendered as the facts panel above and the outcome strip below;
+    ``process_roots`` is the branching judgment — the only part visualised
+    as a tree (Mermaid source and the client tree both use it).
+    """
 
     root: TreeNode | None
     source: str
-    """Mermaid flowchart source (empty when there is no renderable tree)."""
+    """Process-only Mermaid source (empty when there is no process tree)."""
     node_index: dict[str, dict[str, Any]]
     """gid -> full node data for the click-to-inspect panel (JSON island)."""
     truncated: bool
+    inputs: list[TreeNode] = field(default_factory=list)
+    """Every type=input node anywhere in the tree, document order."""
+    actions: list[TreeNode] = field(default_factory=list)
+    """Every type=action node anywhere in the tree, document order."""
+    process_roots: list[TreeNode] = field(default_factory=list)
+    """Roots of the spliced 결정과정 tree (may be several or none)."""
+
+    @property
+    def process_root_gids(self) -> str:
+        """Space-joined generated root ids for the client layout (safe)."""
+        return " ".join(node.gid for node in self.process_roots)
 
 
 def _detail_starts_with(detail: str, prefixes: tuple[str, ...]) -> bool:
@@ -300,32 +324,63 @@ def _normalize_tree(tree: Any) -> tuple[TreeNode | None, bool]:
     return root, truncated
 
 
+def partition_tree(
+    root: TreeNode | None,
+) -> tuple[list[TreeNode], list[TreeNode], list[TreeNode]]:
+    """Partition a normalised tree into the three page zones.
+
+    입력은 입력, 결정과정은 결정과정, 실행은 실행:
+
+    - every ``type=input`` node (anywhere) goes to the facts panel;
+    - every ``type=action`` node (anywhere) goes to the outcome strip;
+    - what remains (rule / llm_step / option / unknown) is the 결정과정 tree.
+      Removing an input/action node splices its children into the removed
+      node's position in the parent (order preserved, recursively), so
+      ancestry survives arbitrary shapes: inputs nested under llm_steps,
+      actions mid-tree with process descendants, even input-only trees
+      (which yield no process roots at all).
+
+    Returns ``(inputs, actions, process_roots)``; inputs/actions are in
+    document (preorder) order and every process node gets its
+    ``process_children`` filled in. Pure and idempotent per normalise run.
+    """
+    inputs: list[TreeNode] = []
+    actions: list[TreeNode] = []
+
+    def splice(node: TreeNode) -> list[TreeNode]:
+        if node.type == "input":
+            inputs.append(node)
+        elif node.type == "action":
+            actions.append(node)
+        gathered: list[TreeNode] = []
+        for child in node.children:
+            gathered.extend(splice(child))
+        if node.type in ("input", "action"):
+            return gathered  # children take this node's place upstream
+        node.process_children = gathered
+        return [node]
+
+    process_roots = splice(root) if root is not None else []
+    return inputs, actions, process_roots
+
+
 def tree_to_mermaid(tree: Any) -> DecisionTreeView:
-    """Transform a ``decision_record.tree`` JSON value into a Mermaid view.
+    """Transform a ``decision_record.tree`` JSON value into the zoned view.
 
     Pure function; safe on malformed input (non-dict nodes are skipped, depth
-    and node count are capped, unknown types fall back to ``other``).
+    and node count are capped, unknown types fall back to ``other``). The
+    JSON island (``node_index``) keeps EVERY node — the inputs panel, the
+    outcome strip and the detail panel all read from it — while the Mermaid
+    source is built from the 결정과정 partition only.
     """
     root, truncated = _normalize_tree(tree)
     if root is None:
         return DecisionTreeView(root=None, source="", node_index={}, truncated=truncated)
 
-    lines = ["flowchart TD"]
-    chosen_lines: list[str] = []
+    inputs, actions, process_roots = partition_tree(root)
     node_index: dict[str, dict[str, Any]] = {}
 
-    def emit(node: TreeNode, parent: TreeNode | None) -> None:
-        open_mark, close_mark = _NODE_SHAPES[node.type]
-        diagram_label = node.label
-        if len(diagram_label) > MAX_DIAGRAM_LABEL_CHARS:
-            diagram_label = diagram_label[: MAX_DIAGRAM_LABEL_CHARS - 1] + "…"
-        escaped = escape_mermaid_label(diagram_label)
-        lines.append(f"  {node.gid}{open_mark}{escaped}{close_mark}:::type_{node.type}")
-        if parent is not None:
-            lines.append(f"  {parent.gid} --> {node.gid}")
-        if node.chosen:
-            # Generated ids only — never user data (grammar stays whitelisted).
-            chosen_lines.append(f"  class {node.gid} type_chosen")
+    def index(node: TreeNode) -> None:
         node_index[node.gid] = {
             "source_id": node.source_id,
             "type": node.type,
@@ -334,21 +389,51 @@ def tree_to_mermaid(tree: Any) -> DecisionTreeView:
             "detail": node.detail,
             "chosen": node.chosen,
             "rejected": node.rejected,
-            # Structure for the client-side forest layout — generated ids
-            # only, so the island carries no user-controlled structure.
+            # Structure travels as generated ids only, so the island carries
+            # no user-controlled structure: "children" is the recorded shape,
+            # "process_children" the spliced 결정과정 the client tree draws.
             "children": [child.gid for child in node.children],
+            "process_children": [child.gid for child in node.process_children],
         }
         for child in node.children:
-            emit(child, node)
+            index(child)
 
-    emit(root, None)
-    lines.extend(chosen_lines)
-    lines.extend(f"  {class_def}" for class_def in _CLASS_DEFS)
+    index(root)
+
+    source = ""
+    if process_roots:
+        lines = ["flowchart TD"]
+        chosen_lines: list[str] = []
+
+        def emit(node: TreeNode, parent: TreeNode | None) -> None:
+            open_mark, close_mark = _NODE_SHAPES[node.type]
+            diagram_label = node.label
+            if len(diagram_label) > MAX_DIAGRAM_LABEL_CHARS:
+                diagram_label = diagram_label[: MAX_DIAGRAM_LABEL_CHARS - 1] + "…"
+            escaped = escape_mermaid_label(diagram_label)
+            lines.append(f"  {node.gid}{open_mark}{escaped}{close_mark}:::type_{node.type}")
+            if parent is not None:
+                lines.append(f"  {parent.gid} --> {node.gid}")
+            if node.chosen:
+                # Generated ids only — never user data (whitelisted grammar).
+                chosen_lines.append(f"  class {node.gid} type_chosen")
+            for child in node.process_children:
+                emit(child, node)
+
+        for process_root in process_roots:
+            emit(process_root, None)
+        lines.extend(chosen_lines)
+        lines.extend(f"  {class_def}" for class_def in _CLASS_DEFS)
+        source = "\n".join(lines)
+
     return DecisionTreeView(
         root=root,
-        source="\n".join(lines),
+        source=source,
         node_index=node_index,
         truncated=truncated,
+        inputs=inputs,
+        actions=actions,
+        process_roots=process_roots,
     )
 
 
