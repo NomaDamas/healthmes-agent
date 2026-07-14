@@ -43,23 +43,32 @@
   }
   .tree-tools { display: flex; gap: 0.4rem; }
 
-  /* ---- shared viewer grid + detail panel --------------------------------- */
-  .viewer-grid { display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr); }
-  @media (min-width: 960px) {
-    .viewer-grid { grid-template-columns: minmax(0, 1fr) 19rem; align-items: start; }
-    #node-detail { position: sticky; top: 4rem; }
-  }
+  /* ---- viewer stack (tree is the main event, full width) ----------------- */
+  .viewer-grid { display: block; }
   .view-stack { min-width: 0; }
+
+  /* ---- node detail: floating popover, hidden until a node is clicked;
+         click the same node again (or ×/Esc) to close. Never a fixed panel
+         that covers the tree. ------------------------------------------------ */
   #node-detail {
-    background: var(--glass);
-    -webkit-backdrop-filter: blur(16px) saturate(150%);
-    backdrop-filter: blur(16px) saturate(150%);
+    position: fixed; z-index: 40; width: min(21rem, calc(100vw - 2rem));
+    max-height: 42vh; overflow-y: auto;
+    background: var(--glass-solid, var(--glass));
+    -webkit-backdrop-filter: blur(18px) saturate(160%);
+    backdrop-filter: blur(18px) saturate(160%);
     border: 1px solid var(--glass-line);
     border-radius: var(--radius);
-    box-shadow: var(--shadow);
-    padding: 0.9rem 1rem 1rem;
+    box-shadow: var(--shadow), 0 10px 30px rgba(20, 40, 30, 0.22);
+    padding: 0.85rem 1rem 1rem;
   }
-  #node-detail h2 { margin: 0 0 0.6rem; }
+  #node-detail h2 { margin: 0 1.4rem 0.5rem 0; font-size: 0.82rem; }
+  #node-detail-close {
+    position: absolute; top: 0.5rem; right: 0.55rem;
+    width: 1.7rem; height: 1.7rem; border: 0; cursor: pointer;
+    border-radius: 999px; background: var(--surface-2); color: var(--ink-2);
+    font-size: 1rem; line-height: 1; display: grid; place-items: center;
+  }
+  #node-detail-close:hover { background: var(--surface-3, var(--surface-2)); color: var(--ink); }
   #node-detail-label { font-weight: 650; overflow-wrap: anywhere; margin-top: 0.45rem; }
   #node-detail-detail {
     white-space: pre-wrap; overflow-wrap: anywhere;
@@ -67,12 +76,49 @@
   }
   #node-detail-source { margin-top: 0.6rem; }
 
-  /* ---- 트리 (analytic top-down decision tree) ----------------------------- */
+  /* ---- 트리 (analytic top-down decision tree, zoom + pan canvas) ---------- */
   :root { --edge: #71837a; --edge-rejected: #a5b1a9; }
   html[data-daypart="night"] { --edge: #6f7f76; --edge-rejected: #4c5952; }
-  #forest-view .card { padding: 0.6rem 0.6rem 0.9rem; }
-  .forest-stage { overflow-x: auto; overflow-y: hidden; }
-  #forest-svg { display: block; margin: 0 auto; max-width: none; }
+  #forest-view .card { padding: 0.6rem; }
+  .forest-stage {
+    position: relative; overflow: hidden; touch-action: none;
+    height: clamp(360px, 64vh, 760px);
+    border-radius: var(--radius-sm);
+    background:
+      radial-gradient(circle at 1px 1px, rgba(60, 90, 75, 0.09) 1px, transparent 0)
+      0 0 / 22px 22px;
+    cursor: grab;
+  }
+  .forest-stage.panning { cursor: grabbing; }
+  #forest-svg { display: block; width: 100%; height: 100%; max-width: none; touch-action: none; }
+  #forest-viewport { transform-origin: 0 0; }
+  /* zoom controls, bottom-right of the canvas */
+  .zoom-controls {
+    position: absolute; right: 0.7rem; bottom: 0.7rem; z-index: 5;
+    display: flex; flex-direction: column; gap: 0.3rem;
+  }
+  .zoom-controls button {
+    width: 2.1rem; height: 2.1rem; border-radius: 0.6rem; cursor: pointer;
+    border: 1px solid var(--glass-line); background: var(--glass-solid, #fff);
+    color: var(--ink); font-size: 1.05rem; line-height: 1;
+    display: grid; place-items: center; box-shadow: var(--shadow);
+  }
+  .zoom-controls button:hover { border-color: var(--brand); color: var(--brand); }
+  .zoom-controls .zoom-fit { font-size: 0.95rem; }
+  .zoom-hint {
+    position: absolute; left: 0.75rem; top: 0.6rem; z-index: 5;
+    font-size: 0.72rem; color: var(--ink-3);
+    background: var(--glass-solid, rgba(255,255,255,0.7));
+    padding: 0.15rem 0.5rem; border-radius: 999px; pointer-events: none;
+  }
+  /* edge-label pills at the middle of each branch (예 / 아니오 / ①②③) */
+  .elabel-bg { fill: var(--glass-solid, #fff); stroke: var(--edge); stroke-width: 1; }
+  .elabel-tx { font-size: 10.5px; font-weight: 700; text-anchor: middle; fill: var(--ink-2); }
+  .elabel.yes .elabel-bg { fill: #dcf3ea; stroke: #7fc9ad; }
+  .elabel.yes .elabel-tx { fill: #0f6b52; }
+  .elabel.no .elabel-bg  { fill: #f3ece6; stroke: #d9c3ad; }
+  .elabel.no .elabel-tx  { fill: #8a5a2b; }
+  .elabel.on-path .elabel-bg { stroke: var(--brand); stroke-width: 1.8; }
   .tlink { fill: none; stroke: var(--edge); stroke-width: 1.6; stroke-linecap: round; }
   .tlink.on-path { stroke: var(--brand); stroke-width: 3; }
   .tlink.rejected { stroke: var(--edge-rejected); stroke-width: 1.2; }
@@ -370,12 +416,18 @@
             <svg id="forest-svg" xmlns="http://www.w3.org/2000/svg" role="group"
                  data-process-roots="{{ graph.process_root_gids }}"
                  aria-label="결정과정 트리 — 규칙과 판단에서 옵션 분기가 갈라지고, 채택된 경로가 강조됩니다"></svg>
+            <span class="zoom-hint" aria-hidden="true">스크롤·드래그로 확대·이동</span>
+            <div class="zoom-controls no-print" role="group" aria-label="확대 축소">
+              <button type="button" id="zoom-in" title="확대" aria-label="확대">＋</button>
+              <button type="button" id="zoom-out" title="축소" aria-label="축소">－</button>
+              <button type="button" id="zoom-fit" class="zoom-fit" title="화면 맞춤" aria-label="화면 맞춤">⤢</button>
+            </div>
           </div>
           <ul class="tree-legend" aria-label="노드 유형 범례">
             {% for t in node_types %}
             <li><span class="badge type-{{ t }}">{{ node_type_labels.get(t, t) }}</span></li>
             {% endfor %}
-            <li class="subtle">노드를 클릭하면 하위 가지가 접히고, 선택한 노드의 상세가 옆 패널에 열립니다</li>
+            <li class="subtle">노드를 클릭하면 상세가 열립니다 (다시 클릭하면 닫힘) · 스크롤로 확대, 드래그로 이동</li>
           </ul>
         </div>
       </section>
@@ -403,15 +455,17 @@
       {% endif %}
     </div>
 
-    <aside id="node-detail" hidden aria-live="polite">
-      <h2>노드 상세</h2>
-      <span id="node-detail-type" class="badge"></span>
-      <span id="node-detail-chosen" class="badge chosen-chip" hidden>채택</span>
-      <div id="node-detail-label"></div>
-      <div id="node-detail-detail"></div>
-      <p id="node-detail-source" class="muted mono"></p>
-    </aside>
   </div>
+
+  <aside id="node-detail" hidden aria-live="polite">
+    <button type="button" id="node-detail-close" aria-label="닫기" title="닫기">×</button>
+    <h2>노드 상세</h2>
+    <span id="node-detail-type" class="badge"></span>
+    <span id="node-detail-chosen" class="badge chosen-chip" hidden>채택</span>
+    <div id="node-detail-label"></div>
+    <div id="node-detail-detail"></div>
+    <p id="node-detail-source" class="muted mono"></p>
+  </aside>
 
   <noscript>
     <p class="muted">JavaScript 없이도 위 리스트 보기는 그대로 읽을 수 있습니다 —
@@ -512,24 +566,39 @@
   var rootSet = {};
   roots.forEach(function (gid) { rootSet[gid] = true; });
 
-  /* 입력 chips + 실행 cards open the shared detail panel (textContent only). */
-  if (panel) {
-    document.querySelectorAll("[data-zone-gid]").forEach(function (chip) {
-      chip.addEventListener("click", function () {
-        showNode(chip.getAttribute("data-zone-gid"), null);
-      });
-    });
+  /* ---------- floating node-detail popover (textContent only) ----------
+     Hidden until a node/chip is clicked; clicking the SAME target again (or
+     ×/Esc) closes it. Positioned beside the clicked element and clamped to the
+     viewport so it never sits under the tree it explains. */
+  function closeDetail() {
+    if (selectedEl) { selectedEl.classList.remove("selected"); }
+    selectedEl = null;
+    selectedGid = null;
+    if (panel) { panel.hidden = true; }
   }
-
-  /* 결정 분기 없음: the grouped list fallback is server-rendered; nothing to
-     boot beyond the zone chips. */
-  if (!controls || !svg || !roots.length) { return; }
-  controls.hidden = false;
-
-  /* ---------- shared node-detail panel (textContent only) ---------- */
+  function positionPopover(el) {
+    panel.hidden = false;
+    var pr = panel.getBoundingClientRect();
+    var pw = pr.width || 320, ph = pr.height || 200, m = 10;
+    var x, y;
+    if (el && el.getBoundingClientRect) {
+      var r = el.getBoundingClientRect();
+      x = r.right + 12;
+      y = r.top;
+      if (x + pw > window.innerWidth - m) { x = r.left - pw - 12; }
+      if (x < m) { x = Math.max(m, Math.min(window.innerWidth - pw - m, r.left)); y = r.bottom + 10; }
+      if (y + ph > window.innerHeight - m) { y = window.innerHeight - ph - m; }
+      if (y < m) { y = m; }
+    } else {
+      x = window.innerWidth - pw - 16;
+      y = 84;
+    }
+    panel.style.left = Math.round(x) + "px";
+    panel.style.top = Math.round(y) + "px";
+  }
   function showNode(gid, el) {
     var info = nodeData[gid];
-    if (!info) { return; }
+    if (!info || !panel) { return; }
     if (selectedEl) { selectedEl.classList.remove("selected"); }
     selectedEl = el || null;
     selectedGid = gid;
@@ -540,8 +609,32 @@
     panelLabel.textContent = info.label;
     panelDetail.textContent = info.detail || "(기록된 상세 내용 없음)";
     panelSource.textContent = info.source_id ? "node id: " + info.source_id : "";
-    panel.hidden = false;
+    positionPopover(el);
   }
+  /* toggle: same target re-click closes; a new target reopens */
+  function toggleDetail(gid, el) {
+    if (selectedGid === gid && panel && !panel.hidden) { closeDetail(); }
+    else { showNode(gid, el); }
+  }
+
+  /* 입력 chips + 실행 cards toggle the same popover (textContent only). */
+  if (panel) {
+    document.querySelectorAll("[data-zone-gid]").forEach(function (chip) {
+      chip.addEventListener("click", function () {
+        toggleDetail(chip.getAttribute("data-zone-gid"), chip);
+      });
+    });
+    var closeBtn = document.getElementById("node-detail-close");
+    if (closeBtn) { closeBtn.addEventListener("click", closeDetail); }
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && panel && !panel.hidden) { closeDetail(); }
+    });
+  }
+
+  /* 결정 분기 없음: the grouped list fallback is server-rendered; nothing to
+     boot beyond the zone chips. */
+  if (!controls || !svg || !roots.length) { return; }
+  controls.hidden = false;
 
   /* ---------- 트리: vanilla top-down tidy tree over the 결정과정 ---------- */
   var parentOf = {};
@@ -700,13 +793,10 @@
     return measures[gid];
   }
 
+  /* node click = toggle its detail popover (navigation is zoom/pan; whole-tree
+     collapse/expand lives on the 모두 펼치기/접기 buttons). */
   function onNodeActivate(gid, g) {
-    showNode(gid, g);
-    var kids = nodeData[gid].process_children || [];
-    if (kids.length) {
-      collapsed[gid] = !collapsed[gid];
-      renderForest();
-    }
+    toggleDetail(gid, g);
   }
 
   function ensureNodeEl(node) {
@@ -769,26 +859,104 @@
       " " + cx + "," + cy;
   }
 
+  /* zoom/pan viewport: all content lives in an inner <g> we translate+scale;
+     the <svg> itself fills the stage and uses pixel user units (no viewBox). */
+  var viewport = document.createElementNS(SVGNS, "g");
+  viewport.setAttribute("id", "forest-viewport");
   var linksLayer = document.createElementNS(SVGNS, "g");
+  var labelsLayer = document.createElementNS(SVGNS, "g");
   var nodesLayer = document.createElementNS(SVGNS, "g");
-  svg.appendChild(linksLayer);
-  svg.appendChild(nodesLayer);
+  viewport.appendChild(linksLayer);
+  viewport.appendChild(labelsLayer);
+  viewport.appendChild(nodesLayer);
+  svg.appendChild(viewport);
+
+  var view = { k: 1, tx: 0, ty: 0 };
+  var contentW = 0, contentH = 0, fitted = false;
+  var MIN_K = 0.4, MAX_K = 2.5;
+
+  function stageSize() {
+    var r = svg.getBoundingClientRect();
+    return { w: r.width || 800, h: r.height || 480 };
+  }
+  function applyTransform() {
+    viewport.setAttribute(
+      "transform", "translate(" + view.tx + "," + view.ty + ") scale(" + view.k + ")"
+    );
+  }
+  function clampK(k) { return Math.max(MIN_K, Math.min(MAX_K, k)); }
+  function fitToView() {
+    var s = stageSize();
+    if (!contentW || !contentH) { return; }
+    var pad = 30;
+    view.k = clampK(Math.min((s.w - pad * 2) / contentW, (s.h - pad * 2) / contentH));
+    view.tx = (s.w - contentW * view.k) / 2;
+    view.ty = Math.max(pad, (s.h - contentH * view.k) / 2);
+    fitted = true;
+    applyTransform();
+  }
+  function zoomAt(factor, sx, sy) {
+    var nk = clampK(view.k * factor);
+    if (nk === view.k) { return; }
+    var cx = (sx - view.tx) / view.k, cy = (sy - view.ty) / view.k;
+    view.k = nk;
+    view.tx = sx - cx * nk;
+    view.ty = sy - cy * nk;
+    applyTransform();
+  }
+  function zoomCenter(factor) {
+    var s = stageSize();
+    zoomAt(factor, s.w / 2, s.h / 2);
+  }
+
+  function edgeLabelClass(text) {
+    if (text === "예" || text === "Yes" || text === "yes" || text === "Y") { return "yes"; }
+    if (text === "아니오" || text === "아니요" || text === "No" || text === "no" || text === "N") { return "no"; }
+    return "";
+  }
 
   function renderForest() {
     var layout = computeLayout();
-    svg.setAttribute("viewBox", "0 0 " + layout.W + " " + layout.H);
-    svg.setAttribute("width", layout.W);
-    svg.setAttribute("height", layout.H);
+    contentW = layout.W;
+    contentH = layout.H;
 
     while (linksLayer.firstChild) { linksLayer.removeChild(linksLayer.firstChild); }
+    while (labelsLayer.firstChild) { labelsLayer.removeChild(labelsLayer.firstChild); }
     layout.links.forEach(function (link) {
+      var onPath = onChosenPath[link.child.gid] && onChosenPath[link.parent.gid];
       var path = document.createElementNS(SVGNS, "path");
       var cls = "tlink";
-      if (onChosenPath[link.child.gid] && onChosenPath[link.parent.gid]) { cls += " on-path"; }
+      if (onPath) { cls += " on-path"; }
       if (link.child.rejected) { cls += " rejected"; }
       path.setAttribute("class", cls);
       path.setAttribute("d", edgePath(link));
       linksLayer.appendChild(path);
+
+      /* edge caption pill (예 / 아니오 / ①②③) at the branch midpoint */
+      var text = (nodeData[link.child.gid] || {}).edge_label || "";
+      if (text) {
+        var mx = (link.parent.x + link.child.x) / 2;
+        var my = (link.parent.y + link.parent.h / 2 + link.child.y - link.child.h / 2) / 2;
+        var w = Math.max(20, textW(text, 10.5) + 12), h = 17;
+        var lg = document.createElementNS(SVGNS, "g");
+        var lcls = "elabel";
+        var yn = edgeLabelClass(text);
+        if (yn) { lcls += " " + yn; }
+        if (onPath) { lcls += " on-path"; }
+        lg.setAttribute("class", lcls);
+        var bg = document.createElementNS(SVGNS, "rect");
+        bg.setAttribute("class", "elabel-bg");
+        bg.setAttribute("x", mx - w / 2); bg.setAttribute("y", my - h / 2);
+        bg.setAttribute("width", w); bg.setAttribute("height", h);
+        bg.setAttribute("rx", 8);
+        lg.appendChild(bg);
+        var tx = document.createElementNS(SVGNS, "text");
+        tx.setAttribute("class", "elabel-tx");
+        tx.setAttribute("x", mx); tx.setAttribute("y", my + 3.6);
+        tx.textContent = text;
+        lg.appendChild(tx);
+        labelsLayer.appendChild(lg);
+      }
     });
 
     var seen = {};
@@ -818,7 +986,69 @@
         gEls[gid].parentNode.removeChild(gEls[gid]);
       }
     });
+    if (!fitted) { fitToView(); } else { applyTransform(); }
   }
+
+  /* ---------- zoom + pan interactions ---------- */
+  var stage = document.getElementById("forest-stage");
+  svg.addEventListener("wheel", function (ev) {
+    ev.preventDefault();
+    var r = svg.getBoundingClientRect();
+    zoomAt(Math.pow(1.0018, -ev.deltaY), ev.clientX - r.left, ev.clientY - r.top);
+  }, { passive: false });
+
+  var pointers = {}, panStart = null, pinchStart = null;
+  function pointerCount() { return Object.keys(pointers).length; }
+  svg.addEventListener("pointerdown", function (ev) {
+    if (ev.target.closest && ev.target.closest("g.fnode")) { return; }
+    pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+    try { svg.setPointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
+    if (pointerCount() === 1) {
+      panStart = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty };
+      if (stage) { stage.classList.add("panning"); }
+    } else if (pointerCount() === 2) {
+      panStart = null;
+      var ids = Object.keys(pointers);
+      var a = pointers[ids[0]], b = pointers[ids[1]];
+      pinchStart = {
+        dist: Math.hypot(a.x - b.x, a.y - b.y), k: view.k,
+        cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2
+      };
+    }
+  });
+  svg.addEventListener("pointermove", function (ev) {
+    if (!pointers[ev.pointerId]) { return; }
+    pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+    if (pointerCount() === 2 && pinchStart) {
+      var ids = Object.keys(pointers);
+      var a = pointers[ids[0]], b = pointers[ids[1]];
+      var dist = Math.hypot(a.x - b.x, a.y - b.y);
+      if (pinchStart.dist > 0) {
+        var r = svg.getBoundingClientRect();
+        var target = clampK(pinchStart.k * (dist / pinchStart.dist));
+        zoomAt(target / view.k, pinchStart.cx - r.left, pinchStart.cy - r.top);
+      }
+    } else if (panStart) {
+      view.tx = panStart.tx + (ev.clientX - panStart.x);
+      view.ty = panStart.ty + (ev.clientY - panStart.y);
+      applyTransform();
+    }
+  });
+  function endPointer(ev) {
+    delete pointers[ev.pointerId];
+    try { svg.releasePointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
+    if (pointerCount() < 2) { pinchStart = null; }
+    if (pointerCount() === 0) { panStart = null; if (stage) { stage.classList.remove("panning"); } }
+  }
+  svg.addEventListener("pointerup", endPointer);
+  svg.addEventListener("pointercancel", endPointer);
+
+  var zi = document.getElementById("zoom-in");
+  var zo = document.getElementById("zoom-out");
+  var zf = document.getElementById("zoom-fit");
+  if (zi) { zi.addEventListener("click", function () { zoomCenter(1.25); }); }
+  if (zo) { zo.addEventListener("click", function () { zoomCenter(0.8); }); }
+  if (zf) { zf.addEventListener("click", fitToView); }
 
   /* ---------- view switching ---------- */
   function setView(which) {
@@ -874,11 +1104,11 @@
       bound += 1;
       el.setAttribute("tabindex", "0");
       el.setAttribute("role", "button");
-      el.addEventListener("click", function () { showNode(gid, el); });
+      el.addEventListener("click", function () { toggleDetail(gid, el); });
       el.addEventListener("keydown", function (ev) {
         if (ev.key === "Enter" || ev.key === " ") {
           ev.preventDefault();
-          showNode(gid, el);
+          toggleDetail(gid, el);
         }
       });
     });

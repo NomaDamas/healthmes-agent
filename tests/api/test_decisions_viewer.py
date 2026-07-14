@@ -207,10 +207,16 @@ def test_partition_zones_and_ancestry_splicing():
     assert view.node_index["n0"]["process_children"] == ["n2", "n3"]
     assert view.node_index["n3"]["process_children"] == ["n5"]
     assert view.node_index["n5"]["process_children"] == ["n7"]  # through ACT
-    # The diagram contains only process nodes and spliced edges.
+    # The diagram contains only process nodes and spliced edges. A branching
+    # node whose children carry no explicit edge_label gets auto-indexed
+    # ①② (docs: round-7 edge-indexing); single children stay plain.
     lines = view.source.splitlines()
-    assert "  n0 --> n2" in lines and "  n0 --> n3" in lines
+    assert "  n0 -->|①| n2" in lines and "  n0 -->|②| n3" in lines
     assert "  n3 --> n5" in lines and "  n5 --> n7" in lines
+    # The effective edge label reaches the JSON island too (client reads it).
+    assert view.node_index["n2"]["edge_label"] == "①"
+    assert view.node_index["n3"]["edge_label"] == "②"
+    assert view.node_index["n5"]["edge_label"] == ""  # single child, unlabelled
     assert not any(":::type_input" in ln for ln in lines if not ln.startswith("  classDef"))
     assert not any(":::type_action" in ln for ln in lines if not ln.startswith("  classDef"))
 
@@ -314,7 +320,9 @@ _NODE_LINE_RE = re.compile(
     r'^  n\d+(?:\(\[|\[\[|\{\{|\(|\[)"[^"]*"(?:\]\)|\]\]|\}\}|\)|\])'
     r":::type_(?:input|rule|llm_step|option|action|other)$"
 )
-_EDGE_LINE_RE = re.compile(r"^  n\d+ --> n\d+$")
+# Edges are plain or carry an escaped label pill (예 / 아니오 / ①②): the
+# label sits between pipes and can never contain a raw pipe (escaped to #124;).
+_EDGE_LINE_RE = re.compile(r"^  n\d+ -->(\|[^|]+\|)? n\d+$")
 _CLASSDEF_LINE_RE = re.compile(r"^  classDef type_\w+ [#\w:,-]+$")
 # Chosen-option highlight: a second class assigned via generated ids only.
 _CLASS_ASSIGN_RE = re.compile(r"^  class n\d+ type_chosen$")
@@ -346,6 +354,69 @@ def test_mermaid_source_grammar_survives_hostile_labels():
     # Hostile type string fell back to the safe class.
     assert view.node_index["n0"]["type"] == "other"
     assert view.node_index["n0"]["raw_type"] == 'rule"]:::evil'
+
+
+def test_edge_labels_explicit_and_hostile(client, session):
+    """Explicit 예/아니오 edge labels flow to the island + Mermaid, and a
+    hostile edge_label can neither break the grammar nor inject markup
+    (docs: round-7 edge indexing)."""
+    tree = {
+        "type": "rule",
+        "label": "root",
+        "children": [
+            {"type": "option", "label": "yes branch", "edge_label": "예", "detail": "채택"},
+            {
+                "type": "option",
+                "label": "no branch",
+                "edge_label": 'x"]|--> n9 <script>',  # hostile
+                "detail": "기각",
+            },
+        ],
+    }
+    view = tree_to_mermaid(tree)
+    # Effective labels reach the JSON island verbatim (client renders via
+    # textContent — raw markup here is inert).
+    assert view.node_index["n1"]["edge_label"] == "예"
+    assert view.node_index["n2"]["edge_label"] == 'x"]|--> n9 <script>'
+    # Mermaid emits the 예 edge and an ESCAPED hostile edge — grammar holds,
+    # no raw pipe/angle-brackets/injected node escape the label.
+    lines = view.source.splitlines()
+    assert "  n0 -->|예| n1" in lines
+    for line in lines[1:]:
+        assert (
+            _NODE_LINE_RE.match(line)
+            or _EDGE_LINE_RE.match(line)
+            or _CLASSDEF_LINE_RE.match(line)
+            or _CLASS_ASSIGN_RE.match(line)
+        ), f"hostile edge label broke the grammar: {line!r}"
+    assert "<script>" not in view.source
+    assert not re.search(r"-->\s*n9\b", view.source)  # the injected edge stayed text
+
+    # On the rendered page the island survives and stays angle-bracket free.
+    record = _seed_decision(session, tree=tree)
+    html = client.get(f"/decisions/{record.id}").text
+    island = _ISLAND_RE.search(html)
+    assert island and "<script>" not in island.group(1)
+    data = json.loads(island.group(1))
+    assert data["n1"]["edge_label"] == "예"
+
+
+def test_tree_canvas_has_zoom_and_toggle_controls(client, session):
+    """The tree is the main stage: a zoom/pan canvas with on-canvas controls
+    and a click-toggle detail popover (docs: round-7)."""
+    record = _seed_decision(session)
+    html = client.get(f"/decisions/{record.id}").text
+    # Zoom controls + hint live inside the canvas.
+    assert 'id="zoom-in"' in html and 'id="zoom-out"' in html and 'id="zoom-fit"' in html
+    assert 'class="zoom-controls' in html
+    # The detail popover has an explicit close affordance (× / Esc close it).
+    assert 'id="node-detail-close"' in html
+    # The SVG canvas is present; the JS wires a pan/zoom viewport group and
+    # toggle semantics (the viewport <g> is built at runtime).
+    assert 'id="forest-svg"' in html
+    assert "forest-viewport" in html
+    assert "function toggleDetail" in html
+    assert "function fitToView" in html
 
 
 def test_decision_page_escapes_hostile_strings(client, session):
