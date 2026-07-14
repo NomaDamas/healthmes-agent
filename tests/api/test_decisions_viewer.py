@@ -511,6 +511,49 @@ def test_decision_page_three_zones(client, session):
     assert "proposed schedule change" not in pre
 
 
+def test_long_labels_render_without_truncation(client, session):
+    """Long 판단 questions must stay fully readable (round-6: 생략 금지).
+
+    The island keeps the untruncated label (the client tree wraps it across
+    tspan lines instead of cutting it) and the Mermaid label is broken into
+    our own <br/> segments — sanitiser intact, full text preserved.
+    """
+    long_label = (
+        "판단 1 — 오후 일정 밀도와 수면 부채를 함께 고려했을 때 "
+        "지금 집중 블록을 유지하는 것이 회복에 유리한가에 대한 검토"
+    )  # 60+ chars
+    assert len(long_label) > 60
+    record = _seed_decision(
+        session,
+        tree={
+            "id": "r",
+            "type": "rule",
+            "label": long_label,
+            "children": [
+                {"id": "o", "type": "option", "label": "짧은 옵션", "children": []}
+            ],
+        },
+    )
+
+    html = client.get(f"/decisions/{record.id}").text
+
+    # Island: the full label, no ellipsis anywhere near it.
+    island = _ISLAND_RE.search(html)
+    assert island
+    data = json.loads(island.group(1))
+    assert data["n0"]["label"] == long_label
+    assert "…" not in data["n0"]["label"]
+    # Mermaid: our <br/> separators (autoescaped in the pre) split the label,
+    # and rejoining them restores every fragment including the tail.
+    pre = html.split('<pre id="decision-graph"', 1)[1].split("</pre>", 1)[0]
+    assert "&lt;br/&gt;" in pre
+    rejoined = pre.replace("&lt;br/&gt;", " ")
+    assert "유리한가에 대한 검토" in rejoined  # the tail survived, not cut
+    assert "판단 1" in rejoined
+    # No user-controlled markup was introduced by the line breaking.
+    assert "<br/>" not in pre  # only the escaped form exists inside the pre
+
+
 def test_decision_page_without_process_tree(client, session):
     """Input-only records: graceful 결정 분기 없음 + grouped list fallback."""
     record = _seed_decision(

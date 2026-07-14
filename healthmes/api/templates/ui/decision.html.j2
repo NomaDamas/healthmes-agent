@@ -94,7 +94,7 @@
   .fnode-option .ntype   { fill: #146055; }
   .fnode-action .ntype   { fill: #2b6532; }
   .fnode-other .ntype    { fill: #4e5b55; }
-  .nlabel { fill: #22312a; font-size: 11.5px; font-weight: 600; text-anchor: middle; }
+  .nlabel { fill: #22312a; font-size: 12px; font-weight: 600; text-anchor: middle; }
   g.fnode.chosen .ncard {
     stroke: var(--brand); stroke-width: 2.4;
     filter: drop-shadow(0 1px 4px rgba(18, 128, 108, 0.35));
@@ -556,8 +556,11 @@
   });
   var collapsed = {};
   var gEls = {};
-  var PILL_W = 170, PILL_H = 46;
-  var DX = 192, DY = 112, TOP_PAD = 30, BOTTOM_PAD = 46, SIDE_PAD = 112;
+  var measures = {};
+  var CARD_W = 240, PAD_X = 12, INNER_W = CARD_W - PAD_X * 2;
+  var LINE_H = 16, MAX_LINES = 4;
+  var DX = CARD_W + 24, GAP_Y = 54, TOP_PAD = 26, BOTTOM_PAD = 44;
+  var SIDE_PAD = CARD_W / 2 + 24;
 
   function countSubtree(gid) {
     var n = 1;
@@ -594,15 +597,107 @@
       return node;
     }
     roots.forEach(function (gid) { walk(gid, 0, false); });
-    var H = TOP_PAD + BOTTOM_PAD + maxDepth * DY + PILL_H;
+    /* rows are as tall as their tallest card; centers per row keep the
+       tidy shape while every label stays fully visible */
+    var rowH = [];
+    nodes.forEach(function (n) {
+      n.h = measure(n.gid).h;
+      if (!rowH[n.depth] || n.h > rowH[n.depth]) { rowH[n.depth] = n.h; }
+    });
+    var rowY = [], y = TOP_PAD;
+    for (var d = 0; d <= maxDepth; d++) {
+      var h = rowH[d] || 50;
+      rowY[d] = y + h / 2;
+      y += h + GAP_Y;
+    }
+    var H = y - GAP_Y + BOTTOM_PAD;
     var W = Math.max(SIDE_PAD * 2 + Math.max(leafCount - 1, 0) * DX, 360);
-    nodes.forEach(function (n) { n.y = TOP_PAD + PILL_H / 2 + n.depth * DY; });
+    nodes.forEach(function (n) { n.y = rowY[n.depth]; });
     return { nodes: nodes, links: links, W: W, H: H };
   }
 
   function truncate(text, max) {
     text = String(text);
     return text.length > max ? text.slice(0, max - 1) + "…" : text;
+  }
+
+  /* ---- full-label wrapping (no ellipsis up to MAX_LINES) ----
+     Width is estimated per char: Korean/CJK counts as full-width. The full
+     text additionally lives in <title> and the detail panel. */
+  function charW(ch, size) {
+    if (ch === " ") { return size * 0.34; }
+    return ch.charCodeAt(0) > 0x2e7f ? size : size * 0.56;
+  }
+  function textW(text, size) {
+    var w = 0;
+    for (var i = 0; i < text.length; i++) { w += charW(text.charAt(i), size); }
+    return w;
+  }
+  function wrapText(text, size, maxW, maxLines) {
+    var words = String(text).split(/\s+/).filter(function (w) { return w.length; });
+    var lines = [], current = "";
+    function commit() { if (current) { lines.push(current); current = ""; } }
+    words.forEach(function (word) {
+      if (textW(word, size) > maxW) {
+        for (var i = 0; i < word.length; i++) {
+          var ch = word.charAt(i);
+          if (current && textW(current + ch, size) > maxW) { commit(); }
+          current += ch;
+        }
+        return;
+      }
+      var candidate = current ? current + " " + word : word;
+      if (current && textW(candidate, size) > maxW) { commit(); current = word; }
+      else { current = candidate; }
+    });
+    commit();
+    if (!lines.length) { lines = [String(text)]; }
+    var clamped = false;
+    if (lines.length > maxLines) {
+      lines = lines.slice(0, maxLines);
+      var last = lines[maxLines - 1];
+      while (last.length && textW(last + "…", size) > maxW) { last = last.slice(0, -1); }
+      lines[maxLines - 1] = last + "…";
+      clamped = true;
+    }
+    return { lines: lines, clamped: clamped };
+  }
+  /* "<kicker> — <body>" labels: the kicker becomes a small overline and the
+     body (the actual question) is the dominant wrapped text. */
+  function splitLabel(text) {
+    text = String(text);
+    var seps = [" — ", " – ", " - ", "—", "–"];
+    for (var i = 0; i < seps.length; i++) {
+      var idx = text.indexOf(seps[i]);
+      if (idx > 0 && idx <= 20) {
+        var kicker = text.slice(0, idx).trim();
+        var body = text.slice(idx + seps[i].length).trim();
+        if (kicker && body) { return { kicker: kicker, body: body }; }
+      }
+    }
+    return { kicker: "", body: text.trim() };
+  }
+  function measure(gid) {
+    if (measures[gid]) { return measures[gid]; }
+    var info = nodeData[gid];
+    var parts = splitLabel(info.label);
+    var overline = info.type === "other" && info.raw_type
+      ? truncate(info.raw_type, 18)
+      : (typeLabels[info.type] || info.type);
+    if (parts.kicker) { overline += " · " + parts.kicker; }
+    if (info.chosen) { overline += " · 채택"; }
+    else if (info.rejected) { overline += " · 기각"; }
+    while (overline.length > 2 && textW(overline, 9) > INNER_W) {
+      overline = overline.slice(0, -2) + "…";
+    }
+    var wrapped = wrapText(parts.body, 12, INNER_W, MAX_LINES);
+    measures[gid] = {
+      overline: overline,
+      lines: wrapped.lines,
+      clamped: wrapped.clamped,
+      h: 50 + (wrapped.lines.length - 1) * LINE_H
+    };
+    return measures[gid];
   }
 
   function onNodeActivate(gid, g) {
@@ -617,30 +712,37 @@
   function ensureNodeEl(node) {
     var g = gEls[node.gid];
     if (!g) {
+      var m = measure(node.gid);
       g = document.createElementNS(SVGNS, "g");
       g.setAttribute("data-gid", node.gid);
       g.setAttribute("tabindex", "0");
       g.setAttribute("role", "button");
       var card = document.createElementNS(SVGNS, "rect");
       card.setAttribute("class", "ncard");
-      card.setAttribute("x", -PILL_W / 2);
-      card.setAttribute("y", -PILL_H / 2);
-      card.setAttribute("width", PILL_W);
-      card.setAttribute("height", PILL_H);
+      card.setAttribute("x", -CARD_W / 2);
+      card.setAttribute("y", -m.h / 2);
+      card.setAttribute("width", CARD_W);
+      card.setAttribute("height", m.h);
       card.setAttribute("rx", 10);
       g.appendChild(card);
       var typeText = document.createElementNS(SVGNS, "text");
       typeText.setAttribute("class", "ntype");
-      typeText.setAttribute("y", -5);
+      typeText.setAttribute("y", -m.h / 2 + 18);
+      typeText.textContent = m.overline;
       g.appendChild(typeText);
       var label = document.createElementNS(SVGNS, "text");
       label.setAttribute("class", "nlabel");
-      label.setAttribute("y", 13);
-      label.textContent = truncate(node.info.label, 15);
+      m.lines.forEach(function (line, i) {
+        var span = document.createElementNS(SVGNS, "tspan");
+        span.setAttribute("x", 0);
+        span.setAttribute("y", -m.h / 2 + 36 + i * LINE_H);
+        span.textContent = line;
+        label.appendChild(span);
+      });
       g.appendChild(label);
       var bud = document.createElementNS(SVGNS, "text");
       bud.setAttribute("class", "bud");
-      bud.setAttribute("y", PILL_H / 2 + 15);
+      bud.setAttribute("y", m.h / 2 + 15);
       g.appendChild(bud);
       var tip = document.createElementNS(SVGNS, "title");
       tip.textContent = node.info.label;
@@ -658,8 +760,8 @@
   }
 
   function edgePath(link) {
-    var px = link.parent.x, py = link.parent.y + PILL_H / 2;
-    var cx = link.child.x, cy = link.child.y - PILL_H / 2;
+    var px = link.parent.x, py = link.parent.y + link.parent.h / 2;
+    var cx = link.child.x, cy = link.child.y - link.child.h / 2;
     var gap = (cy - py) * 0.5;
     return "M" + px + "," + py +
       " C" + px + "," + (py + gap) +
@@ -701,13 +803,6 @@
       if (node.gid === selectedGid) { cls += " selected"; }
       g.setAttribute("class", cls);
       g.style.transform = "translate(" + node.x + "px, " + node.y + "px)";
-      var typeText = g.querySelector(".ntype");
-      var typeName = info.type === "other" && info.raw_type
-        ? truncate(info.raw_type, 18)
-        : (typeLabels[info.type] || info.type);
-      if (info.chosen) { typeName += " · 채택"; }
-      else if (info.rejected) { typeName += " · 기각"; }
-      typeText.textContent = typeName;
       var bud = g.querySelector(".bud");
       bud.textContent = node.hidden > 0 ? "+" + node.hidden : "";
       var state = [info.label, typeLabels[info.type] || info.type];
