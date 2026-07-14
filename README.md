@@ -175,7 +175,8 @@ hardware) lives in each app's README.
 **Skills** (`skills/`, copied into the Hermes home by bootstrap):
 `healthmes-planner` (goal dump → task breakdown → energy-aware block
 proposals → decision recording), `healthmes-capture` (food + medical),
-`doctor-visit-summary`.
+`healthmes-sleep` (sleep/readiness evidence → cautious daily intensity
+decision), `doctor-visit-summary`.
 
 ## Quickstart (mac-native, primary path)
 

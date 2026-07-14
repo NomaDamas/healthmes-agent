@@ -574,7 +574,8 @@ docs/                 PLAN.md (architecture), BACKUP.md (snapshot format),
 scripts/              dev_mac.sh (mac-native tooling), initdb/ (compose),
                       bootstrap.py (hermes), vendor_sync_check.sh (drift report)
 skills/               hermes skills (copied into HERMES_HOME by bootstrap):
-                      healthmes-planner, healthmes-capture, doctor-visit-summary
+                      healthmes-planner, healthmes-capture, healthmes-sleep,
+                      doctor-visit-summary
 tests/                pytest suite (network-free)
 data/                 runtime state (gitignored): pg, redis, sqlite, media, hermes home
 vendor/               read-only upstreams - do not touch
