@@ -210,6 +210,59 @@ _MERMAID_LABEL_TRANSLATION = str.maketrans(
 )
 
 
+def _char_units(ch: str) -> float:
+    """Rough display width of one char (Korean/CJK = full-width = 1.0)."""
+    if ch.isspace():
+        return 0.34
+    return 1.0 if ord(ch) > 0x2E7F else 0.56
+
+
+def _wrap_units(text: str, max_units: float, max_lines: int) -> list[str]:
+    """Greedy width-estimated word wrap (long words hard-break by char).
+
+    Used for the Mermaid diagram labels (joined with ``<br/>`` AFTER each
+    line went through :func:`escape_mermaid_label`) so long 판단 questions
+    stay fully readable instead of being cut. Beyond ``max_lines`` the last
+    line is clamped with an ellipsis — the full text always remains in the
+    node detail panel and the list rail.
+    """
+    lines: list[str] = []
+    current = ""
+    current_units = 0.0
+
+    def units(chunk: str) -> float:
+        return sum(_char_units(ch) for ch in chunk)
+
+    def commit() -> None:
+        nonlocal current, current_units
+        if current:
+            lines.append(current)
+        current = ""
+        current_units = 0.0
+
+    for word in text.split():
+        word_units = units(word)
+        if current and current_units + 0.34 + word_units > max_units:
+            commit()
+        if word_units > max_units:
+            for ch in word:
+                w = _char_units(ch)
+                if current and current_units + w > max_units:
+                    commit()
+                current += ch
+                current_units += w
+            continue
+        current = f"{current} {word}" if current else word
+        current_units += (0.34 if current_units else 0.0) + word_units
+    commit()
+    if not lines:
+        return [text.strip() or text]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip() + "…"
+    return lines
+
+
 def escape_mermaid_label(text: str) -> str:
     """Escape user-derived text for use inside a quoted Mermaid label.
 
@@ -410,7 +463,12 @@ def tree_to_mermaid(tree: Any) -> DecisionTreeView:
             diagram_label = node.label
             if len(diagram_label) > MAX_DIAGRAM_LABEL_CHARS:
                 diagram_label = diagram_label[: MAX_DIAGRAM_LABEL_CHARS - 1] + "…"
-            escaped = escape_mermaid_label(diagram_label)
+            # Full-width-aware wrapping; each line is sanitised separately and
+            # only OUR <br/> separators exist in the label (user <> is inert).
+            escaped = "<br/>".join(
+                escape_mermaid_label(line)
+                for line in _wrap_units(diagram_label, max_units=15.0, max_lines=4)
+            )
             lines.append(f"  {node.gid}{open_mark}{escaped}{close_mark}:::type_{node.type}")
             if parent is not None:
                 lines.append(f"  {parent.gid} --> {node.gid}")
