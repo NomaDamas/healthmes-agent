@@ -221,7 +221,7 @@ def test_fresh_fire_is_persisted_and_pushed(settings, session_factory, alert_sen
     assert event.alert_sent is True
     assert event.payload["summary"] == fire.summary
     assert event.payload["evidence"]["recent_value"] == 85.0
-    assert event.payload["push"] == {"sent": True, "status_code": 202}
+    assert event.payload["push"] == {"sent": True, "status_code": 202, "channel": "webhook"}
 
 
 def test_dedup_key_is_unique_across_sweeps(settings, session_factory, alert_sender) -> None:
@@ -254,6 +254,38 @@ def test_failed_push_is_recorded_and_not_retried(settings, session_factory) -> N
     assert event.alert_sent is False
     assert event.payload["push"]["suppressed_reason"] == "push_failed"
     assert event.payload["push"]["status_code"] == 502
+
+
+def test_native_delivery_surfaces_alert_without_webhook(settings, session_factory) -> None:
+    """native_alert_delivery on: a fired trigger is marked delivered even when
+    the webhook is absent/fails, so the companion apps surface it via
+    /v1/alerts + glance (phone alerts without Telegram — user request). Alert
+    hygiene still gates it."""
+    native_settings = settings.model_copy(update={"native_alert_delivery": True})
+    sender = FakeAlertSender(ok=False)  # no Hermes webhook configured / unreachable
+    with freeze_time("2026-07-09 14:00:00"):
+        evaluator = make_evaluator(native_settings, session_factory, sender, rules=(fixed_rule,))
+        report = evaluator.evaluate_once()
+
+    assert [o.status for o in report.outcomes] == ["pushed"]
+    [event] = all_events(session_factory)
+    # Surfaced for native polling (glance/alerts filter on alert_sent) despite
+    # the webhook failure — the phone gets it without Telegram.
+    assert event.alert_sent is True
+    assert event.payload["push"]["channel"] == "native"
+    assert event.payload["push"]["webhook_ok"] is False
+
+
+def test_native_delivery_off_keeps_webhook_only_semantics(settings, session_factory) -> None:
+    """Default (native off): a failed webhook leaves the alert undelivered."""
+    sender = FakeAlertSender(ok=False)
+    with freeze_time("2026-07-09 14:00:00"):
+        evaluator = make_evaluator(settings, session_factory, sender, rules=(fixed_rule,))
+        report = evaluator.evaluate_once()
+
+    assert [o.status for o in report.outcomes] == ["push_failed"]
+    [event] = all_events(session_factory)
+    assert event.alert_sent is False
 
 
 # ---------------------------------------------------------------------------
