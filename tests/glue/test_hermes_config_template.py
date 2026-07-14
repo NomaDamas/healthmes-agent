@@ -35,6 +35,7 @@ FULL_CONTEXT = {
     "hermes_model": "gpt-5.4",
     "hermes_provider": "openai-codex",
     "hermes_model_base_url": "",
+    "hermes_model_api_key": "",
 }
 
 MINIMAL_CONTEXT = {
@@ -145,6 +146,11 @@ def test_model_block_only_rendered_when_selected() -> None:
 
     with_base = render(dict(FULL_CONTEXT, hermes_model_base_url="http://localhost:11434/v1"))
     assert with_base["model"]["base_url"] == "http://localhost:11434/v1"
+
+    with_key = render(
+        dict(FULL_CONTEXT, hermes_provider="custom", hermes_model_api_key="sk-openai-test")
+    )
+    assert with_key["model"]["api_key"] == "sk-openai-test"
 
 
 def test_default_alert_prompt_renders_clean() -> None:

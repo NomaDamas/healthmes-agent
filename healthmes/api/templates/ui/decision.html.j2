@@ -1,0 +1,681 @@
+{% extends "ui/_base.html.j2" %}
+{% set active_nav = "decisions" %}
+{# Decision viewer — proposal first, evidence tree as the reference view
+   (docs/PLAN.md §5). Context:
+   record            DecisionRecord ORM row
+   graph             DecisionTreeView (source / node_index / root / truncated)
+   short_id          first 8 chars of the record id (crumb)
+   node_types        legend order (known types + "other")
+   + shell_context   token_qs / tz_name / format_local / format_rel / labels
+                     / season / daypart
+
+   THREE views over ONE normalised tree (same JSON island):
+   - 트리 (default): client-built top-down tidy tree — an analytic
+     decision-tree diagram (root on top, levels flowing down, compact
+     type-tinted node cards, gently curved edges, the chosen route
+     highlighted root→action, rejected options de-emphasized). Vanilla
+     layout, no library. Every user string enters the SVG via textContent /
+     attribute assignment — no HTML parsing path exists for user data.
+   - Mermaid 플로차트: the vendored graph-shape view (lazy init).
+   - 리스트: the server-rendered <details> rail — also the no-JS and
+     screen-reader representation (JS off = this view, fully readable).
+   All user-derived values are autoescaped here; the Mermaid source was made
+   inert by escape_mermaid_label() before it reached this template. #}
+
+{% block title %}{{ record.summary }} — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">&nbsp;/ {{ short_id }}</span>{% endblock %}
+
+{% block head %}
+<style>
+  /* ---- header meta ------------------------------------------------------ */
+  .meta-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.2rem 0 1.1rem; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    border: 1px solid var(--line); border-radius: 999px;
+    background: var(--glass-solid); color: var(--ink-2);
+    font-size: 0.78rem; padding: 0.14rem 0.65rem; white-space: nowrap;
+  }
+
+  /* ---- controls ---------------------------------------------------------- */
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center;
+    justify-content: space-between; margin: 0 0 0.9rem;
+  }
+  .tree-tools { display: flex; gap: 0.4rem; }
+
+  /* ---- shared viewer grid + detail panel --------------------------------- */
+  .viewer-grid { display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 960px) {
+    .viewer-grid { grid-template-columns: minmax(0, 1fr) 19rem; align-items: start; }
+    #node-detail { position: sticky; top: 4rem; }
+  }
+  .view-stack { min-width: 0; }
+  #node-detail {
+    background: var(--glass);
+    -webkit-backdrop-filter: blur(16px) saturate(150%);
+    backdrop-filter: blur(16px) saturate(150%);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 0.9rem 1rem 1rem;
+  }
+  #node-detail h2 { margin: 0 0 0.6rem; }
+  #node-detail-label { font-weight: 650; overflow-wrap: anywhere; margin-top: 0.45rem; }
+  #node-detail-detail {
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    color: var(--ink-2); font-size: 0.88rem; margin-top: 0.45rem;
+  }
+  #node-detail-source { margin-top: 0.6rem; }
+
+  /* ---- 트리 (analytic top-down decision tree) ----------------------------- */
+  :root { --edge: #71837a; --edge-rejected: #a5b1a9; }
+  html[data-daypart="night"] { --edge: #6f7f76; --edge-rejected: #4c5952; }
+  #forest-view .card { padding: 0.6rem 0.6rem 0.9rem; }
+  .forest-stage { overflow-x: auto; overflow-y: hidden; }
+  #forest-svg { display: block; margin: 0 auto; max-width: none; }
+  .tlink { fill: none; stroke: var(--edge); stroke-width: 1.6; stroke-linecap: round; }
+  .tlink.on-path { stroke: var(--brand); stroke-width: 3; }
+  .tlink.rejected { stroke: var(--edge-rejected); stroke-width: 1.2; }
+  g.fnode { cursor: pointer; }
+  g.fnode:focus { outline: none; }
+  g.fnode:focus-visible .ncard { stroke: var(--brand); stroke-width: 2.5px; }
+  /* node cards stay light analytic pills in every daypart (paper on canvas) */
+  .ncard { fill: #ffffff; stroke: #d7ddd9; stroke-width: 1.2; }
+  .fnode-input .ncard    { fill: #e9f0fb; stroke: #c7d9f5; }
+  .fnode-rule .ncard     { fill: #efeafa; stroke: #d6cbf2; }
+  .fnode-llm_step .ncard { fill: #faf2d9; stroke: #eedfae; }
+  .fnode-option .ncard   { fill: #e0f4ef; stroke: #b7e4db; }
+  .fnode-action .ncard   { fill: #e4f4e3; stroke: #c2e5c0; }
+  .fnode-other .ncard    { fill: #eff1ef; stroke: #d9dfdb; }
+  .ntype { font-size: 9px; font-weight: 750; letter-spacing: 0.05em; text-anchor: middle; }
+  .fnode-input .ntype    { fill: #2b4d87; }
+  .fnode-rule .ntype     { fill: #55389b; }
+  .fnode-llm_step .ntype { fill: #7c5a14; }
+  .fnode-option .ntype   { fill: #146055; }
+  .fnode-action .ntype   { fill: #2b6532; }
+  .fnode-other .ntype    { fill: #4e5b55; }
+  .nlabel { fill: #22312a; font-size: 11.5px; font-weight: 600; text-anchor: middle; }
+  g.fnode.chosen .ncard {
+    stroke: var(--brand); stroke-width: 2.4;
+    filter: drop-shadow(0 1px 4px rgba(18, 128, 108, 0.35));
+  }
+  g.fnode.chosen .ntype { fill: #0b5c4d; }
+  g.fnode.rejected { opacity: 0.45; }
+  g.fnode.selected .ncard { stroke: #22312a; stroke-width: 2; }
+  .bud { fill: var(--ink-3); font-size: 10px; text-anchor: middle; font-weight: 700; }
+  @media (prefers-reduced-motion: no-preference) {
+    g.fnode { transition: transform 0.4s cubic-bezier(0.22, 0.9, 0.3, 1); }
+    .tlink { transition: opacity 0.25s ease; }
+  }
+  .tree-legend {
+    display: flex; flex-wrap: wrap; gap: 0.45rem 0.7rem; align-items: baseline;
+    margin: 0.6rem 0.4rem 0; padding: 0; list-style: none;
+    font-size: 0.78rem; color: var(--ink-2);
+  }
+  .tree-legend li { display: inline-flex; align-items: baseline; gap: 0.3rem; }
+
+  /* ---- mermaid flowchart view -------------------------------------------- */
+  pre.mermaid {
+    margin: 0; padding: 0.9rem;
+    background: var(--glass);
+    -webkit-backdrop-filter: blur(16px) saturate(150%);
+    backdrop-filter: blur(16px) saturate(150%);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius);
+    overflow-x: auto;
+  }
+  /* the diagram keeps its light-neutral palette at night — the pane becomes
+     solid light paper (legibility over recoloring) */
+  html[data-daypart="night"] pre.mermaid {
+    background: #f3f6f3;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  pre.mermaid:not([data-processed]) { visibility: hidden; min-height: 6rem; }
+  pre.mermaid svg { max-width: 100%; height: auto; }
+  #decision-graph g.node { cursor: pointer; }
+  #decision-graph g.node:focus { outline: none; }
+  #decision-graph g.node.selected,
+  #decision-graph g.node:focus-visible { filter: drop-shadow(0 0 5px var(--brand)); }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 0.45rem 0.7rem;
+    margin: 0.8rem 0 0; padding: 0; list-style: none;
+  }
+  .legend li { display: inline-flex; align-items: baseline; gap: 0.3rem; }
+  .legend .mono { font-size: 0.7rem; color: var(--ink-3); }
+
+  /* ---- 리스트 (details rail — accessibility fallback) --------------------- */
+  .tnode-root { list-style: none; margin: 0; padding: 0; }
+  .tnode-root > li { margin: 0; }
+  details.tnode { margin: 0; }
+  details.tnode > summary {
+    display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;
+    padding: 0.5rem 0.6rem; border-radius: var(--radius-sm);
+    cursor: pointer; list-style: none;
+  }
+  details.tnode > summary::-webkit-details-marker { display: none; }
+  details.tnode > summary:hover { background: var(--surface-2); }
+  .caret { flex: 0 0 auto; color: var(--ink-3); font-size: 0.72rem; translate: 0 -1px; }
+  .caret::before { content: "▸"; display: inline-block; transition: transform 140ms ease; }
+  details[open] > summary .caret::before { transform: rotate(90deg); }
+  .tnode-label { font-weight: 600; overflow-wrap: anywhere; line-height: 1.5; }
+  .tnode-detail {
+    margin: 0.1rem 0.4rem 0.6rem 2.2rem;
+    padding: 0.6rem 0.8rem;
+    background: var(--surface-2);
+    border-radius: var(--radius-sm);
+    color: var(--ink-2);
+    font-size: 0.88rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  ul.tnode-children {
+    list-style: none; margin: 0 0 0.3rem 0.95rem; padding: 0 0 0 1rem;
+    border-left: 2px solid var(--line-soft);
+  }
+  .tnode-leaf {
+    display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;
+    padding: 0.5rem 0.6rem 0.5rem 1.75rem; border-radius: var(--radius-sm);
+  }
+  .tnode.chosen > summary, .tnode-leaf.chosen {
+    background: var(--brand-wash);
+    box-shadow: inset 0 0 0 1.5px var(--brand-soft);
+  }
+  .chosen-chip { background: var(--brand); border-color: var(--brand); color: #ffffff; }
+  html[data-daypart="night"] .chosen-chip { color: #08110e; }
+  .tnode.rejected > summary .tnode-label,
+  .tnode-leaf.rejected .tnode-label {
+    color: var(--ink-3); text-decoration: line-through;
+    text-decoration-thickness: 1px; text-decoration-color: var(--ink-3);
+  }
+  .rejected-chip { background: transparent; color: var(--ink-3); border-style: dashed; }
+
+  .why-eyebrow { margin-top: 1.4rem; }
+  .tree-caption { margin: 0.15rem 0 0.8rem; }
+  .empty-note { color: var(--ink-2); }
+  .foot-links { margin-top: 1.6rem; }
+</style>
+{% endblock %}
+
+{% block content %}
+<p class="eyebrow">{{ kind_labels.get(record.kind.value, record.kind.value) }} · HealthMes의 제안</p>
+<h1>{{ record.summary }}</h1>
+<div class="meta-chips">
+  <span class="badge kind-{{ record.kind.value }}" title="kind: {{ record.kind.value }}">{{ kind_labels.get(record.kind.value, record.kind.value) }}</span>
+  <span class="chip" title="{{ tz_name }} · id {{ record.id }}">{{ format_local(record.created_at) }} · {{ format_rel(record.created_at) }}</span>
+  {% if record.llm_model %}
+  <span class="chip mono" title="LLM 모델">{{ record.llm_model }}</span>
+  {% endif %}
+  {% if record.tokens is not none %}
+  <span class="chip" title="사용 토큰">{{ "{:,}".format(record.tokens) }} tokens</span>
+  {% endif %}
+</div>
+
+<p class="eyebrow why-eyebrow">왜 이런 제안인가요?</p>
+<p class="muted tree-caption">아래 트리는 궁금할 때 펼쳐 보는 참고용 근거 기록입니다 —
+  일정 조정 제안과 하루 피드백이 모두 여기에 남습니다.</p>
+
+<section id="decision-tree">
+{% if graph.root %}
+  {% macro tnode(node) %}
+    {% if node.children or node.detail %}
+  <details class="tnode type-{{ node.type }}{% if node.chosen %} chosen{% endif %}{% if node.rejected %} rejected{% endif %}" open data-gid="{{ node.gid }}">
+    <summary>
+      <span class="caret" aria-hidden="true"></span>
+      <span class="badge type-{{ node.type }}">{% if node.type == "other" and node.raw_type %}{{ node.raw_type }}{% else %}{{ node_type_labels.get(node.type, node.type) }}{% endif %}</span>
+      <span class="tnode-label">{{ node.label }}</span>
+      {% if node.chosen %}<span class="badge chosen-chip">채택</span>{% endif %}
+      {% if node.rejected %}<span class="badge rejected-chip">기각</span>{% endif %}
+    </summary>
+    {% if node.detail %}
+    <div class="tnode-detail">{{ node.detail }}</div>
+    {% endif %}
+    {% if node.children %}
+    <ul class="tnode-children">
+      {% for child in node.children %}
+      <li>{{ tnode(child) }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </details>
+    {% else %}
+  <div class="tnode-leaf type-{{ node.type }}{% if node.chosen %} chosen{% endif %}{% if node.rejected %} rejected{% endif %}" data-gid="{{ node.gid }}">
+    <span class="badge type-{{ node.type }}">{% if node.type == "other" and node.raw_type %}{{ node.raw_type }}{% else %}{{ node_type_labels.get(node.type, node.type) }}{% endif %}</span>
+    <span class="tnode-label">{{ node.label }}</span>
+    {% if node.chosen %}<span class="badge chosen-chip">채택</span>{% endif %}
+    {% if node.rejected %}<span class="badge rejected-chip">기각</span>{% endif %}
+  </div>
+    {% endif %}
+  {% endmacro %}
+
+  <div id="viewer-controls" class="controls no-print" hidden>
+    <div class="seg" role="group" aria-label="보기 전환">
+      <button type="button" id="btn-view-forest" data-view="forest" aria-pressed="true">트리</button>
+      <button type="button" id="btn-view-graph" data-view="graph" aria-pressed="false">플로차트</button>
+      <button type="button" id="btn-view-list" data-view="list" aria-pressed="false">리스트</button>
+    </div>
+    <div class="tree-tools" id="tree-tools">
+      <button type="button" class="btn" id="expand-all">모두 펼치기</button>
+      <button type="button" class="btn" id="collapse-all">모두 접기</button>
+    </div>
+  </div>
+
+  <div class="viewer-grid">
+    <div class="view-stack">
+      <section id="forest-view" aria-label="결정 트리 — 트리 보기" hidden>
+        <div class="card">
+          <div class="forest-stage" id="forest-stage">
+            <svg id="forest-svg" xmlns="http://www.w3.org/2000/svg" role="group"
+                 aria-label="결정 트리 다이어그램 — 루트(트리거)에서 아래로 입력, 판단, 옵션, 실행이 이어집니다"></svg>
+          </div>
+          <ul class="tree-legend" aria-label="노드 유형 범례">
+            {% for t in node_types %}
+            <li><span class="badge type-{{ t }}">{{ node_type_labels.get(t, t) }}</span></li>
+            {% endfor %}
+            <li class="subtle">노드를 클릭하면 하위 가지가 접히고, 선택한 노드의 상세가 옆 패널에 열립니다</li>
+          </ul>
+        </div>
+      </section>
+
+      <section id="graph-view" aria-label="결정 트리 — 플로차트 보기" hidden>
+        <pre id="decision-graph" class="mermaid">{{ graph.source }}</pre>
+        <p id="graph-error" class="error" hidden></p>
+        <p id="graph-hint" class="muted" hidden>노드를 클릭하면 오른쪽에 상세 내용이 열립니다.</p>
+        <ul class="legend" aria-label="노드 유형 범례">
+          {% for t in node_types %}
+          <li><span class="badge type-{{ t }}">{{ node_type_labels.get(t, t) }}</span><span class="mono">{{ t }}</span></li>
+          {% endfor %}
+        </ul>
+      </section>
+
+      <section id="list-view" aria-label="결정 트리 — 리스트 보기">
+        <div class="card">
+          <ol class="tnode-root">
+            <li>{{ tnode(graph.root) }}</li>
+          </ol>
+        </div>
+      </section>
+
+      {% if graph.truncated %}
+      <p class="muted">트리가 커서 앞쪽 {{ graph.node_index | length }}개 노드만 표시했습니다 —
+        전체 트리는 <a href="/decisions/{{ record.id }}.json{{ token_qs }}">JSON 보기</a>에 있습니다.</p>
+      {% endif %}
+    </div>
+
+    <aside id="node-detail" hidden aria-live="polite">
+      <h2>노드 상세</h2>
+      <span id="node-detail-type" class="badge"></span>
+      <span id="node-detail-chosen" class="badge chosen-chip" hidden>채택</span>
+      <div id="node-detail-label"></div>
+      <div id="node-detail-detail"></div>
+      <p id="node-detail-source" class="muted mono"></p>
+    </aside>
+  </div>
+
+  <noscript>
+    <p class="muted">JavaScript 없이도 위 리스트 보기는 그대로 읽을 수 있습니다 —
+      트리와 플로차트 보기만 비활성화됩니다.</p>
+  </noscript>
+{% else %}
+  <p class="empty-note"><em>기록된 결정 트리가 없습니다.</em> 이 결정은 요약만 저장되어 있습니다.</p>
+{% endif %}
+</section>
+
+<p class="muted foot-links">
+  <a href="/decisions/{{ record.id }}.json{{ token_qs }}">JSON 보기</a> ·
+  <a href="/decisions{{ token_qs }}">전체 결정 기록</a>
+</p>
+{% endblock %}
+
+{% block scripts %}
+{% if graph.root %}
+<script type="application/json" id="node-data">{{ graph.node_index | tojson }}</script>
+<script type="application/json" id="type-labels">{{ node_type_labels | tojson }}</script>
+<script src="/static/mermaid.min.js"></script>
+<script>
+(function () {
+  "use strict";
+  /* Trust model: nodeData values are user/LLM-derived and hostile. They only
+     ever reach the page through textContent or DOM attribute assignment —
+     never through any HTML/SVG parsing sink. */
+  function islandJSON(id) {
+    try { return JSON.parse(document.getElementById(id).textContent || "{}"); }
+    catch (err) { return {}; }
+  }
+  var nodeData = islandJSON("node-data");
+  var typeLabels = islandJSON("type-labels");
+  var ROOT = "n0";
+  var SVGNS = "http://www.w3.org/2000/svg";
+
+  var controls = document.getElementById("viewer-controls");
+  var views = {
+    forest: document.getElementById("forest-view"),
+    graph: document.getElementById("graph-view"),
+    list: document.getElementById("list-view")
+  };
+  var viewButtons = {
+    forest: document.getElementById("btn-view-forest"),
+    graph: document.getElementById("btn-view-graph"),
+    list: document.getElementById("btn-view-list")
+  };
+  var treeTools = document.getElementById("tree-tools");
+  var svg = document.getElementById("forest-svg");
+  var graphEl = document.getElementById("decision-graph");
+  var listEl = views.list;
+  var panel = document.getElementById("node-detail");
+  var panelType = document.getElementById("node-detail-type");
+  var panelChosen = document.getElementById("node-detail-chosen");
+  var panelLabel = document.getElementById("node-detail-label");
+  var panelDetail = document.getElementById("node-detail-detail");
+  var panelSource = document.getElementById("node-detail-source");
+  var hint = document.getElementById("graph-hint");
+  var errorEl = document.getElementById("graph-error");
+  var currentView = "list";
+  var mermaidStarted = false;
+  var selectedEl = null;
+  var selectedGid = null;
+
+  if (!nodeData[ROOT]) { return; }
+  if (controls) { controls.hidden = false; }
+
+  /* ---------- shared node-detail panel (textContent only) ---------- */
+  function showNode(gid, el) {
+    var info = nodeData[gid];
+    if (!info) { return; }
+    if (selectedEl) { selectedEl.classList.remove("selected"); }
+    selectedEl = el || null;
+    selectedGid = gid;
+    if (selectedEl) { selectedEl.classList.add("selected"); }
+    panelType.className = "badge type-" + info.type; /* server-whitelisted */
+    panelType.textContent = info.raw_type || info.type;
+    panelChosen.hidden = !info.chosen;
+    panelLabel.textContent = info.label;
+    panelDetail.textContent = info.detail || "(기록된 상세 내용 없음)";
+    panelSource.textContent = info.source_id ? "node id: " + info.source_id : "";
+    panel.hidden = false;
+  }
+
+  /* ---------- 트리: vanilla top-down tidy decision tree ---------- */
+  var parentOf = {};
+  Object.keys(nodeData).forEach(function (gid) {
+    (nodeData[gid].children || []).forEach(function (c) { parentOf[c] = gid; });
+  });
+  var onChosenPath = {};
+  Object.keys(nodeData).forEach(function (gid) {
+    if (!nodeData[gid].chosen) { return; }
+    var cur = gid;
+    while (cur) { onChosenPath[cur] = true; cur = parentOf[cur]; }
+  });
+  var collapsed = {};
+  var gEls = {};
+  var PILL_W = 170, PILL_H = 46;
+  var DX = 192, DY = 112, TOP_PAD = 30, BOTTOM_PAD = 46, SIDE_PAD = 112;
+
+  function countSubtree(gid) {
+    var n = 1;
+    (nodeData[gid].children || []).forEach(function (c) {
+      if (nodeData[c]) { n += countSubtree(c); }
+    });
+    return n;
+  }
+
+  function computeLayout() {
+    var nodes = [], links = [], leafCount = 0, maxDepth = 0;
+    function walk(gid, depth, inheritedRejected) {
+      var info = nodeData[gid];
+      var rejected = inheritedRejected || !!info.rejected;
+      var kids = (info.children || []).filter(function (c) { return nodeData[c]; });
+      var isCollapsed = !!collapsed[gid] && kids.length > 0;
+      var node = {
+        gid: gid, depth: depth, info: info, rejected: rejected,
+        hidden: isCollapsed ? countSubtree(gid) - 1 : 0, x: 0, y: 0, children: []
+      };
+      if (depth > maxDepth) { maxDepth = depth; }
+      if (isCollapsed || kids.length === 0) {
+        node.x = SIDE_PAD + leafCount * DX;
+        leafCount += 1;
+      } else {
+        kids.forEach(function (c) {
+          var childNode = walk(c, depth + 1, rejected);
+          node.children.push(childNode);
+          links.push({ parent: node, child: childNode });
+        });
+        node.x = (node.children[0].x + node.children[node.children.length - 1].x) / 2;
+      }
+      nodes.push(node);
+      return node;
+    }
+    walk(ROOT, 0, false);
+    var H = TOP_PAD + BOTTOM_PAD + maxDepth * DY + PILL_H;
+    var W = Math.max(SIDE_PAD * 2 + Math.max(leafCount - 1, 0) * DX, 360);
+    nodes.forEach(function (n) { n.y = TOP_PAD + PILL_H / 2 + n.depth * DY; });
+    return { nodes: nodes, links: links, W: W, H: H };
+  }
+
+  function truncate(text, max) {
+    text = String(text);
+    return text.length > max ? text.slice(0, max - 1) + "…" : text;
+  }
+
+  function onNodeActivate(gid, g) {
+    showNode(gid, g);
+    var kids = nodeData[gid].children || [];
+    if (kids.length) {
+      collapsed[gid] = !collapsed[gid];
+      renderForest();
+    }
+  }
+
+  function ensureNodeEl(node) {
+    var g = gEls[node.gid];
+    if (!g) {
+      g = document.createElementNS(SVGNS, "g");
+      g.setAttribute("data-gid", node.gid);
+      g.setAttribute("tabindex", "0");
+      g.setAttribute("role", "button");
+      var card = document.createElementNS(SVGNS, "rect");
+      card.setAttribute("class", "ncard");
+      card.setAttribute("x", -PILL_W / 2);
+      card.setAttribute("y", -PILL_H / 2);
+      card.setAttribute("width", PILL_W);
+      card.setAttribute("height", PILL_H);
+      card.setAttribute("rx", 10);
+      g.appendChild(card);
+      var typeText = document.createElementNS(SVGNS, "text");
+      typeText.setAttribute("class", "ntype");
+      typeText.setAttribute("y", -5);
+      g.appendChild(typeText);
+      var label = document.createElementNS(SVGNS, "text");
+      label.setAttribute("class", "nlabel");
+      label.setAttribute("y", 13);
+      label.textContent = truncate(node.info.label, 15);
+      g.appendChild(label);
+      var bud = document.createElementNS(SVGNS, "text");
+      bud.setAttribute("class", "bud");
+      bud.setAttribute("y", PILL_H / 2 + 15);
+      g.appendChild(bud);
+      var tip = document.createElementNS(SVGNS, "title");
+      tip.textContent = node.info.label;
+      g.appendChild(tip);
+      g.addEventListener("click", function () { onNodeActivate(node.gid, g); });
+      g.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          onNodeActivate(node.gid, g);
+        }
+      });
+      gEls[node.gid] = g;
+    }
+    return g;
+  }
+
+  function edgePath(link) {
+    var px = link.parent.x, py = link.parent.y + PILL_H / 2;
+    var cx = link.child.x, cy = link.child.y - PILL_H / 2;
+    var gap = (cy - py) * 0.5;
+    return "M" + px + "," + py +
+      " C" + px + "," + (py + gap) +
+      " " + cx + "," + (cy - gap) +
+      " " + cx + "," + cy;
+  }
+
+  var linksLayer = document.createElementNS(SVGNS, "g");
+  var nodesLayer = document.createElementNS(SVGNS, "g");
+  svg.appendChild(linksLayer);
+  svg.appendChild(nodesLayer);
+
+  function renderForest() {
+    var layout = computeLayout();
+    svg.setAttribute("viewBox", "0 0 " + layout.W + " " + layout.H);
+    svg.setAttribute("width", layout.W);
+    svg.setAttribute("height", layout.H);
+
+    while (linksLayer.firstChild) { linksLayer.removeChild(linksLayer.firstChild); }
+    layout.links.forEach(function (link) {
+      var path = document.createElementNS(SVGNS, "path");
+      var cls = "tlink";
+      if (onChosenPath[link.child.gid] && onChosenPath[link.parent.gid]) { cls += " on-path"; }
+      if (link.child.rejected) { cls += " rejected"; }
+      path.setAttribute("class", cls);
+      path.setAttribute("d", edgePath(link));
+      linksLayer.appendChild(path);
+    });
+
+    var seen = {};
+    layout.nodes.forEach(function (node) {
+      seen[node.gid] = true;
+      var g = ensureNodeEl(node);
+      var info = node.info;
+      var cls = "fnode fnode-" + info.type;
+      if (info.chosen) { cls += " chosen"; }
+      if (node.rejected) { cls += " rejected"; }
+      if (onChosenPath[node.gid]) { cls += " on-path"; }
+      if (node.gid === selectedGid) { cls += " selected"; }
+      g.setAttribute("class", cls);
+      g.style.transform = "translate(" + node.x + "px, " + node.y + "px)";
+      var typeText = g.querySelector(".ntype");
+      var typeName = info.type === "other" && info.raw_type
+        ? truncate(info.raw_type, 18)
+        : (typeLabels[info.type] || info.type);
+      if (info.chosen) { typeName += " · 채택"; }
+      else if (info.rejected) { typeName += " · 기각"; }
+      typeText.textContent = typeName;
+      var bud = g.querySelector(".bud");
+      bud.textContent = node.hidden > 0 ? "+" + node.hidden : "";
+      var state = [info.label, typeLabels[info.type] || info.type];
+      if (info.chosen) { state.push("채택"); }
+      if (node.rejected) { state.push("기각"); }
+      if (node.hidden > 0) { state.push("접힘 · 숨은 노드 " + node.hidden + "개"); }
+      g.setAttribute("aria-label", state.join(" · "));
+      if (!g.parentNode) { nodesLayer.appendChild(g); }
+      if (node.gid === selectedGid) { selectedEl = g; }
+    });
+    Object.keys(gEls).forEach(function (gid) {
+      if (!seen[gid] && gEls[gid].parentNode) {
+        gEls[gid].parentNode.removeChild(gEls[gid]);
+      }
+    });
+  }
+
+  /* ---------- view switching ---------- */
+  function setView(which) {
+    currentView = which;
+    Object.keys(views).forEach(function (key) {
+      views[key].hidden = key !== which;
+      viewButtons[key].setAttribute("aria-pressed", String(key === which));
+    });
+    treeTools.hidden = which === "graph";
+    if (which === "graph") { startMermaid(); }
+    if (which === "forest") { renderForest(); }
+  }
+  Object.keys(viewButtons).forEach(function (key) {
+    viewButtons[key].addEventListener("click", function () { setView(key); });
+  });
+
+  /* ---------- expand / collapse all (acts on the active view) ---------- */
+  function setAllList(open) {
+    listEl.querySelectorAll("details").forEach(function (d) { d.open = open; });
+  }
+  document.getElementById("expand-all").addEventListener("click", function () {
+    if (currentView === "forest") { collapsed = {}; renderForest(); }
+    else { setAllList(true); }
+  });
+  document.getElementById("collapse-all").addEventListener("click", function () {
+    if (currentView === "forest") {
+      Object.keys(nodeData).forEach(function (gid) {
+        if (gid !== ROOT && (nodeData[gid].children || []).length) { collapsed[gid] = true; }
+      });
+      renderForest();
+    } else { setAllList(false); }
+  });
+
+  /* ---------- mermaid flowchart (lazy) ---------- */
+  function fail(message) {
+    if (graphEl) { graphEl.hidden = true; }
+    if (errorEl) { errorEl.hidden = false; errorEl.textContent = message; }
+  }
+  function gidFromDomId(domId) {
+    if (!domId) { return null; }
+    var m = /(?:^|-)(n\d+)-\d+$/.exec(domId);
+    if (!m) { m = /(?:^|-)(n\d+)$/.exec(domId); }
+    return m ? m[1] : null;
+  }
+  function bindGraphClicks() {
+    var nodes = graphEl.querySelectorAll("g.node");
+    var bound = 0;
+    nodes.forEach(function (el) {
+      var gid = gidFromDomId(el.id);
+      if (!gid || !nodeData[gid]) { return; }
+      bound += 1;
+      el.setAttribute("tabindex", "0");
+      el.setAttribute("role", "button");
+      el.addEventListener("click", function () { showNode(gid, el); });
+      el.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          showNode(gid, el);
+        }
+      });
+    });
+    if (bound > 0 && hint) { hint.hidden = false; }
+  }
+  function startMermaid() {
+    if (mermaidStarted) { return; }
+    mermaidStarted = true;
+    if (!window.mermaid) {
+      fail("다이어그램 라이브러리를 불러오지 못했습니다 — 트리와 리스트 보기에서 같은 내용을 볼 수 있습니다.");
+      return;
+    }
+    try {
+      window.mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: "strict",
+        theme: "neutral",
+        suppressErrorRendering: true,
+        fontFamily: "-apple-system, 'Apple SD Gothic Neo', 'Pretendard', 'Noto Sans KR', system-ui, sans-serif",
+        flowchart: { useMaxWidth: true, htmlLabels: true }
+      });
+      window.mermaid.run({ nodes: [graphEl] }).then(bindGraphClicks).catch(function () {
+        fail("다이어그램을 그리지 못했습니다 — 트리와 리스트 보기에서 같은 내용을 볼 수 있습니다.");
+      });
+    } catch (err) {
+      fail("다이어그램을 그리지 못했습니다 — 트리와 리스트 보기에서 같은 내용을 볼 수 있습니다.");
+    }
+  }
+
+  /* ---------- boot: tree by default, list if anything goes wrong ---------- */
+  try {
+    setView("forest");
+  } catch (err) {
+    try { setView("list"); } catch (err2) { /* server-rendered list stays visible */ }
+  }
+  var resizeTimer = null;
+  window.addEventListener("resize", function () {
+    if (currentView !== "forest") { return; }
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(renderForest, 180);
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}

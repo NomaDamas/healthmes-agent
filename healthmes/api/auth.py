@@ -44,8 +44,11 @@ __all__ = [
     "viewer_url",
 ]
 
-# Paths that must stay reachable without credentials (liveness only).
-OPEN_PATHS = frozenset({"/health"})
+# Paths that must stay reachable without credentials. "/health" is liveness;
+# "/" is the static landing shell — it renders links only (no data, no
+# credentials in markup; healthmes/api/decisions.py::landing), so exposing it
+# leaks nothing while giving humans an entry point on the public host.
+OPEN_PATHS = frozenset({"/health", "/"})
 
 # Path prefixes of the human-facing viewer surface that may authenticate via
 # the derived ?token= query credential (browser links cannot carry headers).

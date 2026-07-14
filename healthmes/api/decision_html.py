@@ -1,14 +1,18 @@
-"""Decision viewer rendering: decision tree -> Mermaid flowchart page (docs/PLAN.md §5).
+"""Decision viewer rendering: decision tree -> viewer pages (docs/PLAN.md §5).
 
 Phase-2 implementation of the swap point left by Phase 1: the routes in
 ``healthmes/api/decisions.py`` keep calling ``render_*`` functions with stable
-signatures, but the page is now a Jinja template (``healthmes/api/templates/``)
+signatures, but the pages are Jinja templates (``healthmes/api/templates/ui/``)
 rendering the stored ``decision_record.tree`` — recursive
 ``{id, type: input|rule|llm_step|option|action, label, detail, children[]}``
-nodes — as a Mermaid flowchart with a click-to-inspect detail panel, plus an
-always-present escaped HTML outline (no-JS / screen-reader / render-failure
-fallback). Mermaid itself is vendored (``healthmes/api/static/mermaid.min.js``)
-and served by this service — no CDN, local-first.
+nodes — as TWO views built from the same normalised tree:
+
+- an interactive, collapsible tree ("인터랙티브 트리") of semantic
+  ``<details>``/``<summary>`` nodes — also the no-JS / screen-reader /
+  render-failure representation;
+- the Mermaid flowchart with a click-to-inspect detail panel. Mermaid itself
+  is vendored (``healthmes/api/static/mermaid.min.js``) and served by this
+  service — no CDN, local-first.
 
 Trust model — every string in ``tree`` is user/LLM-derived and treated as
 hostile:
@@ -27,23 +31,39 @@ hostile:
   name or a CSS class.
 - The page initialises Mermaid with ``securityLevel: "strict"`` as a second
   layer, and the detail panel fills itself via ``textContent`` only.
+
+Presentation-only inference: an ``option`` node is highlighted as *chosen*
+when the tree continues through it (it has children) or its detail text
+starts with an adoption marker (``채택``/``선택``/``chosen``/...); rejection
+markers (``기각``/``rejected``/...) dim it. Pure display heuristics — the
+stored record is never modified.
 """
 
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, tzinfo
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader
 
+from healthmes.api.auth import viewer_token
+from healthmes.api.common import ensure_utc, utc_now
 from healthmes.api.pagination import PageMeta
+from healthmes.config import Settings, resolve_timezone
 from healthmes.store import DecisionRecord
 
 __all__ = [
     "KNOWN_NODE_TYPES",
     "FALLBACK_NODE_TYPE",
+    "NODE_TYPE_LABELS",
+    "KIND_LABELS",
+    "SEASONS",
+    "DAYPARTS",
+    "season_for_month",
+    "daypart_for_hour",
     "MAX_TREE_DEPTH",
     "MAX_TREE_NODES",
     "MAX_DIAGRAM_LABEL_CHARS",
@@ -51,27 +71,88 @@ __all__ = [
     "DecisionTreeView",
     "escape_mermaid_label",
     "format_created",
+    "format_created_local",
+    "format_relative",
     "template_environment",
     "tree_to_mermaid",
+    "viewer_query_suffix",
+    "shell_context",
     "render_decision_html",
     "render_decision_list_html",
     "render_not_found_html",
+    "render_index_html",
 ]
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
-# Guard rails against recursion bombs / browser-melting diagrams. The outline
-# and the diagram both come from the same normalised tree, so the caps apply
-# consistently; the full record is always available on the .json view.
+# Guard rails against recursion bombs / browser-melting diagrams. The
+# interactive tree and the diagram both come from the same normalised tree, so
+# the caps apply consistently; the full record is always on the .json view.
 MAX_TREE_DEPTH = 20
 MAX_TREE_NODES = 200
 # Long labels are shortened in the diagram only; the detail panel and the
-# outline always show the full text.
+# interactive tree always show the full text.
 MAX_DIAGRAM_LABEL_CHARS = 80
 
 KNOWN_NODE_TYPES: tuple[str, ...] = ("input", "rule", "llm_step", "option", "action")
 FALLBACK_NODE_TYPE = "other"
 _UNTITLED_LABEL = "(untitled)"
+
+# Korean display labels for the whitelisted node types (the raw type string is
+# still shown for unknown types, escaped by the template).
+NODE_TYPE_LABELS: dict[str, str] = {
+    "input": "입력",
+    "rule": "규칙",
+    "llm_step": "판단",
+    "option": "옵션",
+    "action": "실행",
+    FALLBACK_NODE_TYPE: "기타",
+}
+
+# Korean display labels for DecisionKind values (enum values stay English in
+# every JSON payload; this map is display-only). Framing: the viewer surface
+# presents decisions as proposals/feedback ("제안 · 피드백 기록") — the tree
+# is the reference explanation ("궁금하면 보는 근거") behind each one.
+KIND_LABELS: dict[str, str] = {
+    "schedule_change": "일정 조정",
+    "alert": "선제 알림",
+    "insight": "하루 피드백",
+    "capture": "기록",
+}
+
+# Seasonal scenery (bright daylight backdrops, docs: round-3 demo directive).
+# Auto-selected from the current month in the user's timezone; the client-side
+# header switcher (localStorage) may override — display-only state.
+SEASONS: tuple[str, ...] = ("spring", "summer", "autumn", "winter")
+
+# Time-of-day ambience composed over the season (12 combos via CSS custom
+# properties: season = hue family, daypart = sky/light/glass/ink).
+DAYPARTS: tuple[str, ...] = ("day", "dusk", "night")
+
+
+def daypart_for_hour(hour: int) -> str:
+    """Map a 0-23 local hour to the ambience (06-17 낮 / 17-20 초저녁 / else 밤)."""
+    if 6 <= hour < 17:
+        return "day"
+    if 17 <= hour < 20:
+        return "dusk"
+    return "night"
+
+
+def season_for_month(month: int) -> str:
+    """Map a 1-12 month to the backdrop season (3-5 봄 / 6-8 여름 / 9-11 가을)."""
+    if 3 <= month <= 5:
+        return "spring"
+    if 6 <= month <= 8:
+        return "summer"
+    if 9 <= month <= 11:
+        return "autumn"
+    return "winter"
+
+# Display-only markers deciding whether an option node reads as chosen or
+# rejected (checked against the start of the node's stripped detail text).
+_CHOSEN_PREFIXES = ("채택", "선택", "확정", "chosen", "selected", "accepted", "adopted")
+_REJECTED_PREFIXES = ("기각", "반려", "rejected", "declined", "discarded", "dismissed")
 
 # Mermaid shape delimiters per node type (all wrap the label in one quoted
 # string, so each node line contains exactly two double quotes).
@@ -84,7 +165,8 @@ _NODE_SHAPES: dict[str, tuple[str, str]] = {
     FALLBACK_NODE_TYPE: ('["', '"]'),
 }
 
-# Fills match the .type-* badge palette in templates/_base.html.j2.
+# Fills match the .type-* badge palette in templates/ui/_base.html.j2.
+# type_chosen is additive: emitted as a second class on chosen option nodes.
 _CLASS_DEFS: tuple[str, ...] = (
     "classDef type_input fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a",
     "classDef type_rule fill:#ede9fe,stroke:#6d28d9,color:#4c1d95",
@@ -92,6 +174,7 @@ _CLASS_DEFS: tuple[str, ...] = (
     "classDef type_option fill:#ccfbf1,stroke:#0f766e,color:#134e4a",
     "classDef type_action fill:#dcfce7,stroke:#15803d,color:#14532d",
     "classDef type_other fill:#f4f4f5,stroke:#78716c,color:#3f3f46",
+    "classDef type_chosen stroke:#0d7d69,stroke-width:3px",
 )
 
 # Everything Mermaid could interpret inside (or as a way out of) a quoted
@@ -149,6 +232,10 @@ class TreeNode:
     """The original ``type`` string, for display (escaped by the template)."""
     label: str
     detail: str
+    chosen: bool = False
+    """Display heuristic: option the decision continued through / adopted."""
+    rejected: bool = False
+    """Display heuristic: option whose detail starts with a rejection marker."""
     children: list["TreeNode"] = field(default_factory=list)
 
 
@@ -159,9 +246,14 @@ class DecisionTreeView:
     root: TreeNode | None
     source: str
     """Mermaid flowchart source (empty when there is no renderable tree)."""
-    node_index: dict[str, dict[str, str]]
+    node_index: dict[str, dict[str, Any]]
     """gid -> full node data for the click-to-inspect panel (JSON island)."""
     truncated: bool
+
+
+def _detail_starts_with(detail: str, prefixes: tuple[str, ...]) -> bool:
+    stripped = detail.strip().lower()
+    return stripped.startswith(prefixes)
 
 
 def _normalize_tree(tree: Any) -> tuple[TreeNode | None, bool]:
@@ -197,6 +289,11 @@ def _normalize_tree(tree: Any) -> tuple[TreeNode | None, bool]:
                 child_node = visit(child, depth + 1)
                 if child_node is not None:
                     node.children.append(child_node)
+        if node.type == "option":
+            # Chosen-option inference (display-only): the tree continued below
+            # this option, or its detail opens with an adoption marker.
+            node.chosen = bool(node.children) or _detail_starts_with(detail, _CHOSEN_PREFIXES)
+            node.rejected = not node.chosen and _detail_starts_with(detail, _REJECTED_PREFIXES)
         return node
 
     root = visit(tree, 0)
@@ -214,7 +311,8 @@ def tree_to_mermaid(tree: Any) -> DecisionTreeView:
         return DecisionTreeView(root=None, source="", node_index={}, truncated=truncated)
 
     lines = ["flowchart TD"]
-    node_index: dict[str, dict[str, str]] = {}
+    chosen_lines: list[str] = []
+    node_index: dict[str, dict[str, Any]] = {}
 
     def emit(node: TreeNode, parent: TreeNode | None) -> None:
         open_mark, close_mark = _NODE_SHAPES[node.type]
@@ -225,17 +323,26 @@ def tree_to_mermaid(tree: Any) -> DecisionTreeView:
         lines.append(f"  {node.gid}{open_mark}{escaped}{close_mark}:::type_{node.type}")
         if parent is not None:
             lines.append(f"  {parent.gid} --> {node.gid}")
+        if node.chosen:
+            # Generated ids only — never user data (grammar stays whitelisted).
+            chosen_lines.append(f"  class {node.gid} type_chosen")
         node_index[node.gid] = {
             "source_id": node.source_id,
             "type": node.type,
             "raw_type": node.raw_type,
             "label": node.label,
             "detail": node.detail,
+            "chosen": node.chosen,
+            "rejected": node.rejected,
+            # Structure for the client-side forest layout — generated ids
+            # only, so the island carries no user-controlled structure.
+            "children": [child.gid for child in node.children],
         }
         for child in node.children:
             emit(child, node)
 
     emit(root, None)
+    lines.extend(chosen_lines)
     lines.extend(f"  {class_def}" for class_def in _CLASS_DEFS)
     return DecisionTreeView(
         root=root,
@@ -272,16 +379,96 @@ def format_created(value: Any) -> str:
     return value.strftime("%Y-%m-%d %H:%M UTC")
 
 
-def render_decision_html(record: DecisionRecord) -> str:
-    """Render the full Mermaid viewer page for one decision record."""
+def format_created_local(value: Any, tz: tzinfo | None) -> str:
+    """``created_at`` in the user's timezone (``Settings.timezone``).
+
+    Naive sqlite values are UTC by contract; ``tz=None`` keeps the UTC
+    rendering so render helpers stay callable without Settings (tests).
+    """
+    if value is None:
+        return "—"
+    if tz is None:
+        return format_created(value)
+    return ensure_utc(value).astimezone(tz).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def format_relative(value: Any, now: datetime | None = None) -> str:
+    """Compact Korean relative-time string ("방금 전", "3시간 전", ...).
+
+    Display-only; anything older than four weeks falls back to the date.
+    """
+    if value is None:
+        return "—"
+    reference = ensure_utc(now) if now is not None else utc_now()
+    moment = ensure_utc(value)
+    seconds = (reference - moment).total_seconds()
+    if seconds < 0:
+        seconds = 0.0
+    if seconds < 60:
+        return "방금 전"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}분 전"
+    hours = int(seconds // 3600)
+    if hours < 24:
+        return f"{hours}시간 전"
+    days = int(seconds // 86400)
+    if days < 28:
+        return f"{days}일 전"
+    return moment.strftime("%Y-%m-%d")
+
+
+def viewer_query_suffix(settings: Settings | None) -> str:
+    """``?token=<derived viewer token>`` for same-origin viewer navigation.
+
+    The relative-href twin of :func:`healthmes.api.auth.viewer_url` (which
+    stays the single construction point for *absolute* links the system emits
+    into alerts). In-page navigation between viewer pages must keep the
+    derived read-only credential — never the full API token — attached, or a
+    tap on "전체 결정 기록" from a phone browser would 401. Empty when no API
+    token is configured (open loopback dev) or no settings are supplied.
+    """
+    if settings is None:
+        return ""
+    api_token = settings.api_token.get_secret_value().strip()
+    if not api_token:
+        return ""
+    return f"?token={viewer_token(api_token)}"
+
+
+def shell_context(settings: Settings | None) -> dict[str, Any]:
+    """Context shared by every viewer page: nav token suffix + user-tz helpers.
+
+    Public for the same reason as :func:`template_environment` — the weekly
+    report (healthmes/api/reports.py) renders from the same shell.
+    """
+    tz = resolve_timezone(settings) if settings is not None else UTC
+    now = utc_now()
+    return {
+        "token_qs": viewer_query_suffix(settings),
+        "tz_name": str(tz),
+        "format_local": lambda value: format_created_local(value, tz),
+        "format_rel": lambda value: format_relative(value, now),
+        "kind_labels": KIND_LABELS,
+        "node_type_labels": NODE_TYPE_LABELS,
+        # Seasonal backdrop + time-of-day ambience, auto-picked from the
+        # user's local clock; the client-side switchers may override
+        # (localStorage, display-only).
+        "season": season_for_month(now.astimezone(tz).month),
+        "daypart": daypart_for_hour(now.astimezone(tz).hour),
+    }
+
+
+def render_decision_html(record: DecisionRecord, settings: Settings | None = None) -> str:
+    """Render the decision page (interactive tree + Mermaid view) for one record."""
     graph = tree_to_mermaid(record.tree)
-    template = template_environment().get_template("decision.html.j2")
+    template = template_environment().get_template("ui/decision.html.j2")
     return template.render(
         record=record,
         graph=graph,
-        created_display=format_created(record.created_at),
         short_id=str(record.id)[:8],
         node_types=[*KNOWN_NODE_TYPES, FALLBACK_NODE_TYPE],
+        **shell_context(settings),
     )
 
 
@@ -289,6 +476,7 @@ def render_decision_list_html(
     records: Sequence[DecisionRecord],
     meta: PageMeta,
     kind: str | None = None,
+    settings: Settings | None = None,
 ) -> str:
     """Render the paginated decision index page (newest first).
 
@@ -297,14 +485,22 @@ def render_decision_list_html(
     """
     newer_offset: int | None = max(meta.offset - meta.limit, 0) if meta.offset > 0 else None
     older_offset: int | None = meta.offset + meta.limit if meta.has_more else None
+    shell = shell_context(settings)
+    token_pair = shell["token_qs"].replace("?", "&", 1)
 
     def page_href(offset: int) -> str:
         href = f"/decisions?limit={meta.limit}&offset={offset}"
         if kind:
             href += f"&kind={kind}"
-        return href
+        return href + token_pair
 
-    template = template_environment().get_template("decision_list.html.j2")
+    def kind_href(value: str | None) -> str:
+        href = "/decisions" if not value else f"/decisions?kind={value}"
+        if not value:
+            return href + shell["token_qs"]
+        return href + token_pair
+
+    template = template_environment().get_template("ui/decision_list.html.j2")
     return template.render(
         records=records,
         meta=meta,
@@ -312,11 +508,34 @@ def render_decision_list_html(
         newer_offset=newer_offset,
         older_offset=older_offset,
         page_href=page_href,
-        format_created=format_created,
+        kind_href=kind_href,
+        kind_values=list(KIND_LABELS),
+        **shell,
     )
 
 
-def render_not_found_html(decision_id: str | uuid.UUID) -> str:
+def render_not_found_html(
+    decision_id: str | uuid.UUID, settings: Settings | None = None
+) -> str:
     """Small 404 page so alert links never dump a JSON envelope on a human."""
-    template = template_environment().get_template("decision_not_found.html.j2")
-    return template.render(decision_id=str(decision_id))
+    template = template_environment().get_template("ui/decision_not_found.html.j2")
+    return template.render(decision_id=str(decision_id), **shell_context(settings))
+
+
+def render_index_html(settings: Settings | None = None) -> str:
+    """Static landing shell for ``GET /`` — links only, no data, no credentials.
+
+    Deliberately renders NO viewer token and reads NO store data: the shell is
+    safe to serve to anyone the auth middleware lets through, today and under
+    any future auth posture for ``/`` (docs/PLAN.md §9 stays untouched here).
+    ``settings`` is used ONLY to pick the seasonal backdrop from the user's
+    timezone — never for credentials.
+    """
+    tz = resolve_timezone(settings) if settings is not None else UTC
+    local_now = utc_now().astimezone(tz)
+    template = template_environment().get_template("ui/index.html.j2")
+    return template.render(
+        token_qs="",
+        season=season_for_month(local_now.month),
+        daypart=daypart_for_hour(local_now.hour),
+    )

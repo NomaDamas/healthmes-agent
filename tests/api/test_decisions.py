@@ -82,7 +82,8 @@ def test_decision_html_page_404_is_html(client):
 
     assert response.status_code == 404
     assert response.headers["content-type"].startswith("text/html")
-    assert "Decision not found" in response.text
+    assert "해당 결정 기록이 없습니다" in response.text
+    assert "00000000-0000-0000-0000-000000000000" in response.text
 
 
 def test_decision_html_invalid_uuid_is_validation_error(client):

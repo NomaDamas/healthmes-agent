@@ -115,6 +115,7 @@ TEMPLATE_KEYS = (
     "hermes_model",
     "hermes_provider",
     "hermes_model_base_url",
+    "hermes_model_api_key",
     "ow_mcp_dir",
     "ow_base_url",
     "ow_api_key",
@@ -326,6 +327,10 @@ def build_context(
         "hermes_model": env.get("HERMES_MODEL", "").strip(),
         "hermes_provider": env.get("HERMES_PROVIDER", "").strip(),
         "hermes_model_base_url": env.get("HERMES_MODEL_BASE_URL", "").strip(),
+        # Providers with a fixed key env (ANTHROPIC_API_KEY, XAI_API_KEY,
+        # GEMINI_API_KEY/GOOGLE_API_KEY) do not need this; the `custom`
+        # OpenAI-compatible provider reads model.api_key from config.
+        "hermes_model_api_key": env.get("HERMES_MODEL_API_KEY", "").strip(),
         "ow_mcp_dir": env.get("OW_MCP_DIR", "").strip() or defaults["ow_mcp_dir"],
         "ow_base_url": env.get("OW_BASE_URL", "").strip() or defaults["ow_base_url"],
         "ow_api_key": (
