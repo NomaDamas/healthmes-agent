@@ -105,6 +105,19 @@ class Settings(BaseSettings):
         "docker containers run UTC clocks, so compose forwards HEALTHMES_TIMEZONE).",
     )
 
+    # Delivery: proactive alerts reach the user through the Hermes webhook
+    # (phone+watch via Telegram) AND/OR the native companion apps, which poll
+    # /v1/alerts + /v1/briefing/glance. With native delivery on, a fired
+    # trigger is surfaced to the apps even when no Hermes webhook is
+    # configured or its push fails — so the phone gets alerts without Telegram.
+    native_alert_delivery: bool = Field(
+        default=False,
+        description="Surface fired triggers to the native companion apps "
+        "(/v1/alerts + glance) regardless of the Hermes webhook outcome — "
+        "enables phone/watch alerts without Telegram. Alert hygiene (quiet "
+        "hours, cooldown, daily budget, dedup) still applies.",
+    )
+
     # Native capture uploads (issue #10 companion apps; healthmes/api/media.py).
     media_max_upload_bytes: int = Field(
         default=15 * 1024 * 1024,

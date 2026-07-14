@@ -16,9 +16,13 @@ Runs every ``TRIGGER_INTERVAL_MINUTES`` from the in-service APScheduler
 4. gate the push with the alert-hygiene settings (quiet hours, per-rule
    cooldown, daily alert budget — docs/PLAN.md section 11) and, if allowed,
    POST it to the Hermes gateway via ``healthmes/engine/webhook.py``.
-   ``alert_sent`` is True only after a confirmed 2xx push; suppressed and
-   failed pushes keep the row with the reason in ``payload["push"]`` and are
-   NOT retried for the same dedup key (noise control beats redelivery).
+   ``alert_sent`` marks the alert as delivered to the user: True after a
+   confirmed 2xx webhook push, OR — when ``native_alert_delivery`` is on —
+   whenever a fire passes the hygiene gates, so the native companion apps
+   surface it via /v1/alerts + glance even without Telegram. Suppressed and
+   webhook-only-failed pushes keep the row with the reason in
+   ``payload["push"]`` and are NOT retried for the same dedup key (noise
+   control beats redelivery).
 
 Datetime convention: everything is normalized to UTC before it is persisted
 or bound into a query, so comparisons behave identically on postgres
@@ -674,7 +678,27 @@ class TriggerEvaluator:
         result = self._alert_sender.send(fire, fired_at=now)
         if result.ok:
             event.alert_sent = True
-            event.payload = {**payload, "push": {"sent": True, "status_code": result.status_code}}
+            event.payload = {
+                **payload,
+                "push": {"sent": True, "status_code": result.status_code, "channel": "webhook"},
+            }
+            return FireOutcome(fire=fire, status="pushed")
+
+        # Webhook not delivered (unconfigured or failed). With native delivery
+        # on, the alert is still surfaced to the companion apps via /v1/alerts +
+        # glance polling — the phone/watch get it without Telegram.
+        if self._settings.native_alert_delivery:
+            event.alert_sent = True
+            event.payload = {
+                **payload,
+                "push": {
+                    "sent": True,
+                    "channel": "native",
+                    "webhook_ok": False,
+                    "status_code": result.status_code,
+                    "detail": result.detail,
+                },
+            }
             return FireOutcome(fire=fire, status="pushed")
 
         event.payload = {
