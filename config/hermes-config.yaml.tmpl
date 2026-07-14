@@ -29,6 +29,9 @@ model:
   {%- if hermes_model_base_url %}
   base_url: "{{ hermes_model_base_url }}"
   {%- endif %}
+  {%- if hermes_model_api_key %}
+  api_key: "{{ hermes_model_api_key }}"
+  {%- endif %}
 {%- endif %}
 
 platforms:

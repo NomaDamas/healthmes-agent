@@ -1,0 +1,27 @@
+{% extends "ui/_base.html.j2" %}
+{% set active_nav = "decisions" %}
+{# HTML 404 for /decisions/{id}: alert links must never dump a JSON envelope
+   on a human (docs/PLAN.md §8.5). #}
+
+{% block title %}결정을 찾을 수 없음 — HealthMes{% endblock %}
+
+{% block head %}
+<style>
+  .nf-card {
+    background: var(--glass-solid); border: 1px dashed var(--glass-line);
+    border-radius: var(--radius); padding: 2.4rem 1.4rem; text-align: center;
+    margin-top: 2.5rem;
+  }
+  .nf-card .mono { color: var(--ink-3); font-size: 0.8rem; overflow-wrap: anywhere; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="nf-card">
+  <p class="eyebrow">404 · Not found</p>
+  <h1>해당 결정 기록이 없습니다</h1>
+  <p class="muted">No decision record with id</p>
+  <p class="mono">{{ decision_id }}</p>
+  <p><a href="/decisions{{ token_qs }}">전체 결정 기록으로 돌아가기</a></p>
+</div>
+{% endblock %}

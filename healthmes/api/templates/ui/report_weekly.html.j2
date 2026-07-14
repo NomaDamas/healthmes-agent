@@ -1,0 +1,249 @@
+{% extends "ui/_base.html.j2" %}
+{% set active_nav = "weekly" %}
+{# Weekly report — second viewer surface (docs/PLAN.md §8.5). Context:
+   report          WeeklyReportOut — the exact payload /reports/weekly.json returns
+   spark           SparklineView | None (None = no energy data this week)
+   json_url        absolute href of the JSON twin (derived viewer token embedded)
+   format_created  UTC formatter (kept for compat)
+   + shell_context token_qs / tz_name / format_local / format_rel / kind_labels
+   Pure HTML+SVG — this page ships zero JavaScript by design. Each section
+   header carries its JSON field name: the page renders the same model the
+   .json twin returns, and the caption makes that contract visible. #}
+
+{% block title %}주간 리포트 — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">&nbsp;/ weekly</span>{% endblock %}
+
+{% block head %}
+<style>
+  .hero-grid { display: grid; gap: 1.2rem; grid-template-columns: minmax(0, 1fr); align-items: end; }
+  @media (min-width: 700px) { .hero-grid { grid-template-columns: auto minmax(0, 1fr); gap: 2rem; } }
+  .hero-num {
+    display: block; font-size: 3.4rem; font-weight: 800; letter-spacing: -0.03em;
+    line-height: 1.05; color: var(--brand-deep);
+  }
+  .hero-num-label { font-size: 0.8rem; color: var(--ink-2); font-weight: 600; }
+  svg.spark { display: block; width: 100%; max-width: 30rem; height: auto; }
+  .spark-grid { stroke: var(--line); stroke-width: 1; }
+  .spark-area { fill: var(--brand); opacity: 0.12; }
+  .spark-line { fill: none; stroke: var(--brand); stroke-width: 2.5;
+    stroke-linecap: round; stroke-linejoin: round; }
+  .spark-dot { fill: var(--brand); stroke: var(--surface); stroke-width: 1.5; }
+  .spark-range { display: flex; justify-content: space-between; max-width: 30rem;
+    font-size: 0.72rem; color: var(--ink-3); margin-top: 0.15rem; }
+
+  .meter {
+    height: 6px; border-radius: 999px; background: var(--line-soft);
+    overflow: hidden; flex: 1 1 6rem; max-width: 15rem;
+  }
+  .meter > span { display: block; height: 100%; background: var(--brand); border-radius: 999px; }
+  .meter-row { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.55rem; }
+  .meter-row .pct { font-size: 0.82rem; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+
+  ul.report-list { list-style: none; margin: 0.6rem 0 0; padding: 0; }
+  ul.report-list > li {
+    padding: 0.85rem 0.95rem; margin-bottom: 0.55rem;
+    background: var(--surface-2); border: 1px solid var(--line-soft);
+    border-radius: 12px;
+  }
+  .insight-head { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+  .statement { overflow-wrap: anywhere; margin-top: 0.35rem; line-height: 1.6; }
+  .insight-meta { color: var(--ink-3); font-size: 0.78rem; margin-top: 0.25rem; }
+  .conf-badge { background: var(--surface); }
+  li.conf-high .conf-badge   { background: #def2dd; border-color: #c2e5c0; color: #2b6532; }
+  li.conf-medium .conf-badge { background: #f9efd4; border-color: #eedfae; color: #7c5a14; }
+  li.conf-low .conf-badge,
+  li.conf-none .conf-badge   { background: var(--surface); color: var(--ink-3); border-style: dashed; }
+  .kind-counts { color: var(--ink-2); }
+</style>
+{% endblock %}
+
+{% block content %}
+<p class="eyebrow">Weekly report · 주간 리포트</p>
+<h1>한 주의 몸과 일, 한눈에</h1>
+<p class="muted">
+  {{ report.week_start.isoformat() }} → {{ report.week_end.isoformat() }} ({{ report.timezone }})
+  · 생성 {{ format_local(report.generated_at) }}
+  · <a href="{{ json_url }}">JSON 보기</a>
+</p>
+
+<section class="card" id="energy" aria-label="에너지 추이">
+  <h2>에너지 추이 <code class="k">energy</code></h2>
+  {% if spark %}
+  <div class="hero-grid">
+    <div>
+      <span class="hero-num" id="energy-overall">{{ report.energy.overall_avg }}</span>
+      <span class="hero-num-label">주간 평균 인지 에너지 (0–100)
+        · {{ report.energy.samples }}개 시간 창</span>
+    </div>
+    <div>
+      <svg class="spark" viewBox="0 0 {{ spark.width }} {{ spark.height }}" role="img"
+           aria-label="최근 {{ report.energy.days | length }}일의 일평균 인지 에너지 추이"
+           xmlns="http://www.w3.org/2000/svg">
+        {% for y in spark.gridlines %}
+        <line class="spark-grid" x1="0" y1="{{ y }}" x2="{{ spark.width }}" y2="{{ y }}"></line>
+        {% endfor %}
+        {% for area in spark.areas %}
+        <polygon class="spark-area" points="{{ area }}"></polygon>
+        {% endfor %}
+        {% for seg in spark.segments %}
+        <polyline class="spark-line" points="{{ seg }}"></polyline>
+        {% endfor %}
+        {% for p in spark.points %}
+        <circle class="spark-dot" cx="{{ p.x }}" cy="{{ p.y }}" r="3.2"><title>{{ p.label }}</title></circle>
+        {% endfor %}
+      </svg>
+      <div class="spark-range" aria-hidden="true">
+        <span>{{ report.energy.days[0].date.strftime("%m.%d") }}</span>
+        <span>{{ report.energy.days[-1].date.strftime("%m.%d") }}</span>
+      </div>
+    </div>
+  </div>
+  <p class="muted">빈 구간은 추정값이 저장되지 않은 날입니다 — 계산해 채워 넣지 않습니다.</p>
+  <table class="plain">
+    <thead>
+      <tr><th scope="col">날짜</th><th class="num" scope="col">평균</th><th class="num" scope="col">최저</th><th class="num" scope="col">최고</th><th class="num" scope="col">창</th></tr>
+    </thead>
+    <tbody>
+      {% for day in report.energy.days %}
+      <tr>
+        <td>{{ day.date.strftime("%a") }} {{ day.date.isoformat() }}</td>
+        <td class="num">{{ day.avg_score if day.avg_score is not none else "—" }}</td>
+        <td class="num">{{ day.min_score if day.min_score is not none else "—" }}</td>
+        <td class="num">{{ day.max_score if day.max_score is not none else "—" }}</td>
+        <td class="num">{{ day.samples }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">이번 주에는 기록된 에너지 데이터가 없습니다.</p>
+  {% endif %}
+</section>
+
+<section class="card" id="schedule" aria-label="일정 수용률">
+  <h2>일정 수용률 <code class="k">schedule</code></h2>
+  <div class="stats">
+    <div class="stat"><span class="value" id="schedule-accepted">{{ report.schedule.accepted }}</span><span class="label">수락</span></div>
+    <div class="stat"><span class="value" id="schedule-pushed">{{ report.schedule.pushed }}</span><span class="label">연기</span></div>
+    <div class="stat"><span class="value" id="schedule-declined">{{ report.schedule.declined }}</span><span class="label">거절</span></div>
+    <div class="stat"><span class="value" id="schedule-proposed">{{ report.schedule.proposed }}</span><span class="label">대기 중</span></div>
+  </div>
+  {% if report.schedule.acceptance_pct is not none %}
+  <div class="meter-row">
+    <div class="meter" role="meter" aria-valuemin="0" aria-valuemax="100"
+         aria-valuenow="{{ report.schedule.acceptance_pct }}"
+         aria-label="제안 수용률 {{ report.schedule.acceptance_pct }}%">
+      <span style="width: {{ report.schedule.acceptance_pct }}%"></span>
+    </div>
+    <span class="pct"><strong id="schedule-acceptance">{{ report.schedule.acceptance_pct }}</strong>%</span>
+  </div>
+  <p class="muted">
+    이번 주 결정된 {{ report.schedule.decided }}건의 제안 중 수락·연기로 캘린더에 반영된 비율입니다.
+  </p>
+  {% else %}
+  <p class="muted">이번 주에 결정된 제안이 없습니다.</p>
+  {% endif %}
+</section>
+
+<section class="card" id="alerts" aria-label="알림과 예산">
+  <h2>알림 · 주의 예산 <code class="k">alerts</code></h2>
+  <div class="stats">
+    <div class="stat"><span class="value" id="alerts-fired">{{ report.alerts.fired }}</span><span class="label">트리거 발화</span></div>
+    <div class="stat"><span class="value" id="alerts-delivered">{{ report.alerts.delivered }}</span><span class="label">실제 전달</span></div>
+    <div class="stat"><span class="value" id="alerts-budget">{{ report.alerts.weekly_budget }}</span><span class="label">주간 예산</span></div>
+  </div>
+  {% if report.alerts.weekly_budget %}
+  {% set used_pct = ((100 * report.alerts.delivered / report.alerts.weekly_budget) | round | int) %}
+  <div class="meter-row">
+    <div class="meter" role="meter" aria-valuemin="0" aria-valuemax="100"
+         aria-valuenow="{{ [used_pct, 100] | min }}"
+         aria-label="주간 알림 예산 사용률 {{ used_pct }}%">
+      <span style="width: {{ [used_pct, 100] | min }}%"></span>
+    </div>
+    <span class="pct">예산의 {{ used_pct }}% 사용</span>
+  </div>
+  {% endif %}
+  <p class="muted">
+    예산 = 하루 {{ report.alerts.daily_budget }}건 × {{ report.energy.days | length }}일.
+    발화됐지만 전달되지 않은 트리거는 중복 제거·쿨다운·수면 시간·예산 초과로 걸러진 것입니다.
+  </p>
+  {% if report.alerts.by_rule %}
+  <table class="plain">
+    <thead><tr><th scope="col">규칙</th><th class="num" scope="col">발화</th><th class="num" scope="col">전달</th></tr></thead>
+    <tbody>
+      {% for rule in report.alerts.by_rule %}
+      <tr><td class="mono">{{ rule.rule_id }}</td><td class="num">{{ rule.fired }}</td><td class="num">{{ rule.delivered }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<section class="card" id="insights" aria-label="인사이트">
+  <h2>인사이트 <code class="k">insights</code></h2>
+  <p class="muted">
+    이번 주 <span id="insights-count">{{ report.insights.count }}</span>개의
+    패턴이 데이터에서 발견되었습니다.
+  </p>
+  {% if report.insights.items %}
+  <ul class="report-list">
+    {% for insight in report.insights.items %}
+    <li class="conf-{{ insight.confidence_level }}">
+      <div class="insight-head">
+        <span class="badge mono">{{ insight.kind }}</span>
+        <span class="badge conf-badge">
+          {%- if insight.confidence_level == "high" %}확신도 높음
+          {%- elif insight.confidence_level == "medium" %}확신도 중간
+          {%- elif insight.confidence_level == "low" %}확신도 낮음
+          {%- else %}확신도 미측정{% endif -%}
+        </span>
+      </div>
+      <div class="statement">{{ insight.statement }}</div>
+      {% if insight.confidence is not none %}
+      {% set conf_pct = (insight.confidence * 100) | round | int %}
+      <div class="meter-row">
+        <div class="meter" role="meter" aria-valuemin="0" aria-valuemax="100"
+             aria-valuenow="{{ conf_pct }}" aria-label="확신도 {{ conf_pct }}%">
+          <span style="width: {{ conf_pct }}%"></span>
+        </div>
+        <span class="pct">{{ conf_pct }}%</span>
+      </div>
+      {% endif %}
+      <div class="insight-meta">{{ insight.period }} · {{ format_local(insight.created_at) }}</div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% if report.insights.count > report.insights.items | length %}
+  <p class="muted">최신 {{ report.insights.items | length }}개만 표시했습니다.</p>
+  {% endif %}
+  {% endif %}
+</section>
+
+<section class="card" id="decisions" aria-label="이번 주 결정">
+  <h2>이번 주 결정 <code class="k">decisions</code></h2>
+  <p class="muted">
+    <span id="decisions-count">{{ report.decisions.count }}</span>개의 결정이 기록되었습니다
+    <span class="kind-counts">({% for kind, n in report.decisions.kind_counts.items() %}{{ kind_labels.get(kind, kind) }} {{ n }}{{ " · " if not loop.last else "" }}{% endfor %})</span>.
+  </p>
+  {% if report.decisions.items %}
+  <ul class="decision-list">
+    {% for d in report.decisions.items %}
+    <li>
+      <a class="row" href="{{ d.url }}">
+        <span class="badge kind-{{ d.kind.value }}" title="{{ d.kind.value }}">{{ kind_labels.get(d.kind.value, d.kind.value) }}</span>
+        <span class="when">{{ format_local(d.created_at) }}</span>
+        <span class="row-summary">{{ d.summary }}</span>
+        <span class="row-go" aria-hidden="true">›</span>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+  {% if report.decisions.count > report.decisions.items | length %}
+  <p class="muted">최신 {{ report.decisions.items | length }}개 표시 —
+    <a href="/decisions{{ token_qs }}">전체 결정 기록</a>.</p>
+  {% endif %}
+  {% else %}
+  <p class="muted">이번 주에는 기록된 결정이 없습니다.</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -9,10 +9,12 @@ JSON surface (agent / tooling):
 
 HTML surface (every Telegram alert links ``{public_base_url}/decisions/{id}``):
 
+- ``GET /`` — static landing shell (links only, no data).
 - ``GET /decisions`` — paginated index page, newest first — the weekly-report
   entry point.
-- ``GET /decisions/{id}`` — Mermaid flowchart viewer, rendered by
-  :mod:`healthmes.api.decision_html` (Jinja templates + escaped tree).
+- ``GET /decisions/{id}`` — decision viewer (interactive tree + Mermaid
+  flowchart), rendered by :mod:`healthmes.api.decision_html` (Jinja templates
+  + escaped tree).
 - ``GET /static/mermaid.min.js`` — vendored Mermaid bundle served locally
   (no CDN, local-first).
 
@@ -25,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Select, select
@@ -34,6 +36,7 @@ from starlette import status
 from healthmes.api.decision_html import (
     render_decision_html,
     render_decision_list_html,
+    render_index_html,
     render_not_found_html,
 )
 from healthmes.api.errors import not_found
@@ -108,15 +111,32 @@ def get_decision(decision_id: uuid.UUID, session: SessionDep) -> DecisionOut:
     return DecisionOut.model_validate(_load_decision(session, decision_id))
 
 
+@router.get("/", response_class=HTMLResponse, include_in_schema=False)
+def index_page(request: Request) -> HTMLResponse:
+    """Static landing shell: product one-liner + links to the surfaces.
+
+    Presentation only — no store reads, no credentials in the markup (safe
+    under any auth posture; the shared bearer middleware applies unchanged).
+    Settings feed only the seasonal backdrop (user-tz month), never tokens.
+    """
+    return HTMLResponse(render_index_html(settings=request.app.state.settings))
+
+
 @router.get("/decisions", response_class=HTMLResponse)
 def list_decisions_page(
+    request: Request,
     session: SessionDep,
     page: PageParamsDep,
     kind: DecisionKind | None = None,
 ) -> HTMLResponse:
     """Human-facing decision index, newest first (weekly-report entry point)."""
     rows, meta = paginate(session, _list_stmt(kind), page)
-    html = render_decision_list_html(rows, meta, kind=kind.value if kind is not None else None)
+    html = render_decision_list_html(
+        rows,
+        meta,
+        kind=kind.value if kind is not None else None,
+        settings=request.app.state.settings,
+    )
     return HTMLResponse(html)
 
 
@@ -130,15 +150,18 @@ def get_decision_json_view(decision_id: uuid.UUID, session: SessionDep) -> Decis
 
 
 @router.get("/decisions/{decision_id}", response_class=HTMLResponse)
-def view_decision(decision_id: uuid.UUID, session: SessionDep) -> HTMLResponse:
-    """Human-facing decision page: Mermaid flowchart + detail panel + outline."""
+def view_decision(
+    decision_id: uuid.UUID, session: SessionDep, request: Request
+) -> HTMLResponse:
+    """Human-facing decision page: interactive tree + Mermaid view + detail panel."""
+    settings = request.app.state.settings
     record = session.get(DecisionRecord, decision_id)
     if record is None:
         return HTMLResponse(
-            render_not_found_html(str(decision_id)),
+            render_not_found_html(str(decision_id), settings=settings),
             status_code=status.HTTP_404_NOT_FOUND,
         )
-    return HTMLResponse(render_decision_html(record))
+    return HTMLResponse(render_decision_html(record, settings=settings))
 
 
 @router.get("/static/mermaid.min.js", include_in_schema=False)

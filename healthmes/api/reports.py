@@ -37,7 +37,7 @@ the report link stays tappable from a phone browser. Decision links reuse
 
 import uuid
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Literal
 
@@ -51,10 +51,11 @@ from healthmes.api.auth import viewer_url
 from healthmes.api.briefing import decision_viewer_url
 from healthmes.api.common import ensure_utc, utc_now
 
-# Package-internal reuse of the decision viewer's cached Jinja environment and
-# timestamp formatter — the report template lives in the same templates/
-# directory and follows the same conventions (autoescape on, local-first).
-from healthmes.api.decision_html import format_created, template_environment
+# Package-internal reuse of the decision viewer's cached Jinja environment,
+# timestamp formatter and page-shell context — the report template lives in
+# the same templates/ directory and follows the same conventions (autoescape
+# on, local-first, derived viewer token on in-page navigation).
+from healthmes.api.decision_html import format_created, shell_context, template_environment
 from healthmes.config import Settings, resolve_timezone
 from healthmes.store import (
     CognitiveEnergyEstimate,
@@ -458,6 +459,9 @@ class SparklineView:
     points: list[SparklinePoint]
     gridlines: list[float]
     """y coordinates of the score 0/50/100 reference lines."""
+    areas: list[str] = field(default_factory=list)
+    """Polygon ``points`` strings closing each segment down to the baseline
+    (the soft under-line fill; presentation only, same runs as ``segments``)."""
 
 
 def _score_y(score: int) -> float:
@@ -476,13 +480,21 @@ def build_energy_sparkline(days: list[EnergyDayOut]) -> SparklineView:
     """
     points: list[SparklinePoint] = []
     segments: list[str] = []
+    areas: list[str] = []
     run: list[str] = []
+    run_xs: list[float] = []
 
     def flush_run() -> None:
-        nonlocal run
+        nonlocal run, run_xs
         if len(run) >= 2:
             segments.append(" ".join(run))
+            # Close the run down to the 0-score baseline for the soft fill.
+            areas.append(
+                " ".join(run)
+                + f" {run_xs[-1]},{SPARK_Y_BOTTOM} {run_xs[0]},{SPARK_Y_BOTTOM}"
+            )
         run = []
+        run_xs = []
 
     for index, day in enumerate(days):
         if day.avg_score is None:
@@ -494,6 +506,7 @@ def build_energy_sparkline(days: list[EnergyDayOut]) -> SparklineView:
             SparklinePoint(x=x, y=y, label=f"{day.date.isoformat()}: avg {day.avg_score}")
         )
         run.append(f"{x},{y}")
+        run_xs.append(x)
     flush_run()
 
     return SparklineView(
@@ -502,6 +515,7 @@ def build_energy_sparkline(days: list[EnergyDayOut]) -> SparklineView:
         segments=segments,
         points=points,
         gridlines=[_score_y(score) for score in SPARK_GRID_SCORES],
+        areas=areas,
     )
 
 
@@ -512,12 +526,13 @@ def build_energy_sparkline(days: list[EnergyDayOut]) -> SparklineView:
 
 def render_weekly_report_html(report: WeeklyReportOut, settings: Settings) -> str:
     """Render the weekly report page from the already-built report model."""
-    template = template_environment().get_template("report_weekly.html.j2")
+    template = template_environment().get_template("ui/report_weekly.html.j2")
     return template.render(
         report=report,
         spark=build_energy_sparkline(report.energy.days) if report.energy.samples else None,
         json_url=viewer_url(settings, WEEKLY_REPORT_PATH + ".json"),
         format_created=format_created,
+        **shell_context(settings),
     )
 
 

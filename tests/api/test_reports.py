@@ -336,16 +336,27 @@ def test_weekly_report_html_matches_json(client, session):
     assert '<td class="num">70</td>' in html
     assert "Sat 2026-07-04" in html
 
-    # Inline SVG sparkline, local assets only (dots for the two data days).
+    # Inline SVG sparkline, local assets only (dots for the two data days;
+    # the count is scoped to the spark SVG — the page shell adds decorative
+    # scenery circles of its own).
     assert 'viewBox="0 0 336 72"' in html
-    assert html.count("<circle") == 2
+    spark_svg = html.split('<svg class="spark"', 1)[1].split("</svg>", 1)[0]
+    assert spark_svg.count("<circle") == 2
     assert "cdn" not in html.lower()
-    assert "<script" not in html  # pure HTML+SVG page, no JS needed
+    # The report's data renders as pure HTML+SVG; the only script on the page
+    # is the shared shell's cosmetic season switcher (no data, no libraries).
+    assert html.count("<script") == 1
+    assert 'src="' not in html  # no script files, vendored or otherwise
+    assert "data-season-choice" in html
+    assert "data-daypart-choice" in html
 
-    # Insights with confidence badges (n/a for a null confidence).
+    # Insights with confidence rendered as a labeled meter (0..1 -> %); a null
+    # confidence is honestly "미측정" and gets no meter.
     assert "Stress peaks around 14:00 on workdays" in html
     assert "conf-high" in html
-    assert "n/a" in html
+    assert 'role="meter"' in html
+    assert 'aria-valuenow="90"' in html  # confidence 0.9 -> 90%
+    assert "확신도 미측정" in html
     assert "OLD insight outside the report window" not in html
 
     # Alert rule breakdown.
@@ -403,11 +414,11 @@ def test_weekly_report_empty_week(client):
         "capture": 0,
     }
 
-    assert "No energy data recorded this week." in html
+    assert "이번 주에는 기록된 에너지 데이터가 없습니다." in html
     assert 'id="insights-count">0<' in html
-    assert "No proposals were decided this week." in html
+    assert "이번 주에 결정된 제안이 없습니다." in html
     assert 'id="alerts-fired">0<' in html
-    assert "No decisions recorded this week." in html
+    assert "이번 주에는 기록된 결정이 없습니다." in html
 
 
 # --- auth: bearer everywhere, derived ?token= for the viewer pages ------------

@@ -1,0 +1,104 @@
+{% extends "ui/_base.html.j2" %}
+{# Landing shell for GET / — static links only, no store data, no credentials
+   in the markup (safe under any auth posture). The tiny inline script only
+   copies a ?token= already present in the *visitor's own URL* onto the
+   same-origin links, so tokened demo links keep working; nothing secret is
+   ever rendered server-side here. #}
+
+{% block title %}HealthMes — 몸의 신호로 하루를 조율하는 로컬 에이전트{% endblock %}
+
+{% block head %}
+<style>
+  .landing { text-align: left; padding-top: 2.2rem; }
+  .landing-mark {
+    display: inline-flex; align-items: center; gap: 0.7rem;
+    font-size: clamp(1.9rem, 6vw, 2.6rem); font-weight: 800; letter-spacing: -0.02em;
+  }
+  .landing-mark .brand-dot { width: 0.9rem; height: 0.9rem; }
+  .one-liner { font-size: 1.05rem; margin: 0.9rem 0 0.2rem; max-width: 34rem; line-height: 1.7; }
+  .one-liner-en { color: var(--ink-2); font-size: 0.92rem; max-width: 36rem; }
+  .loop-line {
+    margin-top: 1rem; font-size: 0.92rem; color: var(--ink);
+    background: var(--glass-solid); border: 1px solid var(--glass-line);
+    border-radius: 999px; display: inline-block; padding: 0.4rem 1rem;
+  }
+  .loop-arrow { color: var(--brand-deep); font-weight: 700; margin: 0 0.15rem; }
+  .surface-grid {
+    display: grid; gap: 0.8rem; margin-top: 2rem;
+    grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  }
+  a.surface-card {
+    display: block; padding: 1.05rem 1.15rem 1.1rem;
+    background: var(--glass-solid); border: 1px solid var(--glass-line);
+    border-radius: var(--radius); color: inherit;
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+  }
+  a.surface-card:hover { border-color: var(--brand); box-shadow: var(--shadow); text-decoration: none; }
+  .surface-card h2 { margin: 0 0 0.25rem; font-size: 0.98rem; }
+  .surface-card p { margin: 0 0 0.5rem; color: var(--ink-2); font-size: 0.85rem; line-height: 1.55; }
+  .surface-card code { color: var(--ink-3); font-size: 0.74rem; }
+  .local-note {
+    margin-top: 2.2rem; display: inline-flex; align-items: center; gap: 0.5rem;
+    color: var(--ink-2); font-size: 0.84rem;
+    border: 1px solid var(--glass-line); border-radius: 999px; padding: 0.3rem 0.9rem;
+    background: var(--glass-solid);
+  }
+  .local-note .brand-dot { width: 0.5rem; height: 0.5rem; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="landing">
+  <p class="eyebrow">Health-aware proactive agent</p>
+  <h1 class="landing-mark"><span class="brand-dot" aria-hidden="true"></span>HealthMes</h1>
+  <p class="one-liner">몸의 신호로 하루를 조율하는 로컬 퍼스트 건강 에이전트 —
+    모든 제안에는 <strong>"왜"</strong>가 함께 기록됩니다.</p>
+  <p class="one-liner-en">A local-first health agent that reshapes your day around your body's
+    signals — every nudge ships with its reasoning.</p>
+  <p class="loop-line">제안·알림이 오면 <span class="loop-arrow" aria-hidden="true">→</span> 원탭으로 승인
+    <span class="loop-arrow" aria-hidden="true">→</span> 궁금할 땐 "왜?"를 눌러 근거 숲을 봅니다.</p>
+
+  <nav class="surface-grid" aria-label="서비스 표면">
+    <a class="surface-card" data-token-link href="/decisions">
+      <h2>제안 · 피드백 기록</h2>
+      <p>일정 조정 제안과 하루 피드백, 근거 숲과 함께 최신순.</p>
+      <code>GET /decisions</code>
+    </a>
+    <a class="surface-card" data-token-link href="/reports/weekly">
+      <h2>주간 리포트</h2>
+      <p>에너지 추이 · 인사이트 · 일정 수용률 · 알림 예산.</p>
+      <code>GET /reports/weekly</code>
+    </a>
+    <a class="surface-card" data-token-link href="/v1/briefing/glance">
+      <h2>글랜스 브리핑</h2>
+      <p>컴패니언 앱이 읽는 지금-상태 스냅샷 (JSON).</p>
+      <code>GET /v1/briefing/glance</code>
+    </a>
+    <a class="surface-card" href="/docs">
+      <h2>API 문서</h2>
+      <p>REST 전체 표면의 OpenAPI 문서.</p>
+      <code>GET /docs</code>
+    </a>
+  </nav>
+
+  <p class="local-note"><span class="brand-dot" aria-hidden="true"></span>
+    모든 건강 데이터는 이 기기에만 머뭅니다 · Local-first, no cloud.</p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  "use strict";
+  /* If the visitor's own URL carries ?token=, keep it on same-origin links.
+     The token comes from the browser's location only — never from markup. */
+  var token = new URLSearchParams(window.location.search).get("token");
+  if (!token) { return; }
+  document.querySelectorAll("a[data-token-link]").forEach(function (a) {
+    var url = new URL(a.getAttribute("href"), window.location.origin);
+    url.searchParams.set("token", token);
+    a.setAttribute("href", url.pathname + url.search);
+  });
+})();
+</script>
+{% endblock %}

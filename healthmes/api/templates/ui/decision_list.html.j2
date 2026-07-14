@@ -1,0 +1,89 @@
+{% extends "ui/_base.html.j2" %}
+{% set active_nav = "decisions" %}
+{# Paginated decision index, newest first — the weekly-report entry point
+   (docs/PLAN.md §5, §8.5). Context:
+   records         DecisionRecord rows for this page
+   meta            PageMeta (total_count / limit / offset / has_more)
+   kind            active kind filter value or None
+   newer_offset    offset for the previous (newer) page or None
+   older_offset    offset for the next (older) page or None
+   page_href       callable offset -> href preserving limit, kind and token
+   kind_href       callable kind-value-or-None -> filter href
+   kind_values     DecisionKind values in display order
+   + shell_context token_qs / format_local / format_rel / kind_labels #}
+
+{% block title %}제안 · 피드백 기록 — HealthMes{% endblock %}
+
+{% block head %}
+<style>
+  .filter-row {
+    display: flex; flex-wrap: wrap; gap: 0.4rem;
+    margin: 1rem 0 0.2rem;
+  }
+  .filter-row a {
+    display: inline-block; font-size: 0.8rem; font-weight: 600;
+    color: var(--ink-2); background: var(--glass-solid);
+    border: 1px solid var(--glass-line); border-radius: 999px;
+    padding: 0.2rem 0.75rem;
+  }
+  .filter-row a:hover { border-color: var(--ink-3); text-decoration: none; }
+  .filter-row a[aria-current="true"] {
+    background: var(--brand-soft); border-color: var(--brand-soft);
+    color: var(--brand-deep);
+  }
+  .empty-card {
+    background: var(--glass-solid); border: 1px dashed var(--glass-line);
+    border-radius: var(--radius); padding: 2.2rem 1.2rem; text-align: center;
+    color: var(--ink-2); margin-top: 1.2rem;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<p class="eyebrow">Proposals &amp; feedback</p>
+<h1>제안 · 피드백 기록</h1>
+<p class="muted">
+  총 <strong>{{ meta.total_count }}</strong>건
+  {% if kind %} · 필터: {{ kind_labels.get(kind, kind) }} (<a href="{{ kind_href(none) }}">해제</a>){% endif %}
+  · 최신순 — 일정 조정 제안과 하루 피드백이 모두 여기 남고,
+  카드를 누르면 "왜?"의 근거 숲이 열립니다.
+</p>
+
+<nav class="filter-row" aria-label="종류 필터">
+  <a href="{{ kind_href(none) }}"{% if not kind %} aria-current="true"{% endif %}>전체</a>
+  {% for value in kind_values %}
+  <a href="{{ kind_href(value) }}"{% if kind == value %} aria-current="true"{% endif %}>{{ kind_labels.get(value, value) }}</a>
+  {% endfor %}
+</nav>
+
+{% if records %}
+<ul class="decision-list">
+  {% for r in records %}
+  <li>
+    <a class="row" href="/decisions/{{ r.id }}{{ token_qs }}">
+      <span class="row-summary">{{ r.summary }}</span>
+      <span class="row-meta">
+        <span class="badge kind-{{ r.kind.value }}" title="{{ r.kind.value }}">{{ kind_labels.get(r.kind.value, r.kind.value) }}</span>
+        <span class="when" title="{{ format_local(r.created_at) }}">{{ format_rel(r.created_at) }}</span>
+      </span>
+      <span class="row-go" aria-hidden="true">›</span>
+    </a>
+  </li>
+  {% endfor %}
+</ul>
+<nav class="pager" aria-label="페이지 이동">
+  <span>
+    {% if newer_offset is not none %}<a href="{{ page_href(newer_offset) }}">&larr; 최신</a>{% endif %}
+  </span>
+  <span class="muted">{{ meta.offset + 1 }}–{{ meta.offset + records | length }} / {{ meta.total_count }}</span>
+  <span>
+    {% if older_offset is not none %}<a href="{{ page_href(older_offset) }}">이전 &rarr;</a>{% endif %}
+  </span>
+</nav>
+{% else %}
+<div class="empty-card">
+  <p><strong>아직 기록된 제안이 없습니다.</strong></p>
+  <p class="muted">HealthMes가 제안이나 피드백을 드리면 근거 숲과 함께 여기에 쌓입니다.</p>
+</div>
+{% endif %}
+{% endblock %}

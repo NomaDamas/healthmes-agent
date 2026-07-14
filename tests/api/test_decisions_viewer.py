@@ -226,7 +226,9 @@ _NODE_LINE_RE = re.compile(
     r":::type_(?:input|rule|llm_step|option|action|other)$"
 )
 _EDGE_LINE_RE = re.compile(r"^  n\d+ --> n\d+$")
-_CLASSDEF_LINE_RE = re.compile(r"^  classDef type_\w+ [#\w:,]+$")
+_CLASSDEF_LINE_RE = re.compile(r"^  classDef type_\w+ [#\w:,-]+$")
+# Chosen-option highlight: a second class assigned via generated ids only.
+_CLASS_ASSIGN_RE = re.compile(r"^  class n\d+ type_chosen$")
 
 
 def test_mermaid_source_grammar_survives_hostile_labels():
@@ -238,7 +240,10 @@ def test_mermaid_source_grammar_survives_hostile_labels():
     # cannot add statements, click handlers, comments, or extra nodes.
     for line in lines[1:]:
         assert (
-            _NODE_LINE_RE.match(line) or _EDGE_LINE_RE.match(line) or _CLASSDEF_LINE_RE.match(line)
+            _NODE_LINE_RE.match(line)
+            or _EDGE_LINE_RE.match(line)
+            or _CLASSDEF_LINE_RE.match(line)
+            or _CLASS_ASSIGN_RE.match(line)
         ), f"unexpected statement in mermaid source: {line!r}"
     # Quoting stays balanced: exactly one quoted label per node line.
     for line in lines:
@@ -314,8 +319,105 @@ def test_decision_page_without_renderable_tree(client, session):
     response = client.get(f"/decisions/{record.id}")
 
     assert response.status_code == 200
-    assert "No tree recorded" in response.text
+    assert "기록된 결정 트리가 없습니다" in response.text
     assert 'class="mermaid"' not in response.text
+
+
+def test_decision_page_interactive_tree_and_toggle_controls(client, session):
+    """The three tree views ship with their global controls (demo UI).
+
+    All views render from the same normalised tree: the client-built 숲 트리
+    (SVG node-link forest), the Mermaid flowchart, and the semantic <details>
+    리스트 rail, which keeps the tree readable without JavaScript.
+    """
+    record = _seed_decision(session)
+
+    html = client.get(f"/decisions/{record.id}").text
+
+    # Three views over one tree.
+    assert 'id="forest-view"' in html
+    assert 'id="graph-view"' in html
+    assert 'id="list-view"' in html
+    assert 'id="forest-svg"' in html
+    # View switcher + expand/collapse controls.
+    assert 'data-view="forest"' in html
+    assert 'data-view="graph"' in html
+    assert 'data-view="list"' in html
+    assert ">트리</button>" in html
+    assert "플로차트" in html
+    assert "리스트" in html
+    assert 'id="expand-all"' in html
+    assert 'id="collapse-all"' in html
+    assert "모두 펼치기" in html
+    assert "모두 접기" in html
+    # The list fallback is semantic <details>/<summary> with every node label.
+    assert "<details" in html and "<summary>" in html
+    for label in (
+        "stress_spike rule fired",
+        "night HRV below baseline",
+        "assessed afternoon load",
+        "move focus block to morning",
+        "proposed schedule change",
+    ):
+        assert label in html
+    # Node detail text is present for expansion (escaped by the template).
+    assert "stress 82 vs baseline 55" in html
+    # The forest layout consumes the tree structure from the JSON island —
+    # generated ids only.
+    island = _ISLAND_RE.search(html)
+    assert island
+    data = json.loads(island.group(1))
+    assert data["n0"]["children"] == ["n1", "n2"]
+    assert data["n2"]["children"] == ["n3", "n4"]
+    assert data["n3"]["children"] == []
+    # Ambience shell: server-picked season + daypart attributes and both
+    # header switchers (🌸☀️🍂❄️ / ☀️🌆🌙, localStorage-persisted client-side).
+    assert 'data-season="' in html
+    assert 'data-season-picker' in html
+    for season in ("spring", "summer", "autumn", "winter"):
+        assert f'data-season-choice="{season}"' in html
+    assert 'data-daypart="' in html
+    assert 'data-daypart-picker' in html
+    for daypart in ("day", "dusk", "night"):
+        assert f'data-daypart-choice="{daypart}"' in html
+
+
+def test_interactive_tree_escapes_hostile_strings(client, session):
+    """XSS hardening extends to the interactive views (list rail + 숲 SVG).
+
+    The 숲 트리 builds its SVG client-side from the JSON island: user strings
+    may only travel through textContent / attribute assignment, so the page
+    must contain no HTML-parsing sink for them (pinned below by the absence
+    of any innerHTML use) and the island must stay angle-bracket free.
+    """
+    record = _seed_decision(session, tree=HOSTILE_TREE)
+
+    html = client.get(f"/decisions/{record.id}").text
+
+    list_section = html.split('id="list-view"', 1)[1].split("</section>", 1)[0]
+    # Raw payloads never reach any view...
+    assert "<script>alert" not in html
+    assert "<img src=x onerror=" not in html
+    assert 'href="javascript:' not in html
+    # ...the list rail renders them escaped, content intact.
+    assert "&lt;script&gt;alert" in list_section  # hostile label
+    assert "&lt;img src=x onerror=alert(1)&gt;" in list_section  # hostile detail
+    assert "&lt;b&gt;bold&lt;/b&gt;" in list_section  # child detail
+    # The hostile raw type string lands escaped in the badge, not as markup.
+    assert "rule&#34;]:::evil" in list_section or "rule&quot;]:::evil" in list_section
+    # The forest view's SVG labels are built via textContent only — no
+    # HTML/SVG parsing sink for user strings exists anywhere on the page.
+    assert "innerHTML" not in html
+    assert "insertAdjacentHTML" not in html
+    assert ".textContent" in html
+    # The island (the forest's only data source) is angle-bracket free while
+    # the hostile payload survives intact for the panel/labels.
+    island = _ISLAND_RE.search(html)
+    assert island
+    assert "<" not in island.group(1)
+    data = json.loads(island.group(1))
+    assert data["n0"]["detail"] == "<img src=x onerror=alert(1)>"
+    assert data["n0"]["children"] == ["n1"]
 
 
 def test_mermaid_asset_served_locally(client):
