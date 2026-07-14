@@ -48,8 +48,24 @@ from healthmes.store.models import (  # noqa: E402
     WeeklyGoal,
 )
 
-DEMO_MARK = "[DEMO]"
+# Demo rows carry NO visible marker (nothing on screen should read "데모").
+# Idempotent re-seeding instead deletes them by invisible keys: calendar
+# external_id / trigger dedup_key prefixes, a flag inside the decision tree
+# JSON and the energy inputs_snapshot, and the fixed content strings below.
 DEMO_DEDUP_PREFIX = "demo-day:"
+DEMO_CAL_PREFIX = "demo-"
+DEMO_TREE_FLAG = "_demo"
+
+# Stable ids so the demo viewer URLs never change across re-seeds.
+DEMO_ALERT_ID = uuid.UUID("d0d0d0d0-0000-4a1e-8a1e-000000000001")
+DEMO_FEEDBACK_ID = uuid.UUID("d0d0d0d0-0000-4a1e-8a1e-000000000002")
+
+GOAL_TITLES = ["이번 주 발표 준비 완료", "운동 루틴 되찾기 (주 3회)"]
+TASK_TITLES = ["발표 리허설 2회", "발표 자료 최종 점검", "저녁 가벼운 러닝 30분"]
+INSIGHT_STATEMENTS = [
+    "14-16시 집중 저하 패턴: 수면 부족일수록 오후 스트레스 급등이 1.8배 잦았어요",
+    "아침 러닝을 한 날은 저녁 스트레스 평균이 12% 낮았어요 (n=8)",
+]
 
 
 def _tz() -> ZoneInfo:
@@ -75,35 +91,48 @@ ENERGY_BY_LOCAL_HOUR = {
 
 def wipe(session) -> int:
     n = 0
-    n += session.query(ScheduleProposal).filter(
-        ScheduleProposal.decision_record_id.in_(
-            session.query(DecisionRecord.id).filter(DecisionRecord.summary.like(f"{DEMO_MARK}%"))
-        )
+    # Decisions carry the demo flag inside their tree JSON (invisible on the
+    # page). Find them, drop dependent proposals first (FK), then the rows.
+    demo_decisions = [
+        d for d in session.query(DecisionRecord).all()
+        if isinstance(d.tree, dict) and d.tree.get(DEMO_TREE_FLAG)
+    ]
+    demo_ids = [d.id for d in demo_decisions]
+    if demo_ids:
+        n += session.query(ScheduleProposal).filter(
+            ScheduleProposal.decision_record_id.in_(demo_ids)
+        ).delete(synchronize_session=False)
+        for decision in demo_decisions:
+            session.delete(decision)
+            n += 1
+    n += session.query(CalendarEventMirror).filter(
+        CalendarEventMirror.external_id.like(f"{DEMO_CAL_PREFIX}%")
     ).delete(synchronize_session=False)
-    for model, col in (
-        (Insight, Insight.statement),
-        (DecisionRecord, DecisionRecord.summary),
-        (CalendarEventMirror, CalendarEventMirror.summary),
-    ):
-        n += session.query(model).filter(col.like(f"{DEMO_MARK}%")).delete(
-            synchronize_session=False
-        )
     n += session.query(TriggerEvent).filter(
         TriggerEvent.dedup_key.like(f"{DEMO_DEDUP_PREFIX}%")
     ).delete(synchronize_session=False)
-    n += session.query(Task).filter(Task.title.like(f"{DEMO_MARK}%")).delete(
+    n += session.query(Insight).filter(
+        Insight.statement.in_(INSIGHT_STATEMENTS)
+    ).delete(synchronize_session=False)
+    n += session.query(Task).filter(Task.title.in_(TASK_TITLES)).delete(
         synchronize_session=False
     )
-    n += session.query(WeeklyGoal).filter(WeeklyGoal.title.like(f"{DEMO_MARK}%")).delete(
+    n += session.query(WeeklyGoal).filter(WeeklyGoal.title.in_(GOAL_TITLES)).delete(
         synchronize_session=False
     )
     week_ago_utc0 = naive_utc(
         datetime.combine(date.today() - timedelta(days=6), time.min, tzinfo=_tz())
     )
-    n += session.query(CognitiveEnergyEstimate).filter(
-        CognitiveEnergyEstimate.window_start >= week_ago_utc0,
-        CognitiveEnergyEstimate.inputs_snapshot.isnot(None),
-    ).delete(synchronize_session=False)
+    demo_energy = [
+        e for e in session.query(CognitiveEnergyEstimate).filter(
+            CognitiveEnergyEstimate.window_start >= week_ago_utc0,
+            CognitiveEnergyEstimate.inputs_snapshot.isnot(None),
+        ).all()
+        if isinstance(e.inputs_snapshot, dict) and e.inputs_snapshot.get("demo")
+    ]
+    for est in demo_energy:
+        session.delete(est)
+        n += 1
     return n
 
 
@@ -114,27 +143,26 @@ def seed(session) -> dict[str, str]:
     now_local = datetime.now(tz)
 
     goal = WeeklyGoal(
-        week_start=week_start, title=f"{DEMO_MARK} 데모데이 발표 완성", priority=1, status="active"
+        week_start=week_start, title=GOAL_TITLES[0], priority=1, status="active"
     )
     goal2 = WeeklyGoal(
-        week_start=week_start, title=f"{DEMO_MARK} 운동 루틴 되찾기 (주 3회)",
-        priority=2, status="active",
+        week_start=week_start, title=GOAL_TITLES[1], priority=2, status="active",
     )
     session.add_all([goal, goal2])
     session.flush()
 
     t_rehearse = Task(
-        title=f"{DEMO_MARK} 발표 리허설 2회", goal_id=goal.id, est_minutes=90,
+        title=TASK_TITLES[0], goal_id=goal.id, est_minutes=90,
         deadline=naive_utc(datetime.combine(today, time(13, 0), tzinfo=tz)),
         energy_demand=EnergyDemand.HIGH, status="scheduled", source=TaskSource.USER,
     )
     t_deepwork = Task(
-        title=f"{DEMO_MARK} 데모 시나리오 최종 점검", goal_id=goal.id, est_minutes=90,
+        title=TASK_TITLES[1], goal_id=goal.id, est_minutes=90,
         deadline=naive_utc(datetime.combine(today, time(18, 0), tzinfo=tz)),
         energy_demand=EnergyDemand.HIGH, status="todo", source=TaskSource.AGENT,
     )
     t_run = Task(
-        title=f"{DEMO_MARK} 저녁 가벼운 러닝 30분", goal_id=goal2.id, est_minutes=30,
+        title=TASK_TITLES[2], goal_id=goal2.id, est_minutes=30,
         deadline=None, energy_demand=EnergyDemand.LOW, status="todo",
         source=TaskSource.AGENT,
     )
@@ -143,8 +171,9 @@ def seed(session) -> dict[str, str]:
 
     def block(summary: str, h1: int, m1: int, h2: int, m2: int, agent: bool = False, task_id=None):
         return CalendarEventMirror(
-            external_id=f"demo-{uuid.uuid4().hex[:8]}", calendar_source=CalendarSource.GOOGLE,
-            summary=f"{DEMO_MARK} {summary}",
+            external_id=f"{DEMO_CAL_PREFIX}{uuid.uuid4().hex[:8]}",
+            calendar_source=CalendarSource.GOOGLE,
+            summary=summary,
             start_at=naive_utc(datetime.combine(today, time(h1, m1), tzinfo=tz)),
             end_at=naive_utc(datetime.combine(today, time(h2, m2), tzinfo=tz)),
             is_agent_created=agent, agent_task_id=task_id,
@@ -152,11 +181,12 @@ def seed(session) -> dict[str, str]:
 
     session.add_all([
         block("팀 스탠드업", 10, 0, 10, 30),
-        block("데모데이 발표", 14, 0, 15, 0),
+        block("제품 발표 세션", 14, 0, 15, 0),
         block("발표 리허설 (에이전트 배치)", 11, 0, 12, 30, agent=True, task_id=t_rehearse.id),
     ])
 
     tree = {
+        DEMO_TREE_FLAG: True,
         "id": "root", "type": "rule", "label": "stress_spike_vs_baseline 트리거",
         "detail": "10분 주기 결정론 스캔에서 발화",
         "children": [
@@ -208,8 +238,9 @@ def seed(session) -> dict[str, str]:
         ],
     }
     decision = DecisionRecord(
+        id=DEMO_ALERT_ID,
         kind=DecisionKind.ALERT, tree=tree,
-        summary=f"{DEMO_MARK} 오후 스트레스 급등 → 16시 집중 블록을 내일 오전으로 이동 제안",
+        summary="오후 스트레스 급등 → 16시 집중 블록을 내일 오전으로 이동 제안",
         llm_model="claude-fable-5", tokens=1842,
     )
     session.add(decision)
@@ -223,6 +254,7 @@ def seed(session) -> dict[str, str]:
     ))
 
     feedback_tree = {
+        DEMO_TREE_FLAG: True,
         "id": "root", "type": "rule", "label": "저녁 리뷰 브리핑 (21:30)",
         "detail": "cron 브리핑 — 오늘 하루 피드백",
         "children": [
@@ -242,8 +274,9 @@ def seed(session) -> dict[str, str]:
         ],
     }
     session.add(DecisionRecord(
+        id=DEMO_FEEDBACK_ID,
         kind=DecisionKind.INSIGHT, tree=feedback_tree,
-        summary=f"{DEMO_MARK} 오늘 피드백 — 오전 집중 배치는 적중, 발표 후 회복 버퍼가 없었어요",
+        summary="오늘 피드백 — 오전 집중 배치는 적중, 발표 후 회복 버퍼가 없었어요",
         llm_model="claude-fable-5", tokens=976,
     ))
 
@@ -281,16 +314,9 @@ def seed(session) -> dict[str, str]:
 
     period = f"{week_start.isoformat()}..{(week_start + timedelta(days=6)).isoformat()}"
     session.add_all([
-        Insight(period=period, kind="focus_dip",
-                statement=(
-                    f"{DEMO_MARK} 14-16시 집중 저하 패턴: "
-                    "수면 부족일수록 오후 스트레스 급등이 1.8배 잦았어요"
-                ),
+        Insight(period=period, kind="focus_dip", statement=INSIGHT_STATEMENTS[0],
                 evidence={"window": "14-16h", "n_days": 12, "ratio": 1.8}, confidence=0.68),
-        Insight(period=period, kind="factor_correlation",
-                statement=(
-                    f"{DEMO_MARK} 아침 러닝을 한 날은 저녁 스트레스 평균이 12% 낮았어요 (n=8)"
-                ),
+        Insight(period=period, kind="factor_correlation", statement=INSIGHT_STATEMENTS[1],
                 evidence={"factor": "morning_run", "delta_pct": -12, "n": 8}, confidence=0.62),
     ])
 
