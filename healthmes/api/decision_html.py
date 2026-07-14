@@ -290,6 +290,9 @@ class TreeNode:
     """Display heuristic: option the decision continued through / adopted."""
     rejected: bool = False
     """Display heuristic: option whose detail starts with a rejection marker."""
+    edge_label: str = ""
+    """Optional label of the edge FROM this node's parent (e.g. 예 / 아니오).
+    Recorded per node in the tree JSON as ``edge_label``; empty when absent."""
     children: list["TreeNode"] = field(default_factory=list)
     """Original tree structure (all zones), exactly as recorded."""
     process_children: list["TreeNode"] = field(default_factory=list)
@@ -352,6 +355,8 @@ def _normalize_tree(tree: Any) -> tuple[TreeNode | None, bool]:
         label = str(raw.get("label") or "").strip() or _UNTITLED_LABEL
         detail_value = raw.get("detail")
         detail = "" if detail_value is None else str(detail_value)
+        edge_value = raw.get("edge_label")
+        edge_label = "" if edge_value is None else str(edge_value).strip()
         node = TreeNode(
             gid=gid,
             source_id=str(raw.get("id") or ""),
@@ -359,6 +364,7 @@ def _normalize_tree(tree: Any) -> tuple[TreeNode | None, bool]:
             raw_type=raw_type,
             label=label,
             detail=detail,
+            edge_label=edge_label,
         )
         children = raw.get("children")
         if isinstance(children, list):
@@ -417,6 +423,41 @@ def partition_tree(
     return inputs, actions, process_roots
 
 
+# Circled numerals for auto-indexed edges (①..⑳); larger fan-outs fall back
+# to "(n)". Auto-indexing kicks in only when a branching node's children carry
+# no explicit edge_label of their own.
+_CIRCLED_INDEX: str = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+
+
+def _auto_index_label(index: int) -> str:
+    return _CIRCLED_INDEX[index] if index < len(_CIRCLED_INDEX) else f"({index + 1})"
+
+
+def _child_edge_labels(children: list[TreeNode]) -> list[str]:
+    """Per-child edge label: explicit ``edge_label`` wins; otherwise a
+    branching node (>1 child, none labelled) gets auto-indexed ①②③."""
+    if any(child.edge_label for child in children):
+        return [child.edge_label for child in children]
+    if len(children) > 1:
+        return [_auto_index_label(i) for i in range(len(children))]
+    return ["" for _ in children]
+
+
+def _effective_edge_labels(process_roots: list[TreeNode]) -> dict[str, str]:
+    """Map each process node's gid -> the label of the edge from its parent."""
+    effective: dict[str, str] = {}
+
+    def walk(node: TreeNode) -> None:
+        labels = _child_edge_labels(node.process_children)
+        for child, label in zip(node.process_children, labels, strict=False):
+            effective[child.gid] = label
+            walk(child)
+
+    for root in process_roots:
+        walk(root)
+    return effective
+
+
 def tree_to_mermaid(tree: Any) -> DecisionTreeView:
     """Transform a ``decision_record.tree`` JSON value into the zoned view.
 
@@ -431,6 +472,9 @@ def tree_to_mermaid(tree: Any) -> DecisionTreeView:
         return DecisionTreeView(root=None, source="", node_index={}, truncated=truncated)
 
     inputs, actions, process_roots = partition_tree(root)
+    # Effective edge label per process node (explicit 예/아니오 or auto-index),
+    # so the client tree and the Mermaid view render the same edge captions.
+    edge_labels = _effective_edge_labels(process_roots)
     node_index: dict[str, dict[str, Any]] = {}
 
     def index(node: TreeNode) -> None:
@@ -442,6 +486,9 @@ def tree_to_mermaid(tree: Any) -> DecisionTreeView:
             "detail": node.detail,
             "chosen": node.chosen,
             "rejected": node.rejected,
+            # Label of the edge from this node's parent in the 결정과정 tree;
+            # "" for roots, inputs, actions, and unlabelled single children.
+            "edge_label": edge_labels.get(node.gid, ""),
             # Structure travels as generated ids only, so the island carries
             # no user-controlled structure: "children" is the recorded shape,
             # "process_children" the spliced 결정과정 the client tree draws.
@@ -471,7 +518,11 @@ def tree_to_mermaid(tree: Any) -> DecisionTreeView:
             )
             lines.append(f"  {node.gid}{open_mark}{escaped}{close_mark}:::type_{node.type}")
             if parent is not None:
-                lines.append(f"  {parent.gid} --> {node.gid}")
+                edge = edge_labels.get(node.gid, "")
+                if edge:
+                    lines.append(f"  {parent.gid} -->|{escape_mermaid_label(edge)}| {node.gid}")
+                else:
+                    lines.append(f"  {parent.gid} --> {node.gid}")
             if node.chosen:
                 # Generated ids only — never user data (whitelisted grammar).
                 chosen_lines.append(f"  class {node.gid} type_chosen")
