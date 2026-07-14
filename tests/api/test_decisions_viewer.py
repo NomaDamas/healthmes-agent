@@ -117,27 +117,116 @@ def test_tree_to_mermaid_three_level_fixture():
     lines = view.source.splitlines()
 
     assert lines[0] == "flowchart TD"
-    # Preorder generated ids with type-specific shapes and classes.
+    # 결정과정 only: the diagram carries rule/llm_step/option nodes; input and
+    # action nodes are partitioned out into their own zones.
     assert '  n0{{"stress_spike rule fired"}}:::type_rule' in lines
-    assert '  n1(["night HRV below baseline"]):::type_input' in lines
     assert '  n2["assessed afternoon load"]:::type_llm_step' in lines
     assert '  n3("move focus block to morning"):::type_option' in lines
-    assert '  n4[["proposed schedule change"]]:::type_action' in lines
-    # Edges follow the tree structure.
-    for edge in ("  n0 --> n1", "  n0 --> n2", "  n2 --> n3", "  n2 --> n4"):
+    assert not any(":::type_input" in line for line in lines if not line.startswith("  classDef"))
+    assert not any(":::type_action" in line for line in lines if not line.startswith("  classDef"))
+    # Edges follow the SPLICED process structure (no edges to removed nodes).
+    for edge in ("  n0 --> n2", "  n2 --> n3"):
         assert edge in lines
+    assert "  n0 --> n1" not in lines
+    assert "  n2 --> n4" not in lines
     # A classDef exists for every palette entry.
     for node_type in (*KNOWN_NODE_TYPES, FALLBACK_NODE_TYPE):
         assert any(line.startswith(f"  classDef type_{node_type} ") for line in lines)
 
-    # The node index carries full data for the click-to-inspect panel.
+    # The node index still carries EVERY node for the panel and zone chips.
     assert set(view.node_index) == {"n0", "n1", "n2", "n3", "n4"}
     assert view.node_index["n0"]["source_id"] == "root"
     assert view.node_index["n0"]["detail"] == "stress 82 vs baseline 55"
     assert view.node_index["n4"]["label"] == "proposed schedule change"
+    # Recorded shape vs spliced process shape, both as generated ids.
+    assert view.node_index["n0"]["children"] == ["n1", "n2"]
+    assert view.node_index["n0"]["process_children"] == ["n2"]
+    assert view.node_index["n2"]["children"] == ["n3", "n4"]
+    assert view.node_index["n2"]["process_children"] == ["n3"]
+    # Zone partition: inputs panel, outcome strip, process roots.
+    assert [n.gid for n in view.inputs] == ["n1"]
+    assert [n.gid for n in view.actions] == ["n4"]
+    assert [n.gid for n in view.process_roots] == ["n0"]
+    assert view.process_root_gids == "n0"
     assert not view.truncated
     assert view.root is not None
     assert view.root.children[1].children[0].gid == "n3"
+
+
+def test_partition_zones_and_ancestry_splicing():
+    """The partition rules on arbitrary shapes (docs: round-5 directive).
+
+    Inputs may nest under llm_steps, actions may sit mid-tree with process
+    descendants, inputs may even carry process children — removed nodes'
+    children always reattach to the removed node's position in the parent.
+    """
+    tree = {
+        "id": "r",
+        "type": "rule",
+        "label": "root",
+        "children": [
+            {  # input with a process child -> R1 reattaches to root, slot 1
+                "id": "a",
+                "type": "input",
+                "label": "inA",
+                "children": [{"id": "r1", "type": "rule", "label": "R1", "children": []}],
+            },
+            {
+                "id": "l",
+                "type": "llm_step",
+                "label": "L",
+                "children": [
+                    {"id": "b", "type": "input", "label": "inB", "children": []},
+                    {  # option -> mid-tree action -> option: O2 reattaches to O1
+                        "id": "o1",
+                        "type": "option",
+                        "label": "O1",
+                        "children": [
+                            {
+                                "id": "act",
+                                "type": "action",
+                                "label": "ACT",
+                                "children": [
+                                    {"id": "o2", "type": "option", "label": "O2", "children": []}
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+    view = tree_to_mermaid(tree)
+
+    # gids are preorder over the FULL tree: r=n0 a=n1 r1=n2 l=n3 b=n4 o1=n5 act=n6 o2=n7
+    assert [n.gid for n in view.inputs] == ["n1", "n4"]  # document order
+    assert [n.gid for n in view.actions] == ["n6"]
+    assert [n.gid for n in view.process_roots] == ["n0"]
+    # Splicing preserved ancestry AND order: R1 took inA's slot before L.
+    assert view.node_index["n0"]["process_children"] == ["n2", "n3"]
+    assert view.node_index["n3"]["process_children"] == ["n5"]
+    assert view.node_index["n5"]["process_children"] == ["n7"]  # through ACT
+    # The diagram contains only process nodes and spliced edges.
+    lines = view.source.splitlines()
+    assert "  n0 --> n2" in lines and "  n0 --> n3" in lines
+    assert "  n3 --> n5" in lines and "  n5 --> n7" in lines
+    assert not any(":::type_input" in ln for ln in lines if not ln.startswith("  classDef"))
+    assert not any(":::type_action" in ln for ln in lines if not ln.startswith("  classDef"))
+
+    # Input-only tree: no process at all, everything lands in the facts panel.
+    inputs_only = tree_to_mermaid(
+        {
+            "id": "x",
+            "type": "input",
+            "label": "solo",
+            "children": [{"id": "y", "type": "input", "label": "two", "children": []}],
+        }
+    )
+    assert inputs_only.process_roots == []
+    assert inputs_only.source == ""
+    assert [n.gid for n in inputs_only.inputs] == ["n0", "n1"]
+    assert inputs_only.root is not None  # the page still renders (zones only)
 
 
 def test_tree_to_mermaid_normalises_malformed_nodes():
@@ -382,6 +471,74 @@ def test_decision_page_interactive_tree_and_toggle_controls(client, session):
         assert f'data-daypart-choice="{daypart}"' in html
 
 
+def test_decision_page_three_zones(client, session):
+    """입력 / 결정과정 / 실행 render as three distinct zones (round-5).
+
+    입력은 입력이고, 결정과정은 결정과정이고, 실행은 실행: inputs become the
+    facts panel above, only the branching judgment is visualised as a tree,
+    and actions land in the outcome strip below, connected to the tree.
+    """
+    record = _seed_decision(session)  # THREE_LEVEL_TREE
+
+    html = client.get(f"/decisions/{record.id}").text
+
+    # Zone containers, in page order.
+    assert 'id="zone-inputs"' in html and "고려한 입력" in html
+    assert 'id="zone-process"' in html and "결정과정" in html
+    assert 'id="zone-outcome"' in html
+    assert (
+        html.index('id="zone-inputs"')
+        < html.index('id="zone-process"')
+        < html.index('id="zone-outcome"')
+    )
+    # Inputs render as clickable metric chips (label + detail).
+    assert 'class="input-chip"' in html
+    assert "night HRV below baseline" in html
+    assert 'data-zone-gid="n1"' in html
+    # Actions render as outcome cards with their gate/status detail.
+    assert 'class="outcome-card"' in html
+    assert "proposed schedule change" in html
+    assert "focus block 14:00 to 10:00" in html
+    assert 'data-zone-gid="n4"' in html
+    # A connector ties the process tree's bottom to the outcome strip.
+    assert 'class="outcome-connector"' in html
+    # The client tree draws the process partition only (generated root ids).
+    assert 'data-process-roots="n0"' in html
+    # The flowchart shows the 결정과정 only — no input/action statements.
+    pre = html.split('<pre id="decision-graph"', 1)[1].split("</pre>", 1)[0]
+    assert "stress_spike rule fired" in pre
+    assert "night HRV below baseline" not in pre
+    assert "proposed schedule change" not in pre
+
+
+def test_decision_page_without_process_tree(client, session):
+    """Input-only records: graceful 결정 분기 없음 + grouped list fallback."""
+    record = _seed_decision(
+        session,
+        tree={
+            "id": "solo",
+            "type": "input",
+            "label": "only input fact",
+            "detail": "raw metric 42",
+            "children": [],
+        },
+    )
+
+    response = client.get(f"/decisions/{record.id}")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "결정 분기 없음" in html
+    # No process tree -> no view switcher and no diagram; list stays.
+    assert 'id="viewer-controls"' not in html
+    assert 'class="mermaid"' not in html
+    assert 'id="list-view"' in html
+    # The inputs panel still shows the fact chip.
+    assert 'id="zone-inputs"' in html
+    assert "only input fact" in html
+    assert "raw metric 42" in html
+
+
 def test_interactive_tree_escapes_hostile_strings(client, session):
     """XSS hardening extends to the interactive views (list rail + 숲 SVG).
 
@@ -418,6 +575,8 @@ def test_interactive_tree_escapes_hostile_strings(client, session):
     data = json.loads(island.group(1))
     assert data["n0"]["detail"] == "<img src=x onerror=alert(1)>"
     assert data["n0"]["children"] == ["n1"]
+    # The hostile input child was partitioned out of the process structure.
+    assert data["n0"]["process_children"] == []
 
 
 def test_mermaid_asset_served_locally(client):
