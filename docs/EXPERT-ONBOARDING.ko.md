@@ -73,8 +73,8 @@
    `skills:` 목록에, 브리핑에 연결하려면 `scripts/bootstrap.py`의
    `BRIEFING_JOBS`에 추가 (엔지니어와 함께)
 
-기존 예시 3종이 최고의 교재입니다: `skills/healthmes-planner/`(가장 풍부),
-`healthmes-capture/`, `doctor-visit-summary/`.
+기존 예시 4종이 최고의 교재입니다: `skills/healthmes-planner/`(가장 풍부),
+`healthmes-capture/`, `healthmes-sleep/`, `doctor-visit-summary/`.
 
 ## 3. 새 메트릭(도구) 추가 (파이썬 — 엔지니어와 페어 가능)
 
@@ -131,7 +131,7 @@ make mac-setup && make mac-run     # sqlite로 전체 서비스 기동 (:8100)
 
 ## 6. 시작 과제 추천 (첫 2주)
 
-1. 기존 스킬 3종 정독 → planner의 배치 룰에 임상 관점 리뷰 코멘트 (이슈로)
+1. 기존 스킬 4종 정독 → planner의 배치 룰에 임상 관점 리뷰 코멘트 (이슈로)
 2. 본인 워치 연결 + 4b 체감 대조 프로토콜 시작
 3. 본인 전문 영역에서 임상 질문 1개 골라 스킬 1개 말기 (예: 수면무호흡
    스크리닝, 과훈련 감지, 혈당 안정성 — 데이터 커버리지는 §1 표에서 확인)

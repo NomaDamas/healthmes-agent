@@ -17,7 +17,7 @@ interpreted numbers (with confidence) and reasons about them.
 
 Skills are markdown instruction files the agent loads when planning, capturing,
 or answering. Each lives in `skills/<skill-name>/SKILL.md` and follows the
-vendor format (see the three existing skills as templates —
+vendor format (see the four existing skills as templates —
 `skills/healthmes-planner/SKILL.md` is the richest example).
 
 ```markdown
