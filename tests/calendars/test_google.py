@@ -8,6 +8,7 @@ import pytest
 
 from healthmes.calendars.base import (
     CalendarAuthError,
+    CalendarConflictError,
     EventNotFoundError,
     OwnershipError,
 )
@@ -30,11 +31,15 @@ class FakeStatusError(Exception):
 
 
 class _FakeRequest:
+    """Mirrors googleapiclient ``HttpRequest``: a mutable ``headers`` dict that
+    the backend can set (``If-Match``) before ``execute``."""
+
     def __init__(self, fn) -> None:
         self._fn = fn
+        self.headers: dict[str, str] = {}
 
     def execute(self):
-        return self._fn()
+        return self._fn(self.headers)
 
 
 class _FakeEvents:
@@ -43,23 +48,27 @@ class _FakeEvents:
 
     def list(self, **params):
         self._service.list_calls.append(params)
-        return _FakeRequest(lambda: self._service.next_list_response())
+        return _FakeRequest(lambda headers: self._service.next_list_response())
 
     def get(self, calendarId, eventId):  # noqa: N803 - google client casing
         self._service.get_calls.append((calendarId, eventId))
-        return _FakeRequest(lambda: self._service.get_event(eventId))
+        return _FakeRequest(lambda headers: self._service.get_event(eventId))
 
     def insert(self, calendarId, body):  # noqa: N803
         self._service.insert_calls.append((calendarId, body))
-        return _FakeRequest(lambda: self._service.insert_event(body))
+        return _FakeRequest(lambda headers: self._service.insert_event(body))
 
     def patch(self, calendarId, eventId, body):  # noqa: N803
         self._service.patch_calls.append((calendarId, eventId, body))
-        return _FakeRequest(lambda: self._service.patch_event(eventId, body))
+        return _FakeRequest(
+            lambda headers: self._service.patch_event(eventId, body, headers)
+        )
 
     def delete(self, calendarId, eventId):  # noqa: N803
         self._service.delete_calls.append((calendarId, eventId))
-        return _FakeRequest(lambda: self._service.delete_event(eventId))
+        return _FakeRequest(
+            lambda headers: self._service.delete_event(eventId, headers)
+        )
 
 
 class FakeGoogleService:
@@ -73,6 +82,10 @@ class FakeGoogleService:
         self.insert_calls: list[tuple] = []
         self.patch_calls: list[tuple] = []
         self.delete_calls: list[tuple] = []
+        self.write_headers: list[dict] = []  # headers seen by patch/delete execs
+        #: When True the next conditional write 412s (simulate a concurrent
+        #: remote edit invalidating the etag we read).
+        self.fail_precondition = False
 
     def events(self) -> _FakeEvents:
         return _FakeEvents(self)
@@ -94,17 +107,32 @@ class FakeGoogleService:
         self.stored_events[event_id] = stored
         return stored
 
-    def patch_event(self, event_id: str, body: dict) -> dict:
+    def patch_event(self, event_id: str, body: dict, headers: dict) -> dict:
+        self.write_headers.append(dict(headers))
+        self._enforce_precondition(event_id, headers)
         stored = dict(self.stored_events[event_id])
         stored.update(body)
         stored["etag"] = '"patched"'
         self.stored_events[event_id] = stored
         return stored
 
-    def delete_event(self, event_id: str) -> None:
+    def delete_event(self, event_id: str, headers: dict) -> None:
+        self.write_headers.append(dict(headers))
+        self._enforce_precondition(event_id, headers)
         if event_id not in self.stored_events:
             raise FakeStatusError(404)
         del self.stored_events[event_id]
+
+    def _enforce_precondition(self, event_id: str, headers: dict) -> None:
+        """Reject a conditional write whose ``If-Match`` no longer matches."""
+        if_match = headers.get("If-Match")
+        if if_match is None:
+            return
+        if self.fail_precondition:
+            raise FakeStatusError(412)
+        current = self.stored_events.get(event_id)
+        if current is not None and current.get("etag") != if_match:
+            raise FakeStatusError(412)
 
 
 @pytest.fixture
@@ -292,6 +320,8 @@ class TestUpdateAndDelete:
         assert event_id == "mine"
         assert set(body) == {"start", "end"}
         assert updated.start_at == datetime(2026, 7, 10, 14, 0, tzinfo=UTC)
+        # The patch is guarded by the etag read via GET (optimistic concurrency).
+        assert service.write_headers[-1]["If-Match"] == '"e1"'
 
     def test_update_refuses_untagged_event(self, backend, service) -> None:
         service.stored_events["theirs"] = api_event("theirs", agent=False)
@@ -317,12 +347,40 @@ class TestUpdateAndDelete:
         backend.delete_event("mine")
         assert service.delete_calls == [("primary", "mine")]
         assert "mine" not in service.stored_events
+        # The delete is guarded by the etag read via GET (optimistic concurrency).
+        assert service.write_headers[-1]["If-Match"] == '"e1"'
 
     def test_delete_refuses_untagged_event(self, backend, service) -> None:
         service.stored_events["theirs"] = api_event("theirs", agent=False)
         with pytest.raises(OwnershipError):
             backend.delete_event("theirs")
         assert service.delete_calls == []
+
+    def test_update_conflict_412_raises_and_leaves_event_unmutated(
+        self, backend, service
+    ) -> None:
+        # F3: the event changed remotely between our GET and our PATCH. The
+        # If-Match precondition must make the write 412, not silently overwrite.
+        service.stored_events["mine"] = api_event("mine", agent=True)
+        original = dict(service.stored_events["mine"])
+        service.fail_precondition = True
+        with pytest.raises(CalendarConflictError):
+            backend.update_event(
+                "mine",
+                start_at=datetime(2026, 7, 10, 14, 0, tzinfo=UTC),
+                end_at=datetime(2026, 7, 10, 15, 0, tzinfo=UTC),
+            )
+        assert service.write_headers[-1]["If-Match"] == '"e1"'  # precondition sent
+        assert service.stored_events["mine"] == original  # never overwritten
+
+    def test_delete_conflict_412_raises_and_leaves_event(self, backend, service) -> None:
+        service.stored_events["mine"] = api_event("mine", agent=True)
+        original = dict(service.stored_events["mine"])
+        service.fail_precondition = True
+        with pytest.raises(CalendarConflictError):
+            backend.delete_event("mine")
+        assert service.write_headers[-1]["If-Match"] == '"e1"'  # precondition sent
+        assert service.stored_events["mine"] == original  # never deleted
 
 
 # --- OAuth helpers (offline: file handling only) -------------------------------

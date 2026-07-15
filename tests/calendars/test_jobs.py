@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import select
 
+from healthmes.calendars.base import EventDraft
 from healthmes.calendars.jobs import (
     build_calendar_job,
     build_calendar_jobs,
@@ -19,7 +20,7 @@ from healthmes.calendars.jobs import (
     push_accepted_proposals,
     write_source,
 )
-from healthmes.calendars.state import InMemorySyncStateStore
+from healthmes.calendars.state import InMemoryPendingDiffStore, InMemorySyncStateStore
 from healthmes.calendars.sync import CalendarMirrorService
 from healthmes.store import (
     CalendarEventMirror,
@@ -89,6 +90,34 @@ class TestJobRun:
         rows = session.scalars(select(CalendarEventMirror)).all()
         assert [row.external_id for row in rows] == ["meet-1"]
         assert fake_backend.received_sync_states == [None]
+
+    def test_job_returns_deletion_diff(
+        self, settings, session_factory, session, fake_backend, make_event
+    ) -> None:
+        # F4: the poll job must RETURN the SyncDiff so the schedule_changed
+        # trigger can consume deletions (which vanish from the mirror and so
+        # cannot be re-derived from row updated_at).
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=False,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            pending_store=InMemoryPendingDiffStore(),
+        )
+        fake_backend.queue_changes([make_event("meet-1")], {"sync_token": "tok-1"})
+        fake_backend.queue_changes(
+            [make_event("meet-1", deleted=True, summary=None, etag=None)],
+            {"sync_token": "tok-2"},
+        )
+
+        bootstrap_diff = job()  # silent adoption, but still a SyncDiff
+        assert bootstrap_diff is not None and not bootstrap_diff.has_changes
+
+        deletion_diff = job()
+        assert deletion_diff is not None
+        assert [change.external_id for change in deletion_diff.deleted] == ["meet-1"]
 
     def test_write_backend_pushes_accepted_proposals(
         self, settings, session_factory, session, fake_backend
@@ -213,6 +242,49 @@ class TestJobRun:
         session.expire_all()
         proposal = session.scalars(select(ScheduleProposal)).one()
         assert proposal.status is ProposalStatus.ACCEPTED
+
+    def test_crash_after_remote_create_does_not_duplicate_event(
+        self, session, fake_backend
+    ) -> None:
+        # F8: a prior poll created the remote block + mirror row but crashed
+        # before flipping the proposal to pushed. The retry must reuse the
+        # existing block, not create a second remote event.
+        task = Task(title="Write report")
+        session.add(task)
+        session.flush()
+        session.add(
+            ScheduleProposal(
+                task_id=task.id,
+                proposed_start=utc(2026, 7, 10, 9, 0),
+                proposed_end=utc(2026, 7, 10, 11, 0),
+                status=ProposalStatus.ACCEPTED,
+            )
+        )
+        session.commit()
+
+        service = CalendarMirrorService(session, [fake_backend], InMemorySyncStateStore())
+        # Simulate the interrupted prior poll: the block already exists remotely
+        # and in the mirror, but the proposal is still ACCEPTED.
+        service.create_agent_event(
+            fake_backend.source,
+            EventDraft(
+                summary="Write report",
+                start_at=utc(2026, 7, 10, 9, 0),
+                end_at=utc(2026, 7, 10, 11, 0),
+                agent_task_id=task.id,
+            ),
+        )
+        assert len(fake_backend.created_drafts) == 1
+
+        pushed = push_accepted_proposals(service, session, fake_backend.source)
+
+        assert pushed == 1
+        assert len(fake_backend.created_drafts) == 1  # NO second remote create
+        session.expire_all()
+        assert len(session.scalars(select(CalendarEventMirror)).all()) == 1
+        assert session.scalars(select(ScheduleProposal)).one().status is (
+            ProposalStatus.PUSHED
+        )
 
 
 @pytest.mark.parametrize("source", [CalendarSource.GOOGLE, CalendarSource.CALDAV])

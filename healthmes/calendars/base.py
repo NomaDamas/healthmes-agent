@@ -37,6 +37,7 @@ __all__ = [
     "ICAL_AGENT_TASK_ID_PROPERTY",
     "CalendarAuthError",
     "CalendarBackend",
+    "CalendarConflictError",
     "CalendarError",
     "EventDraft",
     "EventNotFoundError",
@@ -83,6 +84,17 @@ class OwnershipError(CalendarError):
 
     Raised whenever a move/delete targets an event that is not agent-created
     (docs/PLAN.md section 6 ownership split).
+    """
+
+
+class CalendarConflictError(CalendarError):
+    """A conditional write lost its ``If-Match`` precondition (HTTP 412).
+
+    The event changed on the provider between the read that supplied the etag
+    and the write it guarded (a check-then-act race). Rather than blindly
+    overwriting the newer remote state, the backend refuses the write; the
+    caller re-syncs the mirror and retries against the fresh version
+    (docs/PLAN.md section 6).
     """
 
 

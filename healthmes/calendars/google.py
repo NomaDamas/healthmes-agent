@@ -34,6 +34,7 @@ from healthmes.calendars.base import (
     GOOGLE_AGENT_TAG_KEY,
     GOOGLE_AGENT_TASK_ID_KEY,
     CalendarAuthError,
+    CalendarConflictError,
     CalendarError,
     EventDraft,
     EventNotFoundError,
@@ -347,21 +348,55 @@ class GoogleCalendarBackend:
             body["description"] = description
         if not body:
             return current
-        patched = (
-            self._events()
-            .patch(calendarId=self._calendar_id, eventId=external_id, body=body)
-            .execute()
+        # Guard the patch with the etag we just read: if the event changed on
+        # the server in between (check-then-act race) the conditional request
+        # fails with 412 instead of silently clobbering the newer state.
+        request = self._events().patch(
+            calendarId=self._calendar_id, eventId=external_id, body=body
         )
+        self._set_if_match(request, current.etag)
+        try:
+            patched = request.execute()
+        except Exception as exc:  # noqa: BLE001 - status-based dispatch
+            self._raise_for_write_status(exc, external_id)
+            raise  # unreachable; keeps type-checkers happy about ``patched``
         return self._parse_api_event(patched)
 
     def delete_event(self, external_id: str) -> None:
-        self._get_owned_event(external_id)
+        current = self._get_owned_event(external_id)
+        request = self._events().delete(
+            calendarId=self._calendar_id, eventId=external_id
+        )
+        self._set_if_match(request, current.etag)
         try:
-            self._events().delete(calendarId=self._calendar_id, eventId=external_id).execute()
+            request.execute()
         except Exception as exc:  # noqa: BLE001 - status-based dispatch
-            if _http_status(exc) in (404, 410):
-                raise EventNotFoundError(f"google event {external_id!r} not found") from exc
-            raise
+            self._raise_for_write_status(exc, external_id)
+            raise  # unreachable; _raise_for_write_status always raises
+
+    @staticmethod
+    def _set_if_match(request: Any, etag: str | None) -> None:
+        """Attach an ``If-Match`` precondition to a googleapiclient request.
+
+        ``HttpRequest`` exposes a mutable ``headers`` dict; sending the etag
+        makes patch/delete conditional so a concurrent remote edit is rejected
+        (HTTP 412) rather than overwritten.
+        """
+        if etag:
+            request.headers["If-Match"] = etag
+
+    @staticmethod
+    def _raise_for_write_status(exc: BaseException, external_id: str) -> None:
+        """Map a patch/delete failure to the right domain error (always raises)."""
+        status = _http_status(exc)
+        if status == 412:
+            raise CalendarConflictError(
+                f"google event {external_id!r} changed on the server since it was "
+                "read (If-Match precondition failed); re-sync the mirror and retry"
+            ) from exc
+        if status in (404, 410):
+            raise EventNotFoundError(f"google event {external_id!r} not found") from exc
+        raise exc
 
     def _get_owned_event(self, external_id: str) -> ExternalEvent:
         """Fetch + parse an event, enforcing the agent-ownership tag."""
