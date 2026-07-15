@@ -675,7 +675,16 @@ class TriggerEvaluator:
             event.payload = {**payload, "push": {"suppressed_reason": reason}}
             return FireOutcome(fire=fire, status="suppressed", reason=reason)
 
-        result = self._alert_sender.send(fire, fired_at=now)
+        try:
+            result = self._alert_sender.send(fire, fired_at=now)
+        except Exception as exc:
+            # The sender *raised* (transport blew up mid-send) rather than
+            # returning a clean WebhookResult(ok=False) — that latter case is a
+            # gateway that answered non-2xx and is handled below. The
+            # trigger_event row is already flushed (its dedup key is burned), so
+            # a raised send must be unwound; see _handle_send_exception.
+            return self._handle_send_exception(session, fire, event, payload, exc)
+
         if result.ok:
             event.alert_sent = True
             event.payload = {
@@ -710,6 +719,47 @@ class TriggerEvaluator:
             },
         }
         return FireOutcome(fire=fire, status="push_failed", reason=result.detail)
+
+    def _handle_send_exception(
+        self,
+        session: Session,
+        fire: TriggerFire,
+        event: TriggerEvent,
+        payload: dict[str, Any],
+        exc: Exception,
+    ) -> FireOutcome:
+        """Recover a fire whose AlertSender.send() *raised* (not a clean non-2xx).
+
+        The ``trigger_event`` row was already ``add``-ed and ``flush``-ed above,
+        so its dedup key is burned; without unwinding, a transport that raises
+        would permanently swallow the alert. Two recoveries:
+
+        - ``native_alert_delivery`` on: the alert is still surfaced to the
+          companion apps via /v1/alerts + glance polling, so mark it delivered
+          natively (the phone/watch get it without Telegram) and keep the row.
+        - native off: the alert is genuinely undelivered and MUST retry on the
+          next sweep, so the burned dedup key has to go. ``session.expunge`` is
+          NOT enough here — the INSERT already emitted at flush, so expunge only
+          detaches the instance while the row still commits; only
+          ``delete`` + ``flush`` actually removes it, letting the identical fire
+          re-fire (its dedup key was never truly recorded).
+        """
+        if self._settings.native_alert_delivery:
+            event.alert_sent = True
+            event.payload = {
+                **payload,
+                "push": {
+                    "sent": True,
+                    "channel": "native",
+                    "webhook_ok": False,
+                    "webhook_error": str(exc),
+                },
+            }
+            return FireOutcome(fire=fire, status="pushed")
+
+        session.delete(event)
+        session.flush()
+        return FireOutcome(fire=fire, status="push_failed", reason=str(exc))
 
     def _push_suppression_reason(
         self, session: Session, now: datetime, fire: TriggerFire

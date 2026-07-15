@@ -116,6 +116,28 @@ class TestSeamGuard:
             provider.push(stray)
         assert provider._s3 is None  # client was never even constructed
 
+    def test_refuses_plaintext_with_forged_age_magic_prefix(self, vault, s3, tmp_path):
+        """A plaintext file forged to *start* with the age v1 magic line — but
+        with no recipient stanza and no ``--- <MAC>`` terminator — is refused.
+
+        This is the exfiltration the prefix-only check missed: prepend the magic
+        to a raw database and it would have sailed through."""
+        forged = tmp_path / "healthmes-backup-20260101T000000Z.tar.gz.age"
+        forged.write_bytes(b"age-encryption.org/v1\nSQLite format 3\x00 plaintext health data")
+        with pytest.raises(BackupError, match="not an age-encrypted envelope"):
+            vault.push(forged)
+        assert vault_keys(s3) == []
+
+    def test_accepts_a_real_age_encrypted_snapshot(self, vault, s3, local_provider):
+        """A genuine pyrage-encrypted snapshot passes the structural guard and
+        is uploaded byte-identically."""
+        local_info = local_provider.export_snapshot()
+        remote_info = vault.push(local_info.path)
+        assert remote_info.name == local_info.name
+        assert vault_keys(s3) == [f"{PREFIX}/{local_info.name}"]
+        obj = s3.get_object(Bucket=BUCKET, Key=f"{PREFIX}/{local_info.name}")
+        assert obj["Body"].read() == local_info.path.read_bytes()
+
 
 # ---------------------------------------------------------------------------
 # Push / download / list against the fake vault
