@@ -19,6 +19,7 @@ from healthmes.calendars.base import (
     ICAL_AGENT_TASK_ID_PROPERTY,
     CalendarAuthError,
     CalendarBackend,
+    CalendarConflictError,
     CalendarError,
     EventDraft,
     EventNotFoundError,
@@ -29,8 +30,11 @@ from healthmes.calendars.base import (
 from healthmes.calendars.caldav_icloud import ICLOUD_CALDAV_URL, CalDavCalendarBackend
 from healthmes.calendars.google import GOOGLE_SCOPES, GoogleCalendarBackend
 from healthmes.calendars.state import (
+    FilePendingDiffStore,
     FileSyncStateStore,
+    InMemoryPendingDiffStore,
     InMemorySyncStateStore,
+    PendingDiffStore,
     SyncStateStore,
 )
 from healthmes.calendars.sync import (
@@ -50,6 +54,7 @@ __all__ = [
     # contract types
     "CalendarAuthError",
     "CalendarBackend",
+    "CalendarConflictError",
     "CalendarError",
     "EventDraft",
     "EventNotFoundError",
@@ -61,9 +66,12 @@ __all__ = [
     "GoogleCalendarBackend",
     "GOOGLE_SCOPES",
     "ICLOUD_CALDAV_URL",
-    # sync state persistence
+    # sync state + journal persistence
+    "FilePendingDiffStore",
     "FileSyncStateStore",
+    "InMemoryPendingDiffStore",
     "InMemorySyncStateStore",
+    "PendingDiffStore",
     "SyncStateStore",
     # mirror service / diff
     "CalendarMirrorService",

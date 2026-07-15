@@ -41,7 +41,7 @@ from healthmes.calendars.base import (
     coerce_utc,
     ensure_utc,
 )
-from healthmes.calendars.state import SyncStateStore
+from healthmes.calendars.state import PendingDiffStore, SyncStateStore
 from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror, Task
 
@@ -79,7 +79,7 @@ class EventChange:
     new_end_at: datetime | None = None
 
     def to_payload(self) -> dict[str, object]:
-        """JSON-safe dict for trigger payloads / webhook bodies."""
+        """JSON-safe dict for trigger payloads / webhook bodies / the journal."""
         payload = asdict(self)
         payload["calendar_source"] = self.calendar_source.value
         payload["kind"] = self.kind.value
@@ -87,6 +87,27 @@ class EventChange:
             value = payload[key]
             payload[key] = value.isoformat() if isinstance(value, datetime) else None
         return payload
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> "EventChange":
+        """Inverse of :meth:`to_payload` (journal replay round-trip)."""
+
+        def _dt(key: str) -> datetime | None:
+            value = payload.get(key)
+            return datetime.fromisoformat(value) if isinstance(value, str) else None
+
+        summary = payload.get("summary")
+        return cls(
+            calendar_source=CalendarSource(payload["calendar_source"]),
+            external_id=str(payload["external_id"]),
+            kind=ChangeKind(payload["kind"]),
+            summary=summary if isinstance(summary, str) else None,
+            is_agent_created=bool(payload["is_agent_created"]),
+            old_start_at=_dt("old_start_at"),
+            old_end_at=_dt("old_end_at"),
+            new_start_at=_dt("new_start_at"),
+            new_end_at=_dt("new_end_at"),
+        )
 
 
 @dataclass(slots=True)
@@ -115,13 +136,28 @@ class SyncDiff:
         self.agent_modified.extend(other.agent_modified)
 
     def to_payload(self) -> dict[str, object]:
-        """JSON-safe dict for trigger payloads / webhook bodies."""
+        """JSON-safe dict for trigger payloads / webhook bodies / the journal."""
         return {
             "created": [change.to_payload() for change in self.created],
             "moved": [change.to_payload() for change in self.moved],
             "deleted": [change.to_payload() for change in self.deleted],
             "agent_modified": [change.to_payload() for change in self.agent_modified],
         }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> "SyncDiff":
+        """Inverse of :meth:`to_payload` — rebuild a diff from the journal."""
+
+        def _changes(key: str) -> list[EventChange]:
+            raw = payload.get(key) or []
+            return [EventChange.from_payload(item) for item in raw]  # type: ignore[arg-type]
+
+        return cls(
+            created=_changes("created"),
+            moved=_changes("moved"),
+            deleted=_changes("deleted"),
+            agent_modified=_changes("agent_modified"),
+        )
 
 
 class CalendarMirrorService:
@@ -138,6 +174,7 @@ class CalendarMirrorService:
         session: Session,
         backends: Iterable[CalendarBackend],
         state_store: SyncStateStore,
+        pending_store: PendingDiffStore | None = None,
     ) -> None:
         self._session = session
         self._backends: dict[CalendarSource, CalendarBackend] = {}
@@ -146,6 +183,7 @@ class CalendarMirrorService:
                 raise CalendarError(f"duplicate backend for source {backend.source.value!r}")
             self._backends[backend.source] = backend
         self._state_store = state_store
+        self._pending_store = pending_store
 
     # -- pull / diff -------------------------------------------------------
 
@@ -161,19 +199,44 @@ class CalendarMirrorService:
         source = backend.source
         previous_state = self._state_store.load(source)
         bootstrap = previous_state is None
+        # Carry forward any diff a previous run journaled but never delivered
+        # (its cursor save failed after the idempotent mirror commit landed).
+        replayed = self._load_pending(source)
         events, new_state = backend.list_changes(previous_state)
 
         diff = SyncDiff()
+        seen_ids: set[str] = set()
         for event in events:
+            seen_ids.add(event.external_id)
             if event.deleted:
                 self._apply_deletion(source, event, diff)
             else:
                 self._apply_upsert(source, event, diff, bootstrap=bootstrap)
 
-        # Commit rows first, then persist the cursor: a crash in between
-        # re-delivers the same changes, and upserts are idempotent.
+        if bootstrap:
+            # A lost/emptied cursor forces a full-window fetch; mirror rows the
+            # provider no longer returns were deleted (or slid out of the
+            # scheduling window) while we had no cursor — emit tombstones so the
+            # deletion is not lost forever (docs/PLAN.md §6).
+            self._reconcile_tombstones(source, seen_ids, diff)
+
+        if replayed is not None:
+            merged = SyncDiff()
+            merged.extend(replayed)
+            merged.extend(diff)
+            diff = merged
+
+        # Journal the diff BEFORE the mirror commit: once the idempotent upserts
+        # land, the diff can no longer be re-derived, so a crash between the
+        # commit and the cursor save would otherwise lose a deletion/move the
+        # trigger must consume. Cleared only AFTER the cursor advances, so a
+        # failed cursor save replays it next run (at-least-once; the trigger
+        # dedups replays).
+        if diff.has_changes:
+            self._save_pending(source, diff)
         self._session.commit()
         self._state_store.save(source, new_state)
+        self._clear_pending(source)
         if diff.has_changes:
             logger.info(
                 "calendar sync %s: +%d created, %d moved, -%d deleted, %d agent-modified",
@@ -185,6 +248,20 @@ class CalendarMirrorService:
             )
         return diff
 
+    def _load_pending(self, source: CalendarSource) -> SyncDiff | None:
+        if self._pending_store is None:
+            return None
+        payload = self._pending_store.load(source)
+        return SyncDiff.from_payload(payload) if payload else None
+
+    def _save_pending(self, source: CalendarSource, diff: SyncDiff) -> None:
+        if self._pending_store is not None:
+            self._pending_store.save(source, diff.to_payload())
+
+    def _clear_pending(self, source: CalendarSource) -> None:
+        if self._pending_store is not None:
+            self._pending_store.clear(source)
+
     def _apply_upsert(
         self,
         source: CalendarSource,
@@ -194,6 +271,15 @@ class CalendarMirrorService:
         bootstrap: bool,
     ) -> None:
         assert event.start_at is not None and event.end_at is not None  # live event
+        resolved_task_id = self._resolve_task_id(event.agent_task_id)
+        # An incoming provider event is trusted as agent-created ONLY when it
+        # carries the ownership tag AND a task id that resolves to a local Task
+        # row. A forged tag alone (or a tag whose task id we never had) must
+        # never grant the agent write authority over an event the external
+        # calendar really owns — otherwise a hand-crafted ``healthmes=1`` on
+        # someone else's meeting would let the agent move/delete it.
+        trusted_agent = bool(event.is_agent_created) and resolved_task_id is not None
+
         row = self._get_row(source, event.external_id)
         if row is None:
             self._session.add(
@@ -203,15 +289,16 @@ class CalendarMirrorService:
                     summary=event.summary,
                     start_at=event.start_at,
                     end_at=event.end_at,
-                    is_agent_created=event.is_agent_created,
-                    agent_task_id=self._resolve_task_id(event.agent_task_id),
+                    is_agent_created=trusted_agent,
+                    agent_task_id=resolved_task_id if trusted_agent else None,
                     etag=event.etag,
                 )
             )
-            # Agent-tagged events without a row are re-adopted silently (the
-            # row normally pre-exists from create_agent_event); bootstrap
-            # adopts everything silently.
-            if not bootstrap and not event.is_agent_created:
+            # Trusted agent-tagged events without a row are re-adopted silently
+            # (the row normally pre-exists from create_agent_event); bootstrap
+            # adopts everything silently. A forged/untrusted tag is treated as
+            # the genuine external creation it is.
+            if not bootstrap and not trusted_agent:
                 diff.created.append(
                     EventChange(
                         calendar_source=source,
@@ -229,14 +316,19 @@ class CalendarMirrorService:
         old_end = coerce_utc(row.end_at)
         moved = old_start != event.start_at or old_end != event.end_at
         content_changed = (row.summary or None) != (event.summary or None)
+        # Refresh ownership from the freshly-observed provider state: if the tag
+        # was stripped (or its task link no longer resolves) the row flips to
+        # external, and what would have been an agent-move is reclassified into
+        # the external ``diff.moved`` bucket below.
+        ownership_changed = row.is_agent_created != trusted_agent
 
-        if not moved and not content_changed:
-            # Byte-identical re-delivery (410 full resync, lost sync-state
-            # file, crash between commit and cursor save): write NOTHING.
-            # Assigning equal values still dirties the row on sqlite (stored
-            # datetimes load naive, event values are aware), and any UPDATE
-            # bumps updated_at — which the trigger sweep reads as an external
-            # change (triggers.py::_load_schedule_changes contract:
+        if not moved and not content_changed and not ownership_changed:
+            # Byte-identical, same-tag re-delivery (410 full resync, lost
+            # sync-state file, crash between commit and cursor save): write
+            # NOTHING. Assigning equal values still dirties the row on sqlite
+            # (stored datetimes load naive, event values are aware), and any
+            # UPDATE bumps updated_at — which the trigger sweep reads as an
+            # external change (triggers.py::_load_schedule_changes contract:
             # updated_at moves only when the event actually changed).
             return
 
@@ -245,21 +337,21 @@ class CalendarMirrorService:
         row.start_at = event.start_at
         row.end_at = event.end_at
         row.etag = event.etag
-        if row.agent_task_id is None and event.agent_task_id is not None:
-            row.agent_task_id = self._resolve_task_id(event.agent_task_id)
+        row.is_agent_created = trusted_agent
+        row.agent_task_id = resolved_task_id if trusted_agent else None
 
         change = EventChange(
             calendar_source=source,
             external_id=event.external_id,
             kind=ChangeKind.MOVED if moved else ChangeKind.MODIFIED,
             summary=event.summary,
-            is_agent_created=row.is_agent_created,
+            is_agent_created=trusted_agent,
             old_start_at=old_start,
             old_end_at=old_end,
             new_start_at=event.start_at,
             new_end_at=event.end_at,
         )
-        if row.is_agent_created:
+        if trusted_agent:
             diff.agent_modified.append(change)
         elif moved:
             diff.moved.append(change)
@@ -286,6 +378,40 @@ class CalendarMirrorService:
             diff.agent_modified.append(change)
         else:
             diff.deleted.append(change)
+
+    def _reconcile_tombstones(
+        self, source: CalendarSource, seen_ids: set[str], diff: SyncDiff
+    ) -> None:
+        """Tombstone mirror rows the provider no longer returns on a full resync.
+
+        Only runs on bootstrap (sync state None/empty), when the backend fetches
+        the whole current window. Any pre-existing mirror row for this source
+        absent from that fresh set was deleted — or slid past the scheduling
+        window — while we had no cursor to observe the deletion notice. Without a
+        tombstone the mirror keeps a stale row forever and the ``schedule_changed``
+        trigger never learns of the deletion (docs/PLAN.md §6). A true first-ever
+        sync has an empty mirror, so this reconcile is a silent no-op then.
+        """
+        statement = select(CalendarEventMirror).where(
+            CalendarEventMirror.calendar_source == source
+        )
+        for row in self._session.execute(statement).scalars().all():
+            if row.external_id in seen_ids:
+                continue  # freshly upserted, or already handled as a deletion
+            change = EventChange(
+                calendar_source=source,
+                external_id=row.external_id,
+                kind=ChangeKind.DELETED,
+                summary=row.summary,
+                is_agent_created=row.is_agent_created,
+                old_start_at=coerce_utc(row.start_at),
+                old_end_at=coerce_utc(row.end_at),
+            )
+            self._session.delete(row)
+            if change.is_agent_created:
+                diff.agent_modified.append(change)
+            else:
+                diff.deleted.append(change)
 
     # -- ownership-guarded agent writes -------------------------------------
 

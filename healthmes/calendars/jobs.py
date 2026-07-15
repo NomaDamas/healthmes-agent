@@ -31,11 +31,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars.base import CalendarBackend, EventDraft, coerce_utc
-from healthmes.calendars.state import FileSyncStateStore, SyncStateStore
-from healthmes.calendars.sync import CalendarMirrorService
+from healthmes.calendars.state import (
+    FilePendingDiffStore,
+    FileSyncStateStore,
+    PendingDiffStore,
+    SyncStateStore,
+)
+from healthmes.calendars.sync import CalendarMirrorService, SyncDiff
 from healthmes.config import Settings
 from healthmes.store.enums import CalendarSource, ProposalStatus
-from healthmes.store.models import ScheduleProposal, Task
+from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task
 from healthmes.store.session import session_scope
 
 __all__ = [
@@ -57,7 +62,7 @@ class CalendarJobSpec:
     source: CalendarSource
     job_id: str
     interval_minutes: int
-    job: Callable[[], None]
+    job: Callable[[], SyncDiff | None]
 
 
 def calendar_job_id(source: CalendarSource) -> str:
@@ -109,6 +114,38 @@ def _accepted_proposals(session: Session) -> Iterator[tuple[ScheduleProposal, Ta
     yield from ((proposal, task) for proposal, task in rows)
 
 
+def _existing_agent_block(
+    session: Session,
+    source: CalendarSource,
+    task_id: object,
+    proposal: ScheduleProposal,
+) -> CalendarEventMirror | None:
+    """Return the trusted agent mirror row already written for this proposal.
+
+    Matches an agent-created row for the same task/source whose times equal the
+    proposal's — the fingerprint of the block a prior (crashed) poll already
+    created remotely. Times are compared in Python via ``coerce_utc`` because
+    sqlite round-trips ``DateTime`` columns as naive UTC.
+    """
+    candidates = (
+        session.execute(
+            select(CalendarEventMirror).where(
+                CalendarEventMirror.calendar_source == source,
+                CalendarEventMirror.agent_task_id == task_id,
+                CalendarEventMirror.is_agent_created.is_(True),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    start = coerce_utc(proposal.proposed_start)
+    end = coerce_utc(proposal.proposed_end)
+    for row in candidates:
+        if coerce_utc(row.start_at) == start and coerce_utc(row.end_at) == end:
+            return row
+    return None
+
+
 def push_accepted_proposals(
     service: CalendarMirrorService, session: Session, source: CalendarSource
 ) -> int:
@@ -116,28 +153,39 @@ def push_accepted_proposals(
 
     Each proposal is pushed independently: the remote create commits the
     mirror row first, then the status flips to ``pushed`` and commits. A crash
-    between the two leaves the proposal ``accepted`` — the next poll retries
-    (at worst duplicating one block, never losing one). A failing backend
-    call leaves the proposal untouched for the next poll.
+    between the two leaves the proposal ``accepted`` — but the next poll now
+    detects the already-written agent block and reuses it instead of creating a
+    duplicate, so the retry is idempotent (never a second remote event, never a
+    lost one). A failing backend call leaves the proposal untouched for retry.
     """
     pushed = 0
     for proposal, task in list(_accepted_proposals(session)):
-        draft = EventDraft(
-            summary=task.title,
-            start_at=coerce_utc(proposal.proposed_start),
-            end_at=coerce_utc(proposal.proposed_end),
-            agent_task_id=task.id,
-        )
-        try:
-            row = service.create_agent_event(source, draft)
-        except Exception:
-            logger.exception(
-                "Pushing proposal %s (%s) to %s failed; retrying next poll.",
+        row = _existing_agent_block(session, source, task.id, proposal)
+        if row is None:
+            draft = EventDraft(
+                summary=task.title,
+                start_at=coerce_utc(proposal.proposed_start),
+                end_at=coerce_utc(proposal.proposed_end),
+                agent_task_id=task.id,
+            )
+            try:
+                row = service.create_agent_event(source, draft)
+            except Exception:
+                logger.exception(
+                    "Pushing proposal %s (%s) to %s failed; retrying next poll.",
+                    proposal.id,
+                    task.title,
+                    source.value,
+                )
+                continue
+        else:
+            logger.info(
+                "Proposal %s already has agent block %s on %s; finishing the "
+                "interrupted status advance instead of re-creating it.",
                 proposal.id,
-                task.title,
+                row.external_id,
                 source.value,
             )
-            continue
         proposal.status = ProposalStatus.PUSHED
         session.commit()
         pushed += 1
@@ -159,16 +207,20 @@ def build_calendar_job(
     backend_factory: Callable[[], CalendarBackend] | None = None,
     session_factory: sessionmaker[Session] | None = None,
     state_store: SyncStateStore | None = None,
-) -> Callable[[], None]:
+    pending_store: PendingDiffStore | None = None,
+) -> Callable[[], SyncDiff | None]:
     """Zero-arg poll job for one backend (collaborators injectable for tests).
 
     The backend is constructed lazily on the first run and reused (Google
     keeps an authorized service, CalDAV keeps its session); a failed
-    construction is retried on the next interval.
+    construction is retried on the next interval. The job RETURNS the run's
+    :class:`SyncDiff` (``None`` if the run failed) so the downstream
+    ``schedule_changed`` trigger can consume deletions — which vanish from the
+    mirror and so cannot be re-derived from row ``updated_at`` alone.
     """
     backend: CalendarBackend | None = None
 
-    def run_calendar_sync() -> None:
+    def run_calendar_sync() -> SyncDiff | None:
         nonlocal backend
         try:
             if backend is None:
@@ -182,15 +234,22 @@ def build_calendar_job(
                 if state_store is not None
                 else FileSyncStateStore.for_data_dir(settings.data_dir)
             )
+            journal = (
+                pending_store
+                if pending_store is not None
+                else FilePendingDiffStore.for_data_dir(settings.data_dir)
+            )
             with session_scope(session_factory) as session:
-                service = CalendarMirrorService(session, [backend], store)
-                service.sync_backend(backend)
+                service = CalendarMirrorService(session, [backend], store, journal)
+                diff = service.sync_backend(backend)
                 if is_write_backend:
                     push_accepted_proposals(service, session, source)
+                return diff
         except Exception:
             logger.exception(
                 "Calendar sync for %s failed; next interval will retry.", source.value
             )
+            return None
 
     return run_calendar_sync
 
