@@ -73,10 +73,18 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# Every age v1 envelope (pyrage output included) starts with this textual
-# header; anything else is not an encrypted snapshot and must never be
-# uploaded.
+# The exact first line of every age v1 envelope (pyrage output included). The
+# guard does not merely prefix-match this — a plaintext file can start with it
+# too — it parses the surrounding header structure (see
+# ``_is_age_envelope_header``); anything else must never be uploaded.
 AGE_MAGIC = b"age-encryption.org/v1"
+
+# How much of a candidate file to read for the structural header check. An age
+# header (version line + recipient stanza(s) + ``--- <MAC>`` terminator) is a
+# few hundred bytes for our single-scrypt-recipient snapshots and stays well
+# under a kilobyte even for pathological multi-recipient headers; 16 KiB is a
+# comfortable ceiling that never touches the ciphertext body.
+_AGE_HEADER_READ = 16 * 1024
 
 DEFAULT_VAULT_PREFIX = "healthmes-vault"
 
@@ -241,6 +249,57 @@ def _file_digests(path: Path) -> tuple[str, str, int]:
     return md5.hexdigest(), sha256.hexdigest(), size
 
 
+def _is_age_envelope_header(prefix: bytes | str) -> bool:
+    """True only for a *structurally valid* age v1 header — not just the magic.
+
+    A real age v1 envelope opens with::
+
+        age-encryption.org/v1
+        -> <recipient type> <args...>
+        <base64 body line(s)>          # base64, so never begins with '-'
+        --- <base64 MAC>
+
+    Parsing that shape (rather than trusting the leading magic line) is what
+    stops a plaintext file that merely *starts* with ``age-encryption.org/v1``:
+    it has no ``-> `` recipient stanza and no ``--- <MAC>`` terminator, so it is
+    rejected. Because base64 body lines never begin with ``-``, the ``-> ``
+    stanza header and the ``--- `` MAC marker are unambiguous. ``prefix`` may be
+    a truncated read of the file — the whole header fits comfortably within it
+    (see ``_AGE_HEADER_READ``) — and the scan returns at the MAC line, so the
+    binary ciphertext body is never interpreted.
+    """
+    raw = prefix.encode("utf-8", "replace") if isinstance(prefix, str) else prefix
+    lines = raw.split(b"\n")
+    # Version line must be exactly the magic *and* be a complete line (a
+    # following newline, hence a second split element) — so a bare truncated
+    # "age-encryption.org/v1" with nothing after it does not pass.
+    if len(lines) < 2 or lines[0] != AGE_MAGIC:
+        return False
+
+    saw_recipient = False
+    index = 1
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith(b"-> "):
+            if not line[3:].strip():  # stanza header needs a recipient type
+                return False
+            saw_recipient = True
+            index += 1
+            # Consume this stanza's wrapped base64 body lines (never start '-').
+            while index < len(lines) and not lines[index].startswith(b"-"):
+                index += 1
+            continue
+        if line.startswith(b"--- "):
+            # The MAC terminator closes the header: valid only after at least
+            # one recipient stanza, and the MAC itself must be present.
+            return saw_recipient and bool(line[4:].strip())
+        # Anything else at stanza position (body lines were consumed above) is
+        # malformed — e.g. plaintext following a forged magic line.
+        return False
+    # Ran out of input before the MAC terminator: not a well-formed header.
+    return False
+
+
 class RemoteVaultProvider:
     """BackupProvider replicating encrypted snapshot envelopes to an S3 vault.
 
@@ -388,8 +447,10 @@ class RemoteVaultProvider:
 
         Defense against accidental raw-data exfiltration (PLAN section 9: no
         data export bypassing the backup seam): both the canonical snapshot
-        name *and* the age v1 header are required, so neither a stray file
-        nor a renamed plaintext database can ever reach the vault.
+        name *and* a structurally valid age v1 header are required, so neither a
+        stray file nor a renamed plaintext database — even one forged to start
+        with the literal ``age-encryption.org/v1`` magic line — can ever reach
+        the vault.
         """
         if parse_snapshot_name(path.name) is None:
             raise BackupError(
@@ -398,12 +459,12 @@ class RemoteVaultProvider:
                 "(docs/PLAN.md section 9 forbids exporting data around the backup seam)"
             )
         with path.open("rb") as handle:
-            header = handle.read(len(AGE_MAGIC))
-        if header != AGE_MAGIC:
+            header = handle.read(_AGE_HEADER_READ)
+        if not _is_age_envelope_header(header):
             raise BackupError(
                 f"refusing to upload {path.name!r}: not an age-encrypted envelope "
-                "(missing age v1 header) — only ciphertext may leave this machine "
-                "(docs/PLAN.md section 9)"
+                "(missing or malformed age v1 header) — only ciphertext may leave "
+                "this machine (docs/PLAN.md section 9)"
             )
 
     # -- vault operations ---------------------------------------------------

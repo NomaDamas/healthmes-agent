@@ -110,6 +110,22 @@ class FakeAlertSender:
         return WebhookResult(ok=False, status_code=502, detail="gateway unavailable")
 
 
+class RaisingAlertSender:
+    """AlertSender double whose send() *raises* (transport blew up mid-send).
+
+    Distinct from ``FakeAlertSender(ok=False)``, which returns a clean
+    ``WebhookResult(ok=False)`` — a gateway that answered non-2xx.
+    """
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        self.exc = exc if exc is not None else RuntimeError("webhook transport exploded")
+        self.calls = 0
+
+    def send(self, fire: TriggerFire, *, fired_at: datetime) -> WebhookResult:
+        self.calls += 1
+        raise self.exc
+
+
 class FakeHealthReader:
     """HealthReader double returning canned signals."""
 
@@ -286,6 +302,63 @@ def test_native_delivery_off_keeps_webhook_only_semantics(settings, session_fact
     assert [o.status for o in report.outcomes] == ["push_failed"]
     [event] = all_events(session_factory)
     assert event.alert_sent is False
+
+
+def test_sender_exception_native_off_does_not_burn_dedup(settings, session_factory) -> None:
+    """A sender that *raises* (not a clean non-2xx) must not burn the dedup key.
+
+    The trigger_event row is flushed before the push; when the send raises and
+    native delivery is off the alert is genuinely undelivered, so the row is
+    deleted (delete+flush, not expunge) — otherwise the burned key would
+    dedup-drop the retry forever."""
+    sender = RaisingAlertSender()
+    with freeze_time("2026-07-09 14:00:00"):
+        evaluator = make_evaluator(settings, session_factory, sender, rules=(fixed_rule,))
+        report = evaluator.evaluate_once()
+
+    assert [o.status for o in report.outcomes] == ["push_failed"]
+    assert sender.calls == 1
+    # Row removed → dedup key not recorded (an expunge would have left it).
+    assert all_events(session_factory) == []
+
+
+def test_sender_exception_recovers_on_next_sweep(settings, session_factory) -> None:
+    """After a raising sweep unwinds the row, the identical fire re-fires and is
+    delivered on the next sweep (same dedup key, never truly recorded)."""
+    raising = RaisingAlertSender()
+    working = FakeAlertSender()
+    with freeze_time("2026-07-09 14:00:00") as frozen:
+        failed = make_evaluator(
+            settings, session_factory, raising, rules=(fixed_rule,)
+        ).evaluate_once()
+        frozen.tick(timedelta(minutes=10))
+        recovered = make_evaluator(
+            settings, session_factory, working, rules=(fixed_rule,)
+        ).evaluate_once()
+
+    assert [o.status for o in failed.outcomes] == ["push_failed"]
+    assert [o.status for o in recovered.outcomes] == ["pushed"]
+    assert len(working.sent) == 1
+    [event] = all_events(session_factory)  # only the delivered row survives
+    assert event.dedup_key == "fixed_rule:occurrence-1"
+    assert event.alert_sent is True
+
+
+def test_sender_exception_native_on_delivers_natively(settings, session_factory) -> None:
+    """native on: a raising sender still surfaces the alert to companion apps —
+    the row is kept, marked delivered natively, webhook flagged as failed."""
+    native_settings = settings.model_copy(update={"native_alert_delivery": True})
+    sender = RaisingAlertSender()
+    with freeze_time("2026-07-09 14:00:00"):
+        evaluator = make_evaluator(native_settings, session_factory, sender, rules=(fixed_rule,))
+        report = evaluator.evaluate_once()
+
+    assert [o.status for o in report.outcomes] == ["pushed"]
+    [event] = all_events(session_factory)
+    assert event.alert_sent is True
+    assert event.payload["push"]["channel"] == "native"
+    assert event.payload["push"]["webhook_ok"] is False
+    assert "webhook_error" in event.payload["push"]
 
 
 # ---------------------------------------------------------------------------

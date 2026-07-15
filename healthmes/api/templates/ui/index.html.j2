@@ -1,9 +1,10 @@
 {% extends "ui/_base.html.j2" %}
-{# Landing shell for GET / — static links only, no store data, no credentials
-   in the markup (safe under any auth posture). The tiny inline script only
-   copies a ?token= already present in the *visitor's own URL* onto the
-   same-origin links, so tokened demo links keep working; nothing secret is
-   ever rendered server-side here. #}
+{# Landing shell for GET / — static links only, no store data, and NO
+   credentials anywhere: not in the markup, and not propagated onto the links.
+   The viewer token is an HMAC of the API token that the client cannot derive,
+   so the landing carries no credentials — every link is a bare same-origin
+   path, safe to serve to anyone the auth middleware lets through and under any
+   future auth posture. #}
 
 {% block title %}HealthMes — 몸의 신호로 하루를 조율하는 로컬 에이전트{% endblock %}
 
@@ -59,17 +60,17 @@
     <span class="loop-arrow" aria-hidden="true">→</span> 궁금할 땐 "왜?"를 눌러 근거 숲을 봅니다.</p>
 
   <nav class="surface-grid" aria-label="서비스 표면">
-    <a class="surface-card" data-token-link href="/decisions">
+    <a class="surface-card" href="/decisions">
       <h2>제안 · 피드백 기록</h2>
       <p>일정 조정 제안과 하루 피드백, 근거 숲과 함께 최신순.</p>
       <code>GET /decisions</code>
     </a>
-    <a class="surface-card" data-token-link href="/reports/weekly">
+    <a class="surface-card" href="/reports/weekly">
       <h2>주간 리포트</h2>
       <p>에너지 추이 · 인사이트 · 일정 수용률 · 알림 예산.</p>
       <code>GET /reports/weekly</code>
     </a>
-    <a class="surface-card" data-token-link href="/v1/briefing/glance">
+    <a class="surface-card" href="/v1/briefing/glance">
       <h2>글랜스 브리핑</h2>
       <p>컴패니언 앱이 읽는 지금-상태 스냅샷 (JSON).</p>
       <code>GET /v1/briefing/glance</code>
@@ -84,21 +85,4 @@
   <p class="local-note"><span class="brand-dot" aria-hidden="true"></span>
     모든 건강 데이터는 이 기기에만 머뭅니다 · Local-first, no cloud.</p>
 </div>
-{% endblock %}
-
-{% block scripts %}
-<script>
-(function () {
-  "use strict";
-  /* If the visitor's own URL carries ?token=, keep it on same-origin links.
-     The token comes from the browser's location only — never from markup. */
-  var token = new URLSearchParams(window.location.search).get("token");
-  if (!token) { return; }
-  document.querySelectorAll("a[data-token-link]").forEach(function (a) {
-    var url = new URL(a.getAttribute("href"), window.location.origin);
-    url.searchParams.set("token", token);
-    a.setAttribute("href", url.pathname + url.search);
-  });
-})();
-</script>
 {% endblock %}
