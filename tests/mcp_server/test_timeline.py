@@ -6,6 +6,7 @@ accidental UTC assumptions in the arithmetic.
 """
 
 import datetime as dt
+import zoneinfo
 
 from healthmes.mcp_server import timeline
 
@@ -187,3 +188,49 @@ class TestCoverageAndConfidence:
             "n_samples": 1,
             "likely_context": ["event: Standup"],
         }
+
+
+class TestDstFoldMathInUtc:
+    """Defect 3: ordering / subtraction / end math must be done in UTC.
+
+    Across the America/New_York fall-back fold (2024-11-03) the wall clock runs
+    01:59 EDT -> 01:00 EST, so wall-clock addition of the sample step lands the
+    interval end an hour early (before its own last sample), inverting gap and
+    duration math. All arithmetic must go through UTC; local is display-only.
+    For the fixed-offset KST used elsewhere these conversions are the identity,
+    so the other timeline tests are unaffected.
+    """
+
+    NY = zoneinfo.ZoneInfo("America/New_York")
+
+    def _ny(self, hour: int, minute: int, value: float) -> tuple[dt.datetime, float]:
+        return (dt.datetime(2024, 11, 3, hour, minute, tzinfo=dt.UTC).astimezone(self.NY), value)
+
+    def test_end_and_duration_are_utc_correct_across_fold(self):
+        # UTC 05:45 / 06:00 / 06:15 -> NY 01:45 EDT / 01:00 EST / 01:15 EST:
+        # one contiguous rest run straddling the fold.
+        samples = [self._ny(5, 45, 20.0), self._ny(6, 0, 20.0), self._ny(6, 15, 20.0)]
+        intervals = timeline.build_stress_intervals(samples)
+        assert len(intervals) == 1
+        interval = intervals[0]
+        assert interval.label == "rest"
+        assert interval.n_samples == 3
+        # Start is the earliest sample; end is last sample + 15min step, in UTC.
+        assert interval.start.astimezone(dt.UTC) == dt.datetime(2024, 11, 3, 5, 45, tzinfo=dt.UTC)
+        assert interval.end.astimezone(dt.UTC) == dt.datetime(2024, 11, 3, 6, 30, tzinfo=dt.UTC)
+        # 05:45 -> 06:30 UTC = 45 min. Wall-clock addition would put the end at
+        # 01:30 EDT (05:30 UTC) -- before the last sample -- for a bogus span.
+        assert interval.duration_minutes == 45.0
+
+    def test_attach_context_overlap_is_utc_correct_across_fold(self):
+        # A 1h usage bucket starting 01:30 EDT (05:30 UTC) ends, in UTC, at 06:30
+        # UTC. Wall-clock addition would put its end at 02:30 "EDT" = 07:30 UTC,
+        # an hour late. The interval window is [05:30, 07:00) UTC (fully past the
+        # correct bucket end): correct overlap is the whole 60-min bucket
+        # (fraction 1.0 -> 60 min); the buggy end would over-credit 90 min.
+        bucket_start = dt.datetime(2024, 11, 3, 5, 30, tzinfo=dt.UTC).astimezone(self.NY)
+        window_end = dt.datetime(2024, 11, 3, 7, 0, tzinfo=dt.UTC).astimezone(self.NY)
+        usage = [(bucket_start, "social", 3600)]  # 60 min foreground in the 1h bucket
+        context = timeline.attach_context(bucket_start, window_end, [], usage)
+        assert context == ["apps: social (60 min)"]
+

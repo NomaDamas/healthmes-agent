@@ -66,6 +66,9 @@ class TestGetHealthScores:
     async def test_groups_and_interprets_by_category_provider(
         self, mcp_client, mcp_env, call_tool
     ):
+        # Three in-window days so the Defect-4 min-days-with-data gate is met
+        # (values chosen so mean/min/max are unchanged from the 2-day fixture).
+        mcp_env.add_score("stress", "garmin", "2026-07-06T12:00:00Z", 40, qualifier="low")
         mcp_env.add_score("stress", "garmin", "2026-07-07T12:00:00Z", 30, qualifier="calm")
         mcp_env.add_score("stress", "garmin", "2026-07-08T12:00:00Z", 50, qualifier="medium")
         # Out-of-window row that must not leak into the stats.
@@ -92,9 +95,9 @@ class TestGetHealthScores:
         assert stress["mean"] == 40.0
         assert stress["min"] == 30.0
         assert stress["max"] == 50.0
-        assert stress["n_samples"] == 2
-        assert stress["days_with_data"] == 2
-        assert stress["coverage"] == 0.29  # 2/7
+        assert stress["n_samples"] == 3
+        assert stress["days_with_data"] == 3
+        assert stress["coverage"] == 0.43  # 3/7
         assert stress["confidence"] == "low"
 
         # Internal resilience is normalized to the 0-100 score, raw CV kept.
@@ -258,3 +261,91 @@ class TestUserResolution:
         )
         with pytest.raises(ToolError, match="open-wearables API error"):
             await mcp_client.call_tool("get_health_scores", {"end_date": AS_OF})
+
+
+class TestReviewFindingFixes:
+    """Regression tests for the independent-review fixes on the health tools
+    (Defects 1, 4, 5, 6, 7, 8). Env is pinned to KST (UTC+9)."""
+
+    async def test_stress_grouped_by_local_day_not_utc(self, mcp_client, mcp_env, call_tool):
+        # Defect 1: 2026-07-14T22:00Z is 2026-07-15 07:00 in KST, so it must
+        # anchor to local day 07-15 (not UTC day 07-14). Before the fix it was
+        # grouped by UTC and reported as a day-stale reading on 07-14.
+        mcp_env.add_score("stress", "garmin", "2026-07-14T22:00:00Z", 62)
+        result = await call_tool(
+            mcp_client, "get_daily_readiness_context", {"date": "2026-07-15"}
+        )
+        stress = result["stress"]
+        assert stress["source"] == "garmin_stress"
+        assert stress["value"] == 62.0
+        assert stress["observed_on"] == "2026-07-15"  # local day, not 07-14
+        assert stress["stale_days"] == 0
+
+    async def test_health_scores_sparse_window_is_insufficient(
+        self, mcp_client, mcp_env, call_tool
+    ):
+        # Defect 4: two days of data in a 14d window is not a confident aggregate,
+        # but the partial per-group data is still returned honestly.
+        mcp_env.add_score("stress", "garmin", "2026-07-07T12:00:00Z", 30)
+        mcp_env.add_score("stress", "garmin", "2026-07-08T12:00:00Z", 50)
+        result = await call_tool(
+            mcp_client, "get_health_scores", {"range": "14d", "end_date": AS_OF}
+        )
+        assert result["status"] == "insufficient_data"  # best group has 2 < 3 days
+        assert result["truncated"] is False
+        assert result["scores"]["stress:garmin"]["days_with_data"] == 2  # data still shown
+
+    async def test_health_scores_truncation_is_insufficient(
+        self, mcp_client, mcp_env, call_tool
+    ):
+        # Defect 8: a truncated offset window must not be presented as "ok".
+        for day in (28, 29, 30):
+            mcp_env.add_score("stress", "garmin", f"2026-06-{day:02d}T12:00:00Z", 40)
+        for day in range(1, 9):  # 11 distinct in-window days in the 14d window
+            mcp_env.add_score("stress", "garmin", f"2026-07-{day:02d}T12:00:00Z", 40)
+        mcp_env.max_page_size = 1  # 10-page cap hit -> truncated
+        result = await call_tool(
+            mcp_client, "get_health_scores", {"range": "14d", "end_date": AS_OF}
+        )
+        assert result["truncated"] is True
+        assert result["status"] == "insufficient_data"
+
+    async def test_hrv_stale_current_is_insufficient(self, mcp_client, mcp_env, call_tool):
+        # Defect 5: the latest nocturnal HRV is 7 days before as_of -> not current.
+        for day in ("2026-06-26", "2026-06-27", "2026-06-28", "2026-06-29",
+                    "2026-06-30", "2026-07-01"):
+            mcp_env.add_sleep_summary(day, avg_hrv_rmssd_ms=50.0)
+        result = await call_tool(mcp_client, "get_daily_readiness_context", {"date": AS_OF})
+        hrv = result["hrv"]
+        assert hrv["status"] == "insufficient_data"
+        assert "stale" in hrv["reason"]
+        assert hrv["stale_days"] == 7
+
+    async def test_sleep_debt_requires_internal_score(self, mcp_client, mcp_env, call_tool):
+        # Defect 7: provider (oura) sleep scores must NOT be used for sleep debt.
+        for day in ("2026-07-06", "2026-07-07", "2026-07-08"):
+            mcp_env.add_score("sleep", "oura", f"{day}T07:00:00+09:00", 70)
+        result = await call_tool(mcp_client, "get_daily_readiness_context", {"date": AS_OF})
+        sleep = result["sleep_debt"]
+        assert sleep["status"] == "insufficient_data"
+        assert sleep["reason"] == "no_internal_sleep_score"
+        assert "index" not in sleep
+
+    async def test_stale_garmin_stress_yields_to_fresh_proxy_baseline(
+        self, mcp_client, mcp_env, call_tool
+    ):
+        # Defect 6: a ~60-day-old Garmin stress must not suppress a fresh proxy
+        # (before the fix `if not daily` used the stale Garmin as "current").
+        mcp_env.add_score("stress", "garmin", "2026-05-09T12:00:00Z", 80)
+        mcp_env.add_score(
+            "resilience", "internal", "2026-07-08T00:00:00Z", 0.12,
+            components={"resilience_score": {"value": 65}},
+        )
+        result = await call_tool(
+            mcp_client, "get_personal_baselines", {"metrics": ["stress"], "as_of": AS_OF}
+        )
+        stress = result["metrics"]["stress"]
+        assert stress["source"] == "internal_resilience_proxy(100-resilience_score)"
+        assert stress["current"]["date"] == "2026-07-08"  # fresh proxy day, not 05-09
+        assert stress["current"]["value"] == 35.0  # 100 - 65
+

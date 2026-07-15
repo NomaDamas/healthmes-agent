@@ -56,7 +56,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from healthmes.config import Settings, get_settings
+from healthmes.config import Settings, get_settings, system_timezone
 from healthmes.mcp_server import impact, interpret, timeline
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.store import (
@@ -118,6 +118,8 @@ MAX_TREE_NODES = 500
 
 _RANGE_PATTERN = re.compile(r"^(\d{1,3})d$")
 MAX_RANGE_DAYS = 90
+MIN_AGG_DAYS_WITH_DATA = 3
+MIN_TIMELINE_SAMPLES = 3
 
 mcp: FastMCP = FastMCP(
     "healthmes",
@@ -271,9 +273,7 @@ def _local_timezone() -> dt.tzinfo:
                 f"Configured timezone {name!r} is not a valid IANA name "
                 "(HEALTHMES_TIMEZONE, e.g. 'Asia/Seoul')."
             ) from exc
-    local = dt.datetime.now().astimezone().tzinfo
-    assert local is not None
-    return local
+    return system_timezone()
 
 
 def _build_energy_engine() -> Any:
@@ -408,8 +408,15 @@ _summary_daily_values = interpret.summary_daily_values
 async def _fetch_health_scores(
     user_id: str, start: dt.date, end_exclusive: dt.date
 ) -> list[dict[str, Any]]:
+    rows, _truncated = await _fetch_health_scores_tracked(user_id, start, end_exclusive)
+    return rows
+
+
+async def _fetch_health_scores_tracked(
+    user_id: str, start: dt.date, end_exclusive: dt.date
+) -> tuple[list[dict[str, Any]], bool]:
     client = get_ow_client()
-    return await client.collect_health_scores(
+    return await client.collect_health_scores_tracked(
         user_id, start_date=start.isoformat(), end_date=end_exclusive.isoformat()
     )
 
@@ -470,7 +477,9 @@ async def get_health_scores(
         )
 
     user_id = await _resolve_user_id()
-    rows = await _fetch_health_scores(user_id, start_day, end_day + dt.timedelta(days=1))
+    rows, truncated = await _fetch_health_scores_tracked(
+        user_id, start_day, end_day + dt.timedelta(days=1)
+    )
 
     groups: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -533,8 +542,17 @@ async def get_health_scores(
             "confidence": interpret.confidence_label(len(by_day), days),
         }
 
+    best_days = max(
+        (group["days_with_data"] for group in scores.values()),
+        default=0,
+    )
+    enough_data = bool(scores) and best_days >= min(MIN_AGG_DAYS_WITH_DATA, days)
     return {
-        "status": interpret.STATUS_OK if scores else interpret.STATUS_INSUFFICIENT,
+        "status": (
+            interpret.STATUS_OK
+            if enough_data and not truncated
+            else interpret.STATUS_INSUFFICIENT
+        ),
         "window": {
             "start_date": start_day.isoformat(),
             "end_date": end_day.isoformat(),
@@ -542,6 +560,7 @@ async def get_health_scores(
         },
         "categories_requested": list(requested),
         "scores": scores,
+        "truncated": truncated,
     }
 
 
@@ -559,7 +578,8 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     of guessing; overall confidence is the weakest confirmed block. `date` is
     ISO YYYY-MM-DD, default today in the user's timezone.
     """
-    as_of = _parse_date(date, "date")
+    tz = _local_timezone()
+    as_of = _parse_date_local(date, "date", tz)
     fetch_start = as_of - dt.timedelta(days=interpret.BASELINE_WINDOW_DAYS + 7)
     end_exclusive = as_of + dt.timedelta(days=1)
     user_id = await _resolve_user_id()
@@ -574,10 +594,19 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     )
 
     # --- sleep debt (internal sleep score; algorithms/sleep.py, never reinvented)
-    sleep_scores, sleep_source = _sleep_score_series(score_rows)
-    sleep_block = interpret.sleep_debt(sleep_scores, as_of)
-    if sleep_source:
-        sleep_block["source"] = sleep_source
+    internal_scores = interpret.daily_series(
+        _localized(_score_points(score_rows, "sleep", provider="internal"), tz),
+        how="max",
+    )
+    if internal_scores:
+        sleep_block = interpret.sleep_debt(internal_scores, as_of)
+        sleep_block["source"] = "internal_sleep_score"
+    else:
+        sleep_block = {
+            "status": interpret.STATUS_INSUFFICIENT,
+            "reason": "no_internal_sleep_score",
+            "confidence": "low",
+        }
 
     # --- nocturnal HRV vs 14-day baseline (variant-separated, never mixed)
     rmssd = _summary_daily_values(sleep_rows, "avg_hrv_rmssd_ms", as_of)
@@ -585,7 +614,11 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     if rmssd or sdnn:
         variant = "rmssd" if len(rmssd) >= len(sdnn) else "sdnn"
         series = rmssd if variant == "rmssd" else sdnn
-        hrv_block = interpret.metric_baseline(series, as_of)
+        hrv_block = interpret.metric_baseline(
+            series,
+            as_of,
+            max_stale_days=interpret.HRV_MAX_STALE_DAYS,
+        )
         hrv_block["variant"] = variant
         hrv_block["unit"] = "ms"
         hrv_block["source"] = "nocturnal (sleep summaries)"
@@ -598,9 +631,13 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
 
     # --- stress (Garmin native, else internal resilience proxy)
     garmin_stress = interpret.daily_series(
-        _score_points(score_rows, "stress", provider="garmin"), how="mean"
+        _localized(_score_points(score_rows, "stress", provider="garmin"), tz),
+        how="mean",
     )
-    resilience = interpret.daily_series(_resilience_score_points(score_rows), how="latest")
+    resilience = interpret.daily_series(
+        _localized(_resilience_score_points(score_rows), tz),
+        how="latest",
+    )
     stress_block = interpret.stress_context(garmin_stress, resilience, as_of)
 
     # --- charge scores (freshest body_battery / readiness / recovery)
@@ -610,7 +647,10 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
             (recorded_at, value, row)
             for row in score_rows
             if row.get("category") == category
-            for recorded_at, value in _score_points([row], category)
+            for recorded_at, value in _localized(
+                _score_points([row], category),
+                tz,
+            )
             if (as_of - recorded_at.date()).days in (0, 1)
         ]
         if not candidates:
@@ -709,7 +749,8 @@ async def get_personal_baselines(
         raise ToolError(
             f"Unknown metrics {unknown}; supported: {sorted(_BASELINE_METRICS)}"
         )
-    anchor = _parse_date(as_of, "as_of")
+    tz = _local_timezone()
+    anchor = _parse_date_local(as_of, "as_of", tz)
     fetch_start = anchor - dt.timedelta(days=interpret.LONG_BASELINE_WINDOW_DAYS + 1)
     end_exclusive = anchor + dt.timedelta(days=1)
     user_id = await _resolve_user_id()
@@ -739,19 +780,31 @@ async def get_personal_baselines(
         elif source == "recovery_summaries":
             daily = _summary_daily_values(recovery_rows, field, anchor)
         elif field == "sleep":
-            daily, sleep_source = _sleep_score_series(score_rows)
+            daily, sleep_source = _sleep_score_series(score_rows, tz=tz)
             source_label = sleep_source or "health_scores.sleep"
         else:  # stress: Garmin native, else internal resilience proxy
-            daily = interpret.daily_series(
-                _score_points(score_rows, "stress", provider="garmin"), how="mean"
+            garmin_daily = interpret.daily_series(
+                _localized(_score_points(score_rows, "stress", provider="garmin"), tz),
+                how="mean",
             )
-            source_label = "health_scores.stress(garmin)"
-            if not daily:
-                resilience = interpret.daily_series(
-                    _resilience_score_points(score_rows), how="latest"
-                )
-                daily = {day: 100.0 - score for day, score in resilience.items()}
-                source_label = "internal_resilience_proxy(100-resilience_score)"
+            resilience_daily = interpret.daily_series(
+                _localized(_resilience_score_points(score_rows), tz),
+                how="latest",
+            )
+            proxy_daily = {
+                day: max(0.0, min(100.0, 100.0 - score))
+                for day, score in resilience_daily.items()
+            }
+            daily, which = interpret.choose_stress_series(
+                garmin_daily,
+                proxy_daily,
+                anchor,
+            )
+            source_label = {
+                "garmin": "health_scores.stress(garmin)",
+                "proxy": "internal_resilience_proxy(100-resilience_score)",
+                "none": "health_scores.stress(garmin)",
+            }[which]
 
         entry = interpret.metric_baseline(daily, anchor)
         entry["unit"] = unit
@@ -952,7 +1005,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
     user_id = await _resolve_user_id()
     client = get_ow_client()
 
-    series_rows = await client.collect_timeseries(
+    series_rows, series_truncated = await client.collect_timeseries_tracked(
         user_id, start_utc.isoformat(), end_utc.isoformat(), [STRESS_SERIES_TYPE]
     )
     samples_utc = [
@@ -960,6 +1013,28 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
         for recorded_at, value in _stress_samples(series_rows)
         if start_utc <= recorded_at < end_utc
     ]
+
+    if samples_utc and len(samples_utc) < MIN_TIMELINE_SAMPLES and not series_truncated:
+        return {
+            "status": interpret.STATUS_INSUFFICIENT,
+            "date": day.isoformat(),
+            "timezone": str(tz),
+            "reason": "insufficient_stress_samples",
+            "confidence": "low",
+            "truncated": False,
+            "intervals": [],
+        }
+    if series_truncated and not samples_utc:
+        return {
+            "status": interpret.STATUS_INSUFFICIENT,
+            "date": day.isoformat(),
+            "timezone": str(tz),
+            "reason": "stress_timeseries_truncated",
+            "confidence": "low",
+            "coverage": 0.0,
+            "truncated": True,
+            "intervals": [],
+        }
 
     day_level: dict[str, Any] | None = None
     coverage: float | None = None
@@ -993,6 +1068,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
                     context.get("reason", "no_stress_timeseries_and_no_daily_proxy")
                 ),
                 "confidence": "low",
+                "truncated": False,
                 "intervals": [],
             }
         intervals = timeline.proxy_sections(day, tz, float(context["value"]))
@@ -1051,7 +1127,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
         )
         for interval in intervals
     ]
-    return {
+    response = {
         "status": interpret.STATUS_OK,
         "date": day.isoformat(),
         "timezone": str(tz),
@@ -1059,8 +1135,14 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
         "coverage": coverage,
         "confidence": confidence,
         "day_level_stress": day_level,
+        "truncated": series_truncated,
         "intervals": interval_payload,
     }
+    if series_truncated:
+        response["status"] = interpret.STATUS_INSUFFICIENT
+        response["reason"] = "stress_timeseries_truncated"
+        response["confidence"] = "low"
+    return response
 
 
 # Metric registry for compare_impact: how each metric is measured around an
@@ -1235,13 +1317,16 @@ async def _intraday_stress_deltas(
     for occurrence in occurrences:
         pre_start = occurrence.start - span
         post_end = occurrence.end + span
-        series_rows = await client.collect_timeseries(
+        series_rows, truncated = await client.collect_timeseries_tracked(
             user_id,
             pre_start.isoformat(),
             post_end.isoformat(),
             [STRESS_SERIES_TYPE],
             max_pages=4,
         )
+        if truncated:
+            skipped += 1
+            continue
         samples = _stress_samples(series_rows)
         before = impact.window_mean(
             samples, pre_start, occurrence.start, min_samples=IMPACT_MIN_SIDE_SAMPLES
@@ -1317,13 +1402,16 @@ async def compare_impact(
     occurrences.extend(workout_occurrences)
     occurrences.sort(key=lambda occurrence: occurrence.start)
     total_matched = len(occurrences)
-    truncated = total_matched > IMPACT_MAX_OCCURRENCES
-    if truncated:  # keep the most recent occurrences
-        occurrences = occurrences[-IMPACT_MAX_OCCURRENCES:]
 
     spec = dict(_IMPACT_METRICS[metric])
     if spec["kind"] == "nightly":
         occurrences_by_day = impact.dedupe_by_local_day(occurrences, tz)
+        truncated = len(occurrences_by_day) > IMPACT_MAX_OCCURRENCES
+        if truncated:
+            recent_days = sorted(occurrences_by_day)[-IMPACT_MAX_OCCURRENCES:]
+            occurrences_by_day = {
+                day: occurrences_by_day[day] for day in recent_days
+            }
         used = len(occurrences_by_day)
         daily, detail = await _nightly_daily_series(
             metric,
@@ -1336,6 +1424,9 @@ async def compare_impact(
         spec.update(detail)
         rows, skipped = impact.nightly_deltas(occurrences_by_day, daily)
     else:
+        truncated = total_matched > IMPACT_MAX_OCCURRENCES
+        if truncated:  # intraday metrics cap raw occurrences
+            occurrences = occurrences[-IMPACT_MAX_OCCURRENCES:]
         used = len(occurrences)
         rows, skipped = await _intraday_stress_deltas(client, user_id, occurrences, tz)
 

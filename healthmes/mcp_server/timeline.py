@@ -37,7 +37,7 @@ Fixed, documented policy (so results are reproducible and hand-checkable):
 import statistics
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any
 
 __all__ = [
@@ -92,7 +92,11 @@ class StressInterval:
 
     @property
     def duration_minutes(self) -> float:
-        return (self.end - self.start).total_seconds() / 60.0
+        return (_utc(self.end) - _utc(self.start)).total_seconds() / 60.0
+
+
+def _utc(value: datetime) -> datetime:
+    return value.astimezone(UTC)
 
 
 def stress_label(value: float) -> str:
@@ -105,9 +109,9 @@ def stress_label(value: float) -> str:
 
 def _median_step_minutes(points: Sequence[tuple[datetime, float]]) -> float:
     gaps = [
-        (points[i + 1][0] - points[i][0]).total_seconds() / 60.0
+        (_utc(points[i + 1][0]) - _utc(points[i][0])).total_seconds() / 60.0
         for i in range(len(points) - 1)
-        if points[i + 1][0] > points[i][0]
+        if _utc(points[i + 1][0]) > _utc(points[i][0])
     ]
     if not gaps:
         return FALLBACK_STEP_MINUTES
@@ -126,12 +130,12 @@ class _Run:
 
     @property
     def duration_minutes(self) -> float:
-        return (self.end - self.start).total_seconds() / 60.0
+        return (_utc(self.end) - _utc(self.start)).total_seconds() / 60.0
 
     def absorb(self, other: "_Run") -> None:
         self.points.extend(other.points)
-        self.points.sort(key=lambda item: item[0])
-        self.end = max(self.end, other.end)
+        self.points.sort(key=lambda item: _utc(item[0]))
+        self.end = max((self.end, other.end), key=_utc)
 
 
 def build_stress_intervals(
@@ -147,9 +151,12 @@ def build_stress_intervals(
     though the vendor ingest already filters them.
     """
     points = sorted(
-        (ts, float(value))
-        for ts, value in samples
-        if value is not None and float(value) >= 0.0
+        (
+            (ts, float(value))
+            for ts, value in samples
+            if value is not None and float(value) >= 0.0
+        ),
+        key=lambda item: _utc(item[0]),
     )
     if not points:
         return []
@@ -161,11 +168,16 @@ def build_stress_intervals(
     runs: list[_Run] = []
     for ts, value in points:
         label = stress_label(value)
-        if runs and runs[-1].label == label and ts - runs[-1].points[-1][0] <= max_gap:
+        end = (_utc(ts) + step).astimezone(ts.tzinfo)
+        if (
+            runs
+            and runs[-1].label == label
+            and _utc(ts) - _utc(runs[-1].points[-1][0]) <= max_gap
+        ):
             runs[-1].points.append((ts, value))
-            runs[-1].end = ts + step
+            runs[-1].end = end
         else:
-            runs.append(_Run(label=label, points=[(ts, value)], end=ts + step))
+            runs.append(_Run(label=label, points=[(ts, value)], end=end))
 
     # 2. smoothing: absorb short touching runs into their predecessor, then
     #    merge touching same-band neighbors created by the absorption.
@@ -173,7 +185,7 @@ def build_stress_intervals(
     for run in runs:
         if merged:
             prev = merged[-1]
-            touching = run.start <= prev.end
+            touching = _utc(run.start) <= _utc(prev.end)
             if touching and run.label == prev.label:
                 prev.absorb(run)
                 continue
@@ -185,7 +197,7 @@ def build_stress_intervals(
     if (
         len(merged) >= 2
         and merged[0].duration_minutes < min_run_minutes
-        and merged[1].start <= merged[0].end
+        and _utc(merged[1].start) <= _utc(merged[0].end)
     ):
         merged[1].absorb(merged[0])
         merged = merged[1:]
@@ -256,14 +268,16 @@ def attach_context(
     interval (a bucket is ``[bucket_start, bucket_start + bucket_minutes)``).
     """
     context: list[str] = []
+    window_start_utc = _utc(window_start)
+    window_end_utc = _utc(window_end)
 
     overlapping = sorted(
         (
             (start, end, summary)
             for start, end, summary in events
-            if start < window_end and end > window_start
+            if _utc(start) < window_end_utc and _utc(end) > window_start_utc
         ),
-        key=lambda item: (item[0], item[2] or ""),
+        key=lambda item: (_utc(item[0]), item[2] or ""),
     )
     for _start, _end, summary in overlapping[:max_events]:
         title = (summary or "").strip() or "(untitled)"
@@ -272,8 +286,11 @@ def attach_context(
     bucket_span = timedelta(minutes=bucket_minutes)
     minutes_by_category: dict[str, float] = {}
     for bucket_start, category, foreground_seconds in usage:
-        bucket_end = bucket_start + bucket_span
-        overlap = min(bucket_end, window_end) - max(bucket_start, window_start)
+        bucket_start_utc = _utc(bucket_start)
+        bucket_end_utc = bucket_start_utc + bucket_span
+        overlap = min(bucket_end_utc, window_end_utc) - max(
+            bucket_start_utc, window_start_utc
+        )
         overlap_seconds = overlap.total_seconds()
         if overlap_seconds <= 0:
             continue

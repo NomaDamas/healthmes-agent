@@ -166,9 +166,30 @@ class OWClient:
         provider: str | None = None,
     ) -> list[dict[str, Any]]:
         """All health-score rows in a window, following offset pagination."""
+        rows, _truncated = await self.collect_health_scores_tracked(
+            user_id,
+            start_date=start_date,
+            end_date=end_date,
+            category=category,
+            provider=provider,
+        )
+        return rows
+
+    async def collect_health_scores_tracked(
+        self,
+        user_id: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        category: str | None = None,
+        provider: str | None = None,
+        max_pages: int = MAX_PAGES,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Like :meth:`collect_health_scores`, plus a truncation flag."""
         rows: list[dict[str, Any]] = []
         offset = 0
-        for _ in range(MAX_PAGES):
+        has_more = False
+        for _ in range(max_pages):
             payload = await self.get_health_scores(
                 user_id,
                 start_date=start_date,
@@ -180,10 +201,16 @@ class OWClient:
             data = payload.get("data", [])
             rows.extend(data)
             pagination = payload.get("pagination", {})
-            if not pagination.get("has_more") or not data:
-                break
+            has_more = bool(pagination.get("has_more"))
+            if not has_more or not data:
+                return rows, False
             offset += len(data)
-        return rows
+        if has_more:
+            logger.warning(
+                "offset pagination stopped at max_pages=%d with more data available",
+                max_pages,
+            )
+        return rows, has_more
 
     # ------------------------------------------------------------------
     # Summaries (routes/v1/summaries.py — cursor pagination)
@@ -241,23 +268,51 @@ class OWClient:
         self, user_id: str, start_date: str, end_date: str
     ) -> list[dict[str, Any]]:
         """All daily sleep summaries in a window, following cursor pagination."""
-        rows, _ = await self._collect_cursor(
-            lambda cursor: self.get_sleep_summaries(
-                user_id, start_date, end_date, cursor=cursor
-            )
+        rows, _truncated = await self.collect_sleep_summaries_tracked(
+            user_id, start_date, end_date
         )
         return rows
+
+    async def collect_sleep_summaries_tracked(
+        self,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+        *,
+        max_pages: int = MAX_PAGES,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Like :meth:`collect_sleep_summaries`, plus a truncation flag."""
+        return await self._collect_cursor(
+            lambda cursor: self.get_sleep_summaries(
+                user_id, start_date, end_date, cursor=cursor
+            ),
+            max_pages=max_pages,
+        )
 
     async def collect_recovery_summaries(
         self, user_id: str, start_date: str, end_date: str
     ) -> list[dict[str, Any]]:
         """All daily recovery summaries in a window, following cursor pagination."""
-        rows, _ = await self._collect_cursor(
-            lambda cursor: self.get_recovery_summaries(
-                user_id, start_date, end_date, cursor=cursor
-            )
+        rows, _truncated = await self.collect_recovery_summaries_tracked(
+            user_id, start_date, end_date
         )
         return rows
+
+    async def collect_recovery_summaries_tracked(
+        self,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+        *,
+        max_pages: int = MAX_PAGES,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Like :meth:`collect_recovery_summaries`, plus a truncation flag."""
+        return await self._collect_cursor(
+            lambda cursor: self.get_recovery_summaries(
+                user_id, start_date, end_date, cursor=cursor
+            ),
+            max_pages=max_pages,
+        )
 
     # ------------------------------------------------------------------
     # Events (routes/v1/events.py — cursor pagination)
@@ -290,12 +345,27 @@ class OWClient:
         record_type: str | None = None,
     ) -> list[dict[str, Any]]:
         """All workouts in a window, following cursor pagination."""
-        rows, _ = await self._collect_cursor(
-            lambda cursor: self.get_workouts(
-                user_id, start_date, end_date, record_type=record_type, cursor=cursor
-            )
+        rows, _truncated = await self.collect_workouts_tracked(
+            user_id, start_date, end_date, record_type=record_type
         )
         return rows
+
+    async def collect_workouts_tracked(
+        self,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+        *,
+        record_type: str | None = None,
+        max_pages: int = MAX_PAGES,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Like :meth:`collect_workouts`, plus a truncation flag."""
+        return await self._collect_cursor(
+            lambda cursor: self.get_workouts(
+                user_id, start_date, end_date, record_type=record_type, cursor=cursor
+            ),
+            max_pages=max_pages,
+        )
 
     async def get_menstrual_cycles(
         self,
@@ -323,12 +393,26 @@ class OWClient:
         self, user_id: str, start_date: str, end_date: str
     ) -> list[dict[str, Any]]:
         """All menstrual-cycle records in a window, following cursor pagination."""
-        rows, _ = await self._collect_cursor(
-            lambda cursor: self.get_menstrual_cycles(
-                user_id, start_date, end_date, cursor=cursor
-            )
+        rows, _truncated = await self.collect_menstrual_cycles_tracked(
+            user_id, start_date, end_date
         )
         return rows
+
+    async def collect_menstrual_cycles_tracked(
+        self,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+        *,
+        max_pages: int = MAX_PAGES,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Like :meth:`collect_menstrual_cycles`, plus a truncation flag."""
+        return await self._collect_cursor(
+            lambda cursor: self.get_menstrual_cycles(
+                user_id, start_date, end_date, cursor=cursor
+            ),
+            max_pages=max_pages,
+        )
 
     async def get_sleep_sessions(
         self,
