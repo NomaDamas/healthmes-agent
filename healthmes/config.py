@@ -11,12 +11,15 @@ Never hardcode docker service hostnames here.
 
 import datetime
 import ipaddress
+import logging
 import zoneinfo
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -302,6 +305,34 @@ def get_settings() -> Settings:
     return Settings()
 
 
+def system_timezone() -> datetime.tzinfo:
+    """Return the machine's IANA timezone, never a captured local offset."""
+    try:
+        from tzlocal import get_localzone
+
+        local = get_localzone()
+        if isinstance(local, zoneinfo.ZoneInfo):
+            return local
+        key = getattr(local, "key", None)
+        if key:
+            return zoneinfo.ZoneInfo(str(key))
+    except Exception:
+        logger.debug("tzlocal could not resolve the system timezone", exc_info=True)
+
+    try:
+        target = Path("/etc/localtime").resolve(strict=True)
+        parts = target.parts
+        zoneinfo_index = parts.index("zoneinfo")
+        name = "/".join(parts[zoneinfo_index + 1 :])
+        if name:
+            return zoneinfo.ZoneInfo(name)
+    except (OSError, ValueError, zoneinfo.ZoneInfoNotFoundError):
+        logger.debug("/etc/localtime did not resolve to an IANA timezone", exc_info=True)
+
+    logger.warning("Could not resolve the system IANA timezone; falling back to UTC")
+    return datetime.UTC
+
+
 def resolve_timezone(settings: Settings) -> datetime.tzinfo:
     """The user's local timezone: ``Settings.timezone`` (IANA) or the machine's.
 
@@ -315,9 +346,7 @@ def resolve_timezone(settings: Settings) -> datetime.tzinfo:
     name = getattr(settings, "timezone", None)
     if name:
         return zoneinfo.ZoneInfo(str(name))
-    local = datetime.datetime.now().astimezone().tzinfo
-    assert local is not None  # astimezone() always attaches a tzinfo
-    return local
+    return system_timezone()
 
 
 def is_loopback_host(host: str) -> bool:

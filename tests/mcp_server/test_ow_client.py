@@ -275,3 +275,63 @@ class TestResolveSingleUserId:
                 return {"items": [{"id": "sync-user"}], "total": 1}
 
         assert await resolve_single_user_id(SyncFake(), settings) == "sync-user"
+
+
+class TestPaginationTruncationTracked:
+    """Defect 8: the collectors must surface a truncated flag when the page cap
+    stops a fetch with more data available (offset and cursor variants)."""
+
+    async def test_collect_health_scores_tracked_flags_offset_truncation(
+        self, fake_ow, ow_client, ow_user_id
+    ):
+        for minute in range(11):
+            fake_ow.add_score("stress", "garmin", f"2026-07-08T08:{minute:02d}:00Z", 30 + minute)
+        fake_ow.max_page_size = 1  # 10-page cap hit with an 11th row still available
+        rows, truncated = await ow_client.collect_health_scores_tracked(
+            ow_user_id, start_date="2026-07-08", end_date="2026-07-09"
+        )
+        assert len(rows) == 10
+        assert truncated is True
+        fake_ow.max_page_size = None  # now it drains fully
+        rows, truncated = await ow_client.collect_health_scores_tracked(
+            ow_user_id, start_date="2026-07-08", end_date="2026-07-09"
+        )
+        assert len(rows) == 11
+        assert truncated is False
+
+    async def test_collect_sleep_summaries_tracked_flags_cursor_truncation(
+        self, ow_user_id, ow_api_key
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            cursor = request.url.params.get("cursor")
+            n = int(cursor) if cursor else 0
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"date": f"2026-07-{n + 1:02d}"}],
+                    "pagination": {"next_cursor": str(n + 1)},  # never terminates
+                },
+            )
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+        rows, truncated = await client.collect_sleep_summaries_tracked(
+            ow_user_id, "2026-07-01", "2026-07-09", max_pages=3
+        )
+        assert len(rows) == 3  # capped
+        assert truncated is True  # a live cursor remained at the cap
+
+    async def test_plain_collectors_still_return_only_rows(
+        self, fake_ow, ow_client, ow_user_id
+    ):
+        # Backward-compat: the non-tracked API is unchanged for existing callers.
+        fake_ow.add_score("stress", "garmin", "2026-07-08T08:00:00Z", 30)
+        rows = await ow_client.collect_health_scores(
+            ow_user_id, start_date="2026-07-08", end_date="2026-07-09"
+        )
+        assert isinstance(rows, list)
+        assert rows[0]["value"] == 30
+

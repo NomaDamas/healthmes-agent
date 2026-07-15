@@ -46,6 +46,8 @@ MIN_SLEEP_DEBT_NIGHTS = 3
 
 # A daily stress/resilience reading older than this is not "today's" state.
 STRESS_MAX_STALE_DAYS = 3
+# Nocturnal HRV older than this is not a current readiness observation.
+HRV_MAX_STALE_DAYS = 3
 
 STATUS_OK = "ok"
 STATUS_INSUFFICIENT = "insufficient_data"
@@ -131,6 +133,7 @@ def metric_baseline(
     *,
     window_days: int = BASELINE_WINDOW_DAYS,
     min_days: int = MIN_BASELINE_DAYS,
+    max_stale_days: int | None = None,
 ) -> dict[str, Any]:
     """Current value vs trailing-median baseline for one daily metric.
 
@@ -165,6 +168,12 @@ def metric_baseline(
         "coverage": coverage_ratio(n_days, window_days),
         "confidence": confidence_label(n_days, window_days),
     }
+    stale_days = (as_of - current_day).days
+    if max_stale_days is not None and stale_days > max_stale_days:
+        result["status"] = STATUS_INSUFFICIENT
+        result["reason"] = f"current_reading_stale_gt_{max_stale_days}_days"
+        result["stale_days"] = stale_days
+        return result
     if n_days < min_days:
         result["status"] = STATUS_INSUFFICIENT
         result["reason"] = f"need_at_least_{min_days}_baseline_days"
@@ -283,6 +292,32 @@ def stress_context(
         "reason": "no_garmin_stress_and_no_internal_resilience_within_window",
         "confidence": "low",
     }
+
+
+def choose_stress_series(
+    garmin_by_day: Mapping[date, float],
+    proxy_by_day: Mapping[date, float],
+    as_of: date,
+    *,
+    max_stale_days: int = STRESS_MAX_STALE_DAYS,
+) -> tuple[dict[date, float], str]:
+    """Choose one complete stress series without mixing providers."""
+
+    def _latest(series: Mapping[date, float]) -> date | None:
+        candidates = [day for day in series if day <= as_of]
+        return max(candidates) if candidates else None
+
+    garmin_day = _latest(garmin_by_day)
+    proxy_day = _latest(proxy_by_day)
+    if garmin_day is not None and (as_of - garmin_day).days <= max_stale_days:
+        return dict(garmin_by_day), "garmin"
+    if proxy_day is not None and (as_of - proxy_day).days <= max_stale_days:
+        return dict(proxy_by_day), "proxy"
+    if garmin_day is None and proxy_day is None:
+        return {}, "none"
+    if proxy_day is None or (garmin_day is not None and garmin_day >= proxy_day):
+        return dict(garmin_by_day), "garmin"
+    return dict(proxy_by_day), "proxy"
 
 
 def overall_confidence(blocks: Iterable[Mapping[str, Any]]) -> str:

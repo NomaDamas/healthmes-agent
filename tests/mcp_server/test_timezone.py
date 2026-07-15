@@ -57,4 +57,55 @@ class TestLocalTimezoneResolution:
     def test_system_local_is_the_last_resort(self):
         server_module.set_settings(_StubSettings(None))  # type: ignore[arg-type]
         resolved = server_module._local_timezone()
-        assert isinstance(resolved, dt.tzinfo)
+        # Defect 2: never a captured fixed offset -- a real DST-aware IANA zone.
+        assert isinstance(resolved, zoneinfo.ZoneInfo)
+
+
+class TestSystemTimezone:
+    """Defect 2: the machine fallback resolves a real IANA zone, never a fixed
+    offset captured at process start (which would lose DST for off-season
+    queries)."""
+
+    def test_returns_real_iana_zone_not_fixed_offset(self):
+        from healthmes.config import system_timezone
+
+        tz = system_timezone()
+        assert isinstance(tz, zoneinfo.ZoneInfo)
+        assert not isinstance(tz, dt.timezone)  # never datetime.now().astimezone() offset
+
+    def test_falls_back_to_localtime_symlink_when_tzlocal_fails(self, monkeypatch):
+        import tzlocal
+
+        from healthmes.config import system_timezone
+
+        def _boom():
+            raise RuntimeError("tzlocal unavailable")
+
+        monkeypatch.setattr(tzlocal, "get_localzone", _boom)
+        tz = system_timezone()
+        # Resolved from the /etc/localtime symlink (Asia/Seoul on this machine);
+        # tolerate UTC on hosts without a zoneinfo symlink -- either way never a
+        # captured fixed local offset.
+        assert isinstance(tz, zoneinfo.ZoneInfo) or tz == dt.UTC
+
+    def test_falls_back_to_utc_when_everything_fails(self, monkeypatch):
+        import tzlocal
+
+        from healthmes import config
+        from healthmes.config import system_timezone
+
+        def _boom():
+            raise RuntimeError("tzlocal unavailable")
+
+        monkeypatch.setattr(tzlocal, "get_localzone", _boom)
+
+        class _BoomPath:
+            def __init__(self, *args):
+                pass
+
+            def resolve(self, *args, **kwargs):
+                raise OSError("no /etc/localtime")
+
+        monkeypatch.setattr(config, "Path", _BoomPath)
+        assert system_timezone() == dt.UTC
+

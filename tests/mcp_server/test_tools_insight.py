@@ -480,3 +480,64 @@ class TestStoreSideEffectsUntouched:
         )
         with store_factory() as session:
             assert session.scalars(select(FoodLog)).all() == []
+
+
+class TestReviewFindingFixes:
+    """Regression tests for the independent-review fixes on the insight tools
+    (Defects 4, 8, 9). Env is pinned to KST (UTC+9); DAY is the local test day."""
+
+    async def test_impact_dedupes_by_local_day_before_capping(
+        self, mcp_client, mcp_env, call_tool, store_factory
+    ):
+        # Defect 9: 31 wine logs on ONE local day would monopolize the 30-cap and
+        # starve the min-n gate; dedupe-by-local-day must run BEFORE the cap so
+        # the 4 valid prior days survive. (Old code -> insufficient_data.)
+        for minute in range(31):  # all on local day 07-06 (KST) -- the most recent
+            seed_food(
+                store_factory,
+                f"Red wine {minute}",
+                dt.datetime(2026, 7, 6, 3, minute, tzinfo=dt.UTC),  # 12:mm KST 07-06
+            )
+        for day in (1, 2, 3, 4):  # one wine log on each earlier local day
+            seed_food(
+                store_factory,
+                "Red wine dinner",
+                dt.datetime(2026, 7, day, 3, 0, tzinfo=dt.UTC),  # 12:00 KST 07-0d
+            )
+        for day in range(1, 8):  # internal sleep scores 07-01..07-07 so nights pair
+            mcp_env.add_score("sleep", "internal", f"2026-07-{day:02d}T07:00:00+09:00", 60 + day)
+
+        result = await call_tool(
+            mcp_client,
+            "compare_impact",
+            {"factor": "wine", "metric": "sleep_score", "window": "30d", "end_date": DAY},
+        )
+        assert result["status"] == "ok"
+        assert result["occurrences"]["total_matched"] == 35  # 31 + 4 raw matches
+        assert result["occurrences"]["used"] == 5  # 5 distinct local days survive the cap
+        assert result["occurrences"]["truncated"] is False  # 5 distinct days <= 30
+        assert result["effect"]["n"] == 5  # every survivor pairs
+
+    async def test_stress_timeline_truncation_is_insufficient(
+        self, mcp_client, mcp_env, call_tool
+    ):
+        # Defect 8: a truncated intraday series must not be presented as a full
+        # day. 21 in-window samples, page size 1, default 20-page cap -> truncated.
+        for minute in range(21):
+            mcp_env.add_stress_sample(f"2026-07-08T00:{minute:02d}:00Z", 20 + minute % 5)
+        mcp_env.timeseries_page_size = 1
+        result = await call_tool(mcp_client, "get_stress_timeline", {"date": DAY})
+        assert result["truncated"] is True
+        assert result["status"] == "insufficient_data"
+        assert result["reason"] == "stress_timeseries_truncated"
+
+    async def test_stress_timeline_single_sample_is_insufficient(
+        self, mcp_client, mcp_env, call_tool
+    ):
+        # Defect 4: one sample is not a timeline (>= MIN_TIMELINE_SAMPLES required).
+        mcp_env.add_stress_sample("2026-07-08T00:00:00Z", 42)  # 09:00 KST, in window
+        result = await call_tool(mcp_client, "get_stress_timeline", {"date": DAY})
+        assert result["status"] == "insufficient_data"
+        assert result["reason"] == "insufficient_stress_samples"
+        assert result["intervals"] == []
+

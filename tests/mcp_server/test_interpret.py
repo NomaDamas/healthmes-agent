@@ -172,3 +172,60 @@ class TestOverallConfidence:
     def test_all_insufficient_is_low(self):
         assert interpret.overall_confidence([{"status": "insufficient_data"}]) == "low"
         assert interpret.overall_confidence([]) == "low"
+
+
+class TestMetricBaselineStaleness:
+    """Defect 5: an optional max_stale_days ceiling on the 'current' reading.
+
+    Without the ceiling the latest value on/before as_of is treated as current
+    no matter how old; the readiness call site passes a ceiling so a stale HRV
+    is not reported as today's state. Other callers pass no ceiling and keep
+    the original behavior.
+    """
+
+    def test_stale_current_is_insufficient_only_when_gated(self):
+        # Latest reading is 7 days before as_of, with 5 prior history days.
+        daily = {days_ago(n): 50.0 for n in (7, 8, 9, 10, 11, 12)}
+        # Ungated (default): enough history -> ok (baseline behavior preserved).
+        assert interpret.metric_baseline(daily, D)["status"] == "ok"
+        # Gated at 3 days: the current reading is stale -> honest insufficient.
+        gated = interpret.metric_baseline(daily, D, max_stale_days=3)
+        assert gated["status"] == "insufficient_data"
+        assert gated["reason"] == "current_reading_stale_gt_3_days"
+        assert gated["stale_days"] == 7
+        assert gated["current"] == {"date": days_ago(7).isoformat(), "value": 50.0}
+
+    def test_freshness_gate_boundary(self):
+        fresh = {days_ago(n): 50.0 for n in (3, 4, 5, 6, 7, 8)}  # latest exactly 3d old
+        assert interpret.metric_baseline(fresh, D, max_stale_days=3)["status"] == "ok"
+        stale = {days_ago(n): 50.0 for n in (4, 5, 6, 7, 8, 9)}  # latest 4d old
+        result = interpret.metric_baseline(stale, D, max_stale_days=3)
+        assert result["status"] == "insufficient_data"
+        assert result["stale_days"] == 4
+
+
+class TestChooseStressSeries:
+    """Defect 6: pick ONE stress series by freshness near as_of, never mix."""
+
+    def test_fresh_garmin_wins(self):
+        series, which = interpret.choose_stress_series({D: 60.0}, {D: 40.0}, D)
+        assert which == "garmin"
+        assert series == {D: 60.0}
+
+    def test_stale_garmin_yields_to_fresh_proxy(self):
+        # Garmin reading is 60 days old; the proxy is today -> proxy must win
+        # (a stale Garmin reading must NOT suppress a fresh proxy).
+        series, which = interpret.choose_stress_series({days_ago(60): 40.0}, {D: 35.0}, D)
+        assert which == "proxy"
+        assert series == {D: 35.0}
+
+    def test_both_empty_is_none(self):
+        assert interpret.choose_stress_series({}, {}, D) == ({}, "none")
+
+    def test_neither_fresh_prefers_most_recent_then_garmin_on_tie(self):
+        newer_g = interpret.choose_stress_series({days_ago(5): 1.0}, {days_ago(10): 2.0}, D)
+        assert newer_g[1] == "garmin"
+        newer_p = interpret.choose_stress_series({days_ago(10): 1.0}, {days_ago(5): 2.0}, D)
+        assert newer_p[1] == "proxy"
+        tie = interpret.choose_stress_series({days_ago(5): 1.0}, {days_ago(5): 2.0}, D)
+        assert tie[1] == "garmin"
