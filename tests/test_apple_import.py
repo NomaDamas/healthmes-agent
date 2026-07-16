@@ -12,7 +12,6 @@ from pathlib import Path
 import httpx
 import pytest
 
-import healthmes.apple_import as apple_import
 from healthmes.apple_import import (
     AppleImportError,
     import_apple_export,
@@ -90,14 +89,14 @@ def test_open_corrupt_zip_fails_cleanly(tmp_path):
         open_export_xml(bad)
 
 
-def test_open_zip_cap_enforced_during_copy(tmp_path, monkeypatch):
-    # Cap below the actual member size: the copy loop must abort, proving the
-    # limit is enforced on drained bytes, not just declared metadata.
+def test_open_zip_cap_refuses_oversize_member(tmp_path):
+    # Cap below the member size: refused via the declared-size pre-check
+    # (copy-time enforcement is covered by the raw-XML cap test, which has
+    # no metadata to pre-check).
     zip_path = tmp_path / "export.zip"
     _write_zip(zip_path, {"apple_health_export/export.xml": XML_BODY})
-    monkeypatch.setattr(apple_import, "_MAX_XML_BYTES", 10)
-    with pytest.raises(AppleImportError, match="not a plausible"):
-        open_export_xml(zip_path)
+    with pytest.raises(AppleImportError, match="export a shorter range"):
+        open_export_xml(zip_path, max_bytes=10)
 
 
 def test_open_missing_file_fails(tmp_path):
@@ -162,12 +161,47 @@ def test_import_streams_zip_member(tmp_path, settings):
     assert result.filename == "내보내기.xml"
 
 
-def test_import_requires_user_id(tmp_path, settings):
+def _users_then_import_transport(captured: dict, users: list[dict]):
+    """Route GET /users (discovery) and POST import in one mock transport."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/api/v1/users"):
+            return httpx.Response(200, json={"items": users, "total": len(users)})
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json={"status": "processing", "task_id": "t-9"})
+
+    return httpx.MockTransport(handler)
+
+
+def test_import_discovers_sole_user(tmp_path, settings):
     xml = tmp_path / "export.xml"
     xml.write_bytes(XML_BODY)
-    # conftest settings has ow_user_id=None and no --user-id is given.
-    with pytest.raises(AppleImportError, match="no open-wearables user id"):
-        import_apple_export(xml, settings, transport=_capture_transport({}))
+    captured: dict = {}
+    result = import_apple_export(
+        xml,
+        settings,
+        transport=_users_then_import_transport(captured, [{"id": "sole-user"}]),
+    )
+    assert "/users/sole-user/" in captured["url"]
+    assert result.user_id == "sole-user"
+
+
+def test_import_refuses_ambiguous_user_discovery(tmp_path, settings):
+    xml = tmp_path / "export.xml"
+    xml.write_bytes(XML_BODY)
+    with pytest.raises(AppleImportError, match="multiple users"):
+        import_apple_export(
+            xml,
+            settings,
+            transport=_users_then_import_transport({}, [{"id": "a"}, {"id": "b"}]),
+        )
+
+
+def test_import_errors_when_no_users_exist(tmp_path, settings):
+    xml = tmp_path / "export.xml"
+    xml.write_bytes(XML_BODY)
+    with pytest.raises(AppleImportError, match="no users"):
+        import_apple_export(xml, settings, transport=_users_then_import_transport({}, []))
 
 
 def test_import_falls_back_to_settings_user(tmp_path, settings):
@@ -225,3 +259,53 @@ def test_import_rejects_non_json_success_body(tmp_path, settings):
     )
     with pytest.raises(AppleImportError, match="non-JSON"):
         import_apple_export(xml, settings, user_id="u", transport=transport)
+
+
+def test_import_rejects_success_without_task_id(tmp_path, settings):
+    xml = tmp_path / "export.xml"
+    xml.write_bytes(XML_BODY)
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"}))
+    with pytest.raises(AppleImportError, match="NOT imported"):
+        import_apple_export(xml, settings, user_id="u", transport=transport)
+
+
+def test_import_rejects_json_array_success_body(tmp_path, settings):
+    xml = tmp_path / "export.xml"
+    xml.write_bytes(XML_BODY)
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=["weird"]))
+    with pytest.raises(AppleImportError, match="NOT imported"):
+        import_apple_export(xml, settings, user_id="u", transport=transport)
+
+
+def test_import_redacts_api_key_reflected_in_error_body(tmp_path, settings):
+    xml = tmp_path / "export.xml"
+    xml.write_bytes(XML_BODY)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(500, text="debug echo: test-ow-api-key")
+    )
+    with pytest.raises(AppleImportError) as excinfo:
+        import_apple_export(xml, settings, user_id="u", transport=transport)
+    assert "test-ow-api-key" not in str(excinfo.value)
+    assert "***" in str(excinfo.value)
+
+
+def test_open_raw_xml_cap_enforced_during_copy(tmp_path):
+    xml = tmp_path / "export.xml"
+    xml.write_bytes(XML_BODY)
+    with pytest.raises(AppleImportError, match="exceeds 10 bytes"):
+        open_export_xml(xml, max_bytes=10)
+
+
+def test_open_zip_unsupported_compression_fails_cleanly(tmp_path):
+    # Patch the compression-method fields (local header offset 8, central
+    # directory offset +10) to 99: zipfile raises NotImplementedError on read.
+    zip_path = tmp_path / "export.zip"
+    _write_zip(zip_path, {"apple_health_export/export.xml": XML_BODY})
+    data = bytearray(zip_path.read_bytes())
+    data[8:10] = (99).to_bytes(2, "little")
+    cd = data.find(b"PK\x01\x02")
+    assert cd != -1
+    data[cd + 10 : cd + 12] = (99).to_bytes(2, "little")
+    zip_path.write_bytes(bytes(data))
+    with pytest.raises(AppleImportError, match="cannot extract"):
+        open_export_xml(zip_path)

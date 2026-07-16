@@ -458,7 +458,10 @@ def _cmd_import_apple(args: argparse.Namespace) -> int:
     from healthmes.apple_import import AppleImportError, import_apple_export
 
     try:
-        result = import_apple_export(args.file, settings, user_id=args.user_id)
+        kwargs = {} if args.max_bytes is None else {"max_bytes": args.max_bytes}
+        result = import_apple_export(
+            args.file, settings, user_id=args.user_id, **kwargs
+        )
     except AppleImportError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -617,7 +620,15 @@ def build_parser() -> argparse.ArgumentParser:
     import_apple.add_argument(
         "--user-id",
         default=None,
-        help="open-wearables user id (default: HEALTHMES_OW_USER_ID).",
+        help="open-wearables user id (default: HEALTHMES_OW_USER_ID, else "
+        "auto-discovered when exactly one user exists).",
+    )
+    import_apple.add_argument(
+        "--max-bytes",
+        type=int,
+        default=None,
+        help="Override the export-size cap (default 256 MiB — the vendor "
+        "direct-import endpoint buffers the file in server memory).",
     )
     import_apple.set_defaults(func=_cmd_import_apple)
 

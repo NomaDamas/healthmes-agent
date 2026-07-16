@@ -7,23 +7,27 @@ accepts only the raw XML (the Celery task writes the bytes to a temp file and
 parses them as XML — no archive handling), so this module extracts the main
 export XML from a ZIP before uploading.
 
-Export XMLs for years of data reach hundreds of MB, so nothing is buffered
-in memory: ZIP members are copied to a size-capped temp file and the upload
-streams a file object through httpx multipart.
+Nothing is buffered in client memory: both ZIP members and raw XML are
+snapshotted through a size-capped copy into an unlinked temp file and the
+upload streams that file object through httpx multipart. The cap defaults to
+256 MiB because the vendor ``/direct`` endpoint holds the whole body in
+server memory and hands the bytes to Celery (its docs steer larger files to
+the S3 presigned flow, which needs AWS SNS and is not part of the local
+stack). Making the vendor task take a file reference is a candidate upstream
+PR under the PLAN §1 vendor policy.
 
 This is the zero-app-code ingestion path (docs/PLAN.md §13): Health app →
 "모든 건강 데이터 보내기" → ``healthmes import apple <file>`` → real data in
-the data plane. Continuous ingestion (bridge receiver) builds on top of it.
+the data plane. Continuous ingestion (``/v1/ingest/healthkit``) builds on it.
 """
 
 import json
 import logging
-import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 import httpx
 
@@ -35,10 +39,21 @@ logger = logging.getLogger(__name__)
 # the importer understands; only the main export XML is uploaded.
 _EXCLUDED_XML_MARKERS = ("cda", "ecg", "electrocardiogram")
 
-# Copy-time ceiling: declared ZIP sizes can lie (zip bomb), so the cap is
-# enforced while draining the stream, not just against metadata.
-_MAX_XML_BYTES = 2 * 1024**3  # 2 GiB
+# Server-memory-bound ceiling (see module docstring), enforced while draining
+# the stream — declared ZIP sizes can lie and files can grow mid-read.
+DEFAULT_MAX_XML_BYTES = 256 * 1024 * 1024
+_WARN_BYTES = 32 * 1024 * 1024
 _COPY_CHUNK = 1024 * 1024
+
+# Everything the zipfile machinery raises for hostile/exotic archives
+# (unsupported compression → NotImplementedError, CRC/password → RuntimeError).
+_ZIP_READ_ERRORS = (
+    zipfile.BadZipFile,
+    NotImplementedError,
+    RuntimeError,
+    OSError,
+    EOFError,
+)
 
 
 class AppleImportError(Exception):
@@ -87,18 +102,24 @@ def _capped_copy(src: IO[bytes], dst: IO[bytes], *, limit: int) -> int:
         total += len(chunk)
         if total > limit:
             raise AppleImportError(
-                f"export XML exceeds {limit} bytes while extracting; "
-                "not a plausible Apple Health export"
+                f"export XML exceeds {limit} bytes; the direct-import endpoint "
+                "holds the whole file in server memory, so larger exports are "
+                "refused — export a shorter date range from the Health app, "
+                "or raise the cap explicitly with --max-bytes"
             )
         dst.write(chunk)
 
 
-def open_export_xml(path: Path) -> tuple[str, IO[bytes], int]:
+def open_export_xml(
+    path: Path, *, max_bytes: int = DEFAULT_MAX_XML_BYTES
+) -> tuple[str, IO[bytes], int]:
     """Open ``path`` and return ``(upload_filename, xml_stream, size_bytes)``.
 
     Accepts the raw ``export.xml`` or the ZIP straight from the Health app.
-    ZIP members are extracted to an unlinked temp file (never in memory);
-    the returned stream is positioned at 0 and the caller must close it.
+    Either way the bytes are snapshotted into an unlinked temp file through
+    the capped copy (a growing/mutated source cannot exceed the cap or
+    desync the upload length); the returned stream is positioned at 0 and
+    the caller must close it.
     """
     if not path.exists():
         raise AppleImportError(f"file not found: {path}")
@@ -108,53 +129,91 @@ def open_export_xml(path: Path) -> tuple[str, IO[bytes], int]:
     except OSError as exc:
         raise AppleImportError(f"cannot read {path}: {exc}") from exc
 
-    if is_zip:
-        spool = tempfile.TemporaryFile()
-        try:
+    spool = tempfile.TemporaryFile()
+    try:
+        if is_zip:
             with zipfile.ZipFile(path) as archive:
                 member = _pick_export_xml(archive)
-                if member.file_size > _MAX_XML_BYTES:
+                if member.file_size > max_bytes:
                     raise AppleImportError(
-                        f"export XML is {member.file_size} bytes "
-                        f"(> {_MAX_XML_BYTES}); not a plausible Apple Health export"
+                        f"export XML is {member.file_size} bytes (> {max_bytes}); "
+                        "export a shorter range or raise --max-bytes"
                     )
                 with archive.open(member) as src:
-                    size = _capped_copy(src, spool, limit=_MAX_XML_BYTES)
-            spool.seek(0)
-            return Path(member.filename).name, spool, size
-        except (zipfile.BadZipFile, OSError) as exc:
-            spool.close()
-            raise AppleImportError(f"cannot extract {path}: {exc}") from exc
-        except Exception:
-            spool.close()
-            raise
-
-    try:
-        size = path.stat().st_size
-        if size > _MAX_XML_BYTES:
-            raise AppleImportError(
-                f"{path} is {size} bytes (> {_MAX_XML_BYTES}); "
-                "not a plausible Apple Health export"
-            )
-        stream = path.open("rb")
-    except OSError as exc:
-        raise AppleImportError(f"cannot read {path}: {exc}") from exc
-
-    try:
-        head = stream.read(200).lstrip()
-        if not head.startswith(b"<?xml") and b"<HealthData" not in head:
-            raise AppleImportError(
-                f"{path} does not look like an Apple Health export "
-                "(expected XML, or pass the ZIP from the Health app)"
-            )
-        stream.seek(0)
+                    size = _capped_copy(src, spool, limit=max_bytes)
+            filename = Path(member.filename).name
+        else:
+            with path.open("rb") as src:
+                head = src.read(200).lstrip()
+                if not head.startswith(b"<?xml") and b"<HealthData" not in head:
+                    raise AppleImportError(
+                        f"{path} does not look like an Apple Health export "
+                        "(expected XML, or pass the ZIP from the Health app)"
+                    )
+                src.seek(0)
+                size = _capped_copy(src, spool, limit=max_bytes)
+            filename = path.name
     except AppleImportError:
-        stream.close()
+        spool.close()
         raise
-    except OSError as exc:
-        stream.close()
-        raise AppleImportError(f"cannot read {path}: {exc}") from exc
-    return path.name, stream, size
+    except _ZIP_READ_ERRORS as exc:
+        spool.close()
+        raise AppleImportError(f"cannot extract {path}: {exc}") from exc
+    except Exception:
+        spool.close()
+        raise
+
+    spool.seek(0)
+    return filename, spool, size
+
+
+def _redact(text: str, secret: str) -> str:
+    """Server-controlled text with the API key masked (echo/debug responses)."""
+    return text.replace(secret, "***") if secret else text
+
+
+def _discover_sole_user(
+    settings: Settings, *, transport: httpx.BaseTransport | None
+) -> str:
+    """The open-wearables user id when exactly one user exists.
+
+    Mirrors the repo convention that ``HEALTHMES_OW_USER_ID`` is optional on
+    single-user installs: ambiguity is an error, never a guess.
+    """
+    api_key = settings.ow_api_key.get_secret_value()
+    url = f"{settings.ow_base_url.rstrip('/')}/api/v1/users"
+    try:
+        with httpx.Client(timeout=30.0, transport=transport) as client:
+            response = client.get(
+                url,
+                params={"limit": 2},
+                headers={"X-Open-Wearables-API-Key": api_key},
+            )
+    except httpx.HTTPError as exc:
+        raise AppleImportError(
+            f"cannot discover the open-wearables user: {exc.__class__.__name__}: {exc}"
+        ) from exc
+    if response.status_code >= 400:
+        raise AppleImportError(
+            f"cannot discover the open-wearables user: HTTP {response.status_code}"
+        )
+    try:
+        items = response.json().get("items", [])
+    except (json.JSONDecodeError, ValueError, AttributeError) as exc:
+        raise AppleImportError(
+            "cannot discover the open-wearables user: unexpected response shape"
+        ) from exc
+    if len(items) == 1 and items[0].get("id"):
+        return str(items[0]["id"])
+    if not items:
+        raise AppleImportError(
+            "open-wearables has no users yet — create one first "
+            "(open-wearables dashboard), then re-run"
+        )
+    raise AppleImportError(
+        "open-wearables has multiple users — pass --user-id or set "
+        "HEALTHMES_OW_USER_ID"
+    )
 
 
 def import_apple_export(
@@ -162,26 +221,32 @@ def import_apple_export(
     settings: Settings,
     *,
     user_id: str | None = None,
+    max_bytes: int = DEFAULT_MAX_XML_BYTES,
     timeout: float = 600.0,
     transport: httpx.BaseTransport | None = None,
 ) -> AppleImportResult:
     """Upload the export at ``path`` to open-wearables for ``user_id``.
 
-    open-wearables answers 202-style ``{"status": "processing", "task_id":
-    ...}`` immediately and parses in a background worker; large exports keep
-    importing after this returns. The body is streamed from disk — memory
-    stays flat regardless of export size.
+    open-wearables answers ``{"status": "processing", "task_id": ...}``
+    immediately and parses in a background worker; large exports keep
+    importing after this returns. The body is streamed from disk — client
+    memory stays flat regardless of export size.
     """
-    resolved_user = (user_id or settings.ow_user_id or "").strip()
-    if not resolved_user:
-        raise AppleImportError(
-            "no open-wearables user id: pass --user-id or set HEALTHMES_OW_USER_ID"
-        )
     api_key = settings.ow_api_key.get_secret_value()
     if not api_key:
         raise AppleImportError("open-wearables API key missing: set HEALTHMES_OW_API_KEY")
+    resolved_user = (user_id or settings.ow_user_id or "").strip()
+    if not resolved_user:
+        resolved_user = _discover_sole_user(settings, transport=transport)
 
-    filename, xml_stream, size = open_export_xml(path)
+    filename, xml_stream, size = open_export_xml(path, max_bytes=max_bytes)
+    if size > _WARN_BYTES:
+        logger.warning(
+            "%s is %d MB; the vendor /direct endpoint buffers it in server "
+            "memory — expect a slow import on the local stack",
+            filename,
+            size // (1024 * 1024),
+        )
     url = (
         f"{settings.ow_base_url.rstrip('/')}"
         f"/api/v1/users/{resolved_user}/import/apple/xml/direct"
@@ -207,18 +272,27 @@ def import_apple_export(
         raise AppleImportError("open-wearables rejected the API key (401)")
     if response.status_code >= 400:
         raise AppleImportError(
-            f"upload failed: HTTP {response.status_code} — {response.text[:300]}"
+            f"upload failed: HTTP {response.status_code} — "
+            f"{_redact(response.text[:300], api_key)}"
         )
 
+    body: Any
     try:
         body = response.json()
     except (json.JSONDecodeError, ValueError) as exc:
         raise AppleImportError(
             f"open-wearables returned HTTP {response.status_code} but a non-JSON "
-            f"body: {response.text[:200]!r}"
+            f"body: {_redact(response.text[:200], api_key)!r}"
         ) from exc
+    task_id = body.get("task_id") if isinstance(body, dict) else None
+    if not task_id:
+        raise AppleImportError(
+            "open-wearables did not acknowledge the import (no task_id in "
+            f"response: {_redact(str(body)[:200], api_key)!r}) — treat the "
+            "upload as NOT imported"
+        )
     return AppleImportResult(
-        task_id=str(body.get("task_id", "")),
+        task_id=str(task_id),
         user_id=resolved_user,
         filename=filename,
         size_bytes=size,

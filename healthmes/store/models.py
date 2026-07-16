@@ -228,3 +228,29 @@ class TriggerEvent(Base):
     payload: Mapped[JSONDict | None]
     alert_sent: Mapped[bool] = mapped_column(default=False)
     dedup_key: Mapped[str_255 | None] = mapped_column(index=True)
+
+
+class RawIngestEvent(Base):
+    """Append-only index of raw payloads accepted by ``POST /v1/ingest/*``.
+
+    Raw-first principle (docs/PLAN.md §13): the verbatim payload is written
+    to ``HEALTHMES_DATA_DIR/raw_ingest/`` *before* any parsing, and this row
+    records where it landed and what the best-effort interpretation did.
+    Unparseable or unmapped payloads are kept, never rejected — long-horizon
+    unstructured data becomes interpretable as models improve. Rows are
+    never updated after the ingest request finishes and never deleted by
+    application code.
+    """
+
+    __tablename__ = "raw_ingest_event"
+
+    received_at: Mapped[datetime] = mapped_column(index=True)
+    source: Mapped[str_64] = mapped_column(index=True)
+    content_type: Mapped[str_255 | None]
+    path: Mapped[str_255]
+    size_bytes: Mapped[int]
+    sha256: Mapped[str_64] = mapped_column(index=True)
+    parse_status: Mapped[str_32] = mapped_column(default="stored")
+    forward_status: Mapped[str_32] = mapped_column(default="skipped")
+    forward_detail: Mapped[str_255 | None]
+    records_forwarded: Mapped[int] = mapped_column(default=0)

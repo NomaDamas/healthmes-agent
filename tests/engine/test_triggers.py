@@ -256,9 +256,10 @@ def test_dedup_key_is_unique_across_sweeps(settings, session_factory, alert_send
 
 
 def test_failed_push_is_recorded_and_not_retried(settings, session_factory) -> None:
+    off_settings = settings.model_copy(update={"native_alert_delivery": False})
     sender = FakeAlertSender(ok=False)
     with freeze_time("2026-07-09 14:00:00") as frozen:
-        evaluator = make_evaluator(settings, session_factory, sender, rules=(fixed_rule,))
+        evaluator = make_evaluator(off_settings, session_factory, sender, rules=(fixed_rule,))
         first = evaluator.evaluate_once()
         frozen.tick(timedelta(minutes=10))
         second = evaluator.evaluate_once()
@@ -293,10 +294,12 @@ def test_native_delivery_surfaces_alert_without_webhook(settings, session_factor
 
 
 def test_native_delivery_off_keeps_webhook_only_semantics(settings, session_factory) -> None:
-    """Default (native off): a failed webhook leaves the alert undelivered."""
+    """Native off (explicit — the default is on per PLAN §13): a failed
+    webhook leaves the alert undelivered."""
+    off_settings = settings.model_copy(update={"native_alert_delivery": False})
     sender = FakeAlertSender(ok=False)
     with freeze_time("2026-07-09 14:00:00"):
-        evaluator = make_evaluator(settings, session_factory, sender, rules=(fixed_rule,))
+        evaluator = make_evaluator(off_settings, session_factory, sender, rules=(fixed_rule,))
         report = evaluator.evaluate_once()
 
     assert [o.status for o in report.outcomes] == ["push_failed"]
@@ -311,9 +314,10 @@ def test_sender_exception_native_off_does_not_burn_dedup(settings, session_facto
     native delivery is off the alert is genuinely undelivered, so the row is
     deleted (delete+flush, not expunge) — otherwise the burned key would
     dedup-drop the retry forever."""
+    off_settings = settings.model_copy(update={"native_alert_delivery": False})
     sender = RaisingAlertSender()
     with freeze_time("2026-07-09 14:00:00"):
-        evaluator = make_evaluator(settings, session_factory, sender, rules=(fixed_rule,))
+        evaluator = make_evaluator(off_settings, session_factory, sender, rules=(fixed_rule,))
         report = evaluator.evaluate_once()
 
     assert [o.status for o in report.outcomes] == ["push_failed"]
@@ -325,11 +329,12 @@ def test_sender_exception_native_off_does_not_burn_dedup(settings, session_facto
 def test_sender_exception_recovers_on_next_sweep(settings, session_factory) -> None:
     """After a raising sweep unwinds the row, the identical fire re-fires and is
     delivered on the next sweep (same dedup key, never truly recorded)."""
+    off_settings = settings.model_copy(update={"native_alert_delivery": False})
     raising = RaisingAlertSender()
     working = FakeAlertSender()
     with freeze_time("2026-07-09 14:00:00") as frozen:
         failed = make_evaluator(
-            settings, session_factory, raising, rules=(fixed_rule,)
+            off_settings, session_factory, raising, rules=(fixed_rule,)
         ).evaluate_once()
         frozen.tick(timedelta(minutes=10))
         recovered = make_evaluator(

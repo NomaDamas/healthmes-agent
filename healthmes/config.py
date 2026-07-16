@@ -114,11 +114,22 @@ class Settings(BaseSettings):
     # trigger is surfaced to the apps even when no Hermes webhook is
     # configured or its push fails — so the phone gets alerts without Telegram.
     native_alert_delivery: bool = Field(
-        default=False,
+        default=True,
         description="Surface fired triggers to the native companion apps "
         "(/v1/alerts + glance) regardless of the Hermes webhook outcome — "
         "enables phone/watch alerts without Telegram. Alert hygiene (quiet "
-        "hours, cooldown, daily budget, dedup) still applies.",
+        "hours, cooldown, daily budget, dedup) still applies. On by default "
+        "(PLAN §13: alerts must work with zero setup); set false to make "
+        "Telegram the only channel.",
+    )
+
+    # Raw-first ingest receiver (PLAN §13; healthmes/api/ingest.py). Bridge
+    # apps push batches of HealthKit samples; 64 MiB comfortably covers
+    # multi-day backlogs while bounding request memory.
+    ingest_max_bytes: int = Field(
+        default=64 * 1024 * 1024,
+        ge=1,
+        description="Maximum accepted /v1/ingest payload size in bytes.",
     )
 
     # Native capture uploads (issue #10 companion apps; healthmes/api/media.py).
