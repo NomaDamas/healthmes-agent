@@ -1,21 +1,22 @@
 """Apple Health export upload (healthmes/apple_import.py).
 
 Covers the file-shape contract (raw XML vs Health-app ZIP, localized inner
-names, CDA companion exclusion) and the upload request itself via a mock
-transport — no network, per tests/conftest.py policy.
+names, CDA companion exclusion), streaming/cap behavior, and the upload
+request itself via a mock transport — no network, per tests/conftest.py
+policy.
 """
 
-import io
 import zipfile
 from pathlib import Path
 
 import httpx
 import pytest
 
+import healthmes.apple_import as apple_import
 from healthmes.apple_import import (
     AppleImportError,
     import_apple_export,
-    load_export_xml,
+    open_export_xml,
 )
 
 XML_BODY = b'<?xml version="1.0" encoding="UTF-8"?>\n<HealthData locale="ko_KR"></HealthData>\n'
@@ -27,18 +28,26 @@ def _write_zip(path: Path, members: dict[str, bytes]) -> None:
             archive.writestr(name, data)
 
 
-# --- load_export_xml ---------------------------------------------------------
+def _read_and_close(stream) -> bytes:
+    try:
+        return stream.read()
+    finally:
+        stream.close()
 
 
-def test_load_raw_xml(tmp_path):
+# --- open_export_xml ---------------------------------------------------------
+
+
+def test_open_raw_xml(tmp_path):
     xml = tmp_path / "export.xml"
     xml.write_bytes(XML_BODY)
-    filename, data = load_export_xml(xml)
+    filename, stream, size = open_export_xml(xml)
     assert filename == "export.xml"
-    assert data == XML_BODY
+    assert size == len(XML_BODY)
+    assert _read_and_close(stream) == XML_BODY
 
 
-def test_load_zip_picks_main_export_over_cda(tmp_path):
+def test_open_zip_picks_main_export_over_cda(tmp_path):
     zip_path = tmp_path / "export.zip"
     _write_zip(
         zip_path,
@@ -47,36 +56,60 @@ def test_load_zip_picks_main_export_over_cda(tmp_path):
             "apple_health_export/export_cda.xml": b"<ClinicalDocument/>" * 10,
         },
     )
-    filename, data = load_export_xml(zip_path)
+    filename, stream, size = open_export_xml(zip_path)
     assert filename == "export.xml"
-    assert data == XML_BODY
+    assert size == len(XML_BODY)
+    assert _read_and_close(stream) == XML_BODY
 
 
-def test_load_zip_localized_korean_export(tmp_path):
+def test_open_zip_localized_korean_export(tmp_path):
     zip_path = tmp_path / "내보내기.zip"
     _write_zip(zip_path, {"apple_health_export/내보내기.xml": XML_BODY})
-    filename, data = load_export_xml(zip_path)
+    filename, stream, _size = open_export_xml(zip_path)
     assert filename == "내보내기.xml"
-    assert data == XML_BODY
+    assert _read_and_close(stream) == XML_BODY
 
 
-def test_load_zip_without_xml_fails(tmp_path):
+def test_open_zip_without_xml_fails(tmp_path):
     zip_path = tmp_path / "notes.zip"
     _write_zip(zip_path, {"readme.txt": b"hi"})
     with pytest.raises(AppleImportError, match="no export XML"):
-        load_export_xml(zip_path)
+        open_export_xml(zip_path)
 
 
-def test_load_missing_file_fails(tmp_path):
+def test_open_corrupt_zip_fails_cleanly(tmp_path):
+    # Intact end-of-central-directory (so is_zipfile says yes) but a smashed
+    # local file header: reading the member raises BadZipFile, which must
+    # surface as AppleImportError, not a raw traceback.
+    good = tmp_path / "good.zip"
+    _write_zip(good, {"apple_health_export/export.xml": XML_BODY})
+    bad = tmp_path / "broken.zip"
+    data = good.read_bytes()
+    bad.write_bytes(b"XXXX" + data[4:])
+    with pytest.raises(AppleImportError, match="cannot extract"):
+        open_export_xml(bad)
+
+
+def test_open_zip_cap_enforced_during_copy(tmp_path, monkeypatch):
+    # Cap below the actual member size: the copy loop must abort, proving the
+    # limit is enforced on drained bytes, not just declared metadata.
+    zip_path = tmp_path / "export.zip"
+    _write_zip(zip_path, {"apple_health_export/export.xml": XML_BODY})
+    monkeypatch.setattr(apple_import, "_MAX_XML_BYTES", 10)
+    with pytest.raises(AppleImportError, match="not a plausible"):
+        open_export_xml(zip_path)
+
+
+def test_open_missing_file_fails(tmp_path):
     with pytest.raises(AppleImportError, match="file not found"):
-        load_export_xml(tmp_path / "nope.xml")
+        open_export_xml(tmp_path / "nope.xml")
 
 
-def test_load_non_xml_file_fails(tmp_path):
+def test_open_non_xml_file_fails(tmp_path):
     junk = tmp_path / "data.xml"
     junk.write_bytes(b"definitely not xml")
     with pytest.raises(AppleImportError, match="does not look like"):
-        load_export_xml(junk)
+        open_export_xml(junk)
 
 
 # --- import_apple_export -----------------------------------------------------
@@ -116,6 +149,19 @@ def test_import_uploads_multipart_with_api_key(tmp_path, settings):
     assert result.size_bytes == len(XML_BODY)
 
 
+def test_import_streams_zip_member(tmp_path, settings):
+    zip_path = tmp_path / "내보내기.zip"
+    _write_zip(zip_path, {"apple_health_export/내보내기.xml": XML_BODY})
+    captured: dict = {}
+
+    result = import_apple_export(
+        zip_path, settings, user_id="u", transport=_capture_transport(captured)
+    )
+
+    assert XML_BODY in captured["body"]
+    assert result.filename == "내보내기.xml"
+
+
 def test_import_requires_user_id(tmp_path, settings):
     xml = tmp_path / "export.xml"
     xml.write_bytes(XML_BODY)
@@ -153,4 +199,29 @@ def test_import_surfaces_server_error(tmp_path, settings):
         lambda request: httpx.Response(500, text="worker down")
     )
     with pytest.raises(AppleImportError, match="HTTP 500"):
+        import_apple_export(xml, settings, user_id="u", transport=transport)
+
+
+def test_import_wraps_network_error_without_leaking_key(tmp_path, settings):
+    xml = tmp_path / "export.xml"
+    xml.write_bytes(XML_BODY)
+
+    def explode(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(AppleImportError) as excinfo:
+        import_apple_export(
+            xml, settings, user_id="u", transport=httpx.MockTransport(explode)
+        )
+    assert "ConnectError" in str(excinfo.value)
+    assert "test-ow-api-key" not in str(excinfo.value)
+
+
+def test_import_rejects_non_json_success_body(tmp_path, settings):
+    xml = tmp_path / "export.xml"
+    xml.write_bytes(XML_BODY)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, text="<html>proxy page</html>")
+    )
+    with pytest.raises(AppleImportError, match="non-JSON"):
         import_apple_export(xml, settings, user_id="u", transport=transport)
