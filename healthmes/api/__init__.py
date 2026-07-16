@@ -20,6 +20,7 @@ from healthmes.api import (
     alerts,
     app_usage,
     briefing,
+    connect,
     decisions,
     energy,
     food,
@@ -50,6 +51,7 @@ routers: list[APIRouter] = [
     briefing.router,
     alerts.router,
     reports.router,
+    connect.router,
 ]
 
 

@@ -1,4 +1,4 @@
-"""HealthMes command line: serve the API or manage encrypted backups.
+"""HealthMes command line: serve the API, manage backups, connect calendars.
 
 ``python -m healthmes``            → serve (uvicorn), same as before
 ``python -m healthmes serve``      → serve explicitly
@@ -6,6 +6,16 @@
 ``python -m healthmes backup list``              → list snapshots (no passphrase)
 ``python -m healthmes backup restore <snapshot>``→ inspect; add --yes to apply
 ``python -m healthmes backup push <snapshot>``   → upload one snapshot to the vault
+``python -m healthmes connect google``           → browser OAuth; token saved locally
+``python -m healthmes connect icloud --username <apple-id>`` → app-password prompt
+``python -m healthmes connect status``           → which calendars are connected
+``python -m healthmes connect disconnect google|icloud``     → remove stored creds
+
+Calendar connections are runtime state under ``Settings.data_dir`` (docs/
+PLAN.md §6): once ``connect`` succeeds, the sync jobs pick the backend up
+automatically (healthmes/calendars/jobs.py::enabled_sources) — no ``.env``
+edit needed. Secrets are never taken from argv (the iCloud app password is
+prompted hidden via getpass) and never echoed.
 
 ``create``/``list``/``restore`` accept ``--provider {local,remote}``
 (default: the HEALTHMES_BACKUP_PROVIDER selector, then local). The remote
@@ -22,6 +32,7 @@ and process listings).
 """
 
 import argparse
+import getpass
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -35,6 +46,8 @@ from healthmes.backup.snapshot import (
     resolve_backup_provider_name,
     resolve_passphrase,
 )
+from healthmes.calendars import creds as calendar_creds
+from healthmes.calendars.base import CalendarError
 from healthmes.config import Settings, get_settings, is_loopback_host
 
 if TYPE_CHECKING:  # pragma: no cover — typing only; runtime import stays lazy
@@ -249,6 +262,195 @@ def _cmd_backup_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- calendar connections (healthmes connect ...) ---------------------------
+
+
+GOOGLE_SETUP_INSTRUCTIONS = """\
+One-time Google setup (Google requires registering your own OAuth client;
+there is no way around this for a personal installed app):
+
+  1. Open https://console.cloud.google.com/ and create (or select) a project.
+  2. "APIs & Services" -> "Library": enable the **Google Calendar API**.
+  3. "APIs & Services" -> "OAuth consent screen": configure it and add your
+     own Google account as a test user.
+  4. "APIs & Services" -> "Credentials" -> "Create credentials" ->
+     "OAuth client ID" -> application type **Desktop app**.
+  5. Download the client JSON and save it to:
+       {client_secret_path}
+     (or point HEALTHMES_GOOGLE_CLIENT_SECRET_FILE at wherever you keep it).
+
+Then re-run:  healthmes connect google"""
+
+
+def _google_client_secret(settings: Settings) -> Path | None:
+    """The client secret to use: the data-dir standard path, else the override."""
+    from healthmes.calendars import google as google_calendar
+
+    standard = google_calendar.google_client_secret_path(settings.data_dir)
+    if standard.exists():
+        return standard
+    override = settings.google_client_secret_file
+    if override is not None and Path(override).exists():
+        return Path(override)
+    return None
+
+
+def _google_identity(google_calendar, credentials, calendar_id: str) -> str | None:
+    """Best-effort display identity of the authorized calendar (never fails).
+
+    ``calendars.get('primary')`` returns the account email as the summary for
+    most accounts; any API/permission hiccup degrades to ``None`` — the token
+    is already saved, so the connect must not fail on a cosmetic probe.
+    """
+    try:
+        service = google_calendar.build_calendar_service(credentials)
+        info = service.calendars().get(calendarId=calendar_id).execute()
+        return str(info.get("summary") or info.get("id") or "") or None
+    except Exception:  # noqa: BLE001 - cosmetic probe only
+        return None
+
+
+def _cmd_connect_google(args: argparse.Namespace) -> int:
+    settings = _cli_settings()
+    from healthmes.calendars import google as google_calendar
+
+    token_path = google_calendar.google_token_path(settings.data_dir)
+    if calendar_creds.google_connection_state(settings.data_dir) == "connected":
+        print(f"Google Calendar is already connected (token at {token_path}).")
+        print("To re-authorize, run `healthmes connect disconnect google` first.")
+        return 0
+
+    client_secret = _google_client_secret(settings)
+    if client_secret is None:
+        expected = google_calendar.google_client_secret_path(settings.data_dir)
+        print("error: no Google OAuth client secret found.\n", file=sys.stderr)
+        print(
+            GOOGLE_SETUP_INSTRUCTIONS.format(client_secret_path=expected),
+            file=sys.stderr,
+        )
+        return 1
+
+    print("Opening your browser for Google login + consent ...")
+    credentials = google_calendar.run_installed_app_flow(
+        client_secret, token_path, port=args.port
+    )
+    identity = _google_identity(google_calendar, credentials, settings.google_calendar_id)
+    if identity:
+        print(f"connected as {identity}")
+    else:
+        print("connected")
+    print(f"token saved to {token_path} (owner-only)")
+    print(
+        "Google Calendar sync is now enabled automatically (the poll job "
+        "detects this token; HEALTHMES_GOOGLE_CALENDAR_ENABLED=true also "
+        "works). Polling runs while the service has "
+        "HEALTHMES_SCHEDULER_ENABLED=true."
+    )
+    return 0
+
+
+def _cmd_connect_icloud(args: argparse.Namespace) -> int:
+    settings = _cli_settings()
+    username = args.username.strip()
+    if not username:
+        print("error: --username must be a non-empty Apple ID email", file=sys.stderr)
+        return 1
+    url = (args.url or settings.caldav_url).strip()
+    app_password = getpass.getpass(
+        "App-specific password (hidden; create one at https://appleid.apple.com): "
+    ).strip()
+    if not app_password:
+        print("error: empty password — nothing stored.", file=sys.stderr)
+        return 1
+
+    print(f"validating CalDAV connection to {url} as {username} ...")
+    summary = calendar_creds.validate_caldav_connection(
+        username=username, app_password=app_password, url=url
+    )
+    path = calendar_creds.save_caldav_credentials(
+        settings.data_dir, username=username, app_password=app_password, url=url
+    )
+    print(f"connected as {username} — {summary}")
+    print(f"credentials saved to {path} (owner-only, mode 600)")
+    print(
+        "iCloud calendar sync is now enabled automatically (the poll job "
+        "detects this credentials file; the HEALTHMES_CALDAV_* env vars keep "
+        "working and override it). Polling runs while the service has "
+        "HEALTHMES_SCHEDULER_ENABLED=true."
+    )
+    return 0
+
+
+def _cmd_connect_status(_args: argparse.Namespace) -> int:
+    settings = _cli_settings()
+    from healthmes.calendars import google as google_calendar
+
+    google_state = calendar_creds.google_connection_state(settings.data_dir)
+    token_path = google_calendar.google_token_path(settings.data_dir)
+    if google_state == "connected":
+        print(f"google: connected (token at {token_path})")
+    elif google_state == "invalid":
+        print(
+            "google: not connected — token file exists but is unusable; "
+            "run `healthmes connect disconnect google`, then `healthmes connect google`"
+        )
+    else:
+        print("google: not connected — run `healthmes connect google`")
+    if settings.google_calendar_enabled and google_state != "connected":
+        print(
+            "        note: HEALTHMES_GOOGLE_CALENDAR_ENABLED=true forces the poll "
+            "job on, but it will fail until a token exists"
+        )
+
+    resolved = calendar_creds.resolve_caldav_credentials(settings)
+    if resolved is not None:
+        origin = ".env (HEALTHMES_CALDAV_*)" if resolved.source == "env" else (
+            f"creds file at {calendar_creds.caldav_credentials_path(settings.data_dir)}"
+        )
+        print(f"icloud: connected as {resolved.username} (via {origin})")
+        if resolved.source == "env" and (
+            calendar_creds.load_caldav_credentials(settings.data_dir) is not None
+        ):
+            print("        note: a creds file also exists; the env values override it")
+    else:
+        print(
+            "icloud: not connected — run `healthmes connect icloud "
+            "--username <apple-id>`"
+        )
+    if not settings.scheduler_enabled:
+        print(
+            "note: HEALTHMES_SCHEDULER_ENABLED is false — connected calendars "
+            "are polled only while the service runs with it set to true"
+        )
+    return 0
+
+
+def _cmd_connect_disconnect(args: argparse.Namespace) -> int:
+    settings = _cli_settings()
+    if args.target == "google":
+        from healthmes.calendars import google as google_calendar
+
+        removed = calendar_creds.delete_google_token(settings.data_dir)
+        token_path = google_calendar.google_token_path(settings.data_dir)
+        print(f"removed {token_path}" if removed else "nothing to remove (no stored token)")
+        if settings.google_calendar_enabled:
+            print(
+                "note: HEALTHMES_GOOGLE_CALENDAR_ENABLED=true still forces the "
+                "poll job on; unset it to fully disable"
+            )
+        return 0
+    removed = calendar_creds.delete_caldav_credentials(settings.data_dir)
+    creds_path = calendar_creds.caldav_credentials_path(settings.data_dir)
+    print(f"removed {creds_path}" if removed else "nothing to remove (no stored credentials)")
+    if settings.caldav_username.strip() and settings.caldav_app_password.get_secret_value():
+        print(
+            "note: HEALTHMES_CALDAV_USERNAME/HEALTHMES_CALDAV_APP_PASSWORD are "
+            "still set in the environment/.env and keep the connection alive; "
+            "clear them to fully disconnect"
+        )
+    return 0
+
+
 def _add_passphrase_file(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--passphrase-file",
@@ -324,6 +526,53 @@ def build_parser() -> argparse.ArgumentParser:
     push.add_argument("snapshot", help="Snapshot file path, or bare name in the backup dir.")
     push.set_defaults(func=_cmd_backup_push)
 
+    connect = subparsers.add_parser(
+        "connect",
+        help="Connect calendars: Google (browser OAuth) / iCloud (app-specific password).",
+    )
+    connect_sub = connect.add_subparsers(dest="connect_command", required=True)
+
+    connect_google = connect_sub.add_parser(
+        "google",
+        help="Run the installed-app OAuth flow in your browser; the token is "
+        "saved to {data_dir}/google/calendar_token.json. Requires the one-time "
+        "OAuth client secret (instructions are printed when it is missing).",
+    )
+    connect_google.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Fixed localhost port for the OAuth loopback listener (default: random free port).",
+    )
+    connect_google.set_defaults(func=_cmd_connect_google)
+
+    connect_icloud = connect_sub.add_parser(
+        "icloud",
+        help="Connect iCloud Calendar via CalDAV: prompts (hidden) for an "
+        "app-specific password, validates against the server, then stores the "
+        "credential owner-only under {data_dir}/caldav/.",
+    )
+    connect_icloud.add_argument(
+        "--username", required=True, help="Apple ID email (the iCloud account)."
+    )
+    connect_icloud.add_argument(
+        "--url",
+        default=None,
+        help="CalDAV discovery URL (default: HEALTHMES_CALDAV_URL, i.e. iCloud).",
+    )
+    connect_icloud.set_defaults(func=_cmd_connect_icloud)
+
+    connect_status = connect_sub.add_parser(
+        "status", help="Show which calendars are connected (never prints secrets)."
+    )
+    connect_status.set_defaults(func=_cmd_connect_status)
+
+    connect_disconnect = connect_sub.add_parser(
+        "disconnect", help="Remove the stored token/credentials for one calendar."
+    )
+    connect_disconnect.add_argument("target", choices=("google", "icloud"))
+    connect_disconnect.set_defaults(func=_cmd_connect_disconnect)
+
     return parser
 
 
@@ -333,7 +582,7 @@ def main(argv: list[str] | None = None) -> int:
         return _serve()  # bare `python -m healthmes` keeps serving (compose/dev_mac.sh)
     try:
         return args.func(args)
-    except BackupError as exc:
+    except (BackupError, CalendarError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

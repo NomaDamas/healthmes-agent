@@ -168,6 +168,13 @@ class Settings(BaseSettings):
         default="primary",
         description="Google calendar id to mirror ('primary' or a specific calendar's id).",
     )
+    google_client_secret_file: Path | None = Field(
+        default=None,
+        description="Optional path to a Google OAuth client-secret JSON, used by "
+        "`healthmes connect google` when {data_dir}/google/client_secret.json "
+        "is absent (the standard location keeps working; this is an override "
+        "for keeping the download wherever you like).",
+    )
     google_poll_minutes: int = Field(
         default=5,
         ge=1,
@@ -278,6 +285,7 @@ class Settings(BaseSettings):
         "backup_dir",
         "ow_database_url",
         "hermes_home",
+        "google_client_secret_file",
         "backup_provider",
         "vault_endpoint",
         "vault_bucket",

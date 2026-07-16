@@ -1,0 +1,73 @@
+{% extends "ui/_base.html.j2" %}
+{# Calendar-connection STATUS page (healthmes/api/connect.py) — read-only.
+   Renders connection state + the exact CLI commands to run; performs no
+   writes and shows no secret (no tokens, no passwords, no usernames). Every
+   string comes from server-side static text / data-dir paths. #}
+
+{% block title %}캘린더 연결 — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">/ 캘린더 연결</span>{% endblock %}
+
+{% block head %}
+<style>
+  .conn-badge-on {
+    background: var(--brand-soft); border-color: var(--brand); color: var(--brand-deep);
+  }
+  .conn-badge-off { background: var(--surface-2); color: var(--ink-2); }
+  .conn-cmd {
+    display: block; margin: 0.55rem 0; padding: 0.6rem 0.8rem;
+    background: var(--surface-2); border: 1px solid var(--line-soft);
+    border-radius: var(--radius-sm); overflow-x: auto; white-space: pre;
+  }
+  ol.conn-steps { margin: 0.4rem 0 0.2rem; padding-left: 1.3rem; }
+  ol.conn-steps li { margin: 0.25rem 0; font-size: 0.9rem; }
+  .conn-note { color: var(--ink-2); font-size: 0.86rem; margin: 0.35rem 0; }
+</style>
+{% endblock %}
+
+{% block content %}
+<p class="eyebrow">Calendar connections</p>
+<h1>캘린더 연결</h1>
+<p class="muted">이 페이지는 <strong>상태 표시 전용</strong>입니다 — 연결/해제는 이 기기의
+  터미널에서 실행하며, 토큰·앱 암호 같은 비밀 값은 이 페이지에 절대 표시되지 않습니다.</p>
+{% if not scheduler_enabled %}
+<p class="conn-note">참고: 연결되어 있어도 캘린더 폴링은 서비스가
+  <code>HEALTHMES_SCHEDULER_ENABLED=true</code> 로 실행 중일 때만 동작합니다.</p>
+{% endif %}
+
+{% for cal in cards %}
+<section class="card">
+  <h2>{{ cal.label }}
+    {% if cal.connected %}
+    <span class="badge conn-badge-on">연결됨</span>
+    {% else %}
+    <span class="badge conn-badge-off">미연결</span>
+    {% endif %}
+  </h2>
+  <p class="muted">{{ cal.detail }}</p>
+  {% for note in cal.notes %}
+  <p class="conn-note">{{ note }}</p>
+  {% endfor %}
+  {% if not cal.connected %}
+    {% if cal.steps %}
+    <p>최초 1회 준비 (Google이 요구하는 개인 OAuth 클라이언트 등록):</p>
+    <ol class="conn-steps">
+      {% for step in cal.steps %}
+      <li>{{ step }}</li>
+      {% endfor %}
+    </ol>
+    <p>그 다음, 저장소 루트 터미널에서:</p>
+    {% else %}
+    <p>저장소 루트 터미널에서 아래 명령을 실행하세요:</p>
+    {% endif %}
+    <code class="conn-cmd">{{ cal.command }}</code>
+    {% if cal.link_url %}
+    <p class="conn-note"><a href="{{ cal.link_url }}" rel="noopener noreferrer">{{ cal.link_label }}</a>
+      — Apple 계정 암호가 아닌 <strong>앱 암호</strong>를 사용합니다.</p>
+    {% endif %}
+  {% endif %}
+</section>
+{% endfor %}
+
+<p class="muted">연결 확인/해제: <code>uv run healthmes connect status</code> ·
+  <code>uv run healthmes connect disconnect google|icloud</code></p>
+{% endblock %}

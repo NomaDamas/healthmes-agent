@@ -36,8 +36,9 @@ The service exposes `/health`, the REST surface under `/v1/*` (including the
 companion-app glance briefing at `/v1/briefing/glance`), the cognitive-energy
 forecast at `/cognitive-energy/forecast`, the decision viewer at `/decisions`
 + `/decisions/{id}` (Mermaid, served fully locally), the weekly report at
-`/reports/weekly` (+ `.json` twin), and the Layer-B MCP server (Streamable
-HTTP) at exactly `/mcp`.
+`/reports/weekly` (+ `.json` twin), the read-only calendar-connection status
+page at `/connect` (see "캘린더 연결"), and the Layer-B MCP server
+(Streamable HTTP) at exactly `/mcp`.
 
 Background jobs (the 10-minute trigger sweep, the hourly cognitive-energy
 persist and the weekly encrypted backup) are all registered at startup but
@@ -452,6 +453,76 @@ Client caveats worth knowing (all handled by the shipped apps):
 - Push relay (APNs/FCM/WNS) is out of scope **by design** — notification
   delivery is OS-budgeted polling; Telegram is the guaranteed channel.
 
+## 캘린더 연결 (calendar connect)
+
+`healthmes connect` is the low-friction onboarding for the two calendar
+mirrors (docs/PLAN.md §6). A successful connect stores the credential as
+runtime state under `{HEALTHMES_DATA_DIR}` and the sync jobs detect it
+automatically — **no `.env` edit needed** (the `HEALTHMES_GOOGLE_CALENDAR_
+ENABLED` / `HEALTHMES_CALDAV_*` settings keep working and override the stored
+files). Polling itself runs only while the service has
+`HEALTHMES_SCHEDULER_ENABLED=true`. Connection status is also served
+read-only at `GET /connect` (linked from the landing page as "캘린더 연결";
+gated like the other viewer pages, renders no secrets).
+
+### Google Calendar — one-time OAuth client, then one browser login
+
+Honest caveat: Google has no way around a **one-time app registration** for a
+personal installed app — you must create your own OAuth client once. After
+that, connecting (and re-connecting) is a single browser login.
+
+One-time (Google Cloud Console):
+
+1. Open <https://console.cloud.google.com/> and create (or select) a project.
+2. "APIs & Services" → "Library": enable the **Google Calendar API**.
+3. "APIs & Services" → "OAuth consent screen": configure it and add your own
+   Google account as a test user.
+4. "APIs & Services" → "Credentials" → "Create credentials" →
+   "OAuth client ID" → application type **Desktop app**.
+5. Download the client JSON and save it to
+   `{HEALTHMES_DATA_DIR}/google/client_secret.json` (or point
+   `HEALTHMES_GOOGLE_CLIENT_SECRET_FILE` at wherever you keep it).
+
+Then, whenever you want to connect:
+
+```bash
+uv run healthmes connect google      # opens the browser: log in + consent
+```
+
+The token is saved to `{HEALTHMES_DATA_DIR}/google/calendar_token.json`
+(owner-only) and the Google poll job is enabled by its presence. If the
+client secret is missing, the command prints exactly these setup steps.
+
+### iCloud Calendar (CalDAV) — app-specific password only
+
+1. Create an **app-specific password** at <https://appleid.apple.com>
+   (Sign-In and Security → App-Specific Passwords) — never the account
+   password.
+2. Connect (the password is prompted hidden — it never touches argv or shell
+   history — and validated against `caldav.icloud.com` before anything is
+   stored):
+
+```bash
+uv run healthmes connect icloud --username you@icloud.com
+```
+
+On success the credential lands in
+`{HEALTHMES_DATA_DIR}/caldav/credentials.json` with mode 600 and the CalDAV
+poll job is enabled by its presence.
+
+### Status / disconnect
+
+```bash
+uv run healthmes connect status              # which calendars are connected (no secrets)
+uv run healthmes connect disconnect google   # remove the stored token
+uv run healthmes connect disconnect icloud   # remove the stored credentials
+```
+
+Future work (deliberately not built): a hosted "connect with Google" button
+in the web UI would require a registered redirect URI on this service plus
+web-flow secret handling; the `/connect` page therefore shows status +
+instructions only and performs no writes.
+
 ## Real credentials — what needs what
 
 Everything in `tests/` runs offline; the features below only come alive with
@@ -464,8 +535,8 @@ corresponding integrations stay inactive.
 | The agent itself (Claude API) | Anthropic API key | `ANTHROPIC_API_KEY` in `.env` (hermes gateway) |
 | Health data reads (MCP tools, triggers, insights) | open-wearables API key from its developer portal (`:8000/docs`) | `HEALTHMES_OW_API_KEY` (+ `OPEN_WEARABLES_API_KEY` for the vendored MCP server) |
 | Wearable provider syncs | per-provider OAuth apps (Garmin, Oura, ...) | `config/open-wearables.env` (see the vendor backend docs) |
-| Google Calendar mirror | OAuth client secret + one interactive consent | `{HEALTHMES_DATA_DIR}/google/client_secret.json`, then run the installed-app flow once to mint `calendar_token.json`; set `HEALTHMES_GOOGLE_CALENDAR_ENABLED=true` (polled every `HEALTHMES_GOOGLE_POLL_MINUTES` by the in-service scheduler — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
-| Apple Calendar (iCloud CalDAV) mirror | app-specific password from appleid.apple.com | `HEALTHMES_CALDAV_USERNAME` + `HEALTHMES_CALDAV_APP_PASSWORD`; set `HEALTHMES_CALDAV_ENABLED=true` (polled every `HEALTHMES_CALDAV_POLL_MINUTES` — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
+| Google Calendar mirror | OAuth client secret + one interactive consent | one-time client secret to `{HEALTHMES_DATA_DIR}/google/client_secret.json`, then `uv run healthmes connect google` (see "캘린더 연결") — the stored token auto-enables the mirror; `HEALTHMES_GOOGLE_CALENDAR_ENABLED=true` still works (polled every `HEALTHMES_GOOGLE_POLL_MINUTES` — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
+| Apple Calendar (iCloud CalDAV) mirror | app-specific password from appleid.apple.com | `uv run healthmes connect icloud --username <apple-id>` (see "캘린더 연결") — the stored creds file auto-enables the mirror; the env pair `HEALTHMES_CALDAV_USERNAME` + `HEALTHMES_CALDAV_APP_PASSWORD` (+ `HEALTHMES_CALDAV_ENABLED=true`) still works and overrides it (polled every `HEALTHMES_CALDAV_POLL_MINUTES` — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
 | Proactive alert push (HealthMes -> Hermes) | shared HMAC secret | `HEALTHMES_HERMES_WEBHOOK_SECRET` — generated into `.env` by `scripts/bootstrap.py` |
 | Encrypted backups (CLI + weekly job) | a passphrase you choose (and must not lose) | `HEALTHMES_BACKUP_PASSPHRASE` in `.env`, or `--passphrase-file` |
 | Remote vault replication (ciphertext-only, optional) | S3-compatible bucket + access keys (AWS S3 / Cloudflare R2 / MinIO) | `HEALTHMES_VAULT_BUCKET` (+ `HEALTHMES_VAULT_ENDPOINT`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`/`_REGION`/`_PREFIX`); opt in with `HEALTHMES_BACKUP_PROVIDER=remote_vault` or `--provider remote` |
