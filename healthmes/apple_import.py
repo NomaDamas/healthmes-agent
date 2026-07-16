@@ -200,13 +200,17 @@ def _discover_sole_user(
     try:
         envelope = response.json()
         items = envelope.get("items", [])
-        total = envelope.get("total", len(items))
+        total = envelope.get("total")
     except (json.JSONDecodeError, ValueError, AttributeError) as exc:
         raise AppleImportError(
             "cannot discover the open-wearables user: unexpected response shape"
         ) from exc
     # total matters: the page can be filtered down to one item while more
     # users exist — guessing an account is never acceptable.
+    if not isinstance(total, int):
+        raise AppleImportError(
+            "cannot discover the open-wearables user: response lacks a total count"
+        )
     if total == 1 and len(items) == 1 and items[0].get("id"):
         return str(items[0]["id"])
     if not items:
@@ -274,7 +278,8 @@ def import_apple_export(
 
     if response.status_code == 401:
         raise AppleImportError("open-wearables rejected the API key (401)")
-    if response.status_code >= 400:
+    if response.status_code != 200:
+        # The vendor answers exactly 200; a redirect is not an acceptance.
         raise AppleImportError(
             f"upload failed: HTTP {response.status_code} — "
             f"{_redact(response.text, api_key)[:300]}"

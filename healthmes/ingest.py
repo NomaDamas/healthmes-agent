@@ -64,9 +64,10 @@ class IngestForwardError(Exception):
     """open-wearables rejected or never received the forwarded batch."""
 
 
-def _utcnow_naive() -> datetime:
-    """Store convention: naive UTC (matches every other timestamp column)."""
-    return datetime.now(UTC).replace(tzinfo=None)
+def _utcnow() -> datetime:
+    """Aware UTC — the column is TIMESTAMPTZ; naive values would take the
+    postgres session timezone."""
+    return datetime.now(UTC)
 
 
 def _extension_for(content_type: str | None) -> str:
@@ -91,7 +92,7 @@ def store_raw(
     date-partitioned, content-hash suffixed so identical re-posts never
     collide with different payloads) before this returns.
     """
-    received = _utcnow_naive()
+    received = _utcnow()
     digest = hashlib.sha256(body).hexdigest()
     rel_dir = (
         f"{RAW_INGEST_DIRNAME}/{received:%Y}/{received:%m}/{received:%d}"
@@ -135,8 +136,12 @@ def _point_value(point: dict[str, Any]) -> Any | None:
     """
     for key in ("qty", "Avg", "avg"):
         value = point.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                if math.isfinite(value):
+                    return value
+            except OverflowError:  # ints beyond float range are not plausible readings
+                pass
     return None
 
 

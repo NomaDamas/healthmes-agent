@@ -17,7 +17,6 @@ import logging
 from typing import Literal
 
 import anyio.to_thread
-
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
@@ -58,9 +57,9 @@ async def _read_capped_body(request: Request) -> bytes:
         raise HTTPException(status_code=413, detail=f"payload exceeds {limit} bytes")
     chunks = bytearray()
     async for chunk in request.stream():
-        chunks.extend(chunk)
-        if len(chunks) > limit:
+        if len(chunks) + len(chunk) > limit:
             raise HTTPException(status_code=413, detail=f"payload exceeds {limit} bytes")
+        chunks.extend(chunk)
     if not chunks:
         raise HTTPException(status_code=400, detail="empty body")
     return bytes(chunks)

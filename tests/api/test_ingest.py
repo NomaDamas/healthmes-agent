@@ -14,6 +14,8 @@ from sqlalchemy import select
 from healthmes.ingest import transform_hae
 from healthmes.store import RawIngestEvent
 
+OW_USER = "0b6f3a52-8c1d-4e2a-9f10-2a5b7c9d1e3f"
+
 HAE_PAYLOAD = {
     "data": {
         "metrics": [
@@ -78,7 +80,7 @@ def test_healthkit_ingest_stores_raw_and_forwards(client, session, settings):
         return httpx.Response(202, json={"status": "queued"})
 
     client.app.state.ingest_transport = httpx.MockTransport(handler)
-    settings_user = settings.model_copy(update={"ow_user_id": "0b6f3a52-8c1d-4e2a-9f10-2a5b7c9d1e3f"})
+    settings_user = settings.model_copy(update={"ow_user_id": OW_USER})
     client.app.state.settings = settings_user
 
     response = client.post("/v1/ingest/healthkit", json=HAE_PAYLOAD)
@@ -90,7 +92,7 @@ def test_healthkit_ingest_stores_raw_and_forwards(client, session, settings):
     assert ack["records_forwarded"] == 3
 
     # Forwarded to the SDK sync contract for the configured user.
-    assert captured["url"].endswith("/api/v1/sdk/users/0b6f3a52-8c1d-4e2a-9f10-2a5b7c9d1e3f/sync")
+    assert captured["url"].endswith(f"/api/v1/sdk/users/{OW_USER}/sync")
     assert captured["api_key"] == "test-ow-api-key"
     assert captured["body"]["provider"] == "apple"
     assert len(captured["body"]["data"]["records"]) == 3
@@ -119,7 +121,7 @@ def test_healthkit_ingest_forward_failure_keeps_raw(client, session, settings):
         return httpx.Response(500, text="worker down")
 
     client.app.state.ingest_transport = httpx.MockTransport(handler)
-    client.app.state.settings = settings.model_copy(update={"ow_user_id": "0b6f3a52-8c1d-4e2a-9f10-2a5b7c9d1e3f"})
+    client.app.state.settings = settings.model_copy(update={"ow_user_id": OW_USER})
 
     response = client.post("/v1/ingest/healthkit", json=HAE_PAYLOAD)
 
@@ -187,7 +189,7 @@ def test_forward_redirect_is_not_success(client, session, settings):
     )
     client.app.state.ingest_transport = transport
     client.app.state.settings = settings.model_copy(
-        update={"ow_user_id": "0b6f3a52-8c1d-4e2a-9f10-2a5b7c9d1e3f"}
+        update={"ow_user_id": OW_USER}
     )
     response = client.post("/v1/ingest/healthkit", json=HAE_PAYLOAD)
     assert response.status_code == 202
