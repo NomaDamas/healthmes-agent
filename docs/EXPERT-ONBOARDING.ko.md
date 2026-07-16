@@ -73,8 +73,9 @@
    `skills:` 목록에, 브리핑에 연결하려면 `scripts/bootstrap.py`의
    `BRIEFING_JOBS`에 추가 (엔지니어와 함께)
 
-기존 예시 4종이 최고의 교재입니다: `skills/healthmes-planner/`(가장 풍부),
-`healthmes-capture/`, `healthmes-sleep/`, `doctor-visit-summary/`.
+기존 예시 5종이 최고의 교재입니다: `skills/healthmes-planner/`(가장 풍부),
+`healthmes-capture/`, `healthmes-sleep/`, `healthmes-stress/`,
+`doctor-visit-summary/`.
 
 ## 3. 새 메트릭(도구) 추가 (파이썬 — 엔지니어와 페어 가능)
 
