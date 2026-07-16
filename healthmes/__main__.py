@@ -479,6 +479,26 @@ def _cmd_import_apple(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_connect_qr(_args: argparse.Namespace) -> int:
+    settings = _cli_settings()
+    from healthmes.pairing import build_pairing_url, render_terminal_qr
+
+    payload = build_pairing_url(settings)
+    print(render_terminal_qr(payload))
+    print(f"payload: {payload}")
+    if not settings.api_token.get_secret_value().strip():
+        print(
+            "note: no HEALTHMES_API_TOKEN configured — the QR pairs URL only "
+            "(fine for a loopback-only instance)."
+        )
+    print(
+        "Scan with the HealthMes companion app, or copy the url/token into "
+        "a bridge app (e.g. Health Auto Export → REST API target "
+        f"{settings.public_base_url.rstrip('/')}/v1/ingest/healthkit)."
+    )
+    return 0
+
+
 def _add_passphrase_file(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--passphrase-file",
@@ -600,6 +620,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     connect_disconnect.add_argument("target", choices=("google", "icloud"))
     connect_disconnect.set_defaults(func=_cmd_connect_disconnect)
+
+    connect_qr = connect_sub.add_parser(
+        "qr",
+        help="Show the pairing QR (base URL + bearer token) for companion "
+        "and bridge apps — scan instead of typing.",
+    )
+    connect_qr.set_defaults(func=_cmd_connect_qr)
 
     import_parser = subparsers.add_parser(
         "import",
