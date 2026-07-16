@@ -26,6 +26,7 @@ from healthmes.store.models import (
     FoodLog,
     Insight,
     MedicalRecord,
+    RawIngestEvent,
     ScheduleProposal,
     Task,
     TriggerEvent,
@@ -58,6 +59,7 @@ __all__ = [
     "TASK_STATUSES",
     # models
     "AppUsageSample",
+    "RawIngestEvent",
     "CalendarEventMirror",
     "CognitiveEnergyEstimate",
     "DecisionRecord",

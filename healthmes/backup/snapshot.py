@@ -84,7 +84,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: adds the raw_ingest section (older binaries must refuse)
 
 SNAPSHOT_PREFIX = "healthmes-backup-"
 SNAPSHOT_SUFFIX = ".tar.gz.age"
@@ -95,6 +95,7 @@ HEALTHMES_SQLITE_ARCNAME = "db/healthmes.sqlite3"
 HEALTHMES_PG_DUMP_ARCNAME = "db/healthmes.dump"
 OW_PG_DUMP_ARCNAME = "db/open_wearables.dump"
 MEDIA_ARCROOT = "media"
+RAW_INGEST_ARCROOT = "raw_ingest"
 HERMES_ARCROOT = "hermes"
 
 _SQLITE_MEMORY_DATABASES = (None, "", ":memory:")
@@ -137,6 +138,7 @@ class DataLocations:
     database_url: str
     ow_database_url: str | None = None
     media_dir: Path | None = None
+    raw_ingest_dir: Path | None = None
     hermes_home: Path | None = None
 
 
@@ -215,6 +217,7 @@ def resolve_data_locations(settings: Settings) -> DataLocations:
         database_url=settings.database_url,
         ow_database_url=ow_database_url,
         media_dir=Path(settings.data_dir) / "media",
+        raw_ingest_dir=Path(settings.data_dir) / "raw_ingest",
         hermes_home=Path(hermes_home) if hermes_home else None,
     )
 
@@ -562,12 +565,17 @@ def create_snapshot(
             "healthmes_db": _stage_healthmes_db(locations.database_url, stage),
             "open_wearables_db": None,
             "media": None,
+            "raw_ingest": None,
             "hermes_home": None,
         }
         if locations.ow_database_url:
             contents["open_wearables_db"] = _stage_ow_db(locations.ow_database_url, stage)
         if locations.media_dir is not None and locations.media_dir.is_dir():
             contents["media"] = _stage_tree(locations.media_dir, stage, MEDIA_ARCROOT)
+        if locations.raw_ingest_dir is not None and locations.raw_ingest_dir.is_dir():
+            contents["raw_ingest"] = _stage_tree(
+                locations.raw_ingest_dir, stage, RAW_INGEST_ARCROOT
+            )
         if locations.hermes_home is not None and locations.hermes_home.is_dir():
             contents["hermes_home"] = _stage_tree(locations.hermes_home, stage, HERMES_ARCROOT)
 
@@ -748,6 +756,16 @@ def restore_snapshot(
                 _replace_tree(extracted / media_entry["arcroot"], locations.media_dir)
             else:
                 logger.warning("Snapshot contains media but no media_dir target; skipping it.")
+
+        # raw-first ingest store (PLAN §13) — same optional-section semantics
+        raw_entry = contents.get("raw_ingest")
+        if raw_entry is not None:
+            if locations.raw_ingest_dir is not None:
+                _replace_tree(extracted / raw_entry["arcroot"], locations.raw_ingest_dir)
+            else:
+                logger.warning(
+                    "Snapshot contains raw_ingest but no raw_ingest_dir target; skipping it."
+                )
 
         # Hermes state (optional section)
         hermes_entry = contents.get("hermes_home")

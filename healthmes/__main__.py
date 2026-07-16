@@ -10,6 +10,8 @@
 ``python -m healthmes connect icloud --username <apple-id>`` → app-password prompt
 ``python -m healthmes connect status``           → which calendars are connected
 ``python -m healthmes connect disconnect google|icloud``     → remove stored creds
+``python -m healthmes import apple <export.zip|export.xml>`` → upload an Apple
+Health export to open-wearables (zero-app-code wearable ingestion)
 
 Calendar connections are runtime state under ``Settings.data_dir`` (docs/
 PLAN.md §6): once ``connect`` succeeds, the sync jobs pick the backend up
@@ -451,6 +453,32 @@ def _cmd_connect_disconnect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_import_apple(args: argparse.Namespace) -> int:
+    settings = _cli_settings()
+    from healthmes.apple_import import AppleImportError, import_apple_export
+
+    try:
+        kwargs = {} if args.max_bytes is None else {"max_bytes": args.max_bytes}
+        result = import_apple_export(
+            args.file, settings, user_id=args.user_id, **kwargs
+        )
+    except AppleImportError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    size_mb = result.size_bytes / (1024 * 1024)
+    print(
+        f"uploaded {result.filename} ({size_mb:.1f} MB) for open-wearables "
+        f"user {result.user_id}"
+    )
+    print(f"import queued (task {result.task_id or 'unknown'}) — open-wearables ")
+    print(
+        "parses it in the background; minutes for small exports, longer for "
+        "years of data. Progress: the open-wearables dashboard sync status, "
+        "or re-run your usual sleep/energy queries once it lands."
+    )
+    return 0
+
+
 def _add_passphrase_file(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--passphrase-file",
@@ -572,6 +600,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     connect_disconnect.add_argument("target", choices=("google", "icloud"))
     connect_disconnect.set_defaults(func=_cmd_connect_disconnect)
+
+    import_parser = subparsers.add_parser(
+        "import",
+        help="Import external data exports into the data plane (open-wearables).",
+    )
+    import_sub = import_parser.add_subparsers(dest="import_command", required=True)
+
+    import_apple = import_sub.add_parser(
+        "apple",
+        help="Upload an Apple Health export (the ZIP from the Health app, or "
+        "the extracted export.xml) to open-wearables.",
+    )
+    import_apple.add_argument(
+        "file",
+        type=Path,
+        help="Path to 내보내기.zip / export.zip / export.xml from the Health app.",
+    )
+    import_apple.add_argument(
+        "--user-id",
+        default=None,
+        help="open-wearables user id (default: HEALTHMES_OW_USER_ID, else "
+        "auto-discovered when exactly one user exists).",
+    )
+    import_apple.add_argument(
+        "--max-bytes",
+        type=int,
+        default=None,
+        help="Override the export-size cap (default 256 MiB — the vendor "
+        "direct-import endpoint buffers the file in server memory).",
+    )
+    import_apple.set_defaults(func=_cmd_import_apple)
 
     return parser
 
