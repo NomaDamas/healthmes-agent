@@ -20,13 +20,13 @@ from healthmes.store.enums import (
 )
 from healthmes.store.models import (
     AppUsageSample,
-    RawIngestEvent,
     CalendarEventMirror,
     CognitiveEnergyEstimate,
     DecisionRecord,
     FoodLog,
     Insight,
     MedicalRecord,
+    RawIngestEvent,
     ScheduleProposal,
     Task,
     TriggerEvent,

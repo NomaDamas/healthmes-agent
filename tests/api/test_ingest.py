@@ -78,7 +78,7 @@ def test_healthkit_ingest_stores_raw_and_forwards(client, session, settings):
         return httpx.Response(202, json={"status": "queued"})
 
     client.app.state.ingest_transport = httpx.MockTransport(handler)
-    settings_user = settings.model_copy(update={"ow_user_id": "ow-user-7"})
+    settings_user = settings.model_copy(update={"ow_user_id": "0b6f3a52-8c1d-4e2a-9f10-2a5b7c9d1e3f"})
     client.app.state.settings = settings_user
 
     response = client.post("/v1/ingest/healthkit", json=HAE_PAYLOAD)
@@ -86,11 +86,11 @@ def test_healthkit_ingest_stores_raw_and_forwards(client, session, settings):
     assert response.status_code == 202
     ack = response.json()
     assert ack["parse_status"] == "parsed"
-    assert ack["forward_status"] == "forwarded"
+    assert ack["forward_status"] == "queued"
     assert ack["records_forwarded"] == 3
 
     # Forwarded to the SDK sync contract for the configured user.
-    assert captured["url"].endswith("/api/v1/sdk/users/ow-user-7/sync")
+    assert captured["url"].endswith("/api/v1/sdk/users/0b6f3a52-8c1d-4e2a-9f10-2a5b7c9d1e3f/sync")
     assert captured["api_key"] == "test-ow-api-key"
     assert captured["body"]["provider"] == "apple"
     assert len(captured["body"]["data"]["records"]) == 3
@@ -119,7 +119,7 @@ def test_healthkit_ingest_forward_failure_keeps_raw(client, session, settings):
         return httpx.Response(500, text="worker down")
 
     client.app.state.ingest_transport = httpx.MockTransport(handler)
-    client.app.state.settings = settings.model_copy(update={"ow_user_id": "u"})
+    client.app.state.settings = settings.model_copy(update={"ow_user_id": "0b6f3a52-8c1d-4e2a-9f10-2a5b7c9d1e3f"})
 
     response = client.post("/v1/ingest/healthkit", json=HAE_PAYLOAD)
 
@@ -179,3 +179,46 @@ def test_raw_ingest_stores_anything(client, session, settings):
 def test_raw_ingest_validates_source_slug(client):
     response = client.post("/v1/ingest/raw?source=../evil", content=b"x")
     assert response.status_code == 422
+
+
+def test_forward_redirect_is_not_success(client, session, settings):
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(307, headers={"location": "http://x"})
+    )
+    client.app.state.ingest_transport = transport
+    client.app.state.settings = settings.model_copy(
+        update={"ow_user_id": "0b6f3a52-8c1d-4e2a-9f10-2a5b7c9d1e3f"}
+    )
+    response = client.post("/v1/ingest/healthkit", json=HAE_PAYLOAD)
+    assert response.status_code == 202
+    assert response.json()["forward_status"] == "forward_failed"
+
+
+def test_forward_refuses_non_uuid_user(client, session, settings):
+    client.app.state.settings = settings.model_copy(update={"ow_user_id": "not-a-uuid"})
+    response = client.post("/v1/ingest/healthkit", json=HAE_PAYLOAD)
+    assert response.status_code == 202
+    ack = response.json()
+    assert ack["forward_status"] == "forward_failed"
+    assert "UUID" in session.scalars(select(RawIngestEvent)).one().forward_detail
+
+
+def test_transform_skips_non_finite_values():
+    payload = {
+        "data": {
+            "metrics": [
+                {
+                    "name": "heart_rate_variability",
+                    "units": "ms",
+                    "data": [
+                        {"date": "2026-07-16 03:00:00 +0900", "qty": float("nan")},
+                        {"date": "2026-07-16 03:05:00 +0900", "qty": float("inf")},
+                        {"date": "2026-07-16 03:10:00 +0900", "qty": True},
+                        {"date": "2026-07-16 03:15:00 +0900", "qty": 44.0},
+                    ],
+                }
+            ]
+        }
+    }
+    records = transform_hae(payload)
+    assert [r["value"] for r in records] == [44.0]

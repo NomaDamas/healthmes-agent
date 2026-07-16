@@ -193,7 +193,7 @@ class TestManifest:
             out_path=tmp_path / snapshot_name(CREATED_AT),
             created_at=CREATED_AT,
         )
-        assert manifest["schema_version"] == snapshot_mod.SCHEMA_VERSION == 1
+        assert manifest["schema_version"] == snapshot_mod.SCHEMA_VERSION == 2
         assert manifest["created_at"] == CREATED_AT.isoformat()
         contents = manifest["contents"]
         assert contents["healthmes_db"] == {

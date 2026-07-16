@@ -84,7 +84,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: adds the raw_ingest section (older binaries must refuse)
 
 SNAPSHOT_PREFIX = "healthmes-backup-"
 SNAPSHOT_SUFFIX = ".tar.gz.age"

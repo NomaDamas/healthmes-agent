@@ -16,6 +16,8 @@ import json
 import logging
 from typing import Literal
 
+import anyio.to_thread
+
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
@@ -44,16 +46,24 @@ class IngestAck(BaseModel):
 
 
 async def _read_capped_body(request: Request) -> bytes:
+    """Read the body without ever buffering more than the cap.
+
+    The Content-Length fast-path rejects declared oversizes before reading;
+    the streaming loop bounds chunked (or lying) senders.
+    """
     settings = request.app.state.settings
-    body = await request.body()
-    if len(body) > settings.ingest_max_bytes:
-        raise HTTPException(
-            status_code=413,
-            detail=f"payload exceeds {settings.ingest_max_bytes} bytes",
-        )
-    if not body:
+    limit = settings.ingest_max_bytes
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise HTTPException(status_code=413, detail=f"payload exceeds {limit} bytes")
+    chunks = bytearray()
+    async for chunk in request.stream():
+        chunks.extend(chunk)
+        if len(chunks) > limit:
+            raise HTTPException(status_code=413, detail=f"payload exceeds {limit} bytes")
+    if not chunks:
         raise HTTPException(status_code=400, detail="empty body")
-    return body
+    return bytes(chunks)
 
 
 @router.post("/healthkit", status_code=202)
@@ -68,6 +78,10 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
         content_type=request.headers.get("content-type"),
         body=body,
     )
+    # Raw-first durability: index row committed BEFORE any interpretation —
+    # a crash below leaves a findable row, never an orphaned file.
+    session.add(event)
+    session.commit()
 
     payload = None
     try:
@@ -85,8 +99,15 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
     else:
         transport = getattr(request.app.state, "ingest_transport", None)
         try:
-            forward_sdk_sync(settings, records, user_id=user_id, transport=transport)
-            event.forward_status = "forwarded"
+            # Thread pool: the sync HTTP client must not stall the event loop.
+            await anyio.to_thread.run_sync(
+                lambda: forward_sdk_sync(
+                    settings, records, user_id=user_id, transport=transport
+                )
+            )
+            # "queued": open-wearables ack'd (202) and parses asynchronously —
+            # not a claim that the records are already normalized.
+            event.forward_status = "queued"
             event.records_forwarded = len(records)
         except IngestForwardError as exc:
             # Raw is durable; the forward can be replayed from it later.
@@ -94,7 +115,6 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
             event.forward_detail = str(exc)[:255]
             logger.warning("ingest forward failed (raw kept at %s): %s", event.path, exc)
 
-    session.add(event)
     session.commit()
     return IngestAck(
         raw_id=str(event.id),

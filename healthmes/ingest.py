@@ -25,6 +25,8 @@ errors: the raw payload is already durable.
 
 import hashlib
 import logging
+import math
+import uuid as uuid_module
 from datetime import UTC, datetime
 from typing import Any
 
@@ -104,7 +106,7 @@ def store_raw(
     return RawIngestEvent(
         received_at=received,
         source=source,
-        content_type=(content_type or None),
+        content_type=(content_type[:255] if content_type else None),
         path=f"{rel_dir}/{filename}",
         size_bytes=len(body),
         sha256=digest,
@@ -133,7 +135,7 @@ def _point_value(point: dict[str, Any]) -> Any | None:
     """
     for key in ("qty", "Avg", "avg"):
         value = point.get(key)
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
             return value
     return None
 
@@ -197,6 +199,14 @@ def forward_sdk_sync(
     api_key = settings.ow_api_key.get_secret_value()
     if not api_key:
         raise IngestForwardError("open-wearables API key missing (HEALTHMES_OW_API_KEY)")
+    try:
+        uuid_module.UUID(user_id)
+    except ValueError as exc:
+        # The vendor queues unknown users and its worker silently discards
+        # them — a non-UUID id would be a false "queued" forever.
+        raise IngestForwardError(
+            f"HEALTHMES_OW_USER_ID must be the open-wearables user UUID, got {user_id!r}"
+        ) from exc
 
     body = {
         "provider": "apple",
@@ -210,10 +220,13 @@ def forward_sdk_sync(
             response = client.post(
                 url, json=body, headers={"X-Open-Wearables-API-Key": api_key}
             )
-    except httpx.HTTPError as exc:
-        # Never repr the request — headers carry the API key.
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        # HTTPError: transport; ValueError/TypeError: body not JSON-encodable
+        # (e.g. non-finite floats). Never repr the request — headers carry
+        # the API key.
         raise IngestForwardError(f"{exc.__class__.__name__}: {exc}") from exc
-    if response.status_code >= 400:
-        # Redact: a debug/echo server response could reflect the key header.
-        detail = response.text[:200].replace(api_key, "***")
+    if response.status_code != 202:
+        # The vendor contract is an explicit 202 queue ack; anything else
+        # (including 3xx from a proxy) is not an acceptance.
+        detail = response.text.replace(api_key, "***")[:200]
         raise IngestForwardError(f"HTTP {response.status_code} — {detail}")

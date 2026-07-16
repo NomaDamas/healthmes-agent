@@ -40,7 +40,7 @@ def upgrade() -> None:
             server_default=sa.func.now(),
             nullable=False,
         ),
-        sa.Column("received_at", sa.DateTime(), nullable=False),
+        sa.Column("received_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("source", sa.String(length=64), nullable=False),
         sa.Column("content_type", sa.String(length=255), nullable=True),
         sa.Column("path", sa.String(length=255), nullable=False),

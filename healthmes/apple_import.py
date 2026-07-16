@@ -198,12 +198,16 @@ def _discover_sole_user(
             f"cannot discover the open-wearables user: HTTP {response.status_code}"
         )
     try:
-        items = response.json().get("items", [])
+        envelope = response.json()
+        items = envelope.get("items", [])
+        total = envelope.get("total", len(items))
     except (json.JSONDecodeError, ValueError, AttributeError) as exc:
         raise AppleImportError(
             "cannot discover the open-wearables user: unexpected response shape"
         ) from exc
-    if len(items) == 1 and items[0].get("id"):
+    # total matters: the page can be filtered down to one item while more
+    # users exist — guessing an account is never acceptable.
+    if total == 1 and len(items) == 1 and items[0].get("id"):
         return str(items[0]["id"])
     if not items:
         raise AppleImportError(
@@ -273,7 +277,7 @@ def import_apple_export(
     if response.status_code >= 400:
         raise AppleImportError(
             f"upload failed: HTTP {response.status_code} — "
-            f"{_redact(response.text[:300], api_key)}"
+            f"{_redact(response.text, api_key)[:300]}"
         )
 
     body: Any
@@ -282,13 +286,13 @@ def import_apple_export(
     except (json.JSONDecodeError, ValueError) as exc:
         raise AppleImportError(
             f"open-wearables returned HTTP {response.status_code} but a non-JSON "
-            f"body: {_redact(response.text[:200], api_key)!r}"
+            f"body: {_redact(response.text, api_key)[:200]!r}"
         ) from exc
     task_id = body.get("task_id") if isinstance(body, dict) else None
     if not task_id:
         raise AppleImportError(
             "open-wearables did not acknowledge the import (no task_id in "
-            f"response: {_redact(str(body)[:200], api_key)!r}) — treat the "
+            f"response: {_redact(str(body), api_key)[:200]!r}) — treat the "
             "upload as NOT imported"
         )
     return AppleImportResult(
