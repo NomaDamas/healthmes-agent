@@ -20,6 +20,7 @@ from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
     DecisionRecord,
+    EnergyDemand,
     FoodLog,
     ProposalStatus,
     ScheduleProposal,
@@ -98,10 +99,12 @@ class TestUpsertAndListTasks:
             await mcp_client.call_tool(
                 "upsert_task", {"task_id": str(uuid.uuid4()), "status": "done"}
             )
-        with pytest.raises(ToolError, match="weekly_goal"):
-            await mcp_client.call_tool(
-                "upsert_task", {"title": "x", "goal_id": str(uuid.uuid4())}
-            )
+        # An unknown goal_id is lenient now (created with a note), not an error.
+        unknown_goal = await mcp_client.call_tool(
+            "upsert_task", {"title": "x", "goal_id": str(uuid.uuid4())}
+        )
+        assert unknown_goal.data["created"] is True
+        assert "not found" in unknown_goal.data["goal_note"]
         with pytest.raises(ToolError, match="est_minutes"):
             await mcp_client.call_tool("upsert_task", {"title": "x", "est_minutes": 0})
 
@@ -213,9 +216,53 @@ class TestScheduleTools:
             assert len(rows) == 2
             assert all(row.status == ProposalStatus.PROPOSED for row in rows)
 
+    async def test_upsert_task_tolerates_non_uuid_goal_ref(self, mcp_client, call_tool):
+        """An LLM often passes a human label for goal_id; the task is still
+        created (not an error) and a note is returned (docs: live-E2E fix)."""
+        result = await call_tool(
+            mcp_client, "upsert_task", {"title": "논문 리뷰", "goal_id": "goal-1"}
+        )
+        assert result["created"] is True
+        assert "goal-1" in result["goal_note"]
+        assert result["task"]["goal_id"] is None
+
+    async def test_propose_blocks_auto_creates_task_from_title(
+        self, mcp_client, call_tool, store_factory
+    ):
+        """Blocks may carry a title instead of a task_id — a task is auto-created
+        so the agent can propose a plan without the UUID round-trip."""
+        start = dt.datetime.now(dt.UTC).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        result = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "title": "발표 준비",
+                        "energy_demand": "high",
+                        "start": start.isoformat(),
+                        "end": (start + dt.timedelta(minutes=90)).isoformat(),
+                    }
+                ]
+            },
+        )
+        [proposal] = result["proposals"]
+        assert proposal["task_title"] == "발표 준비"
+        assert proposal["proposal_status"] == "proposed"
+        with store_factory() as session:
+            task = session.get(Task, uuid.UUID(proposal["task_id"]))
+            assert task is not None and task.energy_demand == EnergyDemand.HIGH
+
     async def test_propose_blocks_validation(self, mcp_client, call_tool):
         with pytest.raises(ToolError, match="must not be empty"):
             await mcp_client.call_tool("propose_schedule_blocks", {"blocks": []})
+        with pytest.raises(ToolError, match="either task_id or a non-empty title"):
+            await mcp_client.call_tool(
+                "propose_schedule_blocks",
+                {"blocks": [{"start": "2026-07-17T09:00:00", "end": "2026-07-17T10:00:00"}]},
+            )
         created = await call_tool(mcp_client, "upsert_task", {"title": "t"})
         with pytest.raises(ToolError, match="end must be after start"):
             await mcp_client.call_tool(
