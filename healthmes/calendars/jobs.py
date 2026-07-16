@@ -4,10 +4,14 @@ This is the production entry point of the calendar plane — the piece that
 turns the (fully tested) backend/service library into running behavior:
 
 - :func:`build_calendar_jobs` returns one :class:`CalendarJobSpec` per
-  *enabled* backend (``Settings.google_calendar_enabled`` /
-  ``Settings.caldav_enabled``), polling at ``google_poll_minutes`` /
-  ``caldav_poll_minutes`` (PLAN §6: 5 / 10 minutes). The app lifespan
-  registers each spec on the in-process scheduler.
+  *enabled* backend, polling at ``google_poll_minutes`` /
+  ``caldav_poll_minutes`` (PLAN §6: 5 / 10 minutes). A backend is enabled by
+  its settings flag (``Settings.google_calendar_enabled`` /
+  ``Settings.caldav_enabled``) OR by a runtime connection established with
+  ``healthmes connect`` — i.e. the token/creds file under ``Settings.data_dir``
+  exists (healthmes/calendars/creds.py) — so connecting via the CLI needs no
+  ``.env`` edit. The app lifespan registers each spec on the in-process
+  scheduler.
 - Every run syncs that backend into ``calendar_event_mirror`` (the trigger
   sweep's ``schedule_changed`` rule and the energy engine's meeting-load
   factor read the mirror; the sync itself is enough — no push here).
@@ -30,7 +34,8 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from healthmes.calendars.base import CalendarBackend, EventDraft, coerce_utc
+from healthmes.calendars import creds
+from healthmes.calendars.base import CalendarAuthError, CalendarBackend, EventDraft, coerce_utc
 from healthmes.calendars.state import (
     FilePendingDiffStore,
     FileSyncStateStore,
@@ -70,11 +75,19 @@ def calendar_job_id(source: CalendarSource) -> str:
 
 
 def enabled_sources(settings: Settings) -> tuple[CalendarSource, ...]:
-    """Backends enabled by settings, in write-preference order (Google first)."""
+    """Backends enabled by settings OR connected via ``healthmes connect``.
+
+    Write-preference order (Google first). "Connected" means the runtime
+    token/creds file under ``Settings.data_dir`` exists and is usable
+    (healthmes/calendars/creds.py) — establishing a connection with the CLI
+    is enough, no ``.env`` edit required. The settings flags keep working
+    and force a backend on even without a stored file (its poll then fails
+    per-run until credentials appear, exactly as before).
+    """
     sources: list[CalendarSource] = []
-    if settings.google_calendar_enabled:
+    if settings.google_calendar_enabled or creds.google_connected(settings.data_dir):
         sources.append(CalendarSource.GOOGLE)
-    if settings.caldav_enabled:
+    if settings.caldav_enabled or creds.load_caldav_credentials(settings.data_dir) is not None:
         sources.append(CalendarSource.CALDAV)
     return tuple(sources)
 
@@ -96,10 +109,17 @@ def _build_backend(settings: Settings, source: CalendarSource) -> CalendarBacken
         )
     from healthmes.calendars.caldav_icloud import CalDavCalendarBackend
 
+    resolved = creds.resolve_caldav_credentials(settings)
+    if resolved is None:
+        raise CalendarAuthError(
+            "no CalDAV credentials: set HEALTHMES_CALDAV_USERNAME + "
+            "HEALTHMES_CALDAV_APP_PASSWORD, or run `healthmes connect icloud "
+            "--username <apple-id>` once"
+        )
     return CalDavCalendarBackend.connect(
-        username=settings.caldav_username,
-        app_password=settings.caldav_app_password.get_secret_value(),
-        url=settings.caldav_url,
+        username=resolved.username,
+        app_password=resolved.app_password,
+        url=resolved.url,
         calendar_name=settings.caldav_calendar_name,
     )
 

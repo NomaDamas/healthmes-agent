@@ -56,8 +56,11 @@ OPEN_PATHS = frozenset({"/health", "/"})
 # (GET/HEAD only; the middleware never applies the query credential to other
 # methods), so decision/report pages and in-app web views can embed captured
 # photos/voice notes via <img>/<audio> tags. Uploading (POST /v1/media, no
-# trailing slash — not matched by the prefix) stays bearer-only.
-VIEWER_PATH_PREFIXES = ("/decisions", "/static/", "/reports", "/v1/media/")
+# trailing slash — not matched by the prefix) stays bearer-only. "/connect"
+# is the read-only calendar-connection status page (healthmes/api/connect.py
+# — status + instructions, no secrets rendered, no write routes exist under
+# the prefix).
+VIEWER_PATH_PREFIXES = ("/decisions", "/static/", "/reports", "/v1/media/", "/connect")
 
 _VIEWER_TOKEN_CONTEXT = b"healthmes-viewer:"
 
