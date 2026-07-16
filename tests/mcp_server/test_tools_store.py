@@ -251,6 +251,23 @@ class TestScheduleTools:
         [proposal] = result["proposals"]
         assert proposal["task_title"] == "발표 준비"
         assert proposal["proposal_status"] == "proposed"
+
+        # LLMs pass "" instead of null for task_id — treated as omitted.
+        empty = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "task_id": "",
+                        "title": "저녁 러닝",
+                        "start": (start + dt.timedelta(hours=8)).isoformat(),
+                        "end": (start + dt.timedelta(hours=8, minutes=30)).isoformat(),
+                    }
+                ]
+            },
+        )
+        assert empty["proposals"][0]["task_title"] == "저녁 러닝"
         with store_factory() as session:
             task = session.get(Task, uuid.UUID(proposal["task_id"]))
             assert task is not None and task.energy_demand == EnergyDemand.HIGH

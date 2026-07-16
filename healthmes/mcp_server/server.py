@@ -385,8 +385,9 @@ def _resolve_goal_ref(
     ``(None, note)`` so the caller can create the task without a goal and
     surface the note for a later relink.
     """
-    if goal_ref is None:
+    if goal_ref is None or not goal_ref.strip():
         return None, None
+    goal_ref = goal_ref.strip()
     try:
         goal_uuid = uuid.UUID(goal_ref)
     except (ValueError, AttributeError, TypeError):
@@ -1758,6 +1759,10 @@ def propose_schedule_blocks(
         if decision_record_id is not None
         else None
     )
+    for block in blocks:
+        # LLMs pass "" instead of null; treat an empty/whitespace task_id as omitted.
+        if block.task_id is not None and not block.task_id.strip():
+            block.task_id = None
     for index, block in enumerate(blocks):
         if block.task_id is None and not (block.title and block.title.strip()):
             raise ToolError(f"blocks[{index}]: give either task_id or a non-empty title")
