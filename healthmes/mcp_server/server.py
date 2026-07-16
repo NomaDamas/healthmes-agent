@@ -53,7 +53,7 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.config import Settings, get_settings, system_timezone
@@ -373,6 +373,36 @@ def _parse_uuid(value: str, field: str) -> uuid.UUID:
         return uuid.UUID(value)
     except (ValueError, AttributeError, TypeError) as exc:
         raise ToolError(f"{field} must be a UUID, got {value!r}") from exc
+
+
+def _resolve_goal_ref(
+    session: Session, goal_ref: str | None
+) -> tuple[uuid.UUID | None, str | None]:
+    """Best-effort weekly_goal resolution for LLM callers.
+
+    Returns ``(goal_uuid, note)``. Accepts a UUID or an exact (case-insensitive)
+    goal title; an unresolvable reference never raises — it yields
+    ``(None, note)`` so the caller can create the task without a goal and
+    surface the note for a later relink.
+    """
+    if goal_ref is None:
+        return None, None
+    try:
+        goal_uuid = uuid.UUID(goal_ref)
+    except (ValueError, AttributeError, TypeError):
+        goal_uuid = None
+    if goal_uuid is not None:
+        if session.get(WeeklyGoal, goal_uuid) is not None:
+            return goal_uuid, None
+        return None, f"weekly_goal {goal_ref!r} not found — task created without a goal"
+    match = session.scalars(
+        select(WeeklyGoal).where(func.lower(WeeklyGoal.title) == goal_ref.strip().lower())
+    ).first()
+    if match is not None:
+        return match.id, None
+    return None, (
+        f"goal_id {goal_ref!r} is not a known goal id or title — task created without a goal"
+    )
 
 
 def _iso_utc(value: dt.datetime | None) -> str | None:
@@ -1564,11 +1594,13 @@ def upsert_task(
     if est_minutes is not None and est_minutes <= 0:
         raise ToolError(f"est_minutes must be positive, got {est_minutes}")
     deadline_dt = _parse_datetime_utc(deadline, "deadline") if deadline is not None else None
-    goal_uuid = _parse_uuid(goal_id, "goal_id") if goal_id is not None else None
 
     with _store_session() as session:
-        if goal_uuid is not None and session.get(WeeklyGoal, goal_uuid) is None:
-            raise ToolError(f"weekly_goal {goal_id} not found")
+        # Lenient goal linking: an LLM often passes a human label ("goal-1") or
+        # a title instead of the UUID. Resolve what we can (UUID or exact
+        # title); an unresolvable ref does NOT fail task creation — the task is
+        # made without a goal and a note is returned so the agent can relink.
+        goal_uuid, goal_note = _resolve_goal_ref(session, goal_id)
 
         if task_id is not None:
             task = session.get(Task, _parse_uuid(task_id, "task_id"))
@@ -1607,7 +1639,10 @@ def upsert_task(
             created = True
         session.flush()
         payload = _serialize_task(task)
-    return {"status": "ok", "created": created, "task": payload}
+    result: dict[str, Any] = {"status": "ok", "created": created, "task": payload}
+    if goal_note is not None:
+        result["goal_note"] = goal_note
+    return result
 
 
 @mcp.tool
@@ -1684,9 +1719,20 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
 
 
 class ScheduleBlockIn(BaseModel):
-    """One proposed time block for a task (input of propose_schedule_blocks)."""
+    """One proposed time block (input of propose_schedule_blocks).
 
-    task_id: str = Field(description="UUID of an existing task")
+    Give EITHER ``task_id`` (UUID of an existing task) OR ``title`` (a new task
+    is auto-created for the block) — ``title`` is the easy path when you are
+    proposing a plan from scratch.
+    """
+
+    task_id: str | None = Field(default=None, description="UUID of an existing task (optional)")
+    title: str | None = Field(
+        default=None, description="Task title; a task is auto-created when task_id is omitted"
+    )
+    energy_demand: str | None = Field(
+        default=None, description="low / med / high for an auto-created task"
+    )
     start: str = Field(description="Block start, ISO-8601 (naive = UTC)")
     end: str = Field(description="Block end, ISO-8601, after start")
 
@@ -1696,13 +1742,14 @@ def propose_schedule_blocks(
     blocks: list[ScheduleBlockIn],
     decision_record_id: str | None = None,
 ) -> dict[str, Any]:
-    """Propose schedule blocks for tasks (propose-then-confirm gate).
+    """Propose schedule blocks (propose-then-confirm gate).
 
-    Creates schedule proposals in `proposed` state — nothing is written to any
+    Each block targets a task by `task_id` OR carries a `title` (a task is then
+    auto-created) — use `title` to propose a whole plan without pre-creating
+    tasks. Creates proposals in `proposed` state; nothing is written to any
     calendar until the user confirms. Each returned block lists overlapping
-    mirrored calendar events as `conflicts` so clashes are visible before
-    asking. Optionally link the decision_record_id of the reasoning that
-    produced the plan.
+    mirrored calendar events as `conflicts`. Optionally link the
+    decision_record_id of the reasoning that produced the plan.
     """
     if not blocks:
         raise ToolError("blocks must not be empty")
@@ -1711,22 +1758,43 @@ def propose_schedule_blocks(
         if decision_record_id is not None
         else None
     )
-    parsed: list[tuple[uuid.UUID, dt.datetime, dt.datetime]] = []
+    for index, block in enumerate(blocks):
+        if block.task_id is None and not (block.title and block.title.strip()):
+            raise ToolError(f"blocks[{index}]: give either task_id or a non-empty title")
+        if block.energy_demand is not None:
+            ed = "med" if block.energy_demand == "medium" else block.energy_demand
+            if ed not in {e.value for e in EnergyDemand}:
+                raise ToolError(
+                    f"blocks[{index}].energy_demand must be low/med/high, got "
+                    f"{block.energy_demand!r}"
+                )
+    parsed: list[tuple[ScheduleBlockIn, dt.datetime, dt.datetime]] = []
     for index, block in enumerate(blocks):
         start = _parse_datetime_utc(block.start, f"blocks[{index}].start")
         end = _parse_datetime_utc(block.end, f"blocks[{index}].end")
         if end <= start:
             raise ToolError(f"blocks[{index}]: end must be after start")
-        parsed.append((_parse_uuid(block.task_id, f"blocks[{index}].task_id"), start, end))
+        parsed.append((block, start, end))
 
     with _store_session() as session:
         if decision_uuid is not None and session.get(DecisionRecord, decision_uuid) is None:
             raise ToolError(f"decision_record {decision_record_id} not found")
         created: list[dict[str, Any]] = []
-        for task_uuid, start, end in parsed:
-            task = session.get(Task, task_uuid)
-            if task is None:
-                raise ToolError(f"task {task_uuid} not found")
+        for index, (block, start, end) in enumerate(parsed):
+            if block.task_id is not None:
+                task = session.get(Task, _parse_uuid(block.task_id, f"blocks[{index}].task_id"))
+                if task is None:
+                    raise ToolError(f"task {block.task_id} not found")
+            else:
+                ed = "med" if block.energy_demand == "medium" else block.energy_demand
+                task = Task(
+                    title=block.title.strip(),  # type: ignore[union-attr]
+                    energy_demand=EnergyDemand(ed) if ed else EnergyDemand.MED,
+                    status="scheduled",
+                    source=TaskSource.AGENT,
+                )
+                session.add(task)
+                session.flush()
             conflicts = [
                 {
                     "summary": event.summary,
