@@ -29,7 +29,7 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.core:core-ktx:1.19.0")
     // EncryptedSharedPreferences for base URL + token at rest (same artifact
     // and pattern as the :app collector's CollectorPrefs).
     implementation("androidx.security:security-crypto:1.1.0-alpha06")

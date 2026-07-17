@@ -45,7 +45,7 @@ android {
 dependencies {
     implementation(project(":shared"))
 
-    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.core:core-ktx:1.19.0")
     // Tiles 1.4.x builds layouts with the protolayout 1.2.x builders.
     implementation("androidx.wear.tiles:tiles:1.4.1")
     implementation("androidx.wear.protolayout:protolayout:1.2.1")
