@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv (python pinned by .python-version)
         uses: astral-sh/setup-uv@v6
@@ -76,7 +76,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv (python pinned by .python-version)
         uses: astral-sh/setup-uv@v6
@@ -107,7 +107,7 @@ jobs:
     env:
       HEALTHMES_API_TOKEN: ci-smoke-token
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Boot the core of the stack
         run: docker compose up -d --build postgres redis healthmes
