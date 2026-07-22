@@ -36,7 +36,7 @@ dependencies = [
     # age encryption for the Phase-3 local-first backup module
     "pyrage",
     # S3-compatible remote vault replication (RemoteVaultProvider, PLAN §9)
-    "boto3>=1.43.45",
+    "boto3>=1.43.53",
     # Multipart parsing for the capture upload (POST /v1/media, issue #10) —
     # previously only a transitive dep of fastmcp; FastAPI needs it directly.
     "python-multipart>=0.0.32",
