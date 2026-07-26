@@ -467,6 +467,9 @@ class TestCarryoverComposedScore:
         assert estimate.score_exact == pytest.approx(64.75)
         assert estimate.inputs_snapshot["missing_signals"] == []
         assert "carryover_load_penalty" not in {c["name"] for c in estimate.components}
+        # Full-strength byte-identity: the entire component tuple and snapshot
+        # (sans timestamp) must match a genuinely carryover-free baseline.
+        self._baseline_components = estimate.components
 
     @freeze_time("2026-07-09 14:23:00")
     def test_normal_yesterday_stays_byte_identical(
@@ -484,6 +487,30 @@ class TestCarryoverComposedScore:
         estimate = energy_engine_factory(full_signal_ow_rows).compute_window()
         assert estimate.score_exact == pytest.approx(64.75)
         assert estimate.inputs_snapshot["missing_signals"] == []
+        assert "carryover_load_penalty" not in {c["name"] for c in estimate.components}
+
+    @freeze_time("2026-07-09 14:23:00")
+    def test_normal_yesterday_full_estimate_equals_no_yesterday(
+        self,
+        energy_engine_factory,
+        full_signal_ow_rows,
+        seed_vector_store,
+        seed_calendar_event,
+    ) -> None:
+        """Complete-serialization byte-identity, not spot fields (review)."""
+        seed_vector_store()
+        baseline = energy_engine_factory(full_signal_ow_rows).compute_window()
+        seed_calendar_event(
+            dt.datetime(2026, 7, 8, 9, 0, tzinfo=dt.UTC),
+            dt.datetime(2026, 7, 8, 12, 0, tzinfo=dt.UTC),
+        )
+        with_mild = energy_engine_factory(full_signal_ow_rows).compute_window()
+        assert with_mild.components == baseline.components
+        def strip(snap):
+            return {k: v for k, v in snap.items() if k != "generated_at"}
+
+        assert strip(with_mild.inputs_snapshot) == strip(baseline.inputs_snapshot)
+        assert with_mild.score_exact == baseline.score_exact
 
     @freeze_time("2026-07-09 14:23:00")
     def test_heavy_yesterday_subtracts_flat_points_never_raises(
@@ -509,3 +536,5 @@ class TestCarryoverComposedScore:
         assert carry["weight"] is None
         others = [c for c in estimate.components if c["name"] != "carryover_load_penalty"]
         assert sum(c["contribution"] for c in others) == pytest.approx(64.75)
+        # exact-sum contract with no tolerance
+        assert sum(c["contribution"] for c in estimate.components) == estimate.score_exact

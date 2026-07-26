@@ -110,8 +110,11 @@ Two bad values inside one group are one piece of evidence, not two. The
 night-HRV double-count rule above is this principle applied to one pair;
 apply it to every pair.
 
-For an unknown source, absent source, `status: insufficient_data`,
-`truncated: true`, or `confidence: low`, return `insufficient_data`.
+For an unknown source, absent source, `status: insufficient_data`, or
+`truncated: true`, return `insufficient_data`. Low-confidence data is never
+evidence at any level — ignore it (mentioning that it was set aside is
+fine); when **no** medium-or-higher-confidence evidence exists at all, the
+decision is `insufficient_data`.
 
 ## Judgment procedure
 
@@ -133,9 +136,9 @@ For an unknown source, absent source, `status: insufficient_data`,
 4. Choose the intervention level from the evidence:
    - **Level 1 — mention only** (`keep`): one mild signal at medium or
      higher confidence. State it as information; propose no plan change.
-     `daytime-hr` alone never exceeds this level. Low-confidence
-     observations are not evidence at any level — if nothing stronger
-     exists, the decision is `insufficient_data`, not `keep`.
+     `daytime-hr` alone never exceeds this level. (Low-confidence
+     observations are handled by the global rule above: never evidence,
+     `insufficient_data` when nothing stronger exists.)
    - **Level 2 — one optional, reversible suggestion** (`keep` + a light
      [Proposal]): one strong current signal — a large deviation from the
      personal baseline at medium+ confidence — or two evidence groups
