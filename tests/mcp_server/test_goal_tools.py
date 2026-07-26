@@ -97,3 +97,74 @@ class TestListGoals:
         assert [g["title"] for g in included["unassigned_weekly"]] == ["끝난 목표"]
         with store_factory() as session:
             assert session.scalars(select(WeeklyGoal)).one().status == "done"
+
+
+class TestReviewRegressions:
+    async def test_ambiguous_monthly_title_requires_uuid(self, mcp_client, call_tool):
+        await call_tool(
+            mcp_client,
+            "upsert_goal",
+            {"scope": "monthly", "title": "출시 준비", "period_start": "2026-06-01"},
+        )
+        await call_tool(
+            mcp_client,
+            "upsert_goal",
+            {"scope": "monthly", "title": "출시 준비", "period_start": "2026-07-01"},
+        )
+        result = await call_tool(
+            mcp_client,
+            "upsert_goal",
+            {"scope": "weekly", "title": "베타", "monthly_goal_ref": "출시 준비"},
+        )
+        assert result["goal"]["monthly_goal_id"] is None
+        assert "2 monthly goals" in result["goal_note"]
+
+    async def test_failed_relink_keeps_existing_link_and_says_so(
+        self, mcp_client, call_tool
+    ):
+        await call_tool(mcp_client, "upsert_goal", {"scope": "monthly", "title": "출시 준비"})
+        created = await call_tool(
+            mcp_client,
+            "upsert_goal",
+            {"scope": "weekly", "title": "베타", "monthly_goal_ref": "출시 준비"},
+        )
+        linked_id = created["goal"]["monthly_goal_id"]
+        relink = await call_tool(
+            mcp_client,
+            "upsert_goal",
+            {
+                "scope": "weekly",
+                "goal_id": created["goal"]["goal_id"],
+                "monthly_goal_ref": "없는 목표",
+            },
+        )
+        assert relink["goal"]["monthly_goal_id"] == linked_id  # unchanged
+        assert "existing month link unchanged" in relink["goal_note"]
+
+    async def test_monthly_period_normalized_to_first_day(self, mcp_client, call_tool):
+        result = await call_tool(
+            mcp_client,
+            "upsert_goal",
+            {"scope": "monthly", "title": "중순 시작", "period_start": "2026-07-15"},
+        )
+        assert result["goal"]["period_start"] == "2026-07-01"
+
+    async def test_weekly_under_done_month_is_not_misfiled(self, mcp_client, call_tool):
+        month = await call_tool(
+            mcp_client, "upsert_goal", {"scope": "monthly", "title": "끝난 달"}
+        )
+        await call_tool(
+            mcp_client,
+            "upsert_goal",
+            {"scope": "weekly", "title": "이어지는 주", "monthly_goal_ref": "끝난 달"},
+        )
+        await call_tool(
+            mcp_client,
+            "upsert_goal",
+            {"scope": "monthly", "goal_id": month["goal"]["goal_id"], "status": "done"},
+        )
+        listing = await call_tool(mcp_client, "list_goals", {})
+        assert listing["unassigned_weekly"] == []
+        [entry] = listing["weekly_under_hidden_months"]
+        assert entry["title"] == "이어지는 주"
+        assert entry["monthly_goal_id"] is not None

@@ -799,16 +799,18 @@ class TestCarryoverLoadSignal:
         assert signal.value == 1.0
         assert signal.raw["previous_day_booked_minutes"] == 540.0
 
-    def test_normal_yesterday_carries_nothing(self):
+    def test_normal_yesterday_is_absent_not_zero(self):
         import datetime as dt
 
-        from healthmes.engine.cognitive_energy import carryover_load_signal
+        from healthmes.engine.cognitive_energy import MissingSignal, carryover_load_signal
 
         start, end = self._prev_day()
-        # 4h booked = the free ramp point → severity exactly 0 (present, harmless)
+        # ≤4h booked → the factor is ABSENT (a present zero-severity term would
+        # renormalize every other weight and RAISE the score — review finding).
         events = [(start + dt.timedelta(hours=10), start + dt.timedelta(hours=14))]
         signal = carryover_load_signal(events, start, end, calendar_active=True)
-        assert signal.value == 0.0
+        assert isinstance(signal, MissingSignal)
+        assert signal.reason == "previous_day_within_normal_load"
 
     def test_free_yesterday_is_missing_not_zero(self):
         from healthmes.engine.cognitive_energy import MissingSignal, carryover_load_signal

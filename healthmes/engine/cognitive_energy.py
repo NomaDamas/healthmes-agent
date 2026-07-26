@@ -116,6 +116,7 @@ __all__ = [
     "stress_signal",
     "hrv_signal",
     "charge_signal",
+    "carryover_load_signal",
     "meeting_load_signal",
     "fragmentation_signal",
     "menstrual_phase_signal",
@@ -164,6 +165,12 @@ class FactorSpec:
     term: str  # component name (the plan's term name)
     kind: str  # "penalty" | "bonus"
     base_weight: float  # relative weight (share = base_weight / present total)
+    # Additive factors stay OUT of the renormalization pool: they subtract
+    # ``base_weight * value * 100`` points flat. A present-but-zero additive
+    # term can therefore never move the score (review 2026-07-27: a
+    # renormalizing zero-severity term RAISED the score by shrinking every
+    # other penalty's share — 64.75 → 66.43).
+    additive: bool = False
 
 
 _V1_FACTOR_SPECS: tuple[FactorSpec, ...] = (
@@ -183,7 +190,7 @@ _V2_FACTOR_SPECS: tuple[FactorSpec, ...] = (
     # Owner requirement 2026-07-27: yesterday's overload bleeds into today.
     # Adjunct term — present only when yesterday actually had booked time, so
     # every pre-existing flow (no previous-day events) stays byte-identical.
-    FactorSpec("carryover_load", "carryover_load_penalty", "penalty", 0.05),
+    FactorSpec("carryover_load", "carryover_load_penalty", "penalty", 0.05, additive=True),
 )
 FACTOR_SPECS: tuple[FactorSpec, ...] = _V1_FACTOR_SPECS + _V2_FACTOR_SPECS
 FACTORS: dict[str, FactorSpec] = {spec.key: spec for spec in FACTOR_SPECS}
@@ -689,6 +696,10 @@ def carryover_load_signal(
         (booked_minutes - CARRYOVER_FREE_MINUTES)
         / (CARRYOVER_FULL_MINUTES - CARRYOVER_FREE_MINUTES)
     )
+    if severity <= 0:
+        # A normally-loaded yesterday carries nothing — absent, not zero, so
+        # no-carryover flows stay byte-identical (weights, snapshot, score).
+        return MissingSignal("carryover_load", "previous_day_within_normal_load")
     return FactorSignal(
         "carryover_load",
         severity,
@@ -1097,7 +1108,9 @@ def compute_estimate(
         )
 
     by_key = {signal.key: signal for signal in signals}
-    ordered = [spec for spec in FACTOR_SPECS if spec.key in by_key]
+    present = [spec for spec in FACTOR_SPECS if spec.key in by_key]
+    ordered = [spec for spec in present if not spec.additive]
+    additive_specs = [spec for spec in present if spec.additive]
     total_weight = sum(spec.base_weight for spec in ordered)
     # True when the realized shares differ from the declared base weights,
     # i.e. the present factors' weights do not already sum to 1 (the v1 six
@@ -1119,7 +1132,7 @@ def compute_estimate(
                 "penalty_budget_points": round(100.0 - bonus_budget, 4),
                 "bonus_budget_points": round(bonus_budget, 4),
                 "renormalized": renormalized,
-                "factors_present": [spec.key for spec in ordered],
+                "factors_present": [spec.key for spec in present],
                 "factors_missing": missing_payload,
             },
             "contribution": base_points,
@@ -1141,6 +1154,34 @@ def compute_estimate(
                     "base_weight": spec.base_weight,
                     "max_points": round(max_points, 4),
                     "normalized_input": value,
+                },
+                "contribution": contribution,
+            }
+        )
+
+    core_total = sum(item["contribution"] for item in components)
+    for spec in additive_specs:
+        signal = by_key[spec.key]
+        value = _clamp01(float(signal.value))
+        points = spec.base_weight * 100.0 * value
+        if spec.kind == "bonus":
+            contribution = min(points, 100.0 - core_total)
+        else:
+            # Floor-preserving: never subtract below 0 so the exact-sum
+            # invariant (components sum == score_exact) survives the clamp.
+            contribution = -min(points, max(core_total, 0.0))
+        core_total += contribution
+        components.append(
+            {
+                "name": spec.term,
+                "kind": spec.kind,
+                "weight": None,  # flat points, outside the renormalized budget
+                "raw": {
+                    **signal.raw,
+                    "base_weight": spec.base_weight,
+                    "max_points": round(spec.base_weight * 100.0, 4),
+                    "normalized_input": value,
+                    "additive": True,
                 },
                 "contribution": contribution,
             }
@@ -1763,14 +1804,17 @@ class CognitiveEnergyEngine:
         prev_day_end = datetime.combine(
             window_start.astimezone(UTC).date(), time.min, tzinfo=UTC
         )
-        take(
-            carryover_load_signal(
-                ctx.previous_day_events,
-                prev_day_end - timedelta(days=1),
-                prev_day_end,
-                calendar_active=ctx.calendar_active,
-            )
+        carryover = carryover_load_signal(
+            ctx.previous_day_events,
+            prev_day_end - timedelta(days=1),
+            prev_day_end,
+            calendar_active=ctx.calendar_active,
         )
+        if isinstance(carryover, FactorSignal):
+            # Adjunct term: recorded only when real overload carried over —
+            # its absence is the norm, not a data gap worth a missing entry
+            # (keeps every no-carryover snapshot byte-identical to v1 flows).
+            take(carryover)
         take(fragmentation_signal(ctx.usage, window_start, now))
 
         recent_sleep = sorted(digest.sleep_scores_by_day.items())[-8:]
