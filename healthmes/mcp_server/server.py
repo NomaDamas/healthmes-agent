@@ -1016,17 +1016,27 @@ def _stress_samples(rows: Iterable[Mapping[str, Any]]) -> list[tuple[dt.datetime
 
 
 def _typed_samples(
-    rows: Iterable[Mapping[str, Any]], series_type: str
+    rows: Iterable[Mapping[str, Any]],
+    series_type: str,
+    *,
+    drop_nonpositive: bool = False,
 ) -> list[tuple[dt.datetime, float]]:
-    """(aware UTC timestamp, value) samples of one series type; non-positive
-    values dropped (HR of 0 is a sensor gap, steps of 0 are kept via >= 0)."""
+    """(aware UTC timestamp, value) samples of one series type.
+
+    Negative values are always dropped; ``drop_nonpositive`` additionally
+    drops zeros (an HR of 0 is a sensor gap, while 0 steps is stillness
+    evidence that must be kept).
+    """
     samples: list[tuple[dt.datetime, float]] = []
+    floor = 0.0 if drop_nonpositive else -0.0
     for row in rows:
         if row.get("type") != series_type:
             continue
         recorded_at = _parse_recorded_at(row.get("timestamp"))
         value = _as_float(row.get("value"))
         if recorded_at is None or value is None or value < 0:
+            continue
+        if drop_nonpositive and value <= floor:
             continue
         samples.append((recorded_at, value))
     return samples
@@ -1049,19 +1059,43 @@ async def _arousal_hints_for(
     stress-timeline response never fails because hints could not be built.
     """
     try:
-        series_rows, truncated = await client.collect_timeseries_tracked(
+        # One fetch per series: a full day of 1-minute HR alone is ~1,440
+        # rows, so a combined fetch would trip the shared page cap and
+        # spuriously truncate (review finding). The vendor range query can
+        # widen end bounds to midnight, so samples are re-filtered to the
+        # local-day UTC window below.
+        hr_rows, hr_truncated = await client.collect_timeseries_tracked(
             user_id,
             start_utc.isoformat(),
             end_utc.isoformat(),
-            [HR_SERIES_TYPE, STEPS_SERIES_TYPE],
+            [HR_SERIES_TYPE],
         )
-        hr_utc = _typed_samples(series_rows, HR_SERIES_TYPE)
-        steps_utc = _typed_samples(series_rows, STEPS_SERIES_TYPE)
+        step_rows, steps_truncated = await client.collect_timeseries_tracked(
+            user_id,
+            start_utc.isoformat(),
+            end_utc.isoformat(),
+            [STEPS_SERIES_TYPE],
+        )
+        truncated = hr_truncated or steps_truncated
+        hr_utc = [
+            (at, value)
+            for at, value in _typed_samples(hr_rows, HR_SERIES_TYPE, drop_nonpositive=True)
+            if start_utc <= at < end_utc
+        ]
+        steps_utc = [
+            (at, value)
+            for at, value in _typed_samples(step_rows, STEPS_SERIES_TYPE)
+            if start_utc <= at < end_utc
+        ]
 
+        # The vendor returns only workouts fully contained in the queried
+        # range (event_record_repository), and date-only bounds are read as
+        # UTC midnights — pad generously so evening workouts in any timezone
+        # are included; extra spans only ever mask more, never fabricate.
         workout_rows = await client.collect_workouts(
             user_id,
             (day - dt.timedelta(days=1)).isoformat(),
-            (day + dt.timedelta(days=1)).isoformat(),
+            (day + dt.timedelta(days=2)).isoformat(),
         )
         workout_spans: list[tuple[dt.datetime, dt.datetime]] = []
         for row in workout_rows:
@@ -1081,7 +1115,7 @@ async def _arousal_hints_for(
         rhr_series = interpret.summary_daily_values(
             rhr_rows, "resting_heart_rate_bpm", day
         )
-    except OWClientError as exc:
+    except (OWClientError, httpx.HTTPError) as exc:
         logging.getLogger(__name__).warning(
             "arousal hints: open-wearables fetch failed: %s", exc
         )

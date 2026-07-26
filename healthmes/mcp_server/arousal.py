@@ -11,16 +11,18 @@ plan decision on hints alone.
 
 Pipeline (pure functions, no I/O — the MCP layer fetches):
 
-1. ``quiet_windows``  — waking-hour stretches with ~zero steps, outside
-   workout spans. Night hours are excluded as likely sleep (approximation,
+1. ``quiet_windows``  — waking-hour stretches evidenced by **consecutive**
+   still step samples (a lone still bucket proves nothing), with workout
+   spans subtracted, night hours excluded as likely sleep (approximation,
    documented; sleep-event masking is a future refinement — hence the
    confidence cap).
-2. ``resting_baseline`` — median + spread of the last 14 daily resting-HR
-   values (provider-computed RHR; needs ``MIN_BASELINE_DAYS`` to exist).
-3. ``arousal_hint_intervals`` — sustained (≥ ``MIN_HINT_MINUTES``) runs of
-   quiet-window HR at or above baseline + margin.
-4. ``build_arousal_hints`` — the response payload with coverage, capped
-   confidence, and honest ``insufficient_data``.
+2. ``resting_baseline`` — median of the last 14 daily resting-HR values
+   (provider-computed RHR; needs ``MIN_BASELINE_DAYS`` to exist).
+3. ``arousal_hint_intervals`` — per quiet window, sustained elevated spans
+   whose **mean over every sample in the span (dips included)** clears the
+   threshold; data gaps break spans instead of being bridged.
+4. ``build_arousal_hints`` — the response payload with observation-based
+   coverage, capped confidence, and honest ``insufficient_data``.
 
 All thresholds are named constants and are expert-tunable placeholders per
 the PLAN convention — values chosen to be conservative (few false hints)
@@ -35,18 +37,22 @@ from typing import Any
 # Expert-tunable placeholders (PLAN §1.5 confidence-boundary convention).
 QUIET_STEP_THRESHOLD = 5  # steps per sample bucket at or below → "still"
 MIN_QUIET_MINUTES = 15  # a stillness stretch shorter than this is ignored
+MAX_STILL_PAIR_GAP_MINUTES = 15  # consecutive still samples further apart don't chain
 MIN_HINT_MINUTES = 10  # sustained elevation required for one hint
-HINT_GAP_TOLERANCE_MINUTES = 3  # brief dips/missing samples inside a run
+HINT_GAP_TOLERANCE_MINUTES = 3  # max spacing between samples inside one span
 AROUSAL_MARGIN_BPM = 12.0  # elevation over resting baseline that counts
 MIN_BASELINE_DAYS = 7  # fewer RHR days → insufficient_data
 WAKING_START_HOUR = 7  # local; earlier is treated as likely sleep
 WAKING_END_HOUR = 23
+HR_OBSERVATION_SPAN_MINUTES = 6  # one HR sample vouches for at most this span
 MIN_COVERAGE_FOR_MEDIUM = 0.30  # of the waking window observed while quiet
 MIN_COVERAGE = 0.10  # below → insufficient_data
 MEAL_CONTEXT_WINDOW_MINUTES = 45  # food_log entries this close are context
 
 STATUS_OK = "ok"
 STATUS_INSUFFICIENT = "insufficient_data"
+
+Span = tuple[dt.datetime, dt.datetime]
 
 
 @dataclass(frozen=True)
@@ -64,11 +70,11 @@ class HintInterval:
         return (self.end - self.start).total_seconds() / 60.0
 
 
-def _merge_spans(
-    spans: list[tuple[dt.datetime, dt.datetime]],
-) -> list[tuple[dt.datetime, dt.datetime]]:
-    merged: list[tuple[dt.datetime, dt.datetime]] = []
+def _merge_spans(spans: list[Span]) -> list[Span]:
+    merged: list[Span] = []
     for start, end in sorted(spans):
+        if end <= start:
+            continue
         if merged and start <= merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
@@ -76,7 +82,24 @@ def _merge_spans(
     return merged
 
 
-def waking_window(day: dt.date, tz: dt.tzinfo) -> tuple[dt.datetime, dt.datetime]:
+def _subtract_spans(spans: list[Span], blocks: list[Span]) -> list[Span]:
+    """``spans`` minus every ``blocks`` overlap (both need not be merged)."""
+    result = list(spans)
+    for b_start, b_end in _merge_spans(list(blocks)):
+        next_result: list[Span] = []
+        for start, end in result:
+            if b_end <= start or end <= b_start:
+                next_result.append((start, end))
+                continue
+            if start < b_start:
+                next_result.append((start, b_start))
+            if b_end < end:
+                next_result.append((b_end, end))
+        result = next_result
+    return [(start, end) for start, end in result if end > start]
+
+
+def waking_window(day: dt.date, tz: dt.tzinfo) -> Span:
     """The local waking span used for coverage and likely-sleep exclusion."""
     return (
         dt.datetime.combine(day, dt.time(WAKING_START_HOUR), tzinfo=tz),
@@ -86,39 +109,37 @@ def waking_window(day: dt.date, tz: dt.tzinfo) -> tuple[dt.datetime, dt.datetime
 
 def quiet_windows(
     step_samples: list[tuple[dt.datetime, float]],
-    workout_spans: list[tuple[dt.datetime, dt.datetime]],
+    workout_spans: list[Span],
     day: dt.date,
     tz: dt.tzinfo,
-) -> list[tuple[dt.datetime, dt.datetime]]:
-    """Waking stretches that are still (≈no steps) and outside workouts.
+) -> list[Span]:
+    """Waking stretches evidenced still, outside workouts.
 
-    Step samples are bucketed observations ``(local_time, steps)``; a gap in
-    step data is NOT treated as stillness — only observed ≤threshold buckets
-    qualify, so missing data lowers coverage instead of inventing quiet.
+    Stillness needs **two consecutive** still samples: a span is added only
+    between adjacent samples that are both ≤ threshold and no further apart
+    than the pairing cap — so gaps in step data are *unknown*, not quiet,
+    and a lone still bucket proves nothing. Workout spans are subtracted
+    from the result (not merely sampled at bucket timestamps), so a workout
+    starting between two buckets still masks its minutes.
     """
     wake_start, wake_end = waking_window(day, tz)
-    workout_merged = _merge_spans(list(workout_spans))
+    pair_gap = dt.timedelta(minutes=MAX_STILL_PAIR_GAP_MINUTES)
 
     ordered = sorted(step_samples)
-    still: list[tuple[dt.datetime, dt.datetime]] = []
-    for index, (at, steps) in enumerate(ordered):
-        if steps > QUIET_STEP_THRESHOLD:
+    still_pairs: list[Span] = []
+    for (at_a, steps_a), (at_b, steps_b) in zip(ordered, ordered[1:]):
+        if steps_a > QUIET_STEP_THRESHOLD or steps_b > QUIET_STEP_THRESHOLD:
             continue
-        if not (wake_start <= at < wake_end):
+        if at_b - at_a > pair_gap:
             continue
-        if any(start <= at < end for start, end in workout_merged):
-            continue
-        # A bucket covers until the next sample (bounded to 15 min so sparse
-        # data cannot claim long stillness).
-        if index + 1 < len(ordered):
-            span_end = min(ordered[index + 1][0], at + dt.timedelta(minutes=15))
-        else:
-            span_end = at + dt.timedelta(minutes=15)
-        still.append((at, min(span_end, wake_end)))
+        start = max(at_a, wake_start)
+        end = min(at_b, wake_end)
+        if end > start:
+            still_pairs.append((start, end))
 
-    merged = _merge_spans(still)
+    quiet = _subtract_spans(_merge_spans(still_pairs), list(workout_spans))
     min_span = dt.timedelta(minutes=MIN_QUIET_MINUTES)
-    return [(start, end) for start, end in merged if end - start >= min_span]
+    return [(start, end) for start, end in quiet if end - start >= min_span]
 
 
 def resting_baseline(daily_rhr: list[tuple[dt.date, float]]) -> dict[str, Any] | None:
@@ -132,79 +153,111 @@ def resting_baseline(daily_rhr: list[tuple[dt.date, float]]) -> dict[str, Any] |
     }
 
 
+def _window_chains(
+    samples: list[tuple[dt.datetime, float]], window: Span
+) -> list[list[tuple[dt.datetime, float]]]:
+    """Contiguous sample chains inside one window (data gaps break chains)."""
+    gap = dt.timedelta(minutes=HINT_GAP_TOLERANCE_MINUTES)
+    inside = [item for item in samples if window[0] <= item[0] < window[1]]
+    chains: list[list[tuple[dt.datetime, float]]] = []
+    for item in inside:
+        if chains and item[0] - chains[-1][-1][0] <= gap:
+            chains[-1].append(item)
+        else:
+            chains.append([item])
+    return chains
+
+
 def arousal_hint_intervals(
     hr_samples: list[tuple[dt.datetime, float]],
-    quiet: list[tuple[dt.datetime, dt.datetime]],
+    quiet: list[Span],
     baseline_bpm: float,
 ) -> list[HintInterval]:
-    """Sustained quiet-time HR runs at or above baseline + margin."""
+    """Sustained quiet-time elevation, judged over every sample in the span.
+
+    Each quiet window is processed independently (hints never bridge
+    windows). Within a window, contiguous sample chains (gaps ≤ tolerance)
+    are scanned for spans running from one above-threshold sample to a later
+    one; a span counts only when it is long enough AND the mean of **all**
+    its samples — dips included — clears the threshold. Interleaved
+    below-threshold readings therefore drag the mean down and kill the hint
+    instead of being silently discarded.
+    """
     threshold = baseline_bpm + AROUSAL_MARGIN_BPM
-    gap = dt.timedelta(minutes=HINT_GAP_TOLERANCE_MINUTES)
     min_len = dt.timedelta(minutes=MIN_HINT_MINUTES)
 
-    in_quiet = [
-        (at, value)
-        for at, value in sorted(hr_samples)
-        if any(start <= at < end for start, end in quiet)
-    ]
-
     hints: list[HintInterval] = []
-    run: list[tuple[dt.datetime, float]] = []
-    for at, value in in_quiet:
-        if value >= threshold:
-            if run and at - run[-1][0] > gap:
-                _flush_run(run, baseline_bpm, min_len, hints)
-                run = []
-            run.append((at, value))
-        elif run and at - run[-1][0] <= gap:
-            continue  # brief dip inside the tolerance window
-        else:
-            _flush_run(run, baseline_bpm, min_len, hints)
-            run = []
-    _flush_run(run, baseline_bpm, min_len, hints)
+    for window in quiet:
+        for chain in _window_chains(sorted(hr_samples), window):
+            elevated_indices = [
+                index for index, (_, value) in enumerate(chain) if value >= threshold
+            ]
+            if not elevated_indices:
+                continue
+            span = chain[elevated_indices[0] : elevated_indices[-1] + 1]
+            start, end = span[0][0], span[-1][0]
+            if end - start < min_len:
+                continue
+            values = [value for _, value in span]
+            mean = sum(values) / len(values)
+            if mean < threshold:
+                continue
+            hints.append(
+                HintInterval(
+                    start=start,
+                    end=end,
+                    hr_mean=mean,
+                    hr_peak=max(values),
+                    baseline_bpm=baseline_bpm,
+                )
+            )
     return hints
 
 
-def _flush_run(
-    run: list[tuple[dt.datetime, float]],
-    baseline_bpm: float,
-    min_len: dt.timedelta,
-    out: list[HintInterval],
-) -> None:
-    if len(run) < 2:
-        return
-    start, end = run[0][0], run[-1][0]
-    if end - start < min_len:
-        return
-    values = [value for _, value in run]
-    out.append(
-        HintInterval(
-            start=start,
-            end=end,
-            hr_mean=sum(values) / len(values),
-            hr_peak=max(values),
-            baseline_bpm=baseline_bpm,
-        )
-    )
+def observation_spans(
+    hr_samples: list[tuple[dt.datetime, float]],
+) -> list[Span]:
+    """Spans genuinely vouched for by HR samples.
+
+    Each sample covers until the next one, bounded by the expected cadence —
+    so five samples in twelve minutes cover ~twelve minutes, never a whole
+    afternoon, and internal gaps stay uncovered.
+    """
+    bound = dt.timedelta(minutes=HR_OBSERVATION_SPAN_MINUTES)
+    ordered = sorted(at for at, _ in hr_samples)
+    spans: list[Span] = []
+    for index, at in enumerate(ordered):
+        if index + 1 < len(ordered):
+            end = min(ordered[index + 1], at + bound)
+        else:
+            end = at + bound
+        spans.append((at, end))
+    return _merge_spans(spans)
+
+
+def _intersect(a: list[Span], b: list[Span]) -> list[Span]:
+    out: list[Span] = []
+    for a_start, a_end in a:
+        for b_start, b_end in b:
+            start, end = max(a_start, b_start), min(a_end, b_end)
+            if end > start:
+                out.append((start, end))
+    return _merge_spans(out)
 
 
 def quiet_coverage(
-    quiet: list[tuple[dt.datetime, dt.datetime]],
+    quiet: list[Span],
     hr_samples: list[tuple[dt.datetime, float]],
     day: dt.date,
     tz: dt.tzinfo,
 ) -> float:
-    """Fraction of the waking window that is quiet AND has HR observations."""
+    """Fraction of the waking window both quiet AND actually HR-observed."""
     wake_start, wake_end = waking_window(day, tz)
     waking_seconds = (wake_end - wake_start).total_seconds()
     if waking_seconds <= 0:
         return 0.0
-    hr_times = sorted(at for at, _ in hr_samples)
-    covered = 0.0
-    for start, end in quiet:
-        inside = [at for at in hr_times if start <= at < end]
-        if len(inside) >= 2:
-            covered += (min(end, inside[-1] + dt.timedelta(minutes=5)) - start).total_seconds()
+    observed = _intersect(quiet, observation_spans(hr_samples))
+    covered = sum((end - start).total_seconds() for start, end in observed)
     return max(0.0, min(1.0, covered / waking_seconds))
 
 
@@ -226,7 +279,7 @@ def build_arousal_hints(
     tz: dt.tzinfo,
     hr_samples: list[tuple[dt.datetime, float]],
     step_samples: list[tuple[dt.datetime, float]],
-    workout_spans: list[tuple[dt.datetime, dt.datetime]],
+    workout_spans: list[Span],
     daily_rhr: list[tuple[dt.date, float]],
     truncated: bool,
     context_for: Any,

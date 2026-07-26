@@ -70,9 +70,11 @@ interval or score.
   data cannot support a definite plan decision; a definite decision requires
   `observed_on` to match the target date and `stale_days: 0`.
 
-### `arousal_hints` (response field, non-Garmin days)
+### `arousal_hints` (response field — days without a usable Garmin intraday series)
 
-- Non-Garmin responses may carry an `arousal_hints` field: deterministic
+- Any response whose `source` is not `garmin_stress_timeseries` (including
+  `garmin_daily_stress_score`, the resilience proxy, and insufficient-data
+  responses) may carry an `arousal_hints` field: deterministic
   quiet-time heart-rate elevation intervals over the personal resting
   baseline, with calendar, app, and meal-log overlap as `likely_context`.
 - These are **hints about physiological arousal, never measured stress**.

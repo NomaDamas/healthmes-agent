@@ -157,3 +157,57 @@ def test_step_gaps_do_not_invent_stillness():
     steps = [(_t(13), 0.0), (_t(17), 0.0)]
     payload = _build(hr, steps)
     assert payload["status"] == "insufficient_data"
+
+
+# --- adversarial cases from independent review -------------------------------
+
+
+def test_interleaved_dips_drag_mean_below_threshold():
+    # 72bpm highs interleaved with 55bpm dips: old logic discarded dips and
+    # fabricated a "sustained 72" hint; the mean over ALL samples (61.5 < 70)
+    # must kill it.
+    hr = []
+    for m in range(0, 26, 2):
+        hr.append((_t(14, m), 72.0 if (m // 2) % 2 == 0 else 55.0))
+    hr += _hr_flat(13, 14, 60.0) + _hr_flat(15, 17, 60.0)
+    payload = _build(sorted(hr), _steps_still(13, 17))
+    assert payload["status"] == "ok"
+    assert payload["intervals"] == []
+
+
+def test_sparse_evening_samples_cannot_claim_full_coverage():
+    # Five HR samples in 22:47–22:55 only: observation spans are bounded, so
+    # coverage over the 16h waking window must be tiny, not 1.0.
+    hr = [(_t(22, m), 60.0) for m in (47, 49, 51, 53, 55)]
+    payload = _build(hr, _steps_still(7, 23))
+    assert payload["status"] == "insufficient_data"
+    assert payload["reason"] == "quiet_window_coverage_too_low"
+
+
+def test_workout_starting_between_buckets_still_masks():
+    # Still pair at 10:00/10:05 with a workout starting 10:01: the workout
+    # span must be subtracted from the window, not sampled at bucket times.
+    steps = [(_t(10, 0), 0.0), (_t(10, 5), 0.0), (_t(10, 10), 0.0), (_t(10, 15), 0.0)]
+    hr = [(_t(10, m), 90.0) for m in range(0, 16, 2)]
+    payload = _build(hr, steps, workouts=[(_t(10, 1), _t(11, 0))])
+    assert payload["status"] == "insufficient_data"
+
+
+def test_single_isolated_still_sample_proves_nothing():
+    from healthmes.mcp_server.arousal import quiet_windows
+
+    windows = quiet_windows([(_t(13), 0.0)], [], DAY, TZ)
+    assert windows == []
+
+
+def test_hints_never_bridge_across_quiet_windows():
+    # Movement at 13:20 splits stillness into two windows; elevated HR across
+    # the whole stretch must yield per-window hints, never one spanning 13:20.
+    steps = _steps_still(13, 17)
+    steps = [(at, 200.0 if at == _t(13, 20) else v) for at, v in steps]
+    hr = _hr_flat(13, 17, 75.0)
+    payload = _build(hr, steps)
+    assert payload["status"] == "ok"
+    for hint in payload["intervals"]:
+        crosses = hint["start"] < _t(13, 20).isoformat() < hint["end"]
+        assert not crosses
