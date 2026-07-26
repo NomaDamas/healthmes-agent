@@ -285,7 +285,15 @@ Then re-run:  healthmes connect google"""
 
 
 def _google_client_secret(settings: Settings) -> Path | None:
-    """The client secret to use: the data-dir standard path, else the override."""
+    """The client secret to use: data-dir standard path → env override →
+    the packaged project client (config/google_oauth_client.json).
+
+    The packaged fallback is the gcloud/rclone installed-app pattern: the
+    project ships its own OAuth desktop client so a new user's
+    ``connect google`` is a browser login and nothing else — no console
+    registration (PLAN §13). Desktop-app client identifiers are not
+    confidential in Google's model; the account still consents in-browser.
+    """
     from healthmes.calendars import google as google_calendar
 
     standard = google_calendar.google_client_secret_path(settings.data_dir)
@@ -294,6 +302,9 @@ def _google_client_secret(settings: Settings) -> Path | None:
     override = settings.google_client_secret_file
     if override is not None and Path(override).exists():
         return Path(override)
+    packaged = Path(__file__).resolve().parent.parent / "config" / "google_oauth_client.json"
+    if packaged.exists():
+        return packaged
     return None
 
 
