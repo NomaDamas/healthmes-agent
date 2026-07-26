@@ -176,7 +176,8 @@ hardware) lives in each app's README.
 `healthmes-planner` (goal dump → task breakdown → energy-aware block
 proposals → decision recording), `healthmes-capture` (food + medical),
 `healthmes-sleep` (sleep/readiness evidence → cautious daily intensity
-decision), `doctor-visit-summary`.
+decision), `healthmes-stress` (source-aware stress/recovery evidence →
+keep/reconsider/insufficient-data decision), `doctor-visit-summary`.
 
 ## Quickstart (mac-native, primary path)
 

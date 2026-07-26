@@ -14,6 +14,13 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+EXPECTED_SKILLS = (
+    "doctor-visit-summary",
+    "healthmes-capture",
+    "healthmes-planner",
+    "healthmes-sleep",
+    "healthmes-stress",
+)
 
 pytestmark = pytest.mark.usefixtures("clean_env")
 
@@ -71,12 +78,7 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     # 2. Skills copied into the discovery path (SKILLS_DIR = home/skills).
     # Copies, not symlinks: the vendor trust check resolves symlinks and
     # would log a security warning on every skill load (skills_tool.py).
-    for skill in (
-        "healthmes-planner",
-        "healthmes-capture",
-        "healthmes-sleep",
-        "doctor-visit-summary",
-    ):
+    for skill in EXPECTED_SKILLS:
         dest = hermes_home / "skills" / skill
         assert dest.is_dir() and not dest.is_symlink()
         assert (dest / "SKILL.md").read_text() == (
@@ -289,12 +291,7 @@ def test_api_token_flows_into_mcp_headers_and_sidecar(
 
 def test_repo_skills_are_discovered(bootstrap):
     names = [path.name for path in bootstrap.discover_skill_dirs(REPO_ROOT)]
-    assert names == [
-        "doctor-visit-summary",
-        "healthmes-capture",
-        "healthmes-planner",
-        "healthmes-sleep",
-    ]
+    assert names == list(EXPECTED_SKILLS)
 
 
 def test_legacy_symlink_is_migrated_to_copy(bootstrap, hermes_home, env_file, tmp_path):

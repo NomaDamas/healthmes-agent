@@ -65,10 +65,10 @@ def test_skill_docs_use_registry_tool_names(skill_md: Path) -> None:
 
 
 def test_skill_dirs_all_checked() -> None:
-    """The glob really found the four shipped skills (guards silent misses)."""
     assert [path.parent.name for path in SKILL_MDS] == [
         "doctor-visit-summary",
         "healthmes-capture",
         "healthmes-planner",
         "healthmes-sleep",
+        "healthmes-stress",
     ]
