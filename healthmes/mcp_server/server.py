@@ -1361,9 +1361,11 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
         response["status"] = interpret.STATUS_INSUFFICIENT
         response["reason"] = "stress_timeseries_truncated"
         response["confidence"] = "low"
-    if source != "garmin_stress_timeseries":
-        # Non-Garmin days have no measured intraday stress; attach the
-        # deterministic HR arousal-hint interpretation (PLAN §13 follow-up).
+    if source != "garmin_stress_timeseries" or series_truncated:
+        # No *usable* Garmin intraday series (non-Garmin day, daily/proxy
+        # fallback, or a truncated series the skill must not lean on):
+        # attach the deterministic HR arousal-hint interpretation
+        # (PLAN §13 follow-up).
         response["arousal_hints"] = await _arousal_hints_for(
             client, user_id, day, tz, start_utc, end_utc
         )
