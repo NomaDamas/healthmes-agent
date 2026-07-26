@@ -89,6 +89,24 @@ interval or score.
   `medium` by design). When `status` is `insufficient_data`, do not mention
   intraday timing at all.
 
+## Evidence groups — count origins, not measurements
+
+Signals computed from the same underlying measurement rise and fall
+together, so they can never corroborate each other. Assign every strain
+signal to its origin group and count each group as **at most one** piece of
+independent evidence:
+
+- `night-cardiac` — nocturnal HRV (readiness `hrv`), the night-HRV
+  resilience proxy, and charge qualifiers derived from the same night
+  (body battery, recovery, readiness).
+- `native-stress` — Garmin-measured stress (timeseries or daily score).
+- `daytime-hr` — `arousal_hints` intervals.
+- `behavioral` — calendar overload and app-usage context.
+
+Two bad values inside one group are one piece of evidence, not two. The
+night-HRV double-count rule above is this principle applied to one pair;
+apply it to every pair.
+
 For an unknown source, absent source, `status: insufficient_data`,
 `truncated: true`, or `confidence: low`, return `insufficient_data`.
 
@@ -102,24 +120,35 @@ For an unknown source, absent source, `status: insufficient_data`,
    entry `observed_on` to match the target date; previous-day entries may be
    described only as context. A current explicit low readiness, recovery, or
    body-battery qualifier and nocturnal HRV below personal baseline with a
-   negative z-score are strain signals.
-3. Choose `reconsider` only when the evidence is decision-grade:
-   - Garmin timeseries has medium or high confidence, includes a returned
-     `medium` or `high` interval, and an independent current recovery signal
-     points toward strain; or
-   - day-level evidence is accompanied by two independent current recovery
-     signals that point toward strain. Do not double-count night HRV when the
-     source is `night_hrv_resilience_proxy`.
-4. Choose `keep` when current, decision-grade evidence does not contain a
-   returned medium/high timeseries interval and independent recovery evidence
-   does not point toward strain. Explain that `keep` means there is not enough
-   evidence to change the plan, not that the user has no stress.
+   negative z-score are strain signals — all inside the `night-cardiac`
+   evidence group.
+3. **Every valid signal always counts.** A single weak strain signal is
+   never discarded: it must appear in [Evidence], soften the wording of a
+   `keep`, and be mentioned when the user asks how they are doing. What
+   scales with evidence is not whether it matters but **how strongly to
+   intervene** (the ladder below).
+4. Choose the intervention level from the evidence:
+   - **Level 1 — mention only** (`keep`): one mild or low-confidence
+     signal. State it as information; propose no plan change.
+     `daytime-hr` alone never exceeds this level.
+   - **Level 2 — one optional, reversible suggestion** (`keep` + a light
+     [Proposal]): one strong current signal — a large deviation from the
+     personal baseline at medium+ confidence — or two evidence groups
+     mildly aligned. Offer to review the single highest-intensity block;
+     present it as optional, never necessary.
+   - **Level 3 — firm recommendation** (`reconsider`): at least two
+     **different evidence groups**, each current and decision-grade,
+     pointing the same way (e.g. night-cardiac strain + daytime-hr hints,
+     or native-stress + behavioral overload).
 5. Choose `insufficient_data` when evidence is missing, stale, low-confidence,
    truncated, source-limited for the user's question, or materially
    conflicting. State the exact boundary and the one next observation that
    would resolve it.
-6. For `reconsider`, propose one reversible action: review the day's single
-   highest-intensity work or training block. Do not change it automatically.
+6. For any proposal (level 2 or 3), the action is one reversible step:
+   review the day's single highest-intensity work or training block. Never
+   change the schedule automatically. Interruption budgets (quiet hours,
+   daily alert budget, cooldowns) are enforced by the trigger engine — this
+   skill's job is honest grading, not rationing.
 7. If the user supplies fatigue, pain, illness, workload, or life context,
    use it to explain a choice but never present it as wearable-measured fact
    or persist the sensitive text.

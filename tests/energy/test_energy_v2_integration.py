@@ -146,7 +146,9 @@ class TestEngineWithV2Rows:
         assert [item["name"] for item in estimate.components] == ALL_COMPONENT_NAMES
         assert estimate.score_exact == pytest.approx(62.32)
         assert estimate.score == 62
-        assert estimate.inputs_snapshot["missing_signals"] == []
+        assert estimate.inputs_snapshot["missing_signals"] == [
+            {"name": "carryover_load", "reason": "previous_day_free"}
+        ]
 
         by_name = {item["name"]: item for item in estimate.components}
         assert by_name["menstrual_phase_adjustment"]["contribution"] == pytest.approx(-1.68)
@@ -216,6 +218,7 @@ class TestEngineWithV2Rows:
             for item in estimate.inputs_snapshot["missing_signals"]
         }
         assert reasons == {
+            "carryover_load": "previous_day_free",
             "menstrual_phase": "no_cycle_data",
             "sunlight": "no_recent_daylight_data",
             "noise": "no_recent_noise_data",
@@ -245,7 +248,9 @@ class TestLegacyV1RowsStayByteIdentical:
             "fragmentation_penalty",
         ]
         assert estimate.score == 65
-        assert estimate.inputs_snapshot["missing_signals"] == []
+        assert estimate.inputs_snapshot["missing_signals"] == [
+            {"name": "carryover_load", "reason": "previous_day_free"}
+        ]
         v2_info = estimate.inputs_snapshot["ow"]["v2"]
         assert v2_info == {"series_rows": "not_fetched", "cycle_rows": "not_fetched"}
 
