@@ -1770,7 +1770,7 @@ def _resolve_monthly_ref(session: Any, ref: str) -> tuple[Any | None, str | None
     if len(matches) > 1:
         return None, (
             f"{len(matches)} monthly goals are titled {ref!r} (different months) — "
-            "pass the UUID to disambiguate; link left unchanged"
+            "pass the UUID to disambiguate"
         )
     return None, f"monthly goal {ref!r} not found"
 

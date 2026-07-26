@@ -256,7 +256,7 @@ class TestPerFactorRenormalization:
         )
         assert components["base"]["raw"]["renormalized"] is True
         total = sum(item["contribution"] for item in estimate.components)
-        assert total == pytest.approx(estimate.score_exact, abs=1e-9)
+        assert total == estimate.score_exact  # exact-sum contract, no tolerance
 
     @pytest.mark.parametrize(
         ("key", "term", "reason"),
@@ -324,7 +324,7 @@ class TestComponentsSumToScoreV2:
     def test_components_sum_to_score(self, signals: list[FactorSignal]) -> None:
         estimate = compute_estimate(WS, WE, signals)
         total = sum(item["contribution"] for item in estimate.components)
-        assert total == pytest.approx(estimate.score_exact, abs=1e-9)
+        assert total == estimate.score_exact  # exact-sum contract, no tolerance
         assert estimate.score == round(estimate.score_exact)
         assert 0 <= estimate.score <= 100
 

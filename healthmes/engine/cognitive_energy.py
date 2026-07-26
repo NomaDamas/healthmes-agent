@@ -1160,6 +1160,10 @@ def compute_estimate(
         )
 
     core_total = sum(item["contribution"] for item in components)
+    # Deterministic order: penalties before bonuses. The floor/ceiling clamps
+    # make application order observable, so it must never depend on FACTOR_
+    # SPECS declaration order (review 2026-07-27).
+    additive_specs.sort(key=lambda spec: 0 if spec.kind == "penalty" else 1)
     for spec in additive_specs:
         signal = by_key[spec.key]
         value = _clamp01(float(signal.value))
@@ -1186,6 +1190,12 @@ def compute_estimate(
                 "contribution": contribution,
             }
         )
+    if additive_specs and -1e-9 < core_total < 0.0:
+        # Pure float noise from the clamped subtraction: nudge the last
+        # additive component so the exact-sum contract (components sum ==
+        # score_exact) survives the [0, 100] clamp below.
+        components[-1]["contribution"] -= core_total
+        core_total = 0.0
 
     score_exact = sum(item["contribution"] for item in components)
     # Bounded [0, 100] by construction; the clamp is a pure float-noise guard.
