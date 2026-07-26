@@ -185,6 +185,7 @@ def arousal_hint_intervals(
     """
     threshold = baseline_bpm + AROUSAL_MARGIN_BPM
     min_len = dt.timedelta(minutes=MIN_HINT_MINUTES)
+    dip_gap = dt.timedelta(minutes=HINT_GAP_TOLERANCE_MINUTES)
 
     hints: list[HintInterval] = []
     for window in quiet:
@@ -194,23 +195,35 @@ def arousal_hint_intervals(
             ]
             if not elevated_indices:
                 continue
-            span = chain[elevated_indices[0] : elevated_indices[-1] + 1]
-            start, end = span[0][0], span[-1][0]
-            if end - start < min_len:
-                continue
-            values = [value for _, value in span]
-            mean = sum(values) / len(values)
-            if mean < threshold:
-                continue
-            hints.append(
-                HintInterval(
-                    start=start,
-                    end=end,
-                    hr_mean=mean,
-                    hr_peak=max(values),
-                    baseline_bpm=baseline_bpm,
+            # Group elevated samples that are close in time: a normal-HR
+            # stretch longer than the dip tolerance ENDS a candidate — two
+            # separate elevated runs must never fuse into one long "sustained"
+            # span just because the chain (and its overall mean) allows it.
+            groups: list[list[int]] = [[elevated_indices[0]]]
+            for index in elevated_indices[1:]:
+                previous_at = chain[groups[-1][-1]][0]
+                if chain[index][0] - previous_at <= dip_gap:
+                    groups[-1].append(index)
+                else:
+                    groups.append([index])
+            for group in groups:
+                span = chain[group[0] : group[-1] + 1]
+                start, end = span[0][0], span[-1][0]
+                if end - start < min_len:
+                    continue
+                values = [value for _, value in span]
+                mean = sum(values) / len(values)
+                if mean < threshold:
+                    continue
+                hints.append(
+                    HintInterval(
+                        start=start,
+                        end=end,
+                        hr_mean=mean,
+                        hr_peak=max(values),
+                        baseline_bpm=baseline_bpm,
+                    )
                 )
-            )
     return hints
 
 

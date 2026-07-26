@@ -211,3 +211,28 @@ def test_hints_never_bridge_across_quiet_windows():
     for hint in payload["intervals"]:
         crosses = hint["start"] < _t(13, 20).isoformat() < hint["end"]
         assert not crosses
+
+
+def test_separated_elevated_runs_never_fuse():
+    # Two 12-min elevated runs (85bpm) separated by 20 min of normal HR:
+    # verification round reproduced one false 40+min "sustained" hint because
+    # the chain-wide mean stayed above threshold. Runs must stay separate.
+    hr = _hr_flat(13, 17, 60.0)
+    hr += [(_t(14, m), 85.0) for m in range(0, 13, 2)]
+    hr += [(_t(14, 32 + m), 85.0) for m in range(0, 13, 2)]
+    payload = _build(sorted(hr), _steps_still(13, 17))
+    assert payload["status"] == "ok"
+    assert len(payload["intervals"]) == 2
+    for hint in payload["intervals"]:
+        assert hint["minutes"] <= 15
+
+
+def test_legitimate_run_not_suppressed_by_later_normal_stretch():
+    # Inverse of fusing: one clean 12-min run must survive even though the
+    # rest of the afternoon is normal (chain-wide mean would be below
+    # threshold if the whole chain were judged together).
+    hr = _hr_flat(13, 17, 60.0) + [(_t(15, m), 85.0) for m in range(0, 13, 2)]
+    payload = _build(sorted(hr), _steps_still(13, 17))
+    assert payload["status"] == "ok"
+    assert len(payload["intervals"]) == 1
+    assert payload["intervals"][0]["hr_peak"] == 85.0

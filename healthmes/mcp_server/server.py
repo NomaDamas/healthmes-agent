@@ -1201,7 +1201,8 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
     day-level proxy (native daily stress score, else 100 - the night-HRV
     resilience score) spread over morning/afternoon/evening sections — the
     proxy has no intraday resolution, so treat within-day differences as
-    context, not measurement. Non-Garmin responses additionally carry
+    context, not measurement. Responses without a usable Garmin intraday
+    series (the daily-score/proxy/insufficient paths) additionally carry
     `arousal_hints`: deterministic quiet-time HR-elevation intervals over the
     personal resting baseline (hint-grade, confidence capped at medium —
     physiological arousal, never measured stress; see healthmes/mcp_server/
