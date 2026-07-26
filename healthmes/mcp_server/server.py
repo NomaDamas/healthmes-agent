@@ -69,6 +69,7 @@ from healthmes.store import (
     FoodLog,
     MedicalRecord,
     MedicalRecordKind,
+    MonthlyGoal,
     ProposalStatus,
     ScheduleProposal,
     Task,
@@ -1726,6 +1727,171 @@ def _serialize_task(task: Task) -> dict[str, Any]:
         "created_at": _iso_utc(task.created_at),
         "updated_at": _iso_utc(task.updated_at),
     }
+
+GOAL_STATUSES = {"active", "done", "dropped"}
+
+
+def _serialize_goal(goal: Any, *, scope: str) -> dict[str, Any]:
+    period = goal.month_start if scope == "monthly" else goal.week_start
+    payload = {
+        "goal_id": str(goal.id),
+        "scope": scope,
+        "period_start": period.isoformat(),
+        "title": goal.title,
+        "priority": goal.priority,
+        "status": goal.status,
+    }
+    if scope == "weekly":
+        payload["monthly_goal_id"] = (
+            str(goal.monthly_goal_id) if goal.monthly_goal_id else None
+        )
+    return payload
+
+
+def _resolve_monthly_ref(session: Any, ref: str) -> tuple[Any | None, str | None]:
+    """Lenient monthly-goal resolution (UUID or exact title), mirroring
+    ``_resolve_goal_ref`` — never raises, notes instead."""
+    cleaned = (ref or "").strip()
+    if not cleaned:
+        return None, None
+    try:
+        goal = session.get(MonthlyGoal, uuid.UUID(cleaned))
+        if goal is not None:
+            return goal, None
+    except ValueError:
+        pass
+    goal = session.scalars(
+        select(MonthlyGoal).where(func.lower(MonthlyGoal.title) == cleaned.lower())
+    ).first()
+    if goal is not None:
+        return goal, None
+    return None, f"monthly goal {ref!r} not found — weekly goal saved without a month link"
+
+
+@mcp.tool
+def list_goals(include_done: bool = False) -> dict[str, Any]:
+    """Monthly goals with their weekly goals nested under them.
+
+    The month layer answers "왜 이번 주에 이걸 하나" — the planner should keep
+    week plans aligned with the month's direction and say so when placing
+    tasks. Weekly goals with no month link appear under ``unassigned_weekly``.
+    ``include_done`` also returns done/dropped goals (hidden by default).
+    """
+    with _store_session() as session:
+        monthly_rows = list(session.scalars(select(MonthlyGoal)))
+        weekly_rows = list(session.scalars(select(WeeklyGoal)))
+        session.expunge_all()  # serialized below; plain reads, no lazy loads
+    if not include_done:
+        monthly_rows = [g for g in monthly_rows if g.status == "active"]
+        weekly_rows = [g for g in weekly_rows if g.status == "active"]
+    monthly_rows.sort(key=lambda g: (g.month_start.isoformat(), g.priority), reverse=True)
+    weekly_rows.sort(key=lambda g: (g.week_start.isoformat(), g.priority), reverse=True)
+
+    by_month: dict[str, dict[str, Any]] = {}
+    for goal in monthly_rows:
+        entry = _serialize_goal(goal, scope="monthly")
+        entry["weekly_goals"] = []
+        by_month[str(goal.id)] = entry
+    unassigned: list[dict[str, Any]] = []
+    for goal in weekly_rows:
+        entry = _serialize_goal(goal, scope="weekly")
+        parent = by_month.get(str(goal.monthly_goal_id) if goal.monthly_goal_id else "")
+        if parent is not None:
+            parent["weekly_goals"].append(entry)
+        else:
+            unassigned.append(entry)
+    return {
+        "status": "ok",
+        "monthly_goals": list(by_month.values()),
+        "unassigned_weekly": unassigned,
+    }
+
+
+@mcp.tool
+def upsert_goal(
+    scope: str,
+    title: str | None = None,
+    goal_id: str | None = None,
+    period_start: str | None = None,
+    monthly_goal_ref: str | None = None,
+    priority: int | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """Create or update a weekly or monthly goal.
+
+    ``scope`` is "weekly" or "monthly". Create needs ``title``;
+    ``period_start`` (ISO date) defaults to the current week's Monday /
+    current month's first day in the user's timezone. ``monthly_goal_ref``
+    (weekly only) links the week to a month by UUID **or exact title** —
+    unknown refs save the goal anyway and return a note. ``status`` is one
+    of active / done / dropped.
+    """
+    if scope not in ("weekly", "monthly"):
+        raise ToolError(f"scope must be 'weekly' or 'monthly', got {scope!r}")
+    if status is not None and status not in GOAL_STATUSES:
+        raise ToolError(f"status must be one of {sorted(GOAL_STATUSES)}, got {status!r}")
+    model = WeeklyGoal if scope == "weekly" else MonthlyGoal
+    note: str | None = None
+
+    with _store_session() as session:
+        goal = None
+        if goal_id and goal_id.strip():
+            try:
+                goal = session.get(model, uuid.UUID(goal_id.strip()))
+            except ValueError as exc:
+                raise ToolError(f"goal_id must be a UUID, got {goal_id!r}") from exc
+            if goal is None:
+                raise ToolError(f"{scope} goal {goal_id!r} not found")
+        if goal is None:
+            if not (title and title.strip()):
+                raise ToolError("creating a goal requires a title")
+            today = _today_local()
+            if period_start and period_start.strip():
+                try:
+                    period = dt.date.fromisoformat(period_start.strip())
+                except ValueError as exc:
+                    raise ToolError(
+                        f"period_start must be ISO YYYY-MM-DD, got {period_start!r}"
+                    ) from exc
+            elif scope == "weekly":
+                period = today - dt.timedelta(days=today.weekday())
+            else:
+                period = today.replace(day=1)
+            if scope == "weekly":
+                goal = WeeklyGoal(week_start=period, title=title.strip())
+            else:
+                goal = MonthlyGoal(month_start=period, title=title.strip())
+            session.add(goal)
+        else:
+            if title and title.strip():
+                goal.title = title.strip()
+            if period_start and period_start.strip():
+                try:
+                    period = dt.date.fromisoformat(period_start.strip())
+                except ValueError as exc:
+                    raise ToolError(
+                        f"period_start must be ISO YYYY-MM-DD, got {period_start!r}"
+                    ) from exc
+                if scope == "weekly":
+                    goal.week_start = period
+                else:
+                    goal.month_start = period
+        if priority is not None:
+            goal.priority = priority
+        if status is not None:
+            goal.status = status
+        if scope == "weekly" and monthly_goal_ref is not None:
+            parent, note = _resolve_monthly_ref(session, monthly_goal_ref)
+            if parent is not None:
+                goal.monthly_goal_id = parent.id
+        session.flush()
+        payload = _serialize_goal(goal, scope=scope)
+        session.commit()
+
+    result: dict[str, Any] = {"status": "ok", "goal": payload}
+    if note:
+        result["goal_note"] = note
+    return result
 
 
 @mcp.tool

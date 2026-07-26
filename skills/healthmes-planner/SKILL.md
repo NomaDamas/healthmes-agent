@@ -41,6 +41,7 @@ tree.
 
 | Tool (healthmes server) | Use for |
 |---|---|
+| `list_goals` / `upsert_goal` | Goal hierarchy: monthly goals with weekly goals nested under them. Read the month before planning a week; when placing tasks, say which monthly goal a block serves. Capture month-scale statements ("이번 달 안에 …") as monthly goals and link the week's goals to them. |
 | `list_tasks` / `upsert_task` | Task CRUD: title, goal, `est_minutes`, `deadline`, `energy_demand` (`low`/`med`/`high`), status |
 | `get_schedule` | Current merged view: calendar mirror + agent blocks + proposals |
 | `propose_schedule_blocks` | Propose concrete time blocks for tasks; blocks stay `proposed` until the user confirms |

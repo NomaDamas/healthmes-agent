@@ -83,6 +83,7 @@ class TestWeightPolicy:
     def test_v2_weights_are_small_and_documented(self) -> None:
         by_key = {s.key: s for s in _V2_FACTOR_SPECS}
         assert {s.key for s in _V2_FACTOR_SPECS} == {
+            "carryover_load",
             "menstrual_phase",
             "sunlight",
             "noise",
@@ -95,7 +96,7 @@ class TestWeightPolicy:
         assert by_key["alcohol"].base_weight == pytest.approx(0.06)
         assert by_key["hydration"].base_weight == pytest.approx(0.04)
         # Adjunct context: combined, the v2 factors stay a small fraction.
-        assert sum(s.base_weight for s in _V2_FACTOR_SPECS) == pytest.approx(0.25)
+        assert sum(s.base_weight for s in _V2_FACTOR_SPECS) == pytest.approx(0.30)
         assert all(s.base_weight <= 0.10 for s in _V2_FACTOR_SPECS)
 
     def test_terms_and_kinds(self) -> None:
@@ -775,3 +776,63 @@ class TestDigestV2Rows:
         row = _cycle_row("2026-07-06T00:00:00Z", cycle_length=28)
         digest = digest_ow_rows([], [], AS_OF, cycle_rows=[row])
         assert digest.cycles == (row,)
+
+
+class TestCarryoverLoadSignal:
+    """Yesterday's overload bleeding into today (PLAN §14, adjunct term)."""
+
+    def _prev_day(self):
+        import datetime as dt
+
+        end = dt.datetime(2026, 7, 27, 0, 0, tzinfo=dt.UTC)
+        return end - dt.timedelta(days=1), end
+
+    def test_heavy_yesterday_ramps_toward_one(self):
+        import datetime as dt
+
+        from healthmes.engine.cognitive_energy import carryover_load_signal
+
+        start, end = self._prev_day()
+        # 9h booked (union) → severity 1.0 at the full ramp
+        events = [(start + dt.timedelta(hours=9), start + dt.timedelta(hours=18))]
+        signal = carryover_load_signal(events, start, end, calendar_active=True)
+        assert signal.value == 1.0
+        assert signal.raw["previous_day_booked_minutes"] == 540.0
+
+    def test_normal_yesterday_carries_nothing(self):
+        import datetime as dt
+
+        from healthmes.engine.cognitive_energy import carryover_load_signal
+
+        start, end = self._prev_day()
+        # 4h booked = the free ramp point → severity exactly 0 (present, harmless)
+        events = [(start + dt.timedelta(hours=10), start + dt.timedelta(hours=14))]
+        signal = carryover_load_signal(events, start, end, calendar_active=True)
+        assert signal.value == 0.0
+
+    def test_free_yesterday_is_missing_not_zero(self):
+        from healthmes.engine.cognitive_energy import MissingSignal, carryover_load_signal
+
+        start, end = self._prev_day()
+        signal = carryover_load_signal([], start, end, calendar_active=True)
+        assert isinstance(signal, MissingSignal)
+        assert signal.reason == "previous_day_free"
+
+    def test_inactive_calendar_is_missing(self):
+        from healthmes.engine.cognitive_energy import MissingSignal, carryover_load_signal
+
+        start, end = self._prev_day()
+        signal = carryover_load_signal([], start, end, calendar_active=False)
+        assert isinstance(signal, MissingSignal)
+        assert signal.reason == "calendar_mirror_inactive"
+
+    def test_parallel_events_not_double_counted(self):
+        import datetime as dt
+
+        from healthmes.engine.cognitive_energy import carryover_load_signal
+
+        start, end = self._prev_day()
+        # Two fully-overlapping 6h events = 6h union → severity (360-240)/300
+        block = (start + dt.timedelta(hours=9), start + dt.timedelta(hours=15))
+        signal = carryover_load_signal([block, block], start, end, calendar_active=True)
+        assert signal.value == pytest.approx((360 - 240) / 300)
