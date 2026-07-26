@@ -1760,12 +1760,19 @@ def _resolve_monthly_ref(session: Any, ref: str) -> tuple[Any | None, str | None
             return goal, None
     except ValueError:
         pass
-    goal = session.scalars(
-        select(MonthlyGoal).where(func.lower(MonthlyGoal.title) == cleaned.lower())
-    ).first()
-    if goal is not None:
-        return goal, None
-    return None, f"monthly goal {ref!r} not found — weekly goal saved without a month link"
+    matches = list(
+        session.scalars(
+            select(MonthlyGoal).where(func.lower(MonthlyGoal.title) == cleaned.lower())
+        )
+    )
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, (
+            f"{len(matches)} monthly goals are titled {ref!r} (different months) — "
+            "pass the UUID to disambiguate; link left unchanged"
+        )
+    return None, f"monthly goal {ref!r} not found"
 
 
 @mcp.tool
@@ -1784,8 +1791,12 @@ def list_goals(include_done: bool = False) -> dict[str, Any]:
     if not include_done:
         monthly_rows = [g for g in monthly_rows if g.status == "active"]
         weekly_rows = [g for g in weekly_rows if g.status == "active"]
-    monthly_rows.sort(key=lambda g: (g.month_start.isoformat(), g.priority), reverse=True)
-    weekly_rows.sort(key=lambda g: (g.week_start.isoformat(), g.priority), reverse=True)
+    monthly_rows.sort(
+        key=lambda g: (g.month_start.isoformat(), g.priority, str(g.id)), reverse=True
+    )
+    weekly_rows.sort(
+        key=lambda g: (g.week_start.isoformat(), g.priority, str(g.id)), reverse=True
+    )
 
     by_month: dict[str, dict[str, Any]] = {}
     for goal in monthly_rows:
@@ -1793,17 +1804,24 @@ def list_goals(include_done: bool = False) -> dict[str, Any]:
         entry["weekly_goals"] = []
         by_month[str(goal.id)] = entry
     unassigned: list[dict[str, Any]] = []
+    under_hidden: list[dict[str, Any]] = []
     for goal in weekly_rows:
         entry = _serialize_goal(goal, scope="weekly")
-        parent = by_month.get(str(goal.monthly_goal_id) if goal.monthly_goal_id else "")
+        if goal.monthly_goal_id is None:
+            unassigned.append(entry)
+            continue
+        parent = by_month.get(str(goal.monthly_goal_id))
         if parent is not None:
             parent["weekly_goals"].append(entry)
         else:
-            unassigned.append(entry)
+            # Linked, but the parent is filtered out (done/dropped month) —
+            # a truly-unlinked bucket would misreport the FK (review).
+            under_hidden.append(entry)
     return {
         "status": "ok",
         "monthly_goals": list(by_month.values()),
         "unassigned_weekly": unassigned,
+        "weekly_under_hidden_months": under_hidden,
     }
 
 
@@ -1857,6 +1875,8 @@ def upsert_goal(
                 period = today - dt.timedelta(days=today.weekday())
             else:
                 period = today.replace(day=1)
+            if scope == "monthly":
+                period = period.replace(day=1)  # month_start invariant
             if scope == "weekly":
                 goal = WeeklyGoal(week_start=period, title=title.strip())
             else:
@@ -1875,7 +1895,7 @@ def upsert_goal(
                 if scope == "weekly":
                     goal.week_start = period
                 else:
-                    goal.month_start = period
+                    goal.month_start = period.replace(day=1)  # month_start invariant
         if priority is not None:
             goal.priority = priority
         if status is not None:
@@ -1884,6 +1904,12 @@ def upsert_goal(
             parent, note = _resolve_monthly_ref(session, monthly_goal_ref)
             if parent is not None:
                 goal.monthly_goal_id = parent.id
+            elif note is not None:
+                note += (
+                    " — existing month link unchanged"
+                    if goal.monthly_goal_id
+                    else " — goal saved without a month link"
+                )
         session.flush()
         payload = _serialize_goal(goal, scope=scope)
         session.commit()

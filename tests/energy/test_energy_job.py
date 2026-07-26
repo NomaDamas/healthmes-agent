@@ -87,9 +87,7 @@ class TestPersistCurrentWindow:
         total = sum(item["contribution"] for item in items)
         assert total == pytest.approx(payload["score_exact"], abs=1e-9)
         assert abs(row.score - payload["score_exact"]) <= 0.5
-        assert row.inputs_snapshot["missing_signals"] == [
-            {"name": "carryover_load", "reason": "previous_day_free"}
-        ]
+        assert row.inputs_snapshot["missing_signals"] == []
         assert row.inputs_snapshot["ow"]["status"] == "ok"
 
     def test_rerun_same_hour_upserts_single_row(
@@ -151,7 +149,6 @@ class TestPersistCurrentWindow:
             "stress": "ow_unavailable",
             "hrv_deviation": "ow_unavailable",
             "body_battery": "ow_unavailable",
-            "carryover_load": "previous_day_free",
         }
         assert estimate.inputs_snapshot["ow"]["detail"] == "boom"
 

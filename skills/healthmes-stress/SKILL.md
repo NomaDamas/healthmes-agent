@@ -101,7 +101,10 @@ independent evidence:
   (body battery, recovery, readiness).
 - `native-stress` — Garmin-measured stress (timeseries or daily score).
 - `daytime-hr` — `arousal_hints` intervals.
-- `behavioral` — calendar overload and app-usage context.
+- `behavioral` — **separately quantified** workload signals only: the
+  energy engine's meeting-load/fragmentation components or readiness
+  workout load. `likely_context` labels attached to intervals are
+  narrative color and **never vote** as evidence in any group.
 
 Two bad values inside one group are one piece of evidence, not two. The
 night-HRV double-count rule above is this principle applied to one pair;
@@ -128,9 +131,11 @@ For an unknown source, absent source, `status: insufficient_data`,
    scales with evidence is not whether it matters but **how strongly to
    intervene** (the ladder below).
 4. Choose the intervention level from the evidence:
-   - **Level 1 — mention only** (`keep`): one mild or low-confidence
-     signal. State it as information; propose no plan change.
-     `daytime-hr` alone never exceeds this level.
+   - **Level 1 — mention only** (`keep`): one mild signal at medium or
+     higher confidence. State it as information; propose no plan change.
+     `daytime-hr` alone never exceeds this level. Low-confidence
+     observations are not evidence at any level — if nothing stronger
+     exists, the decision is `insufficient_data`, not `keep`.
    - **Level 2 — one optional, reversible suggestion** (`keep` + a light
      [Proposal]): one strong current signal — a large deviation from the
      personal baseline at medium+ confidence — or two evidence groups

@@ -146,9 +146,7 @@ class TestEngineWithV2Rows:
         assert [item["name"] for item in estimate.components] == ALL_COMPONENT_NAMES
         assert estimate.score_exact == pytest.approx(62.32)
         assert estimate.score == 62
-        assert estimate.inputs_snapshot["missing_signals"] == [
-            {"name": "carryover_load", "reason": "previous_day_free"}
-        ]
+        assert estimate.inputs_snapshot["missing_signals"] == []
 
         by_name = {item["name"]: item for item in estimate.components}
         assert by_name["menstrual_phase_adjustment"]["contribution"] == pytest.approx(-1.68)
@@ -218,7 +216,6 @@ class TestEngineWithV2Rows:
             for item in estimate.inputs_snapshot["missing_signals"]
         }
         assert reasons == {
-            "carryover_load": "previous_day_free",
             "menstrual_phase": "no_cycle_data",
             "sunlight": "no_recent_daylight_data",
             "noise": "no_recent_noise_data",
@@ -248,9 +245,7 @@ class TestLegacyV1RowsStayByteIdentical:
             "fragmentation_penalty",
         ]
         assert estimate.score == 65
-        assert estimate.inputs_snapshot["missing_signals"] == [
-            {"name": "carryover_load", "reason": "previous_day_free"}
-        ]
+        assert estimate.inputs_snapshot["missing_signals"] == []
         v2_info = estimate.inputs_snapshot["ow"]["v2"]
         assert v2_info == {"series_rows": "not_fetched", "cycle_rows": "not_fetched"}
 
@@ -453,3 +448,64 @@ class TestForecastSurfacesV2Components:
         for window in ok_windows:
             names = {item["name"] for item in window["components"]}
             assert set(V2_COMPONENT_NAMES) <= names
+
+
+class TestCarryoverComposedScore:
+    """Carryover through the real engine path (review: composed, not just ramp).
+
+    Additive semantics: a heavy yesterday subtracts flat points; a normal or
+    absent yesterday leaves the frozen v1 vector byte-identical (score AND
+    snapshot) — a renormalizing presence would have RAISED the score.
+    """
+
+    @freeze_time("2026-07-09 14:23:00")
+    def test_no_previous_day_events_is_byte_identical(
+        self, energy_engine_factory, full_signal_ow_rows, seed_vector_store
+    ) -> None:
+        seed_vector_store()
+        estimate = energy_engine_factory(full_signal_ow_rows).compute_window()
+        assert estimate.score_exact == pytest.approx(64.75)
+        assert estimate.inputs_snapshot["missing_signals"] == []
+        assert "carryover_load_penalty" not in {c["name"] for c in estimate.components}
+
+    @freeze_time("2026-07-09 14:23:00")
+    def test_normal_yesterday_stays_byte_identical(
+        self,
+        energy_engine_factory,
+        full_signal_ow_rows,
+        seed_vector_store,
+        seed_calendar_event,
+    ) -> None:
+        seed_vector_store()
+        seed_calendar_event(  # 3h booked yesterday — within normal load
+            dt.datetime(2026, 7, 8, 9, 0, tzinfo=dt.UTC),
+            dt.datetime(2026, 7, 8, 12, 0, tzinfo=dt.UTC),
+        )
+        estimate = energy_engine_factory(full_signal_ow_rows).compute_window()
+        assert estimate.score_exact == pytest.approx(64.75)
+        assert estimate.inputs_snapshot["missing_signals"] == []
+
+    @freeze_time("2026-07-09 14:23:00")
+    def test_heavy_yesterday_subtracts_flat_points_never_raises(
+        self,
+        energy_engine_factory,
+        full_signal_ow_rows,
+        seed_vector_store,
+        seed_calendar_event,
+    ) -> None:
+        seed_vector_store()
+        seed_calendar_event(  # 9h booked yesterday — full carryover
+            dt.datetime(2026, 7, 8, 9, 0, tzinfo=dt.UTC),
+            dt.datetime(2026, 7, 8, 18, 0, tzinfo=dt.UTC),
+        )
+        estimate = energy_engine_factory(full_signal_ow_rows).compute_window()
+        # 64.75 − (0.05 × 100 × 1.0) = 59.75: flat subtraction, every other
+        # component share untouched.
+        assert estimate.score_exact == pytest.approx(59.75)
+        carry = next(
+            c for c in estimate.components if c["name"] == "carryover_load_penalty"
+        )
+        assert carry["contribution"] == pytest.approx(-5.0)
+        assert carry["weight"] is None
+        others = [c for c in estimate.components if c["name"] != "carryover_load_penalty"]
+        assert sum(c["contribution"] for c in others) == pytest.approx(64.75)
