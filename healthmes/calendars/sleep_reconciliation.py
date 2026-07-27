@@ -86,6 +86,9 @@ class SleepCalendarReconciler:
             healthmes_source=identity.source,
             healthmes_source_key=identity.source_key,
             observation_fingerprint=fingerprint,
+            sleep_local_date=observation.local_date,
+            sleep_duration_minutes=observation.duration_minutes,
+            sleep_time_in_bed_minutes=observation.time_in_bed_minutes,
             etag=created.etag,
             organizer_self=created.organizer_self,
             has_attendees=created.has_attendees,
@@ -121,6 +124,9 @@ class SleepCalendarReconciler:
         row.end_at = updated.end_at or ensure_utc(observation.end_at)
         row.etag = updated.etag
         row.observation_fingerprint = fingerprint
+        row.sleep_local_date = observation.local_date
+        row.sleep_duration_minutes = observation.duration_minutes
+        row.sleep_time_in_bed_minutes = observation.time_in_bed_minutes
         self._session.commit()
         return SleepCalendarResult(
             action=SleepCalendarAction.UPDATED,

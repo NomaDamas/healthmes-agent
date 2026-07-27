@@ -133,6 +133,9 @@ def test_creates_owned_actual_sleep_with_source_identity(
     assert mirror.healthmes_source == "oura"
     assert mirror.healthmes_source_key == "oura:2026-07-26"
     assert mirror.observation_fingerprint == result.observation_fingerprint
+    assert mirror.sleep_local_date == observation.local_date
+    assert mirror.sleep_duration_minutes == observation.duration_minutes
+    assert mirror.sleep_time_in_bed_minutes == observation.time_in_bed_minutes
 
 
 def test_identical_replay_is_write_free(
@@ -191,6 +194,8 @@ def test_provider_correction_updates_existing_event(
     assert coerce_utc(mirror.end_at) == corrected.end_at
     assert mirror.etag == '"updated"'
     assert mirror.observation_fingerprint == result.observation_fingerprint
+    assert mirror.sleep_duration_minutes == 450
+    assert mirror.sleep_time_in_bed_minutes == 510
 
 
 def test_refuses_source_key_collision_with_unowned_event(

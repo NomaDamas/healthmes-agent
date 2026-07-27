@@ -64,6 +64,7 @@ from healthmes.calendars.adjustments import (
     verify_reply_handle,
 )
 from healthmes.calendars.google import GoogleCalendarBackend
+from healthmes.calendars.sleep_context import actual_sleep_context, actual_sleep_violation
 from healthmes.config import Settings, get_settings, system_timezone
 from healthmes.mcp_server import adjustment_tools, arousal, impact, interpret, timeline
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
@@ -721,6 +722,8 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     workout_rows = await client.collect_workouts(
         user_id, (as_of - dt.timedelta(days=1)).isoformat(), as_of.isoformat()
     )
+    with _store_session() as session:
+        actual_sleep_block = actual_sleep_context(session, as_of, tz)
 
     # --- sleep debt (internal sleep score; algorithms/sleep.py, never reinvented)
     internal_scores = interpret.daily_series(
@@ -832,6 +835,7 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
         "baseline_window_days": interpret.BASELINE_WINDOW_DAYS,
         "confidence": interpret.overall_confidence(core_blocks),
         "sleep_debt": sleep_block,
+        "actual_sleep": actual_sleep_block,
         "hrv": hrv_block,
         "stress": stress_block,
         "charge": charge_block,
@@ -2400,6 +2404,10 @@ def propose_schedule_blocks(
     with _store_session() as session:
         if decision_uuid is not None and session.get(DecisionRecord, decision_uuid) is None:
             raise ToolError(f"decision_record {decision_record_id} not found")
+        for index, (_, start, end) in enumerate(parsed):
+            violation = actual_sleep_violation(session, start, end, _local_timezone())
+            if violation is not None:
+                raise ToolError(f"blocks[{index}]: {violation}")
         created: list[dict[str, Any]] = []
         for index, (block, start, end) in enumerate(parsed):
             if block.task_id is not None:
