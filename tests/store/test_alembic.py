@@ -13,6 +13,7 @@ import sqlalchemy as sa
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy.orm import sessionmaker
 
 from alembic import command
@@ -49,6 +50,12 @@ def _render_offline_upgrade(database_url: str) -> str:
     buffer = io.StringIO()
     command.upgrade(_config(database_url, buffer=buffer), "head", sql=True)
     return buffer.getvalue()
+
+
+def test_migration_graph_has_single_head():
+    script = ScriptDirectory.from_config(_config("sqlite://"))
+
+    assert len(script.get_heads()) == 1
 
 
 class TestOfflineRender:
