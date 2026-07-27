@@ -46,6 +46,7 @@ from healthmes.calendars.base import (
     HealthmesEventKind,
     OwnershipError,
     SyncState,
+    calendar_identity_external_id,
     ensure_utc,
     parse_calendar_identity,
     parse_event_kind,
@@ -333,9 +334,22 @@ class GoogleCalendarBackend:
             "end": {"dateTime": _rfc3339(draft.end_at)},
             "extendedProperties": {"private": private},
         }
+        if draft.identity is not None:
+            body["id"] = calendar_identity_external_id(self.source, draft.identity)
         if draft.description:
             body["description"] = draft.description
-        created = self._events().insert(calendarId=self._calendar_id, body=body).execute()
+        try:
+            created = (
+                self._events()
+                .insert(calendarId=self._calendar_id, body=body)
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001 - status-based dispatch
+            if _http_status(exc) != 409 or draft.identity is None:
+                raise
+            raise CalendarConflictError(
+                "google identity key already exists"
+            ) from exc
         return self._parse_api_event(created)
 
     def update_event(

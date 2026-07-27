@@ -118,15 +118,20 @@ async def preview_recent_sleep(
     timezone = resolve_timezone(settings)
     day = target_date or dt.datetime.now(timezone).date()
     backend = _build_backend(settings, calendar_source)
-    return await reconcile_recent_sleep(
-        target_date=day,
-        calendar_source=calendar_source,
-        client=client,
-        user_id=user_id,
-        session_factory=None,
-        backend=backend,
-        dry_run=True,
-    )
+    try:
+        return await reconcile_recent_sleep(
+            target_date=day,
+            calendar_source=calendar_source,
+            client=client,
+            user_id=user_id,
+            session_factory=None,
+            backend=backend,
+            dry_run=True,
+        )
+    except OWClientError as exc:
+        raise SleepReconciliationError(
+            f"open-wearables sleep data unavailable ({type(exc).__name__})"
+        ) from None
 
 
 async def reconcile_recent_sleep_window(
@@ -202,14 +207,22 @@ async def reconcile_recent_sleep(
         )
         if dry_run:
             return preview
+        if preview["action"] == "blocked":
+            return {**preview, "status": "blocked"}
         if backend is None:
             raise ValueError("backend is required when dry_run is false")
         if backend.source is not calendar_source:
             raise ValueError("backend source does not match target calendar")
         result = SleepCalendarReconciler(session, backend).reconcile(selected)
-        return {
+        response: dict[str, object] = {
             **preview,
             "status": "ok",
             "action": result.action.value,
             "planned_sleep_replacements": len(result.deleted_planned_external_ids),
         }
+        if result.planned_sleep_cleanup_pending:
+            response["status"] = "cleanup_pending"
+            response["planned_sleep_cleanup_pending"] = (
+                result.planned_sleep_cleanup_pending
+            )
+        return response

@@ -106,7 +106,9 @@ class FakeGoogleService:
         return self.stored_events[event_id]
 
     def insert_event(self, body: dict) -> dict:
-        event_id = f"generated-{len(self.stored_events) + 1}"
+        event_id = body.get("id") or f"generated-{len(self.stored_events) + 1}"
+        if event_id in self.stored_events:
+            raise FakeStatusError(409)
         stored = {"id": event_id, "etag": '"1"', "status": "confirmed", **body}
         self.stored_events[event_id] = stored
         return stored
@@ -396,6 +398,30 @@ class TestCreateEvent:
             "healthmes_source_key": "oura:2026-07-26",
         }
         assert created.identity == identity
+
+    def test_identity_collision_requires_a_local_recovery_intent(
+        self, backend, service
+    ) -> None:
+        # Given
+        draft = EventDraft(
+            summary="수면 (실제)",
+            start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+            end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+            identity=CalendarEventIdentity(
+                kind=HealthmesEventKind.ACTUAL_SLEEP,
+                source="oura",
+                source_key="oura:2026-07-26",
+            ),
+        )
+
+        # When
+        first = backend.create_event(draft)
+        with pytest.raises(CalendarConflictError):
+            backend.create_event(draft)
+
+        # Then
+        assert first.identity == draft.identity
+        assert len(service.stored_events) == 1
 
 
 class TestUpdateAndDelete:

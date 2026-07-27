@@ -44,6 +44,7 @@ from healthmes.calendars.base import (
     HealthmesEventKind,
     OwnershipError,
     SyncState,
+    calendar_identity_external_id,
     coerce_utc,
     ensure_utc,
     parse_calendar_identity,
@@ -173,7 +174,18 @@ class CalDavCalendarBackend:
     # -- agent writes ------------------------------------------------------
 
     def create_event(self, draft: EventDraft) -> ExternalEvent:
-        external_id = f"{uuid.uuid4()}@healthmes"
+        external_id = (
+            calendar_identity_external_id(self.source, draft.identity)
+            if draft.identity is not None
+            else f"{uuid.uuid4()}@healthmes"
+        )
+        if draft.identity is not None:
+            try:
+                self.read_event(external_id)
+            except EventNotFoundError:
+                pass
+            else:
+                raise CalendarConflictError("caldav identity key already exists")
         component = icalendar.Event()
         component.add("uid", external_id)
         component.add("dtstamp", datetime.now(UTC))
@@ -194,7 +206,21 @@ class CalDavCalendarBackend:
         calendar.add("prodid", "-//HealthMes Agent//healthmes//EN")
         calendar.add("version", "2.0")
         calendar.add_component(component)
-        self._calendar.add_event(ical=calendar.to_ical().decode("utf-8"))
+        try:
+            self._calendar.add_event(
+                ical=calendar.to_ical().decode("utf-8"),
+                no_overwrite=draft.identity is not None,
+            )
+        except Exception as exc:  # noqa: BLE001 - caldav exposes broad DAV errors
+            if draft.identity is None:
+                raise
+            try:
+                self.read_event(external_id)
+            except EventNotFoundError:
+                raise exc
+            raise CalendarConflictError(
+                "caldav identity key already exists or create conflicted"
+            ) from exc
 
         return ExternalEvent(
             external_id=external_id,
@@ -228,8 +254,8 @@ class CalDavCalendarBackend:
             _replace_property(component, "dtend", ensure_utc(end_at))
         if description is not None:
             _replace_property(component, "description", description)
-        if expected_etag is not None:
-            obj.etag = expected_etag
+        # caldav 3.2.x reads its read-only ``obj.etag`` during save() and
+        # sends it as ``if-match`` on the PUT.
         try:
             obj.save()
         except Exception as exc:  # noqa: BLE001 - caldav exposes broad DAV errors
@@ -259,8 +285,15 @@ class CalDavCalendarBackend:
             raise OwnershipError(
                 f"caldav event {external_id!r} is not {expected_kind.value}"
             )
-        if expected_etag is None or not _conditional_delete(obj, expected_etag):
-            obj.delete()
+        delete_etag = expected_etag or _object_etag(obj)
+        if delete_etag is None:
+            raise CalendarConflictError(
+                "caldav event has no ETag for conditional delete"
+            )
+        if not _conditional_delete(obj, delete_etag):
+            raise CalendarConflictError(
+                "caldav backend cannot guarantee a conditional delete"
+            )
 
     def read_event(self, external_id: str) -> ExternalEvent:
         parsed = self._event_from_object(self._get_owned_object(external_id))

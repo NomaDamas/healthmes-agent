@@ -24,12 +24,13 @@ class PlannedSleepBackend:
         self.delete_calls: list[tuple[str, HealthmesEventKind | None, str | None]] = []
         self.remote_kinds: dict[str, HealthmesEventKind] = {}
         self.missing_ids: set[str] = set()
+        self.actual_event: ExternalEvent | None = None
 
     def list_changes(self, sync_state: SyncState | None) -> tuple[list[ExternalEvent], SyncState]:
         return [], dict(sync_state or {})
 
     def create_event(self, draft: EventDraft) -> ExternalEvent:
-        return ExternalEvent(
+        self.actual_event = ExternalEvent(
             external_id="actual-1",
             summary=draft.summary,
             start_at=draft.start_at,
@@ -39,6 +40,12 @@ class PlannedSleepBackend:
             healthmes_kind=HealthmesEventKind.ACTUAL_SLEEP,
             etag='"actual"',
         )
+        return self.actual_event
+
+    def read_event(self, external_id: str) -> ExternalEvent:
+        if self.actual_event is None or self.actual_event.external_id != external_id:
+            raise EventNotFoundError(external_id)
+        return self.actual_event
 
     def update_event(
         self,

@@ -22,6 +22,7 @@ UTC. Credentials are runtime-only: importing this package never reads token
 files or opens network connections.
 """
 
+import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -55,6 +56,8 @@ __all__ = [
     "OwnershipError",
     "SyncState",
     "coerce_utc",
+    "calendar_identity_key",
+    "calendar_identity_external_id",
     "ensure_utc",
     "parse_calendar_identity",
     "parse_event_kind",
@@ -110,6 +113,23 @@ class CalendarEventIdentity:
             raise ValueError("CalendarEventIdentity.source must be non-empty")
         if not self.source_key.strip():
             raise ValueError("CalendarEventIdentity.source_key must be non-empty")
+
+
+def calendar_identity_key(identity: CalendarEventIdentity) -> str:
+    payload = "\x1f".join(
+        (identity.kind.value, identity.source, identity.source_key)
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def calendar_identity_external_id(
+    source: CalendarSource,
+    identity: CalendarEventIdentity,
+) -> str:
+    key = calendar_identity_key(identity)
+    if source is CalendarSource.GOOGLE:
+        return f"healthmes{key}"
+    return f"healthmes-{key}@healthmes"
 
 
 def parse_calendar_identity(
