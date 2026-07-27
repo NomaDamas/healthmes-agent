@@ -60,13 +60,11 @@ from healthmes.calendars.adjustments import (
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
     SqlAlchemyAdjustmentRepository,
-    evaluate_event_eligibility,
     verify_reply_handle,
 )
 from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.config import Settings, get_settings, system_timezone
-from healthmes.engine.rules import RuleThresholds
-from healthmes.mcp_server import impact, interpret, timeline
+from healthmes.mcp_server import adjustment_tools, impact, interpret, timeline
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.store import (
     AppUsageSample,
@@ -278,9 +276,7 @@ def _local_timezone() -> dt.tzinfo:
     """
     if _timezone_override is not None:
         return _timezone_override
-    name = getattr(_active_settings(), "timezone", None) or os.environ.get(
-        "HEALTHMES_TIMEZONE"
-    )
+    name = getattr(_active_settings(), "timezone", None) or os.environ.get("HEALTHMES_TIMEZONE")
     if name:
         try:
             return zoneinfo.ZoneInfo(str(name))
@@ -475,16 +471,7 @@ def _enum_value(value: Any) -> Any:
 
 
 def _public_calendar_adjustment_status(status: Any) -> str:
-    value = _enum_value(status)
-    aliases = {
-        store_enums.CalendarMutationStatus.APPLIED_RECOVERED.value: (
-            store_enums.CalendarMutationStatus.APPLIED.value
-        ),
-        store_enums.CalendarMutationStatus.FAILED_NO_CHANGE.value: (
-            store_enums.CalendarMutationStatus.FAILED.value
-        ),
-    }
-    return aliases.get(value, str(value))
+    return adjustment_tools.public_calendar_adjustment_status(status)
 
 
 def _decision_viewer_url(decision_id: uuid.UUID | str | None) -> str | None:
@@ -507,94 +494,30 @@ def _calendar_adjustment_display(
     decision_tree: Mapping[str, Any] | None = None,
     event_label: str | None = None,
 ) -> dict[str, Any]:
-    snapshot = proposal.snapshot
-    evidence = {}
-    for child in (decision_tree or {}).get("children", ()):
-        if isinstance(child, Mapping) and child.get("id") == "evidence":
-            evidence = dict(child.get("detail") or {})
-            break
-    return {
-        "proposal_id": str(proposal.id),
-        "operation": _enum_value(snapshot.operation),
-        "event_label": event_label if event_label is not None else snapshot.event_label,
-        "delta_minutes": 30,
-        "before": {
-            "start": _local_iso(snapshot.original_start_at, tz),
-            "end": _local_iso(snapshot.original_end_at, tz),
-        },
-        "after": {
-            "start": _local_iso(snapshot.proposed_start_at, tz),
-            "end": _local_iso(snapshot.proposed_end_at, tz),
-        },
-        "evidence": evidence,
-        "freshness": "validated_for_local_date",
-        "limitations": [
-            "technical_eligibility_only",
-            "explicit_confirmation_required",
-        ],
-        "reply_options": [f"적용 {reply_handle}", f"그대로 {reply_handle}"],
-        "viewer_url": _decision_viewer_url(proposal.proposal_decision_record_id),
-    }
+    return adjustment_tools.calendar_adjustment_display(
+        proposal,
+        tz,
+        reply_handle,
+        decision_tree,
+        event_label,
+        _decision_viewer_url(proposal.proposal_decision_record_id),
+    )
 
 
 def _mirror_to_adjustment_candidate(event: CalendarEventMirror) -> dict[str, Any]:
-    return {
-        "id": event.id,
-        "external_id": event.external_id,
-        "calendar_source": event.calendar_source,
-        "summary": event.summary,
-        "start_at": _ensure_utc_dt(event.start_at),
-        "end_at": _ensure_utc_dt(event.end_at),
-        "is_agent_created": event.is_agent_created,
-        "etag": event.etag,
-        "organizer_self": event.organizer_self,
-        "has_attendees": event.has_attendees,
-        "is_recurring": event.is_recurring,
-        "event_type": event.event_type,
-        "is_all_day": event.is_all_day,
-        "is_locked": event.is_locked,
-        "status": event.status,
-    }
+    return adjustment_tools.mirror_to_adjustment_candidate(event)
 
 
 def _adjustment_projection(
     event: CalendarEventMirror, *, now: dt.datetime, tz: dt.tzinfo
 ) -> dict[str, Any]:
-    local_day = _ensure_utc_dt(event.start_at).astimezone(tz).date()
-    result = evaluate_event_eligibility(
-        event,
-        now=now,
-        local_date=local_day,
-        timezone=tz,
-    )
-    return {
-        "eligible": result.eligible,
-        "operations": ["shorten"] if result.eligible else [],
-        "reasons": list(result.reasons),
-    }
+    return adjustment_tools.adjustment_projection(event, now=now, tz=tz)
 
 
 def _afternoon_busy_minutes(
     events: Iterable[CalendarEventMirror], day: dt.date, tz: dt.tzinfo
 ) -> int:
-    thresholds = RuleThresholds()
-    start = dt.datetime.combine(
-        day,
-        dt.time(hour=thresholds.afternoon_start_hour),
-        tzinfo=tz,
-    ).astimezone(dt.UTC)
-    end = dt.datetime.combine(
-        day,
-        dt.time(hour=thresholds.afternoon_end_hour),
-        tzinfo=tz,
-    ).astimezone(dt.UTC)
-    total = 0
-    for event in events:
-        event_start = max(_ensure_utc_dt(event.start_at), start)
-        event_end = min(_ensure_utc_dt(event.end_at), end)
-        if event_end > event_start:
-            total += int((event_end - event_start).total_seconds() // 60)
-    return total
+    return adjustment_tools.afternoon_busy_minutes(events, day, tz)
 
 
 # ---------------------------------------------------------------------------
@@ -681,9 +604,7 @@ async def get_health_scores(
     requested = tuple(categories) if categories else DEFAULT_SCORE_CATEGORIES
     invalid = sorted(set(requested) - SCORE_CATEGORIES)
     if invalid:
-        raise ToolError(
-            f"Unknown categories {invalid}; valid: {sorted(SCORE_CATEGORIES)}"
-        )
+        raise ToolError(f"Unknown categories {invalid}; valid: {sorted(SCORE_CATEGORIES)}")
 
     user_id = await _resolve_user_id()
     rows, truncated = await _fetch_health_scores_tracked(
@@ -758,9 +679,7 @@ async def get_health_scores(
     enough_data = bool(scores) and best_days >= min(MIN_AGG_DAYS_WITH_DATA, days)
     return {
         "status": (
-            interpret.STATUS_OK
-            if enough_data and not truncated
-            else interpret.STATUS_INSUFFICIENT
+            interpret.STATUS_OK if enough_data and not truncated else interpret.STATUS_INSUFFICIENT
         ),
         "window": {
             "start_date": start_day.isoformat(),
@@ -776,7 +695,7 @@ async def get_health_scores(
 @mcp.tool
 @_with_ow_errors
 async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]:
-    """"Can I push hard today?" — deterministic readiness context for one day.
+    """ "Can I push hard today?" — deterministic readiness context for one day.
 
     Returns interpreted blocks, each with its own status/confidence: sleep_debt
     (trailing 7 nights of the OW internal sleep score), hrv (last night vs the
@@ -955,9 +874,7 @@ async def get_personal_baselines(
     requested = tuple(metrics) if metrics else DEFAULT_BASELINE_METRICS
     unknown = sorted(set(requested) - set(_BASELINE_METRICS))
     if unknown:
-        raise ToolError(
-            f"Unknown metrics {unknown}; supported: {sorted(_BASELINE_METRICS)}"
-        )
+        raise ToolError(f"Unknown metrics {unknown}; supported: {sorted(_BASELINE_METRICS)}")
     tz = _local_timezone()
     anchor = _parse_date_local(as_of, "as_of", tz)
     fetch_start = anchor - dt.timedelta(days=interpret.LONG_BASELINE_WINDOW_DAYS + 1)
@@ -1001,8 +918,7 @@ async def get_personal_baselines(
                 how="latest",
             )
             proxy_daily = {
-                day: max(0.0, min(100.0, 100.0 - score))
-                for day, score in resilience_daily.items()
+                day: max(0.0, min(100.0, 100.0 - score)) for day, score in resilience_daily.items()
             }
             daily, which = interpret.choose_stress_series(
                 garmin_daily,
@@ -1087,7 +1003,7 @@ def _serialize_energy_window(slot: Any, tz: dt.tzinfo) -> dict[str, Any]:
 
 @mcp.tool
 async def get_cognitive_energy_forecast(date: str | None = None) -> dict[str, Any]:
-    """"When is deep work today?" — hourly cognitive-energy scores for one day.
+    """ "When is deep work today?" — hourly cognitive-energy scores for one day.
 
     Returns every hourly window of the given **local** day (`date` is ISO
     YYYY-MM-DD, default today in the user's timezone): windows the hourly
@@ -1128,11 +1044,7 @@ async def get_cognitive_energy_forecast(date: str | None = None) -> dict[str, An
     )
     coverage_label = interpret.confidence_label(len(ok_windows), len(windows))
     richness_label = (
-        "high"
-        if len(factors_present) >= 3
-        else "medium"
-        if len(factors_present) == 2
-        else "low"
+        "high" if len(factors_present) >= 3 else "medium" if len(factors_present) == 2 else "low"
     )
 
     def _extreme(pick: Callable[..., Any]) -> Any | None:
@@ -1153,9 +1065,7 @@ async def get_cognitive_energy_forecast(date: str | None = None) -> dict[str, An
         "date": day.isoformat(),
         "timezone": str(tz),
         "baseline_window_days": interpret.BASELINE_WINDOW_DAYS,
-        "confidence": _weakest_confidence(coverage_label, richness_label)
-        if ok_windows
-        else "low",
+        "confidence": _weakest_confidence(coverage_label, richness_label) if ok_windows else "low",
         "confidence_detail": {
             "window_coverage": coverage_label,
             "health_factor_richness": richness_label,
@@ -1193,7 +1103,7 @@ def _stress_samples(rows: Iterable[Mapping[str, Any]]) -> list[tuple[dt.datetime
 @mcp.tool
 @_with_ow_errors
 async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
-    """"When and why was I stressed?" — labeled stress intervals for one day.
+    """ "When and why was I stressed?" — labeled stress intervals for one day.
 
     Joins the day's stress series with mirrored calendar events and app-usage
     sessions in the **user's local timezone** and returns interpreted
@@ -1273,9 +1183,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
                 "status": interpret.STATUS_INSUFFICIENT,
                 "date": day.isoformat(),
                 "timezone": str(tz),
-                "reason": str(
-                    context.get("reason", "no_stress_timeseries_and_no_daily_proxy")
-                ),
+                "reason": str(context.get("reason", "no_stress_timeseries_and_no_daily_proxy")),
                 "confidence": "low",
                 "truncated": False,
                 "intervals": [],
@@ -1406,15 +1314,11 @@ def _collect_store_occurrences(
     counts = {"food_log": 0, "calendar": 0, "task": 0}
     with _store_session() as session:
         for row in session.scalars(
-            select(FoodLog).where(
-                FoodLog.logged_at >= start_utc, FoodLog.logged_at < end_utc
-            )
+            select(FoodLog).where(FoodLog.logged_at >= start_utc, FoodLog.logged_at < end_utc)
         ):
             if impact.matches(factor, row.description):
                 at = _ensure_utc_dt(row.logged_at)
-                occurrences.append(
-                    impact.Occurrence("food_log", row.description[:80], at, at)
-                )
+                occurrences.append(impact.Occurrence("food_log", row.description[:80], at, at))
                 counts["food_log"] += 1
         for row in session.scalars(
             select(CalendarEventMirror).where(
@@ -1468,9 +1372,7 @@ async def _collect_workout_occurrences(
         if start is None or not (start_utc <= start < end_utc):
             continue
         end = _parse_recorded_at(row.get("end_time")) or start
-        occurrences.append(
-            impact.Occurrence("workout", workout_type, start, max(end, start))
-        )
+        occurrences.append(impact.Occurrence("workout", workout_type, start, max(end, start)))
     return occurrences
 
 
@@ -1569,7 +1471,7 @@ async def compare_impact(
     window: str = "30d",
     end_date: str | None = None,
 ) -> dict[str, Any]:
-    """"Does X agree with me?" — before/after metric deltas around a factor.
+    """ "Does X agree with me?" — before/after metric deltas around a factor.
 
     `factor` is a case-insensitive keyword matched against food-log
     descriptions, calendar event titles, completed task titles, and workout
@@ -1590,9 +1492,7 @@ async def compare_impact(
             f"factor must be at least {IMPACT_MIN_FACTOR_LENGTH} characters, got {factor!r}"
         )
     if metric not in _IMPACT_METRICS:
-        raise ToolError(
-            f"metric must be one of {sorted(_IMPACT_METRICS)}, got {metric!r}"
-        )
+        raise ToolError(f"metric must be one of {sorted(_IMPACT_METRICS)}, got {metric!r}")
     days = _parse_range_days(window, "window")
     tz = _local_timezone()
     end_day = _parse_date_local(end_date, "end_date", tz)
@@ -1618,9 +1518,7 @@ async def compare_impact(
         truncated = len(occurrences_by_day) > IMPACT_MAX_OCCURRENCES
         if truncated:
             recent_days = sorted(occurrences_by_day)[-IMPACT_MAX_OCCURRENCES:]
-            occurrences_by_day = {
-                day: occurrences_by_day[day] for day in recent_days
-            }
+            occurrences_by_day = {day: occurrences_by_day[day] for day in recent_days}
         used = len(occurrences_by_day)
         daily, detail = await _nightly_daily_series(
             metric,
@@ -1661,15 +1559,12 @@ async def compare_impact(
     if stats["n"] < impact.MIN_PAIRED_OBSERVATIONS:
         return {
             "status": interpret.STATUS_INSUFFICIENT,
-            "reason": (
-                f"need_at_least_{impact.MIN_PAIRED_OBSERVATIONS}_paired_observations"
-            ),
+            "reason": (f"need_at_least_{impact.MIN_PAIRED_OBSERVATIONS}_paired_observations"),
             **base,
             "confidence": "low",
         }
     effect = {
-        key: round(value, 2) if isinstance(value, float) else value
-        for key, value in stats.items()
+        key: round(value, 2) if isinstance(value, float) else value for key, value in stats.items()
     }
     examples = [
         {
@@ -1850,12 +1745,11 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
         )
         proposals = list(
             session.scalars(
-                select(ScheduleProposal).where(
+                select(ScheduleProposal)
+                .where(
                     ScheduleProposal.proposed_start < end,
                     ScheduleProposal.proposed_end > start,
-                    ScheduleProposal.status.in_(
-                        [ProposalStatus.PROPOSED, ProposalStatus.ACCEPTED]
-                    ),
+                    ScheduleProposal.status.in_([ProposalStatus.PROPOSED, ProposalStatus.ACCEPTED]),
                 )
                 .order_by(ScheduleProposal.proposed_start)
             )
@@ -2046,8 +1940,7 @@ def expire_and_reconcile_calendar_adjustments() -> list[dict[str, Any]]:
         )
         results = service.expire_and_reconcile_adjustments(writer)
         return [
-            {"status": _enum_value(result.status), "receipt": result.receipt}
-            for result in results
+            {"status": _enum_value(result.status), "receipt": result.receipt} for result in results
         ]
 
 
@@ -2278,9 +2171,7 @@ async def create_medical_record(
     this machine (returned fields carry ids and statuses only).
     """
     if kind not in MEDICAL_RECORD_KINDS:
-        raise ToolError(
-            f"kind must be one of {sorted(MEDICAL_RECORD_KINDS)}, got {kind!r}"
-        )
+        raise ToolError(f"kind must be one of {sorted(MEDICAL_RECORD_KINDS)}, got {kind!r}")
     if not description.strip():
         raise ToolError("description must not be empty")
 
@@ -2358,9 +2249,7 @@ def list_medical_records(
     recent `limit` records are kept, still oldest-first).
     """
     if kind is not None and kind not in MEDICAL_RECORD_KINDS:
-        raise ToolError(
-            f"kind must be one of {sorted(MEDICAL_RECORD_KINDS)}, got {kind!r}"
-        )
+        raise ToolError(f"kind must be one of {sorted(MEDICAL_RECORD_KINDS)}, got {kind!r}")
     if not 1 <= limit <= MAX_MEDICAL_LIST_LIMIT:
         raise ToolError(f"limit must be between 1 and {MAX_MEDICAL_LIST_LIMIT}, got {limit}")
     days = _parse_range_days(range, max_days=MAX_MEDICAL_RANGE_DAYS)
