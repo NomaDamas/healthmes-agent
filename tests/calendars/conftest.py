@@ -74,6 +74,7 @@ class FakeCalendarBackend:
             end_at=draft.end_at,
             is_agent_created=True,
             agent_task_id=draft.agent_task_id,
+            identity=draft.identity,
             etag=f"etag-created-{self._create_counter}",
         )
 
@@ -136,6 +137,7 @@ def make_event() -> object:
         end: datetime | None = None,
         is_agent_created: bool = False,
         agent_task_id=None,
+        identity=None,
         etag: str | None = "etag-1",
         deleted: bool = False,
         organizer_self: bool = False,
@@ -156,6 +158,7 @@ def make_event() -> object:
             end_at=end,
             is_agent_created=is_agent_created,
             agent_task_id=agent_task_id,
+            identity=identity,
             etag=etag,
             deleted=deleted,
             organizer_self=organizer_self,

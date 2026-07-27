@@ -9,9 +9,12 @@ from sqlalchemy import select
 
 from healthmes.calendars.base import (
     CalendarError,
+    CalendarEventIdentity,
     EventDraft,
     EventNotFoundError,
+    HealthmesEventKind,
     OwnershipError,
+    coerce_utc,
 )
 from healthmes.calendars.state import (
     InMemoryPendingDiffStore,
@@ -443,6 +446,40 @@ class TestOwnershipGuard:
         )
         assert rows(session)[row.external_id].agent_task_id is None
 
+    def test_owned_identity_without_task_survives_provider_round_trip(
+        self, service, fake_backend, session, make_event
+    ) -> None:
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key="oura:2026-07-26",
+        )
+        row = service.create_agent_event(
+            fake_backend.source,
+            draft(identity=identity),
+        )
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    row.external_id,
+                    summary="수면 (실제)",
+                    start=coerce_utc(row.start_at),
+                    end=coerce_utc(row.end_at),
+                    is_agent_created=True,
+                    identity=identity,
+                )
+            ],
+            {"sync_token": "tok-1"},
+        )
+
+        service.sync_backend(fake_backend)
+
+        stored = rows(session)[row.external_id]
+        assert stored.is_agent_created
+        assert stored.agent_task_id is None
+        assert stored.healthmes_kind == "actual_sleep"
+        assert stored.healthmes_source_key == "oura:2026-07-26"
+
     def test_move_agent_event(self, service, fake_backend, session) -> None:
         row = service.create_agent_event(fake_backend.source, draft())
         moved = service.move_agent_event(
@@ -552,6 +589,33 @@ class TestForgedTagOwnership:
 
         assert [change.external_id for change in diff.created] == ["bare"]
         assert not rows(session)["bare"].is_agent_created
+
+    def test_unrecognized_sleep_identity_does_not_grant_ownership(
+        self, service, fake_backend, session, make_event
+    ) -> None:
+        self._seed(service, fake_backend, make_event)
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key="oura:2026-07-26",
+        )
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "forged-sleep",
+                    is_agent_created=True,
+                    identity=identity,
+                )
+            ],
+            {"sync_token": "tok-1"},
+        )
+
+        diff = service.sync_backend(fake_backend)
+
+        assert [change.external_id for change in diff.created] == ["forged-sleep"]
+        stored = rows(session)["forged-sleep"]
+        assert not stored.is_agent_created
+        assert stored.healthmes_source_key == "oura:2026-07-26"
 
     def test_tag_stripped_during_move_becomes_external(
         self, service, fake_backend, session, make_event

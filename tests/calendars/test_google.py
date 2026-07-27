@@ -9,8 +9,11 @@ import pytest
 from healthmes.calendars.base import (
     CalendarAuthError,
     CalendarConflictError,
+    CalendarEventIdentity,
     ConfirmedExternalTimeChange,
+    EventDraft,
     EventNotFoundError,
+    HealthmesEventKind,
     OwnershipError,
 )
 from healthmes.calendars.google import (
@@ -342,8 +345,6 @@ class TestEventParsing:
 
 class TestCreateEvent:
     def test_insert_body_carries_ownership_tag(self, backend, service) -> None:
-        from healthmes.calendars.base import EventDraft
-
         task_id = uuid.uuid4()
         draft = EventDraft(
             summary="Deep work",
@@ -366,6 +367,32 @@ class TestCreateEvent:
         assert created.is_agent_created
         assert created.agent_task_id == task_id
         assert created.external_id == "generated-1"
+
+    def test_actual_sleep_identity_round_trips_private_metadata(
+        self, backend, service
+    ) -> None:
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key="oura:2026-07-26",
+        )
+        created = backend.create_event(
+            EventDraft(
+                summary="수면 (실제)",
+                start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+                end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+                identity=identity,
+            )
+        )
+
+        ((_, body),) = service.insert_calls
+        assert body["extendedProperties"]["private"] == {
+            "healthmes": "1",
+            "healthmes_kind": "actual_sleep",
+            "healthmes_source": "oura",
+            "healthmes_source_key": "oura:2026-07-26",
+        }
+        assert created.identity == identity
 
 
 class TestUpdateAndDelete:

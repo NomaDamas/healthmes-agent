@@ -272,15 +272,25 @@ class CalendarMirrorService:
     ) -> None:
         assert event.start_at is not None and event.end_at is not None  # live event
         resolved_task_id = self._resolve_task_id(event.agent_task_id)
+        row = self._get_row(source, event.external_id)
+        trusted_identity = (
+            event.identity is not None
+            and row is not None
+            and row.is_agent_created
+            and row.healthmes_kind == event.identity.kind.value
+            and row.healthmes_source == event.identity.source
+            and row.healthmes_source_key == event.identity.source_key
+        )
         # An incoming provider event is trusted as agent-created ONLY when it
         # carries the ownership tag AND a task id that resolves to a local Task
         # row. A forged tag alone (or a tag whose task id we never had) must
         # never grant the agent write authority over an event the external
         # calendar really owns — otherwise a hand-crafted ``healthmes=1`` on
         # someone else's meeting would let the agent move/delete it.
-        trusted_agent = bool(event.is_agent_created) and resolved_task_id is not None
+        trusted_agent = bool(event.is_agent_created) and (
+            resolved_task_id is not None or trusted_identity
+        )
 
-        row = self._get_row(source, event.external_id)
         if row is None:
             self._session.add(
                 CalendarEventMirror(
@@ -292,6 +302,7 @@ class CalendarMirrorService:
                     is_agent_created=trusted_agent,
                     agent_task_id=resolved_task_id if trusted_agent else None,
                     etag=event.etag,
+                    **_mirror_identity_kwargs(event),
                     **_mirror_metadata_kwargs(event),
                 )
             )
@@ -341,6 +352,7 @@ class CalendarMirrorService:
         row.etag = event.etag
         row.is_agent_created = trusted_agent
         row.agent_task_id = resolved_task_id if trusted_agent else None
+        _apply_mirror_identity(row, event)
         _apply_mirror_metadata(row, event)
 
         change = EventChange(
@@ -434,6 +446,21 @@ class CalendarMirrorService:
             is_agent_created=True,
             agent_task_id=self._resolve_task_id(draft.agent_task_id),
             etag=created.etag,
+            healthmes_kind=(
+                (created.identity or draft.identity).kind.value
+                if created.identity is not None or draft.identity is not None
+                else None
+            ),
+            healthmes_source=(
+                (created.identity or draft.identity).source
+                if created.identity is not None or draft.identity is not None
+                else None
+            ),
+            healthmes_source_key=(
+                (created.identity or draft.identity).source_key
+                if created.identity is not None or draft.identity is not None
+                else None
+            ),
             **_mirror_metadata_kwargs(created),
         )
         self._session.add(row)
@@ -518,6 +545,25 @@ _MIRROR_METADATA_FIELDS = (
     "is_locked",
     "status",
 )
+
+
+def _mirror_identity_kwargs(event: ExternalEvent) -> dict[str, object]:
+    if event.identity is None:
+        return {
+            "healthmes_kind": None,
+            "healthmes_source": None,
+            "healthmes_source_key": None,
+        }
+    return {
+        "healthmes_kind": event.identity.kind.value,
+        "healthmes_source": event.identity.source,
+        "healthmes_source_key": event.identity.source_key,
+    }
+
+
+def _apply_mirror_identity(row: CalendarEventMirror, event: ExternalEvent) -> None:
+    for field_name, value in _mirror_identity_kwargs(event).items():
+        setattr(row, field_name, value)
 
 
 def _mirror_metadata_kwargs(event: ExternalEvent) -> dict[str, object]:

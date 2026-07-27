@@ -33,6 +33,9 @@ from healthmes.calendars.base import (
     AGENT_TAG_VALUE,
     GOOGLE_AGENT_TAG_KEY,
     GOOGLE_AGENT_TASK_ID_KEY,
+    GOOGLE_EVENT_KIND_KEY,
+    GOOGLE_EVENT_SOURCE_KEY,
+    GOOGLE_EVENT_UPSERT_KEY,
     CalendarAuthError,
     CalendarConflictError,
     CalendarError,
@@ -43,6 +46,7 @@ from healthmes.calendars.base import (
     OwnershipError,
     SyncState,
     ensure_utc,
+    parse_calendar_identity,
     parse_task_id,
 )
 from healthmes.store.enums import CalendarSource
@@ -317,6 +321,10 @@ class GoogleCalendarBackend:
         private = {GOOGLE_AGENT_TAG_KEY: AGENT_TAG_VALUE}
         if draft.agent_task_id is not None:
             private[GOOGLE_AGENT_TASK_ID_KEY] = str(draft.agent_task_id)
+        if draft.identity is not None:
+            private[GOOGLE_EVENT_KIND_KEY] = draft.identity.kind.value
+            private[GOOGLE_EVENT_SOURCE_KEY] = draft.identity.source
+            private[GOOGLE_EVENT_UPSERT_KEY] = draft.identity.source_key
         body: dict[str, Any] = {
             "summary": draft.summary,
             "start": {"dateTime": _rfc3339(draft.start_at)},
@@ -475,6 +483,11 @@ class GoogleCalendarBackend:
             end_at=_parse_api_time(end),
             is_agent_created=is_agent,
             agent_task_id=agent_task_id,
+            identity=parse_calendar_identity(
+                private.get(GOOGLE_EVENT_KIND_KEY),
+                private.get(GOOGLE_EVENT_SOURCE_KEY),
+                private.get(GOOGLE_EVENT_UPSERT_KEY),
+            ),
             etag=item.get("etag"),
             deleted=deleted,
             organizer_self=_is_self(item.get("organizer")),

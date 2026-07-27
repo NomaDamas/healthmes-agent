@@ -11,8 +11,10 @@ import icalendar
 import pytest
 
 from healthmes.calendars.base import (
+    CalendarEventIdentity,
     EventDraft,
     EventNotFoundError,
+    HealthmesEventKind,
     OwnershipError,
 )
 from healthmes.calendars.caldav_icloud import (
@@ -273,6 +275,31 @@ class TestCreateEvent:
         events, _ = backend.list_changes(None)
         assert events[0].is_agent_created
         assert stored.uid == created.external_id
+
+    def test_actual_sleep_identity_round_trips_x_properties(
+        self, backend, calendar
+    ) -> None:
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key="oura:2026-07-26",
+        )
+        created = backend.create_event(
+            EventDraft(
+                summary="수면 (실제)",
+                start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+                end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+                identity=identity,
+            )
+        )
+
+        (ical_text,) = calendar.added_icals
+        assert "X-HEALTHMES-KIND:actual_sleep" in ical_text
+        assert "X-HEALTHMES-SOURCE:oura" in ical_text
+        assert "X-HEALTHMES-SOURCE-KEY:oura:2026-07-26" in ical_text
+        (parsed,), _ = backend.list_changes(None)
+        assert created.identity == identity
+        assert parsed.identity == identity
 
 
 class TestUpdateAndDelete:

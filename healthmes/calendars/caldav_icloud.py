@@ -33,6 +33,9 @@ from healthmes.calendars.base import (
     AGENT_TAG_VALUE,
     ICAL_AGENT_PROPERTY,
     ICAL_AGENT_TASK_ID_PROPERTY,
+    ICAL_EVENT_KIND_PROPERTY,
+    ICAL_EVENT_SOURCE_KEY_PROPERTY,
+    ICAL_EVENT_SOURCE_PROPERTY,
     CalendarError,
     EventDraft,
     EventNotFoundError,
@@ -41,6 +44,7 @@ from healthmes.calendars.base import (
     SyncState,
     coerce_utc,
     ensure_utc,
+    parse_calendar_identity,
     parse_task_id,
 )
 from healthmes.store.enums import CalendarSource
@@ -178,6 +182,10 @@ class CalDavCalendarBackend:
         component[ICAL_AGENT_PROPERTY] = AGENT_TAG_VALUE
         if draft.agent_task_id is not None:
             component[ICAL_AGENT_TASK_ID_PROPERTY] = str(draft.agent_task_id)
+        if draft.identity is not None:
+            component[ICAL_EVENT_KIND_PROPERTY] = draft.identity.kind.value
+            component[ICAL_EVENT_SOURCE_PROPERTY] = draft.identity.source
+            component[ICAL_EVENT_SOURCE_KEY_PROPERTY] = draft.identity.source_key
 
         calendar = icalendar.Calendar()
         calendar.add("prodid", "-//HealthMes Agent//healthmes//EN")
@@ -192,6 +200,7 @@ class CalDavCalendarBackend:
             end_at=draft.end_at,
             is_agent_created=True,
             agent_task_id=draft.agent_task_id,
+            identity=draft.identity,
         )
 
     def update_event(
@@ -280,6 +289,11 @@ class CalDavCalendarBackend:
             end_at=end_at,
             is_agent_created=is_agent,
             agent_task_id=parse_task_id(component.get(ICAL_AGENT_TASK_ID_PROPERTY)),
+            identity=parse_calendar_identity(
+                component.get(ICAL_EVENT_KIND_PROPERTY),
+                component.get(ICAL_EVENT_SOURCE_PROPERTY),
+                component.get(ICAL_EVENT_SOURCE_KEY_PROPERTY),
+            ),
             etag=_object_etag(obj),
         )
         return event, _fingerprint(obj, component)

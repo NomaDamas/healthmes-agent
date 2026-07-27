@@ -13,7 +13,7 @@ only relative paths are stored here (``media_path`` columns).
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import ForeignKey, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from healthmes.store.base import Base, JSONDict, str_32, str_64, str_255, string_enum
@@ -107,6 +107,12 @@ class CalendarEventMirror(Base):
             "external_id",
             name="uq_calendar_event_mirror_source_external_id",
         ),
+        Index(
+            "ux_calendar_event_mirror_source_healthmes_source_key",
+            "calendar_source",
+            "healthmes_source_key",
+            unique=True,
+        ),
     )
 
     external_id: Mapped[str_255]
@@ -118,6 +124,10 @@ class CalendarEventMirror(Base):
     agent_task_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("task.id", ondelete="SET NULL"), index=True
     )
+    healthmes_kind: Mapped[str_64 | None]
+    healthmes_source: Mapped[str_255 | None]
+    healthmes_source_key: Mapped[str_255 | None]
+    observation_fingerprint: Mapped[str_255 | None]
     etag: Mapped[str_255 | None]
     sync_token: Mapped[str_255 | None]
     organizer_self: Mapped[bool] = mapped_column(default=False)
