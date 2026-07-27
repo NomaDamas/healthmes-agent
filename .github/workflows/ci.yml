@@ -2,8 +2,8 @@
 # the vendor-coupling smoke; docs/DEVELOPMENT.md "Tests and lint").
 #
 # Three jobs mirror the run targets:
-#   - linux: lint + full offline test suite + docker-compose validation +
-#     alembic offline SQL render for both dialects (no database needed).
+#   - linux: lint + full test suite with a disposable local postgres regression +
+#     docker-compose validation + alembic offline SQL render for both dialects.
 #   - macos: the mac-native path exactly as developers run it — `make mac-test`
 #     (uv + repo-local sqlite; no Homebrew services, no postgres/redis).
 #   - compose-smoke: actually boots the token-free core of the compose stack
@@ -11,11 +11,10 @@
 #     the PLAN §11 "compose boot + Phase-0 demo query" smoke. The demo-query
 #     half needs real Telegram/Anthropic/wearable credentials, which CI does
 #     not have; its contracts (webhook signing, MCP registration, config
-#     render) are pinned by the offline pytest suite instead.
+#     render) are pinned by pytest instead.
 #
-# The two test jobs run offline: the suite is network-free by convention
-# (tests/conftest.py), `docker compose config` needs no daemon pulls, and
-# alembic renders SQL without connecting.
+# Tests make no external network calls. Linux uses only its disposable
+# localhost postgres service; macOS keeps the zero-service sqlite path.
 
 name: CI
 
@@ -40,6 +39,20 @@ jobs:
     name: lint, tests, compose + alembic render (ubuntu)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: healthmes
+          POSTGRES_PASSWORD: healthmes
+          POSTGRES_DB: healthmes_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U healthmes -d healthmes_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -55,6 +68,8 @@ jobs:
         run: uv run ruff check .
 
       - name: pytest
+        env:
+          HEALTHMES_TEST_POSTGRES_URL: postgresql+psycopg://healthmes:healthmes@127.0.0.1:5432/healthmes_test
         run: uv run pytest -q
 
       - name: docker compose config (no daemon required)

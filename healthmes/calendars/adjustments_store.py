@@ -45,6 +45,11 @@ class SqlAlchemyAdjustmentRepository:
         self, dedup_key: str, payload: Mapping[str, Any], fired_at: datetime
     ) -> bool:
         self._begin_immediate_if_possible()
+        if self._session.get_bind().dialect.name == "postgresql":
+            self._session.execute(
+                sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:dedup_key, 0))"),
+                {"dedup_key": dedup_key},
+            )
         existing = self._session.scalar(
             sa.select(TriggerEvent.id).where(TriggerEvent.dedup_key == dedup_key).limit(1)
         )
