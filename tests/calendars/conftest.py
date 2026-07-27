@@ -12,7 +12,12 @@ import pytest
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from healthmes.calendars.base import EventDraft, ExternalEvent, SyncState
+from healthmes.calendars.base import (
+    EventDraft,
+    ExternalEvent,
+    HealthmesEventKind,
+    SyncState,
+)
 from healthmes.store import Base, CalendarSource, create_db_engine
 
 
@@ -51,6 +56,7 @@ class FakeCalendarBackend:
         self.created_drafts: list[EventDraft] = []
         self.update_calls: list[dict[str, object]] = []
         self.delete_calls: list[str] = []
+        self.delete_expected_kinds: list[HealthmesEventKind | None] = []
         self._create_counter = 0
 
     def queue_changes(self, events: list[ExternalEvent], sync_state: SyncState) -> None:
@@ -106,8 +112,14 @@ class FakeCalendarBackend:
             etag="etag-updated",
         )
 
-    def delete_event(self, external_id: str) -> None:
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+    ) -> None:
         self.delete_calls.append(external_id)
+        self.delete_expected_kinds.append(expected_kind)
 
 
 @pytest.fixture

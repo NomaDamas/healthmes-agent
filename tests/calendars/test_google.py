@@ -159,6 +159,7 @@ def api_event(
     end: str = "2026-07-09T09:30:00+09:00",
     agent: bool = False,
     task_id: uuid.UUID | None = None,
+    healthmes_kind: str | None = None,
     status: str = "confirmed",
     etag: str = '"e1"',
     organizer_self: bool = False,
@@ -193,6 +194,8 @@ def api_event(
         private = {"healthmes": "1"}
         if task_id is not None:
             private["healthmes_task_id"] = str(task_id)
+        if healthmes_kind is not None:
+            private["healthmes_kind"] = healthmes_kind
         item["extendedProperties"] = {"private": private}
     return item
 
@@ -445,6 +448,31 @@ class TestUpdateAndDelete:
         with pytest.raises(OwnershipError):
             backend.delete_event("theirs")
         assert service.delete_calls == []
+
+    def test_delete_requires_expected_healthmes_kind(self, backend, service) -> None:
+        service.stored_events["mine"] = api_event(
+            "mine",
+            agent=True,
+            healthmes_kind="actual_sleep",
+        )
+        with pytest.raises(OwnershipError, match="planned_sleep"):
+            backend.delete_event(
+                "mine",
+                expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+            )
+        assert service.delete_calls == []
+
+    def test_delete_accepts_matching_healthmes_kind(self, backend, service) -> None:
+        service.stored_events["mine"] = api_event(
+            "mine",
+            agent=True,
+            healthmes_kind="planned_sleep",
+        )
+        backend.delete_event(
+            "mine",
+            expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+        )
+        assert service.delete_calls == [("primary", "mine")]
 
     def test_update_conflict_412_raises_and_leaves_event_unmutated(
         self, backend, service

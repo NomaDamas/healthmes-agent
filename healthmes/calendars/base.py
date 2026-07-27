@@ -57,6 +57,7 @@ __all__ = [
     "coerce_utc",
     "ensure_utc",
     "parse_calendar_identity",
+    "parse_event_kind",
     "parse_task_id",
 ]
 
@@ -89,6 +90,15 @@ class HealthmesEventKind(StrEnum):
     PLANNED_SLEEP = "planned_sleep"
 
 
+def parse_event_kind(value: object) -> HealthmesEventKind | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return HealthmesEventKind(value.strip())
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class CalendarEventIdentity:
     kind: HealthmesEventKind
@@ -111,9 +121,8 @@ def parse_calendar_identity(
         source_key, str
     ):
         return None
-    try:
-        event_kind = HealthmesEventKind(kind.strip())
-    except ValueError:
+    event_kind = parse_event_kind(kind)
+    if event_kind is None:
         return None
     try:
         return CalendarEventIdentity(
@@ -213,6 +222,7 @@ class ExternalEvent:
     is_agent_created: bool = False
     agent_task_id: uuid.UUID | None = None
     identity: CalendarEventIdentity | None = None
+    healthmes_kind: HealthmesEventKind | None = None
     etag: str | None = None
     deleted: bool = False
     organizer_self: bool = False
@@ -365,6 +375,11 @@ class CalendarBackend(Protocol):
         """
         ...
 
-    def delete_event(self, external_id: str) -> None:
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+    ) -> None:
         """Delete an agent-owned event (same ownership guarantees as update)."""
         ...

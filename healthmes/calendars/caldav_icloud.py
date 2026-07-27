@@ -40,11 +40,13 @@ from healthmes.calendars.base import (
     EventDraft,
     EventNotFoundError,
     ExternalEvent,
+    HealthmesEventKind,
     OwnershipError,
     SyncState,
     coerce_utc,
     ensure_utc,
     parse_calendar_identity,
+    parse_event_kind,
     parse_task_id,
 )
 from healthmes.store.enums import CalendarSource
@@ -201,6 +203,7 @@ class CalDavCalendarBackend:
             is_agent_created=True,
             agent_task_id=draft.agent_task_id,
             identity=draft.identity,
+            healthmes_kind=draft.identity.kind if draft.identity is not None else None,
         )
 
     def update_event(
@@ -228,8 +231,20 @@ class CalDavCalendarBackend:
             raise CalendarError(f"caldav event {external_id!r} unparsable after update")
         return parsed[0]
 
-    def delete_event(self, external_id: str) -> None:
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+    ) -> None:
         obj = self._get_owned_object(external_id)
+        remote_kind = parse_event_kind(
+            obj.icalendar_component.get(ICAL_EVENT_KIND_PROPERTY)
+        )
+        if expected_kind is not None and remote_kind is not expected_kind:
+            raise OwnershipError(
+                f"caldav event {external_id!r} is not {expected_kind.value}"
+            )
         obj.delete()
 
     def _get_owned_object(self, external_id: str) -> Any:
@@ -293,6 +308,9 @@ class CalDavCalendarBackend:
                 component.get(ICAL_EVENT_KIND_PROPERTY),
                 component.get(ICAL_EVENT_SOURCE_PROPERTY),
                 component.get(ICAL_EVENT_SOURCE_KEY_PROPERTY),
+            ),
+            healthmes_kind=parse_event_kind(
+                component.get(ICAL_EVENT_KIND_PROPERTY)
             ),
             etag=_object_etag(obj),
         )

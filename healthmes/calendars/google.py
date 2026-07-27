@@ -43,10 +43,12 @@ from healthmes.calendars.base import (
     EventDraft,
     EventNotFoundError,
     ExternalEvent,
+    HealthmesEventKind,
     OwnershipError,
     SyncState,
     ensure_utc,
     parse_calendar_identity,
+    parse_event_kind,
     parse_task_id,
 )
 from healthmes.store.enums import CalendarSource
@@ -371,8 +373,17 @@ class GoogleCalendarBackend:
             raise  # unreachable; keeps type-checkers happy about ``patched``
         return self._parse_api_event(patched)
 
-    def delete_event(self, external_id: str) -> None:
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+    ) -> None:
         current = self._get_owned_event(external_id)
+        if expected_kind is not None and current.healthmes_kind is not expected_kind:
+            raise OwnershipError(
+                f"google event {external_id!r} is not {expected_kind.value}"
+            )
         request = self._events().delete(
             calendarId=self._calendar_id, eventId=external_id
         )
@@ -488,6 +499,7 @@ class GoogleCalendarBackend:
                 private.get(GOOGLE_EVENT_SOURCE_KEY),
                 private.get(GOOGLE_EVENT_UPSERT_KEY),
             ),
+            healthmes_kind=parse_event_kind(private.get(GOOGLE_EVENT_KIND_KEY)),
             etag=item.get("etag"),
             deleted=deleted,
             organizer_self=_is_self(item.get("organizer")),

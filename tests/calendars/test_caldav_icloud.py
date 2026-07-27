@@ -38,6 +38,7 @@ def make_component(
     end: object = None,
     agent: bool = False,
     task_id: uuid.UUID | None = None,
+    healthmes_kind: str | None = None,
 ) -> icalendar.Event:
     component = icalendar.Event()
     component.add("uid", uid)
@@ -52,6 +53,8 @@ def make_component(
         component["X-HEALTHMES"] = "1"
     if task_id is not None:
         component["X-HEALTHMES-TASK-ID"] = str(task_id)
+    if healthmes_kind is not None:
+        component["X-HEALTHMES-KIND"] = healthmes_kind
     return component
 
 
@@ -338,3 +341,32 @@ class TestUpdateAndDelete:
         with pytest.raises(OwnershipError):
             backend.delete_event("theirs")
         assert calendar.deleted_uids == []
+
+    def test_delete_requires_expected_healthmes_kind(self, backend, calendar) -> None:
+        calendar.put(
+            make_component(
+                "mine@healthmes",
+                agent=True,
+                healthmes_kind="actual_sleep",
+            )
+        )
+        with pytest.raises(OwnershipError, match="planned_sleep"):
+            backend.delete_event(
+                "mine@healthmes",
+                expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+            )
+        assert calendar.deleted_uids == []
+
+    def test_delete_accepts_matching_healthmes_kind(self, backend, calendar) -> None:
+        calendar.put(
+            make_component(
+                "mine@healthmes",
+                agent=True,
+                healthmes_kind="planned_sleep",
+            )
+        )
+        backend.delete_event(
+            "mine@healthmes",
+            expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+        )
+        assert calendar.deleted_uids == ["mine@healthmes"]

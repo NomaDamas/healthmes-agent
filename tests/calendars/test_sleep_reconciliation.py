@@ -78,7 +78,12 @@ class RecordingCalendarBackend:
             etag='"updated"',
         )
 
-    def delete_event(self, external_id: str) -> None:
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+    ) -> None:
         self.delete_calls.append(external_id)
 
 

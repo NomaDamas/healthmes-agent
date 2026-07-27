@@ -10,7 +10,12 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
-from healthmes.calendars.base import EventDraft, ExternalEvent, SyncState
+from healthmes.calendars.base import (
+    EventDraft,
+    ExternalEvent,
+    HealthmesEventKind,
+    SyncState,
+)
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.calendars.sleep_reconciliation import (
     SleepCalendarAction,
@@ -53,7 +58,12 @@ class ConcurrentCalendarBackend:
     ) -> ExternalEvent:
         raise AssertionError("identical concurrent replay must not update")
 
-    def delete_event(self, external_id: str) -> None:
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+    ) -> None:
         raise AssertionError("actual sleep upsert must not delete")
 
 

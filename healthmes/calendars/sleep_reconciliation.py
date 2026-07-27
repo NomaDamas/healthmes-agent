@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 import sqlalchemy as sa
@@ -11,6 +11,7 @@ from healthmes.calendars.base import (
     CalendarBackend,
     CalendarEventIdentity,
     EventDraft,
+    EventNotFoundError,
     HealthmesEventKind,
     OwnershipError,
     ensure_utc,
@@ -30,6 +31,7 @@ class SleepCalendarResult:
     action: SleepCalendarAction
     external_id: str
     observation_fingerprint: str
+    deleted_planned_external_ids: tuple[str, ...] = ()
 
 
 class SleepCalendarReconciler:
@@ -47,15 +49,20 @@ class SleepCalendarReconciler:
         self._lock_source_key(identity.source_key)
         row = self._find_source_key(identity.source_key)
         if row is None:
-            return self._create(observation, identity, fingerprint)
-        self._assert_owned_actual_sleep(row, identity)
-        if row.observation_fingerprint == fingerprint:
-            return SleepCalendarResult(
-                action=SleepCalendarAction.NOOP,
-                external_id=row.external_id,
-                observation_fingerprint=fingerprint,
+            result = self._create(observation, identity, fingerprint)
+        else:
+            self._assert_owned_actual_sleep(row, identity)
+            result = (
+                SleepCalendarResult(
+                    action=SleepCalendarAction.NOOP,
+                    external_id=row.external_id,
+                    observation_fingerprint=fingerprint,
+                )
+                if row.observation_fingerprint == fingerprint
+                else self._update(row, observation, fingerprint)
             )
-        return self._update(row, observation, fingerprint)
+        deleted = self._delete_planned_sleep(observation)
+        return replace(result, deleted_planned_external_ids=deleted)
 
     def _create(
         self,
@@ -136,6 +143,33 @@ class SleepCalendarReconciler:
             sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:source_key, 0))"),
             {"source_key": f"{self._backend.source.value}:{source_key}"},
         )
+
+    def _delete_planned_sleep(
+        self,
+        observation: ActualSleepObservation,
+    ) -> tuple[str, ...]:
+        planned = self._session.scalars(
+            sa.select(CalendarEventMirror).where(
+                CalendarEventMirror.calendar_source == self._backend.source,
+                CalendarEventMirror.is_agent_created.is_(True),
+                CalendarEventMirror.healthmes_kind == HealthmesEventKind.PLANNED_SLEEP.value,
+                CalendarEventMirror.start_at < ensure_utc(observation.end_at),
+                CalendarEventMirror.end_at > ensure_utc(observation.start_at),
+            )
+        ).all()
+        deleted: list[str] = []
+        for row in planned:
+            try:
+                self._backend.delete_event(
+                    row.external_id,
+                    expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+                )
+            except EventNotFoundError:
+                pass
+            self._session.delete(row)
+            self._session.commit()
+            deleted.append(row.external_id)
+        return tuple(deleted)
 
     @staticmethod
     def _assert_owned_actual_sleep(
