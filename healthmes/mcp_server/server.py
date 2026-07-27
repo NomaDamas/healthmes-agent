@@ -42,6 +42,7 @@ resolved by :func:`_local_timezone` (override -> settings -> env -> system).
 import asyncio
 import datetime as dt
 import functools
+import logging
 import os
 import re
 import uuid
@@ -64,7 +65,7 @@ from healthmes.calendars.adjustments import (
 )
 from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.config import Settings, get_settings, system_timezone
-from healthmes.mcp_server import adjustment_tools, impact, interpret, timeline
+from healthmes.mcp_server import adjustment_tools, arousal, impact, interpret, timeline
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.store import (
     AppUsageSample,
@@ -75,6 +76,7 @@ from healthmes.store import (
     FoodLog,
     MedicalRecord,
     MedicalRecordKind,
+    MonthlyGoal,
     ProposalStatus,
     ScheduleProposal,
     Task,
@@ -966,6 +968,8 @@ async def get_personal_baselines(
 # The vendor series type carrying intraday stress (schemas/enums/series_types.py;
 # Garmin is the only provider that ships one — docs/PLAN.md 1.5).
 STRESS_SERIES_TYPE = "garmin_stress_level"
+HR_SERIES_TYPE = "heart_rate"
+STEPS_SERIES_TYPE = "steps"
 
 # Component terms sourced from open-wearables health data; how many of them a
 # forecast window carries grades the forecast's evidence richness.
@@ -1099,6 +1103,177 @@ def _stress_samples(rows: Iterable[Mapping[str, Any]]) -> list[tuple[dt.datetime
     return samples
 
 
+def _typed_samples(
+    rows: Iterable[Mapping[str, Any]],
+    series_type: str,
+    *,
+    drop_nonpositive: bool = False,
+) -> list[tuple[dt.datetime, float]]:
+    """(aware UTC timestamp, value) samples of one series type.
+
+    Negative values are always dropped; ``drop_nonpositive`` additionally
+    drops zeros (an HR of 0 is a sensor gap, while 0 steps is stillness
+    evidence that must be kept).
+    """
+    samples: list[tuple[dt.datetime, float]] = []
+    floor = 0.0 if drop_nonpositive else -0.0
+    for row in rows:
+        if row.get("type") != series_type:
+            continue
+        recorded_at = _parse_recorded_at(row.get("timestamp"))
+        value = _as_float(row.get("value"))
+        if recorded_at is None or value is None or value < 0:
+            continue
+        if drop_nonpositive and value <= floor:
+            continue
+        samples.append((recorded_at, value))
+    return samples
+
+
+async def _arousal_hints_for(
+    client: OWClient,
+    user_id: str,
+    day: dt.date,
+    tz: dt.tzinfo,
+    start_utc: dt.datetime,
+    end_utc: dt.datetime,
+) -> dict[str, Any]:
+    """The ``arousal_hints`` payload for non-Garmin days (healthmes/mcp_server/arousal.py).
+
+    Interpretation stays deterministic code: this fetches continuous HR +
+    steps + workouts + the 14-day resting-HR baseline and the day's
+    calendar/app/meal rows, then delegates to the pure pipeline. Any fetch
+    failure degrades to an honest ``insufficient_data`` payload — the parent
+    stress-timeline response never fails because hints could not be built.
+    """
+    try:
+        # One fetch per series: a full day of 1-minute HR alone is ~1,440
+        # rows, so a combined fetch would trip the shared page cap and
+        # spuriously truncate (review finding). The vendor range query can
+        # widen end bounds to midnight, so samples are re-filtered to the
+        # local-day UTC window below.
+        hr_rows, hr_truncated = await client.collect_timeseries_tracked(
+            user_id,
+            start_utc.isoformat(),
+            end_utc.isoformat(),
+            [HR_SERIES_TYPE],
+        )
+        step_rows, steps_truncated = await client.collect_timeseries_tracked(
+            user_id,
+            start_utc.isoformat(),
+            end_utc.isoformat(),
+            [STEPS_SERIES_TYPE],
+        )
+        truncated = hr_truncated or steps_truncated
+        hr_utc = [
+            (at, value)
+            for at, value in _typed_samples(hr_rows, HR_SERIES_TYPE, drop_nonpositive=True)
+            if start_utc <= at < end_utc
+        ]
+        steps_utc = [
+            (at, value)
+            for at, value in _typed_samples(step_rows, STEPS_SERIES_TYPE)
+            if start_utc <= at < end_utc
+        ]
+
+        # The vendor returns only workouts fully contained in the queried
+        # range (event_record_repository), and date-only bounds are read as
+        # UTC midnights — pad generously so evening workouts in any timezone
+        # are included; extra spans only ever mask more, never fabricate.
+        workout_rows = await client.collect_workouts(
+            user_id,
+            (day - dt.timedelta(days=1)).isoformat(),
+            (day + dt.timedelta(days=2)).isoformat(),
+        )
+        workout_spans: list[tuple[dt.datetime, dt.datetime]] = []
+        for row in workout_rows:
+            w_start = _parse_recorded_at(row.get("start_time"))
+            w_end = _parse_recorded_at(row.get("end_time"))
+            if w_start is None:
+                continue
+            if w_end is None or w_end <= w_start:
+                w_end = w_start + dt.timedelta(hours=1)
+            workout_spans.append((w_start.astimezone(tz), w_end.astimezone(tz)))
+
+        rhr_rows = await client.collect_recovery_summaries(
+            user_id,
+            (day - dt.timedelta(days=interpret.BASELINE_WINDOW_DAYS)).isoformat(),
+            day.isoformat(),
+        )
+        rhr_series = interpret.summary_daily_values(
+            rhr_rows, "resting_heart_rate_bpm", day
+        )
+    except (OWClientError, httpx.HTTPError) as exc:
+        logging.getLogger(__name__).warning(
+            "arousal hints: open-wearables fetch failed: %s", exc
+        )
+        return {
+            "status": arousal.STATUS_INSUFFICIENT,
+            "reason": "wearable_fetch_failed",
+            "confidence": "low",
+            "coverage": 0.0,
+            "intervals": [],
+        }
+
+    with _store_session() as session:
+        event_rows = session.scalars(
+            select(CalendarEventMirror)
+            .where(
+                CalendarEventMirror.start_at < end_utc,
+                CalendarEventMirror.end_at > start_utc,
+            )
+            .order_by(CalendarEventMirror.start_at)
+        ).all()
+        usage_rows = session.scalars(
+            select(AppUsageSample)
+            .where(
+                AppUsageSample.bucket_start >= start_utc - dt.timedelta(minutes=60),
+                AppUsageSample.bucket_start < end_utc,
+            )
+            .order_by(AppUsageSample.bucket_start)
+        ).all()
+        meal_rows = session.scalars(
+            select(FoodLog)
+            .where(FoodLog.logged_at >= start_utc, FoodLog.logged_at < end_utc)
+            .order_by(FoodLog.logged_at)
+        ).all()
+        events = [
+            (
+                _ensure_utc_dt(row.start_at).astimezone(tz),
+                _ensure_utc_dt(row.end_at).astimezone(tz),
+                row.summary,
+            )
+            for row in event_rows
+        ]
+        usage = [
+            (
+                _ensure_utc_dt(row.bucket_start).astimezone(tz),
+                row.category,
+                row.foreground_seconds,
+            )
+            for row in usage_rows
+        ]
+        meals = [
+            (
+                _ensure_utc_dt(row.logged_at).astimezone(tz),
+                str(row.description or "meal")[:60],
+            )
+            for row in meal_rows
+        ]
+
+    return arousal.build_arousal_hints(
+        day=day,
+        tz=tz,
+        hr_samples=[(at.astimezone(tz), value) for at, value in hr_utc],
+        step_samples=[(at.astimezone(tz), value) for at, value in steps_utc],
+        workout_spans=workout_spans,
+        daily_rhr=sorted(rhr_series.items()),
+        truncated=truncated,
+        context_for=lambda start, end: timeline.attach_context(start, end, events, usage),
+        meals=meals,
+    )
+
+
 @mcp.tool
 @_with_ow_errors
 async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
@@ -1114,8 +1289,13 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
     day-level proxy (native daily stress score, else 100 - the night-HRV
     resilience score) spread over morning/afternoon/evening sections — the
     proxy has no intraday resolution, so treat within-day differences as
-    context, not measurement. `date` is ISO YYYY-MM-DD (default today,
-    local). Honest `insufficient_data` when no stress signal exists at all.
+    context, not measurement. Responses without a usable Garmin intraday
+    series (the daily-score/proxy/insufficient paths) additionally carry
+    `arousal_hints`: deterministic quiet-time HR-elevation intervals over the
+    personal resting baseline (hint-grade, confidence capped at medium —
+    physiological arousal, never measured stress; see healthmes/mcp_server/
+    arousal.py). `date` is ISO YYYY-MM-DD (default today, local). Honest
+    `insufficient_data` when no stress signal exists at all.
     """
     tz = _local_timezone()
     day = _parse_date_local(date, "date", tz)
@@ -1141,6 +1321,9 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
             "confidence": "low",
             "truncated": False,
             "intervals": [],
+            "arousal_hints": await _arousal_hints_for(
+                client, user_id, day, tz, start_utc, end_utc
+            ),
         }
     if series_truncated and not samples_utc:
         return {
@@ -1152,6 +1335,9 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
             "coverage": 0.0,
             "truncated": True,
             "intervals": [],
+            "arousal_hints": await _arousal_hints_for(
+                client, user_id, day, tz, start_utc, end_utc
+            ),
         }
 
     day_level: dict[str, Any] | None = None
@@ -1186,6 +1372,9 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
                 "confidence": "low",
                 "truncated": False,
                 "intervals": [],
+                "arousal_hints": await _arousal_hints_for(
+                    client, user_id, day, tz, start_utc, end_utc
+                ),
             }
         intervals = timeline.proxy_sections(day, tz, float(context["value"]))
         source = (
@@ -1258,6 +1447,14 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
         response["status"] = interpret.STATUS_INSUFFICIENT
         response["reason"] = "stress_timeseries_truncated"
         response["confidence"] = "low"
+    if source != "garmin_stress_timeseries" or series_truncated:
+        # No *usable* Garmin intraday series (non-Garmin day, daily/proxy
+        # fallback, or a truncated series the skill must not lean on):
+        # attach the deterministic HR arousal-hint interpretation
+        # (PLAN §13 follow-up).
+        response["arousal_hints"] = await _arousal_hints_for(
+            client, user_id, day, tz, start_utc, end_utc
+        )
     return response
 
 
@@ -1602,6 +1799,197 @@ def _serialize_task(task: Task) -> dict[str, Any]:
         "created_at": _iso_utc(task.created_at),
         "updated_at": _iso_utc(task.updated_at),
     }
+
+GOAL_STATUSES = {"active", "done", "dropped"}
+
+
+def _serialize_goal(goal: Any, *, scope: str) -> dict[str, Any]:
+    period = goal.month_start if scope == "monthly" else goal.week_start
+    payload = {
+        "goal_id": str(goal.id),
+        "scope": scope,
+        "period_start": period.isoformat(),
+        "title": goal.title,
+        "priority": goal.priority,
+        "status": goal.status,
+    }
+    if scope == "weekly":
+        payload["monthly_goal_id"] = (
+            str(goal.monthly_goal_id) if goal.monthly_goal_id else None
+        )
+    return payload
+
+
+def _resolve_monthly_ref(session: Any, ref: str) -> tuple[Any | None, str | None]:
+    """Lenient monthly-goal resolution (UUID or exact title), mirroring
+    ``_resolve_goal_ref`` — never raises, notes instead."""
+    cleaned = (ref or "").strip()
+    if not cleaned:
+        return None, None
+    try:
+        goal = session.get(MonthlyGoal, uuid.UUID(cleaned))
+        if goal is not None:
+            return goal, None
+    except ValueError:
+        pass
+    matches = list(
+        session.scalars(
+            select(MonthlyGoal).where(func.lower(MonthlyGoal.title) == cleaned.lower())
+        )
+    )
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, (
+            f"{len(matches)} monthly goals are titled {ref!r} (different months) — "
+            "pass the UUID to disambiguate"
+        )
+    return None, f"monthly goal {ref!r} not found"
+
+
+@mcp.tool
+def list_goals(include_done: bool = False) -> dict[str, Any]:
+    """Monthly goals with their weekly goals nested under them.
+
+    The month layer answers "왜 이번 주에 이걸 하나" — the planner should keep
+    week plans aligned with the month's direction and say so when placing
+    tasks. Weekly goals with no month link appear under ``unassigned_weekly``.
+    ``include_done`` also returns done/dropped goals (hidden by default).
+    """
+    with _store_session() as session:
+        monthly_rows = list(session.scalars(select(MonthlyGoal)))
+        weekly_rows = list(session.scalars(select(WeeklyGoal)))
+        session.expunge_all()  # serialized below; plain reads, no lazy loads
+    if not include_done:
+        monthly_rows = [g for g in monthly_rows if g.status == "active"]
+        weekly_rows = [g for g in weekly_rows if g.status == "active"]
+    monthly_rows.sort(
+        key=lambda g: (g.month_start.isoformat(), g.priority, str(g.id)), reverse=True
+    )
+    weekly_rows.sort(
+        key=lambda g: (g.week_start.isoformat(), g.priority, str(g.id)), reverse=True
+    )
+
+    by_month: dict[str, dict[str, Any]] = {}
+    for goal in monthly_rows:
+        entry = _serialize_goal(goal, scope="monthly")
+        entry["weekly_goals"] = []
+        by_month[str(goal.id)] = entry
+    unassigned: list[dict[str, Any]] = []
+    under_hidden: list[dict[str, Any]] = []
+    for goal in weekly_rows:
+        entry = _serialize_goal(goal, scope="weekly")
+        if goal.monthly_goal_id is None:
+            unassigned.append(entry)
+            continue
+        parent = by_month.get(str(goal.monthly_goal_id))
+        if parent is not None:
+            parent["weekly_goals"].append(entry)
+        else:
+            # Linked, but the parent is filtered out (done/dropped month) —
+            # a truly-unlinked bucket would misreport the FK (review).
+            under_hidden.append(entry)
+    return {
+        "status": "ok",
+        "monthly_goals": list(by_month.values()),
+        "unassigned_weekly": unassigned,
+        "weekly_under_hidden_months": under_hidden,
+    }
+
+
+@mcp.tool
+def upsert_goal(
+    scope: str,
+    title: str | None = None,
+    goal_id: str | None = None,
+    period_start: str | None = None,
+    monthly_goal_ref: str | None = None,
+    priority: int | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """Create or update a weekly or monthly goal.
+
+    ``scope`` is "weekly" or "monthly". Create needs ``title``;
+    ``period_start`` (ISO date) defaults to the current week's Monday /
+    current month's first day in the user's timezone. ``monthly_goal_ref``
+    (weekly only) links the week to a month by UUID **or exact title** —
+    unknown refs save the goal anyway and return a note. ``status`` is one
+    of active / done / dropped.
+    """
+    if scope not in ("weekly", "monthly"):
+        raise ToolError(f"scope must be 'weekly' or 'monthly', got {scope!r}")
+    if status is not None and status not in GOAL_STATUSES:
+        raise ToolError(f"status must be one of {sorted(GOAL_STATUSES)}, got {status!r}")
+    model = WeeklyGoal if scope == "weekly" else MonthlyGoal
+    note: str | None = None
+
+    with _store_session() as session:
+        goal = None
+        if goal_id and goal_id.strip():
+            try:
+                goal = session.get(model, uuid.UUID(goal_id.strip()))
+            except ValueError as exc:
+                raise ToolError(f"goal_id must be a UUID, got {goal_id!r}") from exc
+            if goal is None:
+                raise ToolError(f"{scope} goal {goal_id!r} not found")
+        if goal is None:
+            if not (title and title.strip()):
+                raise ToolError("creating a goal requires a title")
+            today = _today_local()
+            if period_start and period_start.strip():
+                try:
+                    period = dt.date.fromisoformat(period_start.strip())
+                except ValueError as exc:
+                    raise ToolError(
+                        f"period_start must be ISO YYYY-MM-DD, got {period_start!r}"
+                    ) from exc
+            elif scope == "weekly":
+                period = today - dt.timedelta(days=today.weekday())
+            else:
+                period = today.replace(day=1)
+            if scope == "monthly":
+                period = period.replace(day=1)  # month_start invariant
+            if scope == "weekly":
+                goal = WeeklyGoal(week_start=period, title=title.strip())
+            else:
+                goal = MonthlyGoal(month_start=period, title=title.strip())
+            session.add(goal)
+        else:
+            if title and title.strip():
+                goal.title = title.strip()
+            if period_start and period_start.strip():
+                try:
+                    period = dt.date.fromisoformat(period_start.strip())
+                except ValueError as exc:
+                    raise ToolError(
+                        f"period_start must be ISO YYYY-MM-DD, got {period_start!r}"
+                    ) from exc
+                if scope == "weekly":
+                    goal.week_start = period
+                else:
+                    goal.month_start = period.replace(day=1)  # month_start invariant
+        if priority is not None:
+            goal.priority = priority
+        if status is not None:
+            goal.status = status
+        if scope == "weekly" and monthly_goal_ref is not None:
+            parent, note = _resolve_monthly_ref(session, monthly_goal_ref)
+            if parent is not None:
+                goal.monthly_goal_id = parent.id
+            elif note is not None:
+                note += (
+                    " — existing month link unchanged"
+                    if goal.monthly_goal_id
+                    else " — goal saved without a month link"
+                )
+        session.flush()
+        payload = _serialize_goal(goal, scope=scope)
+        session.commit()
+
+    result: dict[str, Any] = {"status": "ok", "goal": payload}
+    if note:
+        result["goal_note"] = note
+    return result
 
 
 @mcp.tool

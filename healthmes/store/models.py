@@ -44,6 +44,24 @@ __all__ = [
 ]
 
 
+class MonthlyGoal(Base):
+    """A user-stated goal for one month — the layer above weekly goals.
+
+    Owner requirement (2026-07-27): planning must see the month, not only the
+    week. Weekly goals may point at a monthly parent so the planner can keep
+    week plans aligned with the month's direction. Same lean shape as
+    ``WeeklyGoal`` on purpose: goals are capture surfaces, not project
+    management.
+    """
+
+    __tablename__ = "monthly_goal"
+
+    month_start: Mapped[date] = mapped_column(index=True)  # first day of month
+    title: Mapped[str]
+    priority: Mapped[int] = mapped_column(default=0)
+    status: Mapped[str_32] = mapped_column(default="active")
+
+
 class WeeklyGoal(Base):
     """A user-stated goal for one week; the planner decomposes it into tasks."""
 
@@ -53,6 +71,9 @@ class WeeklyGoal(Base):
     title: Mapped[str]
     priority: Mapped[int] = mapped_column(default=0)
     status: Mapped[str_32] = mapped_column(default="active")
+    monthly_goal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("monthly_goal.id", ondelete="SET NULL"), default=None
+    )
 
 
 class Task(Base):

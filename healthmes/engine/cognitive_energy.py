@@ -116,6 +116,7 @@ __all__ = [
     "stress_signal",
     "hrv_signal",
     "charge_signal",
+    "carryover_load_signal",
     "meeting_load_signal",
     "fragmentation_signal",
     "menstrual_phase_signal",
@@ -142,7 +143,7 @@ WINDOW_MINUTES = 60
 # matter. The v1 six are kept at their original values (summing to exactly
 # 1.0) as a backward-compatibility anchor: any estimate computed from v1
 # signals only keeps byte-identical shares and scores. The v2 factors carry
-# small weights on the same scale (0.25 combined ≈ one-fifth of the full set)
+# small weights on the same scale (0.30 combined ≈ a quarter of the full set)
 # — they are adjunct context, never allowed to dominate the physiological
 # core.
 #
@@ -164,6 +165,12 @@ class FactorSpec:
     term: str  # component name (the plan's term name)
     kind: str  # "penalty" | "bonus"
     base_weight: float  # relative weight (share = base_weight / present total)
+    # Additive factors stay OUT of the renormalization pool: they subtract
+    # ``base_weight * value * 100`` points flat. A present-but-zero additive
+    # term can therefore never move the score (review 2026-07-27: a
+    # renormalizing zero-severity term RAISED the score by shrinking every
+    # other penalty's share — 64.75 → 66.43).
+    additive: bool = False
 
 
 _V1_FACTOR_SPECS: tuple[FactorSpec, ...] = (
@@ -180,6 +187,10 @@ _V2_FACTOR_SPECS: tuple[FactorSpec, ...] = (
     FactorSpec("noise", "noise_penalty", "penalty", 0.04),
     FactorSpec("alcohol", "alcohol_penalty", "penalty", 0.06),
     FactorSpec("hydration", "hydration_penalty", "penalty", 0.04),
+    # Owner requirement 2026-07-27: yesterday's overload bleeds into today.
+    # Adjunct term — present only when yesterday actually had booked time, so
+    # every pre-existing flow (no previous-day events) stays byte-identical.
+    FactorSpec("carryover_load", "carryover_load_penalty", "penalty", 0.05, additive=True),
 )
 FACTOR_SPECS: tuple[FactorSpec, ...] = _V1_FACTOR_SPECS + _V2_FACTOR_SPECS
 FACTORS: dict[str, FactorSpec] = {spec.key: spec for spec in FACTOR_SPECS}
@@ -210,6 +221,10 @@ CHARGE_MAX_STALE_DAYS = 1
 # Meeting load: booked fraction of the window plus context switches
 # (event starts inside the window; 3+ starts per hour = maximal switching).
 MEETING_BOOKED_WEIGHT = 0.7
+# Carryover ramp (PLAN §14): ≤4h booked yesterday carries nothing; ≥9h is
+# a full overload day. Expert-tunable placeholders.
+CARRYOVER_FREE_MINUTES = 240.0
+CARRYOVER_FULL_MINUTES = 540.0
 MEETING_SWITCH_WEIGHT = 0.3
 MEETING_MAX_SWITCHES_PER_WINDOW = 3
 # The calendar signal exists only while the mirror is actively synced: any
@@ -651,6 +666,52 @@ class UsageBucket:
     category: str | None
 
 
+def carryover_load_signal(
+    previous_day_events: Sequence[tuple[datetime, datetime]],
+    prev_day_start: datetime,
+    prev_day_end: datetime,
+    *,
+    calendar_active: bool,
+) -> FactorSignal | MissingSignal:
+    """Yesterday's booked-time overload bleeding into today (adjunct term).
+
+    Severity ramps linearly from 0 at ``CARRYOVER_FREE_MINUTES`` booked
+    yesterday to 1 at ``CARRYOVER_FULL_MINUTES`` — a normally-loaded
+    yesterday carries nothing. Missing (weights renormalize without it) when
+    the calendar is inactive OR yesterday had no booked time at all, so
+    every flow without previous-day events stays byte-identical to the
+    pre-carryover engine. Thresholds are expert-tunable placeholders.
+    """
+    if not calendar_active:
+        return MissingSignal("carryover_load", "calendar_mirror_inactive")
+    clipped = [
+        (max(start, prev_day_start), min(end, prev_day_end))
+        for start, end in previous_day_events
+        if start < prev_day_end and end > prev_day_start
+    ]
+    booked_minutes = _union_minutes(clipped)
+    if booked_minutes <= 0:
+        return MissingSignal("carryover_load", "previous_day_free")
+    severity = _clamp01(
+        (booked_minutes - CARRYOVER_FREE_MINUTES)
+        / (CARRYOVER_FULL_MINUTES - CARRYOVER_FREE_MINUTES)
+    )
+    if severity <= 0:
+        # A normally-loaded yesterday carries nothing — absent, not zero, so
+        # no-carryover flows stay byte-identical (weights, snapshot, score).
+        return MissingSignal("carryover_load", "previous_day_within_normal_load")
+    return FactorSignal(
+        "carryover_load",
+        severity,
+        {
+            "source": "calendar_event_mirror.previous_day",
+            "previous_day_booked_minutes": round(booked_minutes, 1),
+            "ramp_free_minutes": CARRYOVER_FREE_MINUTES,
+            "ramp_full_minutes": CARRYOVER_FULL_MINUTES,
+        },
+    )
+
+
 def fragmentation_signal(
     usage: Sequence[UsageBucket],
     window_start: datetime,
@@ -1047,7 +1108,9 @@ def compute_estimate(
         )
 
     by_key = {signal.key: signal for signal in signals}
-    ordered = [spec for spec in FACTOR_SPECS if spec.key in by_key]
+    present = [spec for spec in FACTOR_SPECS if spec.key in by_key]
+    ordered = [spec for spec in present if not spec.additive]
+    additive_specs = [spec for spec in present if spec.additive]
     total_weight = sum(spec.base_weight for spec in ordered)
     # True when the realized shares differ from the declared base weights,
     # i.e. the present factors' weights do not already sum to 1 (the v1 six
@@ -1069,7 +1132,7 @@ def compute_estimate(
                 "penalty_budget_points": round(100.0 - bonus_budget, 4),
                 "bonus_budget_points": round(bonus_budget, 4),
                 "renormalized": renormalized,
-                "factors_present": [spec.key for spec in ordered],
+                "factors_present": [spec.key for spec in present],
                 "factors_missing": missing_payload,
             },
             "contribution": base_points,
@@ -1095,6 +1158,44 @@ def compute_estimate(
                 "contribution": contribution,
             }
         )
+
+    core_total = sum(item["contribution"] for item in components)
+    # Deterministic order: penalties before bonuses. The floor/ceiling clamps
+    # make application order observable, so it must never depend on FACTOR_
+    # SPECS declaration order (review 2026-07-27).
+    additive_specs.sort(key=lambda spec: 0 if spec.kind == "penalty" else 1)
+    for spec in additive_specs:
+        signal = by_key[spec.key]
+        value = _clamp01(float(signal.value))
+        points = spec.base_weight * 100.0 * value
+        if spec.kind == "bonus":
+            contribution = min(points, 100.0 - core_total)
+        else:
+            # Floor-preserving: never subtract below 0 so the exact-sum
+            # invariant (components sum == score_exact) survives the clamp.
+            contribution = -min(points, max(core_total, 0.0))
+        core_total += contribution
+        components.append(
+            {
+                "name": spec.term,
+                "kind": spec.kind,
+                "weight": None,  # flat points, outside the renormalized budget
+                "raw": {
+                    **signal.raw,
+                    "base_weight": spec.base_weight,
+                    "max_points": round(spec.base_weight * 100.0, 4),
+                    "normalized_input": value,
+                    "additive": True,
+                },
+                "contribution": contribution,
+            }
+        )
+    if additive_specs and -1e-9 < core_total < 0.0:
+        # Pure float noise from the clamped subtraction: nudge the last
+        # additive component so the exact-sum contract (components sum ==
+        # score_exact) survives the [0, 100] clamp below.
+        components[-1]["contribution"] -= core_total
+        core_total = 0.0
 
     score_exact = sum(item["contribution"] for item in components)
     # Bounded [0, 100] by construction; the clamp is a pure float-noise guard.
@@ -1256,6 +1357,7 @@ class StoreDayContext:
     """Everything the per-window factors need from the healthmes store."""
 
     events: tuple[tuple[datetime, datetime], ...]
+    previous_day_events: tuple[tuple[datetime, datetime], ...]
     calendar_active: bool
     usage: tuple[UsageBucket, ...]
 
@@ -1264,17 +1366,25 @@ def load_store_day_context(session: Session, day: date) -> StoreDayContext:
     """Prefetch one (UTC) day's calendar events and app-usage buckets."""
     day_start = datetime.combine(day, time.min, tzinfo=UTC)
     day_end = day_start + timedelta(days=1)
+    prev_start = day_start - timedelta(days=1)
 
     event_rows = session.scalars(
         select(CalendarEventMirror)
         .where(
             CalendarEventMirror.start_at < day_end,
-            CalendarEventMirror.end_at > day_start,
+            CalendarEventMirror.end_at > prev_start,
         )
         .order_by(CalendarEventMirror.start_at)
     ).all()
     events = tuple(
-        (_ensure_utc(row.start_at), _ensure_utc(row.end_at)) for row in event_rows
+        (_ensure_utc(row.start_at), _ensure_utc(row.end_at))
+        for row in event_rows
+        if _ensure_utc(row.start_at) < day_end and _ensure_utc(row.end_at) > day_start
+    )
+    previous_day_events = tuple(
+        (_ensure_utc(row.start_at), _ensure_utc(row.end_at))
+        for row in event_rows
+        if _ensure_utc(row.start_at) < day_start and _ensure_utc(row.end_at) > prev_start
     )
 
     active_start = day_start - timedelta(days=CALENDAR_ACTIVE_LOOKAROUND_DAYS)
@@ -1311,7 +1421,12 @@ def load_store_day_context(session: Session, day: date) -> StoreDayContext:
         )
         for row in usage_rows
     )
-    return StoreDayContext(events=events, calendar_active=calendar_active, usage=usage)
+    return StoreDayContext(
+        events=events,
+        previous_day_events=previous_day_events,
+        calendar_active=calendar_active,
+        usage=usage,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1696,6 +1811,20 @@ class CognitiveEnergyEngine:
                 ctx.events, window_start, window_end, calendar_active=ctx.calendar_active
             )
         )
+        prev_day_end = datetime.combine(
+            window_start.astimezone(UTC).date(), time.min, tzinfo=UTC
+        )
+        carryover = carryover_load_signal(
+            ctx.previous_day_events,
+            prev_day_end - timedelta(days=1),
+            prev_day_end,
+            calendar_active=ctx.calendar_active,
+        )
+        if isinstance(carryover, FactorSignal):
+            # Adjunct term: recorded only when real overload carried over —
+            # its absence is the norm, not a data gap worth a missing entry
+            # (keeps every no-carryover snapshot byte-identical to v1 flows).
+            take(carryover)
         take(fragmentation_signal(ctx.usage, window_start, now))
 
         recent_sleep = sorted(digest.sleep_scores_by_day.items())[-8:]

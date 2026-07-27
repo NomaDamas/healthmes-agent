@@ -14,7 +14,7 @@ dockerized postgres):
 
 from logging.config import fileConfig
 
-from sqlalchemy import pool
+from sqlalchemy import event, pool
 
 from alembic import context
 from healthmes.config import get_settings
@@ -59,6 +59,22 @@ def run_migrations_online() -> None:
     """Run migrations in 'online' mode: connect and execute."""
     url = _database_url()
     connectable = create_db_engine(url, poolclass=pool.NullPool)
+
+    if connectable.dialect.name == "sqlite":
+        # The store engine turns PRAGMA foreign_keys=ON at connect time —
+        # right for the app, WRONG for migrations: sqlite batch move-and-copy
+        # drops the old table, which fires child ON DELETE actions and nulled
+        # every task.goal_id during the weekly_goal rebuild (review
+        # 2026-07-27). Migrations recreate identical rows immediately, so FK
+        # enforcement is disabled for the migration connection only. The
+        # listener runs after the store's ON listener (registration order),
+        # and at DBAPI connect time — outside any transaction, where the
+        # pragma actually takes effect.
+        @event.listens_for(connectable, "connect")
+        def _migrations_disable_sqlite_fks(dbapi_connection, _record) -> None:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=OFF")
+            cursor.close()
 
     try:
         with connectable.connect() as connection:
