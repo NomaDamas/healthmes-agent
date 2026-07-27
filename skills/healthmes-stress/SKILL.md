@@ -114,6 +114,12 @@ For an unknown source, absent source, `status: insufficient_data`,
    returned medium/high timeseries interval and independent recovery evidence
    does not point toward strain. Explain that `keep` means there is not enough
    evidence to change the plan, not that the user has no stress.
+   A single strain signal is never silently discarded: mention it in
+   [Evidence], and when it is strong — a large deviation from the personal
+   baseline at `medium` or higher confidence — you may add **one optional,
+   reversible suggestion** (review the day's single highest-intensity block)
+   while the decision stays `keep`. Present it as optional, never necessary;
+   `reconsider` still requires the corroboration rule above.
 5. Choose `insufficient_data` when evidence is missing, stale, low-confidence,
    truncated, source-limited for the user's question, or materially
    conflicting. State the exact boundary and the one next observation that
