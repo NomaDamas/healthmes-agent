@@ -192,6 +192,23 @@ def test_missing_env_file_is_created_for_secret(bootstrap, hermes_home, tmp_path
     assert bootstrap.load_env_file(env_file)["HEALTHMES_HERMES_WEBHOOK_SECRET"]
 
 
+def test_adjustment_secret_is_generated_separately_and_preserved(
+    bootstrap, hermes_home, env_file
+):
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    first = bootstrap.load_env_file(env_file)
+    adjustment_secret = first["HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"]
+
+    assert len(adjustment_secret) == 64
+    assert adjustment_secret != first["HEALTHMES_HERMES_WEBHOOK_SECRET"]
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    assert (
+        bootstrap.load_env_file(env_file)["HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"]
+        == adjustment_secret
+    )
+
+
 # ---------------------------------------------------------------------------
 # Existing-config merge
 # ---------------------------------------------------------------------------

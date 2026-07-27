@@ -189,7 +189,8 @@ The Hermes gateway is configured entirely from outside `vendor/`:
 `$HERMES_HOME/config.yaml`, copies `skills/` into `$HERMES_HOME/skills/`
 (copies, not symlinks — the vendor skill trust check resolves symlinks and
 would log a security warning on every skill load; re-runs resync content),
-generates a `HEALTHMES_HERMES_WEBHOOK_SECRET` into `.env` when missing,
+generates independent `HEALTHMES_HERMES_WEBHOOK_SECRET` and
+`HEALTHMES_CALENDAR_ADJUSTMENT_SECRET` values into `.env` when missing,
 installs the briefing state-snapshot script
 (`scripts/healthmes_briefing_snapshot.py` + a base-URL sidecar) into
 `$HERMES_HOME/scripts/`, and registers the three cron briefings (morning
@@ -544,6 +545,7 @@ corresponding integrations stay inactive.
 | Google Calendar mirror | OAuth client secret + one interactive consent | one-time client secret to `{HEALTHMES_DATA_DIR}/google/client_secret.json`, then `uv run healthmes connect google` (see "캘린더 연결") — the stored token auto-enables the mirror; `HEALTHMES_GOOGLE_CALENDAR_ENABLED=true` still works (polled every `HEALTHMES_GOOGLE_POLL_MINUTES` — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
 | Apple Calendar (iCloud CalDAV) mirror | app-specific password from appleid.apple.com | `uv run healthmes connect icloud --username <apple-id>` (see "캘린더 연결") — the stored creds file auto-enables the mirror; the env pair `HEALTHMES_CALDAV_USERNAME` + `HEALTHMES_CALDAV_APP_PASSWORD` (+ `HEALTHMES_CALDAV_ENABLED=true`) still works and overrides it (polled every `HEALTHMES_CALDAV_POLL_MINUTES` — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
 | Proactive alert push (HealthMes -> Hermes) | shared HMAC secret | `HEALTHMES_HERMES_WEBHOOK_SECRET` — generated into `.env` by `scripts/bootstrap.py` |
+| Calendar adjustment confirmation handles | dedicated signing secret | `HEALTHMES_CALENDAR_ADJUSTMENT_SECRET` — generated into `.env` by `scripts/bootstrap.py`; never shared with webhook or API authentication |
 | Encrypted backups (CLI + weekly job) | a passphrase you choose (and must not lose) | `HEALTHMES_BACKUP_PASSPHRASE` in `.env`, or `--passphrase-file` |
 | Remote vault replication (ciphertext-only, optional) | S3-compatible bucket + access keys (AWS S3 / Cloudflare R2 / MinIO) | `HEALTHMES_VAULT_BUCKET` (+ `HEALTHMES_VAULT_ENDPOINT`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`/`_REGION`/`_PREFIX`); opt in with `HEALTHMES_BACKUP_PROVIDER=remote_vault` or `--provider remote` |
 | Companion & desktop apps (Android/Wear/iOS/watchOS/macOS/Windows) | the service's `HEALTHMES_API_TOKEN` (same LAN rule as the collector) | entered in each app's pairing screen together with the base URL |

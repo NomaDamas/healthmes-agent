@@ -89,6 +89,7 @@ VENDOR_HERMES = REPO_ROOT / "vendor" / "hermes-agent"
 # The one secret bootstrap may mint itself (shared HMAC between
 # healthmes/engine/triggers.py and the Hermes webhook route).
 GENERATED_SECRET_KEY = "HEALTHMES_HERMES_WEBHOOK_SECRET"
+GENERATED_ADJUSTMENT_SECRET_KEY = "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"
 
 # Non-generatable credentials we can only warn about.
 WARN_IF_MISSING = ("TELEGRAM_BOT_TOKEN", "OPEN_WEARABLES_API_KEY")
@@ -277,6 +278,21 @@ def ensure_webhook_secret(env_file: Path, env: dict[str, str], plan: Plan) -> st
     plan.act(f"generate {GENERATED_SECRET_KEY} into {env_file}")
     if not plan.dry_run:
         upsert_env_var(env_file, GENERATED_SECRET_KEY, generated)
+    return generated
+
+
+def ensure_calendar_adjustment_secret(env_file: Path, env: dict[str, str], plan: Plan) -> str:
+    existing = env.get(GENERATED_ADJUSTMENT_SECRET_KEY, "").strip()
+    if existing:
+        if len(existing) < 32:
+            raise ValueError(
+                f"{GENERATED_ADJUSTMENT_SECRET_KEY} must contain at least 32 characters"
+            )
+        return existing
+    generated = secrets.token_hex(32)
+    plan.act(f"generate {GENERATED_ADJUSTMENT_SECRET_KEY} into {env_file}")
+    if not plan.dry_run:
+        upsert_env_var(env_file, GENERATED_ADJUSTMENT_SECRET_KEY, generated)
     return generated
 
 
@@ -931,6 +947,7 @@ def run(args: argparse.Namespace) -> int:
         )
 
     webhook_secret = ensure_webhook_secret(env_file, env, plan)
+    ensure_calendar_adjustment_secret(env_file, env, plan)
     context = build_context(env, args.mode, REPO_ROOT, webhook_secret)
     rendered = render_template(context)
 

@@ -340,14 +340,13 @@ def _calendar_adjustment_writer() -> CalendarAdjustmentWriter:
 
 def _adjustment_handle_secret(settings: Settings | None = None) -> str:
     settings = settings or _active_settings()
-    for value in (
-        settings.hermes_webhook_secret.get_secret_value(),
-        settings.api_token.get_secret_value(),
-    ):
-        value = str(value).strip()
-        if value:
-            return value
-    return "healthmes-local-adjustment-handle"
+    value = settings.calendar_adjustment_secret.get_secret_value().strip()
+    if len(value) < 32:
+        raise ToolError(
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET must be configured "
+            "with at least 32 characters"
+        )
+    return value
 
 
 # ---------------------------------------------------------------------------

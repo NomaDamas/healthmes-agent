@@ -46,6 +46,26 @@ TREE = {
 }
 
 
+def test_adjustment_handle_secret_is_dedicated_and_fails_closed() -> None:
+    unrelated_secrets = Settings(
+        hermes_webhook_secret=SecretStr("webhook-secret"),
+        api_token=SecretStr("api-token"),
+        _env_file=None,
+    )
+
+    with pytest.raises(ToolError, match="HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"):
+        server_module._adjustment_handle_secret(unrelated_secrets)
+
+    dedicated_secret = "a" * 64
+    configured = Settings(
+        calendar_adjustment_secret=SecretStr(dedicated_secret),
+        hermes_webhook_secret=SecretStr("webhook-secret"),
+        api_token=SecretStr("api-token"),
+        _env_file=None,
+    )
+    assert server_module._adjustment_handle_secret(configured) == dedicated_secret
+
+
 class TestUpsertAndListTasks:
     async def test_create_applies_documented_defaults(self, mcp_client, call_tool):
         result = await call_tool(mcp_client, "upsert_task", {"title": "Write weekly report"})

@@ -312,6 +312,7 @@ def mcp_env(
             ow_base_url=OW_BASE_URL,
             ow_api_key=API_KEY,
             public_base_url="http://healthmes.test:8100",
+            calendar_adjustment_secret="test-calendar-adjustment-secret-32-characters",
             data_dir=tmp_path / "data",
             scheduler_enabled=False,
             _env_file=None,

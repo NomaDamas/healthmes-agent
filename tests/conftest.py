@@ -28,6 +28,7 @@ def settings(tmp_path) -> Settings:
         ow_user_id=None,
         hermes_webhook_url="http://hermes.test:8644/webhooks/healthmes-alerts",
         hermes_webhook_secret="test-webhook-secret",
+        calendar_adjustment_secret="test-calendar-adjustment-secret-32-characters",
         public_base_url="http://healthmes.test:8100",
         data_dir=tmp_path / "data",
         port=8100,

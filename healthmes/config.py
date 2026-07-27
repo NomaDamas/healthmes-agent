@@ -94,6 +94,12 @@ class Settings(BaseSettings):
         "additionally accept a derived read-only ?token= link credential. "
         "Empty disables auth — acceptable only on a loopback bind.",
     )
+    calendar_adjustment_secret: SecretStr = Field(
+        default=SecretStr(""),
+        description="Dedicated secret for one-time calendar adjustment confirmation handles. "
+        "Generate and persist a high-entropy value with scripts/bootstrap.py; "
+        "calendar adjustment tools fail closed when it is missing or too short.",
+    )
     scheduler_enabled: bool = Field(
         default=False,
         description="Enable the in-process APScheduler loops (10-minute trigger "
