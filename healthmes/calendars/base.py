@@ -359,6 +359,9 @@ class CalendarBackend(Protocol):
         """Create an agent-owned (tagged) event and return its normalized form."""
         ...
 
+    def read_event(self, external_id: str) -> ExternalEvent:
+        ...
+
     def update_event(
         self,
         external_id: str,
@@ -367,6 +370,7 @@ class CalendarBackend(Protocol):
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         description: str | None = None,
+        expected_etag: str | None = None,
     ) -> ExternalEvent:
         """Patch the given fields of an agent-owned event.
 
@@ -380,6 +384,7 @@ class CalendarBackend(Protocol):
         external_id: str,
         *,
         expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
     ) -> None:
         """Delete an agent-owned event (same ownership guarantees as update)."""
         ...

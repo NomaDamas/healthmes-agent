@@ -17,6 +17,7 @@ from healthmes.api import include_all
 from healthmes.api.auth import install_auth
 from healthmes.backup.local import build_backup_job
 from healthmes.calendars.jobs import build_calendar_jobs
+from healthmes.calendars.sleep_job import build_sleep_reconciliation_job
 from healthmes.config import Settings, get_settings
 from healthmes.engine.cognitive_energy import build_energy_job
 from healthmes.engine.scheduler import (
@@ -25,6 +26,7 @@ from healthmes.engine.scheduler import (
     register_calendar_adjustment_maintenance_job,
     register_calendar_job,
     register_energy_job,
+    register_sleep_reconciliation_job,
     shutdown_scheduler,
     start_scheduler,
 )
@@ -73,6 +75,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             register_calendar_job(
                 scheduler, spec.job, job_id=spec.job_id, minutes=spec.interval_minutes
             )
+        sleep_job = build_sleep_reconciliation_job(settings)
+        if sleep_job is not None:
+            register_sleep_reconciliation_job(scheduler, sleep_job)
         app.state.scheduler = start_scheduler(settings, scheduler=scheduler)
         try:
             # Chain the MCP app's lifespan: it starts the StreamableHTTP

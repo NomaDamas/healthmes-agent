@@ -255,6 +255,32 @@ class TestScheduleTools:
             assert len(rows) == 2
             assert all(row.status == ProposalStatus.PROPOSED for row in rows)
 
+    async def test_propose_planned_sleep_carries_explicit_calendar_kind(
+        self, mcp_client, call_tool, store_factory
+    ):
+        start = dt.datetime.now(dt.UTC).replace(
+            hour=23, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        result = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "title": "Night rest",
+                        "healthmes_kind": "planned_sleep",
+                        "start": start.isoformat(),
+                        "end": (start + dt.timedelta(hours=8)).isoformat(),
+                    }
+                ]
+            },
+        )
+
+        assert result["proposals"][0]["healthmes_kind"] == "planned_sleep"
+        with store_factory() as session:
+            proposal = session.scalars(select(ScheduleProposal)).one()
+            assert proposal.healthmes_kind == "planned_sleep"
+
     async def test_upsert_task_tolerates_non_uuid_goal_ref(self, mcp_client, call_tool):
         """An LLM often passes a human label for goal_id; the task is still
         created (not an error) and a note is returned (docs: live-E2E fix)."""

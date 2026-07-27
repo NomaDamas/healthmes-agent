@@ -35,7 +35,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars import creds
-from healthmes.calendars.base import CalendarAuthError, CalendarBackend, EventDraft, coerce_utc
+from healthmes.calendars.base import (
+    CalendarAuthError,
+    CalendarBackend,
+    CalendarEventIdentity,
+    EventDraft,
+    HealthmesEventKind,
+    coerce_utc,
+)
 from healthmes.calendars.state import (
     FilePendingDiffStore,
     FileSyncStateStore,
@@ -182,11 +189,21 @@ def push_accepted_proposals(
     for proposal, task in list(_accepted_proposals(session)):
         row = _existing_agent_block(session, source, task.id, proposal)
         if row is None:
+            identity = (
+                CalendarEventIdentity(
+                    kind=HealthmesEventKind.PLANNED_SLEEP,
+                    source="planner",
+                    source_key=f"proposal:{proposal.id}",
+                )
+                if proposal.healthmes_kind == HealthmesEventKind.PLANNED_SLEEP.value
+                else None
+            )
             draft = EventDraft(
                 summary=task.title,
                 start_at=coerce_utc(proposal.proposed_start),
                 end_at=coerce_utc(proposal.proposed_end),
                 agent_task_id=task.id,
+                identity=identity,
             )
             try:
                 row = service.create_agent_event(source, draft)

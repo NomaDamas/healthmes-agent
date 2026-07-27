@@ -491,6 +491,35 @@ class TestUpdateAndDelete:
         assert service.write_headers[-1]["If-Match"] == '"e1"'  # precondition sent
         assert service.stored_events["mine"] == original  # never overwritten
 
+    def test_update_uses_mirror_etag_instead_of_fresh_remote_etag(
+        self, backend, service
+    ) -> None:
+        service.stored_events["mine"] = api_event("mine", agent=True, etag='"remote-v2"')
+        with pytest.raises(CalendarConflictError):
+            backend.update_event(
+                "mine",
+                summary="corrected",
+                expected_etag='"mirror-v1"',
+            )
+        assert service.write_headers[-1]["If-Match"] == '"mirror-v1"'
+
+    def test_delete_uses_mirror_etag_instead_of_fresh_remote_etag(
+        self, backend, service
+    ) -> None:
+        service.stored_events["mine"] = api_event(
+            "mine",
+            agent=True,
+            healthmes_kind="planned_sleep",
+            etag='"remote-v2"',
+        )
+        with pytest.raises(CalendarConflictError):
+            backend.delete_event(
+                "mine",
+                expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+                expected_etag='"mirror-v1"',
+            )
+        assert service.write_headers[-1]["If-Match"] == '"mirror-v1"'
+
     def test_delete_conflict_412_raises_and_leaves_event(self, backend, service) -> None:
         service.stored_events["mine"] = api_event("mine", agent=True)
         original = dict(service.stored_events["mine"])

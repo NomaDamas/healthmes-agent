@@ -150,6 +150,8 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
    `actual_sleep.earliest_available_work_time` or across the actual sleep
    interval. This availability rule does not add a second sleep score to the
    readiness calculation.
+8. **Tag planned sleep explicitly.** Set `healthmes_kind: planned_sleep` on
+   sleep blocks; never infer that identity later from a title.
 
 ## Notification grammar (standard message template)
 

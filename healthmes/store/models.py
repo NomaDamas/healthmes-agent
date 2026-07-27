@@ -156,6 +156,7 @@ class ScheduleProposal(Base):
     decision_record_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("decision_record.id", ondelete="SET NULL")
     )
+    healthmes_kind: Mapped[str_64 | None]
 
 
 class CalendarMutationProposal(Base):

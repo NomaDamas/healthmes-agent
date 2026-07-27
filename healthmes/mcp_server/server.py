@@ -63,6 +63,7 @@ from healthmes.calendars.adjustments import (
     SqlAlchemyAdjustmentRepository,
     verify_reply_handle,
 )
+from healthmes.calendars.base import HealthmesEventKind
 from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.calendars.sleep_context import actual_sleep_context, actual_sleep_violation
 from healthmes.config import Settings, get_settings, system_timezone
@@ -2354,6 +2355,10 @@ class ScheduleBlockIn(BaseModel):
     energy_demand: str | None = Field(
         default=None, description="low / med / high for an auto-created task"
     )
+    healthmes_kind: str | None = Field(
+        default=None,
+        description="planned_sleep only when this confirmed block is a sleep plan",
+    )
     start: str = Field(description="Block start, ISO-8601 (naive = UTC)")
     end: str = Field(description="Block end, ISO-8601, after start")
 
@@ -2393,6 +2398,10 @@ def propose_schedule_blocks(
                     f"blocks[{index}].energy_demand must be low/med/high, got "
                     f"{block.energy_demand!r}"
                 )
+        if block.healthmes_kind not in {None, HealthmesEventKind.PLANNED_SLEEP.value}:
+            raise ToolError(
+                f"blocks[{index}].healthmes_kind must be planned_sleep or omitted"
+            )
     parsed: list[tuple[ScheduleBlockIn, dt.datetime, dt.datetime]] = []
     for index, block in enumerate(blocks):
         start = _parse_datetime_utc(block.start, f"blocks[{index}].start")
@@ -2446,6 +2455,7 @@ def propose_schedule_blocks(
                 proposed_end=end,
                 status=ProposalStatus.PROPOSED,
                 decision_record_id=decision_uuid,
+                healthmes_kind=block.healthmes_kind,
             )
             session.add(proposal)
             session.flush()
@@ -2457,6 +2467,7 @@ def propose_schedule_blocks(
                     "start": _iso_utc(start),
                     "end": _iso_utc(end),
                     "proposal_status": _enum_value(proposal.status),
+                    "healthmes_kind": proposal.healthmes_kind,
                     "conflicts": conflicts,
                 }
             )

@@ -56,6 +56,7 @@ class RecordingCalendarBackend:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         description: str | None = None,
+        expected_etag: str | None = None,
     ) -> ExternalEvent:
         self.update_calls.append(
             {
@@ -64,6 +65,7 @@ class RecordingCalendarBackend:
                 "start_at": start_at,
                 "end_at": end_at,
                 "description": description,
+                "expected_etag": expected_etag,
             }
         )
         assert start_at is not None
@@ -83,6 +85,7 @@ class RecordingCalendarBackend:
         external_id: str,
         *,
         expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
     ) -> None:
         self.delete_calls.append(external_id)
 
@@ -178,6 +181,7 @@ def test_provider_correction_updates_existing_event(
 
     # Then
     assert result.action is SleepCalendarAction.UPDATED
+    assert backend.update_calls[0]["expected_etag"] == '"created"'
     assert result.external_id == created.external_id
     assert len(backend.created_drafts) == 1
     assert backend.update_calls == [
@@ -185,10 +189,11 @@ def test_provider_correction_updates_existing_event(
             "external_id": "sleep-1",
             "summary": "수면 (실제)",
             "start_at": corrected.start_at,
-            "end_at": corrected.end_at,
-            "description": ("Actual sleep: 450 min\nTime in bed: 510 min\nSource: oura"),
-        }
-    ]
+                "end_at": corrected.end_at,
+                "description": ("Actual sleep: 450 min\nTime in bed: 510 min\nSource: oura"),
+                "expected_etag": '"created"',
+            }
+        ]
     mirror = session.query(CalendarEventMirror).one()
     assert mirror.external_id == "sleep-1"
     assert coerce_utc(mirror.end_at) == corrected.end_at

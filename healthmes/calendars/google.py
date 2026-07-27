@@ -346,6 +346,7 @@ class GoogleCalendarBackend:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         description: str | None = None,
+        expected_etag: str | None = None,
     ) -> ExternalEvent:
         current = self._get_owned_event(external_id)
         body: dict[str, Any] = {}
@@ -359,13 +360,12 @@ class GoogleCalendarBackend:
             body["description"] = description
         if not body:
             return current
-        # Guard the patch with the etag we just read: if the event changed on
-        # the server in between (check-then-act race) the conditional request
-        # fails with 412 instead of silently clobbering the newer state.
+        # The caller's mirror ETag protects the entire sync-to-write interval;
+        # the fresh ETag is only the fallback for callers without a snapshot.
         request = self._events().patch(
             calendarId=self._calendar_id, eventId=external_id, body=body
         )
-        self._set_if_match(request, current.etag)
+        self._set_if_match(request, expected_etag or current.etag)
         try:
             patched = request.execute()
         except Exception as exc:  # noqa: BLE001 - status-based dispatch
@@ -378,6 +378,7 @@ class GoogleCalendarBackend:
         external_id: str,
         *,
         expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
     ) -> None:
         current = self._get_owned_event(external_id)
         if expected_kind is not None and current.healthmes_kind is not expected_kind:
@@ -387,7 +388,7 @@ class GoogleCalendarBackend:
         request = self._events().delete(
             calendarId=self._calendar_id, eventId=external_id
         )
-        self._set_if_match(request, current.etag)
+        self._set_if_match(request, expected_etag or current.etag)
         try:
             request.execute()
         except Exception as exc:  # noqa: BLE001 - status-based dispatch

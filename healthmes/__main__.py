@@ -12,6 +12,7 @@
 ``python -m healthmes connect disconnect google|icloud``     → remove stored creds
 ``python -m healthmes import apple <export.zip|export.xml>`` → upload an Apple
 Health export to open-wearables (zero-app-code wearable ingestion)
+``python -m healthmes sleep reconcile --dry-run`` → redacted actual-sleep preview
 
 Calendar connections are runtime state under ``Settings.data_dir`` (docs/
 PLAN.md §6): once ``connect`` succeeds, the sync jobs pick the backend up
@@ -34,7 +35,10 @@ and process listings).
 """
 
 import argparse
+import asyncio
+import datetime as dt
 import getpass
+import json
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -50,7 +54,12 @@ from healthmes.backup.snapshot import (
 )
 from healthmes.calendars import creds as calendar_creds
 from healthmes.calendars.base import CalendarError
+from healthmes.calendars.sleep_job import (
+    SleepReconciliationError,
+    preview_recent_sleep,
+)
 from healthmes.config import Settings, get_settings, is_loopback_host
+from healthmes.store import dispose_engine, init_engine
 
 if TYPE_CHECKING:  # pragma: no cover — typing only; runtime import stays lazy
     from healthmes.backup.remote_vault import RemoteVaultProvider
@@ -510,6 +519,17 @@ def _cmd_connect_qr(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sleep_reconcile(args: argparse.Namespace) -> int:
+    settings = _cli_settings()
+    init_engine(settings)
+    try:
+        preview = asyncio.run(preview_recent_sleep(settings, args.date))
+    finally:
+        dispose_engine()
+    print(json.dumps(preview, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def _add_passphrase_file(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--passphrase-file",
@@ -670,6 +690,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_apple.set_defaults(func=_cmd_import_apple)
 
+    sleep = subparsers.add_parser(
+        "sleep",
+        help="Inspect deterministic actual-sleep calendar reconciliation.",
+    )
+    sleep_sub = sleep.add_subparsers(dest="sleep_command", required=True)
+    sleep_reconcile = sleep_sub.add_parser(
+        "reconcile",
+        help="Preview the exact redacted calendar change for one sleep date.",
+    )
+    sleep_reconcile.add_argument(
+        "--dry-run",
+        action="store_true",
+        required=True,
+        help="Required safety gate: preview only; never mutate the calendar.",
+    )
+    sleep_reconcile.add_argument(
+        "--date",
+        type=dt.date.fromisoformat,
+        default=None,
+        help="Local sleep date (YYYY-MM-DD); default is today in the configured timezone.",
+    )
+    sleep_reconcile.set_defaults(func=_cmd_sleep_reconcile)
+
     return parser
 
 
@@ -679,7 +722,7 @@ def main(argv: list[str] | None = None) -> int:
         return _serve()  # bare `python -m healthmes` keeps serving (compose/dev_mac.sh)
     try:
         return args.func(args)
-    except (BackupError, CalendarError) as exc:
+    except (BackupError, CalendarError, SleepReconciliationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

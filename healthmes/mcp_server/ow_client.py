@@ -28,6 +28,7 @@ import httpx
 from healthmes.config import Settings
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Page caps for the collect_* helpers so a pathological backend response can
 # never turn into an unbounded fetch loop.
@@ -104,7 +105,7 @@ class OWClient:
         """GET ``{base_url}{path}`` and return the parsed JSON body."""
         self._ensure_configured()
         url = f"{self.base_url}{path}"
-        logger.debug("GET %s params=%s", url, params)
+        logger.debug("GET open-wearables resource")
 
         async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
             response = await client.get(url, headers=self.headers, params=params)

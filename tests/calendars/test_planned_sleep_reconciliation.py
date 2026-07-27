@@ -21,7 +21,7 @@ class PlannedSleepBackend:
     source = CalendarSource.GOOGLE
 
     def __init__(self) -> None:
-        self.delete_calls: list[tuple[str, HealthmesEventKind | None]] = []
+        self.delete_calls: list[tuple[str, HealthmesEventKind | None, str | None]] = []
         self.remote_kinds: dict[str, HealthmesEventKind] = {}
         self.missing_ids: set[str] = set()
 
@@ -48,6 +48,7 @@ class PlannedSleepBackend:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         description: str | None = None,
+        expected_etag: str | None = None,
     ) -> ExternalEvent:
         raise AssertionError("planned-sleep tests do not correct the actual event")
 
@@ -56,12 +57,13 @@ class PlannedSleepBackend:
         external_id: str,
         *,
         expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
     ) -> None:
         if external_id in self.missing_ids:
             raise EventNotFoundError(external_id)
         if self.remote_kinds.get(external_id) is not expected_kind:
             raise OwnershipError(f"remote kind changed for {external_id}")
-        self.delete_calls.append((external_id, expected_kind))
+        self.delete_calls.append((external_id, expected_kind, expected_etag))
 
 
 @pytest.fixture
@@ -104,6 +106,7 @@ def add_mirror(
             healthmes_source_key=(
                 f"planner:{observation.local_date.isoformat()}" if kind is not None else None
             ),
+            etag='"planned-v1"',
         )
     )
     session.commit()
@@ -130,7 +133,9 @@ def test_replaces_overlapping_owned_planned_sleep(
 
     # Then
     assert result.deleted_planned_external_ids == ("planned-1",)
-    assert backend.delete_calls == [("planned-1", HealthmesEventKind.PLANNED_SLEEP)]
+    assert backend.delete_calls == [
+        ("planned-1", HealthmesEventKind.PLANNED_SLEEP, '"planned-v1"')
+    ]
     assert {row.external_id for row in session.query(CalendarEventMirror).all()} == {"actual-1"}
 
 
@@ -157,7 +162,9 @@ def test_replay_does_not_redelete_planned_sleep(
 
     # Then
     assert replay.deleted_planned_external_ids == ()
-    assert backend.delete_calls == [("planned-1", HealthmesEventKind.PLANNED_SLEEP)]
+    assert backend.delete_calls == [
+        ("planned-1", HealthmesEventKind.PLANNED_SLEEP, '"planned-v1"')
+    ]
 
 
 def test_preserves_external_routine_and_untagged_sleep_title(

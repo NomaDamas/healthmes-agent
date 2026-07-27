@@ -11,6 +11,7 @@ import icalendar
 import pytest
 
 from healthmes.calendars.base import (
+    CalendarConflictError,
     CalendarEventIdentity,
     EventDraft,
     EventNotFoundError,
@@ -28,6 +29,33 @@ KST = timezone(timedelta(hours=9))
 
 class NotFoundError(Exception):
     """Stub matching caldav.lib.error.NotFoundError by class name."""
+
+
+class FakeDavResponse:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+
+class FakeDavClient:
+    def __init__(self, calendar: "FakeCalDavCalendar") -> None:
+        self.calendar = calendar
+
+    def request(
+        self,
+        url: str,
+        method: str,
+        headers: dict[str, str],
+    ) -> FakeDavResponse:
+        uid = url.rsplit("/", 1)[-1]
+        self.calendar.conditional_delete_calls.append((uid, method, headers))
+        obj = self.calendar.objects.get(uid)
+        if obj is None:
+            return FakeDavResponse(404)
+        if headers.get("If-Match") != obj.etag:
+            return FakeDavResponse(412)
+        self.calendar.deleted_uids.append(uid)
+        self.calendar.objects.pop(uid)
+        return FakeDavResponse(204)
 
 
 def make_component(
@@ -64,7 +92,10 @@ class FakeCalDavObject:
     ) -> None:
         self.icalendar_component = component
         self.props = {ETAG_PROPERTY_TAG: etag} if etag else {}
+        self.etag = etag
         self._calendar = calendar
+        self.client = FakeDavClient(calendar)
+        self.url = f"https://caldav.invalid/{self.uid}"
         self.saved = False
 
     @property
@@ -89,6 +120,7 @@ class FakeCalDavCalendar:
         self.added_icals: list[str] = []
         self.saved_objects: list[str] = []
         self.deleted_uids: list[str] = []
+        self.conditional_delete_calls: list[tuple[str, str, dict[str, str]]] = []
 
     def put(
         self, component: icalendar.Event, etag: str | None = '"etag-1"'
@@ -370,3 +402,53 @@ class TestUpdateAndDelete:
             expected_kind=HealthmesEventKind.PLANNED_SLEEP,
         )
         assert calendar.deleted_uids == ["mine@healthmes"]
+
+    def test_delete_sends_mirror_etag_as_if_match(self, backend, calendar) -> None:
+        calendar.put(
+            make_component(
+                "mine@healthmes",
+                agent=True,
+                healthmes_kind="planned_sleep",
+            ),
+            etag='"etag-1"',
+        )
+        backend.delete_event(
+            "mine@healthmes",
+            expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+            expected_etag='"etag-1"',
+        )
+        assert calendar.conditional_delete_calls == [
+            (
+                "mine@healthmes",
+                "DELETE",
+                {"If-Match": '"etag-1"'},
+            )
+        ]
+        assert calendar.deleted_uids == ["mine@healthmes"]
+
+    def test_update_rejects_stale_mirror_etag(self, backend, calendar) -> None:
+        obj = calendar.put(make_component("mine@healthmes", agent=True), etag='"remote-v2"')
+        with pytest.raises(CalendarConflictError):
+            backend.update_event(
+                "mine@healthmes",
+                summary="corrected",
+                expected_etag='"mirror-v1"',
+            )
+        assert not obj.saved
+
+    def test_delete_rejects_stale_mirror_etag(self, backend, calendar) -> None:
+        calendar.put(
+            make_component(
+                "mine@healthmes",
+                agent=True,
+                healthmes_kind="planned_sleep",
+            ),
+            etag='"remote-v2"',
+        )
+        with pytest.raises(CalendarConflictError):
+            backend.delete_event(
+                "mine@healthmes",
+                expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+                expected_etag='"mirror-v1"',
+            )
+        assert calendar.deleted_uids == []

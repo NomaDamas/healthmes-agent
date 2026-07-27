@@ -55,6 +55,7 @@ class ConcurrentCalendarBackend:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         description: str | None = None,
+        expected_etag: str | None = None,
     ) -> ExternalEvent:
         raise AssertionError("identical concurrent replay must not update")
 
@@ -63,6 +64,7 @@ class ConcurrentCalendarBackend:
         external_id: str,
         *,
         expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
     ) -> None:
         raise AssertionError("actual sleep upsert must not delete")
 

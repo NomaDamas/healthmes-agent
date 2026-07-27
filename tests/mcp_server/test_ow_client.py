@@ -1,5 +1,7 @@
 """Unit tests for the open-wearables REST client (httpx.MockTransport only)."""
 
+import logging
+
 import httpx
 import pytest
 
@@ -45,6 +47,17 @@ class TestRequestShape:
         request = fake_ow.requests[-1]
         assert request.url.path == f"/api/v1/users/{ow_user_id}/events/workouts"
         assert request.url.params["record_type"] == "running"
+
+    async def test_debug_log_does_not_expose_provider_user_id(
+        self, caplog, fake_ow, ow_client, ow_user_id
+    ):
+        with caplog.at_level(logging.DEBUG):
+            await ow_client.get_sleep_summaries(
+                ow_user_id,
+                "2026-07-01",
+                "2026-07-09",
+            )
+        assert ow_user_id not in caplog.text
 
     async def test_timeseries_types_are_repeated_query_params(self, ow_user_id, ow_api_key):
         requests: list[httpx.Request] = []
@@ -334,4 +347,3 @@ class TestPaginationTruncationTracked:
         )
         assert isinstance(rows, list)
         assert rows[0]["value"] == 30
-

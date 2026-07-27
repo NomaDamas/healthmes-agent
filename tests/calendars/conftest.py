@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars.base import (
     EventDraft,
+    EventNotFoundError,
     ExternalEvent,
     HealthmesEventKind,
     SyncState,
@@ -57,6 +58,7 @@ class FakeCalendarBackend:
         self.update_calls: list[dict[str, object]] = []
         self.delete_calls: list[str] = []
         self.delete_expected_kinds: list[HealthmesEventKind | None] = []
+        self.events: dict[str, ExternalEvent] = {}
         self._create_counter = 0
 
     def queue_changes(self, events: list[ExternalEvent], sync_state: SyncState) -> None:
@@ -73,7 +75,7 @@ class FakeCalendarBackend:
     def create_event(self, draft: EventDraft) -> ExternalEvent:
         self._create_counter += 1
         self.created_drafts.append(draft)
-        return ExternalEvent(
+        event = ExternalEvent(
             external_id=f"{self.source.value}-agent-{self._create_counter}",
             summary=draft.summary,
             start_at=draft.start_at,
@@ -83,6 +85,14 @@ class FakeCalendarBackend:
             identity=draft.identity,
             etag=f"etag-created-{self._create_counter}",
         )
+        self.events[event.external_id] = event
+        return event
+
+    def read_event(self, external_id: str) -> ExternalEvent:
+        try:
+            return self.events[external_id]
+        except KeyError as exc:
+            raise EventNotFoundError(external_id) from exc
 
     def update_event(
         self,
@@ -92,6 +102,7 @@ class FakeCalendarBackend:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         description: str | None = None,
+        expected_etag: str | None = None,
     ) -> ExternalEvent:
         self.update_calls.append(
             {
@@ -100,10 +111,11 @@ class FakeCalendarBackend:
                 "start_at": start_at,
                 "end_at": end_at,
                 "description": description,
+                "expected_etag": expected_etag,
             }
         )
         assert start_at is not None and end_at is not None, "service always moves with both times"
-        return ExternalEvent(
+        event = ExternalEvent(
             external_id=external_id,
             summary=summary or "moved block",
             start_at=start_at,
@@ -111,15 +123,19 @@ class FakeCalendarBackend:
             is_agent_created=True,
             etag="etag-updated",
         )
+        self.events[external_id] = event
+        return event
 
     def delete_event(
         self,
         external_id: str,
         *,
         expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
     ) -> None:
         self.delete_calls.append(external_id)
         self.delete_expected_kinds.append(expected_kind)
+        self.events.pop(external_id, None)
 
 
 @pytest.fixture

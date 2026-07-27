@@ -13,6 +13,8 @@ jobs owned by later scopes:
   backend, see ``healthmes/calendars/jobs.py``).
 - ``register_calendar_adjustment_maintenance_job`` — expiry/reconcile sweep
   for user-confirmed external calendar adjustment proposals.
+- ``register_sleep_reconciliation_job`` — recent actual-sleep calendar upsert
+  and owned planned-sleep replacement.
 
 Nothing here starts by itself: the app lifespan calls ``start_scheduler``,
 which honors ``Settings.scheduler_enabled`` (False in tests, one-off tooling
@@ -41,11 +43,13 @@ __all__ = [
     "ENERGY_JOB_ID",
     "BACKUP_JOB_ID",
     "CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID",
+    "SLEEP_RECONCILIATION_JOB_ID",
     "create_scheduler",
     "register_energy_job",
     "register_backup_job",
     "register_calendar_job",
     "register_calendar_adjustment_maintenance_job",
+    "register_sleep_reconciliation_job",
     "start_scheduler",
     "shutdown_scheduler",
 ]
@@ -56,6 +60,7 @@ TRIGGER_JOB_ID = "healthmes-trigger-sweep"
 ENERGY_JOB_ID = "healthmes-cognitive-energy"
 BACKUP_JOB_ID = "healthmes-weekly-backup"
 CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID = "healthmes-calendar-adjustment-maintenance"
+SLEEP_RECONCILIATION_JOB_ID = "healthmes-sleep-reconciliation"
 
 # One misfired run is coalesced and allowed to start this late (seconds);
 # with max_instances=1 a slow sweep can never pile up behind itself.
@@ -187,6 +192,25 @@ def register_calendar_adjustment_maintenance_job(
         trigger=IntervalTrigger(minutes=minutes),
         id=CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
         name="HealthMes calendar adjustment maintenance",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=_MISFIRE_GRACE_SECONDS,
+    )
+
+
+def register_sleep_reconciliation_job(
+    scheduler: BackgroundScheduler,
+    job: Callable[[], object],
+    *,
+    minutes: int = 15,
+) -> Job:
+    _remove_job_if_present(scheduler, SLEEP_RECONCILIATION_JOB_ID)
+    return scheduler.add_job(
+        job,
+        trigger=IntervalTrigger(minutes=minutes),
+        id=SLEEP_RECONCILIATION_JOB_ID,
+        name="HealthMes actual sleep reconciliation",
         replace_existing=True,
         coalesce=True,
         max_instances=1,

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import select
 
-from healthmes.calendars.base import EventDraft
+from healthmes.calendars.base import EventDraft, HealthmesEventKind
 from healthmes.calendars.jobs import (
     build_calendar_job,
     build_calendar_jobs,
@@ -199,6 +199,35 @@ class TestJobRun:
         session.expire_all()
         proposal = session.scalars(select(ScheduleProposal)).one()
         assert proposal.status is ProposalStatus.ACCEPTED
+
+    def test_confirmed_planned_sleep_is_written_with_reconciliation_identity(
+        self, session, fake_backend
+    ) -> None:
+        task = Task(title="Night rest")
+        session.add(task)
+        session.flush()
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=utc(2026, 7, 10, 23, 0),
+            proposed_end=utc(2026, 7, 11, 7, 0),
+            status=ProposalStatus.ACCEPTED,
+            healthmes_kind=HealthmesEventKind.PLANNED_SLEEP.value,
+        )
+        session.add(proposal)
+        session.commit()
+        service = CalendarMirrorService(
+            session, [fake_backend], InMemorySyncStateStore()
+        )
+
+        assert push_accepted_proposals(service, session, fake_backend.source) == 1
+
+        [draft] = fake_backend.created_drafts
+        assert draft.identity is not None
+        assert draft.identity.kind is HealthmesEventKind.PLANNED_SLEEP
+        assert draft.identity.source == "planner"
+        assert draft.identity.source_key == f"proposal:{proposal.id}"
+        mirror = session.scalars(select(CalendarEventMirror)).one()
+        assert mirror.healthmes_kind == HealthmesEventKind.PLANNED_SLEEP.value
 
     def test_job_contains_backend_failures(self, settings, session_factory) -> None:
         def exploding_factory():

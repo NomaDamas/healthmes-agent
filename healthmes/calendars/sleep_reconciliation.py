@@ -118,6 +118,7 @@ class SleepCalendarReconciler:
             start_at=ensure_utc(observation.start_at),
             end_at=ensure_utc(observation.end_at),
             description=_description(observation),
+            expected_etag=row.etag,
         )
         row.summary = updated.summary or "수면 (실제)"
         row.start_at = updated.start_at or ensure_utc(observation.start_at)
@@ -169,6 +170,7 @@ class SleepCalendarReconciler:
                 self._backend.delete_event(
                     row.external_id,
                     expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+                    expected_etag=row.etag,
                 )
             except EventNotFoundError:
                 pass

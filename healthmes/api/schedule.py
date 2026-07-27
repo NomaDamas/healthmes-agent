@@ -55,6 +55,7 @@ class ProposalOut(BaseModel):
     proposed_end: datetime
     status: ProposalStatus
     decision_record_id: uuid.UUID | None
+    healthmes_kind: str | None
 
 
 @router.get("/events")
