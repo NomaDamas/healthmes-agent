@@ -24,6 +24,7 @@ EXPECTED_TABLES = {
     "weekly_goal",
     "task",
     "calendar_event_mirror",
+    "calendar_mutation_proposal",
     "schedule_proposal",
     "food_log",
     "app_usage_sample",

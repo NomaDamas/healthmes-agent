@@ -22,6 +22,7 @@ from healthmes.engine.cognitive_energy import build_energy_job
 from healthmes.engine.scheduler import (
     create_scheduler,
     register_backup_job,
+    register_calendar_adjustment_maintenance_job,
     register_calendar_job,
     register_energy_job,
     shutdown_scheduler,
@@ -65,6 +66,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         scheduler = create_scheduler(settings)
         register_energy_job(scheduler, build_energy_job(settings))
         register_backup_job(scheduler, build_backup_job(settings))
+        register_calendar_adjustment_maintenance_job(
+            scheduler, mcp_server.expire_and_reconcile_calendar_adjustments
+        )
         for spec in build_calendar_jobs(settings):
             register_calendar_job(
                 scheduler, spec.job, job_id=spec.job_id, minutes=spec.interval_minutes

@@ -294,6 +294,30 @@ def test_repo_skills_are_discovered(bootstrap):
     assert names == list(EXPECTED_SKILLS)
 
 
+def test_planner_skill_documents_morning_nudge_trust_boundary():
+    skill = (REPO_ROOT / "skills" / "healthmes-planner" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(skill.split())
+
+    assert "External (user-created) events never move" in normalized
+    assert "user-confirmed Google `SHORTEN`" in normalized
+    assert "eligible external event through `resolve_calendar_adjustment`" in normalized
+    assert "one eligible Google event may be shortened" in normalized
+    assert (
+        "mcp__healthmes__evaluate_morning_calendar_nudge` exactly once"
+        in normalized
+    )
+    assert "`적용 <handle>` / `그대로 <handle>`" in normalized
+    assert "do not call `clarify`, and do not wait for a reply" in normalized
+    assert "Only live Telegram replies may call" in normalized
+    assert "mcp__healthmes__resolve_calendar_adjustment" in normalized
+    assert (
+        "Do not rewrite, shorten, translate, log, or expose the handle"
+        in normalized
+    )
+
+
 def test_legacy_symlink_is_migrated_to_copy(bootstrap, hermes_home, env_file, tmp_path):
     """Symlinks left by earlier bootstrap versions become real copies."""
     skills_home = hermes_home / "skills"

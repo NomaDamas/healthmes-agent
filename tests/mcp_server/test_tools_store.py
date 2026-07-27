@@ -14,10 +14,13 @@ from sqlalchemy import select
 
 from healthmes.api.auth import viewer_token
 from healthmes.api.briefing import decision_viewer_url
+from healthmes.calendars.base import ExternalEvent
 from healthmes.config import Settings
 from healthmes.mcp_server import server as server_module
 from healthmes.store import (
     CalendarEventMirror,
+    CalendarMutationProposal,
+    CalendarMutationStatus,
     CalendarSource,
     DecisionRecord,
     EnergyDemand,
@@ -25,6 +28,7 @@ from healthmes.store import (
     ProposalStatus,
     ScheduleProposal,
     Task,
+    TriggerEvent,
 )
 
 TREE = {
@@ -163,6 +167,21 @@ class TestUpsertAndListTasks:
 
 
 class TestScheduleTools:
+    def test_afternoon_busy_minutes_uses_existing_noon_to_six_window(self, pinned_tz):
+        day = dt.date(2026, 7, 24)
+        local_start = dt.datetime.combine(day, dt.time(hour=17), tzinfo=pinned_tz)
+        event = CalendarEventMirror(
+            external_id="window-boundary",
+            calendar_source=CalendarSource.GOOGLE,
+            summary=None,
+            start_at=local_start.astimezone(dt.UTC),
+            end_at=(local_start + dt.timedelta(hours=2)).astimezone(dt.UTC),
+        )
+
+        busy = server_module._afternoon_busy_minutes([event], day, pinned_tz)
+
+        assert busy == 60
+
     def _mirror_event(self, store_factory, start: dt.datetime, end: dt.datetime, summary: str):
         with store_factory() as session:
             session.add(
@@ -347,6 +366,374 @@ class TestScheduleTools:
 
         today_only = await call_tool(mcp_client, "get_schedule", {"range": "today"})
         assert today_only["events"] == []
+
+    async def test_get_schedule_projects_adjustment_eligibility_without_provider_ids(
+        self, mcp_client, call_tool, store_factory, pinned_tz
+    ):
+        start = dt.datetime.now(pinned_tz).replace(
+            hour=14, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="google-secret-event",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="Recovery focus",
+                    start_at=start.astimezone(dt.UTC),
+                    end_at=(start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+                    etag='"etag-v1"',
+                    organizer_self=True,
+                    has_attendees=False,
+                    is_recurring=False,
+                    event_type="default",
+                    is_all_day=False,
+                    is_locked=False,
+                    status="confirmed",
+                )
+            )
+            session.commit()
+
+        result = await call_tool(mcp_client, "get_schedule", {"range": "7d"})
+        [event] = result["events"]
+        assert "external_id" not in event
+        assert "etag" not in event
+        assert event["adjustment"] == {
+            "eligible": True,
+            "operations": ["shorten"],
+            "reasons": [],
+        }
+
+    async def test_evaluate_and_resolve_calendar_adjustment_are_redacted_and_confirmation_gated(
+        self, mcp_client, call_tool, store_factory, pinned_tz, monkeypatch
+    ):
+        day = (dt.datetime.now(pinned_tz) + dt.timedelta(days=1)).date()
+        first = dt.datetime.combine(day, dt.time(hour=14), tzinfo=pinned_tz)
+        with store_factory() as session:
+            for index in range(3):
+                start = first + dt.timedelta(hours=index)
+                session.add(
+                    CalendarEventMirror(
+                        external_id=f"google-secret-{index}",
+                        calendar_source=CalendarSource.GOOGLE,
+                        summary="Recovery focus",
+                        start_at=start.astimezone(dt.UTC),
+                        end_at=(start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+                        etag='"etag-v1"',
+                        organizer_self=True,
+                        has_attendees=False,
+                        is_recurring=False,
+                        event_type="default",
+                        is_all_day=False,
+                        is_locked=False,
+                        status="confirmed",
+                    )
+                )
+            session.commit()
+
+        async def fake_readiness(date: str | None = None) -> dict:
+            return {
+                "status": "ok",
+                "date": date,
+                "sleep_debt": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "date": day.isoformat(),
+                },
+                "hrv": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "date": day.isoformat(),
+                    "score": 35,
+                },
+                "charge": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "date": day.isoformat(),
+                    "value": 35,
+                },
+            }
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.changes = []
+
+            def apply_confirmed_external_time_change(self, change):
+                self.changes.append(change)
+                return ExternalEvent(
+                    external_id=change.external_event_id,
+                    summary="Recovery focus",
+                    start_at=change.proposed_start_at,
+                    end_at=change.proposed_end_at,
+                    etag='"etag-v2"',
+                    organizer_self=True,
+                    has_attendees=False,
+                    is_recurring=False,
+                    event_type="default",
+                    is_all_day=False,
+                    is_locked=False,
+                    status="confirmed",
+                )
+
+        writer = FakeWriter()
+        monkeypatch.setattr(server_module, "get_daily_readiness_context", fake_readiness)
+        server_module.set_calendar_adjustment_writer(writer)
+
+        evaluated = await call_tool(
+            mcp_client, "evaluate_morning_calendar_nudge", {"date": day.isoformat()}
+        )
+        assert evaluated["outcome"] == "proposed"
+        assert evaluated["reply_handle"]
+        assert evaluated["display"]["event_label"] == "Recovery focus"
+        assert evaluated["display"]["before"]["end"].endswith("+09:00")
+        assert "google-secret" not in str(evaluated)
+        assert '"etag-v1"' not in str(evaluated)
+        assert writer.changes == []
+
+        for invalid_arguments in (
+            {
+                "proposal_id": evaluated["proposal_id"],
+                "response": "yes",
+            },
+            {
+                "proposal_id": evaluated["proposal_id"],
+                "response": "yes",
+                "reply_handle": "not-the-issued-handle",
+            },
+        ):
+            with pytest.raises(ToolError, match="reply_handle is missing or invalid"):
+                await mcp_client.call_tool(
+                    "resolve_calendar_adjustment",
+                    invalid_arguments,
+                )
+        assert writer.changes == []
+
+        deduped = await call_tool(
+            mcp_client, "evaluate_morning_calendar_nudge", {"date": day.isoformat()}
+        )
+        assert deduped == {"status": "ok", "outcome": "deduplicated", "date": day.isoformat()}
+        assert "reply_handle" not in deduped
+
+        with store_factory() as session:
+            [proposal] = list(session.scalars(select(CalendarMutationProposal)))
+            assert proposal.reply_handle_digest != evaluated["reply_handle"]
+            [trigger] = list(session.scalars(select(TriggerEvent)))
+            assert trigger.payload["outcome"] == "proposed"
+            tree_text = str(session.get(DecisionRecord, proposal.proposal_decision_record_id).tree)
+            assert evaluated["reply_handle"] not in tree_text
+            assert proposal.reply_handle_digest not in tree_text
+            assert "google-secret" not in tree_text
+            assert '"etag-v1"' not in tree_text
+
+        declined = await call_tool(
+            mcp_client,
+            "resolve_calendar_adjustment",
+            {
+                "proposal_id": evaluated["proposal_id"],
+                "response": "no",
+                "reply_handle": evaluated["reply_handle"],
+                "response_channel": "telegram",
+            },
+        )
+        assert declined["status"] == CalendarMutationStatus.DECLINED.value
+        assert declined["receipt"] == {
+            "operation": "shorten",
+            "delta_minutes": 30,
+            "status": "declined",
+            "provider_code": "user_declined",
+        }
+        assert writer.changes == []
+
+    async def test_no_action_returns_authenticated_decision_viewer_without_proposal(
+        self, mcp_client, call_tool, store_factory, pinned_tz, monkeypatch
+    ):
+        day = (dt.datetime.now(pinned_tz) + dt.timedelta(days=1)).date()
+        first = dt.datetime.combine(day, dt.time(hour=13), tzinfo=pinned_tz)
+        with store_factory() as session:
+            for index in range(3):
+                start = first + dt.timedelta(hours=index)
+                session.add(
+                    CalendarEventMirror(
+                        external_id=f"ineligible-secret-{index}",
+                        calendar_source=CalendarSource.GOOGLE,
+                        summary="Private busy block",
+                        start_at=start.astimezone(dt.UTC),
+                        end_at=(start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+                        etag='"private-etag"',
+                        organizer_self=True,
+                        has_attendees=True,
+                        is_recurring=False,
+                        event_type="default",
+                        is_all_day=False,
+                        is_locked=False,
+                        status="confirmed",
+                    )
+                )
+            session.commit()
+
+        async def fake_readiness(date: str | None = None) -> dict:
+            return {
+                "status": "ok",
+                "date": date,
+                "sleep_debt": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "date": day.isoformat(),
+                },
+                "charge": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "date": day.isoformat(),
+                    "value": 35,
+                },
+            }
+
+        monkeypatch.setattr(server_module, "get_daily_readiness_context", fake_readiness)
+
+        result = await call_tool(
+            mcp_client, "evaluate_morning_calendar_nudge", {"date": day.isoformat()}
+        )
+
+        assert result["outcome"] == "no_action"
+        assert result["reason"] == "no_eligible_event"
+        assert result["display"] == "오늘은 회복 상태와 일정 조건에 맞는 단축 제안이 없습니다."
+        assert result["decision_viewer_url"].startswith("http://healthmes.test:8100/decisions/")
+        assert "reply_handle" not in result
+        assert "ineligible-secret" not in str(result)
+        assert "private-etag" not in str(result)
+        with store_factory() as session:
+            [trigger] = list(session.scalars(select(TriggerEvent)))
+            decision = session.get(DecisionRecord, uuid.UUID(trigger.payload["decision_record_id"]))
+            assert decision is not None
+            assert decision.tree["detail"]["reason"] == "no_eligible_event"
+            assert list(session.scalars(select(CalendarMutationProposal))) == []
+
+    @pytest.mark.parametrize(
+        ("internal_status", "public_status"),
+        [
+            (CalendarMutationStatus.APPLIED_RECOVERED, CalendarMutationStatus.APPLIED.value),
+            (CalendarMutationStatus.UNKNOWN, CalendarMutationStatus.UNKNOWN.value),
+            (CalendarMutationStatus.FAILED_NO_CHANGE, CalendarMutationStatus.FAILED.value),
+        ],
+    )
+    def test_internal_recovery_statuses_are_not_exposed_by_mcp(
+        self, internal_status, public_status
+    ):
+        assert server_module._public_calendar_adjustment_status(internal_status) == public_status
+
+    async def test_resolve_rejects_unknown_proposal_without_sensitive_detail(
+        self, mcp_client
+    ):
+        with pytest.raises(ToolError, match=r"^calendar adjustment proposal not found$"):
+            await mcp_client.call_tool(
+                "resolve_calendar_adjustment",
+                {
+                    "proposal_id": str(uuid.uuid4()),
+                    "response": "yes",
+                    "reply_handle": "not-a-live-handle",
+                },
+            )
+
+    async def test_resolve_calendar_adjustment_yes_calls_injected_writer_once(
+        self, mcp_client, call_tool, store_factory, pinned_tz, monkeypatch
+    ):
+        day = (dt.datetime.now(pinned_tz) + dt.timedelta(days=1)).date()
+        start = dt.datetime.combine(day, dt.time(hour=14), tzinfo=pinned_tz)
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="google-secret-target",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="Recovery focus",
+                    start_at=start.astimezone(dt.UTC),
+                    end_at=(start + dt.timedelta(hours=3)).astimezone(dt.UTC),
+                    etag='"etag-v1"',
+                    organizer_self=True,
+                    has_attendees=False,
+                    is_recurring=False,
+                    event_type="default",
+                    is_all_day=False,
+                    is_locked=False,
+                    status="confirmed",
+                )
+            )
+            session.commit()
+
+        async def fake_readiness(date: str | None = None) -> dict:
+            return {
+                "sleep_debt": {"status": "ok", "confidence": "medium", "date": day.isoformat()},
+                "hrv": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "date": day.isoformat(),
+                },
+                "charge": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "entries": [
+                        {
+                            "category": "body_battery",
+                            "provider": "garmin",
+                            "value": 30,
+                            "observed_on": day.isoformat(),
+                        }
+                    ],
+                },
+            }
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.changes = []
+
+            def apply_confirmed_external_time_change(self, change):
+                self.changes.append(change)
+                return ExternalEvent(
+                    external_id=change.external_event_id,
+                    summary="Recovery focus",
+                    start_at=change.proposed_start_at,
+                    end_at=change.proposed_end_at,
+                    etag='"etag-v2"',
+                    organizer_self=True,
+                    has_attendees=False,
+                    is_recurring=False,
+                    event_type="default",
+                    is_all_day=False,
+                    is_locked=False,
+                    status="confirmed",
+                )
+
+        writer = FakeWriter()
+        monkeypatch.setattr(server_module, "get_daily_readiness_context", fake_readiness)
+        server_module.set_calendar_adjustment_writer(writer)
+        evaluated = await call_tool(
+            mcp_client, "evaluate_morning_calendar_nudge", {"date": day.isoformat()}
+        )
+        assert evaluated["display"]["reply_options"] == [
+            f"적용 {evaluated['reply_handle']}",
+            f"그대로 {evaluated['reply_handle']}",
+        ]
+        assert evaluated["display"]["evidence"]["recovery_value_bucket"] == "low"
+        assert evaluated["display"]["limitations"] == [
+            "technical_eligibility_only",
+            "explicit_confirmation_required",
+        ]
+
+        applied = await call_tool(
+            mcp_client,
+            "resolve_calendar_adjustment",
+            {
+                "proposal_id": evaluated["proposal_id"],
+                "response": "yes",
+                "reply_handle": evaluated["reply_handle"],
+                "response_channel": "telegram",
+            },
+        )
+        assert applied["status"] == CalendarMutationStatus.APPLIED.value
+        assert applied["receipt"]["provider_result"] == "matched"
+        assert len(writer.changes) == 1
+        change = writer.changes[0]
+        assert change.external_event_id == "google-secret-target"
+        assert change.proposed_start_at == change.original_start_at
+        assert change.original_end_at - change.proposed_end_at == dt.timedelta(minutes=30)
 
 
 class TestCaptureTools:

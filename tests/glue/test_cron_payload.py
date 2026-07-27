@@ -59,6 +59,20 @@ def test_briefing_scripts_point_at_the_repo_snapshot(bootstrap, briefing_jobs):
         assert job["script"] == bootstrap.SNAPSHOT_SCRIPT_NAME
 
 
+def test_morning_prompt_calls_server_nudge_once_and_exits(briefing_jobs):
+    morning = next(job for job in briefing_jobs if job["name"] == "healthmes-morning-plan")
+    prompt = morning["prompt"]
+
+    assert prompt.count("mcp__healthmes__evaluate_morning_calendar_nudge") == 1
+    assert "exactly once" in prompt
+    assert "exactly the returned display packet" in prompt
+    assert "`적용 <handle>` / `그대로 <handle>`" in prompt
+    assert "Send at most one proposal/message" in prompt
+    assert "do not call clarify" in prompt
+    assert "exit after delivery without waiting for a reply" in prompt
+    assert "Do not alter the handle" in prompt
+
+
 def test_fallback_payload_matches_real_create_job_keys(vendor_cron, bootstrap):
     vendor_jobs, _home = vendor_cron
     real_job = vendor_jobs.create_job(

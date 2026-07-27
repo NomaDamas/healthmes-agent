@@ -11,6 +11,8 @@ jobs owned by later scopes:
 - ``register_calendar_job`` — per-backend calendar mirror poll + accepted-
   proposal push (PLAN §6; the calendars scope passes one job per enabled
   backend, see ``healthmes/calendars/jobs.py``).
+- ``register_calendar_adjustment_maintenance_job`` — expiry/reconcile sweep
+  for user-confirmed external calendar adjustment proposals.
 
 Nothing here starts by itself: the app lifespan calls ``start_scheduler``,
 which honors ``Settings.scheduler_enabled`` (False in tests, one-off tooling
@@ -38,10 +40,12 @@ __all__ = [
     "TRIGGER_JOB_ID",
     "ENERGY_JOB_ID",
     "BACKUP_JOB_ID",
+    "CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID",
     "create_scheduler",
     "register_energy_job",
     "register_backup_job",
     "register_calendar_job",
+    "register_calendar_adjustment_maintenance_job",
     "start_scheduler",
     "shutdown_scheduler",
 ]
@@ -51,6 +55,7 @@ logger = logging.getLogger(__name__)
 TRIGGER_JOB_ID = "healthmes-trigger-sweep"
 ENERGY_JOB_ID = "healthmes-cognitive-energy"
 BACKUP_JOB_ID = "healthmes-weekly-backup"
+CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID = "healthmes-calendar-adjustment-maintenance"
 
 # One misfired run is coalesced and allowed to start this late (seconds);
 # with max_instances=1 a slow sweep can never pile up behind itself.
@@ -163,6 +168,25 @@ def register_calendar_job(
         trigger=IntervalTrigger(minutes=minutes),
         id=job_id,
         name=f"HealthMes calendar sync ({job_id})",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=_MISFIRE_GRACE_SECONDS,
+    )
+
+
+def register_calendar_adjustment_maintenance_job(
+    scheduler: BackgroundScheduler,
+    job: Callable[[], None],
+    *,
+    minutes: int = 5,
+) -> Job:
+    _remove_job_if_present(scheduler, CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID)
+    return scheduler.add_job(
+        job,
+        trigger=IntervalTrigger(minutes=minutes),
+        id=CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
+        name="HealthMes calendar adjustment maintenance",
         replace_existing=True,
         coalesce=True,
         max_instances=1,

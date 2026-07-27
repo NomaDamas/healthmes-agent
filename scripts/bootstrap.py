@@ -140,10 +140,16 @@ BRIEFING_JOBS: tuple[dict[str, Any], ...] = (
         "prompt": (
             "Morning briefing. A HealthMes state snapshot (open tasks, "
             "today's events, pending proposals, energy forecast) is injected "
-            "above; use it as context and read today's readiness via the "
-            "healthmes MCP tools, then propose today's block layout based "
-            "on the energy picture. One message in the standard notification "
-            "grammar."
+            "above; use it as context. First call "
+            "mcp__healthmes__evaluate_morning_calendar_nudge exactly once. "
+            "If it returns a proposal, send exactly the returned display "
+            "packet: exact change, limitation, viewer link, and the plain-text "
+            "reply choices `적용 <handle>` / `그대로 <handle>`. Do not alter "
+            "the handle or infer target event details. Send at most one "
+            "proposal/message, do not call clarify, and exit after delivery "
+            "without waiting for a reply. If it returns no-action or "
+            "deduplicated, send only the returned no-action display text when "
+            "present; otherwise stay silent."
         ),
         "skills": ["healthmes-planner"],
         "deliver": "telegram",

@@ -200,6 +200,12 @@ round-trips at run time. The snapshot also carries the server-built weekly
 report link (`weekly_report.url`, token-embedded via
 `healthmes.api.reports.weekly_report_url`); the Sunday prompt instructs the
 agent to include it verbatim — the agent never constructs viewer URLs.
+The 07:00 prompt is also the Telegram glue for morning recovery nudges: it
+calls `mcp__healthmes__evaluate_morning_calendar_nudge` exactly once, sends
+the returned display packet and `적용 <handle>` / `그대로 <handle>` choices,
+then exits without waiting. The later allowed-user reply enters the normal
+Hermes live gateway session, which calls
+`mcp__healthmes__resolve_calendar_adjustment` with the reply text.
 
 ```bash
 uv run python scripts/bootstrap.py --dry-run     # show what would change
@@ -543,6 +549,13 @@ corresponding integrations stay inactive.
 | Companion & desktop apps (Android/Wear/iOS/watchOS/macOS/Windows) | the service's `HEALTHMES_API_TOKEN` (same LAN rule as the collector) | entered in each app's pairing screen together with the base URL |
 | Android usage collector | the service's `HEALTHMES_API_TOKEN` (verified server-side; required whenever the service binds beyond loopback) | entered in the app UI; sent as `Authorization: Bearer ...` |
 | API/MCP surface auth | bearer token you mint (`python3 -c "import secrets; print(secrets.token_urlsafe(32))"`) | `HEALTHMES_API_TOKEN` in `.env`; required for `HEALTHMES_HOST=0.0.0.0` and for docker compose |
+
+Calendar ownership remains immutable by default for user-created external
+events. The only confirmed exception is the morning recovery Google
+`SHORTEN` path: server evaluation binds the event snapshot and target change,
+Telegram shows the one-time handle, and a trusted live Hermes session
+resolves `적용 <handle>` or `그대로 <handle>` through the HealthMes MCP tool.
+No cron run waits for replies or performs the external write itself.
 
 Not a credential but environment-shaped: `HEALTHMES_TIMEZONE` (IANA name,
 e.g. `Asia/Seoul`) pins the user-local day for MCP joins and boundaries —

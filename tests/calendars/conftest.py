@@ -138,6 +138,13 @@ def make_event() -> object:
         agent_task_id=None,
         etag: str | None = "etag-1",
         deleted: bool = False,
+        organizer_self: bool = False,
+        has_attendees: bool = False,
+        is_recurring: bool = False,
+        event_type: str | None = None,
+        is_all_day: bool = False,
+        is_locked: bool = False,
+        status: str | None = None,
     ) -> ExternalEvent:
         if not deleted:
             start = start or utc(2026, 7, 9, 9, 0)
@@ -151,6 +158,13 @@ def make_event() -> object:
             agent_task_id=agent_task_id,
             etag=etag,
             deleted=deleted,
+            organizer_self=organizer_self,
+            has_attendees=has_attendees,
+            is_recurring=is_recurring,
+            event_type=event_type,
+            is_all_day=is_all_day,
+            is_locked=is_locked,
+            status=status,
         )
 
     return _make

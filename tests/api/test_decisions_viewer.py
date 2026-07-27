@@ -702,6 +702,46 @@ def test_mermaid_asset_served_locally(client):
     assert "mermaid" in response.text
 
 
+def test_calendar_adjustment_viewer_keeps_confirmation_secrets_out(client, session):
+    record = _seed_decision(
+        session,
+        summary="Calendar adjustment proposal",
+        tree={
+            "id": "calendar_adjustment_initial",
+            "type": "rule",
+            "label": "morning recovery calendar nudge",
+            "detail": {"operation": "shorten", "delta_minutes": 30},
+            "children": [
+                {
+                    "id": "evidence",
+                    "type": "input",
+                    "label": "Recovery was low with medium confidence",
+                    "detail": {"recovery_value_bucket": "low"},
+                },
+                {
+                    "id": "action",
+                    "type": "action",
+                    "label": "ask user to confirm exact calendar change",
+                    "detail": {
+                        "event_label": "Recovery focus",
+                        "before": "2026-07-24T14:00:00+09:00/2026-07-24T15:00:00+09:00",
+                        "after": "2026-07-24T14:00:00+09:00/2026-07-24T14:30:00+09:00",
+                    },
+                },
+            ],
+        },
+    )
+
+    html = client.get(f"/decisions/{record.id}").text
+
+    assert "Recovery focus" in html
+    assert "2026-07-24T14:30:00+09:00" in html
+    assert "plaintext-handle" not in html
+    assert "reply_handle_digest" not in html
+    assert "google-secret-event-id" not in html
+    assert '"etag-v1"' not in html
+
+
 # --- list endpoints (weekly-report entry point) ------------------------------
 
 

@@ -56,7 +56,16 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.calendars.adjustments import (
+    CalendarAdjustmentService,
+    CalendarAdjustmentWriter,
+    SqlAlchemyAdjustmentRepository,
+    evaluate_event_eligibility,
+    verify_reply_handle,
+)
+from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.config import Settings, get_settings, system_timezone
+from healthmes.engine.rules import RuleThresholds
 from healthmes.mcp_server import impact, interpret, timeline
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.store import (
@@ -154,6 +163,7 @@ _ow_user_id_override: str | None = None
 _discovered_user_id: str | None = None
 _timezone_override: dt.tzinfo | None = None
 _energy_engine_override: Any | None = None
+_calendar_adjustment_writer_override: CalendarAdjustmentWriter | None = None
 
 
 def set_settings(settings: Settings | None) -> None:
@@ -200,6 +210,11 @@ def set_energy_engine(engine: Any | None) -> None:
     _energy_engine_override = engine
 
 
+def set_calendar_adjustment_writer(writer: CalendarAdjustmentWriter | None) -> None:
+    global _calendar_adjustment_writer_override
+    _calendar_adjustment_writer_override = writer
+
+
 def reset_runtime_state() -> None:
     """Clear every override and cache (test teardown)."""
     global _discovered_user_id
@@ -209,6 +224,7 @@ def reset_runtime_state() -> None:
     set_ow_user_id(None)
     set_timezone(None)
     set_energy_engine(None)
+    set_calendar_adjustment_writer(None)
     _discovered_user_id = None
 
 
@@ -297,6 +313,45 @@ def _build_energy_engine() -> Any:
     return CognitiveEnergyEngine(
         settings, session_factory=_session_factory_override, ow_reader=reader
     )
+
+
+class _LazyGoogleAdjustmentWriter:
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._backend: GoogleCalendarBackend | None = None
+
+    def _writer(self) -> GoogleCalendarBackend:
+        if self._backend is None:
+            self._backend = GoogleCalendarBackend.from_data_dir(
+                self._settings.data_dir,
+                calendar_id=self._settings.google_calendar_id,
+                interactive=False,
+            )
+        return self._backend
+
+    def apply_confirmed_external_time_change(self, change):
+        return self._writer().apply_confirmed_external_time_change(change)
+
+    def read_event(self, external_id: str):
+        return self._writer().read_event(external_id)
+
+
+def _calendar_adjustment_writer() -> CalendarAdjustmentWriter:
+    if _calendar_adjustment_writer_override is not None:
+        return _calendar_adjustment_writer_override
+    return _LazyGoogleAdjustmentWriter(_active_settings())
+
+
+def _adjustment_handle_secret(settings: Settings | None = None) -> str:
+    settings = settings or _active_settings()
+    for value in (
+        settings.hermes_webhook_secret.get_secret_value(),
+        settings.api_token.get_secret_value(),
+    ):
+        value = str(value).strip()
+        if value:
+            return value
+    return "healthmes-local-adjustment-handle"
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +472,129 @@ def _iso_utc(value: dt.datetime | None) -> str | None:
 
 def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
+
+
+def _public_calendar_adjustment_status(status: Any) -> str:
+    value = _enum_value(status)
+    aliases = {
+        store_enums.CalendarMutationStatus.APPLIED_RECOVERED.value: (
+            store_enums.CalendarMutationStatus.APPLIED.value
+        ),
+        store_enums.CalendarMutationStatus.FAILED_NO_CHANGE.value: (
+            store_enums.CalendarMutationStatus.FAILED.value
+        ),
+    }
+    return aliases.get(value, str(value))
+
+
+def _decision_viewer_url(decision_id: uuid.UUID | str | None) -> str | None:
+    if decision_id is None:
+        return None
+    from healthmes.api.auth import viewer_url
+
+    return viewer_url(_active_settings(), f"/decisions/{decision_id}")
+
+
+def _local_iso(value: dt.datetime, tz: dt.tzinfo) -> str:
+    return _ensure_utc_dt(value).astimezone(tz).isoformat()
+
+
+def _calendar_adjustment_display(
+    proposal: Any,
+    tz: dt.tzinfo,
+    *,
+    reply_handle: str,
+    decision_tree: Mapping[str, Any] | None = None,
+    event_label: str | None = None,
+) -> dict[str, Any]:
+    snapshot = proposal.snapshot
+    evidence = {}
+    for child in (decision_tree or {}).get("children", ()):
+        if isinstance(child, Mapping) and child.get("id") == "evidence":
+            evidence = dict(child.get("detail") or {})
+            break
+    return {
+        "proposal_id": str(proposal.id),
+        "operation": _enum_value(snapshot.operation),
+        "event_label": event_label if event_label is not None else snapshot.event_label,
+        "delta_minutes": 30,
+        "before": {
+            "start": _local_iso(snapshot.original_start_at, tz),
+            "end": _local_iso(snapshot.original_end_at, tz),
+        },
+        "after": {
+            "start": _local_iso(snapshot.proposed_start_at, tz),
+            "end": _local_iso(snapshot.proposed_end_at, tz),
+        },
+        "evidence": evidence,
+        "freshness": "validated_for_local_date",
+        "limitations": [
+            "technical_eligibility_only",
+            "explicit_confirmation_required",
+        ],
+        "reply_options": [f"적용 {reply_handle}", f"그대로 {reply_handle}"],
+        "viewer_url": _decision_viewer_url(proposal.proposal_decision_record_id),
+    }
+
+
+def _mirror_to_adjustment_candidate(event: CalendarEventMirror) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "external_id": event.external_id,
+        "calendar_source": event.calendar_source,
+        "summary": event.summary,
+        "start_at": _ensure_utc_dt(event.start_at),
+        "end_at": _ensure_utc_dt(event.end_at),
+        "is_agent_created": event.is_agent_created,
+        "etag": event.etag,
+        "organizer_self": event.organizer_self,
+        "has_attendees": event.has_attendees,
+        "is_recurring": event.is_recurring,
+        "event_type": event.event_type,
+        "is_all_day": event.is_all_day,
+        "is_locked": event.is_locked,
+        "status": event.status,
+    }
+
+
+def _adjustment_projection(
+    event: CalendarEventMirror, *, now: dt.datetime, tz: dt.tzinfo
+) -> dict[str, Any]:
+    local_day = _ensure_utc_dt(event.start_at).astimezone(tz).date()
+    result = evaluate_event_eligibility(
+        event,
+        now=now,
+        local_date=local_day,
+        timezone=tz,
+    )
+    return {
+        "eligible": result.eligible,
+        "operations": ["shorten"] if result.eligible else [],
+        "reasons": list(result.reasons),
+    }
+
+
+def _afternoon_busy_minutes(
+    events: Iterable[CalendarEventMirror], day: dt.date, tz: dt.tzinfo
+) -> int:
+    thresholds = RuleThresholds()
+    start = dt.datetime.combine(
+        day,
+        dt.time(hour=thresholds.afternoon_start_hour),
+        tzinfo=tz,
+    ).astimezone(dt.UTC)
+    end = dt.datetime.combine(
+        day,
+        dt.time(hour=thresholds.afternoon_end_hour),
+        tzinfo=tz,
+    ).astimezone(dt.UTC)
+    total = 0
+    for event in events:
+        event_start = max(_ensure_utc_dt(event.start_at), start)
+        event_end = min(_ensure_utc_dt(event.end_at), end)
+        if event_end > event_start:
+            total += int((event_end - event_start).total_seconds() // 60)
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -1688,18 +1866,21 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
                 select(Task).where(Task.id.in_([p.task_id for p in proposals]))
             )
         }
-        event_payload = [
-            {
-                "id": str(event.id),
-                "summary": event.summary,
-                "start": _iso_utc(event.start_at),
-                "end": _iso_utc(event.end_at),
-                "calendar_source": _enum_value(event.calendar_source),
-                "is_agent_created": event.is_agent_created,
-                "agent_task_id": str(event.agent_task_id) if event.agent_task_id else None,
-            }
-            for event in events
-        ]
+        now = dt.datetime.now(dt.UTC)
+        event_payload = []
+        for event in events:
+            event_payload.append(
+                {
+                    "id": str(event.id),
+                    "summary": event.summary,
+                    "start": _iso_utc(event.start_at),
+                    "end": _iso_utc(event.end_at),
+                    "calendar_source": _enum_value(event.calendar_source),
+                    "is_agent_created": event.is_agent_created,
+                    "agent_task_id": str(event.agent_task_id) if event.agent_task_id else None,
+                    "adjustment": _adjustment_projection(event, now=now, tz=tz),
+                }
+            )
         proposal_payload = [
             {
                 "id": str(proposal.id),
@@ -1717,6 +1898,157 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
         "events": event_payload,
         "proposals": proposal_payload,
     }
+
+
+@mcp.tool
+async def evaluate_morning_calendar_nudge(date: str | None = None) -> dict[str, Any]:
+    """Evaluate one local morning and return at most one confirmation-gated SHORTEN proposal.
+
+    This tool reads readiness plus the local calendar mirror, but never writes
+    to Google Calendar. A proposal response contains the exact display packet
+    and one-time handle that the trusted Hermes session must relay unchanged.
+    """
+    tz = _local_timezone()
+    local_date = _parse_date_local(date, "date", tz)
+    start, end = _local_day_bounds_utc(local_date, tz)
+    health_context = await get_daily_readiness_context(local_date.isoformat())
+
+    with _store_session() as write_session:
+        repository = SqlAlchemyAdjustmentRepository(write_session)
+        repository.begin_evaluation_boundary()
+        candidates = list(
+            write_session.scalars(
+                select(CalendarEventMirror)
+                .where(CalendarEventMirror.start_at < end, CalendarEventMirror.end_at > start)
+                .order_by(CalendarEventMirror.start_at)
+            )
+        )
+        afternoon_busy = _afternoon_busy_minutes(candidates, local_date, tz)
+        candidate_payload = [_mirror_to_adjustment_candidate(event) for event in candidates]
+
+        service = CalendarAdjustmentService(
+            repository,
+            handle_secret=_adjustment_handle_secret(),
+        )
+        result = service.evaluate_morning_calendar_nudge(
+            local_date=local_date,
+            timezone=tz,
+            health_context=health_context,
+            candidates=candidate_payload,
+            afternoon_busy_minutes=afternoon_busy,
+        )
+        proposal = repository.get_proposal(result.proposal_id) if result.proposal_id else None
+        mirror = (
+            write_session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
+            if proposal is not None
+            else None
+        )
+        display = (
+            _calendar_adjustment_display(
+                proposal,
+                tz,
+                reply_handle=result.reply_handle or "",
+                decision_tree=result.decision_tree,
+                event_label=mirror.summary if mirror is not None else None,
+            )
+            if proposal is not None
+            else None
+        )
+        decision_url = (
+            display["viewer_url"]
+            if display is not None
+            else _decision_viewer_url(result.decision_record_id)
+        )
+
+    payload: dict[str, Any] = {
+        "status": "ok",
+        "outcome": result.outcome,
+        "date": local_date.isoformat(),
+    }
+    if result.reason:
+        payload["reason"] = result.reason
+    if result.outcome == "no_action":
+        payload["display"] = "오늘은 회복 상태와 일정 조건에 맞는 단축 제안이 없습니다."
+    if decision_url is not None:
+        payload["decision_viewer_url"] = decision_url
+    if proposal is not None:
+        payload.update(
+            {
+                "proposal_id": str(proposal.id),
+                "reply_handle": result.reply_handle,
+                "expires_at": _iso_utc(result.expires_at),
+                "display": display,
+            }
+        )
+    return payload
+
+
+@mcp.tool
+def resolve_calendar_adjustment(
+    proposal_id: str,
+    response: str,
+    reply_handle: str | None = None,
+    response_channel: str | None = None,
+) -> dict[str, Any]:
+    """Resolve one live Telegram confirmation against its one-time proposal handle.
+
+    Only an explicit apply response may enter the separate conditional Google
+    writer; decline, expiry, invalid, stale, replayed, and conflicted responses
+    return redacted receipts without a calendar write.
+    """
+    proposal_uuid = _parse_uuid(proposal_id, "proposal_id")
+    with _store_session() as session:
+        repository = SqlAlchemyAdjustmentRepository(session)
+        proposal = repository.get_proposal(proposal_uuid)
+        if proposal is None:
+            raise ToolError("calendar adjustment proposal not found")
+        if not reply_handle or not verify_reply_handle(
+            reply_handle,
+            proposal.reply_handle_digest,
+            _adjustment_handle_secret(),
+        ):
+            raise ToolError("reply_handle is missing or invalid")
+
+        writer = _calendar_adjustment_writer()
+        service = CalendarAdjustmentService(
+            repository,
+            handle_secret=_adjustment_handle_secret(),
+        )
+        mirror_snapshot = session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
+        result = service.resolve_calendar_adjustment(
+            proposal_uuid,
+            response=response,
+            reply_handle=reply_handle,
+            writer=writer,
+            response_channel=response_channel,
+            mirror_snapshot=mirror_snapshot,
+        )
+        current = repository.get_proposal(proposal_uuid)
+        outcome_url = (
+            _decision_viewer_url(current.outcome_decision_record_id)
+            if current is not None and current.outcome_decision_record_id is not None
+            else None
+        )
+    return {
+        "status": _public_calendar_adjustment_status(result.status),
+        "receipt": result.receipt,
+        "outcome_viewer_url": outcome_url,
+    }
+
+
+def expire_and_reconcile_calendar_adjustments() -> list[dict[str, Any]]:
+    writer = _calendar_adjustment_writer()
+    with _store_session() as session:
+        repository = SqlAlchemyAdjustmentRepository(session)
+        service = CalendarAdjustmentService(
+            repository,
+            handle_secret=_adjustment_handle_secret(),
+        )
+        results = service.expire_and_reconcile_adjustments(writer)
+        return [
+            {"status": _enum_value(result.status), "receipt": result.receipt}
+            for result in results
+        ]
 
 
 class ScheduleBlockIn(BaseModel):
