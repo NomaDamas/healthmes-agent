@@ -42,6 +42,7 @@ resolved by :func:`_local_timezone` (override -> settings -> env -> system).
 import asyncio
 import datetime as dt
 import functools
+import logging
 import os
 import re
 import uuid
@@ -57,7 +58,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.config import Settings, get_settings, system_timezone
-from healthmes.mcp_server import impact, interpret, timeline
+from healthmes.mcp_server import arousal, impact, interpret, timeline
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.store import (
     AppUsageSample,
@@ -873,6 +874,8 @@ async def get_personal_baselines(
 # The vendor series type carrying intraday stress (schemas/enums/series_types.py;
 # Garmin is the only provider that ships one — docs/PLAN.md 1.5).
 STRESS_SERIES_TYPE = "garmin_stress_level"
+HR_SERIES_TYPE = "heart_rate"
+STEPS_SERIES_TYPE = "steps"
 
 # Component terms sourced from open-wearables health data; how many of them a
 # forecast window carries grades the forecast's evidence richness.
@@ -1012,6 +1015,177 @@ def _stress_samples(rows: Iterable[Mapping[str, Any]]) -> list[tuple[dt.datetime
     return samples
 
 
+def _typed_samples(
+    rows: Iterable[Mapping[str, Any]],
+    series_type: str,
+    *,
+    drop_nonpositive: bool = False,
+) -> list[tuple[dt.datetime, float]]:
+    """(aware UTC timestamp, value) samples of one series type.
+
+    Negative values are always dropped; ``drop_nonpositive`` additionally
+    drops zeros (an HR of 0 is a sensor gap, while 0 steps is stillness
+    evidence that must be kept).
+    """
+    samples: list[tuple[dt.datetime, float]] = []
+    floor = 0.0 if drop_nonpositive else -0.0
+    for row in rows:
+        if row.get("type") != series_type:
+            continue
+        recorded_at = _parse_recorded_at(row.get("timestamp"))
+        value = _as_float(row.get("value"))
+        if recorded_at is None or value is None or value < 0:
+            continue
+        if drop_nonpositive and value <= floor:
+            continue
+        samples.append((recorded_at, value))
+    return samples
+
+
+async def _arousal_hints_for(
+    client: OWClient,
+    user_id: str,
+    day: dt.date,
+    tz: dt.tzinfo,
+    start_utc: dt.datetime,
+    end_utc: dt.datetime,
+) -> dict[str, Any]:
+    """The ``arousal_hints`` payload for non-Garmin days (healthmes/mcp_server/arousal.py).
+
+    Interpretation stays deterministic code: this fetches continuous HR +
+    steps + workouts + the 14-day resting-HR baseline and the day's
+    calendar/app/meal rows, then delegates to the pure pipeline. Any fetch
+    failure degrades to an honest ``insufficient_data`` payload — the parent
+    stress-timeline response never fails because hints could not be built.
+    """
+    try:
+        # One fetch per series: a full day of 1-minute HR alone is ~1,440
+        # rows, so a combined fetch would trip the shared page cap and
+        # spuriously truncate (review finding). The vendor range query can
+        # widen end bounds to midnight, so samples are re-filtered to the
+        # local-day UTC window below.
+        hr_rows, hr_truncated = await client.collect_timeseries_tracked(
+            user_id,
+            start_utc.isoformat(),
+            end_utc.isoformat(),
+            [HR_SERIES_TYPE],
+        )
+        step_rows, steps_truncated = await client.collect_timeseries_tracked(
+            user_id,
+            start_utc.isoformat(),
+            end_utc.isoformat(),
+            [STEPS_SERIES_TYPE],
+        )
+        truncated = hr_truncated or steps_truncated
+        hr_utc = [
+            (at, value)
+            for at, value in _typed_samples(hr_rows, HR_SERIES_TYPE, drop_nonpositive=True)
+            if start_utc <= at < end_utc
+        ]
+        steps_utc = [
+            (at, value)
+            for at, value in _typed_samples(step_rows, STEPS_SERIES_TYPE)
+            if start_utc <= at < end_utc
+        ]
+
+        # The vendor returns only workouts fully contained in the queried
+        # range (event_record_repository), and date-only bounds are read as
+        # UTC midnights — pad generously so evening workouts in any timezone
+        # are included; extra spans only ever mask more, never fabricate.
+        workout_rows = await client.collect_workouts(
+            user_id,
+            (day - dt.timedelta(days=1)).isoformat(),
+            (day + dt.timedelta(days=2)).isoformat(),
+        )
+        workout_spans: list[tuple[dt.datetime, dt.datetime]] = []
+        for row in workout_rows:
+            w_start = _parse_recorded_at(row.get("start_time"))
+            w_end = _parse_recorded_at(row.get("end_time"))
+            if w_start is None:
+                continue
+            if w_end is None or w_end <= w_start:
+                w_end = w_start + dt.timedelta(hours=1)
+            workout_spans.append((w_start.astimezone(tz), w_end.astimezone(tz)))
+
+        rhr_rows = await client.collect_recovery_summaries(
+            user_id,
+            (day - dt.timedelta(days=interpret.BASELINE_WINDOW_DAYS)).isoformat(),
+            day.isoformat(),
+        )
+        rhr_series = interpret.summary_daily_values(
+            rhr_rows, "resting_heart_rate_bpm", day
+        )
+    except (OWClientError, httpx.HTTPError) as exc:
+        logging.getLogger(__name__).warning(
+            "arousal hints: open-wearables fetch failed: %s", exc
+        )
+        return {
+            "status": arousal.STATUS_INSUFFICIENT,
+            "reason": "wearable_fetch_failed",
+            "confidence": "low",
+            "coverage": 0.0,
+            "intervals": [],
+        }
+
+    with _store_session() as session:
+        event_rows = session.scalars(
+            select(CalendarEventMirror)
+            .where(
+                CalendarEventMirror.start_at < end_utc,
+                CalendarEventMirror.end_at > start_utc,
+            )
+            .order_by(CalendarEventMirror.start_at)
+        ).all()
+        usage_rows = session.scalars(
+            select(AppUsageSample)
+            .where(
+                AppUsageSample.bucket_start >= start_utc - dt.timedelta(minutes=60),
+                AppUsageSample.bucket_start < end_utc,
+            )
+            .order_by(AppUsageSample.bucket_start)
+        ).all()
+        meal_rows = session.scalars(
+            select(FoodLog)
+            .where(FoodLog.logged_at >= start_utc, FoodLog.logged_at < end_utc)
+            .order_by(FoodLog.logged_at)
+        ).all()
+        events = [
+            (
+                _ensure_utc_dt(row.start_at).astimezone(tz),
+                _ensure_utc_dt(row.end_at).astimezone(tz),
+                row.summary,
+            )
+            for row in event_rows
+        ]
+        usage = [
+            (
+                _ensure_utc_dt(row.bucket_start).astimezone(tz),
+                row.category,
+                row.foreground_seconds,
+            )
+            for row in usage_rows
+        ]
+        meals = [
+            (
+                _ensure_utc_dt(row.logged_at).astimezone(tz),
+                str(row.description or "meal")[:60],
+            )
+            for row in meal_rows
+        ]
+
+    return arousal.build_arousal_hints(
+        day=day,
+        tz=tz,
+        hr_samples=[(at.astimezone(tz), value) for at, value in hr_utc],
+        step_samples=[(at.astimezone(tz), value) for at, value in steps_utc],
+        workout_spans=workout_spans,
+        daily_rhr=sorted(rhr_series.items()),
+        truncated=truncated,
+        context_for=lambda start, end: timeline.attach_context(start, end, events, usage),
+        meals=meals,
+    )
+
+
 @mcp.tool
 @_with_ow_errors
 async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
@@ -1027,8 +1201,13 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
     day-level proxy (native daily stress score, else 100 - the night-HRV
     resilience score) spread over morning/afternoon/evening sections — the
     proxy has no intraday resolution, so treat within-day differences as
-    context, not measurement. `date` is ISO YYYY-MM-DD (default today,
-    local). Honest `insufficient_data` when no stress signal exists at all.
+    context, not measurement. Responses without a usable Garmin intraday
+    series (the daily-score/proxy/insufficient paths) additionally carry
+    `arousal_hints`: deterministic quiet-time HR-elevation intervals over the
+    personal resting baseline (hint-grade, confidence capped at medium —
+    physiological arousal, never measured stress; see healthmes/mcp_server/
+    arousal.py). `date` is ISO YYYY-MM-DD (default today, local). Honest
+    `insufficient_data` when no stress signal exists at all.
     """
     tz = _local_timezone()
     day = _parse_date_local(date, "date", tz)
@@ -1054,6 +1233,9 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
             "confidence": "low",
             "truncated": False,
             "intervals": [],
+            "arousal_hints": await _arousal_hints_for(
+                client, user_id, day, tz, start_utc, end_utc
+            ),
         }
     if series_truncated and not samples_utc:
         return {
@@ -1065,6 +1247,9 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
             "coverage": 0.0,
             "truncated": True,
             "intervals": [],
+            "arousal_hints": await _arousal_hints_for(
+                client, user_id, day, tz, start_utc, end_utc
+            ),
         }
 
     day_level: dict[str, Any] | None = None
@@ -1101,6 +1286,9 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
                 "confidence": "low",
                 "truncated": False,
                 "intervals": [],
+                "arousal_hints": await _arousal_hints_for(
+                    client, user_id, day, tz, start_utc, end_utc
+                ),
             }
         intervals = timeline.proxy_sections(day, tz, float(context["value"]))
         source = (
@@ -1173,6 +1361,14 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
         response["status"] = interpret.STATUS_INSUFFICIENT
         response["reason"] = "stress_timeseries_truncated"
         response["confidence"] = "low"
+    if source != "garmin_stress_timeseries" or series_truncated:
+        # No *usable* Garmin intraday series (non-Garmin day, daily/proxy
+        # fallback, or a truncated series the skill must not lean on):
+        # attach the deterministic HR arousal-hint interpretation
+        # (PLAN §13 follow-up).
+        response["arousal_hints"] = await _arousal_hints_for(
+            client, user_id, day, tz, start_utc, end_utc
+        )
     return response
 
 

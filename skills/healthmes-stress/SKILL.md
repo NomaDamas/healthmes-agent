@@ -70,6 +70,25 @@ interval or score.
   data cannot support a definite plan decision; a definite decision requires
   `observed_on` to match the target date and `stale_days: 0`.
 
+### `arousal_hints` (response field — days without a usable Garmin intraday series)
+
+- Any response whose `source` is not `garmin_stress_timeseries` (including
+  `garmin_daily_stress_score`, the resilience proxy, and insufficient-data
+  responses) may carry an `arousal_hints` field: deterministic
+  quiet-time heart-rate elevation intervals over the personal resting
+  baseline, with calendar, app, and meal-log overlap as `likely_context`.
+- These are **hints about physiological arousal, never measured stress**.
+  Caffeine, heat, illness, or excitement produce the same signal. Say
+  "elevated heart rate while at rest" or "arousal hint"; never present a
+  hint as stress, and never present its context as a cause.
+- Use hints only to (a) answer "when" questions at hint strength — state
+  plainly that this is a heart-rate hint, not a stress measurement — and
+  (b) corroborate day-level evidence. A hint can never be the deciding
+  evidence for `reconsider` on its own.
+- Honor the field's own `status`, `coverage`, and `confidence` (capped at
+  `medium` by design). When `status` is `insufficient_data`, do not mention
+  intraday timing at all.
+
 For an unknown source, absent source, `status: insufficient_data`,
 `truncated: true`, or `confidence: low`, return `insufficient_data`.
 
