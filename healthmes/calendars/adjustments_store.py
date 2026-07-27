@@ -180,6 +180,7 @@ class SqlAlchemyAdjustmentRepository:
     ) -> StoredAdjustmentProposal | None:
         result = self._session.execute(
             sa.update(CalendarMutationProposal)
+            .execution_options(synchronize_session=False)
             .where(
                 CalendarMutationProposal.id == proposal_id,
                 CalendarMutationProposal.status == AdjustmentStatus.PENDING,

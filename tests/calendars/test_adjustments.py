@@ -35,6 +35,8 @@ from healthmes.calendars.base import (
     ConfirmedExternalTimeChange,
     ExternalEvent,
 )
+from healthmes.calendars.state import InMemorySyncStateStore
+from healthmes.calendars.sync import CalendarMirrorService
 from healthmes.store import Base, create_db_engine
 from healthmes.store.enums import CalendarMutationStatus, CalendarSource
 from healthmes.store.models import (
@@ -765,6 +767,72 @@ def test_sqlalchemy_repository_persists_proposal_trigger_and_decisions(session) 
     assert mirror.etag == '"etag-v2"'
     assert len(writer.patch_calls) == 1
     assert_sensitive_values_absent(proposal.receipt, HANDLE, "evt-fixture", '"etag-v1"')
+
+
+def test_provider_deletion_preserves_proposal_and_blocks_later_apply(
+    session, fake_backend, make_event
+) -> None:
+    state_store = InMemorySyncStateStore()
+    mirror_service = CalendarMirrorService(session, [fake_backend], state_store)
+    fake_backend.queue_changes(
+        [
+            make_event(
+                "evt-fixture",
+                summary="Recovery-safe focus block",
+                start=datetime(2026, 7, 22, 5, 0, tzinfo=UTC),
+                end=datetime(2026, 7, 22, 6, 0, tzinfo=UTC),
+                etag='"etag-v1"',
+                organizer_self=True,
+                event_type="default",
+                status="confirmed",
+            )
+        ],
+        {"sync_token": "tok-1"},
+    )
+    mirror_service.sync_backend(fake_backend)
+    mirror = session.query(CalendarEventMirror).filter_by(external_id="evt-fixture").one()
+
+    repo = SqlAlchemyAdjustmentRepository(session)
+    service = CalendarAdjustmentService(repo, handle_secret=SECRET, clock=lambda: NOW)
+    result = service.evaluate_morning_calendar_nudge(
+        local_date=LOCAL_DAY,
+        timezone=KST,
+        health_context=health_context(),
+        candidates=[mirror],
+        afternoon_busy_minutes=240,
+        handle_factory=lambda: HANDLE,
+    )
+    proposal = session.get(CalendarMutationProposal, result.proposal_id)
+    proposal_decision_id = proposal.proposal_decision_record_id
+
+    fake_backend.queue_changes(
+        [make_event("evt-fixture", deleted=True, summary=None, etag=None)],
+        {"sync_token": "tok-2"},
+    )
+    mirror_service.sync_backend(fake_backend)
+    session.expire_all()
+
+    retained = session.get(CalendarMutationProposal, result.proposal_id)
+    assert state_store.load(CalendarSource.GOOGLE) == {"sync_token": "tok-2"}
+    assert session.get(CalendarEventMirror, mirror.id) is None
+    assert retained.mirror_event_id is None
+    assert session.get(DecisionRecord, proposal_decision_id) is not None
+
+    writer = FakeWriter()
+    resolved = service.resolve_calendar_adjustment(
+        result.proposal_id,
+        response="yes",
+        reply_handle=HANDLE,
+        writer=writer,
+        response_channel="telegram",
+        mirror_snapshot=None,
+    )
+
+    assert resolved.status == AdjustmentStatus.CONFLICTED
+    assert writer.patch_calls == []
+    assert session.get(CalendarMutationProposal, result.proposal_id).status is (
+        CalendarMutationStatus.CONFLICTED
+    )
 
 
 @pytest.mark.parametrize(

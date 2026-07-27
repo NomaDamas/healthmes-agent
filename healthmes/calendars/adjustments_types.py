@@ -80,7 +80,7 @@ class HandlePair:
 @dataclass(frozen=True, slots=True)
 class ProposalSnapshot:
     calendar_source: CalendarSource
-    mirror_event_id: uuid.UUID | str
+    mirror_event_id: uuid.UUID | str | None
     external_event_id: str
     operation: AdjustmentOperation
     original_start_at: datetime

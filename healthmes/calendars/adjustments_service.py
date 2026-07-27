@@ -48,6 +48,8 @@ from healthmes.calendars.base import (
     ensure_utc,
 )
 
+_MIRROR_SNAPSHOT_UNSET = object()
+
 
 class CalendarAdjustmentService:
     def __init__(
@@ -151,7 +153,7 @@ class CalendarAdjustmentService:
         reply_handle: str | None,
         writer: CalendarAdjustmentWriter,
         response_channel: str | None = None,
-        mirror_snapshot: Any | None = None,
+        mirror_snapshot: Any = _MIRROR_SNAPSHOT_UNSET,
     ) -> ResolveResult:
         now = ensure_utc(self._clock())
         proposal = self._repository.get_proposal(proposal_id)
@@ -211,7 +213,18 @@ class CalendarAdjustmentService:
                 redacted_receipt(status=current_status, provider_code="not_pending"),
             )
         applying = self._repository.commit_applying_boundary(applying.id) or applying
-        if mirror_snapshot is not None and not snapshot_matches(applying.snapshot, mirror_snapshot):
+        if mirror_snapshot is None:
+            return self._terminal(
+                applying,
+                AdjustmentStatus.CONFLICTED,
+                "mirror_deleted",
+                now,
+                expected_status=AdjustmentStatus.APPLYING,
+            )
+        if (
+            mirror_snapshot is not _MIRROR_SNAPSHOT_UNSET
+            and not snapshot_matches(applying.snapshot, mirror_snapshot)
+        ):
             return self._terminal(
                 applying,
                 AdjustmentStatus.CONFLICTED,

@@ -88,7 +88,7 @@ def upgrade() -> None:
             sa.Enum("google", "caldav", name="calendarsource", native_enum=False, length=32),
             nullable=False,
         ),
-        sa.Column("mirror_event_id", sa.Uuid(), nullable=False),
+        sa.Column("mirror_event_id", sa.Uuid(), nullable=True),
         sa.Column("external_event_id", sa.String(length=255), nullable=False),
         sa.Column(
             "operation",
@@ -138,7 +138,7 @@ def upgrade() -> None:
             ["mirror_event_id"],
             ["calendar_event_mirror.id"],
             name=op.f("fk_calendar_mutation_proposal_mirror_event_id_calendar_event_mirror"),
-            ondelete="RESTRICT",
+            ondelete="SET NULL",
         ),
         sa.ForeignKeyConstraint(
             ["outcome_decision_record_id"],

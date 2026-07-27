@@ -140,8 +140,8 @@ class CalendarMutationProposal(Base):
     calendar_source: Mapped[CalendarSource] = mapped_column(
         default=CalendarSource.GOOGLE, index=True
     )
-    mirror_event_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("calendar_event_mirror.id", ondelete="RESTRICT"), index=True
+    mirror_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("calendar_event_mirror.id", ondelete="SET NULL"), index=True
     )
     external_event_id: Mapped[str_255]
     operation: Mapped[CalendarMutationOperation] = mapped_column(

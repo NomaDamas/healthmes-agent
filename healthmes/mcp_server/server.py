@@ -1908,7 +1908,11 @@ def resolve_calendar_adjustment(
             repository,
             handle_secret=_adjustment_handle_secret(),
         )
-        mirror_snapshot = session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
+        mirror_snapshot = (
+            session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
+            if proposal.snapshot.mirror_event_id is not None
+            else None
+        )
         result = service.resolve_calendar_adjustment(
             proposal_uuid,
             response=response,
