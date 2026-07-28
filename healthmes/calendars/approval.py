@@ -10,6 +10,7 @@ from healthmes.store import CalendarSource
 class ApprovalCalendar:
     backend: CalendarBackend
     target: str
+    review_base_url: str | None = None
 
 
 def calendar_approval_target(settings: Settings, source: CalendarSource) -> str:

@@ -14,12 +14,17 @@ from healthmes.calendars.approval import ApprovalCalendar
 from healthmes.calendars.base import (
     CalendarBackend,
     CalendarError,
+    CalendarEventIdentity,
     EventNotFoundError,
     HealthmesEventKind,
     ensure_utc,
 )
 from healthmes.calendars.sleep_event_rendering import observation_fingerprint
-from healthmes.calendars.sleep_observation import ActualSleepObservation, SleepObservationNoOp
+from healthmes.calendars.sleep_observation import (
+    ActualSleepObservation,
+    SleepObservationNoOp,
+    calendar_observations,
+)
 from healthmes.calendars.sleep_proposal_state import capture_provider_state, redacted_digest
 from healthmes.calendars.sleep_reconciliation import SleepCalendarReconciler, SleepCalendarResult
 from healthmes.calendars.sleep_source import SleepSummaryReader, read_actual_sleep
@@ -79,7 +84,12 @@ async def apply_sleep_proposal(
     if current_time >= expires_at:
         return _close(session, proposal, SleepProposalStatus.EXPIRED, current_time)
 
-    selected = await read_actual_sleep(reader, user_id, proposal.local_date)
+    selected = await read_actual_sleep(
+        reader,
+        user_id,
+        proposal.local_date,
+        review_base_url=calendar.review_base_url,
+    )
     if isinstance(selected, SleepObservationNoOp):
         return _close(session, proposal, SleepProposalStatus.CONFLICTED, current_time)
     if observation_fingerprint(selected) != proposal.observation_fingerprint:
@@ -131,17 +141,28 @@ def _read_back(
     observation: ActualSleepObservation,
     result: SleepCalendarResult,
 ) -> dict[str, Any]:
-    remote = backend.read_event(result.external_id)
-    if (
-        not remote.is_agent_created
-        or remote.identity is None
-        or remote.identity.kind is not HealthmesEventKind.ACTUAL_SLEEP
-        or remote.start_at != ensure_utc(observation.start_at)
-        or remote.end_at != ensure_utc(observation.end_at)
-    ):
-        raise SleepReadBackError(
-            "calendar read-back did not match the approved actual sleep"
+    children = calendar_observations(observation)
+    external_ids = result.external_ids or (result.external_id,)
+    if len(children) != len(external_ids):
+        raise SleepReadBackError("calendar read-back event count did not match")
+    remotes = []
+    for child, external_id in zip(children, external_ids, strict=True):
+        remote = backend.read_event(external_id)
+        expected_identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source=child.provider,
+            source_key=child.source_key,
         )
+        if (
+            not remote.is_agent_created
+            or remote.identity != expected_identity
+            or remote.start_at != ensure_utc(child.start_at)
+            or remote.end_at != ensure_utc(child.end_at)
+        ):
+            raise SleepReadBackError(
+                "calendar read-back did not match the approved actual sleep"
+            )
+        remotes.append(remote)
     for external_id in result.deleted_planned_external_ids:
         try:
             backend.read_event(external_id)
@@ -153,9 +174,18 @@ def _read_back(
         "action": result.action.value,
         "calendar": backend.source.value,
         "event": redacted_digest(result.external_id),
-        "start": remote.start_at.isoformat(),
-        "wake_time": remote.end_at.isoformat(),
+        "events": [redacted_digest(external_id) for external_id in external_ids],
+        "segments": [
+            {
+                "start": remote.start_at.isoformat(),
+                "wake_time": remote.end_at.isoformat(),
+            }
+            for remote in remotes
+        ],
+        "start": ensure_utc(observation.start_at).isoformat(),
+        "wake_time": ensure_utc(observation.end_at).isoformat(),
         "planned_sleep_deleted": len(result.deleted_planned_external_ids),
+        "stale_actual_sleep_deleted": len(result.deleted_actual_external_ids),
         "read_back_at": dt.datetime.now(dt.UTC).isoformat(),
     }
 

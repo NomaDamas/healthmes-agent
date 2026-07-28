@@ -18,7 +18,10 @@ from healthmes.calendars.sleep_mirror import (
     SLEEP_CREATE_PENDING_STATUS,
     SLEEP_UPDATE_PENDING_STATUS,
 )
-from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.calendars.sleep_observation import (
+    ActualSleepObservation,
+    calendar_observations,
+)
 from healthmes.calendars.sleep_reconciliation import observation_fingerprint
 from healthmes.calendars.sleep_reconciliation_guards import pending_remote_matches
 from healthmes.store.enums import CalendarSource
@@ -38,6 +41,9 @@ class SleepPreview(TypedDict):
     non_sleep_minutes: int | None
     source: str
     planned_sleep_replacements: int
+    segments: NotRequired[list[dict[str, object]]]
+    segment_count: NotRequired[int]
+    stale_segment_removals: NotRequired[int]
     reason: NotRequired[str]
 
 
@@ -47,19 +53,43 @@ def preview_sleep_reconciliation(
     observation: ActualSleepObservation,
     backend: CalendarBackend | None,
 ) -> SleepPreview:
-    existing = session.scalar(
+    children = calendar_observations(observation)
+    child_keys = {child.source_key for child in children}
+    child_actions: list[str] = []
+    reason: str | None = None
+    for child in children:
+        existing = session.scalar(
+            sa.select(CalendarEventMirror).where(
+                CalendarEventMirror.calendar_source == calendar_source,
+                CalendarEventMirror.healthmes_source_key == child.source_key,
+            )
+        )
+        child_action, child_reason = _actual_sleep_action(
+            existing,
+            child,
+            observation_fingerprint(child),
+            backend,
+        )
+        child_actions.append(child_action)
+        if child_reason is not None:
+            reason = child_reason
+            break
+    stale_segments = session.scalars(
         sa.select(CalendarEventMirror).where(
             CalendarEventMirror.calendar_source == calendar_source,
-            CalendarEventMirror.healthmes_source_key == observation.source_key,
+            CalendarEventMirror.is_agent_created.is_(True),
+            CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
+            CalendarEventMirror.healthmes_source == observation.provider,
+            CalendarEventMirror.sleep_local_date == observation.local_date,
+            CalendarEventMirror.healthmes_source_key.like(
+                f"{observation.source_key}:segment:%"
+            ),
+            CalendarEventMirror.healthmes_source_key.not_in(child_keys),
         )
-    )
-    fingerprint = observation_fingerprint(observation)
-    action, reason = _actual_sleep_action(
-        existing,
-        observation,
-        fingerprint,
-        backend,
-    )
+    ).all()
+    action = _combined_action(child_actions, stale_segments, bool(observation.segments))
+    if reason is not None:
+        action = "blocked"
     planned = session.scalars(
         sa.select(CalendarEventMirror).where(
             CalendarEventMirror.calendar_source == calendar_source,
@@ -103,7 +133,36 @@ def preview_sleep_reconciliation(
     }
     if reason is not None:
         result["reason"] = reason
+    if observation.segments:
+        result["segments"] = [
+            {
+                "start": ensure_utc(segment.start_at).isoformat(),
+                "wake_time": ensure_utc(segment.end_at).isoformat(),
+                "duration_minutes": int(
+                    (segment.end_at - segment.start_at).total_seconds() // 60
+                ),
+            }
+            for segment in observation.segments
+        ]
+        result["segment_count"] = len(observation.segments)
+        result["stale_segment_removals"] = len(stale_segments)
     return result
+
+
+def _combined_action(
+    child_actions: list[str],
+    stale_segments: list[CalendarEventMirror],
+    is_split: bool,
+) -> str:
+    if "blocked" in child_actions:
+        return "blocked"
+    if all(action == "noop" for action in child_actions) and not stale_segments:
+        return "noop"
+    if is_split:
+        return "would_split"
+    if "would_create" in child_actions:
+        return "would_create"
+    return "would_update"
 
 
 def _actual_sleep_action(

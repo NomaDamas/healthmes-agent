@@ -188,7 +188,9 @@ keep/reconsider/insufficient-data decision), `doctor-visit-summary`.
 ## Quickstart (mac-native, primary path)
 
 Requires [uv](https://docs.astral.sh/uv/) and Homebrew; everything is
-ephemeral and repo-local (no `brew services`, no autostart).
+repo-local without `brew services`; `scripts/healthmes_local.sh install`
+registers a per-user macOS LaunchAgent so the stack starts at login and is
+kept alive.
 
 ```bash
 make mac-setup            # brew postgresql@16 + redis if missing, initdb,

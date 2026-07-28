@@ -127,6 +127,7 @@ async def _runtime(request: Request, settings: Settings) -> SleepReviewRuntime:
         ApprovalCalendar(
             _build_backend(settings, source),
             calendar_approval_target(settings, source),
+            settings.public_base_url,
         ),
     )
 
@@ -143,6 +144,8 @@ def _render(
     display_wake = None
     receipt_start = None
     receipt_wake = None
+    display_segments: list[dict[str, object]] = []
+    receipt_segments: list[dict[str, str]] = []
     if proposal is not None and local is not None:
         token = approval_token(
             proposal,
@@ -158,12 +161,38 @@ def _render(
                 str(proposal.snapshot["wake_time"]),
                 timezone,
             )
+        for index, segment in enumerate(proposal.snapshot.get("segments", []), start=1):
+            if not isinstance(segment, dict):
+                continue
+            display_segments.append(
+                {
+                    "index": index,
+                    "start": _display_timestamp(str(segment["start"]), timezone),
+                    "wake_time": _display_timestamp(
+                        str(segment["wake_time"]),
+                        timezone,
+                    ),
+                    "duration_minutes": segment["duration_minutes"],
+                }
+            )
         if proposal.receipt:
             receipt_start = _display_timestamp(str(proposal.receipt["start"]), timezone)
             receipt_wake = _display_timestamp(
                 str(proposal.receipt["wake_time"]),
                 timezone,
             )
+            for segment in proposal.receipt.get("segments", []):
+                if not isinstance(segment, dict):
+                    continue
+                receipt_segments.append(
+                    {
+                        "start": _display_timestamp(str(segment["start"]), timezone),
+                        "wake_time": _display_timestamp(
+                            str(segment["wake_time"]),
+                            timezone,
+                        ),
+                    }
+                )
     template = template_environment().get_template("ui/sleep.html.j2")
     return template.render(
         proposal=proposal,
@@ -171,8 +200,10 @@ def _render(
         approval_token=token,
         display_start=display_start,
         display_wake=display_wake,
+        display_segments=display_segments,
         receipt_start=receipt_start,
         receipt_wake=receipt_wake,
+        receipt_segments=receipt_segments,
         error=error,
         pending=proposal is not None and proposal.status is SleepProposalStatus.PENDING,
         active_nav="sleep",

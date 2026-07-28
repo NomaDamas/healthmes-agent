@@ -450,6 +450,23 @@ class OWClient:
             params["filter_by_priority"] = filter_by_priority
         return await self._get(f"/api/v1/users/{user_id}/events/sleep", params=params)
 
+    async def collect_sleep_sessions(
+        self,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+    ) -> list[dict[str, Any]]:
+        rows, _truncated = await self._collect_cursor(
+            lambda cursor: self.get_sleep_sessions(
+                user_id,
+                start_date,
+                end_date,
+                cursor=cursor,
+                filter_by_priority=True,
+            )
+        )
+        return rows
+
     # ------------------------------------------------------------------
     # Timeseries (routes/v1/timeseries.py — cursor pagination)
     # ------------------------------------------------------------------

@@ -9,7 +9,10 @@ from sqlalchemy.orm import Session
 
 from healthmes.calendars.approval import ApprovalCalendar
 from healthmes.calendars.base import HealthmesEventKind, ensure_utc
-from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.calendars.sleep_observation import (
+    ActualSleepObservation,
+    calendar_observations,
+)
 from healthmes.store.models import CalendarEventMirror
 
 
@@ -23,20 +26,39 @@ def capture_provider_state(
     observation: ActualSleepObservation,
 ) -> dict[str, Any]:
     backend = calendar.backend
-    actual = session.scalar(
+    children = calendar_observations(observation)
+    child_keys = {child.source_key for child in children}
+    actual_rows = session.scalars(
         sa.select(CalendarEventMirror).where(
             CalendarEventMirror.calendar_source == backend.source,
-            CalendarEventMirror.healthmes_source_key == observation.source_key,
+            CalendarEventMirror.is_agent_created.is_(True),
+            CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
+            CalendarEventMirror.healthmes_source == observation.provider,
+            CalendarEventMirror.sleep_local_date == observation.local_date,
+            sa.or_(
+                CalendarEventMirror.healthmes_source_key.in_(child_keys),
+                CalendarEventMirror.healthmes_source_key.like(
+                    f"{observation.source_key}:segment:%"
+                ),
+            ),
         )
-    )
-    actual_state: dict[str, Any] | None = None
-    if actual is not None:
+    ).all()
+    actual_states: list[dict[str, Any]] = []
+    for actual in actual_rows:
         remote = backend.read_event(actual.external_id)
-        actual_state = {
-            "external_id": actual.external_id,
-            "etag": remote.etag,
-            "identity": redacted_digest(repr(remote.identity)),
-        }
+        actual_states.append(
+            {
+                "external_id": actual.external_id,
+                "etag": remote.etag,
+                "identity": redacted_digest(repr(remote.identity)),
+            }
+        )
+    actual_states.sort(key=lambda item: str(item["external_id"]))
+    actual_state: dict[str, Any] | list[dict[str, Any]] | None
+    if observation.segments or len(actual_states) > 1:
+        actual_state = actual_states
+    else:
+        actual_state = actual_states[0] if actual_states else None
 
     planned_rows = session.scalars(
         sa.select(CalendarEventMirror).where(
@@ -71,7 +93,7 @@ def redacted_provider_guard(provider_state: dict[str, Any]) -> dict[str, Any]:
     actual = provider_state["actual"]
     planned = provider_state["planned"]
     actual_digest = None
-    if isinstance(actual, dict):
+    if isinstance(actual, (dict, list)):
         actual_digest = redacted_digest(json.dumps(actual, sort_keys=True))
     planned_digests = [
         redacted_digest(json.dumps(item, sort_keys=True))

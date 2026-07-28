@@ -6,7 +6,6 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol
 
 import anyio
-from pydantic import ValidationError
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars.approval import ApprovalCalendar, calendar_approval_target
@@ -15,13 +14,11 @@ from healthmes.calendars.jobs import _build_backend, write_source
 from healthmes.calendars.sleep_observation import (
     ActualSleepObservation,
     SleepObservationNoOp,
-    SleepObservationNoOpReason,
-    SleepSummaryPayload,
-    select_actual_sleep,
 )
 from healthmes.calendars.sleep_preview import preview_sleep_reconciliation
 from healthmes.calendars.sleep_proposals import prepare_sleep_proposal
 from healthmes.calendars.sleep_reconciliation import SleepCalendarReconciler
+from healthmes.calendars.sleep_source import read_actual_sleep
 from healthmes.config import Settings, resolve_timezone
 from healthmes.mcp_server.ow_client import (
     OWClient,
@@ -90,6 +87,7 @@ def build_sleep_reconciliation_job(
             calendar=ApprovalCalendar(
                 backend,
                 calendar_approval_target(settings, calendar_source),
+                settings.public_base_url,
             ),
         )
 
@@ -215,20 +213,11 @@ async def reconcile_recent_sleep(
     backend: CalendarBackend | None,
     dry_run: bool = False,
 ) -> dict[str, object]:
-    end_date = target_date + dt.timedelta(days=1)
-    rows = await client.collect_sleep_summaries(
+    selected: ActualSleepObservation | SleepObservationNoOp = await read_actual_sleep(
+        client,
         user_id,
-        target_date.isoformat(),
-        end_date.isoformat(),
+        target_date,
     )
-    try:
-        summaries = tuple(SleepSummaryPayload.model_validate(row) for row in rows)
-    except ValidationError:
-        selected: ActualSleepObservation | SleepObservationNoOp = SleepObservationNoOp(
-            reason=SleepObservationNoOpReason.INCOMPLETE
-        )
-    else:
-        selected = select_actual_sleep(summaries, target_date)
     if isinstance(selected, SleepObservationNoOp):
         return {
             "status": "noop",

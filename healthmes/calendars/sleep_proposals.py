@@ -37,7 +37,12 @@ async def prepare_sleep_proposal(
     calendar: ApprovalCalendar,
     now: dt.datetime | None = None,
 ) -> SleepReconciliationProposal:
-    selected = await read_actual_sleep(reader, user_id, target_date)
+    selected = await read_actual_sleep(
+        reader,
+        user_id,
+        target_date,
+        review_base_url=calendar.review_base_url,
+    )
     created_at = now or dt.datetime.now(dt.UTC)
     if isinstance(selected, SleepObservationNoOp):
         snapshot: dict[str, Any] = {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
@@ -30,7 +31,10 @@ from healthmes.calendars.sleep_mirror import (
     mark_sleep_update_pending,
     pending_sleep_mirror,
 )
-from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.calendars.sleep_observation import (
+    ActualSleepObservation,
+    calendar_observations,
+)
 from healthmes.calendars.sleep_reconciliation_guards import (
     assert_owned_actual_sleep,
     assert_pending_remote_matches,
@@ -55,6 +59,53 @@ class SleepCalendarReconciler:
         self._backend = backend
 
     def reconcile(self, observation: ActualSleepObservation) -> SleepCalendarResult:
+        children = calendar_observations(observation)
+        if len(children) == 1 and children[0] is observation:
+            result = self._reconcile_one(observation)
+            stale = self._delete_stale_segments(observation, {observation.source_key})
+            if not stale:
+                return result
+            return replace(
+                result,
+                external_ids=(result.external_id,),
+                deleted_actual_external_ids=stale,
+            )
+        results = tuple(self._reconcile_one(child) for child in children)
+        stale = self._delete_stale_segments(
+            observation,
+            {child.source_key for child in children},
+        )
+        planned_deleted = tuple(
+            dict.fromkeys(
+                external_id
+                for result in results
+                for external_id in result.deleted_planned_external_ids
+            )
+        )
+        action = (
+            SleepCalendarAction.CREATED
+            if any(result.action is SleepCalendarAction.CREATED for result in results)
+            else SleepCalendarAction.UPDATED
+            if any(result.action is SleepCalendarAction.UPDATED for result in results)
+            or stale
+            else SleepCalendarAction.NOOP
+        )
+        return SleepCalendarResult(
+            action=action,
+            external_id=results[0].external_id,
+            external_ids=tuple(result.external_id for result in results),
+            observation_fingerprint=observation_fingerprint(observation),
+            deleted_planned_external_ids=planned_deleted,
+            deleted_actual_external_ids=stale,
+            planned_sleep_cleanup_pending=sum(
+                result.planned_sleep_cleanup_pending for result in results
+            ),
+        )
+
+    def _reconcile_one(
+        self,
+        observation: ActualSleepObservation,
+    ) -> SleepCalendarResult:
         fingerprint = observation_fingerprint(observation)
         identity = CalendarEventIdentity(
             kind=HealthmesEventKind.ACTUAL_SLEEP,
@@ -67,6 +118,45 @@ class SleepCalendarReconciler:
         finally:
             if lock_connection is not None:
                 self._unlock_source_key(lock_connection, identity.source_key)
+
+    def _delete_stale_segments(
+        self,
+        observation: ActualSleepObservation,
+        current_keys: set[str],
+    ) -> tuple[str, ...]:
+        rows = self._session.scalars(
+            sa.select(CalendarEventMirror).where(
+                CalendarEventMirror.calendar_source == self._backend.source,
+                CalendarEventMirror.is_agent_created.is_(True),
+                CalendarEventMirror.healthmes_kind
+                == HealthmesEventKind.ACTUAL_SLEEP.value,
+                CalendarEventMirror.healthmes_source == observation.provider,
+                CalendarEventMirror.sleep_local_date == observation.local_date,
+                CalendarEventMirror.healthmes_source_key.like(
+                    f"{observation.source_key}:segment:%"
+                ),
+                CalendarEventMirror.healthmes_source_key.not_in(current_keys),
+            )
+        ).all()
+        deleted: list[str] = []
+        for row in rows:
+            identity = CalendarEventIdentity(
+                kind=HealthmesEventKind.ACTUAL_SLEEP,
+                source=observation.provider,
+                source_key=row.healthmes_source_key or "",
+            )
+            remote = self._backend.read_event(row.external_id)
+            expected_etag = assert_remote_actual_sleep(remote, identity, row.etag)
+            self._backend.delete_event(
+                row.external_id,
+                expected_kind=HealthmesEventKind.ACTUAL_SLEEP,
+                expected_etag=expected_etag,
+            )
+            deleted.append(row.external_id)
+            self._session.delete(row)
+        if deleted:
+            self._session.commit()
+        return tuple(deleted)
 
     def _reconcile_locked(
         self,

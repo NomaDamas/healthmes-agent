@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import StrEnum
 
@@ -42,6 +42,29 @@ class SleepSummaryPayload(BaseModel):
     sessions: tuple[SleepSessionPayload, ...] | None = None
 
 
+class SleepStageIntervalPayload(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stage: str
+    start_time: datetime
+    end_time: datetime
+
+
+class DetailedSleepSessionPayload(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    start_time: datetime
+    end_time: datetime
+    is_nap: bool = False
+    sleep_stage_intervals: tuple[SleepStageIntervalPayload, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SleepSegment:
+    start_at: datetime
+    end_at: datetime
+
+
 @dataclass(frozen=True, slots=True)
 class ActualSleepObservation:
     local_date: date
@@ -51,6 +74,8 @@ class ActualSleepObservation:
     end_at: datetime
     duration_minutes: int
     time_in_bed_minutes: int | None
+    segments: tuple[SleepSegment, ...] = ()
+    review_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,4 +205,71 @@ def _candidate(
             time_in_bed_minutes=summary.time_in_bed_minutes,
         ),
         main_session_minutes=main_session_minutes,
+    )
+
+
+def split_observation_at_awake_intervals(
+    observation: ActualSleepObservation,
+    sessions: tuple[DetailedSleepSessionPayload, ...],
+) -> ActualSleepObservation:
+    matching = tuple(
+        session
+        for session in sessions
+        if not session.is_nap
+        and session.sleep_stage_intervals
+        and session.start_time == observation.start_at
+        and session.end_time == observation.end_at
+    )
+    if len(matching) != 1:
+        return observation
+
+    segments: list[SleepSegment] = []
+    for interval in sorted(
+        matching[0].sleep_stage_intervals or (),
+        key=lambda item: item.start_time,
+    ):
+        if interval.stage.lower() not in {"deep", "light", "rem"}:
+            continue
+        start_at = max(interval.start_time, observation.start_at)
+        end_at = min(interval.end_time, observation.end_at)
+        if end_at <= start_at:
+            continue
+        if segments and start_at <= segments[-1].end_at:
+            segments[-1] = SleepSegment(
+                start_at=segments[-1].start_at,
+                end_at=max(segments[-1].end_at, end_at),
+            )
+        else:
+            segments.append(SleepSegment(start_at=start_at, end_at=end_at))
+
+    return replace(observation, segments=tuple(segments)) if segments else observation
+
+
+def calendar_observations(
+    observation: ActualSleepObservation,
+) -> tuple[ActualSleepObservation, ...]:
+    if not observation.segments:
+        return (observation,)
+    return tuple(
+        replace(
+            observation,
+            source_key=(
+                observation.source_key
+                if index == 0
+                else f"{observation.source_key}:segment:{index + 1}"
+            ),
+            start_at=segment.start_at,
+            end_at=segment.end_at,
+            duration_minutes=max(
+                1,
+                int((segment.end_at - segment.start_at).total_seconds() // 60),
+            ),
+            time_in_bed_minutes=max(
+                1,
+                int((segment.end_at - segment.start_at).total_seconds() // 60),
+            ),
+            segments=(),
+        )
+        for index, segment in enumerate(observation.segments)
+        if segment.end_at > segment.start_at
     )

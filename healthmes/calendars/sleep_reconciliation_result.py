@@ -15,7 +15,9 @@ class SleepCalendarResult:
     action: SleepCalendarAction
     external_id: str
     observation_fingerprint: str
+    external_ids: tuple[str, ...] = ()
     deleted_planned_external_ids: tuple[str, ...] = ()
+    deleted_actual_external_ids: tuple[str, ...] = ()
     planned_sleep_cleanup_pending: int = 0
 
 

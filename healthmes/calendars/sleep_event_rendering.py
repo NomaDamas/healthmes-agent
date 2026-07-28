@@ -22,6 +22,11 @@ def observation_fingerprint(observation: ActualSleepObservation) -> str:
         ensure_utc(observation.end_at).isoformat(),
         str(observation.duration_minutes),
         str(observation.time_in_bed_minutes),
+        str(observation.review_url),
+        *(
+            f"{ensure_utc(segment.start_at).isoformat()}:{ensure_utc(segment.end_at).isoformat()}"
+            for segment in observation.segments
+        ),
     )
     return hashlib.sha256("\x1f".join(values).encode()).hexdigest()
 
@@ -40,12 +45,18 @@ def event_draft(
 
 
 def description(observation: ActualSleepObservation) -> str:
+    review_link = (
+        f"\nReview or update in HealthMes: {observation.review_url}"
+        if observation.review_url
+        else ""
+    )
     if observation.time_in_bed_minutes is None:
         return (
             "Oura bedtime window: unavailable\n"
             f"Actual sleep: {observation.duration_minutes} min\n"
             "Non-sleep within window: unavailable\n"
             f"Source: {observation.provider}"
+            f"{review_link}"
         )
     non_sleep_minutes = (
         observation.time_in_bed_minutes - observation.duration_minutes
@@ -55,4 +66,5 @@ def description(observation: ActualSleepObservation) -> str:
         f"Actual sleep: {observation.duration_minutes} min\n"
         f"Non-sleep within window: {non_sleep_minutes} min\n"
         f"Source: {observation.provider}"
+        f"{review_link}"
     )
