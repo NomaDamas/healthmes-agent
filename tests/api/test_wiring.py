@@ -36,7 +36,7 @@ EXPECTED_PATHS = [
 
 
 def test_routers_list_covers_all_modules():
-    assert len(routers) == 15
+    assert len(routers) == 17
 
 
 def test_openapi_schema_generates_with_all_paths(client):

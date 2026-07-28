@@ -8,7 +8,9 @@ same posture as /decisions).
 """
 
 import json
+import re
 from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -134,11 +136,97 @@ def test_gating_matches_viewer_pages(settings) -> None:
         )
         assert via_bearer.status_code == 200
 
+    with TestClient(
+        create_app(secured),
+        base_url="http://127.0.0.1:8100",
+    ) as loopback:
+        local_page = loopback.get("/connect")
+        assert local_page.status_code == 200
+        assert "healthmes_local_session" in local_page.headers["set-cookie"]
+
 
 def test_landing_links_to_connect(client) -> None:
     response = client.get("/")
     assert response.status_code == 200
     assert 'href="/connect"' in response.text
+
+
+class FakeCredentials:
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "refresh_token": REFRESH_TOKEN,
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+            }
+        )
+
+
+class FakeWebFlow:
+    credentials = FakeCredentials()
+
+    def authorization_url(self, **kwargs):
+        state = kwargs["state"]
+        return f"https://accounts.google.test/authorize?state={state}", state
+
+    def fetch_token(self, *, authorization_response):
+        assert "code=one-time-code" in authorization_response
+
+
+def test_loopback_google_oauth_connect_and_disconnect_without_secret_render(
+    app,
+    settings,
+) -> None:
+    client_secret = settings.data_dir / "google" / "client_secret.json"
+    client_secret.parent.mkdir(parents=True, exist_ok=True)
+    client_secret.write_text('{"installed":{}}', encoding="utf-8")
+    app.state.google_oauth_flow_factory = lambda *_args: FakeWebFlow()
+
+    with TestClient(app, base_url="http://127.0.0.1:8100") as local:
+        page = local.get("/connect")
+        csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+        assert csrf is not None
+        assert "이 Mac에서 Google 로그인" in page.text
+
+        started = local.post(
+            "/connect/google/start",
+            data={"csrf": csrf.group(1)},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert started.status_code == 303
+        state = parse_qs(urlsplit(started.headers["location"]).query)["state"][0]
+
+        callback = local.get(
+            f"/connect/google/callback?state={state}&code=one-time-code",
+            follow_redirects=False,
+        )
+        assert callback.status_code == 303
+        assert callback.headers["location"] == "/connect?google=connected"
+        connected = local.get(callback.headers["location"])
+        assert "Google OAuth credential 확인됨" in connected.text
+        assert REFRESH_TOKEN not in connected.text
+        assert "client-secret" not in connected.text
+        csrf = re.search(r'name="csrf" value="([^"]+)"', connected.text)
+        assert csrf is not None
+
+        reconnecting = local.post(
+            "/connect/google/reconnect",
+            data={"csrf": csrf.group(1)},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert reconnecting.status_code == 303
+        assert creds.google_connection_state(settings.data_dir) == "connected"
+
+        disconnected = local.post(
+            "/connect/google/disconnect",
+            data={"csrf": csrf.group(1)},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert disconnected.status_code == 303
+        assert creds.google_connection_state(settings.data_dir) == "not_connected"
 
 
 @pytest.mark.asyncio

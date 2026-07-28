@@ -1,0 +1,89 @@
+{% extends "ui/_base.html.j2" %}
+
+{% block title %}Actual sleep review — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">/ actual sleep</span>{% endblock %}
+
+{% block head %}
+<style>
+  .sleep-grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+  .sleep-value { font-size: 1.15rem; font-weight: 720; }
+  .sleep-actions { display: flex; flex-wrap: wrap; gap: 0.7rem; margin-top: 1rem; }
+  .sleep-actions button {
+    border: 1px solid var(--brand); border-radius: var(--radius-sm);
+    padding: 0.65rem 1rem; background: var(--brand); color: white;
+    font: inherit; font-weight: 700; cursor: pointer;
+  }
+  .sleep-actions .keep { color: var(--ink); background: var(--surface); border-color: var(--line); }
+  .receipt { border-left: 4px solid var(--brand); }
+</style>
+{% endblock %}
+
+{% block content %}
+<p class="eyebrow">Approval-bound Calendar write</p>
+<h1>Oura actual sleep → Calendar</h1>
+<p class="muted">이 화면은 현재 Oura observation과 Calendar 상태를 다시 읽고,
+  서버에 고정한 redacted preview만 승인합니다. 입력값으로 캘린더 내용을 바꿀 수 없습니다.</p>
+
+{% if error %}
+<section class="card"><h2>준비되지 않음</h2><p class="error">{{ error }}</p></section>
+{% elif proposal %}
+<div class="sleep-grid">
+  <section class="card">
+    <p class="eyebrow">Oura actual sleep</p>
+    <h2>{{ proposal.local_date }}</h2>
+    {% if proposal.snapshot.start %}
+    <p class="sleep-value">{{ proposal.snapshot.start }} → {{ proposal.snapshot.wake_time }}</p>
+    <p class="muted">수면 {{ proposal.snapshot.duration_minutes }}분 · 침대 {{ proposal.snapshot.time_in_bed_minutes or "—" }}분</p>
+    {% else %}
+    <p class="muted">{{ proposal.snapshot.reason or "관찰값 없음" }}</p>
+    {% endif %}
+  </section>
+  <section class="card">
+    <p class="eyebrow">Current Calendar</p>
+    <h2>{{ proposal.calendar_source.value }}</h2>
+    <p class="sleep-value">{{ proposal.snapshot.action or proposal.status.value }}</p>
+    <p class="muted">대체 예정 planned sleep {{ proposal.snapshot.planned_sleep_replacements or 0 }}개</p>
+    {% if proposal.snapshot.reason %}<p class="error">{{ proposal.snapshot.reason }}</p>{% endif %}
+  </section>
+</div>
+
+<section class="card">
+  <p class="eyebrow">Exact redacted preview</p>
+  <h2>수면 (실제)</h2>
+  <p>{{ proposal.snapshot.start or "—" }} → {{ proposal.snapshot.wake_time or "—" }}</p>
+  <p class="muted">source {{ proposal.snapshot.source or "—" }} · observation {{ proposal.observation_fingerprint[:12] }}…</p>
+  <p class="muted">remote guard actual {{ proposal.snapshot.provider_guard.actual if proposal.snapshot.provider_guard else "—" }}
+    · planned {{ proposal.snapshot.provider_guard.planned|length if proposal.snapshot.provider_guard else 0 }}개</p>
+
+  {% if pending and local_session %}
+  <div class="sleep-actions">
+    <form method="post" action="/sleep/apply">
+      <input type="hidden" name="proposal_id" value="{{ proposal.id }}">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <input type="hidden" name="approval" value="{{ approval_token }}">
+      <button type="submit">이 preview를 Calendar에 반영</button>
+    </form>
+    <form method="post" action="/sleep/keep">
+      <input type="hidden" name="proposal_id" value="{{ proposal.id }}">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <button class="keep" type="submit">현재 Calendar 유지</button>
+    </form>
+  </div>
+  {% elif pending %}
+  <p class="error">승인은 HealthMes가 실행 중인 Mac의 loopback 브라우저에서만 가능합니다.</p>
+  {% else %}
+  <p class="muted">terminal status: <strong>{{ proposal.status.value }}</strong></p>
+  {% endif %}
+</section>
+
+{% if proposal.receipt %}
+<section class="card receipt">
+  <p class="eyebrow">Fresh provider read-back</p>
+  <h2>검증 완료</h2>
+  <p>{{ proposal.receipt.start }} → {{ proposal.receipt.wake_time }}</p>
+  <p class="muted">action {{ proposal.receipt.action }} · event {{ proposal.receipt.event }}
+    · planned sleep 삭제 {{ proposal.receipt.planned_sleep_deleted }}개</p>
+</section>
+{% endif %}
+{% endif %}
+{% endblock %}

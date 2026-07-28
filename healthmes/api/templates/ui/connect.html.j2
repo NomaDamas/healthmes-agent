@@ -20,6 +20,15 @@
   ol.conn-steps { margin: 0.4rem 0 0.2rem; padding-left: 1.3rem; }
   ol.conn-steps li { margin: 0.25rem 0; font-size: 0.9rem; }
   .conn-note { color: var(--ink-2); font-size: 0.86rem; margin: 0.35rem 0; }
+  .conn-actions { display: flex; flex-wrap: wrap; gap: 0.65rem; margin-top: 0.7rem; }
+  .conn-actions button {
+    border: 1px solid var(--brand); border-radius: var(--radius-sm);
+    padding: 0.58rem 0.9rem; background: var(--brand); color: #fff;
+    font: inherit; font-weight: 700; cursor: pointer;
+  }
+  .conn-actions .secondary {
+    border-color: var(--line); background: var(--surface); color: var(--ink);
+  }
 </style>
 {% endblock %}
 
@@ -31,6 +40,9 @@
 {% if not scheduler_enabled %}
 <p class="conn-note">참고: 연결되어 있어도 캘린더 폴링은 서비스가
   <code>HEALTHMES_SCHEDULER_ENABLED=true</code> 로 실행 중일 때만 동작합니다.</p>
+{% endif %}
+{% if google_result %}
+<p class="conn-note">Google Calendar: {{ google_result }}</p>
 {% endif %}
 
 {% for cal in cards %}
@@ -46,6 +58,25 @@
   {% for note in cal.notes %}
   <p class="conn-note">{{ note }}</p>
   {% endfor %}
+  {% if cal.key == "google" and local_session %}
+    {% if cal.connected %}
+    <div class="conn-actions">
+      <form method="post" action="/connect/google/reconnect">
+        <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+        <button type="submit">Google 다시 연결</button>
+      </form>
+      <form method="post" action="/connect/google/disconnect">
+        <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+        <button class="secondary" type="submit">Google 연결 해제</button>
+      </form>
+    </div>
+    {% else %}
+    <form class="conn-actions" method="post" action="/connect/google/start">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <button type="submit">이 Mac에서 Google 로그인</button>
+    </form>
+    {% endif %}
+  {% endif %}
   {% if not cal.connected and cal.command %}
     {% if cal.steps %}
     <p>최초 1회 준비 (Google이 요구하는 개인 OAuth 클라이언트 등록):</p>

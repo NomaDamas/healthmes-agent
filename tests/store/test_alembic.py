@@ -26,6 +26,7 @@ EXPECTED_TABLES = {
     "task",
     "calendar_event_mirror",
     "calendar_mutation_proposal",
+    "sleep_reconciliation_proposal",
     "schedule_proposal",
     "food_log",
     "app_usage_sample",

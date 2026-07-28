@@ -13,6 +13,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "dev_mac.sh"
+LOCAL_SCRIPT = REPO_ROOT / "scripts" / "healthmes_local.sh"
 
 
 def _function_body(text: str, name: str) -> str:
@@ -37,3 +38,28 @@ def test_ow_env_freezes_uv_against_vendor_lock_rewrites() -> None:
     assert re.search(r"^\s*export UV_FROZEN=1\s*$", body, re.MULTILINE)
     # The venv redirect that keeps the vendored backend's venv out of vendor/.
     assert 'export UV_PROJECT_ENVIRONMENT="$OW_VENV_DIR"' in body
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_single_entry_local_script_parses_and_exposes_runtime_commands() -> None:
+    subprocess.run(["bash", "-n", str(LOCAL_SCRIPT)], check=True)
+    text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+    for command in (
+        "install",
+        "update",
+        "start",
+        "stop",
+        "status",
+        "open",
+        "uninstall",
+    ):
+        assert re.search(rf"^{command}\) ", text, re.MULTILINE)
+    assert 'open "$DASHBOARD_URL"' in text
+
+
+def test_uninstall_keeps_data_unless_delete_data_is_explicit() -> None:
+    text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+    body = _function_body(text, "cmd_uninstall")
+    assert '[ "${1:-}" = "--delete-data" ]' in body
+    assert '[ "$DATA_DIR" = "$REPO_ROOT/data" ]' in body
+    assert 'rm -rf "$DATA_DIR"' in body

@@ -121,6 +121,8 @@ class FakeCalendarBackend:
             start_at=start_at,
             end_at=end_at,
             is_agent_created=True,
+            identity=self.events[external_id].identity,
+            healthmes_kind=self.events[external_id].healthmes_kind,
             etag="etag-updated",
         )
         self.events[external_id] = event

@@ -665,7 +665,7 @@ def test_runtime_job_requires_a_configured_calendar(settings) -> None:
     assert build_sleep_reconciliation_job(settings) is None
 
 
-def test_runtime_job_reconciles_the_recent_local_date_window(
+def test_runtime_job_only_proposes_the_recent_local_date_window(
     settings,
     session_factory,
     fake_backend,
@@ -692,38 +692,19 @@ def test_runtime_job_reconciles_the_recent_local_date_window(
     result = job()
 
     # Then
-    assert result == {
-        "status": "ok",
-        "window_start": "2026-07-24",
-        "window_end": "2026-07-26",
-        "results": [
-            {
-                "status": "noop",
-                "reason": "stale",
-                "calendar": "google",
-                "local_date": "2026-07-24",
-            },
-            {
-                "status": "noop",
-                "reason": "stale",
-                "calendar": "google",
-                "local_date": "2026-07-25",
-            },
-            {
-                "status": "ok",
-                "action": "created",
-                "calendar": "google",
-                "local_date": "2026-07-26",
-                "summary": "수면 (실제)",
-                "start": "2026-07-25T14:00:00+00:00",
-                "wake_time": "2026-07-25T22:00:00+00:00",
-                "duration_minutes": 420,
-                "time_in_bed_minutes": 450,
-                "source": "oura",
-                "planned_sleep_replacements": 0,
-            },
-        ],
-    }
+    assert result is not None
+    assert result["status"] == "ok"
+    assert result["window_start"] == "2026-07-24"
+    assert result["window_end"] == "2026-07-26"
+    assert [entry["proposal_status"] for entry in result["results"]] == [
+        "noop",
+        "noop",
+        "pending",
+    ]
+    assert result["results"][-1]["action"] == "would_create"
+    assert fake_backend.created_drafts == []
+    assert fake_backend.update_calls == []
+    assert fake_backend.delete_calls == []
     assert reader.requests == [
         ("redacted-user", "2026-07-24", "2026-07-25"),
         ("redacted-user", "2026-07-25", "2026-07-26"),
@@ -760,7 +741,7 @@ def test_runtime_job_redacts_provider_user_id_from_failures(
     assert "HTTPStatusError" in caplog.text
 
 
-def test_runtime_job_absorbs_a_prior_day_provider_correction(
+def test_runtime_job_proposes_a_prior_day_provider_correction_without_applying(
     settings,
     session_factory,
     fake_backend,
@@ -801,8 +782,9 @@ def test_runtime_job_absorbs_a_prior_day_provider_correction(
 
     assert result is not None
     assert [entry["action"] for entry in result["results"][1:]] == [
-        "updated",
-        "noop",
+        "would_create",
+        "would_create",
     ]
-    assert len(fake_backend.created_drafts) == 2
-    assert len(fake_backend.update_calls) == 1
+    assert fake_backend.created_drafts == []
+    assert fake_backend.update_calls == []
+    assert fake_backend.delete_calls == []

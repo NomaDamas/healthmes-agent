@@ -69,6 +69,19 @@ class CalendarMutationStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class SleepProposalStatus(StrEnum):
+    PENDING = "pending"
+    APPLYING = "applying"
+    APPLIED = "applied"
+    DECLINED = "declined"
+    EXPIRED = "expired"
+    INVALID = "invalid"
+    CONFLICTED = "conflicted"
+    FAILED = "failed"
+    NOOP = "noop"
+    BLOCKED = "blocked"
+
+
 class DecisionKind(StrEnum):
     """What kind of agent decision a decision_record explains (docs/PLAN.md §5)."""
 

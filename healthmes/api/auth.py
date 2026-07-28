@@ -60,7 +60,15 @@ OPEN_PATHS = frozenset({"/health", "/"})
 # is the read-only calendar-connection status page (healthmes/api/connect.py
 # — status + instructions, no secrets rendered, no write routes exist under
 # the prefix).
-VIEWER_PATH_PREFIXES = ("/decisions", "/static/", "/reports", "/v1/media/", "/connect")
+VIEWER_PATH_PREFIXES = (
+    "/decisions",
+    "/static/",
+    "/reports",
+    "/v1/media/",
+    "/connect",
+    "/sleep",
+)
+LOCAL_BROWSER_PATH_PREFIXES = ("/sleep", "/connect/google/")
 
 _VIEWER_TOKEN_CONTEXT = b"healthmes-viewer:"
 
@@ -132,6 +140,11 @@ class BearerTokenMiddleware:
         path = scope.get("path", "")
         if path in OPEN_PATHS:
             return True
+        if path == "/connect" or path.startswith(LOCAL_BROWSER_PATH_PREFIXES):
+            from healthmes.api.local_session import is_loopback_scope
+
+            if is_loopback_scope(scope):
+                return True
         authorization = _header(scope, b"authorization")
         if authorization is not None:
             prefix, _, credential = authorization.partition(" ")
