@@ -76,7 +76,7 @@ jobs:
           Copy-Item artifacts/screensaver/HealthMes.Screensaver.exe artifacts/screensaver/HealthMes.Screensaver.scr
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: healthmes-windows-companion
           path: |
