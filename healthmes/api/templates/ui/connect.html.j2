@@ -1,11 +1,10 @@
 {% extends "ui/_base.html.j2" %}
-{# Calendar-connection STATUS page (healthmes/api/connect.py) — read-only.
-   Renders connection state + the exact CLI commands to run; performs no
-   writes and shows no secret (no tokens, no passwords, no usernames). Every
-   string comes from server-side static text / data-dir paths. #}
+{# Runtime-connection STATUS page (healthmes/api/connect.py) — read-only.
+   Renders Oura/Open Wearables freshness plus Calendar connection state;
+   performs no writes and shows no secret or connected identity. #}
 
-{% block title %}캘린더 연결 — HealthMes{% endblock %}
-{% block crumb %}<span class="crumb">/ 캘린더 연결</span>{% endblock %}
+{% block title %}연결 상태 — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">/ 연결 상태</span>{% endblock %}
 
 {% block head %}
 <style>
@@ -25,10 +24,10 @@
 {% endblock %}
 
 {% block content %}
-<p class="eyebrow">Calendar connections</p>
-<h1>캘린더 연결</h1>
-<p class="muted">이 페이지는 <strong>상태 표시 전용</strong>입니다 — 연결/해제는 이 기기의
-  터미널에서 실행하며, 토큰·앱 암호 같은 비밀 값은 이 페이지에 절대 표시되지 않습니다.</p>
+<p class="eyebrow">Runtime readiness</p>
+<h1>연결 상태</h1>
+<p class="muted">Oura/Open Wearables의 연결·freshness와 Calendar 연결 상태를 읽기 전용으로
+  표시합니다. 토큰·앱 암호·계정 식별자는 이 페이지에 절대 표시되지 않습니다.</p>
 {% if not scheduler_enabled %}
 <p class="conn-note">참고: 연결되어 있어도 캘린더 폴링은 서비스가
   <code>HEALTHMES_SCHEDULER_ENABLED=true</code> 로 실행 중일 때만 동작합니다.</p>
@@ -38,16 +37,16 @@
 <section class="card">
   <h2>{{ cal.label }}
     {% if cal.connected %}
-    <span class="badge conn-badge-on">연결됨</span>
+    <span class="badge conn-badge-on">{{ cal.badge_label or "연결됨" }}</span>
     {% else %}
-    <span class="badge conn-badge-off">미연결</span>
+    <span class="badge conn-badge-off">{{ cal.badge_label or "미연결" }}</span>
     {% endif %}
   </h2>
   <p class="muted">{{ cal.detail }}</p>
   {% for note in cal.notes %}
   <p class="conn-note">{{ note }}</p>
   {% endfor %}
-  {% if not cal.connected %}
+  {% if not cal.connected and cal.command %}
     {% if cal.steps %}
     <p>최초 1회 준비 (Google이 요구하는 개인 OAuth 클라이언트 등록):</p>
     <ol class="conn-steps">

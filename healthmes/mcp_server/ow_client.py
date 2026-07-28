@@ -141,6 +141,12 @@ class OWClient:
             params["search"] = search
         return await self._get("/api/v1/users", params=params)
 
+    async def get_connections(self, user_id: str) -> list[dict[str, Any]]:
+        payload = await self._get(f"/api/v1/users/{user_id}/connections")
+        if not isinstance(payload, list):
+            raise OWClientError("open-wearables returned an invalid connections response")
+        return payload
+
     # ------------------------------------------------------------------
     # Health scores (routes/v1/health_scores.py)
     # ------------------------------------------------------------------
