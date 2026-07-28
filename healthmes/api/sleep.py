@@ -14,7 +14,8 @@ from healthmes.api.local_session import (
     issue_local_session,
     require_local_session,
 )
-from healthmes.calendars.base import CalendarBackend, CalendarError
+from healthmes.calendars.approval import ApprovalCalendar, calendar_approval_target
+from healthmes.calendars.base import CalendarError
 from healthmes.calendars.jobs import _build_backend, write_source
 from healthmes.calendars.sleep_apply import (
     apply_sleep_proposal,
@@ -38,7 +39,7 @@ class SleepReviewUnavailable(RuntimeError):
 class SleepReviewRuntime:
     reader: SleepSummaryReader
     user_id: str
-    backend: CalendarBackend
+    calendar: ApprovalCalendar
 
 
 @router.get("/sleep", response_class=HTMLResponse)
@@ -61,11 +62,11 @@ async def sleep_review_page(
             if proposal is not None
             else await prepare_sleep_proposal(
                 target_date=target_date,
-                calendar_source=runtime.backend.source,
+                calendar_source=runtime.calendar.backend.source,
                 reader=runtime.reader,
                 user_id=runtime.user_id,
                 session=session,
-                backend=runtime.backend,
+                calendar=runtime.calendar,
             )
         )
     except (CalendarError, LookupError, OWClientError, SleepReviewUnavailable) as exc:
@@ -97,7 +98,7 @@ async def apply_sleep(request: Request, session: SessionDep) -> RedirectResponse
         reader=runtime.reader,
         user_id=runtime.user_id,
         session=session,
-        backend=runtime.backend,
+        calendar=runtime.calendar,
     )
     return RedirectResponse(f"/sleep?proposal={proposal_id}", status_code=303)
 
@@ -120,7 +121,14 @@ async def _runtime(request: Request, settings: Settings) -> SleepReviewRuntime:
         raise SleepReviewUnavailable("Google 또는 iCloud Calendar 연결이 필요합니다.")
     reader = OWClient.from_settings(settings)
     user_id = await resolve_single_user_id(reader, settings)
-    return SleepReviewRuntime(reader, user_id, _build_backend(settings, source))
+    return SleepReviewRuntime(
+        reader,
+        user_id,
+        ApprovalCalendar(
+            _build_backend(settings, source),
+            calendar_approval_target(settings, source),
+        ),
+    )
 
 
 def _render(
@@ -131,22 +139,53 @@ def _render(
     signing_secret: bytes,
 ) -> str:
     token = ""
+    display_start = None
+    display_wake = None
+    receipt_start = None
+    receipt_wake = None
     if proposal is not None and local is not None:
         token = approval_token(
             proposal,
             local.session_id,
             signing_secret,
         )
+    if proposal is not None:
+        timezone = resolve_timezone(settings)
+        if proposal.snapshot.get("start"):
+            display_start = _display_timestamp(str(proposal.snapshot["start"]), timezone)
+        if proposal.snapshot.get("wake_time"):
+            display_wake = _display_timestamp(
+                str(proposal.snapshot["wake_time"]),
+                timezone,
+            )
+        if proposal.receipt:
+            receipt_start = _display_timestamp(str(proposal.receipt["start"]), timezone)
+            receipt_wake = _display_timestamp(
+                str(proposal.receipt["wake_time"]),
+                timezone,
+            )
     template = template_environment().get_template("ui/sleep.html.j2")
     return template.render(
         proposal=proposal,
         local_session=local,
         approval_token=token,
+        display_start=display_start,
+        display_wake=display_wake,
+        receipt_start=receipt_start,
+        receipt_wake=receipt_wake,
         error=error,
         pending=proposal is not None and proposal.status is SleepProposalStatus.PENDING,
         active_nav="sleep",
         **shell_context(settings),
     )
+
+
+def _display_timestamp(value: str, timezone: dt.tzinfo) -> str:
+    return dt.datetime.fromisoformat(value).astimezone(timezone).strftime(
+        "%Y-%m-%d %H:%M:%S %Z"
+    )
+
+
 async def _form(request: Request) -> dict[str, str]:
     values = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
     return {key: rows[-1] for key, rows in values.items() if rows}

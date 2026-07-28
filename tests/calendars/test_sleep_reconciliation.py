@@ -139,13 +139,18 @@ def test_creates_owned_actual_sleep_with_source_identity(
     assert result.action is SleepCalendarAction.CREATED
     assert len(backend.created_drafts) == 1
     draft = backend.created_drafts[0]
-    assert draft.summary == "수면 (실제)"
+    assert draft.summary == "Oura 수면 세션"
     assert draft.identity == CalendarEventIdentity(
         kind=HealthmesEventKind.ACTUAL_SLEEP,
         source="oura",
         source_key="oura:2026-07-26",
     )
-    assert draft.description == ("Actual sleep: 420 min\nTime in bed: 480 min\nSource: oura")
+    assert draft.description == (
+        "Oura bedtime window: 480 min\n"
+        "Actual sleep: 420 min\n"
+        "Non-sleep within window: 60 min\n"
+        "Source: oura"
+    )
     mirror = session.query(CalendarEventMirror).one()
     assert mirror.external_id == "sleep-1"
     assert mirror.healthmes_kind == "actual_sleep"
@@ -437,14 +442,19 @@ def test_provider_correction_updates_existing_event(
     assert result.external_id == created.external_id
     assert len(backend.created_drafts) == 1
     assert backend.update_calls == [
-        {
-            "external_id": "sleep-1",
-            "summary": "수면 (실제)",
-            "start_at": corrected.start_at,
-            "end_at": corrected.end_at,
-            "description": ("Actual sleep: 450 min\nTime in bed: 510 min\nSource: oura"),
-            "expected_etag": '"created"',
-        }
+            {
+                "external_id": "sleep-1",
+                "summary": "Oura 수면 세션",
+                "start_at": corrected.start_at,
+                "end_at": corrected.end_at,
+                "description": (
+                    "Oura bedtime window: 510 min\n"
+                    "Actual sleep: 450 min\n"
+                    "Non-sleep within window: 60 min\n"
+                    "Source: oura"
+                ),
+                "expected_etag": '"created"',
+            }
     ]
     mirror = session.query(CalendarEventMirror).one()
     assert mirror.external_id == "sleep-1"

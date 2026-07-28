@@ -8,12 +8,13 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from healthmes.calendars.base import CalendarBackend
+from healthmes.calendars.approval import ApprovalCalendar
 from healthmes.calendars.sleep_event_rendering import observation_fingerprint
 from healthmes.calendars.sleep_observation import SleepObservationNoOp
 from healthmes.calendars.sleep_preview import preview_sleep_reconciliation
 from healthmes.calendars.sleep_proposal_state import (
     capture_provider_state,
+    redacted_digest,
     redacted_provider_guard,
 )
 from healthmes.calendars.sleep_source import SleepSummaryReader, read_actual_sleep
@@ -33,7 +34,7 @@ async def prepare_sleep_proposal(
     reader: SleepSummaryReader,
     user_id: str,
     session: Session,
-    backend: CalendarBackend,
+    calendar: ApprovalCalendar,
     now: dt.datetime | None = None,
 ) -> SleepReconciliationProposal:
     selected = await read_actual_sleep(reader, user_id, target_date)
@@ -44,6 +45,11 @@ async def prepare_sleep_proposal(
             "reason": selected.reason.value,
             "calendar": calendar_source.value,
             "local_date": target_date.isoformat(),
+            "provider_guard": {
+                "target": redacted_digest(calendar.target),
+                "actual": None,
+                "planned": [],
+            },
         }
         return _persist(
             session,
@@ -52,7 +58,11 @@ async def prepare_sleep_proposal(
             source_key=f"oura:{target_date.isoformat()}",
             fingerprint=hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
             snapshot=snapshot,
-            provider_state={"actual": None, "planned": []},
+            provider_state={
+                "target": calendar.target,
+                "actual": None,
+                "planned": [],
+            },
             status=SleepProposalStatus.NOOP,
             created_at=created_at,
         )
@@ -61,9 +71,9 @@ async def prepare_sleep_proposal(
         session,
         calendar_source,
         selected,
-        backend,
+        calendar.backend,
     )
-    provider_state = capture_provider_state(session, backend, selected)
+    provider_state = capture_provider_state(session, calendar, selected)
     snapshot = {**preview, "provider_guard": redacted_provider_guard(provider_state)}
     status = {
         "blocked": SleepProposalStatus.BLOCKED,

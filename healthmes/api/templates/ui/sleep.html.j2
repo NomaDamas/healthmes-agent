@@ -32,8 +32,8 @@
     <p class="eyebrow">Oura actual sleep</p>
     <h2>{{ proposal.local_date }}</h2>
     {% if proposal.snapshot.start %}
-    <p class="sleep-value">{{ proposal.snapshot.start }} → {{ proposal.snapshot.wake_time }}</p>
-    <p class="muted">수면 {{ proposal.snapshot.duration_minutes }}분 · 침대 {{ proposal.snapshot.time_in_bed_minutes or "—" }}분</p>
+    <p class="sleep-value">{{ display_start }} → {{ display_wake }}</p>
+    <p class="muted">실제 수면 {{ proposal.snapshot.duration_minutes }}분 · 침대 구간 {{ proposal.snapshot.time_in_bed_minutes or "—" }}분 · 구간 내 비수면 {{ proposal.snapshot.non_sleep_minutes if proposal.snapshot.non_sleep_minutes is not none else "—" }}분</p>
     {% else %}
     <p class="muted">{{ proposal.snapshot.reason or "관찰값 없음" }}</p>
     {% endif %}
@@ -49,11 +49,12 @@
 
 <section class="card">
   <p class="eyebrow">Exact redacted preview</p>
-  <h2>수면 (실제)</h2>
-  <p>{{ proposal.snapshot.start or "—" }} → {{ proposal.snapshot.wake_time or "—" }}</p>
+  <h2>{{ proposal.snapshot.summary }}</h2>
+  <p>{{ display_start or "—" }} → {{ display_wake or "—" }}</p>
   <p class="muted">source {{ proposal.snapshot.source or "—" }} · observation {{ proposal.observation_fingerprint[:12] }}…</p>
   <p class="muted">remote guard actual {{ proposal.snapshot.provider_guard.actual if proposal.snapshot.provider_guard else "—" }}
     · planned {{ proposal.snapshot.provider_guard.planned|length if proposal.snapshot.provider_guard else 0 }}개</p>
+  <p class="muted">target calendar {{ proposal.snapshot.provider_guard.target if proposal.snapshot.provider_guard else "—" }}</p>
 
   {% if pending and local_session %}
   <div class="sleep-actions">
@@ -80,7 +81,7 @@
 <section class="card receipt">
   <p class="eyebrow">Fresh provider read-back</p>
   <h2>검증 완료</h2>
-  <p>{{ proposal.receipt.start }} → {{ proposal.receipt.wake_time }}</p>
+  <p>{{ receipt_start }} → {{ receipt_wake }}</p>
   <p class="muted">action {{ proposal.receipt.action }} · event {{ proposal.receipt.event }}
     · planned sleep 삭제 {{ proposal.receipt.planned_sleep_deleted }}개</p>
 </section>

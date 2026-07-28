@@ -5,6 +5,8 @@ import re
 from fastapi.testclient import TestClient
 
 from healthmes.api.sleep import SleepReviewRuntime
+from healthmes.calendars.approval import ApprovalCalendar
+from healthmes.calendars.sleep_proposal_state import redacted_digest
 from tests.calendars.conftest import FakeCalendarBackend
 
 
@@ -33,16 +35,24 @@ def test_local_sleep_review_applies_exact_preview_and_shows_read_back(
     app,
 ) -> None:
     fake_backend = FakeCalendarBackend()
+    app.state.settings = app.state.settings.model_copy(
+        update={"timezone": "Asia/Seoul"}
+    )
     app.state.sleep_review_runtime = SleepReviewRuntime(
         SleepReader(),
         "redacted-user",
-        fake_backend,
+        ApprovalCalendar(fake_backend, fake_backend.approval_target),
     )
     with TestClient(app, base_url="http://127.0.0.1:8100") as client:
         preview = client.get("/sleep?date=2026-07-26")
 
         assert preview.status_code == 200
         assert "would_create" in preview.text
+        assert "2026-07-25 23:00:00 KST" in preview.text
+        assert "2026-07-26 07:00:00 KST" in preview.text
+        assert "실제 수면 420분 · 침대 구간 450분 · 구간 내 비수면 30분" in preview.text
+        assert "Oura 수면 세션" in preview.text
+        assert redacted_digest(fake_backend.approval_target) in preview.text
         assert "이 preview를 Calendar에 반영" in preview.text
         cookie = preview.headers["set-cookie"]
         assert "HttpOnly" in cookie and "SameSite=strict" in cookie

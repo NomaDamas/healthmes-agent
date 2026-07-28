@@ -7,7 +7,8 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from healthmes.calendars.base import CalendarBackend, HealthmesEventKind, ensure_utc
+from healthmes.calendars.approval import ApprovalCalendar
+from healthmes.calendars.base import HealthmesEventKind, ensure_utc
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.store.models import CalendarEventMirror
 
@@ -18,9 +19,10 @@ def redacted_digest(value: str) -> str:
 
 def capture_provider_state(
     session: Session,
-    backend: CalendarBackend,
+    calendar: ApprovalCalendar,
     observation: ActualSleepObservation,
 ) -> dict[str, Any]:
+    backend = calendar.backend
     actual = session.scalar(
         sa.select(CalendarEventMirror).where(
             CalendarEventMirror.calendar_source == backend.source,
@@ -57,10 +59,15 @@ def capture_provider_state(
             }
         )
     planned.sort(key=lambda item: str(item["external_id"]))
-    return {"actual": actual_state, "planned": planned}
+    return {
+        "target": calendar.target,
+        "actual": actual_state,
+        "planned": planned,
+    }
 
 
 def redacted_provider_guard(provider_state: dict[str, Any]) -> dict[str, Any]:
+    target = str(provider_state["target"])
     actual = provider_state["actual"]
     planned = provider_state["planned"]
     actual_digest = None
@@ -71,4 +78,8 @@ def redacted_provider_guard(provider_state: dict[str, Any]) -> dict[str, Any]:
         for item in planned
         if isinstance(item, dict)
     ]
-    return {"actual": actual_digest, "planned": planned_digests}
+    return {
+        "target": redacted_digest(target),
+        "actual": actual_digest,
+        "planned": planned_digests,
+    }

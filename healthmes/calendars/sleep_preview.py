@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import NotRequired, TypedDict
+
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
@@ -11,6 +13,7 @@ from healthmes.calendars.base import (
     HealthmesEventKind,
     ensure_utc,
 )
+from healthmes.calendars.sleep_event_rendering import ACTUAL_SLEEP_SUMMARY
 from healthmes.calendars.sleep_mirror import (
     SLEEP_CREATE_PENDING_STATUS,
     SLEEP_UPDATE_PENDING_STATUS,
@@ -22,12 +25,28 @@ from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror
 
 
+class SleepPreview(TypedDict):
+    status: str
+    action: str
+    calendar: str
+    local_date: str
+    summary: str
+    start: str
+    wake_time: str
+    duration_minutes: int
+    time_in_bed_minutes: int | None
+    non_sleep_minutes: int | None
+    source: str
+    planned_sleep_replacements: int
+    reason: NotRequired[str]
+
+
 def preview_sleep_reconciliation(
     session: Session,
     calendar_source: CalendarSource,
     observation: ActualSleepObservation,
     backend: CalendarBackend | None,
-) -> dict[str, object]:
+) -> SleepPreview:
     existing = session.scalar(
         sa.select(CalendarEventMirror).where(
             CalendarEventMirror.calendar_source == calendar_source,
@@ -64,16 +83,21 @@ def preview_sleep_reconciliation(
                 planned_count = 0
                 break
             planned_count += int(replace)
-    result: dict[str, object] = {
+    result: SleepPreview = {
         "status": "preview",
         "action": action,
         "calendar": calendar_source.value,
         "local_date": observation.local_date.isoformat(),
-        "summary": "수면 (실제)",
+        "summary": ACTUAL_SLEEP_SUMMARY,
         "start": ensure_utc(observation.start_at).isoformat(),
         "wake_time": ensure_utc(observation.end_at).isoformat(),
         "duration_minutes": observation.duration_minutes,
         "time_in_bed_minutes": observation.time_in_bed_minutes,
+        "non_sleep_minutes": (
+            observation.time_in_bed_minutes - observation.duration_minutes
+            if observation.time_in_bed_minutes is not None
+            else None
+        ),
         "source": observation.provider,
         "planned_sleep_replacements": planned_count,
     }

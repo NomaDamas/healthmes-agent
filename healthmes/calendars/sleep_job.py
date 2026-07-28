@@ -9,6 +9,7 @@ import anyio
 from pydantic import ValidationError
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.calendars.approval import ApprovalCalendar, calendar_approval_target
 from healthmes.calendars.base import CalendarBackend
 from healthmes.calendars.jobs import _build_backend, write_source
 from healthmes.calendars.sleep_observation import (
@@ -86,7 +87,10 @@ def build_sleep_reconciliation_job(
             client=active_client,
             user_id=resolved_user_id,
             session_factory=session_factory,
-            backend=backend,
+            calendar=ApprovalCalendar(
+                backend,
+                calendar_approval_target(settings, calendar_source),
+            ),
         )
 
     def run_job() -> dict[str, object] | None:
@@ -109,7 +113,7 @@ async def prepare_recent_sleep_window(
     client: SleepSummaryReader,
     user_id: str,
     session_factory: sessionmaker[Session] | None,
-    backend: CalendarBackend,
+    calendar: ApprovalCalendar,
 ) -> dict[str, object]:
     start_date = end_date - dt.timedelta(days=RECENT_SLEEP_WINDOW_DAYS - 1)
     results: list[dict[str, object]] = []
@@ -121,7 +125,7 @@ async def prepare_recent_sleep_window(
                 reader=client,
                 user_id=user_id,
                 session=session,
-                backend=backend,
+                calendar=calendar,
             )
             results.append(
                 {

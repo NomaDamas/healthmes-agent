@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from enum import StrEnum
+from dataclasses import replace
 
-import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
@@ -19,6 +17,7 @@ from healthmes.calendars.planned_sleep_replacement import (
     delete_replaced_planned_sleep,
 )
 from healthmes.calendars.sleep_event_rendering import (
+    ACTUAL_SLEEP_SUMMARY,
     description,
     event_draft,
     observation_fingerprint,
@@ -27,6 +26,7 @@ from healthmes.calendars.sleep_mirror import (
     SLEEP_CREATE_PENDING_STATUS,
     SLEEP_UPDATE_PENDING_STATUS,
     finalize_sleep_mirror,
+    find_sleep_source_key,
     mark_sleep_update_pending,
     pending_sleep_mirror,
 )
@@ -36,22 +36,17 @@ from healthmes.calendars.sleep_reconciliation_guards import (
     assert_pending_remote_matches,
     assert_remote_actual_sleep,
 )
+from healthmes.calendars.sleep_reconciliation_result import (
+    SleepCalendarAction,
+    SleepCalendarResult,
+    created_sleep_result,
+    updated_sleep_result,
+)
+from healthmes.calendars.sleep_source_lock import (
+    lock_sleep_source_key,
+    unlock_sleep_source_key,
+)
 from healthmes.store.models import CalendarEventMirror
-
-
-class SleepCalendarAction(StrEnum):
-    CREATED = "created"
-    UPDATED = "updated"
-    NOOP = "noop"
-
-
-@dataclass(frozen=True, slots=True)
-class SleepCalendarResult:
-    action: SleepCalendarAction
-    external_id: str
-    observation_fingerprint: str
-    deleted_planned_external_ids: tuple[str, ...] = ()
-    planned_sleep_cleanup_pending: int = 0
 
 
 class SleepCalendarReconciler:
@@ -79,7 +74,11 @@ class SleepCalendarReconciler:
         identity: CalendarEventIdentity,
         fingerprint: str,
     ) -> SleepCalendarResult:
-        row = self._find_source_key(identity.source_key)
+        row = find_sleep_source_key(
+            self._session,
+            self._backend.source,
+            identity.source_key,
+        )
         if row is None:
             result = self._create(observation, identity, fingerprint)
             return self._replace_planned_sleep(result, observation)
@@ -182,15 +181,7 @@ class SleepCalendarReconciler:
             observation,
             fingerprint,
         )
-        return self._created_result(row.external_id, fingerprint)
-
-    @staticmethod
-    def _created_result(external_id: str, fingerprint: str) -> SleepCalendarResult:
-        return SleepCalendarResult(
-            action=SleepCalendarAction.CREATED,
-            external_id=external_id,
-            observation_fingerprint=fingerprint,
-        )
+        return created_sleep_result(row.external_id, fingerprint)
 
     def _update(
         self,
@@ -226,7 +217,7 @@ class SleepCalendarReconciler:
                 observation,
                 fingerprint,
             )
-            return self._updated_result(row.external_id, fingerprint)
+            return updated_sleep_result(row.external_id, fingerprint)
         return self._update_remote(
             row,
             observation,
@@ -243,7 +234,7 @@ class SleepCalendarReconciler:
     ) -> SleepCalendarResult:
         updated = self._backend.update_event(
             row.external_id,
-            summary="수면 (실제)",
+            summary=ACTUAL_SLEEP_SUMMARY,
             start_at=ensure_utc(observation.start_at),
             end_at=ensure_utc(observation.end_at),
             description=description(observation),
@@ -256,53 +247,22 @@ class SleepCalendarReconciler:
             observation,
             fingerprint,
         )
-        return self._updated_result(row.external_id, fingerprint)
-
-    @staticmethod
-    def _updated_result(external_id: str, fingerprint: str) -> SleepCalendarResult:
-        return SleepCalendarResult(
-            action=SleepCalendarAction.UPDATED,
-            external_id=external_id,
-            observation_fingerprint=fingerprint,
-        )
-
-    def _find_source_key(self, source_key: str) -> CalendarEventMirror | None:
-        return self._session.scalar(
-            sa.select(CalendarEventMirror).where(
-                CalendarEventMirror.calendar_source == self._backend.source,
-                CalendarEventMirror.healthmes_source_key == source_key,
-            )
-        )
+        return updated_sleep_result(row.external_id, fingerprint)
 
     def _lock_source_key(self, source_key: str) -> Connection | None:
-        bind = self._session.get_bind()
-        if bind.dialect.name != "postgresql":
-            return None
-        engine = bind.engine if isinstance(bind, Connection) else bind
-        connection = engine.connect()
-        try:
-            connection.execute(
-                sa.text("SELECT pg_advisory_lock(hashtextextended(:source_key, 0))"),
-                {"source_key": f"{self._backend.source.value}:{source_key}"},
-            )
-        except BaseException:
-            connection.close()
-            raise
-        return connection
+        return lock_sleep_source_key(
+            self._session,
+            self._backend.source,
+            source_key,
+        )
 
     def _unlock_source_key(
         self,
         connection: Connection,
         source_key: str,
     ) -> None:
-        try:
-            released = connection.scalar(
-                sa.text(
-                    "SELECT pg_advisory_unlock(hashtextextended(:source_key, 0))"
-                ),
-                {"source_key": f"{self._backend.source.value}:{source_key}"},
-            )
-            if released is not True:
-                raise RuntimeError("PostgreSQL source-key advisory lock was not held")
-        finally:
-            connection.close()
+        unlock_sleep_source_key(
+            connection,
+            self._backend.source,
+            source_key,
+        )

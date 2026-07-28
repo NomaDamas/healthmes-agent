@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from healthmes.calendars.base import (
@@ -8,6 +9,7 @@ from healthmes.calendars.base import (
     calendar_identity_external_id,
     ensure_utc,
 )
+from healthmes.calendars.sleep_event_rendering import ACTUAL_SLEEP_SUMMARY
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror
@@ -25,7 +27,7 @@ def pending_sleep_mirror(
     return CalendarEventMirror(
         external_id=calendar_identity_external_id(calendar_source, identity),
         calendar_source=calendar_source,
-        summary="수면 (실제)",
+        summary=ACTUAL_SLEEP_SUMMARY,
         start_at=ensure_utc(observation.start_at),
         end_at=ensure_utc(observation.end_at),
         is_agent_created=True,
@@ -41,6 +43,19 @@ def pending_sleep_mirror(
     )
 
 
+def find_sleep_source_key(
+    session: Session,
+    calendar_source: CalendarSource,
+    source_key: str,
+) -> CalendarEventMirror | None:
+    return session.scalar(
+        sa.select(CalendarEventMirror).where(
+            CalendarEventMirror.calendar_source == calendar_source,
+            CalendarEventMirror.healthmes_source_key == source_key,
+        )
+    )
+
+
 def finalize_sleep_mirror(
     session: Session,
     row: CalendarEventMirror,
@@ -49,7 +64,7 @@ def finalize_sleep_mirror(
     fingerprint: str,
 ) -> None:
     row.external_id = created.external_id
-    row.summary = created.summary or "수면 (실제)"
+    row.summary = created.summary or ACTUAL_SLEEP_SUMMARY
     row.start_at = created.start_at or ensure_utc(observation.start_at)
     row.end_at = created.end_at or ensure_utc(observation.end_at)
     row.etag = created.etag
@@ -71,7 +86,7 @@ def mark_sleep_update_pending(
     fingerprint: str,
     expected_etag: str | None,
 ) -> None:
-    row.summary = "수면 (실제)"
+    row.summary = ACTUAL_SLEEP_SUMMARY
     row.start_at = ensure_utc(observation.start_at)
     row.end_at = ensure_utc(observation.end_at)
     row.etag = expected_etag

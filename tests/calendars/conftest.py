@@ -50,8 +50,13 @@ class FakeCalendarBackend:
     received state. All write calls are recorded for assertions.
     """
 
-    def __init__(self, source: CalendarSource = CalendarSource.GOOGLE) -> None:
+    def __init__(
+        self,
+        source: CalendarSource = CalendarSource.GOOGLE,
+        approval_target: str = "test-calendar",
+    ) -> None:
         self.source = source
+        self.approval_target = f"{source.value}:{approval_target}"
         self._batches: list[tuple[list[ExternalEvent], SyncState]] = []
         self.received_sync_states: list[SyncState | None] = []
         self.created_drafts: list[EventDraft] = []

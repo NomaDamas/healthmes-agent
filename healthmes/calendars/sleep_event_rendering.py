@@ -9,6 +9,9 @@ from healthmes.calendars.base import (
 )
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 
+ACTUAL_SLEEP_SUMMARY = "Oura 수면 세션"
+LEGACY_ACTUAL_SLEEP_SUMMARY = "수면 (실제)"
+
 
 def observation_fingerprint(observation: ActualSleepObservation) -> str:
     values = (
@@ -28,7 +31,7 @@ def event_draft(
     identity: CalendarEventIdentity,
 ) -> EventDraft:
     return EventDraft(
-        summary="수면 (실제)",
+        summary=ACTUAL_SLEEP_SUMMARY,
         start_at=observation.start_at,
         end_at=observation.end_at,
         description=description(observation),
@@ -37,13 +40,19 @@ def event_draft(
 
 
 def description(observation: ActualSleepObservation) -> str:
-    time_in_bed = (
-        f"{observation.time_in_bed_minutes} min"
-        if observation.time_in_bed_minutes is not None
-        else "unavailable"
+    if observation.time_in_bed_minutes is None:
+        return (
+            "Oura bedtime window: unavailable\n"
+            f"Actual sleep: {observation.duration_minutes} min\n"
+            "Non-sleep within window: unavailable\n"
+            f"Source: {observation.provider}"
+        )
+    non_sleep_minutes = (
+        observation.time_in_bed_minutes - observation.duration_minutes
     )
     return (
+        f"Oura bedtime window: {observation.time_in_bed_minutes} min\n"
         f"Actual sleep: {observation.duration_minutes} min\n"
-        f"Time in bed: {time_in_bed}\n"
+        f"Non-sleep within window: {non_sleep_minutes} min\n"
         f"Source: {observation.provider}"
     )

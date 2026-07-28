@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from healthmes.calendars.approval import ApprovalCalendar
 from healthmes.calendars.base import (
     CalendarBackend,
     CalendarError,
@@ -55,9 +56,10 @@ async def apply_sleep_proposal(
     reader: SleepSummaryReader,
     user_id: str,
     session: Session,
-    backend: CalendarBackend,
+    calendar: ApprovalCalendar,
     now: dt.datetime | None = None,
 ) -> SleepApplyResult:
+    backend = calendar.backend
     proposal = session.get(
         SleepReconciliationProposal,
         proposal_id,
@@ -82,7 +84,7 @@ async def apply_sleep_proposal(
         return _close(session, proposal, SleepProposalStatus.CONFLICTED, current_time)
     if observation_fingerprint(selected) != proposal.observation_fingerprint:
         return _close(session, proposal, SleepProposalStatus.CONFLICTED, current_time)
-    if capture_provider_state(session, backend, selected) != proposal.provider_state:
+    if capture_provider_state(session, calendar, selected) != proposal.provider_state:
         return _close(session, proposal, SleepProposalStatus.CONFLICTED, current_time)
 
     proposal.status = SleepProposalStatus.APPLYING

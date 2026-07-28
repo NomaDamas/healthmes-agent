@@ -239,11 +239,12 @@ async def test_dry_run_is_exact_redacted_and_mutation_free(
         "action": "would_create",
         "calendar": "google",
         "local_date": "2026-07-26",
-        "summary": "수면 (실제)",
+        "summary": "Oura 수면 세션",
         "start": "2026-07-25T14:00:00+00:00",
         "wake_time": "2026-07-25T22:00:00+00:00",
         "duration_minutes": 420,
         "time_in_bed_minutes": 450,
+        "non_sleep_minutes": 30,
         "source": "oura",
         "planned_sleep_replacements": 0,
     }
