@@ -100,7 +100,7 @@ def test_list_events_rejects_inverted_range(client):
     assert response.json()["error"]["code"] == "invalid_range"
 
 
-def _seed_proposal(session) -> ScheduleProposal:
+def _seed_proposal_with_handle(session) -> tuple[ScheduleProposal, str]:
     task = Task(title="Deep work block")
     session.add(task)
     session.flush()
@@ -115,6 +115,11 @@ def _seed_proposal(session) -> ScheduleProposal:
     session.add(proposal)
     session.commit()
     session.refresh(proposal)
+    return proposal, handle.plaintext
+
+
+def _seed_proposal(session) -> ScheduleProposal:
+    proposal, _handle = _seed_proposal_with_handle(session)
     return proposal
 
 
@@ -218,6 +223,20 @@ def test_rest_resolution_token_is_not_a_telegram_reply_handle(client, session):
             HANDLE_SECRET,
         )
 
+    session.expire_all()
+    assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PROPOSED
+
+
+def test_rest_action_rejects_telegram_reply_handle(client, session):
+    proposal, reply_handle = _seed_proposal_with_handle(session)
+
+    response = client.post(
+        f"/v1/schedule/proposals/{proposal.id}/accept",
+        json={"resolution_token": reply_handle},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "invalid_resolution_token"
     session.expire_all()
     assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PROPOSED
 

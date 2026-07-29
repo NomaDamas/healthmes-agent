@@ -144,8 +144,13 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             let action: ProposalAction = actionIdentifier == ActionID.apply ? .accept : .decline
             let outcome: ProposalOutcome
             do {
-                _ = try await api.resolveProposal(id: proposalID, action: action)
-                outcome = ProposalOutcome.from(action: action, error: nil)
+                let page = try await api.listProposals(status: .proposed)
+                if let proposal = page.data.first(where: { $0.id == proposalID }) {
+                    _ = try await api.resolveProposal(proposal, action: action)
+                    outcome = ProposalOutcome.from(action: action, error: nil)
+                } else {
+                    outcome = .alreadyResolved(status: "resolved")
+                }
             } catch let error as HealthMesAPIError {
                 outcome = ProposalOutcome.from(action: action, error: error)
             } catch {

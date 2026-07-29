@@ -158,6 +158,7 @@ def _resolve_proposal(
             target,
             token,
             handle_secret,
+            allow_reply_handle=False,
             allow_resolution_token=True,
         )
     except ScheduleProposalResolutionError as exc:

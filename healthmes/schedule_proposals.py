@@ -53,6 +53,7 @@ def resolve_schedule_proposal(
     handle_secret: str,
     *,
     now: dt.datetime | None = None,
+    allow_reply_handle: bool = True,
     allow_resolution_token: bool = False,
 ) -> ScheduleProposal:
     proposal = session.get(ScheduleProposal, proposal_id)
@@ -61,7 +62,8 @@ def resolve_schedule_proposal(
     if proposal.status is not ProposalStatus.PROPOSED:
         raise ScheduleProposalResolutionError("not_proposed")
     reply_handle_valid = bool(
-        reply_handle
+        allow_reply_handle
+        and reply_handle
         and proposal.reply_handle_digest is not None
         and verify_reply_handle(
             reply_handle,

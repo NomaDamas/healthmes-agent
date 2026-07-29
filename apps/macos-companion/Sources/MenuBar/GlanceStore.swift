@@ -119,7 +119,7 @@ public final class GlanceStore: ObservableObject {
     /// Real §8.5 button behaviour (✅ Apply → accept, ❌ Keep → decline).
     public func resolve(_ proposal: ProposalItem, action: ProposalAction) async -> ProposalOutcome {
         do {
-            _ = try await api.resolveProposal(id: proposal.id, action: action)
+            _ = try await api.resolveProposal(proposal, action: action)
             await refreshAlertsAndProposals()
             return ProposalOutcome.from(action: action, error: nil)
         } catch let error as HealthMesAPIError {
