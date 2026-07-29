@@ -1,7 +1,10 @@
 """Tests for the schedule router (calendar mirror range list + proposals)."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
+from pydantic import SecretStr
+
+from healthmes.calendars.adjustments import issue_reply_handle
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
@@ -9,6 +12,8 @@ from healthmes.store import (
     ScheduleProposal,
     Task,
 )
+
+HANDLE_SECRET = "test-calendar-adjustment-secret-32-characters"
 
 
 def _dt(hour: int, minute: int = 0, day: int = 6) -> datetime:
@@ -90,23 +95,26 @@ def test_list_events_rejects_inverted_range(client):
     assert response.json()["error"]["code"] == "invalid_range"
 
 
-def _seed_proposal(session) -> ScheduleProposal:
+def _seed_proposal(session) -> tuple[ScheduleProposal, str]:
     task = Task(title="Deep work block")
     session.add(task)
     session.flush()
+    handle = issue_reply_handle(HANDLE_SECRET)
     proposal = ScheduleProposal(
         task_id=task.id,
         proposed_start=_dt(9),
         proposed_end=_dt(11),
+        reply_handle_digest=handle.digest,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
     )
     session.add(proposal)
     session.commit()
     session.refresh(proposal)
-    return proposal
+    return proposal, handle.plaintext
 
 
 def test_list_proposals_filters_by_status(client, session):
-    proposal = _seed_proposal(session)
+    proposal, _handle = _seed_proposal(session)
 
     listed = client.get("/v1/schedule/proposals", params={"status": "proposed"}).json()
     assert [p["id"] for p in listed["data"]] == [str(proposal.id)]
@@ -117,31 +125,81 @@ def test_list_proposals_filters_by_status(client, session):
 
 
 def test_accept_proposal_then_second_accept_conflicts(client, session):
-    proposal = _seed_proposal(session)
+    proposal, handle = _seed_proposal(session)
 
-    accepted = client.post(f"/v1/schedule/proposals/{proposal.id}/accept")
+    accepted = client.post(
+        f"/v1/schedule/proposals/{proposal.id}/accept",
+        json={"reply_handle": handle},
+    )
     assert accepted.status_code == 200
     assert accepted.json()["status"] == "accepted"
 
     session.expire_all()
     assert session.get(ScheduleProposal, proposal.id).status == ProposalStatus.ACCEPTED
 
-    again = client.post(f"/v1/schedule/proposals/{proposal.id}/accept")
+    again = client.post(
+        f"/v1/schedule/proposals/{proposal.id}/accept",
+        json={"reply_handle": handle},
+    )
     assert again.status_code == 409
     assert again.json()["error"]["code"] == "invalid_transition"
 
 
 def test_decline_proposal(client, session):
-    proposal = _seed_proposal(session)
+    proposal, handle = _seed_proposal(session)
 
-    declined = client.post(f"/v1/schedule/proposals/{proposal.id}/decline")
+    declined = client.post(
+        f"/v1/schedule/proposals/{proposal.id}/decline",
+        json={"reply_handle": handle},
+    )
 
     assert declined.status_code == 200
     assert declined.json()["status"] == "declined"
 
 
 def test_proposal_actions_404_for_unknown_id(client):
-    response = client.post("/v1/schedule/proposals/00000000-0000-0000-0000-000000000000/accept")
+    response = client.post(
+        "/v1/schedule/proposals/00000000-0000-0000-0000-000000000000/accept",
+        json={"reply_handle": "unused-for-missing-proposal"},
+    )
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
+
+
+def test_proposal_actions_require_valid_unexpired_reply_handle(client, session):
+    proposal, handle = _seed_proposal(session)
+    endpoint = f"/v1/schedule/proposals/{proposal.id}/accept"
+
+    missing = client.post(endpoint)
+    assert missing.status_code == 422
+
+    invalid = client.post(endpoint, json={"reply_handle": "wrong-handle"})
+    assert invalid.status_code == 403
+    assert invalid.json()["error"]["code"] == "invalid_reply_handle"
+
+    proposal.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    session.commit()
+    expired = client.post(endpoint, json={"reply_handle": handle})
+    assert expired.status_code == 409
+    assert expired.json()["error"]["code"] == "proposal_expired"
+
+    session.expire_all()
+    assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PROPOSED
+
+
+def test_proposal_actions_fail_closed_without_handle_secret(client, app, session):
+    proposal, handle = _seed_proposal(session)
+    app.state.settings = app.state.settings.model_copy(
+        update={"calendar_adjustment_secret": SecretStr("")}
+    )
+
+    response = client.post(
+        f"/v1/schedule/proposals/{proposal.id}/accept",
+        json={"reply_handle": handle},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "approval_unavailable"
+    session.expire_all()
+    assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PROPOSED

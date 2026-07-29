@@ -42,6 +42,7 @@ from healthmes.calendars.base import (
     EventDraft,
     HealthmesEventKind,
     coerce_utc,
+    parse_event_kind,
 )
 from healthmes.calendars.intake import intake_calendar_tasks
 from healthmes.calendars.state import (
@@ -190,14 +191,11 @@ def push_accepted_proposals(
     for proposal, task in list(_accepted_proposals(session)):
         row = _existing_agent_block(session, source, task.id, proposal)
         if row is None:
-            identity = (
-                CalendarEventIdentity(
-                    kind=HealthmesEventKind.PLANNED_SLEEP,
-                    source="planner",
-                    source_key=f"proposal:{proposal.id}",
-                )
-                if proposal.healthmes_kind == HealthmesEventKind.PLANNED_SLEEP.value
-                else None
+            identity = CalendarEventIdentity(
+                kind=parse_event_kind(proposal.healthmes_kind)
+                or HealthmesEventKind.TASK_BLOCK,
+                source="planner",
+                source_key=f"proposal:{proposal.id}",
             )
             draft = EventDraft(
                 summary=task.title,

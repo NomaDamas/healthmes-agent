@@ -143,12 +143,12 @@ def build_alert_payload(
 ) -> dict[str, Any]:
     """JSON payload for the gateway route (template-addressable flat fields).
 
-    The default route prompt in ``config/hermes-config.yaml.tmpl`` reads
-    ``{rule_id}`` / ``{summary}`` / ``{prompt}`` — string placeholders render
-    in full, whereas ``{__raw__}`` would truncate the indent-2 payload dump
-    at 4000 chars (vendor ``_render_prompt``) and could clip ``evidence`` on
-    large fires. ``event_type`` feeds the route's optional ``events`` filter
-    (vendor lines 554-563).
+    The default route prompt in ``config/hermes-config.yaml.tmpl`` reads only
+    ``{prompt}``, so provider-controlled strings stay inside the prompt's
+    explicit untrusted-data envelope. String placeholders render in full,
+    whereas ``{__raw__}`` would truncate the indent-2 payload dump at 4000
+    chars and could clip ``evidence`` on large fires. ``event_type`` feeds the
+    route's optional ``events`` filter (vendor lines 554-563).
     """
     return {
         "event_type": "healthmes_trigger",

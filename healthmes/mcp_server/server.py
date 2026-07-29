@@ -57,6 +57,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes import schedule_proposals
 from healthmes.calendars.adjustments import (
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
@@ -2495,34 +2496,30 @@ def resolve_schedule_proposal(
 
     proposal_uuid = _parse_uuid(proposal_id, "proposal_id")
     with _store_session() as session:
-        proposal = session.get(ScheduleProposal, proposal_uuid)
-        if proposal is None:
-            raise ToolError(f"schedule proposal {proposal_id} not found")
-        if proposal.status is not ProposalStatus.PROPOSED:
-            raise ToolError(
-                f"schedule proposal {proposal_id} is {_enum_value(proposal.status)}; "
-                "only proposed items can be resolved"
-            )
-        if (
-            not reply_handle
-            or proposal.reply_handle_digest is None
-            or not verify_reply_handle(
+        try:
+            proposal = schedule_proposals.resolve_schedule_proposal(
+                session,
+                proposal_uuid,
+                target,
                 reply_handle,
-                proposal.reply_handle_digest,
                 _adjustment_handle_secret(),
             )
-        ):
-            raise ToolError("reply_handle is missing or invalid")
-        expires_at = (
-            proposal.expires_at.replace(tzinfo=dt.UTC)
-            if proposal.expires_at is not None and proposal.expires_at.tzinfo is None
-            else proposal.expires_at
-        )
-        if expires_at is None or dt.datetime.now(dt.UTC) >= expires_at:
-            raise ToolError("schedule proposal has expired")
+        except schedule_proposals.ScheduleProposalResolutionError as exc:
+            if exc.code == "not_found":
+                raise ToolError(f"schedule proposal {proposal_id} not found") from exc
+            if exc.code == "not_proposed":
+                current = session.get(ScheduleProposal, proposal_uuid)
+                status = _enum_value(current.status) if current is not None else "unknown"
+                raise ToolError(
+                    f"schedule proposal {proposal_id} is {status}; "
+                    "only proposed items can be resolved"
+                ) from exc
+            if exc.code == "invalid_handle":
+                raise ToolError("reply_handle is missing or invalid") from exc
+            if exc.code == "expired":
+                raise ToolError("schedule proposal has expired") from exc
+            raise
         task = session.get(Task, proposal.task_id)
-        proposal.status = target
-        session.flush()
         result = {
             "id": str(proposal.id),
             "task_id": str(proposal.task_id),

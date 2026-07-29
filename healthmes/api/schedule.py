@@ -6,6 +6,7 @@
 - ``GET /v1/schedule/proposals`` + accept/decline actions drive the
   propose-then-confirm gate (docs/PLAN.md §2, §6). Proposals are created by
   the planner via the MCP tool ``propose_schedule_blocks``, not over REST.
+  Resolution requires the one-time reply handle issued with the proposal.
 
 Accepting only marks the proposal ``accepted``; the calendar sync layer later
 writes the block to the external calendar and advances it to ``pushed``.
@@ -15,14 +16,23 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
-from starlette.status import HTTP_422_UNPROCESSABLE_CONTENT
+from starlette.status import (
+    HTTP_403_FORBIDDEN,
+    HTTP_409_CONFLICT,
+    HTTP_422_UNPROCESSABLE_CONTENT,
+    HTTP_503_SERVICE_UNAVAILABLE,
+)
 
 from healthmes.api.common import UTCDateTime
 from healthmes.api.errors import APIError, invalid_transition, not_found
 from healthmes.api.pagination import Page, PageParamsDep, paginate
+from healthmes.schedule_proposals import (
+    ScheduleProposalResolutionError,
+    resolve_schedule_proposal,
+)
 from healthmes.store import CalendarEventMirror, CalendarSource, ProposalStatus, ScheduleProposal
 from healthmes.store.session import SessionDep
 
@@ -56,6 +66,10 @@ class ProposalOut(BaseModel):
     status: ProposalStatus
     decision_record_id: uuid.UUID | None
     healthmes_kind: str | None
+
+
+class ProposalResolutionIn(BaseModel):
+    reply_handle: str
 
 
 @router.get("/events")
@@ -104,26 +118,86 @@ def list_proposals(
 
 
 def _resolve_proposal(
-    session: SessionDep, proposal_id: uuid.UUID, target: ProposalStatus
+    session: SessionDep,
+    request: Request,
+    proposal_id: uuid.UUID,
+    target: ProposalStatus,
+    reply_handle: str,
 ) -> ProposalOut:
-    proposal = session.get(ScheduleProposal, proposal_id)
-    if proposal is None:
-        raise not_found("schedule_proposal", proposal_id)
-    if proposal.status != ProposalStatus.PROPOSED:
-        raise invalid_transition("schedule_proposal", proposal.status.value, target.value)
-    proposal.status = target
+    handle_secret = (
+        request.app.state.settings.calendar_adjustment_secret.get_secret_value().strip()
+    )
+    if len(handle_secret) < 32:
+        raise APIError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "approval_unavailable",
+            "Schedule proposal approval is not configured",
+        )
+    try:
+        proposal = resolve_schedule_proposal(
+            session,
+            proposal_id,
+            target,
+            reply_handle,
+            handle_secret,
+        )
+    except ScheduleProposalResolutionError as exc:
+        if exc.code == "not_found":
+            raise not_found("schedule_proposal", proposal_id) from exc
+        if exc.code == "not_proposed":
+            current = session.get(ScheduleProposal, proposal_id)
+            if current is None:
+                raise not_found("schedule_proposal", proposal_id) from exc
+            raise invalid_transition(
+                "schedule_proposal", current.status.value, target.value
+            ) from exc
+        if exc.code == "invalid_handle":
+            raise APIError(
+                HTTP_403_FORBIDDEN,
+                "invalid_reply_handle",
+                "The schedule proposal reply handle is invalid",
+            ) from exc
+        if exc.code == "expired":
+            raise APIError(
+                HTTP_409_CONFLICT,
+                "proposal_expired",
+                "The schedule proposal has expired",
+            ) from exc
+        raise
     session.commit()
     session.refresh(proposal)
     return ProposalOut.model_validate(proposal)
 
 
 @router.post("/proposals/{proposal_id}/accept")
-def accept_proposal(proposal_id: uuid.UUID, session: SessionDep) -> ProposalOut:
+def accept_proposal(
+    proposal_id: uuid.UUID,
+    body: ProposalResolutionIn,
+    session: SessionDep,
+    request: Request,
+) -> ProposalOut:
     """Accept a pending proposal (``proposed`` -> ``accepted``)."""
-    return _resolve_proposal(session, proposal_id, ProposalStatus.ACCEPTED)
+    return _resolve_proposal(
+        session,
+        request,
+        proposal_id,
+        ProposalStatus.ACCEPTED,
+        body.reply_handle,
+    )
 
 
 @router.post("/proposals/{proposal_id}/decline")
-def decline_proposal(proposal_id: uuid.UUID, session: SessionDep) -> ProposalOut:
+def decline_proposal(
+    proposal_id: uuid.UUID,
+    body: ProposalResolutionIn,
+    session: SessionDep,
+    request: Request,
+) -> ProposalOut:
     """Decline a pending proposal (``proposed`` -> ``declined``)."""
-    return _resolve_proposal(session, proposal_id, ProposalStatus.DECLINED)
+    return _resolve_proposal(
+        session,
+        request,
+        proposal_id,
+        ProposalStatus.DECLINED,
+        body.reply_handle,
+    )

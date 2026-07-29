@@ -442,22 +442,19 @@ class TestJobRun:
         task = Task(title="Write weekly report")
         session.add(task)
         session.flush()
-        session.add_all(
-            [
-                ScheduleProposal(
-                    task_id=task.id,
-                    proposed_start=utc(2026, 7, 10, 9, 0),
-                    proposed_end=utc(2026, 7, 10, 11, 0),
-                    status=ProposalStatus.ACCEPTED,
-                ),
-                ScheduleProposal(
-                    task_id=task.id,
-                    proposed_start=utc(2026, 7, 11, 9, 0),
-                    proposed_end=utc(2026, 7, 11, 10, 0),
-                    status=ProposalStatus.PROPOSED,  # not confirmed: never pushed
-                ),
-            ]
+        accepted = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=utc(2026, 7, 10, 9, 0),
+            proposed_end=utc(2026, 7, 10, 11, 0),
+            status=ProposalStatus.ACCEPTED,
         )
+        pending = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=utc(2026, 7, 11, 9, 0),
+            proposed_end=utc(2026, 7, 11, 10, 0),
+            status=ProposalStatus.PROPOSED,  # not confirmed: never pushed
+        )
+        session.add_all([accepted, pending])
         session.commit()
 
         job = build_calendar_job(
@@ -475,6 +472,11 @@ class TestJobRun:
             "Write weekly report"
         ]
         assert fake_backend.created_drafts[0].agent_task_id == task.id
+        identity = fake_backend.created_drafts[0].identity
+        assert identity is not None
+        assert identity.kind is HealthmesEventKind.TASK_BLOCK
+        assert identity.source == "planner"
+        assert identity.source_key == f"proposal:{accepted.id}"
         session.expire_all()
         mirror = session.scalars(select(CalendarEventMirror)).one()
         assert mirror.is_agent_created

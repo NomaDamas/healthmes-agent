@@ -74,7 +74,7 @@ platforms:
              indentation leaks into the prompt body; indent(12) re-indents
              continuation lines to the block scalar's baseline. #}
           prompt: |
-            {{ healthmes_alert_prompt | default('HealthMes trigger {rule_id} fired: {summary}\n\n{prompt}', true) | indent(12) }}
+            {{ healthmes_alert_prompt | default('{prompt}', true) | indent(12) }}
           skills:
             - healthmes-planner
           deliver: telegram

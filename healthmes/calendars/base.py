@@ -89,6 +89,7 @@ SyncState = dict[str, Any]
 
 
 class HealthmesEventKind(StrEnum):
+    TASK_BLOCK = "task_block"
     ACTUAL_SLEEP = "actual_sleep"
     PLANNED_SLEEP = "planned_sleep"
 
