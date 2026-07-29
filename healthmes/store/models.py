@@ -160,6 +160,8 @@ class ScheduleProposal(Base):
         ForeignKey("decision_record.id", ondelete="SET NULL")
     )
     healthmes_kind: Mapped[str_64 | None]
+    reply_handle_digest: Mapped[str_255 | None]
+    expires_at: Mapped[datetime | None] = mapped_column(index=True)
 
 
 class CalendarMutationProposal(Base):

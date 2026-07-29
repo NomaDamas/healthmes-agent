@@ -8,6 +8,7 @@ from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror, Task
 
 INTAKE_PREFIX = "[HM]"
+MAX_INTAKE_TITLE_LENGTH = 500
 
 
 def intake_title(summary: str | None) -> str | None:
@@ -16,7 +17,8 @@ def intake_title(summary: str | None) -> str | None:
     normalized = summary.strip()
     if not normalized.startswith(INTAKE_PREFIX):
         return None
-    title = normalized[len(INTAKE_PREFIX) :].strip()
+    title = " ".join(normalized[len(INTAKE_PREFIX) :].split())
+    title = title[:MAX_INTAKE_TITLE_LENGTH].rstrip()
     return title or None
 
 

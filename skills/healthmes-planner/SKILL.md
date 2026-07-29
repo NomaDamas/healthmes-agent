@@ -46,8 +46,8 @@ tree.
 | `list_goals` / `upsert_goal` | Goal hierarchy: monthly goals with weekly goals nested under them. Read the month before planning a week; when placing tasks, say which monthly goal a block serves. Capture month-scale statements ("이번 달 안에 …") as monthly goals and link the week's goals to them. |
 | `list_tasks` / `upsert_task` | Task CRUD: title, goal, `est_minutes`, `deadline`, `energy_demand` (`low`/`med`/`high`), status |
 | `get_schedule` | Current merged view: calendar mirror + agent blocks + proposals |
-| `propose_schedule_blocks` | Propose concrete time blocks for tasks; blocks stay `proposed` until the user confirms |
-| `resolve_schedule_proposal` | Accept or decline one pending proposal after the user's live confirmation; accepted blocks are queued for calendar sync |
+| `propose_schedule_blocks` | Propose concrete time blocks for tasks; blocks stay `proposed` until the user confirms and each response includes a private, expiring `reply_handle` |
+| `resolve_schedule_proposal` | Accept or decline one pending proposal after the user's live confirmation; pass its exact one-time `reply_handle`; accepted blocks are queued for calendar sync |
 | `get_health_scores` | STRESS / BODY_BATTERY / READINESS / RECOVERY / internal sleep + resilience scores with qualifier and components |
 | `get_daily_readiness_context` | "Can the user push hard today?" — sleep debt, HRV vs 14-day baseline, stress, prior training load, with `confidence` |
 | `get_personal_baselines` | 14/90-day baselines and current deviation for chosen metrics |
@@ -112,13 +112,16 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
 5. **Propose, then resolve only from the live reply.** Send the blocks through
    `propose_schedule_blocks` and present them with the notification grammar
    (below). Blocks are written to the calendar only after the user confirms.
-   On an explicit live confirmation, call `resolve_schedule_proposal` with
-   the exact returned proposal id and `action: accept`; on an explicit
-   rejection use `action: decline`. If the user edits, decline the old
-   proposal, adjust, and re-propose. An accepted proposal is queued for the
-   next calendar sync; do not claim it is already on the external calendar.
-   This propose-then-confirm gate is the trust model — do not shortcut it,
-   even for "obvious" changes.
+   Retain each returned `reply_handle` privately for the current confirmation
+   exchange. Never display it, log it, or put it in a decision tree. On an
+   explicit live confirmation, call `resolve_schedule_proposal` with the
+   exact returned proposal id, its exact `reply_handle`, and `action: accept`;
+   on an explicit rejection use `action: decline` with the same handle. If
+   the handle expired or the user edits, decline when still possible, adjust,
+   and re-propose. An accepted proposal is queued for the next calendar sync;
+   do not claim it is already on the external calendar. This
+   propose-then-confirm gate is the trust model — do not shortcut it, even
+   for "obvious" changes.
 
    Calendar-input exception: a timed `[HM]` event is already the user's
    preferred work block. If it is acceptable, keep it and explain the no-op;

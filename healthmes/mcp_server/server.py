@@ -61,6 +61,7 @@ from healthmes.calendars.adjustments import (
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
     SqlAlchemyAdjustmentRepository,
+    issue_reply_handle,
     verify_reply_handle,
 )
 from healthmes.calendars.base import HealthmesEventKind
@@ -126,6 +127,7 @@ MAX_MEDICAL_LIST_LIMIT = 500
 DECISION_TREE_NODE_TYPES = frozenset({"input", "rule", "llm_step", "option", "action"})
 MAX_TREE_DEPTH = 12
 MAX_TREE_NODES = 500
+SCHEDULE_PROPOSAL_TTL = dt.timedelta(hours=24)
 
 _RANGE_PATTERN = re.compile(r"^(\d{1,3})d$")
 MAX_RANGE_DAYS = 90
@@ -2395,6 +2397,8 @@ def propose_schedule_blocks(
         parsed.append((block, start, end))
 
     with _store_session() as session:
+        handle_secret = _adjustment_handle_secret()
+        now = dt.datetime.now(dt.UTC)
         if decision_uuid is not None and session.get(DecisionRecord, decision_uuid) is None:
             raise ToolError(f"decision_record {decision_record_id} not found")
         for index, (_, start, end) in enumerate(parsed):
@@ -2447,6 +2451,9 @@ def propose_schedule_blocks(
                 decision_record_id=decision_uuid,
                 healthmes_kind=block.healthmes_kind,
             )
+            handle = issue_reply_handle(handle_secret)
+            proposal.reply_handle_digest = handle.digest
+            proposal.expires_at = min(now + SCHEDULE_PROPOSAL_TTL, start)
             session.add(proposal)
             session.flush()
             created.append(
@@ -2458,6 +2465,8 @@ def propose_schedule_blocks(
                     "end": _iso_utc(end),
                     "proposal_status": _enum_value(proposal.status),
                     "healthmes_kind": proposal.healthmes_kind,
+                    "reply_handle": handle.plaintext,
+                    "expires_at": _iso_utc(proposal.expires_at),
                     "conflicts": conflicts,
                 }
             )
@@ -2465,13 +2474,16 @@ def propose_schedule_blocks(
 
 
 @mcp.tool
-def resolve_schedule_proposal(proposal_id: str, action: str) -> dict[str, Any]:
+def resolve_schedule_proposal(
+    proposal_id: str, action: str, reply_handle: str | None = None
+) -> dict[str, Any]:
     """Accept or decline one pending schedule proposal after live user confirmation.
 
-    Pass the exact proposal ID returned by ``propose_schedule_blocks`` and
-    ``action`` as ``accept`` or ``decline``. Accepting queues the block for the
-    calendar sync job; declining leaves the external calendar unchanged.
-    Only proposals still in ``proposed`` state can be resolved.
+    Pass the exact proposal ID and one-time reply handle returned by
+    ``propose_schedule_blocks``, plus ``action`` as ``accept`` or ``decline``.
+    Accepting queues the block for the calendar sync job; declining leaves the
+    external calendar unchanged. Only unexpired proposals still in ``proposed``
+    state can be resolved.
     """
     target_by_action = {
         "accept": ProposalStatus.ACCEPTED,
@@ -2491,6 +2503,23 @@ def resolve_schedule_proposal(proposal_id: str, action: str) -> dict[str, Any]:
                 f"schedule proposal {proposal_id} is {_enum_value(proposal.status)}; "
                 "only proposed items can be resolved"
             )
+        if (
+            not reply_handle
+            or proposal.reply_handle_digest is None
+            or not verify_reply_handle(
+                reply_handle,
+                proposal.reply_handle_digest,
+                _adjustment_handle_secret(),
+            )
+        ):
+            raise ToolError("reply_handle is missing or invalid")
+        expires_at = (
+            proposal.expires_at.replace(tzinfo=dt.UTC)
+            if proposal.expires_at is not None and proposal.expires_at.tzinfo is None
+            else proposal.expires_at
+        )
+        if expires_at is None or dt.datetime.now(dt.UTC) >= expires_at:
+            raise ToolError("schedule proposal has expired")
         task = session.get(Task, proposal.task_id)
         proposal.status = target
         session.flush()

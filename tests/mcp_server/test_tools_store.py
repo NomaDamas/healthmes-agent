@@ -418,12 +418,18 @@ class TestScheduleTools:
                 ]
             },
         )
-        proposal_id = proposed["proposals"][0]["id"]
+        proposed_block = proposed["proposals"][0]
+        proposal_id = proposed_block["id"]
+        reply_handle = proposed_block["reply_handle"]
 
         accepted = await call_tool(
             mcp_client,
             "resolve_schedule_proposal",
-            {"proposal_id": proposal_id, "action": "accept"},
+            {
+                "proposal_id": proposal_id,
+                "action": "accept",
+                "reply_handle": reply_handle,
+            },
         )
 
         assert accepted["proposal"]["proposal_status"] == "accepted"
@@ -431,12 +437,76 @@ class TestScheduleTools:
         with store_factory() as session:
             proposal = session.get(ScheduleProposal, uuid.UUID(proposal_id))
             assert proposal is not None and proposal.status == ProposalStatus.ACCEPTED
+            assert proposal.reply_handle_digest
+            assert proposal.reply_handle_digest != reply_handle
+            assert proposal.expires_at is not None
 
         with pytest.raises(ToolError, match="only proposed items can be resolved"):
             await mcp_client.call_tool(
                 "resolve_schedule_proposal",
-                {"proposal_id": proposal_id, "action": "accept"},
+                {
+                    "proposal_id": proposal_id,
+                    "action": "accept",
+                    "reply_handle": reply_handle,
+                },
             )
+
+    async def test_resolve_schedule_proposal_requires_live_unexpired_handle(
+        self, mcp_client, call_tool, store_factory
+    ):
+        start = dt.datetime.now(dt.UTC).replace(
+            hour=10, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        proposed = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "title": "Handle-gated block",
+                        "start": start.isoformat(),
+                        "end": (start + dt.timedelta(minutes=30)).isoformat(),
+                    }
+                ]
+            },
+        )
+        block = proposed["proposals"][0]
+
+        with pytest.raises(ToolError, match="reply_handle is missing or invalid"):
+            await mcp_client.call_tool(
+                "resolve_schedule_proposal",
+                {"proposal_id": block["id"], "action": "accept"},
+            )
+        with pytest.raises(ToolError, match="reply_handle is missing or invalid"):
+            await mcp_client.call_tool(
+                "resolve_schedule_proposal",
+                {
+                    "proposal_id": block["id"],
+                    "action": "accept",
+                    "reply_handle": "invalid-handle",
+                },
+            )
+
+        with store_factory() as session:
+            proposal = session.get(ScheduleProposal, uuid.UUID(block["id"]))
+            assert proposal is not None
+            proposal.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
+            session.commit()
+
+        with pytest.raises(ToolError, match="schedule proposal has expired"):
+            await mcp_client.call_tool(
+                "resolve_schedule_proposal",
+                {
+                    "proposal_id": block["id"],
+                    "action": "accept",
+                    "reply_handle": block["reply_handle"],
+                },
+            )
+
+        with store_factory() as session:
+            proposal = session.get(ScheduleProposal, uuid.UUID(block["id"]))
+            assert proposal is not None
+            assert proposal.status is ProposalStatus.PROPOSED
 
     async def test_resolve_schedule_proposal_validates_action(self, mcp_client):
         with pytest.raises(ToolError, match="action must be accept or decline"):
@@ -479,6 +549,8 @@ class TestScheduleTools:
         assert [event["summary"] for event in result["events"]] == ["Dentist"]
         assert len(result["proposals"]) == 1
         assert result["proposals"][0]["task_title"] == "Deep work"
+        assert "reply_handle" not in result["proposals"][0]
+        assert "reply_handle_digest" not in result["proposals"][0]
 
         today_only = await call_tool(mcp_client, "get_schedule", {"range": "today"})
         assert today_only["events"] == []
