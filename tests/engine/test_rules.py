@@ -9,12 +9,14 @@ from datetime import UTC, datetime, timedelta, timezone
 from healthmes.engine.rules import (
     ALL_RULES,
     AfternoonLoad,
+    CalendarTaskInput,
     DeadlineTask,
     RecoverySnapshot,
     RuleThresholds,
     ScheduleChange,
     StressSnapshot,
     TriggerContext,
+    calendar_task_intake,
     deadline_risk,
     low_recovery_heavy_afternoon,
     schedule_changed,
@@ -80,6 +82,25 @@ def make_task(
         est_minutes=est_minutes,
         scheduled_minutes=scheduled_minutes,
         status=status,
+    )
+
+
+def make_calendar_task_input(
+    task_id: str = "calendar-task-1",
+    *,
+    is_all_day: bool = False,
+    input_revision: str = "revision-1",
+) -> CalendarTaskInput:
+    return CalendarTaskInput(
+        task_id=task_id,
+        title=f"Task {task_id}",
+        calendar_source="google",
+        input_revision=input_revision,
+        starts_at=NOW + timedelta(hours=1),
+        ends_at=NOW + timedelta(hours=1, minutes=45),
+        is_all_day=is_all_day,
+        est_minutes=None if is_all_day else 45,
+        deadline=NOW + timedelta(days=1) if is_all_day else None,
     )
 
 
@@ -223,6 +244,39 @@ class TestScheduleChanged:
         assert fire_rev2.dedup_key != fire_ab.dedup_key
 
 
+class TestCalendarTaskIntake:
+    def test_fires_for_calendar_task_input(self) -> None:
+        item = make_calendar_task_input()
+        fire = calendar_task_intake(make_ctx(calendar_task_inputs=(item,)))
+        assert fire is not None
+        assert fire.rule_id == "calendar_task_intake"
+        assert fire.evidence["tasks"][0]["placement"] == "preferred_block"
+        assert "external_id" not in fire.evidence["tasks"][0]
+
+    def test_revision_change_produces_a_new_dedup_key(self) -> None:
+        first = calendar_task_intake(
+            make_ctx(calendar_task_inputs=(make_calendar_task_input(),))
+        )
+        changed = calendar_task_intake(
+            make_ctx(
+                calendar_task_inputs=(
+                    make_calendar_task_input(input_revision="revision-2"),
+                )
+            )
+        )
+        assert first is not None and changed is not None
+        assert first.dedup_key != changed.dedup_key
+
+    def test_all_day_input_is_deadline_only(self) -> None:
+        item = make_calendar_task_input(is_all_day=True)
+        fire = calendar_task_intake(make_ctx(calendar_task_inputs=(item,)))
+        assert fire is not None
+        assert fire.evidence["tasks"][0]["placement"] == "deadline_only"
+
+    def test_no_fire_without_input(self) -> None:
+        assert calendar_task_intake(make_ctx()) is None
+
+
 # ---------------------------------------------------------------------------
 # deadline_risk
 # ---------------------------------------------------------------------------
@@ -271,6 +325,7 @@ def test_all_rules_registry_is_complete_and_ordered() -> None:
     assert ALL_RULES == (
         stress_spike_vs_baseline,
         low_recovery_heavy_afternoon,
+        calendar_task_intake,
         schedule_changed,
         deadline_risk,
     )
@@ -284,6 +339,7 @@ def test_evidence_is_json_serializable() -> None:
         recovery=make_recovery(),
         afternoon=make_afternoon(),
         schedule_changes=(make_change(is_agent_created=True),),
+        calendar_task_inputs=(make_calendar_task_input(),),
         deadline_tasks=(make_task(deadline=NOW.astimezone(UTC) + timedelta(hours=4)),),
     )
     for rule in ALL_RULES:

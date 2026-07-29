@@ -94,9 +94,7 @@ class TestUpsertAndListTasks:
         assert task["source"] == "user"
         assert task["est_minutes"] == 90
 
-    async def test_update_changes_only_provided_fields(
-        self, mcp_client, call_tool, store_factory
-    ):
+    async def test_update_changes_only_provided_fields(self, mcp_client, call_tool, store_factory):
         created = await call_tool(mcp_client, "upsert_task", {"title": "Refactor triggers"})
         task_id = created["task"]["id"]
         updated = await call_tool(
@@ -116,9 +114,7 @@ class TestUpsertAndListTasks:
         with pytest.raises(ToolError, match="title is required"):
             await mcp_client.call_tool("upsert_task", {})
         with pytest.raises(ToolError, match="energy_demand"):
-            await mcp_client.call_tool(
-                "upsert_task", {"title": "x", "energy_demand": "extreme"}
-            )
+            await mcp_client.call_tool("upsert_task", {"title": "x", "energy_demand": "extreme"})
         with pytest.raises(ToolError, match="not found"):
             await mcp_client.call_tool(
                 "upsert_task", {"task_id": str(uuid.uuid4()), "status": "done"}
@@ -132,15 +128,9 @@ class TestUpsertAndListTasks:
         with pytest.raises(ToolError, match="est_minutes"):
             await mcp_client.call_tool("upsert_task", {"title": "x", "est_minutes": 0})
 
-    async def test_list_hides_done_by_default_and_sorts_by_deadline(
-        self, mcp_client, call_tool
-    ):
-        await call_tool(
-            mcp_client, "upsert_task", {"title": "later", "deadline": "2026-07-20"}
-        )
-        await call_tool(
-            mcp_client, "upsert_task", {"title": "sooner", "deadline": "2026-07-10"}
-        )
+    async def test_list_hides_done_by_default_and_sorts_by_deadline(self, mcp_client, call_tool):
+        await call_tool(mcp_client, "upsert_task", {"title": "later", "deadline": "2026-07-20"})
+        await call_tool(mcp_client, "upsert_task", {"title": "sooner", "deadline": "2026-07-10"})
         await call_tool(mcp_client, "upsert_task", {"title": "no deadline"})
         done = await call_tool(mcp_client, "upsert_task", {"title": "finished"})
         await call_tool(
@@ -223,9 +213,7 @@ class TestScheduleTools:
         tomorrow = dt.datetime.now(dt.UTC).replace(
             hour=9, minute=0, second=0, microsecond=0
         ) + dt.timedelta(days=1)
-        self._mirror_event(
-            store_factory, tomorrow, tomorrow + dt.timedelta(hours=1), "Standup"
-        )
+        self._mirror_event(store_factory, tomorrow, tomorrow + dt.timedelta(hours=1), "Standup")
 
         result = await call_tool(
             mcp_client,
@@ -254,6 +242,44 @@ class TestScheduleTools:
             rows = list(session.scalars(select(ScheduleProposal)))
             assert len(rows) == 2
             assert all(row.status == ProposalStatus.PROPOSED for row in rows)
+
+    async def test_propose_block_ignores_its_calendar_input_event(
+        self, mcp_client, call_tool, store_factory
+    ):
+        created = await call_tool(mcp_client, "upsert_task", {"title": "Calendar input"})
+        task_id = uuid.UUID(created["task"]["id"])
+        tomorrow = dt.datetime.now(dt.UTC).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="calendar-input",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="[HM] Calendar input",
+                    start_at=tomorrow.replace(hour=0),
+                    end_at=tomorrow.replace(hour=0) + dt.timedelta(days=1),
+                    is_all_day=True,
+                    intake_task_id=task_id,
+                )
+            )
+            session.commit()
+
+        result = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "task_id": str(task_id),
+                        "start": tomorrow.isoformat(),
+                        "end": (tomorrow + dt.timedelta(minutes=30)).isoformat(),
+                    }
+                ]
+            },
+        )
+
+        assert result["proposals"][0]["conflicts"] == []
 
     async def test_propose_planned_sleep_carries_explicit_calendar_kind(
         self, mcp_client, call_tool, store_factory
@@ -373,6 +399,52 @@ class TestScheduleTools:
                 },
             )
 
+    async def test_resolve_schedule_proposal_accepts_once(
+        self, mcp_client, call_tool, store_factory
+    ):
+        start = dt.datetime.now(dt.UTC).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        proposed = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "title": "Telegram-confirmed block",
+                        "start": start.isoformat(),
+                        "end": (start + dt.timedelta(minutes=30)).isoformat(),
+                    }
+                ]
+            },
+        )
+        proposal_id = proposed["proposals"][0]["id"]
+
+        accepted = await call_tool(
+            mcp_client,
+            "resolve_schedule_proposal",
+            {"proposal_id": proposal_id, "action": "accept"},
+        )
+
+        assert accepted["proposal"]["proposal_status"] == "accepted"
+        assert accepted["proposal"]["calendar_write"] == "queued"
+        with store_factory() as session:
+            proposal = session.get(ScheduleProposal, uuid.UUID(proposal_id))
+            assert proposal is not None and proposal.status == ProposalStatus.ACCEPTED
+
+        with pytest.raises(ToolError, match="only proposed items can be resolved"):
+            await mcp_client.call_tool(
+                "resolve_schedule_proposal",
+                {"proposal_id": proposal_id, "action": "accept"},
+            )
+
+    async def test_resolve_schedule_proposal_validates_action(self, mcp_client):
+        with pytest.raises(ToolError, match="action must be accept or decline"):
+            await mcp_client.call_tool(
+                "resolve_schedule_proposal",
+                {"proposal_id": str(uuid.uuid4()), "action": "maybe"},
+            )
+
     async def test_get_schedule_returns_window_events_and_pending_proposals(
         self, mcp_client, call_tool, store_factory, pinned_tz
     ):
@@ -382,9 +454,7 @@ class TestScheduleTools:
         tomorrow = dt.datetime.now(pinned_tz).replace(
             hour=14, minute=0, second=0, microsecond=0
         ) + dt.timedelta(days=1)
-        self._mirror_event(
-            store_factory, tomorrow, tomorrow + dt.timedelta(hours=1), "Dentist"
-        )
+        self._mirror_event(store_factory, tomorrow, tomorrow + dt.timedelta(hours=1), "Dentist")
         far_future = tomorrow + dt.timedelta(days=30)
         self._mirror_event(
             store_factory, far_future, far_future + dt.timedelta(hours=1), "Far away"
@@ -666,9 +736,7 @@ class TestScheduleTools:
     ):
         assert server_module._public_calendar_adjustment_status(internal_status) == public_status
 
-    async def test_resolve_rejects_unknown_proposal_without_sensitive_detail(
-        self, mcp_client
-    ):
+    async def test_resolve_rejects_unknown_proposal_without_sensitive_detail(self, mcp_client):
         with pytest.raises(ToolError, match=r"^calendar adjustment proposal not found$"):
             await mcp_client.call_tool(
                 "resolve_calendar_adjustment",
@@ -808,13 +876,9 @@ class TestCaptureTools:
         with pytest.raises(ToolError, match="description"):
             await mcp_client.call_tool("log_food", {"description": "   "})
         with pytest.raises(ToolError, match="meal_type"):
-            await mcp_client.call_tool(
-                "log_food", {"description": "toast", "meal_type": "brunch"}
-            )
+            await mcp_client.call_tool("log_food", {"description": "toast", "meal_type": "brunch"})
 
-    async def test_record_decision_returns_viewer_url(
-        self, mcp_client, call_tool, store_factory
-    ):
+    async def test_record_decision_returns_viewer_url(self, mcp_client, call_tool, store_factory):
         result = await call_tool(
             mcp_client,
             "record_decision",

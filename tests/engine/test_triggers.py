@@ -19,6 +19,7 @@ from healthmes.engine.rules import (
     StressSnapshot,
     TriggerContext,
     TriggerFire,
+    calendar_task_intake,
     deadline_risk,
     low_recovery_heavy_afternoon,
     schedule_changed,
@@ -484,6 +485,76 @@ def test_is_in_quiet_hours_plain_and_disabled_windows() -> None:
 # ---------------------------------------------------------------------------
 # Store-driven context: schedule_changed and deadline_risk end-to-end
 # ---------------------------------------------------------------------------
+
+
+def test_calendar_task_intake_invokes_planner_once(
+    settings, session_factory, alert_sender
+) -> None:
+    with freeze_time("2026-07-29 14:00:00") as frozen:
+        now = local_now()
+        with session_factory() as session:
+            task = Task(title="백오피스 작업", est_minutes=45)
+            session.add(task)
+            session.flush()
+            task_id = task.id
+            session.add(
+                CalendarEventMirror(
+                    external_id="hm-backoffice",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="[HM] 백오피스 작업",
+                    start_at=utc(now + timedelta(hours=1)),
+                    end_at=utc(now + timedelta(hours=1, minutes=45)),
+                    organizer_self=True,
+                    event_type="default",
+                    etag="etag-1",
+                    intake_task_id=task_id,
+                )
+            )
+            session.commit()
+
+        evaluator = make_evaluator(
+            settings,
+            session_factory,
+            alert_sender,
+            rules=(calendar_task_intake,),
+        )
+        report = evaluator.evaluate_once()
+
+        assert [outcome.status for outcome in report.outcomes] == ["pushed"]
+        [task_evidence] = report.outcomes[0].fire.evidence["tasks"]
+        assert task_evidence["task_id"] == str(task_id)
+        assert task_evidence["title"] == "백오피스 작업"
+        assert task_evidence["est_minutes"] == 45
+        assert task_evidence["placement"] == "preferred_block"
+        assert "external_id" not in task_evidence
+        assert "duplicate calendar block" in report.outcomes[0].fire.proposal
+
+        assert evaluator.evaluate_once().outcomes == ()
+        assert len(alert_sender.sent) == 1
+
+        with session_factory() as session:
+            task = session.get(Task, task_id)
+            mirror = session.scalar(
+                select(CalendarEventMirror).where(
+                    CalendarEventMirror.intake_task_id == task_id
+                )
+            )
+            assert task is not None and mirror is not None
+            task.title = "백오피스 최종 작업"
+            task.est_minutes = 60
+            mirror.summary = "[HM] 백오피스 최종 작업"
+            mirror.end_at = utc(now + timedelta(hours=2))
+            mirror.etag = "etag-2"
+            session.commit()
+
+        frozen.tick(timedelta(minutes=61))
+        changed = evaluator.evaluate_once()
+        assert [outcome.status for outcome in changed.outcomes] == ["pushed"]
+        [changed_evidence] = changed.outcomes[0].fire.evidence["tasks"]
+        assert changed_evidence["title"] == "백오피스 최종 작업"
+        assert changed_evidence["est_minutes"] == 60
+        assert evaluator.evaluate_once().outcomes == ()
+        assert len(alert_sender.sent) == 2
 
 
 def test_schedule_changed_fires_from_calendar_mirror_diff(

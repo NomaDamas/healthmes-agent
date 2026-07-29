@@ -30,6 +30,7 @@ or bound into a query, so comparisons behave identically on postgres
 """
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import statistics
@@ -46,6 +47,7 @@ from healthmes.config import Settings, resolve_timezone
 from healthmes.engine.rules import (
     ALL_RULES,
     AfternoonLoad,
+    CalendarTaskInput,
     DeadlineTask,
     RecoverySnapshot,
     RuleThresholds,
@@ -510,6 +512,55 @@ def _load_deadline_tasks(
     return tuple(result)
 
 
+def _load_calendar_task_inputs(session: Session) -> tuple[CalendarTaskInput, ...]:
+    processed_revisions: set[str] = set()
+    events = session.scalars(
+        select(TriggerEvent).where(TriggerEvent.rule_id == "calendar_task_intake")
+    ).all()
+    for event in events:
+        evidence = event.payload.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        tasks = evidence.get("tasks")
+        if not isinstance(tasks, list):
+            continue
+        for task in tasks:
+            if isinstance(task, dict) and isinstance(task.get("input_revision"), str):
+                processed_revisions.add(task["input_revision"])
+
+    rows = session.execute(
+        select(CalendarEventMirror, Task)
+        .join(Task, CalendarEventMirror.intake_task_id == Task.id)
+        .where(Task.status.not_in(_TERMINAL_TASK_STATUSES))
+        .order_by(Task.created_at, Task.id)
+    ).all()
+    inputs: list[CalendarTaskInput] = []
+    for mirror, task in rows:
+        raw_revision = (
+            f"{mirror.calendar_source.value}:{mirror.external_id}:"
+            f"{mirror.etag or _ensure_utc(mirror.updated_at).isoformat()}"
+        )
+        input_revision = hashlib.sha256(raw_revision.encode("utf-8")).hexdigest()[:16]
+        if input_revision in processed_revisions:
+            continue
+        inputs.append(
+            CalendarTaskInput(
+                task_id=str(task.id),
+                title=task.title,
+                calendar_source=mirror.calendar_source.value,
+                input_revision=input_revision,
+                starts_at=_ensure_utc(mirror.start_at),
+                ends_at=_ensure_utc(mirror.end_at),
+                is_all_day=mirror.is_all_day,
+                est_minutes=task.est_minutes,
+                deadline=(
+                    _ensure_utc(task.deadline) if task.deadline is not None else None
+                ),
+            )
+        )
+    return tuple(inputs)
+
+
 # ---------------------------------------------------------------------------
 # Evaluator
 # ---------------------------------------------------------------------------
@@ -634,6 +685,7 @@ class TriggerEvaluator:
             schedule_changes=_load_schedule_changes(
                 session, now, timedelta(minutes=SCHEDULE_DIFF_LOOKBACK_MINUTES)
             ),
+            calendar_task_inputs=_load_calendar_task_inputs(session),
             deadline_tasks=_load_deadline_tasks(session, now, self._thresholds),
             thresholds=self._thresholds,
         )

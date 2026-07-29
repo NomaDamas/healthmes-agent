@@ -21,6 +21,8 @@
     <string>en_US.UTF-8</string>
     <key>LC_ALL</key>
     <string>en_US.UTF-8</string>
+    <key>HEALTHMES_SCHEDULER_ENABLED</key>
+    <string>true</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

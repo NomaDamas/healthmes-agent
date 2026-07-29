@@ -43,6 +43,7 @@ from healthmes.calendars.base import (
     HealthmesEventKind,
     coerce_utc,
 )
+from healthmes.calendars.intake import intake_calendar_tasks
 from healthmes.calendars.state import (
     FilePendingDiffStore,
     FileSyncStateStore,
@@ -50,7 +51,7 @@ from healthmes.calendars.state import (
     SyncStateStore,
 )
 from healthmes.calendars.sync import CalendarMirrorService, SyncDiff
-from healthmes.config import Settings
+from healthmes.config import Settings, resolve_timezone
 from healthmes.store.enums import CalendarSource, ProposalStatus
 from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task
 from healthmes.store.session import session_scope
@@ -224,6 +225,7 @@ def push_accepted_proposals(
                 source.value,
             )
         proposal.status = ProposalStatus.PUSHED
+        task.status = "scheduled"
         session.commit()
         pushed += 1
         logger.info(
@@ -279,6 +281,7 @@ def build_calendar_job(
             with session_scope(session_factory) as session:
                 service = CalendarMirrorService(session, [backend], store, journal)
                 diff = service.sync_backend(backend)
+                intake_calendar_tasks(session, source, resolve_timezone(settings))
                 if is_write_backend:
                     push_accepted_proposals(service, session, source)
                 return diff

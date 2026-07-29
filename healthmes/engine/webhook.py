@@ -11,8 +11,9 @@ The receiving contract is ``vendor/hermes-agent/gateway/platforms/webhook.py``
   ``X-Webhook-Signature-V2`` = hex HMAC-SHA256 over the byte string
   ``b"{timestamp}.{body}"`` keyed with the UTF-8 shared secret, plus
   ``X-Webhook-Timestamp`` = unix seconds. The gateway enforces a +/-300s
-  replay window and rejects V2 signatures without a timestamp. The legacy
-  body-only V1 header is deprecated upstream and never sent here.
+  replay window and rejects V2 signatures without a timestamp. A body-only
+  V1 header is sent alongside it for installed gateways that predate V2;
+  current gateways always select and validate V2 when both are present.
 - **Idempotency nonce**: ``X-Request-ID`` is the delivery id the gateway
   dedupes on (vendor lines 609-628; precedence X-GitHub-Delivery > svix-id >
   X-Request-ID). We must NOT send any ``svix-*`` header: its mere presence
@@ -51,6 +52,7 @@ from healthmes.engine.rules import TriggerFire
 __all__ = [
     "WebhookResult",
     "HermesWebhookSender",
+    "sign_v1",
     "sign_v2",
     "build_alert_prompt",
     "build_alert_payload",
@@ -60,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT_SECONDS = 10.0
 SIGNATURE_HEADER = "X-Webhook-Signature-V2"
+LEGACY_SIGNATURE_HEADER = "X-Webhook-Signature"
 TIMESTAMP_HEADER = "X-Webhook-Timestamp"
 REQUEST_ID_HEADER = "X-Request-ID"
 
@@ -71,6 +74,10 @@ class WebhookResult:
     ok: bool
     status_code: int | None = None
     detail: str | None = None
+
+
+def sign_v1(secret: str, body: bytes) -> str:
+    return hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
 
 def sign_v2(secret: str, timestamp: str, body: bytes) -> str:
@@ -198,6 +205,7 @@ class HermesWebhookSender:
             "Content-Type": "application/json",
             TIMESTAMP_HEADER: timestamp,
             SIGNATURE_HEADER: sign_v2(secret, timestamp, body),
+            LEGACY_SIGNATURE_HEADER: sign_v1(secret, body),
             # Delivery id for the gateway's idempotency cache; stable per
             # dedup_key so accidental double-sends collapse gateway-side too.
             REQUEST_ID_HEADER: f"healthmes:{fire.dedup_key}",

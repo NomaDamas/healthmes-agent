@@ -18,12 +18,14 @@ from pydantic import SecretStr
 
 from healthmes.config import Settings
 from healthmes.engine.webhook import (
+    LEGACY_SIGNATURE_HEADER,
     REQUEST_ID_HEADER,
     SIGNATURE_HEADER,
     TIMESTAMP_HEADER,
     HermesWebhookSender,
     build_alert_payload,
     build_alert_prompt,
+    sign_v1,
     sign_v2,
 )
 
@@ -101,6 +103,7 @@ def test_post_matches_vendor_route_and_signature(sender, transport, settings, ma
     # The signature must satisfy the gateway's own verification logic.
     secret = settings.hermes_webhook_secret.get_secret_value()
     assert vendor_validate_v2(request.headers, request.content, secret, now=int(time.time()))
+    assert request.headers[LEGACY_SIGNATURE_HEADER] == sign_v1(secret, request.content)
 
     # Idempotency nonce: stable per dedup_key, and never a svix header
     # (svix-* presence would switch the gateway to Svix validation).

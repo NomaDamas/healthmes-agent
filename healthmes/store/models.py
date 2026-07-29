@@ -124,6 +124,9 @@ class CalendarEventMirror(Base):
     agent_task_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("task.id", ondelete="SET NULL"), index=True
     )
+    intake_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("task.id", ondelete="SET NULL"), index=True
+    )
     healthmes_kind: Mapped[str_64 | None]
     healthmes_source: Mapped[str_255 | None]
     healthmes_source_key: Mapped[str_255 | None]

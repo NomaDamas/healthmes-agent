@@ -54,7 +54,7 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars.adjustments import (
@@ -347,8 +347,7 @@ def _adjustment_handle_secret(settings: Settings | None = None) -> str:
     value = settings.calendar_adjustment_secret.get_secret_value().strip()
     if len(value) < 32:
         raise ToolError(
-            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET must be configured "
-            "with at least 32 characters"
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET must be configured with at least 32 characters"
         )
     return value
 
@@ -1205,13 +1204,9 @@ async def _arousal_hints_for(
             (day - dt.timedelta(days=interpret.BASELINE_WINDOW_DAYS)).isoformat(),
             day.isoformat(),
         )
-        rhr_series = interpret.summary_daily_values(
-            rhr_rows, "resting_heart_rate_bpm", day
-        )
+        rhr_series = interpret.summary_daily_values(rhr_rows, "resting_heart_rate_bpm", day)
     except (OWClientError, httpx.HTTPError) as exc:
-        logging.getLogger(__name__).warning(
-            "arousal hints: open-wearables fetch failed: %s", exc
-        )
+        logging.getLogger(__name__).warning("arousal hints: open-wearables fetch failed: %s", exc)
         return {
             "status": arousal.STATUS_INSUFFICIENT,
             "reason": "wearable_fetch_failed",
@@ -1326,9 +1321,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
             "confidence": "low",
             "truncated": False,
             "intervals": [],
-            "arousal_hints": await _arousal_hints_for(
-                client, user_id, day, tz, start_utc, end_utc
-            ),
+            "arousal_hints": await _arousal_hints_for(client, user_id, day, tz, start_utc, end_utc),
         }
     if series_truncated and not samples_utc:
         return {
@@ -1340,9 +1333,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
             "coverage": 0.0,
             "truncated": True,
             "intervals": [],
-            "arousal_hints": await _arousal_hints_for(
-                client, user_id, day, tz, start_utc, end_utc
-            ),
+            "arousal_hints": await _arousal_hints_for(client, user_id, day, tz, start_utc, end_utc),
         }
 
     day_level: dict[str, Any] | None = None
@@ -1805,6 +1796,7 @@ def _serialize_task(task: Task) -> dict[str, Any]:
         "updated_at": _iso_utc(task.updated_at),
     }
 
+
 GOAL_STATUSES = {"active", "done", "dropped"}
 
 
@@ -1819,9 +1811,7 @@ def _serialize_goal(goal: Any, *, scope: str) -> dict[str, Any]:
         "status": goal.status,
     }
     if scope == "weekly":
-        payload["monthly_goal_id"] = (
-            str(goal.monthly_goal_id) if goal.monthly_goal_id else None
-        )
+        payload["monthly_goal_id"] = str(goal.monthly_goal_id) if goal.monthly_goal_id else None
     return payload
 
 
@@ -1838,9 +1828,7 @@ def _resolve_monthly_ref(session: Any, ref: str) -> tuple[Any | None, str | None
     except ValueError:
         pass
     matches = list(
-        session.scalars(
-            select(MonthlyGoal).where(func.lower(MonthlyGoal.title) == cleaned.lower())
-        )
+        session.scalars(select(MonthlyGoal).where(func.lower(MonthlyGoal.title) == cleaned.lower()))
     )
     if len(matches) == 1:
         return matches[0], None
@@ -1871,9 +1859,7 @@ def list_goals(include_done: bool = False) -> dict[str, Any]:
     monthly_rows.sort(
         key=lambda g: (g.month_start.isoformat(), g.priority, str(g.id)), reverse=True
     )
-    weekly_rows.sort(
-        key=lambda g: (g.week_start.isoformat(), g.priority, str(g.id)), reverse=True
-    )
+    weekly_rows.sort(key=lambda g: (g.week_start.isoformat(), g.priority, str(g.id)), reverse=True)
 
     by_month: dict[str, dict[str, Any]] = {}
     for goal in monthly_rows:
@@ -2399,9 +2385,7 @@ def propose_schedule_blocks(
                     f"{block.energy_demand!r}"
                 )
         if block.healthmes_kind not in {None, HealthmesEventKind.PLANNED_SLEEP.value}:
-            raise ToolError(
-                f"blocks[{index}].healthmes_kind must be planned_sleep or omitted"
-            )
+            raise ToolError(f"blocks[{index}].healthmes_kind must be planned_sleep or omitted")
     parsed: list[tuple[ScheduleBlockIn, dt.datetime, dt.datetime]] = []
     for index, block in enumerate(blocks):
         start = _parse_datetime_utc(block.start, f"blocks[{index}].start")
@@ -2433,6 +2417,17 @@ def propose_schedule_blocks(
                 )
                 session.add(task)
                 session.flush()
+            conflict_query = select(CalendarEventMirror).where(
+                CalendarEventMirror.start_at < end,
+                CalendarEventMirror.end_at > start,
+            )
+            if block.task_id is not None:
+                conflict_query = conflict_query.where(
+                    or_(
+                        CalendarEventMirror.intake_task_id.is_(None),
+                        CalendarEventMirror.intake_task_id != task.id,
+                    )
+                )
             conflicts = [
                 {
                     "summary": event.summary,
@@ -2441,12 +2436,7 @@ def propose_schedule_blocks(
                     "is_agent_created": event.is_agent_created,
                 }
                 for event in session.scalars(
-                    select(CalendarEventMirror)
-                    .where(
-                        CalendarEventMirror.start_at < end,
-                        CalendarEventMirror.end_at > start,
-                    )
-                    .order_by(CalendarEventMirror.start_at)
+                    conflict_query.order_by(CalendarEventMirror.start_at)
                 )
             ]
             proposal = ScheduleProposal(
@@ -2472,6 +2462,48 @@ def propose_schedule_blocks(
                 }
             )
     return {"status": "ok", "proposals": created}
+
+
+@mcp.tool
+def resolve_schedule_proposal(proposal_id: str, action: str) -> dict[str, Any]:
+    """Accept or decline one pending schedule proposal after live user confirmation.
+
+    Pass the exact proposal ID returned by ``propose_schedule_blocks`` and
+    ``action`` as ``accept`` or ``decline``. Accepting queues the block for the
+    calendar sync job; declining leaves the external calendar unchanged.
+    Only proposals still in ``proposed`` state can be resolved.
+    """
+    target_by_action = {
+        "accept": ProposalStatus.ACCEPTED,
+        "decline": ProposalStatus.DECLINED,
+    }
+    target = target_by_action.get(action.strip().lower())
+    if target is None:
+        raise ToolError("action must be accept or decline")
+
+    proposal_uuid = _parse_uuid(proposal_id, "proposal_id")
+    with _store_session() as session:
+        proposal = session.get(ScheduleProposal, proposal_uuid)
+        if proposal is None:
+            raise ToolError(f"schedule proposal {proposal_id} not found")
+        if proposal.status is not ProposalStatus.PROPOSED:
+            raise ToolError(
+                f"schedule proposal {proposal_id} is {_enum_value(proposal.status)}; "
+                "only proposed items can be resolved"
+            )
+        task = session.get(Task, proposal.task_id)
+        proposal.status = target
+        session.flush()
+        result = {
+            "id": str(proposal.id),
+            "task_id": str(proposal.task_id),
+            "task_title": task.title if task is not None else None,
+            "start": _iso_utc(proposal.proposed_start),
+            "end": _iso_utc(proposal.proposed_end),
+            "proposal_status": _enum_value(proposal.status),
+            "calendar_write": "queued" if target is ProposalStatus.ACCEPTED else "unchanged",
+        }
+    return {"status": "ok", "proposal": result}
 
 
 @mcp.tool

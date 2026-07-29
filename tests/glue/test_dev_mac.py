@@ -4,6 +4,7 @@ Shell scripts get no import-time checking, so the invariants that protect
 the read-only vendor tree are pinned here as text/syntax assertions.
 """
 
+import plistlib
 import re
 import shutil
 import subprocess
@@ -83,6 +84,12 @@ def test_install_registers_keepalive_login_launch_agent() -> None:
     assert "<key>LC_ALL</key>" in template
     assert template.count("<string>en_US.UTF-8</string>") == 2
     assert "<string>daemon</string>" in template
+
+
+def test_launch_agent_enables_scheduler_for_background_calendar_polling() -> None:
+    template = plistlib.loads(LAUNCH_AGENT_TEMPLATE.read_bytes())
+    environment = template["EnvironmentVariables"]
+    assert environment["HEALTHMES_SCHEDULER_ENABLED"] == "true"
 
 
 def test_uninstall_keeps_data_unless_delete_data_is_explicit() -> None:

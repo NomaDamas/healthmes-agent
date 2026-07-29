@@ -6,7 +6,7 @@ write backend advances accepted proposals to ``pushed`` by writing tagged
 agent blocks — the contract promised by healthmes/api/schedule.py.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -25,9 +25,11 @@ from healthmes.calendars.sync import CalendarMirrorService
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
+    EnergyDemand,
     ProposalStatus,
     ScheduleProposal,
     Task,
+    TaskSource,
 )
 
 
@@ -72,6 +74,310 @@ class TestEnablement:
 
 
 class TestJobRun:
+    def test_google_hm_event_creates_one_linked_task(
+        self, settings, session_factory, session, fake_backend, make_event
+    ) -> None:
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "hm-backoffice",
+                    summary="[HM] 백오피스 작업",
+                    start=utc(2026, 7, 29, 6, 0),
+                    end=utc(2026, 7, 29, 6, 45),
+                    organizer_self=True,
+                    event_type="default",
+                    status="confirmed",
+                )
+            ],
+            {"sync_token": "tok-1"},
+        )
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+        )
+
+        job()
+        job()
+
+        task = session.scalars(select(Task)).one()
+        assert task.title == "백오피스 작업"
+        assert task.est_minutes == 45
+        assert task.deadline is None
+        assert task.energy_demand is EnergyDemand.MED
+        assert task.source is TaskSource.USER
+
+        mirror = session.scalars(select(CalendarEventMirror)).one()
+        assert mirror.intake_task_id == task.id
+        assert mirror.agent_task_id is None
+        assert mirror.is_agent_created is False
+        assert len(session.scalars(select(Task)).all()) == 1
+
+    def test_google_hm_all_day_event_uses_calendar_date_as_deadline(
+        self, settings, session_factory, session, fake_backend, make_event
+    ) -> None:
+        end = utc(2026, 7, 30)
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "hm-all-day",
+                    summary="[HM] 투자자 목록 정리",
+                    start=utc(2026, 7, 29),
+                    end=end,
+                    organizer_self=True,
+                    event_type="default",
+                    is_all_day=True,
+                )
+            ],
+            {"sync_token": "tok-1"},
+        )
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+        )
+
+        job()
+
+        task = session.scalars(select(Task)).one()
+        assert task.est_minutes is None
+        assert task.deadline == (end - timedelta(microseconds=1)).replace(tzinfo=None)
+
+    def test_google_hm_all_day_deadline_uses_user_timezone(
+        self, settings, session_factory, session, fake_backend, make_event
+    ) -> None:
+        settings = settings.model_copy(update={"timezone": "Asia/Seoul"})
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "hm-all-day-kst",
+                    summary="[HM] 투자자 목록 정리",
+                    start=utc(2026, 7, 30),
+                    end=utc(2026, 7, 31),
+                    organizer_self=True,
+                    event_type="default",
+                    is_all_day=True,
+                )
+            ],
+            {"sync_token": "tok-1"},
+        )
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+        )
+
+        job()
+
+        task = session.scalars(select(Task)).one()
+        assert task.deadline == utc(2026, 7, 30, 14, 59, 59, 999999).replace(
+            tzinfo=None
+        )
+
+    def test_all_day_intake_acceptance_writes_one_owned_block_and_replays_noop(
+        self, settings, session_factory, session, fake_backend, make_event
+    ) -> None:
+        source_event = make_event(
+            "hm-all-day-e2e",
+            summary="[HM] 투자자 목록 정리",
+            start=utc(2026, 7, 29),
+            end=utc(2026, 7, 30),
+            organizer_self=True,
+            event_type="default",
+            is_all_day=True,
+            etag="etag-1",
+        )
+        fake_backend.queue_changes([source_event], {"sync_token": "tok-1"})
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+        )
+
+        job()
+        task = session.scalars(select(Task)).one()
+        task_id = task.id
+        proposal = ScheduleProposal(
+            task_id=task_id,
+            proposed_start=utc(2026, 7, 29, 9),
+            proposed_end=utc(2026, 7, 29, 9, 30),
+            status=ProposalStatus.ACCEPTED,
+        )
+        session.add(proposal)
+        session.commit()
+
+        job()
+        job()
+        fake_backend.queue_changes([source_event], {"sync_token": "tok-2"})
+        job()
+
+        session.expire_all()
+        assert len(session.scalars(select(Task)).all()) == 1
+        assert session.get(Task, task_id).status == "scheduled"
+        assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PUSHED
+        assert len(fake_backend.created_drafts) == 1
+        assert fake_backend.created_drafts[0].agent_task_id == task_id
+        assert len(
+            session.scalars(
+                select(CalendarEventMirror).where(
+                    CalendarEventMirror.is_agent_created.is_(True)
+                )
+            ).all()
+        ) == 1
+
+    def test_google_hm_event_update_changes_the_linked_task_without_duplication(
+        self, settings, session_factory, session, fake_backend, make_event
+    ) -> None:
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "hm-edit",
+                    summary="[HM] 초안 작성",
+                    start=utc(2026, 7, 29, 6, 0),
+                    end=utc(2026, 7, 29, 6, 30),
+                    organizer_self=True,
+                    event_type="default",
+                    etag="etag-1",
+                )
+            ],
+            {"sync_token": "tok-1"},
+        )
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "hm-edit",
+                    summary="[HM] 최종안 작성",
+                    start=utc(2026, 7, 29, 6, 0),
+                    end=utc(2026, 7, 29, 7, 0),
+                    organizer_self=True,
+                    event_type="default",
+                    etag="etag-2",
+                )
+            ],
+            {"sync_token": "tok-2"},
+        )
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+        )
+
+        job()
+        task_id = session.scalars(select(Task.id)).one()
+        job()
+
+        session.expire_all()
+        task = session.scalars(select(Task)).one()
+        assert task.id == task_id
+        assert task.title == "최종안 작성"
+        assert task.est_minutes == 60
+
+    def test_non_intake_calendar_events_never_create_tasks(
+        self, settings, session_factory, session, fake_backend, make_event
+    ) -> None:
+        fake_backend.queue_changes(
+            [
+                make_event("ordinary", summary="백오피스 작업", organizer_self=True),
+                make_event("not-mine", summary="[HM] 작업", organizer_self=False),
+                make_event(
+                    "attendees",
+                    summary="[HM] 작업",
+                    organizer_self=True,
+                    has_attendees=True,
+                ),
+                make_event(
+                    "recurring",
+                    summary="[HM] 작업",
+                    organizer_self=True,
+                    is_recurring=True,
+                ),
+                make_event("empty", summary="[HM]   ", organizer_self=True),
+                make_event(
+                    "special",
+                    summary="[HM] 작업",
+                    organizer_self=True,
+                    event_type="focusTime",
+                ),
+            ],
+            {"sync_token": "tok-1"},
+        )
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+        )
+
+        job()
+
+        assert session.scalars(select(Task)).all() == []
+
+    def test_removing_marker_or_deleting_event_does_not_delete_task(
+        self, settings, session_factory, session, fake_backend, make_event
+    ) -> None:
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "hm-safe",
+                    summary="[HM] 보존할 작업",
+                    organizer_self=True,
+                    event_type="default",
+                    etag="etag-1",
+                )
+            ],
+            {"sync_token": "tok-1"},
+        )
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "hm-safe",
+                    summary="보존할 작업",
+                    organizer_self=True,
+                    event_type="default",
+                    etag="etag-2",
+                )
+            ],
+            {"sync_token": "tok-2"},
+        )
+        fake_backend.queue_changes(
+            [make_event("hm-safe", deleted=True, summary=None, etag=None)],
+            {"sync_token": "tok-3"},
+        )
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+        )
+
+        job()
+        task_id = session.scalars(select(Task.id)).one()
+        job()
+        assert session.scalars(select(Task.id)).one() == task_id
+        job()
+
+        assert session.scalars(select(CalendarEventMirror)).all() == []
+        assert session.scalars(select(Task.id)).one() == task_id
+
     def test_job_syncs_backend_into_mirror(
         self, settings, session_factory, session, fake_backend, make_event
     ) -> None:
@@ -168,6 +474,7 @@ class TestJobRun:
             for proposal in session.scalars(select(ScheduleProposal)).all()
         }
         assert statuses == {ProposalStatus.PUSHED, ProposalStatus.PROPOSED}
+        assert session.get(Task, task.id).status == "scheduled"
 
     def test_read_backend_never_pushes(
         self, settings, session_factory, session, fake_backend
