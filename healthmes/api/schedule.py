@@ -6,7 +6,8 @@
 - ``GET /v1/schedule/proposals`` + accept/decline actions drive the
   propose-then-confirm gate (docs/PLAN.md §2, §6). Proposals are created by
   the planner via the MCP tool ``propose_schedule_blocks``, not over REST.
-  Resolution requires the one-time reply handle issued with the proposal.
+  Authenticated app responses include a scoped resolution token required by
+  the REST actions; Telegram uses the separate one-time reply handle.
 
 Accepting only marks the proposal ``accepted``; the calendar sync layer later
 writes the block to the external calendar and advances it to ``pushed``.
@@ -31,6 +32,7 @@ from healthmes.api.errors import APIError, invalid_transition, not_found
 from healthmes.api.pagination import Page, PageParamsDep, paginate
 from healthmes.schedule_proposals import (
     ScheduleProposalResolutionError,
+    resolution_token,
     resolve_schedule_proposal,
 )
 from healthmes.store import CalendarEventMirror, CalendarSource, ProposalStatus, ScheduleProposal
@@ -66,10 +68,27 @@ class ProposalOut(BaseModel):
     status: ProposalStatus
     decision_record_id: uuid.UUID | None
     healthmes_kind: str | None
+    resolution_token: str | None = None
 
 
 class ProposalResolutionIn(BaseModel):
-    reply_handle: str
+    resolution_token: str
+
+
+def _handle_secret(request: Request) -> str:
+    return request.app.state.settings.calendar_adjustment_secret.get_secret_value().strip()
+
+
+def _proposal_out(proposal: ScheduleProposal, request: Request) -> ProposalOut:
+    handle_secret = _handle_secret(request)
+    token = (
+        resolution_token(proposal, handle_secret)
+        if proposal.status is ProposalStatus.PROPOSED and len(handle_secret) >= 32
+        else None
+    )
+    return ProposalOut.model_validate(proposal).model_copy(
+        update={"resolution_token": token}
+    )
 
 
 @router.get("/events")
@@ -102,6 +121,7 @@ def list_events(
 def list_proposals(
     session: SessionDep,
     page: PageParamsDep,
+    request: Request,
     status_filter: Annotated[ProposalStatus | None, Query(alias="status")] = None,
     task_id: uuid.UUID | None = None,
 ) -> Page[ProposalOut]:
@@ -114,7 +134,7 @@ def list_proposals(
     if task_id is not None:
         stmt = stmt.where(ScheduleProposal.task_id == task_id)
     rows, meta = paginate(session, stmt, page)
-    return Page(data=[ProposalOut.model_validate(row) for row in rows], pagination=meta)
+    return Page(data=[_proposal_out(row, request) for row in rows], pagination=meta)
 
 
 def _resolve_proposal(
@@ -122,11 +142,9 @@ def _resolve_proposal(
     request: Request,
     proposal_id: uuid.UUID,
     target: ProposalStatus,
-    reply_handle: str,
+    token: str,
 ) -> ProposalOut:
-    handle_secret = (
-        request.app.state.settings.calendar_adjustment_secret.get_secret_value().strip()
-    )
+    handle_secret = _handle_secret(request)
     if len(handle_secret) < 32:
         raise APIError(
             HTTP_503_SERVICE_UNAVAILABLE,
@@ -138,8 +156,9 @@ def _resolve_proposal(
             session,
             proposal_id,
             target,
-            reply_handle,
+            token,
             handle_secret,
+            allow_resolution_token=True,
         )
     except ScheduleProposalResolutionError as exc:
         if exc.code == "not_found":
@@ -154,8 +173,8 @@ def _resolve_proposal(
         if exc.code == "invalid_handle":
             raise APIError(
                 HTTP_403_FORBIDDEN,
-                "invalid_reply_handle",
-                "The schedule proposal reply handle is invalid",
+                "invalid_resolution_token",
+                "The schedule proposal resolution token is invalid",
             ) from exc
         if exc.code == "expired":
             raise APIError(
@@ -166,7 +185,7 @@ def _resolve_proposal(
         raise
     session.commit()
     session.refresh(proposal)
-    return ProposalOut.model_validate(proposal)
+    return _proposal_out(proposal, request)
 
 
 @router.post("/proposals/{proposal_id}/accept")
@@ -182,7 +201,7 @@ def accept_proposal(
         request,
         proposal_id,
         ProposalStatus.ACCEPTED,
-        body.reply_handle,
+        body.resolution_token,
     )
 
 
@@ -199,5 +218,5 @@ def decline_proposal(
         request,
         proposal_id,
         ProposalStatus.DECLINED,
-        body.reply_handle,
+        body.resolution_token,
     )

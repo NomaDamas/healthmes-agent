@@ -25,7 +25,8 @@ class ProposalActionLogicTest {
             """
             {"id": "$id", "task_id": "11111111-2222-3333-4444-555555555555",
              "proposed_start": "2026-07-09T05:00:00.497821", "proposed_end": "2026-07-09T06:00:00.497821",
-             "status": "proposed", "decision_record_id": null}
+             "status": "proposed", "decision_record_id": null,
+             "resolution_token": "token-$id"}
             """.trimIndent()
         }
         return ProposalsPage.parse(
@@ -48,6 +49,10 @@ class ProposalActionLogicTest {
 
         assertTrue(target is Target.Single)
         assertEquals("aaa", (target as Target.Single).proposal.id)
+        assertEquals(
+            """{"resolution_token":"token-aaa"}""",
+            target.proposal.resolutionBody(),
+        )
     }
 
     @Test
@@ -68,7 +73,7 @@ class ProposalActionLogicTest {
         val body = """
             {"id": "aaa", "task_id": "t", "proposed_start": "2026-07-09T05:00:00Z",
              "proposed_end": "2026-07-09T06:00:00Z", "status": "accepted",
-             "decision_record_id": null}
+             "decision_record_id": null, "resolution_token": null}
         """.trimIndent()
 
         val outcome = ProposalActionLogic.classifyActionResponse(

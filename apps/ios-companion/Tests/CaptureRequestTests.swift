@@ -117,10 +117,13 @@ final class CaptureRequestTests: XCTestCase {
         XCTAssertEqual(context?["source"] as? String, "ios-app-photo")
     }
 
-    func testProposalActionURLs() {
+    func testProposalActionURLsAndResolutionBody() throws {
         let id = UUID(uuidString: "1F0D3C5E-8A2B-4C47-9BE1-3D2A7C9F4E10")!
-        let accept = HealthMesAPI.proposalActionRequest(
-            pairing: pairing, proposalID: id, action: .accept
+        let accept = try HealthMesAPI.proposalActionRequest(
+            pairing: pairing,
+            proposalID: id,
+            action: .accept,
+            resolutionToken: "scoped-token"
         )
         XCTAssertEqual(
             accept.url?.absoluteString,
@@ -128,8 +131,15 @@ final class CaptureRequestTests: XCTestCase {
                 + "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10/accept"
         )
         XCTAssertEqual(accept.httpMethod, "POST")
-        let decline = HealthMesAPI.proposalActionRequest(
-            pairing: pairing, proposalID: id, action: .decline
+        XCTAssertEqual(
+            try JSONSerialization.jsonObject(with: accept.httpBody!) as? [String: String],
+            ["resolution_token": "scoped-token"]
+        )
+        let decline = try HealthMesAPI.proposalActionRequest(
+            pairing: pairing,
+            proposalID: id,
+            action: .decline,
+            resolutionToken: "scoped-token"
         )
         XCTAssertTrue(decline.url!.absoluteString.hasSuffix("/decline"))
     }
@@ -189,12 +199,14 @@ final class CaptureRequestTests: XCTestCase {
               "proposed_start": "2026-07-10T09:00:00Z",
               "proposed_end": "2026-07-10T10:30:00Z",
               "status": "proposed",
-              "decision_record_id": null
+              "decision_record_id": null,
+              "resolution_token": "scoped-token"
             }
             """
         let proposal = try GlanceJSON.decoder().decode(ProposalItem.self, from: Data(json.utf8))
         XCTAssertEqual(proposal.status, .proposed)
         XCTAssertNil(proposal.decisionRecordId)
+        XCTAssertEqual(proposal.resolutionToken, "scoped-token")
         XCTAssertEqual(
             proposal.proposedEnd.timeIntervalSince(proposal.proposedStart), 90 * 60
         )

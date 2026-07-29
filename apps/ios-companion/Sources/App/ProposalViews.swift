@@ -155,7 +155,8 @@ struct ProposalDetailView: View {
         busy = true
         defer { busy = false }
         do {
-            proposal = try await api.resolveProposal(id: proposalID, action: action)
+            guard let current = proposal else { return }
+            proposal = try await api.resolveProposal(current, action: action)
             message =
                 action == .accept
                 ? String(localized: "Proposal applied.")

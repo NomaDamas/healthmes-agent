@@ -82,9 +82,17 @@ fun ProposalsScreen(services: AppServices, modifier: Modifier = Modifier) {
         actingOn = proposal.id
         scope.launch {
             val outcome = withContext(Dispatchers.IO) {
-                services.api()?.let { api ->
+                val api = services.api()
+                val body = proposal.resolutionBody()
+                if (api == null) {
+                    null
+                } else if (body == null) {
+                    ProposalActionLogic.Outcome.Failed(
+                        "proposal resolution is unavailable"
+                    )
+                } else {
                     ProposalActionLogic.classifyActionResponse(
-                        api.post(Proposal.actionPath(proposal.id, accept))
+                        api.postJson(Proposal.actionPath(proposal.id, accept), body)
                     )
                 }
             }

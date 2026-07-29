@@ -184,9 +184,16 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                 return
             }
             do {
-                let proposal = try await HealthMesAPI().resolveProposal(
-                    id: proposalID, action: action
-                )
+                let api = HealthMesAPI()
+                let page = try await api.listProposals(status: .proposed)
+                guard let pending = page.data.first(where: { $0.id == proposalID }) else {
+                    await postOutcome(
+                        title: String(localized: "Already resolved"),
+                        body: String(localized: "This proposal is no longer pending.")
+                    )
+                    return
+                }
+                let proposal = try await api.resolveProposal(pending, action: action)
                 let title =
                     proposal.status == .accepted
                     ? String(localized: "Proposal applied")

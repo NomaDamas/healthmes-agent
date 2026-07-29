@@ -87,7 +87,7 @@ final class BriefingHomeModel: ObservableObject {
         busyProposalIDs.insert(proposal.id)
         defer { busyProposalIDs.remove(proposal.id) }
         do {
-            let resolved = try await api.resolveProposal(id: proposal.id, action: action)
+            let resolved = try await api.resolveProposal(proposal, action: action)
             pendingProposals.removeAll { $0.id == proposal.id }
             proposalBanner =
                 resolved.status == .accepted

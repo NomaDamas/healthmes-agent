@@ -50,24 +50,23 @@ class ProposalActionWorker(appContext: Context, params: WorkerParameters) :
         val api = HealthmesApi(serverUrl, prefs.token)
 
         val explicitId = inputData.getString(KEY_PROPOSAL_ID)
-        val targetId: String = if (explicitId != null) {
-            explicitId
-        } else {
-            when (val target = resolveTarget(api)) {
-                is Target.Single -> target.proposal.id
-                is Target.NonePending -> return@withContext finish(
-                    context, Outcome.NonePending
-                )
-                is Target.Ambiguous -> return@withContext finish(
-                    context, Outcome.Ambiguous(target.pendingCount)
-                )
-                null -> return@withContext retryOrFail(
-                    context, Outcome.Retry("could not list pending proposals")
-                )
-            }
+        val proposal = when (val target = resolveTarget(api, explicitId)) {
+            is Target.Single -> target.proposal
+            is Target.NonePending -> return@withContext finish(
+                context, Outcome.NonePending
+            )
+            is Target.Ambiguous -> return@withContext finish(
+                context, Outcome.Ambiguous(target.pendingCount)
+            )
+            null -> return@withContext retryOrFail(
+                context, Outcome.Retry("could not list pending proposals")
+            )
         }
-
-        val response = api.post(Proposal.actionPath(targetId, accept))
+        val body = proposal.resolutionBody()
+            ?: return@withContext finish(
+                context, Outcome.Failed("proposal resolution is unavailable")
+            )
+        val response = api.postJson(Proposal.actionPath(proposal.id, accept), body)
         when (val outcome = ProposalActionLogic.classifyActionResponse(response)) {
             is Outcome.Retry -> retryOrFail(context, outcome)
             else -> finish(context, outcome)
@@ -75,11 +74,23 @@ class ProposalActionWorker(appContext: Context, params: WorkerParameters) :
     }
 
     /** Null on transport/parse failure (caller retries). */
-    private fun resolveTarget(api: HealthmesApi): Target? {
-        val response = api.get(ProposalActionLogic.RESOLVE_PATH)
+    private fun resolveTarget(api: HealthmesApi, explicitId: String?): Target? {
+        val path = if (explicitId == null) {
+            ProposalActionLogic.RESOLVE_PATH
+        } else {
+            "${ProposalsPage.ENDPOINT_PATH}?status=proposed&limit=50&offset=0"
+        }
+        val response = api.get(path)
         if (response !is HealthmesApi.Response.Http || !response.isSuccess) return null
         return try {
-            ProposalActionLogic.chooseTarget(ProposalsPage.parse(response.body))
+            val page = ProposalsPage.parse(response.body)
+            if (explicitId == null) {
+                ProposalActionLogic.chooseTarget(page)
+            } else {
+                page.proposals.firstOrNull { it.id == explicitId }
+                    ?.let { Target.Single(it) }
+                    ?: Target.NonePending
+            }
         } catch (_: JSONException) {
             null
         }

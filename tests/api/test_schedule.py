@@ -2,9 +2,14 @@
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from pydantic import SecretStr
 
 from healthmes.calendars.adjustments import issue_reply_handle
+from healthmes.schedule_proposals import (
+    ScheduleProposalResolutionError,
+    resolve_schedule_proposal,
+)
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
@@ -95,7 +100,7 @@ def test_list_events_rejects_inverted_range(client):
     assert response.json()["error"]["code"] == "invalid_range"
 
 
-def _seed_proposal(session) -> tuple[ScheduleProposal, str]:
+def _seed_proposal(session) -> ScheduleProposal:
     task = Task(title="Deep work block")
     session.add(task)
     session.flush()
@@ -110,14 +115,23 @@ def _seed_proposal(session) -> tuple[ScheduleProposal, str]:
     session.add(proposal)
     session.commit()
     session.refresh(proposal)
-    return proposal, handle.plaintext
+    return proposal
+
+
+def _resolution_token(client, proposal: ScheduleProposal) -> str:
+    response = client.get(
+        "/v1/schedule/proposals",
+        params={"status": "proposed", "task_id": str(proposal.task_id)},
+    )
+    return response.json()["data"][0]["resolution_token"]
 
 
 def test_list_proposals_filters_by_status(client, session):
-    proposal, _handle = _seed_proposal(session)
+    proposal = _seed_proposal(session)
 
     listed = client.get("/v1/schedule/proposals", params={"status": "proposed"}).json()
     assert [p["id"] for p in listed["data"]] == [str(proposal.id)]
+    assert listed["data"][0]["resolution_token"]
 
     empty = client.get("/v1/schedule/proposals", params={"status": "accepted"}).json()
     assert empty["data"] == []
@@ -125,11 +139,12 @@ def test_list_proposals_filters_by_status(client, session):
 
 
 def test_accept_proposal_then_second_accept_conflicts(client, session):
-    proposal, handle = _seed_proposal(session)
+    proposal = _seed_proposal(session)
+    token = _resolution_token(client, proposal)
 
     accepted = client.post(
         f"/v1/schedule/proposals/{proposal.id}/accept",
-        json={"reply_handle": handle},
+        json={"resolution_token": token},
     )
     assert accepted.status_code == 200
     assert accepted.json()["status"] == "accepted"
@@ -139,18 +154,19 @@ def test_accept_proposal_then_second_accept_conflicts(client, session):
 
     again = client.post(
         f"/v1/schedule/proposals/{proposal.id}/accept",
-        json={"reply_handle": handle},
+        json={"resolution_token": token},
     )
     assert again.status_code == 409
     assert again.json()["error"]["code"] == "invalid_transition"
 
 
 def test_decline_proposal(client, session):
-    proposal, handle = _seed_proposal(session)
+    proposal = _seed_proposal(session)
+    token = _resolution_token(client, proposal)
 
     declined = client.post(
         f"/v1/schedule/proposals/{proposal.id}/decline",
-        json={"reply_handle": handle},
+        json={"resolution_token": token},
     )
 
     assert declined.status_code == 200
@@ -160,27 +176,28 @@ def test_decline_proposal(client, session):
 def test_proposal_actions_404_for_unknown_id(client):
     response = client.post(
         "/v1/schedule/proposals/00000000-0000-0000-0000-000000000000/accept",
-        json={"reply_handle": "unused-for-missing-proposal"},
+        json={"resolution_token": "unused-for-missing-proposal"},
     )
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
 
 
-def test_proposal_actions_require_valid_unexpired_reply_handle(client, session):
-    proposal, handle = _seed_proposal(session)
+def test_proposal_actions_require_valid_unexpired_resolution_token(client, session):
+    proposal = _seed_proposal(session)
     endpoint = f"/v1/schedule/proposals/{proposal.id}/accept"
 
     missing = client.post(endpoint)
     assert missing.status_code == 422
 
-    invalid = client.post(endpoint, json={"reply_handle": "wrong-handle"})
+    invalid = client.post(endpoint, json={"resolution_token": "wrong-token"})
     assert invalid.status_code == 403
-    assert invalid.json()["error"]["code"] == "invalid_reply_handle"
+    assert invalid.json()["error"]["code"] == "invalid_resolution_token"
 
     proposal.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     session.commit()
-    expired = client.post(endpoint, json={"reply_handle": handle})
+    expired_token = _resolution_token(client, proposal)
+    expired = client.post(endpoint, json={"resolution_token": expired_token})
     assert expired.status_code == 409
     assert expired.json()["error"]["code"] == "proposal_expired"
 
@@ -188,15 +205,33 @@ def test_proposal_actions_require_valid_unexpired_reply_handle(client, session):
     assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PROPOSED
 
 
+def test_rest_resolution_token_is_not_a_telegram_reply_handle(client, session):
+    proposal = _seed_proposal(session)
+    token = _resolution_token(client, proposal)
+
+    with pytest.raises(ScheduleProposalResolutionError, match="invalid_handle"):
+        resolve_schedule_proposal(
+            session,
+            proposal.id,
+            ProposalStatus.ACCEPTED,
+            token,
+            HANDLE_SECRET,
+        )
+
+    session.expire_all()
+    assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PROPOSED
+
+
 def test_proposal_actions_fail_closed_without_handle_secret(client, app, session):
-    proposal, handle = _seed_proposal(session)
+    proposal = _seed_proposal(session)
+    token = _resolution_token(client, proposal)
     app.state.settings = app.state.settings.model_copy(
         update={"calendar_adjustment_secret": SecretStr("")}
     )
 
     response = client.post(
         f"/v1/schedule/proposals/{proposal.id}/accept",
-        json={"reply_handle": handle},
+        json={"resolution_token": token},
     )
 
     assert response.status_code == 503

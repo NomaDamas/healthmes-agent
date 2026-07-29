@@ -22,6 +22,7 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
     public let proposedEnd: Date
     public let status: ProposalStatus
     public let decisionRecordId: UUID?
+    public let resolutionToken: String?
 
     public init(
         id: UUID,
@@ -29,7 +30,8 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
         proposedStart: Date,
         proposedEnd: Date,
         status: ProposalStatus,
-        decisionRecordId: UUID?
+        decisionRecordId: UUID?,
+        resolutionToken: String?
     ) {
         self.id = id
         self.taskId = taskId
@@ -37,6 +39,7 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
         self.proposedEnd = proposedEnd
         self.status = status
         self.decisionRecordId = decisionRecordId
+        self.resolutionToken = resolutionToken
     }
 
     enum CodingKeys: String, CodingKey {
@@ -46,6 +49,7 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
         case proposedEnd = "proposed_end"
         case status
         case decisionRecordId = "decision_record_id"
+        case resolutionToken = "resolution_token"
     }
 }
 
@@ -54,4 +58,12 @@ public typealias ProposalsPage = APIPage<ProposalItem>
 public enum ProposalAction: String {
     case accept
     case decline
+}
+
+public struct ProposalResolutionBody: Codable, Equatable {
+    public let resolutionToken: String
+
+    enum CodingKeys: String, CodingKey {
+        case resolutionToken = "resolution_token"
+    }
 }

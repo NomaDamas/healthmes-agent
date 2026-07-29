@@ -1,4 +1,6 @@
 import datetime as dt
+import hashlib
+import hmac
 import uuid
 
 from sqlalchemy import update
@@ -15,6 +17,34 @@ class ScheduleProposalResolutionError(ValueError):
         self.code = code
 
 
+def resolution_token(proposal: ScheduleProposal, handle_secret: str) -> str | None:
+    if proposal.reply_handle_digest is None or proposal.expires_at is None:
+        return None
+    expires_at = (
+        proposal.expires_at.replace(tzinfo=dt.UTC)
+        if proposal.expires_at.tzinfo is None
+        else proposal.expires_at.astimezone(dt.UTC)
+    )
+    payload = (
+        f"schedule-proposal:{proposal.id}:{proposal.reply_handle_digest}:"
+        f"{expires_at.isoformat()}"
+    )
+    return hmac.new(
+        handle_secret.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_resolution_token(
+    token: str,
+    proposal: ScheduleProposal,
+    handle_secret: str,
+) -> bool:
+    expected = resolution_token(proposal, handle_secret)
+    return expected is not None and hmac.compare_digest(token, expected)
+
+
 def resolve_schedule_proposal(
     session: Session,
     proposal_id: uuid.UUID,
@@ -23,21 +53,28 @@ def resolve_schedule_proposal(
     handle_secret: str,
     *,
     now: dt.datetime | None = None,
+    allow_resolution_token: bool = False,
 ) -> ScheduleProposal:
     proposal = session.get(ScheduleProposal, proposal_id)
     if proposal is None:
         raise ScheduleProposalResolutionError("not_found")
     if proposal.status is not ProposalStatus.PROPOSED:
         raise ScheduleProposalResolutionError("not_proposed")
-    if (
-        not reply_handle
-        or proposal.reply_handle_digest is None
-        or not verify_reply_handle(
+    reply_handle_valid = bool(
+        reply_handle
+        and proposal.reply_handle_digest is not None
+        and verify_reply_handle(
             reply_handle,
             proposal.reply_handle_digest,
             handle_secret,
         )
-    ):
+    )
+    resolution_token_valid = bool(
+        allow_resolution_token
+        and reply_handle
+        and verify_resolution_token(reply_handle, proposal, handle_secret)
+    )
+    if not reply_handle_valid and not resolution_token_valid:
         raise ScheduleProposalResolutionError("invalid_handle")
     expires_at = (
         proposal.expires_at.replace(tzinfo=dt.UTC)

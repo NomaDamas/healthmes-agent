@@ -113,12 +113,15 @@ public final class HealthMesAPI {
     /// `POST /v1/schedule/proposals/{id}/accept|decline` — the real endpoint
     /// behind the §8.5 ✅/❌ buttons.
     public static func proposalActionRequest(
-        pairing: Pairing, proposalID: UUID, action: ProposalAction
-    ) -> URLRequest {
-        baseRequest(
+        pairing: Pairing,
+        proposalID: UUID,
+        action: ProposalAction,
+        resolutionToken: String
+    ) throws -> URLRequest {
+        try jsonRequest(
             pairing: pairing,
             path: "v1/schedule/proposals/\(proposalID.uuidString.lowercased())/\(action.rawValue)",
-            method: "POST"
+            body: ProposalResolutionBody(resolutionToken: resolutionToken)
         )
     }
 
@@ -209,9 +212,19 @@ public final class HealthMesAPI {
         )
     }
 
-    public func resolveProposal(id: UUID, action: ProposalAction) async throws -> ProposalItem {
-        try await perform(
-            Self.proposalActionRequest(pairing: try pairing(), proposalID: id, action: action),
+    public func resolveProposal(
+        _ proposal: ProposalItem, action: ProposalAction
+    ) async throws -> ProposalItem {
+        guard let resolutionToken = proposal.resolutionToken else {
+            throw HealthMesAPIError.httpStatus(422)
+        }
+        return try await perform(
+            Self.proposalActionRequest(
+                pairing: try pairing(),
+                proposalID: proposal.id,
+                action: action,
+                resolutionToken: resolutionToken
+            ),
             expecting: ProposalItem.self
         )
     }

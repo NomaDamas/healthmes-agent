@@ -69,7 +69,8 @@ channel).
 - **Real §8.5 notification actions**: ✅ Apply / ❌ Keep as is enqueue a
   one-shot WorkManager job that resolves the pending schedule proposal and
   calls `POST /v1/schedule/proposals/{id}/accept|decline` with the bearer
-  client. Because alerts carry no proposal id yet (server-side linkage gap),
+  client plus the scoped `resolution_token` from the authenticated proposal
+  list. Because alerts carry no proposal id yet (server-side linkage gap),
   the worker acts only when exactly ONE proposal is pending; zero or 2+ route
   into the app instead of guessing (PLAN.md §11). Second taps render the
   server's 409 `invalid_transition` as "already resolved". ✏️ Adjust

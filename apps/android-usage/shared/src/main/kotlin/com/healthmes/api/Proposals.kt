@@ -43,6 +43,7 @@ data class Proposal(
     /** "proposed" | "accepted" | "pushed" | "declined". */
     val status: String,
     val decisionRecordId: String?,
+    val resolutionToken: String?,
 ) {
     val isPending: Boolean get() = status == STATUS_PROPOSED
 
@@ -57,10 +58,14 @@ data class Proposal(
             proposedEndIso = obj.getString("proposed_end"),
             status = obj.getString("status"),
             decisionRecordId = obj.stringOrNull("decision_record_id"),
+            resolutionToken = obj.stringOrNull("resolution_token"),
         )
 
-        /** Accept/decline action path (POST, empty body). */
         fun actionPath(proposalId: String, accept: Boolean): String =
             "${ProposalsPage.ENDPOINT_PATH}/$proposalId/${if (accept) "accept" else "decline"}"
+    }
+
+    fun resolutionBody(): String? = resolutionToken?.let {
+        JSONObject().put("resolution_token", it).toString()
     }
 }
