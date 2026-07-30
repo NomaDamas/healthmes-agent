@@ -19,6 +19,9 @@ reconciliation is a single shared bearer token (``Settings.api_token``):
   must be tappable from a phone browser, which cannot attach headers —
   embedding the derived read-only credential keeps links working without ever
   putting the full-access API token into Telegram messages or browser history.
+- Loopback-only Calendar write flows accept a short-lived local session only
+  after a full API credential bootstraps it. A loopback proxy connection and
+  attacker-controlled ``Host`` header alone never grant that session.
 - When no token is configured the middleware is not installed (the zero-setup
   loopback dev path); ``python -m healthmes serve`` refuses to bind a
   non-loopback host in that state (see ``healthmes/__main__.py``).
@@ -35,6 +38,11 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from healthmes.api.errors import error_body
+from healthmes.api.local_session import (
+    LOCAL_SESSION_AUTH_SCOPE_KEY,
+    LocalSessionStore,
+    authenticated_local_session,
+)
 from healthmes.config import Settings
 
 __all__ = [
@@ -68,8 +76,6 @@ VIEWER_PATH_PREFIXES = (
     "/connect",
     "/sleep",
 )
-LOCAL_BROWSER_PATH_PREFIXES = ("/sleep", "/connect/google/")
-
 _VIEWER_TOKEN_CONTEXT = b"healthmes-viewer:"
 
 
@@ -113,12 +119,18 @@ def _header(scope: Scope, name: bytes) -> str | None:
 class BearerTokenMiddleware:
     """Rejects unauthenticated requests with the standard 401 error envelope."""
 
-    def __init__(self, app: ASGIApp, api_token: str) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        api_token: str,
+        local_sessions: LocalSessionStore,
+    ) -> None:
         if not api_token:
             raise ValueError("BearerTokenMiddleware requires a non-empty token")
         self._app = app
         self._token = api_token
         self._viewer_token = viewer_token(api_token)
+        self._local_sessions = local_sessions
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or self._is_authorized(scope):
@@ -140,17 +152,18 @@ class BearerTokenMiddleware:
         path = scope.get("path", "")
         if path in OPEN_PATHS:
             return True
-        if path == "/connect" or path.startswith(LOCAL_BROWSER_PATH_PREFIXES):
-            from healthmes.api.local_session import is_loopback_scope
-
-            if is_loopback_scope(scope):
-                return True
         authorization = _header(scope, b"authorization")
         if authorization is not None:
             prefix, _, credential = authorization.partition(" ")
             if prefix.lower() == "bearer" and hmac.compare_digest(
                 credential.strip(), self._token
             ):
+                self._mark_local_session_authenticated(scope)
+                return True
+        if self._is_local_browser_path(path):
+            session = authenticated_local_session(scope, self._local_sessions)
+            if session is not None:
+                self._mark_local_session_authenticated(scope)
                 return True
         if scope.get("method") in ("GET", "HEAD") and path.startswith(VIEWER_PATH_PREFIXES):
             return self._query_token_ok(scope)
@@ -161,11 +174,25 @@ class BearerTokenMiddleware:
         for candidate in query.get("token", ()):
             # The viewer token is the linkable credential; the full API token
             # is accepted too so a power user can paste it manually.
-            if hmac.compare_digest(candidate, self._viewer_token) or hmac.compare_digest(
-                candidate, self._token
-            ):
+            if hmac.compare_digest(candidate, self._token):
+                self._mark_local_session_authenticated(scope)
+                return True
+            if hmac.compare_digest(candidate, self._viewer_token):
                 return True
         return False
+
+    @staticmethod
+    def _is_local_browser_path(path: str) -> bool:
+        return (
+            path == "/connect"
+            or path.startswith("/connect/google/")
+            or path == "/sleep"
+            or path.startswith("/sleep/")
+        )
+
+    @staticmethod
+    def _mark_local_session_authenticated(scope: Scope) -> None:
+        scope.setdefault("state", {})[LOCAL_SESSION_AUTH_SCOPE_KEY] = True
 
 
 def install_auth(app, settings: Settings) -> bool:
@@ -178,5 +205,9 @@ def install_auth(app, settings: Settings) -> bool:
     token = settings.api_token.get_secret_value().strip()
     if not token:
         return False
-    app.add_middleware(BearerTokenMiddleware, api_token=token)
+    app.add_middleware(
+        BearerTokenMiddleware,
+        api_token=token,
+        local_sessions=app.state.local_sessions,
+    )
     return True

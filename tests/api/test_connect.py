@@ -130,6 +130,9 @@ def test_gating_matches_viewer_pages(settings) -> None:
         via_viewer_token = client.get("/connect", params={"token": viewer_token(TOKEN)})
         assert via_viewer_token.status_code == 200
         assert TOKEN not in via_viewer_token.text  # raw API token never renders
+        assert "healthmes_local_session" not in via_viewer_token.headers.get(
+            "set-cookie", ""
+        )
 
         via_bearer = client.get(
             "/connect", headers={"Authorization": f"Bearer {TOKEN}"}
@@ -140,9 +143,47 @@ def test_gating_matches_viewer_pages(settings) -> None:
         create_app(secured),
         base_url="http://127.0.0.1:8100",
     ) as loopback:
-        local_page = loopback.get("/connect")
+        assert loopback.get("/connect").status_code == 401
+        local_page = loopback.get(
+            "/connect",
+            params={"token": TOKEN},
+        )
         assert local_page.status_code == 200
+        assert TOKEN not in local_page.text
         assert "healthmes_local_session" in local_page.headers["set-cookie"]
+        assert loopback.get("/connect").status_code == 200
+
+
+def test_loopback_proxy_cannot_bootstrap_local_session_from_host_header(settings) -> None:
+    secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
+    with TestClient(
+        create_app(secured),
+        base_url="http://proxy.test:8100",
+    ) as proxied:
+        bare = proxied.get("/connect", headers={"Host": "localhost:8100"})
+        assert bare.status_code == 401
+        assert "healthmes_local_session" not in bare.headers.get("set-cookie", "")
+
+        viewer = proxied.get(
+            "/connect",
+            params={"token": viewer_token(TOKEN)},
+            headers={"Host": "localhost:8100"},
+        )
+        assert viewer.status_code == 200
+        assert "healthmes_local_session" not in viewer.headers.get("set-cookie", "")
+        assert 'action="/connect/google/start"' not in viewer.text
+
+        forged = proxied.post(
+            "/connect/google/disconnect",
+            data={"csrf": "forged"},
+            headers={
+                "Host": "localhost:8100",
+                "Origin": "http://localhost:8100",
+                "Cookie": "healthmes_local_session=forged",
+            },
+            follow_redirects=False,
+        )
+        assert forged.status_code == 401
 
 
 def test_landing_links_to_connect(client) -> None:

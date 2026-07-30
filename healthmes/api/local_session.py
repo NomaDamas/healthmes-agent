@@ -4,12 +4,14 @@ import datetime as dt
 import ipaddress
 import secrets
 from dataclasses import dataclass
+from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request, Response, status
 
 LOCAL_SESSION_COOKIE = "healthmes_local_session"
 LOCAL_SESSION_TTL = dt.timedelta(minutes=30)
+LOCAL_SESSION_AUTH_SCOPE_KEY = "healthmes.local_session_authenticated"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +60,21 @@ def install_local_sessions(app) -> None:
     app.state.local_sessions = LocalSessionStore()
 
 
+def authenticated_local_session(
+    scope: dict,
+    store: LocalSessionStore,
+) -> LocalBrowserSession | None:
+    if not is_loopback_scope(scope):
+        return None
+    cookie = SimpleCookie()
+    try:
+        cookie.load(_header(scope, b"cookie"))
+    except CookieError:
+        return None
+    morsel = cookie.get(LOCAL_SESSION_COOKIE)
+    return store.get(morsel.value if morsel is not None else None)
+
+
 def is_loopback_scope(scope: dict) -> bool:
     host = _host_name(_header(scope, b"host"))
     client = scope.get("client")
@@ -71,7 +88,19 @@ def issue_local_session(request: Request, response: Response) -> LocalBrowserSes
     if not is_loopback_scope(request.scope):
         return None
     store: LocalSessionStore = request.app.state.local_sessions
-    session = store.get(request.cookies.get(LOCAL_SESSION_COOKIE)) or store.issue()
+    session = store.get(request.cookies.get(LOCAL_SESSION_COOKIE))
+    api_token = request.app.state.settings.api_token.get_secret_value().strip()
+    # With auth enabled, loopback addressing is necessary but not sufficient:
+    # a local reverse proxy also appears as a loopback peer and can forward an
+    # attacker-controlled Host header. Only full API authentication may create
+    # the first session; the opaque cookie can then continue the local flow.
+    if (
+        session is None
+        and api_token
+        and not request.scope.get("state", {}).get(LOCAL_SESSION_AUTH_SCOPE_KEY)
+    ):
+        return None
+    session = session or store.issue()
     response.set_cookie(
         LOCAL_SESSION_COOKIE,
         session.session_id,
