@@ -60,6 +60,7 @@ registered with `brew services`** (no autostart). Stop the services with
 | `make mac-test` | `uv run pytest -q` |
 | `make mac-ow` | best-effort native boot of the vendored open-wearables backend (see below) |
 | `make mac-ow-worker` | its celery worker (**requires redis** from `mac-services-start`) |
+| `make mac-ow-beat` | its Celery Beat scheduler (**requires redis** from `mac-services-start`) |
 | `make compose-config` | validate `docker-compose.yml` without a daemon |
 
 Notes:
@@ -77,10 +78,12 @@ Notes:
   when `ENVIRONMENT=local`). Requires postgres from `mac-services-start`.
   The svix webhook-registration step retries and is non-fatal (no svix
   server in this stack).
-- **Celery worker & redis:** provider syncs and score jobs run in the
-  celery worker (`make mac-ow-worker`), which needs redis as broker/result
-  backend — start it via `make mac-services-start` first. Without the
-  worker the OW API still serves, but no background syncs happen.
+- **Celery worker, Beat & redis:** provider syncs and score jobs run in the
+  Celery worker (`make mac-ow-worker`), while the separate Celery Beat process
+  (`make mac-ow-beat`) enqueues periodic syncs. Both need redis as
+  broker/result backend — start it via `make mac-services-start` first.
+  Without the worker tasks cannot run; without Beat an existing connection
+  stays stale until a sync is enqueued manually.
 - postgresql@16 is keg-only; the scripts call binaries via
   `$(brew --prefix postgresql@16)/bin` — no PATH changes needed.
 
@@ -116,8 +119,8 @@ or chat logs. Setting `HISTORICAL_SYNC_ON_CONNECT=false` disables the vendored
 grace-period backfill so the explicit historical task below is the single sync
 run being verified.
 
-Start the data plane in separate terminals so the API and its background sync
-worker are both present:
+Start the data plane in separate terminals so the API, background sync worker,
+and periodic Celery Beat scheduler are all present:
 
 ```bash
 make mac-services-start
@@ -126,6 +129,10 @@ make mac-ow
 
 ```bash
 make mac-ow-worker
+```
+
+```bash
+make mac-ow-beat
 ```
 
 Open <http://localhost:8000/docs> and use the OpenAPI operations in this order:
@@ -596,6 +603,7 @@ Services and host ports (all overridable via `.env`):
 | redis      | 6379 | celery broker/result backend                      |
 | ow-backend | 8000 | open-wearables FastAPI (`/docs`)                  |
 | ow-worker  | —    | open-wearables celery worker                      |
+| ow-beat    | —    | open-wearables periodic sync scheduler            |
 | ow-mcp     | 8200 | vendor MCP server over Streamable HTTP (see note) |
 | healthmes  | 8100 | this repo's service (`/health`, `/v1/*`, `/mcp`, `/decisions`, `/cognitive-energy/forecast`; runs `alembic upgrade head` on start) |
 | hermes     | 8644 | hermes gateway webhook receiver (`/webhooks/healthmes-alerts`) |

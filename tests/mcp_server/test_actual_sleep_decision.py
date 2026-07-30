@@ -70,6 +70,38 @@ async def test_readiness_exposes_actual_sleep_without_changing_confidence(
     }
 
 
+async def test_readiness_uses_fresh_oura_sleep_before_calendar_mirror_catches_up(
+    mcp_client,
+    mcp_env,
+    call_tool,
+) -> None:
+    mcp_env.add_sleep_summary(
+        LOCAL_DATE.isoformat(),
+        start_time="2026-07-07T23:30:00+09:00",
+        end_time="2026-07-08T07:00:00+09:00",
+        duration_minutes=420,
+        time_in_bed_minutes=450,
+    )
+
+    result = await call_tool(
+        mcp_client,
+        "get_daily_readiness_context",
+        {"date": LOCAL_DATE.isoformat()},
+    )
+
+    assert result["actual_sleep"] == {
+        "status": "ok",
+        "local_date": "2026-07-08",
+        "start": "2026-07-07T23:30:00+09:00",
+        "wake_time": "2026-07-08T07:00:00+09:00",
+        "duration_minutes": 420,
+        "time_in_bed_minutes": 450,
+        "source": "oura",
+        "freshness": "current",
+        "earliest_available_work_time": "2026-07-08T07:00:00+09:00",
+    }
+
+
 async def test_proposal_before_actual_wake_is_rejected_without_side_effects(
     mcp_client,
     store_factory,

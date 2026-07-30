@@ -22,6 +22,8 @@
 #                    `fastapi dev` when ENVIRONMENT=local)
 #   ow-worker        celery worker of the open-wearables backend
 #                    (requires redis from services-start)
+#   ow-beat          celery beat scheduler of the open-wearables backend
+#                    (requires redis from services-start)
 #
 # Vendor grounding (vendor/ is read-only — the venv of the vendored backend is
 # redirected outside the vendor tree via UV_PROJECT_ENVIRONMENT):
@@ -314,6 +316,16 @@ cmd_ow_worker() {
     exec bash scripts/start/worker.sh
 }
 
+cmd_ow_beat() {
+    load_ow_env
+    info "syncing vendored backend deps (venv: $OW_VENV_DIR)"
+    (cd "$OW_BACKEND_DIR" && uv sync) || die "uv sync failed — see 'ow' subcommand notes"
+    info "starting open-wearables celery beat scheduler"
+    cd "$OW_BACKEND_DIR"
+    exec uv run celery -A app.main:celery_app beat -l info \
+        --schedule "$DATA_DIR/open-wearables-celerybeat-schedule"
+}
+
 usage() {
     sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
@@ -328,5 +340,6 @@ run) cmd_run ;;
 test) cmd_test ;;
 ow) cmd_ow ;;
 ow-worker) cmd_ow_worker ;;
+ow-beat) cmd_ow_beat ;;
 *) usage ;;
 esac

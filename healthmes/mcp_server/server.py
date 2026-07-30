@@ -65,7 +65,13 @@ from healthmes.calendars.adjustments import (
 )
 from healthmes.calendars.base import HealthmesEventKind
 from healthmes.calendars.google import GoogleCalendarBackend
-from healthmes.calendars.sleep_context import actual_sleep_context, actual_sleep_violation
+from healthmes.calendars.sleep_context import (
+    actual_sleep_context,
+    actual_sleep_observation_context,
+    actual_sleep_violation,
+)
+from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.calendars.sleep_source import select_actual_sleep_rows
 from healthmes.config import Settings, get_settings, system_timezone
 from healthmes.mcp_server import adjustment_tools, arousal, impact, interpret, timeline
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
@@ -725,6 +731,10 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     )
     with _store_session() as session:
         actual_sleep_block = actual_sleep_context(session, as_of, tz)
+    if actual_sleep_block["status"] != interpret.STATUS_OK:
+        fresh_sleep = select_actual_sleep_rows(sleep_rows, as_of)
+        if isinstance(fresh_sleep, ActualSleepObservation):
+            actual_sleep_block = actual_sleep_observation_context(fresh_sleep, tz)
 
     # --- sleep debt (internal sleep score; algorithms/sleep.py, never reinvented)
     internal_scores = interpret.daily_series(

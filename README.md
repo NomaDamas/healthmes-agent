@@ -190,7 +190,7 @@ keep/reconsider/insufficient-data decision), `doctor-visit-summary`.
 Requires [uv](https://docs.astral.sh/uv/) and Homebrew; everything is
 repo-local without `brew services`; `scripts/healthmes_local.sh install`
 registers a per-user macOS LaunchAgent so the stack starts at login and is
-kept alive.
+kept alive, including the Open Wearables worker and periodic sync scheduler.
 
 ```bash
 make mac-setup            # brew postgresql@16 + redis if missing, initdb,
@@ -214,7 +214,7 @@ With no `.env` at all, the service runs against a repo-local sqlite file —
 install -m 600 .env.example .env
 install -m 600 config/open-wearables.env.example config/open-wearables.env
 docker compose up -d --build     # postgres, redis, open-wearables (+worker,
-                                 # +mcp), healthmes, hermes gateway
+                                 # +ow-beat, +mcp), healthmes, hermes gateway
 ```
 
 Set `HEALTHMES_TIMEZONE` (e.g. `Asia/Seoul`) in `.env` for the compose path —

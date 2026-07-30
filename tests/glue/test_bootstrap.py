@@ -335,6 +335,17 @@ def test_planner_skill_documents_morning_nudge_trust_boundary():
     )
 
 
+def test_sleep_skill_documents_open_wearables_exclusive_end_date():
+    skill = (REPO_ROOT / "skills" / "healthmes-sleep" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(skill.split())
+
+    assert "The Open Wearables `end_date` is exclusive" in normalized
+    assert "use the day after the target date as `end_date`" in normalized
+    assert "select the record whose `date` exactly matches the target date" in normalized
+
+
 def test_legacy_symlink_is_migrated_to_copy(bootstrap, hermes_home, env_file, tmp_path):
     """Symlinks left by earlier bootstrap versions become real copies."""
     skills_home = hermes_home / "skills"
