@@ -120,6 +120,10 @@ For an unknown source, absent source, `status: insufficient_data`,
    reversible suggestion** (review the day's single highest-intensity block)
    while the decision stays `keep`. Present it as optional, never necessary;
    `reconsider` still requires the corroboration rule above.
+   When you do this, disclose two things in the same breath (domain-expert
+   requirement): **that the suggestion rests on a single signal** ("다른
+   신호의 교차 확인은 없었어요"), and **that the threshold is the user's own
+   personal baseline**, not a population cutoff ("당신의 평소 값 대비").
 5. Choose `insufficient_data` when evidence is missing, stale, low-confidence,
    truncated, source-limited for the user's question, or materially
    conflicting. State the exact boundary and the one next observation that
