@@ -451,11 +451,13 @@ def sleep_score_series(
 
 
 def summary_daily_values(
-    rows: Iterable[Mapping[str, Any]], field: str, up_to: date
+    rows: Iterable[object], field: str, up_to: date
 ) -> dict[date, float]:
     """Per-day values of one summary field, keyed by the summary ``date``."""
     out: dict[date, float] = {}
     for row in rows:
+        if not isinstance(row, Mapping):
+            continue
         raw_day = row.get("date")
         value = as_float(row.get(field))
         if raw_day is None or value is None:
