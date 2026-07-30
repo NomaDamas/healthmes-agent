@@ -24,7 +24,10 @@ whose summary begins with `[HM]` are candidates.
 ## Confirmation behavior
 
 Planner proposals remain `proposed` until a live user reply accepts or declines
-the exact proposal. Acceptance queues the block for the next Calendar sync.
+the exact proposal using `적용 <handle>` or `그대로 <handle>`. Hermes attaches
+a short-lived proof only for that exact inbound Telegram message; HealthMes
+requires both the proof and one-time handle. Acceptance queues the block for the
+next Calendar sync.
 The sync creates one HealthMes-owned event, marks the proposal `pushed`, and
 marks the linked task `scheduled`. Replaying the same approval or provider
 revision must not create another task, proposal, or Calendar event.

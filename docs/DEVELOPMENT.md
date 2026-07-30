@@ -213,7 +213,11 @@ calls `mcp__healthmes__evaluate_morning_calendar_nudge` exactly once, sends
 the returned display packet and `적용 <handle>` / `그대로 <handle>` choices,
 then exits without waiting. The later allowed-user reply enters the normal
 Hermes live gateway session, which calls
-`mcp__healthmes__resolve_calendar_adjustment` with the reply text.
+`mcp__healthmes__resolve_calendar_adjustment` with the exact reply text.
+The vendored MCP client injects a five-minute HMAC proof only when the inbound
+Telegram message is exactly `적용 <handle>` or `그대로 <handle>` and binds the
+proof to the complete resolver arguments. A returned handle without that proof
+cannot authorize either calendar resolver.
 
 ```bash
 uv run python scripts/bootstrap.py --dry-run     # show what would change

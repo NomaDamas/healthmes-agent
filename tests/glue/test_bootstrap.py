@@ -201,6 +201,14 @@ def test_adjustment_secret_is_generated_separately_and_preserved(
 
     assert len(adjustment_secret) == 64
     assert adjustment_secret != first["HEALTHMES_HERMES_WEBHOOK_SECRET"]
+    config = yaml.safe_load((hermes_home / "config.yaml").read_text())
+    proof_config = config["mcp_servers"]["healthmes"]["trusted_session_proof"]
+    assert proof_config["secret_env"] == "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"
+    assert "secret" not in proof_config
+    assert set(proof_config["confirmations"]) == {
+        "resolve_calendar_adjustment",
+        "resolve_schedule_proposal",
+    }
 
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
     assert (

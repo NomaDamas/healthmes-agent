@@ -95,6 +95,7 @@ from healthmes.store import (
     session_scope,
 )
 from healthmes.store import enums as store_enums
+from healthmes.trusted_session import verify_trusted_session_proof
 
 # ---------------------------------------------------------------------------
 # Vocabulary grounded in vendor/open-wearables (do not invent values)
@@ -359,6 +360,23 @@ def _adjustment_handle_secret(settings: Settings | None = None) -> str:
             "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET must be configured with at least 32 characters"
         )
     return value
+
+
+def _require_trusted_session_proof(
+    proof: str | None,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> None:
+    if not verify_trusted_session_proof(
+        proof,
+        _adjustment_handle_secret(),
+        tool_name=tool_name,
+        arguments=arguments,
+    ):
+        raise ToolError(
+            "trusted_session_proof is missing or invalid; "
+            "resolve only from an explicit live Telegram reply"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2274,6 +2292,7 @@ def resolve_calendar_adjustment(
     response: str,
     reply_handle: str | None = None,
     response_channel: str | None = None,
+    trusted_session_proof: str | None = None,
 ) -> dict[str, Any]:
     """Resolve one live Telegram confirmation against its one-time proposal handle.
 
@@ -2281,6 +2300,26 @@ def resolve_calendar_adjustment(
     writer; decline, expiry, invalid, stale, replayed, and conflicted responses
     return redacted receipts without a calendar write.
     """
+    proof_arguments = {
+        "proposal_id": proposal_id,
+        "response": response,
+        "reply_handle": reply_handle,
+        "response_channel": response_channel,
+    }
+    _require_trusted_session_proof(
+        trusted_session_proof,
+        "resolve_calendar_adjustment",
+        proof_arguments,
+    )
+    if response_channel != "telegram":
+        raise ToolError("response_channel must be telegram")
+    normalized_response = response.strip()
+    if normalized_response not in {
+        f"적용 {reply_handle}",
+        f"그대로 {reply_handle}",
+    }:
+        raise ToolError("response must be the exact live Telegram reply")
+    response_choice = normalized_response.split(" ", 1)[0]
     proposal_uuid = _parse_uuid(proposal_id, "proposal_id")
     with _store_session() as session:
         repository = SqlAlchemyAdjustmentRepository(session)
@@ -2306,7 +2345,7 @@ def resolve_calendar_adjustment(
         )
         result = service.resolve_calendar_adjustment(
             proposal_uuid,
-            response=response,
+            response=response_choice,
             reply_handle=reply_handle,
             writer=writer,
             response_channel=response_channel,
@@ -2486,7 +2525,10 @@ def propose_schedule_blocks(
 
 @mcp.tool
 def resolve_schedule_proposal(
-    proposal_id: str, action: str, reply_handle: str | None = None
+    proposal_id: str,
+    action: str,
+    reply_handle: str | None = None,
+    trusted_session_proof: str | None = None,
 ) -> dict[str, Any]:
     """Accept or decline one pending schedule proposal after live user confirmation.
 
@@ -2496,6 +2538,16 @@ def resolve_schedule_proposal(
     external calendar unchanged. Only unexpired proposals still in ``proposed``
     state can be resolved.
     """
+    proof_arguments = {
+        "proposal_id": proposal_id,
+        "action": action,
+        "reply_handle": reply_handle,
+    }
+    _require_trusted_session_proof(
+        trusted_session_proof,
+        "resolve_schedule_proposal",
+        proof_arguments,
+    )
     target_by_action = {
         "accept": ProposalStatus.ACCEPTED,
         "decline": ProposalStatus.DECLINED,

@@ -154,6 +154,9 @@ event를 `SHORTEN`할 수 있다. 대상/변경량/ETag는 server evaluator가 �
 `적용 <handle>` / `그대로 <handle>` 문구를 그대로 보내고 종료한다. 이후 allowed-user
 reply는 live Hermes session이 `resolve_calendar_adjustment()`에 원문 전달한다. MOVE,
 삭제, 제목/참석자/반복 수정, iCloud/CalDAV 외부 이벤트 변경은 여전히 금지다.
+Hermes는 allowed-user의 exact reply와 tool arguments가 일치할 때만 5분짜리 HMAC
+session proof를 주입하고, HealthMes는 proof + one-time handle을 모두 검증한다. 따라서
+cron이나 모델이 evaluator 응답에서 본 handle만 재사용해 자가승인할 수 없다.
 `APPLIED_RECOVERED`, `UNKNOWN`, `FAILED_NO_CHANGE`는 이 예외의 서버 내부 terminal
 receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한을 뜻하지 않는다.
 

@@ -218,6 +218,7 @@ services:
       # Gateway env overrides (vendor gateway/config.py) — set in root .env.
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - HEALTHMES_CALENDAR_ADJUSTMENT_SECRET=${HEALTHMES_CALENDAR_ADJUSTMENT_SECRET:-}
     ports:
       # Webhook platform (gateway/platforms/webhook.py, default port 8644):
       # healthmes reaches it in-cluster at hermes:8644; published for local

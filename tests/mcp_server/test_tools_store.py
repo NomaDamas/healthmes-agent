@@ -30,6 +30,30 @@ from healthmes.store import (
     Task,
     TriggerEvent,
 )
+from healthmes.trusted_session import issue_trusted_session_proof
+
+TRUSTED_SESSION_SECRET = "test-calendar-adjustment-secret-32-characters"
+
+
+def trusted_call_arguments(
+    tool_name: str,
+    arguments: dict,
+    *,
+    issued_at: dt.datetime | None = None,
+) -> dict:
+    return {
+        **arguments,
+        "trusted_session_proof": issue_trusted_session_proof(
+            TRUSTED_SESSION_SECRET,
+            tool_name=tool_name,
+            arguments=arguments,
+            platform="telegram",
+            chat_id="test-chat",
+            user_id="test-user",
+            message_id="test-message",
+            issued_at=issued_at,
+        ),
+    }
 
 TREE = {
     "type": "rule",
@@ -425,11 +449,14 @@ class TestScheduleTools:
         accepted = await call_tool(
             mcp_client,
             "resolve_schedule_proposal",
-            {
-                "proposal_id": proposal_id,
-                "action": "accept",
-                "reply_handle": reply_handle,
-            },
+            trusted_call_arguments(
+                "resolve_schedule_proposal",
+                {
+                    "proposal_id": proposal_id,
+                    "action": "accept",
+                    "reply_handle": reply_handle,
+                },
+            ),
         )
 
         assert accepted["proposal"]["proposal_status"] == "accepted"
@@ -444,11 +471,14 @@ class TestScheduleTools:
         with pytest.raises(ToolError, match="only proposed items can be resolved"):
             await mcp_client.call_tool(
                 "resolve_schedule_proposal",
-                {
-                    "proposal_id": proposal_id,
-                    "action": "accept",
-                    "reply_handle": reply_handle,
-                },
+                trusted_call_arguments(
+                    "resolve_schedule_proposal",
+                    {
+                        "proposal_id": proposal_id,
+                        "action": "accept",
+                        "reply_handle": reply_handle,
+                    },
+                ),
             )
 
     async def test_resolve_schedule_proposal_requires_live_unexpired_handle(
@@ -472,7 +502,7 @@ class TestScheduleTools:
         )
         block = proposed["proposals"][0]
 
-        with pytest.raises(ToolError, match="reply_handle is missing or invalid"):
+        with pytest.raises(ToolError, match="trusted_session_proof is missing or invalid"):
             await mcp_client.call_tool(
                 "resolve_schedule_proposal",
                 {"proposal_id": block["id"], "action": "accept"},
@@ -480,11 +510,14 @@ class TestScheduleTools:
         with pytest.raises(ToolError, match="reply_handle is missing or invalid"):
             await mcp_client.call_tool(
                 "resolve_schedule_proposal",
-                {
-                    "proposal_id": block["id"],
-                    "action": "accept",
-                    "reply_handle": "invalid-handle",
-                },
+                trusted_call_arguments(
+                    "resolve_schedule_proposal",
+                    {
+                        "proposal_id": block["id"],
+                        "action": "accept",
+                        "reply_handle": "invalid-handle",
+                    },
+                ),
             )
 
         with store_factory() as session:
@@ -496,11 +529,14 @@ class TestScheduleTools:
         with pytest.raises(ToolError, match="schedule proposal has expired"):
             await mcp_client.call_tool(
                 "resolve_schedule_proposal",
-                {
-                    "proposal_id": block["id"],
-                    "action": "accept",
-                    "reply_handle": block["reply_handle"],
-                },
+                trusted_call_arguments(
+                    "resolve_schedule_proposal",
+                    {
+                        "proposal_id": block["id"],
+                        "action": "accept",
+                        "reply_handle": block["reply_handle"],
+                    },
+                ),
             )
 
         with store_factory() as session:
@@ -512,7 +548,14 @@ class TestScheduleTools:
         with pytest.raises(ToolError, match="action must be accept or decline"):
             await mcp_client.call_tool(
                 "resolve_schedule_proposal",
-                {"proposal_id": str(uuid.uuid4()), "action": "maybe"},
+                trusted_call_arguments(
+                    "resolve_schedule_proposal",
+                    {
+                        "proposal_id": str(uuid.uuid4()),
+                        "action": "maybe",
+                        "reply_handle": "not-a-live-handle",
+                    },
+                ),
             )
 
     async def test_get_schedule_returns_window_events_and_pending_proposals(
@@ -677,22 +720,31 @@ class TestScheduleTools:
         assert '"etag-v1"' not in str(evaluated)
         assert writer.changes == []
 
-        for invalid_arguments in (
-            {
-                "proposal_id": evaluated["proposal_id"],
-                "response": "yes",
-            },
-            {
-                "proposal_id": evaluated["proposal_id"],
-                "response": "yes",
-                "reply_handle": "not-the-issued-handle",
-            },
-        ):
-            with pytest.raises(ToolError, match="reply_handle is missing or invalid"):
-                await mcp_client.call_tool(
+        handle_only_arguments = {
+            "proposal_id": evaluated["proposal_id"],
+            "response": f"적용 {evaluated['reply_handle']}",
+            "reply_handle": evaluated["reply_handle"],
+            "response_channel": "telegram",
+        }
+        with pytest.raises(ToolError, match="trusted_session_proof is missing or invalid"):
+            await mcp_client.call_tool(
+                "resolve_calendar_adjustment",
+                handle_only_arguments,
+            )
+        invalid_handle_arguments = {
+            "proposal_id": evaluated["proposal_id"],
+            "response": "적용 not-the-issued-handle",
+            "reply_handle": "not-the-issued-handle",
+            "response_channel": "telegram",
+        }
+        with pytest.raises(ToolError, match="reply_handle is missing or invalid"):
+            await mcp_client.call_tool(
+                "resolve_calendar_adjustment",
+                trusted_call_arguments(
                     "resolve_calendar_adjustment",
-                    invalid_arguments,
-                )
+                    invalid_handle_arguments,
+                ),
+            )
         assert writer.changes == []
 
         deduped = await call_tool(
@@ -715,12 +767,15 @@ class TestScheduleTools:
         declined = await call_tool(
             mcp_client,
             "resolve_calendar_adjustment",
-            {
-                "proposal_id": evaluated["proposal_id"],
-                "response": "no",
-                "reply_handle": evaluated["reply_handle"],
-                "response_channel": "telegram",
-            },
+            trusted_call_arguments(
+                "resolve_calendar_adjustment",
+                {
+                    "proposal_id": evaluated["proposal_id"],
+                    "response": f"그대로 {evaluated['reply_handle']}",
+                    "reply_handle": evaluated["reply_handle"],
+                    "response_channel": "telegram",
+                },
+            ),
         )
         assert declined["status"] == CalendarMutationStatus.DECLINED.value
         assert declined["receipt"] == {
@@ -809,14 +864,16 @@ class TestScheduleTools:
         assert server_module._public_calendar_adjustment_status(internal_status) == public_status
 
     async def test_resolve_rejects_unknown_proposal_without_sensitive_detail(self, mcp_client):
+        arguments = {
+            "proposal_id": str(uuid.uuid4()),
+            "response": "적용 not-a-live-handle",
+            "reply_handle": "not-a-live-handle",
+            "response_channel": "telegram",
+        }
         with pytest.raises(ToolError, match=r"^calendar adjustment proposal not found$"):
             await mcp_client.call_tool(
                 "resolve_calendar_adjustment",
-                {
-                    "proposal_id": str(uuid.uuid4()),
-                    "response": "yes",
-                    "reply_handle": "not-a-live-handle",
-                },
+                trusted_call_arguments("resolve_calendar_adjustment", arguments),
             )
 
     async def test_resolve_calendar_adjustment_yes_calls_injected_writer_once(
@@ -906,12 +963,15 @@ class TestScheduleTools:
         applied = await call_tool(
             mcp_client,
             "resolve_calendar_adjustment",
-            {
-                "proposal_id": evaluated["proposal_id"],
-                "response": "yes",
-                "reply_handle": evaluated["reply_handle"],
-                "response_channel": "telegram",
-            },
+            trusted_call_arguments(
+                "resolve_calendar_adjustment",
+                {
+                    "proposal_id": evaluated["proposal_id"],
+                    "response": f"적용 {evaluated['reply_handle']}",
+                    "reply_handle": evaluated["reply_handle"],
+                    "response_channel": "telegram",
+                },
+            ),
         )
         assert applied["status"] == CalendarMutationStatus.APPLIED.value
         assert applied["receipt"]["provider_result"] == "matched"

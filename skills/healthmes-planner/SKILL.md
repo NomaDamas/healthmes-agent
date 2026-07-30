@@ -47,7 +47,7 @@ tree.
 | `list_tasks` / `upsert_task` | Task CRUD: title, goal, `est_minutes`, `deadline`, `energy_demand` (`low`/`med`/`high`), status |
 | `get_schedule` | Current merged view: calendar mirror + agent blocks + proposals |
 | `propose_schedule_blocks` | Propose concrete time blocks for tasks; blocks stay `proposed` until the user confirms and each response includes a private, expiring `reply_handle` |
-| `resolve_schedule_proposal` | Accept or decline one pending proposal after the user's live confirmation; pass its exact one-time `reply_handle`; accepted blocks are queued for calendar sync |
+| `resolve_schedule_proposal` | Accept or decline one pending proposal after the user's exact live reply (`적용 <handle>` / `그대로 <handle>`). Hermes injects a short-lived proof bound to that message and the tool arguments; the handle alone is never sufficient. |
 | `get_health_scores` | STRESS / BODY_BATTERY / READINESS / RECOVERY / internal sleep + resilience scores with qualifier and components |
 | `get_daily_readiness_context` | "Can the user push hard today?" — sleep debt, HRV vs 14-day baseline, stress, prior training load, with `confidence` |
 | `get_personal_baselines` | 14/90-day baselines and current deviation for chosen metrics |
@@ -68,7 +68,7 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
 | Tool (healthmes server) | Use for |
 |---|---|
 | `evaluate_morning_calendar_nudge` | Server-owned 07:00 recovery/calendar evaluation. It may return no-action, deduplicated, or one display packet with a one-time reply handle. |
-| `resolve_calendar_adjustment` | Live Telegram reply resolution only. Pass the user's plain text (`적용 <handle>` or `그대로 <handle>`) through this tool; never resolve from a cron run. |
+| `resolve_calendar_adjustment` | Live Telegram reply resolution only. Pass the user's exact plain text (`적용 <handle>` or `그대로 <handle>`) through this tool; Hermes supplies the proof automatically, and cron/model-only calls remain unauthorized. |
 
 ## When to use
 
@@ -112,11 +112,13 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
 5. **Propose, then resolve only from the live reply.** Send the blocks through
    `propose_schedule_blocks` and present them with the notification grammar
    (below). Blocks are written to the calendar only after the user confirms.
-   Retain each returned `reply_handle` privately for the current confirmation
-   exchange. Never display it, log it, or put it in a decision tree. On an
-   explicit live confirmation, call `resolve_schedule_proposal` with the
-   exact returned proposal id, its exact `reply_handle`, and `action: accept`;
-   on an explicit rejection use `action: decline` with the same handle. If
+   Present only the exact choices `적용 <handle>` / `그대로 <handle>` for the
+   current confirmation exchange; never log the handle or put it in a decision
+   tree. On the matching explicit live confirmation, call
+   `resolve_schedule_proposal` with the exact returned proposal id, its exact
+   `reply_handle`, and `action: accept`; on the matching explicit rejection use
+   `action: decline` with the same handle. Hermes will attach the trusted
+   session proof only when the inbound message exactly matches that choice. If
    the handle expired or the user edits, decline when still possible, adjust,
    and re-propose. An accepted proposal is queued for the next calendar sync;
    do not claim it is already on the external calendar. This
@@ -231,8 +233,9 @@ to Telegram. Each briefing is ONE message in the notification grammar.
 - **Live Telegram reply.** When an allowed user's live gateway message says
   `적용 <handle>` or `그대로 <handle>`, pass that exact text to
   `mcp__healthmes__resolve_calendar_adjustment` and return the resulting
-  receipt/viewer link once. Do not invent handles, accept missing handles, or
-  call the resolver from scheduled cron delivery.
+  receipt/viewer link once. Hermes injects a short-lived proof bound to the
+  message identity and exact arguments. Do not invent handles, accept missing
+  handles, or call the resolver from scheduled cron delivery.
 - **Evening review (21:30).** Compare planned blocks vs what happened
   (`get_schedule`), note wins and slips without moralizing, roll unfinished
   tasks forward, and flag tomorrow's first block. Keep it short.

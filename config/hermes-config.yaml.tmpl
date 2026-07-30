@@ -121,3 +121,28 @@ mcp_servers:
       Authorization: "Bearer {{ healthmes_api_token }}"
     {%- endif %}
     timeout: 120
+    trusted_session_proof:
+      secret_env: HEALTHMES_CALENDAR_ADJUSTMENT_SECRET
+      argument: trusted_session_proof
+      confirmations:
+        resolve_calendar_adjustment:
+          handle_argument: reply_handle
+          passthrough_argument: response
+          bind_arguments:
+            - proposal_id
+            - response
+            - reply_handle
+            - response_channel
+          choices:
+            - 적용
+            - 그대로
+        resolve_schedule_proposal:
+          handle_argument: reply_handle
+          action_argument: action
+          bind_arguments:
+            - proposal_id
+            - action
+            - reply_handle
+          choices:
+            accept: 적용
+            decline: 그대로
