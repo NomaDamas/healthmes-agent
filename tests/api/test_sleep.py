@@ -3,8 +3,11 @@ from __future__ import annotations
 import re
 
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
+from healthmes.api.auth import viewer_token
 from healthmes.api.sleep import SleepReviewRuntime
+from healthmes.app import create_app
 from healthmes.calendars.approval import ApprovalCalendar
 from healthmes.calendars.sleep_proposal_state import redacted_digest
 from tests.calendars.conftest import FakeCalendarBackend
@@ -82,11 +85,6 @@ def test_local_sleep_review_applies_exact_preview_and_shows_read_back(
 
 
 def test_viewer_token_cannot_authorize_sleep_post(settings) -> None:
-    from pydantic import SecretStr
-
-    from healthmes.api.auth import viewer_token
-    from healthmes.app import create_app
-
     token = "viewer-is-read-only"
     secured = settings.model_copy(update={"api_token": SecretStr(token)})
     with TestClient(create_app(secured), base_url="http://healthmes.test:8100") as client:
@@ -96,3 +94,28 @@ def test_viewer_token_cannot_authorize_sleep_post(settings) -> None:
             headers={"Origin": "http://healthmes.test:8100"},
         )
     assert response.status_code == 401
+
+
+def test_loopback_viewer_unlocks_sleep_without_token_in_redirect(settings) -> None:
+    token = "sleep-local-api-token"
+    secured = settings.model_copy(update={"api_token": SecretStr(token)})
+    with TestClient(
+        create_app(secured),
+        base_url="http://127.0.0.1:8100",
+    ) as client:
+        viewer = client.get("/sleep", params={"token": viewer_token(token)})
+        assert viewer.status_code == 200
+        assert 'action="/sleep/unlock"' in viewer.text
+        assert "healthmes_local_session" not in viewer.headers.get("set-cookie", "")
+
+        unlocked = client.post(
+            "/sleep/unlock",
+            data={"api_token": token},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert unlocked.status_code == 303
+        assert unlocked.headers["location"] == "/sleep"
+        assert token not in unlocked.headers["location"]
+        assert token not in unlocked.text
+        assert "healthmes_local_session" in unlocked.headers["set-cookie"]

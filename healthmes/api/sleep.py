@@ -11,6 +11,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from healthmes.api.decision_html import shell_context, template_environment
 from healthmes.api.local_session import (
     LocalBrowserSession,
+    bootstrap_local_session,
+    is_loopback_scope,
     issue_local_session,
     require_local_session,
 )
@@ -40,6 +42,17 @@ class SleepReviewRuntime:
     reader: SleepSummaryReader
     user_id: str
     calendar: ApprovalCalendar
+
+
+@router.post("/sleep/unlock")
+async def unlock_sleep_page(
+    request: Request,
+    proposal: uuid.UUID | None = None,
+) -> RedirectResponse:
+    location = f"/sleep?proposal={proposal}" if proposal is not None else "/sleep"
+    response = RedirectResponse(location, status_code=303)
+    await bootstrap_local_session(request, response)
+    return response
 
 
 @router.get("/sleep", response_class=HTMLResponse)
@@ -77,6 +90,11 @@ async def sleep_review_page(
         local,
         error,
         request.app.state.local_sessions.signing_secret,
+        local_unlock_available=(
+            local is None
+            and bool(settings.api_token.get_secret_value().strip())
+            and is_loopback_scope(request.scope)
+        ),
     )
     rendered = HTMLResponse(html, headers=response.headers)
     return rendered
@@ -138,6 +156,8 @@ def _render(
     local: LocalBrowserSession | None,
     error: str | None,
     signing_secret: bytes,
+    *,
+    local_unlock_available: bool,
 ) -> str:
     token = ""
     display_start = None
@@ -206,6 +226,7 @@ def _render(
         receipt_segments=receipt_segments,
         error=error,
         pending=proposal is not None and proposal.status is SleepProposalStatus.PENDING,
+        local_unlock_available=local_unlock_available,
         active_nav="sleep",
         **shell_context(settings),
     )

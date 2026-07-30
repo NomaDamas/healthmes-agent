@@ -39,10 +39,10 @@ class OpenWearablesStatusReader(Protocol):
     async def list_users(
         self, *, search: str | None = None, limit: int = 100
     ) -> Mapping[str, Any]: ...
-    async def get_connections(self, user_id: str) -> Sequence[Mapping[str, Any]]: ...
+    async def get_connections(self, user_id: str) -> Sequence[object]: ...
     async def collect_sleep_summaries(
         self, user_id: str, start_date: str, end_date: str
-    ) -> Sequence[Mapping[str, Any]]: ...
+    ) -> Sequence[object]: ...
 
 
 async def build_oura_card(
@@ -76,7 +76,8 @@ async def build_oura_card(
         (
             row
             for row in connections
-            if str(row.get("provider", "")).strip().lower() == "oura"
+            if isinstance(row, Mapping)
+            and str(row.get("provider", "")).strip().lower() == "oura"
         ),
         None,
     )
@@ -203,11 +204,13 @@ def _sync_freshness(value: datetime | None, now: datetime) -> tuple[str, bool]:
 
 
 def _sleep_freshness(
-    rows: Sequence[Mapping[str, Any]],
+    rows: Sequence[object],
     today: date,
 ) -> tuple[str, bool] | None:
     dates: list[date] = []
     for row in rows:
+        if not isinstance(row, Mapping):
+            continue
         value = row.get("date") or row.get("local_date") or row.get("calendar_date")
         if not isinstance(value, str):
             continue

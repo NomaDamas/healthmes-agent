@@ -76,6 +76,7 @@ VIEWER_PATH_PREFIXES = (
     "/connect",
     "/sleep",
 )
+LOCAL_SESSION_BOOTSTRAP_PATHS = frozenset({"/connect/unlock", "/sleep/unlock"})
 _VIEWER_TOKEN_CONTEXT = b"healthmes-viewer:"
 
 
@@ -152,6 +153,11 @@ class BearerTokenMiddleware:
         path = scope.get("path", "")
         if path in OPEN_PATHS:
             return True
+        if (
+            scope.get("method") == "POST"
+            and path in LOCAL_SESSION_BOOTSTRAP_PATHS
+        ):
+            return True
         authorization = _header(scope, b"authorization")
         if authorization is not None:
             prefix, _, credential = authorization.partition(" ")
@@ -172,11 +178,6 @@ class BearerTokenMiddleware:
     def _query_token_ok(self, scope: Scope) -> bool:
         query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
         for candidate in query.get("token", ()):
-            # The viewer token is the linkable credential; the full API token
-            # is accepted too so a power user can paste it manually.
-            if hmac.compare_digest(candidate, self._token):
-                self._mark_local_session_authenticated(scope)
-                return True
             if hmac.compare_digest(candidate, self._viewer_token):
                 return True
         return False

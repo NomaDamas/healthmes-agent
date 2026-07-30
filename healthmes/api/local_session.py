@@ -5,7 +5,7 @@ import ipaddress
 import secrets
 from dataclasses import dataclass
 from http.cookies import CookieError, SimpleCookie
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import HTTPException, Request, Response, status
 
@@ -110,6 +110,25 @@ def issue_local_session(request: Request, response: Response) -> LocalBrowserSes
         secure=request.url.scheme == "https",
         path="/",
     )
+    return session
+
+
+async def bootstrap_local_session(
+    request: Request,
+    response: Response,
+) -> LocalBrowserSession:
+    if not is_loopback_scope(request.scope):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "local browser session required")
+    _assert_same_origin(request)
+    values = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+    candidate = values.get("api_token", [""])[-1]
+    expected = request.app.state.settings.api_token.get_secret_value().strip()
+    if not expected or not secrets.compare_digest(candidate, expected):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid API token")
+    request.scope.setdefault("state", {})[LOCAL_SESSION_AUTH_SCOPE_KEY] = True
+    session = issue_local_session(request, response)
+    if session is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "local browser session required")
     return session
 
 

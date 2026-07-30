@@ -29,6 +29,17 @@
 <p class="muted">이 화면은 현재 Oura observation과 Calendar 상태를 다시 읽고,
   서버에 고정한 redacted preview만 승인합니다. 입력값으로 캘린더 내용을 바꿀 수 없습니다.</p>
 
+{% if local_unlock_available %}
+<section class="card">
+  <h2>이 Mac에서 Calendar 승인 잠금 해제</h2>
+  <p class="muted">전체 API 토큰은 URL에 넣지 않고 이 요청에서만 확인합니다.</p>
+  <form class="sleep-actions" method="post" action="/sleep/unlock{% if proposal %}?proposal={{ proposal.id }}{% endif %}">
+    <input type="password" name="api_token" autocomplete="current-password" required>
+    <button type="submit">잠금 해제</button>
+  </form>
+</section>
+{% endif %}
+
 {% if error %}
 <section class="card"><h2>준비되지 않음</h2><p class="error">{{ error }}</p></section>
 {% elif proposal %}
