@@ -76,6 +76,10 @@ async def test_readiness_uses_fresh_oura_sleep_before_calendar_mirror_catches_up
     call_tool,
 ) -> None:
     mcp_env.add_sleep_summary(
+        (LOCAL_DATE - dt.timedelta(days=1)).isoformat(),
+        duration_minutes="malformed historical value",
+    )
+    mcp_env.add_sleep_summary(
         LOCAL_DATE.isoformat(),
         start_time="2026-07-07T23:30:00+09:00",
         end_time="2026-07-08T07:00:00+09:00",
