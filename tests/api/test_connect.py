@@ -156,11 +156,19 @@ def test_gating_matches_viewer_pages(settings) -> None:
             params={"token": viewer_token(TOKEN)},
         )
         assert viewer_page.status_code == 200
-        assert 'action="/connect/unlock"' in viewer_page.text
+        assert 'href="http://127.0.0.1:8100/connect/unlock"' in viewer_page.text
+        assert 'name="api_token"' not in viewer_page.text
         assert TOKEN not in viewer_page.text
         assert "healthmes_local_session" not in viewer_page.headers.get(
             "set-cookie", ""
         )
+
+        unlock_page = loopback.get("/connect/unlock")
+        assert unlock_page.status_code == 200
+        assert unlock_page.headers["cache-control"] == "no-store"
+        assert unlock_page.headers["referrer-policy"] == "same-origin"
+        assert 'action="http://127.0.0.1:8100/connect/unlock"' in unlock_page.text
+        assert 'name="api_token"' in unlock_page.text
 
         rejected = loopback.post(
             "/connect/unlock",
@@ -202,19 +210,30 @@ def test_loopback_proxy_cannot_bootstrap_local_session_from_host_header(settings
         )
         assert viewer.status_code == 200
         assert "healthmes_local_session" not in viewer.headers.get("set-cookie", "")
-        assert 'action="/connect/unlock"' in viewer.text
+        assert 'href="http://127.0.0.1:8100/connect/unlock"' in viewer.text
+        assert 'name="api_token"' not in viewer.text
         assert 'action="/connect/google/start"' not in viewer.text
+
+        proxied_unlock_page = proxied.get(
+            "/connect/unlock",
+            headers={"Host": "localhost:8100"},
+        )
+        assert proxied_unlock_page.status_code == 200
+        assert (
+            'action="http://127.0.0.1:8100/connect/unlock"'
+            in proxied_unlock_page.text
+        )
 
         rejected_unlock = proxied.post(
             "/connect/unlock",
-            data={"api_token": "wrong"},
+            data={"api_token": TOKEN},
             headers={
                 "Host": "localhost:8100",
-                "Origin": "http://localhost:8100",
+                "Origin": "http://proxy.test:8100",
             },
             follow_redirects=False,
         )
-        assert rejected_unlock.status_code == 401
+        assert rejected_unlock.status_code == 403
         assert "healthmes_local_session" not in rejected_unlock.headers.get(
             "set-cookie", ""
         )
@@ -412,6 +431,24 @@ async def test_oura_card_reports_inactive_and_missing_connections(settings) -> N
     assert inactive.detail == "Oura 연결 비활성"
     assert missing.connected is False
     assert missing.detail == "Oura 미연결"
+
+
+@pytest.mark.asyncio
+async def test_oura_card_reports_malformed_user_discovery_as_redacted_error(
+    settings,
+) -> None:
+    configured = settings.model_copy(update={"ow_api_key": SecretStr(OW_API_KEY)})
+
+    class MalformedUsers(FakeOpenWearables):
+        async def list_users(self, *, search=None, limit=100):
+            return {"items": ["private@example.com"]}
+
+    card = await build_oura_card(configured, client=MalformedUsers([]))
+
+    assert card.connected is False
+    assert card.badge_label == "오류"
+    assert card.detail == "Open Wearables 사용자 선택 필요"
+    assert "private@example.com" not in repr(card)
 
 
 @pytest.mark.asyncio

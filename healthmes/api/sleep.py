@@ -14,6 +14,7 @@ from healthmes.api.local_session import (
     bootstrap_local_session,
     is_loopback_scope,
     issue_local_session,
+    local_browser_url,
     require_local_session,
 )
 from healthmes.calendars.approval import ApprovalCalendar, calendar_approval_target
@@ -44,6 +45,36 @@ class SleepReviewRuntime:
     calendar: ApprovalCalendar
 
 
+@router.get("/sleep/unlock", response_class=HTMLResponse)
+async def sleep_unlock_page(
+    request: Request,
+    proposal: uuid.UUID | None = None,
+) -> HTMLResponse:
+    settings: Settings = request.app.state.settings
+    if (
+        not is_loopback_scope(request.scope)
+        or not settings.api_token.get_secret_value().strip()
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "local browser required")
+    path = (
+        f"/sleep/unlock?proposal={proposal}"
+        if proposal is not None
+        else "/sleep/unlock"
+    )
+    template = template_environment().get_template("ui/local_unlock.html.j2")
+    html = template.render(
+        heading="Calendar 승인 잠금 해제",
+        description="전체 API 토큰은 이 Mac의 HealthMes에만 전송됩니다.",
+        post_url=local_browser_url(settings.port, path),
+        active_nav="sleep",
+        **shell_context(settings),
+    )
+    return HTMLResponse(
+        html,
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "same-origin"},
+    )
+
+
 @router.post("/sleep/unlock")
 async def unlock_sleep_page(
     request: Request,
@@ -69,11 +100,11 @@ async def sleep_review_page(
     error: str | None = None
     record: SleepReconciliationProposal | None = None
     try:
-        runtime = await _runtime(request, settings)
-        record = (
-            session.get(SleepReconciliationProposal, proposal)
-            if proposal is not None
-            else await prepare_sleep_proposal(
+        if proposal is not None:
+            record = session.get(SleepReconciliationProposal, proposal)
+        elif local is not None:
+            runtime = await _runtime(request, settings)
+            record = await prepare_sleep_proposal(
                 target_date=target_date,
                 calendar_source=runtime.calendar.backend.source,
                 reader=runtime.reader,
@@ -81,7 +112,6 @@ async def sleep_review_page(
                 session=session,
                 calendar=runtime.calendar,
             )
-        )
     except (CalendarError, LookupError, OWClientError, SleepReviewUnavailable) as exc:
         error = _safe_error(exc)
     html = _render(
@@ -90,10 +120,21 @@ async def sleep_review_page(
         local,
         error,
         request.app.state.local_sessions.signing_secret,
-        local_unlock_available=(
-            local is None
-            and bool(settings.api_token.get_secret_value().strip())
-            and is_loopback_scope(request.scope)
+        local_unlock_url=(
+            local_browser_url(
+                settings.port,
+                (
+                    f"/sleep/unlock?proposal={record.id}"
+                    if record is not None
+                    else "/sleep/unlock"
+                ),
+            )
+            if (
+                local is None
+                and bool(settings.api_token.get_secret_value().strip())
+                and is_loopback_scope(request.scope)
+            )
+            else ""
         ),
     )
     rendered = HTMLResponse(html, headers=response.headers)
@@ -157,7 +198,7 @@ def _render(
     error: str | None,
     signing_secret: bytes,
     *,
-    local_unlock_available: bool,
+    local_unlock_url: str,
 ) -> str:
     token = ""
     display_start = None
@@ -173,46 +214,58 @@ def _render(
             signing_secret,
         )
     if proposal is not None:
-        timezone = resolve_timezone(settings)
-        if proposal.snapshot.get("start"):
-            display_start = _display_timestamp(str(proposal.snapshot["start"]), timezone)
-        if proposal.snapshot.get("wake_time"):
-            display_wake = _display_timestamp(
-                str(proposal.snapshot["wake_time"]),
-                timezone,
-            )
-        for index, segment in enumerate(proposal.snapshot.get("segments", []), start=1):
-            if not isinstance(segment, dict):
-                continue
-            display_segments.append(
-                {
-                    "index": index,
-                    "start": _display_timestamp(str(segment["start"]), timezone),
-                    "wake_time": _display_timestamp(
-                        str(segment["wake_time"]),
-                        timezone,
-                    ),
-                    "duration_minutes": segment["duration_minutes"],
-                }
-            )
-        if proposal.receipt:
-            receipt_start = _display_timestamp(str(proposal.receipt["start"]), timezone)
-            receipt_wake = _display_timestamp(
-                str(proposal.receipt["wake_time"]),
-                timezone,
-            )
-            for segment in proposal.receipt.get("segments", []):
+        try:
+            timezone = resolve_timezone(settings)
+            if proposal.snapshot.get("start"):
+                display_start = _display_timestamp(
+                    str(proposal.snapshot["start"]),
+                    timezone,
+                )
+            if proposal.snapshot.get("wake_time"):
+                display_wake = _display_timestamp(
+                    str(proposal.snapshot["wake_time"]),
+                    timezone,
+                )
+            for index, segment in enumerate(
+                proposal.snapshot.get("segments", []),
+                start=1,
+            ):
                 if not isinstance(segment, dict):
                     continue
-                receipt_segments.append(
+                display_segments.append(
                     {
+                        "index": index,
                         "start": _display_timestamp(str(segment["start"]), timezone),
                         "wake_time": _display_timestamp(
                             str(segment["wake_time"]),
                             timezone,
                         ),
+                        "duration_minutes": segment["duration_minutes"],
                     }
                 )
+            if proposal.receipt:
+                receipt_start = _display_timestamp(
+                    str(proposal.receipt["start"]),
+                    timezone,
+                )
+                receipt_wake = _display_timestamp(
+                    str(proposal.receipt["wake_time"]),
+                    timezone,
+                )
+                for segment in proposal.receipt.get("segments", []):
+                    if not isinstance(segment, dict):
+                        continue
+                    receipt_segments.append(
+                        {
+                            "start": _display_timestamp(str(segment["start"]), timezone),
+                            "wake_time": _display_timestamp(
+                                str(segment["wake_time"]),
+                                timezone,
+                            ),
+                        }
+                    )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            error = "저장된 수면 preview를 표시할 수 없습니다."
     template = template_environment().get_template("ui/sleep.html.j2")
     return template.render(
         proposal=proposal,
@@ -226,7 +279,7 @@ def _render(
         receipt_segments=receipt_segments,
         error=error,
         pending=proposal is not None and proposal.status is SleepProposalStatus.PENDING,
-        local_unlock_available=local_unlock_available,
+        local_unlock_url=local_unlock_url,
         active_nav="sleep",
         **shell_context(settings),
     )

@@ -44,14 +44,11 @@
 {% if google_result %}
 <p class="conn-note">Google Calendar: {{ google_result }}</p>
 {% endif %}
-{% if local_unlock_available %}
+{% if local_unlock_url %}
 <section class="card">
   <h2>이 Mac에서 연결 관리 잠금 해제</h2>
-  <p class="muted">전체 API 토큰은 URL에 넣지 않고 이 요청에서만 확인합니다.</p>
-  <form class="conn-actions" method="post" action="/connect/unlock">
-    <input type="password" name="api_token" autocomplete="current-password" required>
-    <button type="submit">잠금 해제</button>
-  </form>
+  <p class="muted">전체 API 토큰 입력은 이 Mac의 직접 loopback 화면에서만 받습니다.</p>
+  <p><a href="{{ local_unlock_url }}" rel="noreferrer">직접 loopback 화면 열기</a></p>
 </section>
 {% endif %}
 

@@ -154,7 +154,7 @@ class BearerTokenMiddleware:
         if path in OPEN_PATHS:
             return True
         if (
-            scope.get("method") == "POST"
+            scope.get("method") in {"GET", "POST"}
             and path in LOCAL_SESSION_BOOTSTRAP_PATHS
         ):
             return True

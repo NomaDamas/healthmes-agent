@@ -84,6 +84,10 @@ def is_loopback_scope(scope: dict) -> bool:
     )
 
 
+def local_browser_url(port: int, path: str) -> str:
+    return f"http://127.0.0.1:{port}{path}"
+
+
 def issue_local_session(request: Request, response: Response) -> LocalBrowserSession | None:
     if not is_loopback_scope(request.scope):
         return None
@@ -106,7 +110,7 @@ def issue_local_session(request: Request, response: Response) -> LocalBrowserSes
         session.session_id,
         max_age=int(LOCAL_SESSION_TTL.total_seconds()),
         httponly=True,
-        samesite="strict",
+        samesite="lax",
         secure=request.url.scheme == "https",
         path="/",
     )
