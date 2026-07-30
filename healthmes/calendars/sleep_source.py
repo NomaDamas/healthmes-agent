@@ -67,7 +67,7 @@ async def read_actual_sleep(
 
 
 def select_actual_sleep_rows(
-    rows: Sequence[Mapping[str, Any]],
+    rows: Sequence[object],
     target_date: date,
 ) -> ActualSleepObservation | SleepObservationNoOp:
     summaries: list[SleepSummaryPayload] = []
@@ -76,10 +76,11 @@ def select_actual_sleep_rows(
         try:
             summaries.append(SleepSummaryPayload.model_validate(row))
         except ValidationError:
-            invalid_target_row |= row.get("date") in (
-                target_date,
-                target_date.isoformat(),
-            )
+            if isinstance(row, Mapping):
+                invalid_target_row |= row.get("date") in (
+                    target_date,
+                    target_date.isoformat(),
+                )
     selected = select_actual_sleep(tuple(summaries), target_date)
     if (
         invalid_target_row
