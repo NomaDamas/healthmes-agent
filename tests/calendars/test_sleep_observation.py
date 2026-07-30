@@ -13,6 +13,7 @@ from healthmes.calendars.sleep_observation import (
     SleepSummaryPayload,
     select_actual_sleep,
 )
+from healthmes.calendars.sleep_source import select_actual_sleep_rows
 
 TARGET_DATE = date(2026, 7, 26)
 
@@ -95,6 +96,21 @@ def test_selects_longest_candidate_across_provider_summaries() -> None:
     assert isinstance(result, ActualSleepObservation)
     assert result.provider == "oura"
     assert result.start_at == datetime(2026, 7, 26, 2, tzinfo=UTC)
+
+
+def test_malformed_non_mapping_history_does_not_hide_target_sleep() -> None:
+    target = summary(
+        start_time=datetime(2026, 7, 25, 23, tzinfo=UTC),
+        end_time=datetime(2026, 7, 26, 7, tzinfo=UTC),
+    )
+
+    result = select_actual_sleep_rows(
+        ("malformed historical row", target.model_dump()),
+        TARGET_DATE,
+    )
+
+    assert isinstance(result, ActualSleepObservation)
+    assert result.local_date == TARGET_DATE
 
 
 @pytest.mark.parametrize(
