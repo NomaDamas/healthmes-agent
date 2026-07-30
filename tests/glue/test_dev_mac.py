@@ -11,11 +11,16 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "dev_mac.sh"
 LOCAL_SCRIPT = REPO_ROOT / "scripts" / "healthmes_local.sh"
 LAUNCH_AGENT_TEMPLATE = REPO_ROOT / "config" / "com.healthmes.local.plist.in"
+MAKEFILE = REPO_ROOT / "Makefile"
+COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
+DEVELOPMENT_DOC = REPO_ROOT / "docs" / "DEVELOPMENT.md"
+README = REPO_ROOT / "README.md"
 
 
 def _function_body(text: str, name: str) -> str:
@@ -90,6 +95,73 @@ def test_launch_agent_enables_scheduler_for_background_calendar_polling() -> Non
     template = plistlib.loads(LAUNCH_AGENT_TEMPLATE.read_bytes())
     environment = template["EnvironmentVariables"]
     assert environment["HEALTHMES_SCHEDULER_ENABLED"] == "true"
+
+
+def test_local_start_syncs_resolved_ow_key_into_hermes_before_apps() -> None:
+    text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+    start_body = _function_body(text, "cmd_start")
+    sync_body = _function_body(text, "sync_hermes_ow_api_key")
+
+    assert "sync_hermes_ow_api_key" in text
+    assert '[ "$result" = "updated" ] || return' not in sync_body
+    assert start_body.index("resolve_ow_api_key") < start_body.index(
+        "sync_hermes_ow_api_key"
+    )
+    assert start_body.index("sync_hermes_ow_api_key") < start_body.index(
+        'start_process "Open Wearables"'
+    )
+
+
+def test_local_runtime_starts_and_supervises_open_wearables_beat() -> None:
+    dev_text = SCRIPT.read_text(encoding="utf-8")
+    local_text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+
+    assert re.search(r"^ow-beat\) ", dev_text, re.MULTILINE)
+    beat_body = _function_body(dev_text, "cmd_ow_beat")
+    assert "celery -A app.main:celery_app beat -l info" in beat_body
+    assert (
+        '--schedule "$DATA_DIR/open-wearables-celerybeat-schedule"' in beat_body
+    )
+
+    start_body = _function_body(local_text, "cmd_start")
+    daemon_body = _function_body(local_text, "cmd_daemon")
+    stop_body = _function_body(local_text, "stop_apps")
+    status_body = _function_body(local_text, "cmd_status")
+
+    assert 'start_process "Open Wearables beat"' in start_body
+    assert '"$BEAT_PID"' in daemon_body
+    assert 'stop_process "Open Wearables beat"' in stop_body
+    assert 'service_status "Open Wearables beat"' in status_body
+
+
+def test_manual_mac_runtime_exposes_open_wearables_beat_target() -> None:
+    makefile = MAKEFILE.read_text(encoding="utf-8")
+
+    assert "mac-ow-beat" in makefile.split(".PHONY:", 1)[1].split("\n\n", 1)[0]
+    assert re.search(
+        r"^mac-ow-beat:.*\n\t\$\(DEV_MAC\) ow-beat$",
+        makefile,
+        re.MULTILINE,
+    )
+
+
+def test_compose_runtime_starts_open_wearables_beat() -> None:
+    compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+    beat = compose["services"]["ow-beat"]
+
+    assert beat["command"] == "scripts/start/beat.sh"
+    assert beat["environment"] == ["DB_HOST=postgres", "REDIS_HOST=redis"]
+    assert set(beat["depends_on"]) == {"redis", "postgres", "ow-backend"}
+    assert beat["restart"] == "on-failure"
+
+
+def test_runtime_docs_include_open_wearables_beat() -> None:
+    development = " ".join(DEVELOPMENT_DOC.read_text(encoding="utf-8").split())
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+
+    assert "`make mac-ow-beat`" in development
+    assert "Celery Beat" in development
+    assert "ow-beat" in readme
 
 
 def test_uninstall_keeps_data_unless_delete_data_is_explicit() -> None:

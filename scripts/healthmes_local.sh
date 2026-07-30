@@ -7,14 +7,18 @@ RUNTIME_DIR="$DATA_DIR/runtime"
 HEALTHMES_PID="$RUNTIME_DIR/healthmes.pid"
 OW_PID="$RUNTIME_DIR/open-wearables.pid"
 WORKER_PID="$RUNTIME_DIR/open-wearables-worker.pid"
+BEAT_PID="$RUNTIME_DIR/open-wearables-beat.pid"
 HEALTHMES_LOG="$RUNTIME_DIR/healthmes.log"
 OW_LOG="$RUNTIME_DIR/open-wearables.log"
 WORKER_LOG="$RUNTIME_DIR/open-wearables-worker.log"
+BEAT_LOG="$RUNTIME_DIR/open-wearables-beat.log"
 DASHBOARD_URL="${HEALTHMES_DASHBOARD_URL:-http://127.0.0.1:${HEALTHMES_PORT:-8100}/sleep}"
 LAUNCH_AGENT_LABEL="com.healthmes.local"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 LAUNCH_AGENT_PLIST="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
 LAUNCH_AGENT_TEMPLATE="$REPO_ROOT/config/$LAUNCH_AGENT_LABEL.plist.in"
+HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_GATEWAY_LABEL="ai.hermes.gateway"
 
 info() { printf '[healthmes] %s\n' "$*"; }
 die() { printf '[healthmes] %s\n' "$*" >&2; exit 1; }
@@ -113,6 +117,46 @@ resolve_ow_api_key() {
     export HEALTHMES_OW_API_KEY="$api_key"
 }
 
+sync_hermes_ow_api_key() {
+    local config_path="$HERMES_HOME_DIR/config.yaml" result
+    [ -f "$config_path" ] || return
+    result="$(
+        uv run python - "$config_path" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+import yaml
+
+path = Path(sys.argv[1])
+config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+env = config.setdefault("mcp_servers", {}).setdefault(
+    "open_wearables", {}
+).setdefault("env", {})
+key = os.environ["HEALTHMES_OW_API_KEY"]
+if env.get("OPEN_WEARABLES_API_KEY") == key:
+    print("unchanged")
+    raise SystemExit
+env["OPEN_WEARABLES_API_KEY"] = key
+fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    yaml.safe_dump(config, stream, sort_keys=False, allow_unicode=True)
+os.chmod(temp_name, 0o600)
+os.replace(temp_name, path)
+print("updated")
+PY
+    )"
+    if [ "$result" != "updated" ]; then
+        return 0
+    fi
+    info "synchronized Open Wearables credential into Hermes"
+    if launchctl print "gui/$UID/$HERMES_GATEWAY_LABEL" >/dev/null 2>&1; then
+        launchctl kickstart -k "gui/$UID/$HERMES_GATEWAY_LABEL"
+        info "restarted Hermes gateway to reload MCP credentials"
+    fi
+}
+
 install_launch_agent() {
     [ -f "$LAUNCH_AGENT_TEMPLATE" ] || die "missing launch agent template"
     mkdir -p "$LAUNCH_AGENT_DIR" "$RUNTIME_DIR"
@@ -170,10 +214,13 @@ cmd_start() {
     load_runtime_env
     bash "$REPO_ROOT/scripts/dev_mac.sh" services-start
     resolve_ow_api_key
+    sync_hermes_ow_api_key
     start_process "Open Wearables" "$OW_PID" "$OW_LOG" \
         "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow"
     start_process "Open Wearables worker" "$WORKER_PID" "$WORKER_LOG" \
         "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow-worker"
+    start_process "Open Wearables beat" "$BEAT_PID" "$BEAT_LOG" \
+        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow-beat"
     start_process "HealthMes" "$HEALTHMES_PID" "$HEALTHMES_LOG" \
         "exec bash '$REPO_ROOT/scripts/dev_mac.sh' run"
     info "dashboard: $DASHBOARD_URL"
@@ -186,7 +233,8 @@ cmd_daemon() {
         sleep 5
         if ! pid_running "$HEALTHMES_PID" \
             || ! pid_running "$OW_PID" \
-            || ! pid_running "$WORKER_PID"; then
+            || ! pid_running "$WORKER_PID" \
+            || ! pid_running "$BEAT_PID"; then
             cmd_start
         fi
     done
@@ -194,6 +242,7 @@ cmd_daemon() {
 
 stop_apps() {
     stop_process "HealthMes" "$HEALTHMES_PID"
+    stop_process "Open Wearables beat" "$BEAT_PID"
     stop_process "Open Wearables worker" "$WORKER_PID"
     stop_process "Open Wearables" "$OW_PID"
 }
@@ -216,6 +265,7 @@ cmd_status() {
     service_status "HealthMes" "$HEALTHMES_PID"
     service_status "Open Wearables" "$OW_PID"
     service_status "Open Wearables worker" "$WORKER_PID"
+    service_status "Open Wearables beat" "$BEAT_PID"
     bash "$REPO_ROOT/scripts/dev_mac.sh" services-status
     if curl --fail --silent --max-time 2 "http://127.0.0.1:${HEALTHMES_PORT:-8100}/health" >/dev/null; then
         info "HealthMes HTTP: ready"

@@ -39,11 +39,7 @@ async def read_actual_sleep(
         target_date.isoformat(),
         (target_date + timedelta(days=1)).isoformat(),
     )
-    try:
-        summaries = tuple(SleepSummaryPayload.model_validate(row) for row in rows)
-    except ValidationError:
-        return SleepObservationNoOp(reason=SleepObservationNoOpReason.INCOMPLETE)
-    selected = select_actual_sleep(summaries, target_date)
+    selected = select_actual_sleep_rows(rows, target_date)
     if isinstance(selected, SleepObservationNoOp):
         return selected
     if review_base_url is not None:
@@ -68,3 +64,14 @@ async def read_actual_sleep(
     except ValidationError:
         return selected
     return split_observation_at_awake_intervals(selected, sessions)
+
+
+def select_actual_sleep_rows(
+    rows: Sequence[Mapping[str, Any]],
+    target_date: date,
+) -> ActualSleepObservation | SleepObservationNoOp:
+    try:
+        summaries = tuple(SleepSummaryPayload.model_validate(row) for row in rows)
+    except ValidationError:
+        return SleepObservationNoOp(reason=SleepObservationNoOpReason.INCOMPLETE)
+    return select_actual_sleep(summaries, target_date)

@@ -1,7 +1,7 @@
 # HealthMes Agent stack — three planes on one bridge network (docs/PLAN.md §1).
 #
 #   data plane   : postgres (+ dedicated healthmes DB), redis,
-#                  open-wearables backend + celery worker + its MCP server
+#                  open-wearables backend + celery worker/beat + its MCP server
 #   healthmes    : glue service (FastAPI + fastmcp) built from Dockerfile.healthmes
 #   agent plane  : hermes gateway (Telegram + webhook + MCP client)
 #
@@ -99,23 +99,23 @@ services:
       - ow-backend
     restart: on-failure
 
-  # Periodic sync scheduling (vendor `celery-beat`) is not part of the Phase 0
-  # scaffold; uncomment to enable automatic provider syncs.
-  # ow-beat:
-  #   image: open-wearables-platform:latest
-  #   pull_policy: never
-  #   command: scripts/start/beat.sh
-  #   env_file:
-  #     - path: ./config/open-wearables.env
-  #       required: false
-  #   environment:
-  #     - DB_HOST=postgres
-  #     - REDIS_HOST=redis
-  #   depends_on:
-  #     - redis
-  #     - postgres
-  #     - ow-backend
-  #   restart: on-failure
+  ow-beat:
+    # Mirrors the `celery-beat` service of the vendor compose. The worker
+    # executes sync tasks; Beat is the separate process that enqueues them.
+    image: open-wearables-platform:latest
+    pull_policy: never
+    command: scripts/start/beat.sh
+    env_file:
+      - path: ./config/open-wearables.env
+        required: false
+    environment:
+      - DB_HOST=postgres
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+      - postgres
+      - ow-backend
+    restart: on-failure
 
   ow-mcp:
     # vendor/open-wearables/mcp has no Dockerfile and its entrypoint

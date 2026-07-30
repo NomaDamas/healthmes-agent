@@ -21,6 +21,10 @@ directly.
   duration, or source helps explain the interpreted context. It does not expose
   stages, efficiency, HRV, respiration, or SpO2. Defer those reviews instead of
   implying the detail is available.
+- The Open Wearables `end_date` is exclusive. For one target date, pass the
+  target date as `start_date`, use the day after the target date as `end_date`,
+  and select the record whose `date` exactly matches the target date. Never use
+  an earlier record as today's sleep.
 - Use that raw-summary fallback only with an already configured or explicitly
   supplied user id. Never call `mcp__open_wearables__get_users` to enumerate
   accessible names or email addresses for identity resolution.
@@ -79,9 +83,9 @@ directly.
    context question about current fatigue, pain, illness, or an unusual prior
    day. Do not force a single-score conclusion.
 9. If basic timing or duration is needed and the user id is already known,
-   call `mcp__open_wearables__get_sleep_summary` and use only its supported
-   timing, duration, and source fields. Never recompute HealthMes sleep debt
-   from raw rows.
+   call `mcp__open_wearables__get_sleep_summary` with the exclusive-end window
+   above and use only the exact target-date record's supported timing, duration,
+   and source fields. Never recompute HealthMes sleep debt from raw rows.
 
 ## Response shape
 

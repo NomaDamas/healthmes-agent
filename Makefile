@@ -5,7 +5,7 @@
 DEV_MAC := bash scripts/dev_mac.sh
 
 .PHONY: help mac-setup mac-services-start mac-services-stop mac-services-status \
-	mac-run mac-test mac-ow mac-ow-worker compose-config
+	mac-run mac-test mac-ow mac-ow-worker mac-ow-beat compose-config
 
 help: ## List targets
 	@grep -E '^[a-z][a-zA-Z_-]*:.*##' $(MAKEFILE_LIST) | \
@@ -34,6 +34,9 @@ mac-ow: ## Best-effort native boot of vendor/open-wearables backend (needs mac-s
 
 mac-ow-worker: ## open-wearables celery worker (needs redis from mac-services-start)
 	$(DEV_MAC) ow-worker
+
+mac-ow-beat: ## open-wearables celery beat scheduler (needs redis from mac-services-start)
+	$(DEV_MAC) ow-beat
 
 compose-config: ## Validate the docker compose file (no daemon required)
 	docker compose config -q
