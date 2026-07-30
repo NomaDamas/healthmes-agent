@@ -7,6 +7,7 @@ rendering, which never connects.
 """
 
 import io
+import logging
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -57,6 +58,15 @@ def test_migration_graph_has_single_head():
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
     assert len(script.get_heads()) == 1
+
+
+def test_migration_keeps_existing_application_loggers_enabled():
+    logger = logging.getLogger("healthmes.calendars.sleep_job")
+    logger.disabled = False
+
+    _render_offline_upgrade("sqlite:///offline-render.db")
+
+    assert logger.disabled is False
 
 
 class TestOfflineRender:

@@ -335,6 +335,18 @@ class TestResolveSingleUserId:
 
         assert await resolve_single_user_id(SyncFake(), settings) == "sync-user"
 
+    async def test_discovery_rejects_malformed_user_rows(self, settings, monkeypatch):
+        from healthmes.mcp_server.ow_client import resolve_single_user_id
+
+        monkeypatch.delenv("HEALTHMES_OW_USER_ID", raising=False)
+
+        class MalformedFake:
+            def list_users(self, **kwargs):
+                return {"items": ["private@example.com"]}
+
+        with pytest.raises(LookupError, match="HEALTHMES_OW_USER_ID"):
+            await resolve_single_user_id(MalformedFake(), settings)
+
 
 class TestPaginationTruncationTracked:
     """Defect 8: the collectors must surface a truncated flag when the page cap

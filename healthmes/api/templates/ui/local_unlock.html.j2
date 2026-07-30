@@ -1,0 +1,18 @@
+{% extends "ui/_base.html.j2" %}
+
+{% block title %}{{ heading }} — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">/ local unlock</span>{% endblock %}
+
+{% block content %}
+<p class="eyebrow">Direct loopback credential check</p>
+<h1>{{ heading }}</h1>
+<section class="card">
+  <p class="muted">{{ description }}</p>
+  <form method="post" action="{{ post_url }}">
+    <label for="api-token">HealthMes API token</label>
+    <input id="api-token" type="password" name="api_token"
+      autocomplete="current-password" required>
+    <button type="submit">잠금 해제</button>
+  </form>
+</section>
+{% endblock %}

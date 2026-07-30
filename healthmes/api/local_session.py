@@ -4,12 +4,14 @@ import datetime as dt
 import ipaddress
 import secrets
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from http.cookies import CookieError, SimpleCookie
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import HTTPException, Request, Response, status
 
 LOCAL_SESSION_COOKIE = "healthmes_local_session"
 LOCAL_SESSION_TTL = dt.timedelta(minutes=30)
+LOCAL_SESSION_AUTH_SCOPE_KEY = "healthmes.local_session_authenticated"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +60,21 @@ def install_local_sessions(app) -> None:
     app.state.local_sessions = LocalSessionStore()
 
 
+def authenticated_local_session(
+    scope: dict,
+    store: LocalSessionStore,
+) -> LocalBrowserSession | None:
+    if not is_loopback_scope(scope):
+        return None
+    cookie = SimpleCookie()
+    try:
+        cookie.load(_header(scope, b"cookie"))
+    except CookieError:
+        return None
+    morsel = cookie.get(LOCAL_SESSION_COOKIE)
+    return store.get(morsel.value if morsel is not None else None)
+
+
 def is_loopback_scope(scope: dict) -> bool:
     host = _host_name(_header(scope, b"host"))
     client = scope.get("client")
@@ -67,20 +84,55 @@ def is_loopback_scope(scope: dict) -> bool:
     )
 
 
+def local_browser_url(port: int, path: str) -> str:
+    return f"http://127.0.0.1:{port}{path}"
+
+
 def issue_local_session(request: Request, response: Response) -> LocalBrowserSession | None:
     if not is_loopback_scope(request.scope):
         return None
     store: LocalSessionStore = request.app.state.local_sessions
-    session = store.get(request.cookies.get(LOCAL_SESSION_COOKIE)) or store.issue()
+    session = store.get(request.cookies.get(LOCAL_SESSION_COOKIE))
+    api_token = request.app.state.settings.api_token.get_secret_value().strip()
+    # With auth enabled, loopback addressing is necessary but not sufficient:
+    # a local reverse proxy also appears as a loopback peer and can forward an
+    # attacker-controlled Host header. Only full API authentication may create
+    # the first session; the opaque cookie can then continue the local flow.
+    if (
+        session is None
+        and api_token
+        and not request.scope.get("state", {}).get(LOCAL_SESSION_AUTH_SCOPE_KEY)
+    ):
+        return None
+    session = session or store.issue()
     response.set_cookie(
         LOCAL_SESSION_COOKIE,
         session.session_id,
         max_age=int(LOCAL_SESSION_TTL.total_seconds()),
         httponly=True,
-        samesite="strict",
+        samesite="lax",
         secure=request.url.scheme == "https",
         path="/",
     )
+    return session
+
+
+async def bootstrap_local_session(
+    request: Request,
+    response: Response,
+) -> LocalBrowserSession:
+    if not is_loopback_scope(request.scope):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "local browser session required")
+    _assert_same_origin(request)
+    values = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+    candidate = values.get("api_token", [""])[-1]
+    expected = request.app.state.settings.api_token.get_secret_value().strip()
+    if not expected or not secrets.compare_digest(candidate, expected):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid API token")
+    request.scope.setdefault("state", {})[LOCAL_SESSION_AUTH_SCOPE_KEY] = True
+    session = issue_local_session(request, response)
+    if session is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "local browser session required")
     return session
 
 
