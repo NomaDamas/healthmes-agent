@@ -70,8 +70,24 @@ def select_actual_sleep_rows(
     rows: Sequence[Mapping[str, Any]],
     target_date: date,
 ) -> ActualSleepObservation | SleepObservationNoOp:
-    try:
-        summaries = tuple(SleepSummaryPayload.model_validate(row) for row in rows)
-    except ValidationError:
+    summaries: list[SleepSummaryPayload] = []
+    invalid_target_row = False
+    for row in rows:
+        try:
+            summaries.append(SleepSummaryPayload.model_validate(row))
+        except ValidationError:
+            invalid_target_row |= row.get("date") in (
+                target_date,
+                target_date.isoformat(),
+            )
+    selected = select_actual_sleep(tuple(summaries), target_date)
+    if (
+        invalid_target_row
+        and isinstance(selected, SleepObservationNoOp)
+        and selected.reason in {
+            SleepObservationNoOpReason.MISSING,
+            SleepObservationNoOpReason.STALE,
+        }
+    ):
         return SleepObservationNoOp(reason=SleepObservationNoOpReason.INCOMPLETE)
-    return select_actual_sleep(summaries, target_date)
+    return selected
