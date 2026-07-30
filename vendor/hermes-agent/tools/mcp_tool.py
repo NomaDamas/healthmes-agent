@@ -90,8 +90,11 @@ Thread safety:
 """
 
 import asyncio
+import base64
 import contextvars
 import concurrent.futures
+import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -118,6 +121,91 @@ logger = logging.getLogger(__name__)
 # first in the normal case; this outer bound only bites when a stalled SSL
 # handshake defeats the inner timeout (the #29184 failure mode).
 _OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
+
+
+def _trusted_session_call_arguments(
+    server: Any,
+    tool_name: str,
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    config = server._config.get("trusted_session_proof")
+    if not isinstance(config, dict):
+        return arguments
+    confirmations = config.get("confirmations")
+    if not isinstance(confirmations, dict):
+        return arguments
+    confirmation = confirmations.get(tool_name)
+    if not isinstance(confirmation, dict):
+        return arguments
+
+    from gateway.session_context import get_session_env, get_session_message_text
+
+    session = {
+        "platform": get_session_env("HERMES_SESSION_PLATFORM"),
+        "chat_id": get_session_env("HERMES_SESSION_CHAT_ID"),
+        "user_id": get_session_env("HERMES_SESSION_USER_ID"),
+        "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID"),
+    }
+    message_text = get_session_message_text().strip()
+    if session["platform"] != "telegram" or not all(session.values()) or not message_text:
+        return arguments
+
+    handle_argument = confirmation.get("handle_argument")
+    handle = arguments.get(handle_argument) if isinstance(handle_argument, str) else None
+    if not isinstance(handle, str) or not handle:
+        return arguments
+    passthrough_argument = confirmation.get("passthrough_argument")
+    if isinstance(passthrough_argument, str):
+        choices = confirmation.get("choices")
+        allowed = choices if isinstance(choices, list) else []
+        if (
+            arguments.get(passthrough_argument) != message_text
+            or message_text not in {f"{choice} {handle}" for choice in allowed}
+        ):
+            return arguments
+    else:
+        action_argument = confirmation.get("action_argument")
+        choices = confirmation.get("choices")
+        action = arguments.get(action_argument) if isinstance(action_argument, str) else None
+        prefix = choices.get(action) if isinstance(choices, dict) else None
+        if not isinstance(prefix, str) or message_text != f"{prefix} {handle}":
+            return arguments
+
+    secret_env = config.get("secret_env")
+    secret = os.environ.get(secret_env, "") if isinstance(secret_env, str) else ""
+    bind_arguments = confirmation.get("bind_arguments")
+    if not isinstance(secret, str) or len(secret) < 32 or not isinstance(bind_arguments, list):
+        return arguments
+    bound_arguments = {
+        name: arguments.get(name)
+        for name in bind_arguments
+        if isinstance(name, str)
+    }
+    payload = {
+        "v": 1,
+        "tool": tool_name,
+        "arguments": bound_arguments,
+        **session,
+        "issued_at": int(time.time()),
+    }
+    raw_payload = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw_payload).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        encoded.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    proof_argument = config.get("argument", "trusted_session_proof")
+    if not isinstance(proof_argument, str) or not proof_argument:
+        return arguments
+    signed_arguments = dict(arguments)
+    signed_arguments[proof_argument] = f"{encoded}.{signature}"
+    return signed_arguments
 
 
 # ---------------------------------------------------------------------------
@@ -3940,7 +4028,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    call_arguments = _trusted_session_call_arguments(
+                        server,
+                        tool_name,
+                        args,
+                    )
+                    result = await server.session.call_tool(
+                        tool_name,
+                        arguments=call_arguments,
+                    )
                 finally:
                     server._pending_call_context = None
             # MCP CallToolResult has .content (list of content blocks) and .isError
