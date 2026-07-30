@@ -772,6 +772,24 @@ class TestDigestV2Rows:
         digest = digest_ow_rows([], [], AS_OF, series_rows=rows)
         assert digest.hydration_by_day == {dt.date(2026, 7, 8): pytest.approx(250.0)}
 
+    def test_non_mapping_series_and_cycles_are_skipped(self) -> None:
+        cycle = _cycle_row("2026-07-06T00:00:00Z", cycle_length=28)
+        digest = digest_ow_rows(
+            [],
+            [],
+            AS_OF,
+            series_rows=[
+                "malformed",
+                _series_row("2026-07-08T09:00:00+00:00", "hydration", 250.0),
+            ],
+            cycle_rows=["malformed", cycle],
+        )
+
+        assert digest.hydration_by_day == {
+            dt.date(2026, 7, 8): pytest.approx(250.0)
+        }
+        assert digest.cycles == (cycle,)
+
     def test_cycles_pass_through(self) -> None:
         row = _cycle_row("2026-07-06T00:00:00Z", cycle_length=28)
         digest = digest_ow_rows([], [], AS_OF, cycle_rows=[row])

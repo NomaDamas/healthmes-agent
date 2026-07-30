@@ -542,3 +542,28 @@ class TestDigestOwRows:
         digest = digest_ow_rows(rows, [], AS_OF)
         assert digest.sleep_score_source == "provider_sleep_score"
         assert digest.sleep_scores_by_day == {AS_OF: 72.0}
+
+    def test_malformed_score_rows_do_not_hide_valid_charge_data(
+        self, make_score_row
+    ) -> None:
+        rows = [
+            "malformed",
+            make_score_row(
+                "resilience",
+                "internal",
+                "2026-07-09T06:00:00+00:00",
+                5.2,
+                components="malformed",
+            ),
+            make_score_row(
+                "body_battery",
+                "garmin",
+                "2026-07-09T06:30:00+00:00",
+                80.0,
+            ),
+        ]
+
+        digest = digest_ow_rows(rows, [], AS_OF)
+
+        assert digest.resilience_by_day == {}
+        assert digest.charge_points["body_battery"][0][1] == 80.0

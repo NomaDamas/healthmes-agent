@@ -806,7 +806,7 @@ def _as_int(value: Any) -> int | None:
 
 
 def menstrual_phase_signal(
-    cycle_rows: Sequence[Mapping[str, Any]],
+    cycle_rows: Sequence[object],
     as_of: date,
 ) -> FactorSignal | MissingSignal:
     """Cycle-phase adjustment from open-wearables menstrual-cycle records.
@@ -829,6 +829,8 @@ def menstrual_phase_signal(
     key = "menstrual_phase"
     candidates: list[tuple[date, Mapping[str, Any]]] = []
     for row in cycle_rows:
+        if not isinstance(row, Mapping):
+            continue
         started_at = interpret.parse_recorded_at(row.get("start_time"))
         if started_at is not None and started_at.date() <= as_of:
             candidates.append((started_at.date(), row))
@@ -1242,11 +1244,13 @@ class OwDigest:
 
 
 def _series_points(
-    series_rows: Sequence[Mapping[str, Any]], series_type: str
+    series_rows: Sequence[object], series_type: str
 ) -> list[SeriesPoint]:
     """``TimeSeriesSample`` rows of one type as parsed points (bad rows skipped)."""
     points: list[SeriesPoint] = []
     for row in series_rows:
+        if not isinstance(row, Mapping):
+            continue
         if row.get("type") != series_type:
             continue
         recorded_at = interpret.parse_recorded_at(row.get("timestamp"))
@@ -1282,12 +1286,12 @@ def _daily_mean_series(points: Sequence[SeriesPoint]) -> dict[date, float]:
 
 
 def digest_ow_rows(
-    score_rows: Sequence[Mapping[str, Any]],
-    sleep_rows: Sequence[Mapping[str, Any]],
+    score_rows: Sequence[object],
+    sleep_rows: Sequence[object],
     as_of: date,
     *,
-    series_rows: Sequence[Mapping[str, Any]] | None = None,
-    cycle_rows: Sequence[Mapping[str, Any]] | None = None,
+    series_rows: Sequence[object] | None = None,
+    cycle_rows: Sequence[object] | None = None,
 ) -> OwDigest:
     """Digest health-score + sleep-summary rows into the engine's daily series.
 
@@ -1309,8 +1313,10 @@ def digest_ow_rows(
 
     charge: dict[str, list[tuple[datetime, float, str | None]]] = {}
     for row in score_rows:
+        if not isinstance(row, Mapping):
+            continue
         category = row.get("category")
-        if category not in CHARGE_PREFERENCE:
+        if not isinstance(category, str) or category not in CHARGE_PREFERENCE:
             continue
         recorded_at = interpret.parse_recorded_at(row.get("recorded_at"))
         value = interpret.as_float(row.get("value"))
@@ -1343,7 +1349,11 @@ def digest_ow_rows(
         noise_db_by_day=noise_db_by_day,
         alcohol_points=alcohol_points,
         hydration_by_day=hydration_by_day,
-        cycles=tuple(dict(row) for row in cycle_rows) if cycle_rows is not None else None,
+        cycles=(
+            tuple(dict(row) for row in cycle_rows if isinstance(row, Mapping))
+            if cycle_rows is not None
+            else None
+        ),
     )
 
 
