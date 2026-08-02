@@ -53,6 +53,12 @@ _INITIALIZE = {
         "clientInfo": {"name": "smoke", "version": "0"},
     },
 }
+_TOOLS_LIST = {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/list",
+    "params": {},
+}
 _MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 
 
@@ -83,9 +89,40 @@ class TestHttpApp:
             ) as client:
                 response = await client.post("/mcp", json=_INITIALIZE, headers=_MCP_HEADERS)
         assert response.status_code == 200
-        assert response.headers.get("mcp-session-id")
+        assert response.headers.get("mcp-session-id") is None
         assert '"serverInfo"' in response.text
         assert '"healthmes"' in response.text
+
+    async def test_stateless_client_request_survives_server_replacement(self):
+        first_app = build_mcp_http_app()
+        async with first_app.lifespan(first_app):
+            first_transport = httpx.ASGITransport(app=first_app)
+            async with httpx.AsyncClient(
+                transport=first_transport, base_url="http://healthmes.test"
+            ) as client:
+                initialized = await client.post(
+                    "/mcp",
+                    json=_INITIALIZE,
+                    headers=_MCP_HEADERS,
+                )
+
+        replacement_app = build_mcp_http_app()
+        async with replacement_app.lifespan(replacement_app):
+            replacement_transport = httpx.ASGITransport(app=replacement_app)
+            async with httpx.AsyncClient(
+                transport=replacement_transport,
+                base_url="http://healthmes.test",
+            ) as client:
+                listed = await client.post(
+                    "/mcp",
+                    json=_TOOLS_LIST,
+                    headers=_MCP_HEADERS,
+                )
+
+        assert initialized.status_code == 200
+        assert initialized.headers.get("mcp-session-id") is None
+        assert listed.status_code == 200
+        assert '"prepare_actual_sleep_calendar_update"' in listed.text
 
     async def test_documented_fastapi_mount_recipe(self):
         """The exact wiring recorded in needs.app_wiring keeps both surfaces."""
@@ -107,4 +144,4 @@ class TestHttpApp:
                 mcp_response = await client.post("/mcp", json=_INITIALIZE, headers=_MCP_HEADERS)
         assert health_response.status_code == 200  # FastAPI routes keep precedence
         assert mcp_response.status_code == 200
-        assert mcp_response.headers.get("mcp-session-id")
+        assert mcp_response.headers.get("mcp-session-id") is None

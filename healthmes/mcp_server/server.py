@@ -2497,9 +2497,7 @@ def propose_schedule_blocks(
                     "end": _iso_utc(event.end_at),
                     "is_agent_created": event.is_agent_created,
                 }
-                for event in session.scalars(
-                    conflict_query.order_by(CalendarEventMirror.start_at)
-                )
+                for event in session.scalars(conflict_query.order_by(CalendarEventMirror.start_at))
             ]
             proposal = ScheduleProposal(
                 task_id=task.id,
@@ -3059,11 +3057,14 @@ def record_decision(
 # ---------------------------------------------------------------------------
 
 
-def build_mcp_http_app(path: str = "/mcp", stateless_http: bool = False):
+def build_mcp_http_app(path: str = "/mcp", stateless_http: bool = True):
     """Streamable-HTTP ASGI app serving this MCP server at ``path``.
 
     Returns a Starlette app whose ``.lifespan`` MUST be run by the hosting app
-    (it starts the MCP session manager). Composition root wiring:
+    (it starts the MCP transport manager). Stateless HTTP is the default
+    because HealthMes tools keep no transport-session state; this also lets a
+    long-running Hermes client continue after a HealthMes process restart
+    instead of retaining a now-invalid MCP session id. Composition root wiring:
 
         mcp_app = build_mcp_http_app()                 # endpoint: POST /mcp
         app = FastAPI(lifespan=mcp_app.lifespan)       # or chain lifespans
