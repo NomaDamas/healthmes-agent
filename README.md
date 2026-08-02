@@ -181,6 +181,8 @@ hardware) lives in each app's README.
 **Skills** (`skills/`, copied into the Hermes home by bootstrap):
 `healthmes-planner` (goal dump → task breakdown → energy-aware block
 proposals → decision recording), `healthmes-capture` (food + medical),
+`healthmes-caffeine` (exact event + current sleep + explicit user bounds →
+read-only bounded preparation proposal),
 `healthmes-sleep` (sleep/readiness evidence → cautious daily intensity
 decision), `healthmes-stress` (source-aware stress/recovery evidence →
 keep/reconsider/insufficient-data decision), `doctor-visit-summary`.
