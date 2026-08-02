@@ -17,6 +17,11 @@ diagnose a condition, infer a cause, or change a schedule directly.
 
 - Read data only through registered MCP tools. Never call HealthMes or
   open-wearables REST endpoints directly.
+- If a required HealthMes MCP tool is missing or unavailable, or its call
+  fails, fail closed: return `insufficient_data` and state that live HealthMes
+  evidence is unavailable. Do not search session memory or local files, call
+  REST endpoints, or reuse a past observation as current evidence. Do not
+  record a decision from substituted or stale evidence.
 - Start with `mcp__healthmes__get_stress_timeline` for the target date. It
   establishes the source, data resolution, coverage, confidence, and whether
   intraday interpretation is permitted.

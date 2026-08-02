@@ -561,6 +561,45 @@ def install_skills(repo_root: Path, hermes_home: Path, plan: Plan) -> list[Path]
     return installed
 
 
+def discover_plugin_dirs(repo_root: Path) -> list[Path]:
+    plugins_root = repo_root / "plugins"
+    if not plugins_root.is_dir():
+        return []
+    return sorted(
+        child
+        for child in plugins_root.iterdir()
+        if child.is_dir()
+        and (child / "plugin.yaml").is_file()
+        and (child / "__init__.py").is_file()
+    )
+
+
+def install_plugins(repo_root: Path, hermes_home: Path, plan: Plan) -> list[Path]:
+    plugins_home = hermes_home / "plugins"
+    installed: list[Path] = []
+    for plugin_dir in discover_plugin_dirs(repo_root):
+        dest = plugins_home / plugin_dir.name
+        if dest.exists() and not dest.is_dir():
+            plan.warn(
+                f"{dest} exists and is not a directory; leaving it untouched "
+                f"(remove it manually to let bootstrap manage this plugin)"
+            )
+            continue
+        if dest.is_dir() and _dir_snapshot(dest) == _dir_snapshot(plugin_dir):
+            plan.act(f"keep plugin copy {dest} (content up to date)")
+            installed.append(dest)
+            continue
+        action = "resync" if dest.is_dir() else "copy"
+        plan.act(f"{action} plugin {plugin_dir} -> {dest}")
+        if not plan.dry_run:
+            if dest.is_dir():
+                shutil.rmtree(dest)
+            plugins_home.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(plugin_dir, dest)
+        installed.append(dest)
+    return installed
+
+
 # ---------------------------------------------------------------------------
 # Briefing snapshot script (docs/PLAN.md section 4 `script:` context injection)
 # ---------------------------------------------------------------------------
@@ -1153,6 +1192,7 @@ def run(args: argparse.Namespace) -> int:
 
     write_config(hermes_home, rendered, plan)
     install_skills(REPO_ROOT, hermes_home, plan)
+    install_plugins(REPO_ROOT, hermes_home, plan)
     # Before cron registration: the jobs reference this script by name and
     # create_job's lifecycle guard reads it from $HERMES_HOME/scripts/.
     install_snapshot_script(hermes_home, context, plan)

@@ -74,3 +74,23 @@ def test_skill_dirs_all_checked() -> None:
         "healthmes-sleep",
         "healthmes-stress",
     ]
+
+
+@pytest.mark.parametrize("skill_name", ("healthmes-sleep", "healthmes-stress"))
+def test_current_health_skills_fail_closed_without_live_mcp(skill_name: str) -> None:
+    text = (REPO_ROOT / "skills" / skill_name / "SKILL.md").read_text(encoding="utf-8")
+    assert "fail closed: return `insufficient_data`" in text
+    assert "Do not search session memory or local files" in text
+    assert "reuse a past observation as current evidence" in text
+    assert "Do not\n  record a decision from substituted or stale evidence" in text
+
+
+@pytest.mark.parametrize(
+    ("doc_name", "minimum_commands"),
+    (("DEVELOPMENT.md", 2), ("EXTENDING.md", 1)),
+)
+def test_hermes_runtime_docs_install_mcp_extra(
+    doc_name: str, minimum_commands: int
+) -> None:
+    text = (REPO_ROOT / "docs" / doc_name).read_text(encoding="utf-8")
+    assert text.count("--extra messaging --extra mcp") >= minimum_commands

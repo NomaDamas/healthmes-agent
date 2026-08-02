@@ -54,6 +54,9 @@ ACTIVITY_TOOLS = {
     "get_overwork_context",
     "resolve_wellness_context",
 }
+SLEEP_CALENDAR_TOOLS = {
+    "prepare_actual_sleep_calendar_update",
+}
 EXPECTED_TOOLS = (
     TRANCHE_1_TOOLS
     | TRANCHE_2_TOOLS
@@ -61,6 +64,7 @@ EXPECTED_TOOLS = (
     | NUTRITION_TOOLS
     | CALENDAR_ADJUSTMENT_TOOLS
     | ACTIVITY_TOOLS
+    | SLEEP_CALENDAR_TOOLS
 )
 
 _INITIALIZE = {

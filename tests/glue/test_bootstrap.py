@@ -23,6 +23,7 @@ EXPECTED_SKILLS = (
     "healthmes-sleep",
     "healthmes-stress",
 )
+EXPECTED_PLUGINS = ("healthmes-routing",)
 
 pytestmark = pytest.mark.usefixtures("clean_env")
 
@@ -61,6 +62,7 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
 
     # 1. config.yaml rendered and parseable, with vendor-contract keys.
     config = yaml.safe_load((hermes_home / "config.yaml").read_text())
+    assert config["mcp_discovery_timeout"] == 20
     assert config["platforms"]["telegram"]["token"] == "123456:test-token"
     assert config["platforms"]["telegram"]["extra"]["allow_from"] == ["owner-user"]
     route = config["platforms"]["webhook"]["extra"]["routes"]["healthmes-alerts"]
@@ -93,7 +95,18 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
             REPO_ROOT / "skills" / skill / "SKILL.md"
         ).read_text()
 
-    # 3. Briefing snapshot script + base-url sidecar installed into the
+    # 3. Request-scoped routing plugins copied into Hermes discovery.
+    for plugin in EXPECTED_PLUGINS:
+        dest = hermes_home / "plugins" / plugin
+        assert dest.is_dir() and not dest.is_symlink()
+        assert (dest / "plugin.yaml").read_text() == (
+            REPO_ROOT / "plugins" / plugin / "plugin.yaml"
+        ).read_text()
+        assert (dest / "__init__.py").read_text() == (
+            REPO_ROOT / "plugins" / plugin / "__init__.py"
+        ).read_text()
+
+    # 4. Briefing snapshot script + base-url sidecar installed into the
     # scheduler's only allowed script location ($HERMES_HOME/scripts/).
     installed_script = hermes_home / "scripts" / "healthmes_briefing_snapshot.py"
     assert installed_script.is_file()
@@ -107,7 +120,7 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     # and the sidecar carries no token key.
     assert "headers" not in servers["healthmes"]
 
-    # 4. Cron briefings registered in the vendor jobs.json envelope.
+    # 5. Cron briefings registered in the vendor jobs.json envelope.
     jobs_doc = yaml.safe_load((hermes_home / "cron" / "jobs.json").read_text())
     assert set(jobs_doc) >= {"jobs", "updated_at"}
     jobs = {job["name"]: job for job in jobs_doc["jobs"]}
@@ -353,6 +366,7 @@ def test_existing_config_is_merged_not_clobbered(bootstrap, hermes_home, env_fil
         yaml.safe_dump(
             {
                 "model": {"default": "user-chosen-model"},
+                "mcp_discovery_timeout": 1.5,
                 "platforms": {"telegram": {"token": "stale-token"}},
             }
         ),
@@ -363,6 +377,7 @@ def test_existing_config_is_merged_not_clobbered(bootstrap, hermes_home, env_fil
     config = yaml.safe_load((hermes_home / "config.yaml").read_text())
     # Unmanaged user keys survive; managed keys are overwritten.
     assert config["model"] == {"default": "user-chosen-model"}
+    assert config["mcp_discovery_timeout"] == 20
     assert config["platforms"]["telegram"]["token"] == "123456:test-token"
     assert "mcp_servers" in config
     # The pre-merge file was backed up exactly once.

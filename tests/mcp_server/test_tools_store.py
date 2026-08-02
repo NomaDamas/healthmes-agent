@@ -32,6 +32,7 @@ from healthmes.store import (
     TriggerEvent,
 )
 from healthmes.trusted_session import issue_trusted_session_proof
+from tests.calendars.conftest import FakeCalendarBackend
 
 TREE = {
     "type": "rule",
@@ -46,6 +47,52 @@ TREE = {
         },
     ],
 }
+
+
+class TestActualSleepCalendarUpdate:
+    async def test_prepares_preview_without_calendar_write(
+        self,
+        mcp_client,
+        mcp_env,
+        call_tool,
+        monkeypatch,
+    ):
+        backend = FakeCalendarBackend()
+        mcp_env.add_sleep_summary(
+            "2026-07-08",
+            start_time="2026-07-07T23:00:00+09:00",
+            end_time="2026-07-08T07:00:00+09:00",
+            duration_minutes=420,
+            time_in_bed_minutes=480,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "write_source",
+            lambda settings: CalendarSource.GOOGLE,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "_build_backend",
+            lambda settings, source: backend,
+        )
+
+        result = await call_tool(
+            mcp_client,
+            "prepare_actual_sleep_calendar_update",
+            {"date": "2026-07-08", "date_basis": "oura_summary"},
+        )
+
+        assert result["status"] == "preview_ready"
+        assert result["proposal_status"] == "pending"
+        assert result["calendar_write"] == "requires_local_browser_confirmation"
+        assert result["review_url"].startswith(
+            "http://127.0.0.1:8100/sleep?proposal="
+        )
+        assert result["preview"]["start_local"] == "2026-07-07T23:00:00+09:00"
+        assert result["preview"]["wake_time_local"] == "2026-07-08T07:00:00+09:00"
+        assert backend.created_drafts == []
+        assert backend.update_calls == []
+        assert backend.delete_calls == []
 OWNER_USER_ID = "owner-user"
 OWNER_CHAT_ID = "owner-chat"
 
