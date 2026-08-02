@@ -41,6 +41,7 @@ def _proposal_args(
         "personal_daily_limit_mg": 300,
         "population_status": "confirmed_adult",
         "product_form": "beverage_or_food",
+        "intended_consumption_at": event_start_local.isoformat(),
         "target_sleep_at": target_sleep_local.isoformat(),
         "consumed_today_mg": 100,
         "total_intake_complete": True,
@@ -233,6 +234,35 @@ class TestCaffeineProposalTool:
         assert result["recommendation"]["basis"] == "upper_bound_only"
         assert result["reason"] == "personal_event_baseline_unavailable"
 
+    async def test_missing_intended_consumption_time_fails_closed(
+        self,
+        mcp_client,
+        call_tool,
+        mcp_env,
+        store_factory,
+        pinned_tz,
+    ):
+        day, event_start, target_sleep = _local_times(pinned_tz)
+        event_id = _seed_event(
+            store_factory,
+            start=event_start.astimezone(dt.UTC),
+            end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+        )
+        mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        args = _proposal_args(
+            event_id,
+            event_start_local=event_start,
+            target_sleep_local=target_sleep,
+        )
+        args["intended_consumption_at"] = None
+
+        result = await call_tool(mcp_client, "get_caffeine_proposal", args)
+
+        assert result["status"] == "insufficient_data"
+        assert result["reason"] == "missing_timing"
+        assert result["recommendation"]["maximum_additional_mg"] is None
+        assert result["recommendation"]["suggested_additional_mg"] is None
+
     async def test_contraindication_returns_noop_without_a_numeric_proposal(
         self,
         mcp_client,
@@ -259,6 +289,35 @@ class TestCaffeineProposalTool:
 
         assert result["status"] == "noop"
         assert result["reason"] == "clinician_guidance_required"
+        assert result["recommendation"]["maximum_additional_mg"] is None
+        assert result["recommendation"]["suggested_additional_mg"] is None
+
+    async def test_late_intended_consumption_respects_sleep_cutoff(
+        self,
+        mcp_client,
+        call_tool,
+        mcp_env,
+        store_factory,
+        pinned_tz,
+    ):
+        day, event_start, target_sleep = _local_times(pinned_tz)
+        event_id = _seed_event(
+            store_factory,
+            start=event_start.astimezone(dt.UTC),
+            end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+        )
+        mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        args = _proposal_args(
+            event_id,
+            event_start_local=event_start,
+            target_sleep_local=target_sleep,
+        )
+        args["intended_consumption_at"] = (event_start + dt.timedelta(hours=5)).isoformat()
+
+        result = await call_tool(mcp_client, "get_caffeine_proposal", args)
+
+        assert result["status"] == "noop"
+        assert result["reason"] == "within_sleep_cutoff"
         assert result["recommendation"]["maximum_additional_mg"] is None
         assert result["recommendation"]["suggested_additional_mg"] is None
 

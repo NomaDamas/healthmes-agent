@@ -2448,6 +2448,7 @@ async def get_caffeine_proposal(
     personal_daily_limit_mg: int,
     population_status: SupportedPopulationStatus,
     product_form: CaffeineProductForm,
+    intended_consumption_at: str | None = None,
     target_sleep_at: str | None = None,
     consumed_today_mg: int | None = None,
     total_intake_complete: bool = False,
@@ -2465,11 +2466,17 @@ async def get_caffeine_proposal(
     Missing or contradictory evidence returns an honest non-proposal outcome;
     no Calendar or provider state is mutated.
 
-    `target_sleep_at` and `baseline_confirmed_at` must be ISO-8601 timestamps
-    with an explicit UTC offset. `consumed_today_mg` must cover drinks, foods,
-    supplements, and medications before `total_intake_complete=true`.
+    `intended_consumption_at`, `target_sleep_at`, and `baseline_confirmed_at`
+    must be ISO-8601 timestamps with an explicit UTC offset.
+    `consumed_today_mg` must cover drinks, foods, supplements, and medications
+    before `total_intake_complete=true`.
     """
     tz = _local_timezone()
+    intended_consumption = _parse_datetime_local_aware(
+        intended_consumption_at,
+        "intended_consumption_at",
+        tz,
+    )
     target_sleep = _parse_datetime_local_aware(
         target_sleep_at,
         "target_sleep_at",
@@ -2524,7 +2531,7 @@ async def get_caffeine_proposal(
 
     request = caffeine_adapter.build_request(
         event_id=event_snapshot["id"] if event_snapshot is not None else None,
-        event_start=event_start,
+        intended_consumption_at=intended_consumption,
         sleep=sleep,
         consumed_today_mg=consumed_today_mg,
         total_intake_complete=total_intake_complete,

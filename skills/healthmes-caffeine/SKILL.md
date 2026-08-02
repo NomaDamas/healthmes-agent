@@ -36,8 +36,10 @@ Before calling the proposal tool, obtain every applicable field explicitly:
    returned contraindication option applies: pregnancy or breastfeeding,
    trying to become pregnant, relevant medication or condition, pronounced
    sensitivity, or adverse symptoms.
-5. Target sleep time and the user's desired pre-sleep cutoff, both in local
-   time. Convert timestamps to ISO-8601 with an explicit UTC offset.
+5. Intended caffeine consumption time, target sleep time, and the user's
+   desired pre-sleep cutoff, all explicitly confirmed in local time. Never
+   substitute the Calendar event start for consumption time. Convert
+   timestamps to ISO-8601 with an explicit UTC offset.
 6. If the user wants a specific suggested amount rather than only an upper
    bound, their previously confirmed amount for the same exact event and the
    time they confirmed it. Never invent or transfer a baseline from another

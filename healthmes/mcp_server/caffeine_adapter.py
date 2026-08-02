@@ -74,7 +74,7 @@ def select_sleep_evidence(
 def build_request(
     *,
     event_id: str | None,
-    event_start: datetime | None,
+    intended_consumption_at: datetime | None,
     sleep: SleepEvidence | None,
     consumed_today_mg: int | None,
     total_intake_complete: bool,
@@ -102,9 +102,9 @@ def build_request(
             freshness=BaselineFreshness.CURRENT,
         )
     timing = None
-    if event_start is not None and target_sleep_at is not None:
+    if intended_consumption_at is not None and target_sleep_at is not None:
         timing = CaffeineTiming(
-            intended_consumption_at=event_start,
+            intended_consumption_at=intended_consumption_at,
             target_sleep_at=target_sleep_at,
             cutoff_before_sleep=timedelta(hours=cutoff_before_sleep_hours),
         )
