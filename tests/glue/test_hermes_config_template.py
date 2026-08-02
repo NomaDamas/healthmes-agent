@@ -72,6 +72,10 @@ def test_telegram_platform_keys(config: dict) -> None:
     assert isinstance(telegram["extra"]["allow_from"], list)
 
 
+def test_mcp_discovery_wait_covers_local_server_startup(config: dict) -> None:
+    assert config["mcp_discovery_timeout"] == 20
+
+
 def test_home_channel_only_rendered_when_chat_id_set() -> None:
     full = render(dict(FULL_CONTEXT))
     home = full["platforms"]["telegram"]["home_channel"]

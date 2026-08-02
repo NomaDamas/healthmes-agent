@@ -235,7 +235,7 @@ Running the gateway natively (verified live on macOS with dummy creds):
 ```bash
 cd vendor/hermes-agent && \
   HERMES_HOME=... UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
-  uv run --frozen --no-dev --extra messaging hermes gateway run
+  uv run --frozen --no-dev --extra messaging --extra mcp hermes gateway run
 ```
 
 Two caveats from live verification: (1) if a supervised hermes service is
@@ -254,7 +254,7 @@ terminal agent has the identical MCP tools and skills as the Telegram bot:
 ```bash
 cd vendor/hermes-agent && \
   HERMES_HOME=~/.hermes UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
-  uv run --frozen --no-dev --extra messaging hermes            # interactive
+  uv run --frozen --no-dev --extra messaging --extra mcp hermes # interactive
 # one-shot:
 #   ... hermes chat -q "How was my sleep this week?"
 ```

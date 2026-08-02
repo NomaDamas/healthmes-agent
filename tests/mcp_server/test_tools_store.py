@@ -31,6 +31,7 @@ from healthmes.store import (
     TriggerEvent,
 )
 from healthmes.trusted_session import issue_trusted_session_proof
+from tests.calendars.conftest import FakeCalendarBackend
 
 TRUSTED_SESSION_SECRET = "test-calendar-adjustment-secret-32-characters"
 
@@ -55,6 +56,7 @@ def trusted_call_arguments(
         ),
     }
 
+
 TREE = {
     "type": "rule",
     "label": "readiness low",
@@ -68,6 +70,184 @@ TREE = {
         },
     ],
 }
+
+
+class TestActualSleepCalendarUpdate:
+    async def test_prepares_preview_without_calendar_write(
+        self,
+        mcp_client,
+        mcp_env,
+        call_tool,
+        monkeypatch,
+    ):
+        backend = FakeCalendarBackend()
+        mcp_env.add_sleep_summary(
+            "2026-07-08",
+            start_time="2026-07-07T23:00:00+09:00",
+            end_time="2026-07-08T07:00:00+09:00",
+            duration_minutes=420,
+            time_in_bed_minutes=480,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "write_source",
+            lambda settings: CalendarSource.GOOGLE,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "_build_backend",
+            lambda settings, source: backend,
+        )
+
+        result = await call_tool(
+            mcp_client,
+            "prepare_actual_sleep_calendar_update",
+            {"date": "2026-07-08", "date_basis": "oura_summary"},
+        )
+
+        assert result["status"] == "preview_ready"
+        assert result["proposal_status"] == "pending"
+        assert result["calendar_write"] == "requires_local_browser_confirmation"
+        assert result["review_url"].startswith("http://127.0.0.1:8100/sleep?proposal=")
+        assert result["preview"] == {
+            "status": "preview",
+            "action": "would_create",
+            "calendar": "google",
+            "local_date": "2026-07-08",
+            "summary": "Oura 수면 세션",
+            "start": "2026-07-07T14:00:00+00:00",
+            "wake_time": "2026-07-07T22:00:00+00:00",
+            "start_local": "2026-07-07T23:00:00+09:00",
+            "wake_time_local": "2026-07-08T07:00:00+09:00",
+            "timezone": "UTC+09:00",
+            "requested_date": "2026-07-08",
+            "oura_summary_date": "2026-07-08",
+            "date_basis": "oura_summary",
+            "duration_minutes": 420,
+            "time_in_bed_minutes": 480,
+            "non_sleep_minutes": 60,
+            "source": "oura",
+            "planned_sleep_replacements": 0,
+        }
+        assert backend.created_drafts == []
+        assert backend.update_calls == []
+        assert backend.delete_calls == []
+
+    async def test_accepts_night_start_date_for_next_day_oura_summary(
+        self,
+        mcp_client,
+        mcp_env,
+        call_tool,
+        monkeypatch,
+    ):
+        backend = FakeCalendarBackend()
+        mcp_env.add_sleep_summary(
+            "2026-07-30",
+            start_time="2026-07-29T21:20:00+09:00",
+            end_time="2026-07-30T07:07:00+09:00",
+            duration_minutes=527,
+            time_in_bed_minutes=587,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "write_source",
+            lambda settings: CalendarSource.GOOGLE,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "_build_backend",
+            lambda settings, source: backend,
+        )
+
+        result = await call_tool(
+            mcp_client,
+            "prepare_actual_sleep_calendar_update",
+            {"date": "2026-07-29", "date_basis": "night_start"},
+        )
+
+        assert result["status"] == "preview_ready"
+        assert result["preview"]["date_basis"] == "night_start"
+        assert result["preview"]["requested_date"] == "2026-07-29"
+        assert result["preview"]["oura_summary_date"] == "2026-07-30"
+        assert result["preview"]["start_local"] == "2026-07-29T21:20:00+09:00"
+        assert result["preview"]["wake_time_local"] == "2026-07-30T07:07:00+09:00"
+
+    async def test_explicit_oura_summary_date_does_not_jump_to_next_day(
+        self,
+        mcp_client,
+        mcp_env,
+        call_tool,
+        monkeypatch,
+    ):
+        backend = FakeCalendarBackend()
+        mcp_env.add_sleep_summary(
+            "2026-07-29",
+            start_time="2026-07-29T01:23:00+09:00",
+            end_time="2026-07-29T09:01:00+09:00",
+            duration_minutes=348,
+            time_in_bed_minutes=458,
+        )
+        mcp_env.add_sleep_summary(
+            "2026-07-30",
+            start_time="2026-07-29T21:20:00+09:00",
+            end_time="2026-07-30T07:07:00+09:00",
+            duration_minutes=530,
+            time_in_bed_minutes=587,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "write_source",
+            lambda settings: CalendarSource.GOOGLE,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "_build_backend",
+            lambda settings, source: backend,
+        )
+
+        result = await call_tool(
+            mcp_client,
+            "prepare_actual_sleep_calendar_update",
+            {"date": "2026-07-29", "date_basis": "oura_summary"},
+        )
+
+        assert result["status"] == "preview_ready"
+        assert result["preview"]["date_basis"] == "oura_summary"
+        assert result["preview"]["oura_summary_date"] == "2026-07-29"
+        assert result["preview"]["start_local"] == "2026-07-29T01:23:00+09:00"
+        assert result["preview"]["wake_time_local"] == "2026-07-29T09:01:00+09:00"
+
+    async def test_missing_night_start_does_not_substitute_same_day_summary(
+        self,
+        mcp_client,
+        mcp_env,
+        call_tool,
+        monkeypatch,
+    ):
+        mcp_env.add_sleep_summary(
+            "2026-07-28",
+            start_time="2026-07-28T00:41:00+09:00",
+            end_time="2026-07-28T14:05:00+09:00",
+            duration_minutes=533,
+            time_in_bed_minutes=803,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "write_source",
+            lambda settings: CalendarSource.GOOGLE,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "_build_backend",
+            lambda settings, source: FakeCalendarBackend(),
+        )
+
+        with pytest.raises(ToolError, match="밤에 시작한 Oura 주 수면을 찾지 못했습니다"):
+            await call_tool(
+                mcp_client,
+                "prepare_actual_sleep_calendar_update",
+                {"date": "2026-07-28", "date_basis": "night_start"},
+            )
 
 
 def test_adjustment_handle_secret_is_dedicated_and_fails_closed() -> None:

@@ -120,7 +120,7 @@ open http://localhost:8100/docs         # REST playground (OpenAPI)
   ```bash
   cd vendor/hermes-agent && \
     HERMES_HOME=~/.hermes UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
-    uv run --frozen --no-dev --extra messaging hermes chat -q \
+    uv run --frozen --no-dev --extra messaging --extra mcp hermes chat -q \
     "오늘 무리해도 돼? get_daily_readiness_context로 근거 보여줘"
   ```
 

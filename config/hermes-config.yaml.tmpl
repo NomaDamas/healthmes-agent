@@ -13,6 +13,11 @@
 # $HERMES_HOME/cron/jobs.json and are registered by scripts/bootstrap.py
 # against vendor/hermes-agent/cron/jobs.py::create_job.
 
+# The CLI snapshots the tool registry after this bounded discovery wait.
+# Local MCP startup can exceed the vendor's 1.5-second default, especially
+# when a stdio server initializes alongside the HealthMes HTTP transport.
+mcp_discovery_timeout: 20
+
 {%- if hermes_model or hermes_provider %}
 # LLM selection — optional. Omit to let the vendor auto-default (Anthropic).
 # Any plugin under vendor/hermes-agent/plugins/model-providers/ works here

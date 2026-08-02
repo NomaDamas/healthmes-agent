@@ -22,15 +22,18 @@ directory outside the vendor tree) and the repo-root ``.env``:
    resolve as trusted, and they work identically in docker mode where
    ./data/hermes is the only path mounted into the hermes container.
    Legacy symlinks from earlier bootstraps are migrated to copies.
-3. Generate missing secrets into ``.env`` (currently the webhook HMAC
+3. Copy each ``plugins/<name>/`` directory (must contain ``plugin.yaml`` and
+   ``__init__.py``) into ``$HERMES_HOME/plugins/<name>`` so request-scoped
+   routing hooks are active in both CLI and gateway sessions.
+4. Generate missing secrets into ``.env`` (currently the webhook HMAC
    secret shared between healthmes triggers and the Hermes webhook route).
-4. Install the briefing state-snapshot script (scripts/
+5. Install the briefing state-snapshot script (scripts/
    healthmes_briefing_snapshot.py) into ``$HERMES_HOME/scripts/`` plus a
    sidecar JSON carrying the healthmes base URL — the vendor cron scheduler
    only runs ``script:`` files from inside that directory
    (cron/scheduler.py::_run_job_script path guard) and injects their stdout
    into the briefing prompt as context (docs/PLAN.md section 4).
-5. Register the three cron briefings (morning plan 07:00, evening review
+6. Register the three cron briefings (morning plan 07:00, evening review
    21:30, weekly planning Sunday 18:00) against
    vendor/hermes-agent/cron/jobs.py::create_job, each with ``script=`` set
    to the installed snapshot. The vendor module is imported and called
@@ -519,6 +522,45 @@ def install_skills(repo_root: Path, hermes_home: Path, plan: Plan) -> list[Path]
     return installed
 
 
+def discover_plugin_dirs(repo_root: Path) -> list[Path]:
+    plugins_root = repo_root / "plugins"
+    if not plugins_root.is_dir():
+        return []
+    return sorted(
+        child
+        for child in plugins_root.iterdir()
+        if child.is_dir()
+        and (child / "plugin.yaml").is_file()
+        and (child / "__init__.py").is_file()
+    )
+
+
+def install_plugins(repo_root: Path, hermes_home: Path, plan: Plan) -> list[Path]:
+    plugins_home = hermes_home / "plugins"
+    installed: list[Path] = []
+    for plugin_dir in discover_plugin_dirs(repo_root):
+        dest = plugins_home / plugin_dir.name
+        if dest.exists() and not dest.is_dir():
+            plan.warn(
+                f"{dest} exists and is not a directory; leaving it untouched "
+                f"(remove it manually to let bootstrap manage this plugin)"
+            )
+            continue
+        if dest.is_dir() and _dir_snapshot(dest) == _dir_snapshot(plugin_dir):
+            plan.act(f"keep plugin copy {dest} (content up to date)")
+            installed.append(dest)
+            continue
+        action = "resync" if dest.is_dir() else "copy"
+        plan.act(f"{action} plugin {plugin_dir} -> {dest}")
+        if not plan.dry_run:
+            if dest.is_dir():
+                shutil.rmtree(dest)
+            plugins_home.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(plugin_dir, dest)
+        installed.append(dest)
+    return installed
+
+
 # ---------------------------------------------------------------------------
 # Briefing snapshot script (docs/PLAN.md section 4 `script:` context injection)
 # ---------------------------------------------------------------------------
@@ -956,6 +998,7 @@ def run(args: argparse.Namespace) -> int:
 
     write_config(hermes_home, rendered, plan)
     install_skills(REPO_ROOT, hermes_home, plan)
+    install_plugins(REPO_ROOT, hermes_home, plan)
     # Before cron registration: the jobs reference this script by name and
     # create_job's lifecycle guard reads it from $HERMES_HOME/scripts/.
     install_snapshot_script(hermes_home, context, plan)

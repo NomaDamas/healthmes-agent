@@ -32,7 +32,16 @@ CALENDAR_ADJUSTMENT_TOOLS = {
     "evaluate_morning_calendar_nudge",
     "resolve_calendar_adjustment",
 }
-EXPECTED_TOOLS = TRANCHE_1_TOOLS | TRANCHE_2_TOOLS | TRANCHE_3_TOOLS | CALENDAR_ADJUSTMENT_TOOLS
+SLEEP_CALENDAR_TOOLS = {
+    "prepare_actual_sleep_calendar_update",
+}
+EXPECTED_TOOLS = (
+    TRANCHE_1_TOOLS
+    | TRANCHE_2_TOOLS
+    | TRANCHE_3_TOOLS
+    | CALENDAR_ADJUSTMENT_TOOLS
+    | SLEEP_CALENDAR_TOOLS
+)
 
 _INITIALIZE = {
     "jsonrpc": "2.0",

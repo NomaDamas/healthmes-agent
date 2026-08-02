@@ -67,6 +67,7 @@ class FakeOW:
         self.users: list[dict] = [{"id": USER_ID, "email": "user@example.com"}]
         self.health_scores: list[dict] = []
         self.sleep_summaries: list[dict] = []
+        self.sleep_sessions: list[dict] = []
         self.recovery_summaries: list[dict] = []
         self.workouts: list[dict] = []
         self.timeseries: list[dict] = []
@@ -179,6 +180,9 @@ class FakeOW:
             return httpx.Response(
                 200, json=_paginated(self._filter_by_date(self.recovery_summaries, params))
             )
+        if suffix == "events/sleep":
+            rows = self._filter_by_datetime(self.sleep_sessions, "start_time", params)
+            return httpx.Response(200, json=_paginated(rows))
         if suffix == "events/workouts":
             rows = self._filter_by_datetime(self.workouts, "start_time", params)
             return httpx.Response(200, json=_paginated(rows))

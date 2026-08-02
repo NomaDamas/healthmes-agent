@@ -16,6 +16,8 @@ Tranche-1 tools:
   ``get_personal_baselines`` (open-wearables interpreted reads)
 - ``list_tasks`` / ``upsert_task`` / ``get_schedule`` /
   ``propose_schedule_blocks`` (schedule domain, propose-then-confirm gate)
+- ``prepare_actual_sleep_calendar_update`` (Oura actual-sleep preview;
+  local-browser confirmation remains mandatory before any calendar write)
 - ``log_food`` / ``record_decision`` (capture + explainability)
 
 Tranche-2 tools (docs/PLAN.md Phase 2, Layer B second tranche):
@@ -48,7 +50,7 @@ import re
 import uuid
 import zoneinfo
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastmcp import FastMCP
@@ -65,14 +67,17 @@ from healthmes.calendars.adjustments import (
     issue_reply_handle,
     verify_reply_handle,
 )
-from healthmes.calendars.base import HealthmesEventKind
+from healthmes.calendars.approval import ApprovalCalendar, calendar_approval_target
+from healthmes.calendars.base import CalendarError, HealthmesEventKind
 from healthmes.calendars.google import GoogleCalendarBackend
+from healthmes.calendars.jobs import _build_backend, write_source
 from healthmes.calendars.sleep_context import (
     actual_sleep_context,
     actual_sleep_observation_context,
     actual_sleep_violation,
 )
 from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.calendars.sleep_proposals import prepare_sleep_proposal
 from healthmes.calendars.sleep_source import select_actual_sleep_rows
 from healthmes.config import Settings, get_settings, system_timezone
 from healthmes.mcp_server import adjustment_tools, arousal, impact, interpret, timeline
@@ -155,7 +160,10 @@ mcp: FastMCP = FastMCP(
         "calendar and app context), and compare_impact (before/after deltas "
         "around a factor; associations, not causation). Schedule writes go "
         "through propose_schedule_blocks (propose-then-confirm; proposals are "
-        "not calendar events yet). Always call record_decision after making or "
+        "not calendar events yet). Actual Oura sleep mirroring goes through "
+        "prepare_actual_sleep_calendar_update, which returns a local review "
+        "link and never writes before browser confirmation. Always call "
+        "record_decision after making or "
         "proposing a decision so it can be explained in the decision viewer. "
         "Medical-lite capture (create_medical_record / list_medical_records) "
         "is strictly local: records, media and transcripts never leave this "
@@ -2592,6 +2600,142 @@ def resolve_schedule_proposal(
             "calendar_write": "queued" if target is ProposalStatus.ACCEPTED else "unchanged",
         }
     return {"status": "ok", "proposal": result}
+
+
+@mcp.tool
+async def prepare_actual_sleep_calendar_update(
+    date: str | None = None,
+    date_basis: Literal["night_start", "oura_summary"] | None = None,
+) -> dict[str, Any]:
+    """Prepare an Oura actual-sleep Calendar update without writing it.
+
+    Use this when the user asks to update or sync last night's actual sleep
+    time into Calendar. ``date`` may be either the local date when the main
+    sleep started or Oura's wake/summary date (YYYY-MM-DD; defaults to today
+    in the configured timezone). Use ``date_basis="night_start"`` for a
+    user-named night such as "7월 29일 수면", and
+    ``date_basis="oura_summary"`` when the user names Oura's summary date or
+    identifies a same-date session by exact times. An explicit date defaults
+    to ``night_start``; an omitted date defaults to today's ``oura_summary``.
+    A missing night-start match fails instead of substituting a different
+    same-day session. The tool reads fresh Open Wearables data, compares it
+    with the configured Calendar, and freezes a short-lived preview. It never
+    mutates Calendar: the returned loopback-only ``review_url`` must be opened
+    on this Mac and explicitly confirmed before the existing verified apply
+    path can write anything.
+    """
+    requested_date = _parse_date(date, "date")
+    resolved_date_basis = date_basis or (
+        "oura_summary" if date is None else "night_start"
+    )
+    settings = _active_settings()
+    source = write_source(settings)
+    if source is None:
+        raise ToolError(
+            "Google 또는 iCloud Calendar가 연결되지 않아 수면 업데이트를 준비할 수 없습니다."
+        )
+    try:
+        backend = _build_backend(settings, source)
+        user_id = await _resolve_user_id()
+        reader = get_ow_client()
+        target_date = await _resolve_sleep_summary_date(
+            reader,
+            user_id,
+            requested_date,
+            _local_timezone(),
+            resolved_date_basis,
+        )
+        with _store_session() as session:
+            proposal = await prepare_sleep_proposal(
+                target_date=target_date,
+                calendar_source=source,
+                reader=reader,
+                user_id=user_id,
+                session=session,
+                calendar=ApprovalCalendar(
+                    backend,
+                    calendar_approval_target(settings, source),
+                    settings.public_base_url,
+                ),
+            )
+            snapshot = proposal.snapshot
+            preview_keys = (
+                "status",
+                "action",
+                "calendar",
+                "local_date",
+                "summary",
+                "start",
+                "wake_time",
+                "duration_minutes",
+                "time_in_bed_minutes",
+                "non_sleep_minutes",
+                "source",
+                "planned_sleep_replacements",
+                "segments",
+                "segment_count",
+                "stale_segment_removals",
+                "reason",
+            )
+            preview = {key: snapshot[key] for key in preview_keys if key in snapshot}
+            timezone = _local_timezone()
+            if "start" in snapshot:
+                preview["start_local"] = dt.datetime.fromisoformat(
+                    str(snapshot["start"])
+                ).astimezone(timezone).isoformat()
+            if "wake_time" in snapshot:
+                preview["wake_time_local"] = dt.datetime.fromisoformat(
+                    str(snapshot["wake_time"])
+                ).astimezone(timezone).isoformat()
+            preview["timezone"] = str(timezone)
+            preview["requested_date"] = requested_date.isoformat()
+            preview["oura_summary_date"] = target_date.isoformat()
+            preview["date_basis"] = resolved_date_basis
+            proposal_id = str(proposal.id)
+            proposal_status = _enum_value(proposal.status)
+            expires_at = _iso_utc(proposal.expires_at)
+            expires_at_local = _ensure_utc_dt(proposal.expires_at).astimezone(
+                timezone
+            ).isoformat()
+    except (CalendarError, OWClientError, LookupError) as exc:
+        raise ToolError(f"수면 Calendar preview 준비 실패: {type(exc).__name__}") from exc
+
+    pending = proposal_status == "pending"
+    return {
+        "status": "preview_ready" if pending else proposal_status,
+        "proposal_id": proposal_id,
+        "proposal_status": proposal_status,
+        "calendar_write": ("requires_local_browser_confirmation" if pending else "unchanged"),
+        "review_url": (f"http://127.0.0.1:{settings.port}/sleep?proposal={proposal_id}"),
+        "expires_at": expires_at,
+        "expires_at_local": expires_at_local,
+        "preview": preview,
+    }
+
+
+async def _resolve_sleep_summary_date(
+    reader: Any,
+    user_id: str,
+    requested_date: dt.date,
+    timezone: dt.tzinfo,
+    date_basis: Literal["night_start", "oura_summary"],
+) -> dt.date:
+    if date_basis == "oura_summary":
+        return requested_date
+    next_date = requested_date + dt.timedelta(days=1)
+    rows = await reader.collect_sleep_summaries(
+        user_id,
+        requested_date.isoformat(),
+        (requested_date + dt.timedelta(days=2)).isoformat(),
+    )
+    next_observation = select_actual_sleep_rows(rows, next_date)
+    if isinstance(next_observation, ActualSleepObservation):
+        start_date = _ensure_utc_dt(next_observation.start_at).astimezone(timezone).date()
+        if start_date == requested_date:
+            return next_date
+    raise ToolError(
+        f"{requested_date.isoformat()} 밤에 시작한 Oura 주 수면을 찾지 못했습니다."
+    )
 
 
 @mcp.tool
