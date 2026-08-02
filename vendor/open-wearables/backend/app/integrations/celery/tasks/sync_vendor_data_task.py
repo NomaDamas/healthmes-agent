@@ -25,6 +25,19 @@ from app.utils.sync_params import build_sync_params
 logger = getLogger(__name__)
 
 
+def _resolve_247_range(effective_start: str, end_date: str | None) -> tuple[datetime, datetime]:
+    start_dt = datetime.fromisoformat(effective_start.replace("Z", "+00:00"))
+    end_dt = datetime.now(timezone.utc)
+    if end_date:
+        with suppress(ValueError):
+            end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+
+    if start_dt.tzinfo is not None and end_dt.tzinfo is not None:
+        end_dt = end_dt.astimezone(start_dt.tzinfo)
+
+    return start_dt, end_dt
+
+
 def _emit_sync_status(fn: Any, /, *args: Any, **kwargs: Any) -> None:
     """Best-effort sync status emission — never aborts the sync flow."""
     try:
@@ -325,12 +338,7 @@ def sync_vendor_data(
                         # Determine if this is first sync (for API compatibility with providers)
                         is_first_sync = connection.last_synced_at is None
 
-                        # effective_start is always set above; parse into datetime objects
-                        start_dt = datetime.fromisoformat(effective_start.replace("Z", "+00:00"))
-                        end_dt = datetime.now(timezone.utc)
-                        if end_date:
-                            with suppress(ValueError):
-                                end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        start_dt, end_dt = _resolve_247_range(effective_start, end_date)
 
                         _emit_sync_status(
                             progress,

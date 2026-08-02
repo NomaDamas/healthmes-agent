@@ -4,11 +4,12 @@ Tests for sync_vendor_data Celery task.
 Tests synchronization of workout data from external providers (Garmin, Polar, Suunto).
 """
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from sqlalchemy.orm import Session
 
-from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
+from app.integrations.celery.tasks.sync_vendor_data_task import _resolve_247_range, sync_vendor_data
 from app.schemas.auth import ConnectionStatus
 from app.utils.sync_params import build_sync_params
 from tests.factories import UserConnectionFactory, UserFactory
@@ -350,6 +351,18 @@ class TestSyncVendorDataTask:
         assert result["user_id"] == "not-a-valid-uuid"
         assert "user_id" in result["errors"]
         assert "Invalid UUID format" in result["errors"]["user_id"]
+
+
+class TestResolve247Range:
+    def test_normalizes_end_to_start_timezone(self) -> None:
+        start, end = _resolve_247_range(
+            "2026-07-31T06:48:00+09:00",
+            "2026-07-30T23:16:00+00:00",
+        )
+
+        assert start.date() == end.date()
+        assert end.utcoffset() == timedelta(hours=9)
+        assert end == datetime(2026, 7, 31, 8, 16, tzinfo=timezone(timedelta(hours=9)))
 
 
 class TestBuildSyncParams:
