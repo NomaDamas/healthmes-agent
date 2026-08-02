@@ -6,6 +6,7 @@ import pytest
 
 from healthmes.calendars.approval import ApprovalCalendar
 from healthmes.calendars.sleep_apply import (
+    SleepReadBackError,
     apply_sleep_proposal,
     approval_token,
     decline_sleep_proposal,
@@ -108,6 +109,37 @@ async def test_prepare_freezes_redacted_snapshot_without_calendar_write(
     assert fake_backend.created_drafts == []
     assert fake_backend.update_calls == []
     assert fake_backend.delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_replaces_an_expired_pending_preview(
+    session,
+    fake_backend,
+) -> None:
+    now = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
+    first = await prepare_sleep_proposal(
+        target_date=date(2026, 7, 26),
+        calendar_source=CalendarSource.GOOGLE,
+        reader=SleepReader([summary()]),
+        user_id="redacted-user",
+        session=session,
+        calendar=approval_calendar(fake_backend),
+        now=now,
+    )
+
+    replacement = await prepare_sleep_proposal(
+        target_date=date(2026, 7, 26),
+        calendar_source=CalendarSource.GOOGLE,
+        reader=SleepReader([summary()]),
+        user_id="redacted-user",
+        session=session,
+        calendar=approval_calendar(fake_backend),
+        now=now + timedelta(minutes=16),
+    )
+
+    assert replacement.id != first.id
+    assert replacement.status is SleepProposalStatus.PENDING
+    assert replacement.expires_at > first.expires_at
 
 
 @pytest.mark.asyncio
@@ -290,6 +322,109 @@ async def test_valid_one_shot_apply_uses_snapshot_and_fresh_read_back(
     assert replay.status is SleepProposalStatus.APPLIED
     assert len(fake_backend.created_drafts) == 1
     assert session.get(SleepReconciliationProposal, proposal.id).receipt == result.receipt
+
+
+@pytest.mark.asyncio
+async def test_deleted_actual_sleep_can_be_prepared_and_recreated(
+    session,
+    fake_backend,
+) -> None:
+    now = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
+    first = await prepare_sleep_proposal(
+        target_date=date(2026, 7, 26),
+        calendar_source=CalendarSource.GOOGLE,
+        reader=SleepReader([summary()]),
+        user_id="redacted-user",
+        session=session,
+        calendar=approval_calendar(fake_backend),
+        now=now,
+    )
+    await apply_sleep_proposal(
+        proposal_id=first.id,
+        submitted_token=approval_token(first, "local-session", b"secret"),
+        local_session_id="local-session",
+        secret=b"secret",
+        reader=SleepReader([summary()]),
+        user_id="redacted-user",
+        session=session,
+        calendar=approval_calendar(fake_backend),
+        now=now,
+    )
+    fake_backend.events.clear()
+
+    replacement = await prepare_sleep_proposal(
+        target_date=date(2026, 7, 26),
+        calendar_source=CalendarSource.GOOGLE,
+        reader=SleepReader([summary()]),
+        user_id="redacted-user",
+        session=session,
+        calendar=approval_calendar(fake_backend),
+        now=now + timedelta(minutes=1),
+    )
+    result = await apply_sleep_proposal(
+        proposal_id=replacement.id,
+        submitted_token=approval_token(replacement, "local-session", b"secret"),
+        local_session_id="local-session",
+        secret=b"secret",
+        reader=SleepReader([summary()]),
+        user_id="redacted-user",
+        session=session,
+        calendar=approval_calendar(fake_backend),
+        now=now + timedelta(minutes=1),
+    )
+
+    assert replacement.snapshot["action"] == "would_create"
+    assert replacement.provider_state["actual"] is None
+    assert result.status is SleepProposalStatus.APPLIED
+    assert len(fake_backend.created_drafts) == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_read_back_marks_proposal_failed(session) -> None:
+    class CancelledReadBackBackend(FakeCalendarBackend):
+        def read_event(self, external_id):
+            event = super().read_event(external_id)
+            return type(event)(
+                external_id=event.external_id,
+                summary=event.summary,
+                start_at=event.start_at,
+                end_at=event.end_at,
+                is_agent_created=event.is_agent_created,
+                identity=event.identity,
+                etag=event.etag,
+                deleted=True,
+                status="cancelled",
+            )
+
+    backend = CancelledReadBackBackend()
+    now = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
+    proposal = await prepare_sleep_proposal(
+        target_date=date(2026, 7, 26),
+        calendar_source=CalendarSource.GOOGLE,
+        reader=SleepReader([summary()]),
+        user_id="redacted-user",
+        session=session,
+        calendar=approval_calendar(backend),
+        now=now,
+    )
+
+    with pytest.raises(SleepReadBackError):
+        await apply_sleep_proposal(
+            proposal_id=proposal.id,
+            submitted_token=approval_token(proposal, "local-session", b"secret"),
+            local_session_id="local-session",
+            secret=b"secret",
+            reader=SleepReader([summary()]),
+            user_id="redacted-user",
+            session=session,
+            calendar=approval_calendar(backend),
+            now=now,
+        )
+
+    assert (
+        session.get(SleepReconciliationProposal, proposal.id).status
+        is SleepProposalStatus.FAILED
+    )
 
 
 @pytest.mark.asyncio

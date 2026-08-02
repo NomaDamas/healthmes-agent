@@ -97,6 +97,9 @@
   {% elif pending %}
   <p class="error">승인은 HealthMes가 실행 중인 Mac의 loopback 브라우저에서만 가능합니다.</p>
   {% else %}
+  {% if proposal.status.value == "expired" %}
+  <p class="error">이 preview는 만료되었습니다. Telegram에서 같은 수면 요청을 다시 보내 새 링크를 만드세요.</p>
+  {% endif %}
   <p class="muted">terminal status: <strong>{{ proposal.status.value }}</strong></p>
   {% endif %}
 </section>

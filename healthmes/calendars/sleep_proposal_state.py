@@ -8,7 +8,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from healthmes.calendars.approval import ApprovalCalendar
-from healthmes.calendars.base import HealthmesEventKind, ensure_utc
+from healthmes.calendars.base import EventNotFoundError, HealthmesEventKind, ensure_utc
 from healthmes.calendars.sleep_observation import (
     ActualSleepObservation,
     calendar_observations,
@@ -45,7 +45,10 @@ def capture_provider_state(
     ).all()
     actual_states: list[dict[str, Any]] = []
     for actual in actual_rows:
-        remote = backend.read_event(actual.external_id)
+        try:
+            remote = backend.read_event(actual.external_id)
+        except EventNotFoundError:
+            continue
         actual_states.append(
             {
                 "external_id": actual.external_id,

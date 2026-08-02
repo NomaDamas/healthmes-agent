@@ -15,6 +15,7 @@ from healthmes.calendars.base import (
     EventNotFoundError,
     HealthmesEventKind,
     OwnershipError,
+    calendar_identity_external_id,
 )
 from healthmes.calendars.google import (
     GoogleCalendarBackend,
@@ -162,6 +163,8 @@ def api_event(
     agent: bool = False,
     task_id: uuid.UUID | None = None,
     healthmes_kind: str | None = None,
+    healthmes_source: str | None = None,
+    healthmes_source_key: str | None = None,
     status: str = "confirmed",
     etag: str = '"e1"',
     organizer_self: bool = False,
@@ -198,6 +201,10 @@ def api_event(
             private["healthmes_task_id"] = str(task_id)
         if healthmes_kind is not None:
             private["healthmes_kind"] = healthmes_kind
+        if healthmes_source is not None:
+            private["healthmes_source"] = healthmes_source
+        if healthmes_source_key is not None:
+            private["healthmes_source_key"] = healthmes_source_key
         item["extendedProperties"] = {"private": private}
     return item
 
@@ -423,6 +430,69 @@ class TestCreateEvent:
         assert first.identity == draft.identity
         assert len(service.stored_events) == 1
 
+    def test_matching_cancelled_identity_is_restored(self, backend, service) -> None:
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key="oura:2026-07-26",
+        )
+        draft = EventDraft(
+            summary="Oura 수면 세션",
+            start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+            end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+            description="Actual sleep: 420 min",
+            identity=identity,
+        )
+        external_id = calendar_identity_external_id(backend.source, identity)
+        service.stored_events[external_id] = api_event(
+            external_id,
+            agent=True,
+            healthmes_kind=identity.kind.value,
+            healthmes_source=identity.source,
+            healthmes_source_key=identity.source_key,
+            status="cancelled",
+            etag='"deleted"',
+        )
+
+        restored = backend.create_event(draft)
+
+        ((_, patched_id, body),) = service.patch_calls
+        assert patched_id == external_id
+        assert body["status"] == "confirmed"
+        assert body["summary"] == draft.summary
+        assert body["start"] == {"dateTime": "2026-07-25T23:00:00+00:00"}
+        assert body["end"] == {"dateTime": "2026-07-26T07:00:00+00:00"}
+        assert service.write_headers[-1]["If-Match"] == '"deleted"'
+        assert not restored.deleted
+        assert restored.identity == identity
+
+    def test_cancelled_identity_mismatch_is_not_restored(self, backend, service) -> None:
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key="oura:2026-07-26",
+        )
+        draft = EventDraft(
+            summary="Oura 수면 세션",
+            start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+            end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+            identity=identity,
+        )
+        external_id = calendar_identity_external_id(backend.source, identity)
+        service.stored_events[external_id] = api_event(
+            external_id,
+            agent=True,
+            healthmes_kind=identity.kind.value,
+            healthmes_source=identity.source,
+            healthmes_source_key="oura:other-date",
+            status="cancelled",
+        )
+
+        with pytest.raises(CalendarConflictError):
+            backend.create_event(draft)
+
+        assert service.patch_calls == []
+
 
 class TestUpdateAndDelete:
     def _store_agent_event(self, service: FakeGoogleService, event_id: str = "mine") -> None:
@@ -460,6 +530,11 @@ class TestUpdateAndDelete:
         service.stored_events["gone"] = api_event("gone", agent=True, status="cancelled")
         with pytest.raises(EventNotFoundError):
             backend.update_event("gone", summary="x")
+
+    def test_read_cancelled_event_raises_not_found(self, backend, service) -> None:
+        service.stored_events["gone"] = api_event("gone", agent=True, status="cancelled")
+        with pytest.raises(EventNotFoundError):
+            backend.read_event("gone")
 
     def test_delete_checks_ownership_then_deletes(self, backend, service) -> None:
         self._store_agent_event(service)

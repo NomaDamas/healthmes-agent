@@ -239,6 +239,31 @@ def test_pending_create_retries_provider_write_when_remote_is_missing(
     assert session.query(CalendarEventMirror).one().external_id == "sleep-1"
 
 
+def test_deleted_confirmed_sleep_previews_and_recreates(
+    session,
+    backend: RecordingCalendarBackend,
+    observation: ActualSleepObservation,
+) -> None:
+    reconciler = SleepCalendarReconciler(session, backend)
+    reconciler.reconcile(observation)
+    backend.event = None
+
+    preview = preview_sleep_reconciliation(
+        session,
+        CalendarSource.GOOGLE,
+        observation,
+        backend,
+    )
+    recreated = reconciler.reconcile(observation)
+
+    assert preview["action"] == "would_create"
+    assert recreated.action is SleepCalendarAction.CREATED
+    assert len(backend.created_drafts) == 2
+    mirror = session.query(CalendarEventMirror).one()
+    assert mirror.status is None
+    assert mirror.etag == '"created"'
+
+
 def test_pending_create_adopts_a_concurrent_create_only_with_local_intent(
     session,
     observation: ActualSleepObservation,

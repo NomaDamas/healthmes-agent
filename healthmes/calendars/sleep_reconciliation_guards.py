@@ -36,7 +36,7 @@ def assert_remote_actual_sleep(
     identity: CalendarEventIdentity,
     mirror_etag: str | None,
 ) -> str | None:
-    if not event.is_agent_created or event.identity != identity:
+    if event.deleted or not event.is_agent_created or event.identity != identity:
         raise OwnershipError("remote event is not the expected actual_sleep event")
     if mirror_etag is not None and event.etag != mirror_etag:
         raise CalendarConflictError("remote actual_sleep event changed after sync")
@@ -58,7 +58,8 @@ def pending_remote_matches(
     observation: ActualSleepObservation,
 ) -> bool:
     return (
-        event.summary in {ACTUAL_SLEEP_SUMMARY, LEGACY_ACTUAL_SLEEP_SUMMARY}
+        not event.deleted
+        and event.summary in {ACTUAL_SLEEP_SUMMARY, LEGACY_ACTUAL_SLEEP_SUMMARY}
         and event.start_at == ensure_utc(observation.start_at)
         and event.end_at == ensure_utc(observation.end_at)
     )

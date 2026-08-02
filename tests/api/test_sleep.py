@@ -12,7 +12,7 @@ from healthmes.api.sleep import SleepReviewRuntime
 from healthmes.app import create_app
 from healthmes.calendars.approval import ApprovalCalendar
 from healthmes.calendars.sleep_proposal_state import redacted_digest
-from healthmes.store import SleepReconciliationProposal
+from healthmes.store import SleepProposalStatus, SleepReconciliationProposal
 from healthmes.store.session import get_session
 from tests.calendars.conftest import FakeCalendarBackend
 
@@ -190,4 +190,30 @@ def test_malformed_persisted_sleep_segment_renders_safe_error(app, session) -> N
         rendered = client.get(f"/sleep?proposal={proposal_id}")
         assert rendered.status_code == 200
         assert "저장된 수면 preview를 표시할 수 없습니다." in rendered.text
+        assert "이 preview를 Calendar에 반영" not in rendered.text
+
+
+def test_expired_sleep_preview_explains_that_a_new_link_is_required(
+    app,
+    session,
+) -> None:
+    fake_backend = FakeCalendarBackend()
+    app.state.sleep_review_runtime = SleepReviewRuntime(
+        SleepReader(),
+        "redacted-user",
+        ApprovalCalendar(fake_backend, fake_backend.approval_target),
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8100") as client:
+        preview = client.get("/sleep?date=2026-07-26")
+        proposal_id = uuid.UUID(_hidden(preview.text, "proposal_id"))
+        proposal = session.get(SleepReconciliationProposal, proposal_id)
+        assert proposal is not None
+        proposal.status = SleepProposalStatus.EXPIRED
+        session.commit()
+
+        rendered = client.get(f"/sleep?proposal={proposal_id}")
+
+        assert rendered.status_code == 200
+        assert "이 preview는 만료되었습니다." in rendered.text
+        assert "새 링크를 만드세요." in rendered.text
         assert "이 preview를 Calendar에 반영" not in rendered.text

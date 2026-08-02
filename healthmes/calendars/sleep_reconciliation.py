@@ -28,6 +28,7 @@ from healthmes.calendars.sleep_mirror import (
     SLEEP_UPDATE_PENDING_STATUS,
     finalize_sleep_mirror,
     find_sleep_source_key,
+    mark_sleep_create_pending,
     mark_sleep_update_pending,
     pending_sleep_mirror,
 )
@@ -177,8 +178,12 @@ class SleepCalendarReconciler:
         try:
             remote = self._backend.read_event(row.external_id)
         except EventNotFoundError:
-            if row.status != SLEEP_CREATE_PENDING_STATUS:
-                raise
+            mark_sleep_create_pending(
+                self._session,
+                row,
+                observation,
+                fingerprint,
+            )
             result = self._create_remote(row, observation, identity, fingerprint)
             return self._replace_planned_sleep(result, observation)
 

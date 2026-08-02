@@ -154,7 +154,8 @@ def _read_back(
             source_key=child.source_key,
         )
         if (
-            not remote.is_agent_created
+            remote.deleted
+            or not remote.is_agent_created
             or remote.identity != expected_identity
             or remote.start_at != ensure_utc(child.start_at)
             or remote.end_at != ensure_utc(child.end_at)

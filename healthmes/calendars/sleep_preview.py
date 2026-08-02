@@ -192,7 +192,7 @@ def _actual_sleep_action(
     try:
         remote = backend.read_event(existing.external_id)
     except EventNotFoundError:
-        return ("would_create", None) if pending_create else ("blocked", "calendar_event_missing")
+        return "would_create", None
     if not _matches_remote_actual_identity(remote, identity):
         return "blocked", "ownership_mismatch"
     if pending_create:
@@ -226,7 +226,7 @@ def _matches_remote_actual_identity(
     event: ExternalEvent,
     identity: CalendarEventIdentity,
 ) -> bool:
-    return event.is_agent_created and event.identity == identity
+    return not event.deleted and event.is_agent_created and event.identity == identity
 
 
 def _remote_planned_sleep_state(

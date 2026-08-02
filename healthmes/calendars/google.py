@@ -321,6 +321,20 @@ class GoogleCalendarBackend:
     # -- agent writes ------------------------------------------------------
 
     def create_event(self, draft: EventDraft) -> ExternalEvent:
+        body = self._create_body(draft)
+        try:
+            created = (
+                self._events()
+                .insert(calendarId=self._calendar_id, body=body)
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001 - status-based dispatch
+            if _http_status(exc) != 409 or draft.identity is None:
+                raise
+            return self._restore_cancelled_identity(draft, body, exc)
+        return self._parse_api_event(created)
+
+    def _create_body(self, draft: EventDraft) -> dict[str, Any]:
         private = {GOOGLE_AGENT_TAG_KEY: AGENT_TAG_VALUE}
         if draft.agent_task_id is not None:
             private[GOOGLE_AGENT_TASK_ID_KEY] = str(draft.agent_task_id)
@@ -338,19 +352,47 @@ class GoogleCalendarBackend:
             body["id"] = calendar_identity_external_id(self.source, draft.identity)
         if draft.description:
             body["description"] = draft.description
-        try:
-            created = (
-                self._events()
-                .insert(calendarId=self._calendar_id, body=body)
-                .execute()
-            )
-        except Exception as exc:  # noqa: BLE001 - status-based dispatch
-            if _http_status(exc) != 409 or draft.identity is None:
-                raise
+        return body
+
+    def _restore_cancelled_identity(
+        self,
+        draft: EventDraft,
+        body: dict[str, Any],
+        collision: BaseException,
+    ) -> ExternalEvent:
+        external_id = str(body["id"])
+        existing = self._get_event(external_id)
+        if (
+            not existing.deleted
+            or not existing.is_agent_created
+            or existing.identity != draft.identity
+        ):
             raise CalendarConflictError(
                 "google identity key already exists"
-            ) from exc
-        return self._parse_api_event(created)
+            ) from collision
+        restore_body = {key: value for key, value in body.items() if key != "id"}
+        restore_body["status"] = "confirmed"
+        request = self._events().patch(
+            calendarId=self._calendar_id,
+            eventId=external_id,
+            body=restore_body,
+        )
+        self._set_if_match(request, existing.etag)
+        try:
+            restored = request.execute()
+        except Exception as exc:  # noqa: BLE001 - status-based dispatch
+            self._raise_for_write_status(exc, external_id)
+            raise
+        event = self._parse_api_event(restored)
+        if (
+            event.deleted
+            or not event.is_agent_created
+            or event.identity != draft.identity
+        ):
+            raise CalendarConflictError(
+                "google cancelled identity could not be restored"
+            )
+        return event
 
     def update_event(
         self,
@@ -410,7 +452,10 @@ class GoogleCalendarBackend:
             raise  # unreachable; _raise_for_write_status always raises
 
     def read_event(self, external_id: str) -> ExternalEvent:
-        return self._get_event(external_id)
+        event = self._get_event(external_id)
+        if event.deleted:
+            raise EventNotFoundError(f"google event {external_id!r} is cancelled")
+        return event
 
     def apply_confirmed_external_time_change(
         self, change: ConfirmedExternalTimeChange

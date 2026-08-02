@@ -96,3 +96,21 @@ def mark_sleep_update_pending(
     row.sleep_time_in_bed_minutes = observation.time_in_bed_minutes
     row.status = SLEEP_UPDATE_PENDING_STATUS
     session.commit()
+
+
+def mark_sleep_create_pending(
+    session: Session,
+    row: CalendarEventMirror,
+    observation: ActualSleepObservation,
+    fingerprint: str,
+) -> None:
+    row.summary = ACTUAL_SLEEP_SUMMARY
+    row.start_at = ensure_utc(observation.start_at)
+    row.end_at = ensure_utc(observation.end_at)
+    row.etag = None
+    row.observation_fingerprint = fingerprint
+    row.sleep_local_date = observation.local_date
+    row.sleep_duration_minutes = observation.duration_minutes
+    row.sleep_time_in_bed_minutes = observation.time_in_bed_minutes
+    row.status = SLEEP_CREATE_PENDING_STATUS
+    session.commit()
