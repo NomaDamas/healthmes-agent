@@ -119,10 +119,17 @@ async def apply_sleep_proposal(
     claimed, owns_claim = _claim_apply(session, proposal, current_time)
     if not owns_claim or claimed.status is not SleepProposalStatus.APPLYING:
         return SleepApplyResult(claimed.status, claimed.receipt)
+    claim_updated_at = current_time
     try:
         result = SleepCalendarReconciler(session, backend).reconcile(selected)
         receipt = _read_back(backend, selected, result)
-        return _mark_applied(session, claimed.id, receipt, current_time)
+        return _mark_applied(
+            session,
+            claimed.id,
+            receipt,
+            current_time,
+            claim_updated_at,
+        )
     except SQLAlchemyError:
         session.rollback()
         recovered = _recover_exact_apply(
@@ -132,6 +139,7 @@ async def apply_sleep_proposal(
             backend,
             claimed.provider_state,
             current_time,
+            claim_updated_at,
         )
         if recovered is not None:
             return recovered
@@ -251,12 +259,14 @@ def _mark_applied(
     proposal_id: uuid.UUID,
     receipt: dict[str, Any],
     consumed_at: dt.datetime,
+    claim_updated_at: dt.datetime,
 ) -> SleepApplyResult:
     result = session.execute(
         sa.update(SleepReconciliationProposal)
         .where(
             SleepReconciliationProposal.id == proposal_id,
             SleepReconciliationProposal.status == SleepProposalStatus.APPLYING,
+            SleepReconciliationProposal.updated_at == claim_updated_at,
         )
         .values(
             status=SleepProposalStatus.APPLIED,
@@ -281,6 +291,7 @@ def _recover_exact_apply(
     backend: CalendarBackend,
     provider_state: dict[str, Any],
     recovered_at: dt.datetime,
+    claim_updated_at: dt.datetime,
 ) -> SleepApplyResult | None:
     try:
         result = SleepCalendarReconciler(session, backend).reconcile(observation)
@@ -296,7 +307,13 @@ def _recover_exact_apply(
             )
         receipt = _read_back(backend, observation, result)
         receipt["recovered"] = True
-        return _mark_applied(session, proposal_id, receipt, recovered_at)
+        return _mark_applied(
+            session,
+            proposal_id,
+            receipt,
+            recovered_at,
+            claim_updated_at,
+        )
     except (CalendarError, SleepReadBackError, SQLAlchemyError):
         session.rollback()
         return None

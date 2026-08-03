@@ -299,6 +299,7 @@ def test_local_session_cookie_is_bound_to_direct_loopback_origin(settings) -> No
     with TestClient(
         application,
         base_url="http://proxy.test:8100",
+        client=("203.0.113.10", 50000),
     ) as proxied:
         replay = proxied.get(
             "/connect",
@@ -311,10 +312,12 @@ def test_local_session_cookie_is_bound_to_direct_loopback_origin(settings) -> No
 
         write = proxied.post(
             "/connect/google/disconnect",
-            data={"csrf": "forged"},
+            data={
+                "csrf": application.state.local_sessions.get(session_id).csrf_token,
+            },
             headers={
-                "Host": "localhost:8100",
-                "Origin": "http://localhost:8100",
+                "Host": "127.0.0.1:8100",
+                "Origin": "http://127.0.0.1:8100",
                 "Cookie": f"healthmes_local_session={session_id}",
             },
             follow_redirects=False,
@@ -445,7 +448,7 @@ async def test_oura_card_reports_fresh_active_connection_without_identity(settin
 
 
 @pytest.mark.asyncio
-async def test_oura_card_ignores_malformed_upstream_rows(settings) -> None:
+async def test_oura_card_fails_closed_on_malformed_upstream_rows(settings) -> None:
     configured = settings.model_copy(update={"ow_api_key": SecretStr(OW_API_KEY)})
 
     card = await build_oura_card(
@@ -460,8 +463,9 @@ async def test_oura_card_ignores_malformed_upstream_rows(settings) -> None:
         now=datetime(2026, 7, 28, 10, 0, tzinfo=UTC),
     )
 
-    assert card.connected is True
-    assert card.detail == "Oura 연결됨 · 최신 수면 오늘"
+    assert card.connected is False
+    assert card.badge_label == "오류"
+    assert card.detail == "Open Wearables 연결 응답 형식 오류"
 
 
 @pytest.mark.asyncio
@@ -544,7 +548,9 @@ async def test_oura_card_reports_sleep_read_error(settings) -> None:
     [
         ("html-users", "Open Wearables 연결 응답 형식 오류"),
         ("object-connections", "Open Wearables API 연결 또는 응답 오류"),
+        ("mixed-connections", "Open Wearables 연결 응답 형식 오류"),
         ("scalar-sleep", "Open Wearables 수면 데이터 응답 형식 오류"),
+        ("mixed-sleep", "Open Wearables 수면 데이터 응답 형식 오류"),
     ],
 )
 def test_connect_survives_malformed_provider_http_200(
@@ -569,11 +575,27 @@ def test_connect_survives_malformed_provider_http_200(
                         "debug": private_marker,
                     },
                 )
+            if mode == "mixed-connections":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"provider": "oura", "status": "active"},
+                        private_marker,
+                    ],
+                )
             return httpx.Response(
                 200,
                 json=[{"provider": "oura", "status": "active"}],
             )
         if request.url.path.endswith("/summaries/sleep"):
+            if mode == "mixed-sleep":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"date": "2026-07-26"},
+                        private_marker,
+                    ],
+                )
             return httpx.Response(200, json=7)
         raise AssertionError(f"unexpected provider path: {request.url.path}")
 

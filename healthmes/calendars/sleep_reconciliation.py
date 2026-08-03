@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from healthmes.calendars.base import (
     CalendarBackend,
     CalendarConflictError,
+    CalendarError,
     CalendarEventIdentity,
     EventNotFoundError,
     HealthmesEventKind,
@@ -947,6 +948,11 @@ class SleepCalendarReconciler:
                     fingerprint,
                     expected_etag,
                 )
+        except CalendarError as error:
+            try:
+                created = self._backend.read_event(row.external_id)
+            except EventNotFoundError:
+                raise error
         assert_remote_actual_sleep(
             created,
             self._backend.source,

@@ -215,9 +215,9 @@ def _mapping_rows(value: object) -> tuple[Mapping[str, Any], ...]:
         value, (str, bytes, bytearray)
     ):
         raise ProviderPayloadError("provider response must be a row sequence")
+    if any(not isinstance(row, Mapping) for row in value):
+        raise ProviderPayloadError("provider response contains an invalid row")
     rows = tuple(row for row in value if isinstance(row, Mapping))
-    if value and not rows:
-        raise ProviderPayloadError("provider response contains no valid rows")
     return rows
 
 

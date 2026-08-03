@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 
+from healthmes.calendars import sleep_apply as sleep_apply_module
 from healthmes.calendars.approval import ApprovalCalendar
 from healthmes.calendars.base import CalendarError
 from healthmes.calendars.sleep_apply import (
@@ -106,6 +108,19 @@ class FailSecondCreateBackend(FakeCalendarBackend):
         if self.fail_second_create and self.create_attempts == 2:
             raise CalendarError("simulated second segment failure")
         return super().create_event(draft)
+
+
+class AmbiguousSecondCreateBackend(FakeCalendarBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.create_attempts = 0
+
+    def create_event(self, draft):
+        self.create_attempts += 1
+        created = super().create_event(draft)
+        if self.create_attempts == 2:
+            raise CalendarError("simulated provider timeout after create")
+        return created
 
 
 def approval_calendar(backend: FakeCalendarBackend) -> ApprovalCalendar:
@@ -484,6 +499,90 @@ async def test_partial_split_write_is_compensated_and_stale_apply_recovers(
     assert recovered.receipt is not None
     assert len(recovered.receipt["events"]) == 2
     assert len(backend.events) == 2
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_second_split_write_is_confirmed_by_read_back(
+    session,
+) -> None:
+    backend = AmbiguousSecondCreateBackend()
+    reader = SplitSleepReader([summary()])
+    calendar = approval_calendar(backend)
+    now = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
+    proposal = await prepare_sleep_proposal(
+        target_date=date(2026, 7, 26),
+        calendar_source=CalendarSource.GOOGLE,
+        reader=reader,
+        user_id="redacted-user",
+        session=session,
+        calendar=calendar,
+        now=now,
+    )
+
+    result = await apply_sleep_proposal(
+        proposal_id=proposal.id,
+        submitted_token=approval_token(proposal, "local-session", b"secret"),
+        local_session_id="local-session",
+        secret=b"secret",
+        reader=reader,
+        user_id="redacted-user",
+        session=session,
+        calendar=calendar,
+        now=now,
+    )
+
+    assert result.status is SleepProposalStatus.APPLIED
+    assert result.receipt is not None
+    assert len(result.receipt["events"]) == 2
+    assert len(backend.events) == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_cannot_finalize_after_claim_is_replaced(
+    session,
+    fake_backend,
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
+    proposal = await prepare_sleep_proposal(
+        target_date=date(2026, 7, 26),
+        calendar_source=CalendarSource.GOOGLE,
+        reader=SleepReader([summary()]),
+        user_id="redacted-user",
+        session=session,
+        calendar=approval_calendar(fake_backend),
+        now=now,
+    )
+    original_read_back = sleep_apply_module._read_back
+
+    def replace_claim(backend, observation, result):
+        receipt = original_read_back(backend, observation, result)
+        session.execute(
+            sa.update(SleepReconciliationProposal)
+            .where(SleepReconciliationProposal.id == proposal.id)
+            .values(updated_at=now + timedelta(seconds=1))
+        )
+        session.commit()
+        return receipt
+
+    monkeypatch.setattr(sleep_apply_module, "_read_back", replace_claim)
+    result = await apply_sleep_proposal(
+        proposal_id=proposal.id,
+        submitted_token=approval_token(proposal, "local-session", b"secret"),
+        local_session_id="local-session",
+        secret=b"secret",
+        reader=SleepReader([summary()]),
+        user_id="redacted-user",
+        session=session,
+        calendar=approval_calendar(fake_backend),
+        now=now,
+    )
+
+    assert result.status is SleepProposalStatus.APPLYING
+    stored = session.get(SleepReconciliationProposal, proposal.id)
+    assert stored is not None
+    assert stored.status is SleepProposalStatus.APPLYING
+    assert stored.receipt is None
 
 
 @pytest.mark.asyncio

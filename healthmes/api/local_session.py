@@ -70,6 +70,8 @@ def authenticated_local_session(
     scope: dict,
     store: LocalSessionStore,
 ) -> LocalBrowserSession | None:
+    if not is_loopback_scope(scope):
+        return None
     cookie = SimpleCookie()
     try:
         cookie.load(_header(scope, b"cookie"))
@@ -101,7 +103,10 @@ def local_browser_url(port: int, path: str) -> str:
 def issue_local_session(request: Request, response: Response) -> LocalBrowserSession | None:
     origin = _scope_origin(request.scope)
     settings = request.app.state.settings
-    if not _is_direct_local_origin(origin, settings.port):
+    if (
+        not is_loopback_scope(request.scope)
+        or not _is_direct_local_origin(origin, settings.port)
+    ):
         return None
     store: LocalSessionStore = request.app.state.local_sessions
     session = store.get(request.cookies.get(LOCAL_SESSION_COOKIE))
@@ -137,7 +142,10 @@ async def bootstrap_local_session(
 ) -> LocalBrowserSession:
     origin = _scope_origin(request.scope)
     settings = request.app.state.settings
-    if not _is_direct_local_origin(origin, settings.port):
+    if (
+        not is_loopback_scope(request.scope)
+        or not _is_direct_local_origin(origin, settings.port)
+    ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "local browser session required")
     _assert_same_origin(request)
     values = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
@@ -159,7 +167,10 @@ def require_local_session(
 ) -> LocalBrowserSession:
     origin = _scope_origin(request.scope)
     settings = request.app.state.settings
-    if not _is_direct_local_origin(origin, settings.port):
+    if (
+        not is_loopback_scope(request.scope)
+        or not _is_direct_local_origin(origin, settings.port)
+    ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "local browser session required")
     _assert_same_origin(request)
     store: LocalSessionStore = request.app.state.local_sessions
