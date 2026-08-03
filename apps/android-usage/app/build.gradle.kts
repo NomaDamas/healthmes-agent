@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.healthmes.usagecollector"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.healthmes.usagecollector"

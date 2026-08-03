@@ -11,7 +11,7 @@ plugins {
 // module stays untouched.
 android {
     namespace = "com.healthmes.briefing"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         // Must stay <= every consumer's minSdk (:companion 26, :wear 30).
