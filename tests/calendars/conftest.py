@@ -18,6 +18,7 @@ from healthmes.calendars.base import (
     ExternalEvent,
     HealthmesEventKind,
     SyncState,
+    calendar_identity_external_id,
 )
 from healthmes.store import Base, CalendarSource, create_db_engine
 
@@ -75,9 +76,15 @@ class FakeCalendarBackend:
     def create_event(self, draft: EventDraft) -> ExternalEvent:
         self._create_counter += 1
         self.created_drafts.append(draft)
+        external_id = (
+            calendar_identity_external_id(self.source, draft.identity)
+            if draft.identity is not None
+            else f"{self.source.value}-agent-{self._create_counter}"
+        )
         event = ExternalEvent(
-            external_id=f"{self.source.value}-agent-{self._create_counter}",
+            external_id=external_id,
             summary=draft.summary,
+            description=draft.description,
             start_at=draft.start_at,
             end_at=draft.end_at,
             is_agent_created=True,
@@ -118,9 +125,12 @@ class FakeCalendarBackend:
         event = ExternalEvent(
             external_id=external_id,
             summary=summary or "moved block",
+            description=description,
             start_at=start_at,
             end_at=end_at,
             is_agent_created=True,
+            agent_task_id=self.events[external_id].agent_task_id,
+            identity=self.events[external_id].identity,
             etag="etag-updated",
         )
         self.events[external_id] = event
@@ -161,6 +171,7 @@ def make_event() -> object:
         external_id: str,
         *,
         summary: str | None = "Team standup",
+        description: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
         is_agent_created: bool = False,
@@ -182,6 +193,7 @@ def make_event() -> object:
         return ExternalEvent(
             external_id=external_id,
             summary=summary,
+            description=description,
             start_at=start,
             end_at=end,
             is_agent_created=is_agent_created,

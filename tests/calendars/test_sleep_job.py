@@ -13,6 +13,7 @@ from healthmes.calendars.base import (
     EventNotFoundError,
     ExternalEvent,
     HealthmesEventKind,
+    calendar_identity_external_id,
 )
 from healthmes.calendars.sleep_job import (
     build_sleep_reconciliation_job,
@@ -79,6 +80,21 @@ def _summary(*, duration: int = 420, wake_hour: int = 7) -> dict[str, object]:
     }
 
 
+def _planned_identity(source_key: str) -> CalendarEventIdentity:
+    return CalendarEventIdentity(
+        kind=HealthmesEventKind.PLANNED_SLEEP,
+        source="planner",
+        source_key=source_key,
+    )
+
+
+def _planned_external_id(source_key: str) -> str:
+    return calendar_identity_external_id(
+        CalendarSource.GOOGLE,
+        _planned_identity(source_key),
+    )
+
+
 async def test_runtime_create_replay_and_provider_correction(
     session_factory,
     fake_backend,
@@ -135,17 +151,17 @@ async def test_provider_failure_keeps_planned_sleep_and_pending_actual_for_retry
 ) -> None:
     # Given
     reader = SleepReader([_summary()])
+    planned_identity = _planned_identity("proposal:provider-failure")
     planned = ExternalEvent(
-        external_id="planned-provider-failure",
+        external_id=calendar_identity_external_id(
+            CalendarSource.GOOGLE,
+            planned_identity,
+        ),
         summary="수면 (계획)",
         start_at=datetime(2026, 7, 25, 13, tzinfo=UTC),
         end_at=datetime(2026, 7, 26, 1, tzinfo=UTC),
         is_agent_created=True,
-        identity=CalendarEventIdentity(
-            kind=HealthmesEventKind.PLANNED_SLEEP,
-            source="planner",
-            source_key="proposal:provider-failure",
-        ),
+        identity=planned_identity,
         healthmes_kind=HealthmesEventKind.PLANNED_SLEEP,
         etag='"planned-v1"',
     )
@@ -321,17 +337,21 @@ async def test_dry_run_counts_only_owned_planned_sleep(
     session_factory,
 ) -> None:
     # Given
+    planned_identity = _planned_identity("proposal:planned")
+    planned_external_id = _planned_external_id("proposal:planned")
     with session_factory() as session:
         session.add_all(
             [
                 CalendarEventMirror(
-                    external_id="planned",
+                    external_id=planned_external_id,
                     calendar_source=CalendarSource.GOOGLE,
                     summary="수면 (계획)",
                     start_at=datetime(2026, 7, 25, 13, tzinfo=UTC),
                     end_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
                     is_agent_created=True,
                     healthmes_kind="planned_sleep",
+                    healthmes_source=planned_identity.source,
+                    healthmes_source_key=planned_identity.source_key,
                 ),
                 CalendarEventMirror(
                     external_id="routine",
@@ -348,17 +368,13 @@ async def test_dry_run_counts_only_owned_planned_sleep(
     # When
     backend = ReadOnlyBackend(
         {
-            "planned": ExternalEvent(
-                external_id="planned",
+            planned_external_id: ExternalEvent(
+                external_id=planned_external_id,
                 summary="수면 (계획)",
                 start_at=datetime(2026, 7, 25, 13, tzinfo=UTC),
                 end_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
                 is_agent_created=True,
-                identity=CalendarEventIdentity(
-                    kind=HealthmesEventKind.PLANNED_SLEEP,
-                    source="planner",
-                    source_key="proposal:planned",
-                ),
+                identity=planned_identity,
                 healthmes_kind=HealthmesEventKind.PLANNED_SLEEP,
             )
         }
@@ -378,7 +394,7 @@ async def test_dry_run_counts_only_owned_planned_sleep(
     assert preview["planned_sleep_replacements"] == 1
 
 
-async def test_dry_run_blocks_unowned_actual_sleep_mirror(
+async def test_dry_run_recovers_unowned_source_key_collision_without_touching_it(
     session_factory,
 ) -> None:
     with session_factory() as session:
@@ -406,8 +422,7 @@ async def test_dry_run_blocks_unowned_actual_sleep_mirror(
         dry_run=True,
     )
 
-    assert preview["action"] == "blocked"
-    assert preview["reason"] == "ownership_mismatch"
+    assert preview["action"] == "would_create"
     assert preview["planned_sleep_replacements"] == 0
 
 
@@ -441,17 +456,17 @@ async def test_runtime_stops_when_remote_actual_sleep_identity_is_blocked(
         ),
         etag=actual.etag,
     )
+    planned_identity = _planned_identity("proposal:planned")
     planned = ExternalEvent(
-        external_id="planned",
+        external_id=calendar_identity_external_id(
+            CalendarSource.GOOGLE,
+            planned_identity,
+        ),
         summary="수면 (계획)",
         start_at=datetime(2026, 7, 25, 13, tzinfo=UTC),
         end_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
         is_agent_created=True,
-        identity=CalendarEventIdentity(
-            kind=HealthmesEventKind.PLANNED_SLEEP,
-            source="planner",
-            source_key="proposal:planned",
-        ),
+        identity=planned_identity,
         etag='"planned-v1"',
     )
     fake_backend.events[planned.external_id] = planned
@@ -498,10 +513,12 @@ async def test_runtime_stops_when_remote_actual_sleep_identity_is_blocked(
 async def test_remote_kind_changed_planned_sleep_blocks_dry_run_and_live(
     session_factory,
 ) -> None:
+    planned_identity = _planned_identity("proposal:planned")
+    planned_external_id = _planned_external_id("proposal:planned")
     with session_factory() as session:
         session.add(
             CalendarEventMirror(
-                external_id="planned",
+                external_id=planned_external_id,
                 calendar_source=CalendarSource.GOOGLE,
                 summary="수면 (계획)",
                 start_at=datetime(2026, 7, 25, 13, tzinfo=UTC),
@@ -515,12 +532,17 @@ async def test_remote_kind_changed_planned_sleep_blocks_dry_run_and_live(
         session.commit()
     backend = ReadOnlyBackend(
         {
-            "planned": ExternalEvent(
-                external_id="planned",
+            planned_external_id: ExternalEvent(
+                external_id=planned_external_id,
                 summary="Changed",
                 start_at=datetime(2026, 7, 25, 13, tzinfo=UTC),
                 end_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
                 is_agent_created=True,
+                identity=CalendarEventIdentity(
+                    kind=HealthmesEventKind.ACTUAL_SLEEP,
+                    source=planned_identity.source,
+                    source_key=planned_identity.source_key,
+                ),
                 healthmes_kind=HealthmesEventKind.ACTUAL_SLEEP,
             )
         }
@@ -553,7 +575,7 @@ async def test_remote_kind_changed_planned_sleep_blocks_dry_run_and_live(
     with session_factory() as session:
         assert session.scalar(
             select(CalendarEventMirror).where(
-                CalendarEventMirror.external_id == "planned"
+                CalendarEventMirror.external_id == planned_external_id
             )
         ) is not None
 
@@ -561,10 +583,12 @@ async def test_remote_kind_changed_planned_sleep_blocks_dry_run_and_live(
 async def test_stale_planned_sleep_etag_blocks_dry_run_and_live(
     session_factory,
 ) -> None:
+    planned_identity = _planned_identity("proposal:planned")
+    planned_external_id = _planned_external_id("proposal:planned")
     with session_factory() as session:
         session.add(
             CalendarEventMirror(
-                external_id="planned",
+                external_id=planned_external_id,
                 calendar_source=CalendarSource.GOOGLE,
                 summary="수면 (계획)",
                 start_at=datetime(2026, 7, 25, 13, tzinfo=UTC),
@@ -579,12 +603,13 @@ async def test_stale_planned_sleep_etag_blocks_dry_run_and_live(
         session.commit()
     backend = ReadOnlyBackend(
         {
-            "planned": ExternalEvent(
-                external_id="planned",
+            planned_external_id: ExternalEvent(
+                external_id=planned_external_id,
                 summary="수면 (계획)",
                 start_at=datetime(2026, 7, 25, 13, tzinfo=UTC),
                 end_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
                 is_agent_created=True,
+                identity=planned_identity,
                 healthmes_kind=HealthmesEventKind.PLANNED_SLEEP,
                 etag='"remote-v2"',
             )
@@ -618,7 +643,7 @@ async def test_stale_planned_sleep_etag_blocks_dry_run_and_live(
     with session_factory() as session:
         assert session.scalar(
             select(CalendarEventMirror).where(
-                CalendarEventMirror.external_id == "planned"
+                CalendarEventMirror.external_id == planned_external_id
             )
         ) is not None
 
@@ -629,17 +654,17 @@ async def test_planned_sleep_drift_after_actual_create_surfaces_retryable_cleanu
     monkeypatch,
 ) -> None:
     # Given
+    planned_identity = _planned_identity("proposal:race")
     planned = ExternalEvent(
-        external_id="planned-race",
+        external_id=calendar_identity_external_id(
+            CalendarSource.GOOGLE,
+            planned_identity,
+        ),
         summary="수면 (계획)",
         start_at=datetime(2026, 7, 25, 13, tzinfo=UTC),
         end_at=datetime(2026, 7, 26, 1, tzinfo=UTC),
         is_agent_created=True,
-        identity=CalendarEventIdentity(
-            kind=HealthmesEventKind.PLANNED_SLEEP,
-            source="planner",
-            source_key="proposal:race",
-        ),
+        identity=planned_identity,
         healthmes_kind=HealthmesEventKind.PLANNED_SLEEP,
         etag='"planned-v1"',
     )
@@ -725,6 +750,12 @@ def test_runtime_job_reconciles_the_recent_local_date_window(
         "status": "ok",
         "window_start": "2026-07-24",
         "window_end": "2026-07-26",
+        "legacy_cleanup": {
+            "migrated": 0,
+            "quarantined": 0,
+            "removed_missing": 0,
+            "failed": 0,
+        },
         "results": [
             {
                 "status": "noop",

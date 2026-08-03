@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from enum import StrEnum
 
 import sqlalchemy as sa
-from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
 from healthmes.calendars.base import (
@@ -14,6 +14,7 @@ from healthmes.calendars.base import (
     EventNotFoundError,
     HealthmesEventKind,
     OwnershipError,
+    calendar_identity_external_id,
     ensure_utc,
 )
 from healthmes.calendars.planned_sleep_replacement import (
@@ -29,19 +30,31 @@ from healthmes.calendars.sleep_mirror import (
     SLEEP_UPDATE_PENDING_STATUS,
     actual_sleep_identity,
     actual_sleep_identity_from_mirror,
+    adopt_remote_actual_sleep,
+    canonical_actual_sleep_mirror,
     finalize_sleep_mirror,
     find_actual_sleep_mirrors,
     mark_sleep_update_pending,
     pending_sleep_mirror,
     pending_sleep_observation,
+    quarantine_sleep_identity,
+    sleep_observation_from_mirror,
 )
-from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.calendars.sleep_observation import (
+    ACTUAL_SLEEP_IDENTITY_SOURCE,
+    ActualSleepObservation,
+    actual_sleep_source_key,
+)
 from healthmes.calendars.sleep_reconciliation_guards import (
     assert_owned_actual_sleep,
-    assert_pending_remote_matches,
     assert_remote_actual_sleep,
+    pending_remote_matches,
 )
+from healthmes.calendars.write_lock import calendar_write_lock
 from healthmes.store.models import CalendarEventMirror
+
+logger = logging.getLogger(__name__)
+LEGACY_SLEEP_CLEANUP_BATCH_SIZE = 25
 
 
 class SleepCalendarAction(StrEnum):
@@ -65,14 +78,186 @@ class SleepCalendarReconciler:
         self._backend = backend
 
     def reconcile(self, observation: ActualSleepObservation) -> SleepCalendarResult:
-        fingerprint = observation_fingerprint(observation)
-        identity = actual_sleep_identity(observation)
-        lock_connection = self._lock_source_key(identity.source_key)
-        try:
+        return self._reconcile_with_lock(
+            observation,
+            prefer_current_canonical=False,
+        )
+
+    def _reconcile_with_lock(
+        self,
+        observation: ActualSleepObservation,
+        *,
+        prefer_current_canonical: bool,
+    ) -> SleepCalendarResult:
+        with calendar_write_lock(self._session, self._backend.source):
+            self._session.expire_all()
+            if prefer_current_canonical:
+                rows = find_actual_sleep_mirrors(
+                    self._session,
+                    self._backend.source,
+                    observation,
+                )
+                canonical = canonical_actual_sleep_mirror(
+                    rows,
+                    actual_sleep_identity(observation),
+                )
+                if canonical is not None:
+                    observation = sleep_observation_from_mirror(canonical)
+            fingerprint = observation_fingerprint(observation)
+            identity = actual_sleep_identity(observation)
             return self._reconcile_locked(observation, identity, fingerprint)
-        finally:
-            if lock_connection is not None:
-                self._unlock_source_key(lock_connection, identity.source_key)
+
+    def reconcile_legacy_history(
+        self,
+        *,
+        limit: int = LEGACY_SLEEP_CLEANUP_BATCH_SIZE,
+    ) -> dict[str, int]:
+        """Eventually replace provider-specific actual-sleep events.
+
+        Only a currently owned remote event with the exact deterministic
+        legacy identity can seed a canonical replacement. Copied identities
+        are quarantined locally and never deleted remotely.
+        """
+
+        rows = list(
+            self._session.scalars(
+                sa.select(CalendarEventMirror)
+                .where(
+                    CalendarEventMirror.calendar_source == self._backend.source,
+                    CalendarEventMirror.is_agent_created.is_(True),
+                    CalendarEventMirror.healthmes_kind
+                    == HealthmesEventKind.ACTUAL_SLEEP.value,
+                    CalendarEventMirror.sleep_local_date.is_not(None),
+                )
+                .order_by(
+                    CalendarEventMirror.sleep_local_date,
+                    CalendarEventMirror.updated_at.desc(),
+                    CalendarEventMirror.id,
+                )
+            ).all()
+        )
+        candidates: dict[object, ActualSleepObservation] = {}
+        canonical_observations: dict[object, ActualSleepObservation] = {}
+        blocked_dates: set[object] = set()
+        quarantined = 0
+        removed_missing = 0
+        failed = 0
+
+        for row in rows:
+            identity = actual_sleep_identity_from_mirror(row)
+            if identity is None or row.sleep_local_date is None:
+                continue
+            expected_identity = CalendarEventIdentity(
+                kind=HealthmesEventKind.ACTUAL_SLEEP,
+                source=ACTUAL_SLEEP_IDENTITY_SOURCE,
+                source_key=actual_sleep_source_key(row.sleep_local_date),
+            )
+            if (
+                identity != expected_identity
+                or row.external_id
+                != calendar_identity_external_id(
+                    self._backend.source,
+                    expected_identity,
+                )
+            ):
+                continue
+            try:
+                canonical_observations[row.sleep_local_date] = (
+                    sleep_observation_from_mirror(row)
+                )
+            except RuntimeError:
+                blocked_dates.add(row.sleep_local_date)
+                failed += 1
+
+        for row in rows:
+            identity = actual_sleep_identity_from_mirror(row)
+            if identity is None or row.sleep_local_date is None:
+                continue
+            canonical = CalendarEventIdentity(
+                kind=HealthmesEventKind.ACTUAL_SLEEP,
+                source=ACTUAL_SLEEP_IDENTITY_SOURCE,
+                source_key=actual_sleep_source_key(row.sleep_local_date),
+            )
+            expected_external_id = calendar_identity_external_id(
+                self._backend.source,
+                identity,
+            )
+            already_canonical = (
+                identity == canonical and row.external_id == expected_external_id
+            )
+            if already_canonical:
+                continue
+            if row.external_id != expected_external_id:
+                quarantine_sleep_identity(row)
+                self._session.commit()
+                quarantined += 1
+                continue
+            try:
+                remote = self._backend.read_event(row.external_id)
+                assert_remote_actual_sleep(
+                    remote,
+                    self._backend.source,
+                    identity,
+                    row.etag,
+                )
+            except EventNotFoundError:
+                self._session.delete(row)
+                self._session.commit()
+                removed_missing += 1
+                continue
+            except Exception:
+                self._session.rollback()
+                failed += 1
+                logger.exception(
+                    "Legacy actual-sleep validation failed for %s",
+                    row.external_id,
+                )
+                continue
+            assert remote.start_at is not None and remote.end_at is not None
+            row.start_at = remote.start_at
+            row.end_at = remote.end_at
+            row.etag = remote.etag
+            row.summary = remote.summary or row.summary
+            self._session.commit()
+            if row.sleep_local_date in blocked_dates:
+                continue
+            stored_observation = canonical_observations.get(row.sleep_local_date)
+            if stored_observation is None:
+                try:
+                    stored_observation = sleep_observation_from_mirror(row)
+                except RuntimeError:
+                    failed += 1
+                    continue
+            candidates.setdefault(
+                row.sleep_local_date,
+                stored_observation,
+            )
+
+        migrated = 0
+        for observation in candidates.values():
+            if migrated >= limit:
+                break
+            try:
+                self._reconcile_with_lock(
+                    observation,
+                    prefer_current_canonical=(
+                        observation.local_date in canonical_observations
+                    ),
+                )
+                migrated += 1
+            except Exception:
+                self._session.rollback()
+                failed += 1
+                logger.exception(
+                    "Legacy actual-sleep canonicalization failed for %s",
+                    observation.local_date,
+                )
+        return {
+            "migrated": migrated,
+            "quarantined": quarantined,
+            "removed_missing": removed_missing,
+            "failed": failed,
+        }
 
     def _reconcile_locked(
         self,
@@ -85,14 +270,27 @@ class SleepCalendarReconciler:
             self._backend.source,
             observation,
         )
-        if not rows:
+        row = canonical_actual_sleep_mirror(rows, identity)
+        duplicates = list(rows)
+        if row is None:
+            self._quarantine_untrusted_identity_copies(duplicates)
+            duplicates = [
+                duplicate
+                for duplicate in duplicates
+                if duplicate.healthmes_source_key is not None
+            ]
+            self._validate_duplicate_actual_sleep_mirrors(duplicates)
             result = self._create(observation, identity, fingerprint)
-            return self._finish(result, observation, [])
+            return self._finish(result, observation, duplicates)
 
-        row = rows[0]
-        identity = actual_sleep_identity_from_mirror(row) or identity
+        duplicates.remove(row)
+        self._quarantine_untrusted_identity_copies(duplicates)
+        duplicates = [
+            duplicate
+            for duplicate in duplicates
+            if duplicate.healthmes_source_key is not None
+        ]
         assert_owned_actual_sleep(row, identity)
-        duplicates = rows[1:]
         pending_observation = (
             pending_sleep_observation(row)
             if row.status in {
@@ -145,21 +343,29 @@ class SleepCalendarReconciler:
 
         expected_etag = assert_remote_actual_sleep(
             remote,
+            self._backend.source,
             identity,
             row.etag,
         )
         if row.status == SLEEP_CREATE_PENDING_STATUS:
             assert pending_observation is not None
             assert pending_fingerprint is not None
-            assert_pending_remote_matches(remote, pending_observation)
-            finalize_sleep_mirror(
-                self._session,
-                row,
-                remote,
-                pending_observation,
-                pending_fingerprint,
-            )
-            result = self._created_result(row.external_id, pending_fingerprint)
+            if pending_remote_matches(remote, pending_observation):
+                finalize_sleep_mirror(
+                    self._session,
+                    row,
+                    remote,
+                    pending_observation,
+                    pending_fingerprint,
+                )
+                result = self._created_result(row.external_id, pending_fingerprint)
+            else:
+                result = self._update_remote(
+                    row,
+                    pending_observation,
+                    pending_fingerprint,
+                    expected_etag,
+                )
             result = self._apply_latest_after_recovery(
                 row,
                 observation,
@@ -169,11 +375,19 @@ class SleepCalendarReconciler:
             return self._finish(result, observation, duplicates)
 
         if row.observation_fingerprint == fingerprint:
-            result = SleepCalendarResult(
-                action=SleepCalendarAction.NOOP,
-                external_id=row.external_id,
-                observation_fingerprint=fingerprint,
-            )
+            if pending_remote_matches(remote, observation):
+                result = SleepCalendarResult(
+                    action=SleepCalendarAction.NOOP,
+                    external_id=row.external_id,
+                    observation_fingerprint=fingerprint,
+                )
+            else:
+                result = self._update(
+                    row,
+                    observation,
+                    fingerprint,
+                    expected_etag,
+                )
         else:
             result = self._update(row, observation, fingerprint, expected_etag)
         return self._finish(result, observation, duplicates)
@@ -187,6 +401,22 @@ class SleepCalendarReconciler:
         self._delete_duplicate_actual_sleep_mirrors(duplicates)
         return self._replace_planned_sleep(result, observation)
 
+    def _quarantine_untrusted_identity_copies(
+        self,
+        rows: list[CalendarEventMirror],
+    ) -> None:
+        changed = False
+        for row in rows:
+            identity = actual_sleep_identity_from_mirror(row)
+            if identity is None or row.external_id != calendar_identity_external_id(
+                self._backend.source,
+                identity,
+            ):
+                quarantine_sleep_identity(row)
+                changed = True
+        if changed:
+            self._session.commit()
+
     def _delete_duplicate_actual_sleep_mirrors(
         self,
         duplicates: list[CalendarEventMirror],
@@ -199,10 +429,18 @@ class SleepCalendarReconciler:
                     f"{duplicate.external_id!r} has invalid actual_sleep identity"
                 )
             assert_owned_actual_sleep(duplicate, identity)
+            if duplicate.external_id != calendar_identity_external_id(
+                duplicate.calendar_source,
+                identity,
+            ):
+                quarantine_sleep_identity(duplicate)
+                self._session.commit()
+                continue
             try:
                 remote = self._backend.read_event(duplicate.external_id)
                 expected_etag = assert_remote_actual_sleep(
                     remote,
+                    self._backend.source,
                     identity,
                     duplicate.etag,
                 )
@@ -215,6 +453,34 @@ class SleepCalendarReconciler:
                 pass
             self._session.delete(duplicate)
             self._session.commit()
+
+    def _validate_duplicate_actual_sleep_mirrors(
+        self,
+        duplicates: list[CalendarEventMirror],
+    ) -> None:
+        for duplicate in duplicates:
+            identity = actual_sleep_identity_from_mirror(duplicate)
+            if identity is None:
+                raise OwnershipError(
+                    f"{duplicate.calendar_source.value} event "
+                    f"{duplicate.external_id!r} has invalid actual_sleep identity"
+                )
+            assert_owned_actual_sleep(duplicate, identity)
+            if duplicate.external_id != calendar_identity_external_id(
+                duplicate.calendar_source,
+                identity,
+            ):
+                continue
+            try:
+                remote = self._backend.read_event(duplicate.external_id)
+            except EventNotFoundError:
+                continue
+            assert_remote_actual_sleep(
+                remote,
+                self._backend.source,
+                identity,
+                duplicate.etag,
+            )
 
     def _apply_latest_after_recovery(
         self,
@@ -254,6 +520,42 @@ class SleepCalendarReconciler:
         identity: CalendarEventIdentity,
         fingerprint: str,
     ) -> SleepCalendarResult:
+        external_id = calendar_identity_external_id(
+            self._backend.source,
+            identity,
+        )
+        existing = self._session.scalar(
+            sa.select(CalendarEventMirror).where(
+                CalendarEventMirror.calendar_source == self._backend.source,
+                CalendarEventMirror.external_id == external_id,
+            )
+        )
+        if existing is not None:
+            remote = self._backend.read_event(external_id)
+            expected_etag = assert_remote_actual_sleep(
+                remote,
+                self._backend.source,
+                identity,
+                None,
+            )
+            adopt_remote_actual_sleep(existing, remote, identity)
+            self._session.commit()
+            if pending_remote_matches(remote, observation):
+                finalize_sleep_mirror(
+                    self._session,
+                    existing,
+                    remote,
+                    observation,
+                    fingerprint,
+                )
+                return self._noop_result(external_id, fingerprint)
+            return self._update(
+                existing,
+                observation,
+                fingerprint,
+                expected_etag,
+            )
+
         row = pending_sleep_mirror(
             self._backend.source,
             observation,
@@ -275,8 +577,31 @@ class SleepCalendarReconciler:
             created = self._backend.create_event(event_draft(observation, identity))
         except CalendarConflictError:
             created = self._backend.read_event(row.external_id)
-            assert_remote_actual_sleep(created, identity, row.etag)
-            assert_pending_remote_matches(created, observation)
+            expected_etag = assert_remote_actual_sleep(
+                created,
+                self._backend.source,
+                identity,
+                None,
+            )
+            if not pending_remote_matches(created, observation):
+                row.etag = expected_etag
+                self._session.commit()
+                return self._update_remote(
+                    row,
+                    observation,
+                    fingerprint,
+                    expected_etag,
+                )
+        assert_remote_actual_sleep(
+            created,
+            self._backend.source,
+            identity,
+            None,
+        )
+        if not pending_remote_matches(created, observation):
+            raise CalendarConflictError(
+                "provider returned actual_sleep content that differs from intent"
+            )
         finalize_sleep_mirror(
             self._session,
             row,
@@ -290,6 +615,14 @@ class SleepCalendarReconciler:
     def _created_result(external_id: str, fingerprint: str) -> SleepCalendarResult:
         return SleepCalendarResult(
             action=SleepCalendarAction.CREATED,
+            external_id=external_id,
+            observation_fingerprint=fingerprint,
+        )
+
+    @staticmethod
+    def _noop_result(external_id: str, fingerprint: str) -> SleepCalendarResult:
+        return SleepCalendarResult(
+            action=SleepCalendarAction.NOOP,
             external_id=external_id,
             observation_fingerprint=fingerprint,
         )
@@ -318,17 +651,28 @@ class SleepCalendarReconciler:
         identity: CalendarEventIdentity,
         fingerprint: str,
     ) -> SleepCalendarResult:
-        remote_etag = assert_remote_actual_sleep(remote, identity, None)
+        remote_etag = assert_remote_actual_sleep(
+            remote,
+            self._backend.source,
+            identity,
+            None,
+        )
         if row.etag is not None and remote_etag != row.etag:
-            assert_pending_remote_matches(remote, observation)
-            finalize_sleep_mirror(
-                self._session,
+            if pending_remote_matches(remote, observation):
+                finalize_sleep_mirror(
+                    self._session,
+                    row,
+                    remote,
+                    observation,
+                    fingerprint,
+                )
+                return self._updated_result(row.external_id, fingerprint)
+            return self._update_remote(
                 row,
-                remote,
                 observation,
                 fingerprint,
+                remote_etag,
             )
-            return self._updated_result(row.external_id, fingerprint)
         return self._update_remote(
             row,
             observation,
@@ -351,6 +695,22 @@ class SleepCalendarReconciler:
             description=description(observation),
             expected_etag=expected_etag,
         )
+        identity = actual_sleep_identity_from_mirror(row)
+        if identity is None:
+            raise OwnershipError(
+                f"{row.calendar_source.value} event {row.external_id!r} "
+                "lost its actual_sleep identity during update"
+            )
+        assert_remote_actual_sleep(
+            updated,
+            self._backend.source,
+            identity,
+            None,
+        )
+        if not pending_remote_matches(updated, observation):
+            raise CalendarConflictError(
+                "provider returned actual_sleep content that differs from intent"
+            )
         finalize_sleep_mirror(
             self._session,
             row,
@@ -367,36 +727,3 @@ class SleepCalendarReconciler:
             external_id=external_id,
             observation_fingerprint=fingerprint,
         )
-
-    def _lock_source_key(self, source_key: str) -> Connection | None:
-        bind = self._session.get_bind()
-        if bind.dialect.name != "postgresql":
-            return None
-        engine = bind.engine if isinstance(bind, Connection) else bind
-        connection = engine.connect()
-        try:
-            connection.execute(
-                sa.text("SELECT pg_advisory_lock(hashtextextended(:source_key, 0))"),
-                {"source_key": f"{self._backend.source.value}:{source_key}"},
-            )
-        except BaseException:
-            connection.close()
-            raise
-        return connection
-
-    def _unlock_source_key(
-        self,
-        connection: Connection,
-        source_key: str,
-    ) -> None:
-        try:
-            released = connection.scalar(
-                sa.text(
-                    "SELECT pg_advisory_unlock(hashtextextended(:source_key, 0))"
-                ),
-                {"source_key": f"{self._backend.source.value}:{source_key}"},
-            )
-            if released is not True:
-                raise RuntimeError("PostgreSQL source-key advisory lock was not held")
-        finally:
-            connection.close()

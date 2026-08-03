@@ -53,6 +53,10 @@ def find_actual_sleep_mirrors(
     observation: ActualSleepObservation,
 ) -> list[CalendarEventMirror]:
     canonical = actual_sleep_identity(observation)
+    canonical_external_id = calendar_identity_external_id(
+        calendar_source,
+        canonical,
+    )
     provider_match = sa.or_(
         CalendarEventMirror.sleep_provider == observation.provider,
         sa.and_(
@@ -66,6 +70,7 @@ def find_actual_sleep_mirrors(
             .where(
                 CalendarEventMirror.calendar_source == calendar_source,
                 sa.or_(
+                    CalendarEventMirror.external_id == canonical_external_id,
                     CalendarEventMirror.healthmes_source_key
                     == canonical.source_key,
                     sa.and_(
@@ -116,10 +121,44 @@ def find_actual_sleep_mirror(
         calendar_source,
         observation,
     )
+    canonical = canonical_actual_sleep_mirror(
+        rows,
+        actual_sleep_identity(observation),
+    )
+    if canonical is not None:
+        return canonical
+    for row in rows:
+        identity = actual_sleep_identity_from_mirror(row)
+        if (
+            identity is not None
+            and row.is_agent_created
+            and row.external_id
+            == calendar_identity_external_id(calendar_source, identity)
+        ):
+            return row
     return rows[0] if rows else None
 
 
-def pending_sleep_observation(
+def canonical_actual_sleep_mirror(
+    rows: list[CalendarEventMirror],
+    identity: CalendarEventIdentity,
+) -> CalendarEventMirror | None:
+    expected_external_id = calendar_identity_external_id(
+        rows[0].calendar_source,
+        identity,
+    ) if rows else None
+    for row in rows:
+        if (
+            row.external_id == expected_external_id
+            and row.healthmes_kind == identity.kind.value
+            and row.healthmes_source == identity.source
+            and row.healthmes_source_key == identity.source_key
+        ):
+            return row
+    return None
+
+
+def sleep_observation_from_mirror(
     row: CalendarEventMirror,
 ) -> ActualSleepObservation:
     provider = row.sleep_provider
@@ -140,6 +179,51 @@ def pending_sleep_observation(
         duration_minutes=row.sleep_duration_minutes,
         time_in_bed_minutes=row.sleep_time_in_bed_minutes,
     )
+
+
+def pending_sleep_observation(
+    row: CalendarEventMirror,
+) -> ActualSleepObservation:
+    return sleep_observation_from_mirror(row)
+
+
+def adopt_remote_actual_sleep(
+    row: CalendarEventMirror,
+    remote: ExternalEvent,
+    identity: CalendarEventIdentity,
+) -> None:
+    if remote.start_at is None or remote.end_at is None:
+        raise RuntimeError("live actual_sleep event is missing its time range")
+    row.external_id = remote.external_id
+    row.summary = remote.summary or "수면 (실제)"
+    row.start_at = remote.start_at
+    row.end_at = remote.end_at
+    row.is_agent_created = True
+    row.agent_task_id = None
+    row.healthmes_kind = identity.kind.value
+    row.healthmes_source = identity.source
+    row.healthmes_source_key = identity.source_key
+    row.etag = remote.etag
+    row.organizer_self = remote.organizer_self
+    row.has_attendees = remote.has_attendees
+    row.is_recurring = remote.is_recurring
+    row.event_type = remote.event_type
+    row.is_all_day = remote.is_all_day
+    row.is_locked = remote.is_locked
+    row.status = remote.status
+
+
+def quarantine_sleep_identity(row: CalendarEventMirror) -> None:
+    row.is_agent_created = False
+    row.agent_task_id = None
+    row.healthmes_kind = None
+    row.healthmes_source = None
+    row.healthmes_source_key = None
+    row.observation_fingerprint = None
+    row.sleep_local_date = None
+    row.sleep_provider = None
+    row.sleep_duration_minutes = None
+    row.sleep_time_in_bed_minutes = None
 
 
 def pending_sleep_mirror(

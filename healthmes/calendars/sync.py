@@ -33,13 +33,23 @@ from sqlalchemy.orm import Session
 
 from healthmes.calendars.base import (
     CalendarBackend,
+    CalendarConflictError,
     CalendarError,
+    CalendarEventIdentity,
     EventDraft,
     EventNotFoundError,
     ExternalEvent,
     OwnershipError,
+    calendar_identity_external_id,
     coerce_utc,
     ensure_utc,
+    parse_calendar_identity,
+)
+from healthmes.calendars.planned_sleep_replacement import (
+    proposal_for_planner_event,
+)
+from healthmes.calendars.sleep_mirror import (
+    SLEEP_UPDATE_PENDING_STATUS,
 )
 from healthmes.calendars.state import PendingDiffStore, SyncStateStore
 from healthmes.store.enums import CalendarSource
@@ -273,14 +283,26 @@ class CalendarMirrorService:
         assert event.start_at is not None and event.end_at is not None  # live event
         resolved_task_id = self._resolve_task_id(event.agent_task_id)
         row = self._get_row(source, event.external_id)
-        trusted_identity = (
+        canonical_identity = (
             event.identity is not None
-            and row is not None
-            and row.is_agent_created
-            and row.healthmes_kind == event.identity.kind.value
-            and row.healthmes_source == event.identity.source
-            and row.healthmes_source_key == event.identity.source_key
+            and event.external_id
+            == calendar_identity_external_id(source, event.identity)
         )
+        if (
+            canonical_identity
+            and event.identity is not None
+            and event.identity.source == "planner"
+        ):
+            canonical_identity = (
+                proposal_for_planner_event(
+                    self._session,
+                    event.identity,
+                    agent_task_id=event.agent_task_id,
+                    start_at=event.start_at,
+                    end_at=event.end_at,
+                )
+                is not None
+            )
         # An incoming provider event is trusted as agent-created ONLY when it
         # carries the ownership tag AND a task id that resolves to a local Task
         # row. A forged tag alone (or a tag whose task id we never had) must
@@ -288,8 +310,16 @@ class CalendarMirrorService:
         # calendar really owns — otherwise a hand-crafted ``healthmes=1`` on
         # someone else's meeting would let the agent move/delete it.
         trusted_agent = bool(event.is_agent_created) and (
-            resolved_task_id is not None or trusted_identity
+            canonical_identity
+            if event.identity is not None
+            else resolved_task_id is not None
         )
+        if trusted_agent and event.identity is not None:
+            self._quarantine_identity_conflicts(
+                source,
+                event.identity,
+                event.external_id,
+            )
 
         if row is None:
             self._session.add(
@@ -446,35 +476,50 @@ class CalendarMirrorService:
     ) -> CalendarEventMirror:
         """Create a tagged agent block remotely and mirror it immediately."""
         backend = self._backend_for(source)
-        created = backend.create_event(draft)
+        existing: CalendarEventMirror | None = None
+        if draft.identity is not None:
+            external_id = calendar_identity_external_id(source, draft.identity)
+            existing = self._get_row(source, external_id)
+            self._quarantine_identity_conflicts(
+                source,
+                draft.identity,
+                external_id,
+            )
+            if existing is not None:
+                created = backend.read_event(external_id)
+                self._assert_remote_matches_draft(source, created, draft)
+            else:
+                try:
+                    created = backend.create_event(draft)
+                except CalendarConflictError:
+                    created = backend.read_event(external_id)
+                    self._assert_remote_matches_draft(source, created, draft)
+        else:
+            created = backend.create_event(draft)
+        if draft.identity is not None:
+            self._assert_remote_matches_draft(source, created, draft)
         assert created.start_at is not None and created.end_at is not None
-        row = CalendarEventMirror(
+        identity = created.identity or draft.identity
+        row = existing or CalendarEventMirror(
             external_id=created.external_id,
             calendar_source=source,
-            summary=created.summary,
             start_at=created.start_at,
             end_at=created.end_at,
-            is_agent_created=True,
-            agent_task_id=self._resolve_task_id(draft.agent_task_id),
-            etag=created.etag,
-            healthmes_kind=(
-                (created.identity or draft.identity).kind.value
-                if created.identity is not None or draft.identity is not None
-                else None
-            ),
-            healthmes_source=(
-                (created.identity or draft.identity).source
-                if created.identity is not None or draft.identity is not None
-                else None
-            ),
-            healthmes_source_key=(
-                (created.identity or draft.identity).source_key
-                if created.identity is not None or draft.identity is not None
-                else None
-            ),
-            **_mirror_metadata_kwargs(created),
         )
-        self._session.add(row)
+        row.summary = created.summary
+        row.start_at = created.start_at
+        row.end_at = created.end_at
+        row.is_agent_created = True
+        row.agent_task_id = self._resolve_task_id(draft.agent_task_id)
+        row.etag = created.etag
+        row.healthmes_kind = identity.kind.value if identity is not None else None
+        row.healthmes_source = identity.source if identity is not None else None
+        row.healthmes_source_key = (
+            identity.source_key if identity is not None else None
+        )
+        _apply_mirror_metadata(row, created)
+        if existing is None:
+            self._session.add(row)
         self._session.commit()
         return row
 
@@ -501,18 +546,98 @@ class CalendarMirrorService:
         self._session.commit()
         return row
 
-    def delete_agent_event(self, source: CalendarSource, external_id: str) -> None:
+    def delete_agent_event(
+        self,
+        source: CalendarSource,
+        external_id: str,
+        *,
+        expected_identity: CalendarEventIdentity | None = None,
+    ) -> None:
         """Delete an agent-created block; refuses to touch external events."""
         row = self._get_owned_row(source, external_id)
+        expected_etag = row.etag
+        if expected_identity is not None:
+            if (
+                row.healthmes_kind != expected_identity.kind.value
+                or row.healthmes_source != expected_identity.source
+                or row.healthmes_source_key != expected_identity.source_key
+                or row.external_id
+                != calendar_identity_external_id(source, expected_identity)
+            ):
+                raise OwnershipError(
+                    f"{source.value} event {external_id!r} is not the expected "
+                    "proposal-owned event"
+                )
+            try:
+                remote = self._backend_for(source).read_event(external_id)
+            except EventNotFoundError:
+                self._session.delete(row)
+                self._session.commit()
+                return
+            if (
+                not remote.is_agent_created
+                or remote.identity != expected_identity
+                or remote.external_id
+                != calendar_identity_external_id(source, expected_identity)
+            ):
+                raise OwnershipError(
+                    f"{source.value} event {external_id!r} failed remote identity "
+                    "validation"
+                )
+            expected_etag = remote.etag
         try:
             self._backend_for(source).delete_event(
                 external_id,
-                expected_etag=row.etag,
+                expected_kind=(
+                    expected_identity.kind if expected_identity is not None else None
+                ),
+                expected_etag=expected_etag,
             )
         except EventNotFoundError:
             pass
         self._session.delete(row)
         self._session.commit()
+
+    def assert_legacy_agent_event_matches(
+        self,
+        source: CalendarSource,
+        row: CalendarEventMirror,
+        draft: EventDraft,
+    ) -> None:
+        """Validate an identity-less block created by a pre-identity release."""
+        if (
+            not row.is_agent_created
+            or row.calendar_source is not source
+            or row.agent_task_id != draft.agent_task_id
+            or row.healthmes_kind is not None
+            or row.healthmes_source is not None
+            or row.healthmes_source_key is not None
+        ):
+            raise OwnershipError(
+                f"{source.value} event {row.external_id!r} is not a legacy "
+                "agent-owned block"
+            )
+        remote = self._backend_for(source).read_event(row.external_id)
+        if (
+            not remote.is_agent_created
+            or remote.identity is not None
+            or remote.agent_task_id != draft.agent_task_id
+        ):
+            raise OwnershipError(
+                f"{source.value} event {row.external_id!r} failed legacy "
+                "ownership validation"
+            )
+        if (
+            (row.etag is not None and remote.etag != row.etag)
+            or remote.summary != draft.summary
+            or remote.description != draft.description
+            or remote.start_at != draft.start_at
+            or remote.end_at != draft.end_at
+        ):
+            raise CalendarConflictError(
+                f"{source.value} event {row.external_id!r} changed after its "
+                "legacy proposal write"
+            )
 
     # -- internals -----------------------------------------------------------
 
@@ -538,6 +663,71 @@ class CalendarMirrorService:
         if task_id is None:
             return None
         return task_id if self._session.get(Task, task_id) is not None else None
+
+    def _quarantine_identity_conflicts(
+        self,
+        source: CalendarSource,
+        identity: CalendarEventIdentity,
+        expected_external_id: str,
+    ) -> None:
+        conflicts = list(
+            self._session.scalars(
+                select(CalendarEventMirror).where(
+                    CalendarEventMirror.calendar_source == source,
+                    CalendarEventMirror.healthmes_source_key == identity.source_key,
+                    CalendarEventMirror.external_id != expected_external_id,
+                )
+            ).all()
+        )
+        for conflict in conflicts:
+            conflict_identity = parse_calendar_identity(
+                conflict.healthmes_kind,
+                conflict.healthmes_source,
+                conflict.healthmes_source_key,
+            )
+            if (
+                conflict_identity is not None
+                and conflict.external_id
+                == calendar_identity_external_id(source, conflict_identity)
+            ):
+                continue
+            conflict.is_agent_created = False
+            conflict.agent_task_id = None
+            conflict.healthmes_kind = None
+            conflict.healthmes_source = None
+            conflict.healthmes_source_key = None
+            conflict.observation_fingerprint = None
+            conflict.sleep_local_date = None
+            conflict.sleep_provider = None
+            conflict.sleep_duration_minutes = None
+            conflict.sleep_time_in_bed_minutes = None
+        if conflicts:
+            self._session.flush()
+
+    @staticmethod
+    def _assert_remote_matches_draft(
+        source: CalendarSource,
+        event: ExternalEvent,
+        draft: EventDraft,
+    ) -> None:
+        if (
+            draft.identity is None
+            or not event.is_agent_created
+            or event.identity != draft.identity
+            or event.external_id
+            != calendar_identity_external_id(
+                source,
+                draft.identity,
+            )
+            or event.summary != draft.summary
+            or event.description != draft.description
+            or event.start_at != draft.start_at
+            or event.end_at != draft.end_at
+            or event.agent_task_id != draft.agent_task_id
+        ):
+            raise CalendarConflictError(
+                "deterministic calendar identity exists with different content"
+            )
 
     def _get_row(self, source: CalendarSource, external_id: str) -> CalendarEventMirror | None:
         statement = select(CalendarEventMirror).where(
@@ -633,6 +823,11 @@ def _mirror_metadata_kwargs(event: ExternalEvent) -> dict[str, object]:
 
 def _apply_mirror_metadata(row: CalendarEventMirror, event: ExternalEvent) -> None:
     for field_name, value in _mirror_metadata_kwargs(event).items():
+        if (
+            field_name == "status"
+            and row.status == SLEEP_UPDATE_PENDING_STATUS
+        ):
+            continue
         setattr(row, field_name, value)
 
 
@@ -641,4 +836,8 @@ def _mirror_metadata_changed(row: CalendarEventMirror, event: ExternalEvent) -> 
         getattr(row, field) != getattr(event, field)
         for field in _MIRROR_METADATA_FIELDS
         if hasattr(CalendarEventMirror, field)
+        and not (
+            field == "status"
+            and row.status == SLEEP_UPDATE_PENDING_STATUS
+        )
     )

@@ -91,6 +91,7 @@ SyncState = dict[str, Any]
 class HealthmesEventKind(StrEnum):
     ACTUAL_SLEEP = "actual_sleep"
     PLANNED_SLEEP = "planned_sleep"
+    SCHEDULE_BLOCK = "schedule_block"
 
 
 def parse_event_kind(value: object) -> HealthmesEventKind | None:
@@ -237,6 +238,7 @@ class ExternalEvent:
 
     external_id: str
     summary: str | None = None
+    description: str | None = None
     start_at: datetime | None = None
     end_at: datetime | None = None
     is_agent_created: bool = False

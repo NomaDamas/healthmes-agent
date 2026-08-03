@@ -45,5 +45,6 @@ def description(observation: ActualSleepObservation) -> str:
     return (
         f"Actual sleep: {observation.duration_minutes} min\n"
         f"Time in bed: {time_in_bed}\n"
-        f"Source: {observation.provider}"
+        f"Source: {observation.provider}\n"
+        f"HealthMes-Fingerprint: {observation_fingerprint(observation)}"
     )

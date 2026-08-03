@@ -16,15 +16,14 @@ from healthmes.calendars.base import (
     ExternalEvent,
     HealthmesEventKind,
     SyncState,
+    calendar_identity_external_id,
 )
-from healthmes.calendars.sleep_observation import (
-    ActualSleepObservation,
-    actual_sleep_source_key,
-)
+from healthmes.calendars.sleep_observation import ActualSleepObservation, actual_sleep_source_key
 from healthmes.calendars.sleep_reconciliation import (
     SleepCalendarAction,
     SleepCalendarReconciler,
 )
+from healthmes.calendars.write_lock import calendar_write_lock_key
 from healthmes.store import Base, CalendarEventMirror, CalendarSource, create_db_engine
 
 
@@ -42,9 +41,14 @@ class ConcurrentCalendarBackend:
     def create_event(self, draft: EventDraft) -> ExternalEvent:
         with self._guard:
             self.create_count += 1
+            assert draft.identity is not None
             self.event = ExternalEvent(
-                external_id="sleep-concurrent",
+                external_id=calendar_identity_external_id(
+                    self.source,
+                    draft.identity,
+                ),
                 summary=draft.summary,
+                description=draft.description,
                 start_at=draft.start_at,
                 end_at=draft.end_at,
                 is_agent_created=True,
@@ -85,7 +89,7 @@ class ConcurrentCalendarBackend:
     not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
     reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
 )
-def test_postgres_source_key_lock_allows_one_concurrent_create() -> None:
+def test_postgres_calendar_write_lock_allows_one_concurrent_create() -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = create_db_engine(database_url)
     schema = f"hm_test_{uuid.uuid4().hex}"
@@ -141,7 +145,64 @@ def test_postgres_source_key_lock_allows_one_concurrent_create() -> None:
     not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
     reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
 )
-def test_postgres_source_key_lock_is_pinned_away_from_session_pool_commits() -> None:
+def test_postgres_lock_waiters_do_not_exhaust_the_session_pool() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_test_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+        pool_size=3,
+        max_overflow=0,
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    backend = ConcurrentCalendarBackend()
+    start_gate = threading.Barrier(3, timeout=5)
+    observation = ActualSleepObservation(
+        local_date=date(2026, 7, 26),
+        provider="oura",
+        source_key=actual_sleep_source_key(date(2026, 7, 26)),
+        start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+        end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+        duration_minutes=420,
+        time_in_bed_minutes=480,
+    )
+
+    def reconcile_once() -> SleepCalendarAction:
+        with factory() as session:
+            start_gate.wait()
+            return SleepCalendarReconciler(session, backend).reconcile(observation).action
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            actions = [
+                future.result(timeout=10)
+                for future in {
+                    pool.submit(reconcile_once),
+                    pool.submit(reconcile_once),
+                    pool.submit(reconcile_once),
+                }
+            ]
+
+        assert actions.count(SleepCalendarAction.CREATED) == 1
+        assert actions.count(SleepCalendarAction.NOOP) == 2
+        assert backend.create_count == 1
+    finally:
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_calendar_write_lock_is_pinned_away_from_session_pool_commits() -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = create_db_engine(database_url)
     schema = f"hm_test_{uuid.uuid4().hex}"
@@ -206,7 +267,7 @@ def test_postgres_source_key_lock_is_pinned_away_from_session_pool_commits() -> 
     not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
     reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
 )
-def test_postgres_source_key_lock_is_released_after_provider_failure() -> None:
+def test_postgres_calendar_write_lock_is_released_after_provider_failure() -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = create_db_engine(database_url)
     schema = f"hm_test_{uuid.uuid4().hex}"
@@ -233,7 +294,7 @@ def test_postgres_source_key_lock_is_released_after_provider_failure() -> None:
         duration_minutes=420,
         time_in_bed_minutes=480,
     )
-    advisory_key = f"{CalendarSource.GOOGLE.value}:{observation.source_key}"
+    advisory_key = calendar_write_lock_key(CalendarSource.GOOGLE)
 
     try:
         with factory() as session, pytest.raises(RuntimeError, match="unavailable"):

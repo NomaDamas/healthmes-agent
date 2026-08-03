@@ -14,6 +14,7 @@ from healthmes.calendars.base import (
     EventNotFoundError,
     HealthmesEventKind,
     OwnershipError,
+    calendar_identity_external_id,
     coerce_utc,
 )
 from healthmes.calendars.state import (
@@ -642,6 +643,45 @@ class TestForgedTagOwnership:
         assert stored.observation_fingerprint is None
         assert stored.sleep_local_date is None
 
+    def test_deterministic_sleep_identity_is_readopted_after_mirror_loss(
+        self,
+        service,
+        fake_backend,
+        session,
+        state_store,
+        make_event,
+    ) -> None:
+        self._seed(service, fake_backend, make_event)
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="open-wearables",
+            source_key="actual_sleep:2026-07-26",
+        )
+        external_id = calendar_identity_external_id(
+            CalendarSource.GOOGLE,
+            identity,
+        )
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    external_id,
+                    is_agent_created=True,
+                    identity=identity,
+                )
+            ],
+            {"sync_token": "tok-readopted"},
+        )
+
+        diff = service.sync_backend(fake_backend)
+
+        assert diff.created == []
+        adopted = rows(session)[external_id]
+        assert adopted.is_agent_created
+        assert adopted.healthmes_source_key == identity.source_key
+        assert state_store.load(fake_backend.source) == {
+            "sync_token": "tok-readopted"
+        }
+
     def test_copied_sleep_identity_does_not_stall_cursor_progress(
         self,
         service,
@@ -689,6 +729,187 @@ class TestForgedTagOwnership:
         assert forged.healthmes_source_key is None
         assert state_store.load(fake_backend.source) == {
             "sync_token": "tok-forged"
+        }
+
+    def test_copied_planned_sleep_identity_with_valid_task_is_quarantined(
+        self,
+        service,
+        fake_backend,
+        session,
+        state_store,
+        make_event,
+    ) -> None:
+        self._seed(service, fake_backend, make_event)
+        task = Task(title="Planned rest")
+        session.add(task)
+        session.flush()
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.PLANNED_SLEEP,
+            source="planner",
+            source_key=f"proposal:{uuid.uuid4()}",
+        )
+        canonical_external_id = calendar_identity_external_id(
+            CalendarSource.GOOGLE,
+            identity,
+        )
+        session.add(
+            CalendarEventMirror(
+                external_id=canonical_external_id,
+                calendar_source=CalendarSource.GOOGLE,
+                summary="Planned rest",
+                start_at=utc(2026, 7, 25, 14),
+                end_at=utc(2026, 7, 25, 22),
+                is_agent_created=True,
+                agent_task_id=task.id,
+                healthmes_kind=identity.kind.value,
+                healthmes_source=identity.source,
+                healthmes_source_key=identity.source_key,
+            )
+        )
+        session.commit()
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "copied-planned-sleep",
+                    is_agent_created=True,
+                    agent_task_id=task.id,
+                    identity=identity,
+                )
+            ],
+            {"sync_token": "tok-planned-copy"},
+        )
+
+        diff = service.sync_backend(fake_backend)
+
+        assert [change.external_id for change in diff.created] == [
+            "copied-planned-sleep"
+        ]
+        copied = rows(session)["copied-planned-sleep"]
+        assert not copied.is_agent_created
+        assert copied.agent_task_id is None
+        assert copied.healthmes_source_key is None
+        assert rows(session)[canonical_external_id].healthmes_source_key == (
+            identity.source_key
+        )
+        assert state_store.load(fake_backend.source) == {
+            "sync_token": "tok-planned-copy"
+        }
+
+    def test_canonical_event_quarantines_wrong_source_key_owner_and_advances_cursor(
+        self,
+        service,
+        fake_backend,
+        session,
+        state_store,
+        make_event,
+    ) -> None:
+        self._seed(service, fake_backend, make_event)
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="open-wearables",
+            source_key="actual_sleep:2026-07-26",
+        )
+        canonical_external_id = calendar_identity_external_id(
+            CalendarSource.GOOGLE,
+            identity,
+        )
+        session.add(
+            CalendarEventMirror(
+                external_id="legacy-wrong-owner",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="Legacy",
+                start_at=utc(2026, 7, 25, 14),
+                end_at=utc(2026, 7, 25, 22),
+                is_agent_created=True,
+                healthmes_kind=identity.kind.value,
+                healthmes_source="oura",
+                healthmes_source_key=identity.source_key,
+            )
+        )
+        session.commit()
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    canonical_external_id,
+                    is_agent_created=True,
+                    identity=identity,
+                )
+            ],
+            {"sync_token": "tok-canonical-conflict"},
+        )
+
+        diff = service.sync_backend(fake_backend)
+
+        assert diff.created == []
+        stored = rows(session)
+        assert not stored["legacy-wrong-owner"].is_agent_created
+        assert stored["legacy-wrong-owner"].healthmes_source_key is None
+        assert stored[canonical_external_id].healthmes_source == identity.source
+        assert state_store.load(fake_backend.source) == {
+            "sync_token": "tok-canonical-conflict"
+        }
+
+    def test_canonical_event_preserves_exact_legacy_identity_for_cleanup(
+        self,
+        service,
+        fake_backend,
+        session,
+        state_store,
+        make_event,
+    ) -> None:
+        self._seed(service, fake_backend, make_event)
+        canonical_identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="open-wearables",
+            source_key="actual_sleep:2026-07-26",
+        )
+        legacy_identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key=canonical_identity.source_key,
+        )
+        legacy_external_id = calendar_identity_external_id(
+            CalendarSource.GOOGLE,
+            legacy_identity,
+        )
+        session.add(
+            CalendarEventMirror(
+                external_id=legacy_external_id,
+                calendar_source=CalendarSource.GOOGLE,
+                summary="Legacy",
+                start_at=utc(2026, 7, 25, 14),
+                end_at=utc(2026, 7, 25, 22),
+                is_agent_created=True,
+                healthmes_kind=legacy_identity.kind.value,
+                healthmes_source=legacy_identity.source,
+                healthmes_source_key=legacy_identity.source_key,
+            )
+        )
+        session.commit()
+        canonical_external_id = calendar_identity_external_id(
+            CalendarSource.GOOGLE,
+            canonical_identity,
+        )
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    canonical_external_id,
+                    is_agent_created=True,
+                    identity=canonical_identity,
+                )
+            ],
+            {"sync_token": "tok-canonical-with-legacy"},
+        )
+
+        diff = service.sync_backend(fake_backend)
+
+        assert diff.created == []
+        stored = rows(session)
+        assert stored[legacy_external_id].is_agent_created
+        assert stored[legacy_external_id].healthmes_source == "oura"
+        assert stored[canonical_external_id].healthmes_source == "open-wearables"
+        assert state_store.load(fake_backend.source) == {
+            "sync_token": "tok-canonical-with-legacy"
         }
 
     def test_tag_stripped_during_move_becomes_external(

@@ -505,6 +505,7 @@ class GoogleCalendarBackend:
         return ExternalEvent(
             external_id=external_id,
             summary=item.get("summary") or None,
+            description=item.get("description") or None,
             start_at=_parse_api_time(start),
             end_at=_parse_api_time(end),
             is_agent_created=is_agent,

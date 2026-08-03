@@ -156,11 +156,17 @@ async def reconcile_recent_sleep_window(
                 backend=backend,
             )
         )
+    with session_scope(session_factory) as session:
+        legacy_cleanup = SleepCalendarReconciler(
+            session,
+            backend,
+        ).reconcile_legacy_history()
     return {
         "status": "ok",
         "window_start": start_date.isoformat(),
         "window_end": end_date.isoformat(),
         "results": results,
+        "legacy_cleanup": legacy_cleanup,
     }
 
 
