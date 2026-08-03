@@ -13,6 +13,7 @@ public enum ProposalStatus: String, Codable {
     case accepted
     case pushed
     case declined
+    case invalidated
 }
 
 public struct ProposalItem: Codable, Equatable, Identifiable {
@@ -22,7 +23,8 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
     public let proposedEnd: Date
     public let status: ProposalStatus
     public let decisionRecordId: UUID?
-    public let resolutionToken: String?
+    public let acceptResolutionToken: String?
+    public let declineResolutionToken: String?
 
     public init(
         id: UUID,
@@ -31,7 +33,8 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
         proposedEnd: Date,
         status: ProposalStatus,
         decisionRecordId: UUID?,
-        resolutionToken: String?
+        acceptResolutionToken: String?,
+        declineResolutionToken: String?
     ) {
         self.id = id
         self.taskId = taskId
@@ -39,7 +42,8 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
         self.proposedEnd = proposedEnd
         self.status = status
         self.decisionRecordId = decisionRecordId
-        self.resolutionToken = resolutionToken
+        self.acceptResolutionToken = acceptResolutionToken
+        self.declineResolutionToken = declineResolutionToken
     }
 
     enum CodingKeys: String, CodingKey {
@@ -49,7 +53,15 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
         case proposedEnd = "proposed_end"
         case status
         case decisionRecordId = "decision_record_id"
-        case resolutionToken = "resolution_token"
+        case acceptResolutionToken = "accept_resolution_token"
+        case declineResolutionToken = "decline_resolution_token"
+    }
+
+    public func resolutionToken(for action: ProposalAction) -> String? {
+        switch action {
+        case .accept: acceptResolutionToken
+        case .decline: declineResolutionToken
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from healthmes.api.auth import viewer_token
 from healthmes.api.connection_status import (
     ConnectionCard,
     build_connection_cards,
@@ -53,18 +54,18 @@ async def unlock_connect_page(request: Request) -> RedirectResponse:
 async def connect_status_page(request: Request, response: Response) -> HTMLResponse:
     settings: Settings = request.app.state.settings
     local = issue_local_session(request, response)
+    api_token = settings.api_token.get_secret_value().strip()
     template = template_environment().get_template("ui/connect.html.j2")
     html = template.render(
         cards=[await build_oura_card(settings), *build_connection_cards(settings)],
         scheduler_enabled=settings.scheduler_enabled,
         local_session=local,
         local_unlock_url=(
-            local_browser_url(settings.port, "/connect/unlock")
-            if (
-                local is None
-                and bool(settings.api_token.get_secret_value().strip())
-                and is_loopback_scope(request.scope)
+            local_browser_url(
+                settings.port,
+                f"/connect/unlock?token={viewer_token(api_token)}",
             )
+            if local is None and api_token
             else ""
         ),
         google_result=request.query_params.get("google", ""),

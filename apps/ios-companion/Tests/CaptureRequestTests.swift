@@ -162,6 +162,16 @@ final class CaptureRequestTests: XCTestCase {
             proposals.url?.absoluteString,
             "http://192.168.1.20:8100/v1/schedule/proposals?limit=50&status=proposed"
         )
+
+        let proposal = HealthMesAPI.proposalRequest(
+            pairing: pairing,
+            proposalID: UUID(uuidString: "1F0D3C5E-8A2B-4C47-9BE1-3D2A7C9F4E10")!
+        )
+        XCTAssertEqual(
+            proposal.url?.absoluteString,
+            "http://192.168.1.20:8100/v1/schedule/proposals/"
+                + "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10"
+        )
     }
 
     func testErrorEnvelopeMapping() throws {
@@ -191,6 +201,30 @@ final class CaptureRequestTests: XCTestCase {
         XCTAssertNil(other.alreadyResolvedStatus)
     }
 
+    func testForbiddenResolutionTokenPreservesServerError() {
+        let envelope = """
+            {
+              "error": {
+                "code": "invalid_resolution_token",
+                "message": "The schedule proposal resolution token is invalid",
+                "detail": null
+              }
+            }
+            """
+        let error = HealthMesAPI.responseError(
+            statusCode: 403,
+            data: Data(envelope.utf8)
+        )
+
+        guard case .server(403, "invalid_resolution_token", let message, _) = error else {
+            return XCTFail("expected structured forbidden server error")
+        }
+        XCTAssertEqual(
+            message,
+            "The schedule proposal resolution token is invalid"
+        )
+    }
+
     func testProposalItemDecodes() throws {
         let json = """
             {
@@ -200,13 +234,15 @@ final class CaptureRequestTests: XCTestCase {
               "proposed_end": "2026-07-10T10:30:00Z",
               "status": "proposed",
               "decision_record_id": null,
-              "resolution_token": "scoped-token"
+              "accept_resolution_token": "accept-token",
+              "decline_resolution_token": "decline-token"
             }
             """
         let proposal = try GlanceJSON.decoder().decode(ProposalItem.self, from: Data(json.utf8))
         XCTAssertEqual(proposal.status, .proposed)
         XCTAssertNil(proposal.decisionRecordId)
-        XCTAssertEqual(proposal.resolutionToken, "scoped-token")
+        XCTAssertEqual(proposal.resolutionToken(for: .accept), "accept-token")
+        XCTAssertEqual(proposal.resolutionToken(for: .decline), "decline-token")
         XCTAssertEqual(
             proposal.proposedEnd.timeIntervalSince(proposal.proposedStart), 90 * 60
         )

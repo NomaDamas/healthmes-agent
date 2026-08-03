@@ -225,6 +225,7 @@ class CalDavCalendarBackend:
         return ExternalEvent(
             external_id=external_id,
             summary=draft.summary,
+            description=draft.description,
             start_at=draft.start_at,
             end_at=draft.end_at,
             is_agent_created=True,
@@ -362,10 +363,14 @@ class CalDavCalendarBackend:
                 end_at = start_at + (timedelta(days=1) if is_all_day else timedelta())
 
         summary_value = component.get("SUMMARY")
+        description_value = component.get("DESCRIPTION")
         is_agent = str(component.get(ICAL_AGENT_PROPERTY, "")).strip() == AGENT_TAG_VALUE
         event = ExternalEvent(
             external_id=uid,
             summary=str(summary_value) if summary_value is not None else None,
+            description=(
+                str(description_value) if description_value is not None else None
+            ),
             start_at=start_at,
             end_at=end_at,
             is_agent_created=is_agent,

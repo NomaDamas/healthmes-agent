@@ -90,6 +90,17 @@ class InMemoryAdjustmentRepository:
     def get_proposal(self, proposal_id: uuid.UUID) -> StoredAdjustmentProposal | None:
         return self.proposals.get(proposal_id)
 
+    def get_pending_proposal_by_handle_digest(
+        self, handle_digest: str
+    ) -> StoredAdjustmentProposal | None:
+        matches = [
+            proposal
+            for proposal in self.proposals.values()
+            if proposal.status == AdjustmentStatus.PENDING
+            and hmac.compare_digest(proposal.reply_handle_digest, handle_digest)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def commit_applying_boundary(self, proposal_id: uuid.UUID) -> StoredAdjustmentProposal | None:
         proposal = self.proposals.get(proposal_id)
         if proposal is not None:

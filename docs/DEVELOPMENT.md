@@ -213,11 +213,12 @@ calls `mcp__healthmes__evaluate_morning_calendar_nudge` exactly once, sends
 the returned display packet and `적용 <handle>` / `그대로 <handle>` choices,
 then exits without waiting. The later allowed-user reply enters the normal
 Hermes live gateway session, which calls
-`mcp__healthmes__resolve_calendar_adjustment` with the exact reply text.
-The vendored MCP client injects a five-minute HMAC proof only when the inbound
-Telegram message is exactly `적용 <handle>` or `그대로 <handle>` and binds the
-proof to the complete resolver arguments. A returned handle without that proof
-cannot authorize either calendar resolver.
+`mcp__healthmes__resolve_calendar_adjustment` with the exact combined live
+Telegram reply as `response` and its unchanged `reply_handle`. Hermes attaches
+an owner-bound signed proof, and HealthMes resolves the proposal server-side.
+Planner-created schedule proposals use the same exact-reply proof boundary via
+`mcp__healthmes__resolve_schedule_proposal`; REST/native clients use a separate
+proposal-bound resolution token and can never mint a Telegram proof.
 
 ```bash
 uv run python scripts/bootstrap.py --dry-run     # show what would change
@@ -454,7 +455,7 @@ shapes are pinned in `tests/api/`):
 | `GET /v1/media/{media_path}` | bearer **or** derived viewer `?token=` (GET/HEAD only) | Serves the upload back (real content type, `Cache-Control: private, max-age=86400, immutable`); decision/report pages and in-app web views can embed via `<img>`/`<audio>`. All path tricks → uniform 404. |
 | `POST /v1/medical-records` | bearer | REST twin of the `create_medical_record` MCP tool (the Telegram capture-skill contract): `{kind: medication\|symptom, description, media_path?, transcript?, context?}`. The server attaches the deterministic health snapshot under `context.health` (degrades to `{status: unavailable}` when open-wearables is down — capture never fails for infra reasons); caller context is stored under `context.capture`. |
 | `GET /v1/alerts` | bearer | Alert history in glance semantics ("unresolved == recently pushed"): `?hours=1..168` (default 24), paginated `Page` envelope, newest first. Items carry the §8.5 grammar recorded at fire time (`summary`/`evidence`/`proposal`) + `decision_url`; `alerts[0]` agrees verbatim with the glance top alert (test-pinned). |
-| `GET /v1/schedule/proposals` + `POST /v1/schedule/proposals/{id}/accept` / `/decline` | bearer | Pending proposal responses include an expiring `resolution_token`; the apps' ✅/❌ actions return it as `{"resolution_token":"..."}`. Missing body → 422, invalid token → `403 invalid_resolution_token`, expired token → `409 proposal_expired`, second tap → `409 invalid_transition` with `detail {current, requested}` (render "already resolved"); unknown id → 404. |
+| `POST /v1/schedule/proposals/{id}/accept` / `/decline` | bearer | The apps' ✅/❌ actions. Second tap → `409 invalid_transition` with `detail {current, requested}` (render "already resolved"); unknown id → 404. |
 | `POST /v1/food-logs` | bearer | Accepts `media_path` from `POST /v1/media` (≤500 chars). |
 
 Client caveats worth knowing (all handled by the shipped apps):
@@ -567,7 +568,9 @@ Calendar ownership remains immutable by default for user-created external
 events. The only confirmed exception is the morning recovery Google
 `SHORTEN` path: server evaluation binds the event snapshot and target change,
 Telegram shows the one-time handle, and a trusted live Hermes session
-resolves `적용 <handle>` or `그대로 <handle>` through the HealthMes MCP tool.
+parses `적용 <handle>` or `그대로 <handle>` and calls the HealthMes MCP tool
+with the exact combined live reply and unchanged `reply_handle`; no
+`proposal_id` or caller-supplied response channel is accepted.
 No cron run waits for replies or performs the external write itself.
 
 Not a credential but environment-shaped: `HEALTHMES_TIMEZONE` (IANA name,

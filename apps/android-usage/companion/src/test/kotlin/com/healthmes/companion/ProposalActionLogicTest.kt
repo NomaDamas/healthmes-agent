@@ -1,6 +1,7 @@
 package com.healthmes.companion
 
 import com.healthmes.api.HealthmesApi
+import com.healthmes.api.Proposal
 import com.healthmes.api.ProposalsPage
 import com.healthmes.companion.work.ProposalActionLogic
 import com.healthmes.companion.work.ProposalActionLogic.Outcome
@@ -26,7 +27,8 @@ class ProposalActionLogicTest {
             {"id": "$id", "task_id": "11111111-2222-3333-4444-555555555555",
              "proposed_start": "2026-07-09T05:00:00.497821", "proposed_end": "2026-07-09T06:00:00.497821",
              "status": "proposed", "decision_record_id": null,
-             "resolution_token": "token-$id"}
+             "accept_resolution_token": "accept-$id",
+             "decline_resolution_token": "decline-$id"}
             """.trimIndent()
         }
         return ProposalsPage.parse(
@@ -50,9 +52,14 @@ class ProposalActionLogicTest {
         assertTrue(target is Target.Single)
         assertEquals("aaa", (target as Target.Single).proposal.id)
         assertEquals(
-            """{"resolution_token":"token-aaa"}""",
-            target.proposal.resolutionBody(),
+            """{"resolution_token":"accept-aaa"}""",
+            target.proposal.resolutionBody(accept = true),
         )
+        assertEquals(
+            """{"resolution_token":"decline-aaa"}""",
+            target.proposal.resolutionBody(accept = false),
+        )
+        assertEquals("/v1/schedule/proposals/aaa", Proposal.detailPath("aaa"))
     }
 
     @Test
@@ -73,7 +80,8 @@ class ProposalActionLogicTest {
         val body = """
             {"id": "aaa", "task_id": "t", "proposed_start": "2026-07-09T05:00:00Z",
              "proposed_end": "2026-07-09T06:00:00Z", "status": "accepted",
-             "decision_record_id": null, "resolution_token": null}
+             "decision_record_id": null, "accept_resolution_token": null,
+             "decline_resolution_token": null}
         """.trimIndent()
 
         val outcome = ProposalActionLogic.classifyActionResponse(

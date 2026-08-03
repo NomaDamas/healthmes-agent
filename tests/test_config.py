@@ -20,6 +20,8 @@ ALL_ENV_VARS = [
     "HEALTHMES_HOST",
     "HEALTHMES_API_TOKEN",
     "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+    "HEALTHMES_TELEGRAM_OWNER_USER_ID",
+    "HEALTHMES_TELEGRAM_OWNER_CHAT_ID",
     "HEALTHMES_SCHEDULER_ENABLED",
     "HEALTHMES_TIMEZONE",
     "HEALTHMES_BACKUP_DIR",
@@ -70,6 +72,8 @@ def test_defaults(monkeypatch) -> None:
     assert settings.host == "127.0.0.1"
     assert settings.api_token.get_secret_value() == ""
     assert settings.calendar_adjustment_secret.get_secret_value() == ""
+    assert settings.telegram_owner_user_id == ""
+    assert settings.telegram_owner_chat_id == ""
     assert settings.scheduler_enabled is False
     assert settings.timezone is None  # machine-local tz (mac-native default)
     # Backup seam (docs/PLAN.md §9): everything optional by default.
@@ -99,6 +103,8 @@ def test_env_prefix_is_healthmes(monkeypatch) -> None:
     monkeypatch.setenv("HEALTHMES_OW_BASE_URL", "http://ow.internal:8000")
     monkeypatch.setenv("HEALTHMES_DATA_DIR", "/tmp/hm-data")
     monkeypatch.setenv("HEALTHMES_PUBLIC_BASE_URL", "https://healthmes.example.com")
+    monkeypatch.setenv("HEALTHMES_TELEGRAM_OWNER_USER_ID", "owner-user")
+    monkeypatch.setenv("HEALTHMES_TELEGRAM_OWNER_CHAT_ID", "owner-chat")
 
     settings = _clean_settings()
 
@@ -107,6 +113,8 @@ def test_env_prefix_is_healthmes(monkeypatch) -> None:
     assert settings.ow_base_url == "http://ow.internal:8000"
     assert settings.data_dir == Path("/tmp/hm-data")
     assert settings.public_base_url == "https://healthmes.example.com"
+    assert settings.telegram_owner_user_id == "owner-user"
+    assert settings.telegram_owner_chat_id == "owner-chat"
 
 
 def test_quiet_hours_and_alert_budget_from_env(monkeypatch) -> None:

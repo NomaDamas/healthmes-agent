@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
@@ -85,6 +85,12 @@ class SleepObservationNoOp:
 
 type SleepObservationResult = ActualSleepObservation | SleepObservationNoOp
 
+ACTUAL_SLEEP_IDENTITY_SOURCE = "open-wearables"
+
+
+def actual_sleep_source_key(local_date: date) -> str:
+    return f"actual_sleep:{local_date.isoformat()}"
+
 
 @dataclass(frozen=True, slots=True)
 class _SleepCandidate:
@@ -126,7 +132,7 @@ def select_actual_sleep(
                 continue
             assert start_at is not None
             assert end_at is not None
-            main_session_minutes = int((end_at - start_at).total_seconds() // 60)
+            main_session_minutes = _elapsed_minutes(start_at, end_at)
             candidates.append(
                 _candidate(
                     summary,
@@ -153,7 +159,10 @@ def select_actual_sleep(
                     provider=provider,
                     start_at=item.start_time,
                     end_at=item.end_time,
-                    main_session_minutes=item.duration_minutes,
+                    main_session_minutes=_elapsed_minutes(
+                        item.start_time,
+                        item.end_time,
+                    ),
                 )
             )
 
@@ -181,7 +190,16 @@ def _valid_span(start_at: datetime | None, end_at: datetime | None) -> bool:
         and end_at is not None
         and start_at.tzinfo is not None
         and end_at.tzinfo is not None
-        and end_at > start_at
+        and end_at.astimezone(UTC) > start_at.astimezone(UTC)
+    )
+
+
+def _elapsed_minutes(start_at: datetime, end_at: datetime) -> int:
+    return int(
+        (
+            end_at.astimezone(UTC) - start_at.astimezone(UTC)
+        ).total_seconds()
+        // 60
     )
 
 
@@ -198,7 +216,7 @@ def _candidate(
         observation=ActualSleepObservation(
             local_date=summary.date,
             provider=provider,
-            source_key=f"{provider}:{summary.date.isoformat()}",
+            source_key=actual_sleep_source_key(summary.date),
             start_at=start_at,
             end_at=end_at,
             duration_minutes=summary.duration_minutes,

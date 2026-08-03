@@ -48,9 +48,9 @@ platforms:
       name: "{{ telegram_home_chat_name | default('Home', true) }}"
     {%- endif %}
     extra:
-      # Telegram user-id allowlist; when set it is the sole authority
-      # (plugins/platforms/telegram/adapter.py). ["*"] allows everyone.
-      allow_from: {{ telegram_allowed_user_ids | default(['*'], true) | tojson }}
+      # One explicit owner only. An empty list is fail-closed; wildcard access
+      # is never rendered for confirmation-capable HealthMes deployments.
+      allow_from: {{ telegram_allowed_user_ids | default([], true) | tojson }}
 
   webhook:
     enabled: true
@@ -124,25 +124,24 @@ mcp_servers:
     trusted_session_proof:
       secret_env: HEALTHMES_CALENDAR_ADJUSTMENT_SECRET
       argument: trusted_session_proof
+      owner_user_id: "{{ telegram_owner_user_id }}"
+      owner_chat_id: "{{ telegram_owner_chat_id }}"
       confirmations:
         resolve_calendar_adjustment:
           handle_argument: reply_handle
           passthrough_argument: response
           bind_arguments:
-            - proposal_id
             - response
             - reply_handle
-            - response_channel
           choices:
             - 적용
             - 그대로
         resolve_schedule_proposal:
           handle_argument: reply_handle
-          action_argument: action
+          passthrough_argument: response
           bind_arguments:
-            - proposal_id
-            - action
+            - response
             - reply_handle
           choices:
-            accept: 적용
-            decline: 그대로
+            - 적용
+            - 그대로

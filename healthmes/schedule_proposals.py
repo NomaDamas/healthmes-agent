@@ -17,8 +17,14 @@ class ScheduleProposalResolutionError(ValueError):
         self.code = code
 
 
-def resolution_token(proposal: ScheduleProposal, handle_secret: str) -> str | None:
+def resolution_token(
+    proposal: ScheduleProposal,
+    handle_secret: str,
+    target: ProposalStatus,
+) -> str | None:
     if proposal.reply_handle_digest is None or proposal.expires_at is None:
+        return None
+    if target not in {ProposalStatus.ACCEPTED, ProposalStatus.DECLINED}:
         return None
     expires_at = (
         proposal.expires_at.replace(tzinfo=dt.UTC)
@@ -26,7 +32,8 @@ def resolution_token(proposal: ScheduleProposal, handle_secret: str) -> str | No
         else proposal.expires_at.astimezone(dt.UTC)
     )
     payload = (
-        f"schedule-proposal:{proposal.id}:{proposal.reply_handle_digest}:"
+        "healthmes-api:schedule-proposal-resolution:v1:"
+        f"{proposal.id}:{target.value}:{proposal.reply_handle_digest}:"
         f"{expires_at.isoformat()}"
     )
     return hmac.new(
@@ -40,8 +47,9 @@ def verify_resolution_token(
     token: str,
     proposal: ScheduleProposal,
     handle_secret: str,
+    target: ProposalStatus,
 ) -> bool:
-    expected = resolution_token(proposal, handle_secret)
+    expected = resolution_token(proposal, handle_secret, target)
     return expected is not None and hmac.compare_digest(token, expected)
 
 
@@ -74,7 +82,12 @@ def resolve_schedule_proposal(
     resolution_token_valid = bool(
         allow_resolution_token
         and reply_handle
-        and verify_resolution_token(reply_handle, proposal, handle_secret)
+        and verify_resolution_token(
+            reply_handle,
+            proposal,
+            handle_secret,
+            target,
+        )
     )
     if not reply_handle_valid and not resolution_token_valid:
         raise ScheduleProposalResolutionError("invalid_handle")

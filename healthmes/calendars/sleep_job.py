@@ -8,6 +8,7 @@ from typing import Protocol
 import anyio
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.api.auth import viewer_url
 from healthmes.calendars.approval import ApprovalCalendar, calendar_approval_target
 from healthmes.calendars.base import CalendarBackend
 from healthmes.calendars.jobs import _build_backend, write_source
@@ -17,7 +18,10 @@ from healthmes.calendars.sleep_observation import (
 )
 from healthmes.calendars.sleep_preview import preview_sleep_reconciliation
 from healthmes.calendars.sleep_proposals import prepare_sleep_proposal
-from healthmes.calendars.sleep_reconciliation import SleepCalendarReconciler
+from healthmes.calendars.sleep_reconciliation import (
+    SleepCalendarReconciler,
+    SleepCalendarWriteBlocked,
+)
 from healthmes.calendars.sleep_source import read_actual_sleep
 from healthmes.config import Settings, resolve_timezone
 from healthmes.mcp_server.ow_client import (
@@ -88,6 +92,10 @@ def build_sleep_reconciliation_job(
                 backend,
                 calendar_approval_target(settings, calendar_source),
                 settings.public_base_url,
+                lambda target_date: viewer_url(
+                    settings,
+                    f"/sleep?date={target_date.isoformat()}",
+                ),
             ),
         )
 
@@ -195,11 +203,17 @@ async def reconcile_recent_sleep_window(
                 backend=backend,
             )
         )
+    with session_scope(session_factory) as session:
+        legacy_cleanup = SleepCalendarReconciler(
+            session,
+            backend,
+        ).reconcile_legacy_history()
     return {
         "status": "ok",
         "window_start": start_date.isoformat(),
         "window_end": end_date.isoformat(),
         "results": results,
+        "legacy_cleanup": legacy_cleanup,
     }
 
 
@@ -243,13 +257,30 @@ async def reconcile_recent_sleep(
             raise ValueError("backend is required when dry_run is false")
         if backend.source is not calendar_source:
             raise ValueError("backend source does not match target calendar")
-        result = SleepCalendarReconciler(session, backend).reconcile(selected)
+        try:
+            result = SleepCalendarReconciler(session, backend).reconcile(selected)
+        except SleepCalendarWriteBlocked as exc:
+            return {
+                **preview,
+                "status": "blocked",
+                "action": "blocked",
+                "reason": exc.reason,
+                "retryable": exc.retryable,
+                "blocked_proposal_id": exc.proposal_id,
+                "invalidated_schedule_proposal_ids": list(
+                    exc.invalidated_proposal_ids
+                ),
+            }
         response: dict[str, object] = {
             **preview,
             "status": "ok",
             "action": result.action.value,
             "planned_sleep_replacements": len(result.deleted_planned_external_ids),
         }
+        if result.invalidated_schedule_proposal_ids:
+            response["invalidated_schedule_proposal_ids"] = list(
+                result.invalidated_schedule_proposal_ids
+            )
         if result.planned_sleep_cleanup_pending:
             response["status"] = "cleanup_pending"
             response["planned_sleep_cleanup_pending"] = (

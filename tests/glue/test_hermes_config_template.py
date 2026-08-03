@@ -26,6 +26,8 @@ FULL_CONTEXT = {
     "telegram_home_chat_id": "987654321",
     "telegram_home_chat_name": "Me",
     "telegram_allowed_user_ids": ["987654321"],
+    "telegram_owner_user_id": "987654321",
+    "telegram_owner_chat_id": "987654321",
     "hermes_webhook_port": 8644,
     "hermes_webhook_secret": "hmac-secret",
     "healthmes_alert_prompt": "Alert {rule_id}: {summary}",
@@ -70,6 +72,7 @@ def test_telegram_platform_keys(config: dict) -> None:
     assert telegram["token"] == "123456:test-token"
     # allow_from lives under extra (adapter reads config.extra["allow_from"]).
     assert isinstance(telegram["extra"]["allow_from"], list)
+    assert "*" not in telegram["extra"]["allow_from"]
 
 
 def test_home_channel_only_rendered_when_chat_id_set() -> None:
@@ -115,6 +118,13 @@ def test_mcp_servers_stdio_and_url_transports(config: dict) -> None:
     # Streamable HTTP transport: url key.
     assert hm["url"].endswith("/mcp")
     assert "command" not in hm
+    trusted = hm["trusted_session_proof"]
+    assert trusted["owner_user_id"] == (
+        "987654321" if config["platforms"]["telegram"]["extra"]["allow_from"] else ""
+    )
+    assert trusted["confirmations"]["resolve_calendar_adjustment"][
+        "bind_arguments"
+    ] == ["response", "reply_handle"]
 
 
 def test_healthmes_bearer_header_only_rendered_with_token() -> None:

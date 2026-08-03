@@ -10,9 +10,8 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 
 from healthmes.api.local_session import (
-    LOCAL_SESSION_COOKIE,
     LocalBrowserSession,
-    is_loopback_scope,
+    authenticated_local_session,
     require_local_session,
 )
 from healthmes.api.sleep import _form
@@ -105,10 +104,8 @@ def _start_redirect(
 
 @router.get("/connect/google/callback", name="google_oauth_callback")
 async def google_oauth_callback(request: Request, state: str = "") -> RedirectResponse:
-    if not is_loopback_scope(request.scope):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "loopback callback required")
     store = request.app.state.local_sessions
-    local = store.get(request.cookies.get(LOCAL_SESSION_COOKIE))
+    local = authenticated_local_session(request.scope, store)
     if local is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "local browser session required")
     attempt = request.app.state.google_oauth.take(state, local)

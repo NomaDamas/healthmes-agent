@@ -110,6 +110,15 @@ public final class HealthMesAPI {
         return request
     }
 
+    /// `GET /v1/schedule/proposals/{id}` — direct notification/deep-link lookup.
+    public static func proposalRequest(pairing: Pairing, proposalID: UUID) -> URLRequest {
+        baseRequest(
+            pairing: pairing,
+            path: "v1/schedule/proposals/\(proposalID.uuidString.lowercased())",
+            method: "GET"
+        )
+    }
+
     /// `POST /v1/schedule/proposals/{id}/accept|decline` — the real endpoint
     /// behind the §8.5 ✅/❌ buttons.
     public static func proposalActionRequest(
@@ -212,10 +221,17 @@ public final class HealthMesAPI {
         )
     }
 
+    public func getProposal(_ proposalID: UUID) async throws -> ProposalItem {
+        try await perform(
+            Self.proposalRequest(pairing: try pairing(), proposalID: proposalID),
+            expecting: ProposalItem.self
+        )
+    }
+
     public func resolveProposal(
         _ proposal: ProposalItem, action: ProposalAction
     ) async throws -> ProposalItem {
-        guard let resolutionToken = proposal.resolutionToken else {
+        guard let resolutionToken = proposal.resolutionToken(for: action) else {
             throw HealthMesAPIError.httpStatus(422)
         }
         return try await perform(
@@ -274,19 +290,23 @@ public final class HealthMesAPI {
             } catch {
                 throw HealthMesAPIError.decoding(underlying: error)
             }
-        case 401, 403:
+        case 401:
             throw HealthMesAPIError.unauthorized(statusCode: http.statusCode)
         default:
-            if let envelope = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data) {
-                throw HealthMesAPIError.server(
-                    statusCode: http.statusCode,
-                    code: envelope.error.code,
-                    message: envelope.error.message,
-                    detail: envelope.error.detail
-                )
-            }
-            throw HealthMesAPIError.httpStatus(http.statusCode)
+            throw Self.responseError(statusCode: http.statusCode, data: data)
         }
+    }
+
+    static func responseError(statusCode: Int, data: Data) -> HealthMesAPIError {
+        if let envelope = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data) {
+            return HealthMesAPIError.server(
+                statusCode: statusCode,
+                code: envelope.error.code,
+                message: envelope.error.message,
+                detail: envelope.error.detail
+            )
+        }
+        return HealthMesAPIError.httpStatus(statusCode)
     }
 }
 

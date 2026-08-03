@@ -42,6 +42,7 @@ async def prepare_sleep_proposal(
         user_id,
         target_date,
         review_base_url=calendar.review_base_url,
+        review_url_builder=calendar.review_url_builder,
     )
     created_at = now or dt.datetime.now(dt.UTC)
     if isinstance(selected, SleepObservationNoOp):
@@ -124,7 +125,12 @@ def _persist(
         sa.select(SleepReconciliationProposal)
         .where(
             SleepReconciliationProposal.dedup_key.like(f"{base_key}%"),
-            SleepReconciliationProposal.status == SleepProposalStatus.PENDING,
+            SleepReconciliationProposal.status.in_(
+                (
+                    SleepProposalStatus.PENDING,
+                    SleepProposalStatus.APPLYING,
+                )
+            ),
         )
         .order_by(SleepReconciliationProposal.created_at.desc())
     )

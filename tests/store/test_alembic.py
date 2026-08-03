@@ -8,6 +8,8 @@ rendering, which never connects.
 
 import io
 import logging
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -18,7 +20,16 @@ from alembic.script import ScriptDirectory
 from sqlalchemy.orm import sessionmaker
 
 from alembic import command
-from healthmes.store import Base, DecisionKind, DecisionRecord, Task, session_scope
+from healthmes.schedule_proposals import resolution_token, verify_resolution_token
+from healthmes.store import (
+    Base,
+    DecisionKind,
+    DecisionRecord,
+    ProposalStatus,
+    ScheduleProposal,
+    Task,
+    session_scope,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -51,6 +62,16 @@ def _config(database_url: str, buffer: io.StringIO | None = None) -> Config:
 def _render_offline_upgrade(database_url: str) -> str:
     buffer = io.StringIO()
     command.upgrade(_config(database_url, buffer=buffer), "head", sql=True)
+    return buffer.getvalue()
+
+
+def _render_offline_legacy_cleanup_downgrade(database_url: str) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "f2a3b4c5d6e7:e1f2a3b4c5d6",
+        sql=True,
+    )
     return buffer.getvalue()
 
 
@@ -92,6 +113,16 @@ class TestOfflineRender:
     def test_render_marks_head_revision(self):
         rendered = _render_offline_upgrade("sqlite:///offline-render.db")
         assert "INSERT INTO alembic_version" in rendered
+
+    def test_legacy_cleanup_downgrade_renders_for_both_dialects(self):
+        urls = (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        )
+        for url in urls:
+            rendered = _render_offline_legacy_cleanup_downgrade(url)
+            assert "ROW_NUMBER() OVER" in rendered
+            assert "ux_calendar_event_mirror_source_healthmes_source_key" in rendered
 
 
 class TestSqliteUpgrade:
@@ -158,3 +189,412 @@ class TestSqliteUpgrade:
         config = _config(database_url)
         command.upgrade(config, "head")
         command.upgrade(config, "head")  # no-op, must not raise
+
+    def test_legacy_pending_schedule_proposal_is_backfilled_and_resolvable(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'legacy-proposal.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "b4c5d6e7f809")
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        task_table = sa.Table("task", metadata, autoload_with=engine)
+        proposal_table = sa.Table(
+            "schedule_proposal",
+            metadata,
+            autoload_with=engine,
+        )
+        task_id = "1" * 32
+        proposal_id = "2" * 32
+        expired_task_id = "3" * 32
+        expired_proposal_id = "4" * 32
+        with engine.begin() as connection:
+            connection.execute(
+                task_table.insert(),
+                [
+                    {
+                        "id": task_id,
+                        "title": "Legacy pending task",
+                        "energy_demand": "med",
+                        "status": "todo",
+                        "source": "user",
+                    },
+                    {
+                        "id": expired_task_id,
+                        "title": "Expired legacy task",
+                        "energy_demand": "med",
+                        "status": "todo",
+                        "source": "user",
+                    },
+                ],
+            )
+            connection.execute(
+                proposal_table.insert(),
+                [
+                    {
+                        "id": proposal_id,
+                        "task_id": task_id,
+                        "proposed_start": datetime(2026, 8, 4, 9, tzinfo=UTC),
+                        "proposed_end": datetime(2026, 8, 4, 10, tzinfo=UTC),
+                        "status": "proposed",
+                    },
+                    {
+                        "id": expired_proposal_id,
+                        "task_id": expired_task_id,
+                        "proposed_start": datetime(2026, 8, 2, 9, tzinfo=UTC),
+                        "proposed_end": datetime(2026, 8, 2, 10, tzinfo=UTC),
+                        "status": "proposed",
+                    },
+                ],
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            factory = sessionmaker(bind=engine)
+            with factory() as session:
+                proposal = session.get(
+                    ScheduleProposal,
+                    uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                )
+                assert proposal is not None
+                assert proposal.reply_handle_digest
+                assert proposal.expires_at is not None
+                secret = "legacy-proposal-test-secret-at-least-32-characters"
+                accept_token = resolution_token(
+                    proposal,
+                    secret,
+                    ProposalStatus.ACCEPTED,
+                )
+                decline_token = resolution_token(
+                    proposal,
+                    secret,
+                    ProposalStatus.DECLINED,
+                )
+                assert accept_token
+                assert decline_token
+                assert accept_token != decline_token
+                assert verify_resolution_token(
+                    accept_token,
+                    proposal,
+                    secret,
+                    ProposalStatus.ACCEPTED,
+                )
+                assert not verify_resolution_token(
+                    accept_token,
+                    proposal,
+                    secret,
+                    ProposalStatus.DECLINED,
+                )
+                expired = session.get(
+                    ScheduleProposal,
+                    uuid.UUID("44444444-4444-4444-4444-444444444444"),
+                )
+                assert expired is not None
+                assert expired.status is ProposalStatus.INVALIDATED
+                assert expired.reply_handle_digest is None
+                assert expired.expires_at is None
+        finally:
+            engine.dispose()
+
+    def test_old_feature_revision_stamp_upgrades_without_duplicate_columns(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'old-feature-stamp.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "e1f2a3b4c5d6")
+
+        engine = sa.create_engine(database_url)
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE calendar_event_mirror "
+                "ADD COLUMN intake_task_id CHAR(32)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX ix_calendar_event_mirror_intake_task_id "
+                "ON calendar_event_mirror (intake_task_id)"
+            )
+            connection.exec_driver_sql(
+                "ALTER TABLE schedule_proposal "
+                "ADD COLUMN reply_handle_digest VARCHAR(255)"
+            )
+            connection.exec_driver_sql(
+                "ALTER TABLE schedule_proposal ADD COLUMN expires_at DATETIME"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX ix_schedule_proposal_expires_at "
+                "ON schedule_proposal (expires_at)"
+            )
+            connection.exec_driver_sql(
+                "UPDATE alembic_version SET version_num = 'a3b4c5d6e7f8'"
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert inspector.get_table_names()
+            assert inspector.has_table("sleep_reconciliation_proposal")
+            mirror_columns = {
+                item["name"]
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            proposal_columns = {
+                item["name"]
+                for item in inspector.get_columns("schedule_proposal")
+            }
+            mirror_indexes = {
+                item["name"]
+                for item in inspector.get_indexes("calendar_event_mirror")
+            }
+            assert {"intake_task_id", "intake_opted_out"} <= mirror_columns
+            assert {
+                "intake_calendar_source",
+                "intake_external_id",
+                "intake_revision",
+                "reply_handle_digest",
+                "expires_at",
+            } <= proposal_columns
+            assert "ux_calendar_event_mirror_calendar_identity" in mirror_indexes
+            assert "ix_calendar_event_mirror_actual_sleep_cleanup" in mirror_indexes
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d6e7f8091a2b"
+        finally:
+            engine.dispose()
+
+    def test_sleep_hardening_migration_cleans_untrusted_identity(self, tmp_path):
+        database_url = f"sqlite:///{tmp_path / 'sleep-hardening.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "d0e1f2a3b4c5")
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        mirror = sa.Table(
+            "calendar_event_mirror",
+            metadata,
+            autoload_with=engine,
+        )
+        start = datetime(2026, 7, 25, 23, tzinfo=UTC)
+        end = datetime(2026, 7, 26, 7, tzinfo=UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                mirror.insert(),
+                [
+                    {
+                        "id": "a" * 32,
+                        "external_id": "forged",
+                        "calendar_source": "google",
+                        "summary": "Forged",
+                        "start_at": start,
+                        "end_at": end,
+                        "is_agent_created": False,
+                        "healthmes_kind": "actual_sleep",
+                        "healthmes_source": "oura",
+                        "healthmes_source_key": "oura:2026-07-26",
+                        "observation_fingerprint": "forged",
+                        "sleep_local_date": start.date(),
+                        "sleep_duration_minutes": 420,
+                        "sleep_time_in_bed_minutes": 480,
+                    },
+                    {
+                        "id": "b" * 32,
+                        "external_id": "owned",
+                        "calendar_source": "google",
+                        "summary": "Owned",
+                        "start_at": start,
+                        "end_at": end,
+                        "is_agent_created": True,
+                        "healthmes_kind": "actual_sleep",
+                        "healthmes_source": "oura",
+                        "healthmes_source_key": "oura:2026-07-27",
+                        "observation_fingerprint": None,
+                        "sleep_local_date": end.date(),
+                        "sleep_duration_minutes": 420,
+                        "sleep_time_in_bed_minutes": 480,
+                    },
+                ],
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                rows = {
+                    row.external_id: row
+                    for row in connection.execute(
+                        sa.text(
+                            "SELECT external_id, is_agent_created, "
+                            "healthmes_kind, healthmes_source, "
+                            "healthmes_source_key, observation_fingerprint, "
+                            "sleep_local_date, sleep_provider, "
+                            "sleep_duration_minutes, "
+                            "sleep_time_in_bed_minutes "
+                            "FROM calendar_event_mirror"
+                        )
+                    )
+                }
+            forged = rows["forged"]
+            assert forged.healthmes_kind is None
+            assert forged.healthmes_source is None
+            assert forged.healthmes_source_key is None
+            assert forged.observation_fingerprint is None
+            assert forged.sleep_local_date is None
+            assert forged.sleep_provider is None
+            assert forged.sleep_duration_minutes is None
+            assert forged.sleep_time_in_bed_minutes is None
+            assert rows["owned"].sleep_provider == "oura"
+        finally:
+            engine.dispose()
+
+    def test_legacy_cleanup_migration_preserves_identity_and_adds_index(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'legacy-cleanup.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "e1f2a3b4c5d6")
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        mirror = sa.Table(
+            "calendar_event_mirror",
+            metadata,
+            autoload_with=engine,
+        )
+        source_key = "actual_sleep:2024-01-02"
+        with engine.begin() as connection:
+            connection.execute(
+                mirror.insert(),
+                {
+                    "id": "c" * 32,
+                    "external_id": "legacy-provider-specific",
+                    "calendar_source": "google",
+                    "summary": "Legacy sleep",
+                    "start_at": datetime(2024, 1, 1, 23, tzinfo=UTC),
+                    "end_at": datetime(2024, 1, 2, 7, tzinfo=UTC),
+                    "is_agent_created": True,
+                    "healthmes_kind": "actual_sleep",
+                    "healthmes_source": "oura",
+                    "healthmes_source_key": source_key,
+                    "sleep_local_date": datetime(2024, 1, 2, tzinfo=UTC).date(),
+                    "sleep_provider": "oura",
+                    "sleep_duration_minutes": 420,
+                    "sleep_time_in_bed_minutes": 480,
+                },
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                source = connection.scalar(
+                    sa.text(
+                        "SELECT healthmes_source FROM calendar_event_mirror "
+                        "WHERE external_id = 'legacy-provider-specific'"
+                    )
+                )
+            indexes = {
+                item["name"]
+                for item in sa.inspect(engine).get_indexes(
+                    "calendar_event_mirror"
+                )
+            }
+            assert source == "oura"
+            assert "ix_calendar_event_mirror_actual_sleep_cleanup" in indexes
+            assert "ux_calendar_event_mirror_calendar_identity" in indexes
+            assert (
+                "ux_calendar_event_mirror_source_healthmes_source_key"
+                not in indexes
+            )
+        finally:
+            engine.dispose()
+
+    def test_legacy_cleanup_downgrade_quarantines_source_key_conflicts(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'legacy-cleanup-downgrade.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        mirror = sa.Table(
+            "calendar_event_mirror",
+            metadata,
+            autoload_with=engine,
+        )
+        source_key = "actual_sleep:2024-01-02"
+        common = {
+            "calendar_source": "google",
+            "summary": "Sleep",
+            "start_at": datetime(2024, 1, 1, 23, tzinfo=UTC),
+            "end_at": datetime(2024, 1, 2, 7, tzinfo=UTC),
+            "is_agent_created": True,
+            "healthmes_kind": "actual_sleep",
+            "healthmes_source_key": source_key,
+            "sleep_local_date": datetime(2024, 1, 2, tzinfo=UTC).date(),
+            "sleep_duration_minutes": 420,
+        }
+        with engine.begin() as connection:
+            connection.execute(
+                mirror.insert(),
+                [
+                    {
+                        **common,
+                        "id": "c" * 32,
+                        "external_id": "canonical",
+                        "healthmes_source": "open-wearables",
+                        "sleep_provider": "oura",
+                    },
+                    {
+                        **common,
+                        "id": "d" * 32,
+                        "external_id": "legacy",
+                        "healthmes_source": "oura",
+                        "sleep_provider": "oura",
+                    },
+                ],
+            )
+        engine.dispose()
+
+        command.downgrade(config, "e1f2a3b4c5d6")
+
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                rows = {
+                    row.external_id: row
+                    for row in connection.execute(
+                        sa.text(
+                            "SELECT external_id, is_agent_created, "
+                            "healthmes_kind, healthmes_source, "
+                            "healthmes_source_key, sleep_local_date "
+                            "FROM calendar_event_mirror"
+                        )
+                    )
+                }
+            indexes = {
+                item["name"]
+                for item in sa.inspect(engine).get_indexes(
+                    "calendar_event_mirror"
+                )
+            }
+            assert rows["canonical"].healthmes_source_key == source_key
+            assert rows["legacy"].is_agent_created == 0
+            assert rows["legacy"].healthmes_kind is None
+            assert rows["legacy"].healthmes_source is None
+            assert rows["legacy"].healthmes_source_key is None
+            assert rows["legacy"].sleep_local_date is None
+            assert "ux_calendar_event_mirror_source_healthmes_source_key" in indexes
+        finally:
+            engine.dispose()

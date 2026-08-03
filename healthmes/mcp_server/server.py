@@ -62,11 +62,12 @@ from healthmes.calendars.adjustments import (
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
     SqlAlchemyAdjustmentRepository,
+    digest_reply_handle,
     issue_reply_handle,
-    verify_reply_handle,
 )
 from healthmes.calendars.base import HealthmesEventKind
 from healthmes.calendars.google import GoogleCalendarBackend
+from healthmes.calendars.intake import intake_revision
 from healthmes.calendars.sleep_context import (
     actual_sleep_context,
     actual_sleep_observation_context,
@@ -357,25 +358,45 @@ def _adjustment_handle_secret(settings: Settings | None = None) -> str:
     value = settings.calendar_adjustment_secret.get_secret_value().strip()
     if len(value) < 32:
         raise ToolError(
-            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET must be configured with at least 32 characters"
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET must be configured "
+            "with at least 32 characters"
         )
     return value
 
 
-def _require_trusted_session_proof(
+def _telegram_owner_binding(settings: Settings | None = None) -> tuple[str, str]:
+    settings = settings or _active_settings()
+    user_id = settings.telegram_owner_user_id.strip()
+    chat_id = settings.telegram_owner_chat_id.strip()
+    if not user_id or not chat_id or "*" in {user_id, chat_id}:
+        raise ToolError(
+            "HEALTHMES_TELEGRAM_OWNER_USER_ID and "
+            "HEALTHMES_TELEGRAM_OWNER_CHAT_ID must bind one explicit owner"
+        )
+    return user_id, chat_id
+
+
+def _require_trusted_telegram_owner_proof(
     proof: str | None,
+    *,
     tool_name: str,
     arguments: Mapping[str, Any],
 ) -> None:
-    if not verify_trusted_session_proof(
-        proof,
-        _adjustment_handle_secret(),
-        tool_name=tool_name,
-        arguments=arguments,
+    owner_user_id, owner_chat_id = _telegram_owner_binding()
+    if (
+        verify_trusted_session_proof(
+            proof,
+            _adjustment_handle_secret(),
+            tool_name=tool_name,
+            arguments=arguments,
+            expected_user_id=owner_user_id,
+            expected_chat_id=owner_chat_id,
+        )
+        is None
     ):
         raise ToolError(
             "trusted_session_proof is missing or invalid; "
-            "resolve only from an explicit live Telegram reply"
+            "resolve only from the configured owner's live Telegram reply"
         )
 
 
@@ -757,12 +778,24 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
             actual_sleep_block = actual_sleep_observation_context(fresh_sleep, tz)
 
     # --- sleep debt (internal sleep score; algorithms/sleep.py, never reinvented)
-    internal_scores = interpret.daily_series(
-        _localized(_score_points(score_rows, "sleep", provider="internal"), tz),
-        how="max",
+    internal_sleep_points = _localized(
+        _score_points(score_rows, "sleep", provider="internal"), tz
     )
+    internal_scores = interpret.daily_series(internal_sleep_points, how="max")
     if internal_scores:
-        sleep_block = interpret.sleep_debt(internal_scores, as_of)
+        internal_recorded_at = {
+            day: max(
+                recorded_at
+                for recorded_at, value in internal_sleep_points
+                if recorded_at.date() == day and value == score
+            )
+            for day, score in internal_scores.items()
+        }
+        sleep_block = interpret.sleep_debt(
+            internal_scores,
+            as_of,
+            recorded_at_by_day=internal_recorded_at,
+        )
         sleep_block["source"] = "internal_sleep_score"
     else:
         sleep_block = {
@@ -805,6 +838,7 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
 
     # --- charge scores (freshest body_battery / readiness / recovery)
     charge_entries: list[dict[str, Any]] = []
+    charge_recorded_times: list[dt.datetime] = []
     for category in CHARGE_CATEGORIES:
         candidates = [
             (recorded_at, value, row)
@@ -819,6 +853,7 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
         if not candidates:
             continue
         recorded_at, value, row = max(candidates, key=lambda item: item[0])
+        charge_recorded_times.append(recorded_at)
         charge_entries.append(
             {
                 "category": category,
@@ -826,14 +861,18 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
                 "value": round(value, 1),
                 "qualifier": row.get("qualifier"),
                 "observed_on": recorded_at.date().isoformat(),
+                "recorded_at": recorded_at.isoformat(),
             }
         )
     if charge_entries:
-        freshest = max(entry["observed_on"] for entry in charge_entries)
+        freshest_at = max(charge_recorded_times)
         charge_block: dict[str, Any] = {
             "status": interpret.STATUS_OK,
             "entries": charge_entries,
-            "confidence": "high" if freshest == as_of.isoformat() else "medium",
+            "freshest_at": freshest_at.isoformat(),
+            "confidence": (
+                "high" if freshest_at.date() == as_of else "medium"
+            ),
         }
     else:
         charge_block = {
@@ -1235,9 +1274,13 @@ async def _arousal_hints_for(
             (day - dt.timedelta(days=interpret.BASELINE_WINDOW_DAYS)).isoformat(),
             day.isoformat(),
         )
-        rhr_series = interpret.summary_daily_values(rhr_rows, "resting_heart_rate_bpm", day)
+        rhr_series = interpret.summary_daily_values(
+            rhr_rows, "resting_heart_rate_bpm", day
+        )
     except (OWClientError, httpx.HTTPError) as exc:
-        logging.getLogger(__name__).warning("arousal hints: open-wearables fetch failed: %s", exc)
+        logging.getLogger(__name__).warning(
+            "arousal hints: open-wearables fetch failed: %s", exc
+        )
         return {
             "status": arousal.STATUS_INSUFFICIENT,
             "reason": "wearable_fetch_failed",
@@ -1352,7 +1395,9 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
             "confidence": "low",
             "truncated": False,
             "intervals": [],
-            "arousal_hints": await _arousal_hints_for(client, user_id, day, tz, start_utc, end_utc),
+            "arousal_hints": await _arousal_hints_for(
+                client, user_id, day, tz, start_utc, end_utc
+            ),
         }
     if series_truncated and not samples_utc:
         return {
@@ -1364,7 +1409,9 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
             "coverage": 0.0,
             "truncated": True,
             "intervals": [],
-            "arousal_hints": await _arousal_hints_for(client, user_id, day, tz, start_utc, end_utc),
+            "arousal_hints": await _arousal_hints_for(
+                client, user_id, day, tz, start_utc, end_utc
+            ),
         }
 
     day_level: dict[str, Any] | None = None
@@ -1827,7 +1874,6 @@ def _serialize_task(task: Task) -> dict[str, Any]:
         "updated_at": _iso_utc(task.updated_at),
     }
 
-
 GOAL_STATUSES = {"active", "done", "dropped"}
 
 
@@ -1842,7 +1888,9 @@ def _serialize_goal(goal: Any, *, scope: str) -> dict[str, Any]:
         "status": goal.status,
     }
     if scope == "weekly":
-        payload["monthly_goal_id"] = str(goal.monthly_goal_id) if goal.monthly_goal_id else None
+        payload["monthly_goal_id"] = (
+            str(goal.monthly_goal_id) if goal.monthly_goal_id else None
+        )
     return payload
 
 
@@ -1859,7 +1907,9 @@ def _resolve_monthly_ref(session: Any, ref: str) -> tuple[Any | None, str | None
     except ValueError:
         pass
     matches = list(
-        session.scalars(select(MonthlyGoal).where(func.lower(MonthlyGoal.title) == cleaned.lower()))
+        session.scalars(
+            select(MonthlyGoal).where(func.lower(MonthlyGoal.title) == cleaned.lower())
+        )
     )
     if len(matches) == 1:
         return matches[0], None
@@ -1890,7 +1940,9 @@ def list_goals(include_done: bool = False) -> dict[str, Any]:
     monthly_rows.sort(
         key=lambda g: (g.month_start.isoformat(), g.priority, str(g.id)), reverse=True
     )
-    weekly_rows.sort(key=lambda g: (g.week_start.isoformat(), g.priority, str(g.id)), reverse=True)
+    weekly_rows.sort(
+        key=lambda g: (g.week_start.isoformat(), g.priority, str(g.id)), reverse=True
+    )
 
     by_month: dict[str, dict[str, Any]] = {}
     for goal in monthly_rows:
@@ -2288,50 +2340,39 @@ async def evaluate_morning_calendar_nudge(date: str | None = None) -> dict[str, 
 
 @mcp.tool
 def resolve_calendar_adjustment(
-    proposal_id: str,
     response: str,
     reply_handle: str | None = None,
-    response_channel: str | None = None,
     trusted_session_proof: str | None = None,
 ) -> dict[str, Any]:
     """Resolve one live Telegram confirmation against its one-time proposal handle.
 
-    Only an explicit apply response may enter the separate conditional Google
-    writer; decline, expiry, invalid, stale, replayed, and conflicted responses
-    return redacted receipts without a calendar write.
+    The exact live reply is ``적용 <handle>`` or ``그대로 <handle>``. The server
+    resolves the pending proposal from that handle and accepts only a fresh,
+    owner-bound Telegram proof minted by the Hermes gateway.
     """
-    proof_arguments = {
-        "proposal_id": proposal_id,
-        "response": response,
-        "reply_handle": reply_handle,
-        "response_channel": response_channel,
-    }
-    _require_trusted_session_proof(
-        trusted_session_proof,
-        "resolve_calendar_adjustment",
-        proof_arguments,
-    )
-    if response_channel != "telegram":
-        raise ToolError("response_channel must be telegram")
-    normalized_response = response.strip()
-    if normalized_response not in {
+    if not reply_handle:
+        raise ToolError("reply_handle is missing or invalid")
+    if response != response.strip() or response not in {
         f"적용 {reply_handle}",
         f"그대로 {reply_handle}",
     }:
         raise ToolError("response must be the exact live Telegram reply")
-    response_choice = normalized_response.split(" ", 1)[0]
-    proposal_uuid = _parse_uuid(proposal_id, "proposal_id")
+    proof_arguments = {
+        "response": response,
+        "reply_handle": reply_handle,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="resolve_calendar_adjustment",
+        arguments=proof_arguments,
+    )
+    handle_digest = digest_reply_handle(reply_handle, _adjustment_handle_secret())
+
     with _store_session() as session:
         repository = SqlAlchemyAdjustmentRepository(session)
-        proposal = repository.get_proposal(proposal_uuid)
+        proposal = repository.get_pending_proposal_by_handle_digest(handle_digest)
         if proposal is None:
-            raise ToolError("calendar adjustment proposal not found")
-        if not reply_handle or not verify_reply_handle(
-            reply_handle,
-            proposal.reply_handle_digest,
-            _adjustment_handle_secret(),
-        ):
-            raise ToolError("reply_handle is missing or invalid")
+            raise ToolError("reply_handle is invalid, expired, or already consumed")
 
         writer = _calendar_adjustment_writer()
         service = CalendarAdjustmentService(
@@ -2344,14 +2385,14 @@ def resolve_calendar_adjustment(
             else None
         )
         result = service.resolve_calendar_adjustment(
-            proposal_uuid,
-            response=response_choice,
+            proposal.id,
+            response=response.split(" ", 1)[0],
             reply_handle=reply_handle,
             writer=writer,
-            response_channel=response_channel,
+            response_channel="telegram",
             mirror_snapshot=mirror_snapshot,
         )
-        current = repository.get_proposal(proposal_uuid)
+        current = repository.get_proposal(proposal.id)
         outcome_url = (
             _decision_viewer_url(current.outcome_decision_record_id)
             if current is not None and current.outcome_decision_record_id is not None
@@ -2437,7 +2478,9 @@ def propose_schedule_blocks(
                     f"{block.energy_demand!r}"
                 )
         if block.healthmes_kind not in {None, HealthmesEventKind.PLANNED_SLEEP.value}:
-            raise ToolError(f"blocks[{index}].healthmes_kind must be planned_sleep or omitted")
+            raise ToolError(
+                f"blocks[{index}].healthmes_kind must be planned_sleep or omitted"
+            )
     parsed: list[tuple[ScheduleBlockIn, dt.datetime, dt.datetime]] = []
     for index, block in enumerate(blocks):
         start = _parse_datetime_utc(block.start, f"blocks[{index}].start")
@@ -2471,17 +2514,6 @@ def propose_schedule_blocks(
                 )
                 session.add(task)
                 session.flush()
-            conflict_query = select(CalendarEventMirror).where(
-                CalendarEventMirror.start_at < end,
-                CalendarEventMirror.end_at > start,
-            )
-            if block.task_id is not None:
-                conflict_query = conflict_query.where(
-                    or_(
-                        CalendarEventMirror.intake_task_id.is_(None),
-                        CalendarEventMirror.intake_task_id != task.id,
-                    )
-                )
             conflicts = [
                 {
                     "summary": event.summary,
@@ -2490,7 +2522,16 @@ def propose_schedule_blocks(
                     "is_agent_created": event.is_agent_created,
                 }
                 for event in session.scalars(
-                    conflict_query.order_by(CalendarEventMirror.start_at)
+                    select(CalendarEventMirror)
+                    .where(
+                        CalendarEventMirror.start_at < end,
+                        CalendarEventMirror.end_at > start,
+                        or_(
+                            CalendarEventMirror.intake_task_id.is_(None),
+                            CalendarEventMirror.intake_task_id != task.id,
+                        ),
+                    )
+                    .order_by(CalendarEventMirror.start_at)
                 )
             ]
             proposal = ScheduleProposal(
@@ -2501,6 +2542,27 @@ def propose_schedule_blocks(
                 decision_record_id=decision_uuid,
                 healthmes_kind=block.healthmes_kind,
             )
+            intake_matches = [
+                event
+                for event in session.scalars(
+                    select(CalendarEventMirror).where(
+                        CalendarEventMirror.intake_task_id == task.id,
+                        CalendarEventMirror.is_agent_created.is_(False),
+                        CalendarEventMirror.is_all_day.is_(False),
+                    )
+                )
+                if _ensure_utc_dt(event.start_at) == start
+                and _ensure_utc_dt(event.end_at) == end
+            ]
+            if len(intake_matches) > 1:
+                raise ToolError(
+                    f"blocks[{index}]: multiple timed intake events match this block"
+                )
+            if intake_matches:
+                intake_event = intake_matches[0]
+                proposal.intake_calendar_source = intake_event.calendar_source
+                proposal.intake_external_id = intake_event.external_id
+                proposal.intake_revision = intake_revision(intake_event)
             handle = issue_reply_handle(handle_secret)
             proposal.reply_handle_digest = handle.digest
             proposal.expires_at = min(now + SCHEDULE_PROPOSAL_TTL, start)
@@ -2525,73 +2587,90 @@ def propose_schedule_blocks(
 
 @mcp.tool
 def resolve_schedule_proposal(
-    proposal_id: str,
-    action: str,
+    response: str,
     reply_handle: str | None = None,
     trusted_session_proof: str | None = None,
 ) -> dict[str, Any]:
-    """Accept or decline one pending schedule proposal after live user confirmation.
-
-    Pass the exact proposal ID and one-time reply handle returned by
-    ``propose_schedule_blocks``, plus ``action`` as ``accept`` or ``decline``.
-    Accepting queues the block for the calendar sync job; declining leaves the
-    external calendar unchanged. Only unexpired proposals still in ``proposed``
-    state can be resolved.
-    """
+    """Resolve a planner proposal from the configured owner's exact live reply."""
+    if not reply_handle:
+        raise ToolError("reply_handle is missing or invalid")
+    if response != response.strip() or response not in {
+        f"적용 {reply_handle}",
+        f"그대로 {reply_handle}",
+    }:
+        raise ToolError("response must be the exact live Telegram reply")
     proof_arguments = {
-        "proposal_id": proposal_id,
-        "action": action,
+        "response": response,
         "reply_handle": reply_handle,
     }
-    _require_trusted_session_proof(
+    _require_trusted_telegram_owner_proof(
         trusted_session_proof,
-        "resolve_schedule_proposal",
-        proof_arguments,
+        tool_name="resolve_schedule_proposal",
+        arguments=proof_arguments,
     )
-    target_by_action = {
-        "accept": ProposalStatus.ACCEPTED,
-        "decline": ProposalStatus.DECLINED,
-    }
-    target = target_by_action.get(action.strip().lower())
-    if target is None:
-        raise ToolError("action must be accept or decline")
+    handle_digest = digest_reply_handle(reply_handle, _adjustment_handle_secret())
+    target = (
+        ProposalStatus.ACCEPTED
+        if response.startswith("적용 ")
+        else ProposalStatus.DECLINED
+    )
 
-    proposal_uuid = _parse_uuid(proposal_id, "proposal_id")
     with _store_session() as session:
+        proposals = list(
+            session.scalars(
+                select(ScheduleProposal).where(
+                    ScheduleProposal.status == ProposalStatus.PROPOSED,
+                    ScheduleProposal.reply_handle_digest == handle_digest,
+                )
+            )
+        )
+        if len(proposals) != 1:
+            raise ToolError("reply_handle is invalid, expired, or already consumed")
+        proposal = proposals[0]
+        if target is ProposalStatus.ACCEPTED:
+            violation = actual_sleep_violation(
+                session,
+                proposal.proposed_start,
+                proposal.proposed_end,
+                _local_timezone(),
+            )
+            if violation is not None:
+                proposal.status = ProposalStatus.INVALIDATED
+                session.commit()
+                raise ToolError(violation)
         try:
             proposal = schedule_proposals.resolve_schedule_proposal(
                 session,
-                proposal_uuid,
+                proposal.id,
                 target,
                 reply_handle,
                 _adjustment_handle_secret(),
             )
         except schedule_proposals.ScheduleProposalResolutionError as exc:
-            if exc.code == "not_found":
-                raise ToolError(f"schedule proposal {proposal_id} not found") from exc
-            if exc.code == "not_proposed":
-                current = session.get(ScheduleProposal, proposal_uuid)
-                status = _enum_value(current.status) if current is not None else "unknown"
+            if exc.code in {"not_found", "not_proposed", "invalid_handle"}:
                 raise ToolError(
-                    f"schedule proposal {proposal_id} is {status}; "
-                    "only proposed items can be resolved"
+                    "reply_handle is invalid, expired, or already consumed"
                 ) from exc
-            if exc.code == "invalid_handle":
-                raise ToolError("reply_handle is missing or invalid") from exc
             if exc.code == "expired":
                 raise ToolError("schedule proposal has expired") from exc
             raise
         task = session.get(Task, proposal.task_id)
-        result = {
-            "id": str(proposal.id),
-            "task_id": str(proposal.task_id),
-            "task_title": task.title if task is not None else None,
-            "start": _iso_utc(proposal.proposed_start),
-            "end": _iso_utc(proposal.proposed_end),
-            "proposal_status": _enum_value(proposal.status),
-            "calendar_write": "queued" if target is ProposalStatus.ACCEPTED else "unchanged",
+        return {
+            "status": "ok",
+            "proposal": {
+                "id": str(proposal.id),
+                "task_id": str(proposal.task_id),
+                "task_title": task.title if task is not None else None,
+                "start": _iso_utc(proposal.proposed_start),
+                "end": _iso_utc(proposal.proposed_end),
+                "proposal_status": _enum_value(proposal.status),
+                "calendar_write": (
+                    "queued"
+                    if target is ProposalStatus.ACCEPTED
+                    else "unchanged"
+                ),
+            },
         }
-    return {"status": "ok", "proposal": result}
 
 
 @mcp.tool

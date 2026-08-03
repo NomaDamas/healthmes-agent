@@ -180,32 +180,28 @@ class TestTrustedSessionProof:
             "trusted_session_proof": {
                 "secret_env": "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
                 "argument": "trusted_session_proof",
+                "owner_user_id": "owner-user",
+                "owner_chat_id": "owner-chat",
                 "confirmations": {
+                    "resolve_calendar_adjustment": {
+                        "handle_argument": "reply_handle",
+                        "passthrough_argument": "response",
+                        "bind_arguments": ["response", "reply_handle"],
+                        "choices": ["적용", "그대로"],
+                    },
                     "resolve_schedule_proposal": {
                         "handle_argument": "reply_handle",
-                        "action_argument": "action",
-                        "bind_arguments": [
-                            "proposal_id",
-                            "action",
-                            "reply_handle",
-                        ],
-                        "choices": {
-                            "accept": "적용",
-                            "decline": "그대로",
-                        },
-                    }
+                        "passthrough_argument": "response",
+                        "bind_arguments": ["response", "reply_handle"],
+                        "choices": ["적용", "그대로"],
+                    },
                 },
             }
         }
         return server
 
-    def test_exact_live_reply_receives_proof(self, monkeypatch):
-        from gateway.session_context import (
-            clear_session_vars,
-            get_session_env,
-            get_session_message_text,
-            set_session_vars,
-        )
+    def test_exact_live_owner_reply_receives_proof(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
         from tools.mcp_tool import _trusted_session_call_arguments
 
         monkeypatch.setenv(
@@ -214,19 +210,49 @@ class TestTrustedSessionProof:
         )
         tokens = set_session_vars(
             platform="telegram",
-            chat_id="chat-1",
-            user_id="user-1",
+            chat_id="owner-chat",
+            user_id="owner-user",
             message_id="message-1",
+            message_timestamp=str(time.time()),
             message_text="적용 handle-1",
         )
         arguments = {
-            "proposal_id": "proposal-1",
-            "action": "accept",
+            "response": "적용 handle-1",
             "reply_handle": "handle-1",
         }
         try:
-            assert get_session_message_text() == "적용 handle-1"
-            assert get_session_env("HERMES_SESSION_MESSAGE_TEXT") == ""
+            signed = _trusted_session_call_arguments(
+                self._server(),
+                "resolve_calendar_adjustment",
+                arguments,
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert signed.items() >= arguments.items()
+        assert signed["trusted_session_proof"].count(".") == 1
+
+    def test_exact_live_owner_schedule_reply_receives_proof(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool import _trusted_session_call_arguments
+
+        monkeypatch.setenv(
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+            "vendor-test-secret-at-least-32-characters",
+        )
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="owner-chat",
+            user_id="owner-user",
+            message_id="message-2",
+            message_timestamp=str(time.time()),
+            message_text="그대로 handle-2",
+        )
+        arguments = {
+            "response": "그대로 handle-2",
+            "reply_handle": "handle-2",
+        }
+        try:
             signed = _trusted_session_call_arguments(
                 self._server(),
                 "resolve_schedule_proposal",
@@ -238,24 +264,97 @@ class TestTrustedSessionProof:
         assert signed.items() >= arguments.items()
         assert signed["trusted_session_proof"].count(".") == 1
 
+    def test_stale_owner_reply_receives_no_proof(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool import _trusted_session_call_arguments
+
+        monkeypatch.setenv(
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+            "vendor-test-secret-at-least-32-characters",
+        )
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="owner-chat",
+            user_id="owner-user",
+            message_id="message-stale",
+            message_timestamp=str(time.time() - 301),
+            message_text="적용 handle-1",
+        )
+        arguments = {
+            "response": "적용 handle-1",
+            "reply_handle": "handle-1",
+        }
+        try:
+            unsigned = _trusted_session_call_arguments(
+                self._server(),
+                "resolve_schedule_proposal",
+                arguments,
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert unsigned == arguments
+
+    def test_cli_or_cron_schedule_call_receives_no_proof(self, monkeypatch):
+        from tools.mcp_tool import _trusted_session_call_arguments
+
+        monkeypatch.setenv(
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+            "vendor-test-secret-at-least-32-characters",
+        )
+        arguments = {
+            "response": "적용 handle-1",
+            "reply_handle": "handle-1",
+        }
+
+        assert (
+            _trusted_session_call_arguments(
+                self._server(),
+                "resolve_schedule_proposal",
+                arguments,
+            )
+            == arguments
+        )
+
     @pytest.mark.parametrize(
         "session",
         [
             {
                 "platform": "telegram",
-                "chat_id": "chat-1",
-                "user_id": "user-1",
+                "chat_id": "owner-chat",
+                "user_id": "different-user",
+                "message_id": "message-1",
+                "message_text": "적용 handle-1",
+            },
+            {
+                "platform": "telegram",
+                "chat_id": "owner-chat",
+                "user_id": "owner-user",
                 "message_id": "message-1",
                 "message_text": "오늘 일정 보여줘",
             },
             {
                 "platform": "telegram",
-                "chat_id": "chat-1",
+                "chat_id": "owner-chat",
+                "user_id": "owner-user",
+                "message_id": "message-1",
+                "message_text": " 적용 handle-1 ",
+            },
+            {
+                "platform": "discord",
+                "chat_id": "owner-chat",
+                "user_id": "owner-user",
+                "message_id": "message-1",
+                "message_text": "적용 handle-1",
+            },
+            {
+                "platform": "telegram",
+                "chat_id": "owner-chat",
                 "message_text": "적용 handle-1",
             },
         ],
     )
-    def test_non_confirmation_or_non_live_session_receives_no_proof(
+    def test_non_owner_non_confirmation_or_non_live_session_receives_no_proof(
         self,
         session,
         monkeypatch,
@@ -269,14 +368,13 @@ class TestTrustedSessionProof:
         )
         tokens = set_session_vars(**session)
         arguments = {
-            "proposal_id": "proposal-1",
-            "action": "accept",
+            "response": "적용 handle-1",
             "reply_handle": "handle-1",
         }
         try:
             unchanged = _trusted_session_call_arguments(
                 self._server(),
-                "resolve_schedule_proposal",
+                "resolve_calendar_adjustment",
                 arguments,
             )
         finally:

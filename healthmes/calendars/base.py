@@ -92,6 +92,7 @@ class HealthmesEventKind(StrEnum):
     TASK_BLOCK = "task_block"
     ACTUAL_SLEEP = "actual_sleep"
     PLANNED_SLEEP = "planned_sleep"
+    SCHEDULE_BLOCK = "schedule_block"
 
 
 def parse_event_kind(value: object) -> HealthmesEventKind | None:
@@ -238,6 +239,7 @@ class ExternalEvent:
 
     external_id: str
     summary: str | None = None
+    description: str | None = None
     start_at: datetime | None = None
     end_at: datetime | None = None
     is_agent_created: bool = False
@@ -289,11 +291,6 @@ class ConfirmedExternalTimeChange:
         if not self.expected_etag:
             raise ValueError("ConfirmedExternalTimeChange.expected_etag must be non-empty")
 
-        original_start_date = self.original_start_at.date()
-        original_end_date = self.original_end_at.date()
-        proposed_start_date = self.proposed_start_at.date()
-        proposed_end_date = self.proposed_end_at.date()
-
         original_start = ensure_utc(self.original_start_at)
         original_end = ensure_utc(self.original_end_at)
         proposed_start = ensure_utc(self.proposed_start_at)
@@ -318,14 +315,6 @@ class ConfirmedExternalTimeChange:
             raise ValueError("proposed duration must be at least 30 minutes")
         if original_end - proposed_end != timedelta(minutes=30):
             raise ValueError("v0 external time changes must shorten by exactly 30 minutes")
-        dates = {
-            original_start_date,
-            original_end_date,
-            proposed_start_date,
-            proposed_end_date,
-        }
-        if len(dates) != 1:
-            raise ValueError("v0 external time changes must remain on one local date")
 
 
 @dataclass(frozen=True, slots=True)

@@ -13,7 +13,7 @@ only relative paths are stored here (``media_path`` columns).
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import ForeignKey, Index, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, UniqueConstraint, false
 from sqlalchemy.orm import Mapped, mapped_column
 
 from healthmes.store.base import Base, JSONDict, str_32, str_64, str_255, string_enum
@@ -108,10 +108,18 @@ class CalendarEventMirror(Base):
             name="uq_calendar_event_mirror_source_external_id",
         ),
         Index(
-            "ux_calendar_event_mirror_source_healthmes_source_key",
+            "ux_calendar_event_mirror_calendar_identity",
             "calendar_source",
+            "healthmes_kind",
+            "healthmes_source",
             "healthmes_source_key",
             unique=True,
+        ),
+        Index(
+            "ix_calendar_event_mirror_actual_sleep_cleanup",
+            "calendar_source",
+            "healthmes_kind",
+            "sleep_local_date",
         ),
     )
 
@@ -127,11 +135,16 @@ class CalendarEventMirror(Base):
     intake_task_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("task.id", ondelete="SET NULL"), index=True
     )
+    intake_opted_out: Mapped[bool] = mapped_column(
+        default=False,
+        server_default=false(),
+    )
     healthmes_kind: Mapped[str_64 | None]
     healthmes_source: Mapped[str_255 | None]
     healthmes_source_key: Mapped[str_255 | None]
     observation_fingerprint: Mapped[str_255 | None]
     sleep_local_date: Mapped[date | None] = mapped_column(index=True)
+    sleep_provider: Mapped[str_255 | None]
     sleep_duration_minutes: Mapped[int | None]
     sleep_time_in_bed_minutes: Mapped[int | None]
     etag: Mapped[str_255 | None]
@@ -160,8 +173,13 @@ class ScheduleProposal(Base):
         ForeignKey("decision_record.id", ondelete="SET NULL")
     )
     healthmes_kind: Mapped[str_64 | None]
-    reply_handle_digest: Mapped[str_255 | None]
+    reply_handle_digest: Mapped[str_255 | None] = mapped_column(
+        index=True, unique=True
+    )
     expires_at: Mapped[datetime | None] = mapped_column(index=True)
+    intake_calendar_source: Mapped[CalendarSource | None]
+    intake_external_id: Mapped[str_255 | None]
+    intake_revision: Mapped[str_255 | None]
 
 
 class CalendarMutationProposal(Base):

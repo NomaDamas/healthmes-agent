@@ -25,7 +25,7 @@ WatchConnectivity and then talks to the instance directly.
   ❌ Keep as is → `…/decline`, ✏️ Adjust → proposal detail sheet. A second
   tap elsewhere (or in Telegram) surfaces as the server's 409
   `invalid_transition` → rendered "Already resolved (accepted/declined)".
-  App actions return the scoped `resolution_token` from the authenticated
+  App actions return the action-scoped `resolution_token` from the authenticated
   pending-proposal response.
 - **Weekly report** — native rendering of `GET /reports/weekly.json`:
   per-day energy bars (hollow stubs for missing days), insights with

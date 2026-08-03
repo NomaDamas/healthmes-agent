@@ -50,6 +50,7 @@ class ProposalStatus(StrEnum):
     ACCEPTED = "accepted"
     PUSHED = "pushed"
     DECLINED = "declined"
+    INVALIDATED = "invalidated"
 
 
 class CalendarMutationOperation(StrEnum):

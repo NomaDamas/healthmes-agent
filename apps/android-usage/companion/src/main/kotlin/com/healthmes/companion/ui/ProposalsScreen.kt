@@ -83,7 +83,7 @@ fun ProposalsScreen(services: AppServices, modifier: Modifier = Modifier) {
         scope.launch {
             val outcome = withContext(Dispatchers.IO) {
                 val api = services.api()
-                val body = proposal.resolutionBody()
+                val body = proposal.resolutionBody(accept)
                 if (api == null) {
                     null
                 } else if (body == null) {

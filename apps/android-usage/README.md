@@ -17,16 +17,16 @@ deliberately *duplicates* its pairing-prefs pattern instead of importing it.
 
 ## Build matrix
 
-Toolchain for everything: Gradle 8.9 (wrapper), AGP 8.7.3, Kotlin 2.0.21
+Toolchain for everything: Gradle 9.6.1 (wrapper), AGP 9.3.1, Kotlin 2.0.21
 (+ `org.jetbrains.kotlin.plugin.compose` 2.0.21 for `:companion`'s Glance
-code), JDK 17+, `compileSdk = 35`. Point the build at an SDK with platform 35
+code), JDK 17+, `compileSdk = 36`. Point the build at an SDK with platform 36
 via `ANDROID_HOME` or `local.properties`.
 
 | Module | Type | minSdk | Key libraries | Build | JVM unit tests |
 |---|---|---|---|---|---|
 | `:app` | phone app | 26 | WorkManager 2.9.1, security-crypto | `:app:assembleDebug` | `:app:testDebugUnitTest` (hourly bucketing) |
 | `:shared` | library | 26 | security-crypto, org.json (platform) | `:shared:assembleDebug` | tested via `:companion` |
-| `:companion` | phone app | 26 | Compose BOM 2024.10.01 (material3), activity-compose 1.9.3, browser 1.8.0, Glance 1.1.1, WorkManager 2.9.1 | `:companion:assembleDebug` | `:companion:testDebugUnitTest` (glance/alerts/report/proposals contract parsers, state mapper, notification grammar + action plan, proposal-action logic, multipart upload bodies, curve geometry, focus-block selection) |
+| `:companion` | phone app | 26 | Compose BOM 2024.10.01 (material3), activity-compose 1.9.3, browser 1.10.0, Glance 1.1.1, WorkManager 2.9.1 | `:companion:assembleDebug` | `:companion:testDebugUnitTest` (glance/alerts/report/proposals contract parsers, state mapper, notification grammar + action plan, proposal-action logic, multipart upload bodies, curve geometry, focus-block selection) |
 | `:wear` | Wear OS app | 30 | tiles 1.4.1, protolayout 1.2.1, watchface-complications-data-source 1.2.1 | `:wear:assembleDebug` | — (logic lives in `:shared`, tested via `:companion`) |
 
 ```bash
@@ -69,7 +69,7 @@ channel).
 - **Real §8.5 notification actions**: ✅ Apply / ❌ Keep as is enqueue a
   one-shot WorkManager job that resolves the pending schedule proposal and
   calls `POST /v1/schedule/proposals/{id}/accept|decline` with the bearer
-  client plus the scoped `resolution_token` from the authenticated proposal
+  client plus the action-scoped `resolution_token` from the authenticated proposal
   list. Because alerts carry no proposal id yet (server-side linkage gap),
   the worker acts only when exactly ONE proposal is pending; zero or 2+ route
   into the app instead of guessing (PLAN.md §11). Second taps render the

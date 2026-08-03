@@ -313,6 +313,8 @@ def mcp_env(
             ow_api_key=API_KEY,
             public_base_url="http://healthmes.test:8100",
             calendar_adjustment_secret="test-calendar-adjustment-secret-32-characters",
+            telegram_owner_user_id="owner-user",
+            telegram_owner_chat_id="owner-chat",
             data_dir=tmp_path / "data",
             scheduler_enabled=False,
             _env_file=None,

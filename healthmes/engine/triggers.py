@@ -43,6 +43,7 @@ from typing import Any, Protocol
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.calendars.adjustments_proposals import provider_revision_fingerprint
 from healthmes.config import Settings, resolve_timezone
 from healthmes.engine.rules import (
     ALL_RULES,
@@ -59,8 +60,14 @@ from healthmes.engine.rules import (
 )
 from healthmes.engine.webhook import HermesWebhookSender, WebhookResult
 from healthmes.mcp_server import interpret
-from healthmes.store.enums import ProposalStatus
-from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task, TriggerEvent
+from healthmes.store.enums import CalendarMutationStatus, ProposalStatus
+from healthmes.store.models import (
+    CalendarEventMirror,
+    CalendarMutationProposal,
+    ScheduleProposal,
+    Task,
+    TriggerEvent,
+)
 from healthmes.store.session import session_scope
 
 __all__ = [
@@ -427,6 +434,9 @@ def _load_schedule_changes(
     rows = session.scalars(
         select(CalendarEventMirror).where(CalendarEventMirror.updated_at >= cutoff)
     ).all()
+    internal_revisions = _confirmed_internal_adjustment_revisions(
+        session, rows=rows, cutoff=cutoff
+    )
 
     changes: list[ScheduleChange] = []
     for row in rows:
@@ -435,6 +445,14 @@ def _load_schedule_changes(
         is_new = created_at >= cutoff and updated_at == created_at
         start_utc = _ensure_utc(row.start_at)
         end_utc = _ensure_utc(row.end_at)
+        revision = provider_revision_fingerprint(row.etag)
+        if revision is not None and (
+            row.id,
+            revision,
+            start_utc,
+            end_utc,
+        ) in internal_revisions:
+            continue
         if row.is_agent_created:
             # The user touched an agent block in the external calendar
             # (external wins; only real external edits move updated_at past
@@ -462,6 +480,44 @@ def _load_schedule_changes(
             )
         )
     return tuple(changes)
+
+
+def _confirmed_internal_adjustment_revisions(
+    session: Session,
+    *,
+    rows: Sequence[CalendarEventMirror],
+    cutoff: datetime,
+) -> set[tuple[Any, str, datetime, datetime]]:
+    mirror_ids = [row.id for row in rows]
+    if not mirror_ids:
+        return set()
+    proposals = session.scalars(
+        select(CalendarMutationProposal).where(
+            CalendarMutationProposal.mirror_event_id.in_(mirror_ids),
+            CalendarMutationProposal.status.in_(
+                [
+                    CalendarMutationStatus.APPLIED,
+                    CalendarMutationStatus.APPLIED_RECOVERED,
+                ]
+            ),
+            CalendarMutationProposal.updated_at >= cutoff,
+        )
+    ).all()
+    revisions: set[tuple[Any, str, datetime, datetime]] = set()
+    for proposal in proposals:
+        receipt = proposal.receipt if isinstance(proposal.receipt, dict) else {}
+        revision = receipt.get("provider_revision")
+        if not isinstance(revision, str) or not revision:
+            continue
+        revisions.add(
+            (
+                proposal.mirror_event_id,
+                revision,
+                _ensure_utc(proposal.proposed_start_at),
+                _ensure_utc(proposal.proposed_end_at),
+            )
+        )
+    return revisions
 
 
 def _load_deadline_tasks(

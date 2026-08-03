@@ -111,6 +111,15 @@ def build_alert_prompt(fire: TriggerFire, *, public_base_url: str, fired_at: dat
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    # JSON string escaping does not escape angle brackets. Escape the HTML
+    # significant characters so provider text cannot terminate the envelope.
+    trigger_data = (
+        trigger_data.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
     return (
         f"HealthMes deterministic trigger '{fire.rule_id}' fired at "
         f"{fired_at.isoformat()}. Act as the proactive health-aware planner: "

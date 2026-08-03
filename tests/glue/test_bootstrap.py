@@ -30,6 +30,8 @@ def env_file(tmp_path: Path) -> Path:
     path = tmp_path / ".env"
     path.write_text(
         "TELEGRAM_BOT_TOKEN=123456:test-token\n"
+        "HEALTHMES_TELEGRAM_OWNER_USER_ID=owner-user\n"
+        "HEALTHMES_TELEGRAM_OWNER_CHAT_ID=owner-chat\n"
         "OPEN_WEARABLES_API_KEY=ow-test-key\n",
         encoding="utf-8",
     )
@@ -58,6 +60,7 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     # 1. config.yaml rendered and parseable, with vendor-contract keys.
     config = yaml.safe_load((hermes_home / "config.yaml").read_text())
     assert config["platforms"]["telegram"]["token"] == "123456:test-token"
+    assert config["platforms"]["telegram"]["extra"]["allow_from"] == ["owner-user"]
     route = config["platforms"]["webhook"]["extra"]["routes"]["healthmes-alerts"]
     assert route["skills"] == ["healthmes-planner"]
     assert route["deliver"] == "telegram"
@@ -70,6 +73,9 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     # Native defaults: localhost endpoints, repo-local vendored MCP dir.
     servers = config["mcp_servers"]
     assert servers["healthmes"]["url"] == "http://localhost:8100/mcp"
+    trusted = servers["healthmes"]["trusted_session_proof"]
+    assert trusted["owner_user_id"] == "owner-user"
+    assert trusted["owner_chat_id"] == "owner-chat"
     ow = servers["open_wearables"]
     assert ow["env"]["OPEN_WEARABLES_API_URL"] == "http://localhost:8000"
     assert ow["env"]["OPEN_WEARABLES_API_KEY"] == "ow-test-key"
@@ -140,6 +146,123 @@ def test_second_run_is_idempotent(bootstrap, hermes_home, env_file):
         j["id"] for j in jobs_before["jobs"]
     ]
     assert env_file.read_text() == env_before
+
+
+def test_exact_legacy_morning_cron_is_upgraded_without_resetting_runtime_state(
+    bootstrap, hermes_home, env_file
+):
+    created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
+    legacy = bootstrap.build_fallback_job(
+        prompt=(
+            "Morning briefing. A HealthMes state snapshot (open tasks, "
+            "today's events, pending proposals, energy forecast) is injected "
+            "above; use it as context and read today's readiness via the "
+            "healthmes MCP tools, then propose today's block layout based "
+            "on the energy picture. One message in the standard notification "
+            "grammar."
+        ),
+        schedule="0 7 * * *",
+        name="healthmes-morning-plan",
+        deliver="telegram",
+        skills=["healthmes-planner"],
+        script=bootstrap.SNAPSHOT_SCRIPT_NAME,
+        now=created_at,
+    )
+    legacy.update(
+        {
+            "enabled": False,
+            "state": "paused",
+            "paused_at": "2026-07-02T08:00:00+00:00",
+            "paused_reason": "user requested",
+            "repeat": {"times": None, "completed": 9},
+            "next_run_at": "2026-07-03T08:30:00+00:00",
+            "last_run_at": "2026-07-02T08:30:00+00:00",
+            "last_status": "error",
+            "last_error": "legacy failure",
+            "last_delivery_error": "legacy delivery failure",
+        }
+    )
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    bootstrap._write_jobs_envelope(jobs_file, [legacy], now=created_at)
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    jobs = yaml.safe_load(jobs_file.read_text())["jobs"]
+    morning = next(job for job in jobs if job["name"] == "healthmes-morning-plan")
+    desired = next(
+        job for job in bootstrap.BRIEFING_JOBS if job["name"] == "healthmes-morning-plan"
+    )
+    assert morning["id"] == legacy["id"]
+    for field in bootstrap.HEALTHMES_MANAGED_CRON_FIELDS:
+        if field == "schedule":
+            assert morning[field]["expr"] == desired[field]
+        else:
+            assert morning[field] == desired[field]
+    assert morning["origin"] == bootstrap.HEALTHMES_CRON_ORIGIN
+    for field in (
+        "enabled",
+        "state",
+        "paused_at",
+        "paused_reason",
+        "repeat",
+        "created_at",
+        "next_run_at",
+        "last_run_at",
+        "last_status",
+        "last_error",
+        "last_delivery_error",
+    ):
+        assert morning[field] == legacy[field]
+
+
+def test_unmanaged_same_name_healthmes_prompt_cron_is_not_overwritten(
+    bootstrap, hermes_home, env_file
+):
+    created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
+    user_job = bootstrap.build_fallback_job(
+        prompt="Run my private HealthMes morning workflow.",
+        schedule="15 6 * * *",
+        name="healthmes-morning-plan",
+        deliver="local",
+        skills=["personal-planner"],
+        script="personal_morning.py",
+        origin={"source": "user"},
+        now=created_at,
+    )
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    bootstrap._write_jobs_envelope(jobs_file, [user_job], now=created_at)
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    jobs = yaml.safe_load(jobs_file.read_text())["jobs"]
+    unchanged = next(job for job in jobs if job["id"] == user_job["id"])
+    assert unchanged == user_job
+
+
+@pytest.mark.parametrize("origin_state", ["null", "missing"])
+def test_originless_same_name_healthmes_prompt_cron_is_not_overwritten(
+    bootstrap, hermes_home, env_file, origin_state
+):
+    created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
+    user_job = bootstrap.build_fallback_job(
+        prompt="Run my private HealthMes morning workflow.",
+        schedule="15 6 * * *",
+        name="healthmes-morning-plan",
+        deliver="local",
+        skills=["personal-planner"],
+        script="personal_morning.py",
+        now=created_at,
+    )
+    if origin_state == "missing":
+        user_job.pop("origin")
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    bootstrap._write_jobs_envelope(jobs_file, [user_job], now=created_at)
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    jobs = yaml.safe_load(jobs_file.read_text())["jobs"]
+    unchanged = next(job for job in jobs if job["id"] == user_job["id"])
+    assert unchanged == user_job
 
 
 def test_dry_run_writes_nothing(bootstrap, hermes_home, env_file, capsys):
@@ -337,6 +460,9 @@ def test_planner_skill_documents_morning_nudge_trust_boundary():
     assert "do not call `clarify`, and do not wait for a reply" in normalized
     assert "Only live Telegram replies may call" in normalized
     assert "mcp__healthmes__resolve_calendar_adjustment" in normalized
+    assert "exact combined reply as `response`" in normalized
+    assert "unchanged `<handle>` as `reply_handle`" in normalized
+    assert "Do not pass a proposal id or response channel" in normalized
     assert (
         "Do not rewrite, shorten, translate, log, or expose the handle"
         in normalized
@@ -352,6 +478,21 @@ def test_sleep_skill_documents_open_wearables_exclusive_end_date():
     assert "The Open Wearables `end_date` is exclusive" in normalized
     assert "use the day after the target date as `end_date`" in normalized
     assert "select the record whose `date` exactly matches the target date" in normalized
+
+
+def test_wildcard_telegram_owner_is_rejected(bootstrap, tmp_path):
+    env = {
+        "HEALTHMES_TELEGRAM_OWNER_USER_ID": "*",
+        "HEALTHMES_TELEGRAM_OWNER_CHAT_ID": "owner-chat",
+    }
+
+    with pytest.raises(ValueError, match="explicit"):
+        bootstrap.build_context(
+            env,
+            "native",
+            tmp_path,
+            "webhook-secret",
+        )
 
 
 def test_legacy_symlink_is_migrated_to_copy(bootstrap, hermes_home, env_file, tmp_path):

@@ -62,7 +62,7 @@ class ProposalActionWorker(appContext: Context, params: WorkerParameters) :
                 context, Outcome.Retry("could not list pending proposals")
             )
         }
-        val body = proposal.resolutionBody()
+        val body = proposal.resolutionBody(accept)
             ?: return@withContext finish(
                 context, Outcome.Failed("proposal resolution is unavailable")
             )
@@ -75,21 +75,22 @@ class ProposalActionWorker(appContext: Context, params: WorkerParameters) :
 
     /** Null on transport/parse failure (caller retries). */
     private fun resolveTarget(api: HealthmesApi, explicitId: String?): Target? {
-        val path = if (explicitId == null) {
-            ProposalActionLogic.RESOLVE_PATH
-        } else {
-            "${ProposalsPage.ENDPOINT_PATH}?status=proposed&limit=50&offset=0"
-        }
+        val path = explicitId?.let { Proposal.detailPath(it) }
+            ?: ProposalActionLogic.RESOLVE_PATH
         val response = api.get(path)
-        if (response !is HealthmesApi.Response.Http || !response.isSuccess) return null
+        if (response !is HealthmesApi.Response.Http) return null
+        if (explicitId != null && response.code == 404) return Target.NonePending
+        if (!response.isSuccess) return null
         return try {
-            val page = ProposalsPage.parse(response.body)
             if (explicitId == null) {
-                ProposalActionLogic.chooseTarget(page)
+                ProposalActionLogic.chooseTarget(ProposalsPage.parse(response.body))
             } else {
-                page.proposals.firstOrNull { it.id == explicitId }
-                    ?.let { Target.Single(it) }
-                    ?: Target.NonePending
+                val proposal = Proposal.parse(org.json.JSONObject(response.body))
+                if (proposal.id == explicitId && proposal.isPending) {
+                    Target.Single(proposal)
+                } else {
+                    Target.NonePending
+                }
             }
         } catch (_: JSONException) {
             null

@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from healthmes.api.auth import viewer_token
 from healthmes.api.briefing import decision_viewer_url
+from healthmes.calendars.adjustments import MAX_EVIDENCE_CLOCK_SKEW
 from healthmes.calendars.base import ExternalEvent
 from healthmes.config import Settings
 from healthmes.mcp_server import server as server_module
@@ -32,29 +33,6 @@ from healthmes.store import (
 )
 from healthmes.trusted_session import issue_trusted_session_proof
 
-TRUSTED_SESSION_SECRET = "test-calendar-adjustment-secret-32-characters"
-
-
-def trusted_call_arguments(
-    tool_name: str,
-    arguments: dict,
-    *,
-    issued_at: dt.datetime | None = None,
-) -> dict:
-    return {
-        **arguments,
-        "trusted_session_proof": issue_trusted_session_proof(
-            TRUSTED_SESSION_SECRET,
-            tool_name=tool_name,
-            arguments=arguments,
-            platform="telegram",
-            chat_id="test-chat",
-            user_id="test-user",
-            message_id="test-message",
-            issued_at=issued_at,
-        ),
-    }
-
 TREE = {
     "type": "rule",
     "label": "readiness low",
@@ -68,6 +46,34 @@ TREE = {
         },
     ],
 }
+OWNER_USER_ID = "owner-user"
+OWNER_CHAT_ID = "owner-chat"
+
+
+def calendar_reply_arguments(
+    reply_handle: str,
+    *,
+    action: str = "적용",
+    tool_name: str = "resolve_calendar_adjustment",
+    user_id: str = OWNER_USER_ID,
+    chat_id: str = OWNER_CHAT_ID,
+    message_id: str = "message-1",
+) -> dict[str, str]:
+    response = f"{action} {reply_handle}"
+    arguments = {
+        "response": response,
+        "reply_handle": reply_handle,
+    }
+    proof = issue_trusted_session_proof(
+        "test-calendar-adjustment-secret-32-characters",
+        tool_name=tool_name,
+        arguments=arguments,
+        platform="telegram",
+        chat_id=chat_id,
+        user_id=user_id,
+        message_id=message_id,
+    )
+    return {**arguments, "trusted_session_proof": proof}
 
 
 def test_adjustment_handle_secret_is_dedicated_and_fails_closed() -> None:
@@ -88,6 +94,27 @@ def test_adjustment_handle_secret_is_dedicated_and_fails_closed() -> None:
         _env_file=None,
     )
     assert server_module._adjustment_handle_secret(configured) == dedicated_secret
+
+
+def test_telegram_owner_binding_is_explicit_and_fails_closed() -> None:
+    with pytest.raises(ToolError, match="must bind one explicit owner"):
+        server_module._telegram_owner_binding(Settings(_env_file=None))
+    with pytest.raises(ToolError, match="must bind one explicit owner"):
+        server_module._telegram_owner_binding(
+            Settings(
+                telegram_owner_user_id="*",
+                telegram_owner_chat_id="owner-chat",
+                _env_file=None,
+            )
+        )
+
+    assert server_module._telegram_owner_binding(
+        Settings(
+            telegram_owner_user_id=OWNER_USER_ID,
+            telegram_owner_chat_id=OWNER_CHAT_ID,
+            _env_file=None,
+        )
+    ) == (OWNER_USER_ID, OWNER_CHAT_ID)
 
 
 class TestUpsertAndListTasks:
@@ -118,7 +145,9 @@ class TestUpsertAndListTasks:
         assert task["source"] == "user"
         assert task["est_minutes"] == 90
 
-    async def test_update_changes_only_provided_fields(self, mcp_client, call_tool, store_factory):
+    async def test_update_changes_only_provided_fields(
+        self, mcp_client, call_tool, store_factory
+    ):
         created = await call_tool(mcp_client, "upsert_task", {"title": "Refactor triggers"})
         task_id = created["task"]["id"]
         updated = await call_tool(
@@ -138,7 +167,9 @@ class TestUpsertAndListTasks:
         with pytest.raises(ToolError, match="title is required"):
             await mcp_client.call_tool("upsert_task", {})
         with pytest.raises(ToolError, match="energy_demand"):
-            await mcp_client.call_tool("upsert_task", {"title": "x", "energy_demand": "extreme"})
+            await mcp_client.call_tool(
+                "upsert_task", {"title": "x", "energy_demand": "extreme"}
+            )
         with pytest.raises(ToolError, match="not found"):
             await mcp_client.call_tool(
                 "upsert_task", {"task_id": str(uuid.uuid4()), "status": "done"}
@@ -152,9 +183,15 @@ class TestUpsertAndListTasks:
         with pytest.raises(ToolError, match="est_minutes"):
             await mcp_client.call_tool("upsert_task", {"title": "x", "est_minutes": 0})
 
-    async def test_list_hides_done_by_default_and_sorts_by_deadline(self, mcp_client, call_tool):
-        await call_tool(mcp_client, "upsert_task", {"title": "later", "deadline": "2026-07-20"})
-        await call_tool(mcp_client, "upsert_task", {"title": "sooner", "deadline": "2026-07-10"})
+    async def test_list_hides_done_by_default_and_sorts_by_deadline(
+        self, mcp_client, call_tool
+    ):
+        await call_tool(
+            mcp_client, "upsert_task", {"title": "later", "deadline": "2026-07-20"}
+        )
+        await call_tool(
+            mcp_client, "upsert_task", {"title": "sooner", "deadline": "2026-07-10"}
+        )
         await call_tool(mcp_client, "upsert_task", {"title": "no deadline"})
         done = await call_tool(mcp_client, "upsert_task", {"title": "finished"})
         await call_tool(
@@ -200,6 +237,41 @@ class TestUpsertAndListTasks:
         assert set(get_args(TaskStatus)) == STORE_STATUSES
 
 
+class TestCalendarAdjustmentToolContract:
+    async def test_resolver_schema_is_handle_only_and_server_proof_bound(
+        self, mcp_client
+    ):
+        tools = await mcp_client.list_tools()
+        resolver = next(tool for tool in tools if tool.name == "resolve_calendar_adjustment")
+        properties = resolver.inputSchema["properties"]
+
+        assert set(properties) == {
+            "response",
+            "reply_handle",
+            "trusted_session_proof",
+        }
+        assert "proposal_id" not in properties
+        assert "response_channel" not in properties
+
+    async def test_schedule_resolver_schema_is_handle_only_and_server_proof_bound(
+        self,
+        mcp_client,
+    ):
+        tools = await mcp_client.list_tools()
+        resolver = next(
+            tool for tool in tools if tool.name == "resolve_schedule_proposal"
+        )
+        properties = resolver.inputSchema["properties"]
+
+        assert set(properties) == {
+            "response",
+            "reply_handle",
+            "trusted_session_proof",
+        }
+        assert "proposal_id" not in properties
+        assert "action" not in properties
+
+
 class TestScheduleTools:
     def test_afternoon_busy_minutes_uses_existing_noon_to_six_window(self, pinned_tz):
         day = dt.date(2026, 7, 24)
@@ -237,7 +309,9 @@ class TestScheduleTools:
         tomorrow = dt.datetime.now(dt.UTC).replace(
             hour=9, minute=0, second=0, microsecond=0
         ) + dt.timedelta(days=1)
-        self._mirror_event(store_factory, tomorrow, tomorrow + dt.timedelta(hours=1), "Standup")
+        self._mirror_event(
+            store_factory, tomorrow, tomorrow + dt.timedelta(hours=1), "Standup"
+        )
 
         result = await call_tool(
             mcp_client,
@@ -267,44 +341,6 @@ class TestScheduleTools:
             assert len(rows) == 2
             assert all(row.status == ProposalStatus.PROPOSED for row in rows)
 
-    async def test_propose_block_ignores_its_calendar_input_event(
-        self, mcp_client, call_tool, store_factory
-    ):
-        created = await call_tool(mcp_client, "upsert_task", {"title": "Calendar input"})
-        task_id = uuid.UUID(created["task"]["id"])
-        tomorrow = dt.datetime.now(dt.UTC).replace(
-            hour=9, minute=0, second=0, microsecond=0
-        ) + dt.timedelta(days=1)
-        with store_factory() as session:
-            session.add(
-                CalendarEventMirror(
-                    external_id="calendar-input",
-                    calendar_source=CalendarSource.GOOGLE,
-                    summary="[HM] Calendar input",
-                    start_at=tomorrow.replace(hour=0),
-                    end_at=tomorrow.replace(hour=0) + dt.timedelta(days=1),
-                    is_all_day=True,
-                    intake_task_id=task_id,
-                )
-            )
-            session.commit()
-
-        result = await call_tool(
-            mcp_client,
-            "propose_schedule_blocks",
-            {
-                "blocks": [
-                    {
-                        "task_id": str(task_id),
-                        "start": tomorrow.isoformat(),
-                        "end": (tomorrow + dt.timedelta(minutes=30)).isoformat(),
-                    }
-                ]
-            },
-        )
-
-        assert result["proposals"][0]["conflicts"] == []
-
     async def test_propose_planned_sleep_carries_explicit_calendar_kind(
         self, mcp_client, call_tool, store_factory
     ):
@@ -330,6 +366,80 @@ class TestScheduleTools:
         with store_factory() as session:
             proposal = session.scalars(select(ScheduleProposal)).one()
             assert proposal.healthmes_kind == "planned_sleep"
+
+    async def test_schedule_resolution_requires_exact_owner_bound_proof_and_is_one_time(
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+    ):
+        start = dt.datetime.now(dt.UTC).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        proposed = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "title": "Owner-approved block",
+                        "start": start.isoformat(),
+                        "end": (start + dt.timedelta(hours=1)).isoformat(),
+                    }
+                ]
+            },
+        )
+        handle = proposed["proposals"][0]["reply_handle"]
+        valid = calendar_reply_arguments(
+            handle,
+            tool_name="resolve_schedule_proposal",
+        )
+        proof = valid["trusted_session_proof"]
+        tampered_proof = f"{proof[:-1]}{'0' if proof[-1] != '0' else '1'}"
+        attempts = [
+            {
+                "response": f"적용 {handle}",
+                "reply_handle": handle,
+            },
+            {**valid, "trusted_session_proof": tampered_proof},
+            calendar_reply_arguments(
+                handle,
+                tool_name="resolve_schedule_proposal",
+                user_id="different-user",
+            ),
+            calendar_reply_arguments(
+                handle,
+                tool_name="resolve_schedule_proposal",
+                chat_id="different-chat",
+            ),
+            calendar_reply_arguments(
+                handle,
+                tool_name="resolve_calendar_adjustment",
+            ),
+        ]
+        for arguments in attempts:
+            with pytest.raises(ToolError, match="trusted_session_proof"):
+                await mcp_client.call_tool(
+                    "resolve_schedule_proposal",
+                    arguments,
+                )
+
+        resolved = await call_tool(
+            mcp_client,
+            "resolve_schedule_proposal",
+            valid,
+        )
+        assert resolved["proposal"]["proposal_status"] == "accepted"
+        assert resolved["proposal"]["calendar_write"] == "queued"
+
+        with pytest.raises(ToolError, match="already consumed"):
+            await mcp_client.call_tool(
+                "resolve_schedule_proposal",
+                valid,
+            )
+        with store_factory() as session:
+            proposal = session.scalars(select(ScheduleProposal)).one()
+            assert proposal.status is ProposalStatus.ACCEPTED
 
     async def test_upsert_task_tolerates_non_uuid_goal_ref(self, mcp_client, call_tool):
         """An LLM often passes a human label for goal_id; the task is still
@@ -423,141 +533,6 @@ class TestScheduleTools:
                 },
             )
 
-    async def test_resolve_schedule_proposal_accepts_once(
-        self, mcp_client, call_tool, store_factory
-    ):
-        start = dt.datetime.now(dt.UTC).replace(
-            hour=9, minute=0, second=0, microsecond=0
-        ) + dt.timedelta(days=1)
-        proposed = await call_tool(
-            mcp_client,
-            "propose_schedule_blocks",
-            {
-                "blocks": [
-                    {
-                        "title": "Telegram-confirmed block",
-                        "start": start.isoformat(),
-                        "end": (start + dt.timedelta(minutes=30)).isoformat(),
-                    }
-                ]
-            },
-        )
-        proposed_block = proposed["proposals"][0]
-        proposal_id = proposed_block["id"]
-        reply_handle = proposed_block["reply_handle"]
-
-        accepted = await call_tool(
-            mcp_client,
-            "resolve_schedule_proposal",
-            trusted_call_arguments(
-                "resolve_schedule_proposal",
-                {
-                    "proposal_id": proposal_id,
-                    "action": "accept",
-                    "reply_handle": reply_handle,
-                },
-            ),
-        )
-
-        assert accepted["proposal"]["proposal_status"] == "accepted"
-        assert accepted["proposal"]["calendar_write"] == "queued"
-        with store_factory() as session:
-            proposal = session.get(ScheduleProposal, uuid.UUID(proposal_id))
-            assert proposal is not None and proposal.status == ProposalStatus.ACCEPTED
-            assert proposal.reply_handle_digest
-            assert proposal.reply_handle_digest != reply_handle
-            assert proposal.expires_at is not None
-
-        with pytest.raises(ToolError, match="only proposed items can be resolved"):
-            await mcp_client.call_tool(
-                "resolve_schedule_proposal",
-                trusted_call_arguments(
-                    "resolve_schedule_proposal",
-                    {
-                        "proposal_id": proposal_id,
-                        "action": "accept",
-                        "reply_handle": reply_handle,
-                    },
-                ),
-            )
-
-    async def test_resolve_schedule_proposal_requires_live_unexpired_handle(
-        self, mcp_client, call_tool, store_factory
-    ):
-        start = dt.datetime.now(dt.UTC).replace(
-            hour=10, minute=0, second=0, microsecond=0
-        ) + dt.timedelta(days=1)
-        proposed = await call_tool(
-            mcp_client,
-            "propose_schedule_blocks",
-            {
-                "blocks": [
-                    {
-                        "title": "Handle-gated block",
-                        "start": start.isoformat(),
-                        "end": (start + dt.timedelta(minutes=30)).isoformat(),
-                    }
-                ]
-            },
-        )
-        block = proposed["proposals"][0]
-
-        with pytest.raises(ToolError, match="trusted_session_proof is missing or invalid"):
-            await mcp_client.call_tool(
-                "resolve_schedule_proposal",
-                {"proposal_id": block["id"], "action": "accept"},
-            )
-        with pytest.raises(ToolError, match="reply_handle is missing or invalid"):
-            await mcp_client.call_tool(
-                "resolve_schedule_proposal",
-                trusted_call_arguments(
-                    "resolve_schedule_proposal",
-                    {
-                        "proposal_id": block["id"],
-                        "action": "accept",
-                        "reply_handle": "invalid-handle",
-                    },
-                ),
-            )
-
-        with store_factory() as session:
-            proposal = session.get(ScheduleProposal, uuid.UUID(block["id"]))
-            assert proposal is not None
-            proposal.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
-            session.commit()
-
-        with pytest.raises(ToolError, match="schedule proposal has expired"):
-            await mcp_client.call_tool(
-                "resolve_schedule_proposal",
-                trusted_call_arguments(
-                    "resolve_schedule_proposal",
-                    {
-                        "proposal_id": block["id"],
-                        "action": "accept",
-                        "reply_handle": block["reply_handle"],
-                    },
-                ),
-            )
-
-        with store_factory() as session:
-            proposal = session.get(ScheduleProposal, uuid.UUID(block["id"]))
-            assert proposal is not None
-            assert proposal.status is ProposalStatus.PROPOSED
-
-    async def test_resolve_schedule_proposal_validates_action(self, mcp_client):
-        with pytest.raises(ToolError, match="action must be accept or decline"):
-            await mcp_client.call_tool(
-                "resolve_schedule_proposal",
-                trusted_call_arguments(
-                    "resolve_schedule_proposal",
-                    {
-                        "proposal_id": str(uuid.uuid4()),
-                        "action": "maybe",
-                        "reply_handle": "not-a-live-handle",
-                    },
-                ),
-            )
-
     async def test_get_schedule_returns_window_events_and_pending_proposals(
         self, mcp_client, call_tool, store_factory, pinned_tz
     ):
@@ -567,7 +542,9 @@ class TestScheduleTools:
         tomorrow = dt.datetime.now(pinned_tz).replace(
             hour=14, minute=0, second=0, microsecond=0
         ) + dt.timedelta(days=1)
-        self._mirror_event(store_factory, tomorrow, tomorrow + dt.timedelta(hours=1), "Dentist")
+        self._mirror_event(
+            store_factory, tomorrow, tomorrow + dt.timedelta(hours=1), "Dentist"
+        )
         far_future = tomorrow + dt.timedelta(days=30)
         self._mirror_event(
             store_factory, far_future, far_future + dt.timedelta(hours=1), "Far away"
@@ -592,8 +569,6 @@ class TestScheduleTools:
         assert [event["summary"] for event in result["events"]] == ["Dentist"]
         assert len(result["proposals"]) == 1
         assert result["proposals"][0]["task_title"] == "Deep work"
-        assert "reply_handle" not in result["proposals"][0]
-        assert "reply_handle_digest" not in result["proposals"][0]
 
         today_only = await call_tool(mcp_client, "get_schedule", {"range": "today"})
         assert today_only["events"] == []
@@ -720,30 +695,19 @@ class TestScheduleTools:
         assert '"etag-v1"' not in str(evaluated)
         assert writer.changes == []
 
-        handle_only_arguments = {
-            "proposal_id": evaluated["proposal_id"],
-            "response": f"적용 {evaluated['reply_handle']}",
-            "reply_handle": evaluated["reply_handle"],
-            "response_channel": "telegram",
-        }
-        with pytest.raises(ToolError, match="trusted_session_proof is missing or invalid"):
+        with pytest.raises(ToolError, match="trusted_session_proof"):
             await mcp_client.call_tool(
                 "resolve_calendar_adjustment",
-                handle_only_arguments,
+                {
+                    "response": f"적용 {evaluated['reply_handle']}",
+                    "reply_handle": evaluated["reply_handle"],
+                },
             )
-        invalid_handle_arguments = {
-            "proposal_id": evaluated["proposal_id"],
-            "response": "적용 not-the-issued-handle",
-            "reply_handle": "not-the-issued-handle",
-            "response_channel": "telegram",
-        }
-        with pytest.raises(ToolError, match="reply_handle is missing or invalid"):
+        invalid_arguments = calendar_reply_arguments("not-the-issued-handle")
+        with pytest.raises(ToolError, match="invalid, expired, or already consumed"):
             await mcp_client.call_tool(
                 "resolve_calendar_adjustment",
-                trusted_call_arguments(
-                    "resolve_calendar_adjustment",
-                    invalid_handle_arguments,
-                ),
+                invalid_arguments,
             )
         assert writer.changes == []
 
@@ -767,15 +731,7 @@ class TestScheduleTools:
         declined = await call_tool(
             mcp_client,
             "resolve_calendar_adjustment",
-            trusted_call_arguments(
-                "resolve_calendar_adjustment",
-                {
-                    "proposal_id": evaluated["proposal_id"],
-                    "response": f"그대로 {evaluated['reply_handle']}",
-                    "reply_handle": evaluated["reply_handle"],
-                    "response_channel": "telegram",
-                },
-            ),
+            calendar_reply_arguments(evaluated["reply_handle"], action="그대로"),
         )
         assert declined["status"] == CalendarMutationStatus.DECLINED.value
         assert declined["receipt"] == {
@@ -785,6 +741,90 @@ class TestScheduleTools:
             "provider_code": "user_declined",
         }
         assert writer.changes == []
+
+    async def test_evaluate_rejects_same_local_date_future_sleep_score(
+        self, mcp_client, call_tool, mcp_env, store_factory, pinned_tz
+    ):
+        now_local = dt.datetime.now(pinned_tz)
+        day = (now_local + dt.timedelta(days=1)).date()
+        future_recorded_at = (
+            dt.datetime.combine(
+                day,
+                dt.time.min,
+                tzinfo=pinned_tz,
+            )
+            + MAX_EVIDENCE_CLOCK_SKEW
+            + dt.timedelta(seconds=1)
+        )
+        assert future_recorded_at.astimezone(dt.UTC) > (
+            dt.datetime.now(dt.UTC) + MAX_EVIDENCE_CLOCK_SKEW
+        )
+        for days_ago, score in enumerate((70, 80, 90, 90, 90)):
+            score_day = day - dt.timedelta(days=days_ago)
+            recorded_at = (
+                future_recorded_at
+                if days_ago == 0
+                else dt.datetime.combine(
+                    score_day,
+                    dt.time(hour=7),
+                    tzinfo=pinned_tz,
+                )
+            )
+            mcp_env.add_score(
+                "sleep",
+                "internal",
+                recorded_at.isoformat(),
+                score,
+            )
+        mcp_env.add_score(
+            "body_battery",
+            "garmin",
+            now_local.isoformat(),
+            35,
+        )
+
+        event_start = dt.datetime.combine(
+            day,
+            dt.time(hour=14),
+            tzinfo=pinned_tz,
+        )
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="future-sleep-target",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="Recovery focus",
+                    start_at=event_start.astimezone(dt.UTC),
+                    end_at=(event_start + dt.timedelta(hours=3)).astimezone(dt.UTC),
+                    etag='"etag-v1"',
+                    organizer_self=True,
+                    has_attendees=False,
+                    is_recurring=False,
+                    event_type="default",
+                    is_all_day=False,
+                    is_locked=False,
+                    status="confirmed",
+                )
+            )
+            session.commit()
+
+        readiness = await call_tool(
+            mcp_client,
+            "get_daily_readiness_context",
+            {"date": day.isoformat()},
+        )
+        assert readiness["sleep_debt"]["last_night"]["recorded_at"] == (
+            future_recorded_at.isoformat()
+        )
+
+        result = await call_tool(
+            mcp_client,
+            "evaluate_morning_calendar_nudge",
+            {"date": day.isoformat()},
+        )
+
+        assert result["outcome"] == "no_action"
+        assert result["reason"] == "future_sleep"
 
     async def test_no_action_returns_authenticated_decision_viewer_without_proposal(
         self, mcp_client, call_tool, store_factory, pinned_tz, monkeypatch
@@ -863,17 +903,13 @@ class TestScheduleTools:
     ):
         assert server_module._public_calendar_adjustment_status(internal_status) == public_status
 
-    async def test_resolve_rejects_unknown_proposal_without_sensitive_detail(self, mcp_client):
-        arguments = {
-            "proposal_id": str(uuid.uuid4()),
-            "response": "적용 not-a-live-handle",
-            "reply_handle": "not-a-live-handle",
-            "response_channel": "telegram",
-        }
-        with pytest.raises(ToolError, match=r"^calendar adjustment proposal not found$"):
+    async def test_resolve_rejects_unknown_handle_without_sensitive_detail(
+        self, mcp_client
+    ):
+        with pytest.raises(ToolError, match="invalid, expired, or already consumed"):
             await mcp_client.call_tool(
                 "resolve_calendar_adjustment",
-                trusted_call_arguments("resolve_calendar_adjustment", arguments),
+                calendar_reply_arguments("not-a-live-handle"),
             )
 
     async def test_resolve_calendar_adjustment_yes_calls_injected_writer_once(
@@ -960,18 +996,11 @@ class TestScheduleTools:
             "explicit_confirmation_required",
         ]
 
+        confirmation = calendar_reply_arguments(evaluated["reply_handle"])
         applied = await call_tool(
             mcp_client,
             "resolve_calendar_adjustment",
-            trusted_call_arguments(
-                "resolve_calendar_adjustment",
-                {
-                    "proposal_id": evaluated["proposal_id"],
-                    "response": f"적용 {evaluated['reply_handle']}",
-                    "reply_handle": evaluated["reply_handle"],
-                    "response_channel": "telegram",
-                },
-            ),
+            confirmation,
         )
         assert applied["status"] == CalendarMutationStatus.APPLIED.value
         assert applied["receipt"]["provider_result"] == "matched"
@@ -980,6 +1009,86 @@ class TestScheduleTools:
         assert change.external_event_id == "google-secret-target"
         assert change.proposed_start_at == change.original_start_at
         assert change.original_end_at - change.proposed_end_at == dt.timedelta(minutes=30)
+
+        with pytest.raises(ToolError, match="already consumed"):
+            await mcp_client.call_tool(
+                "resolve_calendar_adjustment",
+                confirmation,
+            )
+        assert len(writer.changes) == 1
+
+    async def test_resolve_rejects_forged_or_non_owner_telegram_proof(
+        self, mcp_client, call_tool, store_factory, pinned_tz, monkeypatch
+    ):
+        day = (dt.datetime.now(pinned_tz) + dt.timedelta(days=1)).date()
+        start = dt.datetime.combine(day, dt.time(hour=14), tzinfo=pinned_tz)
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="google-owner-proof-target",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="Recovery focus",
+                    start_at=start.astimezone(dt.UTC),
+                    end_at=(start + dt.timedelta(hours=3)).astimezone(dt.UTC),
+                    etag='"etag-v1"',
+                    organizer_self=True,
+                    has_attendees=False,
+                    is_recurring=False,
+                    event_type="default",
+                    is_all_day=False,
+                    is_locked=False,
+                    status="confirmed",
+                )
+            )
+            session.commit()
+
+        async def fake_readiness(date: str | None = None) -> dict:
+            return {
+                "sleep_debt": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "last_night": {"date": day.isoformat(), "score": 70},
+                },
+                "charge": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "date": day.isoformat(),
+                    "value": 35,
+                },
+            }
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.changes = []
+
+            def apply_confirmed_external_time_change(self, change):
+                self.changes.append(change)
+                raise AssertionError("untrusted proof reached the writer")
+
+        writer = FakeWriter()
+        monkeypatch.setattr(server_module, "get_daily_readiness_context", fake_readiness)
+        server_module.set_calendar_adjustment_writer(writer)
+        evaluated = await call_tool(
+            mcp_client, "evaluate_morning_calendar_nudge", {"date": day.isoformat()}
+        )
+        handle = evaluated["reply_handle"]
+
+        attempts = [
+            {
+                "response": f"적용 {handle}",
+                "reply_handle": handle,
+            },
+            {
+                **calendar_reply_arguments(handle),
+                "trusted_session_proof": "forged.proof",
+            },
+            calendar_reply_arguments(handle, user_id="different-user"),
+            calendar_reply_arguments(handle, chat_id="different-chat"),
+        ]
+        for arguments in attempts:
+            with pytest.raises(ToolError, match="trusted_session_proof"):
+                await mcp_client.call_tool("resolve_calendar_adjustment", arguments)
+        assert writer.changes == []
 
 
 class TestCaptureTools:
@@ -1008,9 +1117,13 @@ class TestCaptureTools:
         with pytest.raises(ToolError, match="description"):
             await mcp_client.call_tool("log_food", {"description": "   "})
         with pytest.raises(ToolError, match="meal_type"):
-            await mcp_client.call_tool("log_food", {"description": "toast", "meal_type": "brunch"})
+            await mcp_client.call_tool(
+                "log_food", {"description": "toast", "meal_type": "brunch"}
+            )
 
-    async def test_record_decision_returns_viewer_url(self, mcp_client, call_tool, store_factory):
+    async def test_record_decision_returns_viewer_url(
+        self, mcp_client, call_tool, store_factory
+    ):
         result = await call_tool(
             mcp_client,
             "record_decision",

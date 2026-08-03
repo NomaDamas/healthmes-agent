@@ -139,13 +139,7 @@ struct ProposalDetailView: View {
 
     private func load() async {
         do {
-            // No GET-by-id endpoint; the list is tiny (single user).
-            let page = try await api.listProposals()
-            if let found = page.data.first(where: { $0.id == proposalID }) {
-                proposal = found
-            } else {
-                message = String(localized: "This proposal no longer exists.")
-            }
+            proposal = try await api.getProposal(proposalID)
         } catch {
             message = BriefingHomeModel.describe(error)
         }

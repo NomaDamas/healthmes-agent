@@ -121,6 +121,8 @@ logger = logging.getLogger(__name__)
 # first in the normal case; this outer bound only bites when a stalled SSL
 # handshake defeats the inner timeout (the #29184 failure mode).
 _OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
+_TRUSTED_SESSION_MAX_AGE_S = 5 * 60
+_TRUSTED_SESSION_CLOCK_SKEW_S = 30
 
 
 def _trusted_session_call_arguments(
@@ -146,8 +148,31 @@ def _trusted_session_call_arguments(
         "user_id": get_session_env("HERMES_SESSION_USER_ID"),
         "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID"),
     }
-    message_text = get_session_message_text().strip()
-    if session["platform"] != "telegram" or not all(session.values()) or not message_text:
+    try:
+        message_issued_at = int(
+            float(get_session_env("HERMES_SESSION_MESSAGE_TIMESTAMP"))
+        )
+    except (TypeError, ValueError):
+        return arguments
+    message_age = time.time() - message_issued_at
+    owner_user_id = str(config.get("owner_user_id") or "").strip()
+    owner_chat_id = str(config.get("owner_chat_id") or "").strip()
+    message_text = get_session_message_text()
+    if (
+        session["platform"] != "telegram"
+        or not all(session.values())
+        or not message_text
+        or not owner_user_id
+        or not owner_chat_id
+        or "*" in {owner_user_id, owner_chat_id}
+        or session["user_id"] != owner_user_id
+        or session["chat_id"] != owner_chat_id
+        or not (
+            -_TRUSTED_SESSION_CLOCK_SKEW_S
+            <= message_age
+            <= _TRUSTED_SESSION_MAX_AGE_S
+        )
+    ):
         return arguments
 
     handle_argument = confirmation.get("handle_argument")
@@ -155,26 +180,19 @@ def _trusted_session_call_arguments(
     if not isinstance(handle, str) or not handle:
         return arguments
     passthrough_argument = confirmation.get("passthrough_argument")
-    if isinstance(passthrough_argument, str):
-        choices = confirmation.get("choices")
-        allowed = choices if isinstance(choices, list) else []
-        if (
-            arguments.get(passthrough_argument) != message_text
-            or message_text not in {f"{choice} {handle}" for choice in allowed}
-        ):
-            return arguments
-    else:
-        action_argument = confirmation.get("action_argument")
-        choices = confirmation.get("choices")
-        action = arguments.get(action_argument) if isinstance(action_argument, str) else None
-        prefix = choices.get(action) if isinstance(choices, dict) else None
-        if not isinstance(prefix, str) or message_text != f"{prefix} {handle}":
-            return arguments
+    choices = confirmation.get("choices")
+    allowed = choices if isinstance(choices, list) else []
+    if (
+        not isinstance(passthrough_argument, str)
+        or arguments.get(passthrough_argument) != message_text
+        or message_text not in {f"{choice} {handle}" for choice in allowed}
+    ):
+        return arguments
 
     secret_env = config.get("secret_env")
     secret = os.environ.get(secret_env, "") if isinstance(secret_env, str) else ""
     bind_arguments = confirmation.get("bind_arguments")
-    if not isinstance(secret, str) or len(secret) < 32 or not isinstance(bind_arguments, list):
+    if len(secret) < 32 or not isinstance(bind_arguments, list):
         return arguments
     bound_arguments = {
         name: arguments.get(name)
@@ -186,7 +204,7 @@ def _trusted_session_call_arguments(
         "tool": tool_name,
         "arguments": bound_arguments,
         **session,
-        "issued_at": int(time.time()),
+        "issued_at": message_issued_at,
     }
     raw_payload = json.dumps(
         payload,

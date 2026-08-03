@@ -123,12 +123,17 @@ def _seed_proposal(session) -> ScheduleProposal:
     return proposal
 
 
-def _resolution_token(client, proposal: ScheduleProposal) -> str:
+def _resolution_token(
+    client,
+    proposal: ScheduleProposal,
+    *,
+    action: str = "accept",
+) -> str:
     response = client.get(
         "/v1/schedule/proposals",
         params={"status": "proposed", "task_id": str(proposal.task_id)},
     )
-    return response.json()["data"][0]["resolution_token"]
+    return response.json()["data"][0][f"{action}_resolution_token"]
 
 
 def test_list_proposals_filters_by_status(client, session):
@@ -136,7 +141,12 @@ def test_list_proposals_filters_by_status(client, session):
 
     listed = client.get("/v1/schedule/proposals", params={"status": "proposed"}).json()
     assert [p["id"] for p in listed["data"]] == [str(proposal.id)]
-    assert listed["data"][0]["resolution_token"]
+    assert listed["data"][0]["accept_resolution_token"]
+    assert listed["data"][0]["decline_resolution_token"]
+    assert (
+        listed["data"][0]["accept_resolution_token"]
+        != listed["data"][0]["decline_resolution_token"]
+    )
 
     empty = client.get("/v1/schedule/proposals", params={"status": "accepted"}).json()
     assert empty["data"] == []
@@ -165,9 +175,45 @@ def test_accept_proposal_then_second_accept_conflicts(client, session):
     assert again.json()["error"]["code"] == "invalid_transition"
 
 
+def test_accept_invalidates_proposal_when_actual_sleep_changed(client, session):
+    proposal = _seed_proposal(session)
+    proposal.proposed_start = _dt(6)
+    proposal.proposed_end = _dt(7)
+    session.add(
+        CalendarEventMirror(
+            external_id="actual-sleep",
+            calendar_source=CalendarSource.GOOGLE,
+            summary="수면 (실제)",
+            start_at=_dt(23, day=5),
+            end_at=_dt(7, 30),
+            is_agent_created=True,
+            healthmes_kind="actual_sleep",
+            sleep_local_date=_dt(7).date(),
+        )
+    )
+    session.commit()
+    token = _resolution_token(client, proposal)
+
+    response = client.post(
+        f"/v1/schedule/proposals/{proposal.id}/accept",
+        json={"resolution_token": token},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "actual_sleep_conflict"
+    assert response.json()["error"]["detail"] == {
+        "proposal_status": "invalidated"
+    }
+    session.expire_all()
+    assert (
+        session.get(ScheduleProposal, proposal.id).status
+        is ProposalStatus.INVALIDATED
+    )
+
+
 def test_decline_proposal(client, session):
     proposal = _seed_proposal(session)
-    token = _resolution_token(client, proposal)
+    token = _resolution_token(client, proposal, action="decline")
 
     declined = client.post(
         f"/v1/schedule/proposals/{proposal.id}/decline",
@@ -208,6 +254,66 @@ def test_proposal_actions_require_valid_unexpired_resolution_token(client, sessi
 
     session.expire_all()
     assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PROPOSED
+
+
+def test_resolution_tokens_are_action_and_proposal_scoped(client, session):
+    first = _seed_proposal(session)
+    second = _seed_proposal(session)
+    first_accept = _resolution_token(client, first, action="accept")
+    first_decline = _resolution_token(client, first, action="decline")
+
+    wrong_action = client.post(
+        f"/v1/schedule/proposals/{first.id}/decline",
+        json={"resolution_token": first_accept},
+    )
+    assert wrong_action.status_code == 403
+    assert wrong_action.json()["error"]["code"] == "invalid_resolution_token"
+
+    wrong_proposal = client.post(
+        f"/v1/schedule/proposals/{second.id}/accept",
+        json={"resolution_token": first_accept},
+    )
+    assert wrong_proposal.status_code == 403
+    assert wrong_proposal.json()["error"]["code"] == "invalid_resolution_token"
+
+    declined = client.post(
+        f"/v1/schedule/proposals/{first.id}/decline",
+        json={"resolution_token": first_decline},
+    )
+    assert declined.status_code == 200
+
+    replay = client.post(
+        f"/v1/schedule/proposals/{first.id}/decline",
+        json={"resolution_token": first_decline},
+    )
+    assert replay.status_code == 409
+    assert replay.json()["error"]["code"] == "invalid_transition"
+
+
+def test_direct_proposal_lookup_reaches_beyond_first_page_and_is_not_cached(
+    client,
+    session,
+):
+    proposals = [_seed_proposal(session) for _ in range(51)]
+    target = proposals[-1]
+    target.proposed_start = _dt(17)
+    target.proposed_end = _dt(18)
+    session.commit()
+
+    first_page = client.get(
+        "/v1/schedule/proposals",
+        params={"status": "proposed", "limit": 50, "offset": 0},
+    )
+    assert first_page.status_code == 200
+    assert first_page.headers["cache-control"] == "no-store"
+    assert str(target.id) not in {row["id"] for row in first_page.json()["data"]}
+
+    direct = client.get(f"/v1/schedule/proposals/{target.id}")
+    assert direct.status_code == 200
+    assert direct.headers["cache-control"] == "no-store"
+    assert direct.json()["id"] == str(target.id)
+    assert direct.json()["accept_resolution_token"]
+    assert direct.json()["decline_resolution_token"]
 
 
 def test_rest_resolution_token_is_not_a_telegram_reply_handle(client, session):

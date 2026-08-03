@@ -195,6 +195,7 @@ def sleep_debt(
     scores_by_day: Mapping[date, float],
     as_of: date,
     *,
+    recorded_at_by_day: Mapping[date, datetime] | None = None,
     window_days: int = SLEEP_DEBT_WINDOW_DAYS,
     min_nights: int = MIN_SLEEP_DEBT_NIGHTS,
 ) -> dict[str, Any]:
@@ -228,10 +229,14 @@ def sleep_debt(
     last_night = max(nights)
     result["status"] = STATUS_OK
     result["index"] = round(sum(debts) / len(debts), 1)
-    result["last_night"] = {
+    last_night_payload: dict[str, Any] = {
         "date": last_night.isoformat(),
         "score": round(nights[last_night], 1),
     }
+    recorded_at = (recorded_at_by_day or {}).get(last_night)
+    if recorded_at is not None:
+        last_night_payload["recorded_at"] = recorded_at.isoformat()
+    result["last_night"] = last_night_payload
     return result
 
 
