@@ -82,6 +82,8 @@ class CaffeineProductForm(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SleepEvidence:
+    """Wearable sleep evidence dated in the user's local-day convention."""
+
     local_date: date | None
     duration_minutes: int | None
     provider: str | None
@@ -112,6 +114,8 @@ class SingleDoseCaffeineGuardrail(SourcedCaffeineLimit):
 
 @dataclass(frozen=True, slots=True)
 class PersonalEventCaffeineBaseline:
+    """Event-bound baseline with an opaque, non-empty provenance key."""
+
     event_id: CalendarEventId
     amount_mg: CaffeineMg
     source: str

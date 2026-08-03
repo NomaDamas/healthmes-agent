@@ -1,5 +1,5 @@
 from dataclasses import fields, replace
-from datetime import date, datetime, timedelta, timezone, tzinfo
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from typing import cast
 
 import pytest
@@ -208,6 +208,16 @@ def test_unbound_event_baseline_never_returns_exact_suggestion(
     assert result.reason is CaffeineProposalReason.PERSONAL_EVENT_BASELINE_UNAVAILABLE
 
 
+def test_nonempty_baseline_source_key_is_audit_provenance() -> None:
+    baseline = replace(_event_baseline(), source_key="audit-record:another-opaque-id")
+
+    result = propose_caffeine(replace(_valid_request(), personal_event_baseline=baseline))
+
+    assert result.status is CaffeineProposalStatus.PROPOSAL
+    assert result.recommendation.suggested_additional_mg == 100
+    assert result.reason is CaffeineProposalReason.PERSONAL_EVENT_BASELINE_APPLIED
+
+
 def test_negative_consumed_caffeine_is_invalid() -> None:
     request = replace(_valid_request(), consumed_today_mg=CaffeineMg(-10))
 
@@ -275,6 +285,22 @@ def test_sleep_date_must_match_proposal_date(sleep_date: date) -> None:
     sleep = replace(request.sleep, local_date=sleep_date)
 
     result = propose_caffeine(replace(request, sleep=sleep))
+
+    assert result.status is CaffeineProposalStatus.INSUFFICIENT_DATA
+    assert result.recommendation.maximum_additional_mg is None
+    assert result.recommendation.suggested_additional_mg is None
+    assert result.reason is CaffeineProposalReason.STALE_SLEEP
+
+
+def test_timing_from_another_local_day_convention_fails_closed() -> None:
+    request = _valid_request()
+    timing = CaffeineTiming(
+        intended_consumption_at=datetime(2026, 7, 30, 16, tzinfo=UTC),
+        target_sleep_at=datetime(2026, 7, 31, 14, tzinfo=UTC),
+        cutoff_before_sleep=timedelta(hours=6),
+    )
+
+    result = propose_caffeine(replace(request, timing=timing))
 
     assert result.status is CaffeineProposalStatus.INSUFFICIENT_DATA
     assert result.recommendation.maximum_additional_mg is None

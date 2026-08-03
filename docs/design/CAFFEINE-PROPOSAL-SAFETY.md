@@ -10,10 +10,14 @@ not determine a safe dose, prescribe caffeine, or provide medical advice.
   allowance.
 - `single_dose_guardrail` independently caps one proposal.
 - `personal_event_baseline` is the user's previously confirmed amount for the
-  exact target event. An exact suggestion requires the event ID, source key,
-  aware confirmation time, and current freshness.
+  exact target event. The event ID is the binding key; the non-empty source key
+  is opaque provenance retained for audit. An exact suggestion requires both,
+  plus an aware confirmation time and current freshness.
 - `consumed_today_mg` must represent complete verified intake from drinks,
   food, supplements, and medications.
+- `sleep.local_date` and `timing.intended_consumption_at` must use the same
+  user-local day convention. Adapters normalize both before calling the pure
+  function; a mismatch fails closed as stale sleep.
 
 The deterministic bounds are:
 
