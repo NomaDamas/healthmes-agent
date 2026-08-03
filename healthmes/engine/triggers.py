@@ -705,15 +705,19 @@ class TriggerEvaluator:
         (tests/hardening/test_trigger_flood.py).
         """
         now = self._now()
-        signals = self._health_reader.read(now)
 
         outcomes: list[FireOutcome] = []
         with session_scope(self._session_factory) as session:
+            retried, pending_keys = self._retry_pending_dispatches(session)
+            outcomes.extend(retried)
+            signals = self._health_reader.read(now)
             context = self._build_context(session, now, signals)
             for rule in self._rules:
                 try:
                     fire = rule(context)
                     if fire is None:
+                        continue
+                    if fire.dedup_key in pending_keys:
                         continue
                     outcomes.append(self._process_fire(session, now, fire))
                 except Exception:
@@ -736,6 +740,72 @@ class TriggerEvaluator:
                 report.count("push_failed"),
             )
         return report
+
+    def _retry_pending_dispatches(
+        self,
+        session: Session,
+    ) -> tuple[list[FireOutcome], set[str]]:
+        """Deliver committed outbox rows independently of rule conditions."""
+        events = session.scalars(
+            select(TriggerEvent)
+            .where(TriggerEvent.alert_sent.is_(False))
+            .order_by(TriggerEvent.fired_at, TriggerEvent.id)
+        ).all()
+        outcomes: list[FireOutcome] = []
+        pending_keys: set[str] = set()
+        for event in events:
+            push = (event.payload or {}).get("push")
+            if not isinstance(push, dict) or push.get("state") != "dispatching":
+                continue
+            locked_event = session.scalar(
+                select(TriggerEvent)
+                .where(TriggerEvent.id == event.id)
+                .with_for_update(skip_locked=True)
+            )
+            if locked_event is None:
+                continue
+            event = locked_event
+            if event.dedup_key is not None:
+                pending_keys.add(event.dedup_key)
+            payload = event.payload or {}
+            summary = payload.get("summary")
+            proposal = payload.get("proposal")
+            evidence = payload.get("evidence")
+            if (
+                not isinstance(summary, str)
+                or not isinstance(proposal, str)
+                or not isinstance(evidence, dict)
+            ):
+                event.payload = {
+                    **payload,
+                    "push": {
+                        "suppressed_reason": _SUPPRESS_PUSH_FAILED,
+                        "detail": "invalid persisted dispatch payload",
+                    },
+                }
+                session.commit()
+                continue
+            fire = TriggerFire(
+                rule_id=event.rule_id,
+                dedup_key=event.dedup_key or f"trigger_event:{event.id}",
+                summary=summary,
+                proposal=proposal,
+                evidence=evidence,
+            )
+            outcomes.append(
+                self._deliver_event(
+                    session,
+                    fire,
+                    event,
+                    {
+                        "summary": summary,
+                        "proposal": proposal,
+                        "evidence": evidence,
+                    },
+                    fired_at=_ensure_utc(event.fired_at),
+                )
+            )
+        return outcomes, pending_keys
 
     def _build_context(
         self, session: Session, now: datetime, signals: HealthSignals
@@ -764,61 +834,70 @@ class TriggerEvaluator:
             .limit(1)
         )
         if existing_event is not None:
-            push = (existing_event.payload or {}).get("push")
-            if (
-                not existing_event.alert_sent
-                and isinstance(push, dict)
-                and push.get("state") == "dispatching"
-            ):
-                event = existing_event
-                payload = {
-                    "summary": fire.summary,
-                    "proposal": fire.proposal,
-                    "evidence": fire.evidence,
-                }
-            else:
-                return FireOutcome(fire=fire, status="deduplicated")
-        else:
-            payload = {
-                "summary": fire.summary,
-                "proposal": fire.proposal,
-                "evidence": fire.evidence,
-            }
-            event = TriggerEvent(
-                fired_at=_ensure_utc(now),
-                rule_id=fire.rule_id,
-                dedup_key=fire.dedup_key,
-                alert_sent=False,
-                payload=payload,
-            )
-            session.add(event)
-            # Flush immediately: the production factory disables autoflush, so
-            # without this the hygiene queries below (cooldown, daily budget) and
-            # the dedup check of LATER fires in this same sweep would not see this
-            # row or the pending ``alert_sent`` updates of earlier fires — N rules
-            # firing in one sweep would then blow through the daily budget
-            # (pinned by tests/hardening/test_trigger_flood.py).
-            session.flush()
+            return FireOutcome(fire=fire, status="deduplicated")
 
-            reason = self._push_suppression_reason(session, now, fire)
-            if reason is not None:
-                event.payload = {**payload, "push": {"suppressed_reason": reason}}
-                return FireOutcome(fire=fire, status="suppressed", reason=reason)
+        payload = {
+            "summary": fire.summary,
+            "proposal": fire.proposal,
+            "evidence": fire.evidence,
+        }
+        event = TriggerEvent(
+            fired_at=_ensure_utc(now),
+            rule_id=fire.rule_id,
+            dedup_key=fire.dedup_key,
+            alert_sent=False,
+            payload=payload,
+        )
+        session.add(event)
+        # Flush immediately: the production factory disables autoflush, so
+        # without this the hygiene queries below (cooldown, daily budget) and
+        # the dedup check of LATER fires in this same sweep would not see this
+        # row or the pending ``alert_sent`` updates of earlier fires — N rules
+        # firing in one sweep would then blow through the daily budget
+        # (pinned by tests/hardening/test_trigger_flood.py).
+        session.flush()
 
-            event.payload = {
-                **payload,
-                "push": {"state": "dispatching", "channel": "webhook"},
-            }
-            # Hermes accepts the request and starts agent work asynchronously.
-            # Commit the correlation row first so record_decision can resolve
-            # trigger_event_id immediately. If this process dies after commit,
-            # the next sweep reuses this exact event and Hermes request id.
-            session.commit()
+        reason = self._push_suppression_reason(session, now, fire)
+        if reason is not None:
+            event.payload = {**payload, "push": {"suppressed_reason": reason}}
+            return FireOutcome(fire=fire, status="suppressed", reason=reason)
 
+        event.payload = {
+            **payload,
+            "push": {"state": "dispatching", "channel": "webhook"},
+        }
+        # Hermes accepts the request and starts agent work asynchronously.
+        # Commit the correlation row first so record_decision can resolve
+        # trigger_event_id immediately. The outbox scan retries this exact row
+        # even when the original rule condition is no longer true.
+        session.commit()
+        event = session.scalar(
+            select(TriggerEvent)
+            .where(TriggerEvent.id == event.id)
+            .with_for_update()
+        )
+        assert event is not None
+        return self._deliver_event(
+            session,
+            fire,
+            event,
+            payload,
+            fired_at=now,
+        )
+
+    def _deliver_event(
+        self,
+        session: Session,
+        fire: TriggerFire,
+        event: TriggerEvent,
+        payload: dict[str, Any],
+        *,
+        fired_at: datetime,
+    ) -> FireOutcome:
         try:
             result = self._alert_sender.send(
                 fire,
-                fired_at=now,
+                fired_at=fired_at,
                 trigger_event_id=event.id,
             )
         except Exception as exc:
@@ -827,7 +906,9 @@ class TriggerEvaluator:
             # gateway that answered non-2xx and is handled below. The
             # trigger_event row is already flushed (its dedup key is burned), so
             # a raised send must be unwound; see _handle_send_exception.
-            return self._handle_send_exception(session, fire, event, payload, exc)
+            outcome = self._handle_send_exception(session, fire, event, payload, exc)
+            session.commit()
+            return outcome
 
         if result.ok:
             event.alert_sent = True
@@ -835,7 +916,9 @@ class TriggerEvaluator:
                 **payload,
                 "push": {"sent": True, "status_code": result.status_code, "channel": "webhook"},
             }
-            return FireOutcome(fire=fire, status="pushed")
+            outcome = FireOutcome(fire=fire, status="pushed")
+            session.commit()
+            return outcome
 
         # Webhook not delivered (unconfigured or failed). With native delivery
         # on, the alert is still surfaced to the companion apps via /v1/alerts +
@@ -852,7 +935,27 @@ class TriggerEvaluator:
                     "detail": result.detail,
                 },
             }
-            return FireOutcome(fire=fire, status="pushed")
+            outcome = FireOutcome(fire=fire, status="pushed")
+            session.commit()
+            return outcome
+
+        if result.retryable:
+            event.payload = {
+                **payload,
+                "push": {
+                    "state": "dispatching",
+                    "channel": "webhook",
+                    "last_status_code": result.status_code,
+                    "last_error": result.detail,
+                },
+            }
+            outcome = FireOutcome(
+                fire=fire,
+                status="push_failed",
+                reason=result.detail,
+            )
+            session.commit()
+            return outcome
 
         event.payload = {
             **payload,
@@ -862,7 +965,9 @@ class TriggerEvaluator:
                 "detail": result.detail,
             },
         }
-        return FireOutcome(fire=fire, status="push_failed", reason=result.detail)
+        outcome = FireOutcome(fire=fire, status="push_failed", reason=result.detail)
+        session.commit()
+        return outcome
 
     def _handle_send_exception(
         self,
@@ -898,6 +1003,14 @@ class TriggerEvaluator:
             }
             return FireOutcome(fire=fire, status="pushed")
 
+        event.payload = {
+            **payload,
+            "push": {
+                "state": "dispatching",
+                "channel": "webhook",
+                "last_error": str(exc),
+            },
+        }
         return FireOutcome(fire=fire, status="push_failed", reason=str(exc))
 
     def _push_suppression_reason(

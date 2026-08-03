@@ -115,8 +115,9 @@ def utc(dt: datetime) -> datetime:
 class FakeAlertSender:
     """Recording AlertSender double; outcome switchable per test."""
 
-    def __init__(self, ok: bool = True) -> None:
+    def __init__(self, ok: bool = True, *, retryable: bool = False) -> None:
         self.ok = ok
+        self.retryable = retryable
         self.sent: list[tuple[TriggerFire, datetime, uuid.UUID]] = []
 
     def send(
@@ -129,7 +130,12 @@ class FakeAlertSender:
         self.sent.append((fire, fired_at, trigger_event_id))
         if self.ok:
             return WebhookResult(ok=True, status_code=202)
-        return WebhookResult(ok=False, status_code=502, detail="gateway unavailable")
+        return WebhookResult(
+            ok=False,
+            status_code=502,
+            detail="gateway unavailable",
+            retryable=self.retryable,
+        )
 
 
 class RaisingAlertSender:
@@ -327,7 +333,7 @@ def test_dispatching_event_retries_with_same_correlation_id(
             settings,
             session_factory,
             sender,
-            rules=(fixed_rule,),
+            rules=(),
         ).evaluate_once()
 
     assert [outcome.status for outcome in report.outcomes] == ["pushed"]
@@ -335,6 +341,34 @@ def test_dispatching_event_retries_with_same_correlation_id(
     [stored] = all_events(session_factory)
     assert stored.id == event_id
     assert stored.alert_sent is True
+
+
+def test_retryable_result_is_recovered_without_rule_refiring(
+    settings, session_factory
+) -> None:
+    off_settings = settings.model_copy(update={"native_alert_delivery": False})
+    failing = FakeAlertSender(ok=False, retryable=True)
+    working = FakeAlertSender()
+    with freeze_time("2026-07-09 14:00:00") as frozen:
+        first = make_evaluator(
+            off_settings,
+            session_factory,
+            failing,
+            rules=(fixed_rule,),
+        ).evaluate_once()
+        frozen.tick(timedelta(minutes=10))
+        recovered = make_evaluator(
+            off_settings,
+            session_factory,
+            working,
+            rules=(),
+        ).evaluate_once()
+
+    assert [outcome.status for outcome in first.outcomes] == ["push_failed"]
+    assert [outcome.status for outcome in recovered.outcomes] == ["pushed"]
+    assert failing.sent[0][2] == working.sent[0][2]
+    [event] = all_events(session_factory)
+    assert event.alert_sent is True
 
 
 def test_dedup_key_is_unique_across_sweeps(settings, session_factory, alert_sender) -> None:

@@ -75,6 +75,7 @@ class WebhookResult:
     ok: bool
     status_code: int | None = None
     detail: str | None = None
+    retryable: bool = False
 
 
 def sign_v1(secret: str, body: bytes) -> str:
@@ -256,7 +257,7 @@ class HermesWebhookSender:
                     response = client.post(url, content=body, headers=headers)
         except httpx.HTTPError as exc:
             logger.warning("Hermes webhook push failed for %s: %s", fire.rule_id, exc)
-            return WebhookResult(ok=False, detail=str(exc))
+            return WebhookResult(ok=False, detail=str(exc), retryable=True)
 
         ok = response.is_success
         if not ok:
@@ -266,4 +267,9 @@ class HermesWebhookSender:
                 response.status_code,
                 response.text[:200],
             )
-        return WebhookResult(ok=ok, status_code=response.status_code, detail=response.text[:200])
+        return WebhookResult(
+            ok=ok,
+            status_code=response.status_code,
+            detail=response.text[:200],
+            retryable=response.status_code == 429 or response.status_code >= 500,
+        )

@@ -296,6 +296,21 @@ def test_non_2xx_is_not_ok(settings, make_fire) -> None:
     )
     assert result.ok is False
     assert result.status_code == 401
+    assert result.retryable is False
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 503])
+def test_transient_http_failures_are_retryable(settings, make_fire, status_code) -> None:
+    transport = CapturingTransport(status_code=status_code)
+    client = httpx.Client(transport=httpx.MockTransport(transport))
+    result = HermesWebhookSender(settings, client=client).send(
+        make_fire(),
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
+    )
+    assert result.ok is False
+    assert result.status_code == status_code
+    assert result.retryable is True
 
 
 def test_transport_error_is_not_ok(settings, make_fire) -> None:
@@ -311,6 +326,7 @@ def test_transport_error_is_not_ok(settings, make_fire) -> None:
     assert result.ok is False
     assert result.status_code is None
     assert "connection refused" in (result.detail or "")
+    assert result.retryable is True
 
 
 def test_missing_secret_fails_closed_without_sending(settings, transport, make_fire) -> None:
