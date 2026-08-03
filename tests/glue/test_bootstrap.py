@@ -148,6 +148,90 @@ def test_second_run_is_idempotent(bootstrap, hermes_home, env_file):
     assert env_file.read_text() == env_before
 
 
+def test_legacy_morning_cron_is_upgraded_without_resetting_runtime_state(
+    bootstrap, hermes_home, env_file
+):
+    created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
+    legacy = bootstrap.build_fallback_job(
+        prompt="Legacy HealthMes morning briefing without the calendar nudge.",
+        schedule="30 8 * * *",
+        name="healthmes-morning-plan",
+        deliver="local",
+        skills=["legacy-healthmes-skill"],
+        script="legacy_snapshot.py",
+        now=created_at,
+    )
+    legacy.update(
+        {
+            "enabled": False,
+            "state": "paused",
+            "paused_at": "2026-07-02T08:00:00+00:00",
+            "paused_reason": "user requested",
+            "repeat": {"times": None, "completed": 9},
+            "next_run_at": "2026-07-03T08:30:00+00:00",
+            "last_run_at": "2026-07-02T08:30:00+00:00",
+            "last_status": "error",
+            "last_error": "legacy failure",
+            "last_delivery_error": "legacy delivery failure",
+        }
+    )
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    bootstrap._write_jobs_envelope(jobs_file, [legacy], now=created_at)
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    jobs = yaml.safe_load(jobs_file.read_text())["jobs"]
+    morning = next(job for job in jobs if job["name"] == "healthmes-morning-plan")
+    desired = next(
+        job for job in bootstrap.BRIEFING_JOBS if job["name"] == "healthmes-morning-plan"
+    )
+    assert morning["id"] == legacy["id"]
+    for field in bootstrap.HEALTHMES_MANAGED_CRON_FIELDS:
+        if field == "schedule":
+            assert morning[field]["expr"] == desired[field]
+        else:
+            assert morning[field] == desired[field]
+    assert morning["origin"] == bootstrap.HEALTHMES_CRON_ORIGIN
+    for field in (
+        "enabled",
+        "state",
+        "paused_at",
+        "paused_reason",
+        "repeat",
+        "created_at",
+        "next_run_at",
+        "last_run_at",
+        "last_status",
+        "last_error",
+        "last_delivery_error",
+    ):
+        assert morning[field] == legacy[field]
+
+
+def test_unmanaged_same_name_cron_is_not_overwritten(
+    bootstrap, hermes_home, env_file
+):
+    created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
+    user_job = bootstrap.build_fallback_job(
+        prompt="Run my private morning workflow.",
+        schedule="15 6 * * *",
+        name="healthmes-morning-plan",
+        deliver="local",
+        skills=["personal-planner"],
+        script="personal_morning.py",
+        origin={"source": "user"},
+        now=created_at,
+    )
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    bootstrap._write_jobs_envelope(jobs_file, [user_job], now=created_at)
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    jobs = yaml.safe_load(jobs_file.read_text())["jobs"]
+    unchanged = next(job for job in jobs if job["id"] == user_job["id"])
+    assert unchanged == user_job
+
+
 def test_dry_run_writes_nothing(bootstrap, hermes_home, env_file, capsys):
     env_before = env_file.read_text()
     assert run_bootstrap(bootstrap, hermes_home, env_file, "--dry-run") == 0

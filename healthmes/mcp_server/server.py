@@ -760,12 +760,24 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     )
 
     # --- sleep debt (internal sleep score; algorithms/sleep.py, never reinvented)
-    internal_scores = interpret.daily_series(
-        _localized(_score_points(score_rows, "sleep", provider="internal"), tz),
-        how="max",
+    internal_sleep_points = _localized(
+        _score_points(score_rows, "sleep", provider="internal"), tz
     )
+    internal_scores = interpret.daily_series(internal_sleep_points, how="max")
     if internal_scores:
-        sleep_block = interpret.sleep_debt(internal_scores, as_of)
+        internal_recorded_at = {
+            day: max(
+                recorded_at
+                for recorded_at, value in internal_sleep_points
+                if recorded_at.date() == day and value == score
+            )
+            for day, score in internal_scores.items()
+        }
+        sleep_block = interpret.sleep_debt(
+            internal_scores,
+            as_of,
+            recorded_at_by_day=internal_recorded_at,
+        )
         sleep_block["source"] = "internal_sleep_score"
     else:
         sleep_block = {

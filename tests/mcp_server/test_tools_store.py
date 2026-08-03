@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from healthmes.api.auth import viewer_token
 from healthmes.api.briefing import decision_viewer_url
+from healthmes.calendars.adjustments import MAX_EVIDENCE_CLOCK_SKEW
 from healthmes.calendars.base import ExternalEvent
 from healthmes.config import Settings
 from healthmes.mcp_server import server as server_module
@@ -621,6 +622,90 @@ class TestScheduleTools:
             "provider_code": "user_declined",
         }
         assert writer.changes == []
+
+    async def test_evaluate_rejects_same_local_date_future_sleep_score(
+        self, mcp_client, call_tool, mcp_env, store_factory, pinned_tz
+    ):
+        now_local = dt.datetime.now(pinned_tz)
+        day = (now_local + dt.timedelta(days=1)).date()
+        future_recorded_at = (
+            dt.datetime.combine(
+                day,
+                dt.time.min,
+                tzinfo=pinned_tz,
+            )
+            + MAX_EVIDENCE_CLOCK_SKEW
+            + dt.timedelta(seconds=1)
+        )
+        assert future_recorded_at.astimezone(dt.UTC) > (
+            dt.datetime.now(dt.UTC) + MAX_EVIDENCE_CLOCK_SKEW
+        )
+        for days_ago, score in enumerate((70, 80, 90, 90, 90)):
+            score_day = day - dt.timedelta(days=days_ago)
+            recorded_at = (
+                future_recorded_at
+                if days_ago == 0
+                else dt.datetime.combine(
+                    score_day,
+                    dt.time(hour=7),
+                    tzinfo=pinned_tz,
+                )
+            )
+            mcp_env.add_score(
+                "sleep",
+                "internal",
+                recorded_at.isoformat(),
+                score,
+            )
+        mcp_env.add_score(
+            "body_battery",
+            "garmin",
+            now_local.isoformat(),
+            35,
+        )
+
+        event_start = dt.datetime.combine(
+            day,
+            dt.time(hour=14),
+            tzinfo=pinned_tz,
+        )
+        with store_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="future-sleep-target",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="Recovery focus",
+                    start_at=event_start.astimezone(dt.UTC),
+                    end_at=(event_start + dt.timedelta(hours=3)).astimezone(dt.UTC),
+                    etag='"etag-v1"',
+                    organizer_self=True,
+                    has_attendees=False,
+                    is_recurring=False,
+                    event_type="default",
+                    is_all_day=False,
+                    is_locked=False,
+                    status="confirmed",
+                )
+            )
+            session.commit()
+
+        readiness = await call_tool(
+            mcp_client,
+            "get_daily_readiness_context",
+            {"date": day.isoformat()},
+        )
+        assert readiness["sleep_debt"]["last_night"]["recorded_at"] == (
+            future_recorded_at.isoformat()
+        )
+
+        result = await call_tool(
+            mcp_client,
+            "evaluate_morning_calendar_nudge",
+            {"date": day.isoformat()},
+        )
+
+        assert result["outcome"] == "no_action"
+        assert result["reason"] == "future_sleep"
 
     async def test_no_action_returns_authenticated_decision_viewer_without_proposal(
         self, mcp_client, call_tool, store_factory, pinned_tz, monkeypatch

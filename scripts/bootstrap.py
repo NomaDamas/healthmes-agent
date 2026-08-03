@@ -31,7 +31,8 @@ directory outside the vendor tree) and the repo-root ``.env``:
    (cron/scheduler.py::_run_job_script path guard) and injects their stdout
    into the briefing prompt as context (docs/PLAN.md section 4).
 5. Register the three cron briefings (morning plan 07:00, evening review
-   21:30, weekly planning Sunday 18:00) against
+   21:30, weekly planning Sunday 18:00), and reconcile an existing
+   HealthMes-managed morning job, against
    vendor/hermes-agent/cron/jobs.py::create_job, each with ``script=`` set
    to the installed snapshot. The vendor module is imported and called
    directly when importable AND croniter is available (cron-expression
@@ -73,6 +74,7 @@ import shutil
 import sys
 import tempfile
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -107,6 +109,18 @@ WARN_IF_MISSING = (
 SNAPSHOT_SCRIPT_NAME = "healthmes_briefing_snapshot.py"
 SNAPSHOT_SCRIPT_SOURCE = REPO_ROOT / "scripts" / SNAPSHOT_SCRIPT_NAME
 SNAPSHOT_SIDECAR_NAME = "healthmes_snapshot.json"
+HEALTHMES_CRON_ORIGIN = {
+    "source": "healthmes-bootstrap",
+    "version": 1,
+}
+HEALTHMES_MORNING_CRON_NAME = "healthmes-morning-plan"
+HEALTHMES_MANAGED_CRON_FIELDS = (
+    "prompt",
+    "schedule",
+    "skills",
+    "deliver",
+    "script",
+)
 
 # Every variable the template references. Optional ones render as "" so the
 # template's `| default(..., true)` fallbacks kick in under StrictUndefined.
@@ -143,7 +157,7 @@ TEMPLATE_KEYS = (
 # the prompts therefore say "the snapshot above" and keep MCP for verification.
 BRIEFING_JOBS: tuple[dict[str, Any], ...] = (
     {
-        "name": "healthmes-morning-plan",
+        "name": HEALTHMES_MORNING_CRON_NAME,
         "schedule": "0 7 * * *",
         "prompt": (
             "Morning briefing. A HealthMes state snapshot (open tasks, "
@@ -718,6 +732,7 @@ def build_fallback_job(
     deliver: str,
     skills: list[str],
     script: str | None = None,
+    origin: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """The exact job dict vendor create_job() persists for these arguments.
@@ -763,7 +778,7 @@ def build_fallback_job(
         "last_error": None,
         "last_delivery_error": None,
         "deliver": deliver,
-        "origin": None,
+        "origin": dict(origin) if origin is not None else None,
         "enabled_toolsets": None,
         "workdir": None,
     }
@@ -807,28 +822,153 @@ def _write_jobs_envelope(
     _chmod_quiet(jobs_file, 0o600)
 
 
-def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
-    """Register BRIEFING_JOBS idempotently (matched by job name).
+def _cron_schedule_expr(job: Mapping[str, Any]) -> str:
+    schedule = job.get("schedule")
+    if isinstance(schedule, Mapping):
+        return str(schedule.get("expr") or schedule.get("display") or "")
+    return str(schedule or "")
 
-    Returns the method used: ``"vendor-create_job"`` (vendor module imported
-    and called directly), ``"payload-fallback"`` (exact create_job payload
-    written into the vendor jobs.json envelope), or ``"no-op"`` (all three
-    briefings were already registered).
+
+def _cron_skills(job: Mapping[str, Any]) -> list[str]:
+    skills = job.get("skills")
+    if isinstance(skills, str):
+        raw = [skills]
+    elif isinstance(skills, list):
+        raw = skills
+    else:
+        raw = [job.get("skill")]
+    return [str(skill).strip() for skill in raw if str(skill or "").strip()]
+
+
+def _is_healthmes_managed_cron(
+    existing: Mapping[str, Any], desired: Mapping[str, Any]
+) -> bool:
+    if str(existing.get("name") or "") != desired["name"]:
+        return False
+    origin = existing.get("origin")
+    if isinstance(origin, Mapping) and origin.get("source") == HEALTHMES_CRON_ORIGIN["source"]:
+        return True
+
+    prompt = str(existing.get("prompt") or "").casefold()
+    return any(
+        (
+            "healthmes" in prompt,
+            "mcp__healthmes__" in prompt,
+            SNAPSHOT_SCRIPT_NAME == existing.get("script"),
+            "healthmes-planner" in _cron_skills(existing),
+        )
+    )
+
+
+def _managed_cron_updates(
+    existing: Mapping[str, Any], desired: Mapping[str, Any]
+) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    if str(existing.get("prompt") or "") != desired["prompt"]:
+        updates["prompt"] = desired["prompt"]
+    if _cron_schedule_expr(existing) != desired["schedule"]:
+        updates["schedule"] = desired["schedule"]
+    if _cron_skills(existing) != desired["skills"]:
+        updates["skills"] = list(desired["skills"])
+    if existing.get("deliver") != desired["deliver"]:
+        updates["deliver"] = desired["deliver"]
+    if existing.get("script") != desired.get("script"):
+        updates["script"] = desired.get("script")
+    if existing.get("origin") != HEALTHMES_CRON_ORIGIN:
+        updates["origin"] = dict(HEALTHMES_CRON_ORIGIN)
+    return updates
+
+
+def _apply_fallback_cron_updates(
+    existing: Mapping[str, Any],
+    updates: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    updated = {**existing, **updates}
+    if "skills" in updates:
+        skills = list(updates["skills"])
+        updated["skills"] = skills
+        updated["skill"] = skills[0] if skills else None
+    if "schedule" in updates:
+        schedule = str(updates["schedule"])
+        updated["schedule"] = {
+            "kind": "cron",
+            "expr": schedule,
+            "display": schedule,
+        }
+        updated["schedule_display"] = schedule
+        if updated.get("state") != "paused":
+            updated["next_run_at"] = _next_cron_run(schedule, now).isoformat()
+    return updated
+
+
+def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
+    """Create BRIEFING_JOBS and reconcile the HealthMes-owned morning job.
+
+    The morning job is updated only when a HealthMes ownership marker or a
+    legacy HealthMes-specific fingerprint is present. Runtime state and job
+    identity remain untouched; only the managed declaration fields drift.
     """
     jobs_file = hermes_home / "cron" / "jobs.json"
-    existing_names = {
-        str(job.get("name", "")) for job in _load_jobs_envelope(jobs_file)
-    }
-    missing = [job for job in BRIEFING_JOBS if job["name"] not in existing_names]
-    for job in BRIEFING_JOBS:
-        if job["name"] in existing_names:
-            plan.act(f"keep cron job '{job['name']}' (already registered)")
-    if not missing:
+    existing_jobs = _load_jobs_envelope(jobs_file)
+    jobs_by_name: dict[str, list[dict[str, Any]]] = {}
+    for existing in existing_jobs:
+        jobs_by_name.setdefault(str(existing.get("name") or ""), []).append(existing)
+
+    missing: list[dict[str, Any]] = []
+    drifted: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    for desired in BRIEFING_JOBS:
+        matches = jobs_by_name.get(desired["name"], [])
+        if not matches:
+            missing.append(desired)
+            continue
+        if len(matches) > 1:
+            plan.warn(
+                f"cron job name '{desired['name']}' is ambiguous; "
+                "leaving all matching jobs unchanged"
+            )
+            continue
+        existing = matches[0]
+        if desired["name"] != HEALTHMES_MORNING_CRON_NAME:
+            plan.act(f"keep cron job '{desired['name']}' (already registered)")
+            continue
+        job_id = str(existing.get("id") or "").strip()
+        id_matches = [
+            job
+            for job in existing_jobs
+            if str(job.get("id") or "").strip() == job_id
+        ]
+        if not job_id or len(id_matches) != 1:
+            plan.warn(
+                f"cron job '{desired['name']}' has a missing or ambiguous id; "
+                "leaving it unchanged"
+            )
+            continue
+        if not _is_healthmes_managed_cron(existing, desired):
+            plan.warn(
+                f"cron job '{desired['name']}' is not HealthMes-managed; "
+                "leaving it unchanged"
+            )
+            continue
+        updates = _managed_cron_updates(existing, desired)
+        if updates:
+            drifted.append((existing, desired, updates))
+        else:
+            plan.act(f"keep cron job '{desired['name']}' (already current)")
+
+    if not missing and not drifted:
         return "no-op"
 
     vendor_jobs = _import_vendor_cron_jobs(hermes_home)
     method = "vendor-create_job" if vendor_jobs is not None else "payload-fallback"
 
+    for existing, desired, updates in drifted:
+        managed_fields = sorted(set(updates) & set(HEALTHMES_MANAGED_CRON_FIELDS))
+        plan.act(
+            f"update cron job '{desired['name']}' "
+            f"(id={existing.get('id')}, fields={managed_fields}) via {method}"
+        )
     for job in missing:
         plan.act(
             f"register cron job '{job['name']}' ({job['schedule']}, "
@@ -838,6 +978,11 @@ def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
         return method
 
     if vendor_jobs is not None:
+        for existing, _desired, updates in drifted:
+            if vendor_jobs.update_job(str(existing.get("id") or ""), updates) is None:
+                raise RuntimeError(
+                    f"cron job disappeared during update: {existing.get('id')}"
+                )
         for job in missing:
             vendor_jobs.create_job(
                 prompt=job["prompt"],
@@ -846,6 +991,7 @@ def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
                 deliver=job["deliver"],
                 skills=list(job["skills"]),
                 script=job.get("script"),
+                origin=dict(HEALTHMES_CRON_ORIGIN),
             )
         return method
 
@@ -854,6 +1000,20 @@ def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
     # next_run_at lands on the configured wall clock, not the system one.
     now = _hermes_now(hermes_home)
     all_jobs = _load_jobs_envelope(jobs_file)
+    updates_by_id = {
+        str(existing.get("id") or ""): updates
+        for existing, _desired, updates in drifted
+    }
+    all_jobs = [
+        _apply_fallback_cron_updates(
+            existing,
+            updates_by_id[str(existing.get("id") or "")],
+            now=now,
+        )
+        if str(existing.get("id") or "") in updates_by_id
+        else existing
+        for existing in all_jobs
+    ]
     for job in missing:
         all_jobs.append(
             build_fallback_job(
@@ -863,6 +1023,7 @@ def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
                 deliver=job["deliver"],
                 skills=list(job["skills"]),
                 script=job.get("script"),
+                origin=HEALTHMES_CRON_ORIGIN,
                 now=now,
             )
         )

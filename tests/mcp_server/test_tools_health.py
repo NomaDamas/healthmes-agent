@@ -136,7 +136,11 @@ class TestDailyReadinessContext:
         assert sleep["status"] == "ok"
         assert sleep["index"] == 20.0  # mean of debts (30, 20, 10)
         assert sleep["nights_counted"] == 3
-        assert sleep["last_night"] == {"date": AS_OF, "score": 70.0}
+        assert sleep["last_night"] == {
+            "date": AS_OF,
+            "score": 70.0,
+            "recorded_at": "2026-07-08T16:10:00+09:00",
+        }
         assert sleep["source"] == "internal_sleep_score"
 
         hrv = result["hrv"]
