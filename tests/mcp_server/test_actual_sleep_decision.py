@@ -127,6 +127,33 @@ async def test_proposal_after_actual_wake_is_allowed(
     assert result["proposals"][0]["task_title"] == "After wake"
 
 
+async def test_cross_midnight_proposal_cannot_bypass_actual_sleep_overlap(
+    mcp_client,
+    store_factory,
+    pinned_tz,
+) -> None:
+    _seed_actual_sleep(store_factory, pinned_tz)
+    start = dt.datetime(2026, 7, 7, 23, 45, tzinfo=pinned_tz)
+
+    with pytest.raises(ToolError, match="overlaps actual sleep"):
+        await mcp_client.call_tool(
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "title": "Cross-midnight overlap",
+                        "start": start.isoformat(),
+                        "end": (start + dt.timedelta(minutes=45)).isoformat(),
+                    }
+                ]
+            },
+        )
+
+    with store_factory() as session:
+        assert list(session.scalars(select(Task))) == []
+        assert list(session.scalars(select(ScheduleProposal))) == []
+
+
 async def test_missing_actual_sleep_preserves_existing_proposal_behavior(
     mcp_client,
     call_tool,

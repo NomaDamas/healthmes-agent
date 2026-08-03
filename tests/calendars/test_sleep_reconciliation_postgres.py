@@ -17,7 +17,10 @@ from healthmes.calendars.base import (
     HealthmesEventKind,
     SyncState,
 )
-from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.calendars.sleep_observation import (
+    ActualSleepObservation,
+    actual_sleep_source_key,
+)
 from healthmes.calendars.sleep_reconciliation import (
     SleepCalendarAction,
     SleepCalendarReconciler,
@@ -100,7 +103,7 @@ def test_postgres_source_key_lock_allows_one_concurrent_create() -> None:
     observation = ActualSleepObservation(
         local_date=date(2026, 7, 26),
         provider="oura",
-        source_key="oura:2026-07-26",
+        source_key=actual_sleep_source_key(date(2026, 7, 26)),
         start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
         end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
         duration_minutes=420,
@@ -174,7 +177,7 @@ def test_postgres_source_key_lock_is_pinned_away_from_session_pool_commits() -> 
     observation = ActualSleepObservation(
         local_date=date(2026, 7, 26),
         provider="oura",
-        source_key="oura:2026-07-26",
+        source_key=actual_sleep_source_key(date(2026, 7, 26)),
         start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
         end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
         duration_minutes=420,
@@ -224,7 +227,7 @@ def test_postgres_source_key_lock_is_released_after_provider_failure() -> None:
     observation = ActualSleepObservation(
         local_date=date(2026, 7, 26),
         provider="oura",
-        source_key="oura:2026-07-26",
+        source_key=actual_sleep_source_key(date(2026, 7, 26)),
         start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
         end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
         duration_minutes=420,

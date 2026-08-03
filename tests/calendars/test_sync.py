@@ -517,6 +517,27 @@ class TestOwnershipGuard:
         assert fake_backend.delete_calls == [row.external_id]
         assert rows(session) == {}
 
+    def test_delete_agent_event_prunes_stale_row_when_remote_is_missing(
+        self, service, fake_backend, session, monkeypatch
+    ) -> None:
+        row = service.create_agent_event(fake_backend.source, draft())
+
+        def missing_delete(
+            external_id,
+            *,
+            expected_kind=None,
+            expected_etag=None,
+        ) -> None:
+            fake_backend.delete_calls.append(external_id)
+            raise EventNotFoundError(external_id)
+
+        monkeypatch.setattr(fake_backend, "delete_event", missing_delete)
+
+        service.delete_agent_event(fake_backend.source, row.external_id)
+
+        assert fake_backend.delete_calls == [row.external_id]
+        assert rows(session) == {}
+
     def test_move_unknown_event_raises_not_found(self, service, fake_backend) -> None:
         with pytest.raises(EventNotFoundError):
             service.move_agent_event(
@@ -615,7 +636,60 @@ class TestForgedTagOwnership:
         assert [change.external_id for change in diff.created] == ["forged-sleep"]
         stored = rows(session)["forged-sleep"]
         assert not stored.is_agent_created
-        assert stored.healthmes_source_key == "oura:2026-07-26"
+        assert stored.healthmes_kind is None
+        assert stored.healthmes_source is None
+        assert stored.healthmes_source_key is None
+        assert stored.observation_fingerprint is None
+        assert stored.sleep_local_date is None
+
+    def test_copied_sleep_identity_does_not_stall_cursor_progress(
+        self,
+        service,
+        fake_backend,
+        session,
+        state_store,
+        make_event,
+    ) -> None:
+        self._seed(service, fake_backend, make_event)
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="open-wearables",
+            source_key="actual_sleep:2026-07-26",
+        )
+        session.add(
+            CalendarEventMirror(
+                external_id="owned-sleep",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="수면 (실제)",
+                start_at=utc(2026, 7, 25, 14),
+                end_at=utc(2026, 7, 25, 22),
+                is_agent_created=True,
+                healthmes_kind=identity.kind.value,
+                healthmes_source=identity.source,
+                healthmes_source_key=identity.source_key,
+            )
+        )
+        session.commit()
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "forged-copy",
+                    is_agent_created=True,
+                    identity=identity,
+                )
+            ],
+            {"sync_token": "tok-forged"},
+        )
+
+        diff = service.sync_backend(fake_backend)
+
+        assert [change.external_id for change in diff.created] == ["forged-copy"]
+        forged = rows(session)["forged-copy"]
+        assert not forged.is_agent_created
+        assert forged.healthmes_source_key is None
+        assert state_store.load(fake_backend.source) == {
+            "sync_token": "tok-forged"
+        }
 
     def test_tag_stripped_during_move_becomes_external(
         self, service, fake_backend, session, make_event

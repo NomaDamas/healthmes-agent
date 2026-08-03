@@ -302,7 +302,7 @@ class CalendarMirrorService:
                     is_agent_created=trusted_agent,
                     agent_task_id=resolved_task_id if trusted_agent else None,
                     etag=event.etag,
-                    **_mirror_identity_kwargs(event),
+                    **_mirror_healthmes_kwargs(event, trusted_agent=trusted_agent),
                     **_mirror_metadata_kwargs(event),
                 )
             )
@@ -329,13 +329,24 @@ class CalendarMirrorService:
         moved = old_start != event.start_at or old_end != event.end_at
         content_changed = (row.summary or None) != (event.summary or None)
         metadata_changed = _mirror_metadata_changed(row, event)
+        healthmes_changed = _mirror_healthmes_changed(
+            row,
+            event,
+            trusted_agent=trusted_agent,
+        )
         # Refresh ownership from the freshly-observed provider state: if the tag
         # was stripped (or its task link no longer resolves) the row flips to
         # external, and what would have been an agent-move is reclassified into
         # the external ``diff.moved`` bucket below.
         ownership_changed = row.is_agent_created != trusted_agent
 
-        if not moved and not content_changed and not ownership_changed and not metadata_changed:
+        if (
+            not moved
+            and not content_changed
+            and not ownership_changed
+            and not metadata_changed
+            and not healthmes_changed
+        ):
             # Byte-identical, same-tag re-delivery (410 full resync, lost
             # sync-state file, crash between commit and cursor save): write
             # NOTHING. Assigning equal values still dirties the row on sqlite
@@ -352,7 +363,7 @@ class CalendarMirrorService:
         row.etag = event.etag
         row.is_agent_created = trusted_agent
         row.agent_task_id = resolved_task_id if trusted_agent else None
-        _apply_mirror_identity(row, event)
+        _apply_mirror_healthmes(row, event, trusted_agent=trusted_agent)
         _apply_mirror_metadata(row, event)
 
         change = EventChange(
@@ -493,7 +504,13 @@ class CalendarMirrorService:
     def delete_agent_event(self, source: CalendarSource, external_id: str) -> None:
         """Delete an agent-created block; refuses to touch external events."""
         row = self._get_owned_row(source, external_id)
-        self._backend_for(source).delete_event(external_id)
+        try:
+            self._backend_for(source).delete_event(
+                external_id,
+                expected_etag=row.etag,
+            )
+        except EventNotFoundError:
+            pass
         self._session.delete(row)
         self._session.commit()
 
@@ -547,23 +564,63 @@ _MIRROR_METADATA_FIELDS = (
 )
 
 
-def _mirror_identity_kwargs(event: ExternalEvent) -> dict[str, object]:
-    if event.identity is None:
-        return {
+_SLEEP_CONTEXT_FIELDS = (
+    "observation_fingerprint",
+    "sleep_local_date",
+    "sleep_provider",
+    "sleep_duration_minutes",
+    "sleep_time_in_bed_minutes",
+)
+
+
+def _mirror_healthmes_kwargs(
+    event: ExternalEvent,
+    *,
+    trusted_agent: bool,
+) -> dict[str, object]:
+    if trusted_agent and event.identity is not None:
+        identity: dict[str, object] = {
+            "healthmes_kind": event.identity.kind.value,
+            "healthmes_source": event.identity.source,
+            "healthmes_source_key": event.identity.source_key,
+        }
+    else:
+        identity = {
             "healthmes_kind": None,
             "healthmes_source": None,
             "healthmes_source_key": None,
         }
-    return {
-        "healthmes_kind": event.identity.kind.value,
-        "healthmes_source": event.identity.source,
-        "healthmes_source_key": event.identity.source_key,
-    }
+    if not trusted_agent:
+        identity.update({field: None for field in _SLEEP_CONTEXT_FIELDS})
+    return identity
 
 
-def _apply_mirror_identity(row: CalendarEventMirror, event: ExternalEvent) -> None:
-    for field_name, value in _mirror_identity_kwargs(event).items():
+def _apply_mirror_healthmes(
+    row: CalendarEventMirror,
+    event: ExternalEvent,
+    *,
+    trusted_agent: bool,
+) -> None:
+    for field_name, value in _mirror_healthmes_kwargs(
+        event,
+        trusted_agent=trusted_agent,
+    ).items():
         setattr(row, field_name, value)
+
+
+def _mirror_healthmes_changed(
+    row: CalendarEventMirror,
+    event: ExternalEvent,
+    *,
+    trusted_agent: bool,
+) -> bool:
+    return any(
+        getattr(row, field_name) != value
+        for field_name, value in _mirror_healthmes_kwargs(
+            event,
+            trusted_agent=trusted_agent,
+        ).items()
+    )
 
 
 def _mirror_metadata_kwargs(event: ExternalEvent) -> dict[str, object]:

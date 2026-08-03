@@ -129,6 +129,7 @@ class CalendarEventMirror(Base):
     healthmes_source_key: Mapped[str_255 | None]
     observation_fingerprint: Mapped[str_255 | None]
     sleep_local_date: Mapped[date | None] = mapped_column(index=True)
+    sleep_provider: Mapped[str_255 | None]
     sleep_duration_minutes: Mapped[int | None]
     sleep_time_in_bed_minutes: Mapped[int | None]
     etag: Mapped[str_255 | None]

@@ -30,6 +30,7 @@ credential can never take down the scheduler loop.
 import logging
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC, tzinfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -43,6 +44,7 @@ from healthmes.calendars.base import (
     HealthmesEventKind,
     coerce_utc,
 )
+from healthmes.calendars.sleep_context import actual_sleep_violation
 from healthmes.calendars.state import (
     FilePendingDiffStore,
     FileSyncStateStore,
@@ -50,7 +52,7 @@ from healthmes.calendars.state import (
     SyncStateStore,
 )
 from healthmes.calendars.sync import CalendarMirrorService, SyncDiff
-from healthmes.config import Settings
+from healthmes.config import Settings, resolve_timezone
 from healthmes.store.enums import CalendarSource, ProposalStatus
 from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task
 from healthmes.store.session import session_scope
@@ -174,7 +176,10 @@ def _existing_agent_block(
 
 
 def push_accepted_proposals(
-    service: CalendarMirrorService, session: Session, source: CalendarSource
+    service: CalendarMirrorService,
+    session: Session,
+    source: CalendarSource,
+    timezone: tzinfo = UTC,
 ) -> int:
     """Write every ``accepted`` proposal to the calendar; advance to ``pushed``.
 
@@ -188,6 +193,33 @@ def push_accepted_proposals(
     pushed = 0
     for proposal, task in list(_accepted_proposals(session)):
         row = _existing_agent_block(session, source, task.id, proposal)
+        violation = actual_sleep_violation(
+            session,
+            coerce_utc(proposal.proposed_start),
+            coerce_utc(proposal.proposed_end),
+            timezone,
+        )
+        if violation is not None:
+            if row is not None:
+                try:
+                    service.delete_agent_event(source, row.external_id)
+                except Exception:
+                    logger.exception(
+                        "Removing invalidated proposal %s event %s from %s failed; "
+                        "retrying next poll.",
+                        proposal.id,
+                        row.external_id,
+                        source.value,
+                    )
+                    continue
+            proposal.status = ProposalStatus.INVALIDATED
+            session.commit()
+            logger.warning(
+                "Proposal %s invalidated before calendar push: %s",
+                proposal.id,
+                violation,
+            )
+            continue
         if row is None:
             identity = (
                 CalendarEventIdentity(
@@ -280,7 +312,12 @@ def build_calendar_job(
                 service = CalendarMirrorService(session, [backend], store, journal)
                 diff = service.sync_backend(backend)
                 if is_write_backend:
-                    push_accepted_proposals(service, session, source)
+                    push_accepted_proposals(
+                        service,
+                        session,
+                        source,
+                        resolve_timezone(settings),
+                    )
                 return diff
         except Exception:
             logger.exception(

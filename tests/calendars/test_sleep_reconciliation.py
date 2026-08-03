@@ -19,7 +19,11 @@ from healthmes.calendars.base import (
     calendar_identity_external_id,
     coerce_utc,
 )
-from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.calendars.sleep_observation import (
+    ACTUAL_SLEEP_IDENTITY_SOURCE,
+    ActualSleepObservation,
+    actual_sleep_source_key,
+)
 from healthmes.calendars.sleep_preview import preview_sleep_reconciliation
 from healthmes.calendars.sleep_reconciliation import (
     SleepCalendarAction,
@@ -116,7 +120,7 @@ def observation() -> ActualSleepObservation:
     return ActualSleepObservation(
         local_date=date(2026, 7, 26),
         provider="oura",
-        source_key="oura:2026-07-26",
+        source_key=actual_sleep_source_key(date(2026, 7, 26)),
         start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
         end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
         duration_minutes=420,
@@ -142,15 +146,16 @@ def test_creates_owned_actual_sleep_with_source_identity(
     assert draft.summary == "수면 (실제)"
     assert draft.identity == CalendarEventIdentity(
         kind=HealthmesEventKind.ACTUAL_SLEEP,
-        source="oura",
-        source_key="oura:2026-07-26",
+        source=ACTUAL_SLEEP_IDENTITY_SOURCE,
+        source_key="actual_sleep:2026-07-26",
     )
     assert draft.description == ("Actual sleep: 420 min\nTime in bed: 480 min\nSource: oura")
     mirror = session.query(CalendarEventMirror).one()
     assert mirror.external_id == "sleep-1"
     assert mirror.healthmes_kind == "actual_sleep"
-    assert mirror.healthmes_source == "oura"
-    assert mirror.healthmes_source_key == "oura:2026-07-26"
+    assert mirror.healthmes_source == ACTUAL_SLEEP_IDENTITY_SOURCE
+    assert mirror.healthmes_source_key == "actual_sleep:2026-07-26"
+    assert mirror.sleep_provider == "oura"
     assert mirror.observation_fingerprint == result.observation_fingerprint
     assert mirror.sleep_local_date == observation.local_date
     assert mirror.sleep_duration_minutes == observation.duration_minutes
@@ -470,6 +475,13 @@ def test_provider_correction_recovers_after_remote_update_before_local_finalize(
         duration_minutes=450,
         time_in_bed_minutes=510,
     )
+    latest = replace(
+        corrected,
+        provider="garmin",
+        end_at=datetime(2026, 7, 26, 7, 45, tzinfo=UTC),
+        duration_minutes=465,
+        time_in_bed_minutes=525,
+    )
     with session_factory() as failing_session:
         real_commit = failing_session.commit
 
@@ -490,20 +502,325 @@ def test_provider_correction_recovers_after_remote_update_before_local_finalize(
         preview = preview_sleep_reconciliation(
             preview_session,
             CalendarSource.GOOGLE,
-            corrected,
+            latest,
             backend,
         )
     with session_factory() as retry_session:
-        result = SleepCalendarReconciler(retry_session, backend).reconcile(corrected)
+        result = SleepCalendarReconciler(retry_session, backend).reconcile(latest)
         recovered = retry_session.query(CalendarEventMirror).one()
 
     # Then
-    assert preview["action"] == "noop"
+    assert preview["action"] == "would_update"
     assert result.action is SleepCalendarAction.UPDATED
-    assert len(backend.update_calls) == 1
+    assert len(backend.update_calls) == 2
     assert recovered.status is None
     assert recovered.etag == '"updated"'
-    assert recovered.observation_fingerprint == observation_fingerprint(corrected)
+    assert recovered.observation_fingerprint == observation_fingerprint(latest)
+    assert recovered.sleep_provider == "garmin"
+    assert recovered.sleep_duration_minutes == 465
+    assert recovered.sleep_time_in_bed_minutes == 525
+    assert coerce_utc(recovered.end_at) == latest.end_at
+
+
+def test_pending_create_recovers_original_intent_before_newer_correction(
+    session,
+    backend: RecordingCalendarBackend,
+    observation: ActualSleepObservation,
+) -> None:
+    original_fingerprint = observation_fingerprint(observation)
+    identity = CalendarEventIdentity(
+        kind=HealthmesEventKind.ACTUAL_SLEEP,
+        source=ACTUAL_SLEEP_IDENTITY_SOURCE,
+        source_key=observation.source_key,
+    )
+    session.add(
+        CalendarEventMirror(
+            external_id=calendar_identity_external_id(
+                CalendarSource.GOOGLE,
+                identity,
+            ),
+            calendar_source=CalendarSource.GOOGLE,
+            summary="수면 (실제)",
+            start_at=observation.start_at,
+            end_at=observation.end_at,
+            is_agent_created=True,
+            healthmes_kind=identity.kind.value,
+            healthmes_source=identity.source,
+            healthmes_source_key=identity.source_key,
+            observation_fingerprint=original_fingerprint,
+            sleep_local_date=observation.local_date,
+            sleep_provider=observation.provider,
+            sleep_duration_minutes=observation.duration_minutes,
+            sleep_time_in_bed_minutes=observation.time_in_bed_minutes,
+            status="healthmes_pending_create",
+        )
+    )
+    session.commit()
+    latest = replace(
+        observation,
+        provider="garmin",
+        end_at=datetime(2026, 7, 26, 7, 30, tzinfo=UTC),
+        duration_minutes=450,
+        time_in_bed_minutes=510,
+    )
+
+    result = SleepCalendarReconciler(session, backend).reconcile(latest)
+
+    assert result.action is SleepCalendarAction.UPDATED
+    assert len(backend.created_drafts) == 1
+    assert backend.created_drafts[0].end_at == observation.end_at
+    assert len(backend.update_calls) == 1
+    assert backend.update_calls[0]["end_at"] == latest.end_at
+    mirror = session.query(CalendarEventMirror).one()
+    assert mirror.observation_fingerprint == observation_fingerprint(latest)
+    assert mirror.sleep_provider == "garmin"
+    assert mirror.sleep_duration_minutes == 450
+    assert mirror.sleep_time_in_bed_minutes == 510
+
+
+def test_provider_winner_switch_updates_same_canonical_event(
+    session,
+    backend: RecordingCalendarBackend,
+    observation: ActualSleepObservation,
+) -> None:
+    reconciler = SleepCalendarReconciler(session, backend)
+    created = reconciler.reconcile(observation)
+    switched = replace(
+        observation,
+        provider="garmin",
+        start_at=datetime(2026, 7, 25, 22, 45, tzinfo=UTC),
+        end_at=datetime(2026, 7, 26, 7, 15, tzinfo=UTC),
+        duration_minutes=450,
+        time_in_bed_minutes=510,
+    )
+
+    updated = reconciler.reconcile(switched)
+
+    assert created.external_id == updated.external_id
+    assert len(backend.created_drafts) == 1
+    assert len(backend.update_calls) == 1
+    assert backend.identity == CalendarEventIdentity(
+        kind=HealthmesEventKind.ACTUAL_SLEEP,
+        source=ACTUAL_SLEEP_IDENTITY_SOURCE,
+        source_key=actual_sleep_source_key(observation.local_date),
+    )
+    mirror = session.query(CalendarEventMirror).one()
+    assert mirror.sleep_provider == "garmin"
+    assert mirror.healthmes_source == ACTUAL_SLEEP_IDENTITY_SOURCE
+
+
+def test_legacy_provider_identity_is_reused_without_duplicate(
+    session,
+    backend: RecordingCalendarBackend,
+    observation: ActualSleepObservation,
+) -> None:
+    legacy_identity = CalendarEventIdentity(
+        kind=HealthmesEventKind.ACTUAL_SLEEP,
+        source="oura",
+        source_key="oura:2026-07-26",
+    )
+    backend.identity = legacy_identity
+    backend.event = ExternalEvent(
+        external_id="legacy-sleep",
+        summary="수면 (실제)",
+        start_at=observation.start_at,
+        end_at=observation.end_at,
+        is_agent_created=True,
+        identity=legacy_identity,
+        etag='"legacy"',
+    )
+    session.add(
+        CalendarEventMirror(
+            external_id="legacy-sleep",
+            calendar_source=CalendarSource.GOOGLE,
+            summary="수면 (실제)",
+            start_at=observation.start_at,
+            end_at=observation.end_at,
+            is_agent_created=True,
+            healthmes_kind=legacy_identity.kind.value,
+            healthmes_source=legacy_identity.source,
+            healthmes_source_key=legacy_identity.source_key,
+            observation_fingerprint=observation_fingerprint(observation),
+            sleep_local_date=observation.local_date,
+            sleep_provider="oura",
+            sleep_duration_minutes=observation.duration_minutes,
+            sleep_time_in_bed_minutes=observation.time_in_bed_minutes,
+            etag='"legacy"',
+        )
+    )
+    session.commit()
+    switched = replace(
+        observation,
+        provider="garmin",
+        end_at=datetime(2026, 7, 26, 7, 30, tzinfo=UTC),
+        duration_minutes=450,
+    )
+
+    result = SleepCalendarReconciler(session, backend).reconcile(switched)
+
+    assert result.action is SleepCalendarAction.UPDATED
+    assert backend.created_drafts == []
+    assert len(backend.update_calls) == 1
+    mirror = session.query(CalendarEventMirror).one()
+    assert mirror.external_id == "legacy-sleep"
+    assert mirror.healthmes_source_key == legacy_identity.source_key
+    assert mirror.sleep_provider == "garmin"
+
+
+def test_multiple_legacy_provider_rows_collapse_to_current_winner(
+    session,
+    observation: ActualSleepObservation,
+) -> None:
+    class MultiEventBackend(RecordingCalendarBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: dict[str, ExternalEvent] = {}
+
+        def read_event(self, external_id: str) -> ExternalEvent:
+            try:
+                return self.events[external_id]
+            except KeyError as exc:
+                raise EventNotFoundError(external_id) from exc
+
+        def delete_event(
+            self,
+            external_id: str,
+            *,
+            expected_kind: HealthmesEventKind | None = None,
+            expected_etag: str | None = None,
+        ) -> None:
+            event = self.read_event(external_id)
+            assert expected_kind is HealthmesEventKind.ACTUAL_SLEEP
+            assert event.etag == expected_etag
+            self.delete_calls.append(external_id)
+            del self.events[external_id]
+
+    backend = MultiEventBackend()
+    switched = replace(
+        observation,
+        provider="garmin",
+        start_at=datetime(2026, 7, 25, 22, 45, tzinfo=UTC),
+        end_at=datetime(2026, 7, 26, 7, 15, tzinfo=UTC),
+        duration_minutes=450,
+        time_in_bed_minutes=510,
+    )
+    identities = {
+        "legacy-oura": CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key="oura:2026-07-26",
+        ),
+        "legacy-garmin": CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="garmin",
+            source_key="garmin:2026-07-26",
+        ),
+    }
+    observations = {
+        "legacy-oura": observation,
+        "legacy-garmin": switched,
+    }
+    for external_id, identity in identities.items():
+        row_observation = observations[external_id]
+        backend.events[external_id] = ExternalEvent(
+            external_id=external_id,
+            summary="수면 (실제)",
+            start_at=row_observation.start_at,
+            end_at=row_observation.end_at,
+            is_agent_created=True,
+            identity=identity,
+            etag=f'"{external_id}"',
+        )
+        session.add(
+            CalendarEventMirror(
+                external_id=external_id,
+                calendar_source=CalendarSource.GOOGLE,
+                summary="수면 (실제)",
+                start_at=row_observation.start_at,
+                end_at=row_observation.end_at,
+                is_agent_created=True,
+                healthmes_kind=identity.kind.value,
+                healthmes_source=identity.source,
+                healthmes_source_key=identity.source_key,
+                observation_fingerprint=observation_fingerprint(row_observation),
+                sleep_local_date=row_observation.local_date,
+                sleep_provider=row_observation.provider,
+                sleep_duration_minutes=row_observation.duration_minutes,
+                sleep_time_in_bed_minutes=row_observation.time_in_bed_minutes,
+                etag=f'"{external_id}"',
+            )
+        )
+    session.commit()
+
+    result = SleepCalendarReconciler(session, backend).reconcile(switched)
+
+    assert result.action is SleepCalendarAction.NOOP
+    assert backend.delete_calls == ["legacy-oura"]
+    assert set(backend.events) == {"legacy-garmin"}
+    [mirror] = session.query(CalendarEventMirror).all()
+    assert mirror.external_id == "legacy-garmin"
+    assert mirror.sleep_provider == "garmin"
+
+
+def test_duplicate_cleanup_waits_for_primary_remote_validation(
+    session,
+    backend: RecordingCalendarBackend,
+    observation: ActualSleepObservation,
+) -> None:
+    switched = replace(observation, provider="garmin")
+    identities = (
+        CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key="oura:2026-07-26",
+        ),
+        CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="garmin",
+            source_key="garmin:2026-07-26",
+        ),
+    )
+    for identity in identities:
+        session.add(
+            CalendarEventMirror(
+                external_id=f"legacy-{identity.source}",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="수면 (실제)",
+                start_at=observation.start_at,
+                end_at=observation.end_at,
+                is_agent_created=True,
+                healthmes_kind=identity.kind.value,
+                healthmes_source=identity.source,
+                healthmes_source_key=identity.source_key,
+                observation_fingerprint=observation_fingerprint(switched),
+                sleep_local_date=observation.local_date,
+                sleep_provider=identity.source,
+                sleep_duration_minutes=observation.duration_minutes,
+                sleep_time_in_bed_minutes=observation.time_in_bed_minutes,
+                etag='"legacy"',
+            )
+        )
+    session.commit()
+    backend.identity = CalendarEventIdentity(
+        kind=HealthmesEventKind.PLANNED_SLEEP,
+        source="planner",
+        source_key="proposal:changed",
+    )
+    backend.event = ExternalEvent(
+        external_id="legacy-garmin",
+        summary="수면 (실제)",
+        start_at=observation.start_at,
+        end_at=observation.end_at,
+        is_agent_created=True,
+        identity=backend.identity,
+        etag='"legacy"',
+    )
+
+    with pytest.raises(OwnershipError):
+        SleepCalendarReconciler(session, backend).reconcile(switched)
+
+    assert backend.delete_calls == []
+    assert session.query(CalendarEventMirror).count() == 2
 
 
 def test_refuses_source_key_collision_with_unowned_event(

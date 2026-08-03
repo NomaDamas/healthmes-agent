@@ -131,6 +131,38 @@ def test_accept_proposal_then_second_accept_conflicts(client, session):
     assert again.json()["error"]["code"] == "invalid_transition"
 
 
+def test_accept_invalidates_proposal_when_actual_sleep_changed(client, session):
+    proposal = _seed_proposal(session)
+    proposal.proposed_start = _dt(6)
+    proposal.proposed_end = _dt(7)
+    session.add(
+        CalendarEventMirror(
+            external_id="actual-sleep",
+            calendar_source=CalendarSource.GOOGLE,
+            summary="수면 (실제)",
+            start_at=_dt(23, day=5),
+            end_at=_dt(7, 30),
+            is_agent_created=True,
+            healthmes_kind="actual_sleep",
+            sleep_local_date=_dt(7).date(),
+        )
+    )
+    session.commit()
+
+    response = client.post(f"/v1/schedule/proposals/{proposal.id}/accept")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "actual_sleep_conflict"
+    assert response.json()["error"]["detail"] == {
+        "proposal_status": "invalidated"
+    }
+    session.expire_all()
+    assert (
+        session.get(ScheduleProposal, proposal.id).status
+        is ProposalStatus.INVALIDATED
+    )
+
+
 def test_decline_proposal(client, session):
     proposal = _seed_proposal(session)
 

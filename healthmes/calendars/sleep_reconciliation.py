@@ -13,6 +13,7 @@ from healthmes.calendars.base import (
     CalendarEventIdentity,
     EventNotFoundError,
     HealthmesEventKind,
+    OwnershipError,
     ensure_utc,
 )
 from healthmes.calendars.planned_sleep_replacement import (
@@ -26,9 +27,13 @@ from healthmes.calendars.sleep_event_rendering import (
 from healthmes.calendars.sleep_mirror import (
     SLEEP_CREATE_PENDING_STATUS,
     SLEEP_UPDATE_PENDING_STATUS,
+    actual_sleep_identity,
+    actual_sleep_identity_from_mirror,
     finalize_sleep_mirror,
+    find_actual_sleep_mirrors,
     mark_sleep_update_pending,
     pending_sleep_mirror,
+    pending_sleep_observation,
 )
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.calendars.sleep_reconciliation_guards import (
@@ -61,11 +66,7 @@ class SleepCalendarReconciler:
 
     def reconcile(self, observation: ActualSleepObservation) -> SleepCalendarResult:
         fingerprint = observation_fingerprint(observation)
-        identity = CalendarEventIdentity(
-            kind=HealthmesEventKind.ACTUAL_SLEEP,
-            source=observation.provider,
-            source_key=observation.source_key,
-        )
+        identity = actual_sleep_identity(observation)
         lock_connection = self._lock_source_key(identity.source_key)
         try:
             return self._reconcile_locked(observation, identity, fingerprint)
@@ -79,29 +80,68 @@ class SleepCalendarReconciler:
         identity: CalendarEventIdentity,
         fingerprint: str,
     ) -> SleepCalendarResult:
-        row = self._find_source_key(identity.source_key)
-        if row is None:
+        rows = find_actual_sleep_mirrors(
+            self._session,
+            self._backend.source,
+            observation,
+        )
+        if not rows:
             result = self._create(observation, identity, fingerprint)
-            return self._replace_planned_sleep(result, observation)
+            return self._finish(result, observation, [])
 
+        row = rows[0]
+        identity = actual_sleep_identity_from_mirror(row) or identity
         assert_owned_actual_sleep(row, identity)
+        duplicates = rows[1:]
+        pending_observation = (
+            pending_sleep_observation(row)
+            if row.status in {
+                SLEEP_CREATE_PENDING_STATUS,
+                SLEEP_UPDATE_PENDING_STATUS,
+            }
+            else None
+        )
+        pending_fingerprint = row.observation_fingerprint
+        if pending_observation is not None and not pending_fingerprint:
+            raise RuntimeError("pending actual_sleep mirror is missing its fingerprint")
         try:
             remote = self._backend.read_event(row.external_id)
         except EventNotFoundError:
             if row.status != SLEEP_CREATE_PENDING_STATUS:
                 raise
-            result = self._create_remote(row, observation, identity, fingerprint)
-            return self._replace_planned_sleep(result, observation)
+            assert pending_observation is not None
+            assert pending_fingerprint is not None
+            result = self._create_remote(
+                row,
+                pending_observation,
+                identity,
+                pending_fingerprint,
+            )
+            result = self._apply_latest_after_recovery(
+                row,
+                observation,
+                fingerprint,
+                result,
+            )
+            return self._finish(result, observation, duplicates)
 
         if row.status == SLEEP_UPDATE_PENDING_STATUS:
+            assert pending_observation is not None
+            assert pending_fingerprint is not None
             result = self._recover_pending_update(
                 row,
                 remote,
-                observation,
+                pending_observation,
                 identity,
-                fingerprint,
+                pending_fingerprint,
             )
-            return self._replace_planned_sleep(result, observation)
+            result = self._apply_latest_after_recovery(
+                row,
+                observation,
+                fingerprint,
+                result,
+            )
+            return self._finish(result, observation, duplicates)
 
         expected_etag = assert_remote_actual_sleep(
             remote,
@@ -109,16 +149,24 @@ class SleepCalendarReconciler:
             row.etag,
         )
         if row.status == SLEEP_CREATE_PENDING_STATUS:
-            assert_pending_remote_matches(remote, observation)
+            assert pending_observation is not None
+            assert pending_fingerprint is not None
+            assert_pending_remote_matches(remote, pending_observation)
             finalize_sleep_mirror(
                 self._session,
                 row,
                 remote,
+                pending_observation,
+                pending_fingerprint,
+            )
+            result = self._created_result(row.external_id, pending_fingerprint)
+            result = self._apply_latest_after_recovery(
+                row,
                 observation,
                 fingerprint,
+                result,
             )
-            result = self._created_result(row.external_id, fingerprint)
-            return self._replace_planned_sleep(result, observation)
+            return self._finish(result, observation, duplicates)
 
         if row.observation_fingerprint == fingerprint:
             result = SleepCalendarResult(
@@ -128,7 +176,61 @@ class SleepCalendarReconciler:
             )
         else:
             result = self._update(row, observation, fingerprint, expected_etag)
+        return self._finish(result, observation, duplicates)
+
+    def _finish(
+        self,
+        result: SleepCalendarResult,
+        observation: ActualSleepObservation,
+        duplicates: list[CalendarEventMirror],
+    ) -> SleepCalendarResult:
+        self._delete_duplicate_actual_sleep_mirrors(duplicates)
         return self._replace_planned_sleep(result, observation)
+
+    def _delete_duplicate_actual_sleep_mirrors(
+        self,
+        duplicates: list[CalendarEventMirror],
+    ) -> None:
+        for duplicate in duplicates:
+            identity = actual_sleep_identity_from_mirror(duplicate)
+            if identity is None:
+                raise OwnershipError(
+                    f"{duplicate.calendar_source.value} event "
+                    f"{duplicate.external_id!r} has invalid actual_sleep identity"
+                )
+            assert_owned_actual_sleep(duplicate, identity)
+            try:
+                remote = self._backend.read_event(duplicate.external_id)
+                expected_etag = assert_remote_actual_sleep(
+                    remote,
+                    identity,
+                    duplicate.etag,
+                )
+                self._backend.delete_event(
+                    duplicate.external_id,
+                    expected_kind=HealthmesEventKind.ACTUAL_SLEEP,
+                    expected_etag=expected_etag,
+                )
+            except EventNotFoundError:
+                pass
+            self._session.delete(duplicate)
+            self._session.commit()
+
+    def _apply_latest_after_recovery(
+        self,
+        row: CalendarEventMirror,
+        observation: ActualSleepObservation,
+        fingerprint: str,
+        recovered: SleepCalendarResult,
+    ) -> SleepCalendarResult:
+        if row.observation_fingerprint == fingerprint:
+            return recovered
+        return self._update(
+            row,
+            observation,
+            fingerprint,
+            row.etag,
+        )
 
     def _replace_planned_sleep(
         self,
@@ -264,14 +366,6 @@ class SleepCalendarReconciler:
             action=SleepCalendarAction.UPDATED,
             external_id=external_id,
             observation_fingerprint=fingerprint,
-        )
-
-    def _find_source_key(self, source_key: str) -> CalendarEventMirror | None:
-        return self._session.scalar(
-            sa.select(CalendarEventMirror).where(
-                CalendarEventMirror.calendar_source == self._backend.source,
-                CalendarEventMirror.healthmes_source_key == source_key,
-            )
         )
 
     def _lock_source_key(self, source_key: str) -> Connection | None:

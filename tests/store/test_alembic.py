@@ -7,6 +7,7 @@ rendering, which never connects.
 """
 
 import io
+from datetime import UTC, datetime
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -147,3 +148,88 @@ class TestSqliteUpgrade:
         config = _config(database_url)
         command.upgrade(config, "head")
         command.upgrade(config, "head")  # no-op, must not raise
+
+    def test_sleep_hardening_migration_cleans_untrusted_identity(self, tmp_path):
+        database_url = f"sqlite:///{tmp_path / 'sleep-hardening.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "d0e1f2a3b4c5")
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        mirror = sa.Table(
+            "calendar_event_mirror",
+            metadata,
+            autoload_with=engine,
+        )
+        start = datetime(2026, 7, 25, 23, tzinfo=UTC)
+        end = datetime(2026, 7, 26, 7, tzinfo=UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                mirror.insert(),
+                [
+                    {
+                        "id": "a" * 32,
+                        "external_id": "forged",
+                        "calendar_source": "google",
+                        "summary": "Forged",
+                        "start_at": start,
+                        "end_at": end,
+                        "is_agent_created": False,
+                        "healthmes_kind": "actual_sleep",
+                        "healthmes_source": "oura",
+                        "healthmes_source_key": "oura:2026-07-26",
+                        "observation_fingerprint": "forged",
+                        "sleep_local_date": start.date(),
+                        "sleep_duration_minutes": 420,
+                        "sleep_time_in_bed_minutes": 480,
+                    },
+                    {
+                        "id": "b" * 32,
+                        "external_id": "owned",
+                        "calendar_source": "google",
+                        "summary": "Owned",
+                        "start_at": start,
+                        "end_at": end,
+                        "is_agent_created": True,
+                        "healthmes_kind": "actual_sleep",
+                        "healthmes_source": "oura",
+                        "healthmes_source_key": "oura:2026-07-27",
+                        "observation_fingerprint": None,
+                        "sleep_local_date": end.date(),
+                        "sleep_duration_minutes": 420,
+                        "sleep_time_in_bed_minutes": 480,
+                    },
+                ],
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                rows = {
+                    row.external_id: row
+                    for row in connection.execute(
+                        sa.text(
+                            "SELECT external_id, is_agent_created, "
+                            "healthmes_kind, healthmes_source, "
+                            "healthmes_source_key, observation_fingerprint, "
+                            "sleep_local_date, sleep_provider, "
+                            "sleep_duration_minutes, "
+                            "sleep_time_in_bed_minutes "
+                            "FROM calendar_event_mirror"
+                        )
+                    )
+                }
+            forged = rows["forged"]
+            assert forged.healthmes_kind is None
+            assert forged.healthmes_source is None
+            assert forged.healthmes_source_key is None
+            assert forged.observation_fingerprint is None
+            assert forged.sleep_local_date is None
+            assert forged.sleep_provider is None
+            assert forged.sleep_duration_minutes is None
+            assert forged.sleep_time_in_bed_minutes is None
+            assert rows["owned"].sleep_provider == "oura"
+        finally:
+            engine.dispose()

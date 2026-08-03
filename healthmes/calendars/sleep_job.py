@@ -180,14 +180,19 @@ async def reconcile_recent_sleep(
         target_date.isoformat(),
         end_date.isoformat(),
     )
-    try:
-        summaries = tuple(SleepSummaryPayload.model_validate(row) for row in rows)
-    except ValidationError:
+    summaries: list[SleepSummaryPayload] = []
+    invalid_rows = 0
+    for row in rows:
+        try:
+            summaries.append(SleepSummaryPayload.model_validate(row))
+        except ValidationError:
+            invalid_rows += 1
+    if not summaries and invalid_rows:
         selected: ActualSleepObservation | SleepObservationNoOp = SleepObservationNoOp(
             reason=SleepObservationNoOpReason.INCOMPLETE
         )
     else:
-        selected = select_actual_sleep(summaries, target_date)
+        selected = select_actual_sleep(tuple(summaries), target_date)
     if isinstance(selected, SleepObservationNoOp):
         return {
             "status": "noop",

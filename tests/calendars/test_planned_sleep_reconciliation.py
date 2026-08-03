@@ -253,3 +253,50 @@ def test_remote_missing_planned_sleep_prunes_stale_mirror(
     assert (
         session.query(CalendarEventMirror).filter_by(external_id="planned-1").one_or_none() is None
     )
+
+
+def test_remote_delete_then_local_commit_failure_recovers_on_retry(
+    session_factory,
+    backend: PlannedSleepBackend,
+    observation: ActualSleepObservation,
+    monkeypatch,
+) -> None:
+    with session_factory() as session:
+        add_mirror(
+            session,
+            observation,
+            external_id="planned-1",
+            owned=True,
+            kind="planned_sleep",
+            summary="수면 (계획)",
+        )
+    backend.remote_kinds["planned-1"] = HealthmesEventKind.PLANNED_SLEEP
+    original_delete = backend.delete_event
+
+    def delete_then_disappear(*args, **kwargs) -> None:
+        original_delete(*args, **kwargs)
+        backend.missing_ids.add("planned-1")
+
+    monkeypatch.setattr(backend, "delete_event", delete_then_disappear)
+    with session_factory() as failing_session:
+        real_commit = failing_session.commit
+
+        def fail_after_remote_delete() -> None:
+            if backend.delete_calls:
+                raise RuntimeError("simulated local cleanup commit failure")
+            real_commit()
+
+        monkeypatch.setattr(failing_session, "commit", fail_after_remote_delete)
+        with pytest.raises(RuntimeError, match="cleanup commit failure"):
+            SleepCalendarReconciler(failing_session, backend).reconcile(observation)
+        failing_session.rollback()
+
+    with session_factory() as retry_session:
+        result = SleepCalendarReconciler(retry_session, backend).reconcile(observation)
+        remaining = {
+            row.external_id
+            for row in retry_session.query(CalendarEventMirror).all()
+        }
+
+    assert result.deleted_planned_external_ids == ("planned-1",)
+    assert remaining == {"actual-1"}

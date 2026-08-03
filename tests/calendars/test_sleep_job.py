@@ -288,6 +288,35 @@ async def test_incomplete_payload_is_explicit_noop(
     }
 
 
+async def test_malformed_provider_row_does_not_discard_valid_summary(
+    session_factory,
+    fake_backend,
+) -> None:
+    reader = SleepReader(
+        [
+            {
+                "date": "2026-07-26",
+                "source": {"provider": "broken"},
+                "duration_minutes": "not-a-number",
+            },
+            _summary(),
+        ]
+    )
+
+    result = await reconcile_recent_sleep(
+        target_date=date(2026, 7, 26),
+        calendar_source=CalendarSource.GOOGLE,
+        client=reader,
+        user_id="redacted-user",
+        session_factory=session_factory,
+        backend=fake_backend,
+        dry_run=True,
+    )
+
+    assert result["action"] == "would_create"
+    assert result["source"] == "oura"
+
+
 async def test_dry_run_counts_only_owned_planned_sleep(
     session_factory,
 ) -> None:
@@ -361,7 +390,7 @@ async def test_dry_run_blocks_unowned_actual_sleep_mirror(
                 start_at=datetime(2026, 7, 25, 14, tzinfo=UTC),
                 end_at=datetime(2026, 7, 25, 22, tzinfo=UTC),
                 is_agent_created=False,
-                healthmes_source_key="oura:2026-07-26",
+                healthmes_source_key="actual_sleep:2026-07-26",
                 observation_fingerprint="stale",
             )
         )

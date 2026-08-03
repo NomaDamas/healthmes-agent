@@ -11,12 +11,16 @@ from healthmes.calendars.base import (
     HealthmesEventKind,
     ensure_utc,
 )
+from healthmes.calendars.sleep_event_rendering import observation_fingerprint
 from healthmes.calendars.sleep_mirror import (
     SLEEP_CREATE_PENDING_STATUS,
     SLEEP_UPDATE_PENDING_STATUS,
+    actual_sleep_identity,
+    actual_sleep_identity_from_mirror,
+    find_actual_sleep_mirror,
+    pending_sleep_observation,
 )
 from healthmes.calendars.sleep_observation import ActualSleepObservation
-from healthmes.calendars.sleep_reconciliation import observation_fingerprint
 from healthmes.calendars.sleep_reconciliation_guards import pending_remote_matches
 from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror
@@ -28,11 +32,10 @@ def preview_sleep_reconciliation(
     observation: ActualSleepObservation,
     backend: CalendarBackend | None,
 ) -> dict[str, object]:
-    existing = session.scalar(
-        sa.select(CalendarEventMirror).where(
-            CalendarEventMirror.calendar_source == calendar_source,
-            CalendarEventMirror.healthmes_source_key == observation.source_key,
-        )
+    existing = find_actual_sleep_mirror(
+        session,
+        calendar_source,
+        observation,
     )
     fingerprint = observation_fingerprint(observation)
     action, reason = _actual_sleep_action(
@@ -90,10 +93,9 @@ def _actual_sleep_action(
 ) -> tuple[str, str | None]:
     if existing is None:
         return "would_create", None
-    identity = CalendarEventIdentity(
-        kind=HealthmesEventKind.ACTUAL_SLEEP,
-        source=observation.provider,
-        source_key=observation.source_key,
+    identity = (
+        actual_sleep_identity_from_mirror(existing)
+        or actual_sleep_identity(observation)
     )
     if not _matches_actual_identity(existing, identity):
         return "blocked", "ownership_mismatch"
@@ -112,15 +114,28 @@ def _actual_sleep_action(
         return ("would_create", None) if pending_create else ("blocked", "calendar_event_missing")
     if not _matches_remote_actual_identity(remote, identity):
         return "blocked", "ownership_mismatch"
+    pending_observation = (
+        pending_sleep_observation(existing)
+        if pending_create or pending_update
+        else observation
+    )
     if pending_create:
-        if not pending_remote_matches(remote, observation):
+        if not pending_remote_matches(remote, pending_observation):
             return "blocked", "calendar_changed"
-        return "noop", None
+        return (
+            ("noop", None)
+            if existing.observation_fingerprint == fingerprint
+            else ("would_update", None)
+        )
     if pending_update:
         if existing.etag is None or remote.etag == existing.etag:
             return "would_update", None
-        if pending_remote_matches(remote, observation):
-            return "noop", None
+        if pending_remote_matches(remote, pending_observation):
+            return (
+                ("noop", None)
+                if existing.observation_fingerprint == fingerprint
+                else ("would_update", None)
+            )
         return "blocked", "calendar_changed"
     if action == "would_update" and existing.etag is not None and remote.etag != existing.etag:
         return "blocked", "calendar_changed"
@@ -156,7 +171,7 @@ def _remote_planned_sleep_state(
     try:
         event = backend.read_event(row.external_id)
     except EventNotFoundError:
-        return False, "planned_sleep_missing"
+        return True, None
     if not event.is_agent_created or event.healthmes_kind is not HealthmesEventKind.PLANNED_SLEEP:
         return False, "planned_sleep_ownership_mismatch"
     if row.etag is not None and event.etag != row.etag:
