@@ -212,6 +212,7 @@ def test_prompt_follows_notification_grammar_and_instructs_planner(settings, mak
     assert "healthmes-planner" in prompt
     assert "record_decision" in prompt
     assert f"trigger_event_id='{TRIGGER_EVENT_ID}'" in prompt
+    assert "schedule_proposal_ids" in prompt
     assert "viewer_url" in prompt
     assert "http://healthmes.test:8100/decisions/" in prompt
 

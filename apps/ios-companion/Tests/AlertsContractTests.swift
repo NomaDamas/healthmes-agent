@@ -38,6 +38,10 @@ final class AlertsContractTests: XCTestCase {
             "http://192.168.1.20:8100/decisions/00000000-0000-0000-0000-00000000e002"
                 + "?token=hm-ro-3q2b8d1f7c6e5a4"
         )
+        XCTAssertEqual(
+            top.proposalId,
+            UUID(uuidString: "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10")
+        )
 
         // Legacy payload-less row: summary falls back to rule_id server-side,
         // proposal/evidence/decision_url are honest nulls.
@@ -46,6 +50,7 @@ final class AlertsContractTests: XCTestCase {
         XCTAssertNil(legacy.proposal)
         XCTAssertNil(legacy.evidence)
         XCTAssertNil(legacy.decisionUrl)
+        XCTAssertNil(legacy.proposalId)
     }
 
     func testDecodesEmptyPage() throws {
@@ -77,7 +82,8 @@ final class SeenAlertsStoreTests: XCTestCase {
             summary: "s",
             proposal: nil,
             evidence: nil,
-            decisionUrl: nil
+            decisionUrl: nil,
+            proposalId: nil
         )
     }
 

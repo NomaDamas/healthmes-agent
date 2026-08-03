@@ -119,8 +119,10 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
    a placement proposal, a re-plan, an alert you chose to send, and also an
    alert you chose to suppress. Include: the inputs you considered (scores,
    baselines, calendar facts), the rules that applied, the options you
-   weighed, and the chosen action. Do this even if the user declines the
-   proposal; the decline is part of the record.
+   weighed, and the chosen action. When step 5 returned proposals, pass all
+   their ids as `schedule_proposal_ids` so the proposal and reasoning remain
+   exactly linked. Do this even if the user declines the proposal; the decline
+   is part of the record.
 
 ## Placement rules
 
@@ -250,8 +252,9 @@ the trigger payload (`rule_id`, summary, evidence keys):
    nothing — suppressed alerts still get a `record_decision`).
 3. `record_decision`, then send at most ONE message in the notification
    grammar. Pass the trusted `trigger_event_id` from the webhook prompt
-   unchanged when recording an alert decision. Alert budget and cooldowns are
-   enforced upstream; your job is to make the one message count.
+   unchanged when recording an alert decision. If step 2 created proposals,
+   also pass every returned id as `schedule_proposal_ids`. Alert budget and
+   cooldowns are enforced upstream; your job is to make the one message count.
 
 ## Extension points (do not remove)
 

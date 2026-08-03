@@ -2950,6 +2950,7 @@ def record_decision(
     llm_model: str | None = None,
     tokens: int | None = None,
     trigger_event_id: str | None = None,
+    schedule_proposal_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Persist an explainable decision record and get its viewer link.
 
@@ -2959,8 +2960,10 @@ def record_decision(
     nodes; append your own llm_step/option/action nodes honestly (never
     rewrite pre-filled ones). Webhook alerts must pass their trusted
     trigger_event_id unchanged so native clients can resolve the exact
-    decision and proposal. Returns the decision viewer URL to attach to any
-    alert or message about this decision.
+    decision and proposal. When proposals were created before this call, pass
+    their returned ids as schedule_proposal_ids; they are linked to this
+    decision atomically. Returns the decision viewer URL to attach to any alert
+    or message about this decision.
     """
     if kind not in {k.value for k in DecisionKind}:
         raise ToolError(
@@ -2976,6 +2979,12 @@ def record_decision(
     )
     if trigger_uuid is not None and kind != DecisionKind.ALERT.value:
         raise ToolError("trigger_event_id is valid only for kind='alert'")
+    proposal_uuids = [
+        _parse_uuid(value, f"schedule_proposal_ids[{index}]")
+        for index, value in enumerate(schedule_proposal_ids or [])
+    ]
+    if len(set(proposal_uuids)) != len(proposal_uuids):
+        raise ToolError("schedule_proposal_ids must not contain duplicates")
     with _store_session() as session:
         if trigger_uuid is not None:
             if session.get(TriggerEvent, trigger_uuid) is None:
@@ -2989,6 +2998,24 @@ def record_decision(
                 raise ToolError(
                     f"trigger_event {trigger_event_id} already has a decision record"
                 )
+        proposals: list[ScheduleProposal] = []
+        for proposal_id, proposal_uuid in zip(
+            schedule_proposal_ids or [],
+            proposal_uuids,
+            strict=True,
+        ):
+            proposal = session.get(ScheduleProposal, proposal_uuid)
+            if proposal is None:
+                raise ToolError(f"schedule_proposal {proposal_id} not found")
+            if proposal.status != ProposalStatus.PROPOSED:
+                raise ToolError(
+                    f"schedule_proposal {proposal_id} is not pending"
+                )
+            if proposal.decision_record_id is not None:
+                raise ToolError(
+                    f"schedule_proposal {proposal_id} already has a decision record"
+                )
+            proposals.append(proposal)
         row = DecisionRecord(
             kind=DecisionKind(kind),
             tree=tree,
@@ -2999,6 +3026,8 @@ def record_decision(
         )
         session.add(row)
         session.flush()
+        for proposal in proposals:
+            proposal.decision_record_id = row.id
         decision_id = str(row.id)
     # Viewer pages are opened from the phone browser (no headers); the shared
     # construction point embeds the derived read-only credential — never the
@@ -3009,6 +3038,7 @@ def record_decision(
     return {
         "status": "ok",
         "decision_id": decision_id,
+        "schedule_proposal_ids": [str(value) for value in proposal_uuids],
         "viewer_url": viewer_url(_active_settings(), f"/decisions/{decision_id}"),
     }
 

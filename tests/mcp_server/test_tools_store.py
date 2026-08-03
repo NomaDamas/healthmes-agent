@@ -1211,6 +1211,23 @@ class TestCaptureTools:
             session.commit()
             trigger_id = trigger.id
 
+        start = dt.datetime.now(dt.UTC).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        proposed = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "title": "Correlated alert block",
+                        "start": start.isoformat(),
+                        "end": (start + dt.timedelta(hours=1)).isoformat(),
+                    }
+                ]
+            },
+        )
+        proposal_id = proposed["proposals"][0]["id"]
         result = await call_tool(
             mcp_client,
             "record_decision",
@@ -1219,12 +1236,17 @@ class TestCaptureTools:
                 "summary": "Correlated alert",
                 "tree": TREE,
                 "trigger_event_id": str(trigger_id),
+                "schedule_proposal_ids": [proposal_id],
             },
         )
+        assert result["schedule_proposal_ids"] == [proposal_id]
         with store_factory() as session:
             row = session.get(DecisionRecord, uuid.UUID(result["decision_id"]))
             assert row is not None
             assert row.trigger_event_id == trigger_id
+            proposal = session.get(ScheduleProposal, uuid.UUID(proposal_id))
+            assert proposal is not None
+            assert proposal.decision_record_id == row.id
 
         with pytest.raises(ToolError, match="already has a decision"):
             await mcp_client.call_tool(

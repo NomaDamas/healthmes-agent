@@ -10,10 +10,9 @@ import UserNotifications
 /// there is no push relay by design (local-first), so Telegram remains the
 /// guaranteed-delivery channel. The Settings toggle says exactly that.
 ///
-/// ✅ Apply / ❌ Keep actions are attached ONLY when exactly one schedule
-/// proposal is pending (no alert→proposal FK exists, so that is the only
-/// case where "Apply" is unambiguous — same rule as the iOS/Android apps)
-/// and they call the real accept/decline endpoints from the action handler.
+/// ✅ Apply / ❌ Keep actions are attached only when the alert response carries
+/// its exact pending proposal id, and they call the real accept/decline
+/// endpoints from the action handler.
 /// ✏️ Adjust and plain clicks open the decision viewer in the browser.
 @MainActor
 public final class MacNotificationManager: NSObject, ObservableObject {
@@ -72,16 +71,13 @@ public final class MacNotificationManager: NSObject, ObservableObject {
     }
 
     /// Store hook: post exactly one notification per not-yet-seen alert.
-    public func process(alerts: [AlertItem], pendingProposals: [ProposalItem]) {
+    public func process(alerts: [AlertItem], pendingProposals _: [ProposalItem]) {
         guard isEnabled, let center else { return }
         let unseen = seenStore.unseen(from: alerts)
         guard !unseen.isEmpty else { return }
-        let pendingProposalID = pendingProposals.count == 1 ? pendingProposals[0].id : nil
 
         for alert in unseen {
-            let content = AlertNotificationContent.from(
-                alert: alert, pendingProposalID: pendingProposalID
-            )
+            let content = AlertNotificationContent.from(alert: alert)
             let unContent = UNMutableNotificationContent()
             unContent.title = content.title
             unContent.body = content.body
