@@ -174,6 +174,21 @@ class SqlAlchemyAdjustmentRepository:
         proposal = self._session.get(CalendarMutationProposal, proposal_id)
         return self._from_model(proposal) if proposal is not None else None
 
+    def get_pending_proposal_by_handle_digest(
+        self, handle_digest: str
+    ) -> StoredAdjustmentProposal | None:
+        proposals = list(
+            self._session.scalars(
+                sa.select(CalendarMutationProposal)
+                .where(
+                    CalendarMutationProposal.reply_handle_digest == handle_digest,
+                    CalendarMutationProposal.status == AdjustmentStatus.PENDING,
+                )
+                .limit(2)
+            )
+        )
+        return self._from_model(proposals[0]) if len(proposals) == 1 else None
+
     def compare_and_mark_applying(
         self,
         proposal_id: uuid.UUID,

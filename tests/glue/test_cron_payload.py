@@ -90,6 +90,7 @@ def test_fallback_payload_matches_real_create_job_keys(vendor_cron, bootstrap):
         deliver="telegram",
         skills=["healthmes-planner"],
         script=bootstrap.SNAPSHOT_SCRIPT_NAME,
+        origin=bootstrap.HEALTHMES_CRON_ORIGIN,
     )
     assert set(fallback_job) == set(real_job)
 
@@ -135,6 +136,7 @@ def test_fallback_writer_output_is_loadable_by_vendor(vendor_cron, bootstrap):
         assert job["skills"] == ["healthmes-planner"]
         assert job["deliver"] == "telegram"
         assert job["script"] == "healthmes_briefing_snapshot.py"
+        assert job["origin"] == bootstrap.HEALTHMES_CRON_ORIGIN
 
     # Re-registration is a no-op (matched by name).
     plan2 = bootstrap.Plan(dry_run=False)

@@ -67,7 +67,7 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
 | Tool (healthmes server) | Use for |
 |---|---|
 | `evaluate_morning_calendar_nudge` | Server-owned 07:00 recovery/calendar evaluation. It may return no-action, deduplicated, or one display packet with a one-time reply handle. |
-| `resolve_calendar_adjustment` | Live Telegram reply resolution only. Pass the user's plain text (`적용 <handle>` or `그대로 <handle>`) through this tool; never resolve from a cron run. |
+| `resolve_calendar_adjustment` | Live Telegram reply resolution only. Pass the exact combined `적용 <handle>` / `그대로 <handle>` text as `response` and the unchanged handle as `reply_handle`. Hermes attaches the owner-bound proof; never pass a proposal id/channel or resolve from cron. |
 
 ## When to use
 
@@ -143,9 +143,11 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
    agent-created blocks are movable, and only via a new confirmed proposal.
    The sole confirmed external-event exception is the server-owned morning
    nudge: one eligible Google event may be shortened after the user replies
-   `적용 <handle>`, and only through `resolve_calendar_adjustment`. Do not
-   move, delete, retitle, extend, or edit attendees/recurrence for external
-   events.
+   `적용 <handle>`, and only through `resolve_calendar_adjustment` with the
+   exact combined live reply and the unchanged `reply_handle`; Hermes adds the
+   owner-bound proof and the server resolves the pending proposal by handle.
+   Do not move, delete, retitle, extend, or edit attendees/recurrence for
+   external events.
 7. **Start after actual wake.** Never place a block before
    `actual_sleep.earliest_available_work_time` or across the actual sleep
    interval. This availability rule does not add a second sleep score to the
@@ -215,9 +217,13 @@ to Telegram. Each briefing is ONE message in the notification grammar.
   silent. Only live Telegram replies may call
   `mcp__healthmes__resolve_calendar_adjustment`.
 - **Live Telegram reply.** When an allowed user's live gateway message says
-  `적용 <handle>` or `그대로 <handle>`, pass that exact text to
-  `mcp__healthmes__resolve_calendar_adjustment` and return the resulting
-  receipt/viewer link once. Do not invent handles, accept missing handles, or
+  `적용 <handle>` or `그대로 <handle>`, parse the two fields without changing
+  either value. Call `mcp__healthmes__resolve_calendar_adjustment` with the
+  exact combined reply as `response` and the unchanged `<handle>` as
+  `reply_handle`. Do not pass a proposal id or response channel: the server
+  resolves the pending proposal from the one-time handle, while Hermes adds
+  an owner-bound signed proof outside model control. Return the resulting
+  receipt/viewer link once. Do not invent handles, accept missing values, or
   call the resolver from scheduled cron delivery.
 - **Evening review (21:30).** Compare planned blocks vs what happened
   (`get_schedule`), note wins and slips without moralizing, roll unfinished

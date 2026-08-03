@@ -43,12 +43,13 @@ def validate_shorten_change(
     proposed_start_at: datetime,
     proposed_end_at: datetime,
     expected_etag: str,
+    timezone: tzinfo,
     operation: AdjustmentOperation | str = AdjustmentOperation.SHORTEN,
 ) -> ConfirmedExternalTimeChange:
     if _operation_value(operation) != AdjustmentOperation.SHORTEN.value:
         raise AdjustmentError("v0 supports only SHORTEN")
     try:
-        return ConfirmedExternalTimeChange(
+        change = ConfirmedExternalTimeChange(
             external_event_id=external_event_id,
             original_start_at=original_start_at,
             original_end_at=original_end_at,
@@ -58,6 +59,15 @@ def validate_shorten_change(
         )
     except ValueError as exc:
         raise AdjustmentError(str(exc)) from exc
+    local_dates = {
+        change.original_start_at.astimezone(timezone).date(),
+        change.original_end_at.astimezone(timezone).date(),
+        change.proposed_start_at.astimezone(timezone).date(),
+        change.proposed_end_at.astimezone(timezone).date(),
+    }
+    if len(local_dates) != 1:
+        raise AdjustmentError("v0 external time changes must remain on one local date")
+    return change
 
 
 def make_shorten_snapshot(event: Any, *, timezone: tzinfo) -> ProposalSnapshot:
@@ -71,6 +81,7 @@ def make_shorten_snapshot(event: Any, *, timezone: tzinfo) -> ProposalSnapshot:
         proposed_start_at=start,
         proposed_end_at=proposed_end,
         expected_etag=str(_attr(event, "etag")),
+        timezone=timezone,
     )
     return ProposalSnapshot(
         calendar_source=CalendarSource.GOOGLE,
@@ -157,6 +168,12 @@ def protected_event_fingerprint(event: Any) -> str:
     }
     material = "|".join(f"{key}={fields[key]}" for key in sorted(fields))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def provider_revision_fingerprint(etag: str | None) -> str | None:
+    if not etag:
+        return None
+    return hashlib.sha256(etag.encode("utf-8")).hexdigest()
 
 
 def snapshot_matches(snapshot: ProposalSnapshot, event: Any) -> bool:

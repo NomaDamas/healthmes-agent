@@ -10,7 +10,7 @@ plugins {
 // deliverable (docs/design/WATCH-NOTIFICATIONS.ko.md).
 android {
     namespace = "com.healthmes.wear"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.healthmes.wear"

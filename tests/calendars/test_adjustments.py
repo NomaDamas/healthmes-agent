@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from healthmes.api.decision_html import render_decision_html
 from healthmes.calendars.adjustments import (
     APPLYING_RECONCILE_DELAY,
+    MAX_EVIDENCE_CLOCK_SKEW,
     AdjustmentError,
     AdjustmentOperation,
     AdjustmentStatus,
@@ -25,6 +26,7 @@ from healthmes.calendars.adjustments import (
     morning_dedup_key,
     outcome_decision_tree,
     proposal_dedup_key,
+    provider_revision_fingerprint,
     redacted_receipt,
     validate_shorten_change,
     verify_reply_handle,
@@ -225,6 +227,7 @@ def test_validate_shorten_change_rejects_invalid_invariants(overrides, match) ->
         "proposed_start_at": datetime(2026, 7, 22, 5, 0, tzinfo=UTC),
         "proposed_end_at": datetime(2026, 7, 22, 5, 30, tzinfo=UTC),
         "expected_etag": '"etag-v1"',
+        "timezone": KST,
         "operation": AdjustmentOperation.SHORTEN,
     }
     kwargs.update(overrides)
@@ -241,9 +244,36 @@ def test_validate_shorten_change_accepts_expected_delta() -> None:
         proposed_start_at=datetime(2026, 7, 22, 5, 0, tzinfo=UTC),
         proposed_end_at=datetime(2026, 7, 22, 5, 30, tzinfo=UTC),
         expected_etag='"etag-v1"',
+        timezone=KST,
     )
 
     assert change.proposed_end_at == datetime(2026, 7, 22, 5, 30, tzinfo=UTC)
+
+
+def test_make_shorten_snapshot_accepts_one_kst_day_across_utc_midnight() -> None:
+    candidate = event(
+        start_at=datetime(2026, 7, 21, 23, 30, tzinfo=UTC),
+        end_at=datetime(2026, 7, 22, 0, 30, tzinfo=UTC),
+    )
+
+    snapshot = make_shorten_snapshot(candidate, timezone=KST)
+
+    assert snapshot.local_original_start_at.startswith("2026-07-22T08:30:00")
+    assert snapshot.local_original_end_at.startswith("2026-07-22T09:30:00")
+    assert snapshot.proposed_end_at == datetime(2026, 7, 22, 0, 0, tzinfo=UTC)
+
+
+def test_validate_shorten_change_rejects_actual_local_midnight_crossing() -> None:
+    with pytest.raises(AdjustmentError, match="one local date"):
+        validate_shorten_change(
+            external_event_id="evt-fixture",
+            original_start_at=datetime(2026, 7, 22, 14, 30, tzinfo=UTC),
+            original_end_at=datetime(2026, 7, 22, 15, 30, tzinfo=UTC),
+            proposed_start_at=datetime(2026, 7, 22, 14, 30, tzinfo=UTC),
+            proposed_end_at=datetime(2026, 7, 22, 15, 0, tzinfo=UTC),
+            expected_etag='"etag-v1"',
+            timezone=KST,
+        )
 
 
 @pytest.mark.parametrize(
@@ -314,6 +344,72 @@ def test_health_evidence_gate_accepts_fresh_low_recovery() -> None:
 
     assert result.allowed
     assert result.facts["recovery_value_bucket"] == "low"
+
+
+@pytest.mark.parametrize(
+    ("context_overrides", "reason"),
+    [
+        (
+            {
+                "sleep_debt": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "observed_at": NOW + MAX_EVIDENCE_CLOCK_SKEW + timedelta(seconds=1),
+                }
+            },
+            "future_sleep",
+        ),
+        (
+            {
+                "charge": {
+                    "status": "ok",
+                    "confidence": "medium",
+                    "observed_at": NOW + MAX_EVIDENCE_CLOCK_SKEW + timedelta(seconds=1),
+                    "value": 32,
+                }
+            },
+            "future_recovery",
+        ),
+    ],
+)
+def test_health_evidence_rejects_timestamps_beyond_clock_skew(
+    context_overrides, reason
+) -> None:
+    result = evaluate_health_evidence(
+        health_context(**context_overrides),
+        local_date=LOCAL_DAY,
+        now=NOW,
+        afternoon_busy_minutes=240,
+        eligible_event_count=1,
+    )
+
+    assert not result.allowed
+    assert result.reason == reason
+
+
+def test_health_evidence_accepts_timestamps_at_clock_skew_boundary() -> None:
+    boundary = NOW + MAX_EVIDENCE_CLOCK_SKEW
+    result = evaluate_health_evidence(
+        health_context(
+            sleep_debt={
+                "status": "ok",
+                "confidence": "medium",
+                "observed_at": boundary,
+            },
+            charge={
+                "status": "ok",
+                "confidence": "medium",
+                "observed_at": boundary,
+                "value": 32,
+            },
+        ),
+        local_date=LOCAL_DAY,
+        now=NOW,
+        afternoon_busy_minutes=240,
+        eligible_event_count=1,
+    )
+
+    assert result.allowed
 
 
 def test_health_evidence_accepts_daily_readiness_charge_entries() -> None:
@@ -765,6 +861,7 @@ def test_sqlalchemy_repository_persists_proposal_trigger_and_decisions(session) 
     assert decisions[1].tree["detail"]["receipt"]["status"] == "applied"
     assert mirror.end_at == datetime(2026, 7, 22, 5, 30, tzinfo=UTC)
     assert mirror.etag == '"etag-v2"'
+    assert proposal.receipt["provider_revision"] == provider_revision_fingerprint('"etag-v2"')
     assert len(writer.patch_calls) == 1
     assert_sensitive_values_absent(proposal.receipt, HANDLE, "evt-fixture", '"etag-v1"')
 

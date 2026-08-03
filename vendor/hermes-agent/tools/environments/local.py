@@ -206,6 +206,7 @@ def _build_provider_env_blocklist() -> frozenset:
         "GITHUB_APP_INSTALLATION_ID",
         "MODAL_TOKEN_ID",
         "MODAL_TOKEN_SECRET",
+        "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
         "DAYTONA_API_KEY",
         "GATEWAY_RELAY_ID",
         "GATEWAY_RELAY_SECRET",
@@ -424,6 +425,7 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "HASS_TOKEN",
     "EMAIL_PASSWORD",
     "HERMES_DASHBOARD_SESSION_TOKEN",
+    "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",

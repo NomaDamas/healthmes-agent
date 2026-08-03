@@ -152,7 +152,10 @@ score = 100
 event를 `SHORTEN`할 수 있다. 대상/변경량/ETag는 server evaluator가 고정하고, agent는
 07:00 cron에서 `evaluate_morning_calendar_nudge()` 결과 display packet과
 `적용 <handle>` / `그대로 <handle>` 문구를 그대로 보내고 종료한다. 이후 allowed-user
-reply는 live Hermes session이 `resolve_calendar_adjustment()`에 원문 전달한다. MOVE,
+reply는 live Hermes session이 원문에서 response와 handle을 분리하고, 기존 evaluation의
+정확한 Telegram 응답 문자열과 변경하지 않은 `reply_handle`을
+`resolve_calendar_adjustment()`에 전달한다. 서버는 owner-bound signed proof를
+검증하고 handle로 pending proposal을 찾는다. MOVE,
 삭제, 제목/참석자/반복 수정, iCloud/CalDAV 외부 이벤트 변경은 여전히 금지다.
 `APPLIED_RECOVERED`, `UNKNOWN`, `FAILED_NO_CHANGE`는 이 예외의 서버 내부 terminal
 receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한을 뜻하지 않는다.
@@ -417,10 +420,15 @@ issue #10(풀 네이티브 폰 앱)·#11(macOS/Windows 데스크톱 글랜스)�
 2. **강한 단일 신호 = 가벼운 제안 가능** (소유자 요구) — 신호가 하나여도
    개인 baseline 대비 큰 편차·중간+ 신뢰도면 선택적·가역적 제안 1개를 붙일
    수 있다. 결정 자체(reconsider)는 여전히 sake의 교차 확인 규칙을 따른다.
-3. **미결 — 도메인 전문가 논의 대상**: 같은 밤 심장 데이터에서 파생된
-   신호들(HRV 수준 vs 회복탄력성 변동성 vs charge 판정)을 교차 검증 관점에서
-   몇 개의 독립 증거로 취급할지는 sake와 논의 후 결정한다. 코드/스킬은
-   결론 전까지 원설계 유지.
+3. **해소됨 (2026-07-28, 도메인 전문가 sake 피드백)**:
+   - #54 각성 힌트: 무이견 (raw 확인 후 승인).
+   - 강한 단일 신호 제안: **동의** — 단 알림에 ⑴ 단일 신호 기반임과 ⑵ 기준이
+     개인 baseline임을 명시할 것 (스킬에 반영됨).
+   - 비-가민 "두 번째 증거": **수일간 안정심박(RHR) 상승 추세** 채택.
+     핵심 프레이밍 — RHR은 "스트레스 지표"가 아니라 **자율신경계 등의 영향을
+     받은 심장 반응의 간접 관찰값**이다. 스킬·알림·문서 어디서도 스트레스
+     지표라 부르지 말 것. 구현은 기존 순서 유지: 소유자 실데이터 축적 →
+     분석 → 배선 (추측 선행 금지).
 
 ### 임계값 자동 보정 로드맵 (하드코딩 상수의 수명 종료 계획)
 
