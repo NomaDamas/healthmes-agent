@@ -103,6 +103,7 @@ async def apply_sleep_proposal(
         user_id,
         proposal.local_date,
         review_base_url=calendar.review_base_url,
+        review_url_builder=calendar.review_url_builder,
     )
     if isinstance(selected, SleepObservationNoOp):
         return _close(session, proposal, SleepProposalStatus.CONFLICTED, current_time)

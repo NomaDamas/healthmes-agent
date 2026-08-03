@@ -8,6 +8,7 @@ from typing import Protocol
 import anyio
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.api.auth import viewer_url
 from healthmes.calendars.approval import ApprovalCalendar, calendar_approval_target
 from healthmes.calendars.base import CalendarBackend
 from healthmes.calendars.jobs import _build_backend, write_source
@@ -91,6 +92,10 @@ def build_sleep_reconciliation_job(
                 backend,
                 calendar_approval_target(settings, calendar_source),
                 settings.public_base_url,
+                lambda target_date: viewer_url(
+                    settings,
+                    f"/sleep?date={target_date.isoformat()}",
+                ),
             ),
         )
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import date, timedelta
 from typing import Any, Protocol
@@ -34,6 +34,7 @@ async def read_actual_sleep(
     target_date: date,
     *,
     review_base_url: str | None = None,
+    review_url_builder: Callable[[date], str] | None = None,
 ) -> ActualSleepObservation | SleepObservationNoOp:
     rows = await reader.collect_sleep_summaries(
         user_id,
@@ -43,7 +44,12 @@ async def read_actual_sleep(
     selected = select_actual_sleep_rows(rows, target_date)
     if isinstance(selected, SleepObservationNoOp):
         return selected
-    if review_base_url is not None:
+    if review_url_builder is not None:
+        selected = replace(
+            selected,
+            review_url=review_url_builder(target_date),
+        )
+    elif review_base_url is not None:
         selected = replace(
             selected,
             review_url=(

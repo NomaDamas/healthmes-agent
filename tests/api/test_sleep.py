@@ -124,6 +124,72 @@ def test_deployed_calendar_review_url_preserves_query_and_viewer_auth(
     assert 'name="api_token"' not in response.text
 
 
+def test_applied_calendar_review_link_opens_on_authenticated_deployment(
+    settings,
+    session_factory,
+) -> None:
+    token = "calendar-review-api-token"
+    secured = settings.model_copy(
+        update={
+            "api_token": SecretStr(token),
+            "timezone": "Asia/Seoul",
+        }
+    )
+    app = create_app(secured)
+
+    def _override_get_session():
+        database_session = session_factory()
+        try:
+            yield database_session
+        finally:
+            database_session.close()
+
+    app.dependency_overrides[get_session] = _override_get_session
+    fake_backend = FakeCalendarBackend()
+    app.state.sleep_review_runtime = SleepReviewRuntime(
+        SleepReader(),
+        "redacted-user",
+        ApprovalCalendar(
+            fake_backend,
+            fake_backend.approval_target,
+            secured.public_base_url,
+            lambda target_date: viewer_url(
+                secured,
+                f"/sleep?date={target_date.isoformat()}",
+            ),
+        ),
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8100") as client:
+        preview = client.get(
+            "/sleep?date=2026-07-26",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        form = {
+            "proposal_id": _hidden(preview.text, "proposal_id"),
+            "csrf": _hidden(preview.text, "csrf"),
+            "approval": _hidden(preview.text, "approval"),
+        }
+        applied = client.post(
+            "/sleep/apply",
+            data=form,
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+
+        assert applied.status_code == 303
+        description = fake_backend.created_drafts[0].description or ""
+        match = re.search(r"Review or update in HealthMes: (\S+)", description)
+        assert match is not None
+        review_url = match.group(1)
+        assert review_url == viewer_url(secured, "/sleep?date=2026-07-26")
+        assert token not in review_url
+
+        opened = client.get(review_url)
+
+    assert opened.status_code == 200
+    assert token not in opened.text
+
+
 def test_viewer_token_get_does_not_persist_sleep_proposal(
     settings,
     session_factory,
@@ -166,8 +232,12 @@ def test_loopback_viewer_unlocks_sleep_without_token_in_redirect(settings) -> No
     ) as client:
         viewer = client.get("/sleep", params={"token": viewer_token(token)})
         assert viewer.status_code == 200
-        assert 'href="http://127.0.0.1:8100/sleep/unlock"' in viewer.text
+        assert (
+            f'href="http://127.0.0.1:8100/sleep/unlock?token={viewer_token(token)}"'
+            in viewer.text
+        )
         assert 'name="api_token"' not in viewer.text
+        assert token not in viewer.text
         assert "healthmes_local_session" not in viewer.headers.get("set-cookie", "")
 
         unlock_page = client.get(

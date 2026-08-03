@@ -8,6 +8,7 @@ from urllib.parse import parse_qs
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from healthmes.api.auth import viewer_token, viewer_url
 from healthmes.api.decision_html import shell_context, template_environment
 from healthmes.api.local_session import (
     LocalBrowserSession,
@@ -120,22 +121,7 @@ async def sleep_review_page(
         local,
         error,
         request.app.state.local_sessions.signing_secret,
-        local_unlock_url=(
-            local_browser_url(
-                settings.port,
-                (
-                    f"/sleep/unlock?proposal={record.id}"
-                    if record is not None
-                    else "/sleep/unlock"
-                ),
-            )
-            if (
-                local is None
-                and bool(settings.api_token.get_secret_value().strip())
-                and is_loopback_scope(request.scope)
-            )
-            else ""
-        ),
+        local_unlock_url=_local_unlock_url(settings, record) if local is None else "",
     )
     rendered = HTMLResponse(html, headers=response.headers)
     return rendered
@@ -187,7 +173,30 @@ async def _runtime(request: Request, settings: Settings) -> SleepReviewRuntime:
             _build_backend(settings, source),
             calendar_approval_target(settings, source),
             settings.public_base_url,
+            lambda target_date: viewer_url(
+                settings,
+                f"/sleep?date={target_date.isoformat()}",
+            ),
         ),
+    )
+
+
+def _local_unlock_url(
+    settings: Settings,
+    record: SleepReconciliationProposal | None,
+) -> str:
+    api_token = settings.api_token.get_secret_value().strip()
+    if not api_token:
+        return ""
+    path = (
+        f"/sleep/unlock?proposal={record.id}"
+        if record is not None
+        else "/sleep/unlock"
+    )
+    separator = "&" if "?" in path else "?"
+    return local_browser_url(
+        settings.port,
+        f"{path}{separator}token={viewer_token(api_token)}",
     )
 
 

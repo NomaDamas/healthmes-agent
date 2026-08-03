@@ -1,3 +1,5 @@
+import datetime as dt
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import assert_never
 
@@ -11,6 +13,7 @@ class ApprovalCalendar:
     backend: CalendarBackend
     target: str
     review_base_url: str | None = None
+    review_url_builder: Callable[[dt.date], str] | None = None
 
 
 def calendar_approval_target(settings: Settings, source: CalendarSource) -> str:
