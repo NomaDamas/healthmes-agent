@@ -7,6 +7,7 @@ from typing import Any
 from healthmes.calendars.adjustments_types import (
     CONFIDENCE_RANK,
     DEFAULT_FRESHNESS,
+    MAX_EVIDENCE_CLOCK_SKEW,
     MIN_ORIGINAL_DURATION,
     MIN_START_LEAD,
     EligibilityResult,
@@ -85,8 +86,11 @@ def evaluate_health_evidence(
         return HealthEvidenceResult(False, "missing_sleep")
     if _confidence(sleep.get("confidence")) < CONFIDENCE_RANK["medium"]:
         return HealthEvidenceResult(False, "low_confidence_sleep")
-    if not _fresh_enough(sleep, local_date=local_date, now=now, freshness=freshness):
-        return HealthEvidenceResult(False, "stale_sleep")
+    sleep_freshness = _freshness_failure(
+        sleep, local_date=local_date, now=now, freshness=freshness
+    )
+    if sleep_freshness is not None:
+        return HealthEvidenceResult(False, f"{sleep_freshness}_sleep")
 
     hrv_block = _mapping(context.get("nocturnal_hrv") or context.get("hrv"))
     charge_block = _mapping(
@@ -96,20 +100,30 @@ def evaluate_health_evidence(
         or context.get("recovery")
     )
     recovery_blocks = [hrv_block, charge_block]
-    usable_recovery = [
+    confidence_qualified = [
         block
         for block in recovery_blocks
         if block.get("status") == "ok"
         and _confidence(block.get("confidence")) >= CONFIDENCE_RANK["medium"]
-        and _fresh_enough(block, local_date=local_date, now=now, freshness=freshness)
+    ]
+    recovery_freshness = {
+        id(block): _freshness_failure(
+            block, local_date=local_date, now=now, freshness=freshness
+        )
+        for block in confidence_qualified
+    }
+    usable_recovery = [
+        block for block in confidence_qualified if recovery_freshness[id(block)] is None
     ]
     if not usable_recovery:
         if any(block for block in recovery_blocks):
-            if any(
-                _confidence(block.get("confidence")) < CONFIDENCE_RANK["medium"]
-                for block in recovery_blocks
-            ):
+            if not confidence_qualified:
                 return HealthEvidenceResult(False, "low_confidence_recovery")
+            if any(
+                recovery_freshness[id(block)] == "future"
+                for block in confidence_qualified
+            ):
+                return HealthEvidenceResult(False, "future_recovery")
             return HealthEvidenceResult(False, "stale_recovery")
         return HealthEvidenceResult(False, "missing_recovery")
 
@@ -157,9 +171,9 @@ def _confidence(value: Any) -> int:
     return CONFIDENCE_RANK.get(str(value or "low").lower(), 0)
 
 
-def _fresh_enough(
+def _freshness_failure(
     block: Mapping[str, Any], *, local_date: date, now: datetime, freshness: timedelta
-) -> bool:
+) -> str | None:
     observed = _observed_at(block)
     if observed is None:
         observed_date = (
@@ -172,8 +186,13 @@ def _fresh_enough(
                 if isinstance(entry, Mapping) and entry.get("observed_on")
             ]
             observed_date = max(entry_dates, default=None)
-        return str(observed_date) == local_date.isoformat()
-    return ensure_utc(now) - observed <= freshness
+        return None if str(observed_date) == local_date.isoformat() else "stale"
+    age = ensure_utc(now) - observed
+    if age < -MAX_EVIDENCE_CLOCK_SKEW:
+        return "future"
+    if age > freshness:
+        return "stale"
+    return None
 
 
 def _observed_at(block: Mapping[str, Any]) -> datetime | None:

@@ -206,7 +206,8 @@ calls `mcp__healthmes__evaluate_morning_calendar_nudge` exactly once, sends
 the returned display packet and `적용 <handle>` / `그대로 <handle>` choices,
 then exits without waiting. The later allowed-user reply enters the normal
 Hermes live gateway session, which calls
-`mcp__healthmes__resolve_calendar_adjustment` with the reply text.
+`mcp__healthmes__resolve_calendar_adjustment` with separate `proposal_id`,
+`response`, `reply_handle`, and `response_channel: "telegram"` arguments.
 
 ```bash
 uv run python scripts/bootstrap.py --dry-run     # show what would change
@@ -556,7 +557,9 @@ Calendar ownership remains immutable by default for user-created external
 events. The only confirmed exception is the morning recovery Google
 `SHORTEN` path: server evaluation binds the event snapshot and target change,
 Telegram shows the one-time handle, and a trusted live Hermes session
-resolves `적용 <handle>` or `그대로 <handle>` through the HealthMes MCP tool.
+parses `적용 <handle>` or `그대로 <handle>` and calls the HealthMes MCP tool
+with the server-returned `proposal_id`, the separate response word, and the
+unchanged `reply_handle`.
 No cron run waits for replies or performs the external write itself.
 
 Not a credential but environment-shaped: `HEALTHMES_TIMEZONE` (IANA name,

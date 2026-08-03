@@ -25,6 +25,7 @@ MIN_START_LEAD = timedelta(minutes=60)
 START_SAFETY_LEAD = timedelta(minutes=15)
 HANDLE_TTL = timedelta(minutes=60)
 DEFAULT_FRESHNESS = timedelta(days=1)
+MAX_EVIDENCE_CLOCK_SKEW = timedelta(minutes=5)
 APPLYING_RECONCILE_DELAY = timedelta(minutes=5)
 
 CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}

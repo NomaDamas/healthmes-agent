@@ -329,6 +329,10 @@ def test_planner_skill_documents_morning_nudge_trust_boundary():
     assert "do not call `clarify`, and do not wait for a reply" in normalized
     assert "Only live Telegram replies may call" in normalized
     assert "mcp__healthmes__resolve_calendar_adjustment" in normalized
+    assert "original evaluation packet's `proposal_id`" in normalized
+    assert '`response: "적용"`' in normalized
+    assert "exact `<handle>` as `reply_handle`" in normalized
+    assert "Never pass the combined reply text as `response`" in normalized
     assert (
         "Do not rewrite, shorten, translate, log, or expose the handle"
         in normalized
