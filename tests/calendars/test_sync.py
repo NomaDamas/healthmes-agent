@@ -2,7 +2,8 @@
 
 import json
 import uuid
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -12,16 +13,28 @@ from healthmes.calendars.base import (
     CalendarEventIdentity,
     EventDraft,
     EventNotFoundError,
+    ExternalEvent,
     HealthmesEventKind,
     OwnershipError,
     calendar_identity_external_id,
     coerce_utc,
 )
+from healthmes.calendars.sleep_event_rendering import observation_fingerprint
+from healthmes.calendars.sleep_mirror import (
+    SLEEP_CREATE_PENDING_STATUS,
+    SLEEP_UPDATE_PENDING_STATUS,
+    mark_sleep_update_pending,
+)
+from healthmes.calendars.sleep_observation import (
+    ACTUAL_SLEEP_IDENTITY_SOURCE,
+    ActualSleepObservation,
+    actual_sleep_source_key,
+)
 from healthmes.calendars.state import (
     InMemoryPendingDiffStore,
     InMemorySyncStateStore,
 )
-from healthmes.calendars.sync import CalendarMirrorService, ChangeKind
+from healthmes.calendars.sync import CalendarMirrorService, ChangeKind, SyncDiff
 from healthmes.store import CalendarEventMirror, CalendarSource, Task
 
 
@@ -311,6 +324,157 @@ class TestUnchangedRedelivery:
         session.expire_all()
         row = rows(session)["meet-1"]
         assert row.updated_at.strftime("%Y-%m-%d %H:%M:%S") != self.BACKDATED
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("upsert", "delete", "tombstone"),
+)
+@pytest.mark.parametrize(
+    "pending_status",
+    (SLEEP_CREATE_PENDING_STATUS, SLEEP_UPDATE_PENDING_STATUS),
+)
+def test_sqlite_stale_sync_cache_preserves_pending_sleep_intent(
+    session_factory,
+    fake_backend,
+    mutation: str,
+    pending_status: str,
+) -> None:
+    observation = ActualSleepObservation(
+        local_date=date(2026, 7, 26),
+        provider="oura",
+        source_key=actual_sleep_source_key(date(2026, 7, 26)),
+        start_at=utc(2026, 7, 25, 23),
+        end_at=utc(2026, 7, 26, 7),
+        duration_minutes=420,
+        time_in_bed_minutes=480,
+    )
+    corrected = replace(
+        observation,
+        provider="garmin",
+        start_at=observation.start_at - timedelta(minutes=15),
+        end_at=observation.end_at + timedelta(minutes=45),
+        duration_minutes=465,
+        time_in_bed_minutes=525,
+    )
+    identity = CalendarEventIdentity(
+        kind=HealthmesEventKind.ACTUAL_SLEEP,
+        source=ACTUAL_SLEEP_IDENTITY_SOURCE,
+        source_key=observation.source_key,
+    )
+    external_id = calendar_identity_external_id(
+        CalendarSource.GOOGLE,
+        identity,
+    )
+    with session_factory() as seed_session:
+        seed_session.add(
+            CalendarEventMirror(
+                external_id=external_id,
+                calendar_source=CalendarSource.GOOGLE,
+                summary="수면 (실제)",
+                start_at=observation.start_at,
+                end_at=observation.end_at,
+                is_agent_created=True,
+                healthmes_kind=identity.kind.value,
+                healthmes_source=identity.source,
+                healthmes_source_key=identity.source_key,
+                observation_fingerprint=observation_fingerprint(observation),
+                sleep_local_date=observation.local_date,
+                sleep_provider=observation.provider,
+                sleep_duration_minutes=observation.duration_minutes,
+                sleep_time_in_bed_minutes=observation.time_in_bed_minutes,
+                etag='"base"',
+            )
+        )
+        seed_session.commit()
+
+    stale_session = session_factory(expire_on_commit=False)
+    try:
+        stale_row = stale_session.scalar(
+            select(CalendarEventMirror).where(
+                CalendarEventMirror.external_id == external_id
+            )
+        )
+        assert stale_row is not None
+        stale_session.commit()
+
+        with session_factory() as pending_session:
+            pending_row = pending_session.scalar(
+                select(CalendarEventMirror).where(
+                    CalendarEventMirror.external_id == external_id
+                )
+            )
+            assert pending_row is not None
+            mark_sleep_update_pending(
+                pending_session,
+                pending_row,
+                corrected,
+                observation_fingerprint(corrected),
+                pending_row.etag,
+            )
+            if pending_status == SLEEP_CREATE_PENDING_STATUS:
+                pending_row.status = SLEEP_CREATE_PENDING_STATUS
+                pending_session.commit()
+
+        assert stale_row.status is None
+        stale_remote = ExternalEvent(
+            external_id=external_id,
+            summary="수면 (실제)",
+            description="stale provider observation",
+            start_at=observation.start_at,
+            end_at=observation.end_at,
+            is_agent_created=True,
+            identity=identity,
+            etag='"stale-sync"',
+            organizer_self=True,
+        )
+        service = CalendarMirrorService(
+            stale_session,
+            [fake_backend],
+            InMemorySyncStateStore(),
+        )
+        diff = SyncDiff()
+        if mutation == "upsert":
+            service._apply_upsert(
+                CalendarSource.GOOGLE,
+                stale_remote,
+                diff,
+                bootstrap=False,
+            )
+        elif mutation == "delete":
+            service._apply_deletion(
+                CalendarSource.GOOGLE,
+                ExternalEvent(external_id=external_id, deleted=True),
+                diff,
+            )
+        else:
+            service._reconcile_tombstones(
+                CalendarSource.GOOGLE,
+                set(),
+                diff,
+            )
+        stale_session.commit()
+
+        with session_factory() as verify_session:
+            preserved = verify_session.scalar(select(CalendarEventMirror))
+            assert preserved is not None
+            assert preserved.status == pending_status
+            assert preserved.etag == '"base"'
+            assert coerce_utc(preserved.start_at) == corrected.start_at
+            assert coerce_utc(preserved.end_at) == corrected.end_at
+            assert preserved.sleep_provider == corrected.provider
+            assert preserved.sleep_duration_minutes == corrected.duration_minutes
+            assert (
+                preserved.sleep_time_in_bed_minutes
+                == corrected.time_in_bed_minutes
+            )
+            assert preserved.observation_fingerprint == observation_fingerprint(
+                corrected
+            )
+            assert preserved.organizer_self is False
+        assert not diff.has_changes
+    finally:
+        stale_session.close()
 
 
 class TestAgentEventDiff:

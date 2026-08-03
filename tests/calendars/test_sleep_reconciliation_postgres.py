@@ -214,6 +214,29 @@ class PendingRecoveryBackend(ConcurrentCalendarBackend):
             return self.event
 
 
+class PausingSyncService(CalendarMirrorService):
+    def __init__(
+        self,
+        *args,
+        initial_snapshot_read: threading.Event,
+        resume_sync: threading.Event,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._initial_snapshot_read = initial_snapshot_read
+        self._resume_sync = resume_sync
+
+    def _lock_current_row(
+        self,
+        source: CalendarSource,
+        external_id: str,
+    ) -> CalendarEventMirror | None:
+        self._initial_snapshot_read.set()
+        if not self._resume_sync.wait(timeout=5):
+            raise RuntimeError("timed out waiting to resume stale sync")
+        return super()._lock_current_row(source, external_id)
+
+
 @pytest.mark.skipif(
     not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
     reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
@@ -264,6 +287,140 @@ def test_postgres_calendar_write_lock_allows_one_concurrent_create() -> None:
         assert backend.create_count == 1
         assert row_count == 1
     finally:
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin_engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("upsert", "delete", "tombstone"),
+)
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_stale_sync_snapshot_preserves_pending_intent(
+    mutation: str,
+) -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_test_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    backend = PendingRecoveryBackend()
+    observation = ActualSleepObservation(
+        local_date=date(2026, 7, 26),
+        provider="oura",
+        source_key=actual_sleep_source_key(date(2026, 7, 26)),
+        start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+        end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+        duration_minutes=420,
+        time_in_bed_minutes=480,
+    )
+    corrected = replace(
+        observation,
+        provider="garmin",
+        start_at=datetime(2026, 7, 25, 22, 45, tzinfo=UTC),
+        end_at=datetime(2026, 7, 26, 7, 45, tzinfo=UTC),
+        duration_minutes=465,
+        time_in_bed_minutes=525,
+    )
+    initial_snapshot_read = threading.Event()
+    resume_sync = threading.Event()
+
+    try:
+        with factory() as session:
+            SleepCalendarReconciler(session, backend).reconcile(observation)
+            row = session.scalar(sa.select(CalendarEventMirror))
+            assert row is not None
+            external_id = row.external_id
+            expected_etag = row.etag
+        assert backend.event is not None
+        stale_remote = replace(
+            backend.event,
+            etag='"stale-sync-observation"',
+            organizer_self=True,
+        )
+
+        def run_stale_sync() -> SyncDiff:
+            with factory() as stale_session:
+                service = PausingSyncService(
+                    stale_session,
+                    [backend],
+                    InMemorySyncStateStore(),
+                    initial_snapshot_read=initial_snapshot_read,
+                    resume_sync=resume_sync,
+                )
+                diff = SyncDiff()
+                if mutation == "upsert":
+                    service._apply_upsert(
+                        CalendarSource.GOOGLE,
+                        stale_remote,
+                        diff,
+                        bootstrap=False,
+                    )
+                elif mutation == "delete":
+                    service._apply_deletion(
+                        CalendarSource.GOOGLE,
+                        ExternalEvent(external_id=external_id, deleted=True),
+                        diff,
+                    )
+                else:
+                    service._reconcile_tombstones(
+                        CalendarSource.GOOGLE,
+                        set(),
+                        diff,
+                    )
+                stale_session.commit()
+                return diff
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            stale_future = pool.submit(run_stale_sync)
+            assert initial_snapshot_read.wait(timeout=5)
+
+            with factory() as pending_session:
+                pending = pending_session.scalar(sa.select(CalendarEventMirror))
+                assert pending is not None
+                mark_sleep_update_pending(
+                    pending_session,
+                    pending,
+                    corrected,
+                    observation_fingerprint(corrected),
+                    pending.etag,
+                )
+
+            resume_sync.set()
+            diff = stale_future.result(timeout=10)
+
+        assert not diff.has_changes
+        with factory() as verify_session:
+            preserved = verify_session.scalar(sa.select(CalendarEventMirror))
+            assert preserved is not None
+            assert preserved.status == "healthmes_pending_update"
+            assert preserved.etag == expected_etag
+            assert preserved.start_at == corrected.start_at
+            assert preserved.end_at == corrected.end_at
+            assert preserved.sleep_provider == corrected.provider
+            assert preserved.sleep_duration_minutes == corrected.duration_minutes
+            assert (
+                preserved.sleep_time_in_bed_minutes
+                == corrected.time_in_bed_minutes
+            )
+            assert preserved.observation_fingerprint == observation_fingerprint(
+                corrected
+            )
+            assert preserved.organizer_self is False
+    finally:
+        resume_sync.set()
         engine.dispose()
         with admin_engine.begin() as connection:
             connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
@@ -337,6 +494,7 @@ def test_postgres_late_pending_sync_cannot_roll_back_recovery() -> None:
             SyncDiff(),
             bootstrap=False,
         )
+        stale_session.commit()
 
         with factory() as recovery_session:
             result = SleepCalendarReconciler(
@@ -345,7 +503,6 @@ def test_postgres_late_pending_sync_cannot_roll_back_recovery() -> None:
             ).reconcile(corrected)
         assert result.action is SleepCalendarAction.UPDATED
 
-        stale_session.commit()
         with factory() as verify_session:
             recovered = verify_session.scalar(sa.select(CalendarEventMirror))
             assert recovered is not None

@@ -28,6 +28,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
+import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -39,7 +40,6 @@ from healthmes.calendars.base import (
     EventDraft,
     EventNotFoundError,
     ExternalEvent,
-    HealthmesEventKind,
     OwnershipError,
     calendar_identity_external_id,
     coerce_utc,
@@ -316,6 +316,12 @@ class CalendarMirrorService:
             if event.identity is not None
             else resolved_task_id is not None
         )
+        row = self._lock_current_row(source, event.external_id)
+        if row is not None and _pending_sleep_intent(row):
+            # Reconciliation owns every desired field while a provider write is
+            # pending. The next reconciliation pass re-reads the remote event.
+            return
+
         if trusted_agent and event.identity is not None:
             self._quarantine_identity_conflicts(
                 source,
@@ -356,17 +362,7 @@ class CalendarMirrorService:
                 )
             return
 
-        pending_actual_sleep = _pending_actual_sleep_merge(
-            row,
-            event,
-            trusted_agent=trusted_agent,
-        )
-        if pending_actual_sleep:
-            # Pending intent is authoritative until recovery re-reads remote
-            # state. Writing even only the observed ETag here lets a stale sync
-            # transaction commit after recovery and roll the finalized ETag back.
-            return
-
+        snapshot = _mirror_snapshot(row)
         old_start = coerce_utc(row.start_at)
         old_end = coerce_utc(row.end_at)
         moved = old_start != event.start_at or old_end != event.end_at
@@ -400,14 +396,23 @@ class CalendarMirrorService:
             return
 
         # External wins for every event, including agent-created ones.
-        row.summary = event.summary
-        row.start_at = event.start_at
-        row.end_at = event.end_at
-        row.etag = event.etag
-        row.is_agent_created = trusted_agent
-        row.agent_task_id = resolved_task_id if trusted_agent else None
-        _apply_mirror_healthmes(row, event, trusted_agent=trusted_agent)
-        _apply_mirror_metadata(row, event)
+        self._cas_update_row(
+            row,
+            snapshot,
+            {
+                "summary": event.summary,
+                "start_at": event.start_at,
+                "end_at": event.end_at,
+                "etag": event.etag,
+                "is_agent_created": trusted_agent,
+                "agent_task_id": resolved_task_id if trusted_agent else None,
+                **_mirror_healthmes_kwargs(
+                    event,
+                    trusted_agent=trusted_agent,
+                ),
+                **_mirror_metadata_kwargs(event),
+            },
+        )
 
         change = EventChange(
             calendar_source=source,
@@ -433,6 +438,10 @@ class CalendarMirrorService:
         row = self._get_row(source, event.external_id)
         if row is None:
             return  # never mirrored (or already pruned) — nothing changed for us
+        row = self._lock_current_row(source, event.external_id)
+        if row is None or _pending_sleep_intent(row):
+            return
+        snapshot = _mirror_snapshot(row)
         change = EventChange(
             calendar_source=source,
             external_id=event.external_id,
@@ -442,7 +451,7 @@ class CalendarMirrorService:
             old_start_at=coerce_utc(row.start_at),
             old_end_at=coerce_utc(row.end_at),
         )
-        self._session.delete(row)
+        self._cas_delete_row(row, snapshot)
         if change.is_agent_created:
             diff.agent_modified.append(change)
         else:
@@ -463,10 +472,18 @@ class CalendarMirrorService:
         """
         statement = select(CalendarEventMirror).where(
             CalendarEventMirror.calendar_source == source
-        )
+        ).order_by(CalendarEventMirror.external_id)
         for row in self._session.execute(statement).scalars().all():
             if row.external_id in seen_ids:
                 continue  # freshly upserted, or already handled as a deletion
+            row = self._lock_current_row(source, row.external_id)
+            if (
+                row is None
+                or row.external_id in seen_ids
+                or _pending_sleep_intent(row)
+            ):
+                continue
+            snapshot = _mirror_snapshot(row)
             change = EventChange(
                 calendar_source=source,
                 external_id=row.external_id,
@@ -476,7 +493,7 @@ class CalendarMirrorService:
                 old_start_at=coerce_utc(row.start_at),
                 old_end_at=coerce_utc(row.end_at),
             )
-            self._session.delete(row)
+            self._cas_delete_row(row, snapshot)
             if change.is_agent_created:
                 diff.agent_modified.append(change)
             else:
@@ -690,9 +707,18 @@ class CalendarMirrorService:
                     CalendarEventMirror.healthmes_source_key == identity.source_key,
                     CalendarEventMirror.external_id != expected_external_id,
                 )
+                .order_by(CalendarEventMirror.external_id)
             ).all()
         )
         for conflict in conflicts:
+            conflict = self._lock_current_row(source, conflict.external_id)
+            if (
+                conflict is None
+                or conflict.external_id == expected_external_id
+                or conflict.healthmes_source_key != identity.source_key
+                or _pending_sleep_intent(conflict)
+            ):
+                continue
             conflict_identity = parse_calendar_identity(
                 conflict.healthmes_kind,
                 conflict.healthmes_source,
@@ -704,18 +730,22 @@ class CalendarMirrorService:
                 == calendar_identity_external_id(source, conflict_identity)
             ):
                 continue
-            conflict.is_agent_created = False
-            conflict.agent_task_id = None
-            conflict.healthmes_kind = None
-            conflict.healthmes_source = None
-            conflict.healthmes_source_key = None
-            conflict.observation_fingerprint = None
-            conflict.sleep_local_date = None
-            conflict.sleep_provider = None
-            conflict.sleep_duration_minutes = None
-            conflict.sleep_time_in_bed_minutes = None
-        if conflicts:
-            self._session.flush()
+            self._cas_update_row(
+                conflict,
+                _mirror_snapshot(conflict),
+                {
+                    "is_agent_created": False,
+                    "agent_task_id": None,
+                    "healthmes_kind": None,
+                    "healthmes_source": None,
+                    "healthmes_source_key": None,
+                    "observation_fingerprint": None,
+                    "sleep_local_date": None,
+                    "sleep_provider": None,
+                    "sleep_duration_minutes": None,
+                    "sleep_time_in_bed_minutes": None,
+                },
+            )
 
     @staticmethod
     def _assert_remote_matches_draft(
@@ -748,6 +778,59 @@ class CalendarMirrorService:
             CalendarEventMirror.external_id == external_id,
         )
         return self._session.execute(statement).scalar_one_or_none()
+
+    def _lock_current_row(
+        self,
+        source: CalendarSource,
+        external_id: str,
+    ) -> CalendarEventMirror | None:
+        statement = (
+            select(CalendarEventMirror)
+            .where(
+                CalendarEventMirror.calendar_source == source,
+                CalendarEventMirror.external_id == external_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        with self._session.no_autoflush:
+            return self._session.execute(statement).scalar_one_or_none()
+
+    def _cas_update_row(
+        self,
+        row: CalendarEventMirror,
+        snapshot: dict[str, object],
+        values: dict[str, object],
+    ) -> None:
+        result = self._session.execute(
+            sa.update(CalendarEventMirror)
+            .where(*_mirror_snapshot_predicates(snapshot))
+            .values(**values, updated_at=sa.func.now())
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            raise CalendarConflictError(
+                f"{row.calendar_source.value} mirror {row.external_id!r} "
+                "changed during sync; retry with a fresh provider cursor"
+            )
+        self._session.expire(row)
+
+    def _cas_delete_row(
+        self,
+        row: CalendarEventMirror,
+        snapshot: dict[str, object],
+    ) -> None:
+        result = self._session.execute(
+            sa.delete(CalendarEventMirror)
+            .where(*_mirror_snapshot_predicates(snapshot))
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            raise CalendarConflictError(
+                f"{row.calendar_source.value} mirror {row.external_id!r} "
+                "changed during sync; retry with a fresh provider cursor"
+            )
+        self._session.expunge(row)
 
     def _backend_for(self, source: CalendarSource) -> CalendarBackend:
         backend = self._backends.get(source)
@@ -834,25 +917,35 @@ def _mirror_metadata_kwargs(event: ExternalEvent) -> dict[str, object]:
     }
 
 
-def _pending_actual_sleep_merge(
-    row: CalendarEventMirror,
-    event: ExternalEvent,
-    *,
-    trusted_agent: bool,
-) -> bool:
-    return (
-        trusted_agent
-        and row.status
-        in {
-            SLEEP_CREATE_PENDING_STATUS,
-            SLEEP_UPDATE_PENDING_STATUS,
-        }
-        and row.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value
-        and event.identity is not None
-        and event.identity.kind is HealthmesEventKind.ACTUAL_SLEEP
-        and row.healthmes_source == event.identity.source
-        and row.healthmes_source_key == event.identity.source_key
-    )
+def _pending_sleep_intent(row: CalendarEventMirror) -> bool:
+    return row.status in {
+        SLEEP_CREATE_PENDING_STATUS,
+        SLEEP_UPDATE_PENDING_STATUS,
+    }
+
+
+def _mirror_snapshot(row: CalendarEventMirror) -> dict[str, object]:
+    return {
+        column.key: getattr(row, column.key)
+        for column in _MIRROR_CAS_COLUMNS
+    }
+
+
+def _mirror_snapshot_predicates(
+    snapshot: dict[str, object],
+) -> tuple[sa.ColumnElement[bool], ...]:
+    predicates: list[sa.ColumnElement[bool]] = []
+    for column in _MIRROR_CAS_COLUMNS:
+        value = snapshot[column.key]
+        predicates.append(column.is_(None) if value is None else column == value)
+    return tuple(predicates)
+
+
+_MIRROR_CAS_COLUMNS = tuple(
+    column
+    for column in CalendarEventMirror.__table__.columns
+    if column.key not in {"created_at", "updated_at"}
+)
 
 
 def _apply_mirror_metadata(row: CalendarEventMirror, event: ExternalEvent) -> None:
