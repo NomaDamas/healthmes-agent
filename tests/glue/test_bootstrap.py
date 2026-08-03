@@ -208,12 +208,12 @@ def test_legacy_morning_cron_is_upgraded_without_resetting_runtime_state(
         assert morning[field] == legacy[field]
 
 
-def test_unmanaged_same_name_cron_is_not_overwritten(
+def test_unmanaged_same_name_healthmes_prompt_cron_is_not_overwritten(
     bootstrap, hermes_home, env_file
 ):
     created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
     user_job = bootstrap.build_fallback_job(
-        prompt="Run my private morning workflow.",
+        prompt="Run my private HealthMes morning workflow.",
         schedule="15 6 * * *",
         name="healthmes-morning-plan",
         deliver="local",

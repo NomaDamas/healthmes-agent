@@ -846,8 +846,11 @@ def _is_healthmes_managed_cron(
     if str(existing.get("name") or "") != desired["name"]:
         return False
     origin = existing.get("origin")
-    if isinstance(origin, Mapping) and origin.get("source") == HEALTHMES_CRON_ORIGIN["source"]:
-        return True
+    if origin is not None:
+        return (
+            isinstance(origin, Mapping)
+            and origin.get("source") == HEALTHMES_CRON_ORIGIN["source"]
+        )
 
     prompt = str(existing.get("prompt") or "").casefold()
     return any(
