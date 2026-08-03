@@ -13,77 +13,218 @@ OW_LOG="$RUNTIME_DIR/open-wearables.log"
 WORKER_LOG="$RUNTIME_DIR/open-wearables-worker.log"
 BEAT_LOG="$RUNTIME_DIR/open-wearables-beat.log"
 DASHBOARD_URL="${HEALTHMES_DASHBOARD_URL:-http://127.0.0.1:${HEALTHMES_PORT:-8100}/sleep}"
+DEV_MAC_SCRIPT="${HEALTHMES_DEV_MAC_SCRIPT:-$REPO_ROOT/scripts/dev_mac.sh}"
 LAUNCH_AGENT_LABEL="com.healthmes.local"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 LAUNCH_AGENT_PLIST="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
 LAUNCH_AGENT_TEMPLATE="$REPO_ROOT/config/$LAUNCH_AGENT_LABEL.plist.in"
 HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
 HERMES_GATEWAY_LABEL="ai.hermes.gateway"
+LAUNCHCTL_BIN="${HEALTHMES_LAUNCHCTL_BIN:-launchctl}"
+PS_BIN="${HEALTHMES_PS_BIN:-ps}"
+KILL_BIN="${HEALTHMES_KILL_BIN:-/bin/kill}"
+SLEEP_BIN="${HEALTHMES_SLEEP_BIN:-sleep}"
+BASH_BIN="${HEALTHMES_BASH_BIN:-/bin/bash}"
+UUIDGEN_BIN="${HEALTHMES_UUIDGEN_BIN:-uuidgen}"
 
 info() { printf '[healthmes] %s\n' "$*"; }
 die() { printf '[healthmes] %s\n' "$*" >&2; exit 1; }
 
-pid_running() {
-    local file=$1 pid
-    [ -f "$file" ] || return 1
-    pid="$(<"$file")"
-    [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+identity_file() {
+    printf '%s.identity\n' "$1"
 }
 
-descendant_pids() {
-    local parent=$1 child
-    for child in $(pgrep -P "$parent" 2>/dev/null || true); do
-        printf '%s\n' "$child"
-        descendant_pids "$child"
+clear_process_identity() {
+    local pid_file=$1
+    rm -f "$pid_file" "$(identity_file "$pid_file")"
+}
+
+valid_managed_pid() {
+    local pid=$1
+    [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ]
+}
+
+trim_whitespace() {
+    local value=$1
+    while [[ "$value" == [[:space:]]* ]]; do
+        value="${value#?}"
+    done
+    while [[ "$value" == *[[:space:]] ]]; do
+        value="${value%?}"
+    done
+    printf '%s\n' "$value"
+}
+
+ps_value() {
+    local pid=$1 field=$2 value
+    value="$("$PS_BIN" -ww -p "$pid" -o "$field=" 2>/dev/null)" || return 1
+    value="$(trim_whitespace "$value")"
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$value"
+}
+
+load_process_identity() {
+    local pid_file=$1 file key value stored_pid
+    file="$(identity_file "$pid_file")"
+    [ -f "$pid_file" ] && [ -f "$file" ] || return 1
+
+    PROCESS_PID=
+    PROCESS_PGID=
+    PROCESS_EXECUTABLE=
+    PROCESS_START_TIME=
+    PROCESS_NONCE=
+    while IFS=$'\t' read -r key value; do
+        case "$key" in
+        pid) PROCESS_PID=$value ;;
+        pgid) PROCESS_PGID=$value ;;
+        executable) PROCESS_EXECUTABLE=$value ;;
+        start_time) PROCESS_START_TIME=$value ;;
+        nonce) PROCESS_NONCE=$value ;;
+        esac
+    done <"$file"
+    stored_pid="$(<"$pid_file")"
+
+    valid_managed_pid "$PROCESS_PID" \
+        && [ "$stored_pid" = "$PROCESS_PID" ] \
+        && [ "$PROCESS_PGID" = "$PROCESS_PID" ] \
+        && [ "${PROCESS_EXECUTABLE##*/}" = "bash" ] \
+        && [ -n "$PROCESS_START_TIME" ] \
+        && [[ "$PROCESS_NONCE" =~ ^[A-Za-z0-9-]+$ ]]
+}
+
+load_process_snapshot() {
+    local pid=$1
+    valid_managed_pid "$pid" || return 1
+    SNAPSHOT_PID="$(ps_value "$pid" pid)" || return 1
+    SNAPSHOT_PGID="$(ps_value "$pid" pgid)" || return 1
+    SNAPSHOT_EXECUTABLE="$(ps_value "$pid" comm)" || return 1
+    SNAPSHOT_START_TIME="$(ps_value "$pid" lstart)" || return 1
+    SNAPSHOT_COMMAND="$(ps_value "$pid" command)" || return 1
+}
+
+process_identity_matches() {
+    local pid_file=$1 marker
+    load_process_identity "$pid_file" || return 1
+    load_process_snapshot "$PROCESS_PID" || return 1
+    marker="healthmes_local.sh __service_runner $PROCESS_NONCE "
+
+    [ "$SNAPSHOT_PID" = "$PROCESS_PID" ] \
+        && [ "$SNAPSHOT_PGID" = "$PROCESS_PGID" ] \
+        && [ "$SNAPSHOT_EXECUTABLE" = "$PROCESS_EXECUTABLE" ] \
+        && [ "$SNAPSHOT_START_TIME" = "$PROCESS_START_TIME" ] \
+        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]
+}
+
+write_process_identity() {
+    local pid_file=$1 pid=$2 nonce=$3 file temp pid_temp
+    file="$(identity_file "$pid_file")"
+    temp="$(mktemp "$RUNTIME_DIR/.process-identity.XXXXXX")"
+    pid_temp="$(mktemp "$RUNTIME_DIR/.process-pid.XXXXXX")"
+    umask 077
+    {
+        printf 'pid\t%s\n' "$pid"
+        printf 'pgid\t%s\n' "$SNAPSHOT_PGID"
+        printf 'executable\t%s\n' "$SNAPSHOT_EXECUTABLE"
+        printf 'start_time\t%s\n' "$SNAPSHOT_START_TIME"
+        printf 'nonce\t%s\n' "$nonce"
+    } >"$temp"
+    printf '%s\n' "$pid" >"$pid_temp"
+    mv "$temp" "$file"
+    mv "$pid_temp" "$pid_file"
+}
+
+capture_process_identity() {
+    local pid_file=$1 pid=$2 nonce=$3 marker
+    load_process_snapshot "$pid" || return 1
+    marker="healthmes_local.sh __service_runner $nonce "
+    [ "$SNAPSHOT_PID" = "$pid" ] \
+        && [ "$SNAPSHOT_PGID" = "$pid" ] \
+        && [ "${SNAPSHOT_EXECUTABLE##*/}" = "bash" ] \
+        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]] \
+        || return 1
+    write_process_identity "$pid_file" "$pid" "$nonce"
+}
+
+pid_running() {
+    process_identity_matches "$1"
+}
+
+new_service_nonce() {
+    local nonce
+    nonce="$("$UUIDGEN_BIN")" || return 1
+    nonce="${nonce//-/}"
+    [[ "$nonce" =~ ^[A-Za-z0-9]+$ ]] || return 1
+    printf '%s\n' "$nonce"
+}
+
+run_service_runner() {
+    local nonce=$1 command=$2 child status
+    [ -n "$nonce" ] && [ "${HEALTHMES_SERVICE_NONCE:-}" = "$nonce" ] \
+        || die "invalid service runner nonce"
+    trap ':' INT TERM
+    "$BASH_BIN" -lc "$command" &
+    child=$!
+    while true; do
+        wait "$child" && return 0
+        status=$?
+        "$KILL_BIN" -0 "$child" 2>/dev/null || return "$status"
+        "$SLEEP_BIN" 0.1
     done
 }
 
 start_process() {
-    local name=$1 pid_file=$2 log_file=$3 command=$4
+    local name=$1 pid_file=$2 log_file=$3 command=$4 nonce pid
     if pid_running "$pid_file"; then
-        info "$name already running (pid $(<"$pid_file"))"
+        info "$name already running (pid $PROCESS_PID)"
         return
     fi
+    if [ -f "$pid_file" ] || [ -f "$(identity_file "$pid_file")" ]; then
+        info "$name stale process identity ignored"
+        clear_process_identity "$pid_file"
+    fi
     mkdir -p "$RUNTIME_DIR"
+    nonce="$(new_service_nonce)" || die "failed to generate $name service nonce"
     (
         cd "$REPO_ROOT"
-        nohup bash -lc "$command" >>"$log_file" 2>&1 &
+        set -m
+        nohup env HEALTHMES_SERVICE_NONCE="$nonce" \
+            "$BASH_BIN" "$REPO_ROOT/scripts/healthmes_local.sh" \
+            __service_runner "$nonce" "$command" >>"$log_file" 2>&1 &
         printf '%s\n' "$!" >"$pid_file"
+        set +m
     )
-    sleep 1
-    pid_running "$pid_file" || die "$name failed to start; see $log_file"
-    info "$name started (pid $(<"$pid_file"))"
+    pid="$(<"$pid_file")"
+    "$SLEEP_BIN" 1
+    if ! capture_process_identity "$pid_file" "$pid" "$nonce"; then
+        clear_process_identity "$pid_file"
+        die "$name failed identity verification; see $log_file"
+    fi
+    info "$name started (pid $pid)"
+}
+
+signal_process_group() {
+    local signal=$1 pid_file=$2 pid
+    process_identity_matches "$pid_file" || return 1
+    pid=$PROCESS_PID
+    "$KILL_BIN" -s "$signal" "-$pid"
 }
 
 stop_process() {
-    local name=$1 pid_file=$2 pid child process_pid still_running
-    local -a pids
-    if ! pid_running "$pid_file"; then
-        rm -f "$pid_file"
+    local name=$1 pid_file=$2
+    if ! process_identity_matches "$pid_file"; then
+        clear_process_identity "$pid_file"
         info "$name stopped"
         return
     fi
-    pid="$(<"$pid_file")"
-    pids=("$pid")
-    while read -r child; do
-        [ -n "$child" ] && pids+=("$child")
-    done < <(descendant_pids "$pid")
-    kill "${pids[@]}" 2>/dev/null || true
+    signal_process_group TERM "$pid_file" 2>/dev/null || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        still_running=false
-        for process_pid in "${pids[@]}"; do
-            if kill -0 "$process_pid" 2>/dev/null; then
-                still_running=true
-                break
-            fi
-        done
-        [ "$still_running" = false ] && break
-        sleep 0.2
+        process_identity_matches "$pid_file" || break
+        "$SLEEP_BIN" 0.2
     done
-    for process_pid in "${pids[@]}"; do
-        kill -0 "$process_pid" 2>/dev/null && kill -9 "$process_pid"
-    done
-    rm -f "$pid_file"
+    if process_identity_matches "$pid_file"; then
+        signal_process_group KILL "$pid_file" 2>/dev/null || true
+    fi
+    clear_process_identity "$pid_file"
     info "$name stopped"
 }
 
@@ -151,8 +292,8 @@ PY
         return 0
     fi
     info "synchronized Open Wearables credential into Hermes"
-    if launchctl print "gui/$UID/$HERMES_GATEWAY_LABEL" >/dev/null 2>&1; then
-        launchctl kickstart -k "gui/$UID/$HERMES_GATEWAY_LABEL"
+    if "$LAUNCHCTL_BIN" print "gui/$UID/$HERMES_GATEWAY_LABEL" >/dev/null 2>&1; then
+        "$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$HERMES_GATEWAY_LABEL"
         info "restarted Hermes gateway to reload MCP credentials"
     fi
 }
@@ -166,16 +307,18 @@ install_launch_agent() {
     sed "s|__REPO_ROOT__|$escaped_repo|g" "$LAUNCH_AGENT_TEMPLATE" >"$temp_plist"
     install -m 644 "$temp_plist" "$LAUNCH_AGENT_PLIST"
     rm -f "$temp_plist"
-    launchctl bootout "gui/$UID/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+    "$LAUNCHCTL_BIN" disable "gui/$UID/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+    "$LAUNCHCTL_BIN" bootout "gui/$UID/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
     bootstrap_log="$(mktemp)"
     bootstrapped=false
+    "$LAUNCHCTL_BIN" enable "gui/$UID/$LAUNCH_AGENT_LABEL"
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        if launchctl bootstrap "gui/$UID" "$LAUNCH_AGENT_PLIST" \
+        if "$LAUNCHCTL_BIN" bootstrap "gui/$UID" "$LAUNCH_AGENT_PLIST" \
             2>"$bootstrap_log"; then
             bootstrapped=true
             break
         fi
-        sleep 0.5
+        "$SLEEP_BIN" 0.5
     done
     if [ "$bootstrapped" != true ]; then
         cat "$bootstrap_log" >&2
@@ -183,13 +326,27 @@ install_launch_agent() {
         die "failed to register login launch agent"
     fi
     rm -f "$bootstrap_log"
-    launchctl enable "gui/$UID/$LAUNCH_AGENT_LABEL"
-    launchctl kickstart -k "gui/$UID/$LAUNCH_AGENT_LABEL"
+    "$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$LAUNCH_AGENT_LABEL"
     info "login launch agent installed ($LAUNCH_AGENT_LABEL)"
 }
 
+stop_launch_agent() {
+    "$LAUNCHCTL_BIN" disable "gui/$UID/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+    "$LAUNCHCTL_BIN" bootout "gui/$UID/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+}
+
+start_launch_agent() {
+    "$LAUNCHCTL_BIN" enable "gui/$UID/$LAUNCH_AGENT_LABEL"
+    if ! "$LAUNCHCTL_BIN" print "gui/$UID/$LAUNCH_AGENT_LABEL" \
+        >/dev/null 2>&1; then
+        "$LAUNCHCTL_BIN" bootstrap "gui/$UID" "$LAUNCH_AGENT_PLIST"
+    fi
+    "$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$LAUNCH_AGENT_LABEL"
+    info "login launch agent started ($LAUNCH_AGENT_LABEL)"
+}
+
 uninstall_launch_agent() {
-    launchctl bootout "gui/$UID/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+    stop_launch_agent
     if [ -f "$LAUNCH_AGENT_PLIST" ]; then
         rm "$LAUNCH_AGENT_PLIST"
         info "login launch agent removed"
@@ -197,7 +354,7 @@ uninstall_launch_agent() {
 }
 
 cmd_install() {
-    bash "$REPO_ROOT/scripts/dev_mac.sh" setup
+    bash "$DEV_MAC_SCRIPT" setup
     install_launch_agent
     info "installed and configured to start at login"
 }
@@ -206,13 +363,13 @@ cmd_update() {
     git -C "$REPO_ROOT" diff --quiet || die "working tree has changes; commit or stash first"
     git -C "$REPO_ROOT" diff --cached --quiet || die "index has changes; commit or stash first"
     git -C "$REPO_ROOT" pull --ff-only
-    bash "$REPO_ROOT/scripts/dev_mac.sh" setup
+    bash "$DEV_MAC_SCRIPT" setup
     info "updated"
 }
 
-cmd_start() {
+start_apps() {
     load_runtime_env
-    bash "$REPO_ROOT/scripts/dev_mac.sh" services-start
+    bash "$DEV_MAC_SCRIPT" services-start
     resolve_ow_api_key
     sync_hermes_ow_api_key
     start_process "Open Wearables" "$OW_PID" "$OW_LOG" \
@@ -226,16 +383,24 @@ cmd_start() {
     info "dashboard: $DASHBOARD_URL"
 }
 
+cmd_start() {
+    if [ -f "$LAUNCH_AGENT_PLIST" ]; then
+        start_launch_agent
+        return
+    fi
+    start_apps
+}
+
 cmd_daemon() {
     trap 'stop_apps; exit 0' INT TERM
-    cmd_start
+    start_apps
     while true; do
-        sleep 5
+        "$SLEEP_BIN" 5
         if ! pid_running "$HEALTHMES_PID" \
             || ! pid_running "$OW_PID" \
             || ! pid_running "$WORKER_PID" \
             || ! pid_running "$BEAT_PID"; then
-            cmd_start
+            start_apps
         fi
     done
 }
@@ -248,14 +413,15 @@ stop_apps() {
 }
 
 cmd_stop() {
+    stop_launch_agent
     stop_apps
-    bash "$REPO_ROOT/scripts/dev_mac.sh" services-stop
+    bash "$DEV_MAC_SCRIPT" services-stop
 }
 
 service_status() {
     local name=$1 file=$2
     if pid_running "$file"; then
-        info "$name: running (pid $(<"$file"))"
+        info "$name: running (pid $PROCESS_PID)"
     else
         info "$name: stopped"
     fi
@@ -266,7 +432,7 @@ cmd_status() {
     service_status "Open Wearables" "$OW_PID"
     service_status "Open Wearables worker" "$WORKER_PID"
     service_status "Open Wearables beat" "$BEAT_PID"
-    bash "$REPO_ROOT/scripts/dev_mac.sh" services-status
+    bash "$DEV_MAC_SCRIPT" services-status
     if curl --fail --silent --max-time 2 "http://127.0.0.1:${HEALTHMES_PORT:-8100}/health" >/dev/null; then
         info "HealthMes HTTP: ready"
     else
@@ -307,5 +473,6 @@ status) cmd_status ;;
 open) cmd_open ;;
 daemon) cmd_daemon ;;
 uninstall) cmd_uninstall "${2:-}" ;;
+__service_runner) run_service_runner "${2:-}" "${3:-}" ;;
 *) usage ;;
 esac
