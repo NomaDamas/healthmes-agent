@@ -25,7 +25,7 @@ import org.json.JSONException
 
 /**
  * One-shot WorkManager job behind the §8.5 notification buttons: resolves
- * the pending schedule proposal (unless an explicit id was passed), calls
+ * the exact server-correlated pending schedule proposal, calls
  * `POST /v1/schedule/proposals/{id}/accept|decline` with the paired bearer
  * client, and posts a small result notification. Decision logic lives in
  * [ProposalActionLogic] (JVM-tested); this is the Android shell.
@@ -49,6 +49,7 @@ class ProposalActionWorker(appContext: Context, params: WorkerParameters) :
         val api = HealthmesApi(serverUrl, prefs.token)
 
         val explicitId = inputData.getString(KEY_PROPOSAL_ID)
+            ?: return@withContext finish(context, Outcome.NonePending)
         val proposal = when (val target = resolveTarget(api, explicitId)) {
             is Target.Single -> target.proposal
             is Target.NonePending -> return@withContext finish(
@@ -73,10 +74,11 @@ class ProposalActionWorker(appContext: Context, params: WorkerParameters) :
     }
 
     /** Null on transport/parse failure (caller retries). */
-    private fun resolveTarget(api: HealthmesApi, explicitId: String?): Target? {
-        val response = api.get(ProposalActionLogic.resolvePath(explicitId))
+    private fun resolveTarget(api: HealthmesApi, explicitId: String): Target? {
+        val path = ProposalActionLogic.resolvePath(explicitId) ?: return Target.NonePending
+        val response = api.get(path)
         if (response !is HealthmesApi.Response.Http) return null
-        if (explicitId != null && response.code == 404) return Target.NonePending
+        if (response.code == 404) return Target.NonePending
         if (!response.isSuccess) return null
         return try {
             ProposalActionLogic.chooseTarget(response.body, explicitId)

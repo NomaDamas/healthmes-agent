@@ -758,37 +758,62 @@ class TriggerEvaluator:
         # recorded is never persisted or pushed again. Keys embed their
         # temporal scope (date / diff fingerprint), so "again later" is a new
         # key by construction.
-        already = session.scalar(
-            select(TriggerEvent.id).where(TriggerEvent.dedup_key == fire.dedup_key).limit(1)
+        existing_event = session.scalar(
+            select(TriggerEvent)
+            .where(TriggerEvent.dedup_key == fire.dedup_key)
+            .limit(1)
         )
-        if already is not None:
-            return FireOutcome(fire=fire, status="deduplicated")
+        if existing_event is not None:
+            push = (existing_event.payload or {}).get("push")
+            if (
+                not existing_event.alert_sent
+                and isinstance(push, dict)
+                and push.get("state") == "dispatching"
+            ):
+                event = existing_event
+                payload = {
+                    "summary": fire.summary,
+                    "proposal": fire.proposal,
+                    "evidence": fire.evidence,
+                }
+            else:
+                return FireOutcome(fire=fire, status="deduplicated")
+        else:
+            payload = {
+                "summary": fire.summary,
+                "proposal": fire.proposal,
+                "evidence": fire.evidence,
+            }
+            event = TriggerEvent(
+                fired_at=_ensure_utc(now),
+                rule_id=fire.rule_id,
+                dedup_key=fire.dedup_key,
+                alert_sent=False,
+                payload=payload,
+            )
+            session.add(event)
+            # Flush immediately: the production factory disables autoflush, so
+            # without this the hygiene queries below (cooldown, daily budget) and
+            # the dedup check of LATER fires in this same sweep would not see this
+            # row or the pending ``alert_sent`` updates of earlier fires — N rules
+            # firing in one sweep would then blow through the daily budget
+            # (pinned by tests/hardening/test_trigger_flood.py).
+            session.flush()
 
-        payload: dict[str, Any] = {
-            "summary": fire.summary,
-            "proposal": fire.proposal,
-            "evidence": fire.evidence,
-        }
-        event = TriggerEvent(
-            fired_at=_ensure_utc(now),
-            rule_id=fire.rule_id,
-            dedup_key=fire.dedup_key,
-            alert_sent=False,
-            payload=payload,
-        )
-        session.add(event)
-        # Flush immediately: the production factory disables autoflush, so
-        # without this the hygiene queries below (cooldown, daily budget) and
-        # the dedup check of LATER fires in this same sweep would not see this
-        # row or the pending ``alert_sent`` updates of earlier fires — N rules
-        # firing in one sweep would then blow through the daily budget
-        # (pinned by tests/hardening/test_trigger_flood.py).
-        session.flush()
+            reason = self._push_suppression_reason(session, now, fire)
+            if reason is not None:
+                event.payload = {**payload, "push": {"suppressed_reason": reason}}
+                return FireOutcome(fire=fire, status="suppressed", reason=reason)
 
-        reason = self._push_suppression_reason(session, now, fire)
-        if reason is not None:
-            event.payload = {**payload, "push": {"suppressed_reason": reason}}
-            return FireOutcome(fire=fire, status="suppressed", reason=reason)
+            event.payload = {
+                **payload,
+                "push": {"state": "dispatching", "channel": "webhook"},
+            }
+            # Hermes accepts the request and starts agent work asynchronously.
+            # Commit the correlation row first so record_decision can resolve
+            # trigger_event_id immediately. If this process dies after commit,
+            # the next sweep reuses this exact event and Hermes request id.
+            session.commit()
 
         try:
             result = self._alert_sender.send(
@@ -849,19 +874,16 @@ class TriggerEvaluator:
     ) -> FireOutcome:
         """Recover a fire whose AlertSender.send() *raised* (not a clean non-2xx).
 
-        The ``trigger_event`` row was already ``add``-ed and ``flush``-ed above,
-        so its dedup key is burned; without unwinding, a transport that raises
-        would permanently swallow the alert. Two recoveries:
+        The ``trigger_event`` row is committed in ``dispatching`` state before
+        the external call, so Hermes background processing can resolve its id
+        and a process crash leaves durable retry intent. Two recoveries:
 
         - ``native_alert_delivery`` on: the alert is still surfaced to the
           companion apps via /v1/alerts + glance polling, so mark it delivered
           natively (the phone/watch get it without Telegram) and keep the row.
-        - native off: the alert is genuinely undelivered and MUST retry on the
-          next sweep, so the burned dedup key has to go. ``session.expunge`` is
-          NOT enough here — the INSERT already emitted at flush, so expunge only
-          detaches the instance while the row still commits; only
-          ``delete`` + ``flush`` actually removes it, letting the identical fire
-          re-fire (its dedup key was never truly recorded).
+        - native off: leave the row in ``dispatching`` state. The next sweep
+          retries the same event id and stable Hermes request id, preserving
+          correlation while the gateway collapses an uncertain duplicate.
         """
         if self._settings.native_alert_delivery:
             event.alert_sent = True
@@ -876,8 +898,6 @@ class TriggerEvaluator:
             }
             return FireOutcome(fire=fire, status="pushed")
 
-        session.delete(event)
-        session.flush()
         return FireOutcome(fire=fire, status="push_failed", reason=str(exc))
 
     def _push_suppression_reason(

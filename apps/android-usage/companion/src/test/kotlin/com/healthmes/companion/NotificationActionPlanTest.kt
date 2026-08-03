@@ -30,6 +30,7 @@ class NotificationActionPlanTest {
             plan.accept.proposalId,
         )
         assertEquals(plan.accept.proposalId, plan.decline.proposalId)
+        assertTrue(plan.isActionable)
     }
 
     @Test
@@ -103,5 +104,6 @@ class NotificationActionPlanTest {
         assertNull(grammar.decisionUrl)
         assertNull(plan.accept.proposalId)
         assertNull(plan.decline.proposalId)
+        assertEquals(false, plan.isActionable)
     }
 }

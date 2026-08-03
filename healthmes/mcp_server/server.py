@@ -54,7 +54,7 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes import schedule_proposals
@@ -2942,6 +2942,38 @@ def _validate_tree(node: Any, depth: int = 0, count: int = 0) -> int:
     return count
 
 
+def _claim_schedule_proposals(
+    session: Session,
+    proposals: list[tuple[str, uuid.UUID]],
+    decision_record_id: uuid.UUID,
+) -> None:
+    """Atomically attach pending proposals to one decision record."""
+    for proposal_id, proposal_uuid in proposals:
+        claimed = session.execute(
+            update(ScheduleProposal)
+            .where(
+                ScheduleProposal.id == proposal_uuid,
+                ScheduleProposal.status == ProposalStatus.PROPOSED,
+                ScheduleProposal.decision_record_id.is_(None),
+            )
+            .values(decision_record_id=decision_record_id)
+        )
+        if claimed.rowcount == 1:
+            continue
+        proposal = session.get(
+            ScheduleProposal,
+            proposal_uuid,
+            populate_existing=True,
+        )
+        if proposal is None:
+            raise ToolError(f"schedule_proposal {proposal_id} not found")
+        if proposal.status != ProposalStatus.PROPOSED:
+            raise ToolError(f"schedule_proposal {proposal_id} is not pending")
+        raise ToolError(
+            f"schedule_proposal {proposal_id} already has a decision record"
+        )
+
+
 @mcp.tool
 def record_decision(
     kind: str,
@@ -2998,24 +3030,6 @@ def record_decision(
                 raise ToolError(
                     f"trigger_event {trigger_event_id} already has a decision record"
                 )
-        proposals: list[ScheduleProposal] = []
-        for proposal_id, proposal_uuid in zip(
-            schedule_proposal_ids or [],
-            proposal_uuids,
-            strict=True,
-        ):
-            proposal = session.get(ScheduleProposal, proposal_uuid)
-            if proposal is None:
-                raise ToolError(f"schedule_proposal {proposal_id} not found")
-            if proposal.status != ProposalStatus.PROPOSED:
-                raise ToolError(
-                    f"schedule_proposal {proposal_id} is not pending"
-                )
-            if proposal.decision_record_id is not None:
-                raise ToolError(
-                    f"schedule_proposal {proposal_id} already has a decision record"
-                )
-            proposals.append(proposal)
         row = DecisionRecord(
             kind=DecisionKind(kind),
             tree=tree,
@@ -3026,8 +3040,17 @@ def record_decision(
         )
         session.add(row)
         session.flush()
-        for proposal in proposals:
-            proposal.decision_record_id = row.id
+        _claim_schedule_proposals(
+            session,
+            list(
+                zip(
+                    schedule_proposal_ids or [],
+                    proposal_uuids,
+                    strict=True,
+                )
+            ),
+            row.id,
+        )
         decision_id = str(row.id)
     # Viewer pages are opened from the phone browser (no headers); the shared
     # construction point embeds the derived read-only credential — never the

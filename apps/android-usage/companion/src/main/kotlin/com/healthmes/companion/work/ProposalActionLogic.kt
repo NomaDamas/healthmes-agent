@@ -3,27 +3,20 @@ package com.healthmes.companion.work
 import com.healthmes.api.ApiError
 import com.healthmes.api.HealthmesApi
 import com.healthmes.api.Proposal
-import com.healthmes.api.ProposalsPage
 import org.json.JSONException
 
 /**
  * Pure decision logic behind the notification Apply / Keep-as-is buttons
  * (JVM unit-tested; [ProposalActionWorker] is the thin Android shell).
  *
- * Proposal alerts carry an explicit id and use the direct detail endpoint.
- * Legacy/generic alerts resolve at execution time from
- * `GET /v1/schedule/proposals?status=proposed` and act ONLY when that fallback
- * is unambiguous. With zero or 2+ pending proposals the worker refuses to
- * guess (PLAN.md §11: a wrong assistant gets muted) and routes the user into
- * the app instead.
+ * Proposal alerts must carry an explicit server-correlated id and use the
+ * direct detail endpoint. Generic alerts never infer a target from the global
+ * pending-proposal list (PLAN.md §11: a wrong assistant gets muted).
  */
 object ProposalActionLogic {
 
-    /** Query for the resolve step: 2 rows is enough to detect ambiguity. */
-    const val RESOLVE_PATH = "${ProposalsPage.ENDPOINT_PATH}?status=proposed&limit=2&offset=0"
-
-    fun resolvePath(explicitId: String?): String =
-        explicitId?.let(Proposal::detailPath) ?: RESOLVE_PATH
+    fun resolvePath(explicitId: String?): String? =
+        explicitId?.let(Proposal::detailPath)
 
     sealed class Target {
         data class Single(val proposal: Proposal) : Target()
@@ -31,28 +24,17 @@ object ProposalActionLogic {
         data class Ambiguous(val pendingCount: Int) : Target()
     }
 
-    /** Chooses the action target from the pending-proposals page. */
-    fun chooseTarget(page: ProposalsPage): Target {
-        // total_count covers pending proposals beyond the fetched window.
-        val pending = page.pagination.totalCount
-        return when {
-            pending <= 0 -> Target.NonePending
-            pending == 1 && page.proposals.isNotEmpty() -> Target.Single(page.proposals.first())
-            else -> Target.Ambiguous(pending)
-        }
-    }
-
     @Throws(JSONException::class)
     fun chooseTarget(body: String, explicitId: String?): Target =
-        if (explicitId == null) {
-            chooseTarget(ProposalsPage.parse(body))
-        } else {
+        if (explicitId != null) {
             val proposal = Proposal.parse(org.json.JSONObject(body))
             if (proposal.id == explicitId && proposal.isPending) {
                 Target.Single(proposal)
             } else {
                 Target.NonePending
             }
+        } else {
+            Target.NonePending
         }
 
     sealed class Outcome {

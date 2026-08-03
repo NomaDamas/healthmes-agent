@@ -56,7 +56,7 @@ object AlertNotifier {
                 )
         }
 
-        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(grammar.observation)
             .setContentText(grammar.evidence)
@@ -65,7 +65,9 @@ object AlertNotifier {
             .setAutoCancel(true)
             .setCategory(NotificationCompat.CATEGORY_RECOMMENDATION)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .addAction(
+
+        if (plan.isActionable) {
+            builder.addAction(
                 0,
                 context.getString(R.string.notification_action_apply),
                 broadcastIntent(context, plan.accept),
@@ -84,7 +86,8 @@ object AlertNotifier {
                 context.getString(R.string.notification_action_keep),
                 broadcastIntent(context, plan.decline),
             )
-            .build()
+        }
+        val notification = builder.build()
 
         val manager = NotificationManagerCompat.from(context)
         if (manager.areNotificationsEnabled()) {

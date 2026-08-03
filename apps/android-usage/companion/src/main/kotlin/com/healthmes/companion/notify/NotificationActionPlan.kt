@@ -13,12 +13,12 @@ package com.healthmes.companion.notify
  *   or the briefing home when the alert carries none
  *
  * Proposal-producing alerts carry their exact pending proposal id. Legacy or
- * generic alerts keep [proposalId] null, so the worker resolves at tap time
- * and acts ONLY when that fallback is unambiguous (see ProposalActionLogic).
+ * generic alerts keep [proposalId] null and render no proposal actions.
  */
 data class NotificationActionPlan(
     val accept: ActionSpec,
     val decline: ActionSpec,
+    val isActionable: Boolean,
     /** Adjust button → in-app destination (proposals screen). */
     val adjustDestination: String,
     /** Content tap target. */
@@ -29,7 +29,7 @@ data class NotificationActionPlan(
     data class ActionSpec(
         /** Wire action sent to the worker: "accept" | "decline". */
         val wireAction: String,
-        /** Explicit proposal id, or null = resolve-at-tap-time. */
+        /** Exact server-correlated proposal id. */
         val proposalId: String?,
         /** PendingIntent request code — must differ across the buttons. */
         val requestCode: Int,
@@ -76,6 +76,7 @@ data class NotificationActionPlan(
             NotificationActionPlan(
                 accept = ActionSpec(WIRE_ACCEPT, proposalId, REQUEST_ACCEPT),
                 decline = ActionSpec(WIRE_DECLINE, proposalId, REQUEST_DECLINE),
+                isActionable = proposalId != null,
                 adjustDestination = DEST_PROPOSALS,
                 contentTap = grammar.decisionUrl?.let { ContentTap.Decision(it) }
                     ?: ContentTap.Home,

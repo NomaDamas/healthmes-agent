@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from freezegun import freeze_time
 from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 
 from healthmes.calendars.adjustments import provider_revision_fingerprint
 from healthmes.config import Settings
@@ -36,6 +37,7 @@ from healthmes.engine.triggers import (
     is_in_quiet_hours,
 )
 from healthmes.engine.webhook import WebhookResult
+from healthmes.store import Base, create_db_engine
 from healthmes.store.enums import (
     CalendarMutationOperation,
     CalendarMutationStatus,
@@ -267,6 +269,74 @@ def test_fresh_fire_is_persisted_and_pushed(settings, session_factory, alert_sen
     assert event.payload["push"] == {"sent": True, "status_code": 202, "channel": "webhook"}
 
 
+def test_trigger_event_is_committed_before_webhook_dispatch(settings, tmp_path) -> None:
+    engine = create_db_engine(f"sqlite+pysqlite:///{tmp_path / 'trigger-visibility.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+    class VisibilityCheckingSender(FakeAlertSender):
+        def send(self, fire, *, fired_at, trigger_event_id):
+            with factory() as observing_session:
+                event = observing_session.get(TriggerEvent, trigger_event_id)
+                assert event is not None
+                assert event.payload["push"]["state"] == "dispatching"
+            return super().send(
+                fire,
+                fired_at=fired_at,
+                trigger_event_id=trigger_event_id,
+            )
+
+    sender = VisibilityCheckingSender()
+    try:
+        with freeze_time("2026-07-09 14:00:00"):
+            report = make_evaluator(
+                settings,
+                factory,
+                sender,
+                rules=(fixed_rule,),
+            ).evaluate_once()
+        assert [outcome.status for outcome in report.outcomes] == ["pushed"]
+    finally:
+        engine.dispose()
+
+
+def test_dispatching_event_retries_with_same_correlation_id(
+    settings, session_factory
+) -> None:
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        event = TriggerEvent(
+            fired_at=utc(now),
+            rule_id="fixed_rule",
+            dedup_key="fixed_rule:occurrence-1",
+            alert_sent=False,
+            payload={
+                "summary": "observation",
+                "proposal": "proposal",
+                "evidence": {},
+                "push": {"state": "dispatching", "channel": "webhook"},
+            },
+        )
+        with session_factory() as session:
+            session.add(event)
+            session.commit()
+            event_id = event.id
+
+        sender = FakeAlertSender()
+        report = make_evaluator(
+            settings,
+            session_factory,
+            sender,
+            rules=(fixed_rule,),
+        ).evaluate_once()
+
+    assert [outcome.status for outcome in report.outcomes] == ["pushed"]
+    assert sender.sent[0][2] == event_id
+    [stored] = all_events(session_factory)
+    assert stored.id == event_id
+    assert stored.alert_sent is True
+
+
 def test_dedup_key_is_unique_across_sweeps(settings, session_factory, alert_sender) -> None:
     with freeze_time("2026-07-09 14:00:00") as frozen:
         evaluator = make_evaluator(
@@ -335,12 +405,7 @@ def test_native_delivery_off_keeps_webhook_only_semantics(settings, session_fact
 
 
 def test_sender_exception_native_off_does_not_burn_dedup(settings, session_factory) -> None:
-    """A sender that *raises* (not a clean non-2xx) must not burn the dedup key.
-
-    The trigger_event row is flushed before the push; when the send raises and
-    native delivery is off the alert is genuinely undelivered, so the row is
-    deleted (delete+flush, not expunge) — otherwise the burned key would
-    dedup-drop the retry forever."""
+    """An uncertain send keeps durable retry intent and correlation metadata."""
     off_settings = settings.model_copy(update={"native_alert_delivery": False})
     sender = RaisingAlertSender()
     with freeze_time("2026-07-09 14:00:00"):
@@ -349,13 +414,13 @@ def test_sender_exception_native_off_does_not_burn_dedup(settings, session_facto
 
     assert [o.status for o in report.outcomes] == ["push_failed"]
     assert sender.calls == 1
-    # Row removed → dedup key not recorded (an expunge would have left it).
-    assert all_events(session_factory) == []
+    [event] = all_events(session_factory)
+    assert event.alert_sent is False
+    assert event.payload["push"]["state"] == "dispatching"
 
 
 def test_sender_exception_recovers_on_next_sweep(settings, session_factory) -> None:
-    """After a raising sweep unwinds the row, the identical fire re-fires and is
-    delivered on the next sweep (same dedup key, never truly recorded)."""
+    """An uncertain send retries the same durable event on the next sweep."""
     off_settings = settings.model_copy(update={"native_alert_delivery": False})
     raising = RaisingAlertSender()
     working = FakeAlertSender()
@@ -371,8 +436,9 @@ def test_sender_exception_recovers_on_next_sweep(settings, session_factory) -> N
     assert [o.status for o in failed.outcomes] == ["push_failed"]
     assert [o.status for o in recovered.outcomes] == ["pushed"]
     assert len(working.sent) == 1
-    [event] = all_events(session_factory)  # only the delivered row survives
+    [event] = all_events(session_factory)
     assert event.dedup_key == "fixed_rule:occurrence-1"
+    assert working.sent[0][2] == event.id
     assert event.alert_sent is True
 
 
