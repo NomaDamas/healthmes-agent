@@ -13,7 +13,6 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.healthmes.api.HealthmesApi
 import com.healthmes.api.Proposal
-import com.healthmes.api.ProposalsPage
 import com.healthmes.briefing.PairingPrefs
 import com.healthmes.companion.R
 import com.healthmes.companion.notify.ActionResultNotifier
@@ -75,23 +74,12 @@ class ProposalActionWorker(appContext: Context, params: WorkerParameters) :
 
     /** Null on transport/parse failure (caller retries). */
     private fun resolveTarget(api: HealthmesApi, explicitId: String?): Target? {
-        val path = explicitId?.let { Proposal.detailPath(it) }
-            ?: ProposalActionLogic.RESOLVE_PATH
-        val response = api.get(path)
+        val response = api.get(ProposalActionLogic.resolvePath(explicitId))
         if (response !is HealthmesApi.Response.Http) return null
         if (explicitId != null && response.code == 404) return Target.NonePending
         if (!response.isSuccess) return null
         return try {
-            if (explicitId == null) {
-                ProposalActionLogic.chooseTarget(ProposalsPage.parse(response.body))
-            } else {
-                val proposal = Proposal.parse(org.json.JSONObject(response.body))
-                if (proposal.id == explicitId && proposal.isPending) {
-                    Target.Single(proposal)
-                } else {
-                    Target.NonePending
-                }
-            }
+            ProposalActionLogic.chooseTarget(response.body, explicitId)
         } catch (_: JSONException) {
             null
         }

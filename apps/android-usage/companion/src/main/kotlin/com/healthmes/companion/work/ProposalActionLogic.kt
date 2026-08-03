@@ -10,17 +10,20 @@ import org.json.JSONException
  * Pure decision logic behind the notification Apply / Keep-as-is buttons
  * (JVM unit-tested; [ProposalActionWorker] is the thin Android shell).
  *
- * Alerts carry no proposal id yet (trigger events and planner-created
- * proposals are unlinked server-side), so a button tap resolves its target
- * at execution time from `GET /v1/schedule/proposals?status=proposed` — and
- * acts ONLY when that is unambiguous. With zero or 2+ pending proposals the
- * worker refuses to guess (PLAN.md §11: a wrong assistant gets muted) and
- * routes the user into the app instead.
+ * Proposal alerts carry an explicit id and use the direct detail endpoint.
+ * Legacy/generic alerts resolve at execution time from
+ * `GET /v1/schedule/proposals?status=proposed` and act ONLY when that fallback
+ * is unambiguous. With zero or 2+ pending proposals the worker refuses to
+ * guess (PLAN.md §11: a wrong assistant gets muted) and routes the user into
+ * the app instead.
  */
 object ProposalActionLogic {
 
     /** Query for the resolve step: 2 rows is enough to detect ambiguity. */
     const val RESOLVE_PATH = "${ProposalsPage.ENDPOINT_PATH}?status=proposed&limit=2&offset=0"
+
+    fun resolvePath(explicitId: String?): String =
+        explicitId?.let(Proposal::detailPath) ?: RESOLVE_PATH
 
     sealed class Target {
         data class Single(val proposal: Proposal) : Target()
@@ -38,6 +41,19 @@ object ProposalActionLogic {
             else -> Target.Ambiguous(pending)
         }
     }
+
+    @Throws(JSONException::class)
+    fun chooseTarget(body: String, explicitId: String?): Target =
+        if (explicitId == null) {
+            chooseTarget(ProposalsPage.parse(body))
+        } else {
+            val proposal = Proposal.parse(org.json.JSONObject(body))
+            if (proposal.id == explicitId && proposal.isPending) {
+                Target.Single(proposal)
+            } else {
+                Target.NonePending
+            }
+        }
 
     sealed class Outcome {
         /** 2xx — the proposal reached [status] ("accepted" / "declined"). */

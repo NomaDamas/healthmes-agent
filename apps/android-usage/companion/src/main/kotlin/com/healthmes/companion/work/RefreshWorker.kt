@@ -88,7 +88,9 @@ class RefreshWorker(appContext: Context, params: WorkerParameters) :
         val current = briefing.alerts.unresolvedCount
         if (lastSeen in 0 until current) {
             val grammar = fetchNewestAlertGrammar(prefs) ?: NotificationGrammar.fromGlance(briefing)
-            grammar?.let { AlertNotifier.notify(context, it) }
+            grammar?.let {
+                AlertNotifier.notify(context, it, proposalId = it.proposalId)
+            }
         }
         prefs.lastSeenAlertCount = current
     }

@@ -29,9 +29,13 @@ object AlertNotifier {
     const val CHANNEL_ID = "healthmes_briefing_alerts"
     const val NOTIFICATION_ID = 4210
 
-    fun notify(context: Context, grammar: NotificationGrammar) {
+    fun notify(
+        context: Context,
+        grammar: NotificationGrammar,
+        proposalId: String? = grammar.proposalId,
+    ) {
         ensureChannel(context)
-        val plan = NotificationActionPlan.from(grammar)
+        val plan = NotificationActionPlan.from(grammar, proposalId)
 
         // Dedicated request code (never 0): see the registry note on
         // NotificationActionPlan — a shared code would let other notifiers'

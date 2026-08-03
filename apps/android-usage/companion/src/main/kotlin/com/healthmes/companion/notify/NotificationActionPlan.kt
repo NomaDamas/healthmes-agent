@@ -12,10 +12,9 @@ package com.healthmes.companion.notify
  * - content tap → the decision viewer for the alert's `decision_url`,
  *   or the briefing home when the alert carries none
  *
- * The §8.5 grammar has no proposal-id linkage yet (alerts are trigger
- * events; the proposal is created by the planner), so [proposalId] stays
- * null and the worker resolves the target pending proposal at tap time —
- * acting ONLY when it is unambiguous (see ProposalActionLogic).
+ * Proposal-producing alerts carry their exact pending proposal id. Legacy or
+ * generic alerts keep [proposalId] null, so the worker resolves at tap time
+ * and acts ONLY when that fallback is unambiguous (see ProposalActionLogic).
  */
 data class NotificationActionPlan(
     val accept: ActionSpec,
@@ -70,7 +69,10 @@ data class NotificationActionPlan(
         const val REQUEST_FOCUS_BLOCK_TAP = 5
         const val REQUEST_ACTION_RESULT_TAP = 6
 
-        fun from(grammar: NotificationGrammar, proposalId: String? = null) =
+        fun from(
+            grammar: NotificationGrammar,
+            proposalId: String? = grammar.proposalId,
+        ) =
             NotificationActionPlan(
                 accept = ActionSpec(WIRE_ACCEPT, proposalId, REQUEST_ACCEPT),
                 decline = ActionSpec(WIRE_DECLINE, proposalId, REQUEST_DECLINE),

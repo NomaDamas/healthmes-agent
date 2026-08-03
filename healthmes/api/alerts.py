@@ -29,7 +29,13 @@ from healthmes.api.briefing import ALERT_RECENT_HOURS, decision_viewer_url
 from healthmes.api.common import ensure_utc, utc_now
 from healthmes.api.pagination import Page, PageMeta, PageParamsDep
 from healthmes.config import Settings
-from healthmes.store import DecisionKind, DecisionRecord, TriggerEvent
+from healthmes.store import (
+    DecisionKind,
+    DecisionRecord,
+    ProposalStatus,
+    ScheduleProposal,
+    TriggerEvent,
+)
 from healthmes.store.session import SessionDep
 
 __all__ = ["router", "MAX_WINDOW_HOURS"]
@@ -50,12 +56,13 @@ class AlertOut(BaseModel):
     proposal: str | None  # proposal line
     evidence: dict[str, Any] | None  # evidence facts (client renders the line)
     decision_url: str | None  # "why this?" decision-viewer deep link
+    proposal_id: uuid.UUID | None = None  # unique pending proposal for native actions
 
 
-def _decision_links(
-    session: Session, settings: Settings, events: list[TriggerEvent]
-) -> dict[uuid.UUID, str]:
-    """Viewer link per event: earliest alert-kind decision at/after its fire.
+def _decision_ids(
+    session: Session, events: list[TriggerEvent]
+) -> dict[uuid.UUID, uuid.UUID]:
+    """Decision per event: earliest alert-kind decision at/after its fire.
 
     Exactly the glance top-alert heuristic (there is no FK yet —
     briefing._alerts_block documents the placeholder policy), batched so one
@@ -75,14 +82,41 @@ def _decision_links(
             .order_by(DecisionRecord.created_at.asc(), DecisionRecord.id.asc())
         ).all()
     ]
-    links: dict[uuid.UUID, str] = {}
+    decision_ids: dict[uuid.UUID, uuid.UUID] = {}
     for event in events:
         fired = ensure_utc(event.fired_at)
         for created_at, decision_id in decisions:
             if created_at >= fired:
-                links[event.id] = decision_viewer_url(settings, decision_id)
+                decision_ids[event.id] = decision_id
                 break
-    return links
+    return decision_ids
+
+
+def _proposal_ids(
+    session: Session, decision_ids: dict[uuid.UUID, uuid.UUID]
+) -> dict[uuid.UUID, uuid.UUID]:
+    """Unique pending schedule proposal per alert decision.
+
+    A decision may propose multiple blocks. Native one-tap actions are attached
+    only when the alert maps to exactly one pending proposal; otherwise clients
+    retain their ambiguity-safe fallback.
+    """
+    if not decision_ids:
+        return {}
+    by_decision: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for decision_id, proposal_id in session.execute(
+        select(ScheduleProposal.decision_record_id, ScheduleProposal.id).where(
+            ScheduleProposal.decision_record_id.in_(set(decision_ids.values())),
+            ScheduleProposal.status == ProposalStatus.PROPOSED,
+        )
+    ):
+        if decision_id is not None:
+            by_decision.setdefault(decision_id, []).append(proposal_id)
+    return {
+        event_id: proposals[0]
+        for event_id, decision_id in decision_ids.items()
+        if len(proposals := by_decision.get(decision_id, [])) == 1
+    }
 
 
 @router.get("")
@@ -106,7 +140,12 @@ def list_alerts(
     ]
 
     window = events[page.offset : page.offset + page.limit]
-    links = _decision_links(session, settings, window)
+    decision_ids = _decision_ids(session, window)
+    links = {
+        event_id: decision_viewer_url(settings, decision_id)
+        for event_id, decision_id in decision_ids.items()
+    }
+    proposal_ids = _proposal_ids(session, decision_ids)
     data = []
     for event in window:
         payload: dict[str, Any] = event.payload or {}
@@ -124,6 +163,7 @@ def list_alerts(
                 proposal=str(proposal) if proposal is not None else None,
                 evidence=evidence if isinstance(evidence, dict) else None,
                 decision_url=links.get(event.id),
+                proposal_id=proposal_ids.get(event.id),
             )
         )
     meta = PageMeta(

@@ -8,13 +8,22 @@ heuristic) — one test asserts glance/list agreement directly.
 
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 from freezegun import freeze_time
 
-from healthmes.store import DecisionKind, DecisionRecord, TriggerEvent
+from healthmes.store import (
+    DecisionKind,
+    DecisionRecord,
+    EnergyDemand,
+    ProposalStatus,
+    ScheduleProposal,
+    Task,
+    TaskSource,
+    TriggerEvent,
+)
 
 FROZEN_NOW = "2026-07-09 14:23:00"
 ALERTS = "/v1/alerts"
@@ -140,6 +149,74 @@ def test_decision_links_use_the_glance_heuristic(client, seeded):
     assert glance_alerts["top"]["decision_url"] == alerts[0]["decision_url"]
 
 
+def test_proposal_alert_resolves_its_direct_target_beyond_first_page(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "calendar_task_intake",
+        payload=_payload("A calendar task needs a block."),
+    )
+    decision = DecisionRecord(
+        kind=DecisionKind.ALERT,
+        tree={"id": "root", "type": "action", "label": "schedule", "children": []},
+        summary="Schedule the calendar task",
+    )
+    decision.created_at = _utc(9, 13, 55)
+    session.add_all([event, decision])
+    session.flush()
+
+    proposals: list[ScheduleProposal] = []
+    base_start = _utc(10, 0)
+    for index in range(51):
+        task = Task(
+            title=f"Task {index}",
+            energy_demand=EnergyDemand.MED,
+            status="scheduled",
+            source=TaskSource.AGENT,
+        )
+        session.add(task)
+        session.flush()
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=base_start + timedelta(minutes=index),
+            proposed_end=base_start + timedelta(minutes=index + 30),
+            status=ProposalStatus.PROPOSED,
+            decision_record_id=decision.id if index == 50 else None,
+            reply_handle_digest=f"{index + 1:064x}",
+            expires_at=_utc(10, 12),
+        )
+        session.add(proposal)
+        proposals.append(proposal)
+    session.commit()
+    target_id = proposals[-1].id
+
+    with frozen():
+        alert = client.get(ALERTS, params={"limit": 1}).json()["data"][0]
+        first_page = client.get(
+            "/v1/schedule/proposals",
+            params={"status": "proposed", "limit": 50, "offset": 0},
+        ).json()
+        direct = client.get(f"/v1/schedule/proposals/{target_id}")
+
+    assert alert["proposal_id"] == str(target_id)
+    assert str(target_id) not in {row["id"] for row in first_page["data"]}
+    assert first_page["pagination"]["total_count"] == 51
+    assert direct.status_code == 200
+    token = direct.json()["accept_resolution_token"]
+    assert token
+
+    with frozen():
+        resolved = client.post(
+            f"/v1/schedule/proposals/{target_id}/accept",
+            json={"resolution_token": token},
+        )
+
+    assert resolved.status_code == 200
+    assert resolved.json()["status"] == "accepted"
+
+
 def test_legacy_row_without_payload_falls_back_to_rule_id(client, session):
     session.add(_event(_utc(9, 12, 0), "legacy_rule", payload=None))
     session.commit()
@@ -151,6 +228,7 @@ def test_legacy_row_without_payload_falls_back_to_rule_id(client, session):
     assert alert["proposal"] is None
     assert alert["evidence"] is None
     assert alert["decision_url"] is None
+    assert alert["proposal_id"] is None
 
 
 def test_hours_param_widens_the_window(client, seeded):

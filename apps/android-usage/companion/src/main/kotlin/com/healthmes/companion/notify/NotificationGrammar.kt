@@ -31,6 +31,7 @@ data class NotificationGrammar(
     val evidence: String,
     val proposal: String,
     val decisionUrl: String?,
+    val proposalId: String?,
 ) {
 
     /** Three grammar lines for BigTextStyle. */
@@ -45,6 +46,7 @@ data class NotificationGrammar(
             proposal = alert.proposal
                 ?: "Open the decision record for the reasoning, or adjust in the app.",
             decisionUrl = alert.decisionUrl,
+            proposalId = alert.proposalId,
         )
 
         /** Null when the payload has no top alert to phrase. */
@@ -65,6 +67,7 @@ data class NotificationGrammar(
                 evidence = evidence,
                 proposal = proposal,
                 decisionUrl = top.decisionUrl,
+                proposalId = null,
             )
         }
     }

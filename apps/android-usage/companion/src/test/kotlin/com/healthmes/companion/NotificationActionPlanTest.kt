@@ -25,10 +25,11 @@ class NotificationActionPlanTest {
 
         assertEquals(NotificationActionPlan.WIRE_ACCEPT, plan.accept.wireAction)
         assertEquals(NotificationActionPlan.WIRE_DECLINE, plan.decline.wireAction)
-        // No alert→proposal linkage exists server-side yet: the worker
-        // resolves the target at tap time.
-        assertNull(plan.accept.proposalId)
-        assertNull(plan.decline.proposalId)
+        assertEquals(
+            "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10",
+            plan.accept.proposalId,
+        )
+        assertEquals(plan.accept.proposalId, plan.decline.proposalId)
     }
 
     @Test
@@ -94,10 +95,13 @@ class NotificationActionPlanTest {
     @Test
     fun `legacy alert grammar still renders all three lines`() {
         val grammar = grammarFromFixture(1)
+        val plan = NotificationActionPlan.from(grammar)
 
         assertEquals("schedule_changed", grammar.observation)
         assertEquals("Rule schedule_changed fired", grammar.evidence)
         assertTrue(grammar.proposal.isNotBlank())
         assertNull(grammar.decisionUrl)
+        assertNull(plan.accept.proposalId)
+        assertNull(plan.decline.proposalId)
     }
 }

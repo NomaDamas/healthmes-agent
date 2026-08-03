@@ -76,6 +76,51 @@ class ProposalActionLogicTest {
     }
 
     @Test
+    fun `explicit notification target uses direct lookup beyond the list window`() {
+        val explicitId = "target-51"
+        val body = """
+            {"id": "$explicitId", "task_id": "11111111-2222-3333-4444-555555555555",
+             "proposed_start": "2026-07-11T05:00:00", "proposed_end": "2026-07-11T06:00:00",
+             "status": "proposed", "decision_record_id": null,
+             "accept_resolution_token": "accept-target",
+             "decline_resolution_token": "decline-target"}
+        """.trimIndent()
+
+        assertEquals(
+            "/v1/schedule/proposals/$explicitId",
+            ProposalActionLogic.resolvePath(explicitId),
+        )
+        assertEquals(
+            ProposalActionLogic.RESOLVE_PATH,
+            ProposalActionLogic.resolvePath(null),
+        )
+        val target = ProposalActionLogic.chooseTarget(body, explicitId)
+        assertTrue(target is Target.Single)
+        assertEquals(explicitId, (target as Target.Single).proposal.id)
+    }
+
+    @Test
+    fun `legacy notification remains ambiguity safe with more than one proposal`() {
+        val body = """
+            {"data": [
+              {"id": "aaa", "task_id": "11111111-2222-3333-4444-555555555555",
+               "proposed_start": "2026-07-11T05:00:00", "proposed_end": "2026-07-11T06:00:00",
+               "status": "proposed", "decision_record_id": null,
+               "accept_resolution_token": "accept-aaa", "decline_resolution_token": "decline-aaa"},
+              {"id": "bbb", "task_id": "11111111-2222-3333-4444-555555555555",
+               "proposed_start": "2026-07-11T07:00:00", "proposed_end": "2026-07-11T08:00:00",
+               "status": "proposed", "decision_record_id": null,
+               "accept_resolution_token": "accept-bbb", "decline_resolution_token": "decline-bbb"}
+            ], "pagination": {"total_count": 51, "limit": 2, "offset": 0, "has_more": true}}
+        """.trimIndent()
+
+        assertEquals(
+            Target.Ambiguous(51),
+            ProposalActionLogic.chooseTarget(body, explicitId = null),
+        )
+    }
+
+    @Test
     fun `2xx with the proposal body reports the reached status`() {
         val body = """
             {"id": "aaa", "task_id": "t", "proposed_start": "2026-07-09T05:00:00Z",

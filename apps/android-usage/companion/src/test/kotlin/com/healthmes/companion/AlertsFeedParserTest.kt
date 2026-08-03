@@ -37,6 +37,7 @@ class AlertsFeedParserTest {
             "http://192.168.1.20:8100/decisions/0b8f3e0a-2b9f-4c47-a9d4-2f2b7f6f3a11?token=viewer-abc123",
             top.decisionUrl,
         )
+        assertEquals("1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10", top.proposalId)
 
         assertEquals(2, page.pagination.totalCount)
         assertEquals(50, page.pagination.limit)
@@ -66,6 +67,7 @@ class AlertsFeedParserTest {
         assertTrue(legacy.evidence.isEmpty())
         assertNull(legacy.evidenceLine())
         assertNull(legacy.decisionUrl)
+        assertNull(legacy.proposalId)
     }
 
     @Test
