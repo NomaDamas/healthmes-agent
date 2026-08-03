@@ -337,13 +337,18 @@ async def test_valid_one_shot_apply_uses_snapshot_and_fresh_read_back(
     assert session.get(SleepReconciliationProposal, proposal.id).receipt == result.receipt
 
 
+@pytest.mark.parametrize(
+    "calendar_source",
+    (CalendarSource.GOOGLE, CalendarSource.CALDAV),
+)
 @pytest.mark.asyncio
 async def test_approval_splits_calendar_events_around_awake_intervals(
     session,
-    fake_backend,
+    calendar_source,
 ) -> None:
     now = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
     reader = SplitSleepReader([summary()])
+    fake_backend = FakeCalendarBackend(calendar_source)
     calendar = ApprovalCalendar(
         fake_backend,
         fake_backend.approval_target,
@@ -351,7 +356,7 @@ async def test_approval_splits_calendar_events_around_awake_intervals(
     )
     proposal = await prepare_sleep_proposal(
         target_date=date(2026, 7, 26),
-        calendar_source=CalendarSource.GOOGLE,
+        calendar_source=calendar_source,
         reader=reader,
         user_id="redacted-user",
         session=session,
