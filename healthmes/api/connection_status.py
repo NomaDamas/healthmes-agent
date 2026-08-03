@@ -39,10 +39,14 @@ class OpenWearablesStatusReader(Protocol):
     async def list_users(
         self, *, search: str | None = None, limit: int = 100
     ) -> Mapping[str, Any]: ...
-    async def get_connections(self, user_id: str) -> Sequence[object]: ...
+    async def get_connections(self, user_id: str) -> object: ...
     async def collect_sleep_summaries(
         self, user_id: str, start_date: str, end_date: str
-    ) -> Sequence[object]: ...
+    ) -> object: ...
+
+
+class ProviderPayloadError(ValueError):
+    """A successful provider response did not match its documented shape."""
 
 
 async def build_oura_card(
@@ -63,7 +67,7 @@ async def build_oura_card(
     reader = client or OWClient.from_settings(settings)
     try:
         user_id = await resolve_single_user_id(reader, settings)
-        connections = await reader.get_connections(user_id)
+        connections = _mapping_rows(await reader.get_connections(user_id))
     except OWConfigurationError:
         return _oura_error("Open Wearables API key 미설정")
     except OWAuthError:
@@ -71,7 +75,12 @@ async def build_oura_card(
     except LookupError:
         return _oura_error("Open Wearables 사용자 선택 필요")
     except OWClientError:
-        return _oura_error("Open Wearables API 연결 오류")
+        return _oura_error(
+            "Open Wearables API 연결 또는 응답 오류",
+            notes=("Open Wearables 서비스 상태와 API 버전을 확인하세요.",),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return _oura_payload_error("연결")
     connection = next(
         (
             row
@@ -93,10 +102,12 @@ async def build_oura_card(
         )
     current = (now or datetime.now(UTC)).astimezone(resolve_timezone(settings))
     try:
-        rows = await reader.collect_sleep_summaries(
-            user_id,
-            (current.date() - timedelta(days=7)).isoformat(),
-            (current.date() + timedelta(days=1)).isoformat(),
+        rows = _mapping_rows(
+            await reader.collect_sleep_summaries(
+                user_id,
+                (current.date() - timedelta(days=7)).isoformat(),
+                (current.date() + timedelta(days=1)).isoformat(),
+            )
         )
     except OWClientError:
         return ConnectionCard(
@@ -105,7 +116,10 @@ async def build_oura_card(
             False,
             "Open Wearables 수면 데이터 확인 오류",
             badge_label="오류",
+            notes=("Open Wearables 서비스 상태와 API 버전을 확인하세요.",),
         )
+    except (AttributeError, TypeError, ValueError):
+        return _oura_payload_error("수면 데이터")
     freshness, fresh = _sleep_freshness(rows, current.date()) or _sync_freshness(
         _parse_datetime(connection.get("last_synced_at")),
         current.astimezone(UTC),
@@ -174,10 +188,37 @@ def _icloud_card(settings: Settings) -> ConnectionCard:
     )
 
 
-def _oura_error(detail: str) -> ConnectionCard:
+def _oura_error(
+    detail: str,
+    *,
+    notes: tuple[str, ...] = (),
+) -> ConnectionCard:
     return ConnectionCard(
-        "oura", "Oura · Open Wearables", False, detail, badge_label="오류"
+        "oura",
+        "Oura · Open Wearables",
+        False,
+        detail,
+        badge_label="오류",
+        notes=notes,
     )
+
+
+def _oura_payload_error(stage: str) -> ConnectionCard:
+    return _oura_error(
+        f"Open Wearables {stage} 응답 형식 오류",
+        notes=("Open Wearables를 업데이트하거나 서비스 로그를 확인하세요.",),
+    )
+
+
+def _mapping_rows(value: object) -> tuple[Mapping[str, Any], ...]:
+    if not isinstance(value, Sequence) or isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        raise ProviderPayloadError("provider response must be a row sequence")
+    rows = tuple(row for row in value if isinstance(row, Mapping))
+    if value and not rows:
+        raise ProviderPayloadError("provider response contains no valid rows")
+    return rows
 
 
 def _parse_datetime(value: Any) -> datetime | None:

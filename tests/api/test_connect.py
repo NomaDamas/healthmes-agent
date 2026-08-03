@@ -12,15 +12,17 @@ import re
 from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from healthmes.api import connection_status
 from healthmes.api.auth import viewer_token
 from healthmes.api.connect import build_oura_card
 from healthmes.app import create_app
 from healthmes.calendars import creds
-from healthmes.mcp_server.ow_client import OWClientError
+from healthmes.mcp_server.ow_client import OWClient, OWClientError
 
 TOKEN = "connect-page-api-token"
 APP_PASSWORD = "abcd-efgh-ijkl-mnop"
@@ -130,6 +132,10 @@ def test_gating_matches_viewer_pages(settings) -> None:
         via_viewer_token = client.get("/connect", params={"token": viewer_token(TOKEN)})
         assert via_viewer_token.status_code == 200
         assert TOKEN not in via_viewer_token.text  # raw API token never renders
+        assert (
+            f"http://127.0.0.1:8100/connect/unlock?token={viewer_token(TOKEN)}"
+            in via_viewer_token.text
+        )
         assert "healthmes_local_session" not in via_viewer_token.headers.get(
             "set-cookie", ""
         )
@@ -156,14 +162,21 @@ def test_gating_matches_viewer_pages(settings) -> None:
             params={"token": viewer_token(TOKEN)},
         )
         assert viewer_page.status_code == 200
-        assert 'href="http://127.0.0.1:8100/connect/unlock"' in viewer_page.text
+        assert (
+            f'href="http://127.0.0.1:8100/connect/unlock?token={viewer_token(TOKEN)}"'
+            in viewer_page.text
+        )
         assert 'name="api_token"' not in viewer_page.text
         assert TOKEN not in viewer_page.text
         assert "healthmes_local_session" not in viewer_page.headers.get(
             "set-cookie", ""
         )
 
-        unlock_page = loopback.get("/connect/unlock")
+        assert loopback.get("/connect/unlock").status_code == 401
+        unlock_page = loopback.get(
+            "/connect/unlock",
+            params={"token": viewer_token(TOKEN)},
+        )
         assert unlock_page.status_code == 200
         assert unlock_page.headers["cache-control"] == "no-store"
         assert unlock_page.headers["referrer-policy"] == "same-origin"
@@ -210,18 +223,33 @@ def test_loopback_proxy_cannot_bootstrap_local_session_from_host_header(settings
         )
         assert viewer.status_code == 200
         assert "healthmes_local_session" not in viewer.headers.get("set-cookie", "")
-        assert 'href="http://127.0.0.1:8100/connect/unlock"' in viewer.text
+        assert (
+            f'href="http://127.0.0.1:8100/connect/unlock?token={viewer_token(TOKEN)}"'
+            in viewer.text
+        )
         assert 'name="api_token"' not in viewer.text
         assert 'action="/connect/google/start"' not in viewer.text
 
+        assert (
+            proxied.get(
+                "/connect/unlock",
+                headers={"Host": "localhost:8100"},
+            ).status_code
+            == 401
+        )
         proxied_unlock_page = proxied.get(
             "/connect/unlock",
+            params={"token": viewer_token(TOKEN)},
             headers={"Host": "localhost:8100"},
         )
         assert proxied_unlock_page.status_code == 200
         assert (
             'action="http://127.0.0.1:8100/connect/unlock"'
             in proxied_unlock_page.text
+        )
+        assert TOKEN not in proxied_unlock_page.text
+        assert "healthmes_local_session" not in proxied_unlock_page.headers.get(
+            "set-cookie", ""
         )
 
         rejected_unlock = proxied.post(
@@ -249,6 +277,49 @@ def test_loopback_proxy_cannot_bootstrap_local_session_from_host_header(settings
             follow_redirects=False,
         )
         assert forged.status_code == 401
+
+
+def test_local_session_cookie_is_bound_to_direct_loopback_origin(settings) -> None:
+    secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
+    application = create_app(secured)
+    with TestClient(
+        application,
+        base_url="http://127.0.0.1:8100",
+    ) as direct:
+        unlocked = direct.post(
+            "/connect/unlock",
+            data={"api_token": TOKEN},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert unlocked.status_code == 303
+        session_id = direct.cookies.get("healthmes_local_session")
+        assert session_id
+
+    with TestClient(
+        application,
+        base_url="http://proxy.test:8100",
+    ) as proxied:
+        replay = proxied.get(
+            "/connect",
+            headers={
+                "Host": "localhost:8100",
+                "Cookie": f"healthmes_local_session={session_id}",
+            },
+        )
+        assert replay.status_code == 401
+
+        write = proxied.post(
+            "/connect/google/disconnect",
+            data={"csrf": "forged"},
+            headers={
+                "Host": "localhost:8100",
+                "Origin": "http://localhost:8100",
+                "Cookie": f"healthmes_local_session={session_id}",
+            },
+            follow_redirects=False,
+        )
+        assert write.status_code == 401
 
 
 def test_landing_links_to_connect(client) -> None:
@@ -466,3 +537,60 @@ async def test_oura_card_reports_sleep_read_error(settings) -> None:
     assert card.connected is False
     assert card.badge_label == "오류"
     assert card.detail == "Open Wearables 수면 데이터 확인 오류"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_detail"),
+    [
+        ("html-users", "Open Wearables 연결 응답 형식 오류"),
+        ("object-connections", "Open Wearables API 연결 또는 응답 오류"),
+        ("scalar-sleep", "Open Wearables 수면 데이터 응답 형식 오류"),
+    ],
+)
+def test_connect_survives_malformed_provider_http_200(
+    client,
+    monkeypatch,
+    mode,
+    expected_detail,
+) -> None:
+    private_marker = "private-upstream-body-must-not-render"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/users":
+            if mode == "html-users":
+                return httpx.Response(200, text=f"<html>{private_marker}</html>")
+            return httpx.Response(200, json={"items": [{"id": "redacted-user"}]})
+        if request.url.path.endswith("/connections"):
+            if mode == "object-connections":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [{"provider": "oura", "status": "active"}],
+                        "debug": private_marker,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json=[{"provider": "oura", "status": "active"}],
+            )
+        if request.url.path.endswith("/summaries/sleep"):
+            return httpx.Response(200, json=7)
+        raise AssertionError(f"unexpected provider path: {request.url.path}")
+
+    reader = OWClient(
+        "http://open-wearables.test",
+        OW_API_KEY,
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr(
+        connection_status.OWClient,
+        "from_settings",
+        classmethod(lambda _cls, _settings: reader),
+    )
+
+    response = client.get("/connect")
+
+    assert response.status_code == 200
+    assert expected_detail in response.text
+    assert "Open Wearables" in response.text
+    assert private_marker not in response.text

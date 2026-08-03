@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import func, select
 
-from healthmes.api.auth import viewer_token
+from healthmes.api.auth import viewer_token, viewer_url
 from healthmes.api.sleep import SleepReviewRuntime
 from healthmes.app import create_app
 from healthmes.calendars.approval import ApprovalCalendar
@@ -100,6 +100,30 @@ def test_viewer_token_cannot_authorize_sleep_post(settings) -> None:
     assert response.status_code == 401
 
 
+def test_deployed_calendar_review_url_preserves_query_and_viewer_auth(
+    settings,
+) -> None:
+    token = "calendar-review-api-token"
+    secured = settings.model_copy(update={"api_token": SecretStr(token)})
+    review_url = viewer_url(secured, "/sleep?date=2026-07-26")
+
+    assert review_url == (
+        "http://healthmes.test:8100/sleep"
+        f"?date=2026-07-26&token={viewer_token(token)}"
+    )
+    assert token not in review_url
+
+    with TestClient(
+        create_app(secured),
+        base_url="http://healthmes.test:8100",
+    ) as client:
+        response = client.get(review_url)
+
+    assert response.status_code == 200
+    assert token not in response.text
+    assert 'name="api_token"' not in response.text
+
+
 def test_viewer_token_get_does_not_persist_sleep_proposal(
     settings,
     session_factory,
@@ -146,7 +170,10 @@ def test_loopback_viewer_unlocks_sleep_without_token_in_redirect(settings) -> No
         assert 'name="api_token"' not in viewer.text
         assert "healthmes_local_session" not in viewer.headers.get("set-cookie", "")
 
-        unlock_page = client.get("/sleep/unlock")
+        unlock_page = client.get(
+            "/sleep/unlock",
+            params={"token": viewer_token(token)},
+        )
         assert unlock_page.status_code == 200
         assert 'action="http://127.0.0.1:8100/sleep/unlock"' in unlock_page.text
         assert 'name="api_token"' in unlock_page.text

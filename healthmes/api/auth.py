@@ -32,7 +32,7 @@ Streamable-HTTP responses keep streaming untouched.
 
 import hashlib
 import hmac
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -76,7 +76,9 @@ VIEWER_PATH_PREFIXES = (
     "/connect",
     "/sleep",
 )
-LOCAL_SESSION_BOOTSTRAP_PATHS = frozenset({"/connect/unlock", "/sleep/unlock"})
+LOCAL_SESSION_BOOTSTRAP_POST_PATHS = frozenset(
+    {"/connect/unlock", "/sleep/unlock"}
+)
 _VIEWER_TOKEN_CONTEXT = b"healthmes-viewer:"
 
 
@@ -106,7 +108,22 @@ def viewer_url(settings: Settings, path: str) -> str:
     url = f"{settings.public_base_url.rstrip('/')}{path}"
     api_token = settings.api_token.get_secret_value().strip()
     if api_token:
-        url = f"{url}?token={viewer_token(api_token)}"
+        parts = urlsplit(url)
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key != "token"
+        ]
+        query.append(("token", viewer_token(api_token)))
+        url = urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                parts.path,
+                urlencode(query),
+                parts.fragment,
+            )
+        )
     return url
 
 
@@ -154,8 +171,8 @@ class BearerTokenMiddleware:
         if path in OPEN_PATHS:
             return True
         if (
-            scope.get("method") in {"GET", "POST"}
-            and path in LOCAL_SESSION_BOOTSTRAP_PATHS
+            scope.get("method") == "POST"
+            and path in LOCAL_SESSION_BOOTSTRAP_POST_PATHS
         ):
             return True
         authorization = _header(scope, b"authorization")
