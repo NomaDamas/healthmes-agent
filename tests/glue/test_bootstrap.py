@@ -148,17 +148,24 @@ def test_second_run_is_idempotent(bootstrap, hermes_home, env_file):
     assert env_file.read_text() == env_before
 
 
-def test_legacy_morning_cron_is_upgraded_without_resetting_runtime_state(
+def test_exact_legacy_morning_cron_is_upgraded_without_resetting_runtime_state(
     bootstrap, hermes_home, env_file
 ):
     created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
     legacy = bootstrap.build_fallback_job(
-        prompt="Legacy HealthMes morning briefing without the calendar nudge.",
-        schedule="30 8 * * *",
+        prompt=(
+            "Morning briefing. A HealthMes state snapshot (open tasks, "
+            "today's events, pending proposals, energy forecast) is injected "
+            "above; use it as context and read today's readiness via the "
+            "healthmes MCP tools, then propose today's block layout based "
+            "on the energy picture. One message in the standard notification "
+            "grammar."
+        ),
+        schedule="0 7 * * *",
         name="healthmes-morning-plan",
-        deliver="local",
-        skills=["legacy-healthmes-skill"],
-        script="legacy_snapshot.py",
+        deliver="telegram",
+        skills=["healthmes-planner"],
+        script=bootstrap.SNAPSHOT_SCRIPT_NAME,
         now=created_at,
     )
     legacy.update(
@@ -222,6 +229,32 @@ def test_unmanaged_same_name_healthmes_prompt_cron_is_not_overwritten(
         origin={"source": "user"},
         now=created_at,
     )
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    bootstrap._write_jobs_envelope(jobs_file, [user_job], now=created_at)
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    jobs = yaml.safe_load(jobs_file.read_text())["jobs"]
+    unchanged = next(job for job in jobs if job["id"] == user_job["id"])
+    assert unchanged == user_job
+
+
+@pytest.mark.parametrize("origin_state", ["null", "missing"])
+def test_originless_same_name_healthmes_prompt_cron_is_not_overwritten(
+    bootstrap, hermes_home, env_file, origin_state
+):
+    created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
+    user_job = bootstrap.build_fallback_job(
+        prompt="Run my private HealthMes morning workflow.",
+        schedule="15 6 * * *",
+        name="healthmes-morning-plan",
+        deliver="local",
+        skills=["personal-planner"],
+        script="personal_morning.py",
+        now=created_at,
+    )
+    if origin_state == "missing":
+        user_job.pop("origin")
     jobs_file = hermes_home / "cron" / "jobs.json"
     bootstrap._write_jobs_envelope(jobs_file, [user_job], now=created_at)
 

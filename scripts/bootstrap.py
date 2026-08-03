@@ -212,6 +212,23 @@ BRIEFING_JOBS: tuple[dict[str, Any], ...] = (
     },
 )
 
+LEGACY_HEALTHMES_MORNING_CRON_FINGERPRINTS: tuple[dict[str, Any], ...] = (
+    {
+        "prompt": (
+            "Morning briefing. A HealthMes state snapshot (open tasks, "
+            "today's events, pending proposals, energy forecast) is injected "
+            "above; use it as context and read today's readiness via the "
+            "healthmes MCP tools, then propose today's block layout based "
+            "on the energy picture. One message in the standard notification "
+            "grammar."
+        ),
+        "schedule": "0 7 * * *",
+        "skills": ["healthmes-planner"],
+        "deliver": "telegram",
+        "script": SNAPSHOT_SCRIPT_NAME,
+    },
+)
+
 _CRON_FIELD_RE = re.compile(r"^[\d\*\-,/]+$")  # same shape check as parse_schedule
 
 
@@ -840,6 +857,16 @@ def _cron_skills(job: Mapping[str, Any]) -> list[str]:
     return [str(skill).strip() for skill in raw if str(skill or "").strip()]
 
 
+def _cron_managed_declaration(job: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "prompt": str(job.get("prompt") or ""),
+        "schedule": _cron_schedule_expr(job),
+        "skills": _cron_skills(job),
+        "deliver": job.get("deliver"),
+        "script": job.get("script"),
+    }
+
+
 def _is_healthmes_managed_cron(
     existing: Mapping[str, Any], desired: Mapping[str, Any]
 ) -> bool:
@@ -851,15 +878,10 @@ def _is_healthmes_managed_cron(
             isinstance(origin, Mapping)
             and origin.get("source") == HEALTHMES_CRON_ORIGIN["source"]
         )
-
-    prompt = str(existing.get("prompt") or "").casefold()
+    declaration = _cron_managed_declaration(existing)
     return any(
-        (
-            "healthmes" in prompt,
-            "mcp__healthmes__" in prompt,
-            SNAPSHOT_SCRIPT_NAME == existing.get("script"),
-            "healthmes-planner" in _cron_skills(existing),
-        )
+        declaration == fingerprint
+        for fingerprint in LEGACY_HEALTHMES_MORNING_CRON_FINGERPRINTS
     )
 
 
