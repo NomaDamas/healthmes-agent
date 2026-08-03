@@ -18,7 +18,7 @@ plugins {
 // before.
 android {
     namespace = "com.healthmes.companion"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.healthmes.companion"
@@ -75,7 +75,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
 
     // Decision viewer: Custom Tabs first, in-app WebView fallback.
-    implementation("androidx.browser:browser:1.8.0")
+    implementation("androidx.browser:browser:1.10.0")
 
     testImplementation("junit:junit:4.13.2")
     // Unit tests exercise the shared org.json-based contract parsers on the
