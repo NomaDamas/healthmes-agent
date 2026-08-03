@@ -40,6 +40,7 @@ import hmac
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -94,7 +95,13 @@ def sign_v2(secret: str, timestamp: str, body: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), signed_content, hashlib.sha256).hexdigest()
 
 
-def build_alert_prompt(fire: TriggerFire, *, public_base_url: str, fired_at: datetime) -> str:
+def build_alert_prompt(
+    fire: TriggerFire,
+    *,
+    public_base_url: str,
+    fired_at: datetime,
+    trigger_event_id: uuid.UUID,
+) -> str:
     """Build the agent instruction for one trigger fire.
 
     External trigger values stay inside a JSON data envelope. The instruction
@@ -134,7 +141,9 @@ def build_alert_prompt(fire: TriggerFire, *, public_base_url: str, fired_at: dat
         f"tools (do not re-derive raw data; use the interpreted context "
         f"tools).\n"
         f"2. Record your reasoning with the healthmes record_decision MCP "
-        f"tool (kind='alert'); it returns a decision id.\n"
+        f"tool (kind='alert', trigger_event_id='{trigger_event_id}'); this "
+        f"exact id is trusted correlation metadata, not provider content, and "
+        f"must be passed unchanged. The tool returns a decision id.\n"
         f"3. Send the user exactly ONE concise message in the standard "
         f"notification grammar: one observation line, one evidence line, one "
         f"proposal line, then the quick choices 'apply / adjust / keep as "
@@ -148,7 +157,11 @@ def build_alert_prompt(fire: TriggerFire, *, public_base_url: str, fired_at: dat
 
 
 def build_alert_payload(
-    fire: TriggerFire, *, public_base_url: str, fired_at: datetime
+    fire: TriggerFire,
+    *,
+    public_base_url: str,
+    fired_at: datetime,
+    trigger_event_id: uuid.UUID,
 ) -> dict[str, Any]:
     """JSON payload for the gateway route (template-addressable flat fields).
 
@@ -163,12 +176,18 @@ def build_alert_payload(
         "event_type": "healthmes_trigger",
         "rule_id": fire.rule_id,
         "dedup_key": fire.dedup_key,
+        "trigger_event_id": str(trigger_event_id),
         "fired_at": fired_at.isoformat(),
         "summary": fire.summary,
         "proposal": fire.proposal,
         "evidence": fire.evidence,
         "decision_link_base": public_base_url.rstrip("/") + "/decisions",
-        "prompt": build_alert_prompt(fire, public_base_url=public_base_url, fired_at=fired_at),
+        "prompt": build_alert_prompt(
+            fire,
+            public_base_url=public_base_url,
+            fired_at=fired_at,
+            trigger_event_id=trigger_event_id,
+        ),
     }
 
 
@@ -184,7 +203,13 @@ class HermesWebhookSender:
         self._settings = settings
         self._client = client
 
-    def send(self, fire: TriggerFire, *, fired_at: datetime) -> WebhookResult:
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> WebhookResult:
         """POST one fire; True only on a 2xx gateway response.
 
         The gateway answers 202 (accepted, agent run scheduled) or 200 with
@@ -201,7 +226,10 @@ class HermesWebhookSender:
             return WebhookResult(ok=False, detail="webhook secret not configured")
 
         payload = build_alert_payload(
-            fire, public_base_url=self._settings.public_base_url, fired_at=fired_at
+            fire,
+            public_base_url=self._settings.public_base_url,
+            fired_at=fired_at,
+            trigger_event_id=trigger_event_id,
         )
         body = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")

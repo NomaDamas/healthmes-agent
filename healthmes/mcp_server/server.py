@@ -92,6 +92,7 @@ from healthmes.store import (
     ScheduleProposal,
     Task,
     TaskSource,
+    TriggerEvent,
     WeeklyGoal,
     session_scope,
 )
@@ -2948,6 +2949,7 @@ def record_decision(
     tree: dict[str, Any],
     llm_model: str | None = None,
     tokens: int | None = None,
+    trigger_event_id: str | None = None,
 ) -> dict[str, Any]:
     """Persist an explainable decision record and get its viewer link.
 
@@ -2955,7 +2957,9 @@ def record_decision(
     recursive node structure {id?, type: input|rule|llm_step|option|action,
     label, detail?, children[]} — deterministic layers pre-fill input/rule
     nodes; append your own llm_step/option/action nodes honestly (never
-    rewrite pre-filled ones). Returns the decision viewer URL to attach to any
+    rewrite pre-filled ones). Webhook alerts must pass their trusted
+    trigger_event_id unchanged so native clients can resolve the exact
+    decision and proposal. Returns the decision viewer URL to attach to any
     alert or message about this decision.
     """
     if kind not in {k.value for k in DecisionKind}:
@@ -2965,13 +2969,33 @@ def record_decision(
     if not summary.strip():
         raise ToolError("summary must not be empty")
     _validate_tree(tree)
+    trigger_uuid = (
+        _parse_uuid(trigger_event_id, "trigger_event_id")
+        if trigger_event_id is not None
+        else None
+    )
+    if trigger_uuid is not None and kind != DecisionKind.ALERT.value:
+        raise ToolError("trigger_event_id is valid only for kind='alert'")
     with _store_session() as session:
+        if trigger_uuid is not None:
+            if session.get(TriggerEvent, trigger_uuid) is None:
+                raise ToolError(f"trigger_event {trigger_event_id} not found")
+            existing = session.scalar(
+                select(DecisionRecord.id)
+                .where(DecisionRecord.trigger_event_id == trigger_uuid)
+                .limit(1)
+            )
+            if existing is not None:
+                raise ToolError(
+                    f"trigger_event {trigger_event_id} already has a decision record"
+                )
         row = DecisionRecord(
             kind=DecisionKind(kind),
             tree=tree,
             summary=summary,
             llm_model=llm_model,
             tokens=tokens,
+            trigger_event_id=trigger_uuid,
         )
         session.add(row)
         session.flush()

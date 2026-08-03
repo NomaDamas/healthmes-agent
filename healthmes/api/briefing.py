@@ -47,8 +47,8 @@ Data sources and honesty rules:
   :data:`ALERT_RECENT_HOURS`). The store has no resolution tracking yet, so
   "unresolved" == "recent" — a documented placeholder policy for the domain
   expert to refine. ``top.decision_url`` links the earliest alert-kind
-  decision recorded at/after the fire (the agent records its reasoning right
-  after pushing; there is no FK yet), else ``null``.
+  decision linked to the trigger event by the webhook correlation ID, else
+  ``null``.
 - **decision URLs** come from :func:`healthmes.api.auth.viewer_url` — the one
   construction point shared with the MCP ``record_decision`` tool and the
   weekly report: ``{public_base_url}/decisions/{id}`` plus the *derived
@@ -83,7 +83,6 @@ from healthmes.config import Settings, resolve_timezone
 from healthmes.store import (
     CalendarEventMirror,
     CognitiveEnergyEstimate,
-    DecisionKind,
     DecisionRecord,
     EnergyDemand,
     ProposalStatus,
@@ -339,15 +338,11 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
     top = events[0]
     payload: dict[str, Any] = top.payload or {}
     summary = payload.get("summary")
-    decision = session.scalars(
+    decision = session.scalar(
         select(DecisionRecord)
-        .where(
-            DecisionRecord.kind == DecisionKind.ALERT,
-            DecisionRecord.created_at >= ensure_utc(top.fired_at),
-        )
-        .order_by(DecisionRecord.created_at.asc(), DecisionRecord.id.asc())
+        .where(DecisionRecord.trigger_event_id == top.id)
         .limit(1)
-    ).first()
+    )
     return GlanceAlertsOut(
         unresolved_count=len(events),
         top=GlanceAlertOut(

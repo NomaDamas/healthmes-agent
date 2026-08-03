@@ -7,6 +7,7 @@ The rendered output must be valid YAML whose keys match the vendor parsers:
   (vendor tools/mcp_tool.py)
 """
 
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -188,6 +189,7 @@ def test_default_alert_prompt_keeps_provider_text_inside_untrusted_envelope() ->
         fire,
         public_base_url="http://healthmes.test:8100",
         fired_at=datetime(2026, 7, 29, 7, 0, tzinfo=UTC),
+        trigger_event_id=uuid.UUID("00000000-0000-0000-0000-00000000a11e"),
     )
     cfg = render(dict(MINIMAL_CONTEXT))
     route_prompt = cfg["platforms"]["webhook"]["extra"]["routes"]["healthmes-alerts"][

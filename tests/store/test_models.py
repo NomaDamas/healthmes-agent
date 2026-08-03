@@ -616,6 +616,25 @@ class TestDecisionRecord:
         assert record.llm_model == "claude-fable-5"
         assert record.tokens == 1234
 
+    def test_alert_decision_roundtrips_trigger_correlation(self, session):
+        trigger = TriggerEvent(
+            fired_at=T0,
+            rule_id="calendar_task_intake",
+            alert_sent=True,
+        )
+        session.add(trigger)
+        session.flush()
+        record = _roundtrip(
+            session,
+            DecisionRecord(
+                kind=DecisionKind.ALERT,
+                tree={"id": "root", "type": "rule", "label": "alert"},
+                summary="Correlated alert",
+                trigger_event_id=trigger.id,
+            ),
+        )
+        assert record.trigger_event_id == trigger.id
+
 
 class TestInsight:
     def test_roundtrip(self, session):

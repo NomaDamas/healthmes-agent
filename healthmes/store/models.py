@@ -290,12 +290,23 @@ class DecisionRecord(Base):
     """
 
     __tablename__ = "decision_record"
+    __table_args__ = (
+        Index(
+            "ux_decision_record_trigger_event_id",
+            "trigger_event_id",
+            unique=True,
+        ),
+    )
 
     kind: Mapped[DecisionKind] = mapped_column(index=True)
     tree: Mapped[JSONDict]
     summary: Mapped[str]
     llm_model: Mapped[str_64 | None]
     tokens: Mapped[int | None]
+    trigger_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("trigger_event.id", ondelete="SET NULL"),
+        default=None,
+    )
 
 
 class Insight(Base):

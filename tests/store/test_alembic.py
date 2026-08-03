@@ -366,7 +366,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d6e7f8091a2b"
+                ) == "e7f8091a2b3c"
         finally:
             engine.dispose()
 

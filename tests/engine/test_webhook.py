@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import json
 import time
+import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -31,6 +32,7 @@ from healthmes.engine.webhook import (
 )
 
 FIRED_AT = datetime(2026, 7, 9, 5, 0, tzinfo=UTC)
+TRIGGER_EVENT_ID = uuid.UUID("00000000-0000-0000-0000-00000000a11e")
 
 
 def vendor_validate_v2(headers: httpx.Headers, body: bytes, secret: str, *, now: int) -> bool:
@@ -90,7 +92,11 @@ def sender(settings: Settings, transport: CapturingTransport) -> HermesWebhookSe
 @freeze_time("2026-07-09 05:00:00")
 def test_post_matches_vendor_route_and_signature(sender, transport, settings, make_fire) -> None:
     fire = make_fire(rule_id="stress_spike_vs_baseline")
-    result = sender.send(fire, fired_at=FIRED_AT)
+    result = sender.send(
+        fire,
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
+    )
 
     assert result.ok is True
     assert result.status_code == 202
@@ -114,7 +120,11 @@ def test_post_matches_vendor_route_and_signature(sender, transport, settings, ma
 
 @freeze_time("2026-07-09 05:00:00")
 def test_signature_rejects_tampering(sender, transport, settings, make_fire) -> None:
-    sender.send(make_fire(), fired_at=FIRED_AT)
+    sender.send(
+        make_fire(),
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
+    )
     [request] = transport.requests
     secret = settings.hermes_webhook_secret.get_secret_value()
     now = int(time.time())
@@ -131,7 +141,11 @@ def test_signature_rejects_tampering(sender, transport, settings, make_fire) -> 
 
 @freeze_time("2026-07-09 05:00:00")
 def test_signature_covers_exact_sent_bytes(sender, transport, settings, make_fire) -> None:
-    sender.send(make_fire(), fired_at=FIRED_AT)
+    sender.send(
+        make_fire(),
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
+    )
     [request] = transport.requests
     secret = settings.hermes_webhook_secret.get_secret_value()
     timestamp = request.headers[TIMESTAMP_HEADER]
@@ -141,7 +155,11 @@ def test_signature_covers_exact_sent_bytes(sender, transport, settings, make_fir
 
 def test_payload_fields_feed_route_prompt_template(sender, transport, settings, make_fire) -> None:
     fire = make_fire(rule_id="deadline_risk", dedup_key="deadline_risk:abc123")
-    sender.send(fire, fired_at=FIRED_AT)
+    sender.send(
+        fire,
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
+    )
     [request] = transport.requests
     payload = json.loads(request.content)
 
@@ -150,6 +168,7 @@ def test_payload_fields_feed_route_prompt_template(sender, transport, settings, 
     assert payload["event_type"] == "healthmes_trigger"
     assert payload["rule_id"] == "deadline_risk"
     assert payload["dedup_key"] == "deadline_risk:abc123"
+    assert payload["trigger_event_id"] == str(TRIGGER_EVENT_ID)
     assert payload["fired_at"] == FIRED_AT.isoformat()
     assert payload["summary"] == fire.summary
     assert payload["proposal"] == fire.proposal
@@ -161,7 +180,10 @@ def test_payload_fields_feed_route_prompt_template(sender, transport, settings, 
 def test_prompt_follows_notification_grammar_and_instructs_planner(settings, make_fire) -> None:
     fire = make_fire()
     prompt = build_alert_prompt(
-        fire, public_base_url=settings.public_base_url, fired_at=FIRED_AT
+        fire,
+        public_base_url=settings.public_base_url,
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
     )
     trigger_data = json.dumps(
         {
@@ -189,6 +211,7 @@ def test_prompt_follows_notification_grammar_and_instructs_planner(settings, mak
     # the derived viewer token when API auth is configured).
     assert "healthmes-planner" in prompt
     assert "record_decision" in prompt
+    assert f"trigger_event_id='{TRIGGER_EVENT_ID}'" in prompt
     assert "viewer_url" in prompt
     assert "http://healthmes.test:8100/decisions/" in prompt
 
@@ -201,7 +224,10 @@ def test_prompt_contains_provider_instructions_as_json_data(settings, make_fire)
     )
 
     prompt = build_alert_prompt(
-        malicious, public_base_url=settings.public_base_url, fired_at=FIRED_AT
+        malicious,
+        public_base_url=settings.public_base_url,
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
     )
 
     assert (
@@ -222,7 +248,10 @@ def test_prompt_provider_data_cannot_close_untrusted_envelope(settings, make_fir
     )
 
     prompt = build_alert_prompt(
-        malicious, public_base_url=settings.public_base_url, fired_at=FIRED_AT
+        malicious,
+        public_base_url=settings.public_base_url,
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
     )
 
     assert prompt.count(closing_tag) == 1
@@ -243,17 +272,27 @@ def test_prompt_provider_data_cannot_close_untrusted_envelope(settings, make_fir
 def test_payload_prompt_matches_builder(settings, make_fire) -> None:
     fire = make_fire()
     payload = build_alert_payload(
-        fire, public_base_url=settings.public_base_url, fired_at=FIRED_AT
+        fire,
+        public_base_url=settings.public_base_url,
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
     )
     assert payload["prompt"] == build_alert_prompt(
-        fire, public_base_url=settings.public_base_url, fired_at=FIRED_AT
+        fire,
+        public_base_url=settings.public_base_url,
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
     )
 
 
 def test_non_2xx_is_not_ok(settings, make_fire) -> None:
     transport = CapturingTransport(status_code=401)
     client = httpx.Client(transport=httpx.MockTransport(transport))
-    result = HermesWebhookSender(settings, client=client).send(make_fire(), fired_at=FIRED_AT)
+    result = HermesWebhookSender(settings, client=client).send(
+        make_fire(),
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
+    )
     assert result.ok is False
     assert result.status_code == 401
 
@@ -263,7 +302,11 @@ def test_transport_error_is_not_ok(settings, make_fire) -> None:
         raise httpx.ConnectError("connection refused", request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(explode))
-    result = HermesWebhookSender(settings, client=client).send(make_fire(), fired_at=FIRED_AT)
+    result = HermesWebhookSender(settings, client=client).send(
+        make_fire(),
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
+    )
     assert result.ok is False
     assert result.status_code is None
     assert "connection refused" in (result.detail or "")
@@ -272,6 +315,10 @@ def test_transport_error_is_not_ok(settings, make_fire) -> None:
 def test_missing_secret_fails_closed_without_sending(settings, transport, make_fire) -> None:
     no_secret = settings.model_copy(update={"hermes_webhook_secret": SecretStr("")})
     client = httpx.Client(transport=httpx.MockTransport(transport))
-    result = HermesWebhookSender(no_secret, client=client).send(make_fire(), fired_at=FIRED_AT)
+    result = HermesWebhookSender(no_secret, client=client).send(
+        make_fire(),
+        fired_at=FIRED_AT,
+        trigger_event_id=TRIGGER_EVENT_ID,
+    )
     assert result.ok is False
     assert transport.requests == []

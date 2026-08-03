@@ -115,10 +115,16 @@ class FakeAlertSender:
 
     def __init__(self, ok: bool = True) -> None:
         self.ok = ok
-        self.sent: list[tuple[TriggerFire, datetime]] = []
+        self.sent: list[tuple[TriggerFire, datetime, uuid.UUID]] = []
 
-    def send(self, fire: TriggerFire, *, fired_at: datetime) -> WebhookResult:
-        self.sent.append((fire, fired_at))
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> WebhookResult:
+        self.sent.append((fire, fired_at, trigger_event_id))
         if self.ok:
             return WebhookResult(ok=True, status_code=202)
         return WebhookResult(ok=False, status_code=502, detail="gateway unavailable")
@@ -135,7 +141,13 @@ class RaisingAlertSender:
         self.exc = exc if exc is not None else RuntimeError("webhook transport exploded")
         self.calls = 0
 
-    def send(self, fire: TriggerFire, *, fired_at: datetime) -> WebhookResult:
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> WebhookResult:
         self.calls += 1
         raise self.exc
 
@@ -241,11 +253,12 @@ def test_fresh_fire_is_persisted_and_pushed(settings, session_factory, alert_sen
 
     assert [outcome.status for outcome in report.outcomes] == ["pushed"]
     assert len(alert_sender.sent) == 1
-    fire, fired_at = alert_sender.sent[0]
+    fire, fired_at, trigger_event_id = alert_sender.sent[0]
     assert fire.rule_id == "stress_spike_vs_baseline"
     assert fired_at.tzinfo is not None
 
     [event] = all_events(session_factory)
+    assert trigger_event_id == event.id
     assert event.rule_id == "stress_spike_vs_baseline"
     assert event.dedup_key == "stress_spike_vs_baseline:2026-07-09"
     assert event.alert_sent is True

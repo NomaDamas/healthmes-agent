@@ -12,6 +12,7 @@ flushes per fire and isolates per-rule exceptions
 (healthmes/engine/triggers.py).
 """
 
+import uuid
 from datetime import datetime, time, timedelta
 
 from freezegun import freeze_time
@@ -30,7 +31,13 @@ class RecordingSender:
     def __init__(self) -> None:
         self.sent: list[TriggerFire] = []
 
-    def send(self, fire: TriggerFire, *, fired_at: datetime) -> WebhookResult:
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> WebhookResult:
         self.sent.append(fire)
         return WebhookResult(ok=True, status_code=202)
 

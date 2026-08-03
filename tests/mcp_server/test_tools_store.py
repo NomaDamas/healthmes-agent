@@ -1193,6 +1193,70 @@ class TestCaptureTools:
         )
         assert result["status"] == "ok"
 
+    async def test_record_alert_decision_binds_exact_trigger_once(
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+    ):
+        trigger = TriggerEvent(
+            fired_at=dt.datetime(2026, 7, 9, 14, 0, tzinfo=dt.UTC),
+            rule_id="calendar_task_intake",
+            payload={"summary": "Schedule this task"},
+            alert_sent=True,
+            dedup_key="calendar-task:correlation-test",
+        )
+        with store_factory() as session:
+            session.add(trigger)
+            session.commit()
+            trigger_id = trigger.id
+
+        result = await call_tool(
+            mcp_client,
+            "record_decision",
+            {
+                "kind": "alert",
+                "summary": "Correlated alert",
+                "tree": TREE,
+                "trigger_event_id": str(trigger_id),
+            },
+        )
+        with store_factory() as session:
+            row = session.get(DecisionRecord, uuid.UUID(result["decision_id"]))
+            assert row is not None
+            assert row.trigger_event_id == trigger_id
+
+        with pytest.raises(ToolError, match="already has a decision"):
+            await mcp_client.call_tool(
+                "record_decision",
+                {
+                    "kind": "alert",
+                    "summary": "Duplicate correlation",
+                    "tree": TREE,
+                    "trigger_event_id": str(trigger_id),
+                },
+            )
+        with pytest.raises(ToolError, match="valid only for kind='alert'"):
+            await mcp_client.call_tool(
+                "record_decision",
+                {
+                    "kind": "insight",
+                    "summary": "Wrong kind",
+                    "tree": TREE,
+                    "trigger_event_id": str(trigger_id),
+                },
+            )
+        with pytest.raises(ToolError, match="not found"):
+            await mcp_client.call_tool(
+                "record_decision",
+                {
+                    "kind": "alert",
+                    "summary": "Missing trigger",
+                    "tree": TREE,
+                    "trigger_event_id": str(uuid.uuid4()),
+                },
+            )
+
     async def test_record_decision_tree_validation(self, mcp_client):
         with pytest.raises(ToolError, match="kind"):
             await mcp_client.call_tool(

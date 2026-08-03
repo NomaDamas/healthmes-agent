@@ -249,8 +249,9 @@ the trigger payload (`rule_id`, summary, evidence keys):
 2. Decide: re-plan (build a proposal), inform only, or do nothing (say
    nothing — suppressed alerts still get a `record_decision`).
 3. `record_decision`, then send at most ONE message in the notification
-   grammar. Alert budget and cooldowns are enforced upstream; your job is to
-   make the one message count.
+   grammar. Pass the trusted `trigger_event_id` from the webhook prompt
+   unchanged when recording an alert decision. Alert budget and cooldowns are
+   enforced upstream; your job is to make the one message count.
 
 ## Extension points (do not remove)
 

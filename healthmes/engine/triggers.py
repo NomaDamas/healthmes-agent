@@ -34,6 +34,7 @@ import hashlib
 import inspect
 import logging
 import statistics
+import uuid
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -150,7 +151,13 @@ class HealthReader(Protocol):
 class AlertSender(Protocol):
     """Anything that can push a fire to the agent plane (webhook by default)."""
 
-    def send(self, fire: TriggerFire, *, fired_at: datetime) -> WebhookResult: ...
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> WebhookResult: ...
 
 
 def _run_maybe_async(value: Any) -> Any:
@@ -784,7 +791,11 @@ class TriggerEvaluator:
             return FireOutcome(fire=fire, status="suppressed", reason=reason)
 
         try:
-            result = self._alert_sender.send(fire, fired_at=now)
+            result = self._alert_sender.send(
+                fire,
+                fired_at=now,
+                trigger_event_id=event.id,
+            )
         except Exception as exc:
             # The sender *raised* (transport blew up mid-send) rather than
             # returning a clean WebhookResult(ok=False) — that latter case is a
