@@ -9,6 +9,7 @@ import datetime as dt
 import pytest
 from fastmcp.exceptions import ToolError
 
+from healthmes.calendars.adjustments import evaluate_health_evidence
 from healthmes.mcp_server import server as server_module
 
 AS_OF = "2026-07-08"
@@ -135,7 +136,11 @@ class TestDailyReadinessContext:
         assert sleep["status"] == "ok"
         assert sleep["index"] == 20.0  # mean of debts (30, 20, 10)
         assert sleep["nights_counted"] == 3
-        assert sleep["last_night"] == {"date": AS_OF, "score": 70.0}
+        assert sleep["last_night"] == {
+            "date": AS_OF,
+            "score": 70.0,
+            "recorded_at": "2026-07-08T16:10:00+09:00",
+        }
         assert sleep["source"] == "internal_sleep_score"
 
         hrv = result["hrv"]
@@ -162,8 +167,10 @@ class TestDailyReadinessContext:
                 "value": 55.0,
                 "qualifier": None,
                 "observed_on": AS_OF,
+                "recorded_at": "2026-07-08T15:30:00+09:00",
             }
         ]
+        assert charge["freshest_at"] == "2026-07-08T15:30:00+09:00"
 
         load = result["yesterday_load"]
         assert load["date"] == "2026-07-07"
@@ -191,6 +198,60 @@ class TestDailyReadinessContext:
         assert result["confidence"] == "low"
         # A day with no workouts is still a valid (rest-day) observation.
         assert result["yesterday_load"]["workouts"] == 0
+
+    async def test_actual_readiness_fixture_is_fresh_with_nested_sleep_date(
+        self, mcp_env
+    ):
+        for day, score in [
+            ("2026-07-04", 90),
+            ("2026-07-05", 90),
+            ("2026-07-06", 90),
+            ("2026-07-07", 80),
+            ("2026-07-08", 70),
+        ]:
+            mcp_env.add_score("sleep", "internal", f"{day}T07:00:00Z", score)
+        mcp_env.add_score("body_battery", "garmin", "2026-07-08T06:30:00Z", 35)
+
+        readiness = await server_module.get_daily_readiness_context(AS_OF)
+        result = evaluate_health_evidence(
+            readiness,
+            local_date=D,
+            now=dt.datetime(2026, 7, 8, 7, 0, tzinfo=dt.UTC),
+            afternoon_busy_minutes=240,
+            eligible_event_count=1,
+        )
+
+        assert readiness["sleep_debt"]["last_night"]["date"] == AS_OF
+        assert result.allowed
+
+    async def test_actual_readiness_fixture_rejects_same_day_future_charge(
+        self, mcp_env
+    ):
+        for day, score in [
+            ("2026-07-04", 90),
+            ("2026-07-05", 90),
+            ("2026-07-06", 90),
+            ("2026-07-07", 80),
+            ("2026-07-08", 70),
+        ]:
+            mcp_env.add_score("sleep", "internal", f"{day}T07:00:00Z", score)
+        mcp_env.add_score("body_battery", "garmin", "2026-07-08T08:00:00Z", 35)
+
+        readiness = await server_module.get_daily_readiness_context(AS_OF)
+        result = evaluate_health_evidence(
+            readiness,
+            local_date=D,
+            now=dt.datetime(2026, 7, 8, 7, 0, tzinfo=dt.UTC),
+            afternoon_busy_minutes=240,
+            eligible_event_count=1,
+        )
+
+        assert readiness["charge"]["entries"][0]["recorded_at"] == (
+            "2026-07-08T17:00:00+09:00"
+        )
+        assert readiness["charge"]["freshest_at"] == "2026-07-08T17:00:00+09:00"
+        assert not result.allowed
+        assert result.reason == "future_recovery"
 
 
 class TestPersonalBaselines:
@@ -348,4 +409,3 @@ class TestReviewFindingFixes:
         assert stress["source"] == "internal_resilience_proxy(100-resilience_score)"
         assert stress["current"]["date"] == "2026-07-08"  # fresh proxy day, not 05-09
         assert stress["current"]["value"] == 35.0  # 100 - 65
-

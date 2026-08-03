@@ -115,6 +115,22 @@ class TestSleepDebt:
         assert result["coverage"] == 0.43  # 3/7
         assert result["last_night"] == {"date": "2026-07-08", "score": 70.0}
 
+    def test_preserves_selected_score_recorded_at(self):
+        recorded_at = dt.datetime(2026, 7, 8, 7, 30, tzinfo=dt.UTC)
+        scores = {D: 70.0, days_ago(1): 80.0, days_ago(2): 90.0}
+
+        result = interpret.sleep_debt(
+            scores,
+            D,
+            recorded_at_by_day={D: recorded_at},
+        )
+
+        assert result["last_night"] == {
+            "date": "2026-07-08",
+            "score": 70.0,
+            "recorded_at": "2026-07-08T07:30:00+00:00",
+        }
+
     def test_scores_above_100_never_produce_negative_debt(self):
         scores = {D: 100.0, days_ago(1): 100.0, days_ago(2): 100.0}
         assert interpret.sleep_debt(scores, D)["index"] == 0.0

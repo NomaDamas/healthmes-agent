@@ -108,10 +108,18 @@ class CalendarEventMirror(Base):
             name="uq_calendar_event_mirror_source_external_id",
         ),
         Index(
-            "ux_calendar_event_mirror_source_healthmes_source_key",
+            "ux_calendar_event_mirror_calendar_identity",
             "calendar_source",
+            "healthmes_kind",
+            "healthmes_source",
             "healthmes_source_key",
             unique=True,
+        ),
+        Index(
+            "ix_calendar_event_mirror_actual_sleep_cleanup",
+            "calendar_source",
+            "healthmes_kind",
+            "sleep_local_date",
         ),
     )
 
@@ -129,6 +137,7 @@ class CalendarEventMirror(Base):
     healthmes_source_key: Mapped[str_255 | None]
     observation_fingerprint: Mapped[str_255 | None]
     sleep_local_date: Mapped[date | None] = mapped_column(index=True)
+    sleep_provider: Mapped[str_255 | None]
     sleep_duration_minutes: Mapped[int | None]
     sleep_time_in_bed_minutes: Mapped[int | None]
     etag: Mapped[str_255 | None]

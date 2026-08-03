@@ -124,7 +124,12 @@ def _persist(
         sa.select(SleepReconciliationProposal)
         .where(
             SleepReconciliationProposal.dedup_key.like(f"{base_key}%"),
-            SleepReconciliationProposal.status == SleepProposalStatus.PENDING,
+            SleepReconciliationProposal.status.in_(
+                (
+                    SleepProposalStatus.PENDING,
+                    SleepProposalStatus.APPLYING,
+                )
+            ),
         )
         .order_by(SleepReconciliationProposal.created_at.desc())
     )

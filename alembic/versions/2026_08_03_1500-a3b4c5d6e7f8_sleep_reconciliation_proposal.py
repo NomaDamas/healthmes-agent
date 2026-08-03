@@ -5,8 +5,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision: str = "e1f2a3b4c5d6"
-down_revision: str | None = "d0e1f2a3b4c5"
+revision: str = "a3b4c5d6e7f8"
+down_revision: str | None = "f2a3b4c5d6e7"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

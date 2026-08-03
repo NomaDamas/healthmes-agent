@@ -43,7 +43,7 @@ jobs:
       run:
         working-directory: apps/ios-companion
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Select the newest stable Xcode on the runner
         # The runner image ships several Xcodes; the default is not always
@@ -120,7 +120,7 @@ jobs:
       run:
         working-directory: apps/macos-companion
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Select the newest stable Xcode on the runner
         run: |

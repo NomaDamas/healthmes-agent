@@ -28,21 +28,28 @@ credential can never take down the scheduler loop.
 """
 
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, tzinfo
+from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars import creds
 from healthmes.calendars.base import (
     CalendarAuthError,
     CalendarBackend,
+    CalendarConflictError,
     CalendarEventIdentity,
     EventDraft,
     HealthmesEventKind,
+    OwnershipError,
+    calendar_identity_external_id,
     coerce_utc,
 )
+from healthmes.calendars.sleep_context import actual_sleep_violation
 from healthmes.calendars.state import (
     FilePendingDiffStore,
     FileSyncStateStore,
@@ -50,7 +57,8 @@ from healthmes.calendars.state import (
     SyncStateStore,
 )
 from healthmes.calendars.sync import CalendarMirrorService, SyncDiff
-from healthmes.config import Settings
+from healthmes.calendars.write_lock import calendar_write_lock
+from healthmes.config import Settings, resolve_timezone
 from healthmes.store.enums import CalendarSource, ProposalStatus
 from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task
 from healthmes.store.session import session_scope
@@ -131,50 +139,134 @@ def _build_backend(settings: Settings, source: CalendarSource) -> CalendarBacken
     )
 
 
-def _accepted_proposals(session: Session) -> Iterator[tuple[ScheduleProposal, Task]]:
-    rows = session.execute(
-        select(ScheduleProposal, Task)
+def _accepted_proposal_ids(session: Session) -> list[UUID]:
+    statement = (
+        select(ScheduleProposal.id)
         .join(Task, ScheduleProposal.task_id == Task.id)
         .where(ScheduleProposal.status == ProposalStatus.ACCEPTED)
         .order_by(ScheduleProposal.proposed_start)
     )
-    yield from ((proposal, task) for proposal, task in rows)
+    bind = session.get_bind()
+    if isinstance(bind, Connection):
+        return list(bind.scalars(statement))
+    assert isinstance(bind, Engine)
+    with bind.connect() as connection:
+        return list(connection.scalars(statement))
 
 
 def _existing_agent_block(
     session: Session,
     source: CalendarSource,
-    task_id: object,
     proposal: ScheduleProposal,
 ) -> CalendarEventMirror | None:
     """Return the trusted agent mirror row already written for this proposal.
 
-    Matches an agent-created row for the same task/source whose times equal the
-    proposal's — the fingerprint of the block a prior (crashed) poll already
-    created remotely. Times are compared in Python via ``coerce_utc`` because
-    sqlite round-trips ``DateTime`` columns as naive UTC.
+    The proposal UUID is part of the deterministic remote identity, so another
+    proposal for the same task and time can never be mistaken for this block.
+    Times are compared in Python via ``coerce_utc`` because sqlite round-trips
+    ``DateTime`` columns as naive UTC.
     """
-    candidates = (
-        session.execute(
+    identity = _proposal_identity(proposal)
+    row = session.scalar(
+        select(CalendarEventMirror).where(
+            CalendarEventMirror.calendar_source == source,
+            CalendarEventMirror.is_agent_created.is_(True),
+            CalendarEventMirror.healthmes_kind == identity.kind.value,
+            CalendarEventMirror.healthmes_source == identity.source,
+            CalendarEventMirror.healthmes_source_key == identity.source_key,
+        )
+    )
+    if row is None:
+        return None
+    if row.external_id != calendar_identity_external_id(source, identity):
+        return None
+    start = coerce_utc(proposal.proposed_start)
+    end = coerce_utc(proposal.proposed_end)
+    if (
+        row.agent_task_id != proposal.task_id
+        or coerce_utc(row.start_at) != start
+        or coerce_utc(row.end_at) != end
+    ):
+        raise CalendarConflictError(
+            f"proposal {proposal.id} owns a calendar block with different content"
+        )
+    return row
+
+
+def _legacy_agent_block(
+    session: Session,
+    source: CalendarSource,
+    proposal: ScheduleProposal,
+    task: Task,
+) -> CalendarEventMirror | None:
+    """Find one unambiguous block created before proposal identities existed."""
+    if proposal.healthmes_kind == HealthmesEventKind.PLANNED_SLEEP.value:
+        return None
+    candidates = list(
+        session.scalars(
             select(CalendarEventMirror).where(
                 CalendarEventMirror.calendar_source == source,
-                CalendarEventMirror.agent_task_id == task_id,
+                CalendarEventMirror.agent_task_id == task.id,
                 CalendarEventMirror.is_agent_created.is_(True),
+                CalendarEventMirror.healthmes_kind.is_(None),
+                CalendarEventMirror.healthmes_source.is_(None),
+                CalendarEventMirror.healthmes_source_key.is_(None),
             )
-        )
-        .scalars()
-        .all()
+        ).all()
     )
     start = coerce_utc(proposal.proposed_start)
     end = coerce_utc(proposal.proposed_end)
-    for row in candidates:
-        if coerce_utc(row.start_at) == start and coerce_utc(row.end_at) == end:
-            return row
-    return None
+    matching = [
+        row
+        for row in candidates
+        if coerce_utc(row.start_at) == start and coerce_utc(row.end_at) == end
+    ]
+    if not matching:
+        return None
+    if len(matching) != 1:
+        raise CalendarConflictError(
+            f"proposal {proposal.id} has ambiguous legacy calendar blocks"
+        )
+    competing = list(
+        session.scalars(
+            select(ScheduleProposal).where(
+                ScheduleProposal.id != proposal.id,
+                ScheduleProposal.task_id == proposal.task_id,
+                ScheduleProposal.status.in_(
+                    [ProposalStatus.ACCEPTED, ProposalStatus.PUSHED]
+                ),
+            )
+        ).all()
+    )
+    if any(
+        coerce_utc(other.proposed_start) == start
+        and coerce_utc(other.proposed_end) == end
+        for other in competing
+    ):
+        raise CalendarConflictError(
+            f"proposal {proposal.id} cannot uniquely claim its legacy block"
+        )
+    return matching[0]
+
+
+def _proposal_identity(proposal: ScheduleProposal) -> CalendarEventIdentity:
+    kind = (
+        HealthmesEventKind.PLANNED_SLEEP
+        if proposal.healthmes_kind == HealthmesEventKind.PLANNED_SLEEP.value
+        else HealthmesEventKind.SCHEDULE_BLOCK
+    )
+    return CalendarEventIdentity(
+        kind=kind,
+        source="planner",
+        source_key=f"proposal:{proposal.id}",
+    )
 
 
 def push_accepted_proposals(
-    service: CalendarMirrorService, session: Session, source: CalendarSource
+    service: CalendarMirrorService,
+    session: Session,
+    source: CalendarSource,
+    timezone: tzinfo = UTC,
 ) -> int:
     """Write every ``accepted`` proposal to the calendar; advance to ``pushed``.
 
@@ -186,18 +278,20 @@ def push_accepted_proposals(
     lost one). A failing backend call leaves the proposal untouched for retry.
     """
     pushed = 0
-    for proposal, task in list(_accepted_proposals(session)):
-        row = _existing_agent_block(session, source, task.id, proposal)
-        if row is None:
-            identity = (
-                CalendarEventIdentity(
-                    kind=HealthmesEventKind.PLANNED_SLEEP,
-                    source="planner",
-                    source_key=f"proposal:{proposal.id}",
-                )
-                if proposal.healthmes_kind == HealthmesEventKind.PLANNED_SLEEP.value
-                else None
-            )
+    # Do not hold a Session read transaction while waiting for the provider
+    # write lock. That can deadlock SQLite commits and needlessly consume a
+    # PostgreSQL pool connection while the advisory-lock connection waits.
+    proposal_ids = _accepted_proposal_ids(session)
+    for proposal_id in proposal_ids:
+        with calendar_write_lock(session, source):
+            session.expire_all()
+            proposal = session.get(ScheduleProposal, proposal_id)
+            if proposal is None or proposal.status is not ProposalStatus.ACCEPTED:
+                continue
+            task = session.get(Task, proposal.task_id)
+            if task is None:
+                continue
+            identity = _proposal_identity(proposal)
             draft = EventDraft(
                 summary=task.title,
                 start_at=coerce_utc(proposal.proposed_start),
@@ -206,8 +300,83 @@ def push_accepted_proposals(
                 identity=identity,
             )
             try:
+                row = _existing_agent_block(session, source, proposal)
+                legacy_row = (
+                    _legacy_agent_block(session, source, proposal, task)
+                    if row is None
+                    else None
+                )
+                if legacy_row is not None:
+                    service.assert_legacy_agent_event_matches(
+                        source,
+                        legacy_row,
+                        EventDraft(
+                            summary=draft.summary,
+                            start_at=draft.start_at,
+                            end_at=draft.end_at,
+                            description=draft.description,
+                            agent_task_id=draft.agent_task_id,
+                        ),
+                    )
+            except (CalendarConflictError, OwnershipError):
+                logger.exception(
+                    "Proposal %s has a conflicting owned calendar identity; "
+                    "leaving it accepted for review.",
+                    proposal.id,
+                )
+                continue
+            violation = actual_sleep_violation(
+                session,
+                coerce_utc(proposal.proposed_start),
+                coerce_utc(proposal.proposed_end),
+                timezone,
+            )
+            if violation is not None:
+                owned_row = row or legacy_row
+                if owned_row is not None:
+                    try:
+                        service.delete_agent_event(
+                            source,
+                            owned_row.external_id,
+                            expected_identity=(
+                                identity if row is not None else None
+                            ),
+                        )
+                    except Exception:
+                        session.rollback()
+                        logger.exception(
+                            "Removing invalidated proposal %s event %s from %s "
+                            "failed; retrying next poll.",
+                            proposal.id,
+                            owned_row.external_id,
+                            source.value,
+                        )
+                        continue
+                proposal.status = ProposalStatus.INVALIDATED
+                session.commit()
+                logger.warning(
+                    "Proposal %s invalidated before calendar push: %s",
+                    proposal.id,
+                    violation,
+                )
+                continue
+            if legacy_row is not None:
+                proposal.status = ProposalStatus.PUSHED
+                session.commit()
+                pushed += 1
+                logger.info(
+                    "Proposal %s adopted legacy agent block %s on %s without "
+                    "creating a duplicate.",
+                    proposal.id,
+                    legacy_row.external_id,
+                    source.value,
+                )
+                continue
+            reused_existing = row is not None
+            try:
                 row = service.create_agent_event(source, draft)
             except Exception:
+                session.rollback()
                 logger.exception(
                     "Pushing proposal %s (%s) to %s failed; retrying next poll.",
                     proposal.id,
@@ -215,24 +384,56 @@ def push_accepted_proposals(
                     source.value,
                 )
                 continue
-        else:
-            logger.info(
-                "Proposal %s already has agent block %s on %s; finishing the "
-                "interrupted status advance instead of re-creating it.",
-                proposal.id,
-                row.external_id,
-                source.value,
+            if reused_existing:
+                logger.info(
+                    "Proposal %s already has agent block %s on %s; finishing the "
+                    "interrupted status advance instead of re-creating it.",
+                    proposal.id,
+                    row.external_id,
+                    source.value,
+                )
+
+            session.expire_all()
+            post_create_violation = actual_sleep_violation(
+                session,
+                coerce_utc(proposal.proposed_start),
+                coerce_utc(proposal.proposed_end),
+                timezone,
             )
-        proposal.status = ProposalStatus.PUSHED
-        session.commit()
-        pushed += 1
-        logger.info(
-            "Proposal %s pushed to %s as event %s (%s).",
-            proposal.id,
-            source.value,
-            row.external_id,
-            task.title,
-        )
+            if post_create_violation is not None:
+                try:
+                    service.delete_agent_event(
+                        source,
+                        row.external_id,
+                        expected_identity=identity,
+                    )
+                except Exception:
+                    session.rollback()
+                    logger.exception(
+                        "Rolling back proposal %s event %s after a concurrent "
+                        "sleep update failed; retrying next poll.",
+                        proposal.id,
+                        row.external_id,
+                    )
+                    continue
+                proposal.status = ProposalStatus.INVALIDATED
+                session.commit()
+                logger.warning(
+                    "Proposal %s invalidated after calendar create: %s",
+                    proposal.id,
+                    post_create_violation,
+                )
+                continue
+            proposal.status = ProposalStatus.PUSHED
+            session.commit()
+            pushed += 1
+            logger.info(
+                "Proposal %s pushed to %s as event %s (%s).",
+                proposal.id,
+                source.value,
+                row.external_id,
+                task.title,
+            )
     return pushed
 
 
@@ -280,7 +481,12 @@ def build_calendar_job(
                 service = CalendarMirrorService(session, [backend], store, journal)
                 diff = service.sync_backend(backend)
                 if is_write_backend:
-                    push_accepted_proposals(service, session, source)
+                    push_accepted_proposals(
+                        service,
+                        session,
+                        source,
+                        resolve_timezone(settings),
+                    )
                 return diff
         except Exception:
             logger.exception(

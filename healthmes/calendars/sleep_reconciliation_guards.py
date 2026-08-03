@@ -5,13 +5,15 @@ from healthmes.calendars.base import (
     CalendarEventIdentity,
     ExternalEvent,
     OwnershipError,
+    calendar_identity_external_id,
     ensure_utc,
 )
 from healthmes.calendars.sleep_event_rendering import (
     ACTUAL_SLEEP_SUMMARY,
-    LEGACY_ACTUAL_SLEEP_SUMMARY,
+    description,
 )
 from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror
 
 
@@ -33,10 +35,16 @@ def assert_owned_actual_sleep(
 
 def assert_remote_actual_sleep(
     event: ExternalEvent,
+    calendar_source: CalendarSource,
     identity: CalendarEventIdentity,
     mirror_etag: str | None,
 ) -> str | None:
-    if not event.is_agent_created or event.identity != identity:
+    if (
+        not event.is_agent_created
+        or event.identity != identity
+        or event.external_id
+        != calendar_identity_external_id(calendar_source, identity)
+    ):
         raise OwnershipError("remote event is not the expected actual_sleep event")
     if mirror_etag is not None and event.etag != mirror_etag:
         raise CalendarConflictError("remote actual_sleep event changed after sync")
@@ -58,7 +66,8 @@ def pending_remote_matches(
     observation: ActualSleepObservation,
 ) -> bool:
     return (
-        event.summary in {ACTUAL_SLEEP_SUMMARY, LEGACY_ACTUAL_SLEEP_SUMMARY}
+        event.summary == ACTUAL_SLEEP_SUMMARY
+        and event.description == description(observation)
         and event.start_at == ensure_utc(observation.start_at)
         and event.end_at == ensure_utc(observation.end_at)
     )

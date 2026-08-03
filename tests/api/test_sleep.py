@@ -58,7 +58,7 @@ def test_local_sleep_review_applies_exact_preview_and_shows_read_back(
         assert "2026-07-25 23:00:00 KST" in preview.text
         assert "2026-07-26 07:00:00 KST" in preview.text
         assert "실제 수면 420분 · 침대 구간 450분 · 구간 내 비수면 30분" in preview.text
-        assert "Oura 수면 세션" in preview.text
+        assert "수면 (실제)" in preview.text
         assert redacted_digest(fake_backend.approval_target) in preview.text
         assert "이 preview를 Calendar에 반영" in preview.text
         cookie = preview.headers["set-cookie"]

@@ -30,7 +30,7 @@ def actual_sleep_context(
         "wake_time": wake.isoformat(),
         "duration_minutes": row.sleep_duration_minutes,
         "time_in_bed_minutes": row.sleep_time_in_bed_minutes,
-        "source": row.healthmes_source,
+        "source": row.sleep_provider or row.healthmes_source,
         "freshness": "current",
         "earliest_available_work_time": wake.isoformat(),
     }
@@ -61,23 +61,26 @@ def actual_sleep_violation(
     end: dt.datetime,
     timezone: dt.tzinfo,
 ) -> str | None:
-    local_date = start.astimezone(timezone).date()
-    row = _actual_sleep_for_date(session, local_date)
+    start_utc = coerce_utc(start)
+    end_utc = coerce_utc(end)
+    row = session.scalar(
+        sa.select(CalendarEventMirror)
+        .where(
+            CalendarEventMirror.is_agent_created.is_(True),
+            CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
+            CalendarEventMirror.start_at < end_utc,
+            CalendarEventMirror.end_at > start_utc,
+        )
+        .order_by(CalendarEventMirror.end_at.desc())
+        .limit(1)
+    )
     if row is None:
         return None
-    sleep_start = coerce_utc(row.start_at)
     wake = coerce_utc(row.end_at)
-    if start < wake and end > sleep_start:
-        return (
-            f"block starts before actual wake time "
-            f"{wake.astimezone(timezone).isoformat()} and overlaps actual sleep"
-        )
-    if start < wake:
-        return (
-            f"block starts before actual wake time "
-            f"{wake.astimezone(timezone).isoformat()}"
-        )
-    return None
+    return (
+        f"block starts before actual wake time "
+        f"{wake.astimezone(timezone).isoformat()} and overlaps actual sleep"
+    )
 
 
 def _actual_sleep_for_date(

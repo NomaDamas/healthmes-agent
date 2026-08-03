@@ -12,6 +12,7 @@ from healthmes.calendars.sleep_observation import (
     DetailedSleepSessionPayload,
     SleepObservationNoOp,
     SleepObservationNoOpReason,
+    SleepStageIntervalPayload,
     SleepSummaryPayload,
     select_actual_sleep,
     split_observation_at_awake_intervals,
@@ -57,13 +58,43 @@ async def read_actual_sleep(
         target_date.isoformat(),
         (target_date + timedelta(days=1)).isoformat(),
     )
-    try:
-        sessions = tuple(
-            DetailedSleepSessionPayload.model_validate(row) for row in session_rows
-        )
-    except ValidationError:
+    sessions = _valid_detailed_sleep_sessions(session_rows)
+    if not sessions:
         return selected
     return split_observation_at_awake_intervals(selected, sessions)
+
+
+def _valid_detailed_sleep_sessions(
+    rows: object,
+) -> tuple[DetailedSleepSessionPayload, ...]:
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+        return ()
+    sessions: list[DetailedSleepSessionPayload] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        normalized = dict(row)
+        interval_rows = row.get("sleep_stage_intervals")
+        if isinstance(interval_rows, Sequence) and not isinstance(
+            interval_rows,
+            (str, bytes, bytearray),
+        ):
+            valid_intervals = []
+            for interval in interval_rows:
+                try:
+                    valid_intervals.append(
+                        SleepStageIntervalPayload.model_validate(interval)
+                    )
+                except ValidationError:
+                    continue
+            normalized["sleep_stage_intervals"] = valid_intervals
+        elif interval_rows is not None:
+            normalized["sleep_stage_intervals"] = []
+        try:
+            sessions.append(DetailedSleepSessionPayload.model_validate(normalized))
+        except ValidationError:
+            continue
+    return tuple(sessions)
 
 
 def select_actual_sleep_rows(

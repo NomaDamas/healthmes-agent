@@ -9,8 +9,8 @@ from healthmes.calendars.base import (
 )
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 
-ACTUAL_SLEEP_SUMMARY = "Oura 수면 세션"
-LEGACY_ACTUAL_SLEEP_SUMMARY = "수면 (실제)"
+ACTUAL_SLEEP_SUMMARY = "수면 (실제)"
+LEGACY_ACTUAL_SLEEP_SUMMARY = ACTUAL_SLEEP_SUMMARY
 
 
 def observation_fingerprint(observation: ActualSleepObservation) -> str:
@@ -65,6 +65,7 @@ def description(observation: ActualSleepObservation) -> str:
         f"Oura bedtime window: {observation.time_in_bed_minutes} min\n"
         f"Actual sleep: {observation.duration_minutes} min\n"
         f"Non-sleep within window: {non_sleep_minutes} min\n"
-        f"Source: {observation.provider}"
+        f"Source: {observation.provider}\n"
+        f"HealthMes-Fingerprint: {observation_fingerprint(observation)}"
         f"{review_link}"
     )

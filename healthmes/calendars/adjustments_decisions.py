@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from healthmes.calendars.adjustments_proposals import provider_revision_fingerprint
 from healthmes.calendars.adjustments_types import (
     SHORTEN_MINUTES,
     AdjustmentOperation,
@@ -30,6 +31,7 @@ def redacted_receipt(
         receipt["provider_code"] = provider_code
     if provider_event is not None and provider_event.etag:
         receipt["provider_result"] = "matched"
+        receipt["provider_revision"] = provider_revision_fingerprint(provider_event.etag)
     return receipt
 
 

@@ -18,7 +18,7 @@ plugins {
 // before.
 android {
     namespace = "com.healthmes.companion"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.healthmes.companion"
@@ -58,7 +58,7 @@ dependencies {
     implementation(project(":shared"))
 
     implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("com.google.android.material:material:1.12.0")
     // 15-minute periodic refresh + one-shot notification-action calls.
     implementation("androidx.work:work-runtime-ktx:2.9.1")
@@ -75,7 +75,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
 
     // Decision viewer: Custom Tabs first, in-app WebView fallback.
-    implementation("androidx.browser:browser:1.8.0")
+    implementation("androidx.browser:browser:1.10.0")
 
     testImplementation("junit:junit:4.13.2")
     // Unit tests exercise the shared org.json-based contract parsers on the

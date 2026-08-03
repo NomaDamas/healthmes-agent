@@ -33,7 +33,6 @@ def capture_provider_state(
             CalendarEventMirror.calendar_source == backend.source,
             CalendarEventMirror.is_agent_created.is_(True),
             CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
-            CalendarEventMirror.healthmes_source == observation.provider,
             CalendarEventMirror.sleep_local_date == observation.local_date,
             sa.or_(
                 CalendarEventMirror.healthmes_source_key.in_(child_keys),
