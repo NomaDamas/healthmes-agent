@@ -15,7 +15,9 @@ from healthmes.calendars.base import (
     HealthmesEventKind,
     OwnershipError,
     calendar_identity_external_id,
+    coerce_utc,
     ensure_utc,
+    parse_calendar_identity,
 )
 from healthmes.calendars.planned_sleep_replacement import (
     delete_replaced_planned_sleep,
@@ -51,7 +53,8 @@ from healthmes.calendars.sleep_reconciliation_guards import (
     pending_remote_matches,
 )
 from healthmes.calendars.write_lock import calendar_write_lock
-from healthmes.store.models import CalendarEventMirror
+from healthmes.store.enums import ProposalStatus
+from healthmes.store.models import CalendarEventMirror, ScheduleProposal
 
 logger = logging.getLogger(__name__)
 LEGACY_SLEEP_CLEANUP_BATCH_SIZE = 25
@@ -63,6 +66,22 @@ class SleepCalendarAction(StrEnum):
     NOOP = "noop"
 
 
+class SleepCalendarWriteBlocked(RuntimeError):
+    def __init__(
+        self,
+        *,
+        reason: str,
+        proposal_id: str,
+        retryable: bool,
+        invalidated_proposal_ids: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.proposal_id = proposal_id
+        self.retryable = retryable
+        self.invalidated_proposal_ids = invalidated_proposal_ids
+
+
 @dataclass(frozen=True, slots=True)
 class SleepCalendarResult:
     action: SleepCalendarAction
@@ -70,6 +89,7 @@ class SleepCalendarResult:
     observation_fingerprint: str
     deleted_planned_external_ids: tuple[str, ...] = ()
     planned_sleep_cleanup_pending: int = 0
+    invalidated_schedule_proposal_ids: tuple[str, ...] = ()
 
 
 class SleepCalendarReconciler:
@@ -105,7 +125,204 @@ class SleepCalendarReconciler:
                     observation = sleep_observation_from_mirror(canonical)
             fingerprint = observation_fingerprint(observation)
             identity = actual_sleep_identity(observation)
-            return self._reconcile_locked(observation, identity, fingerprint)
+            invalidated_proposal_ids = (
+                self._invalidate_overlapping_pushed_schedule_blocks(observation)
+            )
+            result = self._reconcile_locked(observation, identity, fingerprint)
+            return replace(
+                result,
+                invalidated_schedule_proposal_ids=invalidated_proposal_ids,
+            )
+
+    def _invalidate_overlapping_pushed_schedule_blocks(
+        self,
+        observation: ActualSleepObservation,
+    ) -> tuple[str, ...]:
+        start_at = ensure_utc(observation.start_at)
+        end_at = ensure_utc(observation.end_at)
+        proposals = list(
+            self._session.scalars(
+                sa.select(ScheduleProposal)
+                .where(
+                    ScheduleProposal.status == ProposalStatus.PUSHED,
+                    ScheduleProposal.proposed_start < end_at,
+                    ScheduleProposal.proposed_end > start_at,
+                    sa.or_(
+                        ScheduleProposal.healthmes_kind.is_(None),
+                        ScheduleProposal.healthmes_kind
+                        == HealthmesEventKind.SCHEDULE_BLOCK.value,
+                    ),
+                )
+                .order_by(ScheduleProposal.proposed_start, ScheduleProposal.id)
+            ).all()
+        )
+        invalidated: list[str] = []
+        for proposal in proposals:
+            proposal_id = str(proposal.id)
+            identity = CalendarEventIdentity(
+                kind=HealthmesEventKind.SCHEDULE_BLOCK,
+                source="planner",
+                source_key=f"proposal:{proposal.id}",
+            )
+            external_id = calendar_identity_external_id(
+                self._backend.source,
+                identity,
+            )
+            row = self._session.scalar(
+                sa.select(CalendarEventMirror).where(
+                    CalendarEventMirror.calendar_source == self._backend.source,
+                    CalendarEventMirror.external_id == external_id,
+                )
+            )
+            identity_row = self._session.scalar(
+                sa.select(CalendarEventMirror).where(
+                    CalendarEventMirror.calendar_source == self._backend.source,
+                    CalendarEventMirror.healthmes_kind == identity.kind.value,
+                    CalendarEventMirror.healthmes_source == identity.source,
+                    CalendarEventMirror.healthmes_source_key == identity.source_key,
+                )
+            )
+            if (
+                identity_row is not None
+                and identity_row.external_id != external_id
+            ) or (
+                row is not None
+                and (
+                    not row.is_agent_created
+                    or row.agent_task_id != proposal.task_id
+                    or row.healthmes_kind != identity.kind.value
+                    or row.healthmes_source != identity.source
+                    or row.healthmes_source_key != identity.source_key
+                    or coerce_utc(row.start_at)
+                    != coerce_utc(proposal.proposed_start)
+                    or coerce_utc(row.end_at)
+                    != coerce_utc(proposal.proposed_end)
+                )
+            ) or self._has_unverifiable_owned_block(proposal):
+                raise SleepCalendarWriteBlocked(
+                    reason="overlapping_pushed_block_ownership_conflict",
+                    proposal_id=proposal_id,
+                    retryable=False,
+                    invalidated_proposal_ids=tuple(invalidated),
+                )
+
+            try:
+                remote = self._backend.read_event(external_id)
+            except EventNotFoundError:
+                remote = None
+            except OwnershipError as exc:
+                raise SleepCalendarWriteBlocked(
+                    reason="overlapping_pushed_block_ownership_conflict",
+                    proposal_id=proposal_id,
+                    retryable=False,
+                    invalidated_proposal_ids=tuple(invalidated),
+                ) from exc
+            except Exception as exc:
+                raise SleepCalendarWriteBlocked(
+                    reason="overlapping_pushed_block_cleanup_retry",
+                    proposal_id=proposal_id,
+                    retryable=True,
+                    invalidated_proposal_ids=tuple(invalidated),
+                ) from exc
+
+            if remote is not None:
+                if (
+                    not remote.is_agent_created
+                    or remote.identity != identity
+                    or remote.external_id != external_id
+                    or remote.agent_task_id != proposal.task_id
+                    or remote.start_at != coerce_utc(proposal.proposed_start)
+                    or remote.end_at != coerce_utc(proposal.proposed_end)
+                ):
+                    raise SleepCalendarWriteBlocked(
+                        reason="overlapping_pushed_block_ownership_conflict",
+                        proposal_id=proposal_id,
+                        retryable=False,
+                        invalidated_proposal_ids=tuple(invalidated),
+                    )
+                if remote.etag is None:
+                    raise SleepCalendarWriteBlocked(
+                        reason="overlapping_pushed_block_cleanup_retry",
+                        proposal_id=proposal_id,
+                        retryable=True,
+                        invalidated_proposal_ids=tuple(invalidated),
+                    )
+                try:
+                    self._backend.delete_event(
+                        external_id,
+                        expected_kind=HealthmesEventKind.SCHEDULE_BLOCK,
+                        expected_etag=remote.etag,
+                    )
+                except EventNotFoundError:
+                    pass
+                except OwnershipError as exc:
+                    raise SleepCalendarWriteBlocked(
+                        reason="overlapping_pushed_block_ownership_conflict",
+                        proposal_id=proposal_id,
+                        retryable=False,
+                        invalidated_proposal_ids=tuple(invalidated),
+                    ) from exc
+                except Exception as exc:
+                    raise SleepCalendarWriteBlocked(
+                        reason="overlapping_pushed_block_cleanup_retry",
+                        proposal_id=proposal_id,
+                        retryable=True,
+                        invalidated_proposal_ids=tuple(invalidated),
+                    ) from exc
+
+            try:
+                if row is not None:
+                    self._session.delete(row)
+                proposal.status = ProposalStatus.INVALIDATED
+                self._session.commit()
+            except Exception as exc:
+                self._session.rollback()
+                raise SleepCalendarWriteBlocked(
+                    reason="overlapping_pushed_block_cleanup_retry",
+                    proposal_id=proposal_id,
+                    retryable=True,
+                    invalidated_proposal_ids=tuple(invalidated),
+                ) from exc
+            invalidated.append(proposal_id)
+            logger.warning(
+                "Invalidated pushed proposal %s because actual sleep overlaps "
+                "its exact owned calendar block.",
+                proposal.id,
+            )
+        return tuple(invalidated)
+
+    def _has_unverifiable_owned_block(
+        self,
+        proposal: ScheduleProposal,
+    ) -> bool:
+        candidates = self._session.scalars(
+            sa.select(CalendarEventMirror).where(
+                CalendarEventMirror.calendar_source == self._backend.source,
+                CalendarEventMirror.is_agent_created.is_(True),
+                CalendarEventMirror.agent_task_id == proposal.task_id,
+            )
+        ).all()
+        start_at = coerce_utc(proposal.proposed_start)
+        end_at = coerce_utc(proposal.proposed_end)
+        for candidate in candidates:
+            if (
+                coerce_utc(candidate.start_at) != start_at
+                or coerce_utc(candidate.end_at) != end_at
+            ):
+                continue
+            candidate_identity = parse_calendar_identity(
+                candidate.healthmes_kind,
+                candidate.healthmes_source,
+                candidate.healthmes_source_key,
+            )
+            if candidate_identity is None:
+                return True
+            if candidate.external_id != calendar_identity_external_id(
+                self._backend.source,
+                candidate_identity,
+            ):
+                return True
+        return False
 
     def reconcile_legacy_history(
         self,
@@ -657,16 +874,16 @@ class SleepCalendarReconciler:
             identity,
             None,
         )
+        if pending_remote_matches(remote, observation):
+            finalize_sleep_mirror(
+                self._session,
+                row,
+                remote,
+                observation,
+                fingerprint,
+            )
+            return self._updated_result(row.external_id, fingerprint)
         if row.etag is not None and remote_etag != row.etag:
-            if pending_remote_matches(remote, observation):
-                finalize_sleep_mirror(
-                    self._session,
-                    row,
-                    remote,
-                    observation,
-                    fingerprint,
-                )
-                return self._updated_result(row.external_id, fingerprint)
             return self._update_remote(
                 row,
                 observation,

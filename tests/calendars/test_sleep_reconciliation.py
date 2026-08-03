@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 import sqlalchemy as sa
@@ -30,11 +30,18 @@ from healthmes.calendars.sleep_preview import preview_sleep_reconciliation
 from healthmes.calendars.sleep_reconciliation import (
     SleepCalendarAction,
     SleepCalendarReconciler,
+    SleepCalendarWriteBlocked,
     observation_fingerprint,
 )
 from healthmes.calendars.state import InMemorySyncStateStore
 from healthmes.calendars.sync import CalendarMirrorService
-from healthmes.store import CalendarEventMirror, CalendarSource
+from healthmes.store import (
+    CalendarEventMirror,
+    CalendarSource,
+    ProposalStatus,
+    ScheduleProposal,
+    Task,
+)
 
 
 def actual_sleep_identity_for(
@@ -199,6 +206,36 @@ class MultiEventBackend(RecordingCalendarBackend):
         event = self.read_event(external_id)
         assert expected_kind is HealthmesEventKind.ACTUAL_SLEEP
         assert event.etag == expected_etag
+        self.delete_calls.append(external_id)
+        del self.events[external_id]
+
+
+class ScheduleAwareBackend(MultiEventBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.delete_requests: list[
+            tuple[str, HealthmesEventKind | None, str | None]
+        ] = []
+        self.timeline: list[str] = []
+
+    def create_event(self, draft: EventDraft) -> ExternalEvent:
+        assert draft.identity is not None
+        self.timeline.append(f"create:{draft.identity.kind.value}")
+        return super().create_event(draft)
+
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
+    ) -> None:
+        event = self.read_event(external_id)
+        assert event.identity is not None
+        assert expected_kind is event.identity.kind
+        assert event.etag == expected_etag
+        self.delete_requests.append((external_id, expected_kind, expected_etag))
+        self.timeline.append(f"delete:{event.identity.kind.value}")
         self.delete_calls.append(external_id)
         del self.events[external_id]
 
@@ -486,6 +523,7 @@ def test_sync_between_remote_create_and_local_finalize_keeps_retry_write_free(
             healthmes_source_key=identity.source_key,
             observation_fingerprint=observation_fingerprint(observation),
             sleep_local_date=observation.local_date,
+            sleep_provider=observation.provider,
             sleep_duration_minutes=observation.duration_minutes,
             sleep_time_in_bed_minutes=observation.time_in_bed_minutes,
             status="healthmes_pending_create",
@@ -513,10 +551,12 @@ def test_sync_between_remote_create_and_local_finalize_keeps_retry_write_free(
         [backend],
         InMemorySyncStateStore(),
     ).sync_backend(backend)
+    pending = session.query(CalendarEventMirror).one()
+    assert pending.status == "healthmes_pending_create"
     result = SleepCalendarReconciler(session, backend).reconcile(observation)
 
     # Then
-    assert result.action is SleepCalendarAction.NOOP
+    assert result.action is SleepCalendarAction.CREATED
     assert backend.created_drafts == []
     mirror = session.query(CalendarEventMirror).one()
     assert mirror.is_agent_created
@@ -672,6 +712,79 @@ def test_provider_correction_recovers_after_remote_update_before_local_finalize(
     assert coerce_utc(recovered.end_at) == latest.end_at
 
 
+def test_pending_update_sync_preserves_exact_intent_before_crash_recovery(
+    session,
+    backend: RecordingCalendarBackend,
+    observation: ActualSleepObservation,
+    monkeypatch,
+) -> None:
+    SleepCalendarReconciler(session, backend).reconcile(observation)
+    corrected = replace(
+        observation,
+        provider="garmin",
+        start_at=observation.start_at - timedelta(minutes=15),
+        end_at=observation.end_at + timedelta(minutes=45),
+        duration_minutes=465,
+        time_in_bed_minutes=525,
+    )
+    original_update = backend.update_event
+
+    def fail_before_remote_update(*_args, **_kwargs):
+        raise RuntimeError("simulated crash before provider update")
+
+    monkeypatch.setattr(backend, "update_event", fail_before_remote_update)
+    with pytest.raises(RuntimeError, match="before provider update"):
+        SleepCalendarReconciler(session, backend).reconcile(corrected)
+
+    pending = session.query(CalendarEventMirror).one()
+    assert pending.status == "healthmes_pending_update"
+    assert pending.summary == "수면 (실제)"
+    assert coerce_utc(pending.start_at) == corrected.start_at
+    assert coerce_utc(pending.end_at) == corrected.end_at
+    assert pending.sleep_provider == corrected.provider
+    assert pending.sleep_duration_minutes == corrected.duration_minutes
+    assert pending.sleep_time_in_bed_minutes == corrected.time_in_bed_minutes
+    assert pending.observation_fingerprint == observation_fingerprint(corrected)
+
+    assert backend.event is not None
+    old_remote = backend.event
+    pending_etag = pending.etag
+    backend.list_changes = lambda _state: (
+        [replace(old_remote, etag='"stale-sync-observation"')],
+        {"sync_token": "old-remote"},
+    )
+    CalendarMirrorService(
+        session,
+        [backend],
+        InMemorySyncStateStore(),
+    ).sync_backend(backend)
+
+    pending = session.query(CalendarEventMirror).one()
+    assert pending.status == "healthmes_pending_update"
+    assert pending.etag == pending_etag
+    assert pending.summary == "수면 (실제)"
+    assert coerce_utc(pending.start_at) == corrected.start_at
+    assert coerce_utc(pending.end_at) == corrected.end_at
+    assert pending.sleep_provider == corrected.provider
+    assert pending.sleep_duration_minutes == corrected.duration_minutes
+    assert pending.sleep_time_in_bed_minutes == corrected.time_in_bed_minutes
+    assert pending.observation_fingerprint == observation_fingerprint(corrected)
+
+    monkeypatch.setattr(backend, "update_event", original_update)
+    result = SleepCalendarReconciler(session, backend).reconcile(corrected)
+
+    assert result.action is SleepCalendarAction.UPDATED
+    assert backend.event is not None
+    assert backend.event.start_at == corrected.start_at
+    assert backend.event.end_at == corrected.end_at
+    assert backend.event.description == description(corrected)
+    recovered = session.query(CalendarEventMirror).one()
+    assert recovered.status is None
+    assert coerce_utc(recovered.start_at) == corrected.start_at
+    assert coerce_utc(recovered.end_at) == corrected.end_at
+    assert recovered.observation_fingerprint == observation_fingerprint(corrected)
+
+
 def test_metrics_only_pending_recovery_does_not_trust_unrelated_etag_change(
     session,
     backend: RecordingCalendarBackend,
@@ -748,6 +861,212 @@ def test_update_rejects_success_response_with_wrong_description(
     assert pending.status == "healthmes_pending_update"
     assert pending.observation_fingerprint == observation_fingerprint(corrected)
     assert pending.sleep_duration_minutes == corrected.duration_minutes
+
+
+def test_late_actual_sleep_invalidates_exact_pushed_schedule_block_first(
+    session,
+    observation: ActualSleepObservation,
+) -> None:
+    backend = ScheduleAwareBackend()
+    task = Task(title="Early focus")
+    session.add(task)
+    session.flush()
+    proposal = ScheduleProposal(
+        task_id=task.id,
+        proposed_start=observation.end_at - timedelta(minutes=30),
+        proposed_end=observation.end_at + timedelta(minutes=30),
+        status=ProposalStatus.PUSHED,
+    )
+    session.add(proposal)
+    session.commit()
+    identity = CalendarEventIdentity(
+        kind=HealthmesEventKind.SCHEDULE_BLOCK,
+        source="planner",
+        source_key=f"proposal:{proposal.id}",
+    )
+    external_id = calendar_identity_external_id(
+        CalendarSource.GOOGLE,
+        identity,
+    )
+    remote = ExternalEvent(
+        external_id=external_id,
+        summary=task.title,
+        start_at=coerce_utc(proposal.proposed_start),
+        end_at=coerce_utc(proposal.proposed_end),
+        is_agent_created=True,
+        agent_task_id=task.id,
+        identity=identity,
+        etag='"schedule-v1"',
+    )
+    backend.events[external_id] = remote
+    session.add(
+        CalendarEventMirror(
+            external_id=external_id,
+            calendar_source=CalendarSource.GOOGLE,
+            summary=task.title,
+            start_at=proposal.proposed_start,
+            end_at=proposal.proposed_end,
+            is_agent_created=True,
+            agent_task_id=task.id,
+            healthmes_kind=identity.kind.value,
+            healthmes_source=identity.source,
+            healthmes_source_key=identity.source_key,
+            etag=remote.etag,
+        )
+    )
+    session.commit()
+
+    result = SleepCalendarReconciler(session, backend).reconcile(observation)
+
+    assert result.invalidated_schedule_proposal_ids == (str(proposal.id),)
+    assert session.get(ScheduleProposal, proposal.id).status is (
+        ProposalStatus.INVALIDATED
+    )
+    assert backend.delete_requests == [
+        (
+            external_id,
+            HealthmesEventKind.SCHEDULE_BLOCK,
+            '"schedule-v1"',
+        )
+    ]
+    assert backend.timeline == [
+        "delete:schedule_block",
+        "create:actual_sleep",
+    ]
+    remaining = session.query(CalendarEventMirror).all()
+    assert [row.healthmes_kind for row in remaining] == [
+        HealthmesEventKind.ACTUAL_SLEEP.value
+    ]
+
+
+def test_late_actual_sleep_blocks_on_schedule_ownership_mismatch(
+    session,
+    observation: ActualSleepObservation,
+) -> None:
+    backend = ScheduleAwareBackend()
+    task = Task(title="Protected focus")
+    session.add(task)
+    session.flush()
+    proposal = ScheduleProposal(
+        task_id=task.id,
+        proposed_start=observation.end_at - timedelta(minutes=30),
+        proposed_end=observation.end_at + timedelta(minutes=30),
+        status=ProposalStatus.PUSHED,
+    )
+    session.add(proposal)
+    session.commit()
+    identity = CalendarEventIdentity(
+        kind=HealthmesEventKind.SCHEDULE_BLOCK,
+        source="planner",
+        source_key=f"proposal:{proposal.id}",
+    )
+    external_id = calendar_identity_external_id(
+        CalendarSource.GOOGLE,
+        identity,
+    )
+    backend.events[external_id] = ExternalEvent(
+        external_id=external_id,
+        summary=task.title,
+        start_at=coerce_utc(proposal.proposed_start),
+        end_at=coerce_utc(proposal.proposed_end),
+        is_agent_created=False,
+        agent_task_id=task.id,
+        identity=identity,
+        etag='"schedule-v2"',
+    )
+
+    with pytest.raises(SleepCalendarWriteBlocked) as raised:
+        SleepCalendarReconciler(session, backend).reconcile(observation)
+
+    assert raised.value.reason == "overlapping_pushed_block_ownership_conflict"
+    assert raised.value.retryable is False
+    assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PUSHED
+    assert backend.delete_calls == []
+    assert backend.created_drafts == []
+
+
+def test_late_actual_sleep_blocks_on_legacy_identityless_schedule_block(
+    session,
+    observation: ActualSleepObservation,
+) -> None:
+    backend = ScheduleAwareBackend()
+    task = Task(title="Legacy focus")
+    session.add(task)
+    session.flush()
+    proposal = ScheduleProposal(
+        task_id=task.id,
+        proposed_start=observation.end_at - timedelta(minutes=30),
+        proposed_end=observation.end_at + timedelta(minutes=30),
+        status=ProposalStatus.PUSHED,
+    )
+    session.add(proposal)
+    session.commit()
+    legacy_external_id = "legacy-schedule-block"
+    backend.events[legacy_external_id] = ExternalEvent(
+        external_id=legacy_external_id,
+        summary=task.title,
+        start_at=coerce_utc(proposal.proposed_start),
+        end_at=coerce_utc(proposal.proposed_end),
+        is_agent_created=True,
+        agent_task_id=task.id,
+        etag='"legacy"',
+    )
+    session.add(
+        CalendarEventMirror(
+            external_id=legacy_external_id,
+            calendar_source=CalendarSource.GOOGLE,
+            summary=task.title,
+            start_at=proposal.proposed_start,
+            end_at=proposal.proposed_end,
+            is_agent_created=True,
+            agent_task_id=task.id,
+            etag='"legacy"',
+        )
+    )
+    session.commit()
+
+    with pytest.raises(SleepCalendarWriteBlocked) as raised:
+        SleepCalendarReconciler(session, backend).reconcile(observation)
+
+    assert raised.value.reason == "overlapping_pushed_block_ownership_conflict"
+    assert raised.value.retryable is False
+    assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PUSHED
+    assert backend.delete_calls == []
+    assert backend.created_drafts == []
+    assert legacy_external_id in backend.events
+
+
+def test_external_overlap_is_never_deleted_for_actual_sleep(
+    session,
+    observation: ActualSleepObservation,
+) -> None:
+    backend = ScheduleAwareBackend()
+    backend.events["external-meeting"] = ExternalEvent(
+        external_id="external-meeting",
+        summary="External meeting",
+        start_at=observation.end_at - timedelta(minutes=30),
+        end_at=observation.end_at + timedelta(minutes=30),
+        is_agent_created=False,
+        etag='"external"',
+    )
+    session.add(
+        CalendarEventMirror(
+            external_id="external-meeting",
+            calendar_source=CalendarSource.GOOGLE,
+            summary="External meeting",
+            start_at=observation.end_at - timedelta(minutes=30),
+            end_at=observation.end_at + timedelta(minutes=30),
+            is_agent_created=False,
+            etag='"external"',
+        )
+    )
+    session.commit()
+
+    result = SleepCalendarReconciler(session, backend).reconcile(observation)
+
+    assert result.action is SleepCalendarAction.CREATED
+    assert backend.delete_calls == []
+    assert "external-meeting" in backend.events
 
 
 def test_pending_create_recovers_original_intent_before_newer_correction(

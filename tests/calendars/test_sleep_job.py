@@ -14,12 +14,19 @@ from healthmes.calendars.base import (
     ExternalEvent,
     HealthmesEventKind,
     calendar_identity_external_id,
+    coerce_utc,
 )
 from healthmes.calendars.sleep_job import (
     build_sleep_reconciliation_job,
     reconcile_recent_sleep,
 )
-from healthmes.store import CalendarEventMirror, CalendarSource
+from healthmes.store import (
+    CalendarEventMirror,
+    CalendarSource,
+    ProposalStatus,
+    ScheduleProposal,
+    Task,
+)
 
 
 class SleepReader:
@@ -142,6 +149,100 @@ async def test_runtime_create_replay_and_provider_correction(
         ("redacted-user", "2026-07-26", "2026-07-27"),
         ("redacted-user", "2026-07-26", "2026-07-27"),
     ]
+
+
+async def test_schedule_delete_conflict_blocks_actual_sleep_for_retry(
+    session_factory,
+    fake_backend,
+    monkeypatch,
+) -> None:
+    reader = SleepReader([_summary()])
+    with session_factory() as session:
+        task = Task(title="Early focus")
+        session.add(task)
+        session.flush()
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=datetime(2026, 7, 25, 21, 30, tzinfo=UTC),
+            proposed_end=datetime(2026, 7, 25, 22, 30, tzinfo=UTC),
+            status=ProposalStatus.PUSHED,
+        )
+        session.add(proposal)
+        session.commit()
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.SCHEDULE_BLOCK,
+            source="planner",
+            source_key=f"proposal:{proposal.id}",
+        )
+        external_id = calendar_identity_external_id(
+            CalendarSource.GOOGLE,
+            identity,
+        )
+        remote = ExternalEvent(
+            external_id=external_id,
+            summary=task.title,
+            start_at=coerce_utc(proposal.proposed_start),
+            end_at=coerce_utc(proposal.proposed_end),
+            is_agent_created=True,
+            agent_task_id=task.id,
+            identity=identity,
+            etag='"schedule-v1"',
+        )
+        fake_backend.events[external_id] = remote
+        session.add(
+            CalendarEventMirror(
+                external_id=external_id,
+                calendar_source=CalendarSource.GOOGLE,
+                summary=task.title,
+                start_at=proposal.proposed_start,
+                end_at=proposal.proposed_end,
+                is_agent_created=True,
+                agent_task_id=task.id,
+                healthmes_kind=identity.kind.value,
+                healthmes_source=identity.source,
+                healthmes_source_key=identity.source_key,
+                etag=remote.etag,
+            )
+        )
+        session.commit()
+        proposal_uuid = proposal.id
+        proposal_id = str(proposal_uuid)
+
+    def reject_conditional_delete(
+        external_id: str,
+        *,
+        expected_kind=None,
+        expected_etag=None,
+    ) -> None:
+        raise CalendarConflictError(external_id)
+
+    monkeypatch.setattr(
+        fake_backend,
+        "delete_event",
+        reject_conditional_delete,
+    )
+
+    result = await reconcile_recent_sleep(
+        target_date=date(2026, 7, 26),
+        calendar_source=CalendarSource.GOOGLE,
+        client=reader,
+        user_id="redacted-user",
+        session_factory=session_factory,
+        backend=fake_backend,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["action"] == "blocked"
+    assert result["reason"] == "overlapping_pushed_block_cleanup_retry"
+    assert result["retryable"] is True
+    assert result["blocked_proposal_id"] == proposal_id
+    assert result["invalidated_schedule_proposal_ids"] == []
+    assert fake_backend.created_drafts == []
+    with session_factory() as session:
+        proposal = session.get(ScheduleProposal, proposal_uuid)
+        assert proposal is not None
+        assert proposal.status is ProposalStatus.PUSHED
+        assert session.query(CalendarEventMirror).count() == 1
 
 
 async def test_provider_failure_keeps_planned_sleep_and_pending_actual_for_retry(

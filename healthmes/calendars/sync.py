@@ -39,6 +39,7 @@ from healthmes.calendars.base import (
     EventDraft,
     EventNotFoundError,
     ExternalEvent,
+    HealthmesEventKind,
     OwnershipError,
     calendar_identity_external_id,
     coerce_utc,
@@ -49,6 +50,7 @@ from healthmes.calendars.planned_sleep_replacement import (
     proposal_for_planner_event,
 )
 from healthmes.calendars.sleep_mirror import (
+    SLEEP_CREATE_PENDING_STATUS,
     SLEEP_UPDATE_PENDING_STATUS,
 )
 from healthmes.calendars.state import PendingDiffStore, SyncStateStore
@@ -352,6 +354,17 @@ class CalendarMirrorService:
                         new_end_at=event.end_at,
                     )
                 )
+            return
+
+        pending_actual_sleep = _pending_actual_sleep_merge(
+            row,
+            event,
+            trusted_agent=trusted_agent,
+        )
+        if pending_actual_sleep:
+            # Pending intent is authoritative until recovery re-reads remote
+            # state. Writing even only the observed ETag here lets a stale sync
+            # transaction commit after recovery and roll the finalized ETag back.
             return
 
         old_start = coerce_utc(row.start_at)
@@ -821,13 +834,29 @@ def _mirror_metadata_kwargs(event: ExternalEvent) -> dict[str, object]:
     }
 
 
+def _pending_actual_sleep_merge(
+    row: CalendarEventMirror,
+    event: ExternalEvent,
+    *,
+    trusted_agent: bool,
+) -> bool:
+    return (
+        trusted_agent
+        and row.status
+        in {
+            SLEEP_CREATE_PENDING_STATUS,
+            SLEEP_UPDATE_PENDING_STATUS,
+        }
+        and row.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value
+        and event.identity is not None
+        and event.identity.kind is HealthmesEventKind.ACTUAL_SLEEP
+        and row.healthmes_source == event.identity.source
+        and row.healthmes_source_key == event.identity.source_key
+    )
+
+
 def _apply_mirror_metadata(row: CalendarEventMirror, event: ExternalEvent) -> None:
     for field_name, value in _mirror_metadata_kwargs(event).items():
-        if (
-            field_name == "status"
-            and row.status == SLEEP_UPDATE_PENDING_STATUS
-        ):
-            continue
         setattr(row, field_name, value)
 
 
@@ -836,8 +865,4 @@ def _mirror_metadata_changed(row: CalendarEventMirror, event: ExternalEvent) -> 
         getattr(row, field) != getattr(event, field)
         for field in _MIRROR_METADATA_FIELDS
         if hasattr(CalendarEventMirror, field)
-        and not (
-            field == "status"
-            and row.status == SLEEP_UPDATE_PENDING_STATUS
-        )
     )

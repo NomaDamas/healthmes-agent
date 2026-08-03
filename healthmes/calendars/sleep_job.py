@@ -19,7 +19,10 @@ from healthmes.calendars.sleep_observation import (
     select_actual_sleep,
 )
 from healthmes.calendars.sleep_preview import preview_sleep_reconciliation
-from healthmes.calendars.sleep_reconciliation import SleepCalendarReconciler
+from healthmes.calendars.sleep_reconciliation import (
+    SleepCalendarReconciler,
+    SleepCalendarWriteBlocked,
+)
 from healthmes.config import Settings, resolve_timezone
 from healthmes.mcp_server.ow_client import (
     OWClient,
@@ -224,13 +227,30 @@ async def reconcile_recent_sleep(
             raise ValueError("backend is required when dry_run is false")
         if backend.source is not calendar_source:
             raise ValueError("backend source does not match target calendar")
-        result = SleepCalendarReconciler(session, backend).reconcile(selected)
+        try:
+            result = SleepCalendarReconciler(session, backend).reconcile(selected)
+        except SleepCalendarWriteBlocked as exc:
+            return {
+                **preview,
+                "status": "blocked",
+                "action": "blocked",
+                "reason": exc.reason,
+                "retryable": exc.retryable,
+                "blocked_proposal_id": exc.proposal_id,
+                "invalidated_schedule_proposal_ids": list(
+                    exc.invalidated_proposal_ids
+                ),
+            }
         response: dict[str, object] = {
             **preview,
             "status": "ok",
             "action": result.action.value,
             "planned_sleep_replacements": len(result.deleted_planned_external_ids),
         }
+        if result.invalidated_schedule_proposal_ids:
+            response["invalidated_schedule_proposal_ids"] = list(
+                result.invalidated_schedule_proposal_ids
+            )
         if result.planned_sleep_cleanup_pending:
             response["status"] = "cleanup_pending"
             response["planned_sleep_cleanup_pending"] = (
