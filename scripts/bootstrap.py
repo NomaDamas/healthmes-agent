@@ -92,7 +92,12 @@ GENERATED_SECRET_KEY = "HEALTHMES_HERMES_WEBHOOK_SECRET"
 GENERATED_ADJUSTMENT_SECRET_KEY = "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"
 
 # Non-generatable credentials we can only warn about.
-WARN_IF_MISSING = ("TELEGRAM_BOT_TOKEN", "OPEN_WEARABLES_API_KEY")
+WARN_IF_MISSING = (
+    "TELEGRAM_BOT_TOKEN",
+    "OPEN_WEARABLES_API_KEY",
+    "HEALTHMES_TELEGRAM_OWNER_USER_ID",
+    "HEALTHMES_TELEGRAM_OWNER_CHAT_ID",
+)
 
 # Briefing state-snapshot script (docs/PLAN.md section 4 `script:` context
 # injection). The vendor scheduler resolves relative script paths under
@@ -110,6 +115,8 @@ TEMPLATE_KEYS = (
     "telegram_home_chat_id",
     "telegram_home_chat_name",
     "telegram_allowed_user_ids",
+    "telegram_owner_user_id",
+    "telegram_owner_chat_id",
     "hermes_webhook_port",
     "hermes_webhook_secret",
     "healthmes_alert_prompt",
@@ -330,13 +337,17 @@ def build_context(
 ) -> dict[str, Any]:
     """Template context: every TEMPLATE_KEYS entry is present (maybe '')."""
     defaults = mode_defaults(mode, repo_root, env)
-    allowed_raw = env.get("TELEGRAM_ALLOWED_USER_IDS", "").strip()
-    allowed_ids = [part.strip() for part in allowed_raw.split(",") if part.strip()]
+    owner_user_id = env.get("HEALTHMES_TELEGRAM_OWNER_USER_ID", "").strip()
+    owner_chat_id = env.get("HEALTHMES_TELEGRAM_OWNER_CHAT_ID", "").strip()
+    if "*" in {owner_user_id, owner_chat_id}:
+        raise ValueError("Telegram owner user/chat ids must be explicit; '*' is forbidden")
     context: dict[str, Any] = {
         "telegram_bot_token": env.get("TELEGRAM_BOT_TOKEN", "").strip(),
         "telegram_home_chat_id": env.get("TELEGRAM_HOME_CHAT_ID", "").strip(),
         "telegram_home_chat_name": env.get("TELEGRAM_HOME_CHAT_NAME", "").strip(),
-        "telegram_allowed_user_ids": allowed_ids,
+        "telegram_allowed_user_ids": [owner_user_id] if owner_user_id else [],
+        "telegram_owner_user_id": owner_user_id,
+        "telegram_owner_chat_id": owner_chat_id,
         "hermes_webhook_port": env.get("HERMES_WEBHOOK_PORT", "").strip(),
         "hermes_webhook_secret": webhook_secret,
         "healthmes_alert_prompt": env.get("HEALTHMES_ALERT_PROMPT", "").strip(),

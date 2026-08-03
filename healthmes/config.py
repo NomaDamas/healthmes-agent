@@ -100,6 +100,16 @@ class Settings(BaseSettings):
         "Generate and persist a high-entropy value with scripts/bootstrap.py; "
         "calendar adjustment tools fail closed when it is missing or too short.",
     )
+    telegram_owner_user_id: str = Field(
+        default="",
+        description="Telegram user id of the single owner allowed to confirm "
+        "calendar mutations. Empty or '*' makes confirmation fail closed.",
+    )
+    telegram_owner_chat_id: str = Field(
+        default="",
+        description="Telegram chat id in which the owner may confirm calendar "
+        "mutations. Empty or '*' makes confirmation fail closed.",
+    )
     scheduler_enabled: bool = Field(
         default=False,
         description="Enable the in-process APScheduler loops (10-minute trigger "

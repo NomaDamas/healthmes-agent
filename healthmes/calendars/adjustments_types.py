@@ -174,6 +174,10 @@ class AdjustmentRepository(Protocol):
 
     def get_proposal(self, proposal_id: uuid.UUID) -> StoredAdjustmentProposal | None: ...
 
+    def get_pending_proposal_by_handle_digest(
+        self, handle_digest: str
+    ) -> StoredAdjustmentProposal | None: ...
+
     def compare_and_mark_applying(
         self,
         proposal_id: uuid.UUID,

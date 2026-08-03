@@ -30,6 +30,8 @@ def env_file(tmp_path: Path) -> Path:
     path = tmp_path / ".env"
     path.write_text(
         "TELEGRAM_BOT_TOKEN=123456:test-token\n"
+        "HEALTHMES_TELEGRAM_OWNER_USER_ID=owner-user\n"
+        "HEALTHMES_TELEGRAM_OWNER_CHAT_ID=owner-chat\n"
         "OPEN_WEARABLES_API_KEY=ow-test-key\n",
         encoding="utf-8",
     )
@@ -58,6 +60,7 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     # 1. config.yaml rendered and parseable, with vendor-contract keys.
     config = yaml.safe_load((hermes_home / "config.yaml").read_text())
     assert config["platforms"]["telegram"]["token"] == "123456:test-token"
+    assert config["platforms"]["telegram"]["extra"]["allow_from"] == ["owner-user"]
     route = config["platforms"]["webhook"]["extra"]["routes"]["healthmes-alerts"]
     assert route["skills"] == ["healthmes-planner"]
     assert route["deliver"] == "telegram"
@@ -70,6 +73,9 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     # Native defaults: localhost endpoints, repo-local vendored MCP dir.
     servers = config["mcp_servers"]
     assert servers["healthmes"]["url"] == "http://localhost:8100/mcp"
+    trusted = servers["healthmes"]["trusted_session_proof"]
+    assert trusted["owner_user_id"] == "owner-user"
+    assert trusted["owner_chat_id"] == "owner-chat"
     ow = servers["open_wearables"]
     assert ow["env"]["OPEN_WEARABLES_API_URL"] == "http://localhost:8000"
     assert ow["env"]["OPEN_WEARABLES_API_KEY"] == "ow-test-key"
@@ -329,14 +335,28 @@ def test_planner_skill_documents_morning_nudge_trust_boundary():
     assert "do not call `clarify`, and do not wait for a reply" in normalized
     assert "Only live Telegram replies may call" in normalized
     assert "mcp__healthmes__resolve_calendar_adjustment" in normalized
-    assert "original evaluation packet's `proposal_id`" in normalized
-    assert '`response: "적용"`' in normalized
-    assert "exact `<handle>` as `reply_handle`" in normalized
-    assert "Never pass the combined reply text as `response`" in normalized
+    assert "exact combined reply as `response`" in normalized
+    assert "unchanged `<handle>` as `reply_handle`" in normalized
+    assert "Do not pass a proposal id or response channel" in normalized
     assert (
         "Do not rewrite, shorten, translate, log, or expose the handle"
         in normalized
     )
+
+
+def test_wildcard_telegram_owner_is_rejected(bootstrap, tmp_path):
+    env = {
+        "HEALTHMES_TELEGRAM_OWNER_USER_ID": "*",
+        "HEALTHMES_TELEGRAM_OWNER_CHAT_ID": "owner-chat",
+    }
+
+    with pytest.raises(ValueError, match="explicit"):
+        bootstrap.build_context(
+            env,
+            "native",
+            tmp_path,
+            "webhook-secret",
+        )
 
 
 def test_legacy_symlink_is_migrated_to_copy(bootstrap, hermes_home, env_file, tmp_path):

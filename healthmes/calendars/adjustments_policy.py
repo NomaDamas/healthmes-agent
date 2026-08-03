@@ -175,9 +175,15 @@ def _freshness_failure(
     block: Mapping[str, Any], *, local_date: date, now: datetime, freshness: timedelta
 ) -> str | None:
     observed = _observed_at(block)
+    last_night = _mapping(block.get("last_night"))
+    if observed is None:
+        observed = _observed_at(last_night)
     if observed is None:
         observed_date = (
-            block.get("date") or block.get("observed_date") or block.get("freshest_date")
+            block.get("date")
+            or block.get("observed_date")
+            or block.get("freshest_date")
+            or last_night.get("date")
         )
         if observed_date is None:
             entry_dates = [
@@ -200,6 +206,13 @@ def _observed_at(block: Mapping[str, Any]) -> datetime | None:
         value = block.get(key)
         if isinstance(value, datetime):
             return ensure_utc(value)
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is not None:
+                return ensure_utc(parsed)
     return None
 
 

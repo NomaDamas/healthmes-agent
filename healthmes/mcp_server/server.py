@@ -61,7 +61,7 @@ from healthmes.calendars.adjustments import (
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
     SqlAlchemyAdjustmentRepository,
-    verify_reply_handle,
+    digest_reply_handle,
 )
 from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.config import Settings, get_settings, system_timezone
@@ -85,6 +85,7 @@ from healthmes.store import (
     session_scope,
 )
 from healthmes.store import enums as store_enums
+from healthmes.trusted_session import verify_trusted_session_proof
 
 # ---------------------------------------------------------------------------
 # Vocabulary grounded in vendor/open-wearables (do not invent values)
@@ -349,6 +350,42 @@ def _adjustment_handle_secret(settings: Settings | None = None) -> str:
             "with at least 32 characters"
         )
     return value
+
+
+def _telegram_owner_binding(settings: Settings | None = None) -> tuple[str, str]:
+    settings = settings or _active_settings()
+    user_id = settings.telegram_owner_user_id.strip()
+    chat_id = settings.telegram_owner_chat_id.strip()
+    if not user_id or not chat_id or "*" in {user_id, chat_id}:
+        raise ToolError(
+            "HEALTHMES_TELEGRAM_OWNER_USER_ID and "
+            "HEALTHMES_TELEGRAM_OWNER_CHAT_ID must bind one explicit owner"
+        )
+    return user_id, chat_id
+
+
+def _require_trusted_telegram_owner_proof(
+    proof: str | None,
+    *,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> None:
+    owner_user_id, owner_chat_id = _telegram_owner_binding()
+    if (
+        verify_trusted_session_proof(
+            proof,
+            _adjustment_handle_secret(),
+            tool_name=tool_name,
+            arguments=arguments,
+            expected_user_id=owner_user_id,
+            expected_chat_id=owner_chat_id,
+        )
+        is None
+    ):
+        raise ToolError(
+            "trusted_session_proof is missing or invalid; "
+            "resolve only from the configured owner's live Telegram reply"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +808,7 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
 
     # --- charge scores (freshest body_battery / readiness / recovery)
     charge_entries: list[dict[str, Any]] = []
+    charge_recorded_times: list[dt.datetime] = []
     for category in CHARGE_CATEGORIES:
         candidates = [
             (recorded_at, value, row)
@@ -785,6 +823,7 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
         if not candidates:
             continue
         recorded_at, value, row = max(candidates, key=lambda item: item[0])
+        charge_recorded_times.append(recorded_at)
         charge_entries.append(
             {
                 "category": category,
@@ -792,14 +831,18 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
                 "value": round(value, 1),
                 "qualifier": row.get("qualifier"),
                 "observed_on": recorded_at.date().isoformat(),
+                "recorded_at": recorded_at.isoformat(),
             }
         )
     if charge_entries:
-        freshest = max(entry["observed_on"] for entry in charge_entries)
+        freshest_at = max(charge_recorded_times)
         charge_block: dict[str, Any] = {
             "status": interpret.STATUS_OK,
             "entries": charge_entries,
-            "confidence": "high" if freshest == as_of.isoformat() else "medium",
+            "freshest_at": freshest_at.isoformat(),
+            "confidence": (
+                "high" if freshest_at.date() == as_of else "medium"
+            ),
         }
     else:
         charge_block = {
@@ -2266,29 +2309,39 @@ async def evaluate_morning_calendar_nudge(date: str | None = None) -> dict[str, 
 
 @mcp.tool
 def resolve_calendar_adjustment(
-    proposal_id: str,
     response: str,
     reply_handle: str | None = None,
-    response_channel: str | None = None,
+    trusted_session_proof: str | None = None,
 ) -> dict[str, Any]:
     """Resolve one live Telegram confirmation against its one-time proposal handle.
 
-    Only an explicit apply response may enter the separate conditional Google
-    writer; decline, expiry, invalid, stale, replayed, and conflicted responses
-    return redacted receipts without a calendar write.
+    The exact live reply is ``적용 <handle>`` or ``그대로 <handle>``. The server
+    resolves the pending proposal from that handle and accepts only a fresh,
+    owner-bound Telegram proof minted by the Hermes gateway.
     """
-    proposal_uuid = _parse_uuid(proposal_id, "proposal_id")
+    if not reply_handle:
+        raise ToolError("reply_handle is missing or invalid")
+    if response != response.strip() or response not in {
+        f"적용 {reply_handle}",
+        f"그대로 {reply_handle}",
+    }:
+        raise ToolError("response must be the exact live Telegram reply")
+    proof_arguments = {
+        "response": response,
+        "reply_handle": reply_handle,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="resolve_calendar_adjustment",
+        arguments=proof_arguments,
+    )
+    handle_digest = digest_reply_handle(reply_handle, _adjustment_handle_secret())
+
     with _store_session() as session:
         repository = SqlAlchemyAdjustmentRepository(session)
-        proposal = repository.get_proposal(proposal_uuid)
+        proposal = repository.get_pending_proposal_by_handle_digest(handle_digest)
         if proposal is None:
-            raise ToolError("calendar adjustment proposal not found")
-        if not reply_handle or not verify_reply_handle(
-            reply_handle,
-            proposal.reply_handle_digest,
-            _adjustment_handle_secret(),
-        ):
-            raise ToolError("reply_handle is missing or invalid")
+            raise ToolError("reply_handle is invalid, expired, or already consumed")
 
         writer = _calendar_adjustment_writer()
         service = CalendarAdjustmentService(
@@ -2301,14 +2354,14 @@ def resolve_calendar_adjustment(
             else None
         )
         result = service.resolve_calendar_adjustment(
-            proposal_uuid,
-            response=response,
+            proposal.id,
+            response=response.split(" ", 1)[0],
             reply_handle=reply_handle,
             writer=writer,
-            response_channel=response_channel,
+            response_channel="telegram",
             mirror_snapshot=mirror_snapshot,
         )
-        current = repository.get_proposal(proposal_uuid)
+        current = repository.get_proposal(proposal.id)
         outcome_url = (
             _decision_viewer_url(current.outcome_decision_record_id)
             if current is not None and current.outcome_decision_record_id is not None

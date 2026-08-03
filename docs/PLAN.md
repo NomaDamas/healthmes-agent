@@ -153,8 +153,9 @@ event를 `SHORTEN`할 수 있다. 대상/변경량/ETag는 server evaluator가 �
 07:00 cron에서 `evaluate_morning_calendar_nudge()` 결과 display packet과
 `적용 <handle>` / `그대로 <handle>` 문구를 그대로 보내고 종료한다. 이후 allowed-user
 reply는 live Hermes session이 원문에서 response와 handle을 분리하고, 기존 evaluation의
-`proposal_id`, 별도 `response`, 변경하지 않은 `reply_handle`,
-`response_channel="telegram"`을 `resolve_calendar_adjustment()`에 전달한다. MOVE,
+정확한 Telegram 응답 문자열과 변경하지 않은 `reply_handle`을
+`resolve_calendar_adjustment()`에 전달한다. 서버는 owner-bound signed proof를
+검증하고 handle로 pending proposal을 찾는다. MOVE,
 삭제, 제목/참석자/반복 수정, iCloud/CalDAV 외부 이벤트 변경은 여전히 금지다.
 `APPLIED_RECOVERED`, `UNKNOWN`, `FAILED_NO_CHANGE`는 이 예외의 서버 내부 terminal
 receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한을 뜻하지 않는다.

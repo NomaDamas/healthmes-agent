@@ -90,6 +90,7 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+_SESSION_MESSAGE_TEXT: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_TEXT", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
@@ -165,6 +166,7 @@ def set_session_vars(
     session_key: str = "",
     session_id: str = "",
     message_id: str = "",
+    message_text: str = "",
     profile: str = "",
     cwd: str = "",
     async_delivery: bool = True,
@@ -202,6 +204,7 @@ def set_session_vars(
         _SESSION_ID.set(session_id),
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
+        _SESSION_MESSAGE_TEXT.set(message_text),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
@@ -237,6 +240,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_ID,
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
+        _SESSION_MESSAGE_TEXT,
         _SESSION_PROFILE,
     ):
         var.set("")
@@ -289,6 +293,7 @@ def reset_session_vars() -> None:
     """
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _SESSION_MESSAGE_TEXT.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
@@ -325,6 +330,11 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def get_session_message_text() -> str:
+    value = _SESSION_MESSAGE_TEXT.get()
+    return "" if value is _UNSET else value
 
 
 def async_delivery_supported() -> bool:
