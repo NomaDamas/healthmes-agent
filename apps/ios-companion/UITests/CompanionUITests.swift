@@ -87,4 +87,53 @@ final class CompanionUITests: XCTestCase {
             "food-log POST should round-trip against the live instance"
         )
     }
+
+    /// Visual contract for #91: a user can expand the notification and see
+    /// both decision buttons without opening the HealthMes app.
+    func testExpandedDecisionNotificationShowsNoAndYes() throws {
+        let app = XCUIApplication()
+        app.launchArguments += ["-healthmes-notification-demo"]
+
+        addUIInterruptionMonitor(withDescription: "Notification permission") { alert in
+            let allow = alert.buttons["허용"].exists ? alert.buttons["허용"] : alert.buttons["Allow"]
+            guard allow.exists else { return false }
+            allow.tap()
+            return true
+        }
+
+        app.launch()
+        app.tap()
+        sleep(1)
+        XCUIDevice.shared.press(.home)
+
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let notificationTitle = springboard.staticTexts["Sleep debt · recovery low"]
+        XCTAssertTrue(
+            notificationTitle.waitForExistence(timeout: 8),
+            "The deterministic HealthMes decision notification should appear."
+        )
+
+        notificationTitle.press(forDuration: 1.5)
+
+        XCTAssertTrue(
+            springboard.staticTexts["Health-based schedule proposal"].waitForExistence(timeout: 5),
+            "The HealthMes content extension must render instead of a blank card."
+        )
+        XCTAssertTrue(
+            springboard.staticTexts[
+                "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
+            ].exists,
+            "The expanded card must explain the proposed schedule change."
+        )
+
+        let no = springboard.buttons["No"]
+        let yes = springboard.buttons["Yes"]
+        XCTAssertTrue(no.waitForExistence(timeout: 5), "Expanded notification must show No.")
+        XCTAssertTrue(yes.waitForExistence(timeout: 5), "Expanded notification must show Yes.")
+
+        let screenshot = XCTAttachment(screenshot: springboard.screenshot())
+        screenshot.name = "HealthMes expanded decision notification"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
 }

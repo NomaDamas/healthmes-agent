@@ -97,6 +97,50 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         try? await UNUserNotificationCenter.current().add(request)
     }
 
+    #if DEBUG
+        /// Deterministic simulator/UI-test entry point for visually proving
+        /// the expanded notification card and its two decision actions.
+        func postDecisionDemo() async {
+            guard await requestAuthorization() else { return }
+
+            // Give the UI test enough time to put the app in the background
+            // so SpringBoard, rather than the foreground delegate, owns it.
+            try? await Task.sleep(for: .seconds(6))
+
+            let formatter = ISO8601DateFormatter()
+            let now = Date()
+            let alertID = UUID().uuidString.lowercased()
+            let content = AlertNotificationContent(
+                title: String(localized: "Sleep debt · recovery low"),
+                body: [
+                    String(localized: "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"),
+                    AlertNotificationContent.expansionHint,
+                ].joined(separator: "\n"),
+                categoryID: AlertNotificationContent.actionableCategoryID,
+                threadID: "healthmes-decision-demo",
+                userInfo: [
+                    AlertNotificationContent.userInfoAlertID: alertID,
+                    AlertNotificationContent.userInfoProposalID:
+                        "00000000-0000-0000-0000-000000000091",
+                    AlertNotificationContent.userInfoDecisionObservation:
+                        String(localized: "Sleep debt · recovery low"),
+                    AlertNotificationContent.userInfoDecisionAction:
+                        String(
+                            localized:
+                                "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
+                        ),
+                    AlertNotificationContent.userInfoDecisionAfter:
+                        formatter.string(from: now.addingTimeInterval(24 * 60 * 60)),
+                    AlertNotificationContent.userInfoDecisionEndsAt:
+                        formatter.string(from: now.addingTimeInterval(25.5 * 60 * 60)),
+                    AlertNotificationContent.userInfoDecisionExpiresAt:
+                        formatter.string(from: now.addingTimeInterval(30 * 60)),
+                ]
+            )
+            await post(content: content)
+        }
+    #endif
+
     /// Outcome toast for actions taken from the lock screen (there is no
     /// visible UI to confirm in).
     func postOutcome(title: String, body: String) async {

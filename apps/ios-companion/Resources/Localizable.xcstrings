@@ -254,6 +254,28 @@
         }
       }
     },
+    "Sleep debt · recovery low": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "수면 부족 · 회복 낮음"
+          }
+        }
+      }
+    },
+    "Move the 2:00 PM focus block to tomorrow at 9:30 AM?": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "14:00 집중 업무를 내일 09:30으로 옮길까요?"
+          }
+        }
+      }
+    },
     "Long-press to choose No or Yes": {
       "extractionState": "manual",
       "localizations": {

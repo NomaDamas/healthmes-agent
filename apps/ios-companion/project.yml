@@ -140,6 +140,9 @@ targets:
       - Sources/NotificationContentExtension
     resources:
       - Resources/Localizable.xcstrings
+    dependencies:
+      - sdk: UserNotifications.framework
+      - sdk: UserNotificationsUI.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.notification-content

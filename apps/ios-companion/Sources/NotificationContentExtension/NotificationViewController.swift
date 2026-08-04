@@ -108,7 +108,10 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
     func didReceive(_ notification: UNNotification) {
         let content = notification.request.content
         let info = content.userInfo
-        installDecisionActions()
+        // The category actions still mirror to Apple Watch. On iPhone this
+        // custom card owns the interaction, so suppress the duplicate native
+        // action list below it.
+        extensionContext?.notificationActions = []
         proposalID = (info["healthmes_proposal_id"] as? String).flatMap(UUID.init(uuidString:))
         statusLabel.text =
             info["healthmes_decision_observation"] as? String ?? content.title
@@ -203,26 +206,6 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         yesButton.isEnabled = true
     }
 
-    private func installDecisionActions() {
-        #if targetEnvironment(simulator)
-            let protectedOptions: UNNotificationActionOptions = []
-        #else
-            let protectedOptions: UNNotificationActionOptions = [.authenticationRequired]
-        #endif
-        let no = UNNotificationAction(
-            identifier: "HEALTHMES_NO",
-            title: String(localized: "No"),
-            options: protectedOptions,
-            icon: UNNotificationActionIcon(systemImageName: "xmark.circle")
-        )
-        let yes = UNNotificationAction(
-            identifier: "HEALTHMES_YES",
-            title: String(localized: "Yes"),
-            options: protectedOptions,
-            icon: UNNotificationActionIcon(systemImageName: "checkmark.circle.fill")
-        )
-        extensionContext?.notificationActions = [no, yes]
-    }
 }
 
 private enum DecisionAction: String {
