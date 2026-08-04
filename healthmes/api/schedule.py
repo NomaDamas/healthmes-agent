@@ -15,14 +15,16 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
-from starlette.status import HTTP_422_UNPROCESSABLE_CONTENT
+from starlette.status import HTTP_409_CONFLICT, HTTP_422_UNPROCESSABLE_CONTENT
 
 from healthmes.api.common import UTCDateTime
 from healthmes.api.errors import APIError, invalid_transition, not_found
 from healthmes.api.pagination import Page, PageParamsDep, paginate
+from healthmes.calendars.sleep_context import actual_sleep_violation
+from healthmes.config import resolve_timezone
 from healthmes.store import CalendarEventMirror, CalendarSource, ProposalStatus, ScheduleProposal
 from healthmes.store.session import SessionDep
 
@@ -55,6 +57,7 @@ class ProposalOut(BaseModel):
     proposed_end: datetime
     status: ProposalStatus
     decision_record_id: uuid.UUID | None
+    healthmes_kind: str | None
 
 
 @router.get("/events")
@@ -103,13 +106,35 @@ def list_proposals(
 
 
 def _resolve_proposal(
-    session: SessionDep, proposal_id: uuid.UUID, target: ProposalStatus
+    session: SessionDep,
+    proposal_id: uuid.UUID,
+    target: ProposalStatus,
+    *,
+    request: Request | None = None,
 ) -> ProposalOut:
     proposal = session.get(ScheduleProposal, proposal_id)
     if proposal is None:
         raise not_found("schedule_proposal", proposal_id)
     if proposal.status != ProposalStatus.PROPOSED:
         raise invalid_transition("schedule_proposal", proposal.status.value, target.value)
+    if target is ProposalStatus.ACCEPTED:
+        if request is None:
+            raise RuntimeError("request is required when accepting a proposal")
+        violation = actual_sleep_violation(
+            session,
+            proposal.proposed_start,
+            proposal.proposed_end,
+            resolve_timezone(request.app.state.settings),
+        )
+        if violation is not None:
+            proposal.status = ProposalStatus.INVALIDATED
+            session.commit()
+            raise APIError(
+                HTTP_409_CONFLICT,
+                "actual_sleep_conflict",
+                violation,
+                detail={"proposal_status": ProposalStatus.INVALIDATED.value},
+            )
     proposal.status = target
     session.commit()
     session.refresh(proposal)
@@ -117,9 +142,18 @@ def _resolve_proposal(
 
 
 @router.post("/proposals/{proposal_id}/accept")
-def accept_proposal(proposal_id: uuid.UUID, session: SessionDep) -> ProposalOut:
+def accept_proposal(
+    proposal_id: uuid.UUID,
+    session: SessionDep,
+    request: Request,
+) -> ProposalOut:
     """Accept a pending proposal (``proposed`` -> ``accepted``)."""
-    return _resolve_proposal(session, proposal_id, ProposalStatus.ACCEPTED)
+    return _resolve_proposal(
+        session,
+        proposal_id,
+        ProposalStatus.ACCEPTED,
+        request=request,
+    )
 
 
 @router.post("/proposals/{proposal_id}/decline")

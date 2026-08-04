@@ -12,7 +12,14 @@ import pytest
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from healthmes.calendars.base import EventDraft, ExternalEvent, SyncState
+from healthmes.calendars.base import (
+    EventDraft,
+    EventNotFoundError,
+    ExternalEvent,
+    HealthmesEventKind,
+    SyncState,
+    calendar_identity_external_id,
+)
 from healthmes.store import Base, CalendarSource, create_db_engine
 
 
@@ -51,6 +58,8 @@ class FakeCalendarBackend:
         self.created_drafts: list[EventDraft] = []
         self.update_calls: list[dict[str, object]] = []
         self.delete_calls: list[str] = []
+        self.delete_expected_kinds: list[HealthmesEventKind | None] = []
+        self.events: dict[str, ExternalEvent] = {}
         self._create_counter = 0
 
     def queue_changes(self, events: list[ExternalEvent], sync_state: SyncState) -> None:
@@ -67,15 +76,30 @@ class FakeCalendarBackend:
     def create_event(self, draft: EventDraft) -> ExternalEvent:
         self._create_counter += 1
         self.created_drafts.append(draft)
-        return ExternalEvent(
-            external_id=f"{self.source.value}-agent-{self._create_counter}",
+        external_id = (
+            calendar_identity_external_id(self.source, draft.identity)
+            if draft.identity is not None
+            else f"{self.source.value}-agent-{self._create_counter}"
+        )
+        event = ExternalEvent(
+            external_id=external_id,
             summary=draft.summary,
+            description=draft.description,
             start_at=draft.start_at,
             end_at=draft.end_at,
             is_agent_created=True,
             agent_task_id=draft.agent_task_id,
+            identity=draft.identity,
             etag=f"etag-created-{self._create_counter}",
         )
+        self.events[event.external_id] = event
+        return event
+
+    def read_event(self, external_id: str) -> ExternalEvent:
+        try:
+            return self.events[external_id]
+        except KeyError as exc:
+            raise EventNotFoundError(external_id) from exc
 
     def update_event(
         self,
@@ -85,6 +109,7 @@ class FakeCalendarBackend:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         description: str | None = None,
+        expected_etag: str | None = None,
     ) -> ExternalEvent:
         self.update_calls.append(
             {
@@ -93,20 +118,34 @@ class FakeCalendarBackend:
                 "start_at": start_at,
                 "end_at": end_at,
                 "description": description,
+                "expected_etag": expected_etag,
             }
         )
         assert start_at is not None and end_at is not None, "service always moves with both times"
-        return ExternalEvent(
+        event = ExternalEvent(
             external_id=external_id,
             summary=summary or "moved block",
+            description=description,
             start_at=start_at,
             end_at=end_at,
             is_agent_created=True,
+            agent_task_id=self.events[external_id].agent_task_id,
+            identity=self.events[external_id].identity,
             etag="etag-updated",
         )
+        self.events[external_id] = event
+        return event
 
-    def delete_event(self, external_id: str) -> None:
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
+    ) -> None:
         self.delete_calls.append(external_id)
+        self.delete_expected_kinds.append(expected_kind)
+        self.events.pop(external_id, None)
 
 
 @pytest.fixture
@@ -132,10 +171,12 @@ def make_event() -> object:
         external_id: str,
         *,
         summary: str | None = "Team standup",
+        description: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
         is_agent_created: bool = False,
         agent_task_id=None,
+        identity=None,
         etag: str | None = "etag-1",
         deleted: bool = False,
         organizer_self: bool = False,
@@ -152,10 +193,12 @@ def make_event() -> object:
         return ExternalEvent(
             external_id=external_id,
             summary=summary,
+            description=description,
             start_at=start,
             end_at=end,
             is_agent_created=is_agent_created,
             agent_task_id=agent_task_id,
+            identity=identity,
             etag=etag,
             deleted=deleted,
             organizer_self=organizer_self,

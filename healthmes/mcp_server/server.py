@@ -63,7 +63,9 @@ from healthmes.calendars.adjustments import (
     SqlAlchemyAdjustmentRepository,
     digest_reply_handle,
 )
+from healthmes.calendars.base import HealthmesEventKind
 from healthmes.calendars.google import GoogleCalendarBackend
+from healthmes.calendars.sleep_context import actual_sleep_context, actual_sleep_violation
 from healthmes.config import Settings, get_settings, system_timezone
 from healthmes.mcp_server import adjustment_tools, arousal, impact, interpret, timeline
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
@@ -758,6 +760,8 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     workout_rows = await client.collect_workouts(
         user_id, (as_of - dt.timedelta(days=1)).isoformat(), as_of.isoformat()
     )
+    with _store_session() as session:
+        actual_sleep_block = actual_sleep_context(session, as_of, tz)
 
     # --- sleep debt (internal sleep score; algorithms/sleep.py, never reinvented)
     internal_sleep_points = _localized(
@@ -887,6 +891,7 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
         "baseline_window_days": interpret.BASELINE_WINDOW_DAYS,
         "confidence": interpret.overall_confidence(core_blocks),
         "sleep_debt": sleep_block,
+        "actual_sleep": actual_sleep_block,
         "hrv": hrv_block,
         "stress": stress_block,
         "charge": charge_block,
@@ -2415,6 +2420,10 @@ class ScheduleBlockIn(BaseModel):
     energy_demand: str | None = Field(
         default=None, description="low / med / high for an auto-created task"
     )
+    healthmes_kind: str | None = Field(
+        default=None,
+        description="planned_sleep only when this confirmed block is a sleep plan",
+    )
     start: str = Field(description="Block start, ISO-8601 (naive = UTC)")
     end: str = Field(description="Block end, ISO-8601, after start")
 
@@ -2454,6 +2463,10 @@ def propose_schedule_blocks(
                     f"blocks[{index}].energy_demand must be low/med/high, got "
                     f"{block.energy_demand!r}"
                 )
+        if block.healthmes_kind not in {None, HealthmesEventKind.PLANNED_SLEEP.value}:
+            raise ToolError(
+                f"blocks[{index}].healthmes_kind must be planned_sleep or omitted"
+            )
     parsed: list[tuple[ScheduleBlockIn, dt.datetime, dt.datetime]] = []
     for index, block in enumerate(blocks):
         start = _parse_datetime_utc(block.start, f"blocks[{index}].start")
@@ -2465,6 +2478,10 @@ def propose_schedule_blocks(
     with _store_session() as session:
         if decision_uuid is not None and session.get(DecisionRecord, decision_uuid) is None:
             raise ToolError(f"decision_record {decision_record_id} not found")
+        for index, (_, start, end) in enumerate(parsed):
+            violation = actual_sleep_violation(session, start, end, _local_timezone())
+            if violation is not None:
+                raise ToolError(f"blocks[{index}]: {violation}")
         created: list[dict[str, Any]] = []
         for index, (block, start, end) in enumerate(parsed):
             if block.task_id is not None:
@@ -2503,6 +2520,7 @@ def propose_schedule_blocks(
                 proposed_end=end,
                 status=ProposalStatus.PROPOSED,
                 decision_record_id=decision_uuid,
+                healthmes_kind=block.healthmes_kind,
             )
             session.add(proposal)
             session.flush()
@@ -2514,6 +2532,7 @@ def propose_schedule_blocks(
                     "start": _iso_utc(start),
                     "end": _iso_utc(end),
                     "proposal_status": _enum_value(proposal.status),
+                    "healthmes_kind": proposal.healthmes_kind,
                     "conflicts": conflicts,
                 }
             )

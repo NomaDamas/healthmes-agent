@@ -138,7 +138,9 @@ class TestCreateMedicalRecord:
             row = session.scalars(select(MedicalRecord)).one()
         health = row.context["health"]
         assert health["status"] == "unavailable"
-        assert "connection refused" in health["reason"]
+        assert health["reason"] == (
+            "open-wearables API error: open-wearables request failed (transport)"
+        )
 
     async def test_transcript_is_stored_for_voice_captures(
         self, mcp_client, call_tool, store_factory

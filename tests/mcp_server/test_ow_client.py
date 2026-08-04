@@ -1,5 +1,7 @@
 """Unit tests for the open-wearables REST client (httpx.MockTransport only)."""
 
+import logging
+
 import httpx
 import pytest
 
@@ -7,6 +9,7 @@ from healthmes.config import Settings
 from healthmes.mcp_server.ow_client import (
     OWAuthError,
     OWClient,
+    OWClientError,
     OWConfigurationError,
     OWNotFoundError,
 )
@@ -45,6 +48,17 @@ class TestRequestShape:
         request = fake_ow.requests[-1]
         assert request.url.path == f"/api/v1/users/{ow_user_id}/events/workouts"
         assert request.url.params["record_type"] == "running"
+
+    async def test_debug_log_does_not_expose_provider_user_id(
+        self, caplog, fake_ow, ow_client, ow_user_id
+    ):
+        with caplog.at_level(logging.DEBUG):
+            await ow_client.get_sleep_summaries(
+                ow_user_id,
+                "2026-07-01",
+                "2026-07-09",
+            )
+        assert ow_user_id not in caplog.text
 
     async def test_timeseries_types_are_repeated_query_params(self, ow_user_id, ow_api_key):
         requests: list[httpx.Request] = []
@@ -99,8 +113,12 @@ class TestErrorMapping:
             await client.list_users()
 
     async def test_404_maps_to_not_found(self, ow_client):
-        with pytest.raises(OWNotFoundError):
-            await ow_client._get("/api/v1/users/nonexistent/health-scores")
+        provider_user_id = "provider-user-secret"
+        with pytest.raises(OWNotFoundError) as exc_info:
+            await ow_client._get(
+                f"/api/v1/users/{provider_user_id}/health-scores"
+            )
+        assert provider_user_id not in str(exc_info.value)
 
     async def test_missing_api_key_fails_before_any_request(self, fake_ow):
         client = OWClient(
@@ -112,7 +130,7 @@ class TestErrorMapping:
             await client.list_users()
         assert fake_ow.requests == []
 
-    async def test_5xx_raises_http_status_error(self, ow_api_key):
+    async def test_5xx_maps_to_redacted_client_error(self, ow_api_key):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(500, json={"detail": "boom"})
 
@@ -121,8 +139,15 @@ class TestErrorMapping:
             api_key=ow_api_key,
             transport=httpx.MockTransport(handler),
         )
-        with pytest.raises(httpx.HTTPStatusError):
-            await client.list_users()
+        provider_user_id = "provider-user-secret"
+        with pytest.raises(OWClientError) as exc_info:
+            await client.get_sleep_summaries(
+                provider_user_id,
+                "2026-07-01",
+                "2026-07-09",
+            )
+        assert provider_user_id not in str(exc_info.value)
+        assert "open-wearables.test" not in str(exc_info.value)
 
 
 class TestPagination:
@@ -334,4 +359,3 @@ class TestPaginationTruncationTracked:
         )
         assert isinstance(rows, list)
         assert rows[0]["value"] == 30
-

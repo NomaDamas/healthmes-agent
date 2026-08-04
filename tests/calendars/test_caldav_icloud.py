@@ -9,10 +9,15 @@ from datetime import UTC, date, datetime, timedelta, timezone
 
 import icalendar
 import pytest
+from caldav import Event as CalDavEvent
+from caldav.lib.url import URL
 
 from healthmes.calendars.base import (
+    CalendarConflictError,
+    CalendarEventIdentity,
     EventDraft,
     EventNotFoundError,
+    HealthmesEventKind,
     OwnershipError,
 )
 from healthmes.calendars.caldav_icloud import (
@@ -28,6 +33,41 @@ class NotFoundError(Exception):
     """Stub matching caldav.lib.error.NotFoundError by class name."""
 
 
+class FakeDavResponse:
+    def __init__(self, status: int, headers: dict[str, str] | None = None) -> None:
+        self.status = status
+        self.headers = headers or {}
+
+
+class FakeDavClient:
+    def __init__(self, calendar: "FakeCalDavCalendar") -> None:
+        self.calendar = calendar
+        self.url = URL("https://caldav.invalid/")
+
+    def request(
+        self,
+        url: str,
+        method: str,
+        headers: dict[str, str],
+    ) -> FakeDavResponse:
+        uid = url.rsplit("/", 1)[-1]
+        self.calendar.conditional_delete_calls.append((uid, method, headers))
+        obj = self.calendar.objects.get(uid)
+        if obj is None:
+            return FakeDavResponse(404)
+        if headers.get("If-Match") != obj.etag:
+            return FakeDavResponse(412)
+        self.calendar.deleted_uids.append(uid)
+        self.calendar.objects.pop(uid)
+        return FakeDavResponse(204)
+
+    def put(self, url, body: str, headers: dict[str, str]) -> FakeDavResponse:
+        self.calendar.conditional_update_calls.append(
+            (str(url), body, dict(headers))
+        )
+        return FakeDavResponse(204, {"Etag": '"etag-after-put"'})
+
+
 def make_component(
     uid: str,
     *,
@@ -36,6 +76,7 @@ def make_component(
     end: object = None,
     agent: bool = False,
     task_id: uuid.UUID | None = None,
+    healthmes_kind: str | None = None,
 ) -> icalendar.Event:
     component = icalendar.Event()
     component.add("uid", uid)
@@ -50,6 +91,8 @@ def make_component(
         component["X-HEALTHMES"] = "1"
     if task_id is not None:
         component["X-HEALTHMES-TASK-ID"] = str(task_id)
+    if healthmes_kind is not None:
+        component["X-HEALTHMES-KIND"] = healthmes_kind
     return component
 
 
@@ -60,7 +103,13 @@ class FakeCalDavObject:
         self.icalendar_component = component
         self.props = {ETAG_PROPERTY_TAG: etag} if etag else {}
         self._calendar = calendar
+        self.client = FakeDavClient(calendar)
+        self.url = f"https://caldav.invalid/{self.uid}"
         self.saved = False
+
+    @property
+    def etag(self) -> str | None:
+        return self.props.get(ETAG_PROPERTY_TAG)
 
     @property
     def uid(self) -> str:
@@ -77,6 +126,7 @@ class FakeCalDavObject:
 
 class FakeCalDavCalendar:
     def __init__(self, ctag: str | None = "ctag-1") -> None:
+        self.url = URL("https://caldav.invalid/")
         self.ctag = ctag
         self.objects: dict[str, FakeCalDavObject] = {}
         self.events_calls = 0
@@ -84,6 +134,8 @@ class FakeCalDavCalendar:
         self.added_icals: list[str] = []
         self.saved_objects: list[str] = []
         self.deleted_uids: list[str] = []
+        self.conditional_delete_calls: list[tuple[str, str, dict[str, str]]] = []
+        self.conditional_update_calls: list[tuple[str, str, dict[str, str]]] = []
 
     def put(
         self, component: icalendar.Event, etag: str | None = '"etag-1"'
@@ -106,11 +158,20 @@ class FakeCalDavCalendar:
             raise NotFoundError(uid)
         return self.objects[uid]
 
-    def add_event(self, ical: str | None = None, **_: object) -> FakeCalDavObject:
+    def add_event(
+        self,
+        ical: str | None = None,
+        *,
+        no_overwrite: bool = False,
+        **_: object,
+    ) -> FakeCalDavObject:
         assert ical is not None
-        self.added_icals.append(ical)
         parsed = icalendar.Calendar.from_ical(ical)
         (component,) = [c for c in parsed.subcomponents if c.name == "VEVENT"]
+        uid = str(component.get("UID"))
+        if no_overwrite and uid in self.objects:
+            raise RuntimeError(f"precondition failed for {uid}")
+        self.added_icals.append(ical)
         return self.put(component, etag='"fresh"')
 
 
@@ -274,6 +335,98 @@ class TestCreateEvent:
         assert events[0].is_agent_created
         assert stored.uid == created.external_id
 
+    def test_actual_sleep_identity_round_trips_x_properties(
+        self, backend, calendar
+    ) -> None:
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key="oura:2026-07-26",
+        )
+        created = backend.create_event(
+            EventDraft(
+                summary="수면 (실제)",
+                start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+                end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+                identity=identity,
+            )
+        )
+
+        (ical_text,) = calendar.added_icals
+        assert "X-HEALTHMES-KIND:actual_sleep" in ical_text
+        assert "X-HEALTHMES-SOURCE:oura" in ical_text
+        assert "X-HEALTHMES-SOURCE-KEY:oura:2026-07-26" in ical_text
+        (parsed,), _ = backend.list_changes(None)
+        assert created.identity == identity
+        assert parsed.identity == identity
+
+    def test_identity_collision_requires_a_local_recovery_intent(
+        self, backend, calendar
+    ) -> None:
+        # Given
+        draft = EventDraft(
+            summary="수면 (실제)",
+            start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+            end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+            identity=CalendarEventIdentity(
+                kind=HealthmesEventKind.ACTUAL_SLEEP,
+                source="oura",
+                source_key="oura:2026-07-26",
+            ),
+        )
+
+        # When
+        first = backend.create_event(draft)
+        with pytest.raises(CalendarConflictError):
+            backend.create_event(draft)
+
+        # Then
+        assert first.identity == draft.identity
+        assert len(calendar.objects) == 1
+        assert len(calendar.added_icals) == 1
+
+    def test_identity_create_does_not_overwrite_a_concurrent_foreign_event(
+        self, backend, calendar, monkeypatch
+    ) -> None:
+        # Given
+        draft = EventDraft(
+            summary="수면 (실제)",
+            start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+            end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+            identity=CalendarEventIdentity(
+                kind=HealthmesEventKind.ACTUAL_SLEEP,
+                source="oura",
+                source_key="oura:2026-07-26",
+            ),
+        )
+        add_event = calendar.add_event
+
+        def raced_add_event(
+            ical: str | None = None,
+            *,
+            no_overwrite: bool = False,
+            **kwargs: object,
+        ) -> FakeCalDavObject:
+            assert ical is not None
+            parsed = icalendar.Calendar.from_ical(ical)
+            (component,) = [c for c in parsed.subcomponents if c.name == "VEVENT"]
+            uid = str(component.get("UID"))
+            calendar.put(make_component(uid, summary="Foreign"))
+            return add_event(
+                ical=ical,
+                no_overwrite=no_overwrite,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(calendar, "add_event", raced_add_event)
+
+        # When / Then
+        with pytest.raises(OwnershipError):
+            backend.create_event(draft)
+        stored = next(iter(calendar.objects.values())).icalendar_component
+        assert str(stored.get("SUMMARY")) == "Foreign"
+        assert stored.get("X-HEALTHMES") is None
+
 
 class TestUpdateAndDelete:
     def test_update_rewrites_times_and_saves(self, backend, calendar) -> None:
@@ -296,6 +449,48 @@ class TestUpdateAndDelete:
             backend.update_event("theirs", summary="hijack")
         assert calendar.saved_objects == []
 
+    def test_update_uses_the_read_only_remote_etag_for_if_match(
+        self, backend, calendar
+    ) -> None:
+        obj = calendar.put(
+            make_component("mine@healthmes", agent=True),
+            etag='"remote-v1"',
+        )
+
+        updated = backend.update_event(
+            "mine@healthmes",
+            summary="corrected",
+            expected_etag='"remote-v1"',
+        )
+
+        assert obj.saved
+        assert updated.summary == "corrected"
+        assert obj.etag == '"remote-v1"'
+
+    def test_real_caldav_save_sends_the_read_only_etag_as_if_match(
+        self, backend, calendar
+    ) -> None:
+        component = make_component("mine@healthmes", agent=True)
+        obj = CalDavEvent(
+            client=FakeDavClient(calendar),
+            url="https://caldav.invalid/mine@healthmes",
+            data=component.to_ical().decode(),
+            parent=calendar,
+            props={ETAG_PROPERTY_TAG: '"remote-v1"'},
+        )
+        calendar.objects["mine@healthmes"] = obj
+
+        updated = backend.update_event(
+            "mine@healthmes",
+            summary="corrected",
+            expected_etag='"remote-v1"',
+        )
+
+        assert updated.summary == "corrected"
+        assert len(calendar.conditional_update_calls) == 1
+        _, _, headers = calendar.conditional_update_calls[0]
+        assert headers["if-match"] == '"remote-v1"'
+
     def test_update_missing_event_raises_not_found(self, backend) -> None:
         with pytest.raises(EventNotFoundError):
             backend.update_event("ghost", summary="x")
@@ -310,4 +505,104 @@ class TestUpdateAndDelete:
         calendar.put(make_component("theirs", agent=False))
         with pytest.raises(OwnershipError):
             backend.delete_event("theirs")
+        assert calendar.deleted_uids == []
+
+    def test_delete_requires_expected_healthmes_kind(self, backend, calendar) -> None:
+        calendar.put(
+            make_component(
+                "mine@healthmes",
+                agent=True,
+                healthmes_kind="actual_sleep",
+            )
+        )
+        with pytest.raises(OwnershipError, match="planned_sleep"):
+            backend.delete_event(
+                "mine@healthmes",
+                expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+            )
+        assert calendar.deleted_uids == []
+
+    def test_delete_accepts_matching_healthmes_kind(self, backend, calendar) -> None:
+        calendar.put(
+            make_component(
+                "mine@healthmes",
+                agent=True,
+                healthmes_kind="planned_sleep",
+            )
+        )
+        backend.delete_event(
+            "mine@healthmes",
+            expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+        )
+        assert calendar.deleted_uids == ["mine@healthmes"]
+
+    def test_delete_sends_mirror_etag_as_if_match(self, backend, calendar) -> None:
+        calendar.put(
+            make_component(
+                "mine@healthmes",
+                agent=True,
+                healthmes_kind="planned_sleep",
+            ),
+            etag='"etag-1"',
+        )
+        backend.delete_event(
+            "mine@healthmes",
+            expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+            expected_etag='"etag-1"',
+        )
+        assert calendar.conditional_delete_calls == [
+            (
+                "mine@healthmes",
+                "DELETE",
+                {"If-Match": '"etag-1"'},
+            )
+        ]
+        assert calendar.deleted_uids == ["mine@healthmes"]
+
+    def test_delete_blocks_when_neither_mirror_nor_remote_has_an_etag(
+        self, backend, calendar
+    ) -> None:
+        calendar.put(
+            make_component(
+                "mine@healthmes",
+                agent=True,
+                healthmes_kind="planned_sleep",
+            ),
+            etag=None,
+        )
+
+        with pytest.raises(CalendarConflictError, match="ETag"):
+            backend.delete_event(
+                "mine@healthmes",
+                expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+            )
+
+        assert calendar.conditional_delete_calls == []
+        assert calendar.deleted_uids == []
+
+    def test_update_rejects_stale_mirror_etag(self, backend, calendar) -> None:
+        obj = calendar.put(make_component("mine@healthmes", agent=True), etag='"remote-v2"')
+        with pytest.raises(CalendarConflictError):
+            backend.update_event(
+                "mine@healthmes",
+                summary="corrected",
+                expected_etag='"mirror-v1"',
+            )
+        assert not obj.saved
+
+    def test_delete_rejects_stale_mirror_etag(self, backend, calendar) -> None:
+        calendar.put(
+            make_component(
+                "mine@healthmes",
+                agent=True,
+                healthmes_kind="planned_sleep",
+            ),
+            etag='"remote-v2"',
+        )
+        with pytest.raises(CalendarConflictError):
+            backend.delete_event(
+                "mine@healthmes",
+                expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+                expected_etag='"mirror-v1"',
+            )
         assert calendar.deleted_uids == []

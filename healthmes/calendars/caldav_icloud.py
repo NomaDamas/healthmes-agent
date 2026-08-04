@@ -33,14 +33,22 @@ from healthmes.calendars.base import (
     AGENT_TAG_VALUE,
     ICAL_AGENT_PROPERTY,
     ICAL_AGENT_TASK_ID_PROPERTY,
+    ICAL_EVENT_KIND_PROPERTY,
+    ICAL_EVENT_SOURCE_KEY_PROPERTY,
+    ICAL_EVENT_SOURCE_PROPERTY,
+    CalendarConflictError,
     CalendarError,
     EventDraft,
     EventNotFoundError,
     ExternalEvent,
+    HealthmesEventKind,
     OwnershipError,
     SyncState,
+    calendar_identity_external_id,
     coerce_utc,
     ensure_utc,
+    parse_calendar_identity,
+    parse_event_kind,
     parse_task_id,
 )
 from healthmes.store.enums import CalendarSource
@@ -166,7 +174,18 @@ class CalDavCalendarBackend:
     # -- agent writes ------------------------------------------------------
 
     def create_event(self, draft: EventDraft) -> ExternalEvent:
-        external_id = f"{uuid.uuid4()}@healthmes"
+        external_id = (
+            calendar_identity_external_id(self.source, draft.identity)
+            if draft.identity is not None
+            else f"{uuid.uuid4()}@healthmes"
+        )
+        if draft.identity is not None:
+            try:
+                self.read_event(external_id)
+            except EventNotFoundError:
+                pass
+            else:
+                raise CalendarConflictError("caldav identity key already exists")
         component = icalendar.Event()
         component.add("uid", external_id)
         component.add("dtstamp", datetime.now(UTC))
@@ -178,20 +197,41 @@ class CalDavCalendarBackend:
         component[ICAL_AGENT_PROPERTY] = AGENT_TAG_VALUE
         if draft.agent_task_id is not None:
             component[ICAL_AGENT_TASK_ID_PROPERTY] = str(draft.agent_task_id)
+        if draft.identity is not None:
+            component[ICAL_EVENT_KIND_PROPERTY] = draft.identity.kind.value
+            component[ICAL_EVENT_SOURCE_PROPERTY] = draft.identity.source
+            component[ICAL_EVENT_SOURCE_KEY_PROPERTY] = draft.identity.source_key
 
         calendar = icalendar.Calendar()
         calendar.add("prodid", "-//HealthMes Agent//healthmes//EN")
         calendar.add("version", "2.0")
         calendar.add_component(component)
-        self._calendar.add_event(ical=calendar.to_ical().decode("utf-8"))
+        try:
+            self._calendar.add_event(
+                ical=calendar.to_ical().decode("utf-8"),
+                no_overwrite=draft.identity is not None,
+            )
+        except Exception as exc:  # noqa: BLE001 - caldav exposes broad DAV errors
+            if draft.identity is None:
+                raise
+            try:
+                self.read_event(external_id)
+            except EventNotFoundError:
+                raise exc
+            raise CalendarConflictError(
+                "caldav identity key already exists or create conflicted"
+            ) from exc
 
         return ExternalEvent(
             external_id=external_id,
             summary=draft.summary,
+            description=draft.description,
             start_at=draft.start_at,
             end_at=draft.end_at,
             is_agent_created=True,
             agent_task_id=draft.agent_task_id,
+            identity=draft.identity,
+            healthmes_kind=draft.identity.kind if draft.identity is not None else None,
         )
 
     def update_event(
@@ -202,8 +242,10 @@ class CalDavCalendarBackend:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         description: str | None = None,
+        expected_etag: str | None = None,
     ) -> ExternalEvent:
         obj = self._get_owned_object(external_id)
+        self._assert_expected_etag(obj, external_id, expected_etag)
         component = obj.icalendar_component
         if summary is not None:
             _replace_property(component, "summary", summary)
@@ -213,15 +255,64 @@ class CalDavCalendarBackend:
             _replace_property(component, "dtend", ensure_utc(end_at))
         if description is not None:
             _replace_property(component, "description", description)
-        obj.save()
+        # caldav 3.2.x reads its read-only ``obj.etag`` during save() and
+        # sends it as ``if-match`` on the PUT.
+        try:
+            obj.save()
+        except Exception as exc:  # noqa: BLE001 - caldav exposes broad DAV errors
+            if _is_precondition_failure(exc):
+                raise CalendarConflictError(
+                    f"caldav event {external_id!r} changed during update"
+                ) from exc
+            raise
         parsed = self._event_from_object(obj)
         if parsed is None:  # pragma: no cover - we just wrote a valid component
             raise CalendarError(f"caldav event {external_id!r} unparsable after update")
         return parsed[0]
 
-    def delete_event(self, external_id: str) -> None:
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
+    ) -> None:
         obj = self._get_owned_object(external_id)
-        obj.delete()
+        self._assert_expected_etag(obj, external_id, expected_etag)
+        remote_kind = parse_event_kind(
+            obj.icalendar_component.get(ICAL_EVENT_KIND_PROPERTY)
+        )
+        if expected_kind is not None and remote_kind is not expected_kind:
+            raise OwnershipError(
+                f"caldav event {external_id!r} is not {expected_kind.value}"
+            )
+        delete_etag = expected_etag or _object_etag(obj)
+        if delete_etag is None:
+            raise CalendarConflictError(
+                "caldav event has no ETag for conditional delete"
+            )
+        if not _conditional_delete(obj, delete_etag):
+            raise CalendarConflictError(
+                "caldav backend cannot guarantee a conditional delete"
+            )
+
+    def read_event(self, external_id: str) -> ExternalEvent:
+        parsed = self._event_from_object(self._get_owned_object(external_id))
+        if parsed is None:
+            raise CalendarError(f"caldav event {external_id!r} is unparsable")
+        return parsed[0]
+
+    @staticmethod
+    def _assert_expected_etag(
+        obj: Any,
+        external_id: str,
+        expected_etag: str | None,
+    ) -> None:
+        current_etag = _object_etag(obj)
+        if expected_etag is not None and current_etag != expected_etag:
+            raise CalendarConflictError(
+                f"caldav event {external_id!r} changed since mirror sync"
+            )
 
     def _get_owned_object(self, external_id: str) -> Any:
         """Fetch by UID and enforce the X-HEALTHMES ownership tag."""
@@ -272,14 +363,26 @@ class CalDavCalendarBackend:
                 end_at = start_at + (timedelta(days=1) if is_all_day else timedelta())
 
         summary_value = component.get("SUMMARY")
+        description_value = component.get("DESCRIPTION")
         is_agent = str(component.get(ICAL_AGENT_PROPERTY, "")).strip() == AGENT_TAG_VALUE
         event = ExternalEvent(
             external_id=uid,
             summary=str(summary_value) if summary_value is not None else None,
+            description=(
+                str(description_value) if description_value is not None else None
+            ),
             start_at=start_at,
             end_at=end_at,
             is_agent_created=is_agent,
             agent_task_id=parse_task_id(component.get(ICAL_AGENT_TASK_ID_PROPERTY)),
+            identity=parse_calendar_identity(
+                component.get(ICAL_EVENT_KIND_PROPERTY),
+                component.get(ICAL_EVENT_SOURCE_PROPERTY),
+                component.get(ICAL_EVENT_SOURCE_KEY_PROPERTY),
+            ),
+            healthmes_kind=parse_event_kind(
+                component.get(ICAL_EVENT_KIND_PROPERTY)
+            ),
             etag=_object_etag(obj),
         )
         return event, _fingerprint(obj, component)
@@ -295,6 +398,34 @@ def _object_etag(obj: Any) -> str | None:
     props = getattr(obj, "props", None) or {}
     etag = props.get(ETAG_PROPERTY_TAG)
     return str(etag) if etag else None
+
+
+def _conditional_delete(obj: Any, expected_etag: str) -> bool:
+    client = getattr(obj, "client", None)
+    url = getattr(obj, "url", None)
+    if client is None or url is None or not hasattr(client, "request"):
+        return False
+    response = client.request(
+        str(url),
+        method="DELETE",
+        headers={"If-Match": expected_etag},
+    )
+    status = getattr(response, "status", None)
+    if status == 412:
+        raise CalendarConflictError("caldav event changed during delete")
+    if status == 404:
+        raise EventNotFoundError("caldav event disappeared during delete")
+    if status not in (200, 204):
+        raise CalendarError("caldav conditional delete failed")
+    return True
+
+
+def _is_precondition_failure(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status == 412:
+        return True
+    reason = getattr(exc, "reason", "")
+    return isinstance(reason, str) and "412" in reason
 
 
 def _fingerprint(obj: Any, component: Any) -> str:

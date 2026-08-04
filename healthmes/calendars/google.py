@@ -33,6 +33,9 @@ from healthmes.calendars.base import (
     AGENT_TAG_VALUE,
     GOOGLE_AGENT_TAG_KEY,
     GOOGLE_AGENT_TASK_ID_KEY,
+    GOOGLE_EVENT_KIND_KEY,
+    GOOGLE_EVENT_SOURCE_KEY,
+    GOOGLE_EVENT_UPSERT_KEY,
     CalendarAuthError,
     CalendarConflictError,
     CalendarError,
@@ -40,9 +43,13 @@ from healthmes.calendars.base import (
     EventDraft,
     EventNotFoundError,
     ExternalEvent,
+    HealthmesEventKind,
     OwnershipError,
     SyncState,
+    calendar_identity_external_id,
     ensure_utc,
+    parse_calendar_identity,
+    parse_event_kind,
     parse_task_id,
 )
 from healthmes.store.enums import CalendarSource
@@ -317,15 +324,32 @@ class GoogleCalendarBackend:
         private = {GOOGLE_AGENT_TAG_KEY: AGENT_TAG_VALUE}
         if draft.agent_task_id is not None:
             private[GOOGLE_AGENT_TASK_ID_KEY] = str(draft.agent_task_id)
+        if draft.identity is not None:
+            private[GOOGLE_EVENT_KIND_KEY] = draft.identity.kind.value
+            private[GOOGLE_EVENT_SOURCE_KEY] = draft.identity.source
+            private[GOOGLE_EVENT_UPSERT_KEY] = draft.identity.source_key
         body: dict[str, Any] = {
             "summary": draft.summary,
             "start": {"dateTime": _rfc3339(draft.start_at)},
             "end": {"dateTime": _rfc3339(draft.end_at)},
             "extendedProperties": {"private": private},
         }
+        if draft.identity is not None:
+            body["id"] = calendar_identity_external_id(self.source, draft.identity)
         if draft.description:
             body["description"] = draft.description
-        created = self._events().insert(calendarId=self._calendar_id, body=body).execute()
+        try:
+            created = (
+                self._events()
+                .insert(calendarId=self._calendar_id, body=body)
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001 - status-based dispatch
+            if _http_status(exc) != 409 or draft.identity is None:
+                raise
+            raise CalendarConflictError(
+                "google identity key already exists"
+            ) from exc
         return self._parse_api_event(created)
 
     def update_event(
@@ -336,6 +360,7 @@ class GoogleCalendarBackend:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         description: str | None = None,
+        expected_etag: str | None = None,
     ) -> ExternalEvent:
         current = self._get_owned_event(external_id)
         body: dict[str, Any] = {}
@@ -349,13 +374,12 @@ class GoogleCalendarBackend:
             body["description"] = description
         if not body:
             return current
-        # Guard the patch with the etag we just read: if the event changed on
-        # the server in between (check-then-act race) the conditional request
-        # fails with 412 instead of silently clobbering the newer state.
+        # The caller's mirror ETag protects the entire sync-to-write interval;
+        # the fresh ETag is only the fallback for callers without a snapshot.
         request = self._events().patch(
             calendarId=self._calendar_id, eventId=external_id, body=body
         )
-        self._set_if_match(request, current.etag)
+        self._set_if_match(request, expected_etag or current.etag)
         try:
             patched = request.execute()
         except Exception as exc:  # noqa: BLE001 - status-based dispatch
@@ -363,12 +387,22 @@ class GoogleCalendarBackend:
             raise  # unreachable; keeps type-checkers happy about ``patched``
         return self._parse_api_event(patched)
 
-    def delete_event(self, external_id: str) -> None:
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
+    ) -> None:
         current = self._get_owned_event(external_id)
+        if expected_kind is not None and current.healthmes_kind is not expected_kind:
+            raise OwnershipError(
+                f"google event {external_id!r} is not {expected_kind.value}"
+            )
         request = self._events().delete(
             calendarId=self._calendar_id, eventId=external_id
         )
-        self._set_if_match(request, current.etag)
+        self._set_if_match(request, expected_etag or current.etag)
         try:
             request.execute()
         except Exception as exc:  # noqa: BLE001 - status-based dispatch
@@ -471,10 +505,17 @@ class GoogleCalendarBackend:
         return ExternalEvent(
             external_id=external_id,
             summary=item.get("summary") or None,
+            description=item.get("description") or None,
             start_at=_parse_api_time(start),
             end_at=_parse_api_time(end),
             is_agent_created=is_agent,
             agent_task_id=agent_task_id,
+            identity=parse_calendar_identity(
+                private.get(GOOGLE_EVENT_KIND_KEY),
+                private.get(GOOGLE_EVENT_SOURCE_KEY),
+                private.get(GOOGLE_EVENT_UPSERT_KEY),
+            ),
+            healthmes_kind=parse_event_kind(private.get(GOOGLE_EVENT_KIND_KEY)),
             etag=item.get("etag"),
             deleted=deleted,
             organizer_self=_is_self(item.get("organizer")),

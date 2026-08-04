@@ -9,8 +9,11 @@ import pytest
 from healthmes.calendars.base import (
     CalendarAuthError,
     CalendarConflictError,
+    CalendarEventIdentity,
     ConfirmedExternalTimeChange,
+    EventDraft,
     EventNotFoundError,
+    HealthmesEventKind,
     OwnershipError,
 )
 from healthmes.calendars.google import (
@@ -103,7 +106,9 @@ class FakeGoogleService:
         return self.stored_events[event_id]
 
     def insert_event(self, body: dict) -> dict:
-        event_id = f"generated-{len(self.stored_events) + 1}"
+        event_id = body.get("id") or f"generated-{len(self.stored_events) + 1}"
+        if event_id in self.stored_events:
+            raise FakeStatusError(409)
         stored = {"id": event_id, "etag": '"1"', "status": "confirmed", **body}
         self.stored_events[event_id] = stored
         return stored
@@ -156,6 +161,7 @@ def api_event(
     end: str = "2026-07-09T09:30:00+09:00",
     agent: bool = False,
     task_id: uuid.UUID | None = None,
+    healthmes_kind: str | None = None,
     status: str = "confirmed",
     etag: str = '"e1"',
     organizer_self: bool = False,
@@ -190,6 +196,8 @@ def api_event(
         private = {"healthmes": "1"}
         if task_id is not None:
             private["healthmes_task_id"] = str(task_id)
+        if healthmes_kind is not None:
+            private["healthmes_kind"] = healthmes_kind
         item["extendedProperties"] = {"private": private}
     return item
 
@@ -342,8 +350,6 @@ class TestEventParsing:
 
 class TestCreateEvent:
     def test_insert_body_carries_ownership_tag(self, backend, service) -> None:
-        from healthmes.calendars.base import EventDraft
-
         task_id = uuid.uuid4()
         draft = EventDraft(
             summary="Deep work",
@@ -366,6 +372,56 @@ class TestCreateEvent:
         assert created.is_agent_created
         assert created.agent_task_id == task_id
         assert created.external_id == "generated-1"
+
+    def test_actual_sleep_identity_round_trips_private_metadata(
+        self, backend, service
+    ) -> None:
+        identity = CalendarEventIdentity(
+            kind=HealthmesEventKind.ACTUAL_SLEEP,
+            source="oura",
+            source_key="oura:2026-07-26",
+        )
+        created = backend.create_event(
+            EventDraft(
+                summary="수면 (실제)",
+                start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+                end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+                identity=identity,
+            )
+        )
+
+        ((_, body),) = service.insert_calls
+        assert body["extendedProperties"]["private"] == {
+            "healthmes": "1",
+            "healthmes_kind": "actual_sleep",
+            "healthmes_source": "oura",
+            "healthmes_source_key": "oura:2026-07-26",
+        }
+        assert created.identity == identity
+
+    def test_identity_collision_requires_a_local_recovery_intent(
+        self, backend, service
+    ) -> None:
+        # Given
+        draft = EventDraft(
+            summary="수면 (실제)",
+            start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+            end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+            identity=CalendarEventIdentity(
+                kind=HealthmesEventKind.ACTUAL_SLEEP,
+                source="oura",
+                source_key="oura:2026-07-26",
+            ),
+        )
+
+        # When
+        first = backend.create_event(draft)
+        with pytest.raises(CalendarConflictError):
+            backend.create_event(draft)
+
+        # Then
+        assert first.identity == draft.identity
+        assert len(service.stored_events) == 1
 
 
 class TestUpdateAndDelete:
@@ -419,6 +475,31 @@ class TestUpdateAndDelete:
             backend.delete_event("theirs")
         assert service.delete_calls == []
 
+    def test_delete_requires_expected_healthmes_kind(self, backend, service) -> None:
+        service.stored_events["mine"] = api_event(
+            "mine",
+            agent=True,
+            healthmes_kind="actual_sleep",
+        )
+        with pytest.raises(OwnershipError, match="planned_sleep"):
+            backend.delete_event(
+                "mine",
+                expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+            )
+        assert service.delete_calls == []
+
+    def test_delete_accepts_matching_healthmes_kind(self, backend, service) -> None:
+        service.stored_events["mine"] = api_event(
+            "mine",
+            agent=True,
+            healthmes_kind="planned_sleep",
+        )
+        backend.delete_event(
+            "mine",
+            expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+        )
+        assert service.delete_calls == [("primary", "mine")]
+
     def test_update_conflict_412_raises_and_leaves_event_unmutated(
         self, backend, service
     ) -> None:
@@ -435,6 +516,35 @@ class TestUpdateAndDelete:
             )
         assert service.write_headers[-1]["If-Match"] == '"e1"'  # precondition sent
         assert service.stored_events["mine"] == original  # never overwritten
+
+    def test_update_uses_mirror_etag_instead_of_fresh_remote_etag(
+        self, backend, service
+    ) -> None:
+        service.stored_events["mine"] = api_event("mine", agent=True, etag='"remote-v2"')
+        with pytest.raises(CalendarConflictError):
+            backend.update_event(
+                "mine",
+                summary="corrected",
+                expected_etag='"mirror-v1"',
+            )
+        assert service.write_headers[-1]["If-Match"] == '"mirror-v1"'
+
+    def test_delete_uses_mirror_etag_instead_of_fresh_remote_etag(
+        self, backend, service
+    ) -> None:
+        service.stored_events["mine"] = api_event(
+            "mine",
+            agent=True,
+            healthmes_kind="planned_sleep",
+            etag='"remote-v2"',
+        )
+        with pytest.raises(CalendarConflictError):
+            backend.delete_event(
+                "mine",
+                expected_kind=HealthmesEventKind.PLANNED_SLEEP,
+                expected_etag='"mirror-v1"',
+            )
+        assert service.write_headers[-1]["If-Match"] == '"mirror-v1"'
 
     def test_delete_conflict_412_raises_and_leaves_event(self, backend, service) -> None:
         service.stored_events["mine"] = api_event("mine", agent=True)

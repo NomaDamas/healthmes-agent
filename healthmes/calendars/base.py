@@ -22,9 +22,11 @@ UTC. Credentials are runtime-only: importing this package never reads token
 files or opens network connections.
 """
 
+import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 from healthmes.store.enums import CalendarSource
@@ -33,20 +35,32 @@ __all__ = [
     "AGENT_TAG_VALUE",
     "GOOGLE_AGENT_TAG_KEY",
     "GOOGLE_AGENT_TASK_ID_KEY",
+    "GOOGLE_EVENT_KIND_KEY",
+    "GOOGLE_EVENT_SOURCE_KEY",
+    "GOOGLE_EVENT_UPSERT_KEY",
     "ICAL_AGENT_PROPERTY",
     "ICAL_AGENT_TASK_ID_PROPERTY",
+    "ICAL_EVENT_KIND_PROPERTY",
+    "ICAL_EVENT_SOURCE_KEY_PROPERTY",
+    "ICAL_EVENT_SOURCE_PROPERTY",
     "CalendarAuthError",
     "CalendarBackend",
     "CalendarConflictError",
     "CalendarError",
+    "CalendarEventIdentity",
     "ConfirmedExternalTimeChange",
     "EventDraft",
     "EventNotFoundError",
     "ExternalEvent",
+    "HealthmesEventKind",
     "OwnershipError",
     "SyncState",
     "coerce_utc",
+    "calendar_identity_key",
+    "calendar_identity_external_id",
     "ensure_utc",
+    "parse_calendar_identity",
+    "parse_event_kind",
     "parse_task_id",
 ]
 
@@ -58,14 +72,87 @@ GOOGLE_AGENT_TAG_KEY = "healthmes"
 AGENT_TAG_VALUE = "1"
 #: Google private extended-property key carrying the healthmes task UUID.
 GOOGLE_AGENT_TASK_ID_KEY = "healthmes_task_id"
+GOOGLE_EVENT_KIND_KEY = "healthmes_kind"
+GOOGLE_EVENT_SOURCE_KEY = "healthmes_source"
+GOOGLE_EVENT_UPSERT_KEY = "healthmes_source_key"
 #: iCalendar X-property marking an agent-created VEVENT.
 ICAL_AGENT_PROPERTY = "X-HEALTHMES"
 #: iCalendar X-property carrying the healthmes task UUID.
 ICAL_AGENT_TASK_ID_PROPERTY = "X-HEALTHMES-TASK-ID"
+ICAL_EVENT_KIND_PROPERTY = "X-HEALTHMES-KIND"
+ICAL_EVENT_SOURCE_PROPERTY = "X-HEALTHMES-SOURCE"
+ICAL_EVENT_SOURCE_KEY_PROPERTY = "X-HEALTHMES-SOURCE-KEY"
 
 #: Opaque per-backend change cursor (Google syncToken / CalDAV ctag+etags).
 #: Must stay JSON-serializable so any SyncStateStore can persist it.
 SyncState = dict[str, Any]
+
+
+class HealthmesEventKind(StrEnum):
+    ACTUAL_SLEEP = "actual_sleep"
+    PLANNED_SLEEP = "planned_sleep"
+    SCHEDULE_BLOCK = "schedule_block"
+
+
+def parse_event_kind(value: object) -> HealthmesEventKind | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return HealthmesEventKind(value.strip())
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarEventIdentity:
+    kind: HealthmesEventKind
+    source: str
+    source_key: str
+
+    def __post_init__(self) -> None:
+        if not self.source.strip():
+            raise ValueError("CalendarEventIdentity.source must be non-empty")
+        if not self.source_key.strip():
+            raise ValueError("CalendarEventIdentity.source_key must be non-empty")
+
+
+def calendar_identity_key(identity: CalendarEventIdentity) -> str:
+    payload = "\x1f".join(
+        (identity.kind.value, identity.source, identity.source_key)
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def calendar_identity_external_id(
+    source: CalendarSource,
+    identity: CalendarEventIdentity,
+) -> str:
+    key = calendar_identity_key(identity)
+    if source is CalendarSource.GOOGLE:
+        return f"healthmes{key}"
+    return f"healthmes-{key}@healthmes"
+
+
+def parse_calendar_identity(
+    kind: object,
+    source: object,
+    source_key: object,
+) -> CalendarEventIdentity | None:
+    if not isinstance(kind, str) or not isinstance(source, str) or not isinstance(
+        source_key, str
+    ):
+        return None
+    event_kind = parse_event_kind(kind)
+    if event_kind is None:
+        return None
+    try:
+        return CalendarEventIdentity(
+            kind=event_kind,
+            source=source.strip(),
+            source_key=source_key.strip(),
+        )
+    except ValueError:
+        return None
 
 
 class CalendarError(Exception):
@@ -151,10 +238,13 @@ class ExternalEvent:
 
     external_id: str
     summary: str | None = None
+    description: str | None = None
     start_at: datetime | None = None
     end_at: datetime | None = None
     is_agent_created: bool = False
     agent_task_id: uuid.UUID | None = None
+    identity: CalendarEventIdentity | None = None
+    healthmes_kind: HealthmesEventKind | None = None
     etag: str | None = None
     deleted: bool = False
     organizer_self: bool = False
@@ -239,6 +329,7 @@ class EventDraft:
     end_at: datetime
     description: str | None = None
     agent_task_id: uuid.UUID | None = None
+    identity: CalendarEventIdentity | None = None
 
     def __post_init__(self) -> None:
         if not self.summary:
@@ -277,6 +368,9 @@ class CalendarBackend(Protocol):
         """Create an agent-owned (tagged) event and return its normalized form."""
         ...
 
+    def read_event(self, external_id: str) -> ExternalEvent:
+        ...
+
     def update_event(
         self,
         external_id: str,
@@ -285,6 +379,7 @@ class CalendarBackend(Protocol):
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         description: str | None = None,
+        expected_etag: str | None = None,
     ) -> ExternalEvent:
         """Patch the given fields of an agent-owned event.
 
@@ -293,6 +388,12 @@ class CalendarBackend(Protocol):
         """
         ...
 
-    def delete_event(self, external_id: str) -> None:
+    def delete_event(
+        self,
+        external_id: str,
+        *,
+        expected_kind: HealthmesEventKind | None = None,
+        expected_etag: str | None = None,
+    ) -> None:
         """Delete an agent-owned event (same ownership guarantees as update)."""
         ...

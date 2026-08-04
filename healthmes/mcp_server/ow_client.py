@@ -28,6 +28,7 @@ import httpx
 from healthmes.config import Settings
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Page caps for the collect_* helpers so a pathological backend response can
 # never turn into an unbounded fetch loop.
@@ -104,16 +105,27 @@ class OWClient:
         """GET ``{base_url}{path}`` and return the parsed JSON body."""
         self._ensure_configured()
         url = f"{self.base_url}{path}"
-        logger.debug("GET %s params=%s", url, params)
+        logger.debug("GET open-wearables resource")
 
-        async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
-            response = await client.get(url, headers=self.headers, params=params)
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout,
+                transport=self._transport,
+            ) as client:
+                response = await client.get(url, headers=self.headers, params=params)
+        except httpx.HTTPError:
+            raise OWClientError("open-wearables request failed (transport)") from None
 
         if response.status_code == 401:
             raise OWAuthError("open-wearables rejected the API key (401)")
         if response.status_code == 404:
-            raise OWNotFoundError(f"open-wearables resource not found: {path}")
-        response.raise_for_status()
+            raise OWNotFoundError("open-wearables resource not found (404)")
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            raise OWClientError(
+                f"open-wearables request failed ({response.status_code})"
+            ) from None
         return response.json()
 
     # ------------------------------------------------------------------

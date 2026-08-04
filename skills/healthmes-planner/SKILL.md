@@ -98,7 +98,9 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
 
 2. **Read the body.** Call `get_daily_readiness_context` for the planning
    day(s) and `get_health_scores` for the recent window. Note the
-   `confidence` field of every value you plan to rely on.
+   `confidence` field of every value you plan to rely on. When
+   `actual_sleep.status` is `ok`, treat its
+   `earliest_available_work_time` as a hard scheduling boundary.
 
 3. **Read the calendar.** `get_schedule` for the placement horizon. Existing
    external events are immovable facts; agent-created blocks may be moved.
@@ -146,6 +148,12 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
    owner-bound proof and the server resolves the pending proposal by handle.
    Do not move, delete, retitle, extend, or edit attendees/recurrence for
    external events.
+7. **Start after actual wake.** Never place a block before
+   `actual_sleep.earliest_available_work_time` or across the actual sleep
+   interval. This availability rule does not add a second sleep score to the
+   readiness calculation.
+8. **Tag planned sleep explicitly.** Set `healthmes_kind: planned_sleep` on
+   sleep blocks; never infer that identity later from a title.
 
 ## Notification grammar (standard message template)
 
