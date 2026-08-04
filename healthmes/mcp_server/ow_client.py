@@ -21,6 +21,7 @@ The optional ``transport`` argument exists so tests can inject
 import inspect
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any, Literal
 
 import httpx
@@ -140,6 +141,12 @@ class OWClient:
         if search:
             params["search"] = search
         return await self._get("/api/v1/users", params=params)
+
+    async def get_connections(self, user_id: str) -> list[dict[str, Any]]:
+        payload = await self._get(f"/api/v1/users/{user_id}/connections")
+        if not isinstance(payload, list):
+            raise OWClientError("open-wearables returned an invalid connections response")
+        return payload
 
     # ------------------------------------------------------------------
     # Health scores (routes/v1/health_scores.py)
@@ -444,6 +451,23 @@ class OWClient:
             params["filter_by_priority"] = filter_by_priority
         return await self._get(f"/api/v1/users/{user_id}/events/sleep", params=params)
 
+    async def collect_sleep_sessions(
+        self,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+    ) -> list[dict[str, Any]]:
+        rows, _truncated = await self._collect_cursor(
+            lambda cursor: self.get_sleep_sessions(
+                user_id,
+                start_date,
+                end_date,
+                cursor=cursor,
+                filter_by_priority=True,
+            )
+        )
+        return rows
+
     # ------------------------------------------------------------------
     # Timeseries (routes/v1/timeseries.py — cursor pagination)
     # ------------------------------------------------------------------
@@ -576,10 +600,19 @@ async def resolve_single_user_id(client: Any, settings: Settings) -> str:
     payload = client.list_users(limit=2)
     if inspect.isawaitable(payload):
         payload = await payload
-    items = payload.get("items") or payload.get("data") or []
-    if len(items) == 1 and items[0].get("id"):
+    if not isinstance(payload, Mapping):
+        items = []
+    else:
+        items = payload.get("items") or payload.get("data") or []
+    if (
+        isinstance(items, list)
+        and len(items) == 1
+        and isinstance(items[0], Mapping)
+        and items[0].get("id")
+    ):
         return str(items[0]["id"])
+    count = len(items) if isinstance(items, list) else 0
     raise LookupError(
         "Cannot determine the open-wearables user id: set HEALTHMES_OW_USER_ID "
-        f"(API key currently sees {len(items)} users; auto-discovery needs exactly one)."
+        f"(API key currently sees {count} users; auto-discovery needs exactly one)."
     )

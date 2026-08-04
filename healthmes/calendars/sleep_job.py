@@ -1,28 +1,28 @@
 from __future__ import annotations
 
-import asyncio
 import datetime as dt
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol
 
-from pydantic import ValidationError
+import anyio
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.api.auth import viewer_url
+from healthmes.calendars.approval import ApprovalCalendar, calendar_approval_target
 from healthmes.calendars.base import CalendarBackend
 from healthmes.calendars.jobs import _build_backend, write_source
 from healthmes.calendars.sleep_observation import (
     ActualSleepObservation,
     SleepObservationNoOp,
-    SleepObservationNoOpReason,
-    SleepSummaryPayload,
-    select_actual_sleep,
 )
 from healthmes.calendars.sleep_preview import preview_sleep_reconciliation
+from healthmes.calendars.sleep_proposals import prepare_sleep_proposal
 from healthmes.calendars.sleep_reconciliation import (
     SleepCalendarReconciler,
     SleepCalendarWriteBlocked,
 )
+from healthmes.calendars.sleep_source import read_actual_sleep
 from healthmes.config import Settings, resolve_timezone
 from healthmes.mcp_server.ow_client import (
     OWClient,
@@ -82,18 +82,26 @@ def build_sleep_reconciliation_job(
             if date_provider is not None
             else dt.datetime.now(local_timezone).date()
         )
-        return await reconcile_recent_sleep_window(
+        return await prepare_recent_sleep_window(
             end_date=target_date,
             calendar_source=calendar_source,
             client=active_client,
             user_id=resolved_user_id,
             session_factory=session_factory,
-            backend=backend,
+            calendar=ApprovalCalendar(
+                backend,
+                calendar_approval_target(settings, calendar_source),
+                settings.public_base_url,
+                lambda target_date: viewer_url(
+                    settings,
+                    f"/sleep?date={target_date.isoformat()}",
+                ),
+            ),
         )
 
     def run_job() -> dict[str, object] | None:
         try:
-            return asyncio.run(run_once())
+            return anyio.run(run_once)
         except Exception as exc:
             logger.error(
                 "Actual sleep reconciliation failed (%s); next interval will retry.",
@@ -102,6 +110,42 @@ def build_sleep_reconciliation_job(
             return None
 
     return run_job
+
+
+async def prepare_recent_sleep_window(
+    *,
+    end_date: dt.date,
+    calendar_source: CalendarSource,
+    client: SleepSummaryReader,
+    user_id: str,
+    session_factory: sessionmaker[Session] | None,
+    calendar: ApprovalCalendar,
+) -> dict[str, object]:
+    start_date = end_date - dt.timedelta(days=RECENT_SLEEP_WINDOW_DAYS - 1)
+    results: list[dict[str, object]] = []
+    for offset in range(RECENT_SLEEP_WINDOW_DAYS):
+        with session_scope(session_factory) as session:
+            proposal = await prepare_sleep_proposal(
+                target_date=start_date + dt.timedelta(days=offset),
+                calendar_source=calendar_source,
+                reader=client,
+                user_id=user_id,
+                session=session,
+                calendar=calendar,
+            )
+            results.append(
+                {
+                    **proposal.snapshot,
+                    "proposal_id": str(proposal.id),
+                    "proposal_status": proposal.status.value,
+                }
+            )
+    return {
+        "status": "ok",
+        "window_start": start_date.isoformat(),
+        "window_end": end_date.isoformat(),
+        "results": results,
+    }
 
 
 async def preview_recent_sleep(
@@ -183,25 +227,11 @@ async def reconcile_recent_sleep(
     backend: CalendarBackend | None,
     dry_run: bool = False,
 ) -> dict[str, object]:
-    end_date = target_date + dt.timedelta(days=1)
-    rows = await client.collect_sleep_summaries(
+    selected: ActualSleepObservation | SleepObservationNoOp = await read_actual_sleep(
+        client,
         user_id,
-        target_date.isoformat(),
-        end_date.isoformat(),
+        target_date,
     )
-    summaries: list[SleepSummaryPayload] = []
-    invalid_rows = 0
-    for row in rows:
-        try:
-            summaries.append(SleepSummaryPayload.model_validate(row))
-        except ValidationError:
-            invalid_rows += 1
-    if not summaries and invalid_rows:
-        selected: ActualSleepObservation | SleepObservationNoOp = SleepObservationNoOp(
-            reason=SleepObservationNoOpReason.INCOMPLETE
-        )
-    else:
-        selected = select_actual_sleep(tuple(summaries), target_date)
     if isinstance(selected, SleepObservationNoOp):
         return {
             "status": "noop",

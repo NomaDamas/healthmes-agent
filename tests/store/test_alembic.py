@@ -7,6 +7,7 @@ rendering, which never connects.
 """
 
 import io
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,6 +28,7 @@ EXPECTED_TABLES = {
     "task",
     "calendar_event_mirror",
     "calendar_mutation_proposal",
+    "sleep_reconciliation_proposal",
     "schedule_proposal",
     "food_log",
     "app_usage_sample",
@@ -67,6 +69,15 @@ def test_migration_graph_has_single_head():
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
     assert len(script.get_heads()) == 1
+
+
+def test_migration_keeps_existing_application_loggers_enabled():
+    logger = logging.getLogger("healthmes.calendars.sleep_job")
+    logger.disabled = False
+
+    _render_offline_upgrade("sqlite:///offline-render.db")
+
+    assert logger.disabled is False
 
 
 class TestOfflineRender:

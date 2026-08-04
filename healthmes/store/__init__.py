@@ -18,6 +18,7 @@ from healthmes.store.enums import (
     EnergyDemand,
     MedicalRecordKind,
     ProposalStatus,
+    SleepProposalStatus,
     TaskSource,
 )
 from healthmes.store.models import (
@@ -46,6 +47,7 @@ from healthmes.store.session import (
     init_engine,
     session_scope,
 )
+from healthmes.store.sleep_models import SleepReconciliationProposal
 
 __all__ = [
     # base
@@ -60,6 +62,7 @@ __all__ = [
     "EnergyDemand",
     "MedicalRecordKind",
     "ProposalStatus",
+    "SleepProposalStatus",
     "TaskSource",
     "TASK_DONE_STATUSES",
     "TASK_STATUSES",
@@ -75,6 +78,7 @@ __all__ = [
     "Insight",
     "MedicalRecord",
     "ScheduleProposal",
+    "SleepReconciliationProposal",
     "Task",
     "TriggerEvent",
     "WeeklyGoal",

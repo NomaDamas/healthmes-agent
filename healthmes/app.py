@@ -15,6 +15,8 @@ from starlette.types import Receive, Scope, Send
 from healthmes import __version__
 from healthmes.api import include_all
 from healthmes.api.auth import install_auth
+from healthmes.api.google_oauth import install_google_oauth
+from healthmes.api.local_session import install_local_sessions
 from healthmes.backup.local import build_backup_job
 from healthmes.calendars.jobs import build_calendar_jobs
 from healthmes.calendars.sleep_job import build_sleep_reconciliation_job
@@ -98,6 +100,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    install_local_sessions(app)
+    install_google_oauth(app)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

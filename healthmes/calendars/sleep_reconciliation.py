@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
-from enum import StrEnum
+from dataclasses import replace
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
@@ -10,6 +9,7 @@ from sqlalchemy.orm import Session
 from healthmes.calendars.base import (
     CalendarBackend,
     CalendarConflictError,
+    CalendarError,
     CalendarEventIdentity,
     EventNotFoundError,
     HealthmesEventKind,
@@ -23,6 +23,7 @@ from healthmes.calendars.planned_sleep_replacement import (
     delete_replaced_planned_sleep,
 )
 from healthmes.calendars.sleep_event_rendering import (
+    ACTUAL_SLEEP_SUMMARY,
     description,
     event_draft,
     observation_fingerprint,
@@ -46,11 +47,18 @@ from healthmes.calendars.sleep_observation import (
     ACTUAL_SLEEP_IDENTITY_SOURCE,
     ActualSleepObservation,
     actual_sleep_source_key,
+    calendar_observations,
 )
 from healthmes.calendars.sleep_reconciliation_guards import (
     assert_owned_actual_sleep,
     assert_remote_actual_sleep,
     pending_remote_matches,
+)
+from healthmes.calendars.sleep_reconciliation_result import (
+    SleepCalendarAction,
+    SleepCalendarResult,
+    created_sleep_result,
+    updated_sleep_result,
 )
 from healthmes.calendars.write_lock import calendar_write_lock
 from healthmes.store.enums import ProposalStatus
@@ -58,12 +66,6 @@ from healthmes.store.models import CalendarEventMirror, ScheduleProposal
 
 logger = logging.getLogger(__name__)
 LEGACY_SLEEP_CLEANUP_BATCH_SIZE = 25
-
-
-class SleepCalendarAction(StrEnum):
-    CREATED = "created"
-    UPDATED = "updated"
-    NOOP = "noop"
 
 
 class SleepCalendarWriteBlocked(RuntimeError):
@@ -82,26 +84,72 @@ class SleepCalendarWriteBlocked(RuntimeError):
         self.invalidated_proposal_ids = invalidated_proposal_ids
 
 
-@dataclass(frozen=True, slots=True)
-class SleepCalendarResult:
-    action: SleepCalendarAction
-    external_id: str
-    observation_fingerprint: str
-    deleted_planned_external_ids: tuple[str, ...] = ()
-    planned_sleep_cleanup_pending: int = 0
-    invalidated_schedule_proposal_ids: tuple[str, ...] = ()
-
-
 class SleepCalendarReconciler:
     def __init__(self, session: Session, backend: CalendarBackend) -> None:
         self._session = session
         self._backend = backend
 
     def reconcile(self, observation: ActualSleepObservation) -> SleepCalendarResult:
-        return self._reconcile_with_lock(
-            observation,
-            prefer_current_canonical=False,
+        with calendar_write_lock(self._session, self._backend.source):
+            self._session.expire_all()
+            return self._reconcile_observation_locked(observation)
+
+    def _reconcile_observation_locked(
+        self,
+        observation: ActualSleepObservation,
+    ) -> SleepCalendarResult:
+        invalidated_proposal_ids = (
+            self._invalidate_overlapping_pushed_schedule_blocks(observation)
         )
+        children = calendar_observations(observation)
+        completed: list[tuple[ActualSleepObservation, SleepCalendarResult]] = []
+        try:
+            for child in children:
+                completed.append((child, self._reconcile_one_locked(child)))
+        except Exception:
+            self._compensate_created_segments(completed)
+            raise
+        results = tuple(result for _, result in completed)
+        stale = self._delete_stale_segments(
+            observation,
+            {child.source_key for child in children},
+        )
+        planned_deleted = tuple(
+            dict.fromkeys(
+                external_id
+                for result in results
+                for external_id in result.deleted_planned_external_ids
+            )
+        )
+        action = (
+            SleepCalendarAction.CREATED
+            if any(result.action is SleepCalendarAction.CREATED for result in results)
+            else SleepCalendarAction.UPDATED
+            if any(result.action is SleepCalendarAction.UPDATED for result in results)
+            or stale
+            else SleepCalendarAction.NOOP
+        )
+        combined = SleepCalendarResult(
+            action=action,
+            external_id=results[0].external_id,
+            external_ids=tuple(result.external_id for result in results),
+            observation_fingerprint=observation_fingerprint(observation),
+            deleted_planned_external_ids=planned_deleted,
+            deleted_actual_external_ids=stale,
+            planned_sleep_cleanup_pending=sum(
+                result.planned_sleep_cleanup_pending for result in results
+            ),
+            invalidated_schedule_proposal_ids=invalidated_proposal_ids,
+        )
+        return self._replace_planned_sleep(combined, observation)
+
+    def _reconcile_one_locked(
+        self,
+        observation: ActualSleepObservation,
+    ) -> SleepCalendarResult:
+        fingerprint = observation_fingerprint(observation)
+        identity = actual_sleep_identity(observation)
+        return self._reconcile_locked(observation, identity, fingerprint)
 
     def _reconcile_with_lock(
         self,
@@ -123,16 +171,15 @@ class SleepCalendarReconciler:
                 )
                 if canonical is not None:
                     observation = sleep_observation_from_mirror(canonical)
-            fingerprint = observation_fingerprint(observation)
-            identity = actual_sleep_identity(observation)
             invalidated_proposal_ids = (
                 self._invalidate_overlapping_pushed_schedule_blocks(observation)
             )
-            result = self._reconcile_locked(observation, identity, fingerprint)
-            return replace(
+            result = self._reconcile_one_locked(observation)
+            result = replace(
                 result,
                 invalidated_schedule_proposal_ids=invalidated_proposal_ids,
             )
+            return self._replace_planned_sleep(result, observation)
 
     def _invalidate_overlapping_pushed_schedule_blocks(
         self,
@@ -476,6 +523,95 @@ class SleepCalendarReconciler:
             "failed": failed,
         }
 
+    def _delete_stale_segments(
+        self,
+        observation: ActualSleepObservation,
+        current_keys: set[str],
+    ) -> tuple[str, ...]:
+        rows = self._session.scalars(
+            sa.select(CalendarEventMirror).where(
+                CalendarEventMirror.calendar_source == self._backend.source,
+                CalendarEventMirror.is_agent_created.is_(True),
+                CalendarEventMirror.healthmes_kind
+                == HealthmesEventKind.ACTUAL_SLEEP.value,
+                CalendarEventMirror.sleep_local_date == observation.local_date,
+                CalendarEventMirror.healthmes_source_key.like(
+                    f"{observation.source_key}:segment:%"
+                ),
+                CalendarEventMirror.healthmes_source_key.not_in(current_keys),
+            )
+        ).all()
+        deleted: list[str] = []
+        for row in rows:
+            identity = actual_sleep_identity_from_mirror(row)
+            if identity is None:
+                raise OwnershipError(
+                    f"{row.calendar_source.value} event {row.external_id!r} "
+                    "has invalid actual_sleep identity"
+                )
+            try:
+                remote = self._backend.read_event(row.external_id)
+                expected_etag = assert_remote_actual_sleep(
+                    remote,
+                    self._backend.source,
+                    identity,
+                    row.etag,
+                )
+                self._backend.delete_event(
+                    row.external_id,
+                    expected_kind=HealthmesEventKind.ACTUAL_SLEEP,
+                    expected_etag=expected_etag,
+                )
+            except EventNotFoundError:
+                pass
+            deleted.append(row.external_id)
+            self._session.delete(row)
+        if deleted:
+            self._session.commit()
+        return tuple(deleted)
+
+    def _compensate_created_segments(
+        self,
+        completed: list[tuple[ActualSleepObservation, SleepCalendarResult]],
+    ) -> None:
+        for child, result in reversed(completed):
+            if result.action is not SleepCalendarAction.CREATED:
+                continue
+            identity = actual_sleep_identity(child)
+            try:
+                remote = self._backend.read_event(result.external_id)
+                expected_etag = assert_remote_actual_sleep(
+                    remote,
+                    self._backend.source,
+                    identity,
+                    None,
+                )
+                if expected_etag is None or not pending_remote_matches(remote, child):
+                    continue
+                self._backend.delete_event(
+                    result.external_id,
+                    expected_kind=HealthmesEventKind.ACTUAL_SLEEP,
+                    expected_etag=expected_etag,
+                )
+                row = self._session.scalar(
+                    sa.select(CalendarEventMirror).where(
+                        CalendarEventMirror.calendar_source == self._backend.source,
+                        CalendarEventMirror.external_id == result.external_id,
+                        CalendarEventMirror.healthmes_kind == identity.kind.value,
+                        CalendarEventMirror.healthmes_source == identity.source,
+                        CalendarEventMirror.healthmes_source_key == identity.source_key,
+                    )
+                )
+                if row is not None:
+                    self._session.delete(row)
+                self._session.commit()
+            except Exception:
+                self._session.rollback()
+                logger.exception(
+                    "Failed to compensate partial split-sleep create for %s",
+                    child.source_key,
+                )
+
     def _reconcile_locked(
         self,
         observation: ActualSleepObservation,
@@ -575,7 +711,10 @@ class SleepCalendarReconciler:
                     pending_observation,
                     pending_fingerprint,
                 )
-                result = self._created_result(row.external_id, pending_fingerprint)
+                result = created_sleep_result(
+                    row.external_id,
+                    pending_fingerprint,
+                )
             else:
                 result = self._update_remote(
                     row,
@@ -616,7 +755,7 @@ class SleepCalendarReconciler:
         duplicates: list[CalendarEventMirror],
     ) -> SleepCalendarResult:
         self._delete_duplicate_actual_sleep_mirrors(duplicates)
-        return self._replace_planned_sleep(result, observation)
+        return result
 
     def _quarantine_untrusted_identity_copies(
         self,
@@ -809,6 +948,11 @@ class SleepCalendarReconciler:
                     fingerprint,
                     expected_etag,
                 )
+        except CalendarError as error:
+            try:
+                created = self._backend.read_event(row.external_id)
+            except EventNotFoundError:
+                raise error
         assert_remote_actual_sleep(
             created,
             self._backend.source,
@@ -826,15 +970,7 @@ class SleepCalendarReconciler:
             observation,
             fingerprint,
         )
-        return self._created_result(row.external_id, fingerprint)
-
-    @staticmethod
-    def _created_result(external_id: str, fingerprint: str) -> SleepCalendarResult:
-        return SleepCalendarResult(
-            action=SleepCalendarAction.CREATED,
-            external_id=external_id,
-            observation_fingerprint=fingerprint,
-        )
+        return created_sleep_result(row.external_id, fingerprint)
 
     @staticmethod
     def _noop_result(external_id: str, fingerprint: str) -> SleepCalendarResult:
@@ -882,7 +1018,7 @@ class SleepCalendarReconciler:
                 observation,
                 fingerprint,
             )
-            return self._updated_result(row.external_id, fingerprint)
+            return updated_sleep_result(row.external_id, fingerprint)
         if row.etag is not None and remote_etag != row.etag:
             return self._update_remote(
                 row,
@@ -906,7 +1042,7 @@ class SleepCalendarReconciler:
     ) -> SleepCalendarResult:
         updated = self._backend.update_event(
             row.external_id,
-            summary="수면 (실제)",
+            summary=ACTUAL_SLEEP_SUMMARY,
             start_at=ensure_utc(observation.start_at),
             end_at=ensure_utc(observation.end_at),
             description=description(observation),
@@ -935,12 +1071,4 @@ class SleepCalendarReconciler:
             observation,
             fingerprint,
         )
-        return self._updated_result(row.external_id, fingerprint)
-
-    @staticmethod
-    def _updated_result(external_id: str, fingerprint: str) -> SleepCalendarResult:
-        return SleepCalendarResult(
-            action=SleepCalendarAction.UPDATED,
-            external_id=external_id,
-            observation_fingerprint=fingerprint,
-        )
+        return updated_sleep_result(row.external_id, fingerprint)

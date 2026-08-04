@@ -1,11 +1,10 @@
 {% extends "ui/_base.html.j2" %}
-{# Calendar-connection STATUS page (healthmes/api/connect.py) — read-only.
-   Renders connection state + the exact CLI commands to run; performs no
-   writes and shows no secret (no tokens, no passwords, no usernames). Every
-   string comes from server-side static text / data-dir paths. #}
+{# Runtime-connection STATUS page (healthmes/api/connect.py) — read-only.
+   Renders Oura/Open Wearables freshness plus Calendar connection state;
+   performs no writes and shows no secret or connected identity. #}
 
-{% block title %}캘린더 연결 — HealthMes{% endblock %}
-{% block crumb %}<span class="crumb">/ 캘린더 연결</span>{% endblock %}
+{% block title %}연결 상태 — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">/ 연결 상태</span>{% endblock %}
 
 {% block head %}
 <style>
@@ -21,33 +20,71 @@
   ol.conn-steps { margin: 0.4rem 0 0.2rem; padding-left: 1.3rem; }
   ol.conn-steps li { margin: 0.25rem 0; font-size: 0.9rem; }
   .conn-note { color: var(--ink-2); font-size: 0.86rem; margin: 0.35rem 0; }
+  .conn-actions { display: flex; flex-wrap: wrap; gap: 0.65rem; margin-top: 0.7rem; }
+  .conn-actions button {
+    border: 1px solid var(--brand); border-radius: var(--radius-sm);
+    padding: 0.58rem 0.9rem; background: var(--brand); color: #fff;
+    font: inherit; font-weight: 700; cursor: pointer;
+  }
+  .conn-actions .secondary {
+    border-color: var(--line); background: var(--surface); color: var(--ink);
+  }
 </style>
 {% endblock %}
 
 {% block content %}
-<p class="eyebrow">Calendar connections</p>
-<h1>캘린더 연결</h1>
-<p class="muted">이 페이지는 <strong>상태 표시 전용</strong>입니다 — 연결/해제는 이 기기의
-  터미널에서 실행하며, 토큰·앱 암호 같은 비밀 값은 이 페이지에 절대 표시되지 않습니다.</p>
+<p class="eyebrow">Runtime readiness</p>
+<h1>연결 상태</h1>
+<p class="muted">Oura/Open Wearables의 연결·freshness와 Calendar 연결 상태를 읽기 전용으로
+  표시합니다. 토큰·앱 암호·계정 식별자는 이 페이지에 절대 표시되지 않습니다.</p>
 {% if not scheduler_enabled %}
 <p class="conn-note">참고: 연결되어 있어도 캘린더 폴링은 서비스가
   <code>HEALTHMES_SCHEDULER_ENABLED=true</code> 로 실행 중일 때만 동작합니다.</p>
+{% endif %}
+{% if google_result %}
+<p class="conn-note">Google Calendar: {{ google_result }}</p>
+{% endif %}
+{% if local_unlock_url %}
+<section class="card">
+  <h2>이 Mac에서 연결 관리 잠금 해제</h2>
+  <p class="muted">전체 API 토큰 입력은 이 Mac의 직접 loopback 화면에서만 받습니다.</p>
+  <p><a href="{{ local_unlock_url }}" rel="noreferrer">직접 loopback 화면 열기</a></p>
+</section>
 {% endif %}
 
 {% for cal in cards %}
 <section class="card">
   <h2>{{ cal.label }}
     {% if cal.connected %}
-    <span class="badge conn-badge-on">연결됨</span>
+    <span class="badge conn-badge-on">{{ cal.badge_label or "연결됨" }}</span>
     {% else %}
-    <span class="badge conn-badge-off">미연결</span>
+    <span class="badge conn-badge-off">{{ cal.badge_label or "미연결" }}</span>
     {% endif %}
   </h2>
   <p class="muted">{{ cal.detail }}</p>
   {% for note in cal.notes %}
   <p class="conn-note">{{ note }}</p>
   {% endfor %}
-  {% if not cal.connected %}
+  {% if cal.key == "google" and local_session %}
+    {% if cal.connected %}
+    <div class="conn-actions">
+      <form method="post" action="/connect/google/reconnect">
+        <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+        <button type="submit">Google 다시 연결</button>
+      </form>
+      <form method="post" action="/connect/google/disconnect">
+        <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+        <button class="secondary" type="submit">Google 연결 해제</button>
+      </form>
+    </div>
+    {% else %}
+    <form class="conn-actions" method="post" action="/connect/google/start">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <button type="submit">이 Mac에서 Google 로그인</button>
+    </form>
+    {% endif %}
+  {% endif %}
+  {% if not cal.connected and cal.command %}
     {% if cal.steps %}
     <p>최초 1회 준비 (Google이 요구하는 개인 OAuth 클라이언트 등록):</p>
     <ol class="conn-steps">

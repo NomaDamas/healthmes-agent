@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import NotRequired, TypedDict
+
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
@@ -17,7 +19,10 @@ from healthmes.calendars.base import (
 from healthmes.calendars.planned_sleep_replacement import (
     read_owned_planned_sleep,
 )
-from healthmes.calendars.sleep_event_rendering import observation_fingerprint
+from healthmes.calendars.sleep_event_rendering import (
+    ACTUAL_SLEEP_SUMMARY,
+    observation_fingerprint,
+)
 from healthmes.calendars.sleep_mirror import (
     SLEEP_CREATE_PENDING_STATUS,
     SLEEP_UPDATE_PENDING_STATUS,
@@ -27,7 +32,10 @@ from healthmes.calendars.sleep_mirror import (
     find_actual_sleep_mirrors,
     pending_sleep_observation,
 )
-from healthmes.calendars.sleep_observation import ActualSleepObservation
+from healthmes.calendars.sleep_observation import (
+    ActualSleepObservation,
+    calendar_observations,
+)
 from healthmes.calendars.sleep_reconciliation_guards import (
     assert_owned_actual_sleep,
     assert_remote_actual_sleep,
@@ -37,51 +45,92 @@ from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror
 
 
+class SleepPreview(TypedDict):
+    status: str
+    action: str
+    calendar: str
+    local_date: str
+    summary: str
+    start: str
+    wake_time: str
+    duration_minutes: int
+    time_in_bed_minutes: int | None
+    non_sleep_minutes: int | None
+    source: str
+    planned_sleep_replacements: int
+    segments: NotRequired[list[dict[str, object]]]
+    segment_count: NotRequired[int]
+    stale_segment_removals: NotRequired[int]
+    reason: NotRequired[str]
+
+
 def preview_sleep_reconciliation(
     session: Session,
     calendar_source: CalendarSource,
     observation: ActualSleepObservation,
     backend: CalendarBackend | None,
-) -> dict[str, object]:
-    rows = find_actual_sleep_mirrors(
-        session,
-        calendar_source,
-        observation,
-    )
-    identity = actual_sleep_identity(observation)
-    existing = canonical_actual_sleep_mirror(rows, identity)
-    if existing is None:
-        existing = next(
-            (
-                row
-                for row in rows
-                if (
-                    (row_identity := actual_sleep_identity_from_mirror(row))
-                    is not None
-                    and row.is_agent_created
-                    and row.external_id
-                    == calendar_identity_external_id(calendar_source, row_identity)
-                )
-            ),
-            rows[0] if rows else None,
-        )
-    fingerprint = observation_fingerprint(observation)
-    action, reason = _actual_sleep_action(
-        existing,
-        observation,
-        fingerprint,
-        backend,
-    )
-    if action != "blocked":
-        legacy_reason = _legacy_actual_sleep_reason(
-            rows,
-            identity,
+) -> SleepPreview:
+    children = calendar_observations(observation)
+    child_keys = {child.source_key for child in children}
+    child_actions: list[str] = []
+    reason: str | None = None
+    for child in children:
+        rows = find_actual_sleep_mirrors(
+            session,
             calendar_source,
+            child,
+        )
+        identity = actual_sleep_identity(child)
+        existing = canonical_actual_sleep_mirror(rows, identity)
+        if existing is None:
+            existing = next(
+                (
+                    row
+                    for row in rows
+                    if (
+                        (row_identity := actual_sleep_identity_from_mirror(row))
+                        is not None
+                        and row.is_agent_created
+                        and row.external_id
+                        == calendar_identity_external_id(calendar_source, row_identity)
+                    )
+                ),
+                rows[0] if rows else None,
+            )
+        child_action, child_reason = _actual_sleep_action(
+            existing,
+            child,
+            observation_fingerprint(child),
             backend,
         )
-        if legacy_reason is not None:
-            action = "blocked"
-            reason = legacy_reason
+        if child_action != "blocked":
+            child_reason = _legacy_actual_sleep_reason(
+                rows,
+                identity,
+                calendar_source,
+                backend,
+            )
+            if child_reason is not None:
+                child_action = "blocked"
+        child_actions.append(child_action)
+        if child_reason is not None:
+            reason = child_reason
+            break
+    stale_segments = session.scalars(
+        sa.select(CalendarEventMirror).where(
+            CalendarEventMirror.calendar_source == calendar_source,
+            CalendarEventMirror.is_agent_created.is_(True),
+            CalendarEventMirror.healthmes_kind == HealthmesEventKind.ACTUAL_SLEEP.value,
+            CalendarEventMirror.sleep_local_date == observation.local_date,
+            CalendarEventMirror.healthmes_source_key.like(
+                f"{observation.source_key}:segment:%"
+            ),
+            CalendarEventMirror.healthmes_source_key.not_in(child_keys),
+        )
+    ).all()
+    action = _combined_action(child_actions, stale_segments, bool(observation.segments))
+    if reason is not None:
+        action = "blocked"
     planned = session.scalars(
         sa.select(CalendarEventMirror).where(
             CalendarEventMirror.calendar_source == calendar_source,
@@ -105,22 +154,56 @@ def preview_sleep_reconciliation(
                 planned_count = 0
                 break
             planned_count += int(replace)
-    result: dict[str, object] = {
+    result: SleepPreview = {
         "status": "preview",
         "action": action,
         "calendar": calendar_source.value,
         "local_date": observation.local_date.isoformat(),
-        "summary": "수면 (실제)",
+        "summary": ACTUAL_SLEEP_SUMMARY,
         "start": ensure_utc(observation.start_at).isoformat(),
         "wake_time": ensure_utc(observation.end_at).isoformat(),
         "duration_minutes": observation.duration_minutes,
         "time_in_bed_minutes": observation.time_in_bed_minutes,
+        "non_sleep_minutes": (
+            observation.time_in_bed_minutes - observation.duration_minutes
+            if observation.time_in_bed_minutes is not None
+            else None
+        ),
         "source": observation.provider,
         "planned_sleep_replacements": planned_count,
     }
     if reason is not None:
         result["reason"] = reason
+    if observation.segments:
+        result["segments"] = [
+            {
+                "start": ensure_utc(segment.start_at).isoformat(),
+                "wake_time": ensure_utc(segment.end_at).isoformat(),
+                "duration_minutes": int(
+                    (segment.end_at - segment.start_at).total_seconds() // 60
+                ),
+            }
+            for segment in observation.segments
+        ]
+        result["segment_count"] = len(observation.segments)
+        result["stale_segment_removals"] = len(stale_segments)
     return result
+
+
+def _combined_action(
+    child_actions: list[str],
+    stale_segments: list[CalendarEventMirror],
+    is_split: bool,
+) -> str:
+    if "blocked" in child_actions:
+        return "blocked"
+    if all(action == "noop" for action in child_actions) and not stale_segments:
+        return "noop"
+    if is_split:
+        return "would_split"
+    if "would_create" in child_actions:
+        return "would_create"
+    return "would_update"
 
 
 def _actual_sleep_action(

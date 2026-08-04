@@ -24,6 +24,7 @@
 <meta name="color-scheme" content="light dark">
 <meta name="robots" content="noindex">
 <title>{% block title %}HealthMes{% endblock %}</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M4 17h6l3-8 5 15 3-7h7' fill='none' stroke='%2312806c' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
   /* ---- tokens (bright-first: one light theme, tinted per season) -------- */
   :root {
@@ -556,6 +557,8 @@
     <nav class="site-nav" aria-label="주요 페이지">
       <a href="/decisions{{ token_qs }}"{% if active_nav == "decisions" %} aria-current="page"{% endif %}>제안 기록</a>
       <a href="/reports/weekly{{ token_qs }}"{% if active_nav == "weekly" %} aria-current="page"{% endif %}>주간 리포트</a>
+      <a href="/sleep{{ token_qs }}"{% if active_nav == "sleep" %} aria-current="page"{% endif %}>Actual sleep</a>
+      <a href="/connect{{ token_qs }}"{% if active_nav == "connect" %} aria-current="page"{% endif %}>연결</a>
     </nav>
     <div class="ambience no-print">
       <div class="season-picker" role="group" aria-label="계절 배경 선택" data-season-picker hidden>

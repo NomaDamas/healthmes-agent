@@ -8,7 +8,10 @@ from healthmes.calendars.base import (
     calendar_identity_external_id,
     ensure_utc,
 )
-from healthmes.calendars.sleep_event_rendering import description
+from healthmes.calendars.sleep_event_rendering import (
+    ACTUAL_SLEEP_SUMMARY,
+    description,
+)
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror
@@ -63,7 +66,7 @@ def pending_remote_matches(
     observation: ActualSleepObservation,
 ) -> bool:
     return (
-        event.summary == "수면 (실제)"
+        event.summary == ACTUAL_SLEEP_SUMMARY
         and event.description == description(observation)
         and event.start_at == ensure_utc(observation.start_at)
         and event.end_at == ensure_utc(observation.end_at)

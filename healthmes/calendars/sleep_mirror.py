@@ -12,6 +12,7 @@ from healthmes.calendars.base import (
     ensure_utc,
     parse_calendar_identity,
 )
+from healthmes.calendars.sleep_event_rendering import ACTUAL_SLEEP_SUMMARY
 from healthmes.calendars.sleep_observation import (
     ACTUAL_SLEEP_IDENTITY_SOURCE,
     ActualSleepObservation,
@@ -30,7 +31,7 @@ def actual_sleep_identity(
     return CalendarEventIdentity(
         kind=HealthmesEventKind.ACTUAL_SLEEP,
         source=ACTUAL_SLEEP_IDENTITY_SOURCE,
-        source_key=actual_sleep_source_key(observation.local_date),
+        source_key=observation.source_key,
     )
 
 
@@ -57,6 +58,8 @@ def find_actual_sleep_mirrors(
         calendar_source,
         canonical,
     )
+    base_source_key = actual_sleep_source_key(observation.local_date)
+    is_base_observation = observation.source_key == base_source_key
     provider_match = sa.or_(
         CalendarEventMirror.sleep_provider == observation.provider,
         sa.and_(
@@ -74,11 +77,18 @@ def find_actual_sleep_mirrors(
                     CalendarEventMirror.healthmes_source_key
                     == canonical.source_key,
                     sa.and_(
+                        is_base_observation,
                         CalendarEventMirror.is_agent_created.is_(True),
                         CalendarEventMirror.healthmes_kind
                         == HealthmesEventKind.ACTUAL_SLEEP.value,
                         CalendarEventMirror.sleep_local_date
                         == observation.local_date,
+                        sa.or_(
+                            CalendarEventMirror.healthmes_source_key.is_(None),
+                            CalendarEventMirror.healthmes_source_key.not_like(
+                                f"{base_source_key}:segment:%"
+                            ),
+                        ),
                     ),
                 ),
             )
@@ -170,10 +180,20 @@ def sleep_observation_from_mirror(
         or row.sleep_duration_minutes is None
     ):
         raise RuntimeError("pending actual_sleep mirror is missing observation context")
+    base_source_key = actual_sleep_source_key(row.sleep_local_date)
+    source_key = (
+        row.healthmes_source_key
+        if row.healthmes_source_key
+        and (
+            row.healthmes_source == ACTUAL_SLEEP_IDENTITY_SOURCE
+            or row.healthmes_source_key.startswith(f"{base_source_key}:segment:")
+        )
+        else base_source_key
+    )
     return ActualSleepObservation(
         local_date=row.sleep_local_date,
         provider=provider,
-        source_key=actual_sleep_source_key(row.sleep_local_date),
+        source_key=source_key,
         start_at=coerce_utc(row.start_at),
         end_at=coerce_utc(row.end_at),
         duration_minutes=row.sleep_duration_minutes,
@@ -235,7 +255,7 @@ def pending_sleep_mirror(
     return CalendarEventMirror(
         external_id=calendar_identity_external_id(calendar_source, identity),
         calendar_source=calendar_source,
-        summary="수면 (실제)",
+        summary=ACTUAL_SLEEP_SUMMARY,
         start_at=ensure_utc(observation.start_at),
         end_at=ensure_utc(observation.end_at),
         is_agent_created=True,
@@ -252,6 +272,19 @@ def pending_sleep_mirror(
     )
 
 
+def find_sleep_source_key(
+    session: Session,
+    calendar_source: CalendarSource,
+    source_key: str,
+) -> CalendarEventMirror | None:
+    return session.scalar(
+        sa.select(CalendarEventMirror).where(
+            CalendarEventMirror.calendar_source == calendar_source,
+            CalendarEventMirror.healthmes_source_key == source_key,
+        )
+    )
+
+
 def finalize_sleep_mirror(
     session: Session,
     row: CalendarEventMirror,
@@ -260,7 +293,7 @@ def finalize_sleep_mirror(
     fingerprint: str,
 ) -> None:
     row.external_id = created.external_id
-    row.summary = created.summary or "수면 (실제)"
+    row.summary = created.summary or ACTUAL_SLEEP_SUMMARY
     row.start_at = created.start_at or ensure_utc(observation.start_at)
     row.end_at = created.end_at or ensure_utc(observation.end_at)
     row.etag = created.etag
@@ -286,7 +319,7 @@ def mark_sleep_update_pending(
     fingerprint: str,
     expected_etag: str | None,
 ) -> None:
-    row.summary = "수면 (실제)"
+    row.summary = ACTUAL_SLEEP_SUMMARY
     row.start_at = ensure_utc(observation.start_at)
     row.end_at = ensure_utc(observation.end_at)
     row.etag = expected_etag

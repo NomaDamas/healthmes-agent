@@ -6,6 +6,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from healthmes.calendars.base import HealthmesEventKind, coerce_utc
+from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.store.models import CalendarEventMirror
 
 
@@ -30,6 +31,25 @@ def actual_sleep_context(
         "duration_minutes": row.sleep_duration_minutes,
         "time_in_bed_minutes": row.sleep_time_in_bed_minutes,
         "source": row.sleep_provider or row.healthmes_source,
+        "freshness": "current",
+        "earliest_available_work_time": wake.isoformat(),
+    }
+
+
+def actual_sleep_observation_context(
+    observation: ActualSleepObservation,
+    timezone: dt.tzinfo,
+) -> dict[str, object]:
+    start = observation.start_at.astimezone(timezone)
+    wake = observation.end_at.astimezone(timezone)
+    return {
+        "status": "ok",
+        "local_date": observation.local_date.isoformat(),
+        "start": start.isoformat(),
+        "wake_time": wake.isoformat(),
+        "duration_minutes": observation.duration_minutes,
+        "time_in_bed_minutes": observation.time_in_bed_minutes,
+        "source": observation.provider,
         "freshness": "current",
         "earliest_available_work_time": wake.isoformat(),
     }

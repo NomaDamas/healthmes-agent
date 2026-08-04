@@ -51,8 +51,13 @@ class FakeCalendarBackend:
     received state. All write calls are recorded for assertions.
     """
 
-    def __init__(self, source: CalendarSource = CalendarSource.GOOGLE) -> None:
+    def __init__(
+        self,
+        source: CalendarSource = CalendarSource.GOOGLE,
+        approval_target: str = "test-calendar",
+    ) -> None:
         self.source = source
+        self.approval_target = f"{source.value}:{approval_target}"
         self._batches: list[tuple[list[ExternalEvent], SyncState]] = []
         self.received_sync_states: list[SyncState | None] = []
         self.created_drafts: list[EventDraft] = []
@@ -131,6 +136,7 @@ class FakeCalendarBackend:
             is_agent_created=True,
             agent_task_id=self.events[external_id].agent_task_id,
             identity=self.events[external_id].identity,
+            healthmes_kind=self.events[external_id].healthmes_kind,
             etag="etag-updated",
         )
         self.events[external_id] = event

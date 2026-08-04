@@ -91,6 +91,27 @@ class TestRequestShape:
         assert fake_ow.requests[-1].url.path == "/api/v1/users"
         assert payload["items"][0]["id"] == ow_user_id
 
+    async def test_connections_path_and_list_response(self, ow_user_id, ow_api_key):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json=[{"provider": "oura", "status": "active", "last_synced_at": None}],
+            )
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        connections = await client.get_connections(ow_user_id)
+
+        assert requests[-1].url.path == f"/api/v1/users/{ow_user_id}/connections"
+        assert connections[0]["provider"] == "oura"
+
     def test_from_settings_reads_base_url_and_secret_key(self):
         settings = Settings(
             ow_base_url="http://somewhere.test:9999/",
@@ -148,6 +169,19 @@ class TestErrorMapping:
             )
         assert provider_user_id not in str(exc_info.value)
         assert "open-wearables.test" not in str(exc_info.value)
+
+    async def test_connections_rejects_non_list_response(self, ow_user_id, ow_api_key):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"data": []})
+
+        client = OWClient(
+            base_url="http://open-wearables.test",
+            api_key=ow_api_key,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(OWClientError, match="invalid connections response"):
+            await client.get_connections(ow_user_id)
 
 
 class TestPagination:
@@ -300,6 +334,18 @@ class TestResolveSingleUserId:
                 return {"items": [{"id": "sync-user"}], "total": 1}
 
         assert await resolve_single_user_id(SyncFake(), settings) == "sync-user"
+
+    async def test_discovery_rejects_malformed_user_rows(self, settings, monkeypatch):
+        from healthmes.mcp_server.ow_client import resolve_single_user_id
+
+        monkeypatch.delenv("HEALTHMES_OW_USER_ID", raising=False)
+
+        class MalformedFake:
+            def list_users(self, **kwargs):
+                return {"items": ["private@example.com"]}
+
+        with pytest.raises(LookupError, match="HEALTHMES_OW_USER_ID"):
+            await resolve_single_user_id(MalformedFake(), settings)
 
 
 class TestPaginationTruncationTracked:
