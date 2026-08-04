@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from healthmes.mcp_server.caffeine_contract import (
     CaffeineContraindication,
@@ -64,7 +64,7 @@ def current_event_baseline(
             and bool(baseline.source_key.strip())
             and _aware(baseline.confirmed_at)
             and timing is not None
-            and baseline.confirmed_at <= timing.intended_consumption_at
+            and _utc(baseline.confirmed_at) <= _utc(timing.intended_consumption_at)
         )
     except Exception:
         return False
@@ -75,7 +75,10 @@ def within_sleep_cutoff(request: CaffeineProposalRequest) -> bool | None:
     if timing is None:
         return None
     try:
-        return timing.target_sleep_at - timing.intended_consumption_at < timing.cutoff_before_sleep
+        return (
+            _utc(timing.target_sleep_at) - _utc(timing.intended_consumption_at)
+            < timing.cutoff_before_sleep
+        )
     except Exception:
         return None
 
@@ -143,7 +146,7 @@ def _invalid_timing(timing: CaffeineTiming) -> bool:
         return (
             not _aware(timing.intended_consumption_at)
             or not _aware(timing.target_sleep_at)
-            or timing.target_sleep_at <= timing.intended_consumption_at
+            or _utc(timing.target_sleep_at) <= _utc(timing.intended_consumption_at)
             or timing.cutoff_before_sleep <= timedelta(0)
         )
     except Exception:
@@ -155,3 +158,7 @@ def _aware(value: datetime) -> bool:
         return value.tzinfo is not None and value.utcoffset() is not None
     except Exception:
         return False
+
+
+def _utc(value: datetime) -> datetime:
+    return value.astimezone(UTC)

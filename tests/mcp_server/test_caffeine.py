@@ -1,6 +1,7 @@
 from dataclasses import fields, replace
 from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -490,6 +491,50 @@ def test_exceptional_baseline_timezone_removes_exact_suggestion() -> None:
     assert result.reason is CaffeineProposalReason.PERSONAL_EVENT_BASELINE_UNAVAILABLE
 
 
+def test_baseline_confirmed_after_consumption_during_dst_fallback_is_unavailable() -> None:
+    request = _valid_request()
+    local_timezone = ZoneInfo("America/New_York")
+    timing = replace(
+        request.timing,
+        intended_consumption_at=datetime(
+            2026,
+            11,
+            1,
+            1,
+            45,
+            tzinfo=local_timezone,
+            fold=0,
+        ),
+        target_sleep_at=datetime(2026, 11, 1, 23, tzinfo=local_timezone),
+    )
+    baseline = replace(
+        _event_baseline(),
+        confirmed_at=datetime(
+            2026,
+            11,
+            1,
+            1,
+            30,
+            tzinfo=local_timezone,
+            fold=1,
+        ),
+    )
+    sleep = replace(request.sleep, local_date=date(2026, 11, 1))
+
+    result = propose_caffeine(
+        replace(
+            request,
+            sleep=sleep,
+            timing=timing,
+            personal_event_baseline=baseline,
+        )
+    )
+
+    assert result.status is CaffeineProposalStatus.PROPOSAL
+    assert result.recommendation.suggested_additional_mg is None
+    assert result.reason is CaffeineProposalReason.PERSONAL_EVENT_BASELINE_UNAVAILABLE
+
+
 def test_same_inputs_always_return_same_result() -> None:
     first = propose_caffeine(_valid_request())
     second = propose_caffeine(_valid_request())
@@ -574,6 +619,23 @@ def test_consumption_at_sleep_cutoff_is_allowed() -> None:
 
     assert result.status is CaffeineProposalStatus.PROPOSAL
     assert result.recommendation.suggested_additional_mg == 100
+
+
+def test_sleep_cutoff_uses_elapsed_time_across_dst_spring_forward() -> None:
+    request = _valid_request()
+    local_timezone = ZoneInfo("America/New_York")
+    timing = CaffeineTiming(
+        intended_consumption_at=datetime(2026, 3, 8, 0, 30, tzinfo=local_timezone),
+        target_sleep_at=datetime(2026, 3, 8, 6, 30, tzinfo=local_timezone),
+        cutoff_before_sleep=timedelta(hours=6),
+    )
+    sleep = replace(request.sleep, local_date=date(2026, 3, 8))
+
+    result = propose_caffeine(replace(request, sleep=sleep, timing=timing))
+
+    assert result.status is CaffeineProposalStatus.NOOP
+    assert result.recommendation.suggested_additional_mg is None
+    assert result.reason is CaffeineProposalReason.WITHIN_SLEEP_CUTOFF
 
 
 def test_minor_returns_noop_without_numeric_proposal() -> None:
