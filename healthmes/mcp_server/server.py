@@ -2455,14 +2455,14 @@ async def get_caffeine_proposal(
     personal_daily_limit_mg: int,
     population_status: SupportedPopulationStatus,
     product_form: CaffeineProductForm,
+    cutoff_before_sleep_hours: float,
+    contraindications: list[CaffeineContraindication],
     intended_consumption_at: str | None = None,
     target_sleep_at: str | None = None,
     consumed_today_mg: int | None = None,
     total_intake_complete: bool = False,
     personal_event_baseline_mg: int | None = None,
     baseline_confirmed_at: str | None = None,
-    cutoff_before_sleep_hours: float = 6.0,
-    contraindications: list[CaffeineContraindication] | None = None,
 ) -> dict[str, Any]:
     """A bounded caffeine preparation proposal for one exact mirrored event.
 
@@ -2475,6 +2475,8 @@ async def get_caffeine_proposal(
 
     `intended_consumption_at`, `target_sleep_at`, and `baseline_confirmed_at`
     must be ISO-8601 timestamps with an explicit UTC offset.
+    `cutoff_before_sleep_hours` and `contraindications` must be supplied from
+    explicit user-confirmed context; the adapter does not infer defaults.
     `consumed_today_mg` must cover drinks, foods, supplements, and medications
     before `total_intake_complete=true`.
     """
@@ -2548,7 +2550,7 @@ async def get_caffeine_proposal(
         target_sleep_at=target_sleep,
         cutoff_before_sleep_hours=cutoff_before_sleep_hours,
         population_status=population_status,
-        contraindications=contraindications or [],
+        contraindications=contraindications,
         product_form=product_form,
     )
     return caffeine_adapter.serialize_proposal(

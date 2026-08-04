@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from healthmes.mcp_server.caffeine import propose_caffeine
@@ -27,6 +27,7 @@ SINGLE_DOSE_GUARDRAIL_MG = CaffeineMg(200)
 FDA_SOURCE = "fda_population_guidance"
 EFSA_SOURCE = "efsa_population_guidance"
 USER_SOURCE = "user_confirmed_via_agent"
+BASELINE_FRESHNESS_WINDOW = timedelta(hours=24)
 
 
 def select_sleep_evidence(
@@ -99,7 +100,10 @@ def build_request(
             source=USER_SOURCE,
             source_key=f"event-baseline:{event_id}:{baseline_confirmed_at.isoformat()}",
             confirmed_at=baseline_confirmed_at,
-            freshness=BaselineFreshness.CURRENT,
+            freshness=_baseline_freshness(
+                confirmed_at=baseline_confirmed_at,
+                intended_consumption_at=intended_consumption_at,
+            ),
         )
     timing = None
     if intended_consumption_at is not None and target_sleep_at is not None:
@@ -135,6 +139,26 @@ def build_request(
         ),
         product_form=product_form,
     )
+
+
+def _baseline_freshness(
+    *,
+    confirmed_at: datetime,
+    intended_consumption_at: datetime | None,
+) -> BaselineFreshness:
+    if intended_consumption_at is None:
+        return BaselineFreshness.STALE
+    if confirmed_at.tzinfo is None or confirmed_at.utcoffset() is None:
+        return BaselineFreshness.STALE
+    if intended_consumption_at.tzinfo is None or intended_consumption_at.utcoffset() is None:
+        return BaselineFreshness.STALE
+    try:
+        age = intended_consumption_at.astimezone(UTC) - confirmed_at.astimezone(UTC)
+    except (OverflowError, ValueError):
+        return BaselineFreshness.STALE
+    if timedelta(0) <= age <= BASELINE_FRESHNESS_WINDOW:
+        return BaselineFreshness.CURRENT
+    return BaselineFreshness.STALE
 
 
 def serialize_proposal(

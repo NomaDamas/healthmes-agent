@@ -48,6 +48,7 @@ def _proposal_args(
         "personal_event_baseline_mg": 100,
         "baseline_confirmed_at": (event_start_local - dt.timedelta(hours=1)).isoformat(),
         "cutoff_before_sleep_hours": 6,
+        "contraindications": [],
     }
 
 
@@ -234,6 +235,63 @@ class TestCaffeineProposalTool:
         assert result["recommendation"]["basis"] == "upper_bound_only"
         assert result["reason"] == "personal_event_baseline_unavailable"
 
+    async def test_stale_baseline_returns_only_an_upper_bound(
+        self,
+        mcp_client,
+        call_tool,
+        mcp_env,
+        store_factory,
+        pinned_tz,
+    ):
+        day, event_start, target_sleep = _local_times(pinned_tz)
+        event_id = _seed_event(
+            store_factory,
+            start=event_start.astimezone(dt.UTC),
+            end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+        )
+        mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        args = _proposal_args(
+            event_id,
+            event_start_local=event_start,
+            target_sleep_local=target_sleep,
+        )
+        args["baseline_confirmed_at"] = (event_start - dt.timedelta(days=2)).isoformat()
+
+        result = await call_tool(mcp_client, "get_caffeine_proposal", args)
+
+        assert result["status"] == "proposal"
+        assert result["facts"]["personal_event_baseline"]["freshness"] == "stale"
+        assert result["recommendation"] == {
+            "maximum_additional_mg": 200,
+            "suggested_additional_mg": None,
+            "basis": "upper_bound_only",
+        }
+        assert result["reason"] == "personal_event_baseline_unavailable"
+
+    @pytest.mark.parametrize("missing_field", ["cutoff_before_sleep_hours", "contraindications"])
+    async def test_cutoff_and_contraindication_confirmation_are_required(
+        self,
+        mcp_client,
+        store_factory,
+        pinned_tz,
+        missing_field,
+    ):
+        _, event_start, target_sleep = _local_times(pinned_tz)
+        event_id = _seed_event(
+            store_factory,
+            start=event_start.astimezone(dt.UTC),
+            end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+        )
+        args = _proposal_args(
+            event_id,
+            event_start_local=event_start,
+            target_sleep_local=target_sleep,
+        )
+        del args[missing_field]
+
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool("get_caffeine_proposal", args)
+
     async def test_missing_intended_consumption_time_fails_closed(
         self,
         mcp_client,
@@ -342,6 +400,8 @@ class TestCaffeineProposalTool:
                     "personal_daily_limit_mg": 300,
                     "population_status": "confirmed_adult",
                     "product_form": "beverage_or_food",
+                    "cutoff_before_sleep_hours": 6,
+                    "contraindications": [],
                     "target_sleep_at": "2026-08-02T23:00:00",
                 },
             )
