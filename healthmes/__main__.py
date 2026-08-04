@@ -97,6 +97,9 @@ def _serve() -> int:
         factory=True,
         host=settings.host,
         port=settings.port,
+        # Viewer links carry a derived read-only query credential. Keep
+        # request URLs out of persistent launchd logs.
+        access_log=False,
     )
     return 0
 

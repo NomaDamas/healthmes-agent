@@ -9,6 +9,112 @@
 결정합니다. 코드는 필요 없습니다 — 당신의 역할은 §3의 설계 질문에 답하고,
 그 결정을 §4 양식에 근거·검증 방법과 함께 기록하는 것입니다.
 
+## 0. 소유자 결정 — HealthMes Decision Remote
+
+2026-08-04 소유자 결정으로 워치 제품의 역할을 다음 한 문장으로 고정한다.
+
+> **HealthMes가 제안한 행동을 손목에서 3초 안에 결정하는 리모컨.**
+
+### 0.1 플랫폼 순서
+
+1. iPhone의 조작 가능한 알림을 먼저 완성한다.
+2. iPhone 알림을 Apple Watch에 미러링해 실제 기기에서 가독성·응답성을 검증한다.
+3. 검증된 정보 계층을 watchOS 네이티브 결정 카드로 만든다.
+4. 같은 결정 계약과 UX 원칙을 Android 알림과 Wear OS(Galaxy Watch)로 이식한다.
+
+Apple Watch를 먼저 만드는 이유는 제품 우선순위이지 플랫폼 종속 설계의 근거가
+아니다. 서버의 결정 의미와 행동 계약은 공통이고, 각 플랫폼은 이를 네이티브
+컴포넌트로 렌더링한다.
+
+```text
+Open Wearables / HealthKit / Android Health Connect
+                    │ 건강 데이터
+                    ▼
+            HealthMes Decision Engine
+                    │ 공통 Decision Card
+          ┌─────────┴──────────┐
+          ▼                    ▼
+  iPhone + Apple Watch   Android + Wear OS
+```
+
+Open Wearables는 Apple Watch·Galaxy Watch 등에서 들어오는 건강 데이터의 통합
+계층이다. 알림 UI, 승인 권한, 일정 실행, 결과 학습은 HealthMes가 소유한다.
+
+### 0.2 공통 Decision Card 계약
+
+모든 플랫폼이 같은 의미를 렌더링하도록 서버 계약을 다음 형태로 수렴시킨다.
+
+```text
+decision_id
+proposal_id
+kind / severity
+title
+observation_short
+evidence_short
+proposed_action
+before / after
+expires_at
+accept_action
+decline_action
+decision_url
+```
+
+플랫폼별 버튼 모양과 레이아웃은 달라도 `accept`와 `decline`의 의미, 대상
+`proposal_id`, 만료와 중복 처리 규칙은 동일해야 한다.
+
+### 0.3 첫 MVP 화면
+
+```text
+수면 부족 · 회복 낮음
+
+14:00 집중 업무를
+내일 09:30으로 옮길까요?
+
+[ 예 ]          [ 아니요 ]
+
+왜? · 18분 후 만료
+```
+
+- 첫 화면 행동은 `예` / `아니요` 두 개다.
+- `수정`은 iPhone 결정 상세 화면으로 위임한다.
+- `왜?`는 한 줄 근거 또는 iPhone 상세 화면을 연다.
+- 성공, 이미 처리됨, 만료, 연결 실패를 명시적으로 보여준다.
+- 긴 건강 리포트, 채팅, 전체 캘린더 편집은 워치 MVP에 포함하지 않는다.
+
+### 0.4 iPhone 알림 UX
+
+현재 구현은 로컬 알림에 실제 `적용` / `조정` / `유지` 액션을 연결하지만,
+표현은 관찰·근거·제안을 줄글로 조합한 시스템 알림이다. 목표 UX는 다음과 같다.
+
+- 축소 배너: 상태 + 제안 핵심 한 줄
+- 길게 누른 확장 화면: 상태 배지, 변경 전·후 시간, `예` / `아니요`
+- 알림 탭: iPhone 결정 상세 화면
+- `예`: 제안별 resolution token으로 승인
+- `아니요`: 같은 제안을 거절하고 반복 알림 금지
+- 처리 결과: 성공·이미 처리됨·만료·오프라인 상태를 후속 알림으로 표시
+
+iPhone의 시각적 확장 카드는 Notification Content Extension 후보지만, 축소
+배너와 Apple Watch 미러 알림은 OS가 허용하는 시스템 레이아웃을 따른다.
+따라서 iPhone 확장 UI를 그대로 Watch에 복사한다고 가정하지 않는다.
+
+### 0.5 전달과 표현을 분리한다
+
+- **표현**: Decision Card가 무엇을 어떻게 보여주는가.
+- **전달**: 새 결정을 폰이 언제 알게 되는가.
+
+현재 네이티브 알림은 `GET /v1/alerts` 폴링에서 파생되므로 iOS 백그라운드
+예산에 따라 지연될 수 있다. 1차 실기기 검증은 이 경로로 진행하되, 지연이
+핵심 사용성을 깨뜨린다는 증거가 나오면 APNs 전달을 별도 단계로 추가한다.
+
+### 0.6 MVP 성공 기준
+
+- 알림을 본 뒤 결정까지 중앙값 3초 이내
+- 잘못된 proposal을 처리한 사례 0건
+- 중복 탭·다른 기기 처리 시 안전하게 `이미 처리됨` 표시
+- Watch에서 응답한 결정이 서버와 캘린더에 정확히 한 번 반영
+- 2주 실사용에서 유용 평가 70% 이상
+- 무시·만료·방해 평가를 빠짐없이 결과 기록에 연결
+
 읽는 순서: `docs/EXPERT-ONBOARDING.ko.md`(역할·QA 프로토콜) →
 `docs/PLAN.md` §8.5(알림 문법)·§11(알림 소음) → 이 문서.
 
@@ -332,9 +438,10 @@ vs 본인 체감 2주 기록)과 ④ 알림 소음 일지(유용/무시/방해 �
   전부 임시값입니다.
 
 **아직 없음 / 보류 (결정 대기 또는 후속 플럼빙)**
-- 알림의 근거(`evidence`)·제안(`proposal`) 줄은 트리거 페이로드에는 있지만
-  글랜스 API `alerts.top`에는 `summary`(관찰)만 노출 — 확장 알림을 폴링으로
-  온전히 렌더하려면 노출 결정 필요(Q2·Q5와 연동).
+- `GET /v1/alerts`는 근거(`evidence`), 제안(`proposal`), 정확한
+  `proposal_id`를 제공하고 iOS/Android/macOS 알림 액션이 이를 소비한다.
+  그러나 iPhone의 시각적 Notification Content Extension과 watchOS 네이티브
+  결정 카드는 아직 없다.
 - 알림 "해결됨" 추적 없음 — `unresolved_count`는 "최근 24시간 내 푸시됨"의
   자리표시 정책입니다(개선 대상으로 명시됨).
 - 야간 억제 이벤트의 표면 이월 없음(Q6), 알림 등급 필드 없음(Q2),

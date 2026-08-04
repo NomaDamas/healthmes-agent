@@ -30,6 +30,12 @@ public struct AlertNotificationContent: Equatable {
     public static let userInfoAlertID = "healthmes_alert_id"
     public static let userInfoDecisionURL = "healthmes_decision_url"
     public static let userInfoProposalID = "healthmes_proposal_id"
+    public static let userInfoDecisionTitle = "healthmes_decision_title"
+    public static let userInfoDecisionObservation = "healthmes_decision_observation"
+    public static let userInfoDecisionAction = "healthmes_decision_action"
+    public static let userInfoDecisionAfter = "healthmes_decision_after"
+    public static let userInfoDecisionEndsAt = "healthmes_decision_ends_at"
+    public static let userInfoDecisionExpiresAt = "healthmes_decision_expires_at"
 
     /// Observation line (§8.5 line 1).
     public let title: String
@@ -79,10 +85,19 @@ public struct AlertNotificationContent: Equatable {
         if let exactProposalID {
             userInfo[userInfoProposalID] = exactProposalID.uuidString.lowercased()
         }
+        if let card = alert.decisionCard {
+            let formatter = ISO8601DateFormatter()
+            userInfo[userInfoDecisionTitle] = card.title
+            userInfo[userInfoDecisionObservation] = card.observationShort
+            userInfo[userInfoDecisionAction] = card.proposedAction
+            userInfo[userInfoDecisionAfter] = formatter.string(from: card.after)
+            userInfo[userInfoDecisionEndsAt] = formatter.string(from: card.endsAt)
+            userInfo[userInfoDecisionExpiresAt] = formatter.string(from: card.expiresAt)
+        }
 
         return AlertNotificationContent(
-            title: alert.summary,
-            body: bodyLines.joined(separator: "\n"),
+            title: alert.decisionCard?.observationShort ?? alert.summary,
+            body: alert.decisionCard?.proposedAction ?? bodyLines.joined(separator: "\n"),
             categoryID: exactProposalID != nil ? actionableCategoryID : infoCategoryID,
             threadID: alert.ruleId,
             userInfo: userInfo

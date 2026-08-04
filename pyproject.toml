@@ -22,6 +22,7 @@ dependencies = [
     # Settings / schemas
     "pydantic>=2",
     "pydantic-settings",
+    "python-dotenv",
     # Config rendering (hermes-config.yaml.tmpl) + decision viewer pages
     "jinja2",
     "pyyaml",

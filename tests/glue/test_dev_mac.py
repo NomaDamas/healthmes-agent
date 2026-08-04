@@ -253,6 +253,7 @@ def test_single_entry_local_script_parses_and_exposes_runtime_commands() -> None
         "update",
         "start",
         "stop",
+        "restart",
         "status",
         "open",
         "uninstall",

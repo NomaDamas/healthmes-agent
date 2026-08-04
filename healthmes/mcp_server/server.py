@@ -2657,6 +2657,7 @@ def resolve_schedule_proposal(
                 target,
                 reply_handle,
                 _adjustment_handle_secret(),
+                surface="telegram",
             )
         except schedule_proposals.ScheduleProposalResolutionError as exc:
             if exc.code in {"not_found", "not_proposed", "invalid_handle"}:

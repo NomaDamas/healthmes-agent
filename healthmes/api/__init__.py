@@ -32,6 +32,7 @@ from healthmes.api import (
     medical,
     reports,
     schedule,
+    settings_ui,
     sleep,
     tasks,
 )
@@ -44,6 +45,7 @@ routers: list[APIRouter] = [
     goals.router,
     tasks.router,
     schedule.router,
+    settings_ui.router,
     food.router,
     medical.router,
     media.router,

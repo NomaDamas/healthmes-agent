@@ -46,6 +46,7 @@ targets:
         buildPhase: resources
     dependencies:
       - target: HealthMesWidgets
+      - target: HealthMesNotificationContent
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion
@@ -126,6 +127,31 @@ targets:
       properties:
         com.apple.security.application-groups:
           - group.com.healthmes.companion
+
+  # --------------------------------------- expanded actionable notification UI
+  HealthMesNotificationContent:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Sources/NotificationContentExtension
+    resources:
+      - Resources/Localizable.xcstrings
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.notification-content
+        TARGETED_DEVICE_FAMILY: "1"
+        SKIP_INSTALL: true
+    info:
+      path: Support/HealthMesNotificationContent-Info.plist
+      properties:
+        CFBundleDisplayName: HealthMes Decision
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.content-extension
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationViewController
+          NSExtensionAttributes:
+            UNNotificationExtensionCategory: HEALTHMES_ALERT_ACTIONABLE
+            UNNotificationExtensionDefaultContentHidden: true
+            UNNotificationExtensionInitialContentSizeRatio: 0.72
 
   # ------------------------------------------------------------- watchOS app
   # Modern single-target watch app. Declared as companion of the iOS app so

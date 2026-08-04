@@ -9,46 +9,41 @@ import UserNotifications
 ///   local-first; Telegram remains the guaranteed-delivery channel).
 /// - Content comes from the shared `AlertNotificationContent` builder
 ///   (observation title, evidence+proposal body).
-/// - Action buttons are wired to REAL endpoints: ✅ Apply →
-///   `POST /v1/schedule/proposals/{id}/accept`, ❌ Keep as is → `…/decline`,
-///   ✏️ Adjust → opens the proposal detail in-app. The buttons appear only
+/// - Action buttons are wired to REAL endpoints: Yes →
+///   `POST /v1/schedule/proposals/{id}/accept`, No → `…/decline`.
+///   The buttons appear only
 ///   when the refresh loop attached a pending proposal id; otherwise the
 ///   notification carries just the tap-through ("why this?" viewer).
 final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationManager()
 
     enum ActionID {
-        static let apply = "HEALTHMES_APPLY"
-        static let adjust = "HEALTHMES_ADJUST"
-        static let keep = "HEALTHMES_KEEP"
+        static let yes = "HEALTHMES_YES"
+        static let no = "HEALTHMES_NO"
     }
 
     func configure() {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
 
-        // §8.5 button row. Titles are localized (ko/en); the emoji prefixes
-        // mirror the Telegram inline keyboard so the vocabulary stays one
-        // system (wording itself is the domain expert's to refine —
-        // docs/design/WATCH-NOTIFICATIONS.ko.md).
-        let apply = UNNotificationAction(
-            identifier: ActionID.apply,
-            title: String(localized: "✅ Apply"),
+        // The same native category is mirrored to Apple Watch, where the
+        // owner can decide without opening either app.
+        let yes = UNNotificationAction(
+            identifier: ActionID.yes,
+            title: String(localized: "Yes"),
             options: [.authenticationRequired]
         )
-        let adjust = UNNotificationAction(
-            identifier: ActionID.adjust,
-            title: String(localized: "✏️ Adjust"),
-            options: [.foreground]
-        )
-        let keep = UNNotificationAction(
-            identifier: ActionID.keep,
-            title: String(localized: "❌ Keep as is"),
+        let no = UNNotificationAction(
+            identifier: ActionID.no,
+            title: String(localized: "No"),
             options: [.authenticationRequired]
         )
         let actionable = UNNotificationCategory(
             identifier: AlertNotificationContent.actionableCategoryID,
-            actions: [apply, adjust, keep],
+            // Apple Watch Double Tap can invoke the first non-destructive
+            // action. Default to the non-mutating choice so an accidental
+            // gesture can never approve a calendar change.
+            actions: [no, yes],
             intentIdentifiers: []
         )
         let info = UNNotificationCategory(
@@ -138,20 +133,10 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             .flatMap(UUID.init(uuidString:))
 
         switch response.actionIdentifier {
-        case ActionID.apply:
+        case ActionID.yes:
             resolve(proposalID, action: .accept, completionHandler: completionHandler)
-        case ActionID.keep:
+        case ActionID.no:
             resolve(proposalID, action: .decline, completionHandler: completionHandler)
-        case ActionID.adjust:
-            // .foreground option: the app is coming up — route to the sheet.
-            Task { @MainActor in
-                if let proposalID {
-                    AppRouter.shared.openProposalDetail(proposalID)
-                } else {
-                    AppRouter.shared.tab = .home
-                }
-                completionHandler()
-            }
         case UNNotificationDefaultActionIdentifier:
             // Tap-through = the §8.5 "why this?" link when the alert has a
             // decision record; home otherwise.
@@ -187,20 +172,33 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                 let api = HealthMesAPI()
                 let pending = try await api.getProposal(proposalID)
                 guard pending.isActionable else {
+                    let stillProposed = pending.status == .proposed
                     await postOutcome(
-                        title: String(localized: "Already resolved"),
-                        body: String(localized: "This proposal is no longer pending.")
+                        title: stillProposed
+                            ? String(localized: "Proposal expired")
+                            : String(localized: "Already resolved"),
+                        body: stillProposed
+                            ? String(localized: "The decision window closed without a change.")
+                            : String(localized: "This proposal is no longer pending.")
                     )
                     return
                 }
-                let proposal = try await api.resolveProposal(pending, action: action)
+                let proposal = try await api.resolveProposal(
+                    pending,
+                    action: action,
+                    // A mirrored Watch action is delivered through the iPhone
+                    // delegate, which cannot reliably distinguish the device.
+                    surface: "apple_notification"
+                )
                 let title =
                     proposal.status == .accepted
-                    ? String(localized: "Proposal applied")
-                    : String(localized: "Kept as is")
+                    ? String(localized: "Calendar change approved")
+                    : String(localized: "Calendar change declined")
                 await postOutcome(
                     title: title,
-                    body: String(localized: "Your HealthMes instance recorded the decision.")
+                    body: proposal.status == .accepted
+                        ? String(localized: "HealthMes recorded Yes. Calendar sync will apply it.")
+                        : String(localized: "HealthMes recorded No. The calendar stays unchanged.")
                 )
             } catch let error as HealthMesAPIError where error.isAlreadyResolved {
                 await postOutcome(
@@ -208,6 +206,11 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                     body: String(
                         localized: "This proposal was already decided (\(error.alreadyResolvedStatus ?? "resolved"))."
                     )
+                )
+            } catch let error as HealthMesAPIError where error.isProposalExpired {
+                await postOutcome(
+                    title: String(localized: "Proposal expired"),
+                    body: String(localized: "The decision window closed without a change.")
                 )
             } catch {
                 await postOutcome(

@@ -122,6 +122,116 @@
         }
       }
     },
+    "Proposal expired": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "제안 만료됨"
+          }
+        }
+      }
+    },
+    "The decision window closed without a change.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "결정 시간이 지나 일정은 변경되지 않았습니다."
+          }
+        }
+      }
+    },
+    "Calendar change approved": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "일정 변경 승인됨"
+          }
+        }
+      }
+    },
+    "Calendar change declined": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "일정 변경 거절됨"
+          }
+        }
+      }
+    },
+    "Decide in 3 seconds: Yes or No": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "3초 안에 결정하세요: 예 또는 아니오"
+          }
+        }
+      }
+    },
+    "HealthMes recorded No. The calendar stays unchanged.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "HealthMes가 아니오를 기록했습니다. 캘린더는 그대로 유지됩니다."
+          }
+        }
+      }
+    },
+    "HealthMes recorded Yes. Calendar sync will apply it.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "HealthMes가 예를 기록했습니다. 캘린더 동기화가 반영합니다."
+          }
+        }
+      }
+    },
+    "No": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아니오"
+          }
+        }
+      }
+    },
+    "This proposal is no longer pending.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 제안은 더 이상 대기 중이 아닙니다."
+          }
+        }
+      }
+    },
+    "Yes": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "예"
+          }
+        }
+      }
+    },
     "Apply": {
       "extractionState": "manual",
       "localizations": {
