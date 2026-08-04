@@ -2541,6 +2541,7 @@ async def get_caffeine_proposal(
     request = caffeine_adapter.build_request(
         event_id=event_snapshot["id"] if event_snapshot is not None else None,
         intended_consumption_at=intended_consumption,
+        observed_at=dt.datetime.now(dt.UTC),
         sleep=sleep,
         consumed_today_mg=consumed_today_mg,
         total_intake_complete=total_intake_complete,

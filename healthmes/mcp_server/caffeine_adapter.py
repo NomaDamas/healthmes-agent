@@ -76,6 +76,7 @@ def build_request(
     *,
     event_id: str | None,
     intended_consumption_at: datetime | None,
+    observed_at: datetime,
     sleep: SleepEvidence | None,
     consumed_today_mg: int | None,
     total_intake_complete: bool,
@@ -103,6 +104,7 @@ def build_request(
             freshness=_baseline_freshness(
                 confirmed_at=baseline_confirmed_at,
                 intended_consumption_at=intended_consumption_at,
+                observed_at=observed_at,
             ),
         )
     timing = None
@@ -145,6 +147,7 @@ def _baseline_freshness(
     *,
     confirmed_at: datetime,
     intended_consumption_at: datetime | None,
+    observed_at: datetime,
 ) -> BaselineFreshness:
     if intended_consumption_at is None:
         return BaselineFreshness.STALE
@@ -152,8 +155,13 @@ def _baseline_freshness(
         return BaselineFreshness.STALE
     if intended_consumption_at.tzinfo is None or intended_consumption_at.utcoffset() is None:
         return BaselineFreshness.STALE
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        return BaselineFreshness.STALE
     try:
-        age = intended_consumption_at.astimezone(UTC) - confirmed_at.astimezone(UTC)
+        confirmed_at_utc = confirmed_at.astimezone(UTC)
+        if confirmed_at_utc > observed_at.astimezone(UTC):
+            return BaselineFreshness.STALE
+        age = intended_consumption_at.astimezone(UTC) - confirmed_at_utc
     except (OverflowError, ValueError):
         return BaselineFreshness.STALE
     if timedelta(0) <= age <= BASELINE_FRESHNESS_WINDOW:

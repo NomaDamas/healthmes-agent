@@ -5,6 +5,7 @@ import pytest
 from fastmcp.exceptions import ToolError
 from sqlalchemy import select
 
+from healthmes.mcp_server import server as server_module
 from healthmes.store import CalendarEventMirror, CalendarSource
 
 
@@ -256,6 +257,43 @@ class TestCaffeineProposalTool:
             target_sleep_local=target_sleep,
         )
         args["baseline_confirmed_at"] = (event_start - dt.timedelta(days=2)).isoformat()
+
+        result = await call_tool(mcp_client, "get_caffeine_proposal", args)
+
+        assert result["status"] == "proposal"
+        assert result["facts"]["personal_event_baseline"]["freshness"] == "stale"
+        assert result["recommendation"] == {
+            "maximum_additional_mg": 200,
+            "suggested_additional_mg": None,
+            "basis": "upper_bound_only",
+        }
+        assert result["reason"] == "personal_event_baseline_unavailable"
+
+    async def test_future_baseline_confirmation_is_not_current_evidence(
+        self,
+        mcp_client,
+        call_tool,
+        mcp_env,
+        store_factory,
+        pinned_tz,
+        monkeypatch,
+    ):
+        now = dt.datetime.now(pinned_tz)
+        event_start = now + dt.timedelta(hours=2)
+        target_sleep = event_start + dt.timedelta(hours=10)
+        monkeypatch.setattr(server_module, "_today_local", lambda: event_start.date())
+        event_id = _seed_event(
+            store_factory,
+            start=event_start.astimezone(dt.UTC),
+            end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+        )
+        mcp_env.add_sleep_summary(event_start.date().isoformat(), duration_minutes=374)
+        args = _proposal_args(
+            event_id,
+            event_start_local=event_start,
+            target_sleep_local=target_sleep,
+        )
+        args["baseline_confirmed_at"] = (now + dt.timedelta(hours=1)).isoformat()
 
         result = await call_tool(mcp_client, "get_caffeine_proposal", args)
 
