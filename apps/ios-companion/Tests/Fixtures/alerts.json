@@ -7,7 +7,8 @@
       "summary": "Recovery 38 today.",
       "proposal": "Move the 14:00 block to tomorrow.",
       "evidence": {"hrv_delta_pct": -18, "baseline_days": 14},
-      "decision_url": "http://192.168.1.20:8100/decisions/00000000-0000-0000-0000-00000000e002?token=hm-ro-3q2b8d1f7c6e5a4"
+      "decision_url": "http://192.168.1.20:8100/decisions/00000000-0000-0000-0000-00000000e002?token=hm-ro-3q2b8d1f7c6e5a4",
+      "proposal_id": "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10"
     },
     {
       "id": "8f1d3c5e-8a2b-4c47-9be1-3d2a7c9f4e22",
@@ -16,7 +17,8 @@
       "summary": "schedule_overload",
       "proposal": null,
       "evidence": null,
-      "decision_url": null
+      "decision_url": null,
+      "proposal_id": null
     }
   ],
   "pagination": {

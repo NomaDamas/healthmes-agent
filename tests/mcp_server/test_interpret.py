@@ -57,6 +57,16 @@ class TestPrimitives:
         assert interpret.daily_series(points, how="max") == {D: 80.0}
         assert interpret.daily_series(points, how="latest") == {D: 80.0}
 
+    def test_summary_daily_values_skips_non_mapping_rows(self):
+        rows = [
+            "malformed",
+            {"date": D.isoformat(), "avg_hrv_rmssd_ms": 48.0},
+        ]
+
+        assert interpret.summary_daily_values(rows, "avg_hrv_rmssd_ms", D) == {
+            D: 48.0
+        }
+
 
 class TestMetricBaseline:
     def test_hand_computed_baseline_and_z(self):

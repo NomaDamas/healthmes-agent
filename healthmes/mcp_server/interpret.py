@@ -381,7 +381,7 @@ def localized(
 
 
 def score_points(
-    rows: Iterable[Mapping[str, Any]],
+    rows: Iterable[object],
     category: str,
     *,
     provider: str | None = None,
@@ -390,9 +390,14 @@ def score_points(
     """(recorded_at, value) points for one health-score category."""
     points: list[tuple[datetime, float]] = []
     for row in rows:
+        if not isinstance(row, Mapping):
+            continue
         if row.get("category") != category:
             continue
-        row_provider = row.get("provider") or "unknown"
+        raw_provider = row.get("provider")
+        row_provider = (
+            raw_provider if isinstance(raw_provider, str) and raw_provider else "unknown"
+        )
         if provider is not None and row_provider != provider:
             continue
         if row_provider in exclude_providers:
@@ -405,7 +410,7 @@ def score_points(
     return points
 
 
-def resilience_score_points(rows: Iterable[Mapping[str, Any]]) -> list[tuple[datetime, float]]:
+def resilience_score_points(rows: Iterable[object]) -> list[tuple[datetime, float]]:
     """(recorded_at, resilience_score 0-100) from internal resilience rows.
 
     The row ``value`` is the raw HRV-CV; the 0-100 score lives in
@@ -414,11 +419,18 @@ def resilience_score_points(rows: Iterable[Mapping[str, Any]]) -> list[tuple[dat
     """
     points: list[tuple[datetime, float]] = []
     for row in rows:
+        if not isinstance(row, Mapping):
+            continue
         if row.get("category") != "resilience" or row.get("provider") != "internal":
             continue
         recorded_at = parse_recorded_at(row.get("recorded_at"))
-        components = row.get("components") or {}
-        score = as_float((components.get("resilience_score") or {}).get("value"))
+        components = row.get("components")
+        if not isinstance(components, Mapping):
+            continue
+        resilience = components.get("resilience_score")
+        if not isinstance(resilience, Mapping):
+            continue
+        score = as_float(resilience.get("value"))
         if recorded_at is None or score is None:
             continue
         points.append((recorded_at, score))
@@ -426,7 +438,7 @@ def resilience_score_points(rows: Iterable[Mapping[str, Any]]) -> list[tuple[dat
 
 
 def sleep_score_series(
-    rows: Iterable[Mapping[str, Any]],
+    rows: Iterable[object],
     *,
     tz: tzinfo | None = None,
 ) -> tuple[dict[date, float], str | None]:
@@ -456,11 +468,13 @@ def sleep_score_series(
 
 
 def summary_daily_values(
-    rows: Iterable[Mapping[str, Any]], field: str, up_to: date
+    rows: Iterable[object], field: str, up_to: date
 ) -> dict[date, float]:
     """Per-day values of one summary field, keyed by the summary ``date``."""
     out: dict[date, float] = {}
     for row in rows:
+        if not isinstance(row, Mapping):
+            continue
         raw_day = row.get("date")
         value = as_float(row.get(field))
         if raw_day is None or value is None:

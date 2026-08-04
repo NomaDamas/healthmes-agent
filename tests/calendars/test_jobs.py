@@ -8,7 +8,7 @@ agent blocks — the contract promised by healthmes/api/schedule.py.
 
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -20,6 +20,7 @@ from healthmes.calendars.base import (
     EventNotFoundError,
     HealthmesEventKind,
 )
+from healthmes.calendars.intake import intake_calendar_tasks, intake_revision
 from healthmes.calendars.jobs import (
     _proposal_identity,
     build_calendar_job,
@@ -37,6 +38,7 @@ from healthmes.store import (
     ProposalStatus,
     ScheduleProposal,
     Task,
+    TaskSource,
 )
 
 
@@ -81,6 +83,213 @@ class TestEnablement:
 
 
 class TestJobRun:
+    def test_intake_opt_out_is_sticky_until_hm_is_readded(self, session) -> None:
+        mirror = CalendarEventMirror(
+            external_id="hm-opt-out",
+            calendar_source=CalendarSource.GOOGLE,
+            summary="[HM] Write launch notes",
+            start_at=utc(2026, 8, 4, 9),
+            end_at=utc(2026, 8, 4, 10),
+            organizer_self=True,
+            event_type="default",
+            etag="etag-1",
+        )
+        session.add(mirror)
+        session.commit()
+
+        [created] = intake_calendar_tasks(
+            session,
+            CalendarSource.GOOGLE,
+            UTC,
+        )
+        session.commit()
+        original_task_id = created.id
+        assert created.source is TaskSource.USER
+
+        mirror.summary = "Write launch notes"
+        mirror.etag = "etag-2"
+        [cancelled] = intake_calendar_tasks(
+            session,
+            CalendarSource.GOOGLE,
+            UTC,
+        )
+        session.commit()
+        assert cancelled.id == original_task_id
+        assert cancelled.status == "cancelled"
+        assert mirror.intake_task_id is None
+        assert mirror.intake_opted_out is True
+
+        assert intake_calendar_tasks(
+            session,
+            CalendarSource.GOOGLE,
+            UTC,
+        ) == ()
+        assert len(session.scalars(select(Task)).all()) == 1
+
+        mirror.summary = "[HM] Write revised launch notes"
+        mirror.etag = "etag-3"
+        [readded] = intake_calendar_tasks(
+            session,
+            CalendarSource.GOOGLE,
+            UTC,
+        )
+        session.commit()
+        assert readded.id != original_task_id
+        assert readded.title == "Write revised launch notes"
+        assert mirror.intake_task_id == readded.id
+        assert mirror.intake_opted_out is False
+
+    def test_timed_intake_event_is_adopted_without_provider_create(
+        self,
+        session,
+        fake_backend,
+    ) -> None:
+        task = Task(title="Write launch notes", source=TaskSource.USER)
+        session.add(task)
+        session.flush()
+        mirror = CalendarEventMirror(
+            external_id="hm-timed",
+            calendar_source=CalendarSource.GOOGLE,
+            summary="[HM] Write launch notes",
+            start_at=utc(2026, 8, 4, 9),
+            end_at=utc(2026, 8, 4, 10),
+            organizer_self=True,
+            event_type="default",
+            etag="etag-1",
+            intake_task_id=task.id,
+        )
+        session.add(mirror)
+        session.commit()
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=mirror.start_at,
+            proposed_end=mirror.end_at,
+            status=ProposalStatus.ACCEPTED,
+            intake_calendar_source=mirror.calendar_source,
+            intake_external_id=mirror.external_id,
+            intake_revision=intake_revision(mirror),
+        )
+        session.add(proposal)
+        session.commit()
+        service = CalendarMirrorService(
+            session,
+            [fake_backend],
+            InMemorySyncStateStore(),
+        )
+
+        assert push_accepted_proposals(
+            service,
+            session,
+            fake_backend.source,
+        ) == 1
+        assert fake_backend.created_drafts == []
+        assert session.get(ScheduleProposal, proposal.id).status is (
+            ProposalStatus.PUSHED
+        )
+        assert session.get(Task, task.id).status == "scheduled"
+        assert mirror.is_agent_created is False
+
+    def test_changed_timed_intake_invalidates_instead_of_creating_duplicate(
+        self,
+        session,
+        fake_backend,
+    ) -> None:
+        task = Task(title="Write launch notes", source=TaskSource.USER)
+        session.add(task)
+        session.flush()
+        mirror = CalendarEventMirror(
+            external_id="hm-changed",
+            calendar_source=CalendarSource.GOOGLE,
+            summary="[HM] Write launch notes",
+            start_at=utc(2026, 8, 4, 9),
+            end_at=utc(2026, 8, 4, 10),
+            organizer_self=True,
+            event_type="default",
+            etag="etag-1",
+            intake_task_id=task.id,
+        )
+        session.add(mirror)
+        session.commit()
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=mirror.start_at,
+            proposed_end=mirror.end_at,
+            status=ProposalStatus.ACCEPTED,
+            intake_calendar_source=mirror.calendar_source,
+            intake_external_id=mirror.external_id,
+            intake_revision=intake_revision(mirror),
+        )
+        session.add(proposal)
+        session.commit()
+
+        mirror.end_at = mirror.end_at + timedelta(minutes=30)
+        mirror.etag = "etag-2"
+        session.commit()
+        service = CalendarMirrorService(
+            session,
+            [fake_backend],
+            InMemorySyncStateStore(),
+        )
+
+        assert push_accepted_proposals(
+            service,
+            session,
+            fake_backend.source,
+        ) == 0
+        assert fake_backend.created_drafts == []
+        assert session.get(ScheduleProposal, proposal.id).status is (
+            ProposalStatus.INVALIDATED
+        )
+
+    def test_all_day_intake_still_creates_provider_agnostic_output_block(
+        self,
+        session,
+        fake_backend_factory,
+    ) -> None:
+        task = Task(title="Prepare launch", source=TaskSource.USER)
+        session.add(task)
+        session.flush()
+        session.add(
+            CalendarEventMirror(
+                external_id="hm-all-day",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="[HM] Prepare launch",
+                start_at=utc(2026, 8, 4),
+                end_at=utc(2026, 8, 5),
+                organizer_self=True,
+                event_type="default",
+                is_all_day=True,
+                etag="etag-1",
+                intake_task_id=task.id,
+            )
+        )
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=utc(2026, 8, 4, 9),
+            proposed_end=utc(2026, 8, 4, 10),
+            status=ProposalStatus.ACCEPTED,
+        )
+        session.add(proposal)
+        session.commit()
+        caldav_backend = fake_backend_factory(CalendarSource.CALDAV)
+        service = CalendarMirrorService(
+            session,
+            [caldav_backend],
+            InMemorySyncStateStore(),
+        )
+
+        assert push_accepted_proposals(
+            service,
+            session,
+            CalendarSource.CALDAV,
+        ) == 1
+        assert [draft.summary for draft in caldav_backend.created_drafts] == [
+            "Prepare launch"
+        ]
+        assert session.get(ScheduleProposal, proposal.id).status is (
+            ProposalStatus.PUSHED
+        )
+
     def test_job_syncs_backend_into_mirror(
         self, settings, session_factory, session, fake_backend, make_event
     ) -> None:
@@ -99,6 +308,41 @@ class TestJobRun:
         rows = session.scalars(select(CalendarEventMirror)).all()
         assert [row.external_id for row in rows] == ["meet-1"]
         assert fake_backend.received_sync_states == [None]
+
+    def test_job_commits_intake_before_proposal_push(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+        make_event,
+    ) -> None:
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "hm-intake",
+                    summary="[HM] Persist imported task",
+                    organizer_self=True,
+                    event_type="default",
+                )
+            ],
+            {"sync_token": "tok-1"},
+        )
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+        )
+
+        assert job() is not None
+
+        with session_factory() as persisted:
+            task = persisted.scalars(select(Task)).one()
+            mirror = persisted.scalars(select(CalendarEventMirror)).one()
+            assert task.title == "Persist imported task"
+            assert mirror.intake_task_id == task.id
 
     def test_job_returns_deletion_diff(
         self, settings, session_factory, session, fake_backend, make_event

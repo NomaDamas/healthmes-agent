@@ -84,7 +84,7 @@ struct ProposalDetailView: View {
                     Text("Proposed block")
                 }
 
-                if proposal.status == .proposed {
+                if proposal.isActionable {
                     Section {
                         Button {
                             Task { await resolve(.accept) }
@@ -139,13 +139,7 @@ struct ProposalDetailView: View {
 
     private func load() async {
         do {
-            // No GET-by-id endpoint; the list is tiny (single user).
-            let page = try await api.listProposals()
-            if let found = page.data.first(where: { $0.id == proposalID }) {
-                proposal = found
-            } else {
-                message = String(localized: "This proposal no longer exists.")
-            }
+            proposal = try await api.getProposal(proposalID)
         } catch {
             message = BriefingHomeModel.describe(error)
         }
@@ -155,7 +149,8 @@ struct ProposalDetailView: View {
         busy = true
         defer { busy = false }
         do {
-            proposal = try await api.resolveProposal(id: proposalID, action: action)
+            guard let current = proposal else { return }
+            proposal = try await api.resolveProposal(current, action: action)
             message =
                 action == .accept
                 ? String(localized: "Proposal applied.")

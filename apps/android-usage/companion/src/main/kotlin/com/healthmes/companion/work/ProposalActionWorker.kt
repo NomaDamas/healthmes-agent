@@ -13,7 +13,6 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.healthmes.api.HealthmesApi
 import com.healthmes.api.Proposal
-import com.healthmes.api.ProposalsPage
 import com.healthmes.briefing.PairingPrefs
 import com.healthmes.companion.R
 import com.healthmes.companion.notify.ActionResultNotifier
@@ -26,7 +25,7 @@ import org.json.JSONException
 
 /**
  * One-shot WorkManager job behind the §8.5 notification buttons: resolves
- * the pending schedule proposal (unless an explicit id was passed), calls
+ * the exact server-correlated pending schedule proposal, calls
  * `POST /v1/schedule/proposals/{id}/accept|decline` with the paired bearer
  * client, and posts a small result notification. Decision logic lives in
  * [ProposalActionLogic] (JVM-tested); this is the Android shell.
@@ -50,24 +49,24 @@ class ProposalActionWorker(appContext: Context, params: WorkerParameters) :
         val api = HealthmesApi(serverUrl, prefs.token)
 
         val explicitId = inputData.getString(KEY_PROPOSAL_ID)
-        val targetId: String = if (explicitId != null) {
-            explicitId
-        } else {
-            when (val target = resolveTarget(api)) {
-                is Target.Single -> target.proposal.id
-                is Target.NonePending -> return@withContext finish(
-                    context, Outcome.NonePending
-                )
-                is Target.Ambiguous -> return@withContext finish(
-                    context, Outcome.Ambiguous(target.pendingCount)
-                )
-                null -> return@withContext retryOrFail(
-                    context, Outcome.Retry("could not list pending proposals")
-                )
-            }
+            ?: return@withContext finish(context, Outcome.NonePending)
+        val proposal = when (val target = resolveTarget(api, explicitId)) {
+            is Target.Single -> target.proposal
+            is Target.NonePending -> return@withContext finish(
+                context, Outcome.NonePending
+            )
+            is Target.Ambiguous -> return@withContext finish(
+                context, Outcome.Ambiguous(target.pendingCount)
+            )
+            null -> return@withContext retryOrFail(
+                context, Outcome.Retry("could not list pending proposals")
+            )
         }
-
-        val response = api.post(Proposal.actionPath(targetId, accept))
+        val body = proposal.resolutionBody(accept)
+            ?: return@withContext finish(
+                context, Outcome.Failed("proposal resolution is unavailable")
+            )
+        val response = api.postJson(Proposal.actionPath(proposal.id, accept), body)
         when (val outcome = ProposalActionLogic.classifyActionResponse(response)) {
             is Outcome.Retry -> retryOrFail(context, outcome)
             else -> finish(context, outcome)
@@ -75,11 +74,14 @@ class ProposalActionWorker(appContext: Context, params: WorkerParameters) :
     }
 
     /** Null on transport/parse failure (caller retries). */
-    private fun resolveTarget(api: HealthmesApi): Target? {
-        val response = api.get(ProposalActionLogic.RESOLVE_PATH)
-        if (response !is HealthmesApi.Response.Http || !response.isSuccess) return null
+    private fun resolveTarget(api: HealthmesApi, explicitId: String): Target? {
+        val path = ProposalActionLogic.resolvePath(explicitId) ?: return Target.NonePending
+        val response = api.get(path)
+        if (response !is HealthmesApi.Response.Http) return null
+        if (response.code == 404) return Target.NonePending
+        if (!response.isSuccess) return null
         return try {
-            ProposalActionLogic.chooseTarget(ProposalsPage.parse(response.body))
+            ProposalActionLogic.chooseTarget(response.body, explicitId)
         } catch (_: JSONException) {
             null
         }

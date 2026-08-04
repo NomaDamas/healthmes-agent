@@ -57,6 +57,7 @@
   "alerts": {
     "unresolved_count": 2,
     "top": {
+      "id": "00000000-0000-0000-0000-00000000a123",
       "rule_id": "stress_spike",
       "summary": "Stress spiked 45% above your 14-day baseline",
       "decision_url": "http://192.168.1.20:8100/decisions/0b8f3e0a-2b9f-4c47-a9d4-2f2b7f6f3a11?token=viewer-abc123"

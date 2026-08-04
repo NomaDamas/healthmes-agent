@@ -54,12 +54,14 @@ public struct AlertNotificationContent: Equatable {
     }
 
     /// Build notification content from one alert-history item.
-    /// `pendingProposalID` (when the refresh loop found a proposal awaiting
-    /// confirmation) upgrades the category to the actionable one.
+    /// The server-correlated `alert.proposalId` upgrades the category to the
+    /// actionable one. `pendingProposalID` remains an explicit test/preview
+    /// override.
     public static func from(
         alert: AlertItem,
         pendingProposalID: UUID? = nil
     ) -> AlertNotificationContent {
+        let exactProposalID = pendingProposalID ?? alert.proposalId
         var bodyLines: [String] = []
         if let evidence = evidenceLine(alert.evidence) {
             bodyLines.append(evidence)
@@ -74,14 +76,14 @@ public struct AlertNotificationContent: Equatable {
         if let decisionUrl = alert.decisionUrl {
             userInfo[userInfoDecisionURL] = decisionUrl
         }
-        if let pendingProposalID {
-            userInfo[userInfoProposalID] = pendingProposalID.uuidString.lowercased()
+        if let exactProposalID {
+            userInfo[userInfoProposalID] = exactProposalID.uuidString.lowercased()
         }
 
         return AlertNotificationContent(
             title: alert.summary,
             body: bodyLines.joined(separator: "\n"),
-            categoryID: pendingProposalID != nil ? actionableCategoryID : infoCategoryID,
+            categoryID: exactProposalID != nil ? actionableCategoryID : infoCategoryID,
             threadID: alert.ruleId,
             userInfo: userInfo
         )

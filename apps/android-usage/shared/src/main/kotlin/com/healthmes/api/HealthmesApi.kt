@@ -34,9 +34,6 @@ class HealthmesApi(private val baseUrl: String, private val token: String?) {
     fun postJson(path: String, json: String): Response =
         request("POST", path, json.toByteArray(Charsets.UTF_8), "application/json")
 
-    /** Empty-body POST (the schedule-proposal accept/decline actions). */
-    fun post(path: String): Response = request("POST", path, ByteArray(0), null)
-
     /**
      * `POST /v1/media` — multipart/form-data with the single `file` field the
      * endpoint reads. The server ignores the client filename by contract, so

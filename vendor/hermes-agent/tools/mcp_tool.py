@@ -121,6 +121,8 @@ logger = logging.getLogger(__name__)
 # first in the normal case; this outer bound only bites when a stalled SSL
 # handshake defeats the inner timeout (the #29184 failure mode).
 _OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
+_TRUSTED_SESSION_MAX_AGE_S = 5 * 60
+_TRUSTED_SESSION_CLOCK_SKEW_S = 30
 
 
 def _trusted_session_call_arguments(
@@ -146,6 +148,13 @@ def _trusted_session_call_arguments(
         "user_id": get_session_env("HERMES_SESSION_USER_ID"),
         "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID"),
     }
+    try:
+        message_issued_at = int(
+            float(get_session_env("HERMES_SESSION_MESSAGE_TIMESTAMP"))
+        )
+    except (TypeError, ValueError):
+        return arguments
+    message_age = time.time() - message_issued_at
     owner_user_id = str(config.get("owner_user_id") or "").strip()
     owner_chat_id = str(config.get("owner_chat_id") or "").strip()
     message_text = get_session_message_text()
@@ -158,6 +167,11 @@ def _trusted_session_call_arguments(
         or "*" in {owner_user_id, owner_chat_id}
         or session["user_id"] != owner_user_id
         or session["chat_id"] != owner_chat_id
+        or not (
+            -_TRUSTED_SESSION_CLOCK_SKEW_S
+            <= message_age
+            <= _TRUSTED_SESSION_MAX_AGE_S
+        )
     ):
         return arguments
 
@@ -190,7 +204,7 @@ def _trusted_session_call_arguments(
         "tool": tool_name,
         "arguments": bound_arguments,
         **session,
-        "issued_at": int(time.time()),
+        "issued_at": message_issued_at,
     }
     raw_payload = json.dumps(
         payload,

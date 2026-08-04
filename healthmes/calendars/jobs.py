@@ -29,6 +29,7 @@ credential can never take down the scheduler loop.
 
 import logging
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, tzinfo
 from uuid import UUID
@@ -48,6 +49,11 @@ from healthmes.calendars.base import (
     OwnershipError,
     calendar_identity_external_id,
     coerce_utc,
+)
+from healthmes.calendars.intake import (
+    intake_calendar_tasks,
+    intake_revision,
+    is_intake_eligible,
 )
 from healthmes.calendars.sleep_context import actual_sleep_violation
 from healthmes.calendars.state import (
@@ -262,6 +268,48 @@ def _proposal_identity(proposal: ScheduleProposal) -> CalendarEventIdentity:
     )
 
 
+def _timed_intake_block(
+    session: Session,
+    proposal: ScheduleProposal,
+) -> CalendarEventMirror | None:
+    """Return the exact externally-owned timed intake event captured by a proposal."""
+    fields = (
+        proposal.intake_calendar_source,
+        proposal.intake_external_id,
+        proposal.intake_revision,
+    )
+    if fields == (None, None, None):
+        return None
+    if any(value is None for value in fields):
+        raise CalendarConflictError(
+            f"proposal {proposal.id} has incomplete timed intake identity"
+        )
+    row = session.scalar(
+        select(CalendarEventMirror).where(
+            CalendarEventMirror.calendar_source
+            == proposal.intake_calendar_source,
+            CalendarEventMirror.external_id == proposal.intake_external_id,
+        ).with_for_update()
+    )
+    if (
+        row is None
+        or row.intake_task_id != proposal.task_id
+        or row.is_all_day
+        or not is_intake_eligible(row)
+        or intake_revision(row) != proposal.intake_revision
+    ):
+        raise CalendarConflictError(
+            f"proposal {proposal.id} timed intake event changed or disappeared"
+        )
+    start = coerce_utc(proposal.proposed_start)
+    end = coerce_utc(proposal.proposed_end)
+    if coerce_utc(row.start_at) != start or coerce_utc(row.end_at) != end:
+        raise CalendarConflictError(
+            f"proposal {proposal.id} timed intake interval changed"
+        )
+    return row
+
+
 def push_accepted_proposals(
     service: CalendarMirrorService,
     session: Session,
@@ -283,13 +331,36 @@ def push_accepted_proposals(
     # PostgreSQL pool connection while the advisory-lock connection waits.
     proposal_ids = _accepted_proposal_ids(session)
     for proposal_id in proposal_ids:
-        with calendar_write_lock(session, source):
+        with ExitStack() as locks:
+            locks.enter_context(calendar_write_lock(session, source))
             session.expire_all()
             proposal = session.get(ScheduleProposal, proposal_id)
             if proposal is None or proposal.status is not ProposalStatus.ACCEPTED:
                 continue
+            if (
+                proposal.intake_calendar_source is not None
+                and proposal.intake_calendar_source is not source
+            ):
+                locks.enter_context(
+                    calendar_write_lock(
+                        session,
+                        proposal.intake_calendar_source,
+                    )
+                )
             task = session.get(Task, proposal.task_id)
             if task is None:
+                continue
+            try:
+                intake_row = _timed_intake_block(session, proposal)
+            except CalendarConflictError as exc:
+                proposal.status = ProposalStatus.INVALIDATED
+                session.commit()
+                logger.warning(
+                    "Proposal %s invalidated because its timed intake event "
+                    "cannot be safely adopted: %s",
+                    proposal.id,
+                    exc,
+                )
                 continue
             identity = _proposal_identity(proposal)
             draft = EventDraft(
@@ -360,8 +431,22 @@ def push_accepted_proposals(
                     violation,
                 )
                 continue
+            if intake_row is not None:
+                proposal.status = ProposalStatus.PUSHED
+                task.status = "scheduled"
+                session.commit()
+                pushed += 1
+                logger.info(
+                    "Proposal %s adopted timed intake event %s on %s without "
+                    "creating a duplicate.",
+                    proposal.id,
+                    intake_row.external_id,
+                    source.value,
+                )
+                continue
             if legacy_row is not None:
                 proposal.status = ProposalStatus.PUSHED
+                task.status = "scheduled"
                 session.commit()
                 pushed += 1
                 logger.info(
@@ -425,6 +510,7 @@ def push_accepted_proposals(
                 )
                 continue
             proposal.status = ProposalStatus.PUSHED
+            task.status = "scheduled"
             session.commit()
             pushed += 1
             logger.info(
@@ -479,7 +565,14 @@ def build_calendar_job(
             )
             with session_scope(session_factory) as session:
                 service = CalendarMirrorService(session, [backend], store, journal)
-                diff = service.sync_backend(backend)
+                with calendar_write_lock(session, source):
+                    diff = service.sync_backend(backend)
+                    intake_calendar_tasks(
+                        session,
+                        source,
+                        resolve_timezone(settings),
+                    )
+                    session.commit()
                 if is_write_backend:
                     push_accepted_proposals(
                         service,

@@ -82,9 +82,17 @@ fun ProposalsScreen(services: AppServices, modifier: Modifier = Modifier) {
         actingOn = proposal.id
         scope.launch {
             val outcome = withContext(Dispatchers.IO) {
-                services.api()?.let { api ->
+                val api = services.api()
+                val body = proposal.resolutionBody(accept)
+                if (api == null) {
+                    null
+                } else if (body == null) {
+                    ProposalActionLogic.Outcome.Failed(
+                        "proposal resolution is unavailable"
+                    )
+                } else {
                     ProposalActionLogic.classifyActionResponse(
-                        api.post(Proposal.actionPath(proposal.id, accept))
+                        api.postJson(Proposal.actionPath(proposal.id, accept), body)
                     )
                 }
             }
@@ -254,7 +262,7 @@ private fun ProposalCard(
                     label = { Text(proposal.status, style = MaterialTheme.typography.labelSmall) },
                 )
             }
-            if (proposal.isPending) {
+            if (proposal.isActionable) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Spacer(modifier = Modifier.weight(1f))
                     TextButton(enabled = !busy, onClick = onDecline) {

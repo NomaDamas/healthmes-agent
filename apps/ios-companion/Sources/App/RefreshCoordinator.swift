@@ -7,7 +7,7 @@ import UserNotifications
 ///
 ///   1. `GET /v1/alerts` (24 h window — glance semantics),
 ///   2. diff against SeenAlertsStore → local notification per NEW alert,
-///      with the pending schedule proposal attached when unambiguous,
+///      with the exact server-correlated schedule proposal when present,
 ///   3. badge = unresolved count,
 ///   4. `GET /v1/briefing/glance` (ETag-cheap) → Live Activity sync.
 ///
@@ -51,26 +51,15 @@ actor RefreshCoordinator {
         guard status == .authorized || status == .provisional else {
             // Not authorized: remember what exists so enabling notifications
             // later never dumps the whole backlog at once.
-            seenStore.markSeen(alerts)
+            seenStore.primeWithoutNotifying(alerts)
             return
         }
-        let unseen = seenStore.unseen(from: alerts)
+        let unseen = seenStore.unseenOrPrime(from: alerts)
         guard !unseen.isEmpty else { return }
-
-        // No FK from alert → proposal exists yet (the store tracks them
-        // separately; briefing.py documents the placeholder policy), so the
-        // ✅/✏️/❌ buttons are attached only when exactly ONE proposal is
-        // pending — the only case where "Apply" is unambiguous. Otherwise
-        // the notification is informational and the home tab shows the
-        // proposal list.
-        let pendingProposals = (try? await api.listProposals(status: .proposed))?.data ?? []
-        let unambiguousProposal = pendingProposals.count == 1 ? pendingProposals[0].id : nil
 
         // Oldest first so notification order matches fired order.
         for alert in unseen.reversed() {
-            let content = AlertNotificationContent.from(
-                alert: alert, pendingProposalID: unambiguousProposal
-            )
+            let content = AlertNotificationContent.from(alert: alert)
             await NotificationManager.shared.post(content: content)
         }
         seenStore.markSeen(unseen)

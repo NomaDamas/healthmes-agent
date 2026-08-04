@@ -26,6 +26,7 @@ __all__ = [
     "RecoverySnapshot",
     "AfternoonLoad",
     "ScheduleChange",
+    "CalendarTaskInput",
     "DeadlineTask",
     "RuleThresholds",
     "TriggerContext",
@@ -33,6 +34,7 @@ __all__ = [
     "ALL_RULES",
     "stress_spike_vs_baseline",
     "low_recovery_heavy_afternoon",
+    "calendar_task_intake",
     "schedule_changed",
     "deadline_risk",
 ]
@@ -125,6 +127,19 @@ class ScheduleChange:
 
 
 @dataclass(frozen=True, slots=True)
+class CalendarTaskInput:
+    task_id: str
+    title: str
+    calendar_source: str
+    input_revision: str
+    starts_at: datetime
+    ends_at: datetime
+    is_all_day: bool
+    est_minutes: int | None
+    deadline: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class DeadlineTask:
     """A not-done task inside the deadline horizon, with its scheduled cover.
 
@@ -177,6 +192,7 @@ class TriggerContext:
     recovery: RecoverySnapshot | None = None
     afternoon: AfternoonLoad | None = None
     schedule_changes: tuple[ScheduleChange, ...] = ()
+    calendar_task_inputs: tuple[CalendarTaskInput, ...] = ()
     deadline_tasks: tuple[DeadlineTask, ...] = ()
     thresholds: RuleThresholds = field(default_factory=RuleThresholds)
 
@@ -330,6 +346,49 @@ def schedule_changed(ctx: TriggerContext) -> TriggerFire | None:
     )
 
 
+def calendar_task_intake(ctx: TriggerContext) -> TriggerFire | None:
+    inputs = ctx.calendar_task_inputs
+    if not inputs:
+        return None
+
+    labels = [item.title for item in inputs]
+    return TriggerFire(
+        rule_id="calendar_task_intake",
+        dedup_key=(
+            "calendar_task_intake:"
+            + _digest(item.input_revision for item in inputs)
+        ),
+        summary=(
+            f"{len(inputs)} task(s) entered through Google Calendar: "
+            f"{', '.join(labels[:3])}"
+            + ("..." if len(labels) > 3 else "")
+        ),
+        proposal=(
+            "Reflect these tasks in the current plan. Treat timed events as "
+            "user-preferred work blocks and do not create a duplicate calendar block. "
+            "For all-day inputs, propose concrete time blocks and request confirmation."
+        ),
+        evidence={
+            "tasks": [
+                {
+                    "task_id": item.task_id,
+                    "title": item.title,
+                    "calendar_source": item.calendar_source,
+                    "input_revision": item.input_revision,
+                    "starts_at": _iso(item.starts_at),
+                    "ends_at": _iso(item.ends_at),
+                    "est_minutes": item.est_minutes,
+                    "deadline": _iso(item.deadline),
+                    "placement": (
+                        "deadline_only" if item.is_all_day else "preferred_block"
+                    ),
+                }
+                for item in inputs
+            ]
+        },
+    )
+
+
 def deadline_risk(ctx: TriggerContext) -> TriggerFire | None:
     """Fire when tasks near their deadline lack enough scheduled time.
 
@@ -400,6 +459,7 @@ def deadline_risk(ctx: TriggerContext) -> TriggerFire | None:
 ALL_RULES: tuple[TriggerRule, ...] = (
     stress_spike_vs_baseline,
     low_recovery_heavy_afternoon,
+    calendar_task_intake,
     schedule_changed,
     deadline_risk,
 )

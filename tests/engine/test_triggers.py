@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from freezegun import freeze_time
 from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 
 from healthmes.calendars.adjustments import provider_revision_fingerprint
 from healthmes.config import Settings
@@ -21,6 +22,7 @@ from healthmes.engine.rules import (
     StressSnapshot,
     TriggerContext,
     TriggerFire,
+    calendar_task_intake,
     deadline_risk,
     low_recovery_heavy_afternoon,
     schedule_changed,
@@ -35,6 +37,7 @@ from healthmes.engine.triggers import (
     is_in_quiet_hours,
 )
 from healthmes.engine.webhook import WebhookResult
+from healthmes.store import Base, create_db_engine
 from healthmes.store.enums import (
     CalendarMutationOperation,
     CalendarMutationStatus,
@@ -112,15 +115,27 @@ def utc(dt: datetime) -> datetime:
 class FakeAlertSender:
     """Recording AlertSender double; outcome switchable per test."""
 
-    def __init__(self, ok: bool = True) -> None:
+    def __init__(self, ok: bool = True, *, retryable: bool = False) -> None:
         self.ok = ok
-        self.sent: list[tuple[TriggerFire, datetime]] = []
+        self.retryable = retryable
+        self.sent: list[tuple[TriggerFire, datetime, uuid.UUID]] = []
 
-    def send(self, fire: TriggerFire, *, fired_at: datetime) -> WebhookResult:
-        self.sent.append((fire, fired_at))
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> WebhookResult:
+        self.sent.append((fire, fired_at, trigger_event_id))
         if self.ok:
             return WebhookResult(ok=True, status_code=202)
-        return WebhookResult(ok=False, status_code=502, detail="gateway unavailable")
+        return WebhookResult(
+            ok=False,
+            status_code=502,
+            detail="gateway unavailable",
+            retryable=self.retryable,
+        )
 
 
 class RaisingAlertSender:
@@ -134,7 +149,13 @@ class RaisingAlertSender:
         self.exc = exc if exc is not None else RuntimeError("webhook transport exploded")
         self.calls = 0
 
-    def send(self, fire: TriggerFire, *, fired_at: datetime) -> WebhookResult:
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> WebhookResult:
         self.calls += 1
         raise self.exc
 
@@ -240,17 +261,114 @@ def test_fresh_fire_is_persisted_and_pushed(settings, session_factory, alert_sen
 
     assert [outcome.status for outcome in report.outcomes] == ["pushed"]
     assert len(alert_sender.sent) == 1
-    fire, fired_at = alert_sender.sent[0]
+    fire, fired_at, trigger_event_id = alert_sender.sent[0]
     assert fire.rule_id == "stress_spike_vs_baseline"
     assert fired_at.tzinfo is not None
 
     [event] = all_events(session_factory)
+    assert trigger_event_id == event.id
     assert event.rule_id == "stress_spike_vs_baseline"
     assert event.dedup_key == "stress_spike_vs_baseline:2026-07-09"
     assert event.alert_sent is True
     assert event.payload["summary"] == fire.summary
     assert event.payload["evidence"]["recent_value"] == 85.0
     assert event.payload["push"] == {"sent": True, "status_code": 202, "channel": "webhook"}
+
+
+def test_trigger_event_is_committed_before_webhook_dispatch(settings, tmp_path) -> None:
+    engine = create_db_engine(f"sqlite+pysqlite:///{tmp_path / 'trigger-visibility.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+    class VisibilityCheckingSender(FakeAlertSender):
+        def send(self, fire, *, fired_at, trigger_event_id):
+            with factory() as observing_session:
+                event = observing_session.get(TriggerEvent, trigger_event_id)
+                assert event is not None
+                assert event.payload["push"]["state"] == "dispatching"
+            return super().send(
+                fire,
+                fired_at=fired_at,
+                trigger_event_id=trigger_event_id,
+            )
+
+    sender = VisibilityCheckingSender()
+    try:
+        with freeze_time("2026-07-09 14:00:00"):
+            report = make_evaluator(
+                settings,
+                factory,
+                sender,
+                rules=(fixed_rule,),
+            ).evaluate_once()
+        assert [outcome.status for outcome in report.outcomes] == ["pushed"]
+    finally:
+        engine.dispose()
+
+
+def test_dispatching_event_retries_with_same_correlation_id(
+    settings, session_factory
+) -> None:
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        event = TriggerEvent(
+            fired_at=utc(now),
+            rule_id="fixed_rule",
+            dedup_key="fixed_rule:occurrence-1",
+            alert_sent=False,
+            payload={
+                "summary": "observation",
+                "proposal": "proposal",
+                "evidence": {},
+                "push": {"state": "dispatching", "channel": "webhook"},
+            },
+        )
+        with session_factory() as session:
+            session.add(event)
+            session.commit()
+            event_id = event.id
+
+        sender = FakeAlertSender()
+        report = make_evaluator(
+            settings,
+            session_factory,
+            sender,
+            rules=(),
+        ).evaluate_once()
+
+    assert [outcome.status for outcome in report.outcomes] == ["pushed"]
+    assert sender.sent[0][2] == event_id
+    [stored] = all_events(session_factory)
+    assert stored.id == event_id
+    assert stored.alert_sent is True
+
+
+def test_retryable_result_is_recovered_without_rule_refiring(
+    settings, session_factory
+) -> None:
+    off_settings = settings.model_copy(update={"native_alert_delivery": False})
+    failing = FakeAlertSender(ok=False, retryable=True)
+    working = FakeAlertSender()
+    with freeze_time("2026-07-09 14:00:00") as frozen:
+        first = make_evaluator(
+            off_settings,
+            session_factory,
+            failing,
+            rules=(fixed_rule,),
+        ).evaluate_once()
+        frozen.tick(timedelta(minutes=10))
+        recovered = make_evaluator(
+            off_settings,
+            session_factory,
+            working,
+            rules=(),
+        ).evaluate_once()
+
+    assert [outcome.status for outcome in first.outcomes] == ["push_failed"]
+    assert [outcome.status for outcome in recovered.outcomes] == ["pushed"]
+    assert failing.sent[0][2] == working.sent[0][2]
+    [event] = all_events(session_factory)
+    assert event.alert_sent is True
 
 
 def test_dedup_key_is_unique_across_sweeps(settings, session_factory, alert_sender) -> None:
@@ -321,12 +439,7 @@ def test_native_delivery_off_keeps_webhook_only_semantics(settings, session_fact
 
 
 def test_sender_exception_native_off_does_not_burn_dedup(settings, session_factory) -> None:
-    """A sender that *raises* (not a clean non-2xx) must not burn the dedup key.
-
-    The trigger_event row is flushed before the push; when the send raises and
-    native delivery is off the alert is genuinely undelivered, so the row is
-    deleted (delete+flush, not expunge) — otherwise the burned key would
-    dedup-drop the retry forever."""
+    """An uncertain send keeps durable retry intent and correlation metadata."""
     off_settings = settings.model_copy(update={"native_alert_delivery": False})
     sender = RaisingAlertSender()
     with freeze_time("2026-07-09 14:00:00"):
@@ -335,13 +448,13 @@ def test_sender_exception_native_off_does_not_burn_dedup(settings, session_facto
 
     assert [o.status for o in report.outcomes] == ["push_failed"]
     assert sender.calls == 1
-    # Row removed → dedup key not recorded (an expunge would have left it).
-    assert all_events(session_factory) == []
+    [event] = all_events(session_factory)
+    assert event.alert_sent is False
+    assert event.payload["push"]["state"] == "dispatching"
 
 
 def test_sender_exception_recovers_on_next_sweep(settings, session_factory) -> None:
-    """After a raising sweep unwinds the row, the identical fire re-fires and is
-    delivered on the next sweep (same dedup key, never truly recorded)."""
+    """An uncertain send retries the same durable event on the next sweep."""
     off_settings = settings.model_copy(update={"native_alert_delivery": False})
     raising = RaisingAlertSender()
     working = FakeAlertSender()
@@ -357,8 +470,9 @@ def test_sender_exception_recovers_on_next_sweep(settings, session_factory) -> N
     assert [o.status for o in failed.outcomes] == ["push_failed"]
     assert [o.status for o in recovered.outcomes] == ["pushed"]
     assert len(working.sent) == 1
-    [event] = all_events(session_factory)  # only the delivered row survives
+    [event] = all_events(session_factory)
     assert event.dedup_key == "fixed_rule:occurrence-1"
+    assert working.sent[0][2] == event.id
     assert event.alert_sent is True
 
 
@@ -497,6 +611,76 @@ def test_is_in_quiet_hours_plain_and_disabled_windows() -> None:
 # ---------------------------------------------------------------------------
 # Store-driven context: schedule_changed and deadline_risk end-to-end
 # ---------------------------------------------------------------------------
+
+
+def test_calendar_task_intake_invokes_planner_once(
+    settings, session_factory, alert_sender
+) -> None:
+    with freeze_time("2026-07-29 14:00:00") as frozen:
+        now = local_now()
+        with session_factory() as session:
+            task = Task(title="백오피스 작업", est_minutes=45)
+            session.add(task)
+            session.flush()
+            task_id = task.id
+            session.add(
+                CalendarEventMirror(
+                    external_id="hm-backoffice",
+                    calendar_source=CalendarSource.GOOGLE,
+                    summary="[HM] 백오피스 작업",
+                    start_at=utc(now + timedelta(hours=1)),
+                    end_at=utc(now + timedelta(hours=1, minutes=45)),
+                    organizer_self=True,
+                    event_type="default",
+                    etag="etag-1",
+                    intake_task_id=task_id,
+                )
+            )
+            session.commit()
+
+        evaluator = make_evaluator(
+            settings,
+            session_factory,
+            alert_sender,
+            rules=(calendar_task_intake,),
+        )
+        report = evaluator.evaluate_once()
+
+        assert [outcome.status for outcome in report.outcomes] == ["pushed"]
+        [task_evidence] = report.outcomes[0].fire.evidence["tasks"]
+        assert task_evidence["task_id"] == str(task_id)
+        assert task_evidence["title"] == "백오피스 작업"
+        assert task_evidence["est_minutes"] == 45
+        assert task_evidence["placement"] == "preferred_block"
+        assert "external_id" not in task_evidence
+        assert "duplicate calendar block" in report.outcomes[0].fire.proposal
+
+        assert evaluator.evaluate_once().outcomes == ()
+        assert len(alert_sender.sent) == 1
+
+        with session_factory() as session:
+            task = session.get(Task, task_id)
+            mirror = session.scalar(
+                select(CalendarEventMirror).where(
+                    CalendarEventMirror.intake_task_id == task_id
+                )
+            )
+            assert task is not None and mirror is not None
+            task.title = "백오피스 최종 작업"
+            task.est_minutes = 60
+            mirror.summary = "[HM] 백오피스 최종 작업"
+            mirror.end_at = utc(now + timedelta(hours=2))
+            mirror.etag = "etag-2"
+            session.commit()
+
+        frozen.tick(timedelta(minutes=61))
+        changed = evaluator.evaluate_once()
+        assert [outcome.status for outcome in changed.outcomes] == ["pushed"]
+        [changed_evidence] = changed.outcomes[0].fire.evidence["tasks"]
+        assert changed_evidence["title"] == "백오피스 최종 작업"
+        assert changed_evidence["est_minutes"] == 60
+        assert evaluator.evaluate_once().outcomes == ()
+        assert len(alert_sender.sent) == 2
 
 
 def test_schedule_changed_fires_from_calendar_mirror_diff(

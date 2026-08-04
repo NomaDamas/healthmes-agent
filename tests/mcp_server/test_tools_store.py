@@ -54,6 +54,7 @@ def calendar_reply_arguments(
     reply_handle: str,
     *,
     action: str = "적용",
+    tool_name: str = "resolve_calendar_adjustment",
     user_id: str = OWNER_USER_ID,
     chat_id: str = OWNER_CHAT_ID,
     message_id: str = "message-1",
@@ -65,7 +66,7 @@ def calendar_reply_arguments(
     }
     proof = issue_trusted_session_proof(
         "test-calendar-adjustment-secret-32-characters",
-        tool_name="resolve_calendar_adjustment",
+        tool_name=tool_name,
         arguments=arguments,
         platform="telegram",
         chat_id=chat_id,
@@ -252,6 +253,24 @@ class TestCalendarAdjustmentToolContract:
         assert "proposal_id" not in properties
         assert "response_channel" not in properties
 
+    async def test_schedule_resolver_schema_is_handle_only_and_server_proof_bound(
+        self,
+        mcp_client,
+    ):
+        tools = await mcp_client.list_tools()
+        resolver = next(
+            tool for tool in tools if tool.name == "resolve_schedule_proposal"
+        )
+        properties = resolver.inputSchema["properties"]
+
+        assert set(properties) == {
+            "response",
+            "reply_handle",
+            "trusted_session_proof",
+        }
+        assert "proposal_id" not in properties
+        assert "action" not in properties
+
 
 class TestScheduleTools:
     def test_afternoon_busy_minutes_uses_existing_noon_to_six_window(self, pinned_tz):
@@ -347,6 +366,80 @@ class TestScheduleTools:
         with store_factory() as session:
             proposal = session.scalars(select(ScheduleProposal)).one()
             assert proposal.healthmes_kind == "planned_sleep"
+
+    async def test_schedule_resolution_requires_exact_owner_bound_proof_and_is_one_time(
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+    ):
+        start = dt.datetime.now(dt.UTC).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        proposed = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "title": "Owner-approved block",
+                        "start": start.isoformat(),
+                        "end": (start + dt.timedelta(hours=1)).isoformat(),
+                    }
+                ]
+            },
+        )
+        handle = proposed["proposals"][0]["reply_handle"]
+        valid = calendar_reply_arguments(
+            handle,
+            tool_name="resolve_schedule_proposal",
+        )
+        proof = valid["trusted_session_proof"]
+        tampered_proof = f"{proof[:-1]}{'0' if proof[-1] != '0' else '1'}"
+        attempts = [
+            {
+                "response": f"적용 {handle}",
+                "reply_handle": handle,
+            },
+            {**valid, "trusted_session_proof": tampered_proof},
+            calendar_reply_arguments(
+                handle,
+                tool_name="resolve_schedule_proposal",
+                user_id="different-user",
+            ),
+            calendar_reply_arguments(
+                handle,
+                tool_name="resolve_schedule_proposal",
+                chat_id="different-chat",
+            ),
+            calendar_reply_arguments(
+                handle,
+                tool_name="resolve_calendar_adjustment",
+            ),
+        ]
+        for arguments in attempts:
+            with pytest.raises(ToolError, match="trusted_session_proof"):
+                await mcp_client.call_tool(
+                    "resolve_schedule_proposal",
+                    arguments,
+                )
+
+        resolved = await call_tool(
+            mcp_client,
+            "resolve_schedule_proposal",
+            valid,
+        )
+        assert resolved["proposal"]["proposal_status"] == "accepted"
+        assert resolved["proposal"]["calendar_write"] == "queued"
+
+        with pytest.raises(ToolError, match="already consumed"):
+            await mcp_client.call_tool(
+                "resolve_schedule_proposal",
+                valid,
+            )
+        with store_factory() as session:
+            proposal = session.scalars(select(ScheduleProposal)).one()
+            assert proposal.status is ProposalStatus.ACCEPTED
 
     async def test_upsert_task_tolerates_non_uuid_goal_ref(self, mcp_client, call_tool):
         """An LLM often passes a human label for goal_id; the task is still
@@ -1099,6 +1192,92 @@ class TestCaptureTools:
             },
         )
         assert result["status"] == "ok"
+
+    async def test_record_alert_decision_binds_exact_trigger_once(
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+    ):
+        trigger = TriggerEvent(
+            fired_at=dt.datetime(2026, 7, 9, 14, 0, tzinfo=dt.UTC),
+            rule_id="calendar_task_intake",
+            payload={"summary": "Schedule this task"},
+            alert_sent=True,
+            dedup_key="calendar-task:correlation-test",
+        )
+        with store_factory() as session:
+            session.add(trigger)
+            session.commit()
+            trigger_id = trigger.id
+
+        start = dt.datetime.now(dt.UTC).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        proposed = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "title": "Correlated alert block",
+                        "start": start.isoformat(),
+                        "end": (start + dt.timedelta(hours=1)).isoformat(),
+                    }
+                ]
+            },
+        )
+        proposal_id = proposed["proposals"][0]["id"]
+        result = await call_tool(
+            mcp_client,
+            "record_decision",
+            {
+                "kind": "alert",
+                "summary": "Correlated alert",
+                "tree": TREE,
+                "trigger_event_id": str(trigger_id),
+                "schedule_proposal_ids": [proposal_id],
+            },
+        )
+        assert result["schedule_proposal_ids"] == [proposal_id]
+        with store_factory() as session:
+            row = session.get(DecisionRecord, uuid.UUID(result["decision_id"]))
+            assert row is not None
+            assert row.trigger_event_id == trigger_id
+            proposal = session.get(ScheduleProposal, uuid.UUID(proposal_id))
+            assert proposal is not None
+            assert proposal.decision_record_id == row.id
+
+        with pytest.raises(ToolError, match="already has a decision"):
+            await mcp_client.call_tool(
+                "record_decision",
+                {
+                    "kind": "alert",
+                    "summary": "Duplicate correlation",
+                    "tree": TREE,
+                    "trigger_event_id": str(trigger_id),
+                },
+            )
+        with pytest.raises(ToolError, match="valid only for kind='alert'"):
+            await mcp_client.call_tool(
+                "record_decision",
+                {
+                    "kind": "insight",
+                    "summary": "Wrong kind",
+                    "tree": TREE,
+                    "trigger_event_id": str(trigger_id),
+                },
+            )
+        with pytest.raises(ToolError, match="not found"):
+            await mcp_client.call_tool(
+                "record_decision",
+                {
+                    "kind": "alert",
+                    "summary": "Missing trigger",
+                    "tree": TREE,
+                    "trigger_event_id": str(uuid.uuid4()),
+                },
+            )
 
     async def test_record_decision_tree_validation(self, mcp_client):
         with pytest.raises(ToolError, match="kind"):

@@ -1,8 +1,8 @@
 import Foundation
 
-/// Remembers which alert ids already produced a local notification, so the
+/// Remembers which alert revisions already produced a local notification, so the
 /// polling loop (BGAppRefreshTask + foreground sync) notifies each pushed
-/// alert exactly once. App Group defaults — the state survives relaunches
+/// alert once per actionable revision. App Group defaults — the state survives relaunches
 /// and is honest across processes.
 ///
 /// The server is the real noise gate (quiet hours / cooldown / daily budget,
@@ -12,6 +12,8 @@ public final class SeenAlertsStore {
     public static let shared = SeenAlertsStore()
 
     static let defaultsKey = "healthmes.alerts.notified-ids"
+    static let initializedKey = "healthmes.alerts.notification-baseline-initialized"
+    static let pendingBaselineKey = "healthmes.alerts.notification-baseline-pending"
     /// Alert history is budget-capped server-side (≤8/day), so a small cap
     /// covers weeks while keeping the defaults payload tiny.
     static let capacity = 200
@@ -28,35 +30,98 @@ public final class SeenAlertsStore {
 
     /// Alerts (newest first, as the endpoint returns them) not yet notified.
     public func unseen(from alerts: [AlertItem]) -> [AlertItem] {
-        let seen = seenIDs()
-        return alerts.filter { !seen.contains($0.id.uuidString.lowercased()) }
+        let seen = migrateLegacyIDs(using: alerts)
+        return alerts.filter {
+            let id = $0.id.uuidString.lowercased()
+            let revision = revisionKey(for: $0)
+            if $0.proposalId == nil {
+                return !seen.contains(where: { $0.hasPrefix("\(id):") })
+            }
+            return !seen.contains(revision)
+        }
     }
 
-    /// Record ids as notified, newest kept when the cap trims.
+    /// Suppress the first successfully loaded history after pairing or a
+    /// failed enable-time fetch, then diff revisions normally.
+    public func unseenOrPrime(from alerts: [AlertItem]) -> [AlertItem] {
+        if defaults.bool(forKey: Self.pendingBaselineKey) {
+            primeWithoutNotifying(alerts)
+            return []
+        }
+        if defaults.object(forKey: Self.initializedKey) == nil {
+            defaults.set(true, forKey: Self.initializedKey)
+        }
+        return unseen(from: alerts)
+    }
+
+    /// Record revisions as notified, newest kept when the cap trims.
     public func markSeen(_ alerts: [AlertItem]) {
         guard !alerts.isEmpty else { return }
         var ordered = defaults.stringArray(forKey: Self.defaultsKey) ?? []
         for alert in alerts {
-            let id = alert.id.uuidString.lowercased()
-            if let index = ordered.firstIndex(of: id) {
+            let legacyID = alert.id.uuidString.lowercased()
+            let revision = revisionKey(for: alert)
+            ordered.removeAll { $0 == legacyID }
+            if let index = ordered.firstIndex(of: revision) {
                 ordered.remove(at: index)
             }
-            ordered.insert(id, at: 0)
+            ordered.insert(revision, at: 0)
         }
         if ordered.count > Self.capacity {
             ordered.removeLast(ordered.count - Self.capacity)
         }
         defaults.set(ordered, forKey: Self.defaultsKey)
+        defaults.set(true, forKey: Self.initializedKey)
+        defaults.removeObject(forKey: Self.pendingBaselineKey)
     }
 
     /// First launch with an already-populated history must not fire a
     /// notification storm: mark everything current as seen without
     /// notifying. Called once when notifications are first enabled.
     public func primeWithoutNotifying(_ alerts: [AlertItem]) {
+        defaults.set(true, forKey: Self.initializedKey)
+        defaults.removeObject(forKey: Self.pendingBaselineKey)
         markSeen(alerts)
+    }
+
+    public func deferPrimingUntilNextFeed() {
+        defaults.set(true, forKey: Self.pendingBaselineKey)
     }
 
     public func clear() {
         defaults.removeObject(forKey: Self.defaultsKey)
+        defaults.removeObject(forKey: Self.initializedKey)
+        defaults.removeObject(forKey: Self.pendingBaselineKey)
+    }
+
+    private func revisionKey(for alert: AlertItem) -> String {
+        let id = alert.id.uuidString.lowercased()
+        let proposal = alert.proposalId?.uuidString.lowercased() ?? "informational"
+        return "\(id):\(proposal)"
+    }
+
+    private func migrateLegacyIDs(using alerts: [AlertItem]) -> Set<String> {
+        var ordered = defaults.stringArray(forKey: Self.defaultsKey) ?? []
+        let current = Dictionary(uniqueKeysWithValues: alerts.map {
+            let id = $0.id.uuidString.lowercased()
+            return (id, "\(id):informational")
+        })
+        var changed = false
+        ordered = ordered.map { stored in
+            guard !stored.contains(":"), let revision = current[stored] else {
+                return stored
+            }
+            changed = true
+            return revision
+        }
+        if changed {
+            var unique: [String] = []
+            for revision in ordered where !unique.contains(revision) {
+                unique.append(revision)
+            }
+            ordered = unique
+            defaults.set(ordered, forKey: Self.defaultsKey)
+        }
+        return Set(ordered)
     }
 }

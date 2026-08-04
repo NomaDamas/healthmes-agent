@@ -58,6 +58,7 @@ class RefreshWorker(appContext: Context, params: WorkerParameters) :
 
             is BriefingRepository.RefreshOutcome.Unchanged -> {
                 prefs.lastResult = "Up to date — 304 (${stamp()})."
+                outcome.briefing?.let { maybeNotifyRisingAlerts(context, prefs, it) }
                 FocusBlockNotifier.update(context, outcome.briefing)
                 BriefingWidget().updateAll(context)
                 Result.success()
@@ -86,24 +87,91 @@ class RefreshWorker(appContext: Context, params: WorkerParameters) :
     ) {
         val lastSeen = prefs.lastSeenAlertCount
         val current = briefing.alerts.unresolvedCount
-        if (lastSeen in 0 until current) {
-            val grammar = fetchNewestAlertGrammar(prefs) ?: NotificationGrammar.fromGlance(briefing)
-            grammar?.let { AlertNotifier.notify(context, it) }
+        val fetchedAlerts = fetchAlertGrammars(prefs)
+        val alerts = fetchedAlerts.orEmpty()
+        val newest = alerts.firstOrNull()
+        val fallback = NotificationGrammar.fromGlance(briefing)
+        if (!prefs.alertNotificationStateInitialized) {
+            if (fetchedAlerts == null) {
+                if (lastSeen in 0 until current) {
+                    fallback?.let {
+                        AlertNotifier.notify(context, it, proposalId = it.proposalId)
+                        it.alertRevision?.let { revision ->
+                            prefs.alertNotificationFallbackRevisions =
+                                prefs.alertNotificationFallbackRevisions + revision
+                        }
+                    }
+                }
+            } else {
+                if (lastSeen < 0) {
+                    prefs.alertNotificationRevisions =
+                        NotificationGrammar.currentRevisions(alerts)
+                } else {
+                    val previous = NotificationGrammar.legacyRevisions(alerts)
+                    val grammar =
+                        if (lastSeen < current) newest ?: fallback
+                        else NotificationGrammar.pendingNotification(previous, alerts)
+                    grammar?.let {
+                        AlertNotifier.notify(context, it, proposalId = it.proposalId)
+                    }
+                    prefs.alertNotificationRevisions =
+                        NotificationGrammar.mergeRevisions(
+                            previous,
+                            alerts,
+                            grammar?.alertRevision,
+                        )
+                }
+                prefs.alertNotificationStateInitialized = true
+                prefs.alertNotificationFallbackRevisions = emptySet()
+            }
+        } else {
+            val countRose = current > lastSeen
+            val previous =
+                prefs.alertNotificationRevisions + prefs.alertNotificationFallbackRevisions
+            val grammar =
+                fetchedAlerts?.let {
+                    NotificationGrammar.pendingNotification(previous, alerts)
+                        ?: if (countRose) fallback else null
+                } ?: if (countRose) fallback else null
+            grammar?.let {
+                AlertNotifier.notify(context, it, proposalId = it.proposalId)
+            }
+            if (fetchedAlerts != null) {
+                prefs.alertNotificationRevisions =
+                    NotificationGrammar.mergeRevisions(
+                        previous,
+                        alerts,
+                        grammar?.alertRevision,
+                    )
+                prefs.alertNotificationFallbackRevisions = emptySet()
+            } else if (countRose) {
+                fallback?.let {
+                    it.alertRevision?.let { revision ->
+                        prefs.alertNotificationFallbackRevisions =
+                            prefs.alertNotificationFallbackRevisions + revision
+                    }
+                }
+            }
         }
-        prefs.lastSeenAlertCount = current
+        if (
+            prefs.alertNotificationStateInitialized ||
+            fetchedAlerts != null ||
+            lastSeen >= 0
+        ) {
+            prefs.lastSeenAlertCount = current
+        }
     }
 
-    /** Newest pushed alert with its real §8.5 lines; null on any failure. */
-    private fun fetchNewestAlertGrammar(prefs: PairingPrefs): NotificationGrammar? {
+    /** Recent pushed alerts with their real §8.5 lines; null on any failure. */
+    private fun fetchAlertGrammars(prefs: PairingPrefs): List<NotificationGrammar>? {
         val serverUrl = prefs.serverUrl ?: return null
         val response = HealthmesApi(serverUrl, prefs.token)
-            .get("${AlertsPage.ENDPOINT_PATH}?limit=1&offset=0")
+            .get("${AlertsPage.ENDPOINT_PATH}?limit=50&offset=0")
         if (response !is HealthmesApi.Response.Http || !response.isSuccess) return null
         return runCatching { AlertsPage.parse(response.body) }
             .getOrNull()
             ?.alerts
-            ?.firstOrNull()
-            ?.let { NotificationGrammar.fromAlert(it) }
+            ?.map { NotificationGrammar.fromAlert(it) }
     }
 
     private fun stamp(): String =

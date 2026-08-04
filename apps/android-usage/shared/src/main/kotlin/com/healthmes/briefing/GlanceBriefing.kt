@@ -54,6 +54,7 @@ data class GlanceBriefing(
     data class Alerts(val unresolvedCount: Int, val top: TopAlert?)
 
     data class TopAlert(
+        val id: String?,
         val ruleId: String,
         val summary: String,
         val decisionUrl: String?,
@@ -109,6 +110,7 @@ data class GlanceBriefing(
                 unresolvedCount = alertsObj.getInt("unresolved_count"),
                 top = topObj?.let {
                     TopAlert(
+                        id = it.optStringOrNull("id"),
                         ruleId = it.getString("rule_id"),
                         summary = it.getString("summary"),
                         decisionUrl = it.optStringOrNull("decision_url"),

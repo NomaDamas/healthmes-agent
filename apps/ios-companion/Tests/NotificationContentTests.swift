@@ -16,7 +16,8 @@ final class NotificationContentTests: XCTestCase {
             summary: "Recovery 38 today.",
             proposal: "Move the 14:00 block to tomorrow.",
             evidence: ["hrv_delta_pct": .number(-18), "baseline_days": .number(14)],
-            decisionUrl: "http://192.168.1.20:8100/decisions/x?token=hm-ro-abc"
+            decisionUrl: "http://192.168.1.20:8100/decisions/x?token=hm-ro-abc",
+            proposalId: nil
         )
     }
 
@@ -56,7 +57,8 @@ final class NotificationContentTests: XCTestCase {
             summary: "schedule_overload",
             proposal: nil,
             evidence: nil,
-            decisionUrl: nil
+            decisionUrl: nil,
+            proposalId: nil
         )
         let content = AlertNotificationContent.from(alert: bare, pendingProposalID: nil)
 
@@ -94,7 +96,11 @@ final class NotificationContentTests: XCTestCase {
         let content = AlertNotificationContent.from(alert: page.data[0])
         XCTAssertEqual(content.title, "Recovery 38 today.")
         XCTAssertTrue(content.body.hasSuffix("Move the 14:00 block to tomorrow."))
-        XCTAssertEqual(content.categoryID, AlertNotificationContent.infoCategoryID)
+        XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)
+        XCTAssertEqual(
+            content.userInfo[AlertNotificationContent.userInfoProposalID],
+            "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10"
+        )
     }
 }
 

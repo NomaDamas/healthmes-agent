@@ -15,6 +15,7 @@ TRANCHE_1_TOOLS = {
     "upsert_task",
     "get_schedule",
     "propose_schedule_blocks",
+    "resolve_schedule_proposal",
     "log_food",
     "record_decision",
 }
@@ -31,9 +32,7 @@ CALENDAR_ADJUSTMENT_TOOLS = {
     "evaluate_morning_calendar_nudge",
     "resolve_calendar_adjustment",
 }
-EXPECTED_TOOLS = (
-    TRANCHE_1_TOOLS | TRANCHE_2_TOOLS | TRANCHE_3_TOOLS | CALENDAR_ADJUSTMENT_TOOLS
-)
+EXPECTED_TOOLS = TRANCHE_1_TOOLS | TRANCHE_2_TOOLS | TRANCHE_3_TOOLS | CALENDAR_ADJUSTMENT_TOOLS
 
 _INITIALIZE = {
     "jsonrpc": "2.0",
@@ -96,9 +95,7 @@ class TestHttpApp:
                 transport=transport, base_url="http://healthmes.test"
             ) as client:
                 health_response = await client.get("/health")
-                mcp_response = await client.post(
-                    "/mcp", json=_INITIALIZE, headers=_MCP_HEADERS
-                )
+                mcp_response = await client.post("/mcp", json=_INITIALIZE, headers=_MCP_HEADERS)
         assert health_response.status_code == 200  # FastAPI routes keep precedence
         assert mcp_response.status_code == 200
         assert mcp_response.headers.get("mcp-session-id")

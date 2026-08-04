@@ -30,6 +30,10 @@ final class SharedContractMacTests: XCTestCase {
         XCTAssertEqual(page.data.count, 2)
         XCTAssertEqual(page.pagination.totalCount, 2)
         XCTAssertEqual(page.data[0].ruleId, "deep_sleep_drop")
+        XCTAssertEqual(
+            page.data[0].proposalId,
+            UUID(uuidString: "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10")
+        )
         // Legacy payload-less rows fall back to rule_id as the summary.
         XCTAssertEqual(page.data[1].summary, "schedule_overload")
         XCTAssertNil(page.data[1].evidence)
@@ -58,9 +62,13 @@ final class SharedContractMacTests: XCTestCase {
             plain.body,
             "baseline_days 14 · hrv_delta_pct -18\nMove the 14:00 block to tomorrow."
         )
-        XCTAssertEqual(plain.categoryID, AlertNotificationContent.infoCategoryID)
+        XCTAssertEqual(plain.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(plain.threadID, "deep_sleep_drop")
         XCTAssertNotNil(plain.userInfo[AlertNotificationContent.userInfoDecisionURL])
+        XCTAssertEqual(
+            plain.userInfo[AlertNotificationContent.userInfoProposalID],
+            "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10"
+        )
 
         let proposalID = UUID()
         let actionable = AlertNotificationContent.from(alert: alert, pendingProposalID: proposalID)

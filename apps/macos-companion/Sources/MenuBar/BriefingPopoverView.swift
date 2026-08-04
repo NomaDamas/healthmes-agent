@@ -287,7 +287,7 @@ struct ProposalRowView: View {
                 .fontWeight(.medium)
             if let outcome {
                 outcomeLine(outcome)
-            } else {
+            } else if proposal.isActionable {
                 HStack(spacing: 8) {
                     Button {
                         Task { await act(.accept) }
@@ -310,6 +310,10 @@ struct ProposalRowView: View {
                     .font(.caption)
                 }
                 .controlSize(.small)
+            } else {
+                Text(verbatim: proposal.status.rawValue)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             if showDetails {
                 VStack(alignment: .leading, spacing: 2) {

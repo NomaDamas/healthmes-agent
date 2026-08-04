@@ -41,6 +41,8 @@ TASK_REPORT_ID = uuid.UUID("00000000-0000-0000-0000-00000000a002")
 DECISION_ALERT_OLD_ID = uuid.UUID("00000000-0000-0000-0000-00000000d001")
 DECISION_ALERT_TOP_ID = uuid.UUID("00000000-0000-0000-0000-00000000d002")
 DECISION_SCHEDULE_ID = uuid.UUID("00000000-0000-0000-0000-00000000d003")
+TRIGGER_ALERT_OLD_ID = uuid.UUID("00000000-0000-0000-0000-00000000f001")
+TRIGGER_ALERT_TOP_ID = uuid.UUID("00000000-0000-0000-0000-00000000f002")
 
 
 def _utc(day: int, hour: int, minute: int = 0, month: int = 7) -> datetime:
@@ -92,8 +94,8 @@ def seeded(session):
                a pending and a past-accepted proposal never appear.
     Alerts   : pushed fires 13:50 (top) + 09:00; a suppressed 14:00 fire and a
                pushed fire 2 days ago are excluded -> unresolved_count 2.
-    Decisions: alert-kind 09:05 and 13:55 (earliest at/after 13:50 wins the
-               top link), schedule_change 14:10 = latest overall.
+    Decisions: alert-kind rows are linked directly to their trigger events;
+               schedule_change 14:10 = latest overall.
     """
     task_deep = Task(id=TASK_DEEP_ID, title="Ship revenue model", energy_demand=EnergyDemand.HIGH)
     task_report = Task(
@@ -173,6 +175,7 @@ def seeded(session):
     session.add_all(
         [
             TriggerEvent(
+                id=TRIGGER_ALERT_TOP_ID,
                 fired_at=_utc(9, 13, 50),
                 rule_id="stress_spike_vs_baseline",
                 payload={"summary": "Stress 82 vs baseline 55", "proposal": "Take a break"},
@@ -180,6 +183,7 @@ def seeded(session):
                 dedup_key="stress:2026-07-09",
             ),
             TriggerEvent(
+                id=TRIGGER_ALERT_OLD_ID,
                 fired_at=_utc(9, 9),
                 rule_id="low_battery_heavy_afternoon",
                 payload={"summary": "Body battery 21 before a heavy afternoon"},
@@ -202,6 +206,7 @@ def seeded(session):
             ),
         ]
     )
+    session.flush()
 
     session.add_all(
         [
@@ -211,6 +216,7 @@ def seeded(session):
                 tree={"type": "input", "label": "morning alert"},
                 summary="Reasoning for the 09:00 alert",
                 created_at=_utc(9, 9, 5),
+                trigger_event_id=TRIGGER_ALERT_OLD_ID,
             ),
             DecisionRecord(
                 id=DECISION_ALERT_TOP_ID,
@@ -218,6 +224,7 @@ def seeded(session):
                 tree={"type": "input", "label": "stress alert"},
                 summary="Reasoning for the 13:50 alert",
                 created_at=_utc(9, 13, 55),
+                trigger_event_id=TRIGGER_ALERT_TOP_ID,
             ),
             DecisionRecord(
                 id=DECISION_SCHEDULE_ID,
@@ -273,6 +280,7 @@ def test_seeded_glance_returns_exact_payload(client, seeded):
         "alerts": {
             "unresolved_count": 2,
             "top": {
+                "id": str(TRIGGER_ALERT_TOP_ID),
                 "rule_id": "stress_spike_vs_baseline",
                 "summary": "Stress 82 vs baseline 55",
                 "decision_url": f"{BASE_URL}/decisions/{DECISION_ALERT_TOP_ID}",
@@ -308,15 +316,14 @@ def test_empty_database_yields_valid_all_null_shape(client):
 def test_alert_without_payload_or_decision_degrades_honestly(client, session):
     # Legacy/threadbare rows: no payload -> the rule id is the summary; no
     # alert-kind decision recorded after the fire -> decision_url null.
-    session.add(
-        TriggerEvent(
-            fired_at=_utc(9, 13, 0),
-            rule_id="schedule_changed",
-            payload=None,
-            alert_sent=True,
-            dedup_key="sched:2026-07-09",
-        )
+    event = TriggerEvent(
+        fired_at=_utc(9, 13, 0),
+        rule_id="schedule_changed",
+        payload=None,
+        alert_sent=True,
+        dedup_key="sched:2026-07-09",
     )
+    session.add(event)
     # An alert decision from BEFORE the fire must not be claimed by it.
     session.add(
         DecisionRecord(
@@ -331,6 +338,7 @@ def test_alert_without_payload_or_decision_degrades_honestly(client, session):
     body = client.get(GLANCE).json()
 
     assert body["alerts"]["unresolved_count"] == 1
+    assert body["alerts"]["top"]["id"] == str(event.id)
     assert body["alerts"]["top"]["rule_id"] == "schedule_changed"
     assert body["alerts"]["top"]["summary"] == "schedule_changed"
     assert body["alerts"]["top"]["decision_url"] is None

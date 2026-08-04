@@ -25,10 +25,12 @@ class NotificationActionPlanTest {
 
         assertEquals(NotificationActionPlan.WIRE_ACCEPT, plan.accept.wireAction)
         assertEquals(NotificationActionPlan.WIRE_DECLINE, plan.decline.wireAction)
-        // No alert→proposal linkage exists server-side yet: the worker
-        // resolves the target at tap time.
-        assertNull(plan.accept.proposalId)
-        assertNull(plan.decline.proposalId)
+        assertEquals(
+            "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10",
+            plan.accept.proposalId,
+        )
+        assertEquals(plan.accept.proposalId, plan.decline.proposalId)
+        assertTrue(plan.isActionable)
     }
 
     @Test
@@ -83,6 +85,11 @@ class NotificationActionPlanTest {
         val grammar = grammarFromFixture(0)
 
         assertEquals("Stress spiked 45% above your 14-day baseline", grammar.observation)
+        assertEquals(
+            "3f6a1c2e-8d4b-4f0a-9c7e-5b2d1a0f9e8d:" +
+                "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10",
+            grammar.alertRevision,
+        )
         // Evidence is the recorded facts, not the glance-derived filler.
         assertTrue(grammar.evidence.contains("hrv_delta_pct: -18"))
         assertEquals(
@@ -94,10 +101,18 @@ class NotificationActionPlanTest {
     @Test
     fun `legacy alert grammar still renders all three lines`() {
         val grammar = grammarFromFixture(1)
+        val plan = NotificationActionPlan.from(grammar)
 
         assertEquals("schedule_changed", grammar.observation)
         assertEquals("Rule schedule_changed fired", grammar.evidence)
         assertTrue(grammar.proposal.isNotBlank())
         assertNull(grammar.decisionUrl)
+        assertEquals(
+            "56b7a1de-9f7d-4f1e-8f7a-6d2f2b7f6f3a:informational",
+            grammar.alertRevision,
+        )
+        assertNull(plan.accept.proposalId)
+        assertNull(plan.decline.proposalId)
+        assertEquals(false, plan.isActionable)
     }
 }

@@ -10,10 +10,9 @@ import UserNotifications
 /// there is no push relay by design (local-first), so Telegram remains the
 /// guaranteed-delivery channel. The Settings toggle says exactly that.
 ///
-/// ✅ Apply / ❌ Keep actions are attached ONLY when exactly one schedule
-/// proposal is pending (no alert→proposal FK exists, so that is the only
-/// case where "Apply" is unambiguous — same rule as the iOS/Android apps)
-/// and they call the real accept/decline endpoints from the action handler.
+/// ✅ Apply / ❌ Keep actions are attached only when the alert response carries
+/// its exact pending proposal id, and they call the real accept/decline
+/// endpoints from the action handler.
 /// ✏️ Adjust and plain clicks open the decision viewer in the browser.
 @MainActor
 public final class MacNotificationManager: NSObject, ObservableObject {
@@ -60,28 +59,38 @@ public final class MacNotificationManager: NSObject, ObservableObject {
     /// Settings toggle handler. Enabling requests authorization and primes
     /// the seen-store with the current history so an existing backlog never
     /// replays as a notification storm.
-    public func setEnabled(_ enabled: Bool, currentAlerts: [AlertItem]) async {
-        UserDefaults.standard.set(enabled, forKey: Self.enabledDefaultsKey)
-        guard enabled, let center else { return }
+    public func setEnabled(
+        _ enabled: Bool,
+        currentAlerts: [AlertItem],
+        hasLoadedAlerts: Bool
+    ) async {
+        guard enabled else {
+            UserDefaults.standard.set(false, forKey: Self.enabledDefaultsKey)
+            return
+        }
+        if hasLoadedAlerts {
+            seenStore.primeWithoutNotifying(currentAlerts)
+        } else {
+            seenStore.deferPrimingUntilNextFeed()
+        }
+        guard let center else {
+            UserDefaults.standard.set(false, forKey: Self.enabledDefaultsKey)
+            return
+        }
         let granted =
             (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
         authorizationDenied = !granted
-        if granted {
-            seenStore.primeWithoutNotifying(currentAlerts)
-        }
+        UserDefaults.standard.set(granted, forKey: Self.enabledDefaultsKey)
     }
 
     /// Store hook: post exactly one notification per not-yet-seen alert.
-    public func process(alerts: [AlertItem], pendingProposals: [ProposalItem]) {
+    public func process(alerts: [AlertItem], pendingProposals _: [ProposalItem]) {
         guard isEnabled, let center else { return }
-        let unseen = seenStore.unseen(from: alerts)
+        let unseen = seenStore.unseenOrPrime(from: alerts)
         guard !unseen.isEmpty else { return }
-        let pendingProposalID = pendingProposals.count == 1 ? pendingProposals[0].id : nil
 
         for alert in unseen {
-            let content = AlertNotificationContent.from(
-                alert: alert, pendingProposalID: pendingProposalID
-            )
+            let content = AlertNotificationContent.from(alert: alert)
             let unContent = UNMutableNotificationContent()
             unContent.title = content.title
             unContent.body = content.body
@@ -144,8 +153,13 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             let action: ProposalAction = actionIdentifier == ActionID.apply ? .accept : .decline
             let outcome: ProposalOutcome
             do {
-                _ = try await api.resolveProposal(id: proposalID, action: action)
-                outcome = ProposalOutcome.from(action: action, error: nil)
+                let proposal = try await api.getProposal(proposalID)
+                if proposal.isActionable {
+                    _ = try await api.resolveProposal(proposal, action: action)
+                    outcome = ProposalOutcome.from(action: action, error: nil)
+                } else {
+                    outcome = .alreadyResolved(status: "resolved")
+                }
             } catch let error as HealthMesAPIError {
                 outcome = ProposalOutcome.from(action: action, error: error)
             } catch {

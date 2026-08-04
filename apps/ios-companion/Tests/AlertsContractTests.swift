@@ -38,6 +38,10 @@ final class AlertsContractTests: XCTestCase {
             "http://192.168.1.20:8100/decisions/00000000-0000-0000-0000-00000000e002"
                 + "?token=hm-ro-3q2b8d1f7c6e5a4"
         )
+        XCTAssertEqual(
+            top.proposalId,
+            UUID(uuidString: "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10")
+        )
 
         // Legacy payload-less row: summary falls back to rule_id server-side,
         // proposal/evidence/decision_url are honest nulls.
@@ -46,6 +50,7 @@ final class AlertsContractTests: XCTestCase {
         XCTAssertNil(legacy.proposal)
         XCTAssertNil(legacy.evidence)
         XCTAssertNil(legacy.decisionUrl)
+        XCTAssertNil(legacy.proposalId)
     }
 
     func testDecodesEmptyPage() throws {
@@ -69,7 +74,7 @@ final class SeenAlertsStoreTests: XCTestCase {
         return (SeenAlertsStore(defaults: defaults), defaults)
     }
 
-    private func alert(_ id: UUID) -> AlertItem {
+    private func alert(_ id: UUID, proposalId: UUID? = nil) -> AlertItem {
         AlertItem(
             id: id,
             ruleId: "rule",
@@ -77,7 +82,8 @@ final class SeenAlertsStoreTests: XCTestCase {
             summary: "s",
             proposal: nil,
             evidence: nil,
-            decisionUrl: nil
+            decisionUrl: nil,
+            proposalId: proposalId
         )
     }
 
@@ -98,6 +104,76 @@ final class SeenAlertsStoreTests: XCTestCase {
         let existing = [alert(UUID()), alert(UUID())]
         store.primeWithoutNotifying(existing)
         XCTAssertTrue(store.unseen(from: existing).isEmpty)
+    }
+
+    func testFailedInitialFeedPrimesTheNextSuccessfulHistory() {
+        let (store, _) = makeStore()
+        let existing = alert(UUID())
+        let later = alert(UUID())
+
+        store.deferPrimingUntilNextFeed()
+        XCTAssertTrue(store.unseenOrPrime(from: [existing]).isEmpty)
+        XCTAssertEqual(store.unseenOrPrime(from: [later, existing]).map(\.id), [later.id])
+    }
+
+    func testSuccessfulEmptyBaselineDoesNotSwallowTheNextAlert() {
+        let (store, _) = makeStore()
+        let first = alert(UUID())
+
+        store.deferPrimingUntilNextFeed()
+        XCTAssertTrue(store.unseenOrPrime(from: []).isEmpty)
+        XCTAssertEqual(store.unseenOrPrime(from: [first]).map(\.id), [first.id])
+    }
+
+    func testEmptyLegacyStoreDoesNotSwallowTheFirstNewAlert() {
+        let (store, _) = makeStore()
+        let first = alert(UUID())
+
+        XCTAssertEqual(store.unseenOrPrime(from: [first]).map(\.id), [first.id])
+    }
+
+    func testProposalCorrelationUpgradesAnInformationalAlertOnce() {
+        let (store, _) = makeStore()
+        let id = UUID()
+        let informational = alert(id)
+        let actionable = alert(id, proposalId: UUID())
+
+        store.markSeen([informational])
+        XCTAssertEqual(store.unseen(from: [actionable]).map(\.id), [id])
+        store.markSeen([actionable])
+        XCTAssertTrue(store.unseen(from: [actionable]).isEmpty)
+    }
+
+    func testLegacySeenIDMigratesToTheCurrentRevision() {
+        let (store, defaults) = makeStore()
+        let id = UUID()
+        defaults.set([id.uuidString.lowercased()], forKey: SeenAlertsStore.defaultsKey)
+
+        let informational = alert(id)
+        XCTAssertTrue(store.unseen(from: [informational]).isEmpty)
+        XCTAssertEqual(
+            store.unseen(from: [alert(id, proposalId: UUID())]).map(\.id),
+            [id]
+        )
+    }
+
+    func testLegacySeenIDDoesNotConsumeCurrentActionableRevision() {
+        let (store, defaults) = makeStore()
+        let id = UUID()
+        defaults.set([id.uuidString.lowercased()], forKey: SeenAlertsStore.defaultsKey)
+
+        XCTAssertEqual(
+            store.unseen(from: [alert(id, proposalId: UUID())]).map(\.id),
+            [id]
+        )
+    }
+
+    func testResolvedProposalDoesNotDowngradeIntoANewInformationalAlert() {
+        let (store, _) = makeStore()
+        let id = UUID()
+        store.markSeen([alert(id, proposalId: UUID())])
+
+        XCTAssertTrue(store.unseen(from: [alert(id)]).isEmpty)
     }
 
     func testCapKeepsNewestIDs() {

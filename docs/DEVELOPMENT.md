@@ -216,6 +216,9 @@ Hermes live gateway session, which calls
 `mcp__healthmes__resolve_calendar_adjustment` with the exact combined live
 Telegram reply as `response` and its unchanged `reply_handle`. Hermes attaches
 an owner-bound signed proof, and HealthMes resolves the proposal server-side.
+Planner-created schedule proposals use the same exact-reply proof boundary via
+`mcp__healthmes__resolve_schedule_proposal`; REST/native clients use a separate
+proposal-bound resolution token and can never mint a Telegram proof.
 
 ```bash
 uv run python scripts/bootstrap.py --dry-run     # show what would change

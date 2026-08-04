@@ -69,6 +69,23 @@ class PairingPrefs(context: Context) {
         get() = prefs.getInt(KEY_LAST_SEEN_ALERTS, -1)
         set(value) = prefs.edit { putInt(KEY_LAST_SEEN_ALERTS, value) }
 
+    /** Revisions observed for the current alert window. */
+    var alertNotificationRevisions: Set<String>
+        get() = prefs.getStringSet(KEY_ALERT_NOTIFICATION_REVISIONS, emptySet())?.toSet().orEmpty()
+        set(value) = prefs.edit { putStringSet(KEY_ALERT_NOTIFICATION_REVISIONS, value) }
+
+    /** False on upgrade from the legacy count-only notification state. */
+    var alertNotificationStateInitialized: Boolean
+        get() = prefs.getBoolean(KEY_ALERT_NOTIFICATION_STATE_INITIALIZED, false)
+        set(value) = prefs.edit { putBoolean(KEY_ALERT_NOTIFICATION_STATE_INITIALIZED, value) }
+
+    /** Exact informational revisions shown while the detailed alert feed was unavailable. */
+    var alertNotificationFallbackRevisions: Set<String>
+        get() = prefs.getStringSet(KEY_ALERT_NOTIFICATION_FALLBACK_REVISIONS, emptySet())
+            ?.toSet()
+            .orEmpty()
+        set(value) = prefs.edit { putStringSet(KEY_ALERT_NOTIFICATION_FALLBACK_REVISIONS, value) }
+
     /** Human-readable outcome of the last refresh (shown in pairing UIs). */
     var lastResult: String?
         get() = prefs.getString(KEY_LAST_RESULT, null)
@@ -85,6 +102,11 @@ class PairingPrefs(context: Context) {
         const val KEY_BRIEFING_JSON = "briefing_json"
         const val KEY_LAST_FETCH_MS = "last_fetch_ms"
         const val KEY_LAST_SEEN_ALERTS = "last_seen_alert_count"
+        const val KEY_ALERT_NOTIFICATION_REVISIONS = "alert_notification_revisions"
+        const val KEY_ALERT_NOTIFICATION_STATE_INITIALIZED =
+            "alert_notification_state_initialized"
+        const val KEY_ALERT_NOTIFICATION_FALLBACK_REVISIONS =
+            "alert_notification_fallback_revisions"
         const val KEY_LAST_RESULT = "last_result"
     }
 }

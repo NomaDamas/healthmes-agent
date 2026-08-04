@@ -13,7 +13,7 @@ only relative paths are stored here (``media_path`` columns).
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import ForeignKey, Index, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, UniqueConstraint, false
 from sqlalchemy.orm import Mapped, mapped_column
 
 from healthmes.store.base import Base, JSONDict, str_32, str_64, str_255, string_enum
@@ -132,6 +132,13 @@ class CalendarEventMirror(Base):
     agent_task_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("task.id", ondelete="SET NULL"), index=True
     )
+    intake_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("task.id", ondelete="SET NULL"), index=True
+    )
+    intake_opted_out: Mapped[bool] = mapped_column(
+        default=False,
+        server_default=false(),
+    )
     healthmes_kind: Mapped[str_64 | None]
     healthmes_source: Mapped[str_255 | None]
     healthmes_source_key: Mapped[str_255 | None]
@@ -166,6 +173,13 @@ class ScheduleProposal(Base):
         ForeignKey("decision_record.id", ondelete="SET NULL")
     )
     healthmes_kind: Mapped[str_64 | None]
+    reply_handle_digest: Mapped[str_255 | None] = mapped_column(
+        index=True, unique=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(index=True)
+    intake_calendar_source: Mapped[CalendarSource | None]
+    intake_external_id: Mapped[str_255 | None]
+    intake_revision: Mapped[str_255 | None]
 
 
 class CalendarMutationProposal(Base):
@@ -276,12 +290,23 @@ class DecisionRecord(Base):
     """
 
     __tablename__ = "decision_record"
+    __table_args__ = (
+        Index(
+            "ux_decision_record_trigger_event_id",
+            "trigger_event_id",
+            unique=True,
+        ),
+    )
 
     kind: Mapped[DecisionKind] = mapped_column(index=True)
     tree: Mapped[JSONDict]
     summary: Mapped[str]
     llm_model: Mapped[str_64 | None]
     tokens: Mapped[int | None]
+    trigger_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("trigger_event.id", ondelete="SET NULL"),
+        default=None,
+    )
 
 
 class Insight(Base):

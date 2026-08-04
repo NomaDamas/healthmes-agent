@@ -1,7 +1,7 @@
 package com.healthmes.companion
 
 import com.healthmes.api.HealthmesApi
-import com.healthmes.api.ProposalsPage
+import com.healthmes.api.Proposal
 import com.healthmes.companion.work.ProposalActionLogic
 import com.healthmes.companion.work.ProposalActionLogic.Outcome
 import com.healthmes.companion.work.ProposalActionLogic.Target
@@ -16,51 +16,49 @@ import org.junit.Test
  */
 class ProposalActionLogicTest {
 
-    private fun page(totalCount: Int, ids: List<String>): ProposalsPage {
-        // Datetimes are deliberately sqlite-NAIVE (no Z/offset): that is what
-        // the default deployment's GET /v1/schedule/proposals really emits
-        // (UTC by store contract). Z-suffixed fixtures previously masked a
-        // parse crash in the proposals screen.
-        val data = ids.joinToString(",") { id ->
-            """
-            {"id": "$id", "task_id": "11111111-2222-3333-4444-555555555555",
-             "proposed_start": "2026-07-09T05:00:00.497821", "proposed_end": "2026-07-09T06:00:00.497821",
-             "status": "proposed", "decision_record_id": null}
-            """.trimIndent()
-        }
-        return ProposalsPage.parse(
-            """
-            {"data": [$data],
-             "pagination": {"total_count": $totalCount, "limit": 2, "offset": 0,
-                            "has_more": ${totalCount > ids.size}}}
-            """.trimIndent()
+    @Test
+    fun `explicit notification target uses direct lookup beyond the list window`() {
+        val explicitId = "target-51"
+        val body = """
+            {"id": "$explicitId", "task_id": "11111111-2222-3333-4444-555555555555",
+             "proposed_start": "2026-07-11T05:00:00", "proposed_end": "2026-07-11T06:00:00",
+             "status": "proposed", "decision_record_id": null,
+             "accept_resolution_token": "accept-target",
+             "decline_resolution_token": "decline-target"}
+        """.trimIndent()
+
+        assertEquals(
+            "/v1/schedule/proposals/$explicitId",
+            ProposalActionLogic.resolvePath(explicitId),
         )
-    }
-
-    @Test
-    fun `zero pending proposals means nothing to act on`() {
-        assertEquals(Target.NonePending, ProposalActionLogic.chooseTarget(page(0, emptyList())))
-    }
-
-    @Test
-    fun `exactly one pending proposal is the unambiguous target`() {
-        val target = ProposalActionLogic.chooseTarget(page(1, listOf("aaa")))
-
+        assertEquals(
+            null,
+            ProposalActionLogic.resolvePath(null),
+        )
+        val target = ProposalActionLogic.chooseTarget(body, explicitId)
         assertTrue(target is Target.Single)
-        assertEquals("aaa", (target as Target.Single).proposal.id)
+        assertEquals(explicitId, (target as Target.Single).proposal.id)
     }
 
     @Test
-    fun `two or more pending proposals refuse to guess`() {
+    fun `generic alert never infers a proposal target`() {
         assertEquals(
-            Target.Ambiguous(2),
-            ProposalActionLogic.chooseTarget(page(2, listOf("aaa", "bbb"))),
+            Target.NonePending,
+            ProposalActionLogic.chooseTarget("""{"data": []}""", explicitId = null),
         )
-        // total_count larger than the fetched window still counts as ambiguous.
-        assertEquals(
-            Target.Ambiguous(5),
-            ProposalActionLogic.chooseTarget(page(5, listOf("aaa", "bbb"))),
-        )
+    }
+
+    @Test
+    fun `proposed detail without resolution tokens is not actionable`() {
+        val explicitId = "expired-target"
+        val body = """
+            {"id": "$explicitId", "task_id": "11111111-2222-3333-4444-555555555555",
+             "proposed_start": "2026-07-11T05:00:00", "proposed_end": "2026-07-11T06:00:00",
+             "status": "proposed", "decision_record_id": null,
+             "accept_resolution_token": null, "decline_resolution_token": null}
+        """.trimIndent()
+
+        assertEquals(Target.NonePending, ProposalActionLogic.chooseTarget(body, explicitId))
     }
 
     @Test
@@ -68,7 +66,8 @@ class ProposalActionLogicTest {
         val body = """
             {"id": "aaa", "task_id": "t", "proposed_start": "2026-07-09T05:00:00Z",
              "proposed_end": "2026-07-09T06:00:00Z", "status": "accepted",
-             "decision_record_id": null}
+             "decision_record_id": null, "accept_resolution_token": null,
+             "decline_resolution_token": null}
         """.trimIndent()
 
         val outcome = ProposalActionLogic.classifyActionResponse(

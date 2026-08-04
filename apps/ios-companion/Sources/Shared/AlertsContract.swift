@@ -41,6 +41,7 @@ public struct AlertItem: Codable, Equatable, Identifiable {
     public let proposal: String?
     public let evidence: [String: JSONValue]?
     public let decisionUrl: String?
+    public let proposalId: UUID?
 
     public init(
         id: UUID,
@@ -49,7 +50,8 @@ public struct AlertItem: Codable, Equatable, Identifiable {
         summary: String,
         proposal: String?,
         evidence: [String: JSONValue]?,
-        decisionUrl: String?
+        decisionUrl: String?,
+        proposalId: UUID?
     ) {
         self.id = id
         self.ruleId = ruleId
@@ -58,6 +60,7 @@ public struct AlertItem: Codable, Equatable, Identifiable {
         self.proposal = proposal
         self.evidence = evidence
         self.decisionUrl = decisionUrl
+        self.proposalId = proposalId
     }
 
     enum CodingKeys: String, CodingKey {
@@ -68,6 +71,7 @@ public struct AlertItem: Codable, Equatable, Identifiable {
         case proposal
         case evidence
         case decisionUrl = "decision_url"
+        case proposalId = "proposal_id"
     }
 }
 

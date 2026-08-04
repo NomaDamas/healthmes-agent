@@ -30,16 +30,18 @@ or bound into a query, so comparisons behave identically on postgres
 """
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import statistics
+import uuid
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars.adjustments_proposals import provider_revision_fingerprint
@@ -47,6 +49,7 @@ from healthmes.config import Settings, resolve_timezone
 from healthmes.engine.rules import (
     ALL_RULES,
     AfternoonLoad,
+    CalendarTaskInput,
     DeadlineTask,
     RecoverySnapshot,
     RuleThresholds,
@@ -148,7 +151,13 @@ class HealthReader(Protocol):
 class AlertSender(Protocol):
     """Anything that can push a fire to the agent plane (webhook by default)."""
 
-    def send(self, fire: TriggerFire, *, fired_at: datetime) -> WebhookResult: ...
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> WebhookResult: ...
 
 
 def _run_maybe_async(value: Any) -> Any:
@@ -566,6 +575,55 @@ def _load_deadline_tasks(
     return tuple(result)
 
 
+def _load_calendar_task_inputs(session: Session) -> tuple[CalendarTaskInput, ...]:
+    processed_revisions: set[str] = set()
+    events = session.scalars(
+        select(TriggerEvent).where(TriggerEvent.rule_id == "calendar_task_intake")
+    ).all()
+    for event in events:
+        evidence = event.payload.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        tasks = evidence.get("tasks")
+        if not isinstance(tasks, list):
+            continue
+        for task in tasks:
+            if isinstance(task, dict) and isinstance(task.get("input_revision"), str):
+                processed_revisions.add(task["input_revision"])
+
+    rows = session.execute(
+        select(CalendarEventMirror, Task)
+        .join(Task, CalendarEventMirror.intake_task_id == Task.id)
+        .where(Task.status.not_in(_TERMINAL_TASK_STATUSES))
+        .order_by(Task.created_at, Task.id)
+    ).all()
+    inputs: list[CalendarTaskInput] = []
+    for mirror, task in rows:
+        raw_revision = (
+            f"{mirror.calendar_source.value}:{mirror.external_id}:"
+            f"{mirror.etag or _ensure_utc(mirror.updated_at).isoformat()}"
+        )
+        input_revision = hashlib.sha256(raw_revision.encode("utf-8")).hexdigest()[:16]
+        if input_revision in processed_revisions:
+            continue
+        inputs.append(
+            CalendarTaskInput(
+                task_id=str(task.id),
+                title=task.title,
+                calendar_source=mirror.calendar_source.value,
+                input_revision=input_revision,
+                starts_at=_ensure_utc(mirror.start_at),
+                ends_at=_ensure_utc(mirror.end_at),
+                is_all_day=mirror.is_all_day,
+                est_minutes=task.est_minutes,
+                deadline=(
+                    _ensure_utc(task.deadline) if task.deadline is not None else None
+                ),
+            )
+        )
+    return tuple(inputs)
+
+
 # ---------------------------------------------------------------------------
 # Evaluator
 # ---------------------------------------------------------------------------
@@ -647,15 +705,19 @@ class TriggerEvaluator:
         (tests/hardening/test_trigger_flood.py).
         """
         now = self._now()
-        signals = self._health_reader.read(now)
 
         outcomes: list[FireOutcome] = []
         with session_scope(self._session_factory) as session:
+            retried, pending_keys = self._retry_pending_dispatches(session)
+            outcomes.extend(retried)
+            signals = self._health_reader.read(now)
             context = self._build_context(session, now, signals)
             for rule in self._rules:
                 try:
                     fire = rule(context)
                     if fire is None:
+                        continue
+                    if fire.dedup_key in pending_keys:
                         continue
                     outcomes.append(self._process_fire(session, now, fire))
                 except Exception:
@@ -679,6 +741,72 @@ class TriggerEvaluator:
             )
         return report
 
+    def _retry_pending_dispatches(
+        self,
+        session: Session,
+    ) -> tuple[list[FireOutcome], set[str]]:
+        """Deliver committed outbox rows independently of rule conditions."""
+        events = session.scalars(
+            select(TriggerEvent)
+            .where(TriggerEvent.alert_sent.is_(False))
+            .order_by(TriggerEvent.fired_at, TriggerEvent.id)
+        ).all()
+        outcomes: list[FireOutcome] = []
+        pending_keys: set[str] = set()
+        for event in events:
+            if not self._is_dispatching(event):
+                continue
+            locked_event = session.scalar(
+                select(TriggerEvent)
+                .where(TriggerEvent.id == event.id)
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+            if locked_event is None or not self._is_dispatching(locked_event):
+                continue
+            event = locked_event
+            if event.dedup_key is not None:
+                pending_keys.add(event.dedup_key)
+            payload = event.payload or {}
+            summary = payload.get("summary")
+            proposal = payload.get("proposal")
+            evidence = payload.get("evidence")
+            if (
+                not isinstance(summary, str)
+                or not isinstance(proposal, str)
+                or not isinstance(evidence, dict)
+            ):
+                event.payload = {
+                    **payload,
+                    "push": {
+                        "suppressed_reason": _SUPPRESS_PUSH_FAILED,
+                        "detail": "invalid persisted dispatch payload",
+                    },
+                }
+                session.commit()
+                continue
+            fire = TriggerFire(
+                rule_id=event.rule_id,
+                dedup_key=event.dedup_key or f"trigger_event:{event.id}",
+                summary=summary,
+                proposal=proposal,
+                evidence=evidence,
+            )
+            outcomes.append(
+                self._deliver_event(
+                    session,
+                    fire,
+                    event,
+                    {
+                        "summary": summary,
+                        "proposal": proposal,
+                        "evidence": evidence,
+                    },
+                    fired_at=_ensure_utc(event.fired_at),
+                )
+            )
+        return outcomes, pending_keys
+
     def _build_context(
         self, session: Session, now: datetime, signals: HealthSignals
     ) -> TriggerContext:
@@ -690,6 +818,7 @@ class TriggerEvaluator:
             schedule_changes=_load_schedule_changes(
                 session, now, timedelta(minutes=SCHEDULE_DIFF_LOOKBACK_MINUTES)
             ),
+            calendar_task_inputs=_load_calendar_task_inputs(session),
             deadline_tasks=_load_deadline_tasks(session, now, self._thresholds),
             thresholds=self._thresholds,
         )
@@ -699,13 +828,20 @@ class TriggerEvaluator:
         # recorded is never persisted or pushed again. Keys embed their
         # temporal scope (date / diff fingerprint), so "again later" is a new
         # key by construction.
-        already = session.scalar(
-            select(TriggerEvent.id).where(TriggerEvent.dedup_key == fire.dedup_key).limit(1)
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:dedup_key, 0))"),
+                {"dedup_key": fire.dedup_key},
+            )
+        existing_event = session.scalar(
+            select(TriggerEvent)
+            .where(TriggerEvent.dedup_key == fire.dedup_key)
+            .limit(1)
         )
-        if already is not None:
+        if existing_event is not None:
             return FireOutcome(fire=fire, status="deduplicated")
 
-        payload: dict[str, Any] = {
+        payload = {
             "summary": fire.summary,
             "proposal": fire.proposal,
             "evidence": fire.evidence,
@@ -731,15 +867,64 @@ class TriggerEvaluator:
             event.payload = {**payload, "push": {"suppressed_reason": reason}}
             return FireOutcome(fire=fire, status="suppressed", reason=reason)
 
+        event.payload = {
+            **payload,
+            "push": {"state": "dispatching", "channel": "webhook"},
+        }
+        # Hermes accepts the request and starts agent work asynchronously.
+        # Commit the correlation row first so record_decision can resolve
+        # trigger_event_id immediately. The outbox scan retries this exact row
+        # even when the original rule condition is no longer true.
+        session.commit()
+        event = session.scalar(
+            select(TriggerEvent)
+            .where(TriggerEvent.id == event.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if event is None or not self._is_dispatching(event):
+            return FireOutcome(fire=fire, status="deduplicated")
+        return self._deliver_event(
+            session,
+            fire,
+            event,
+            payload,
+            fired_at=now,
+        )
+
+    @staticmethod
+    def _is_dispatching(event: TriggerEvent) -> bool:
+        push = (event.payload or {}).get("push")
+        return (
+            not event.alert_sent
+            and isinstance(push, dict)
+            and push.get("state") == "dispatching"
+        )
+
+    def _deliver_event(
+        self,
+        session: Session,
+        fire: TriggerFire,
+        event: TriggerEvent,
+        payload: dict[str, Any],
+        *,
+        fired_at: datetime,
+    ) -> FireOutcome:
         try:
-            result = self._alert_sender.send(fire, fired_at=now)
+            result = self._alert_sender.send(
+                fire,
+                fired_at=fired_at,
+                trigger_event_id=event.id,
+            )
         except Exception as exc:
             # The sender *raised* (transport blew up mid-send) rather than
             # returning a clean WebhookResult(ok=False) — that latter case is a
             # gateway that answered non-2xx and is handled below. The
             # trigger_event row is already flushed (its dedup key is burned), so
             # a raised send must be unwound; see _handle_send_exception.
-            return self._handle_send_exception(session, fire, event, payload, exc)
+            outcome = self._handle_send_exception(session, fire, event, payload, exc)
+            session.commit()
+            return outcome
 
         if result.ok:
             event.alert_sent = True
@@ -747,7 +932,9 @@ class TriggerEvaluator:
                 **payload,
                 "push": {"sent": True, "status_code": result.status_code, "channel": "webhook"},
             }
-            return FireOutcome(fire=fire, status="pushed")
+            outcome = FireOutcome(fire=fire, status="pushed")
+            session.commit()
+            return outcome
 
         # Webhook not delivered (unconfigured or failed). With native delivery
         # on, the alert is still surfaced to the companion apps via /v1/alerts +
@@ -764,7 +951,27 @@ class TriggerEvaluator:
                     "detail": result.detail,
                 },
             }
-            return FireOutcome(fire=fire, status="pushed")
+            outcome = FireOutcome(fire=fire, status="pushed")
+            session.commit()
+            return outcome
+
+        if result.retryable:
+            event.payload = {
+                **payload,
+                "push": {
+                    "state": "dispatching",
+                    "channel": "webhook",
+                    "last_status_code": result.status_code,
+                    "last_error": result.detail,
+                },
+            }
+            outcome = FireOutcome(
+                fire=fire,
+                status="push_failed",
+                reason=result.detail,
+            )
+            session.commit()
+            return outcome
 
         event.payload = {
             **payload,
@@ -774,7 +981,9 @@ class TriggerEvaluator:
                 "detail": result.detail,
             },
         }
-        return FireOutcome(fire=fire, status="push_failed", reason=result.detail)
+        outcome = FireOutcome(fire=fire, status="push_failed", reason=result.detail)
+        session.commit()
+        return outcome
 
     def _handle_send_exception(
         self,
@@ -786,19 +995,16 @@ class TriggerEvaluator:
     ) -> FireOutcome:
         """Recover a fire whose AlertSender.send() *raised* (not a clean non-2xx).
 
-        The ``trigger_event`` row was already ``add``-ed and ``flush``-ed above,
-        so its dedup key is burned; without unwinding, a transport that raises
-        would permanently swallow the alert. Two recoveries:
+        The ``trigger_event`` row is committed in ``dispatching`` state before
+        the external call, so Hermes background processing can resolve its id
+        and a process crash leaves durable retry intent. Two recoveries:
 
         - ``native_alert_delivery`` on: the alert is still surfaced to the
           companion apps via /v1/alerts + glance polling, so mark it delivered
           natively (the phone/watch get it without Telegram) and keep the row.
-        - native off: the alert is genuinely undelivered and MUST retry on the
-          next sweep, so the burned dedup key has to go. ``session.expunge`` is
-          NOT enough here — the INSERT already emitted at flush, so expunge only
-          detaches the instance while the row still commits; only
-          ``delete`` + ``flush`` actually removes it, letting the identical fire
-          re-fire (its dedup key was never truly recorded).
+        - native off: leave the row in ``dispatching`` state. The next sweep
+          retries the same event id and stable Hermes request id, preserving
+          correlation while the gateway collapses an uncertain duplicate.
         """
         if self._settings.native_alert_delivery:
             event.alert_sent = True
@@ -813,8 +1019,14 @@ class TriggerEvaluator:
             }
             return FireOutcome(fire=fire, status="pushed")
 
-        session.delete(event)
-        session.flush()
+        event.payload = {
+            **payload,
+            "push": {
+                "state": "dispatching",
+                "channel": "webhook",
+                "last_error": str(exc),
+            },
+        }
         return FireOutcome(fire=fire, status="push_failed", reason=str(exc))
 
     def _push_suppression_reason(

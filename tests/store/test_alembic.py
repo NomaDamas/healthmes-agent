@@ -8,6 +8,7 @@ rendering, which never connects.
 
 import io
 import logging
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,7 +20,16 @@ from alembic.script import ScriptDirectory
 from sqlalchemy.orm import sessionmaker
 
 from alembic import command
-from healthmes.store import Base, DecisionKind, DecisionRecord, Task, session_scope
+from healthmes.schedule_proposals import resolution_token, verify_resolution_token
+from healthmes.store import (
+    Base,
+    DecisionKind,
+    DecisionRecord,
+    ProposalStatus,
+    ScheduleProposal,
+    Task,
+    session_scope,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -179,6 +189,186 @@ class TestSqliteUpgrade:
         config = _config(database_url)
         command.upgrade(config, "head")
         command.upgrade(config, "head")  # no-op, must not raise
+
+    def test_legacy_pending_schedule_proposal_is_backfilled_and_resolvable(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'legacy-proposal.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "b4c5d6e7f809")
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        task_table = sa.Table("task", metadata, autoload_with=engine)
+        proposal_table = sa.Table(
+            "schedule_proposal",
+            metadata,
+            autoload_with=engine,
+        )
+        task_id = "1" * 32
+        proposal_id = "2" * 32
+        expired_task_id = "3" * 32
+        expired_proposal_id = "4" * 32
+        with engine.begin() as connection:
+            connection.execute(
+                task_table.insert(),
+                [
+                    {
+                        "id": task_id,
+                        "title": "Legacy pending task",
+                        "energy_demand": "med",
+                        "status": "todo",
+                        "source": "user",
+                    },
+                    {
+                        "id": expired_task_id,
+                        "title": "Expired legacy task",
+                        "energy_demand": "med",
+                        "status": "todo",
+                        "source": "user",
+                    },
+                ],
+            )
+            connection.execute(
+                proposal_table.insert(),
+                [
+                    {
+                        "id": proposal_id,
+                        "task_id": task_id,
+                        "proposed_start": datetime(2026, 8, 4, 9, tzinfo=UTC),
+                        "proposed_end": datetime(2026, 8, 4, 10, tzinfo=UTC),
+                        "status": "proposed",
+                    },
+                    {
+                        "id": expired_proposal_id,
+                        "task_id": expired_task_id,
+                        "proposed_start": datetime(2026, 8, 2, 9, tzinfo=UTC),
+                        "proposed_end": datetime(2026, 8, 2, 10, tzinfo=UTC),
+                        "status": "proposed",
+                    },
+                ],
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            factory = sessionmaker(bind=engine)
+            with factory() as session:
+                proposal = session.get(
+                    ScheduleProposal,
+                    uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                )
+                assert proposal is not None
+                assert proposal.reply_handle_digest
+                assert proposal.expires_at is not None
+                secret = "legacy-proposal-test-secret-at-least-32-characters"
+                accept_token = resolution_token(
+                    proposal,
+                    secret,
+                    ProposalStatus.ACCEPTED,
+                )
+                decline_token = resolution_token(
+                    proposal,
+                    secret,
+                    ProposalStatus.DECLINED,
+                )
+                assert accept_token
+                assert decline_token
+                assert accept_token != decline_token
+                assert verify_resolution_token(
+                    accept_token,
+                    proposal,
+                    secret,
+                    ProposalStatus.ACCEPTED,
+                )
+                assert not verify_resolution_token(
+                    accept_token,
+                    proposal,
+                    secret,
+                    ProposalStatus.DECLINED,
+                )
+                expired = session.get(
+                    ScheduleProposal,
+                    uuid.UUID("44444444-4444-4444-4444-444444444444"),
+                )
+                assert expired is not None
+                assert expired.status is ProposalStatus.INVALIDATED
+                assert expired.reply_handle_digest is None
+                assert expired.expires_at is None
+        finally:
+            engine.dispose()
+
+    def test_old_feature_revision_stamp_upgrades_without_duplicate_columns(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'old-feature-stamp.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "e1f2a3b4c5d6")
+
+        engine = sa.create_engine(database_url)
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE calendar_event_mirror "
+                "ADD COLUMN intake_task_id CHAR(32)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX ix_calendar_event_mirror_intake_task_id "
+                "ON calendar_event_mirror (intake_task_id)"
+            )
+            connection.exec_driver_sql(
+                "ALTER TABLE schedule_proposal "
+                "ADD COLUMN reply_handle_digest VARCHAR(255)"
+            )
+            connection.exec_driver_sql(
+                "ALTER TABLE schedule_proposal ADD COLUMN expires_at DATETIME"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX ix_schedule_proposal_expires_at "
+                "ON schedule_proposal (expires_at)"
+            )
+            connection.exec_driver_sql(
+                "UPDATE alembic_version SET version_num = 'a3b4c5d6e7f8'"
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert inspector.get_table_names()
+            assert inspector.has_table("sleep_reconciliation_proposal")
+            mirror_columns = {
+                item["name"]
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            proposal_columns = {
+                item["name"]
+                for item in inspector.get_columns("schedule_proposal")
+            }
+            mirror_indexes = {
+                item["name"]
+                for item in inspector.get_indexes("calendar_event_mirror")
+            }
+            assert {"intake_task_id", "intake_opted_out"} <= mirror_columns
+            assert {
+                "intake_calendar_source",
+                "intake_external_id",
+                "intake_revision",
+                "reply_handle_digest",
+                "expires_at",
+            } <= proposal_columns
+            assert "ux_calendar_event_mirror_calendar_identity" in mirror_indexes
+            assert "ix_calendar_event_mirror_actual_sleep_cleanup" in mirror_indexes
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f8091a2b3c4d"
+        finally:
+            engine.dispose()
 
     def test_sleep_hardening_migration_cleans_untrusted_identity(self, tmp_path):
         database_url = f"sqlite:///{tmp_path / 'sleep-hardening.db'}"

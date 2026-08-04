@@ -12,19 +12,31 @@ writes the block to the external calendar and advances it to ``pushed``.
 """
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query, Request, Response
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
-from starlette.status import HTTP_409_CONFLICT, HTTP_422_UNPROCESSABLE_CONTENT
+from starlette.status import (
+    HTTP_403_FORBIDDEN,
+    HTTP_409_CONFLICT,
+    HTTP_422_UNPROCESSABLE_CONTENT,
+    HTTP_503_SERVICE_UNAVAILABLE,
+)
 
 from healthmes.api.common import UTCDateTime
 from healthmes.api.errors import APIError, invalid_transition, not_found
 from healthmes.api.pagination import Page, PageParamsDep, paginate
 from healthmes.calendars.sleep_context import actual_sleep_violation
 from healthmes.config import resolve_timezone
+from healthmes.schedule_proposals import (
+    ScheduleProposalResolutionError,
+    invalidate_schedule_proposal,
+    resolution_token,
+    resolve_schedule_proposal,
+    verify_resolution_token,
+)
 from healthmes.store import CalendarEventMirror, CalendarSource, ProposalStatus, ScheduleProposal
 from healthmes.store.session import SessionDep
 
@@ -58,6 +70,45 @@ class ProposalOut(BaseModel):
     status: ProposalStatus
     decision_record_id: uuid.UUID | None
     healthmes_kind: str | None
+    accept_resolution_token: str | None = None
+    decline_resolution_token: str | None = None
+
+
+class ProposalResolutionIn(BaseModel):
+    resolution_token: str
+
+
+def _handle_secret(request: Request) -> str:
+    return request.app.state.settings.calendar_adjustment_secret.get_secret_value().strip()
+
+
+def _proposal_out(proposal: ScheduleProposal, request: Request) -> ProposalOut:
+    handle_secret = _handle_secret(request)
+    expires_at = proposal.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    actionable = (
+        proposal.status is ProposalStatus.PROPOSED
+        and expires_at is not None
+        and datetime.now(UTC) < expires_at
+        and len(handle_secret) >= 32
+    )
+    accept_token = (
+        resolution_token(proposal, handle_secret, ProposalStatus.ACCEPTED)
+        if actionable
+        else None
+    )
+    decline_token = (
+        resolution_token(proposal, handle_secret, ProposalStatus.DECLINED)
+        if actionable
+        else None
+    )
+    return ProposalOut.model_validate(proposal).model_copy(
+        update={
+            "accept_resolution_token": accept_token,
+            "decline_resolution_token": decline_token,
+        }
+    )
 
 
 @router.get("/events")
@@ -90,36 +141,89 @@ def list_events(
 def list_proposals(
     session: SessionDep,
     page: PageParamsDep,
+    request: Request,
+    response: Response,
     status_filter: Annotated[ProposalStatus | None, Query(alias="status")] = None,
     task_id: uuid.UUID | None = None,
 ) -> Page[ProposalOut]:
     """List schedule proposals ordered by proposed start."""
+    response.headers["Cache-Control"] = "no-store"
     stmt = select(ScheduleProposal).order_by(
         ScheduleProposal.proposed_start, ScheduleProposal.created_at
     )
     if status_filter is not None:
         stmt = stmt.where(ScheduleProposal.status == status_filter)
+        if status_filter is ProposalStatus.PROPOSED:
+            stmt = stmt.where(ScheduleProposal.expires_at > datetime.now(UTC))
     if task_id is not None:
         stmt = stmt.where(ScheduleProposal.task_id == task_id)
     rows, meta = paginate(session, stmt, page)
-    return Page(data=[ProposalOut.model_validate(row) for row in rows], pagination=meta)
+    return Page(data=[_proposal_out(row, request) for row in rows], pagination=meta)
+
+
+@router.get("/proposals/{proposal_id}")
+def get_proposal(
+    proposal_id: uuid.UUID,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+) -> ProposalOut:
+    """Fetch one proposal directly for notification/deep-link actions."""
+    response.headers["Cache-Control"] = "no-store"
+    proposal = session.get(ScheduleProposal, proposal_id)
+    if proposal is None:
+        raise not_found("schedule_proposal", proposal_id)
+    return _proposal_out(proposal, request)
 
 
 def _resolve_proposal(
     session: SessionDep,
+    request: Request,
     proposal_id: uuid.UUID,
     target: ProposalStatus,
-    *,
-    request: Request | None = None,
+    token: str,
 ) -> ProposalOut:
+    handle_secret = _handle_secret(request)
+    if len(handle_secret) < 32:
+        raise APIError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "approval_unavailable",
+            "Schedule proposal approval is not configured",
+        )
     proposal = session.get(ScheduleProposal, proposal_id)
     if proposal is None:
         raise not_found("schedule_proposal", proposal_id)
-    if proposal.status != ProposalStatus.PROPOSED:
-        raise invalid_transition("schedule_proposal", proposal.status.value, target.value)
+    if not verify_resolution_token(
+        token,
+        proposal,
+        handle_secret,
+        target,
+    ):
+        raise APIError(
+            HTTP_403_FORBIDDEN,
+            "invalid_resolution_token",
+            "The schedule proposal resolution token is invalid",
+        )
+    expires_at = proposal.expires_at
+    if expires_at is None:
+        raise APIError(
+            HTTP_403_FORBIDDEN,
+            "invalid_resolution_token",
+            "The schedule proposal resolution token is invalid",
+        )
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if datetime.now(UTC) >= expires_at:
+        raise APIError(
+            HTTP_409_CONFLICT,
+            "proposal_expired",
+            "The schedule proposal has expired",
+        )
+    if proposal.status is not ProposalStatus.PROPOSED:
+        raise invalid_transition(
+            "schedule_proposal", proposal.status.value, target.value
+        )
     if target is ProposalStatus.ACCEPTED:
-        if request is None:
-            raise RuntimeError("request is required when accepting a proposal")
         violation = actual_sleep_violation(
             session,
             proposal.proposed_start,
@@ -127,7 +231,25 @@ def _resolve_proposal(
             resolve_timezone(request.app.state.settings),
         )
         if violation is not None:
-            proposal.status = ProposalStatus.INVALIDATED
+            try:
+                invalidate_schedule_proposal(
+                    session,
+                    proposal_id,
+                )
+            except ScheduleProposalResolutionError as exc:
+                session.rollback()
+                if exc.code == "expired":
+                    raise APIError(
+                        HTTP_409_CONFLICT,
+                        "proposal_expired",
+                        "The schedule proposal has expired",
+                    ) from exc
+                session.expire(proposal)
+                raise invalid_transition(
+                    "schedule_proposal",
+                    proposal.status.value,
+                    target.value,
+                ) from exc
             session.commit()
             raise APIError(
                 HTTP_409_CONFLICT,
@@ -135,28 +257,73 @@ def _resolve_proposal(
                 violation,
                 detail={"proposal_status": ProposalStatus.INVALIDATED.value},
             )
-    proposal.status = target
+    try:
+        proposal = resolve_schedule_proposal(
+            session,
+            proposal_id,
+            target,
+            token,
+            handle_secret,
+            allow_reply_handle=False,
+            allow_resolution_token=True,
+        )
+    except ScheduleProposalResolutionError as exc:
+        if exc.code == "not_found":
+            raise not_found("schedule_proposal", proposal_id) from exc
+        if exc.code == "not_proposed":
+            current = session.get(ScheduleProposal, proposal_id)
+            if current is None:
+                raise not_found("schedule_proposal", proposal_id) from exc
+            raise invalid_transition(
+                "schedule_proposal", current.status.value, target.value
+            ) from exc
+        if exc.code == "invalid_handle":
+            raise APIError(
+                HTTP_403_FORBIDDEN,
+                "invalid_resolution_token",
+                "The schedule proposal resolution token is invalid",
+            ) from exc
+        if exc.code == "expired":
+            raise APIError(
+                HTTP_409_CONFLICT,
+                "proposal_expired",
+                "The schedule proposal has expired",
+            ) from exc
+        raise
     session.commit()
     session.refresh(proposal)
-    return ProposalOut.model_validate(proposal)
+    return _proposal_out(proposal, request)
 
 
 @router.post("/proposals/{proposal_id}/accept")
 def accept_proposal(
     proposal_id: uuid.UUID,
+    body: ProposalResolutionIn,
     session: SessionDep,
     request: Request,
 ) -> ProposalOut:
     """Accept a pending proposal (``proposed`` -> ``accepted``)."""
     return _resolve_proposal(
         session,
+        request,
         proposal_id,
         ProposalStatus.ACCEPTED,
-        request=request,
+        body.resolution_token,
     )
 
 
 @router.post("/proposals/{proposal_id}/decline")
-def decline_proposal(proposal_id: uuid.UUID, session: SessionDep) -> ProposalOut:
+def decline_proposal(
+    proposal_id: uuid.UUID,
+    body: ProposalResolutionIn,
+    session: SessionDep,
+    request: Request,
+) -> ProposalOut:
     """Decline a pending proposal (``proposed`` -> ``declined``)."""
-    return _resolve_proposal(session, proposal_id, ProposalStatus.DECLINED)
+    return _resolve_proposal(
+        session,
+        request,
+        proposal_id,
+        ProposalStatus.DECLINED,
+        body.resolution_token,
+    )

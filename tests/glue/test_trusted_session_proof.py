@@ -18,7 +18,13 @@ def _server() -> SimpleNamespace:
                         "passthrough_argument": "response",
                         "bind_arguments": ["response", "reply_handle"],
                         "choices": ["적용", "그대로"],
-                    }
+                    },
+                    "resolve_schedule_proposal": {
+                        "handle_argument": "reply_handle",
+                        "passthrough_argument": "response",
+                        "bind_arguments": ["response", "reply_handle"],
+                        "choices": ["적용", "그대로"],
+                    },
                 },
             }
         }
@@ -43,6 +49,7 @@ def test_vendor_live_owner_reply_proof_verifies_at_healthmes_boundary(
         chat_id="owner-chat",
         user_id="owner-user",
         message_id="message-1",
+        message_timestamp=str(dt.datetime.now(dt.UTC).timestamp()),
         message_text="적용 handle-1",
     )
     try:
@@ -59,6 +66,50 @@ def test_vendor_live_owner_reply_proof_verifies_at_healthmes_boundary(
             signed["trusted_session_proof"],
             secret,
             tool_name="resolve_calendar_adjustment",
+            arguments=arguments,
+            expected_user_id="owner-user",
+            expected_chat_id="owner-chat",
+            now=dt.datetime.now(dt.UTC),
+        )
+        is not None
+    )
+
+
+def test_vendor_live_owner_schedule_reply_proof_verifies_at_healthmes_boundary(
+    vendor_cron,
+    monkeypatch,
+) -> None:
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _trusted_session_call_arguments
+
+    secret = "cross-runtime-test-secret-at-least-32-characters"
+    arguments = {
+        "response": "그대로 handle-2",
+        "reply_handle": "handle-2",
+    }
+    monkeypatch.setenv("HEALTHMES_CALENDAR_ADJUSTMENT_SECRET", secret)
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="owner-chat",
+        user_id="owner-user",
+        message_id="message-2",
+        message_timestamp=str(dt.datetime.now(dt.UTC).timestamp()),
+        message_text="그대로 handle-2",
+    )
+    try:
+        signed = _trusted_session_call_arguments(
+            _server(),
+            "resolve_schedule_proposal",
+            arguments,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert (
+        verify_trusted_session_proof(
+            signed["trusted_session_proof"],
+            secret,
+            tool_name="resolve_schedule_proposal",
             arguments=arguments,
             expected_user_id="owner-user",
             expected_chat_id="owner-chat",
@@ -115,6 +166,13 @@ def test_vendor_non_owner_or_cron_turn_cannot_mint_confirmation_proof(
         finally:
             clear_session_vars(tokens)
         assert unsigned == arguments
+
+    unsigned_cli = _trusted_session_call_arguments(
+        _server(),
+        "resolve_schedule_proposal",
+        arguments,
+    )
+    assert unsigned_cli == arguments
 
 
 def test_proof_secret_is_removed_from_model_subprocesses(

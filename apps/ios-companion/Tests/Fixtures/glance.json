@@ -57,6 +57,7 @@
   "alerts": {
     "unresolved_count": 2,
     "top": {
+      "id": "00000000-0000-0000-0000-00000000a123",
       "rule_id": "stress_spike_vs_baseline",
       "summary": "Stress 82 vs baseline 55",
       "decision_url": "http://192.168.1.20:8100/decisions/1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10?token=hm-ro-3q2b8d1f7c6e5a4"

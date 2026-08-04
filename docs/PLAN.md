@@ -157,6 +157,9 @@ reply는 live Hermes session이 원문에서 response와 handle을 분리하고,
 `resolve_calendar_adjustment()`에 전달한다. 서버는 owner-bound signed proof를
 검증하고 handle로 pending proposal을 찾는다. MOVE,
 삭제, 제목/참석자/반복 수정, iCloud/CalDAV 외부 이벤트 변경은 여전히 금지다.
+Hermes는 allowed-user의 exact reply와 tool arguments가 일치할 때만 5분짜리 HMAC
+session proof를 주입하고, HealthMes는 proof + one-time handle을 모두 검증한다. 따라서
+cron이나 모델이 evaluator 응답에서 본 handle만 재사용해 자가승인할 수 없다.
 `APPLIED_RECOVERED`, `UNKNOWN`, `FAILED_NO_CHANGE`는 이 예외의 서버 내부 terminal
 receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한을 뜻하지 않는다.
 

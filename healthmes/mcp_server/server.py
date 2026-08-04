@@ -54,17 +54,20 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes import schedule_proposals
 from healthmes.calendars.adjustments import (
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
     SqlAlchemyAdjustmentRepository,
     digest_reply_handle,
+    issue_reply_handle,
 )
 from healthmes.calendars.base import HealthmesEventKind
 from healthmes.calendars.google import GoogleCalendarBackend
+from healthmes.calendars.intake import intake_revision
 from healthmes.calendars.sleep_context import (
     actual_sleep_context,
     actual_sleep_observation_context,
@@ -89,6 +92,7 @@ from healthmes.store import (
     ScheduleProposal,
     Task,
     TaskSource,
+    TriggerEvent,
     WeeklyGoal,
     session_scope,
 )
@@ -133,6 +137,7 @@ MAX_MEDICAL_LIST_LIMIT = 500
 DECISION_TREE_NODE_TYPES = frozenset({"input", "rule", "llm_step", "option", "action"})
 MAX_TREE_DEPTH = 12
 MAX_TREE_NODES = 500
+SCHEDULE_PROPOSAL_TTL = dt.timedelta(hours=24)
 
 _RANGE_PATTERN = re.compile(r"^(\d{1,3})d$")
 MAX_RANGE_DAYS = 90
@@ -2486,6 +2491,8 @@ def propose_schedule_blocks(
         parsed.append((block, start, end))
 
     with _store_session() as session:
+        handle_secret = _adjustment_handle_secret()
+        now = dt.datetime.now(dt.UTC)
         if decision_uuid is not None and session.get(DecisionRecord, decision_uuid) is None:
             raise ToolError(f"decision_record {decision_record_id} not found")
         for index, (_, start, end) in enumerate(parsed):
@@ -2520,6 +2527,10 @@ def propose_schedule_blocks(
                     .where(
                         CalendarEventMirror.start_at < end,
                         CalendarEventMirror.end_at > start,
+                        or_(
+                            CalendarEventMirror.intake_task_id.is_(None),
+                            CalendarEventMirror.intake_task_id != task.id,
+                        ),
                     )
                     .order_by(CalendarEventMirror.start_at)
                 )
@@ -2532,6 +2543,30 @@ def propose_schedule_blocks(
                 decision_record_id=decision_uuid,
                 healthmes_kind=block.healthmes_kind,
             )
+            intake_matches = [
+                event
+                for event in session.scalars(
+                    select(CalendarEventMirror).where(
+                        CalendarEventMirror.intake_task_id == task.id,
+                        CalendarEventMirror.is_agent_created.is_(False),
+                        CalendarEventMirror.is_all_day.is_(False),
+                    )
+                )
+                if _ensure_utc_dt(event.start_at) == start
+                and _ensure_utc_dt(event.end_at) == end
+            ]
+            if len(intake_matches) > 1:
+                raise ToolError(
+                    f"blocks[{index}]: multiple timed intake events match this block"
+                )
+            if intake_matches:
+                intake_event = intake_matches[0]
+                proposal.intake_calendar_source = intake_event.calendar_source
+                proposal.intake_external_id = intake_event.external_id
+                proposal.intake_revision = intake_revision(intake_event)
+            handle = issue_reply_handle(handle_secret)
+            proposal.reply_handle_digest = handle.digest
+            proposal.expires_at = min(now + SCHEDULE_PROPOSAL_TTL, start)
             session.add(proposal)
             session.flush()
             created.append(
@@ -2543,10 +2578,111 @@ def propose_schedule_blocks(
                     "end": _iso_utc(end),
                     "proposal_status": _enum_value(proposal.status),
                     "healthmes_kind": proposal.healthmes_kind,
+                    "reply_handle": handle.plaintext,
+                    "expires_at": _iso_utc(proposal.expires_at),
                     "conflicts": conflicts,
                 }
             )
     return {"status": "ok", "proposals": created}
+
+
+@mcp.tool
+def resolve_schedule_proposal(
+    response: str,
+    reply_handle: str | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Resolve a planner proposal from the configured owner's exact live reply."""
+    if not reply_handle:
+        raise ToolError("reply_handle is missing or invalid")
+    if response != response.strip() or response not in {
+        f"적용 {reply_handle}",
+        f"그대로 {reply_handle}",
+    }:
+        raise ToolError("response must be the exact live Telegram reply")
+    proof_arguments = {
+        "response": response,
+        "reply_handle": reply_handle,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="resolve_schedule_proposal",
+        arguments=proof_arguments,
+    )
+    handle_digest = digest_reply_handle(reply_handle, _adjustment_handle_secret())
+    target = (
+        ProposalStatus.ACCEPTED
+        if response.startswith("적용 ")
+        else ProposalStatus.DECLINED
+    )
+
+    with _store_session() as session:
+        proposals = list(
+            session.scalars(
+                select(ScheduleProposal).where(
+                    ScheduleProposal.status == ProposalStatus.PROPOSED,
+                    ScheduleProposal.reply_handle_digest == handle_digest,
+                )
+            )
+        )
+        if len(proposals) != 1:
+            raise ToolError("reply_handle is invalid, expired, or already consumed")
+        proposal = proposals[0]
+        if target is ProposalStatus.ACCEPTED:
+            violation = actual_sleep_violation(
+                session,
+                proposal.proposed_start,
+                proposal.proposed_end,
+                _local_timezone(),
+            )
+            if violation is not None:
+                try:
+                    schedule_proposals.invalidate_schedule_proposal(
+                        session,
+                        proposal.id,
+                    )
+                except schedule_proposals.ScheduleProposalResolutionError as exc:
+                    session.rollback()
+                    if exc.code == "expired":
+                        raise ToolError("schedule proposal has expired") from exc
+                    raise ToolError(
+                        "reply_handle is invalid, expired, or already consumed"
+                    ) from exc
+                session.commit()
+                raise ToolError(violation)
+        try:
+            proposal = schedule_proposals.resolve_schedule_proposal(
+                session,
+                proposal.id,
+                target,
+                reply_handle,
+                _adjustment_handle_secret(),
+            )
+        except schedule_proposals.ScheduleProposalResolutionError as exc:
+            if exc.code in {"not_found", "not_proposed", "invalid_handle"}:
+                raise ToolError(
+                    "reply_handle is invalid, expired, or already consumed"
+                ) from exc
+            if exc.code == "expired":
+                raise ToolError("schedule proposal has expired") from exc
+            raise
+        task = session.get(Task, proposal.task_id)
+        return {
+            "status": "ok",
+            "proposal": {
+                "id": str(proposal.id),
+                "task_id": str(proposal.task_id),
+                "task_title": task.title if task is not None else None,
+                "start": _iso_utc(proposal.proposed_start),
+                "end": _iso_utc(proposal.proposed_end),
+                "proposal_status": _enum_value(proposal.status),
+                "calendar_write": (
+                    "queued"
+                    if target is ProposalStatus.ACCEPTED
+                    else "unchanged"
+                ),
+            },
+        }
 
 
 @mcp.tool
@@ -2817,6 +2953,38 @@ def _validate_tree(node: Any, depth: int = 0, count: int = 0) -> int:
     return count
 
 
+def _claim_schedule_proposals(
+    session: Session,
+    proposals: list[tuple[str, uuid.UUID]],
+    decision_record_id: uuid.UUID,
+) -> None:
+    """Atomically attach pending proposals to one decision record."""
+    for proposal_id, proposal_uuid in proposals:
+        claimed = session.execute(
+            update(ScheduleProposal)
+            .where(
+                ScheduleProposal.id == proposal_uuid,
+                ScheduleProposal.status == ProposalStatus.PROPOSED,
+                ScheduleProposal.decision_record_id.is_(None),
+            )
+            .values(decision_record_id=decision_record_id)
+        )
+        if claimed.rowcount == 1:
+            continue
+        proposal = session.get(
+            ScheduleProposal,
+            proposal_uuid,
+            populate_existing=True,
+        )
+        if proposal is None:
+            raise ToolError(f"schedule_proposal {proposal_id} not found")
+        if proposal.status != ProposalStatus.PROPOSED:
+            raise ToolError(f"schedule_proposal {proposal_id} is not pending")
+        raise ToolError(
+            f"schedule_proposal {proposal_id} already has a decision record"
+        )
+
+
 @mcp.tool
 def record_decision(
     kind: str,
@@ -2824,6 +2992,8 @@ def record_decision(
     tree: dict[str, Any],
     llm_model: str | None = None,
     tokens: int | None = None,
+    trigger_event_id: str | None = None,
+    schedule_proposal_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Persist an explainable decision record and get its viewer link.
 
@@ -2831,8 +3001,12 @@ def record_decision(
     recursive node structure {id?, type: input|rule|llm_step|option|action,
     label, detail?, children[]} — deterministic layers pre-fill input/rule
     nodes; append your own llm_step/option/action nodes honestly (never
-    rewrite pre-filled ones). Returns the decision viewer URL to attach to any
-    alert or message about this decision.
+    rewrite pre-filled ones). Webhook alerts must pass their trusted
+    trigger_event_id unchanged so native clients can resolve the exact
+    decision and proposal. When proposals were created before this call, pass
+    their returned ids as schedule_proposal_ids; they are linked to this
+    decision atomically. Returns the decision viewer URL to attach to any alert
+    or message about this decision.
     """
     if kind not in {k.value for k in DecisionKind}:
         raise ToolError(
@@ -2841,16 +3015,53 @@ def record_decision(
     if not summary.strip():
         raise ToolError("summary must not be empty")
     _validate_tree(tree)
+    trigger_uuid = (
+        _parse_uuid(trigger_event_id, "trigger_event_id")
+        if trigger_event_id is not None
+        else None
+    )
+    if trigger_uuid is not None and kind != DecisionKind.ALERT.value:
+        raise ToolError("trigger_event_id is valid only for kind='alert'")
+    proposal_uuids = [
+        _parse_uuid(value, f"schedule_proposal_ids[{index}]")
+        for index, value in enumerate(schedule_proposal_ids or [])
+    ]
+    if len(set(proposal_uuids)) != len(proposal_uuids):
+        raise ToolError("schedule_proposal_ids must not contain duplicates")
     with _store_session() as session:
+        if trigger_uuid is not None:
+            if session.get(TriggerEvent, trigger_uuid) is None:
+                raise ToolError(f"trigger_event {trigger_event_id} not found")
+            existing = session.scalar(
+                select(DecisionRecord.id)
+                .where(DecisionRecord.trigger_event_id == trigger_uuid)
+                .limit(1)
+            )
+            if existing is not None:
+                raise ToolError(
+                    f"trigger_event {trigger_event_id} already has a decision record"
+                )
         row = DecisionRecord(
             kind=DecisionKind(kind),
             tree=tree,
             summary=summary,
             llm_model=llm_model,
             tokens=tokens,
+            trigger_event_id=trigger_uuid,
         )
         session.add(row)
         session.flush()
+        _claim_schedule_proposals(
+            session,
+            list(
+                zip(
+                    schedule_proposal_ids or [],
+                    proposal_uuids,
+                    strict=True,
+                )
+            ),
+            row.id,
+        )
         decision_id = str(row.id)
     # Viewer pages are opened from the phone browser (no headers); the shared
     # construction point embeds the derived read-only credential — never the
@@ -2861,6 +3072,7 @@ def record_decision(
     return {
         "status": "ok",
         "decision_id": decision_id,
+        "schedule_proposal_ids": [str(value) for value in proposal_uuids],
         "viewer_url": viewer_url(_active_settings(), f"/decisions/{decision_id}"),
     }
 

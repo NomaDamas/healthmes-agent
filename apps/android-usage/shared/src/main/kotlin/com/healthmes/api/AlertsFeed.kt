@@ -11,7 +11,8 @@ import org.json.JSONObject
  * evidence facts (client renders the line), proposal, and the "why this?"
  * decision-viewer deep link (derived viewer token already embedded — the
  * server resolves it with the exact glance top-alert heuristic, so
- * `data[0]` always agrees with the widget's top alert).
+ * `data[0]` always agrees with the widget's top alert). A proposal-producing
+ * alert also carries its unique pending schedule-proposal id.
  */
 data class AlertsPage(val alerts: List<AlertItem>, val pagination: PageMeta) {
 
@@ -46,6 +47,8 @@ data class AlertItem(
     val evidence: Map<String, String>,
     /** Browser-tappable "why this?" viewer link, or null. */
     val decisionUrl: String?,
+    /** Unique pending schedule proposal produced by this alert, or null. */
+    val proposalId: String?,
 ) {
 
     /** One compact evidence line ("hrv_delta_pct: -18 · window_h: 24"). */
@@ -71,6 +74,7 @@ data class AlertItem(
                 proposal = obj.stringOrNull("proposal"),
                 evidence = evidence,
                 decisionUrl = obj.stringOrNull("decision_url"),
+                proposalId = obj.stringOrNull("proposal_id"),
             )
         }
     }

@@ -68,6 +68,7 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
 |---|---|
 | `evaluate_morning_calendar_nudge` | Server-owned 07:00 recovery/calendar evaluation. It may return no-action, deduplicated, or one display packet with a one-time reply handle. |
 | `resolve_calendar_adjustment` | Live Telegram reply resolution only. Pass the exact combined `적용 <handle>` / `그대로 <handle>` text as `response` and the unchanged handle as `reply_handle`. Hermes attaches the owner-bound proof; never pass a proposal id/channel or resolve from cron. |
+| `resolve_schedule_proposal` | Live Telegram reply resolution for planner-created blocks. Pass the same exact combined reply and unchanged handle; Hermes attaches the owner-bound proof. Native apps resolve through their separate proposal-bound REST token. |
 
 ## When to use
 
@@ -118,8 +119,10 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
    a placement proposal, a re-plan, an alert you chose to send, and also an
    alert you chose to suppress. Include: the inputs you considered (scores,
    baselines, calendar facts), the rules that applied, the options you
-   weighed, and the chosen action. Do this even if the user declines the
-   proposal; the decline is part of the record.
+   weighed, and the chosen action. When step 5 returned proposals, pass all
+   their ids as `schedule_proposal_ids` so the proposal and reasoning remain
+   exactly linked. Do this even if the user declines the proposal; the decline
+   is part of the record.
 
 ## Placement rules
 
@@ -225,6 +228,12 @@ to Telegram. Each briefing is ONE message in the notification grammar.
   an owner-bound signed proof outside model control. Return the resulting
   receipt/viewer link once. Do not invent handles, accept missing values, or
   call the resolver from scheduled cron delivery.
+- **Planner proposal reply.** A proposal returned by
+  `propose_schedule_blocks` also includes `적용 <handle>` / `그대로 <handle>`.
+  On the configured owner's exact live Telegram reply, call
+  `mcp__healthmes__resolve_schedule_proposal` with that exact text as
+  `response` and the unchanged handle as `reply_handle`. Never call it from
+  cron or Hermes CLI, and never substitute a REST resolution token.
 - **Evening review (21:30).** Compare planned blocks vs what happened
   (`get_schedule`), note wins and slips without moralizing, roll unfinished
   tasks forward, and flag tomorrow's first block. Keep it short.
@@ -242,8 +251,10 @@ the trigger payload (`rule_id`, summary, evidence keys):
 2. Decide: re-plan (build a proposal), inform only, or do nothing (say
    nothing — suppressed alerts still get a `record_decision`).
 3. `record_decision`, then send at most ONE message in the notification
-   grammar. Alert budget and cooldowns are enforced upstream; your job is to
-   make the one message count.
+   grammar. Pass the trusted `trigger_event_id` from the webhook prompt
+   unchanged when recording an alert decision. If step 2 created proposals,
+   also pass every returned id as `schedule_proposal_ids`. Alert budget and
+   cooldowns are enforced upstream; your job is to make the one message count.
 
 ## Extension points (do not remove)
 

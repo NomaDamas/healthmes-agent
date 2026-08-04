@@ -74,7 +74,7 @@ platforms:
              indentation leaks into the prompt body; indent(12) re-indents
              continuation lines to the block scalar's baseline. #}
           prompt: |
-            {{ healthmes_alert_prompt | default('HealthMes trigger {rule_id} fired: {summary}\n\n{prompt}', true) | indent(12) }}
+            {{ healthmes_alert_prompt | default('{prompt}', true) | indent(12) }}
           skills:
             - healthmes-planner
           deliver: telegram
@@ -128,6 +128,15 @@ mcp_servers:
       owner_chat_id: "{{ telegram_owner_chat_id }}"
       confirmations:
         resolve_calendar_adjustment:
+          handle_argument: reply_handle
+          passthrough_argument: response
+          bind_arguments:
+            - response
+            - reply_handle
+          choices:
+            - 적용
+            - 그대로
+        resolve_schedule_proposal:
           handle_argument: reply_handle
           passthrough_argument: response
           bind_arguments:

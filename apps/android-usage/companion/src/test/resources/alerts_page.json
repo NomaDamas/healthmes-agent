@@ -11,7 +11,8 @@
         "window_hours": 24,
         "baseline": "14-day"
       },
-      "decision_url": "http://192.168.1.20:8100/decisions/0b8f3e0a-2b9f-4c47-a9d4-2f2b7f6f3a11?token=viewer-abc123"
+      "decision_url": "http://192.168.1.20:8100/decisions/0b8f3e0a-2b9f-4c47-a9d4-2f2b7f6f3a11?token=viewer-abc123",
+      "proposal_id": "1f0d3c5e-8a2b-4c47-9be1-3d2a7c9f4e10"
     },
     {
       "id": "56b7a1de-9f7d-4f1e-8f7a-6d2f2b7f6f3a",
@@ -20,7 +21,8 @@
       "summary": "schedule_changed",
       "proposal": null,
       "evidence": null,
-      "decision_url": null
+      "decision_url": null,
+      "proposal_id": null
     }
   ],
   "pagination": {
