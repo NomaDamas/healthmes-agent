@@ -10,10 +10,12 @@ from apscheduler.triggers.interval import IntervalTrigger
 from healthmes.config import Settings
 from healthmes.engine.scheduler import (
     BACKUP_JOB_ID,
+    CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
     ENERGY_JOB_ID,
     TRIGGER_JOB_ID,
     create_scheduler,
     register_backup_job,
+    register_calendar_adjustment_maintenance_job,
     register_energy_job,
     shutdown_scheduler,
     start_scheduler,
@@ -68,6 +70,15 @@ def test_backup_job_hook_registers_weekly_cron(scheduler) -> None:
     assert fields["day_of_week"] == "sun"
     assert fields["hour"] == "3"
     assert fields["minute"] == "30"
+
+
+def test_calendar_adjustment_maintenance_hook_registers_interval_job(scheduler) -> None:
+    assert scheduler.get_job(CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID) is None
+    job = register_calendar_adjustment_maintenance_job(scheduler, noop)
+    assert scheduler.get_job(CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID) is job
+    assert isinstance(job.trigger, IntervalTrigger)
+    assert job.trigger.interval == timedelta(minutes=5)
+    assert job.func is noop
 
 
 def test_hooks_are_replaceable(scheduler) -> None:

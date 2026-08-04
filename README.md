@@ -48,7 +48,10 @@ Telegram (phone + watch)          decision viewer (web)
   `HEALTHMES_GOOGLE_CALENDAR_ENABLED` / `HEALTHMES_CALDAV_ENABLED` (and the
   scheduler on) the service polls every 5/10 minutes and writes
   user-accepted schedule proposals to the calendar, advancing them to
-  `pushed`.
+  `pushed`. Existing external events stay immutable by default; the narrow
+  exception is a confirmed morning recovery `SHORTEN` of one eligible Google
+  event, resolved from a Telegram live reply (`적용 <handle>` / `그대로
+  <handle>`) through the HealthMes MCP contract.
 - Bearer-token auth over the whole HTTP surface (REST, viewer pages, `/mcp`)
   once `HEALTHMES_API_TOKEN` is set; non-loopback binds refuse to start
   without it, so medical data is never network-readable unauthenticated.
@@ -59,6 +62,9 @@ Telegram (phone + watch)          decision viewer (web)
   dedup keys, per-rule crash isolation.
 - Hermes bootstrap (`scripts/bootstrap.py`): renders the gateway config,
   copy-installs `skills/`, registers morning/evening/weekly cron briefings.
+  The 07:00 prompt calls the server-owned morning evaluator once, sends its
+  display packet and plain-text reply handle to Telegram, then exits without
+  waiting; live replies are resolved by the normal Hermes gateway session.
 
 **Cognitive energy & explainability (Phase 2)**
 - Rule-based, fully explainable energy engine (`healthmes/engine/

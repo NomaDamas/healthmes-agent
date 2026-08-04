@@ -6,6 +6,7 @@ cutoff from the same frozen local clock. All persisted datetimes are
 normalized to UTC by the engine.
 """
 
+import uuid
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
@@ -13,6 +14,7 @@ import pytest
 from freezegun import freeze_time
 from sqlalchemy import select
 
+from healthmes.calendars.adjustments import provider_revision_fingerprint
 from healthmes.config import Settings
 from healthmes.engine.rules import (
     RecoverySnapshot,
@@ -33,8 +35,19 @@ from healthmes.engine.triggers import (
     is_in_quiet_hours,
 )
 from healthmes.engine.webhook import WebhookResult
-from healthmes.store.enums import CalendarSource, ProposalStatus
-from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task, TriggerEvent
+from healthmes.store.enums import (
+    CalendarMutationOperation,
+    CalendarMutationStatus,
+    CalendarSource,
+    ProposalStatus,
+)
+from healthmes.store.models import (
+    CalendarEventMirror,
+    CalendarMutationProposal,
+    ScheduleProposal,
+    Task,
+    TriggerEvent,
+)
 
 
 def local_now() -> datetime:
@@ -582,6 +595,147 @@ def test_untouched_external_events_do_not_fire(settings, session_factory, alert_
         )
         assert evaluator.evaluate_once().outcomes == ()
         assert alert_sender.sent == []
+
+
+def test_confirmed_internal_adjustment_does_not_fire_schedule_changed(
+    settings, session_factory, alert_sender
+) -> None:
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        with session_factory() as session:
+            task = Task(title="Write report", est_minutes=60)
+            session.add(task)
+            session.flush()
+            start = utc(now + timedelta(hours=4))
+            original_end = utc(now + timedelta(hours=5, minutes=30))
+            proposed_end = utc(now + timedelta(hours=5))
+            session.add(
+                ScheduleProposal(
+                    task_id=task.id,
+                    proposed_start=start,
+                    proposed_end=proposed_end,
+                    status=ProposalStatus.ACCEPTED,
+                )
+            )
+            mirror = CalendarEventMirror(
+                external_id="ext-adjusted",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="Confirmed shortening",
+                start_at=start,
+                end_at=proposed_end,
+                is_agent_created=False,
+                etag='"etag-v2"',
+                created_at=utc(now - timedelta(days=2)),
+                updated_at=utc(now - timedelta(minutes=1)),
+            )
+            session.add(mirror)
+            session.flush()
+            session.add(
+                CalendarMutationProposal(
+                    calendar_source=CalendarSource.GOOGLE,
+                    mirror_event_id=mirror.id,
+                    external_event_id=mirror.external_id,
+                    operation=CalendarMutationOperation.SHORTEN,
+                    original_start_at=start,
+                    original_end_at=original_end,
+                    proposed_start_at=start,
+                    proposed_end_at=proposed_end,
+                    expected_etag='"etag-v1"',
+                    protected_fingerprint="protected",
+                    reply_handle_digest="digest",
+                    expires_at=utc(now + timedelta(hours=1)),
+                    consumed_at=utc(now - timedelta(minutes=1)),
+                    attempt_id=str(uuid.uuid4()),
+                    status=CalendarMutationStatus.APPLIED,
+                    dedup_key="internal-adjustment",
+                    response_channel="telegram",
+                    receipt={
+                        "status": "applied",
+                        "provider_revision": provider_revision_fingerprint('"etag-v2"'),
+                    },
+                    created_at=utc(now - timedelta(minutes=2)),
+                    updated_at=utc(now - timedelta(minutes=1)),
+                )
+            )
+            session.commit()
+
+        evaluator = make_evaluator(
+            settings, session_factory, alert_sender, rules=(schedule_changed,)
+        )
+
+        assert evaluator.evaluate_once().outcomes == ()
+        assert alert_sender.sent == []
+
+
+def test_external_change_after_internal_adjustment_still_fires(
+    settings, session_factory, alert_sender
+) -> None:
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        with session_factory() as session:
+            task = Task(title="Write report", est_minutes=60)
+            session.add(task)
+            session.flush()
+            start = utc(now + timedelta(hours=4))
+            applied_end = utc(now + timedelta(hours=5))
+            externally_moved_end = utc(now + timedelta(hours=5, minutes=30))
+            session.add(
+                ScheduleProposal(
+                    task_id=task.id,
+                    proposed_start=start,
+                    proposed_end=externally_moved_end,
+                    status=ProposalStatus.ACCEPTED,
+                )
+            )
+            mirror = CalendarEventMirror(
+                external_id="ext-adjusted",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="Externally changed after apply",
+                start_at=start,
+                end_at=externally_moved_end,
+                is_agent_created=False,
+                etag='"etag-v3"',
+                created_at=utc(now - timedelta(days=2)),
+                updated_at=utc(now - timedelta(minutes=1)),
+            )
+            session.add(mirror)
+            session.flush()
+            session.add(
+                CalendarMutationProposal(
+                    calendar_source=CalendarSource.GOOGLE,
+                    mirror_event_id=mirror.id,
+                    external_event_id=mirror.external_id,
+                    operation=CalendarMutationOperation.SHORTEN,
+                    original_start_at=start,
+                    original_end_at=externally_moved_end,
+                    proposed_start_at=start,
+                    proposed_end_at=applied_end,
+                    expected_etag='"etag-v1"',
+                    protected_fingerprint="protected",
+                    reply_handle_digest="digest",
+                    expires_at=utc(now + timedelta(hours=1)),
+                    consumed_at=utc(now - timedelta(minutes=2)),
+                    attempt_id=str(uuid.uuid4()),
+                    status=CalendarMutationStatus.APPLIED,
+                    dedup_key="prior-internal-adjustment",
+                    response_channel="telegram",
+                    receipt={
+                        "status": "applied",
+                        "provider_revision": provider_revision_fingerprint('"etag-v2"'),
+                    },
+                    created_at=utc(now - timedelta(minutes=3)),
+                    updated_at=utc(now - timedelta(minutes=2)),
+                )
+            )
+            session.commit()
+
+        evaluator = make_evaluator(
+            settings, session_factory, alert_sender, rules=(schedule_changed,)
+        )
+        report = evaluator.evaluate_once()
+
+        assert [outcome.status for outcome in report.outcomes] == ["pushed"]
+        assert report.outcomes[0].fire.evidence["changes"][0]["external_id"] == "ext-adjusted"
 
 
 def test_deadline_risk_fires_until_task_is_covered(

@@ -292,6 +292,7 @@ class CalendarMirrorService:
                     is_agent_created=trusted_agent,
                     agent_task_id=resolved_task_id if trusted_agent else None,
                     etag=event.etag,
+                    **_mirror_metadata_kwargs(event),
                 )
             )
             # Trusted agent-tagged events without a row are re-adopted silently
@@ -316,13 +317,14 @@ class CalendarMirrorService:
         old_end = coerce_utc(row.end_at)
         moved = old_start != event.start_at or old_end != event.end_at
         content_changed = (row.summary or None) != (event.summary or None)
+        metadata_changed = _mirror_metadata_changed(row, event)
         # Refresh ownership from the freshly-observed provider state: if the tag
         # was stripped (or its task link no longer resolves) the row flips to
         # external, and what would have been an agent-move is reclassified into
         # the external ``diff.moved`` bucket below.
         ownership_changed = row.is_agent_created != trusted_agent
 
-        if not moved and not content_changed and not ownership_changed:
+        if not moved and not content_changed and not ownership_changed and not metadata_changed:
             # Byte-identical, same-tag re-delivery (410 full resync, lost
             # sync-state file, crash between commit and cursor save): write
             # NOTHING. Assigning equal values still dirties the row on sqlite
@@ -339,6 +341,7 @@ class CalendarMirrorService:
         row.etag = event.etag
         row.is_agent_created = trusted_agent
         row.agent_task_id = resolved_task_id if trusted_agent else None
+        _apply_mirror_metadata(row, event)
 
         change = EventChange(
             calendar_source=source,
@@ -431,6 +434,7 @@ class CalendarMirrorService:
             is_agent_created=True,
             agent_task_id=self._resolve_task_id(draft.agent_task_id),
             etag=created.etag,
+            **_mirror_metadata_kwargs(created),
         )
         self._session.add(row)
         self._session.commit()
@@ -503,3 +507,35 @@ class CalendarMirrorService:
         if backend is None:
             raise CalendarError(f"no calendar backend configured for source {source.value!r}")
         return backend
+
+
+_MIRROR_METADATA_FIELDS = (
+    "organizer_self",
+    "has_attendees",
+    "is_recurring",
+    "event_type",
+    "is_all_day",
+    "is_locked",
+    "status",
+)
+
+
+def _mirror_metadata_kwargs(event: ExternalEvent) -> dict[str, object]:
+    return {
+        field: getattr(event, field)
+        for field in _MIRROR_METADATA_FIELDS
+        if hasattr(CalendarEventMirror, field)
+    }
+
+
+def _apply_mirror_metadata(row: CalendarEventMirror, event: ExternalEvent) -> None:
+    for field_name, value in _mirror_metadata_kwargs(event).items():
+        setattr(row, field_name, value)
+
+
+def _mirror_metadata_changed(row: CalendarEventMirror, event: ExternalEvent) -> bool:
+    return any(
+        getattr(row, field) != getattr(event, field)
+        for field in _MIRROR_METADATA_FIELDS
+        if hasattr(CalendarEventMirror, field)
+    )

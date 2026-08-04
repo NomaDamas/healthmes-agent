@@ -9,6 +9,7 @@ import pytest
 from healthmes.calendars.base import (
     CalendarAuthError,
     CalendarConflictError,
+    ConfirmedExternalTimeChange,
     EventNotFoundError,
     OwnershipError,
 )
@@ -110,6 +111,8 @@ class FakeGoogleService:
     def patch_event(self, event_id: str, body: dict, headers: dict) -> dict:
         self.write_headers.append(dict(headers))
         self._enforce_precondition(event_id, headers)
+        if event_id not in self.stored_events:
+            raise FakeStatusError(404)
         stored = dict(self.stored_events[event_id])
         stored.update(body)
         stored["etag"] = '"patched"'
@@ -155,11 +158,34 @@ def api_event(
     task_id: uuid.UUID | None = None,
     status: str = "confirmed",
     etag: str = '"e1"',
+    organizer_self: bool = False,
+    attendees: list[dict] | None = None,
+    recurrence: list[str] | None = None,
+    recurring_event_id: str | None = None,
+    event_type: str | None = None,
+    all_day: bool = False,
+    locked: bool = False,
 ) -> dict:
     item: dict = {"id": event_id, "status": status, "etag": etag, "summary": summary}
     if status != "cancelled":
-        item["start"] = {"dateTime": start}
-        item["end"] = {"dateTime": end}
+        if all_day:
+            item["start"] = {"date": start[:10]}
+            item["end"] = {"date": end[:10]}
+        else:
+            item["start"] = {"dateTime": start}
+            item["end"] = {"dateTime": end}
+    if organizer_self:
+        item["organizer"] = {"email": "owner@example.invalid", "self": True}
+    if attendees is not None:
+        item["attendees"] = attendees
+    if recurrence is not None:
+        item["recurrence"] = recurrence
+    if recurring_event_id is not None:
+        item["recurringEventId"] = recurring_event_id
+    if event_type is not None:
+        item["eventType"] = event_type
+    if locked:
+        item["locked"] = True
     if agent:
         private = {"healthmes": "1"}
         if task_id is not None:
@@ -273,6 +299,43 @@ class TestEventParsing:
         assert event.is_agent_created
         assert event.agent_task_id == task_id
 
+    def test_google_eligibility_metadata_is_normalized(self, backend, service) -> None:
+        service.list_responses = [
+            {
+                "items": [
+                    api_event(
+                        "a",
+                        organizer_self=True,
+                        attendees=[{"email": "guest@example.invalid"}],
+                        recurrence=["RRULE:FREQ=WEEKLY"],
+                        event_type="default",
+                        locked=True,
+                    ),
+                    api_event("b", all_day=True),
+                ],
+                "nextSyncToken": "t",
+            }
+        ]
+        first, second = backend.list_changes(None)[0]
+        assert first.organizer_self
+        assert first.has_attendees
+        assert first.is_recurring
+        assert first.event_type == "default"
+        assert first.is_locked
+        assert first.status == "confirmed"
+        assert not first.is_all_day
+        assert second.is_all_day
+
+    def test_google_recurring_instance_is_recurring_metadata(self, backend, service) -> None:
+        service.list_responses = [
+            {
+                "items": [api_event("a", recurring_event_id="series-1")],
+                "nextSyncToken": "t",
+            }
+        ]
+        (event,), _ = backend.list_changes(None)
+        assert event.is_recurring
+
 
 # --- agent writes -------------------------------------------------------------
 
@@ -381,6 +444,59 @@ class TestUpdateAndDelete:
             backend.delete_event("mine")
         assert service.write_headers[-1]["If-Match"] == '"e1"'  # precondition sent
         assert service.stored_events["mine"] == original  # never deleted
+
+
+class TestConfirmedExternalTimeChangeWriter:
+    def _change(self, event_id: str = "theirs") -> ConfirmedExternalTimeChange:
+        return ConfirmedExternalTimeChange(
+            external_event_id=event_id,
+            original_start_at=datetime(2026, 7, 10, 9, 0, tzinfo=UTC),
+            original_end_at=datetime(2026, 7, 10, 10, 30, tzinfo=UTC),
+            proposed_start_at=datetime(2026, 7, 10, 9, 0, tzinfo=UTC),
+            proposed_end_at=datetime(2026, 7, 10, 10, 0, tzinfo=UTC),
+            expected_etag='"etag-v1"',
+        )
+
+    def test_applies_external_end_only_patch_with_proposal_etag(
+        self, backend, service
+    ) -> None:
+        service.stored_events["theirs"] = api_event(
+            "theirs",
+            start="2026-07-10T09:00:00+00:00",
+            end="2026-07-10T10:30:00+00:00",
+            agent=False,
+            etag='"etag-v1"',
+        )
+        updated = backend.apply_confirmed_external_time_change(self._change())
+
+        assert service.get_calls == []
+        assert service.patch_calls == [
+            (
+                "primary",
+                "theirs",
+                {"end": {"dateTime": "2026-07-10T10:00:00+00:00"}},
+            )
+        ]
+        assert service.write_headers[-1]["If-Match"] == '"etag-v1"'
+        assert updated.external_id == "theirs"
+        assert updated.start_at == datetime(2026, 7, 10, 9, 0, tzinfo=UTC)
+        assert updated.end_at == datetime(2026, 7, 10, 10, 0, tzinfo=UTC)
+
+    def test_conflict_uses_proposal_etag_and_leaves_event_unmutated(
+        self, backend, service
+    ) -> None:
+        service.stored_events["theirs"] = api_event(
+            "theirs",
+            start="2026-07-10T09:00:00+00:00",
+            end="2026-07-10T10:30:00+00:00",
+            agent=False,
+            etag='"etag-v2"',
+        )
+        original = dict(service.stored_events["theirs"])
+        with pytest.raises(CalendarConflictError):
+            backend.apply_confirmed_external_time_change(self._change())
+        assert service.write_headers[-1]["If-Match"] == '"etag-v1"'
+        assert service.stored_events["theirs"] == original
 
 
 # --- OAuth helpers (offline: file handling only) -------------------------------

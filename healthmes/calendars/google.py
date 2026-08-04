@@ -36,6 +36,7 @@ from healthmes.calendars.base import (
     CalendarAuthError,
     CalendarConflictError,
     CalendarError,
+    ConfirmedExternalTimeChange,
     EventDraft,
     EventNotFoundError,
     ExternalEvent,
@@ -374,6 +375,37 @@ class GoogleCalendarBackend:
             self._raise_for_write_status(exc, external_id)
             raise  # unreachable; _raise_for_write_status always raises
 
+    def read_event(self, external_id: str) -> ExternalEvent:
+        return self._get_event(external_id)
+
+    def apply_confirmed_external_time_change(
+        self, change: ConfirmedExternalTimeChange
+    ) -> ExternalEvent:
+        body = {"end": {"dateTime": _rfc3339(change.proposed_end_at)}}
+        request = self._events().patch(
+            calendarId=self._calendar_id,
+            eventId=change.external_event_id,
+            body=body,
+        )
+        self._set_if_match(request, change.expected_etag)
+        try:
+            patched = request.execute()
+        except Exception as exc:  # noqa: BLE001 - status-based dispatch
+            self._raise_for_write_status(exc, change.external_event_id)
+            raise
+        event = self._parse_api_event(patched)
+        if event.external_id != change.external_event_id:
+            raise CalendarError(
+                f"google patch returned event {event.external_id!r}, "
+                f"expected {change.external_event_id!r}"
+            )
+        if event.start_at != change.proposed_start_at or event.end_at != change.proposed_end_at:
+            raise CalendarError(
+                f"google patch returned unexpected time range for "
+                f"{change.external_event_id!r}"
+            )
+        return event
+
     @staticmethod
     def _set_if_match(request: Any, etag: str | None) -> None:
         """Attach an ``If-Match`` precondition to a googleapiclient request.
@@ -400,6 +432,17 @@ class GoogleCalendarBackend:
 
     def _get_owned_event(self, external_id: str) -> ExternalEvent:
         """Fetch + parse an event, enforcing the agent-ownership tag."""
+        event = self._get_event(external_id)
+        if event.deleted:
+            raise EventNotFoundError(f"google event {external_id!r} is cancelled")
+        if not event.is_agent_created:
+            raise OwnershipError(
+                f"google event {external_id!r} is not agent-created "
+                "(missing healthmes=1 extended property); the external calendar owns it"
+            )
+        return event
+
+    def _get_event(self, external_id: str) -> ExternalEvent:
         try:
             item = (
                 self._events()
@@ -410,15 +453,7 @@ class GoogleCalendarBackend:
             if _http_status(exc) in (404, 410):
                 raise EventNotFoundError(f"google event {external_id!r} not found") from exc
             raise
-        event = self._parse_api_event(item)
-        if event.deleted:
-            raise EventNotFoundError(f"google event {external_id!r} is cancelled")
-        if not event.is_agent_created:
-            raise OwnershipError(
-                f"google event {external_id!r} is not agent-created "
-                "(missing healthmes=1 extended property); the external calendar owns it"
-            )
-        return event
+        return self._parse_api_event(item)
 
     # -- parsing -----------------------------------------------------------
 
@@ -429,16 +464,26 @@ class GoogleCalendarBackend:
         private = (item.get("extendedProperties") or {}).get("private") or {}
         is_agent = str(private.get(GOOGLE_AGENT_TAG_KEY, "")) == AGENT_TAG_VALUE
         agent_task_id = parse_task_id(private.get(GOOGLE_AGENT_TASK_ID_KEY))
-        deleted = item.get("status") == "cancelled"
+        status = item.get("status")
+        start = item.get("start")
+        end = item.get("end")
+        deleted = status == "cancelled"
         return ExternalEvent(
             external_id=external_id,
             summary=item.get("summary") or None,
-            start_at=_parse_api_time(item.get("start")),
-            end_at=_parse_api_time(item.get("end")),
+            start_at=_parse_api_time(start),
+            end_at=_parse_api_time(end),
             is_agent_created=is_agent,
             agent_task_id=agent_task_id,
             etag=item.get("etag"),
             deleted=deleted,
+            organizer_self=_is_self(item.get("organizer")),
+            has_attendees=bool(item.get("attendees") or []),
+            is_recurring=bool(item.get("recurrence") or item.get("recurringEventId")),
+            event_type=item.get("eventType") or "default",
+            is_all_day=_is_all_day_time(start) or _is_all_day_time(end),
+            is_locked=bool(item.get("locked")),
+            status=status,
         )
 
     def _events(self) -> Any:
@@ -459,3 +504,11 @@ def _parse_api_time(value: dict[str, Any] | None) -> datetime | None:
         day = date.fromisoformat(value["date"])
         return datetime.combine(day, time.min, tzinfo=UTC)
     return None
+
+
+def _is_all_day_time(value: dict[str, Any] | None) -> bool:
+    return bool(value and value.get("date") and not value.get("dateTime"))
+
+
+def _is_self(value: object) -> bool:
+    return isinstance(value, dict) and bool(value.get("self"))

@@ -189,7 +189,8 @@ The Hermes gateway is configured entirely from outside `vendor/`:
 `$HERMES_HOME/config.yaml`, copies `skills/` into `$HERMES_HOME/skills/`
 (copies, not symlinks — the vendor skill trust check resolves symlinks and
 would log a security warning on every skill load; re-runs resync content),
-generates a `HEALTHMES_HERMES_WEBHOOK_SECRET` into `.env` when missing,
+generates independent `HEALTHMES_HERMES_WEBHOOK_SECRET` and
+`HEALTHMES_CALENDAR_ADJUSTMENT_SECRET` values into `.env` when missing,
 installs the briefing state-snapshot script
 (`scripts/healthmes_briefing_snapshot.py` + a base-URL sidecar) into
 `$HERMES_HOME/scripts/`, and registers the three cron briefings (morning
@@ -200,6 +201,14 @@ round-trips at run time. The snapshot also carries the server-built weekly
 report link (`weekly_report.url`, token-embedded via
 `healthmes.api.reports.weekly_report_url`); the Sunday prompt instructs the
 agent to include it verbatim — the agent never constructs viewer URLs.
+The 07:00 prompt is also the Telegram glue for morning recovery nudges: it
+calls `mcp__healthmes__evaluate_morning_calendar_nudge` exactly once, sends
+the returned display packet and `적용 <handle>` / `그대로 <handle>` choices,
+then exits without waiting. The later allowed-user reply enters the normal
+Hermes live gateway session, which calls
+`mcp__healthmes__resolve_calendar_adjustment` with the exact combined live
+Telegram reply as `response` and its unchanged `reply_handle`. Hermes attaches
+an owner-bound signed proof, and HealthMes resolves the proposal server-side.
 
 ```bash
 uv run python scripts/bootstrap.py --dry-run     # show what would change
@@ -538,11 +547,21 @@ corresponding integrations stay inactive.
 | Google Calendar mirror | OAuth client secret + one interactive consent | one-time client secret to `{HEALTHMES_DATA_DIR}/google/client_secret.json`, then `uv run healthmes connect google` (see "캘린더 연결") — the stored token auto-enables the mirror; `HEALTHMES_GOOGLE_CALENDAR_ENABLED=true` still works (polled every `HEALTHMES_GOOGLE_POLL_MINUTES` — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
 | Apple Calendar (iCloud CalDAV) mirror | app-specific password from appleid.apple.com | `uv run healthmes connect icloud --username <apple-id>` (see "캘린더 연결") — the stored creds file auto-enables the mirror; the env pair `HEALTHMES_CALDAV_USERNAME` + `HEALTHMES_CALDAV_APP_PASSWORD` (+ `HEALTHMES_CALDAV_ENABLED=true`) still works and overrides it (polled every `HEALTHMES_CALDAV_POLL_MINUTES` — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
 | Proactive alert push (HealthMes -> Hermes) | shared HMAC secret | `HEALTHMES_HERMES_WEBHOOK_SECRET` — generated into `.env` by `scripts/bootstrap.py` |
+| Calendar adjustment confirmation handles | dedicated signing secret | `HEALTHMES_CALENDAR_ADJUSTMENT_SECRET` — generated into `.env` by `scripts/bootstrap.py`; never shared with webhook or API authentication |
 | Encrypted backups (CLI + weekly job) | a passphrase you choose (and must not lose) | `HEALTHMES_BACKUP_PASSPHRASE` in `.env`, or `--passphrase-file` |
 | Remote vault replication (ciphertext-only, optional) | S3-compatible bucket + access keys (AWS S3 / Cloudflare R2 / MinIO) | `HEALTHMES_VAULT_BUCKET` (+ `HEALTHMES_VAULT_ENDPOINT`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`/`_REGION`/`_PREFIX`); opt in with `HEALTHMES_BACKUP_PROVIDER=remote_vault` or `--provider remote` |
 | Companion & desktop apps (Android/Wear/iOS/watchOS/macOS/Windows) | the service's `HEALTHMES_API_TOKEN` (same LAN rule as the collector) | entered in each app's pairing screen together with the base URL |
 | Android usage collector | the service's `HEALTHMES_API_TOKEN` (verified server-side; required whenever the service binds beyond loopback) | entered in the app UI; sent as `Authorization: Bearer ...` |
 | API/MCP surface auth | bearer token you mint (`python3 -c "import secrets; print(secrets.token_urlsafe(32))"`) | `HEALTHMES_API_TOKEN` in `.env`; required for `HEALTHMES_HOST=0.0.0.0` and for docker compose |
+
+Calendar ownership remains immutable by default for user-created external
+events. The only confirmed exception is the morning recovery Google
+`SHORTEN` path: server evaluation binds the event snapshot and target change,
+Telegram shows the one-time handle, and a trusted live Hermes session
+parses `적용 <handle>` or `그대로 <handle>` and calls the HealthMes MCP tool
+with the exact combined live reply and unchanged `reply_handle`; no
+`proposal_id` or caller-supplied response channel is accepted.
+No cron run waits for replies or performs the external write itself.
 
 Not a credential but environment-shaped: `HEALTHMES_TIMEZONE` (IANA name,
 e.g. `Asia/Seoul`) pins the user-local day for MCP joins and boundaries —

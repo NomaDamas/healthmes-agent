@@ -19,6 +19,9 @@ ALL_ENV_VARS = [
     "HEALTHMES_PORT",
     "HEALTHMES_HOST",
     "HEALTHMES_API_TOKEN",
+    "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+    "HEALTHMES_TELEGRAM_OWNER_USER_ID",
+    "HEALTHMES_TELEGRAM_OWNER_CHAT_ID",
     "HEALTHMES_SCHEDULER_ENABLED",
     "HEALTHMES_TIMEZONE",
     "HEALTHMES_BACKUP_DIR",
@@ -68,6 +71,9 @@ def test_defaults(monkeypatch) -> None:
     # network unless the operator opts in (and then a token is enforced).
     assert settings.host == "127.0.0.1"
     assert settings.api_token.get_secret_value() == ""
+    assert settings.calendar_adjustment_secret.get_secret_value() == ""
+    assert settings.telegram_owner_user_id == ""
+    assert settings.telegram_owner_chat_id == ""
     assert settings.scheduler_enabled is False
     assert settings.timezone is None  # machine-local tz (mac-native default)
     # Backup seam (docs/PLAN.md §9): everything optional by default.
@@ -97,6 +103,8 @@ def test_env_prefix_is_healthmes(monkeypatch) -> None:
     monkeypatch.setenv("HEALTHMES_OW_BASE_URL", "http://ow.internal:8000")
     monkeypatch.setenv("HEALTHMES_DATA_DIR", "/tmp/hm-data")
     monkeypatch.setenv("HEALTHMES_PUBLIC_BASE_URL", "https://healthmes.example.com")
+    monkeypatch.setenv("HEALTHMES_TELEGRAM_OWNER_USER_ID", "owner-user")
+    monkeypatch.setenv("HEALTHMES_TELEGRAM_OWNER_CHAT_ID", "owner-chat")
 
     settings = _clean_settings()
 
@@ -105,6 +113,8 @@ def test_env_prefix_is_healthmes(monkeypatch) -> None:
     assert settings.ow_base_url == "http://ow.internal:8000"
     assert settings.data_dir == Path("/tmp/hm-data")
     assert settings.public_base_url == "https://healthmes.example.com"
+    assert settings.telegram_owner_user_id == "owner-user"
+    assert settings.telegram_owner_chat_id == "owner-chat"
 
 
 def test_quiet_hours_and_alert_budget_from_env(monkeypatch) -> None:
@@ -206,15 +216,24 @@ def test_secrets_are_not_leaked_in_repr(monkeypatch) -> None:
     monkeypatch.setenv("HEALTHMES_OW_API_KEY", "super-secret-key")
     monkeypatch.setenv("HEALTHMES_HERMES_WEBHOOK_SECRET", "hmac-secret")
     monkeypatch.setenv("HEALTHMES_API_TOKEN", "bearer-secret")
+    monkeypatch.setenv(
+        "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+        "calendar-adjustment-secret-that-is-long-enough",
+    )
 
     settings = _clean_settings()
 
     assert "super-secret-key" not in repr(settings)
     assert "hmac-secret" not in repr(settings)
     assert "bearer-secret" not in repr(settings)
+    assert "calendar-adjustment-secret-that-is-long-enough" not in repr(settings)
     assert settings.ow_api_key.get_secret_value() == "super-secret-key"
     assert settings.hermes_webhook_secret.get_secret_value() == "hmac-secret"
     assert settings.api_token.get_secret_value() == "bearer-secret"
+    assert (
+        settings.calendar_adjustment_secret.get_secret_value()
+        == "calendar-adjustment-secret-that-is-long-enough"
+    )
 
 
 def test_host_and_api_token_from_env(monkeypatch) -> None:

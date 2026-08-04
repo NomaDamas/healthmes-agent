@@ -7,6 +7,7 @@ import pytest
 
 from healthmes.calendars.base import (
     CalendarBackend,
+    ConfirmedExternalTimeChange,
     EventDraft,
     ExternalEvent,
     coerce_utc,
@@ -88,6 +89,56 @@ class TestExternalEvent:
     def test_rejects_empty_id(self) -> None:
         with pytest.raises(ValueError, match="external_id"):
             ExternalEvent(external_id="", deleted=True)
+
+    def test_provider_metadata_defaults_to_ineligible_shape(self) -> None:
+        event = ExternalEvent(
+            external_id="e1",
+            start_at=datetime(2026, 7, 9, 9, 0, tzinfo=UTC),
+            end_at=datetime(2026, 7, 9, 10, 0, tzinfo=UTC),
+        )
+        assert not event.organizer_self
+        assert not event.has_attendees
+        assert not event.is_recurring
+        assert event.event_type is None
+        assert not event.is_all_day
+        assert not event.is_locked
+        assert event.status is None
+
+
+class TestConfirmedExternalTimeChange:
+    def test_normalizes_valid_30_minute_shorten(self) -> None:
+        change = ConfirmedExternalTimeChange(
+            external_event_id="meet-1",
+            original_start_at=datetime(2026, 7, 9, 18, 0, tzinfo=KST),
+            original_end_at=datetime(2026, 7, 9, 19, 30, tzinfo=KST),
+            proposed_start_at=datetime(2026, 7, 9, 18, 0, tzinfo=KST),
+            proposed_end_at=datetime(2026, 7, 9, 19, 0, tzinfo=KST),
+            expected_etag='"etag-v1"',
+        )
+        assert change.original_start_at == datetime(2026, 7, 9, 9, 0, tzinfo=UTC)
+        assert change.proposed_end_at == datetime(2026, 7, 9, 10, 0, tzinfo=UTC)
+
+    def test_rejects_moving_start(self) -> None:
+        with pytest.raises(ValueError, match="may not move start_at"):
+            ConfirmedExternalTimeChange(
+                external_event_id="meet-1",
+                original_start_at=datetime(2026, 7, 9, 9, 0, tzinfo=UTC),
+                original_end_at=datetime(2026, 7, 9, 10, 0, tzinfo=UTC),
+                proposed_start_at=datetime(2026, 7, 9, 9, 15, tzinfo=UTC),
+                proposed_end_at=datetime(2026, 7, 9, 9, 30, tzinfo=UTC),
+                expected_etag='"etag-v1"',
+            )
+
+    def test_rejects_non_30_minute_shorten(self) -> None:
+        with pytest.raises(ValueError, match="exactly 30 minutes"):
+            ConfirmedExternalTimeChange(
+                external_event_id="meet-1",
+                original_start_at=datetime(2026, 7, 9, 9, 0, tzinfo=UTC),
+                original_end_at=datetime(2026, 7, 9, 10, 30, tzinfo=UTC),
+                proposed_start_at=datetime(2026, 7, 9, 9, 0, tzinfo=UTC),
+                proposed_end_at=datetime(2026, 7, 9, 10, 15, tzinfo=UTC),
+                expected_etag='"etag-v1"',
+            )
 
 
 class TestEventDraft:

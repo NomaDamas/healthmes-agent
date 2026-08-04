@@ -13,7 +13,12 @@ from fastapi.testclient import TestClient
 from healthmes import __version__
 from healthmes.app import create_app
 from healthmes.config import Settings
-from healthmes.engine.scheduler import BACKUP_JOB_ID, ENERGY_JOB_ID, TRIGGER_JOB_ID
+from healthmes.engine.scheduler import (
+    BACKUP_JOB_ID,
+    CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
+    ENERGY_JOB_ID,
+    TRIGGER_JOB_ID,
+)
 from healthmes.mcp_server import server as mcp_server
 from healthmes.store import Base, get_engine
 from healthmes.store import session as store_session
@@ -134,7 +139,12 @@ class TestSchedulerWiring:
             assert scheduler is not None
             assert scheduler.running
             job_ids = {job.id for job in scheduler.get_jobs()}
-            assert job_ids == {TRIGGER_JOB_ID, ENERGY_JOB_ID, BACKUP_JOB_ID}
+            assert job_ids == {
+                TRIGGER_JOB_ID,
+                ENERGY_JOB_ID,
+                BACKUP_JOB_ID,
+                CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
+            }
         assert not scheduler.running
         assert app.state.scheduler is None
 
@@ -160,6 +170,7 @@ class TestSchedulerWiring:
                 TRIGGER_JOB_ID,
                 ENERGY_JOB_ID,
                 BACKUP_JOB_ID,
+                CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
                 calendar_job_id(CalendarSource.GOOGLE),
                 calendar_job_id(CalendarSource.CALDAV),
             }
@@ -192,5 +203,6 @@ class TestSchedulerWiring:
             TRIGGER_JOB_ID,
             ENERGY_JOB_ID,
             BACKUP_JOB_ID,
+            CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
         }
         assert not prepared.running

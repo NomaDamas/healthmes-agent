@@ -16,8 +16,10 @@ from datetime import date, datetime
 from sqlalchemy import ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
-from healthmes.store.base import Base, JSONDict, str_32, str_64, str_255
+from healthmes.store.base import Base, JSONDict, str_32, str_64, str_255, string_enum
 from healthmes.store.enums import (
+    CalendarMutationOperation,
+    CalendarMutationStatus,
     CalendarSource,
     DecisionKind,
     EnergyDemand,
@@ -31,6 +33,7 @@ __all__ = [
     "Task",
     "CalendarEventMirror",
     "ScheduleProposal",
+    "CalendarMutationProposal",
     "FoodLog",
     "AppUsageSample",
     "CognitiveEnergyEstimate",
@@ -117,6 +120,13 @@ class CalendarEventMirror(Base):
     )
     etag: Mapped[str_255 | None]
     sync_token: Mapped[str_255 | None]
+    organizer_self: Mapped[bool] = mapped_column(default=False)
+    has_attendees: Mapped[bool] = mapped_column(default=False)
+    is_recurring: Mapped[bool] = mapped_column(default=False)
+    event_type: Mapped[str_64 | None]
+    is_all_day: Mapped[bool] = mapped_column(default=False)
+    is_locked: Mapped[bool] = mapped_column(default=False)
+    status: Mapped[str_32 | None]
 
 
 class ScheduleProposal(Base):
@@ -133,6 +143,55 @@ class ScheduleProposal(Base):
     decision_record_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("decision_record.id", ondelete="SET NULL")
     )
+
+
+class CalendarMutationProposal(Base):
+    __tablename__ = "calendar_mutation_proposal"
+    __table_args__ = (
+        UniqueConstraint(
+            "dedup_key",
+            name="uq_calendar_mutation_proposal_dedup_key",
+        ),
+        UniqueConstraint(
+            "attempt_id",
+            name="uq_calendar_mutation_proposal_attempt_id",
+        ),
+    )
+
+    calendar_source: Mapped[CalendarSource] = mapped_column(
+        default=CalendarSource.GOOGLE, index=True
+    )
+    mirror_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("calendar_event_mirror.id", ondelete="SET NULL"), index=True
+    )
+    external_event_id: Mapped[str_255]
+    operation: Mapped[CalendarMutationOperation] = mapped_column(
+        string_enum(CalendarMutationOperation),
+        default=CalendarMutationOperation.SHORTEN
+    )
+    original_start_at: Mapped[datetime]
+    original_end_at: Mapped[datetime]
+    proposed_start_at: Mapped[datetime]
+    proposed_end_at: Mapped[datetime]
+    expected_etag: Mapped[str_255]
+    protected_fingerprint: Mapped[str_255]
+    reply_handle_digest: Mapped[str_255]
+    expires_at: Mapped[datetime] = mapped_column(index=True)
+    consumed_at: Mapped[datetime | None]
+    attempt_id: Mapped[str_64 | None] = mapped_column(index=True)
+    status: Mapped[CalendarMutationStatus] = mapped_column(
+        string_enum(CalendarMutationStatus),
+        default=CalendarMutationStatus.PENDING, index=True
+    )
+    dedup_key: Mapped[str_255]
+    proposal_decision_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("decision_record.id", ondelete="SET NULL"), index=True
+    )
+    outcome_decision_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("decision_record.id", ondelete="SET NULL"), index=True
+    )
+    response_channel: Mapped[str_32 | None]
+    receipt: Mapped[JSONDict | None]
 
 
 class FoodLog(Base):

@@ -14,6 +14,9 @@ from sqlalchemy.exc import IntegrityError
 from healthmes.store import (
     AppUsageSample,
     CalendarEventMirror,
+    CalendarMutationOperation,
+    CalendarMutationProposal,
+    CalendarMutationStatus,
     CalendarSource,
     CognitiveEnergyEstimate,
     DecisionKind,
@@ -148,6 +151,38 @@ class TestCalendarEventMirror:
         assert mirror.agent_task_id == task.id
         assert mirror.etag == '"etag-1"'
         assert mirror.sync_token == "sync-token-9"
+        assert mirror.organizer_self is False
+        assert mirror.has_attendees is False
+        assert mirror.is_recurring is False
+        assert mirror.event_type is None
+        assert mirror.is_all_day is False
+        assert mirror.is_locked is False
+        assert mirror.status is None
+
+    def test_eligibility_metadata_roundtrip(self, session):
+        mirror = _roundtrip(
+            session,
+            CalendarEventMirror(
+                external_id="evt-metadata",
+                calendar_source=CalendarSource.GOOGLE,
+                start_at=T0,
+                end_at=T1,
+                organizer_self=True,
+                has_attendees=True,
+                is_recurring=True,
+                event_type="focusTime",
+                is_all_day=True,
+                is_locked=True,
+                status="confirmed",
+            ),
+        )
+        assert mirror.organizer_self is True
+        assert mirror.has_attendees is True
+        assert mirror.is_recurring is True
+        assert mirror.event_type == "focusTime"
+        assert mirror.is_all_day is True
+        assert mirror.is_locked is True
+        assert mirror.status == "confirmed"
 
     def test_source_external_id_unique(self, session):
         session.add(
@@ -249,6 +284,235 @@ class TestScheduleProposal:
         session.commit()
         session.expunge_all()
         assert session.get(ScheduleProposal, proposal_id) is None
+
+
+class TestCalendarMutationProposal:
+    def test_roundtrip(self, session):
+        mirror = _roundtrip(
+            session,
+            CalendarEventMirror(
+                external_id="google-event-1",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="Focus",
+                start_at=T0,
+                end_at=T1,
+                etag='"etag-v1"',
+            ),
+        )
+        proposal_record = _roundtrip(
+            session,
+            DecisionRecord(kind=DecisionKind.SCHEDULE_CHANGE, tree={"id": "p"}, summary="p"),
+        )
+        outcome_record = _roundtrip(
+            session,
+            DecisionRecord(kind=DecisionKind.SCHEDULE_CHANGE, tree={"id": "o"}, summary="o"),
+        )
+        proposal = _roundtrip(
+            session,
+            CalendarMutationProposal(
+                mirror_event_id=mirror.id,
+                external_event_id="google-event-1",
+                original_start_at=T0,
+                original_end_at=T1,
+                proposed_start_at=T0,
+                proposed_end_at=datetime(2026, 7, 6, 10, 0, 0),
+                expected_etag='"etag-v1"',
+                protected_fingerprint="fingerprint-1",
+                reply_handle_digest="digest-1",
+                expires_at=datetime(2026, 7, 6, 9, 45, 0),
+                consumed_at=datetime(2026, 7, 6, 9, 5, 0),
+                attempt_id="attempt-1",
+                status=CalendarMutationStatus.APPLIED,
+                dedup_key="calendar-nudge:2026-07-06:google-event-1",
+                proposal_decision_record_id=proposal_record.id,
+                outcome_decision_record_id=outcome_record.id,
+                response_channel="telegram",
+                receipt={"status": "applied", "delta_minutes": 30},
+            ),
+        )
+        assert proposal.calendar_source is CalendarSource.GOOGLE
+        assert proposal.mirror_event_id == mirror.id
+        assert proposal.external_event_id == "google-event-1"
+        assert proposal.operation is CalendarMutationOperation.SHORTEN
+        assert proposal.original_start_at == T0
+        assert proposal.original_end_at == T1
+        assert proposal.proposed_start_at == T0
+        assert proposal.proposed_end_at == datetime(2026, 7, 6, 10, 0, 0)
+        assert proposal.expected_etag == '"etag-v1"'
+        assert proposal.protected_fingerprint == "fingerprint-1"
+        assert proposal.reply_handle_digest == "digest-1"
+        assert proposal.expires_at == datetime(2026, 7, 6, 9, 45, 0)
+        assert proposal.consumed_at == datetime(2026, 7, 6, 9, 5, 0)
+        assert proposal.attempt_id == "attempt-1"
+        assert proposal.status is CalendarMutationStatus.APPLIED
+        assert proposal.dedup_key == "calendar-nudge:2026-07-06:google-event-1"
+        assert proposal.proposal_decision_record_id == proposal_record.id
+        assert proposal.outcome_decision_record_id == outcome_record.id
+        assert proposal.response_channel == "telegram"
+        assert proposal.receipt == {"status": "applied", "delta_minutes": 30}
+
+    def test_defaults(self, session):
+        mirror = _roundtrip(
+            session,
+            CalendarEventMirror(
+                external_id="google-event-defaults",
+                calendar_source=CalendarSource.GOOGLE,
+                start_at=T0,
+                end_at=T1,
+            ),
+        )
+        proposal = _roundtrip(
+            session,
+            CalendarMutationProposal(
+                mirror_event_id=mirror.id,
+                external_event_id="google-event-defaults",
+                original_start_at=T0,
+                original_end_at=T1,
+                proposed_start_at=T0,
+                proposed_end_at=datetime(2026, 7, 6, 10, 0, 0),
+                expected_etag='"etag-v1"',
+                protected_fingerprint="fingerprint-1",
+                reply_handle_digest="digest-1",
+                expires_at=datetime(2026, 7, 6, 9, 45, 0),
+                dedup_key="calendar-nudge:2026-07-06:google-event-defaults",
+            ),
+        )
+        assert proposal.calendar_source is CalendarSource.GOOGLE
+        assert proposal.operation is CalendarMutationOperation.SHORTEN
+        assert proposal.status is CalendarMutationStatus.PENDING
+        assert proposal.consumed_at is None
+        assert proposal.attempt_id is None
+        assert proposal.response_channel is None
+        assert proposal.receipt is None
+
+    def test_requires_existing_mirror(self, session):
+        session.add(
+            CalendarMutationProposal(
+                mirror_event_id=uuid.uuid4(),
+                external_event_id="missing",
+                original_start_at=T0,
+                original_end_at=T1,
+                proposed_start_at=T0,
+                proposed_end_at=datetime(2026, 7, 6, 10, 0, 0),
+                expected_etag='"etag-v1"',
+                protected_fingerprint="fingerprint-1",
+                reply_handle_digest="digest-1",
+                expires_at=datetime(2026, 7, 6, 9, 45, 0),
+                dedup_key="calendar-nudge:2026-07-06:missing",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    def test_dedup_key_unique(self, session):
+        mirror = _roundtrip(
+            session,
+            CalendarEventMirror(
+                external_id="google-event-dedup",
+                calendar_source=CalendarSource.GOOGLE,
+                start_at=T0,
+                end_at=T1,
+            ),
+        )
+        for external_event_id in ("google-event-dedup", "google-event-dedup-again"):
+            session.add(
+                CalendarMutationProposal(
+                    mirror_event_id=mirror.id,
+                    external_event_id=external_event_id,
+                    original_start_at=T0,
+                    original_end_at=T1,
+                    proposed_start_at=T0,
+                    proposed_end_at=datetime(2026, 7, 6, 10, 0, 0),
+                    expected_etag='"etag-v1"',
+                    protected_fingerprint="fingerprint-1",
+                    reply_handle_digest="digest-1",
+                    expires_at=datetime(2026, 7, 6, 9, 45, 0),
+                    dedup_key="calendar-nudge:2026-07-06:dedup",
+                )
+            )
+            if external_event_id == "google-event-dedup":
+                session.commit()
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    def test_attempt_id_unique_when_present(self, session):
+        mirror = _roundtrip(
+            session,
+            CalendarEventMirror(
+                external_id="google-event-attempt",
+                calendar_source=CalendarSource.GOOGLE,
+                start_at=T0,
+                end_at=T1,
+            ),
+        )
+        for dedup_key in ("calendar-nudge:attempt-1", "calendar-nudge:attempt-2"):
+            session.add(
+                CalendarMutationProposal(
+                    mirror_event_id=mirror.id,
+                    external_event_id="google-event-attempt",
+                    original_start_at=T0,
+                    original_end_at=T1,
+                    proposed_start_at=T0,
+                    proposed_end_at=datetime(2026, 7, 6, 10, 0, 0),
+                    expected_etag='"etag-v1"',
+                    protected_fingerprint="fingerprint-1",
+                    reply_handle_digest="digest-1",
+                    expires_at=datetime(2026, 7, 6, 9, 45, 0),
+                    attempt_id="attempt-dup",
+                    dedup_key=dedup_key,
+                )
+            )
+            if dedup_key == "calendar-nudge:attempt-1":
+                session.commit()
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    def test_decision_record_delete_sets_links_null(self, session):
+        mirror = _roundtrip(
+            session,
+            CalendarEventMirror(
+                external_id="google-event-decision",
+                calendar_source=CalendarSource.GOOGLE,
+                start_at=T0,
+                end_at=T1,
+            ),
+        )
+        proposal_record = _roundtrip(
+            session,
+            DecisionRecord(kind=DecisionKind.SCHEDULE_CHANGE, tree={"id": "p"}, summary="p"),
+        )
+        outcome_record = _roundtrip(
+            session,
+            DecisionRecord(kind=DecisionKind.SCHEDULE_CHANGE, tree={"id": "o"}, summary="o"),
+        )
+        proposal_id = _roundtrip(
+            session,
+            CalendarMutationProposal(
+                mirror_event_id=mirror.id,
+                external_event_id="google-event-decision",
+                original_start_at=T0,
+                original_end_at=T1,
+                proposed_start_at=T0,
+                proposed_end_at=datetime(2026, 7, 6, 10, 0, 0),
+                expected_etag='"etag-v1"',
+                protected_fingerprint="fingerprint-1",
+                reply_handle_digest="digest-1",
+                expires_at=datetime(2026, 7, 6, 9, 45, 0),
+                dedup_key="calendar-nudge:2026-07-06:decision",
+                proposal_decision_record_id=proposal_record.id,
+                outcome_decision_record_id=outcome_record.id,
+            ),
+        ).id
+        session.delete(session.get(DecisionRecord, proposal_record.id))
+        session.delete(session.get(DecisionRecord, outcome_record.id))
+        session.commit()
+        session.expire_all()
+        loaded = session.get(CalendarMutationProposal, proposal_id)
+        assert loaded.proposal_decision_record_id is None
+        assert loaded.outcome_decision_record_id is None
 
 
 class TestFoodLog:
@@ -476,6 +740,34 @@ class TestEnumStorage:
             {"id": proposal.id.hex},
         ).scalar_one()
         assert raw == "pushed"
+
+        mutation = _roundtrip(
+            session,
+            CalendarMutationProposal(
+                mirror_event_id=mirror.id,
+                external_event_id="e",
+                original_start_at=T0,
+                original_end_at=T1,
+                proposed_start_at=T0,
+                proposed_end_at=datetime(2026, 7, 6, 10, 0, 0),
+                expected_etag='"etag-v1"',
+                protected_fingerprint="fingerprint-1",
+                reply_handle_digest="digest-1",
+                expires_at=datetime(2026, 7, 6, 9, 45, 0),
+                status=CalendarMutationStatus.CONFLICTED,
+                dedup_key="calendar-nudge:2026-07-06:e",
+            ),
+        )
+        assert mutation.operation is CalendarMutationOperation.SHORTEN
+        assert mutation.status is CalendarMutationStatus.CONFLICTED
+        raw = session.execute(
+            text(
+                "SELECT operation, status FROM calendar_mutation_proposal "
+                "WHERE id = :id"
+            ),
+            {"id": mutation.id.hex},
+        ).one()
+        assert tuple(raw) == ("shorten", "conflicted")
 
         record = _roundtrip(
             session,

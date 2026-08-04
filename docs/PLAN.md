@@ -147,6 +147,19 @@ score = 100
 
 **충돌 철학 = 소유권 분할 (동기화 늪 회피):** 외부 캘린더가 에이전트가 만들지 않은 모든 이벤트의 source of truth. 에이전트는 자기 블록만 쓰고(`healthmes=1` extended property / `X-HEALTHMES` iCal 속성 태깅) 자기 것만 이동/삭제 가능. 사용자가 외부에서 에이전트 이벤트를 수정하면 외부 승리 → mirror diff가 `schedule_changed` 트리거 발화 → 에이전트 재계획 + 선제 alert (제품이 원하는 동작 그 자체).
 
+**좁은 확정 예외:** morning recovery nudge는 외부 이벤트 불변 원칙을 기본값으로 유지하되,
+사용자가 Telegram live reply에서 `적용 <handle>`을 보낸 뒤에만 Google의 단일 eligible
+event를 `SHORTEN`할 수 있다. 대상/변경량/ETag는 server evaluator가 고정하고, agent는
+07:00 cron에서 `evaluate_morning_calendar_nudge()` 결과 display packet과
+`적용 <handle>` / `그대로 <handle>` 문구를 그대로 보내고 종료한다. 이후 allowed-user
+reply는 live Hermes session이 원문에서 response와 handle을 분리하고, 기존 evaluation의
+정확한 Telegram 응답 문자열과 변경하지 않은 `reply_handle`을
+`resolve_calendar_adjustment()`에 전달한다. 서버는 owner-bound signed proof를
+검증하고 handle로 pending proposal을 찾는다. MOVE,
+삭제, 제목/참석자/반복 수정, iCloud/CalDAV 외부 이벤트 변경은 여전히 금지다.
+`APPLIED_RECOVERED`, `UNKNOWN`, `FAILED_NO_CHANGE`는 이 예외의 서버 내부 terminal
+receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한을 뜻하지 않는다.
+
 **신뢰 구축:** 초기엔 propose-then-confirm(Telegram에서 승인 후 캘린더 기록), 패턴이 수락되면 자동 기록으로 승격.
 
 ## 7. 앱사용 추적 — 현실 점검

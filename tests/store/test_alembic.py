@@ -13,6 +13,7 @@ import sqlalchemy as sa
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy.orm import sessionmaker
 
 from alembic import command
@@ -24,6 +25,7 @@ EXPECTED_TABLES = {
     "weekly_goal",
     "task",
     "calendar_event_mirror",
+    "calendar_mutation_proposal",
     "schedule_proposal",
     "food_log",
     "app_usage_sample",
@@ -48,6 +50,12 @@ def _render_offline_upgrade(database_url: str) -> str:
     buffer = io.StringIO()
     command.upgrade(_config(database_url, buffer=buffer), "head", sql=True)
     return buffer.getvalue()
+
+
+def test_migration_graph_has_single_head():
+    script = ScriptDirectory.from_config(_config("sqlite://"))
+
+    assert len(script.get_heads()) == 1
 
 
 class TestOfflineRender:

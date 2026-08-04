@@ -180,6 +180,9 @@ services:
       # data and the published port is reachable from the LAN.
       - HEALTHMES_HOST=0.0.0.0
       - HEALTHMES_API_TOKEN=${HEALTHMES_API_TOKEN:-}
+      - HEALTHMES_CALENDAR_ADJUSTMENT_SECRET=${HEALTHMES_CALENDAR_ADJUSTMENT_SECRET:-}
+      - HEALTHMES_TELEGRAM_OWNER_USER_ID=${HEALTHMES_TELEGRAM_OWNER_USER_ID:-}
+      - HEALTHMES_TELEGRAM_OWNER_CHAT_ID=${HEALTHMES_TELEGRAM_OWNER_CHAT_ID:-}
       # Container clocks are UTC; forward the user's IANA timezone from .env /
       # the shell so local-day joins and alert quiet hours stay correct
       # (empty = fall back to UTC).
@@ -217,6 +220,7 @@ services:
       # Gateway env overrides (vendor gateway/config.py) — set in root .env.
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - HEALTHMES_CALENDAR_ADJUSTMENT_SECRET=${HEALTHMES_CALENDAR_ADJUSTMENT_SECRET:-}
     ports:
       # Webhook platform (gateway/platforms/webhook.py, default port 8644):
       # healthmes reaches it in-cluster at hermes:8644; published for local

@@ -80,6 +80,35 @@ class TestBootstrap:
         service.sync_backend(fake_backend)
         assert state_store.load(fake_backend.source) == {"sync_token": "tok-1"}
 
+    def test_first_sync_mirrors_provider_metadata(
+        self, service, fake_backend, session, make_event
+    ) -> None:
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "meet-1",
+                    organizer_self=True,
+                    has_attendees=True,
+                    is_recurring=True,
+                    event_type="default",
+                    is_all_day=False,
+                    is_locked=True,
+                    status="confirmed",
+                )
+            ],
+            {"sync_token": "tok-1"},
+        )
+        service.sync_backend(fake_backend)
+
+        row = rows(session)["meet-1"]
+        assert row.organizer_self is True
+        assert row.has_attendees is True
+        assert row.is_recurring is True
+        assert row.event_type == "default"
+        assert row.is_all_day is False
+        assert row.is_locked is True
+        assert row.status == "confirmed"
+
 
 class TestSyncStatePersistence:
     def test_next_run_receives_persisted_state(self, service, fake_backend) -> None:
@@ -171,6 +200,29 @@ class TestNonAgentDiff:
 
         assert not diff.has_changes
         assert rows(session)["meet-1"].summary == "Team standup (renamed)"
+
+    def test_metadata_only_change_is_mirrored_silently(
+        self, service, fake_backend, session, make_event
+    ) -> None:
+        self._bootstrap(service, fake_backend, make_event)
+        fake_backend.queue_changes(
+            [
+                make_event(
+                    "meet-1",
+                    organizer_self=True,
+                    event_type="default",
+                    status="confirmed",
+                )
+            ],
+            {"sync_token": "tok-2"},
+        )
+        diff = service.sync_backend(fake_backend)
+
+        row = rows(session)["meet-1"]
+        assert not diff.has_changes
+        assert row.organizer_self is True
+        assert row.event_type == "default"
+        assert row.status == "confirmed"
 
     def test_deleted(self, service, fake_backend, session, make_event) -> None:
         self._bootstrap(service, fake_backend, make_event)

@@ -172,6 +172,126 @@ class TestMCPStatus:
         assert statuses["disabled"]["disabled"] is True
 
 
+class TestTrustedSessionProof:
+    @staticmethod
+    def _server():
+        server = _make_mock_server("healthmes")
+        server._config = {
+            "trusted_session_proof": {
+                "secret_env": "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+                "argument": "trusted_session_proof",
+                "owner_user_id": "owner-user",
+                "owner_chat_id": "owner-chat",
+                "confirmations": {
+                    "resolve_calendar_adjustment": {
+                        "handle_argument": "reply_handle",
+                        "passthrough_argument": "response",
+                        "bind_arguments": ["response", "reply_handle"],
+                        "choices": ["적용", "그대로"],
+                    }
+                },
+            }
+        }
+        return server
+
+    def test_exact_live_owner_reply_receives_proof(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool import _trusted_session_call_arguments
+
+        monkeypatch.setenv(
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+            "vendor-test-secret-at-least-32-characters",
+        )
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="owner-chat",
+            user_id="owner-user",
+            message_id="message-1",
+            message_text="적용 handle-1",
+        )
+        arguments = {
+            "response": "적용 handle-1",
+            "reply_handle": "handle-1",
+        }
+        try:
+            signed = _trusted_session_call_arguments(
+                self._server(),
+                "resolve_calendar_adjustment",
+                arguments,
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert signed.items() >= arguments.items()
+        assert signed["trusted_session_proof"].count(".") == 1
+
+    @pytest.mark.parametrize(
+        "session",
+        [
+            {
+                "platform": "telegram",
+                "chat_id": "owner-chat",
+                "user_id": "different-user",
+                "message_id": "message-1",
+                "message_text": "적용 handle-1",
+            },
+            {
+                "platform": "telegram",
+                "chat_id": "owner-chat",
+                "user_id": "owner-user",
+                "message_id": "message-1",
+                "message_text": "오늘 일정 보여줘",
+            },
+            {
+                "platform": "telegram",
+                "chat_id": "owner-chat",
+                "user_id": "owner-user",
+                "message_id": "message-1",
+                "message_text": " 적용 handle-1 ",
+            },
+            {
+                "platform": "discord",
+                "chat_id": "owner-chat",
+                "user_id": "owner-user",
+                "message_id": "message-1",
+                "message_text": "적용 handle-1",
+            },
+            {
+                "platform": "telegram",
+                "chat_id": "owner-chat",
+                "message_text": "적용 handle-1",
+            },
+        ],
+    )
+    def test_non_owner_non_confirmation_or_non_live_session_receives_no_proof(
+        self,
+        session,
+        monkeypatch,
+    ):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool import _trusted_session_call_arguments
+
+        monkeypatch.setenv(
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+            "vendor-test-secret-at-least-32-characters",
+        )
+        tokens = set_session_vars(**session)
+        arguments = {
+            "response": "적용 handle-1",
+            "reply_handle": "handle-1",
+        }
+        try:
+            unchanged = _trusted_session_call_arguments(
+                self._server(),
+                "resolve_calendar_adjustment",
+                arguments,
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert unchanged == arguments
+
+
 class TestLifecycleConfig:
     def test_get_lifecycle_seconds_accepts_top_level_and_nested_values(self):
         from tools.mcp_tool import _get_lifecycle_seconds

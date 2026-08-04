@@ -57,8 +57,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.calendars.adjustments import (
+    CalendarAdjustmentService,
+    CalendarAdjustmentWriter,
+    SqlAlchemyAdjustmentRepository,
+    digest_reply_handle,
+)
+from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.config import Settings, get_settings, system_timezone
-from healthmes.mcp_server import arousal, impact, interpret, timeline
+from healthmes.mcp_server import adjustment_tools, arousal, impact, interpret, timeline
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.store import (
     AppUsageSample,
@@ -78,6 +85,7 @@ from healthmes.store import (
     session_scope,
 )
 from healthmes.store import enums as store_enums
+from healthmes.trusted_session import verify_trusted_session_proof
 
 # ---------------------------------------------------------------------------
 # Vocabulary grounded in vendor/open-wearables (do not invent values)
@@ -156,6 +164,7 @@ _ow_user_id_override: str | None = None
 _discovered_user_id: str | None = None
 _timezone_override: dt.tzinfo | None = None
 _energy_engine_override: Any | None = None
+_calendar_adjustment_writer_override: CalendarAdjustmentWriter | None = None
 
 
 def set_settings(settings: Settings | None) -> None:
@@ -202,6 +211,11 @@ def set_energy_engine(engine: Any | None) -> None:
     _energy_engine_override = engine
 
 
+def set_calendar_adjustment_writer(writer: CalendarAdjustmentWriter | None) -> None:
+    global _calendar_adjustment_writer_override
+    _calendar_adjustment_writer_override = writer
+
+
 def reset_runtime_state() -> None:
     """Clear every override and cache (test teardown)."""
     global _discovered_user_id
@@ -211,6 +225,7 @@ def reset_runtime_state() -> None:
     set_ow_user_id(None)
     set_timezone(None)
     set_energy_engine(None)
+    set_calendar_adjustment_writer(None)
     _discovered_user_id = None
 
 
@@ -264,9 +279,7 @@ def _local_timezone() -> dt.tzinfo:
     """
     if _timezone_override is not None:
         return _timezone_override
-    name = getattr(_active_settings(), "timezone", None) or os.environ.get(
-        "HEALTHMES_TIMEZONE"
-    )
+    name = getattr(_active_settings(), "timezone", None) or os.environ.get("HEALTHMES_TIMEZONE")
     if name:
         try:
             return zoneinfo.ZoneInfo(str(name))
@@ -299,6 +312,80 @@ def _build_energy_engine() -> Any:
     return CognitiveEnergyEngine(
         settings, session_factory=_session_factory_override, ow_reader=reader
     )
+
+
+class _LazyGoogleAdjustmentWriter:
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._backend: GoogleCalendarBackend | None = None
+
+    def _writer(self) -> GoogleCalendarBackend:
+        if self._backend is None:
+            self._backend = GoogleCalendarBackend.from_data_dir(
+                self._settings.data_dir,
+                calendar_id=self._settings.google_calendar_id,
+                interactive=False,
+            )
+        return self._backend
+
+    def apply_confirmed_external_time_change(self, change):
+        return self._writer().apply_confirmed_external_time_change(change)
+
+    def read_event(self, external_id: str):
+        return self._writer().read_event(external_id)
+
+
+def _calendar_adjustment_writer() -> CalendarAdjustmentWriter:
+    if _calendar_adjustment_writer_override is not None:
+        return _calendar_adjustment_writer_override
+    return _LazyGoogleAdjustmentWriter(_active_settings())
+
+
+def _adjustment_handle_secret(settings: Settings | None = None) -> str:
+    settings = settings or _active_settings()
+    value = settings.calendar_adjustment_secret.get_secret_value().strip()
+    if len(value) < 32:
+        raise ToolError(
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET must be configured "
+            "with at least 32 characters"
+        )
+    return value
+
+
+def _telegram_owner_binding(settings: Settings | None = None) -> tuple[str, str]:
+    settings = settings or _active_settings()
+    user_id = settings.telegram_owner_user_id.strip()
+    chat_id = settings.telegram_owner_chat_id.strip()
+    if not user_id or not chat_id or "*" in {user_id, chat_id}:
+        raise ToolError(
+            "HEALTHMES_TELEGRAM_OWNER_USER_ID and "
+            "HEALTHMES_TELEGRAM_OWNER_CHAT_ID must bind one explicit owner"
+        )
+    return user_id, chat_id
+
+
+def _require_trusted_telegram_owner_proof(
+    proof: str | None,
+    *,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> None:
+    owner_user_id, owner_chat_id = _telegram_owner_binding()
+    if (
+        verify_trusted_session_proof(
+            proof,
+            _adjustment_handle_secret(),
+            tool_name=tool_name,
+            arguments=arguments,
+            expected_user_id=owner_user_id,
+            expected_chat_id=owner_chat_id,
+        )
+        is None
+    ):
+        raise ToolError(
+            "trusted_session_proof is missing or invalid; "
+            "resolve only from the configured owner's live Telegram reply"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +508,56 @@ def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
 
 
+def _public_calendar_adjustment_status(status: Any) -> str:
+    return adjustment_tools.public_calendar_adjustment_status(status)
+
+
+def _decision_viewer_url(decision_id: uuid.UUID | str | None) -> str | None:
+    if decision_id is None:
+        return None
+    from healthmes.api.auth import viewer_url
+
+    return viewer_url(_active_settings(), f"/decisions/{decision_id}")
+
+
+def _local_iso(value: dt.datetime, tz: dt.tzinfo) -> str:
+    return _ensure_utc_dt(value).astimezone(tz).isoformat()
+
+
+def _calendar_adjustment_display(
+    proposal: Any,
+    tz: dt.tzinfo,
+    *,
+    reply_handle: str,
+    decision_tree: Mapping[str, Any] | None = None,
+    event_label: str | None = None,
+) -> dict[str, Any]:
+    return adjustment_tools.calendar_adjustment_display(
+        proposal,
+        tz,
+        reply_handle,
+        decision_tree,
+        event_label,
+        _decision_viewer_url(proposal.proposal_decision_record_id),
+    )
+
+
+def _mirror_to_adjustment_candidate(event: CalendarEventMirror) -> dict[str, Any]:
+    return adjustment_tools.mirror_to_adjustment_candidate(event)
+
+
+def _adjustment_projection(
+    event: CalendarEventMirror, *, now: dt.datetime, tz: dt.tzinfo
+) -> dict[str, Any]:
+    return adjustment_tools.adjustment_projection(event, now=now, tz=tz)
+
+
+def _afternoon_busy_minutes(
+    events: Iterable[CalendarEventMirror], day: dt.date, tz: dt.tzinfo
+) -> int:
+    return adjustment_tools.afternoon_busy_minutes(events, day, tz)
+
+
 # ---------------------------------------------------------------------------
 # open-wearables row digestion — shared pure functions living in
 # healthmes/mcp_server/interpret.py (also consumed by the cognitive-energy
@@ -505,9 +642,7 @@ async def get_health_scores(
     requested = tuple(categories) if categories else DEFAULT_SCORE_CATEGORIES
     invalid = sorted(set(requested) - SCORE_CATEGORIES)
     if invalid:
-        raise ToolError(
-            f"Unknown categories {invalid}; valid: {sorted(SCORE_CATEGORIES)}"
-        )
+        raise ToolError(f"Unknown categories {invalid}; valid: {sorted(SCORE_CATEGORIES)}")
 
     user_id = await _resolve_user_id()
     rows, truncated = await _fetch_health_scores_tracked(
@@ -582,9 +717,7 @@ async def get_health_scores(
     enough_data = bool(scores) and best_days >= min(MIN_AGG_DAYS_WITH_DATA, days)
     return {
         "status": (
-            interpret.STATUS_OK
-            if enough_data and not truncated
-            else interpret.STATUS_INSUFFICIENT
+            interpret.STATUS_OK if enough_data and not truncated else interpret.STATUS_INSUFFICIENT
         ),
         "window": {
             "start_date": start_day.isoformat(),
@@ -600,7 +733,7 @@ async def get_health_scores(
 @mcp.tool
 @_with_ow_errors
 async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]:
-    """"Can I push hard today?" — deterministic readiness context for one day.
+    """ "Can I push hard today?" — deterministic readiness context for one day.
 
     Returns interpreted blocks, each with its own status/confidence: sleep_debt
     (trailing 7 nights of the OW internal sleep score), hrv (last night vs the
@@ -627,12 +760,24 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     )
 
     # --- sleep debt (internal sleep score; algorithms/sleep.py, never reinvented)
-    internal_scores = interpret.daily_series(
-        _localized(_score_points(score_rows, "sleep", provider="internal"), tz),
-        how="max",
+    internal_sleep_points = _localized(
+        _score_points(score_rows, "sleep", provider="internal"), tz
     )
+    internal_scores = interpret.daily_series(internal_sleep_points, how="max")
     if internal_scores:
-        sleep_block = interpret.sleep_debt(internal_scores, as_of)
+        internal_recorded_at = {
+            day: max(
+                recorded_at
+                for recorded_at, value in internal_sleep_points
+                if recorded_at.date() == day and value == score
+            )
+            for day, score in internal_scores.items()
+        }
+        sleep_block = interpret.sleep_debt(
+            internal_scores,
+            as_of,
+            recorded_at_by_day=internal_recorded_at,
+        )
         sleep_block["source"] = "internal_sleep_score"
     else:
         sleep_block = {
@@ -675,6 +820,7 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
 
     # --- charge scores (freshest body_battery / readiness / recovery)
     charge_entries: list[dict[str, Any]] = []
+    charge_recorded_times: list[dt.datetime] = []
     for category in CHARGE_CATEGORIES:
         candidates = [
             (recorded_at, value, row)
@@ -689,6 +835,7 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
         if not candidates:
             continue
         recorded_at, value, row = max(candidates, key=lambda item: item[0])
+        charge_recorded_times.append(recorded_at)
         charge_entries.append(
             {
                 "category": category,
@@ -696,14 +843,18 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
                 "value": round(value, 1),
                 "qualifier": row.get("qualifier"),
                 "observed_on": recorded_at.date().isoformat(),
+                "recorded_at": recorded_at.isoformat(),
             }
         )
     if charge_entries:
-        freshest = max(entry["observed_on"] for entry in charge_entries)
+        freshest_at = max(charge_recorded_times)
         charge_block: dict[str, Any] = {
             "status": interpret.STATUS_OK,
             "entries": charge_entries,
-            "confidence": "high" if freshest == as_of.isoformat() else "medium",
+            "freshest_at": freshest_at.isoformat(),
+            "confidence": (
+                "high" if freshest_at.date() == as_of else "medium"
+            ),
         }
     else:
         charge_block = {
@@ -779,9 +930,7 @@ async def get_personal_baselines(
     requested = tuple(metrics) if metrics else DEFAULT_BASELINE_METRICS
     unknown = sorted(set(requested) - set(_BASELINE_METRICS))
     if unknown:
-        raise ToolError(
-            f"Unknown metrics {unknown}; supported: {sorted(_BASELINE_METRICS)}"
-        )
+        raise ToolError(f"Unknown metrics {unknown}; supported: {sorted(_BASELINE_METRICS)}")
     tz = _local_timezone()
     anchor = _parse_date_local(as_of, "as_of", tz)
     fetch_start = anchor - dt.timedelta(days=interpret.LONG_BASELINE_WINDOW_DAYS + 1)
@@ -825,8 +974,7 @@ async def get_personal_baselines(
                 how="latest",
             )
             proxy_daily = {
-                day: max(0.0, min(100.0, 100.0 - score))
-                for day, score in resilience_daily.items()
+                day: max(0.0, min(100.0, 100.0 - score)) for day, score in resilience_daily.items()
             }
             daily, which = interpret.choose_stress_series(
                 garmin_daily,
@@ -913,7 +1061,7 @@ def _serialize_energy_window(slot: Any, tz: dt.tzinfo) -> dict[str, Any]:
 
 @mcp.tool
 async def get_cognitive_energy_forecast(date: str | None = None) -> dict[str, Any]:
-    """"When is deep work today?" — hourly cognitive-energy scores for one day.
+    """ "When is deep work today?" — hourly cognitive-energy scores for one day.
 
     Returns every hourly window of the given **local** day (`date` is ISO
     YYYY-MM-DD, default today in the user's timezone): windows the hourly
@@ -954,11 +1102,7 @@ async def get_cognitive_energy_forecast(date: str | None = None) -> dict[str, An
     )
     coverage_label = interpret.confidence_label(len(ok_windows), len(windows))
     richness_label = (
-        "high"
-        if len(factors_present) >= 3
-        else "medium"
-        if len(factors_present) == 2
-        else "low"
+        "high" if len(factors_present) >= 3 else "medium" if len(factors_present) == 2 else "low"
     )
 
     def _extreme(pick: Callable[..., Any]) -> Any | None:
@@ -979,9 +1123,7 @@ async def get_cognitive_energy_forecast(date: str | None = None) -> dict[str, An
         "date": day.isoformat(),
         "timezone": str(tz),
         "baseline_window_days": interpret.BASELINE_WINDOW_DAYS,
-        "confidence": _weakest_confidence(coverage_label, richness_label)
-        if ok_windows
-        else "low",
+        "confidence": _weakest_confidence(coverage_label, richness_label) if ok_windows else "low",
         "confidence_detail": {
             "window_coverage": coverage_label,
             "health_factor_richness": richness_label,
@@ -1190,7 +1332,7 @@ async def _arousal_hints_for(
 @mcp.tool
 @_with_ow_errors
 async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
-    """"When and why was I stressed?" — labeled stress intervals for one day.
+    """ "When and why was I stressed?" — labeled stress intervals for one day.
 
     Joins the day's stress series with mirrored calendar events and app-usage
     sessions in the **user's local timezone** and returns interpreted
@@ -1281,9 +1423,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
                 "status": interpret.STATUS_INSUFFICIENT,
                 "date": day.isoformat(),
                 "timezone": str(tz),
-                "reason": str(
-                    context.get("reason", "no_stress_timeseries_and_no_daily_proxy")
-                ),
+                "reason": str(context.get("reason", "no_stress_timeseries_and_no_daily_proxy")),
                 "confidence": "low",
                 "truncated": False,
                 "intervals": [],
@@ -1425,15 +1565,11 @@ def _collect_store_occurrences(
     counts = {"food_log": 0, "calendar": 0, "task": 0}
     with _store_session() as session:
         for row in session.scalars(
-            select(FoodLog).where(
-                FoodLog.logged_at >= start_utc, FoodLog.logged_at < end_utc
-            )
+            select(FoodLog).where(FoodLog.logged_at >= start_utc, FoodLog.logged_at < end_utc)
         ):
             if impact.matches(factor, row.description):
                 at = _ensure_utc_dt(row.logged_at)
-                occurrences.append(
-                    impact.Occurrence("food_log", row.description[:80], at, at)
-                )
+                occurrences.append(impact.Occurrence("food_log", row.description[:80], at, at))
                 counts["food_log"] += 1
         for row in session.scalars(
             select(CalendarEventMirror).where(
@@ -1487,9 +1623,7 @@ async def _collect_workout_occurrences(
         if start is None or not (start_utc <= start < end_utc):
             continue
         end = _parse_recorded_at(row.get("end_time")) or start
-        occurrences.append(
-            impact.Occurrence("workout", workout_type, start, max(end, start))
-        )
+        occurrences.append(impact.Occurrence("workout", workout_type, start, max(end, start)))
     return occurrences
 
 
@@ -1588,7 +1722,7 @@ async def compare_impact(
     window: str = "30d",
     end_date: str | None = None,
 ) -> dict[str, Any]:
-    """"Does X agree with me?" — before/after metric deltas around a factor.
+    """ "Does X agree with me?" — before/after metric deltas around a factor.
 
     `factor` is a case-insensitive keyword matched against food-log
     descriptions, calendar event titles, completed task titles, and workout
@@ -1609,9 +1743,7 @@ async def compare_impact(
             f"factor must be at least {IMPACT_MIN_FACTOR_LENGTH} characters, got {factor!r}"
         )
     if metric not in _IMPACT_METRICS:
-        raise ToolError(
-            f"metric must be one of {sorted(_IMPACT_METRICS)}, got {metric!r}"
-        )
+        raise ToolError(f"metric must be one of {sorted(_IMPACT_METRICS)}, got {metric!r}")
     days = _parse_range_days(window, "window")
     tz = _local_timezone()
     end_day = _parse_date_local(end_date, "end_date", tz)
@@ -1637,9 +1769,7 @@ async def compare_impact(
         truncated = len(occurrences_by_day) > IMPACT_MAX_OCCURRENCES
         if truncated:
             recent_days = sorted(occurrences_by_day)[-IMPACT_MAX_OCCURRENCES:]
-            occurrences_by_day = {
-                day: occurrences_by_day[day] for day in recent_days
-            }
+            occurrences_by_day = {day: occurrences_by_day[day] for day in recent_days}
         used = len(occurrences_by_day)
         daily, detail = await _nightly_daily_series(
             metric,
@@ -1680,15 +1810,12 @@ async def compare_impact(
     if stats["n"] < impact.MIN_PAIRED_OBSERVATIONS:
         return {
             "status": interpret.STATUS_INSUFFICIENT,
-            "reason": (
-                f"need_at_least_{impact.MIN_PAIRED_OBSERVATIONS}_paired_observations"
-            ),
+            "reason": (f"need_at_least_{impact.MIN_PAIRED_OBSERVATIONS}_paired_observations"),
             **base,
             "confidence": "low",
         }
     effect = {
-        key: round(value, 2) if isinstance(value, float) else value
-        for key, value in stats.items()
+        key: round(value, 2) if isinstance(value, float) else value for key, value in stats.items()
     }
     examples = [
         {
@@ -2060,12 +2187,11 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
         )
         proposals = list(
             session.scalars(
-                select(ScheduleProposal).where(
+                select(ScheduleProposal)
+                .where(
                     ScheduleProposal.proposed_start < end,
                     ScheduleProposal.proposed_end > start,
-                    ScheduleProposal.status.in_(
-                        [ProposalStatus.PROPOSED, ProposalStatus.ACCEPTED]
-                    ),
+                    ScheduleProposal.status.in_([ProposalStatus.PROPOSED, ProposalStatus.ACCEPTED]),
                 )
                 .order_by(ScheduleProposal.proposed_start)
             )
@@ -2076,18 +2202,21 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
                 select(Task).where(Task.id.in_([p.task_id for p in proposals]))
             )
         }
-        event_payload = [
-            {
-                "id": str(event.id),
-                "summary": event.summary,
-                "start": _iso_utc(event.start_at),
-                "end": _iso_utc(event.end_at),
-                "calendar_source": _enum_value(event.calendar_source),
-                "is_agent_created": event.is_agent_created,
-                "agent_task_id": str(event.agent_task_id) if event.agent_task_id else None,
-            }
-            for event in events
-        ]
+        now = dt.datetime.now(dt.UTC)
+        event_payload = []
+        for event in events:
+            event_payload.append(
+                {
+                    "id": str(event.id),
+                    "summary": event.summary,
+                    "start": _iso_utc(event.start_at),
+                    "end": _iso_utc(event.end_at),
+                    "calendar_source": _enum_value(event.calendar_source),
+                    "is_agent_created": event.is_agent_created,
+                    "agent_task_id": str(event.agent_task_id) if event.agent_task_id else None,
+                    "adjustment": _adjustment_projection(event, now=now, tz=tz),
+                }
+            )
         proposal_payload = [
             {
                 "id": str(proposal.id),
@@ -2105,6 +2234,170 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
         "events": event_payload,
         "proposals": proposal_payload,
     }
+
+
+@mcp.tool
+async def evaluate_morning_calendar_nudge(date: str | None = None) -> dict[str, Any]:
+    """Evaluate one local morning and return at most one confirmation-gated SHORTEN proposal.
+
+    This tool reads readiness plus the local calendar mirror, but never writes
+    to Google Calendar. A proposal response contains the exact display packet
+    and one-time handle that the trusted Hermes session must relay unchanged.
+    """
+    tz = _local_timezone()
+    local_date = _parse_date_local(date, "date", tz)
+    start, end = _local_day_bounds_utc(local_date, tz)
+    health_context = await get_daily_readiness_context(local_date.isoformat())
+
+    with _store_session() as write_session:
+        repository = SqlAlchemyAdjustmentRepository(write_session)
+        repository.begin_evaluation_boundary()
+        candidates = list(
+            write_session.scalars(
+                select(CalendarEventMirror)
+                .where(CalendarEventMirror.start_at < end, CalendarEventMirror.end_at > start)
+                .order_by(CalendarEventMirror.start_at)
+            )
+        )
+        afternoon_busy = _afternoon_busy_minutes(candidates, local_date, tz)
+        candidate_payload = [_mirror_to_adjustment_candidate(event) for event in candidates]
+
+        service = CalendarAdjustmentService(
+            repository,
+            handle_secret=_adjustment_handle_secret(),
+        )
+        result = service.evaluate_morning_calendar_nudge(
+            local_date=local_date,
+            timezone=tz,
+            health_context=health_context,
+            candidates=candidate_payload,
+            afternoon_busy_minutes=afternoon_busy,
+        )
+        proposal = repository.get_proposal(result.proposal_id) if result.proposal_id else None
+        mirror = (
+            write_session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
+            if proposal is not None
+            else None
+        )
+        display = (
+            _calendar_adjustment_display(
+                proposal,
+                tz,
+                reply_handle=result.reply_handle or "",
+                decision_tree=result.decision_tree,
+                event_label=mirror.summary if mirror is not None else None,
+            )
+            if proposal is not None
+            else None
+        )
+        decision_url = (
+            display["viewer_url"]
+            if display is not None
+            else _decision_viewer_url(result.decision_record_id)
+        )
+
+    payload: dict[str, Any] = {
+        "status": "ok",
+        "outcome": result.outcome,
+        "date": local_date.isoformat(),
+    }
+    if result.reason:
+        payload["reason"] = result.reason
+    if result.outcome == "no_action":
+        payload["display"] = "오늘은 회복 상태와 일정 조건에 맞는 단축 제안이 없습니다."
+    if decision_url is not None:
+        payload["decision_viewer_url"] = decision_url
+    if proposal is not None:
+        payload.update(
+            {
+                "proposal_id": str(proposal.id),
+                "reply_handle": result.reply_handle,
+                "expires_at": _iso_utc(result.expires_at),
+                "display": display,
+            }
+        )
+    return payload
+
+
+@mcp.tool
+def resolve_calendar_adjustment(
+    response: str,
+    reply_handle: str | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Resolve one live Telegram confirmation against its one-time proposal handle.
+
+    The exact live reply is ``적용 <handle>`` or ``그대로 <handle>``. The server
+    resolves the pending proposal from that handle and accepts only a fresh,
+    owner-bound Telegram proof minted by the Hermes gateway.
+    """
+    if not reply_handle:
+        raise ToolError("reply_handle is missing or invalid")
+    if response != response.strip() or response not in {
+        f"적용 {reply_handle}",
+        f"그대로 {reply_handle}",
+    }:
+        raise ToolError("response must be the exact live Telegram reply")
+    proof_arguments = {
+        "response": response,
+        "reply_handle": reply_handle,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="resolve_calendar_adjustment",
+        arguments=proof_arguments,
+    )
+    handle_digest = digest_reply_handle(reply_handle, _adjustment_handle_secret())
+
+    with _store_session() as session:
+        repository = SqlAlchemyAdjustmentRepository(session)
+        proposal = repository.get_pending_proposal_by_handle_digest(handle_digest)
+        if proposal is None:
+            raise ToolError("reply_handle is invalid, expired, or already consumed")
+
+        writer = _calendar_adjustment_writer()
+        service = CalendarAdjustmentService(
+            repository,
+            handle_secret=_adjustment_handle_secret(),
+        )
+        mirror_snapshot = (
+            session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
+            if proposal.snapshot.mirror_event_id is not None
+            else None
+        )
+        result = service.resolve_calendar_adjustment(
+            proposal.id,
+            response=response.split(" ", 1)[0],
+            reply_handle=reply_handle,
+            writer=writer,
+            response_channel="telegram",
+            mirror_snapshot=mirror_snapshot,
+        )
+        current = repository.get_proposal(proposal.id)
+        outcome_url = (
+            _decision_viewer_url(current.outcome_decision_record_id)
+            if current is not None and current.outcome_decision_record_id is not None
+            else None
+        )
+    return {
+        "status": _public_calendar_adjustment_status(result.status),
+        "receipt": result.receipt,
+        "outcome_viewer_url": outcome_url,
+    }
+
+
+def expire_and_reconcile_calendar_adjustments() -> list[dict[str, Any]]:
+    writer = _calendar_adjustment_writer()
+    with _store_session() as session:
+        repository = SqlAlchemyAdjustmentRepository(session)
+        service = CalendarAdjustmentService(
+            repository,
+            handle_secret=_adjustment_handle_secret(),
+        )
+        results = service.expire_and_reconcile_adjustments(writer)
+        return [
+            {"status": _enum_value(result.status), "receipt": result.receipt} for result in results
+        ]
 
 
 class ScheduleBlockIn(BaseModel):
@@ -2334,9 +2627,7 @@ async def create_medical_record(
     this machine (returned fields carry ids and statuses only).
     """
     if kind not in MEDICAL_RECORD_KINDS:
-        raise ToolError(
-            f"kind must be one of {sorted(MEDICAL_RECORD_KINDS)}, got {kind!r}"
-        )
+        raise ToolError(f"kind must be one of {sorted(MEDICAL_RECORD_KINDS)}, got {kind!r}")
     if not description.strip():
         raise ToolError("description must not be empty")
 
@@ -2414,9 +2705,7 @@ def list_medical_records(
     recent `limit` records are kept, still oldest-first).
     """
     if kind is not None and kind not in MEDICAL_RECORD_KINDS:
-        raise ToolError(
-            f"kind must be one of {sorted(MEDICAL_RECORD_KINDS)}, got {kind!r}"
-        )
+        raise ToolError(f"kind must be one of {sorted(MEDICAL_RECORD_KINDS)}, got {kind!r}")
     if not 1 <= limit <= MAX_MEDICAL_LIST_LIMIT:
         raise ToolError(f"limit must be between 1 and {MAX_MEDICAL_LIST_LIMIT}, got {limit}")
     days = _parse_range_days(range, max_days=MAX_MEDICAL_RANGE_DAYS)

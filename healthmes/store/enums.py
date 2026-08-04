@@ -52,6 +52,23 @@ class ProposalStatus(StrEnum):
     DECLINED = "declined"
 
 
+class CalendarMutationOperation(StrEnum):
+    SHORTEN = "shorten"
+
+
+class CalendarMutationStatus(StrEnum):
+    PENDING = "pending"
+    APPLYING = "applying"
+    APPLIED = "applied"
+    APPLIED_RECOVERED = "applied_recovered"
+    DECLINED = "declined"
+    EXPIRED = "expired"
+    CONFLICTED = "conflicted"
+    FAILED = "failed"
+    FAILED_NO_CHANGE = "failed_no_change"
+    UNKNOWN = "unknown"
+
+
 class DecisionKind(StrEnum):
     """What kind of agent decision a decision_record explains (docs/PLAN.md §5)."""
 

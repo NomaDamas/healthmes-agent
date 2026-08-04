@@ -27,7 +27,13 @@ TRANCHE_3_TOOLS = {
     "create_medical_record",
     "list_medical_records",
 }
-EXPECTED_TOOLS = TRANCHE_1_TOOLS | TRANCHE_2_TOOLS | TRANCHE_3_TOOLS
+CALENDAR_ADJUSTMENT_TOOLS = {
+    "evaluate_morning_calendar_nudge",
+    "resolve_calendar_adjustment",
+}
+EXPECTED_TOOLS = (
+    TRANCHE_1_TOOLS | TRANCHE_2_TOOLS | TRANCHE_3_TOOLS | CALENDAR_ADJUSTMENT_TOOLS
+)
 
 _INITIALIZE = {
     "jsonrpc": "2.0",
@@ -43,7 +49,7 @@ _MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 
 
 class TestToolInventory:
-    async def test_exactly_the_tranche_1_2_and_3_tools_are_registered(self, mcp_client):
+    async def test_exactly_the_documented_tools_are_registered(self, mcp_client):
         tools = await mcp_client.list_tools()
         assert {tool.name for tool in tools} == EXPECTED_TOOLS
 

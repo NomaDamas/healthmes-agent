@@ -24,7 +24,7 @@ files or opens network connections.
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
 from healthmes.store.enums import CalendarSource
@@ -39,6 +39,7 @@ __all__ = [
     "CalendarBackend",
     "CalendarConflictError",
     "CalendarError",
+    "ConfirmedExternalTimeChange",
     "EventDraft",
     "EventNotFoundError",
     "ExternalEvent",
@@ -156,6 +157,13 @@ class ExternalEvent:
     agent_task_id: uuid.UUID | None = None
     etag: str | None = None
     deleted: bool = False
+    organizer_self: bool = False
+    has_attendees: bool = False
+    is_recurring: bool = False
+    event_type: str | None = None
+    is_all_day: bool = False
+    is_locked: bool = False
+    status: str | None = None
 
     def __post_init__(self) -> None:
         if not self.external_id:
@@ -168,6 +176,54 @@ class ExternalEvent:
             object.__setattr__(self, "end_at", ensure_utc(self.end_at))
         if self.start_at is not None and self.end_at is not None and self.end_at < self.start_at:
             raise ValueError("ExternalEvent.end_at must not precede start_at")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedExternalTimeChange:
+    """A user-confirmed, time-only mutation for one external event.
+
+    This is the narrow exception to the external-calendar ownership rule:
+    only an end-time shortening fixed by a confirmed proposal can cross this
+    boundary.
+    """
+
+    external_event_id: str
+    original_start_at: datetime
+    original_end_at: datetime
+    proposed_start_at: datetime
+    proposed_end_at: datetime
+    expected_etag: str
+
+    def __post_init__(self) -> None:
+        if not self.external_event_id:
+            raise ValueError("ConfirmedExternalTimeChange.external_event_id must be non-empty")
+        if not self.expected_etag:
+            raise ValueError("ConfirmedExternalTimeChange.expected_etag must be non-empty")
+
+        original_start = ensure_utc(self.original_start_at)
+        original_end = ensure_utc(self.original_end_at)
+        proposed_start = ensure_utc(self.proposed_start_at)
+        proposed_end = ensure_utc(self.proposed_end_at)
+
+        object.__setattr__(self, "original_start_at", original_start)
+        object.__setattr__(self, "original_end_at", original_end)
+        object.__setattr__(self, "proposed_start_at", proposed_start)
+        object.__setattr__(self, "proposed_end_at", proposed_end)
+
+        if original_end <= original_start:
+            raise ValueError("original_end_at must be after original_start_at")
+        if proposed_end <= proposed_start:
+            raise ValueError("proposed_end_at must be after proposed_start_at")
+        if proposed_start != original_start:
+            raise ValueError("v0 external time changes may not move start_at")
+        if not (original_start < proposed_end < original_end):
+            raise ValueError("v0 external time changes must shorten the event end")
+        if original_end - original_start < timedelta(minutes=60):
+            raise ValueError("original duration must be at least 60 minutes")
+        if proposed_end - proposed_start < timedelta(minutes=30):
+            raise ValueError("proposed duration must be at least 30 minutes")
+        if original_end - proposed_end != timedelta(minutes=30):
+            raise ValueError("v0 external time changes must shorten by exactly 30 minutes")
 
 
 @dataclass(frozen=True, slots=True)

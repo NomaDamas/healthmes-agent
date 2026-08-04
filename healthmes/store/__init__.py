@@ -11,6 +11,8 @@ from healthmes.store.base import JSONB, Base, string_enum
 from healthmes.store.enums import (
     TASK_DONE_STATUSES,
     TASK_STATUSES,
+    CalendarMutationOperation,
+    CalendarMutationStatus,
     CalendarSource,
     DecisionKind,
     EnergyDemand,
@@ -21,6 +23,7 @@ from healthmes.store.enums import (
 from healthmes.store.models import (
     AppUsageSample,
     CalendarEventMirror,
+    CalendarMutationProposal,
     CognitiveEnergyEstimate,
     DecisionRecord,
     FoodLog,
@@ -51,6 +54,8 @@ __all__ = [
     "string_enum",
     # enums
     "CalendarSource",
+    "CalendarMutationOperation",
+    "CalendarMutationStatus",
     "DecisionKind",
     "EnergyDemand",
     "MedicalRecordKind",
@@ -63,6 +68,7 @@ __all__ = [
     "MonthlyGoal",
     "RawIngestEvent",
     "CalendarEventMirror",
+    "CalendarMutationProposal",
     "CognitiveEnergyEstimate",
     "DecisionRecord",
     "FoodLog",
