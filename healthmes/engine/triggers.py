@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars.adjustments_proposals import provider_revision_fingerprint
@@ -754,15 +754,15 @@ class TriggerEvaluator:
         outcomes: list[FireOutcome] = []
         pending_keys: set[str] = set()
         for event in events:
-            push = (event.payload or {}).get("push")
-            if not isinstance(push, dict) or push.get("state") != "dispatching":
+            if not self._is_dispatching(event):
                 continue
             locked_event = session.scalar(
                 select(TriggerEvent)
                 .where(TriggerEvent.id == event.id)
                 .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
             )
-            if locked_event is None:
+            if locked_event is None or not self._is_dispatching(locked_event):
                 continue
             event = locked_event
             if event.dedup_key is not None:
@@ -828,6 +828,11 @@ class TriggerEvaluator:
         # recorded is never persisted or pushed again. Keys embed their
         # temporal scope (date / diff fingerprint), so "again later" is a new
         # key by construction.
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:dedup_key, 0))"),
+                {"dedup_key": fire.dedup_key},
+            )
         existing_event = session.scalar(
             select(TriggerEvent)
             .where(TriggerEvent.dedup_key == fire.dedup_key)
@@ -875,14 +880,25 @@ class TriggerEvaluator:
             select(TriggerEvent)
             .where(TriggerEvent.id == event.id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
-        assert event is not None
+        if event is None or not self._is_dispatching(event):
+            return FireOutcome(fire=fire, status="deduplicated")
         return self._deliver_event(
             session,
             fire,
             event,
             payload,
             fired_at=now,
+        )
+
+    @staticmethod
+    def _is_dispatching(event: TriggerEvent) -> bool:
+        push = (event.payload or {}).get("push")
+        return (
+            not event.alert_sent
+            and isinstance(push, dict)
+            and push.get("state") == "dispatching"
         )
 
     def _deliver_event(

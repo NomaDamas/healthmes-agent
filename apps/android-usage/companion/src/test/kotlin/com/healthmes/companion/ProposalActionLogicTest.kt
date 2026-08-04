@@ -49,6 +49,19 @@ class ProposalActionLogicTest {
     }
 
     @Test
+    fun `proposed detail without resolution tokens is not actionable`() {
+        val explicitId = "expired-target"
+        val body = """
+            {"id": "$explicitId", "task_id": "11111111-2222-3333-4444-555555555555",
+             "proposed_start": "2026-07-11T05:00:00", "proposed_end": "2026-07-11T06:00:00",
+             "status": "proposed", "decision_record_id": null,
+             "accept_resolution_token": null, "decline_resolution_token": null}
+        """.trimIndent()
+
+        assertEquals(Target.NonePending, ProposalActionLogic.chooseTarget(body, explicitId))
+    }
+
+    @Test
     fun `2xx with the proposal body reports the reached status`() {
         val body = """
             {"id": "aaa", "task_id": "t", "proposed_start": "2026-07-09T05:00:00Z",

@@ -3,6 +3,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from freezegun import freeze_time
 from pydantic import SecretStr
 
 from healthmes.calendars.adjustments import issue_reply_handle
@@ -237,6 +238,7 @@ def test_proposal_actions_404_for_unknown_id(client):
 def test_proposal_actions_require_valid_unexpired_resolution_token(client, session):
     proposal = _seed_proposal(session)
     endpoint = f"/v1/schedule/proposals/{proposal.id}/accept"
+    expired_token = _resolution_token(client, proposal)
 
     missing = client.post(endpoint)
     assert missing.status_code == 422
@@ -245,15 +247,35 @@ def test_proposal_actions_require_valid_unexpired_resolution_token(client, sessi
     assert invalid.status_code == 403
     assert invalid.json()["error"]["code"] == "invalid_resolution_token"
 
-    proposal.expires_at = datetime.now(UTC) - timedelta(seconds=1)
-    session.commit()
-    expired_token = _resolution_token(client, proposal)
-    expired = client.post(endpoint, json={"resolution_token": expired_token})
+    with freeze_time(proposal.expires_at + timedelta(seconds=1)):
+        expired = client.post(endpoint, json={"resolution_token": expired_token})
     assert expired.status_code == 409
     assert expired.json()["error"]["code"] == "proposal_expired"
 
     session.expire_all()
     assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PROPOSED
+
+
+def test_expired_proposal_is_hidden_from_pending_list_without_losing_direct_audit(
+    client,
+    session,
+):
+    proposal = _seed_proposal(session)
+    proposal.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    session.commit()
+
+    listed = client.get(
+        "/v1/schedule/proposals",
+        params={"status": "proposed"},
+    ).json()
+    response = client.get(f"/v1/schedule/proposals/{proposal.id}")
+
+    assert listed["data"] == []
+    assert listed["pagination"]["total_count"] == 0
+    assert response.status_code == 200
+    assert response.json()["status"] == "proposed"
+    assert response.json()["accept_resolution_token"] is None
+    assert response.json()["decline_resolution_token"] is None
 
 
 def test_resolution_tokens_are_action_and_proposal_scoped(client, session):

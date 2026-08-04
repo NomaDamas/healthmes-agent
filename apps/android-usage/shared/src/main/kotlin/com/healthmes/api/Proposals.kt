@@ -47,6 +47,10 @@ data class Proposal(
     val declineResolutionToken: String?,
 ) {
     val isPending: Boolean get() = status == STATUS_PROPOSED
+    val isActionable: Boolean
+        get() = isPending &&
+            acceptResolutionToken != null &&
+            declineResolutionToken != null
 
     companion object {
         const val STATUS_PROPOSED = "proposed"

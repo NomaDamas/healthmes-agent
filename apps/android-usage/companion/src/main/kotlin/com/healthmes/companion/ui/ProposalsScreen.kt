@@ -262,7 +262,7 @@ private fun ProposalCard(
                     label = { Text(proposal.status, style = MaterialTheme.typography.labelSmall) },
                 )
             }
-            if (proposal.isPending) {
+            if (proposal.isActionable) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Spacer(modifier = Modifier.weight(1f))
                     TextButton(enabled = !busy, onClick = onDecline) {

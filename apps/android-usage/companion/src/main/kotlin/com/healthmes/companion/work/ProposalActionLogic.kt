@@ -28,7 +28,7 @@ object ProposalActionLogic {
     fun chooseTarget(body: String, explicitId: String?): Target =
         if (explicitId != null) {
             val proposal = Proposal.parse(org.json.JSONObject(body))
-            if (proposal.id == explicitId && proposal.isPending) {
+            if (proposal.id == explicitId && proposal.isActionable) {
                 Target.Single(proposal)
             } else {
                 Target.NonePending

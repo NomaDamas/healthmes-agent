@@ -83,14 +83,23 @@ def _handle_secret(request: Request) -> str:
 
 def _proposal_out(proposal: ScheduleProposal, request: Request) -> ProposalOut:
     handle_secret = _handle_secret(request)
+    expires_at = proposal.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    actionable = (
+        proposal.status is ProposalStatus.PROPOSED
+        and expires_at is not None
+        and datetime.now(UTC) < expires_at
+        and len(handle_secret) >= 32
+    )
     accept_token = (
         resolution_token(proposal, handle_secret, ProposalStatus.ACCEPTED)
-        if proposal.status is ProposalStatus.PROPOSED and len(handle_secret) >= 32
+        if actionable
         else None
     )
     decline_token = (
         resolution_token(proposal, handle_secret, ProposalStatus.DECLINED)
-        if proposal.status is ProposalStatus.PROPOSED and len(handle_secret) >= 32
+        if actionable
         else None
     )
     return ProposalOut.model_validate(proposal).model_copy(
@@ -143,6 +152,8 @@ def list_proposals(
     )
     if status_filter is not None:
         stmt = stmt.where(ScheduleProposal.status == status_filter)
+        if status_filter is ProposalStatus.PROPOSED:
+            stmt = stmt.where(ScheduleProposal.expires_at > datetime.now(UTC))
     if task_id is not None:
         stmt = stmt.where(ScheduleProposal.task_id == task_id)
     rows, meta = paginate(session, stmt, page)

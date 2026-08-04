@@ -141,7 +141,7 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             let outcome: ProposalOutcome
             do {
                 let proposal = try await api.getProposal(proposalID)
-                if proposal.status == .proposed {
+                if proposal.isActionable {
                     _ = try await api.resolveProposal(proposal, action: action)
                     outcome = ProposalOutcome.from(action: action, error: nil)
                 } else {

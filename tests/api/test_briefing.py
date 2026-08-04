@@ -280,6 +280,7 @@ def test_seeded_glance_returns_exact_payload(client, seeded):
         "alerts": {
             "unresolved_count": 2,
             "top": {
+                "id": str(TRIGGER_ALERT_TOP_ID),
                 "rule_id": "stress_spike_vs_baseline",
                 "summary": "Stress 82 vs baseline 55",
                 "decision_url": f"{BASE_URL}/decisions/{DECISION_ALERT_TOP_ID}",
@@ -315,15 +316,14 @@ def test_empty_database_yields_valid_all_null_shape(client):
 def test_alert_without_payload_or_decision_degrades_honestly(client, session):
     # Legacy/threadbare rows: no payload -> the rule id is the summary; no
     # alert-kind decision recorded after the fire -> decision_url null.
-    session.add(
-        TriggerEvent(
-            fired_at=_utc(9, 13, 0),
-            rule_id="schedule_changed",
-            payload=None,
-            alert_sent=True,
-            dedup_key="sched:2026-07-09",
-        )
+    event = TriggerEvent(
+        fired_at=_utc(9, 13, 0),
+        rule_id="schedule_changed",
+        payload=None,
+        alert_sent=True,
+        dedup_key="sched:2026-07-09",
     )
+    session.add(event)
     # An alert decision from BEFORE the fire must not be claimed by it.
     session.add(
         DecisionRecord(
@@ -338,6 +338,7 @@ def test_alert_without_payload_or_decision_degrades_honestly(client, session):
     body = client.get(GLANCE).json()
 
     assert body["alerts"]["unresolved_count"] == 1
+    assert body["alerts"]["top"]["id"] == str(event.id)
     assert body["alerts"]["top"]["rule_id"] == "schedule_changed"
     assert body["alerts"]["top"]["summary"] == "schedule_changed"
     assert body["alerts"]["top"]["decision_url"] is None

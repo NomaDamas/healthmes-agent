@@ -74,7 +74,7 @@ final class SeenAlertsStoreTests: XCTestCase {
         return (SeenAlertsStore(defaults: defaults), defaults)
     }
 
-    private func alert(_ id: UUID) -> AlertItem {
+    private func alert(_ id: UUID, proposalId: UUID? = nil) -> AlertItem {
         AlertItem(
             id: id,
             ruleId: "rule",
@@ -83,7 +83,7 @@ final class SeenAlertsStoreTests: XCTestCase {
             proposal: nil,
             evidence: nil,
             decisionUrl: nil,
-            proposalId: nil
+            proposalId: proposalId
         )
     }
 
@@ -104,6 +104,50 @@ final class SeenAlertsStoreTests: XCTestCase {
         let existing = [alert(UUID()), alert(UUID())]
         store.primeWithoutNotifying(existing)
         XCTAssertTrue(store.unseen(from: existing).isEmpty)
+    }
+
+    func testProposalCorrelationUpgradesAnInformationalAlertOnce() {
+        let (store, _) = makeStore()
+        let id = UUID()
+        let informational = alert(id)
+        let actionable = alert(id, proposalId: UUID())
+
+        store.markSeen([informational])
+        XCTAssertEqual(store.unseen(from: [actionable]).map(\.id), [id])
+        store.markSeen([actionable])
+        XCTAssertTrue(store.unseen(from: [actionable]).isEmpty)
+    }
+
+    func testLegacySeenIDMigratesToTheCurrentRevision() {
+        let (store, defaults) = makeStore()
+        let id = UUID()
+        defaults.set([id.uuidString.lowercased()], forKey: SeenAlertsStore.defaultsKey)
+
+        let informational = alert(id)
+        XCTAssertTrue(store.unseen(from: [informational]).isEmpty)
+        XCTAssertEqual(
+            store.unseen(from: [alert(id, proposalId: UUID())]).map(\.id),
+            [id]
+        )
+    }
+
+    func testLegacySeenIDDoesNotConsumeCurrentActionableRevision() {
+        let (store, defaults) = makeStore()
+        let id = UUID()
+        defaults.set([id.uuidString.lowercased()], forKey: SeenAlertsStore.defaultsKey)
+
+        XCTAssertEqual(
+            store.unseen(from: [alert(id, proposalId: UUID())]).map(\.id),
+            [id]
+        )
+    }
+
+    func testResolvedProposalDoesNotDowngradeIntoANewInformationalAlert() {
+        let (store, _) = makeStore()
+        let id = UUID()
+        store.markSeen([alert(id, proposalId: UUID())])
+
+        XCTAssertTrue(store.unseen(from: [alert(id)]).isEmpty)
     }
 
     func testCapKeepsNewestIDs() {

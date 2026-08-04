@@ -63,6 +63,12 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
         case .decline: declineResolutionToken
         }
     }
+
+    public var isActionable: Bool {
+        status == .proposed
+            && acceptResolutionToken != nil
+            && declineResolutionToken != nil
+    }
 }
 
 public typealias ProposalsPage = APIPage<ProposalItem>

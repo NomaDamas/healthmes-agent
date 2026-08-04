@@ -84,7 +84,7 @@ struct ProposalDetailView: View {
                     Text("Proposed block")
                 }
 
-                if proposal.status == .proposed {
+                if proposal.isActionable {
                     Section {
                         Button {
                             Task { await resolve(.accept) }

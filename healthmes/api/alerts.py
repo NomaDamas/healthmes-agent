@@ -83,11 +83,13 @@ def _proposal_ids(
     """
     if not decision_ids:
         return {}
+    now = utc_now()
     by_decision: dict[uuid.UUID, list[uuid.UUID]] = {}
     for decision_id, proposal_id in session.execute(
         select(ScheduleProposal.decision_record_id, ScheduleProposal.id).where(
             ScheduleProposal.decision_record_id.in_(set(decision_ids.values())),
             ScheduleProposal.status == ProposalStatus.PROPOSED,
+            ScheduleProposal.expires_at > now,
         )
     ):
         if decision_id is not None:

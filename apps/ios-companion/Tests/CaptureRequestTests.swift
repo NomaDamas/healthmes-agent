@@ -240,11 +240,22 @@ final class CaptureRequestTests: XCTestCase {
             """
         let proposal = try GlanceJSON.decoder().decode(ProposalItem.self, from: Data(json.utf8))
         XCTAssertEqual(proposal.status, .proposed)
+        XCTAssertTrue(proposal.isActionable)
         XCTAssertNil(proposal.decisionRecordId)
         XCTAssertEqual(proposal.resolutionToken(for: .accept), "accept-token")
         XCTAssertEqual(proposal.resolutionToken(for: .decline), "decline-token")
         XCTAssertEqual(
             proposal.proposedEnd.timeIntervalSince(proposal.proposedStart), 90 * 60
         )
+
+        let expiredJSON = json
+            .replacingOccurrences(of: "\"accept-token\"", with: "null")
+            .replacingOccurrences(of: "\"decline-token\"", with: "null")
+        let expired = try GlanceJSON.decoder().decode(
+            ProposalItem.self,
+            from: Data(expiredJSON.utf8)
+        )
+        XCTAssertEqual(expired.status, .proposed)
+        XCTAssertFalse(expired.isActionable)
     }
 }

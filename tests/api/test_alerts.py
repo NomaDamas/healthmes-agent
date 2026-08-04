@@ -160,6 +160,7 @@ def test_decision_links_use_exact_trigger_correlation(client, seeded):
 
     # The list must agree with the glance widget contract verbatim.
     assert glance_alerts["unresolved_count"] == len(alerts) == 2
+    assert glance_alerts["top"]["id"] == alerts[0]["id"]
     assert glance_alerts["top"]["rule_id"] == alerts[0]["rule_id"]
     assert glance_alerts["top"]["summary"] == alerts[0]["summary"]
     assert glance_alerts["top"]["decision_url"] == alerts[0]["decision_url"]
@@ -235,6 +236,46 @@ def test_proposal_alert_resolves_its_direct_target_beyond_first_page(
 
     assert resolved.status_code == 200
     assert resolved.json()["status"] == "accepted"
+
+
+def test_expired_proposal_is_not_exposed_as_an_alert_action(client, session):
+    event = _event(
+        _utc(9, 13, 50),
+        "calendar_task_intake",
+        payload=_payload("An expired calendar task proposal."),
+    )
+    decision = DecisionRecord(
+        kind=DecisionKind.ALERT,
+        tree={"id": "root", "type": "action", "label": "schedule", "children": []},
+        summary="Expired schedule proposal",
+        trigger_event_id=event.id,
+    )
+    task = Task(
+        title="Expired task",
+        energy_demand=EnergyDemand.MED,
+        status="scheduled",
+        source=TaskSource.AGENT,
+    )
+    session.add_all([event, decision, task])
+    session.flush()
+    session.add(
+        ScheduleProposal(
+            task_id=task.id,
+            proposed_start=_utc(10, 9),
+            proposed_end=_utc(10, 10),
+            status=ProposalStatus.PROPOSED,
+            decision_record_id=decision.id,
+            reply_handle_digest="a" * 64,
+            expires_at=_utc(9, 14, 22),
+        )
+    )
+    session.commit()
+
+    with frozen():
+        (alert,) = client.get(ALERTS).json()["data"]
+
+    assert alert["id"] == str(event.id)
+    assert alert["proposal_id"] is None
 
 
 def test_multiple_alerts_keep_exact_proposals_when_decisions_finish_out_of_order(

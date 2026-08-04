@@ -186,7 +186,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             do {
                 let api = HealthMesAPI()
                 let pending = try await api.getProposal(proposalID)
-                guard pending.status == .proposed else {
+                guard pending.isActionable else {
                     await postOutcome(
                         title: String(localized: "Already resolved"),
                         body: String(localized: "This proposal is no longer pending.")

@@ -24,7 +24,8 @@ Response shape (all timestamps ISO-8601 aware UTC, ``Z`` suffix)::
       ],
       "alerts": {
         "unresolved_count": 2,
-        "top": {"rule_id": ..., "summary": ..., "decision_url": ...|null} | null
+        "top": {"id": ..., "rule_id": ..., "summary": ...,
+                "decision_url": ...|null} | null
       },
       "latest_decision": {"id": ..., "url": ...} | null
     }
@@ -150,6 +151,7 @@ class GlanceBlockOut(BaseModel):
 class GlanceAlertOut(BaseModel):
     """The most recent unresolved alert, notification-grammar shaped."""
 
+    id: uuid.UUID
     rule_id: str
     summary: str
     decision_url: str | None
@@ -346,6 +348,7 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
     return GlanceAlertsOut(
         unresolved_count=len(events),
         top=GlanceAlertOut(
+            id=top.id,
             rule_id=top.rule_id,
             # The observation line of the notification grammar; the rule id is
             # the honest fallback when a legacy row has no payload.
