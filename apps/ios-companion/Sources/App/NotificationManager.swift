@@ -26,17 +26,25 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
 
+        #if targetEnvironment(simulator)
+            let protectedActionOptions: UNNotificationActionOptions = []
+        #else
+            let protectedActionOptions: UNNotificationActionOptions = [.authenticationRequired]
+        #endif
+
         // The same native category is mirrored to Apple Watch, where the
         // owner can decide without opening either app.
         let yes = UNNotificationAction(
             identifier: ActionID.yes,
             title: String(localized: "Yes"),
-            options: [.authenticationRequired]
+            options: protectedActionOptions,
+            icon: UNNotificationActionIcon(systemImageName: "checkmark.circle.fill")
         )
         let no = UNNotificationAction(
             identifier: ActionID.no,
             title: String(localized: "No"),
-            options: [.authenticationRequired]
+            options: protectedActionOptions,
+            icon: UNNotificationActionIcon(systemImageName: "xmark.circle")
         )
         let actionable = UNNotificationCategory(
             identifier: AlertNotificationContent.actionableCategoryID,

@@ -30,7 +30,8 @@ final class NotificationContentTests: XCTestCase {
         XCTAssertEqual(content.title, "Recovery 38 today.")
         XCTAssertEqual(
             content.body,
-            "baseline_days 14 · hrv_delta_pct -18\nMove the 14:00 block to tomorrow."
+            "baseline_days 14 · hrv_delta_pct -18\nMove the 14:00 block to tomorrow.\n"
+                + AlertNotificationContent.expansionHint
         )
         // Buttons only exist because a real pending proposal is attached.
         XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)
@@ -69,6 +70,60 @@ final class NotificationContentTests: XCTestCase {
         XCTAssertEqual(content.categoryID, AlertNotificationContent.infoCategoryID)
         XCTAssertNil(content.userInfo[AlertNotificationContent.userInfoProposalID])
         XCTAssertNil(content.userInfo[AlertNotificationContent.userInfoDecisionURL])
+        XCTAssertFalse(content.body.contains(AlertNotificationContent.expansionHint))
+    }
+
+    func testDecisionCardUsesCompactActionableBannerAndExtensionPayload() {
+        let after = Date(timeIntervalSince1970: 1_783_674_600)
+        let endsAt = after.addingTimeInterval(5_400)
+        let expiresAt = Date(timeIntervalSince1970: 1_783_610_400)
+        let card = DecisionCard(
+            decisionId: alertID,
+            proposalId: proposalID,
+            kind: "schedule_move",
+            severity: "coaching",
+            title: "Protect recovery",
+            observationShort: "Sleep debt is high",
+            evidenceShort: "HRV is 18% below baseline",
+            proposedAction: "Move deep work to tomorrow at 09:30?",
+            before: nil,
+            after: after,
+            endsAt: endsAt,
+            expiresAt: expiresAt,
+            decisionUrl: nil
+        )
+        let alert = AlertItem(
+            id: alertID,
+            ruleId: "low_recovery_heavy_afternoon",
+            firedAt: Date(),
+            summary: "Fallback summary",
+            proposal: "Fallback proposal",
+            evidence: nil,
+            decisionUrl: nil,
+            proposalId: proposalID,
+            decisionCard: card
+        )
+
+        let content = AlertNotificationContent.from(alert: alert)
+
+        XCTAssertEqual(content.title, "Sleep debt is high")
+        XCTAssertEqual(
+            content.body,
+            "Move deep work to tomorrow at 09:30?\n"
+                + AlertNotificationContent.expansionHint
+        )
+        XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)
+        XCTAssertEqual(
+            content.userInfo[AlertNotificationContent.userInfoDecisionObservation],
+            "Sleep debt is high"
+        )
+        XCTAssertEqual(
+            content.userInfo[AlertNotificationContent.userInfoDecisionAction],
+            "Move deep work to tomorrow at 09:30?"
+        )
+        XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionAfter])
+        XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionEndsAt])
+        XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionExpiresAt])
     }
 
     func testEvidenceLineIsSortedAndTypeStable() {
@@ -95,7 +150,10 @@ final class NotificationContentTests: XCTestCase {
         )
         let content = AlertNotificationContent.from(alert: page.data[0])
         XCTAssertEqual(content.title, "Recovery 38 today.")
-        XCTAssertTrue(content.body.hasSuffix("Move the 14:00 block to tomorrow."))
+        XCTAssertTrue(
+            content.body.contains("Move the 14:00 block to tomorrow.")
+                && content.body.hasSuffix(AlertNotificationContent.expansionHint)
+        )
         XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(
             content.userInfo[AlertNotificationContent.userInfoProposalID],

@@ -21,18 +21,12 @@ WatchConnectivity and then talks to the instance directly.
   (`summary`), evidence line rendered from the `evidence` facts, proposal
   line, relative fired-time, "Why this?" → in-app decision viewer. Lines the
   payload does not carry are dropped, never invented.
-- **Decision Remote actions** — **Yes** →
-  `POST /v1/schedule/proposals/{id}/accept`, **No** → `…/decline`, directly
-  from the iPhone notification or its mirrored Apple Watch notification.
-  A second
+- **Real alert actions** — ✅ Apply → `POST /v1/schedule/proposals/{id}/accept`,
+  ❌ Keep as is → `…/decline`, ✏️ Adjust → proposal detail sheet. A second
   tap elsewhere (or in Telegram) surfaces as the server's 409
   `invalid_transition` → rendered "Already resolved (accepted/declined)".
   App actions return the action-scoped `resolution_token` from the authenticated
-  pending-proposal response. The server records `decided_at` and
-  `decision_surface` (`apple_notification` for mirrored iPhone/Watch actions,
-  because iOS does not expose which device handled the response); accepted
-  proposals are written by the calendar job and
-  then become `pushed`.
+  pending-proposal response.
 - **Weekly report** — native rendering of `GET /reports/weekly.json`:
   per-day energy bars (hollow stubs for missing days), insights with
   confidence badges (high/medium/low/none), schedule adherence, alert
@@ -50,15 +44,15 @@ WatchConnectivity and then talks to the instance directly.
   uploaded `media_path`, so Retry never re-uploads or loses data. Medical
   captures send capture metadata only (`context.capture`); the server
   attaches its own health snapshot (`context.health`).
-- **Native Decision Card notifications** —
+- **Native notifications** (parity with Android's `AlertNotifier`) —
   BGAppRefreshTask + foreground sync poll `GET /v1/alerts`, diff against a
   seen-store (exactly-once per alert), and post local notifications in the
-  §8.5 grammar. `decision_card` links the alert's persisted decision to one
-  exact pending proposal; only an unambiguous, unexpired proposal receives
-  **Yes/No** actions. Long-press on iPhone opens the custom Decision Card
-  content extension. The same native actions are mirrored by watchOS; the
-  custom iPhone layout itself is not copied to the watch. Tap-through opens
-  the decision viewer. Badge = unresolved count.
+  §8.5 grammar: observation title, evidence+proposal body, per-rule thread.
+  ✅/✏️/❌ actions are attached **only when exactly one pending proposal
+  exists** (no alert→proposal FK exists yet, so that is the only case where
+  "Apply" is unambiguous) and call the real endpoints from the action
+  handler, confirming with an outcome notification. Tap-through opens the
+  decision viewer. Badge = unresolved count.
 - **Live Activity** — current focus block (from glance `next_blocks`) on
   the lock screen / Dynamic Island with timer progress; started on
   foreground refresh, updated by the background task, `staleDate = block
@@ -91,7 +85,7 @@ deliverable: `docs/design/WATCH-NOTIFICATIONS.ko.md` (design system:
 | Endpoint | Used by |
 |---|---|
 | `GET /v1/briefing/glance` (ETag/304, max-age 300) | home, widgets, watch, Live Activity |
-| `GET /v1/alerts?hours=24` (§8.5 grammar + `decision_card`) | home alert list, notifications |
+| `GET /v1/alerts?hours=24` (§8.5 grammar items) | home alert list, notifications |
 | `GET /v1/schedule/proposals?status=proposed` + `POST …/{id}/accept\|decline` | proposal cards, notification actions |
 | `GET /reports/weekly.json` | report tab |
 | `POST /v1/media` (multipart `file`) + `GET /v1/media/{path}` | capture upload / preview URL |
@@ -159,33 +153,6 @@ xcrun simctl launch booted com.healthmes.companion
 # 3. run the UI acceptance tests against it
 xcodebuild test … -only-testing:HealthMesCompanionUITests
 ```
-
-## Real-device Decision Remote QA
-
-Simulator builds need no signing, but an iPhone and Apple Watch do. On this
-Mac, Xcode currently reports no valid code-signing identity, so the final
-hardware-only step must be performed after selecting the owner's Apple
-Developer Team.
-
-1. Run `xcodegen generate`, open `HealthMesCompanion.xcodeproj`, and select the
-   same Team for `HealthMesCompanion`, `HealthMesNotificationContent`,
-   `HealthMesWidgets`, `HealthMesWatchApp`, and `HealthMesWatchWidgets`.
-2. Connect the paired iPhone and Apple Watch, run the iPhone app, then install
-   the watch app from the Watch app if Xcode does not install it automatically.
-3. Pair with `https://healthmes-agent.jinminseong.com` and the configured
-   `HEALTHMES_API_TOKEN`; allow notifications and enable iPhone notification
-   mirroring for HealthMes in the Watch app.
-4. On this Mac, open `http://127.0.0.1:8100/settings`, unlock with the API
-   token, and choose **테스트 결정 만들기**.
-5. Refresh HealthMes once on iPhone, close it, then choose **Yes** or **No**
-   from the iPhone notification or Apple Watch notification.
-6. In **결정 기록 보기**, verify the decision surface and outcome. For Yes,
-   first expect `accepted`; after the connected calendar job runs, expect
-   `pushed` and verify the HealthMes-owned block in Apple or Google Calendar.
-
-The notification is polling-derived, not APNs-delivered. Foreground refresh is
-the deterministic QA trigger; background arrival timing remains controlled by
-iOS.
 
 ## Pairing flow
 
@@ -284,7 +251,7 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
 
 **Not yet verified (honest list):**
 
-- **No real device runs yet.** Everything below the simulator boundary is
+- **No real device runs.** Everything below the simulator boundary is
   unproven on hardware: App Group + Keychain access-group sharing under
   real signing, WidgetKit budgets, ATS vs LAN IPs, camera capture (the
   simulator has no camera; the code path is device-only by
@@ -295,11 +262,7 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
   support them but starting requires app-foreground timing not driven in
   tests), notification banner delivery + action buttons under a real OS
   budget (content builder unit-tested; delivery path not UI-automated).
-- **Watch notification action mirroring and WatchConnectivity pairing sync**
-  still need the signed iPhone + Apple Watch run described above. The native
-  Yes/No category compiles for iOS and is the system-owned interaction that
-  watchOS mirrors; the custom iPhone content extension is not a watch layout.
-  The pairing path also needs
+- **WatchConnectivity pairing sync** still not exercised end-to-end (needs
   a paired phone+watch simulator pair or hardware); the watch app renders
   its "not paired" guidance until the first sync lands. Watch surfaces
   remain #7-era placeholders by design (expert worksheet pending).
@@ -309,6 +272,6 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
   embedded into the iPhone app for distribution.
 - Voice-capture transcription is manual (a transcript field) — no on-device
   speech-to-text yet; the server accepts `transcript` when present.
-- Notification Yes/No buttons attach only when the alert's persisted decision
-  maps to exactly one unexpired pending proposal. Ambiguous decisions remain
-  view-only rather than guessing which calendar mutation the user intended.
+- Notification ✅/✏️/❌ buttons attach only when exactly one proposal is
+  pending; a proper alert→proposal link needs a server-side FK (recorded as
+  a follow-up need, matches the store's documented placeholder policy).

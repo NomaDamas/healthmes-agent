@@ -454,8 +454,8 @@ shapes are pinned in `tests/api/`):
 | `POST /v1/media` | bearer **only** | `multipart/form-data`, field name exactly `file`; client filename ignored. `Content-Length` **required** (`411` without one — chunked bodies are refused; the size cap is enforced off the header BEFORE the body is received/spooled). Content-type allowlist (jpeg/png/heic/webp images, m4a/mp3/ogg/wav audio; aliases normalized). `201 → {media_path, content_type, bytes}`; `415` (detail.allowed), `413` (cap = `HEALTHMES_MEDIA_MAX_UPLOAD_BYTES`, default 15 MiB; declared length beyond cap + 64 KiB envelope allowance is refused unread), `422` missing `file` field or empty file. Files land under `{data_dir}/media/YYYY/MM/` (UTC sharding). |
 | `GET /v1/media/{media_path}` | bearer **or** derived viewer `?token=` (GET/HEAD only) | Serves the upload back (real content type, `Cache-Control: private, max-age=86400, immutable`); decision/report pages and in-app web views can embed via `<img>`/`<audio>`. All path tricks → uniform 404. |
 | `POST /v1/medical-records` | bearer | REST twin of the `create_medical_record` MCP tool (the Telegram capture-skill contract): `{kind: medication\|symptom, description, media_path?, transcript?, context?}`. The server attaches the deterministic health snapshot under `context.health` (degrades to `{status: unavailable}` when open-wearables is down — capture never fails for infra reasons); caller context is stored under `context.capture`. |
-| `GET /v1/alerts` | bearer | Alert history in glance semantics ("unresolved == recently pushed"): `?hours=1..168` (default 24), paginated `Page` envelope, newest first. Items carry the §8.5 grammar, `decision_url`, and an optional platform-neutral `decision_card` linked to exactly one unexpired pending proposal. |
-| `POST /v1/schedule/proposals/{id}/accept` / `/decline` | bearer | Native **Yes/No** actions. The optional `surface` records where the owner decided. Yes means `accepted`; the calendar job later writes and read-backs the event before status becomes `pushed`. Second tap → `409 invalid_transition`; unknown id → 404. |
+| `GET /v1/alerts` | bearer | Alert history in glance semantics ("unresolved == recently pushed"): `?hours=1..168` (default 24), paginated `Page` envelope, newest first. Items carry the §8.5 grammar recorded at fire time (`summary`/`evidence`/`proposal`) + `decision_url`; `alerts[0]` agrees verbatim with the glance top alert (test-pinned). |
+| `POST /v1/schedule/proposals/{id}/accept` / `/decline` | bearer | The apps' ✅/❌ actions. Second tap → `409 invalid_transition` with `detail {current, requested}` (render "already resolved"); unknown id → 404. |
 | `POST /v1/food-logs` | bearer | Accepts `media_path` from `POST /v1/media` (≤500 chars). |
 
 Client caveats worth knowing (all handled by the shipped apps):
@@ -464,68 +464,13 @@ Client caveats worth knowing (all handled by the shipped apps):
   food-logs) serialize naive-UTC datetimes (no `Z`), while glance/alerts
   serialize timezone-aware — clients must parse both (the shared parsers
   treat naive as UTC).
-- **No guessing across proposals**: an alert follows its persisted
-  `TriggerEvent → DecisionRecord → ScheduleProposal` correlation. Native
-  actions appear only when that decision has exactly one unexpired pending
-  proposal; multi-proposal decisions remain view-only.
+- **No alert→proposal linkage yet**: alert items carry no
+  `schedule_proposal` id, so notification action buttons act only when
+  exactly one proposal is pending (the no-guessing policy of PLAN §11);
+  otherwise they route into the app. Lifting this needs a server-side
+  linkage field.
 - Push relay (APNs/FCM/WNS) is out of scope **by design** — notification
   delivery is OS-budgeted polling; Telegram is the guaranteed channel.
-
-### 통합 설정과 공개 Live QA
-
-`GET /settings` is the single status/setup surface for Decision Remote,
-notification hygiene, Google/Apple calendars, Open Wearables, backup, and QA.
-The public host accepts the derived read-only viewer token, but configuration
-writes and QA-decision creation are restricted to a direct loopback browser
-session with CSRF protection. Secrets are never rendered after save.
-
-```bash
-# Public URL and the jobs required for accepted -> pushed:
-HEALTHMES_API_TOKEN=<high-entropy-owner-token>
-HEALTHMES_PUBLIC_BASE_URL=https://healthmes-agent.jinminseong.com
-HEALTHMES_SCHEDULER_ENABLED=true
-HEALTHMES_NATIVE_ALERT_DELIVERY=true
-
-# Mint missing signing secrets without replacing existing values:
-uv run python scripts/bootstrap.py --skip-cron
-
-# Apply the Decision Remote outcome migration:
-uv run alembic upgrade head
-```
-
-For the full local stack (`com.healthmes.local`), restart it so `.env` is
-reloaded, then revalidate and restart the public tunnel:
-
-```bash
-scripts/healthmes_local.sh restart
-scripts/install_public_launch_agents.sh
-```
-
-For the API-only public agent, the installer itself restarts the API and
-tunnel:
-
-```bash
-scripts/install_public_launch_agents.sh
-```
-
-The installer refuses to expose the tunnel when `HEALTHMES_API_TOKEN` is
-empty. The repository-owned Cloudflare ingress template is
-`config/cloudflared.healthmes-agent.yml.in`. The installer renders the
-configured `HEALTHMES_PORT` into `~/.cloudflared/config.yml`; the credential
-file itself stays machine-local and is never copied into the repository.
-Route both hostnames to the existing tunnel and keep the catch-all 404 rule
-last.
-
-For a persistent macOS owner deployment, install the two narrow LaunchAgents:
-
-```bash
-scripts/install_public_launch_agents.sh
-launchctl print gui/$UID/com.healthmes.agent.public
-launchctl print gui/$UID/com.healthmes.agent.tunnel
-```
-
-They run only the HealthMes API and the named Cloudflare tunnel, restart on
-failure, and write logs under `~/Library/Logs/HealthMes/`.
 
 ## 캘린더 연결 (calendar connect)
 

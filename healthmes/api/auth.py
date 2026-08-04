@@ -75,10 +75,9 @@ VIEWER_PATH_PREFIXES = (
     "/v1/media/",
     "/connect",
     "/sleep",
-    "/settings",
 )
 LOCAL_SESSION_BOOTSTRAP_POST_PATHS = frozenset(
-    {"/connect/unlock", "/sleep/unlock", "/settings/unlock"}
+    {"/connect/unlock", "/sleep/unlock"}
 )
 _VIEWER_TOKEN_CONTEXT = b"healthmes-viewer:"
 
@@ -207,8 +206,6 @@ class BearerTokenMiddleware:
             or path.startswith("/connect/google/")
             or path == "/sleep"
             or path.startswith("/sleep/")
-            or path == "/settings"
-            or path.startswith("/settings/")
         )
 
     @staticmethod

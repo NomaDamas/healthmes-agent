@@ -55,6 +55,7 @@ targets:
       path: Support/HealthMesCompanion-Info.plist
       properties:
         CFBundleDisplayName: HealthMes
+        HealthMesKeychainAccessGroup: $(AppIdentifierPrefix)group.com.healthmes.companion
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         ITSAppUsesNonExemptEncryption: false
@@ -95,6 +96,8 @@ targets:
       properties:
         com.apple.security.application-groups:
           - group.com.healthmes.companion
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)group.com.healthmes.companion
 
   # ------------------------------------------- iOS home + lock-screen widgets
   # Also hosts the focus-block Live Activity UI (ActivityKit renders live
@@ -133,6 +136,7 @@ targets:
     type: app-extension
     platform: iOS
     sources:
+      - Sources/Shared/Pairing.swift
       - Sources/NotificationContentExtension
     resources:
       - Resources/Localizable.xcstrings
@@ -145,13 +149,24 @@ targets:
       path: Support/HealthMesNotificationContent-Info.plist
       properties:
         CFBundleDisplayName: HealthMes Decision
+        HealthMesKeychainAccessGroup: $(AppIdentifierPrefix)group.com.healthmes.companion
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.content-extension
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationViewController
           NSExtensionAttributes:
             UNNotificationExtensionCategory: HEALTHMES_ALERT_ACTIONABLE
             UNNotificationExtensionDefaultContentHidden: true
-            UNNotificationExtensionInitialContentSizeRatio: 0.72
+            UNNotificationExtensionInitialContentSizeRatio: 0.58
+            UNNotificationExtensionUserInteractionEnabled: true
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    entitlements:
+      path: Support/HealthMesNotificationContent.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.healthmes.companion
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)group.com.healthmes.companion
 
   # ------------------------------------------------------------- watchOS app
   # Modern single-target watch app. Declared as companion of the iOS app so

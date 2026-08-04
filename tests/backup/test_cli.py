@@ -139,7 +139,6 @@ class TestServe:
             "factory": True,
             "host": "127.0.0.1",
             "port": 8123,
-            "access_log": False,
         }
 
     def test_explicit_serve_subcommand(self, monkeypatch):

@@ -26,7 +26,6 @@ KILL_BIN="${HEALTHMES_KILL_BIN:-/bin/kill}"
 SLEEP_BIN="${HEALTHMES_SLEEP_BIN:-sleep}"
 BASH_BIN="${HEALTHMES_BASH_BIN:-/bin/bash}"
 UUIDGEN_BIN="${HEALTHMES_UUIDGEN_BIN:-uuidgen}"
-PYTHON_BIN="${HEALTHMES_PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
 
 info() { printf '[healthmes] %s\n' "$*"; }
 die() { printf '[healthmes] %s\n' "$*" >&2; exit 1; }
@@ -230,21 +229,12 @@ stop_process() {
 }
 
 load_runtime_env() {
-    local key value env_dump
-    [ -x "$PYTHON_BIN" ] || die "missing project Python: $PYTHON_BIN"
-    env_dump="$(mktemp)"
-    chmod 600 "$env_dump"
-    if ! "$PYTHON_BIN" "$REPO_ROOT/scripts/load_runtime_env.py" \
-        "$REPO_ROOT/.env" \
-        "$REPO_ROOT/.env.local" \
-        "$REPO_ROOT/config/open-wearables.env" >"$env_dump"; then
-        rm -f "$env_dump"
-        die "failed to load runtime environment"
-    fi
-    while IFS= read -r -d '' key && IFS= read -r -d '' value; do
-        export "$key=$value"
-    done <"$env_dump"
-    rm -f "$env_dump"
+    set -a
+    [ -f "$REPO_ROOT/.env" ] && source "$REPO_ROOT/.env"
+    [ -f "$REPO_ROOT/.env.local" ] && source "$REPO_ROOT/.env.local"
+    [ -f "$REPO_ROOT/config/open-wearables.env" ] \
+        && source "$REPO_ROOT/config/open-wearables.env"
+    set +a
 }
 
 resolve_ow_api_key() {
@@ -428,11 +418,6 @@ cmd_stop() {
     bash "$DEV_MAC_SCRIPT" services-stop
 }
 
-cmd_restart() {
-    cmd_stop
-    cmd_start
-}
-
 service_status() {
     local name=$1 file=$2
     if pid_running "$file"; then
@@ -475,7 +460,7 @@ cmd_uninstall() {
 }
 
 usage() {
-    printf 'usage: %s install|update|start|stop|restart|status|open|uninstall [--delete-data]\n' "$0"
+    printf 'usage: %s install|update|start|stop|status|open|uninstall [--delete-data]\n' "$0"
     exit 1
 }
 
@@ -484,7 +469,6 @@ install) cmd_install ;;
 update) cmd_update ;;
 start) cmd_start ;;
 stop) cmd_stop ;;
-restart) cmd_restart ;;
 status) cmd_status ;;
 open) cmd_open ;;
 daemon) cmd_daemon ;;

@@ -6,7 +6,7 @@ import Foundation
 //   [observation, 1 line]   -> notification title
 //   [evidence, 1 line]      -> body line 1
 //   [proposal, 1 line]      -> body line 2
-//   [buttons]  ✅ Apply / ✏️ Adjust / ❌ Keep as-is   -> UNNotificationActions
+//   [buttons]  No / Yes   -> UNNotificationActions
 //   [link]     Why this? -> decision-viewer deep link -> userInfo route
 //
 // Pure Foundation so the mapping from a `GET /v1/alerts` item is unit-
@@ -20,7 +20,7 @@ import Foundation
 // silent — is the healthcare domain expert's deliverable
 // (docs/design/WATCH-NOTIFICATIONS.ko.md Q2/Q3/Q5).
 public struct AlertNotificationContent: Equatable {
-    /// Category with ✅ Apply / ✏️ Adjust / ❌ Keep actions — used only when
+    /// Category with No / Yes actions — used only when
     /// a pending schedule proposal is attached, so every button maps to a
     /// REAL endpoint call instead of a stub.
     public static let actionableCategoryID = "HEALTHMES_ALERT_ACTIONABLE"
@@ -36,6 +36,7 @@ public struct AlertNotificationContent: Equatable {
     public static let userInfoDecisionAfter = "healthmes_decision_after"
     public static let userInfoDecisionEndsAt = "healthmes_decision_ends_at"
     public static let userInfoDecisionExpiresAt = "healthmes_decision_expires_at"
+    public static let expansionHint = String(localized: "Long-press to choose No or Yes")
 
     /// Observation line (§8.5 line 1).
     public let title: String
@@ -95,10 +96,17 @@ public struct AlertNotificationContent: Equatable {
             userInfo[userInfoDecisionExpiresAt] = formatter.string(from: card.expiresAt)
         }
 
+        let isActionable = exactProposalID != nil
+        let renderedBody = alert.decisionCard?.proposedAction ?? bodyLines.joined(separator: "\n")
+        let body =
+            isActionable && !renderedBody.isEmpty
+            ? "\(renderedBody)\n\(expansionHint)"
+            : renderedBody
+
         return AlertNotificationContent(
             title: alert.decisionCard?.observationShort ?? alert.summary,
-            body: alert.decisionCard?.proposedAction ?? bodyLines.joined(separator: "\n"),
-            categoryID: exactProposalID != nil ? actionableCategoryID : infoCategoryID,
+            body: body,
+            categoryID: isActionable ? actionableCategoryID : infoCategoryID,
             threadID: alert.ruleId,
             userInfo: userInfo
         )

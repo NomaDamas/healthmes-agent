@@ -122,6 +122,61 @@
         }
       }
     },
+    "Could not decide. Try again from the iPhone app.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "처리하지 못했습니다. iPhone 앱에서 다시 시도하세요."
+          }
+        }
+      }
+    },
+    "No recorded. Your calendar stays unchanged.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아니요로 기록했습니다. 캘린더는 그대로 유지됩니다."
+          }
+        }
+      }
+    },
+    "Recording No…": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아니요를 기록하는 중…"
+          }
+        }
+      }
+    },
+    "Recording Yes…": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "예를 기록하는 중…"
+          }
+        }
+      }
+    },
+    "Yes recorded. Calendar sync will apply the change.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "예로 기록했습니다. 캘린더 동기화가 변경을 반영합니다."
+          }
+        }
+      }
+    },
     "Proposal expired": {
       "extractionState": "manual",
       "localizations": {
@@ -166,13 +221,57 @@
         }
       }
     },
-    "Decide in 3 seconds: Yes or No": {
+    "Available until %@": {
       "extractionState": "manual",
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "3초 안에 결정하세요: 예 또는 아니오"
+            "value": "%@까지 결정 가능"
+          }
+        }
+      }
+    },
+    "Choose No or Yes below": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아래에서 아니요 또는 예를 선택하세요"
+          }
+        }
+      }
+    },
+    "Health-based schedule proposal": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "건강 기반 일정 제안"
+          }
+        }
+      }
+    },
+    "Long-press to choose No or Yes": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "길게 눌러 아니요 / 예"
+          }
+        }
+      }
+    },
+    "New time: %@ – %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "변경 시간: %@ – %@"
           }
         }
       }
@@ -183,7 +282,7 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "HealthMes가 아니오를 기록했습니다. 캘린더는 그대로 유지됩니다."
+            "value": "HealthMes가 아니요를 기록했습니다. 캘린더는 그대로 유지됩니다."
           }
         }
       }
@@ -205,7 +304,7 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "아니오"
+            "value": "아니요"
           }
         }
       }
