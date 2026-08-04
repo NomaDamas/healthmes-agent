@@ -76,7 +76,14 @@ from healthmes.calendars.sleep_context import (
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.calendars.sleep_source import select_actual_sleep_rows
 from healthmes.config import Settings, get_settings, system_timezone
-from healthmes.mcp_server import adjustment_tools, arousal, caffeine_adapter, impact, interpret, timeline
+from healthmes.mcp_server import (
+    adjustment_tools,
+    arousal,
+    caffeine_adapter,
+    impact,
+    interpret,
+    timeline,
+)
 from healthmes.mcp_server.caffeine_contract import (
     CaffeineContraindication,
     CaffeineProductForm,
