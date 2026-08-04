@@ -88,8 +88,9 @@ final class CompanionUITests: XCTestCase {
         )
     }
 
-    /// Visual contract for #91: a user can expand the notification and see
-    /// both decision buttons without opening the HealthMes app.
+    /// Visual contract for #91: the ordinary compact banner arrives first,
+    /// then expanding it reveals the glass decision remote without opening
+    /// the HealthMes app.
     func testExpandedDecisionNotificationShowsNoAndYes() throws {
         let app = XCUIApplication()
         app.launchArguments += ["-healthmes-notification-demo"]
@@ -112,11 +113,19 @@ final class CompanionUITests: XCTestCase {
             notificationTitle.waitForExistence(timeout: 8),
             "The deterministic HealthMes decision notification should appear."
         )
+        XCTAssertFalse(
+            springboard.buttons["healthmes-decision-yes"].exists,
+            "iOS owns the compact banner and may hide category actions until expansion."
+        )
+        let compactScreenshot = XCTAttachment(screenshot: springboard.screenshot())
+        compactScreenshot.name = "HealthMes ordinary compact banner"
+        compactScreenshot.lifetime = .keepAlways
+        add(compactScreenshot)
 
         notificationTitle.press(forDuration: 1.5)
 
         XCTAssertTrue(
-            springboard.staticTexts["Health-based schedule proposal"].waitForExistence(timeout: 5),
+            springboard.staticTexts["HEALTHMES · DECISION"].waitForExistence(timeout: 5),
             "The HealthMes content extension must render instead of a blank card."
         )
         XCTAssertTrue(
@@ -126,8 +135,8 @@ final class CompanionUITests: XCTestCase {
             "The expanded card must explain the proposed schedule change."
         )
 
-        let no = springboard.buttons["No"]
-        let yes = springboard.buttons["Yes"]
+        let no = springboard.buttons["healthmes-decision-no"]
+        let yes = springboard.buttons["healthmes-decision-yes"]
         XCTAssertTrue(no.waitForExistence(timeout: 5), "Expanded notification must show No.")
         XCTAssertTrue(yes.waitForExistence(timeout: 5), "Expanded notification must show Yes.")
 

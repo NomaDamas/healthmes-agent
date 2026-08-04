@@ -103,12 +103,28 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         func postDecisionDemo() async {
             guard await requestAuthorization() else { return }
 
+            let center = UNUserNotificationCenter.current()
+            center.removeAllPendingNotificationRequests()
+            center.removeAllDeliveredNotifications()
+
             // Give the UI test enough time to put the app in the background
             // so SpringBoard, rather than the foreground delegate, owns it.
             try? await Task.sleep(for: .seconds(6))
 
             let formatter = ISO8601DateFormatter()
             let now = Date()
+            let calendar = Calendar.autoupdatingCurrent
+            let tomorrow = calendar.date(byAdding: .day, value: 1, to: now) ?? now
+            let proposedStart =
+                calendar.date(
+                    bySettingHour: 9,
+                    minute: 30,
+                    second: 0,
+                    of: tomorrow
+                ) ?? tomorrow
+            let proposedEnd =
+                calendar.date(byAdding: .minute, value: 90, to: proposedStart)
+                ?? proposedStart.addingTimeInterval(90 * 60)
             let alertID = UUID().uuidString.lowercased()
             let content = AlertNotificationContent(
                 title: String(localized: "Sleep debt · recovery low"),
@@ -130,9 +146,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                                 "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
                         ),
                     AlertNotificationContent.userInfoDecisionAfter:
-                        formatter.string(from: now.addingTimeInterval(24 * 60 * 60)),
+                        formatter.string(from: proposedStart),
                     AlertNotificationContent.userInfoDecisionEndsAt:
-                        formatter.string(from: now.addingTimeInterval(25.5 * 60 * 60)),
+                        formatter.string(from: proposedEnd),
                     AlertNotificationContent.userInfoDecisionExpiresAt:
                         formatter.string(from: now.addingTimeInterval(30 * 60)),
                 ]

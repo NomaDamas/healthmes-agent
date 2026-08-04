@@ -3,106 +3,122 @@ import UserNotifications
 import UserNotificationsUI
 
 final class NotificationViewController: UIViewController, UNNotificationContentExtension {
-    private let badgeLabel = InsetLabel()
+    private let signalIconView = UIImageView()
+    private let signalLabel = UILabel()
     private let statusLabel = UILabel()
     private let actionLabel = UILabel()
     private let timeLabel = UILabel()
-    private let expiryLabel = UILabel()
     private let hintLabel = UILabel()
     private let noButton = UIButton(type: .system)
     private let yesButton = UIButton(type: .system)
     private var proposalID: UUID?
+    private let healthGreen = UIColor(red: 0.02, green: 0.34, blue: 0.25, alpha: 1)
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = UIColor.systemBackground
+        // The notification container already supplies Liquid Glass. Keeping
+        // this view clear avoids stacking an opaque card inside that material.
+        view.backgroundColor = .clear
 
-        badgeLabel.text = String(localized: "Health-based schedule proposal")
-        badgeLabel.font = .preferredFont(forTextStyle: .caption1)
-        badgeLabel.adjustsFontForContentSizeCategory = true
-        badgeLabel.textColor = UIColor(red: 0.02, green: 0.34, blue: 0.25, alpha: 1)
-        badgeLabel.backgroundColor = UIColor(red: 0.84, green: 0.95, blue: 0.89, alpha: 1)
-        badgeLabel.layer.cornerRadius = 8
-        badgeLabel.clipsToBounds = true
+        signalIconView.image = UIImage(systemName: "waveform.path.ecg")
+        signalIconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
+            pointSize: 13,
+            weight: .semibold
+        )
+        signalIconView.tintColor = healthGreen
+        signalIconView.contentMode = .scaleAspectFit
+        signalIconView.setContentHuggingPriority(.required, for: .horizontal)
 
-        statusLabel.font = .preferredFont(forTextStyle: .headline)
+        signalLabel.text = String(localized: "HEALTHMES · DECISION")
+        signalLabel.font = .preferredFont(forTextStyle: .caption1)
+        signalLabel.adjustsFontForContentSizeCategory = true
+        signalLabel.textColor = healthGreen
+
+        statusLabel.font = .preferredFont(forTextStyle: .subheadline)
         statusLabel.adjustsFontForContentSizeCategory = true
         statusLabel.textColor = .secondaryLabel
-        statusLabel.numberOfLines = 2
+        statusLabel.numberOfLines = 1
 
-        actionLabel.font = .preferredFont(forTextStyle: .title2)
+        actionLabel.font = .preferredFont(forTextStyle: .title3)
         actionLabel.adjustsFontForContentSizeCategory = true
         actionLabel.textColor = .label
         actionLabel.numberOfLines = 3
 
         timeLabel.font = .preferredFont(forTextStyle: .subheadline)
         timeLabel.adjustsFontForContentSizeCategory = true
-        timeLabel.textColor = .label
+        timeLabel.textColor = .secondaryLabel
         timeLabel.numberOfLines = 2
 
-        expiryLabel.font = .preferredFont(forTextStyle: .caption1)
-        expiryLabel.adjustsFontForContentSizeCategory = true
-        expiryLabel.textColor = .secondaryLabel
-
-        hintLabel.text = String(localized: "Choose No or Yes below")
+        hintLabel.text = String(localized: "Choose without opening the app")
         hintLabel.font = .preferredFont(forTextStyle: .footnote)
         hintLabel.adjustsFontForContentSizeCategory = true
-        hintLabel.textColor = UIColor(red: 0.02, green: 0.34, blue: 0.25, alpha: 1)
+        hintLabel.textColor = .tertiaryLabel
 
-        var noConfiguration = UIButton.Configuration.tinted()
+        var noConfiguration: UIButton.Configuration
+        var yesConfiguration: UIButton.Configuration
+        if #available(iOS 26.0, *) {
+            noConfiguration = .glass()
+            yesConfiguration = .prominentGlass()
+        } else {
+            noConfiguration = .tinted()
+            yesConfiguration = .filled()
+        }
         noConfiguration.title = String(localized: "No")
-        noConfiguration.image = UIImage(systemName: "xmark.circle")
+        noConfiguration.image = UIImage(systemName: "xmark")
         noConfiguration.imagePadding = 6
         noConfiguration.cornerStyle = .large
+        noConfiguration.baseForegroundColor = .label
         noButton.configuration = noConfiguration
+        noButton.accessibilityIdentifier = "healthmes-decision-no"
         noButton.addTarget(self, action: #selector(declineProposal), for: .touchUpInside)
 
-        var yesConfiguration = UIButton.Configuration.filled()
         yesConfiguration.title = String(localized: "Yes")
-        yesConfiguration.image = UIImage(systemName: "checkmark.circle.fill")
+        yesConfiguration.image = UIImage(systemName: "checkmark")
         yesConfiguration.imagePadding = 6
         yesConfiguration.cornerStyle = .large
-        yesConfiguration.baseBackgroundColor = UIColor(
-            red: 0.02, green: 0.34, blue: 0.25, alpha: 1
-        )
+        yesConfiguration.baseBackgroundColor = healthGreen
+        yesConfiguration.baseForegroundColor = .white
         yesButton.configuration = yesConfiguration
+        yesButton.accessibilityIdentifier = "healthmes-decision-yes"
         yesButton.addTarget(self, action: #selector(acceptProposal), for: .touchUpInside)
+
+        let signalRow = UIStackView(arrangedSubviews: [signalIconView, signalLabel])
+        signalRow.axis = .horizontal
+        signalRow.alignment = .center
+        signalRow.spacing = 6
 
         let buttonRow = UIStackView(arrangedSubviews: [noButton, yesButton])
         buttonRow.axis = .horizontal
         buttonRow.distribution = .fillEqually
         buttonRow.spacing = 10
 
-        let divider = UIView()
-        divider.backgroundColor = .separator
-        divider.translatesAutoresizingMaskIntoConstraints = false
-        divider.heightAnchor.constraint(equalToConstant: 1 / UIScreen.main.scale).isActive = true
-
         let stack = UIStackView(arrangedSubviews: [
-            badgeLabel,
+            signalRow,
             statusLabel,
             actionLabel,
             timeLabel,
-            expiryLabel,
-            divider,
             hintLabel,
             buttonRow,
         ])
         stack.axis = .vertical
-        stack.spacing = 8
-        stack.setCustomSpacing(12, after: badgeLabel)
-        stack.setCustomSpacing(12, after: statusLabel)
-        stack.setCustomSpacing(12, after: actionLabel)
-        stack.setCustomSpacing(12, after: expiryLabel)
+        stack.spacing = 7
+        stack.setCustomSpacing(10, after: signalRow)
+        stack.setCustomSpacing(5, after: statusLabel)
+        stack.setCustomSpacing(10, after: actionLabel)
+        stack.setCustomSpacing(14, after: hintLabel)
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
-            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 16),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -16),
+            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 14),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -14),
+            signalIconView.widthAnchor.constraint(equalToConstant: 18),
+            signalIconView.heightAnchor.constraint(equalToConstant: 18),
+            noButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
+            yesButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
         ])
-        preferredContentSize = CGSize(width: 0, height: 292)
+        preferredContentSize = CGSize(width: 0, height: 244)
     }
 
     func didReceive(_ notification: UNNotification) {
@@ -119,10 +135,15 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
             info["healthmes_decision_action"] as? String ?? content.body
 
         let formatter = ISO8601DateFormatter()
-        let display = DateFormatter()
-        display.locale = .autoupdatingCurrent
-        display.dateStyle = .none
-        display.timeStyle = .short
+        let dayDisplay = DateFormatter()
+        dayDisplay.locale = .autoupdatingCurrent
+        dayDisplay.dateStyle = .medium
+        dayDisplay.timeStyle = .none
+        dayDisplay.doesRelativeDateFormatting = true
+        let timeDisplay = DateFormatter()
+        timeDisplay.locale = .autoupdatingCurrent
+        timeDisplay.dateStyle = .none
+        timeDisplay.timeStyle = .short
         if
             let startText = info["healthmes_decision_after"] as? String,
             let endText = info["healthmes_decision_ends_at"] as? String,
@@ -130,9 +151,10 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
             let end = formatter.date(from: endText)
         {
             timeLabel.text = String(
-                format: String(localized: "New time: %@ – %@"),
-                display.string(from: start),
-                display.string(from: end)
+                format: String(localized: "%@ · %@ – %@"),
+                dayDisplay.string(from: start),
+                timeDisplay.string(from: start),
+                timeDisplay.string(from: end)
             )
         } else {
             timeLabel.text = nil
@@ -142,12 +164,12 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
             let expiryText = info["healthmes_decision_expires_at"] as? String,
             let expiry = formatter.date(from: expiryText)
         {
-            expiryLabel.text = String(
-                format: String(localized: "Available until %@"),
-                display.string(from: expiry)
+            hintLabel.text = String(
+                format: String(localized: "Decide by %@ · no app needed"),
+                timeDisplay.string(from: expiry)
             )
         } else {
-            expiryLabel.text = nil
+            hintLabel.text = String(localized: "Choose without opening the app")
         }
     }
 
@@ -176,9 +198,7 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
                         status == "accepted"
                         ? String(localized: "Yes recorded. Calendar sync will apply the change.")
                         : String(localized: "No recorded. Your calendar stays unchanged.")
-                    hintLabel.textColor = UIColor(
-                        red: 0.02, green: 0.34, blue: 0.25, alpha: 1
-                    )
+                    hintLabel.textColor = healthGreen
                     noButton.isHidden = true
                     yesButton.isHidden = true
                 }
@@ -284,21 +304,5 @@ private struct NotificationDecisionResolver {
         case notPaired
         case notActionable
         case requestFailed
-    }
-}
-
-private final class InsetLabel: UILabel {
-    private let insets = UIEdgeInsets(top: 5, left: 9, bottom: 5, right: 9)
-
-    override var intrinsicContentSize: CGSize {
-        let size = super.intrinsicContentSize
-        return CGSize(
-            width: size.width + insets.left + insets.right,
-            height: size.height + insets.top + insets.bottom
-        )
-    }
-
-    override func drawText(in rect: CGRect) {
-        super.drawText(in: rect.inset(by: insets))
     }
 }
