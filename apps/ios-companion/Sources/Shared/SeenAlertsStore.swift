@@ -12,6 +12,8 @@ public final class SeenAlertsStore {
     public static let shared = SeenAlertsStore()
 
     static let defaultsKey = "healthmes.alerts.notified-ids"
+    static let initializedKey = "healthmes.alerts.notification-baseline-initialized"
+    static let pendingBaselineKey = "healthmes.alerts.notification-baseline-pending"
     /// Alert history is budget-capped server-side (≤8/day), so a small cap
     /// covers weeks while keeping the defaults payload tiny.
     static let capacity = 200
@@ -39,6 +41,19 @@ public final class SeenAlertsStore {
         }
     }
 
+    /// Suppress the first successfully loaded history after pairing or a
+    /// failed enable-time fetch, then diff revisions normally.
+    public func unseenOrPrime(from alerts: [AlertItem]) -> [AlertItem] {
+        if defaults.bool(forKey: Self.pendingBaselineKey) {
+            primeWithoutNotifying(alerts)
+            return []
+        }
+        if defaults.object(forKey: Self.initializedKey) == nil {
+            defaults.set(true, forKey: Self.initializedKey)
+        }
+        return unseen(from: alerts)
+    }
+
     /// Record revisions as notified, newest kept when the cap trims.
     public func markSeen(_ alerts: [AlertItem]) {
         guard !alerts.isEmpty else { return }
@@ -56,17 +71,27 @@ public final class SeenAlertsStore {
             ordered.removeLast(ordered.count - Self.capacity)
         }
         defaults.set(ordered, forKey: Self.defaultsKey)
+        defaults.set(true, forKey: Self.initializedKey)
+        defaults.removeObject(forKey: Self.pendingBaselineKey)
     }
 
     /// First launch with an already-populated history must not fire a
     /// notification storm: mark everything current as seen without
     /// notifying. Called once when notifications are first enabled.
     public func primeWithoutNotifying(_ alerts: [AlertItem]) {
+        defaults.set(true, forKey: Self.initializedKey)
+        defaults.removeObject(forKey: Self.pendingBaselineKey)
         markSeen(alerts)
+    }
+
+    public func deferPrimingUntilNextFeed() {
+        defaults.set(true, forKey: Self.pendingBaselineKey)
     }
 
     public func clear() {
         defaults.removeObject(forKey: Self.defaultsKey)
+        defaults.removeObject(forKey: Self.initializedKey)
+        defaults.removeObject(forKey: Self.pendingBaselineKey)
     }
 
     private func revisionKey(for alert: AlertItem) -> String {

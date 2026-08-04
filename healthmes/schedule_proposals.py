@@ -3,7 +3,7 @@ import hashlib
 import hmac
 import uuid
 
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from healthmes.calendars.adjustments_logic import verify_reply_handle
@@ -17,6 +17,86 @@ class ScheduleProposalResolutionError(ValueError):
         self.code = code
 
 
+def _as_utc(value: dt.datetime) -> dt.datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC)
+
+
+def _proposal_expiry(proposal: ScheduleProposal) -> dt.datetime | None:
+    expires_at = proposal.expires_at
+    return _as_utc(expires_at) if expires_at is not None else None
+
+
+def _raise_transition_conflict(
+    session: Session,
+    proposal: ScheduleProposal,
+    current: dt.datetime,
+) -> None:
+    session.expire(proposal)
+    expires_at = _proposal_expiry(proposal)
+    if (
+        proposal.status is ProposalStatus.PROPOSED
+        and (expires_at is None or current >= expires_at)
+    ):
+        raise ScheduleProposalResolutionError("expired")
+    raise ScheduleProposalResolutionError("not_proposed")
+
+
+def _transition_locked_postgres(
+    session: Session,
+    proposal_id: uuid.UUID,
+    target: ProposalStatus,
+    now: dt.datetime | None,
+) -> ScheduleProposal:
+    proposal = session.scalar(
+        select(ScheduleProposal)
+        .where(ScheduleProposal.id == proposal_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if proposal is None:
+        raise ScheduleProposalResolutionError("not_found")
+    current = _as_utc(
+        now
+        or session.scalar(select(func.clock_timestamp()))
+        or dt.datetime.now(dt.UTC)
+    )
+    expires_at = _proposal_expiry(proposal)
+    if proposal.status is not ProposalStatus.PROPOSED:
+        raise ScheduleProposalResolutionError("not_proposed")
+    if expires_at is None or current >= expires_at:
+        raise ScheduleProposalResolutionError("expired")
+    proposal.status = target
+    session.flush()
+    session.refresh(proposal)
+    return proposal
+
+
+def _transition_compare_and_swap(
+    session: Session,
+    proposal: ScheduleProposal,
+    target: ProposalStatus,
+    current: dt.datetime,
+) -> ScheduleProposal:
+    result = session.execute(
+        update(ScheduleProposal)
+        .where(
+            ScheduleProposal.id == proposal.id,
+            ScheduleProposal.status == ProposalStatus.PROPOSED,
+            ScheduleProposal.expires_at.is_not(None),
+            ScheduleProposal.expires_at > current,
+        )
+        .values(status=target)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        _raise_transition_conflict(session, proposal, current)
+    session.flush()
+    session.refresh(proposal)
+    return proposal
+
+
 def resolution_token(
     proposal: ScheduleProposal,
     handle_secret: str,
@@ -26,11 +106,9 @@ def resolution_token(
         return None
     if target not in {ProposalStatus.ACCEPTED, ProposalStatus.DECLINED}:
         return None
-    expires_at = (
-        proposal.expires_at.replace(tzinfo=dt.UTC)
-        if proposal.expires_at.tzinfo is None
-        else proposal.expires_at.astimezone(dt.UTC)
-    )
+    expires_at = _proposal_expiry(proposal)
+    assert expires_at is not None
+    expires_at = expires_at.astimezone(dt.UTC)
     payload = (
         "healthmes-api:schedule-proposal-resolution:v1:"
         f"{proposal.id}:{target.value}:{proposal.reply_handle_digest}:"
@@ -91,25 +169,40 @@ def resolve_schedule_proposal(
     )
     if not reply_handle_valid and not resolution_token_valid:
         raise ScheduleProposalResolutionError("invalid_handle")
-    expires_at = (
-        proposal.expires_at.replace(tzinfo=dt.UTC)
-        if proposal.expires_at is not None and proposal.expires_at.tzinfo is None
-        else proposal.expires_at
-    )
-    current = now or dt.datetime.now(dt.UTC)
+    expires_at = _proposal_expiry(proposal)
+    current = _as_utc(now or dt.datetime.now(dt.UTC))
     if expires_at is None or current >= expires_at:
         raise ScheduleProposalResolutionError("expired")
-    result = session.execute(
-        update(ScheduleProposal)
-        .where(
-            ScheduleProposal.id == proposal_id,
-            ScheduleProposal.status == ProposalStatus.PROPOSED,
+    if session.get_bind().dialect.name == "postgresql":
+        return _transition_locked_postgres(
+            session,
+            proposal_id,
+            target,
+            now,
         )
-        .values(status=target)
+    return _transition_compare_and_swap(session, proposal, target, current)
+
+
+def invalidate_schedule_proposal(
+    session: Session,
+    proposal_id: uuid.UUID,
+    *,
+    now: dt.datetime | None = None,
+) -> ScheduleProposal:
+    proposal = session.get(ScheduleProposal, proposal_id)
+    if proposal is None:
+        raise ScheduleProposalResolutionError("not_found")
+    current = _as_utc(now or dt.datetime.now(dt.UTC))
+    if session.get_bind().dialect.name == "postgresql":
+        return _transition_locked_postgres(
+            session,
+            proposal_id,
+            ProposalStatus.INVALIDATED,
+            now,
+        )
+    return _transition_compare_and_swap(
+        session,
+        proposal,
+        ProposalStatus.INVALIDATED,
+        current,
     )
-    if result.rowcount != 1:
-        session.expire(proposal)
-        raise ScheduleProposalResolutionError("not_proposed")
-    session.flush()
-    session.refresh(proposal)
-    return proposal

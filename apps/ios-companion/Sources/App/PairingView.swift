@@ -105,6 +105,8 @@ struct PairingView: View {
                 _ = await NotificationManager.shared.requestAuthorization()
                 if let page = try? await HealthMesAPI().listAlerts(hours: 24) {
                     SeenAlertsStore.shared.primeWithoutNotifying(page.data)
+                } else {
+                    SeenAlertsStore.shared.deferPrimingUntilNextFeed()
                 }
                 BackgroundRefreshManager.shared.schedule()
             }

@@ -77,7 +77,11 @@ struct PairingSettingsView: View {
                 }
                 .onChange(of: notificationsEnabled) { _, enabled in
                     Task {
-                        await notifications.setEnabled(enabled, currentAlerts: store.alerts)
+                        await notifications.setEnabled(
+                            enabled,
+                            currentAlerts: store.alerts,
+                            hasLoadedAlerts: store.hasLoadedAlerts
+                        )
                     }
                 }
                 if notifications.authorizationDenied {

@@ -51,10 +51,10 @@ actor RefreshCoordinator {
         guard status == .authorized || status == .provisional else {
             // Not authorized: remember what exists so enabling notifications
             // later never dumps the whole backlog at once.
-            seenStore.markSeen(alerts)
+            seenStore.primeWithoutNotifying(alerts)
             return
         }
-        let unseen = seenStore.unseen(from: alerts)
+        let unseen = seenStore.unseenOrPrime(from: alerts)
         guard !unseen.isEmpty else { return }
 
         // Oldest first so notification order matches fired order.

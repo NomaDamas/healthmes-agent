@@ -9,6 +9,7 @@ from pydantic import SecretStr
 from healthmes.calendars.adjustments import issue_reply_handle
 from healthmes.schedule_proposals import (
     ScheduleProposalResolutionError,
+    invalidate_schedule_proposal,
     resolve_schedule_proposal,
 )
 from healthmes.store import (
@@ -210,6 +211,29 @@ def test_accept_invalidates_proposal_when_actual_sleep_changed(client, session):
         session.get(ScheduleProposal, proposal.id).status
         is ProposalStatus.INVALIDATED
     )
+
+
+def test_invalidation_does_not_overwrite_a_resolved_proposal(session):
+    proposal = _seed_proposal(session)
+    proposal.status = ProposalStatus.ACCEPTED
+    session.commit()
+
+    with pytest.raises(ScheduleProposalResolutionError, match="not_proposed"):
+        invalidate_schedule_proposal(session, proposal.id)
+
+    session.expire_all()
+    assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.ACCEPTED
+
+
+def test_invalidation_does_not_consume_an_expired_proposal(session):
+    proposal = _seed_proposal(session)
+    expired_at = proposal.expires_at + timedelta(seconds=1)
+
+    with pytest.raises(ScheduleProposalResolutionError, match="expired"):
+        invalidate_schedule_proposal(session, proposal.id, now=expired_at)
+
+    session.expire_all()
+    assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PROPOSED
 
 
 def test_decline_proposal(client, session):

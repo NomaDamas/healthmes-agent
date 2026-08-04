@@ -59,21 +59,34 @@ public final class MacNotificationManager: NSObject, ObservableObject {
     /// Settings toggle handler. Enabling requests authorization and primes
     /// the seen-store with the current history so an existing backlog never
     /// replays as a notification storm.
-    public func setEnabled(_ enabled: Bool, currentAlerts: [AlertItem]) async {
-        UserDefaults.standard.set(enabled, forKey: Self.enabledDefaultsKey)
-        guard enabled, let center else { return }
+    public func setEnabled(
+        _ enabled: Bool,
+        currentAlerts: [AlertItem],
+        hasLoadedAlerts: Bool
+    ) async {
+        guard enabled else {
+            UserDefaults.standard.set(false, forKey: Self.enabledDefaultsKey)
+            return
+        }
+        if hasLoadedAlerts {
+            seenStore.primeWithoutNotifying(currentAlerts)
+        } else {
+            seenStore.deferPrimingUntilNextFeed()
+        }
+        guard let center else {
+            UserDefaults.standard.set(false, forKey: Self.enabledDefaultsKey)
+            return
+        }
         let granted =
             (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
         authorizationDenied = !granted
-        if granted {
-            seenStore.primeWithoutNotifying(currentAlerts)
-        }
+        UserDefaults.standard.set(granted, forKey: Self.enabledDefaultsKey)
     }
 
     /// Store hook: post exactly one notification per not-yet-seen alert.
     public func process(alerts: [AlertItem], pendingProposals _: [ProposalItem]) {
         guard isEnabled, let center else { return }
-        let unseen = seenStore.unseen(from: alerts)
+        let unseen = seenStore.unseenOrPrime(from: alerts)
         guard !unseen.isEmpty else { return }
 
         for alert in unseen {

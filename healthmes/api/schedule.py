@@ -32,6 +32,7 @@ from healthmes.calendars.sleep_context import actual_sleep_violation
 from healthmes.config import resolve_timezone
 from healthmes.schedule_proposals import (
     ScheduleProposalResolutionError,
+    invalidate_schedule_proposal,
     resolution_token,
     resolve_schedule_proposal,
     verify_resolution_token,
@@ -230,7 +231,25 @@ def _resolve_proposal(
             resolve_timezone(request.app.state.settings),
         )
         if violation is not None:
-            proposal.status = ProposalStatus.INVALIDATED
+            try:
+                invalidate_schedule_proposal(
+                    session,
+                    proposal_id,
+                )
+            except ScheduleProposalResolutionError as exc:
+                session.rollback()
+                if exc.code == "expired":
+                    raise APIError(
+                        HTTP_409_CONFLICT,
+                        "proposal_expired",
+                        "The schedule proposal has expired",
+                    ) from exc
+                session.expire(proposal)
+                raise invalid_transition(
+                    "schedule_proposal",
+                    proposal.status.value,
+                    target.value,
+                ) from exc
             session.commit()
             raise APIError(
                 HTTP_409_CONFLICT,

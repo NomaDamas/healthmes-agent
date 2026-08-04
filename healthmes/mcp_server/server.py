@@ -2636,7 +2636,18 @@ def resolve_schedule_proposal(
                 _local_timezone(),
             )
             if violation is not None:
-                proposal.status = ProposalStatus.INVALIDATED
+                try:
+                    schedule_proposals.invalidate_schedule_proposal(
+                        session,
+                        proposal.id,
+                    )
+                except schedule_proposals.ScheduleProposalResolutionError as exc:
+                    session.rollback()
+                    if exc.code == "expired":
+                        raise ToolError("schedule proposal has expired") from exc
+                    raise ToolError(
+                        "reply_handle is invalid, expired, or already consumed"
+                    ) from exc
                 session.commit()
                 raise ToolError(violation)
         try:

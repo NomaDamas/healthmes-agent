@@ -106,6 +106,32 @@ final class SeenAlertsStoreTests: XCTestCase {
         XCTAssertTrue(store.unseen(from: existing).isEmpty)
     }
 
+    func testFailedInitialFeedPrimesTheNextSuccessfulHistory() {
+        let (store, _) = makeStore()
+        let existing = alert(UUID())
+        let later = alert(UUID())
+
+        store.deferPrimingUntilNextFeed()
+        XCTAssertTrue(store.unseenOrPrime(from: [existing]).isEmpty)
+        XCTAssertEqual(store.unseenOrPrime(from: [later, existing]).map(\.id), [later.id])
+    }
+
+    func testSuccessfulEmptyBaselineDoesNotSwallowTheNextAlert() {
+        let (store, _) = makeStore()
+        let first = alert(UUID())
+
+        store.deferPrimingUntilNextFeed()
+        XCTAssertTrue(store.unseenOrPrime(from: []).isEmpty)
+        XCTAssertEqual(store.unseenOrPrime(from: [first]).map(\.id), [first.id])
+    }
+
+    func testEmptyLegacyStoreDoesNotSwallowTheFirstNewAlert() {
+        let (store, _) = makeStore()
+        let first = alert(UUID())
+
+        XCTAssertEqual(store.unseenOrPrime(from: [first]).map(\.id), [first.id])
+    }
+
     func testProposalCorrelationUpgradesAnInformationalAlertOnce() {
         let (store, _) = makeStore()
         let id = UUID()

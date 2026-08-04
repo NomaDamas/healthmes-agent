@@ -20,6 +20,7 @@ public final class GlanceStore: ObservableObject {
     /// Localization key of the current fetch problem, nil when healthy.
     @Published public private(set) var errorKey: String?
     @Published public private(set) var alerts: [AlertItem] = []
+    @Published public private(set) var hasLoadedAlerts = false
     @Published public private(set) var pendingProposals: [ProposalItem] = []
     @Published public private(set) var isPaired: Bool
     @Published public private(set) var isRefreshing = false
@@ -69,6 +70,7 @@ public final class GlanceStore: ObservableObject {
         guard isPaired else {
             payload = nil
             alerts = []
+            hasLoadedAlerts = false
             pendingProposals = []
             errorKey = nil
             return
@@ -108,6 +110,7 @@ public final class GlanceStore: ObservableObject {
             let page = try await api.listAlerts(hours: 24, limit: 20, offset: 0)
             let proposals = try await api.listProposals(status: .proposed)
             alerts = page.data
+            hasLoadedAlerts = true
             pendingProposals = proposals.data
             onAlertsRefreshed?(alerts, pendingProposals)
         } catch {
@@ -148,6 +151,7 @@ public final class GlanceStore: ObservableObject {
         SeenAlertsStore.shared.clear()
         payload = nil
         alerts = []
+        hasLoadedAlerts = false
         pendingProposals = []
         isPaired = false
         isStale = false
