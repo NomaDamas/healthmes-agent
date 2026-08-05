@@ -18,6 +18,7 @@ from healthmes.engine.scheduler import (
     CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
     ENERGY_JOB_ID,
     SLEEP_RECONCILIATION_JOB_ID,
+    STORAGE_MAINTENANCE_JOB_ID,
     TRIGGER_JOB_ID,
 )
 from healthmes.mcp_server import server as mcp_server
@@ -145,6 +146,7 @@ class TestSchedulerWiring:
                 ENERGY_JOB_ID,
                 BACKUP_JOB_ID,
                 CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
+                STORAGE_MAINTENANCE_JOB_ID,
             }
         assert not scheduler.running
         assert app.state.scheduler is None
@@ -173,6 +175,7 @@ class TestSchedulerWiring:
                 BACKUP_JOB_ID,
                 CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
                 SLEEP_RECONCILIATION_JOB_ID,
+                STORAGE_MAINTENANCE_JOB_ID,
                 calendar_job_id(CalendarSource.GOOGLE),
                 calendar_job_id(CalendarSource.CALDAV),
             }
@@ -206,5 +209,6 @@ class TestSchedulerWiring:
             ENERGY_JOB_ID,
             BACKUP_JOB_ID,
             CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
+            STORAGE_MAINTENANCE_JOB_ID,
         }
         assert not prepared.running
