@@ -1,10 +1,10 @@
-# HealthMes 통합 저장·보존·과금 아키텍처
+# HealthMes 통합 저장·보존 아키텍처
 
 > **문서 지위:** 2026-08-05 소유자 결정을 구현 가능한 저장 계약으로 구체화한
 > 아키텍처 기준 문서.
 >
 > **범위:** 다입력 웰니스 플랫폼의 로컬·모바일·노트북·iCloud·관리형 클라우드
-> 저장, 데이터별 보존기간, 용량 관리, 과금, 삭제·복구, 병렬 개발 격리.
+> 저장, 데이터별 보존기간, 용량 관리, 삭제·복구, 병렬 개발 격리.
 >
 > 음식 분석·음식 사진 인식은 sake가 담당한다. HealthMes는 그 결과를 공통
 > `WellnessEvent`로 받아 저장·맥락 연결만 한다.
@@ -52,7 +52,7 @@ HealthMes는 **하나의 논리적 정본인 Personal Data Node**를 둔다.
    선택한다.
 3. 로컬 용량이 부족해도 원본부터 안전하게 축약하고 핵심 개인화 기록은 유지한다.
 4. 모바일·노트북·클라우드가 같은 논리 모델과 보존 정책을 사용한다.
-5. 클라우드 사업은 평문 데이터 판매가 아니라 암호문 저장·복구·내구성을 판다.
+5. 미래 클라우드 저장소가 현재 로컬 데이터 계약을 바꾸지 않고 붙을 수 있게 한다.
 6. HealthMes와 Hermes 개발은 브랜치와 worktree 수준에서 격리한다.
 
 ### 비목표
@@ -429,7 +429,7 @@ HealthMes payload는 iCloud 업로드 전에 앱 수준에서 암호화한다. �
 
 ```text
 Control plane
-계정·기기·결제·quota·복구 상태·감사
+계정·기기·quota·복구 상태·감사
 
 Data plane
 암호문 object·무결성 hash·만료 시각
@@ -445,55 +445,45 @@ expires_at 삭제·snapshot rotation·quota 계산
 
 노트북이 없는 사용자를 위해 Hosted Personal Data Node를 제공할 수 있다. 이 상품은
 서버에서 HealthMes/Hermes가 데이터를 처리하므로 Zero-Knowledge Vault와 같은
-보안 약속을 할 수 없다. 이름, 동의, 가격, 보안 설명을 반드시 분리한다.
+보안 약속을 할 수 없다. 이름, 동의, 보안 설명을 반드시 분리한다.
 
-## 10. 과금 정책
+## 10. Future Work — 가격과 상품 정책
 
-사용자는 “며칠 보관할지”를 선택하지만, 과금은 실제 저장 bytes를 기준으로 해야 한다.
+가격, 상품 tier, 무료 용량, 초과요금은 현재 아키텍처 범위에서 결정하지 않는다.
+먼저 실제 사용량과 보존 패턴을 측정해야 한다.
 
 ```text
-사용자 UX
-데이터별 1/7/14/30/90일/무기한 선택
+현재 확정
+데이터별 1/7/14/30/90일/무기한 보존
+데이터 클래스별 실제 bytes 측정
+30일 뒤 예상 저장량 표시
+로컬·iCloud·RemoteVault provider 경계
 
-내부 과금
-월평균 암호문 GB + snapshot 예약량 + 선택 서비스
+Future Work
+무료 용량
+유료 tier
+초과요금
+Enterprise 계약
 ```
 
-보존일만으로 과금하면 사진이 많은 사용자와 센서만 쓰는 사용자의 비용 차이를
-반영하지 못한다.
+### 가격 결정 전에 필요한 데이터
 
-### 권장 상품 구조
+- 사용자별 하루 평균 raw·정규화·미디어 증가량
+- 압축과 compaction 전·후 크기
+- `1/7/14/30/90일/무기한` 선택 비율
+- snapshot 평균 크기와 복구 빈도
+- iCloud/BYOS/RemoteVault 사용 비율
+- 저장소 운영비, 데이터 이동량, 지원 비용
 
-| 상품 | 저장 위치 | HealthMes 저장 과금 | 용도 |
-|---|---|---:|---|
-| Local | 사용자 노트북/홈서버 | 무료 | 기본 로컬-first |
-| BYOS iCloud/S3 | 사용자 계정 | 저장비 무료, 앱 기능만 과금 가능 | 사용자가 저장비 직접 부담 |
-| Vault 20GB | HealthMes 암호화 Vault | 월 구독 | 개인 기본 백업 |
-| Vault 100GB | HealthMes 암호화 Vault | 월 구독 | 여러 기기·긴 보존 |
-| Vault 500GB+ | HealthMes 암호화 Vault | 월 구독 + 명시적 초과분 | 미디어·장기 archive |
-| Enterprise | 전용 tenant/bucket/BYOK | 계약 | 보존 정책·감사·SLA |
+### 지금 구현할 용량 경계
 
-### 가격 가설
+- 사용자가 정책을 바꾸기 전에 예상 저장량을 보여준다.
+- 로컬·iCloud·RemoteVault 각각 현재 사용량과 quota를 표시한다.
+- quota 70%에서 경고, 90%에서 정책 변경이나 공간 확장을 제안한다.
+- quota에 도달해도 로컬 캡처와 이미 저장된 데이터 조회는 계속 동작한다.
+- `무기한`은 무제한이라는 뜻이 아니라 현재 저장 위치의 용량 한도 안에서 동작한다.
 
-시장 검증 전 가격을 코드나 계약으로 고정하지 않는다. 초기 가설은 다음과 같다.
-
-- Local/BYOS: 저장 공간 요금 `0원`
-- Vault 20GB: 월 `3,900~4,900원`
-- Vault 100GB: 월 `7,900~9,900원`
-- Vault 500GB: 월 `19,900~29,000원`
-- 초과 저장: 사용자가 미리 동의한 GB 묶음
-- Enterprise: 최소 계약금 + 실제 저장량 + SLA/BYOK/감사 기능
-
-가격은 원가만이 아니라 클라이언트 암호화, 자동 복구, 무결성 검증, 지원,
-데이터 이동 비용을 포함한다. 일반 iCloud와 GB 가격만으로 경쟁하지 않는다.
-
-### 예측 가능한 청구
-
-- 사용자가 정책을 바꾸기 전에 예상 월 저장량과 필요한 plan을 보여준다.
-- quota 70%에서 경고, 90%에서 정책 제안, 100%에서 새 원본의 cloud 업로드를 멈춘다.
-- 자동 초과 과금은 기본 off다.
-- 로컬 캡처는 cloud quota가 차도 계속 동작한다.
-- `무기한` 선택은 현재 plan에서 예상 몇 개월 후 quota에 도달하는지 표시한다.
+가격 정책은 위 계측이 실사용으로 검증된 뒤 별도 제품 문서에서 결정한다.
 
 ## 11. 암호화와 키
 
@@ -616,13 +606,12 @@ Hermes 작업
 
 ### Phase E — 관리형 Vault
 
-- tenant/quota/billing control plane
+- tenant/device/quota control plane
 - ciphertext object lifecycle
-- 20/100/500GB plan
 - restore drill
 - export/delete 감사
 
-**종료 조건:** 서버가 평문과 키 없이 저장·삭제·복구·과금할 수 있다.
+**종료 조건:** 서버가 평문과 키 없이 저장·삭제·복구·사용량 계측을 할 수 있다.
 
 ## 15. 최종 결정
 
@@ -642,8 +631,8 @@ iCloud
 보존
 = 데이터별 1/7/14/30/90일/무기한
 
-과금
-= 사용자가 보는 보존일 + 실제 평균 GB quota
+가격 정책
+= 실제 사용량 계측 이후 Future Work
 
 장기 가치
 = 원본 전체가 아니라 특징·사용자 수정·판단·실제 결과
@@ -675,8 +664,3 @@ iCloud
   https://www.postgresql.org/docs/current/brin.html
 - Apache Parquet:
   https://parquet.apache.org/docs/
-- Cloudflare R2 pricing:
-  https://developers.cloudflare.com/r2/pricing/
-- AWS S3 pricing:
-  https://aws.amazon.com/s3/pricing/
-

@@ -217,7 +217,8 @@ MVP는 클라우드가 아닌 **시임(인터페이스)만** 정의:
 - LLM 프라이버시(지금부터 강제): Claude API 호출만 머신 밖으로, 스킬은 요약-후-전송, MCP 도구는 집계값 반환, 원시 시계열/미디어는 반출 안 함.
 
 저장 정본, 모바일 queue, `HEALTHMES_DATA_DIR`, 데이터별
-`1/7/14/30/90일/무기한` 보존, iCloud 역할, RemoteVault 과금, 삭제·복구 및
+`1/7/14/30/90일/무기한` 보존, iCloud 역할, RemoteVault 용량 관리,
+가격 정책 Future Work, 삭제·복구 및
 worktree 격리의 상세 계약은
 [`STORAGE-ARCHITECTURE.ko.md`](STORAGE-ARCHITECTURE.ko.md)를 따른다.
 
@@ -346,13 +347,13 @@ issue #10(풀 네이티브 폰 앱)·#11(macOS/Windows 데스크톱 글랜스)�
 - 남음: `compare_impact` 축적 활용 심화 (태그 이벤트가 쌓인 뒤의 장기 상관 리뷰 절차,
   주간 리포트와의 연결)
 
-**Phase 7 — 비즈니스 레이어 (§9 시임의 구현)**
+**Phase 7 — 원격 저장 기반 (§9 시임의 구현)**
 - 이번에 구현: `RemoteVaultProvider` — 동일 `BackupProvider` 프로토콜로 S3 호환
   엔드포인트(AWS/R2/MinIO)에 age 암호문 스냅샷만 복제(평문·비-age 업로드 거부, 서버는
   암호문만 보관), 로컬 스냅샷 우선 + 업로드 무결성 검증, `healthmes backup push`/
   `--provider remote` CLI, 주간 잡 셀렉터 연동 (`docs/BACKUP.md` §3)
-- 남음: 과금/멀티테넌트 서비스화 (호스팅 vault 상품화, 키·테넌트 관리, SLA — 시임
-  뒤편의 서버 사이드 사업 영역)
+- 남음: 멀티테넌트 서비스화와 가격 정책 (호스팅 vault, 키·테넌트 관리, SLA를
+  포함하며 실제 저장량 계측 이후 별도 Future Work에서 결정)
 
 ---
 
