@@ -50,18 +50,16 @@ final class SharedContractMacTests: XCTestCase {
     }
 
     func testNotificationGrammarMappingOnMacOS() throws {
-        // §8.5 line order out of a real alert item: observation → title,
-        // evidence line then proposal line → body; actionable category only
-        // when a pending proposal id is attached.
+        // Legacy alerts without a structured decision card stay compact.
+        // Structured schedule proposals use title / health reason / target
+        // time, which is pinned by the iOS notification tests.
         let page = try GlanceJSON.decoder().decode(AlertsPage.self, from: fixtureData("alerts"))
         let alert = page.data[0]
 
         let plain = AlertNotificationContent.from(alert: alert)
         XCTAssertEqual(plain.title, "Recovery 38 today.")
-        XCTAssertEqual(
-            plain.body,
-            "baseline_days 14 · hrv_delta_pct -18\nMove the 14:00 block to tomorrow."
-        )
+        XCTAssertEqual(plain.subtitle, "")
+        XCTAssertEqual(plain.body, "baseline_days 14 · hrv_delta_pc…")
         XCTAssertEqual(plain.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(plain.threadID, "deep_sleep_drop")
         XCTAssertNotNil(plain.userInfo[AlertNotificationContent.userInfoDecisionURL])
