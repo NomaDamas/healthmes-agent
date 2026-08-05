@@ -77,9 +77,9 @@ final class NotificationContentTests: XCTestCase {
         let card = DecisionCard(
             decisionId: alertID,
             proposalId: proposalID,
-            kind: "schedule_move",
+            kind: "schedule_change",
             severity: "coaching",
-            title: "Protect recovery",
+            title: "Deep Work",
             observationShort: "Sleep debt is high",
             evidenceShort: "HRV is 18% below baseline",
             proposedAction: "Move deep work to tomorrow at 09:30?",
@@ -103,7 +103,8 @@ final class NotificationContentTests: XCTestCase {
 
         let content = AlertNotificationContent.from(alert: alert)
 
-        XCTAssertEqual(content.title, "Move focus block?")
+        XCTAssertEqual(content.title, "Move Deep Work?")
+        XCTAssertEqual(content.subtitle, "Sleep debt is high")
         XCTAssertTrue(content.body.hasPrefix("→ "))
         XCTAssertFalse(content.body.contains("\n"))
         XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)

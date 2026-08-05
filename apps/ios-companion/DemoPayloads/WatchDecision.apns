@@ -12,15 +12,16 @@
   ],
   "aps": {
     "alert": {
-      "title": "Move 2 PM focus?",
+      "title": "Move Deep Work?",
+      "subtitle": "Low recovery · sleep debt",
       "body": "→ Thu · 9:30 AM"
     },
     "category": "HEALTHMES_ALERT_ACTIONABLE",
     "sound": "default"
   },
   "healthmes_proposal_id": "00000000-0000-0000-0000-000000000091",
-  "healthmes_decision_title": "Protect recovery",
-  "healthmes_decision_observation": "Sleep debt · recovery low",
+  "healthmes_decision_title": "Deep Work",
+  "healthmes_decision_observation": "Low recovery · sleep debt",
   "healthmes_decision_evidence": "HRV is 18% below your baseline",
   "healthmes_decision_action": "Move the 2:00 PM focus block to tomorrow at 9:30 AM?",
   "healthmes_decision_before": "2026-08-05T14:00:00+09:00",

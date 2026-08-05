@@ -6,6 +6,7 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
     private let signalIconView = UIImageView()
     private let signalLabel = UILabel()
     private let actionLabel = UILabel()
+    private let reasonLabel = UILabel()
     private let timeLabel = UILabel()
     private let hintLabel = UILabel()
     private let detailScrollView = UIScrollView()
@@ -41,6 +42,13 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         actionLabel.numberOfLines = 1
         actionLabel.adjustsFontSizeToFitWidth = true
         actionLabel.minimumScaleFactor = 0.78
+
+        reasonLabel.font = .preferredFont(forTextStyle: .subheadline)
+        reasonLabel.adjustsFontForContentSizeCategory = true
+        reasonLabel.textColor = healthGreen
+        reasonLabel.numberOfLines = 1
+        reasonLabel.adjustsFontSizeToFitWidth = true
+        reasonLabel.minimumScaleFactor = 0.8
 
         timeLabel.font = .preferredFont(forTextStyle: .subheadline)
         timeLabel.adjustsFontForContentSizeCategory = true
@@ -108,6 +116,7 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         let stack = UIStackView(arrangedSubviews: [
             signalRow,
             actionLabel,
+            reasonLabel,
             timeLabel,
             buttonRow,
             hintLabel,
@@ -117,6 +126,7 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         stack.spacing = 7
         stack.setCustomSpacing(10, after: signalRow)
         stack.setCustomSpacing(4, after: actionLabel)
+        stack.setCustomSpacing(4, after: reasonLabel)
         stack.setCustomSpacing(12, after: timeLabel)
         stack.setCustomSpacing(12, after: buttonRow)
         stack.setCustomSpacing(4, after: hintLabel)
@@ -133,7 +143,7 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
             yesButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
             detailScrollView.heightAnchor.constraint(equalToConstant: 104),
         ])
-        preferredContentSize = CGSize(width: 0, height: 302)
+        preferredContentSize = CGSize(width: 0, height: 326)
     }
 
     func didReceive(_ notification: UNNotification) {
@@ -145,6 +155,8 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         extensionContext?.notificationActions = []
         proposalID = (info["healthmes_proposal_id"] as? String).flatMap(UUID.init(uuidString:))
         actionLabel.text = content.title
+        reasonLabel.text = content.subtitle
+        reasonLabel.isHidden = content.subtitle.isEmpty
         timeLabel.text = content.body
         detailLabel.attributedText = detailText(info: info)
         detailScrollView.setContentOffset(.zero, animated: false)

@@ -108,10 +108,14 @@ final class CompanionUITests: XCTestCase {
         XCUIDevice.shared.press(.home)
 
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let notificationTitle = springboard.staticTexts["Move 2 PM focus?"]
+        let notificationTitle = springboard.staticTexts["Move Deep Work?"]
         XCTAssertTrue(
             notificationTitle.waitForExistence(timeout: 8),
             "The deterministic HealthMes decision notification should appear."
+        )
+        XCTAssertTrue(
+            springboard.staticTexts["Low recovery · sleep debt"].exists,
+            "The compact notification must explain the health reason immediately."
         )
         XCTAssertFalse(
             springboard.buttons["healthmes-decision-yes"].exists,

@@ -47,6 +47,8 @@ public struct AlertNotificationContent: Equatable {
     /// short line so watchOS can surface the actions without scrolling past
     /// health evidence first.
     public let title: String
+    /// One short health reason shown directly below the decision.
+    public let subtitle: String
     /// The immediate result of saying Yes, also constrained to one line.
     public let body: String
     public let categoryID: String
@@ -79,12 +81,29 @@ public struct AlertNotificationContent: Equatable {
     }
 
     public static func decisionPrompt(for card: DecisionCard) -> String {
-        switch card.kind {
-        case "schedule_move":
-            return String(localized: "Move focus block?")
-        default:
-            return compactLine(card.title, limit: 26)
-        }
+        // Every decision card currently comes from a schedule proposal.
+        // `kind` identifies the calendar event subtype (`schedule_change`,
+        // `planned_sleep`, `actual_sleep`, ...), not whether it is movable.
+        return String(
+            format: String(localized: "Move %@?"),
+            compactLine(card.title, limit: 22)
+        )
+    }
+
+    public init(
+        title: String,
+        subtitle: String = "",
+        body: String,
+        categoryID: String,
+        threadID: String,
+        userInfo: [String: String]
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.body = body
+        self.categoryID = categoryID
+        self.threadID = threadID
+        self.userInfo = userInfo
     }
 
     public static func targetLine(after: Date) -> String {
@@ -148,17 +167,21 @@ public struct AlertNotificationContent: Equatable {
 
         let isActionable = exactProposalID != nil
         let title: String
+        let subtitle: String
         let body: String
         if let card = alert.decisionCard, isActionable {
             title = decisionPrompt(for: card)
+            subtitle = compactLine(card.observationShort, limit: 28)
             body = targetLine(after: card.after)
         } else {
             title = compactLine(alert.summary, limit: 26)
+            subtitle = ""
             body = compactLine(bodyLines.joined(separator: " "), limit: 32)
         }
 
         return AlertNotificationContent(
             title: title,
+            subtitle: subtitle,
             body: body,
             categoryID: isActionable ? actionableCategoryID : infoCategoryID,
             threadID: alert.ruleId,

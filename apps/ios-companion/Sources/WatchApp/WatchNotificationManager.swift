@@ -11,7 +11,7 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
         let no = UNNotificationAction(
             identifier: AlertNotificationActionID.no,
             title: String(localized: "No"),
-            options: [],
+            options: [.authenticationRequired],
             icon: UNNotificationActionIcon(systemImageName: "xmark")
         )
         let yes = UNNotificationAction(
@@ -53,7 +53,11 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
                 ?? proposedStart.addingTimeInterval(90 * 60)
 
             let content = UNMutableNotificationContent()
-            content.title = String(localized: "Move 2 PM focus?")
+            content.title = String(
+                format: String(localized: "Move %@?"),
+                String(localized: "Deep Work")
+            )
+            content.subtitle = String(localized: "Low recovery · sleep debt")
             content.body = AlertNotificationContent.targetLine(after: proposedStart)
             content.categoryIdentifier = AlertNotificationContent.actionableCategoryID
             content.sound = .default
@@ -61,9 +65,9 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
                 AlertNotificationContent.userInfoProposalID:
                     "00000000-0000-0000-0000-000000000091",
                 AlertNotificationContent.userInfoDecisionTitle:
-                    String(localized: "Protect recovery"),
+                    String(localized: "Deep Work"),
                 AlertNotificationContent.userInfoDecisionObservation:
-                    String(localized: "Sleep debt · recovery low"),
+                    String(localized: "Low recovery · sleep debt"),
                 AlertNotificationContent.userInfoDecisionEvidence:
                     String(localized: "HRV is 18% below your baseline"),
                 AlertNotificationContent.userInfoDecisionAction:

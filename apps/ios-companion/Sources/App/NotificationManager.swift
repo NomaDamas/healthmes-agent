@@ -75,6 +75,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     func post(content: AlertNotificationContent) async {
         let notification = UNMutableNotificationContent()
         notification.title = content.title
+        if !content.subtitle.isEmpty {
+            notification.subtitle = content.subtitle
+        }
         if !content.body.isEmpty {
             notification.body = content.body
         }
@@ -102,10 +105,6 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             center.removeAllPendingNotificationRequests()
             center.removeAllDeliveredNotifications()
 
-            // Give the UI test enough time to put the app in the background
-            // so SpringBoard, rather than the foreground delegate, owns it.
-            try? await Task.sleep(for: .seconds(6))
-
             let formatter = ISO8601DateFormatter()
             let now = Date()
             let calendar = Calendar.autoupdatingCurrent
@@ -122,18 +121,43 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             let proposedEnd =
                 calendar.date(byAdding: .minute, value: 90, to: proposedStart)
                 ?? proposedStart.addingTimeInterval(90 * 60)
+            let proposalID =
+                UUID(uuidString: DecisionActivityAttributes.demoProposalID)!
+            let prompt = String(
+                format: String(localized: "Move %@?"),
+                String(localized: "Deep Work")
+            )
+            let reason = String(localized: "Low recovery · sleep debt")
+            let target = AlertNotificationContent.targetLine(after: proposedStart)
+            let expiresAt = now.addingTimeInterval(30 * 60)
+
+            await DecisionLiveActivityController.shared.startDemo(
+                proposalID: proposalID,
+                title: prompt,
+                reason: reason,
+                target: target,
+                expiresAt: expiresAt
+            )
+
+            // Give the UI test enough time to put the app in the background
+            // so SpringBoard, rather than the foreground delegate, owns it.
+            try? await Task.sleep(for: .seconds(6))
+
             let alertID = UUID().uuidString.lowercased()
             let content = AlertNotificationContent(
-                title: String(localized: "Move 2 PM focus?"),
-                body: AlertNotificationContent.targetLine(after: proposedStart),
+                title: prompt,
+                subtitle: reason,
+                body: target,
                 categoryID: AlertNotificationContent.actionableCategoryID,
                 threadID: "healthmes-decision-demo",
                 userInfo: [
                     AlertNotificationContent.userInfoAlertID: alertID,
                     AlertNotificationContent.userInfoProposalID:
-                        "00000000-0000-0000-0000-000000000091",
+                        proposalID.uuidString.lowercased(),
                     AlertNotificationContent.userInfoDecisionObservation:
-                        String(localized: "Sleep debt · recovery low"),
+                        String(localized: "Low recovery · sleep debt"),
+                    AlertNotificationContent.userInfoDecisionTitle:
+                        String(localized: "Deep Work"),
                     AlertNotificationContent.userInfoDecisionEvidence:
                         String(localized: "HRV is 18% below your baseline"),
                     AlertNotificationContent.userInfoDecisionAction:
@@ -148,7 +172,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                     AlertNotificationContent.userInfoDecisionEndsAt:
                         formatter.string(from: proposedEnd),
                     AlertNotificationContent.userInfoDecisionExpiresAt:
-                        formatter.string(from: now.addingTimeInterval(30 * 60)),
+                        formatter.string(from: expiresAt),
                 ]
             )
             await post(content: content)

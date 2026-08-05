@@ -265,6 +265,83 @@
         }
       }
     },
+    "Low recovery · sleep debt": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "낮은 회복 · 수면 부족"
+          }
+        }
+      }
+    },
+    "Deep Work": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "몰입 업무"
+          }
+        }
+      }
+    },
+    "Decision expired · calendar unchanged": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "결정 만료 · 캘린더 유지"
+          }
+        }
+      }
+    },
+    "Yes recorded · calendar will update": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "예로 기록됨 · 캘린더 변경 예정"
+          }
+        }
+      }
+    },
+    "No recorded · calendar unchanged": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아니요로 기록됨 · 캘린더 유지"
+          }
+        }
+      }
+    },
+    "Could not decide · open HealthMes": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "결정 실패 · HealthMes를 여세요"
+          }
+        }
+      }
+    },
+    "Move %@?": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 옮길까요?"
+          }
+        }
+      }
+    },
     "Move 2 PM focus?": {
       "extractionState": "manual",
       "localizations": {
