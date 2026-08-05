@@ -35,4 +35,3 @@ These rules apply to the entire repository.
 - Storage architecture and product documentation may change.
 - Application, migration, runtime, and vendored code must not change unless a
   later implementation task explicitly owns those files in a new worktree.
-
