@@ -81,6 +81,16 @@ HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개�
   - 모든 Layer B 도구는 **원시 시계열이 아닌 해석된 델타 + confidence/coverage 필드**를 반환 (토큰 절약·프라이버시·환각 방지·설명가능성 4중 이득). 데이터가 빈약하면 "insufficient_data"를 정직하게 반환.
 - **Layer C — 스킬 (얇은 판단 지침):** `healthmes-planner`(배치 룰: 에너지 높은 시간에 energy_demand=high 태스크, 회복 낮으면 운동 대신 휴식 제안 등), `healthmes-capture`, `healthmes-insight`(주간 리뷰 절차), Phase 3 `doctor-visit-summary`. **스킬 스크립트가 REST를 직접 호출하는 것 금지** — 데이터 접근이 MCP를 우회하면 decision tree 기록이 끊긴다.
 
+**다입력 플랫폼 해자:** Open Wearables 외 건강·행동·환경·일정·주관 상태·의료
+입력을 계속 추가할 수 있는 범용 인터페이스 자체를 독립적인 해자로 둔다. 모든
+입력은 provenance/confidence/consent/retention을 포함한 공통 계약으로 들어오며,
+지원 범위는 넓게 설계하고 실제 adapter는 검증 순서대로 확장한다. 상세 전략은
+[`WELLNESS-DATA-PLATFORM.ko.md`](WELLNESS-DATA-PLATFORM.ko.md)를 따른다.
+
+**소유권 메모 (2026-08-05):** 음식 분석·음식 사진 인식의 추가 개발은 sake가
+담당한다. HealthMes는 기존 음식 기록 경로만 유지하고, sake의 결과를 공통 웰니스
+입력 계약으로 받아 다른 맥락과 연결한다. 중복 모델 조사·구현은 하지 않는다.
+
 ### 지표 신뢰도 경계 (도구에 내장)
 
 손목 HRV는 야간 측정만 신뢰 구간(주간 스팟 측정은 노이즈), Garmin 스트레스 자체가 HRV 파생 추정치, 소비자기기 칼로리는 부정확. → Layer B 도구가 측정 조건·커버리지를 confidence로 계량화하고, 스킬 프롬프트에 "confidence 낮으면 단정적 조언 금지" 명시. 햇빛 노출·소음·음주·수분·생리주기 단계는 흔히 무시되지만 인지에너지와 상관이 높은 지표 — v2 에너지 요인으로 예약.
@@ -205,6 +215,12 @@ MVP는 클라우드가 아닌 **시임(인터페이스)만** 정의:
 - MVP 구현: `LocalDirectoryProvider` + CLI `healthmes backup create/restore` + 주간 자동 백업
 - 미래 유료 서비스 = 동일 프로토콜의 `RemoteVaultProvider`(S3 호환 + 클라이언트사이드 암호화, 서버는 평문 불가시). **이 인터페이스를 우회한 데이터 반출 금지.**
 - LLM 프라이버시(지금부터 강제): Claude API 호출만 머신 밖으로, 스킬은 요약-후-전송, MCP 도구는 집계값 반환, 원시 시계열/미디어는 반출 안 함.
+
+저장 정본, 모바일 queue, `HEALTHMES_DATA_DIR`, 데이터별
+`1/7/14/30/90일/무기한` 보존, iCloud 역할, RemoteVault 용량 관리,
+가격 정책 Future Work, 삭제·복구 및
+worktree 격리의 상세 계약은
+[`STORAGE-ARCHITECTURE.ko.md`](STORAGE-ARCHITECTURE.ko.md)를 따른다.
 
 ## 10. 단계별 로드맵
 
@@ -331,13 +347,13 @@ issue #10(풀 네이티브 폰 앱)·#11(macOS/Windows 데스크톱 글랜스)�
 - 남음: `compare_impact` 축적 활용 심화 (태그 이벤트가 쌓인 뒤의 장기 상관 리뷰 절차,
   주간 리포트와의 연결)
 
-**Phase 7 — 비즈니스 레이어 (§9 시임의 구현)**
+**Phase 7 — 원격 저장 기반 (§9 시임의 구현)**
 - 이번에 구현: `RemoteVaultProvider` — 동일 `BackupProvider` 프로토콜로 S3 호환
   엔드포인트(AWS/R2/MinIO)에 age 암호문 스냅샷만 복제(평문·비-age 업로드 거부, 서버는
   암호문만 보관), 로컬 스냅샷 우선 + 업로드 무결성 검증, `healthmes backup push`/
   `--provider remote` CLI, 주간 잡 셀렉터 연동 (`docs/BACKUP.md` §3)
-- 남음: 과금/멀티테넌트 서비스화 (호스팅 vault 상품화, 키·테넌트 관리, SLA — 시임
-  뒤편의 서버 사이드 사업 영역)
+- 남음: 멀티테넌트 서비스화와 가격 정책 (호스팅 vault, 키·테넌트 관리, SLA를
+  포함하며 실제 저장량 계측 이후 별도 Future Work에서 결정)
 
 ---
 
