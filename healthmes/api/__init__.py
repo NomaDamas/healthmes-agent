@@ -33,6 +33,7 @@ from healthmes.api import (
     reports,
     schedule,
     sleep,
+    storage,
     tasks,
 )
 from healthmes.api.errors import install_error_handlers
@@ -58,6 +59,7 @@ routers: list[APIRouter] = [
     connect.router,
     google_oauth.router,
     sleep.router,
+    storage.router,
 ]
 
 

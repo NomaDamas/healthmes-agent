@@ -9,6 +9,24 @@
 > 음식 분석·음식 사진 인식은 sake가 담당한다. HealthMes는 그 결과를 공통
 > `WellnessEvent`로 받아 저장·맥락 연결만 한다.
 
+## 구현 상태 — 2026-08-05
+
+컴퓨터 Personal Data Node의 저장 제어 계층은 구현되었다.
+
+- `WellnessEvent`, `RetentionPolicy`, `StorageObject`, `StorageUsageDaily`,
+  `PurgeJob` 모델과 Alembic 마이그레이션
+- 데이터별 `1/7/14/30/90일/무기한` 정책 API
+- raw ingest와 media 업로드의 중앙 저장 객체 자동 색인
+- 파일 사용량 측정, 미등록 raw/media 발견, dry-run, 안전 경로 검증,
+  만료 삭제, 미디어 참조 정리, 삭제 감사
+- 매시간 storage maintenance scheduler
+- `/storage` 컴퓨터 웹 관리 화면과 `/v1/storage/*` API
+- 기존 LocalDirectory/RemoteVault 암호화 백업 상태 표시
+
+iOS/Android의 저장 설정 UI와 durable upload queue는 별도 후속 작업이다.
+이번 구현의 설정 정본은 컴퓨터 Personal Data Node이며, 모바일은 향후 동일 API를
+사용한다.
+
 ## TLDR
 
 HealthMes는 **하나의 논리적 정본인 Personal Data Node**를 둔다.

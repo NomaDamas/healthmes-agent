@@ -26,6 +26,7 @@ from healthmes.ingest import (
     store_raw,
     transform_hae,
 )
+from healthmes.storage import index_raw_ingest
 from healthmes.store.session import SessionDep
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
     # Raw-first durability: index row committed BEFORE any interpretation —
     # a crash below leaves a findable row, never an orphaned file.
     session.add(event)
+    index_raw_ingest(session, settings, event)
     session.commit()
 
     payload = None
@@ -149,6 +151,8 @@ async def ingest_raw(
     event.parse_status = "stored_unparsed"
     event.forward_status = "not_applicable"
     session.add(event)
+    session.flush()
+    index_raw_ingest(session, settings, event)
     session.commit()
     return IngestAck(
         raw_id=str(event.id),

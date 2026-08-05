@@ -42,11 +42,13 @@ __all__ = [
     "TRIGGER_JOB_ID",
     "ENERGY_JOB_ID",
     "BACKUP_JOB_ID",
+    "STORAGE_MAINTENANCE_JOB_ID",
     "CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID",
     "SLEEP_RECONCILIATION_JOB_ID",
     "create_scheduler",
     "register_energy_job",
     "register_backup_job",
+    "register_storage_maintenance_job",
     "register_calendar_job",
     "register_calendar_adjustment_maintenance_job",
     "register_sleep_reconciliation_job",
@@ -59,6 +61,7 @@ logger = logging.getLogger(__name__)
 TRIGGER_JOB_ID = "healthmes-trigger-sweep"
 ENERGY_JOB_ID = "healthmes-cognitive-energy"
 BACKUP_JOB_ID = "healthmes-weekly-backup"
+STORAGE_MAINTENANCE_JOB_ID = "healthmes-storage-maintenance"
 CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID = "healthmes-calendar-adjustment-maintenance"
 SLEEP_RECONCILIATION_JOB_ID = "healthmes-sleep-reconciliation"
 
@@ -151,6 +154,25 @@ def register_backup_job(
         coalesce=True,
         max_instances=1,
         misfire_grace_time=3600,
+    )
+
+
+def register_storage_maintenance_job(
+    scheduler: BackgroundScheduler,
+    job: Callable[[], None],
+    *,
+    minutes: int = 60,
+) -> Job:
+    _remove_job_if_present(scheduler, STORAGE_MAINTENANCE_JOB_ID)
+    return scheduler.add_job(
+        job,
+        trigger=IntervalTrigger(minutes=minutes),
+        id=STORAGE_MAINTENANCE_JOB_ID,
+        name="HealthMes storage retention maintenance",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
     )
 
 

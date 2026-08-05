@@ -1,0 +1,67 @@
+{% extends "ui/_base.html.j2" %}
+{% block title %}저장 관리 — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">/ 저장 관리</span>{% endblock %}
+{% block head %}
+<style>
+  .storage-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(15rem,1fr)); gap:1rem; }
+  .storage-meter { height:.7rem; border-radius:999px; background:var(--surface-2); overflow:hidden; }
+  .storage-meter span { display:block; height:100%; background:var(--brand); }
+  .storage-row { display:flex; justify-content:space-between; gap:1rem; padding:.7rem 0; border-bottom:1px solid var(--line-soft); }
+  .storage-row form { display:flex; gap:.45rem; }
+  select, button { font:inherit; border-radius:var(--radius-sm); padding:.45rem .65rem; }
+  button { border:1px solid var(--brand); background:var(--brand); color:white; font-weight:700; }
+</style>
+{% endblock %}
+{% block content %}
+<p class="eyebrow">Personal Data Node</p>
+<h1>저장 관리</h1>
+<p class="muted">정본 위치: <code>{{ storage.data_dir }}</code>. 원본은 요약·정규화가 끝난 뒤 정책에 따라 삭제됩니다.</p>
+{% set used = storage.disk_total_bytes - storage.disk_free_bytes %}
+{% set pct = (used * 100 / storage.disk_total_bytes) if storage.disk_total_bytes else 0 %}
+<section class="card">
+  <h2>컴퓨터 디스크</h2>
+  <div class="storage-meter"><span style="width:{{ pct }}%"></span></div>
+  <p class="muted">전체 {{ "%.1f"|format(storage.disk_total_bytes / 1073741824) }}GB · 여유 {{ "%.1f"|format(storage.disk_free_bytes / 1073741824) }}GB</p>
+</section>
+<section class="card">
+  <h2>암호화 백업</h2>
+  <p><strong>{{ storage.backup.provider }}</strong> · snapshot {{ storage.backup.snapshot_count }}개</p>
+  <p class="muted">최근: {{ storage.backup.latest_snapshot or "아직 없음" }} · 암호화 키 {{ "설정됨" if storage.backup.encryption_configured else "미설정" }}</p>
+  <p class="muted"><code>{{ storage.backup.directory }}</code></p>
+</section>
+<div class="storage-grid">
+{% for key, value in storage.usage.items() %}
+<section class="card"><h2>{{ key }}</h2><p>{{ "%.2f"|format(value.bytes / 1048576) }}MB · {{ value.objects }}개</p></section>
+{% endfor %}
+</div>
+<section class="card">
+  <h2>데이터별 보존기간</h2>
+  {% for policy in storage.policies %}
+  <div class="storage-row">
+    <strong>{{ policy.data_class }}</strong>
+    {% if local_session %}
+    <form method="post" action="/storage/policy">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <input type="hidden" name="data_class" value="{{ policy.data_class }}">
+      <select name="preset">
+      {% for name in presets %}
+        <option value="{{ name }}"{% if name == policy.preset %} selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+      </select>
+      <button type="submit">저장</button>
+    </form>
+    {% else %}<span>{{ policy.preset }} · 이 컴퓨터에서 인증 후 변경 가능</span>{% endif %}
+  </div>
+  {% endfor %}
+</section>
+{% if local_session %}
+<section class="card">
+  <h2>정리 작업</h2>
+  <form method="post" action="/storage/maintenance">
+    <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+    <label><input type="checkbox" name="dry_run" value="true" checked> 삭제 없이 미리보기</label>
+    <button type="submit">정리 실행</button>
+  </form>
+</section>
+{% endif %}
+{% endblock %}
