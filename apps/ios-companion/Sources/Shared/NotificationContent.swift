@@ -1,5 +1,10 @@
 import Foundation
 
+public enum AlertNotificationActionID {
+    public static let yes = "HEALTHMES_YES"
+    public static let no = "HEALTHMES_NO"
+}
+
 // The docs/PLAN.md §8.5 notification grammar, as data (parity with the
 // Android companion's NotificationGrammar.kt):
 //

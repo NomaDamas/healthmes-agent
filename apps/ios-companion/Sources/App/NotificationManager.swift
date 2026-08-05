@@ -17,11 +17,6 @@ import UserNotifications
 final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationManager()
 
-    enum ActionID {
-        static let yes = "HEALTHMES_YES"
-        static let no = "HEALTHMES_NO"
-    }
-
     func configure() {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -35,13 +30,13 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         // The same native category is mirrored to Apple Watch, where the
         // owner can decide without opening either app.
         let yes = UNNotificationAction(
-            identifier: ActionID.yes,
+            identifier: AlertNotificationActionID.yes,
             title: String(localized: "Yes"),
             options: protectedActionOptions,
             icon: UNNotificationActionIcon(systemImageName: "checkmark.circle.fill")
         )
         let no = UNNotificationAction(
-            identifier: ActionID.no,
+            identifier: AlertNotificationActionID.no,
             title: String(localized: "No"),
             options: protectedActionOptions,
             icon: UNNotificationActionIcon(systemImageName: "xmark.circle")
@@ -201,9 +196,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             .flatMap(UUID.init(uuidString:))
 
         switch response.actionIdentifier {
-        case ActionID.yes:
+        case AlertNotificationActionID.yes:
             resolve(proposalID, action: .accept, completionHandler: completionHandler)
-        case ActionID.no:
+        case AlertNotificationActionID.no:
             resolve(proposalID, action: .decline, completionHandler: completionHandler)
         case UNNotificationDefaultActionIdentifier:
             // Tap-through = the §8.5 "why this?" link when the alert has a
