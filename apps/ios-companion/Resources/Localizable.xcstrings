@@ -265,6 +265,28 @@
         }
       }
     },
+    "Move 2 PM focus?": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "2시 집중 일정 미룰까요?"
+          }
+        }
+      }
+    },
+    "Move focus block?": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "집중 일정 미룰까요?"
+          }
+        }
+      }
+    },
     "Move the 2:00 PM focus block to tomorrow at 9:30 AM?": {
       "extractionState": "manual",
       "localizations": {
@@ -272,6 +294,83 @@
           "stringUnit": {
             "state": "translated",
             "value": "14:00 집중 업무를 내일 09:30으로 옮길까요?"
+          }
+        }
+      }
+    },
+    "→ Tomorrow · 9:30 AM": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "→ 내일 · 오전 9:30"
+          }
+        }
+      }
+    },
+    "→ %@ · %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "→ %@ · %@"
+          }
+        }
+      }
+    },
+    "Details": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "상세 정보"
+          }
+        }
+      }
+    },
+    "Details · decide by %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "상세 정보 · %@까지 결정"
+          }
+        }
+      }
+    },
+    "HRV is 18% below your baseline": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "HRV가 개인 기준선보다 18% 낮습니다"
+          }
+        }
+      }
+    },
+    "Protect recovery": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "회복 보호"
+          }
+        }
+      }
+    },
+    "What changes": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "무엇이 바뀌나요"
           }
         }
       }

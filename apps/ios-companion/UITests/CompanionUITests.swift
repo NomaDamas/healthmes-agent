@@ -108,7 +108,7 @@ final class CompanionUITests: XCTestCase {
         XCUIDevice.shared.press(.home)
 
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let notificationTitle = springboard.staticTexts["Sleep debt · recovery low"]
+        let notificationTitle = springboard.staticTexts["Move 2 PM focus?"]
         XCTAssertTrue(
             notificationTitle.waitForExistence(timeout: 8),
             "The deterministic HealthMes decision notification should appear."
@@ -129,10 +129,8 @@ final class CompanionUITests: XCTestCase {
             "The HealthMes content extension must render instead of a blank card."
         )
         XCTAssertTrue(
-            springboard.staticTexts[
-                "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
-            ].exists,
-            "The expanded card must explain the proposed schedule change."
+            springboard.staticTexts["healthmes-decision-details"].exists,
+            "The expanded notification must expose a scrollable decision detail region."
         )
 
         let no = springboard.buttons["healthmes-decision-no"]

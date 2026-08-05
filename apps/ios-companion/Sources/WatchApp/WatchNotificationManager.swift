@@ -39,15 +39,41 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             center.removeAllPendingNotificationRequests()
             center.removeAllDeliveredNotifications()
 
+            let formatter = ISO8601DateFormatter()
+            let now = Date()
+            let calendar = Calendar.autoupdatingCurrent
+            let todayFocus =
+                calendar.date(bySettingHour: 14, minute: 0, second: 0, of: now) ?? now
+            let tomorrow = calendar.date(byAdding: .day, value: 1, to: now) ?? now
+            let proposedStart =
+                calendar.date(bySettingHour: 9, minute: 30, second: 0, of: tomorrow)
+                ?? tomorrow
+            let proposedEnd =
+                calendar.date(byAdding: .minute, value: 90, to: proposedStart)
+                ?? proposedStart.addingTimeInterval(90 * 60)
+
             let content = UNMutableNotificationContent()
-            content.title = String(localized: "Recovery is low")
-            content.subtitle = String(localized: "HealthMes decision")
-            content.body = String(localized: "Move the 2 PM focus block to tomorrow at 9:30?")
+            content.title = String(localized: "Move 2 PM focus?")
+            content.body = AlertNotificationContent.targetLine(after: proposedStart)
             content.categoryIdentifier = AlertNotificationContent.actionableCategoryID
             content.sound = .default
             content.userInfo = [
                 AlertNotificationContent.userInfoProposalID:
-                    "00000000-0000-0000-0000-000000000091"
+                    "00000000-0000-0000-0000-000000000091",
+                AlertNotificationContent.userInfoDecisionTitle:
+                    String(localized: "Protect recovery"),
+                AlertNotificationContent.userInfoDecisionObservation:
+                    String(localized: "Sleep debt · recovery low"),
+                AlertNotificationContent.userInfoDecisionEvidence:
+                    String(localized: "HRV is 18% below your baseline"),
+                AlertNotificationContent.userInfoDecisionAction:
+                    String(localized: "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"),
+                AlertNotificationContent.userInfoDecisionBefore:
+                    formatter.string(from: todayFocus),
+                AlertNotificationContent.userInfoDecisionAfter:
+                    formatter.string(from: proposedStart),
+                AlertNotificationContent.userInfoDecisionEndsAt:
+                    formatter.string(from: proposedEnd),
             ]
 
             let request = UNNotificationRequest(
@@ -90,6 +116,14 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             action = .accept
         case AlertNotificationActionID.no:
             action = .decline
+        case UNNotificationDefaultActionIdentifier:
+            Task { @MainActor in
+                WatchDecisionInbox.shared.present(
+                    content: response.notification.request.content
+                )
+                completionHandler()
+            }
+            return
         default:
             completionHandler()
             return

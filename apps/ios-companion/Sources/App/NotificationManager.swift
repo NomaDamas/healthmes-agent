@@ -109,6 +109,8 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             let formatter = ISO8601DateFormatter()
             let now = Date()
             let calendar = Calendar.autoupdatingCurrent
+            let currentStart =
+                calendar.date(bySettingHour: 14, minute: 0, second: 0, of: now) ?? now
             let tomorrow = calendar.date(byAdding: .day, value: 1, to: now) ?? now
             let proposedStart =
                 calendar.date(
@@ -122,11 +124,8 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                 ?? proposedStart.addingTimeInterval(90 * 60)
             let alertID = UUID().uuidString.lowercased()
             let content = AlertNotificationContent(
-                title: String(localized: "Sleep debt · recovery low"),
-                body: [
-                    String(localized: "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"),
-                    AlertNotificationContent.expansionHint,
-                ].joined(separator: "\n"),
+                title: String(localized: "Move 2 PM focus?"),
+                body: AlertNotificationContent.targetLine(after: proposedStart),
                 categoryID: AlertNotificationContent.actionableCategoryID,
                 threadID: "healthmes-decision-demo",
                 userInfo: [
@@ -135,11 +134,15 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                         "00000000-0000-0000-0000-000000000091",
                     AlertNotificationContent.userInfoDecisionObservation:
                         String(localized: "Sleep debt · recovery low"),
+                    AlertNotificationContent.userInfoDecisionEvidence:
+                        String(localized: "HRV is 18% below your baseline"),
                     AlertNotificationContent.userInfoDecisionAction:
                         String(
                             localized:
                                 "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
                         ),
+                    AlertNotificationContent.userInfoDecisionBefore:
+                        formatter.string(from: currentStart),
                     AlertNotificationContent.userInfoDecisionAfter:
                         formatter.string(from: proposedStart),
                     AlertNotificationContent.userInfoDecisionEndsAt:

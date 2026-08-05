@@ -26,13 +26,11 @@ final class NotificationContentTests: XCTestCase {
             alert: fullAlert, pendingProposalID: proposalID
         )
 
-        // [observation] → title, [evidence]\n[proposal] → body.
+        // Legacy alerts are compacted defensively for the smallest watch.
         XCTAssertEqual(content.title, "Recovery 38 today.")
-        XCTAssertEqual(
-            content.body,
-            "baseline_days 14 · hrv_delta_pct -18\nMove the 14:00 block to tomorrow.\n"
-                + AlertNotificationContent.expansionHint
-        )
+        XCTAssertLessThanOrEqual(content.body.count, 32)
+        XCTAssertFalse(content.body.contains("\n"))
+        XCTAssertTrue(content.body.hasPrefix("baseline_days 14"))
         // Buttons only exist because a real pending proposal is attached.
         XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(content.threadID, "deep_sleep_drop")
@@ -70,7 +68,6 @@ final class NotificationContentTests: XCTestCase {
         XCTAssertEqual(content.categoryID, AlertNotificationContent.infoCategoryID)
         XCTAssertNil(content.userInfo[AlertNotificationContent.userInfoProposalID])
         XCTAssertNil(content.userInfo[AlertNotificationContent.userInfoDecisionURL])
-        XCTAssertFalse(content.body.contains(AlertNotificationContent.expansionHint))
     }
 
     func testDecisionCardUsesCompactActionableBannerAndExtensionPayload() {
@@ -106,12 +103,9 @@ final class NotificationContentTests: XCTestCase {
 
         let content = AlertNotificationContent.from(alert: alert)
 
-        XCTAssertEqual(content.title, "Sleep debt is high")
-        XCTAssertEqual(
-            content.body,
-            "Move deep work to tomorrow at 09:30?\n"
-                + AlertNotificationContent.expansionHint
-        )
+        XCTAssertEqual(content.title, "Move focus block?")
+        XCTAssertTrue(content.body.hasPrefix("→ "))
+        XCTAssertFalse(content.body.contains("\n"))
         XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(
             content.userInfo[AlertNotificationContent.userInfoDecisionObservation],
@@ -120,6 +114,10 @@ final class NotificationContentTests: XCTestCase {
         XCTAssertEqual(
             content.userInfo[AlertNotificationContent.userInfoDecisionAction],
             "Move deep work to tomorrow at 09:30?"
+        )
+        XCTAssertEqual(
+            content.userInfo[AlertNotificationContent.userInfoDecisionEvidence],
+            "HRV is 18% below baseline"
         )
         XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionAfter])
         XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionEndsAt])
@@ -150,10 +148,8 @@ final class NotificationContentTests: XCTestCase {
         )
         let content = AlertNotificationContent.from(alert: page.data[0])
         XCTAssertEqual(content.title, "Recovery 38 today.")
-        XCTAssertTrue(
-            content.body.contains("Move the 14:00 block to tomorrow.")
-                && content.body.hasSuffix(AlertNotificationContent.expansionHint)
-        )
+        XCTAssertLessThanOrEqual(content.body.count, 32)
+        XCTAssertFalse(content.body.contains("\n"))
         XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(
             content.userInfo[AlertNotificationContent.userInfoProposalID],

@@ -5,6 +5,7 @@ import SwiftUI
 /// this app should show anything beyond complications at all) is the domain
 /// expert's call: docs/design/WATCH-NOTIFICATIONS.ko.md (docs/PLAN.md §8.5).
 struct WatchHomeView: View {
+    @StateObject private var decisionInbox = WatchDecisionInbox.shared
     @State private var headline = "Loading..."
     @State private var detail = ""
 
@@ -27,6 +28,9 @@ struct WatchHomeView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .task { await refresh() }
+        .sheet(item: $decisionInbox.detail) { detail in
+            WatchDecisionDetailView(detail: detail)
+        }
     }
 
     @MainActor

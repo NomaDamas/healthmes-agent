@@ -5,10 +5,11 @@ import UserNotificationsUI
 final class NotificationViewController: UIViewController, UNNotificationContentExtension {
     private let signalIconView = UIImageView()
     private let signalLabel = UILabel()
-    private let statusLabel = UILabel()
     private let actionLabel = UILabel()
     private let timeLabel = UILabel()
     private let hintLabel = UILabel()
+    private let detailScrollView = UIScrollView()
+    private let detailLabel = UILabel()
     private let noButton = UIButton(type: .system)
     private let yesButton = UIButton(type: .system)
     private var proposalID: UUID?
@@ -34,25 +35,37 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         signalLabel.adjustsFontForContentSizeCategory = true
         signalLabel.textColor = healthGreen
 
-        statusLabel.font = .preferredFont(forTextStyle: .subheadline)
-        statusLabel.adjustsFontForContentSizeCategory = true
-        statusLabel.textColor = .secondaryLabel
-        statusLabel.numberOfLines = 1
-
         actionLabel.font = .preferredFont(forTextStyle: .title3)
         actionLabel.adjustsFontForContentSizeCategory = true
         actionLabel.textColor = .label
-        actionLabel.numberOfLines = 3
+        actionLabel.numberOfLines = 1
+        actionLabel.adjustsFontSizeToFitWidth = true
+        actionLabel.minimumScaleFactor = 0.78
 
         timeLabel.font = .preferredFont(forTextStyle: .subheadline)
         timeLabel.adjustsFontForContentSizeCategory = true
         timeLabel.textColor = .secondaryLabel
-        timeLabel.numberOfLines = 2
+        timeLabel.numberOfLines = 1
 
-        hintLabel.text = String(localized: "Choose without opening the app")
+        hintLabel.text = String(localized: "Details")
         hintLabel.font = .preferredFont(forTextStyle: .footnote)
         hintLabel.adjustsFontForContentSizeCategory = true
         hintLabel.textColor = .tertiaryLabel
+
+        detailScrollView.alwaysBounceVertical = true
+        detailScrollView.showsVerticalScrollIndicator = true
+        detailLabel.numberOfLines = 0
+        detailLabel.adjustsFontForContentSizeCategory = true
+        detailLabel.accessibilityIdentifier = "healthmes-decision-details"
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailScrollView.addSubview(detailLabel)
+        NSLayoutConstraint.activate([
+            detailLabel.leadingAnchor.constraint(equalTo: detailScrollView.contentLayoutGuide.leadingAnchor),
+            detailLabel.trailingAnchor.constraint(equalTo: detailScrollView.contentLayoutGuide.trailingAnchor),
+            detailLabel.topAnchor.constraint(equalTo: detailScrollView.contentLayoutGuide.topAnchor),
+            detailLabel.bottomAnchor.constraint(equalTo: detailScrollView.contentLayoutGuide.bottomAnchor),
+            detailLabel.widthAnchor.constraint(equalTo: detailScrollView.frameLayoutGuide.widthAnchor),
+        ])
 
         var noConfiguration: UIButton.Configuration
         var yesConfiguration: UIButton.Configuration
@@ -94,18 +107,19 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
 
         let stack = UIStackView(arrangedSubviews: [
             signalRow,
-            statusLabel,
             actionLabel,
             timeLabel,
-            hintLabel,
             buttonRow,
+            hintLabel,
+            detailScrollView,
         ])
         stack.axis = .vertical
         stack.spacing = 7
         stack.setCustomSpacing(10, after: signalRow)
-        stack.setCustomSpacing(5, after: statusLabel)
-        stack.setCustomSpacing(10, after: actionLabel)
-        stack.setCustomSpacing(14, after: hintLabel)
+        stack.setCustomSpacing(4, after: actionLabel)
+        stack.setCustomSpacing(12, after: timeLabel)
+        stack.setCustomSpacing(12, after: buttonRow)
+        stack.setCustomSpacing(4, after: hintLabel)
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -117,8 +131,9 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
             signalIconView.heightAnchor.constraint(equalToConstant: 18),
             noButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
             yesButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
+            detailScrollView.heightAnchor.constraint(equalToConstant: 104),
         ])
-        preferredContentSize = CGSize(width: 0, height: 244)
+        preferredContentSize = CGSize(width: 0, height: 302)
     }
 
     func didReceive(_ notification: UNNotification) {
@@ -129,48 +144,96 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         // action list below it.
         extensionContext?.notificationActions = []
         proposalID = (info["healthmes_proposal_id"] as? String).flatMap(UUID.init(uuidString:))
-        statusLabel.text =
-            info["healthmes_decision_observation"] as? String ?? content.title
-        actionLabel.text =
-            info["healthmes_decision_action"] as? String ?? content.body
+        actionLabel.text = content.title
+        timeLabel.text = content.body
+        detailLabel.attributedText = detailText(info: info)
+        detailScrollView.setContentOffset(.zero, animated: false)
 
         let formatter = ISO8601DateFormatter()
-        let dayDisplay = DateFormatter()
-        dayDisplay.locale = .autoupdatingCurrent
-        dayDisplay.dateStyle = .medium
-        dayDisplay.timeStyle = .none
-        dayDisplay.doesRelativeDateFormatting = true
         let timeDisplay = DateFormatter()
         timeDisplay.locale = .autoupdatingCurrent
         timeDisplay.dateStyle = .none
         timeDisplay.timeStyle = .short
-        if
-            let startText = info["healthmes_decision_after"] as? String,
-            let endText = info["healthmes_decision_ends_at"] as? String,
-            let start = formatter.date(from: startText),
-            let end = formatter.date(from: endText)
-        {
-            timeLabel.text = String(
-                format: String(localized: "%@ · %@ – %@"),
-                dayDisplay.string(from: start),
-                timeDisplay.string(from: start),
-                timeDisplay.string(from: end)
-            )
-        } else {
-            timeLabel.text = nil
-        }
 
         if
             let expiryText = info["healthmes_decision_expires_at"] as? String,
             let expiry = formatter.date(from: expiryText)
         {
             hintLabel.text = String(
-                format: String(localized: "Decide by %@ · no app needed"),
+                format: String(localized: "Details · decide by %@"),
                 timeDisplay.string(from: expiry)
             )
         } else {
-            hintLabel.text = String(localized: "Choose without opening the app")
+            hintLabel.text = String(localized: "Details")
         }
+    }
+
+    private func detailText(info: [AnyHashable: Any]) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let sectionFont = UIFont.preferredFont(forTextStyle: .caption1)
+        let bodyFont = UIFont.preferredFont(forTextStyle: .footnote)
+        let sectionAttributes: [NSAttributedString.Key: Any] = [
+            .font: sectionFont,
+            .foregroundColor: UIColor.tertiaryLabel,
+        ]
+        let bodyAttributes: [NSAttributedString.Key: Any] = [
+            .font: bodyFont,
+            .foregroundColor: UIColor.secondaryLabel,
+        ]
+
+        func appendSection(_ title: String, lines: [String]) {
+            let visibleLines = lines.filter { !$0.isEmpty }
+            guard !visibleLines.isEmpty else { return }
+            if result.length > 0 {
+                result.append(NSAttributedString(string: "\n\n"))
+            }
+            result.append(
+                NSAttributedString(string: title.uppercased() + "\n", attributes: sectionAttributes)
+            )
+            result.append(
+                NSAttributedString(
+                    string: visibleLines.joined(separator: "\n"),
+                    attributes: bodyAttributes
+                )
+            )
+        }
+
+        appendSection(
+            String(localized: "Why this?"),
+            lines: [
+                info[NotificationUserInfoKey.observation] as? String ?? "",
+                info[NotificationUserInfoKey.evidence] as? String ?? "",
+            ]
+        )
+
+        let formatter = ISO8601DateFormatter()
+        let time = DateFormatter()
+        time.locale = .autoupdatingCurrent
+        time.dateStyle = .none
+        time.timeStyle = .short
+        let before = (info[NotificationUserInfoKey.before] as? String)
+            .flatMap(formatter.date(from:))
+        let after = (info[NotificationUserInfoKey.after] as? String)
+            .flatMap(formatter.date(from:))
+        let endsAt = (info[NotificationUserInfoKey.endsAt] as? String)
+            .flatMap(formatter.date(from:))
+        var scheduleLine = ""
+        if let after {
+            let destination =
+                endsAt.map { "\(time.string(from: after))–\(time.string(from: $0))" }
+                ?? time.string(from: after)
+            scheduleLine =
+                before.map { "\(time.string(from: $0)) → \(destination)" }
+                ?? destination
+        }
+        appendSection(
+            String(localized: "What changes"),
+            lines: [
+                scheduleLine,
+                info[NotificationUserInfoKey.action] as? String ?? "",
+            ]
+        )
+        return result
     }
 
     @objc private func declineProposal() {
@@ -226,6 +289,15 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         yesButton.isEnabled = true
     }
 
+}
+
+private enum NotificationUserInfoKey {
+    static let observation = "healthmes_decision_observation"
+    static let evidence = "healthmes_decision_evidence"
+    static let action = "healthmes_decision_action"
+    static let before = "healthmes_decision_before"
+    static let after = "healthmes_decision_after"
+    static let endsAt = "healthmes_decision_ends_at"
 }
 
 private enum DecisionAction: String {
