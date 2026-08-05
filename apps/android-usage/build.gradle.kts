@@ -7,5 +7,5 @@ plugins {
     // Required by :companion for Glance (@Composable) widget code; with
     // Kotlin 2.x the Compose compiler ships as this Kotlin subplugin and its
     // version must match the Kotlin version above.
-    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.4.10" apply false
 }
