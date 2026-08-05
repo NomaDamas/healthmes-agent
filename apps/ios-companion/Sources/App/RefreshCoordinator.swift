@@ -33,6 +33,11 @@ actor RefreshCoordinator {
             anySuccess = true
             await notifyNewAlerts(page.data)
             NotificationManager.shared.setBadge(page.pagination.totalCount)
+            await DecisionLiveActivityController.shared.sync(
+                alerts: page.data,
+                isForeground: isForeground,
+                now: now
+            )
         }
 
         // -- Glance → Live Activity ---------------------------------------

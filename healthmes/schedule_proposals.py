@@ -35,10 +35,7 @@ def _raise_transition_conflict(
 ) -> None:
     session.expire(proposal)
     expires_at = _proposal_expiry(proposal)
-    if (
-        proposal.status is ProposalStatus.PROPOSED
-        and (expires_at is None or current >= expires_at)
-    ):
+    if proposal.status is ProposalStatus.PROPOSED and (expires_at is None or current >= expires_at):
         raise ScheduleProposalResolutionError("expired")
     raise ScheduleProposalResolutionError("not_proposed")
 
@@ -48,6 +45,7 @@ def _transition_locked_postgres(
     proposal_id: uuid.UUID,
     target: ProposalStatus,
     now: dt.datetime | None,
+    surface: str | None = None,
 ) -> ScheduleProposal:
     proposal = session.scalar(
         select(ScheduleProposal)
@@ -58,9 +56,7 @@ def _transition_locked_postgres(
     if proposal is None:
         raise ScheduleProposalResolutionError("not_found")
     current = _as_utc(
-        now
-        or session.scalar(select(func.clock_timestamp()))
-        or dt.datetime.now(dt.UTC)
+        now or session.scalar(select(func.clock_timestamp())) or dt.datetime.now(dt.UTC)
     )
     expires_at = _proposal_expiry(proposal)
     if proposal.status is not ProposalStatus.PROPOSED:
@@ -68,6 +64,9 @@ def _transition_locked_postgres(
     if expires_at is None or current >= expires_at:
         raise ScheduleProposalResolutionError("expired")
     proposal.status = target
+    if surface is not None:
+        proposal.decided_at = current
+        proposal.decision_surface = surface
     session.flush()
     session.refresh(proposal)
     return proposal
@@ -78,7 +77,14 @@ def _transition_compare_and_swap(
     proposal: ScheduleProposal,
     target: ProposalStatus,
     current: dt.datetime,
+    surface: str | None = None,
 ) -> ScheduleProposal:
+    values: dict[str, object] = {"status": target}
+    if surface is not None:
+        values.update(
+            decided_at=current,
+            decision_surface=surface,
+        )
     result = session.execute(
         update(ScheduleProposal)
         .where(
@@ -87,7 +93,7 @@ def _transition_compare_and_swap(
             ScheduleProposal.expires_at.is_not(None),
             ScheduleProposal.expires_at > current,
         )
-        .values(status=target)
+        .values(**values)
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
@@ -139,6 +145,7 @@ def resolve_schedule_proposal(
     handle_secret: str,
     *,
     now: dt.datetime | None = None,
+    surface: str | None = None,
     allow_reply_handle: bool = True,
     allow_resolution_token: bool = False,
 ) -> ScheduleProposal:
@@ -171,6 +178,7 @@ def resolve_schedule_proposal(
         raise ScheduleProposalResolutionError("invalid_handle")
     expires_at = _proposal_expiry(proposal)
     current = _as_utc(now or dt.datetime.now(dt.UTC))
+    normalized_surface = normalize_decision_surface(surface)
     if expires_at is None or current >= expires_at:
         raise ScheduleProposalResolutionError("expired")
     if session.get_bind().dialect.name == "postgresql":
@@ -179,8 +187,34 @@ def resolve_schedule_proposal(
             proposal_id,
             target,
             now,
+            normalized_surface,
         )
-    return _transition_compare_and_swap(session, proposal, target, current)
+    return _transition_compare_and_swap(
+        session,
+        proposal,
+        target,
+        current,
+        normalized_surface,
+    )
+
+
+def normalize_decision_surface(value: str | None) -> str:
+    normalized = (value or "api").strip().lower().replace("-", "_")
+    allowed = {
+        "api",
+        "apple_notification",
+        "ios_notification",
+        "apple_watch_notification",
+        "ios_app",
+        "android_notification",
+        "wear_os_notification",
+        "android_app",
+        "web",
+        "telegram",
+        "slack",
+        "discord",
+    }
+    return normalized if normalized in allowed else "api"
 
 
 def invalidate_schedule_proposal(

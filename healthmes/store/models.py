@@ -177,6 +177,8 @@ class ScheduleProposal(Base):
         index=True, unique=True
     )
     expires_at: Mapped[datetime | None] = mapped_column(index=True)
+    decided_at: Mapped[datetime | None] = mapped_column(index=True)
+    decision_surface: Mapped[str_32 | None]
     intake_calendar_source: Mapped[CalendarSource | None]
     intake_external_id: Mapped[str_255 | None]
     intake_revision: Mapped[str_255 | None]

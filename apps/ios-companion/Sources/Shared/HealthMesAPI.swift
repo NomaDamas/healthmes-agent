@@ -45,6 +45,11 @@ public enum HealthMesAPIError: Error {
         else { return nil }
         return current
     }
+
+    public var isProposalExpired: Bool {
+        if case .server(409, "proposal_expired", _, _) = self { return true }
+        return false
+    }
 }
 
 public final class HealthMesAPI {
@@ -125,12 +130,16 @@ public final class HealthMesAPI {
         pairing: Pairing,
         proposalID: UUID,
         action: ProposalAction,
-        resolutionToken: String
+        resolutionToken: String,
+        surface: String = "ios_app"
     ) throws -> URLRequest {
         try jsonRequest(
             pairing: pairing,
             path: "v1/schedule/proposals/\(proposalID.uuidString.lowercased())/\(action.rawValue)",
-            body: ProposalResolutionBody(resolutionToken: resolutionToken)
+            body: ProposalResolutionBody(
+                resolutionToken: resolutionToken,
+                surface: surface
+            )
         )
     }
 
@@ -229,7 +238,9 @@ public final class HealthMesAPI {
     }
 
     public func resolveProposal(
-        _ proposal: ProposalItem, action: ProposalAction
+        _ proposal: ProposalItem,
+        action: ProposalAction,
+        surface: String = "ios_app"
     ) async throws -> ProposalItem {
         guard let resolutionToken = proposal.resolutionToken(for: action) else {
             throw HealthMesAPIError.httpStatus(422)
@@ -239,7 +250,8 @@ public final class HealthMesAPI {
                 pairing: try pairing(),
                 proposalID: proposal.id,
                 action: action,
-                resolutionToken: resolutionToken
+                resolutionToken: resolutionToken,
+                surface: surface
             ),
             expecting: ProposalItem.self
         )

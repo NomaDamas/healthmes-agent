@@ -17,6 +17,7 @@ struct HealthMesWidgetBundle: WidgetBundle {
         GlanceWidget()
         #if canImport(ActivityKit)
             FocusBlockLiveActivity()
+            DecisionLiveActivity()
         #endif
     }
 }

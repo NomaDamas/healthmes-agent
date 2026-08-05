@@ -222,6 +222,9 @@ def test_proposal_alert_resolves_its_direct_target_beyond_first_page(
         direct = client.get(f"/v1/schedule/proposals/{target_id}")
 
     assert alert["proposal_id"] == str(target_id)
+    assert alert["decision_card"]["proposal_id"] == str(target_id)
+    assert alert["decision_card"]["title"] == "Task 50"
+    assert alert["decision_card"]["after"].startswith("2026-07-10T00:50:00")
     assert str(target_id) not in {row["id"] for row in first_page["data"]}
     assert first_page["pagination"]["total_count"] == 51
     assert direct.status_code == 200

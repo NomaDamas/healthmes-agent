@@ -9,7 +9,7 @@ rendering, which never connects.
 import io
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -209,6 +209,7 @@ class TestSqliteUpgrade:
         proposal_id = "2" * 32
         expired_task_id = "3" * 32
         expired_proposal_id = "4" * 32
+        now = datetime.now(UTC)
         with engine.begin() as connection:
             connection.execute(
                 task_table.insert(),
@@ -235,15 +236,15 @@ class TestSqliteUpgrade:
                     {
                         "id": proposal_id,
                         "task_id": task_id,
-                        "proposed_start": datetime(2026, 8, 4, 9, tzinfo=UTC),
-                        "proposed_end": datetime(2026, 8, 4, 10, tzinfo=UTC),
+                        "proposed_start": now + timedelta(days=2),
+                        "proposed_end": now + timedelta(days=2, hours=1),
                         "status": "proposed",
                     },
                     {
                         "id": expired_proposal_id,
                         "task_id": expired_task_id,
-                        "proposed_start": datetime(2026, 8, 2, 9, tzinfo=UTC),
-                        "proposed_end": datetime(2026, 8, 2, 10, tzinfo=UTC),
+                        "proposed_start": now - timedelta(days=2),
+                        "proposed_end": now - timedelta(days=2) + timedelta(hours=1),
                         "status": "proposed",
                     },
                 ],
@@ -366,7 +367,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "f8091a2b3c4d"
+                ) == "a9b0c1d2e3f4"
         finally:
             engine.dispose()
 

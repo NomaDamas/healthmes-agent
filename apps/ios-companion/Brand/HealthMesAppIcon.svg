@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="background" x1="128" y1="96" x2="896" y2="928" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0B8069"/>
+      <stop offset="0.58" stop-color="#00654F"/>
+      <stop offset="1" stop-color="#003F35"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(770 188) rotate(132) scale(620)">
+      <stop stop-color="#9CF2D7" stop-opacity="0.58"/>
+      <stop offset="1" stop-color="#9CF2D7" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glass" x1="242" y1="208" x2="806" y2="826" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" stop-opacity="0.3"/>
+      <stop offset="0.52" stop-color="#FFFFFF" stop-opacity="0.1"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.18"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#background)"/>
+  <rect width="1024" height="1024" fill="url(#glow)"/>
+  <circle cx="512" cy="512" r="326" fill="url(#glass)" stroke="#FFFFFF" stroke-opacity="0.2" stroke-width="3"/>
+  <path
+    d="M226 528H350L409 376L489 648L555 456L607 528H653"
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-width="52"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M623 566L697 640L824 414"
+    fill="none"
+    stroke="#B7FFE8"
+    stroke-width="58"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

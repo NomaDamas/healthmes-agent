@@ -70,12 +70,15 @@ class ProposalOut(BaseModel):
     status: ProposalStatus
     decision_record_id: uuid.UUID | None
     healthmes_kind: str | None
+    decided_at: datetime | None
+    decision_surface: str | None
     accept_resolution_token: str | None = None
     decline_resolution_token: str | None = None
 
 
 class ProposalResolutionIn(BaseModel):
     resolution_token: str
+    surface: str | None = None
 
 
 def _handle_secret(request: Request) -> str:
@@ -182,6 +185,7 @@ def _resolve_proposal(
     proposal_id: uuid.UUID,
     target: ProposalStatus,
     token: str,
+    surface: str | None,
 ) -> ProposalOut:
     handle_secret = _handle_secret(request)
     if len(handle_secret) < 32:
@@ -264,6 +268,7 @@ def _resolve_proposal(
             target,
             token,
             handle_secret,
+            surface=surface,
             allow_reply_handle=False,
             allow_resolution_token=True,
         )
@@ -294,7 +299,6 @@ def _resolve_proposal(
     session.refresh(proposal)
     return _proposal_out(proposal, request)
 
-
 @router.post("/proposals/{proposal_id}/accept")
 def accept_proposal(
     proposal_id: uuid.UUID,
@@ -309,6 +313,7 @@ def accept_proposal(
         proposal_id,
         ProposalStatus.ACCEPTED,
         body.resolution_token,
+        body.surface,
     )
 
 
@@ -326,4 +331,5 @@ def decline_proposal(
         proposal_id,
         ProposalStatus.DECLINED,
         body.resolution_token,
+        body.surface,
     )
