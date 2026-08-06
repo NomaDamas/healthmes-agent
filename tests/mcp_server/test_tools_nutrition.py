@@ -27,6 +27,7 @@ from healthmes.nutrition.repository import (
     persist_observation,
 )
 from healthmes.storage import register_storage_object
+from healthmes.store import WellnessEvent
 from healthmes.trusted_session import issue_trusted_session_proof
 
 
@@ -103,6 +104,33 @@ def _seed(store_factory, settings, observed_at):
     return observation
 
 
+def _untrusted_collision(
+    *,
+    event_type: str,
+    observed_at: dt.datetime,
+    source_record_id: str,
+) -> WellnessEvent:
+    return WellnessEvent(
+        event_type=event_type,
+        schema_version=1,
+        observed_at=observed_at,
+        recorded_at=observed_at,
+        timezone="Asia/Seoul",
+        source_provider=f"untrusted-{event_type}",
+        source_device="fixture",
+        source_record_id=source_record_id,
+        capture_method="manual",
+        quality_flags=None,
+        confidence=None,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=None,
+        expires_at=None,
+        payload={"invalid_for_healthmes_provider": True},
+        derived_from=None,
+    )
+
+
 async def test_unconfirmed_estimate_is_visible_but_not_known_total(
     mcp_client, call_tool, store_factory
 ):
@@ -113,6 +141,22 @@ async def test_unconfirmed_estimate_is_visible_but_not_known_total(
         settings,
         dt.datetime(2026, 8, 6, 1, tzinfo=dt.UTC),
     )
+    with store_factory() as session:
+        for event_type in (
+            "nutrition.observation.v1",
+            "nutrition.confirmation.v1",
+            "nutrition.daily-confirmation.v1",
+        ):
+            session.add(
+                _untrusted_collision(
+                    event_type=event_type,
+                    observed_at=dt.datetime(
+                        2026, 8, 6, 1, 1, tzinfo=dt.UTC
+                    ),
+                    source_record_id=str(observation.observation_id),
+                )
+            )
+        session.commit()
 
     evidence = await call_tool(
         mcp_client,
@@ -193,6 +237,48 @@ def _trusted(tool_name, arguments):
     return {**arguments, "trusted_session_proof": proof}
 
 
+def _nutrition_review_items(
+    *, serving_unit: str = "ml"
+) -> list[dict[str, object]]:
+    nutrient_values = {
+        "energy": (90, "kcal"),
+        "protein": (4, "g"),
+        "carbohydrate": (13, "g"),
+        "fat": (2, "g"),
+        "fiber": (0, "g"),
+        "sugar": (11, "g"),
+        "sodium": (80, "mg"),
+        "caffeine": (100, "mg"),
+    }
+    return [
+        {
+            "item_index": 0,
+            "name": "small latte",
+            "intake_type": "beverage",
+            "serving": {
+                "kind": "exact",
+                "unit": serving_unit,
+                "exact": 250,
+                "estimation_basis": "owner_correction",
+            },
+            "nutrients": [
+                {
+                    "nutrient": nutrient,
+                    "amount": {
+                        "kind": "exact",
+                        "unit": unit,
+                        "exact": amount,
+                        "estimation_basis": "owner_correction",
+                    },
+                    "confidence": "high",
+                }
+                for nutrient, (amount, unit) in nutrient_values.items()
+            ],
+            "confidence": "high",
+        }
+    ]
+
+
 async def test_trusted_mcp_confirmation_flow(
     mcp_client, call_tool, store_factory
 ):
@@ -233,6 +319,64 @@ async def test_trusted_mcp_confirmation_flow(
     assert known["confirmed_caffeine_mg"] == 175
 
 
+async def test_trusted_mcp_full_nutrition_review_is_visible(
+    mcp_client, call_tool, store_factory
+):
+    server_module.set_timezone("Asia/Seoul")
+    settings = server_module._active_settings()
+    observation = _seed(
+        store_factory,
+        settings,
+        dt.datetime(2026, 8, 6, 1, tzinfo=dt.UTC),
+    )
+    items = _nutrition_review_items()
+    arguments = {
+        "operation_id": str(uuid.uuid4()),
+        "observation_id": str(observation.observation_id),
+        "status": "corrected",
+        "items": items,
+    }
+    result = await call_tool(
+        mcp_client,
+        "review_photo_nutrition_observation",
+        _trusted("review_photo_nutrition_observation", arguments),
+    )
+    assert result["review_status"] == "corrected"
+
+    observations = await call_tool(
+        mcp_client,
+        "get_recent_nutrition_observations",
+        {},
+    )
+    review = observations["observations"][0]["latest_nutrition_review"]
+    assert review["status"] == "corrected"
+    assert review["items"][0]["name"] == "small latte"
+
+
+async def test_mcp_nutrition_review_rejects_oversized_estimate_fields(
+    mcp_client, call_tool, store_factory
+):
+    server_module.set_timezone("Asia/Seoul")
+    settings = server_module._active_settings()
+    observation = _seed(
+        store_factory,
+        settings,
+        dt.datetime(2026, 8, 6, 1, tzinfo=dt.UTC),
+    )
+    arguments = {
+        "operation_id": str(uuid.uuid4()),
+        "observation_id": str(observation.observation_id),
+        "status": "corrected",
+        "items": _nutrition_review_items(serving_unit="x" * 1000),
+    }
+    with pytest.raises(ToolError, match="unit must contain"):
+        await call_tool(
+            mcp_client,
+            "review_photo_nutrition_observation",
+            _trusted("review_photo_nutrition_observation", arguments),
+        )
+
+
 async def test_confirmation_tools_reject_missing_or_tampered_proof(
     mcp_client, store_factory
 ):
@@ -250,5 +394,15 @@ async def test_confirmation_tools_reject_missing_or_tampered_proof(
                 "observation_id": str(observation.observation_id),
                 "status": "confirmed",
                 "items": [{"item_index": 0, "caffeine_mg": 180}],
+            },
+        )
+    with pytest.raises(ToolError, match="trusted_session_proof"):
+        await mcp_client.call_tool(
+            "review_photo_nutrition_observation",
+            {
+                "operation_id": str(uuid.uuid4()),
+                "observation_id": str(observation.observation_id),
+                "status": "confirmed",
+                "items": [],
             },
         )

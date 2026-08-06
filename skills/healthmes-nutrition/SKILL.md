@@ -1,7 +1,7 @@
 ---
 name: healthmes-nutrition
 description: Capture photo, text, or voice-transcript food context; keep observations separate from consumption; and build evidence-bound wellness decisions.
-version: 2.0.0
+version: 2.1.0
 author: HealthMes Agent
 license: MIT
 metadata:
@@ -22,7 +22,11 @@ web, or agent surfaces can render.
 - `log_consumed` is the owner's intent, not proof that the outcome was stored.
 - Only `confirm_intake_outcome(status="consumed")` creates known intake.
 - Nutrient facts retain `origin`, `confidence`, exact/range/unknown, and units.
-- Sake photo analysis remains caffeine-first. It does not extract full nutrition.
+- Photo analysis extracts serving plus core nutrition: energy, protein,
+  carbohydrate, fat, fiber, sugar, sodium, and caffeine. Additional nutrients
+  use the same generic contract.
+- A photo nutrition review can confirm, fully correct, or reject the VLM
+  observation without overwriting its original provenance.
 - Voice requires a transcript produced locally before capture. This skill does
   not claim that HealthMes transcribed the audio.
 - Captured history is not proof that every meal in a day was recorded.
@@ -37,6 +41,8 @@ web, or agent surfaces can render.
 
 | Tool | Purpose |
 |---|---|
+| `mcp__healthmes__get_recent_nutrition_observations` | Read photo nutrition estimates, provenance, and latest owner review |
+| `mcp__healthmes__review_photo_nutrition_observation` | Confirm, fully correct, or reject one photo nutrition observation |
 | `mcp__healthmes__capture_intake_interaction` | Store photo, exact text, or local voice-transcript context with an explicit intent |
 | `mcp__healthmes__confirm_intake_outcome` | Store consumed, not-consumed, or cancelled from the owner's exact reply |
 | `mcp__healthmes__search_intake_records` | Search reusable records by time, intent, modality, nutrient, confirmation, or text |
@@ -58,20 +64,24 @@ web, or agent surfaces can render.
 1. Preserve the owner's intent. Use `log_consumed`, `ask_before_intake`,
    `inspect_only`, `plan_future`, or `compare_option`; never infer a different
    intent from the media alone.
-2. Capture the interaction. For photo, pass the existing sake
+2. For a photo, read the observation and preserve exact/range/unknown. If the
+   owner corrects it, write a complete replacement with
+   `review_photo_nutrition_observation` and a fresh `operation_id` before
+   capture.
+3. Capture the interaction. For photo, pass the existing
    `nutrition_observation_id`. For voice, pass the local media token and exact
    local transcript. For text, preserve the owner's exact text.
-3. If the owner is logging consumption, ask for exact confirmation and call
+4. If the owner is logging consumption, ask for exact confirmation and call
    `confirm_intake_outcome`. Do not silently turn the capture into intake.
-4. If the owner asks before eating, call `request_intake_decision`. Use only
+5. If the owner asks before eating, call `request_intake_decision`. Use only
    the returned candidate, confirmed history, evidence IDs, and explicit
    limitations.
-5. Record the result with `record_intake_decision`. If the owner later eats
+6. Record the result with `record_intake_decision`. If the owner later eats
    the candidate, separately call `confirm_intake_outcome(status="consumed")`.
-6. For caffeine quantity decisions, keep using the sake confirmation flow.
+7. For caffeine quantity decisions, keep using the sake confirmation flow.
    Continue only when `get_known_caffeine_intake_for_day` reports both
    `status: known` and `total_intake_complete: true`.
-7. Generate one new `operation_id` for each logical write and include it in
+8. Generate one new `operation_id` for each logical write and include it in
    the trusted proof. Preserve the same ID only when retrying the exact input.
 
 ## Sake confirmation procedure

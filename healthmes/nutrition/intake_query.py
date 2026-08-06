@@ -441,6 +441,36 @@ def _snapshot_for_interaction(
     )
 
 
+def _nutrition_source_event_ids(
+    session: Session,
+    record: dict[str, Any],
+) -> list[uuid.UUID]:
+    event_ids: list[uuid.UUID] = []
+    observation_id = record.get("nutrition_observation_id")
+    if observation_id:
+        event_id = session.scalar(
+            select(WellnessEvent.id).where(
+                WellnessEvent.event_type == "nutrition.observation.v1",
+                WellnessEvent.source_provider == "sake-vlm",
+                WellnessEvent.source_record_id == observation_id,
+            )
+        )
+        if event_id is not None:
+            event_ids.append(event_id)
+    review_id = record.get("nutrition_review_id")
+    if review_id:
+        event_id = session.scalar(
+            select(WellnessEvent.id).where(
+                WellnessEvent.event_type == "nutrition.review.v1",
+                WellnessEvent.source_provider == "user-nutrition-review",
+                WellnessEvent.source_record_id == review_id,
+            )
+        )
+        if event_id is not None:
+            event_ids.append(event_id)
+    return event_ids
+
+
 def _caffeine_gate(
     session: Session,
     *,
@@ -463,6 +493,7 @@ def _caffeine_gate(
                 "observation_count": 0,
                 "reviewed_count": 0,
                 "unreviewed_observation_ids": [],
+                "unquantified_observation_ids": [],
                 "evidence": [],
                 "daily_confirmation_id": None,
                 "reason": "interaction timezone is not an IANA timezone",
@@ -479,7 +510,14 @@ def _caffeine_gate(
         entry["observation_id"] for entry in gate["evidence"]
     }
     confirmation_ids = {
-        entry["confirmation_id"] for entry in gate["evidence"]
+        entry["confirmation_id"]
+        for entry in gate["evidence"]
+        if entry.get("event_type") == "nutrition.confirmation.v1"
+    }
+    review_ids = {
+        entry["confirmation_id"]
+        for entry in gate["evidence"]
+        if entry.get("event_type") == "nutrition.review.v1"
     }
     event_ids: list[uuid.UUID] = []
     if observation_ids:
@@ -499,6 +537,16 @@ def _caffeine_gate(
                     WellnessEvent.event_type == "nutrition.confirmation.v1",
                     WellnessEvent.source_provider == "user-confirmation",
                     WellnessEvent.source_record_id.in_(confirmation_ids),
+                )
+            )
+        )
+    if review_ids:
+        event_ids.extend(
+            session.scalars(
+                select(WellnessEvent.id).where(
+                    WellnessEvent.event_type == "nutrition.review.v1",
+                    WellnessEvent.source_provider == "user-nutrition-review",
+                    WellnessEvent.source_record_id.in_(review_ids),
                 )
             )
         )
@@ -526,12 +574,18 @@ def build_decision_context_snapshot(
     primary, primary_event_ids = _snapshot_for_interaction(
         session, request.interaction_id
     )
+    primary_event_ids.extend(
+        _nutrition_source_event_ids(session, primary)
+    )
     comparisons: list[dict[str, Any]] = []
     comparison_event_ids: list[uuid.UUID] = []
     for interaction_id in request.compare_interaction_ids:
         value, event_ids = _snapshot_for_interaction(session, interaction_id)
         comparisons.append(value)
         comparison_event_ids.extend(event_ids)
+        comparison_event_ids.extend(
+            _nutrition_source_event_ids(session, value)
+        )
 
     anchor = request.intended_consumption_at or request.requested_at
     history_start = anchor - timedelta(days=request.lookback_days)
@@ -550,23 +604,11 @@ def build_decision_context_snapshot(
         anchor=anchor,
         timezone=primary["timezone"],
     )
-    observation_event_ids: list[uuid.UUID] = []
-    nutrition_observation_id = primary.get("nutrition_observation_id")
-    if nutrition_observation_id:
-        observation_event_id = session.scalar(
-            select(WellnessEvent.id).where(
-                WellnessEvent.event_type == "nutrition.observation.v1",
-                WellnessEvent.source_record_id == nutrition_observation_id,
-            )
-        )
-        if observation_event_id is not None:
-            observation_event_ids.append(observation_event_id)
     evidence_ids = [
         request_event_id,
         *primary_event_ids,
         *comparison_event_ids,
         *history_event_ids,
-        *observation_event_ids,
         *caffeine_event_ids,
     ]
     return {

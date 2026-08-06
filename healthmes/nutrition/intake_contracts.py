@@ -96,6 +96,7 @@ class IntakeInteraction:
     media_path: str | None
     nutrition_observation_id: uuid.UUID | None
     items: tuple[NormalizedIntakeItem, ...]
+    nutrition_review_id: uuid.UUID | None = None
     warnings: tuple[str, ...] = ()
     schema_version: str = "intake-interaction-v1"
 
@@ -112,6 +113,7 @@ class StructuredIntakeSnapshot:
     source: str
     nutrition_observation_id: uuid.UUID | None
     items: tuple[NormalizedIntakeItem, ...]
+    nutrition_review_id: uuid.UUID | None = None
     warnings: tuple[str, ...] = ()
     schema_version: str = "structured-intake-snapshot-v1"
 

@@ -16,9 +16,11 @@ from sqlalchemy.orm import Session
 
 from healthmes.config import Settings
 from healthmes.nutrition.contracts import (
+    ConfirmationStatus,
     Estimate,
     EstimateKind,
     NutritionObservation,
+    NutritionReview,
 )
 from healthmes.nutrition.intake_contracts import (
     CaptureModality,
@@ -45,6 +47,7 @@ from healthmes.nutrition.intake_contracts import (
 )
 from healthmes.nutrition.repository import (
     get_observation,
+    latest_nutrition_reviews,
     storage_object_for_media,
 )
 from healthmes.storage import classify_storage_object, ensure_default_policies
@@ -324,20 +327,33 @@ def _validate_items(items: tuple[NormalizedIntakeItem, ...]) -> None:
 def normalize_photo_observation(
     observation: NutritionObservation,
 ) -> tuple[NormalizedIntakeItem, ...]:
-    """Adapt the caffeine-first sake schema without changing its payload."""
+    """Adapt the sake observation without changing its stored payload."""
 
     normalized: list[NormalizedIntakeItem] = []
     for item in observation.items:
-        nutrients = ()
-        if item.caffeine.kind is not EstimateKind.UNKNOWN:
+        nutrients = tuple(
+            NutrientFact(
+                nutrient=nutrient.nutrient,
+                amount=nutrient.amount,
+                confidence=nutrient.confidence,
+                origin=EvidenceOrigin.VLM,
+                evidence_text=nutrient.amount.evidence_text,
+            )
+            for nutrient in item.nutrients
+        )
+        if (
+            not any(value.nutrient == "caffeine" for value in nutrients)
+            and item.caffeine.kind is not EstimateKind.UNKNOWN
+        ):
             nutrients = (
+                *nutrients,
                 NutrientFact(
                     nutrient="caffeine",
                     amount=item.caffeine,
                     confidence=item.confidence,
                     origin=EvidenceOrigin.VLM,
                     evidence_text=item.caffeine.evidence_text,
-                ),
+                )
             )
         normalized.append(
             NormalizedIntakeItem(
@@ -354,6 +370,38 @@ def normalize_photo_observation(
             )
         )
     return tuple(normalized)
+
+
+def normalize_nutrition_review(
+    observation: NutritionObservation,
+    review: NutritionReview | None,
+) -> tuple[NormalizedIntakeItem, ...]:
+    if review is None or review.status is ConfirmationStatus.CONFIRMED:
+        return normalize_photo_observation(observation)
+    if review.status is ConfirmationStatus.REJECTED:
+        raise IntakeInteractionError(
+            "rejected nutrition observations cannot create interactions"
+        )
+    return tuple(
+        NormalizedIntakeItem(
+            name=item.name,
+            intake_type=item.intake_type.value,
+            serving=item.serving,
+            nutrients=tuple(
+                NutrientFact(
+                    nutrient=nutrient.nutrient,
+                    amount=nutrient.amount,
+                    confidence=nutrient.confidence,
+                    origin=EvidenceOrigin.USER,
+                    evidence_text=None,
+                )
+                for nutrient in item.nutrients
+            ),
+            confidence=item.confidence,
+            warnings=item.warnings,
+        )
+        for item in sorted(review.items, key=lambda value: value.item_index)
+    )
 
 
 def structured_snapshot(
@@ -385,6 +433,7 @@ def structured_snapshot(
         source=interaction.source,
         nutrition_observation_id=interaction.nutrition_observation_id,
         items=durable_items,
+        nutrition_review_id=interaction.nutrition_review_id,
         warnings=interaction.warnings,
     )
 
@@ -463,13 +512,26 @@ def create_interaction(
             raise IntakeInteractionError(
                 "photo media_path must match the nutrition observation"
             )
-        if interaction.items != normalize_photo_observation(observation):
+        review = latest_nutrition_reviews(
+            session, {observation.observation_id}
+        ).get(observation.observation_id)
+        if interaction.nutrition_review_id != (
+            review.review_id if review is not None else None
+        ):
             raise IntakeInteractionError(
-                "photo items must be adapted from the stored sake observation"
+                "photo interaction must reference the latest nutrition review"
+            )
+        if interaction.items != normalize_nutrition_review(observation, review):
+            raise IntakeInteractionError(
+                "photo items must match the latest reviewed nutrition observation"
             )
     elif interaction.nutrition_observation_id is not None:
         raise IntakeInteractionError(
             "text and voice interactions cannot reference a photo observation"
+        )
+    elif interaction.nutrition_review_id is not None:
+        raise IntakeInteractionError(
+            "text and voice interactions cannot reference a nutrition review"
         )
 
     if interaction.modality is CaptureModality.TEXT:
@@ -531,7 +593,16 @@ def create_interaction(
             {
                 "nutrition_observation_id": str(
                     interaction.nutrition_observation_id
-                )
+                ),
+                **(
+                    {
+                        "nutrition_review_id": str(
+                            interaction.nutrition_review_id
+                        )
+                    }
+                    if interaction.nutrition_review_id is not None
+                    else {}
+                ),
             }
             if interaction.nutrition_observation_id is not None
             else None
@@ -613,6 +684,9 @@ def create_photo_interaction(
     observation = get_observation(session, observation_id)
     if observation is None:
         raise IntakeInteractionError("nutrition observation not found")
+    review = latest_nutrition_reviews(session, {observation_id}).get(
+        observation_id
+    )
     interaction = IntakeInteraction(
         interaction_id=operation_id,
         operation_fingerprint=operation_fingerprint,
@@ -625,7 +699,8 @@ def create_photo_interaction(
         source_text=source_text,
         media_path=observation.capture.media_path,
         nutrition_observation_id=observation.observation_id,
-        items=normalize_photo_observation(observation),
+        items=normalize_nutrition_review(observation, review),
+        nutrition_review_id=review.review_id if review is not None else None,
         warnings=observation.warnings,
     )
     create_interaction(session, settings, interaction)

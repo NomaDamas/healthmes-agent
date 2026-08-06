@@ -38,7 +38,7 @@ Intake Interaction Engine
 ```text
 Capture
   |
-  +--> photo: 기존 sake observation ID 참조
+  +--> photo: NutritionObservation ID 참조
   +--> text: 사용자 원문을 단기 capture에 보존
   +--> voice: 로컬 audio token + transcript를 단기 capture에 보존
   |
@@ -68,12 +68,18 @@ IntakeInteraction (관찰)
 것을 막는다. 이미 만료된 raw capture의 동일 재시도는 새 식사를 만들지 않고
 명시적 충돌을 반환한다.
 
-## sake와 결합
+## 사진 분석 및 Sake와 결합
 
-사진 입력은 새 사진분석 스키마를 만들지 않는다. 기존 sake
-`NutritionObservation`을 ID로 참조하고, 이름·제공량·카페인 값을 검색용
-`NormalizedIntakeItem`으로 투영한다. 원본 payload와 VLM provenance는 그대로
-남는다. 현재 sake 사진 스키마에서 투영 가능한 영양소는 카페인뿐이다.
+사진 입력은 `NutritionObservation`을 ID로 참조하고 이름, 제공량, 핵심
+영양소와 추가 영양소를 검색용 `NormalizedIntakeItem`으로 투영한다. 원본
+payload와 VLM provenance는 그대로 남는다. Sake 카페인 관찰은 이 일반 영양
+관찰의 부분집합이며, 기존 전용 `caffeine` 필드와 확인 도구는 계속 동작한다.
+
+사진 관찰은 별도 `NutritionReview`로 확인, 전체 수정, 거절할 수 있다. 원본 VLM
+관찰은 덮어쓰지 않는다. 새 사진 interaction은 최신 검토본을 사용하며, 거절된
+관찰에서는 만들 수 없다. 이미 생성된 interaction은 불변 snapshot이므로 이후
+정정은 `IntakeOutcome.corrected_items`로 기록한다. 검토 이벤트는 원 관찰과 같은
+보존정책 및 만료시각을 사용해 원 관찰 삭제 뒤 고아 데이터로 남지 않는다.
 
 텍스트나 음성 transcript에 구조화된 영양소가 함께 제공되면
 `NutrientFact`에 다음 정보를 보존한다.
@@ -136,5 +142,5 @@ ID와 limitations를 저장하므로 이후 에이전트가 무엇을 근거로 
 - 알레르기와 약물 상호작용은 일반 웰니스 엔진에서 제안하지 않고
   `unsupported`로만 기록한다. 서버가 고정된 안전 문구와 limitation을 저장하고
   호출자가 보낸 recommendation은 폐기한다.
-- UI, 자동 텍스트 영양 분석, 서버 음성 전사, 전체 영양소 사진 추출은 이
-  엔진의 구현 범위가 아니다.
+- UI, 자동 텍스트 영양 분석, 서버 음성 전사는 이 엔진의 구현 범위가 아니다.
+- 사진 전체 영양소는 VLM 추정치이며 의료적 측정값이 아니다.

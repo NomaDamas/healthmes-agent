@@ -17,21 +17,31 @@ from healthmes.config import Settings
 from healthmes.nutrition.contracts import (
     CaffeineConfirmation,
     CaptureContext,
+    Confidence,
     ConfirmationStatus,
     ConfirmedCaffeineItem,
     DailyIntakeConfirmation,
+    Estimate,
+    EstimateKind,
+    IntakeType,
     Location,
     MetadataSource,
+    NutrientEstimate,
     NutritionObservation,
+    NutritionReview,
+    ReviewedNutritionItem,
     VisionProvenance,
+    nutrition_review_to_payload,
 )
 from healthmes.nutrition.repository import (
     NutritionRepositoryError,
     get_observation,
+    latest_nutrition_reviews,
     list_observations,
     observation_for_media,
     persist_caffeine_confirmation,
     persist_daily_confirmation,
+    persist_nutrition_review,
     persist_observation,
     storage_object_for_media,
 )
@@ -107,6 +117,111 @@ class ConfirmObservationInput(BaseModel):
             raise ValueError("rejected observations cannot contain confirmed items")
         if self.status != "rejected" and not self.items:
             raise ValueError("confirmed or corrected observations require item values")
+        indexes = [item.item_index for item in self.items]
+        if len(indexes) != len(set(indexes)):
+            raise ValueError("item_index values must be unique")
+        return self
+
+
+class ReviewedEstimateInput(BaseModel):
+    kind: EstimateKind
+    unit: str = Field(min_length=1, max_length=32)
+    exact: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    minimum: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    maximum: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    estimation_basis: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> Self:
+        if self.kind is EstimateKind.EXACT:
+            valid = (
+                self.exact is not None
+                and self.minimum is None
+                and self.maximum is None
+            )
+        elif self.kind is EstimateKind.RANGE:
+            valid = (
+                self.exact is None
+                and self.minimum is not None
+                and self.maximum is not None
+                and self.minimum <= self.maximum
+            )
+        else:
+            valid = all(
+                value is None
+                for value in (self.exact, self.minimum, self.maximum)
+            )
+        if not valid:
+            raise ValueError("reviewed estimate shape is invalid")
+        return self
+
+    def to_domain(self) -> Estimate:
+        return Estimate(
+            kind=self.kind,
+            unit=self.unit,
+            exact=self.exact,
+            minimum=self.minimum,
+            maximum=self.maximum,
+            estimation_basis=self.estimation_basis,
+        )
+
+
+class ReviewedNutrientInput(BaseModel):
+    nutrient: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+    amount: ReviewedEstimateInput
+    confidence: Confidence = Confidence.HIGH
+
+    def to_domain(self) -> NutrientEstimate:
+        return NutrientEstimate(
+            nutrient=self.nutrient,
+            amount=self.amount.to_domain(),
+            confidence=self.confidence,
+        )
+
+
+class ReviewedNutritionItemInput(BaseModel):
+    item_index: int = Field(ge=0)
+    name: str = Field(min_length=1, max_length=300)
+    intake_type: IntakeType
+    serving: ReviewedEstimateInput
+    nutrients: list[ReviewedNutrientInput] = Field(
+        min_length=1, max_length=100
+    )
+    confidence: Confidence = Confidence.HIGH
+    warnings: list[str] = Field(default_factory=list, max_length=20)
+
+    def to_domain(self) -> ReviewedNutritionItem:
+        return ReviewedNutritionItem(
+            item_index=self.item_index,
+            name=self.name,
+            intake_type=self.intake_type,
+            serving=self.serving.to_domain(),
+            nutrients=tuple(value.to_domain() for value in self.nutrients),
+            confidence=self.confidence,
+            warnings=tuple(self.warnings),
+        )
+
+
+class ReviewNutritionObservationInput(BaseModel):
+    operation_id: uuid.UUID
+    status: Literal["confirmed", "corrected", "rejected"]
+    source: str = Field(min_length=1, max_length=64)
+    items: list[ReviewedNutritionItemInput] = Field(
+        default_factory=list, max_length=50
+    )
+
+    @model_validator(mode="after")
+    def validate_items(self) -> Self:
+        if self.status == "corrected" and not self.items:
+            raise ValueError("corrected reviews require complete item values")
+        if self.status != "corrected" and self.items:
+            raise ValueError(
+                "confirmed or rejected reviews cannot contain corrected items"
+            )
         indexes = [item.item_index for item in self.items]
         if len(indexes) != len(set(indexes)):
             raise ValueError("item_index values must be unique")
@@ -310,4 +425,62 @@ def confirm_nutrition_observation(
         "confirmation_id": str(confirmation.confirmation_id),
         "observation_id": str(observation_id),
         "status": confirmation.status.value,
+    }
+
+
+@router.post("/{observation_id}/review", status_code=status.HTTP_201_CREATED)
+def review_nutrition_observation(
+    observation_id: uuid.UUID,
+    body: ReviewNutritionObservationInput,
+    session: SessionDep,
+) -> dict[str, str]:
+    review = NutritionReview(
+        review_id=body.operation_id,
+        observation_id=observation_id,
+        status=ConfirmationStatus(body.status),
+        reviewed_at=utc_now(),
+        source=body.source,
+        items=tuple(item.to_domain() for item in body.items),
+    )
+    try:
+        persist_nutrition_review(session, review)
+    except NutritionRepositoryError as exc:
+        if str(exc) == "nutrition observation not found":
+            raise not_found("nutrition observation", observation_id) from exc
+        if "operation_id was already used" in str(exc):
+            raise APIError(
+                status.HTTP_409_CONFLICT,
+                "nutrition_review_operation_conflict",
+                str(exc),
+            ) from exc
+        raise APIError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "invalid_nutrition_review",
+            str(exc),
+        ) from exc
+    session.commit()
+    return {
+        "review_id": str(review.review_id),
+        "observation_id": str(observation_id),
+        "status": review.status.value,
+    }
+
+
+@router.get("/{observation_id}/review")
+def get_nutrition_observation_review(
+    observation_id: uuid.UUID,
+    session: SessionDep,
+) -> dict[str, object]:
+    if get_observation(session, observation_id) is None:
+        raise not_found("nutrition observation", observation_id)
+    review = latest_nutrition_reviews(session, {observation_id}).get(
+        observation_id
+    )
+    return {
+        "observation_id": str(observation_id),
+        "review": (
+            nutrition_review_to_payload(review)
+            if review is not None
+            else None
+        ),
     }

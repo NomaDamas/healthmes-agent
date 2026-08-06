@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import date, timedelta
 
 from sqlalchemy import select
 
@@ -12,6 +13,7 @@ from healthmes.nutrition.contracts import (
     IntakeType,
     ObservationStatus,
 )
+from healthmes.nutrition.query import known_caffeine_for_day
 from healthmes.nutrition.schema import VLMEstimate, VLMExtraction, VLMItem
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
 
@@ -125,6 +127,27 @@ def _photo_observation(client) -> str:
     )
     assert response.status_code == 201
     return response.json()["observation_id"]
+
+
+def _reviewed_nutrients(*, caffeine: float = 95) -> list[dict[str, object]]:
+    values = {
+        "energy": (80, "kcal"),
+        "protein": (4, "g"),
+        "carbohydrate": (12, "g"),
+        "fat": (2, "g"),
+        "fiber": (0, "g"),
+        "sugar": (10, "g"),
+        "sodium": (75, "mg"),
+        "caffeine": (caffeine, "mg"),
+    }
+    return [
+        {
+            "nutrient": nutrient,
+            "amount": _estimate(amount, unit, basis="owner_correction"),
+            "confidence": "high",
+        }
+        for nutrient, (amount, unit) in values.items()
+    ]
 
 
 def test_text_capture_and_consumption_are_separate_events(client, session):
@@ -444,6 +467,260 @@ def test_photo_adapter_keeps_sake_observation_and_maps_caffeine(
         json={**request_body, "source_text": "다른 질문"},
     )
     assert conflict.status_code == 409
+
+
+def test_photo_review_correction_flows_into_interaction_search_and_context(
+    client, session
+):
+    observation_id = _photo_observation(client)
+    review_body = {
+        "operation_id": str(uuid.uuid4()),
+        "status": "corrected",
+        "source": "desktop-web",
+        "items": [
+            {
+                "item_index": 0,
+                "name": "small bottled latte",
+                "intake_type": "beverage",
+                "serving": _estimate(
+                    250, "ml", basis="owner_correction"
+                ),
+                "nutrients": _reviewed_nutrients(),
+                "confidence": "high",
+            }
+        ],
+    }
+    reviewed = client.post(
+        f"/v1/nutrition-observations/{observation_id}/review",
+        json=review_body,
+    )
+    assert reviewed.status_code == 201
+    retry = client.post(
+        f"/v1/nutrition-observations/{observation_id}/review",
+        json=review_body,
+    )
+    assert retry.status_code == 201
+    assert retry.json()["review_id"] == reviewed.json()["review_id"]
+    conflict = client.post(
+        f"/v1/nutrition-observations/{observation_id}/review",
+        json={
+            **review_body,
+            "status": "rejected",
+            "items": [],
+        },
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == (
+        "nutrition_review_operation_conflict"
+    )
+    assert "operation_id was already used" in conflict.text
+    review_view = client.get(
+        f"/v1/nutrition-observations/{observation_id}/review"
+    )
+    assert review_view.status_code == 200
+    assert review_view.json()["review"]["status"] == "corrected"
+
+    created = client.post(
+        "/v1/intake-interactions",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "intent": "ask_before_intake",
+            "modality": "photo",
+            "source": "galaxy-device",
+            "nutrition_observation_id": observation_id,
+        },
+    )
+    assert created.status_code == 201
+    assert created.json()["nutrition_review_id"] == reviewed.json()["review_id"]
+    item = created.json()["items"][0]
+    assert item["name"] == "small bottled latte"
+    nutrients = {
+        value["nutrient"]: value for value in item["nutrients"]
+    }
+    assert nutrients["energy"]["amount"]["exact"] == 80
+    assert nutrients["caffeine"]["amount"]["exact"] == 95
+    assert nutrients["caffeine"]["origin"] == "user"
+
+    searched = client.get(
+        "/v1/intake-interactions",
+        params={"nutrient": "energy"},
+    )
+    assert searched.status_code == 200
+    assert searched.json()["records"][0]["resolved_items"][0]["name"] == (
+        "small bottled latte"
+    )
+    decision_request = client.post(
+        f"/v1/intake-interactions/{created.json()['interaction_id']}/decision-requests",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "scope": "daily_nutrition",
+            "source": "galaxy-device",
+        },
+    )
+    assert decision_request.status_code == 201
+    context = client.get(
+        "/v1/intake-interactions/decision-requests/"
+        f"{decision_request.json()['request_id']}/context"
+    )
+    assert context.status_code == 200
+    review_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.review.v1"
+        )
+    )
+    assert review_event is not None
+    assert str(review_event.id) in context.json()["evidence_event_ids"]
+    observation_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.observation.v1",
+            WellnessEvent.source_record_id == observation_id,
+        )
+    )
+    assert observation_event is not None
+    assert review_event.retention_policy_id == (
+        observation_event.retention_policy_id
+    )
+    assert review_event.expires_at == observation_event.expires_at
+    retention_update = client.put(
+        "/v1/storage/settings/nutrition_observation",
+        json={"preset": "30d"},
+    )
+    assert retention_update.status_code == 200
+    session.expire_all()
+    assert review_event.expires_at == observation_event.expires_at
+
+    colliding_review = WellnessEvent(
+        event_type="nutrition.review.v1",
+        schema_version=1,
+        observed_at=review_event.observed_at,
+        recorded_at=review_event.recorded_at + timedelta(seconds=1),
+        timezone=review_event.timezone,
+        source_provider="untrusted-fixture",
+        source_device="fixture",
+        source_record_id=review_event.source_record_id,
+        capture_method="manual",
+        quality_flags=review_event.quality_flags,
+        confidence=1.0,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=review_event.retention_policy_id,
+        expires_at=review_event.expires_at,
+        payload=review_event.payload,
+        derived_from=review_event.derived_from,
+    )
+    session.add(colliding_review)
+    session.commit()
+    latest_review = client.get(
+        f"/v1/nutrition-observations/{observation_id}/review"
+    )
+    assert latest_review.status_code == 200
+    assert latest_review.json()["review"]["review_id"] == (
+        reviewed.json()["review_id"]
+    )
+
+    daily = client.post(
+        "/v1/nutrition-observations/daily-confirmations",
+        json={
+            "local_date": "2026-08-06",
+            "timezone": "Asia/Seoul",
+            "observation_ids": [observation_id],
+            "total_intake_complete": True,
+            "source": "desktop-web",
+        },
+    )
+    assert daily.status_code == 201
+    session.expire_all()
+    caffeine = known_caffeine_for_day(
+        session,
+        local_date=date(2026, 8, 6),
+        timezone="Asia/Seoul",
+    )
+    assert caffeine["status"] == "known"
+    assert caffeine["confirmed_caffeine_mg"] == 95
+    assert caffeine["evidence"][0]["event_type"] == "nutrition.review.v1"
+
+    comparison_primary = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            intent="compare_option",
+            source_text="이 식사와 라테를 비교해줘",
+        ),
+    )
+    assert comparison_primary.status_code == 201
+    comparison_request = client.post(
+        f"/v1/intake-interactions/{comparison_primary.json()['interaction_id']}"
+        "/decision-requests",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "scope": "compare_options",
+            "source": "desktop-web",
+            "compare_interaction_ids": [created.json()["interaction_id"]],
+        },
+    )
+    assert comparison_request.status_code == 201
+    comparison_context = client.get(
+        "/v1/intake-interactions/decision-requests/"
+        f"{comparison_request.json()['request_id']}/context"
+    )
+    assert comparison_context.status_code == 200
+    assert str(review_event.id) in (
+        comparison_context.json()["evidence_event_ids"]
+    )
+    assert str(colliding_review.id) not in (
+        comparison_context.json()["evidence_event_ids"]
+    )
+
+
+def test_rejected_photo_observation_cannot_create_interaction(client):
+    observation_id = _photo_observation(client)
+    rejected = client.post(
+        f"/v1/nutrition-observations/{observation_id}/review",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "rejected",
+            "source": "desktop-web",
+        },
+    )
+    assert rejected.status_code == 201
+
+    created = client.post(
+        "/v1/intake-interactions",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "intent": "log_consumed",
+            "modality": "photo",
+            "source": "galaxy-device",
+            "nutrition_observation_id": observation_id,
+        },
+    )
+    assert created.status_code == 422
+    assert "rejected nutrition observations" in created.text
+
+
+def test_corrected_photo_review_requires_every_core_nutrient(client):
+    observation_id = _photo_observation(client)
+    response = client.post(
+        f"/v1/nutrition-observations/{observation_id}/review",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "corrected",
+            "source": "desktop-web",
+            "items": [
+                {
+                    "item_index": 0,
+                    "name": "small bottled latte",
+                    "intake_type": "beverage",
+                    "serving": _estimate(
+                        250, "ml", basis="owner_correction"
+                    ),
+                    "nutrients": _reviewed_nutrients()[:-1],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_nutrition_review"
+    assert "missing core nutrients" in response.text
 
 
 def test_inspect_only_cannot_request_decision(client):

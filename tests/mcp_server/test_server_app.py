@@ -32,6 +32,7 @@ NUTRITION_TOOLS = {
     "capture_intake_interaction",
     "confirm_intake_outcome",
     "get_recent_nutrition_observations",
+    "review_photo_nutrition_observation",
     "get_caffeine_observations",
     "get_known_caffeine_intake_for_day",
     "get_intake_decision_context",

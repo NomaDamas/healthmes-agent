@@ -86,12 +86,20 @@ class Estimate:
 
 
 @dataclass(frozen=True, slots=True)
+class NutrientEstimate:
+    nutrient: str
+    amount: Estimate
+    confidence: Confidence = Confidence.LOW
+
+
+@dataclass(frozen=True, slots=True)
 class IntakeItem:
     intake_type: IntakeType
     name_candidates: tuple[str, ...]
     category: str | None
     serving: Estimate
     caffeine: Estimate
+    nutrients: tuple[NutrientEstimate, ...] = ()
     label_text_candidates: tuple[str, ...] = ()
     product_code_candidates: tuple[str, ...] = ()
     confidence: Confidence = Confidence.LOW
@@ -137,6 +145,27 @@ class CaffeineConfirmation:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewedNutritionItem:
+    item_index: int
+    name: str
+    intake_type: IntakeType
+    serving: Estimate
+    nutrients: tuple[NutrientEstimate, ...]
+    confidence: Confidence = Confidence.HIGH
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class NutritionReview:
+    review_id: uuid.UUID
+    observation_id: uuid.UUID
+    status: ConfirmationStatus
+    reviewed_at: datetime
+    source: str
+    items: tuple[ReviewedNutritionItem, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class DailyIntakeConfirmation:
     confirmation_id: uuid.UUID
     local_date: date
@@ -149,6 +178,7 @@ class DailyIntakeConfirmation:
 
 _OBSERVATION_ADAPTER = TypeAdapter(NutritionObservation)
 _CAFFEINE_CONFIRMATION_ADAPTER = TypeAdapter(CaffeineConfirmation)
+_NUTRITION_REVIEW_ADAPTER = TypeAdapter(NutritionReview)
 _DAILY_CONFIRMATION_ADAPTER = TypeAdapter(DailyIntakeConfirmation)
 
 
@@ -166,6 +196,14 @@ def caffeine_confirmation_to_payload(value: CaffeineConfirmation) -> dict[str, A
 
 def caffeine_confirmation_from_payload(value: dict[str, Any]) -> CaffeineConfirmation:
     return _CAFFEINE_CONFIRMATION_ADAPTER.validate_python(value)
+
+
+def nutrition_review_to_payload(value: NutritionReview) -> dict[str, Any]:
+    return _NUTRITION_REVIEW_ADAPTER.dump_python(value, mode="json")
+
+
+def nutrition_review_from_payload(value: dict[str, Any]) -> NutritionReview:
+    return _NUTRITION_REVIEW_ADAPTER.validate_python(value)
 
 
 def daily_confirmation_to_payload(value: DailyIntakeConfirmation) -> dict[str, Any]:

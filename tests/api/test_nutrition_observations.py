@@ -11,8 +11,14 @@ from healthmes.nutrition.contracts import (
     EstimateKind,
     IntakeType,
     ObservationStatus,
+    observation_from_payload,
 )
-from healthmes.nutrition.schema import VLMEstimate, VLMExtraction, VLMItem
+from healthmes.nutrition.schema import (
+    VLMEstimate,
+    VLMExtraction,
+    VLMItem,
+    VLMNutrient,
+)
 from healthmes.nutrition.vision import VisionInvalidOutput, VisionUnavailable
 from healthmes.storage import run_storage_maintenance
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
@@ -61,6 +67,38 @@ def _extraction() -> VLMExtraction:
                     evidence_text="Caffeine 180 mg",
                     estimation_basis="visible_label",
                 ),
+                nutrients=[
+                    VLMNutrient(
+                        nutrient="energy",
+                        amount=VLMEstimate(
+                            kind=EstimateKind.RANGE,
+                            unit="kcal",
+                            minimum=120,
+                            maximum=180,
+                            estimation_basis="product_type_and_container",
+                        ),
+                        confidence=Confidence.MEDIUM,
+                    ),
+                    VLMNutrient(
+                        nutrient="protein",
+                        amount=VLMEstimate(
+                            kind=EstimateKind.RANGE,
+                            unit="g",
+                            minimum=4,
+                            maximum=8,
+                            estimation_basis="product_type_and_container",
+                        ),
+                        confidence=Confidence.MEDIUM,
+                    ),
+                    VLMNutrient(
+                        nutrient="vitamin_b12",
+                        amount=VLMEstimate(
+                            kind=EstimateKind.UNKNOWN,
+                            unit="mcg",
+                        ),
+                        confidence=Confidence.LOW,
+                    ),
+                ],
                 label_text_candidates=["355 mL", "Caffeine 180 mg"],
                 product_code_candidates=[],
                 confidence=Confidence.HIGH,
@@ -113,6 +151,23 @@ def test_analyze_persists_sake_payload_and_reclassifies_media(
     body = response.json()
     assert body["capture"]["media_path"] == media_path
     assert body["items"][0]["caffeine"]["exact"] == 180
+    nutrients = {
+        value["nutrient"]: value
+        for value in body["items"][0]["nutrients"]
+    }
+    assert set(nutrients) >= {
+        "energy",
+        "protein",
+        "carbohydrate",
+        "fat",
+        "fiber",
+        "sugar",
+        "sodium",
+        "caffeine",
+        "vitamin_b12",
+    }
+    assert nutrients["energy"]["amount"]["minimum"] == 120
+    assert nutrients["carbohydrate"]["amount"]["kind"] == "unknown"
     assert body["confirmation_status"] == "unconfirmed"
     assert body["vision"]["model_digest"] == "sha256:fixture"
 
@@ -169,6 +224,65 @@ def test_analysis_is_idempotent_per_uploaded_media(client, session):
             )
         )
     ) == 1
+
+
+def test_legacy_caffeine_only_observation_payload_remains_readable():
+    observation = _extraction().items[0].to_domain()
+    payload = {
+        "observation_id": "d8951321-e120-4d99-8f3f-ddf70cd9ce01",
+        "capture": {
+            "media_path": "media/legacy.jpg",
+            "captured_at": "2026-08-06T00:00:00Z",
+            "timezone": "UTC",
+            "source": "legacy",
+            "location": None,
+            "metadata_provenance": {
+                "captured_at": "fixture",
+                "timezone": "fixture",
+                "location": "unavailable",
+            },
+        },
+        "status": "usable",
+        "confidence": "high",
+        "warnings": [],
+        "items": [
+            {
+                "intake_type": observation.intake_type.value,
+                "name_candidates": list(observation.name_candidates),
+                "category": observation.category,
+                "serving": {
+                    "kind": "exact",
+                    "unit": "ml",
+                    "exact": 355,
+                    "evidence_text": "355 mL",
+                    "estimation_basis": "visible_label",
+                },
+                "caffeine": {
+                    "kind": "exact",
+                    "unit": "mg",
+                    "exact": 180,
+                    "evidence_text": "Caffeine 180 mg",
+                    "estimation_basis": "visible_label",
+                },
+                "label_text_candidates": [],
+                "product_code_candidates": [],
+                "confidence": "high",
+                "warnings": [],
+            }
+        ],
+        "vision": {
+            "provider": "ollama",
+            "model": "legacy-model",
+            "model_digest": None,
+            "prompt_version": "photo-intake-v1",
+            "schema_version": "nutrition-observation-v1",
+            "analyzed_at": "2026-08-06T00:00:01Z",
+        },
+        "confirmation_status": "unconfirmed",
+    }
+    parsed = observation_from_payload(payload)
+    assert parsed.items[0].nutrients == ()
+    assert parsed.items[0].caffeine.exact == 180
 
 
 def test_capture_context_rejects_timezone_offset_mismatch(client):

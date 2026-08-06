@@ -137,14 +137,17 @@ raw_ref / derived_from[]
 
 ## 음식 입력 담당 경계
 
-음식 분석과 음식 사진 인식의 도메인 계약은 **sake가 담당**한다. HealthMes는
-sake의 `NutritionObservation` 구조를 평탄화하거나 기존 `FoodLog`로 바꾸지 않고
-`WellnessEvent.payload`에 원형 그대로 저장한다. 사진 원본은
+음식 사진 인식은 Sake의 카페인 관찰 계약을 하위 호환으로 포함하는 HealthMes
+`NutritionObservation` v2 계약을 사용한다. HealthMes는 이를 기존 `FoodLog`로
+평탄화하지 않고 `WellnessEvent.payload`에 원형 그대로 저장한다. 사진 원본은
 `nutrition_media`, 구조화 관측값은 `nutrition_observation`, 사용자 확인은
 `nutrition_confirmation`으로 분리해 각 보존정책을 독립 적용한다. HealthMes가
-별도의 경쟁 사진분석 스키마를 만들거나 관측값을 자동으로 사실로 승격하지 않는다.
+관측값을 자동으로 사실로 승격하지 않는다. 일반 영양 검토는
+`nutrition.review.v1`, Sake의 정확한 카페인·일일 완전성 확인은 기존 전용
+confirmation 이벤트로 각각 남긴다. 일반 영양 검토는 관찰과 같은 보존정책을
+사용하고, 카페인·일일 완전성 확인만 장기 confirmation 정책을 사용한다.
 
-HealthMes의 `IntakeInteraction`은 sake 분석 위의 오케스트레이션 계약이다. 사진,
+HealthMes의 `IntakeInteraction`은 영양 관찰 위의 오케스트레이션 계약이다. 사진,
 텍스트, 로컬 음성 transcript를 같은 식사 맥락으로 찾게 하지만 sake payload를
 복사하거나 변경하지 않는다. `먹은 기록`, `먹기 전 후보`, `분석 전용`, `계획`,
 `비교` intent를 분리하고 실제 섭취는 별도 `IntakeOutcome`이 있어야만 확정한다.

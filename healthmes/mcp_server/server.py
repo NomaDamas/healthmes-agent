@@ -83,6 +83,8 @@ from healthmes.nutrition.contracts import (
     ConfirmationStatus,
     ConfirmedCaffeineItem,
     DailyIntakeConfirmation,
+    NutritionReview,
+    ReviewedNutritionItem,
 )
 from healthmes.nutrition.intake_contracts import (
     CaptureModality,
@@ -121,6 +123,7 @@ from healthmes.nutrition.repository import (
     NutritionRepositoryError,
     persist_caffeine_confirmation,
     persist_daily_confirmation,
+    persist_nutrition_review,
 )
 from healthmes.store import (
     AppUsageSample,
@@ -144,6 +147,7 @@ from healthmes.store import enums as store_enums
 from healthmes.trusted_session import verify_trusted_session_proof
 
 _NORMALIZED_INTAKE_ITEMS = TypeAdapter(tuple[NormalizedIntakeItem, ...])
+_REVIEWED_NUTRITION_ITEMS = TypeAdapter(tuple[ReviewedNutritionItem, ...])
 
 # ---------------------------------------------------------------------------
 # Vocabulary grounded in vendor/open-wearables (do not invent values)
@@ -2875,7 +2879,7 @@ def confirm_photo_caffeine_observation(
             raise ToolError(f"items[{index}].item_index must be a non-negative integer")
         if (
             isinstance(caffeine_mg, bool)
-            or not isinstance(caffeine_mg, (int, float))
+            or not isinstance(caffeine_mg, int | float)
             or caffeine_mg < 0
         ):
             raise ToolError(f"items[{index}].caffeine_mg must be non-negative")
@@ -2917,6 +2921,70 @@ def confirm_photo_caffeine_observation(
         "confirmation_id": str(confirmation.confirmation_id),
         "observation_id": observation_id,
         "confirmation_status": status,
+    }
+
+
+@mcp.tool
+def review_photo_nutrition_observation(
+    operation_id: str,
+    observation_id: str,
+    status: str,
+    items: list[dict[str, Any]] | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Confirm, fully correct, or reject one photo nutrition observation.
+
+    Corrected items replace the VLM estimates when a later interaction is
+    created. This owner write requires a proof over the exact arguments.
+    """
+    if status not in {
+        ConfirmationStatus.CONFIRMED.value,
+        ConfirmationStatus.CORRECTED.value,
+        ConfirmationStatus.REJECTED.value,
+    }:
+        raise ToolError("status must be confirmed, corrected, or rejected")
+    raw_items = items or []
+    if status == ConfirmationStatus.CORRECTED.value and not raw_items:
+        raise ToolError("corrected reviews require complete item values")
+    if status != ConfirmationStatus.CORRECTED.value and raw_items:
+        raise ToolError(
+            "confirmed or rejected reviews cannot contain corrected items"
+        )
+    try:
+        parsed_items = _REVIEWED_NUTRITION_ITEMS.validate_python(raw_items)
+    except ValidationError as exc:
+        raise ToolError(
+            f"items do not match the nutrition review schema: {exc}"
+        ) from exc
+    proof_arguments = {
+        "operation_id": operation_id,
+        "observation_id": observation_id,
+        "status": status,
+        "items": raw_items,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="review_photo_nutrition_observation",
+        arguments=proof_arguments,
+    )
+    review = NutritionReview(
+        review_id=_parse_uuid(operation_id, "operation_id"),
+        observation_id=_parse_uuid(observation_id, "observation_id"),
+        status=ConfirmationStatus(status),
+        reviewed_at=dt.datetime.now(dt.UTC),
+        source="telegram-owner",
+        items=parsed_items,
+    )
+    try:
+        with _store_session() as session:
+            persist_nutrition_review(session, review)
+    except NutritionRepositoryError as exc:
+        raise ToolError(str(exc)) from exc
+    return {
+        "status": "ok",
+        "review_id": str(review.review_id),
+        "observation_id": observation_id,
+        "review_status": status,
     }
 
 

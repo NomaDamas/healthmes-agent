@@ -8,8 +8,12 @@ from PIL import Image
 from pydantic import SecretStr
 
 from healthmes.config import Settings
-from healthmes.nutrition.contracts import EstimateKind
-from healthmes.nutrition.schema import VLMEstimate
+from healthmes.nutrition.contracts import Confidence, EstimateKind, IntakeType
+from healthmes.nutrition.schema import (
+    VLMEstimate,
+    VLMItem,
+    VLMNutrient,
+)
 from healthmes.nutrition.vision import (
     AnthropicVisionProvider,
     GeminiVisionProvider,
@@ -81,6 +85,72 @@ def test_exact_estimate_requires_visible_label_evidence():
             unit="mg",
             exact=180,
             estimation_basis="visual_guess",
+        )
+
+
+def test_vlm_estimate_rejects_non_finite_numbers():
+    with pytest.raises(ValueError):
+        VLMEstimate(
+            kind=EstimateKind.EXACT,
+            unit="kcal",
+            exact=float("inf"),
+            evidence_text="Energy infinity kcal",
+            estimation_basis="visible_label",
+        )
+
+
+def test_vlm_item_inserts_missing_core_nutrients():
+    item = VLMItem(
+        intake_type=IntakeType.FOOD,
+        name_candidates=["sandwich"],
+        serving=VLMEstimate(
+            kind=EstimateKind.RANGE,
+            unit="g",
+            minimum=150,
+            maximum=250,
+            estimation_basis="visible_portion",
+        ),
+        caffeine=VLMEstimate(kind=EstimateKind.UNKNOWN, unit="mg"),
+        nutrients=[],
+        confidence=Confidence.MEDIUM,
+    )
+    nutrients = {value.nutrient: value for value in item.nutrients}
+    assert set(nutrients) == {
+        "energy",
+        "protein",
+        "carbohydrate",
+        "fat",
+        "fiber",
+        "sugar",
+        "sodium",
+        "caffeine",
+    }
+    assert nutrients["energy"].amount.kind is EstimateKind.UNKNOWN
+
+
+def test_vlm_nutrient_rejects_wrong_core_unit_and_duplicate_names():
+    with pytest.raises(ValueError, match="energy estimates must use kcal"):
+        VLMNutrient(
+            nutrient="energy",
+            amount=VLMEstimate(kind=EstimateKind.UNKNOWN, unit="kJ"),
+            confidence=Confidence.LOW,
+        )
+    duplicate = VLMNutrient(
+        nutrient="protein",
+        amount=VLMEstimate(kind=EstimateKind.UNKNOWN, unit="g"),
+        confidence=Confidence.LOW,
+    )
+    with pytest.raises(ValueError, match="duplicate nutrient"):
+        VLMItem(
+            intake_type=IntakeType.FOOD,
+            name_candidates=["sandwich"],
+            serving=VLMEstimate(
+                kind=EstimateKind.UNKNOWN,
+                unit="g",
+            ),
+            caffeine=VLMEstimate(kind=EstimateKind.UNKNOWN, unit="mg"),
+            nutrients=[duplicate, duplicate],
+            confidence=Confidence.LOW,
         )
 
 
