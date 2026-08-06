@@ -1,8 +1,8 @@
 import XCTest
 
 // End-to-end UI tests for the issue-#10 daily loop, driven against a REAL
-// paired healthmes instance (see README "Live smoke test"): briefing home
-// renders live glance/alerts data, tab navigation works, and the §8.5
+// paired healthmes instance (see README "Live smoke test"): the fixed wellness
+// canvas renders live data, same-canvas lenses work, and the §8.5
 // Yes button drives the real accept endpoint.
 //
 // These tests SKIP (never fail) when the app is not paired or the instance
@@ -46,19 +46,20 @@ final class CompanionUITests: XCTestCase {
     func testDailyLoopSurfacesRenderAgainstLiveInstance() throws {
         let app = try launchPairedApp()
 
-        XCTAssertTrue(app.staticTexts["NOW"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["NEXT"].exists)
-        XCTAssertTrue(app.staticTexts["DECISION"].exists)
+        XCTAssertTrue(app.staticTexts["CURRENT STATE"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["BODY → PLAN"].exists)
+        XCTAssertTrue(app.textFields.firstMatch.exists)
 
-        app.buttons["Plan"].tap()
-        XCTAssertTrue(app.staticTexts["THIS WEEK"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.staticTexts["SCHEDULE"].exists)
-        XCTAssertTrue(app.staticTexts["OPEN TASKS"].exists)
+        app.buttons["조율"].tap()
+        XCTAssertTrue(app.staticTexts["BODY-AWARE COORDINATION"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["PROTECTED CONSTRAINTS"].exists)
+        XCTAssertTrue(app.staticTexts["SCHEDULE IMPACT"].exists)
 
-        app.buttons["Decisions"].tap()
-        XCTAssertTrue(app.staticTexts["HISTORY"].waitForExistence(timeout: 15))
+        app.buttons["변화"].tap()
+        XCTAssertTrue(app.staticTexts["OUTCOME LEARNING"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["OUTCOME LOOP"].exists)
 
-        app.buttons["Profile"].tap()
+        app.buttons["Settings"].tap()
         try tapSettingsLink("Weekly report", in: app)
         XCTAssertTrue(app.staticTexts["Energy trend"].waitForExistence(timeout: 15))
         XCTAssertTrue(app.staticTexts["Schedule adherence"].exists)
@@ -87,9 +88,9 @@ final class CompanionUITests: XCTestCase {
     func testFoodCaptureRoundTrip() throws {
         let app = try launchPairedApp()
 
-        app.buttons["Profile"].tap()
+        app.buttons["Settings"].tap()
         try tapSettingsLink("Capture", in: app)
-        let field = app.textFields.firstMatch
+        let field = app.textFields["Description"]
         guard field.waitForExistence(timeout: 10) else {
             throw XCTSkip("Capture form not reachable.")
         }
