@@ -1,5 +1,8 @@
 import SwiftUI
 
+/// Compatibility destinations used by menu-bar commands and older views.
+/// The full-window product maps them onto one fixed wellness canvas instead
+/// of rendering five independent pages.
 enum MacAppSection: String, CaseIterable, Identifiable {
     case today
     case plan
@@ -32,7 +35,13 @@ enum MacAppSection: String, CaseIterable, Identifiable {
 
 @MainActor
 final class MacAppRouter: ObservableObject {
-    @Published var section: MacAppSection = .today
+    @Published var section: MacAppSection = .today {
+        didSet {
+            routeLegacySection(section)
+        }
+    }
+    @Published var lens: WellnessLens = .now
+    @Published private(set) var isSettingsPresented = false
     @Published private(set) var speakRequest = 0
 
     func requestSpeak() {
@@ -40,6 +49,34 @@ final class MacAppRouter: ObservableObject {
         Task { @MainActor in
             await Task.yield()
             speakRequest += 1
+        }
+    }
+
+    func selectLens(_ lens: WellnessLens) {
+        isSettingsPresented = false
+        self.lens = lens
+    }
+
+    func presentSettings() {
+        isSettingsPresented = true
+    }
+
+    func dismissSettings() {
+        isSettingsPresented = false
+    }
+
+    private func routeLegacySection(_ section: MacAppSection) {
+        switch section {
+        case .today:
+            selectLens(.now)
+        case .plan:
+            selectLens(.coordinate)
+        case .decisions:
+            selectLens(.change)
+        case .speak:
+            isSettingsPresented = false
+        case .settings:
+            presentSettings()
         }
     }
 }
