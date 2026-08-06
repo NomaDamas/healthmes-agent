@@ -72,6 +72,37 @@ enum WatchDecisionResult: Equatable {
     }
 }
 
+enum WatchWellnessAvailability: Equatable {
+    case current
+    case stale
+    case unpaired
+    case unauthorized
+    case offline
+    case contractError
+
+    var label: String {
+        switch self {
+        case .current: return String(localized: "Current")
+        case .stale: return String(localized: "Cached · may be old")
+        case .unpaired: return String(localized: "Pair with iPhone")
+        case .unauthorized: return String(localized: "Connection needs attention")
+        case .offline: return String(localized: "Offline")
+        case .contractError: return String(localized: "App update needed")
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .current: return "checkmark.circle"
+        case .stale: return "clock.arrow.circlepath"
+        case .unpaired: return "iphone.gen2"
+        case .unauthorized: return "key.slash"
+        case .offline: return "wifi.slash"
+        case .contractError: return "exclamationmark.arrow.triangle.2.circlepath"
+        }
+    }
+}
+
 @MainActor
 final class WatchDecisionRemoteModel: ObservableObject {
     @Published var decision: PendingDecision?
@@ -79,6 +110,9 @@ final class WatchDecisionRemoteModel: ObservableObject {
     @Published var applyingAction: ProposalAction?
     @Published var result: WatchDecisionResult?
     @Published var glanceLine: String?
+    @Published var energyScore: Int?
+    @Published var wellnessImpact: String?
+    @Published var availability: WatchWellnessAvailability = .offline
 
     private let api = HealthMesAPI()
     private let glanceClient = GlanceClient()
@@ -86,7 +120,10 @@ final class WatchDecisionRemoteModel: ObservableObject {
     func refresh() async {
         guard PairingStore.shared.load() != nil else {
             result = .offline
-            glanceLine = String(localized: "Pair with the iPhone app.")
+            availability = .unpaired
+            glanceLine = nil
+            energyScore = nil
+            wellnessImpact = String(localized: "Connect HealthMes on iPhone first.")
             return
         }
         isLoading = true
@@ -103,16 +140,25 @@ final class WatchDecisionRemoteModel: ObservableObject {
         } catch {
             decision = nil
             result = .offline
+            availability = Self.availability(for: error)
         }
 
         do {
             let glance = try await glanceClient.fetch()
+            energyScore = glance.payload.energy.score
+            wellnessImpact = Self.impact(for: glance.payload.energy.score)
             glanceLine = GlanceFormat.nextBlockLine(glance.payload)
-                ?? GlanceFormat.energyLine(glance.payload)
+            availability = .current
         } catch {
             if let cached = GlanceSnapshotCache.shared.decodedPayload() {
+                energyScore = cached.energy.score
+                wellnessImpact = Self.impact(for: cached.energy.score)
                 glanceLine = GlanceFormat.nextBlockLine(cached)
-                    ?? GlanceFormat.energyLine(cached)
+                availability = .stale
+            } else {
+                energyScore = nil
+                wellnessImpact = String(localized: "Not enough health data to adjust the plan.")
+                availability = Self.availability(for: error)
             }
         }
     }
@@ -175,6 +221,32 @@ final class WatchDecisionRemoteModel: ObservableObject {
         case .proposed, .invalidated:
             return .expired
         }
+    }
+
+    private static func availability(for error: Error) -> WatchWellnessAvailability {
+        switch error {
+        case GlanceClientError.notPaired, HealthMesAPIError.notPaired:
+            return .unpaired
+        case GlanceClientError.unauthorized, HealthMesAPIError.unauthorized:
+            return .unauthorized
+        case GlanceClientError.decoding, HealthMesAPIError.decoding:
+            return .contractError
+        default:
+            return .offline
+        }
+    }
+
+    private static func impact(for score: Int?) -> String {
+        guard let score else {
+            return String(localized: "Not enough data to change today's plan.")
+        }
+        if score < 45 {
+            return String(localized: "Protect recovery before high-energy work.")
+        }
+        if score < 70 {
+            return String(localized: "Save capacity for one important block.")
+        }
+        return String(localized: "Use this capacity on the highest-priority goal.")
     }
 }
 
@@ -306,21 +378,51 @@ struct WatchDecisionRemoteView: View {
     }
 
     private var glance: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("HealthMes", systemImage: "waveform.path.ecg")
-                .font(.headline)
-            Text("No decision waiting")
-                .font(.subheadline.weight(.semibold))
-            if let glanceLine = model.glanceLine {
-                Text(verbatim: glanceLine)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("CAPACITY")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if let energyScore = model.energyScore {
+                        Text(verbatim: "\(energyScore)")
+                            .font(.system(.title2, design: .rounded).bold())
+                            .accessibilityLabel(Text("Cognitive energy"))
+                            .accessibilityValue(Text(verbatim: "\(energyScore)"))
+                    }
+                }
+
+                Text(verbatim: model.wellnessImpact ?? String(localized: "Checking body-to-plan impact…"))
+                    .font(.headline)
+                    .lineLimit(3)
+                    .minimumScaleFactor(0.78)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let glanceLine = model.glanceLine {
+                    Label {
+                        Text(verbatim: glanceLine)
+                            .lineLimit(2)
+                    } icon: {
+                        Image(systemName: "calendar")
+                    }
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                }
+
+                Label(
+                    model.availability.label,
+                    systemImage: model.availability.systemImage
+                )
+                .font(.caption2)
+                .foregroundStyle(model.availability == .current ? .green : .orange)
+
+                Button("Refresh") {
+                    Task { await model.refresh() }
+                }
+                .buttonStyle(.bordered)
+                .frame(maxWidth: .infinity)
             }
-            Button("Refresh") {
-                Task { await model.refresh() }
-            }
-            .buttonStyle(.bordered)
         }
     }
 }
