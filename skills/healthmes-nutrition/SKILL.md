@@ -16,6 +16,11 @@ Use this skill after HealthMes has analyzed an uploaded food or drink photo.
 The VLM output is an unconfirmed observation, never a fact about total daily
 intake and never medical advice.
 
+This version is deliberately caffeine-first. It does not extract calories,
+macronutrients, micronutrients, ingredients, or recipes. It also does not
+analyze text or voice nutrition entries; those require a future capture
+normalization contract before they can enter this confirmation workflow.
+
 ## Tools
 
 | Tool | Purpose |

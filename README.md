@@ -84,13 +84,15 @@ Telegram (phone + watch)          decision viewer (web)
   `create_medical_record`, `list_medical_records`, `record_decision` —
   all returning interpreted deltas with confidence/coverage, honest
   `insufficient_data` when signals are thin.
-- Sake nutrition evidence slice: uploaded food/drink photos are analyzed by a
-  local Ollama vision model into the versioned `NutritionObservation`
-  contract. The structured payload is stored intact as a `WellnessEvent`;
-  photo, observation, and confirmation each have independent retention.
-  Five MCP tools expose estimates and accept trusted owner confirmations;
-  a daily caffeine total is returned only after every item and the complete
-  local day are explicitly confirmed.
+- Sake nutrition evidence slice: uploaded food/drink photos are analyzed into
+  the versioned `NutritionObservation` contract by local Ollama (default) or an
+  explicitly authorized OpenAI, Gemini, Anthropic, or xAI provider. The
+  structured payload is stored intact as a `WellnessEvent`; photo, observation,
+  and confirmation each have independent retention. The current bounded slice
+  extracts caffeine evidence only, not full nutrition. Text and voice nutrition
+  analysis are not implemented. Five MCP tools expose estimates and accept
+  trusted owner confirmations; a daily caffeine total is returned only after
+  every item and the complete local day are explicitly confirmed.
 - Decision viewer: every proactive decision is a `decision_record` tree
   rendered as a Mermaid flowchart at `/decisions/{id}` (vendored Mermaid,
   no CDN), with a paginated index at `/decisions`.

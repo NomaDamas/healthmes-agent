@@ -41,10 +41,10 @@ from healthmes.nutrition.schema import (
     SUPPORTED_IMAGE_TYPES,
 )
 from healthmes.nutrition.vision import (
-    OllamaVisionProvider,
     VisionInvalidOutput,
     VisionProvider,
     VisionUnavailable,
+    create_vision_provider,
 )
 from healthmes.store.session import SessionDep
 
@@ -133,7 +133,7 @@ class ConfirmDayInput(BaseModel):
 
 def _provider(request: Request, settings: Settings) -> VisionProvider:
     override = getattr(request.app.state, "nutrition_vision_provider", None)
-    return override if override is not None else OllamaVisionProvider(settings)
+    return override if override is not None else create_vision_provider(settings)
 
 
 @router.post(
