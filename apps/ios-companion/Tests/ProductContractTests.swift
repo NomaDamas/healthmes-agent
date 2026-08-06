@@ -325,4 +325,103 @@ final class ProductContractTests: XCTestCase {
             return XCTFail("failed refresh leg was reported as success")
         }
     }
+
+    func testWellnessSceneValidatorFailsClosedForUnsafeActions() throws {
+        let module = WellnessSceneModule(
+            id: "state",
+            kind: .healthState,
+            title: "회복",
+            summary: "평소보다 낮습니다."
+        )
+        let mutation = WellnessScene(
+            id: "unsafe-mutation",
+            lens: .coordinate,
+            title: "조율",
+            summary: "제안",
+            severity: .action,
+            freshness: .current,
+            modules: [module],
+            actions: [
+                WellnessSceneAction(
+                    id: "accept",
+                    kind: .acceptProposal,
+                    label: "예"
+                )
+            ]
+        )
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                mutation,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(error as? WellnessSceneValidationError, .mutationWithoutProposal)
+        }
+
+        let external = WellnessScene(
+            id: "unsafe-url",
+            lens: .change,
+            title: "변화",
+            summary: "상세",
+            severity: .neutral,
+            freshness: .current,
+            modules: [module],
+            actions: [
+                WellnessSceneAction(
+                    id: "web",
+                    kind: .openWebDetail,
+                    label: "자세히",
+                    url: URL(string: "https://attacker.test/decision")!
+                )
+            ]
+        )
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                external,
+                pairedBaseURL: pairing.baseURL
+            )
+        )
+    }
+
+    func testWellnessCommandParserUsesLensesAndExplicitWritePrefixes() {
+        XCTAssertEqual(
+            WellnessCommandParser.parse("지금 내 상태 보여줘"),
+            .show(.now)
+        )
+        XCTAssertEqual(
+            WellnessCommandParser.parse("일정을 조율해줘"),
+            .show(.coordinate)
+        )
+        XCTAssertEqual(
+            WellnessCommandParser.parse("지난 결정 결과 패턴"),
+            .show(.change)
+        )
+        XCTAssertEqual(
+            WellnessCommandParser.parse("할 일: 라이브 QA"),
+            .createTask("라이브 QA")
+        )
+        XCTAssertEqual(
+            WellnessCommandParser.parse("주간 목표: 회복 블록 보호"),
+            .createGoal("회복 블록 보호")
+        )
+        XCTAssertEqual(
+            WellnessCommandParser.parse("내일 어떻게 하지?"),
+            .clarify("내일 어떻게 하지?")
+        )
+    }
+
+    func testAcceptedAndPushedStayDistinctInGeneratedUISemantics() {
+        XCTAssertEqual(
+            ProposalStatusPresentation.label(for: .accepted),
+            "Approved · calendar sync pending"
+        )
+        XCTAssertEqual(
+            ProposalStatusPresentation.label(for: .pushed),
+            "Applied to calendar"
+        )
+        XCTAssertNotEqual(
+            ProposalStatusPresentation.detail(for: .accepted),
+            ProposalStatusPresentation.detail(for: .pushed)
+        )
+    }
 }
