@@ -137,10 +137,12 @@ raw_ref / derived_from[]
 
 ## 음식 입력 담당 경계
 
-음식 분석과 음식 사진 인식은 **sake가 담당 중**이므로 이 전략의 구현 범위에서
-제외한다. HealthMes는 기존 `food_log` 기록 경로를 유지하고, sake가 만드는
-결과를 향후 `WellnessEvent` 계약으로 받아 다른 건강·행동·결과 맥락과 연결한다.
-중복된 음식 모델 조사·선정·구현은 진행하지 않는다.
+음식 분석과 음식 사진 인식의 도메인 계약은 **sake가 담당**한다. HealthMes는
+sake의 `NutritionObservation` 구조를 평탄화하거나 기존 `FoodLog`로 바꾸지 않고
+`WellnessEvent.payload`에 원형 그대로 저장한다. 사진 원본은
+`nutrition_media`, 구조화 관측값은 `nutrition_observation`, 사용자 확인은
+`nutrition_confirmation`으로 분리해 각 보존정책을 독립 적용한다. HealthMes가
+별도의 경쟁 음식 스키마를 만들거나 관측값을 자동으로 사실로 승격하지 않는다.
 
 ## 저장 및 보존 전략
 

@@ -157,6 +157,25 @@ class Settings(BaseSettings):
         "nothing is stored. Default 15 MiB — plenty for phone photos and "
         "voice memos while keeping a LAN peer from filling the disk.",
     )
+    nutrition_ollama_base_url: str = Field(
+        default="http://127.0.0.1:11434",
+        description="Ollama API used for local intake-photo extraction. "
+        "Non-loopback endpoints require HTTPS and allow_remote_vision on each request.",
+    )
+    nutrition_vision_model: str = Field(
+        default="qwen3-vl:4b-instruct",
+        min_length=1,
+        description="Pinned local vision model tag; mutable latest aliases are not recommended.",
+    )
+    nutrition_vision_model_digest: str | None = Field(
+        default=None,
+        description="Optional immutable model digest recorded with every observation.",
+    )
+    nutrition_vision_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        description="Timeout for one local structured photo-analysis request.",
+    )
 
     # Alert hygiene (docs/PLAN.md §11: a noisy assistant gets muted within a
     # week). Consumed by healthmes/engine/triggers.py before any webhook push.

@@ -1,0 +1,364 @@
+"""Photo -> sake observation -> retention-aware storage API tests."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from sqlalchemy import select
+
+from healthmes.nutrition.contracts import (
+    Confidence,
+    EstimateKind,
+    IntakeType,
+    ObservationStatus,
+)
+from healthmes.nutrition.schema import VLMEstimate, VLMExtraction, VLMItem
+from healthmes.nutrition.vision import VisionInvalidOutput, VisionUnavailable
+from healthmes.storage import run_storage_maintenance
+from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
+
+JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
+
+
+class FakeVision:
+    provider_name = "fixture"
+    model = "fixture-v1"
+    model_digest = "sha256:fixture"
+
+    def __init__(self, extraction=None, error=None):
+        self.extraction = extraction or _extraction()
+        self.error = error
+        self.calls = []
+
+    def analyze(self, image_path, *, allow_remote):
+        self.calls.append((image_path, allow_remote))
+        if self.error is not None:
+            raise self.error
+        return self.extraction
+
+
+def _extraction() -> VLMExtraction:
+    return VLMExtraction(
+        status=ObservationStatus.USABLE,
+        confidence=Confidence.HIGH,
+        warnings=[],
+        items=[
+            VLMItem(
+                intake_type=IntakeType.BEVERAGE,
+                name_candidates=["bottled coffee"],
+                category="coffee",
+                serving=VLMEstimate(
+                    kind=EstimateKind.EXACT,
+                    unit="ml",
+                    exact=355,
+                    evidence_text="355 mL",
+                    estimation_basis="visible_label",
+                ),
+                caffeine=VLMEstimate(
+                    kind=EstimateKind.EXACT,
+                    unit="mg",
+                    exact=180,
+                    evidence_text="Caffeine 180 mg",
+                    estimation_basis="visible_label",
+                ),
+                label_text_candidates=["355 mL", "Caffeine 180 mg"],
+                product_code_candidates=[],
+                confidence=Confidence.HIGH,
+                warnings=[],
+            )
+        ],
+    )
+
+
+def _upload(client, content=JPEG, content_type="image/jpeg"):
+    response = client.post(
+        "/v1/media",
+        files={"file": ("coffee.jpg", content, content_type)},
+    )
+    assert response.status_code == 201
+    return response.json()["media_path"]
+
+
+def _request(media_path, **overrides):
+    payload = {
+        "media_path": media_path,
+        "captured_at": "2026-08-06T08:30:00+09:00",
+        "timezone": "Asia/Seoul",
+        "source": "ios-app-photo",
+        "location": None,
+        "metadata_provenance": {
+            "captured_at": "app",
+            "timezone": "app",
+            "location": "unavailable",
+        },
+        "allow_remote_vision": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_analyze_persists_sake_payload_and_reclassifies_media(
+    client, session
+):
+    provider = FakeVision()
+    client.app.state.nutrition_vision_provider = provider
+    media_path = _upload(client)
+
+    response = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(media_path),
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["capture"]["media_path"] == media_path
+    assert body["items"][0]["caffeine"]["exact"] == 180
+    assert body["confirmation_status"] == "unconfirmed"
+    assert body["vision"]["model_digest"] == "sha256:fixture"
+
+    session.expire_all()
+    event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.observation.v1"
+        )
+    )
+    assert event is not None
+    assert event.payload == body
+    assert event.source_provider == "sake-vlm"
+    assert event.expires_at is not None
+    obj = session.scalar(
+        select(StorageObject).where(StorageObject.relative_path == media_path)
+    )
+    assert obj is not None
+    assert obj.data_class == "nutrition_media"
+    assert obj.safe_to_purge is True
+    assert obj.retention_policy_id is not None
+
+    storage = client.get("/v1/storage/settings").json()
+    assert storage["usage"]["nutrition_media"] == {
+        "bytes": len(JPEG),
+        "objects": 1,
+    }
+    policies = {
+        row.data_class: row.retention_days
+        for row in session.scalars(select(RetentionPolicy))
+    }
+    assert policies["nutrition_media"] == 7
+    assert policies["nutrition_observation"] == 90
+    assert policies["nutrition_confirmation"] is None
+
+
+def test_analysis_is_idempotent_per_uploaded_media(client, session):
+    provider = FakeVision()
+    client.app.state.nutrition_vision_provider = provider
+    media_path = _upload(client)
+    payload = _request(media_path)
+
+    first = client.post("/v1/nutrition-observations/analyze", json=payload)
+    second = client.post("/v1/nutrition-observations/analyze", json=payload)
+
+    assert first.status_code == second.status_code == 201
+    assert first.json()["observation_id"] == second.json()["observation_id"]
+    assert len(provider.calls) == 1
+    assert len(
+        list(
+            session.scalars(
+                select(WellnessEvent).where(
+                    WellnessEvent.event_type == "nutrition.observation.v1"
+                )
+            )
+        )
+    ) == 1
+
+
+def test_capture_context_rejects_timezone_offset_mismatch(client):
+    media_path = _upload(client)
+    response = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(media_path, captured_at="2026-08-06T08:30:00+00:00"),
+    )
+    assert response.status_code == 422
+    assert "offset conflicts" in response.text
+
+
+def test_analysis_rejects_non_image_media(client):
+    media_path = _upload(client, content=b"voice", content_type="audio/mpeg")
+    response = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(media_path),
+    )
+    assert response.status_code == 415
+    assert response.json()["error"]["code"] == "unsupported_media_type"
+
+
+def test_provider_failures_do_not_create_observation(client, session):
+    media_path = _upload(client)
+    client.app.state.nutrition_vision_provider = FakeVision(
+        error=VisionUnavailable("local model unavailable")
+    )
+    unavailable = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(media_path),
+    )
+    assert unavailable.status_code == 503
+    assert unavailable.json()["error"]["code"] == "vision_unavailable"
+
+    client.app.state.nutrition_vision_provider = FakeVision(
+        error=VisionInvalidOutput("bad schema")
+    )
+    invalid = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(media_path),
+    )
+    assert invalid.status_code == 502
+    assert invalid.json()["error"]["code"] == "vision_invalid_output"
+    assert list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == "nutrition.observation.v1"
+            )
+        )
+    ) == []
+
+
+def test_confirmation_and_daily_completeness_are_separate_events(client, session):
+    client.app.state.nutrition_vision_provider = FakeVision()
+    media_path = _upload(client)
+    observation = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(media_path),
+    ).json()
+    observation_id = observation["observation_id"]
+
+    confirmed = client.post(
+        f"/v1/nutrition-observations/{observation_id}/confirm",
+        json={
+            "status": "confirmed",
+            "source": "ios-app",
+            "items": [{"item_index": 0, "caffeine_mg": 180}],
+        },
+    )
+    assert confirmed.status_code == 201
+
+    daily = client.post(
+        "/v1/nutrition-observations/daily-confirmations",
+        json={
+            "local_date": "2026-08-06",
+            "timezone": "Asia/Seoul",
+            "observation_ids": [observation_id],
+            "total_intake_complete": True,
+            "source": "ios-app",
+        },
+    )
+    assert daily.status_code == 201
+
+    events = list(
+        session.scalars(
+            select(WellnessEvent).order_by(WellnessEvent.recorded_at)
+        )
+    )
+    assert {
+        event.event_type for event in events
+    } == {
+        "nutrition.observation.v1",
+        "nutrition.confirmation.v1",
+        "nutrition.daily-confirmation.v1",
+    }
+    observation_event = next(
+        event for event in events if event.event_type == "nutrition.observation.v1"
+    )
+    assert observation_event.payload["confirmation_status"] == "unconfirmed"
+    confirmation_events = [
+        event for event in events if event.event_type != "nutrition.observation.v1"
+    ]
+    assert all(event.expires_at is None for event in confirmation_events)
+
+
+def test_confirmation_requires_every_real_observation_item(client):
+    client.app.state.nutrition_vision_provider = FakeVision()
+    media_path = _upload(client)
+    observation_id = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(media_path),
+    ).json()["observation_id"]
+
+    response = client.post(
+        f"/v1/nutrition-observations/{observation_id}/confirm",
+        json={
+            "status": "confirmed",
+            "source": "desktop-web",
+            "items": [{"item_index": 1, "caffeine_mg": 180}],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_nutrition_confirmation"
+
+
+def test_complete_day_confirmation_requires_every_observation(client):
+    client.app.state.nutrition_vision_provider = FakeVision()
+    observation_ids = []
+    for _ in range(2):
+        media_path = _upload(client)
+        observation_ids.append(
+            client.post(
+                "/v1/nutrition-observations/analyze",
+                json=_request(media_path),
+            ).json()["observation_id"]
+        )
+
+    response = client.post(
+        "/v1/nutrition-observations/daily-confirmations",
+        json={
+            "local_date": "2026-08-06",
+            "timezone": "Asia/Seoul",
+            "observation_ids": observation_ids[:1],
+            "total_intake_complete": True,
+            "source": "desktop-web",
+        },
+    )
+
+    assert response.status_code == 422
+    assert (
+        response.json()["error"]["code"]
+        == "invalid_daily_nutrition_confirmation"
+    )
+    assert "every observation" in response.text
+
+
+def test_expired_photo_is_deleted_without_deleting_observation(
+    client, session, settings
+):
+    client.app.state.nutrition_vision_provider = FakeVision()
+    media_path = _upload(client)
+    observation_id = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(media_path),
+    ).json()["observation_id"]
+    photo = settings.data_dir / media_path
+
+    report = run_storage_maintenance(
+        session,
+        settings,
+        now=datetime(2026, 8, 14, 8, 30, tzinfo=UTC),
+    )
+    session.commit()
+    session.expire_all()
+
+    assert report.deleted == 1
+    assert not photo.exists()
+    obj = session.scalar(
+        select(StorageObject).where(StorageObject.relative_path == media_path)
+    )
+    assert obj is not None
+    assert obj.purged_at is not None
+    observation = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.source_record_id == observation_id
+        )
+    )
+    assert observation is not None
+    assert observation.expires_at is not None
+    assert observation.expires_at.replace(tzinfo=UTC) > datetime(
+        2026, 8, 14, 8, 30, tzinfo=UTC
+    )

@@ -37,7 +37,10 @@ RETENTION_PRESETS: dict[str, int | None] = {
 DEFAULT_RETENTION: dict[str, str] = {
     "raw_payload": "14d",
     "media": "7d",
+    "nutrition_media": "7d",
     "normalized": "30d",
+    "nutrition_observation": "90d",
+    "nutrition_confirmation": "forever",
     "aggregate": "forever",
     "decision": "forever",
     "medical_record": "forever",
@@ -157,6 +160,25 @@ def register_storage_object(
     return obj
 
 
+def classify_storage_object(
+    session: Session,
+    obj: StorageObject,
+    *,
+    data_class: str,
+    observed_at: datetime,
+    safe_to_purge: bool,
+) -> StorageObject:
+    """Move an indexed object under a purpose-specific retention policy."""
+    policies = {row.data_class: row for row in ensure_default_policies(session)}
+    policy = policies[data_class]
+    obj.data_class = data_class
+    obj.retention_policy_id = policy.id
+    obj.expires_at = _expiry(policy, observed_at)
+    obj.safe_to_purge = safe_to_purge
+    session.flush()
+    return obj
+
+
 def index_raw_ingest(
     session: Session, settings: Settings, raw: RawIngestEvent
 ) -> WellnessEvent:
@@ -239,11 +261,18 @@ def _discover_unindexed(session: Session, settings: Settings) -> None:
 def measure_usage(session: Session, settings: Settings) -> dict[str, dict[str, int]]:
     root = settings.data_dir.resolve()
     totals: dict[str, dict[str, int]] = {}
+    indexed = {
+        row.relative_path: row.data_class
+        for row in session.scalars(
+            select(StorageObject).where(StorageObject.purged_at.is_(None))
+        )
+    }
     if root.exists():
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
-            data_class = _class_for(path, root)
+            relative = path.relative_to(root).as_posix()
+            data_class = indexed.get(relative, _class_for(path, root))
             bucket = totals.setdefault(data_class, {"bytes": 0, "objects": 0})
             bucket["bytes"] += path.stat().st_size
             bucket["objects"] += 1
@@ -309,7 +338,7 @@ def run_storage_maintenance(
         try:
             if path.exists():
                 path.unlink()
-            if obj.data_class == "media":
+            if obj.data_class in {"media", "nutrition_media"}:
                 food_rows = session.scalars(
                     select(FoodLog).where(FoodLog.media_path == obj.relative_path)
                 )

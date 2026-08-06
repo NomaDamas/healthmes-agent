@@ -68,6 +68,7 @@ def test_skill_dirs_all_checked() -> None:
     assert [path.parent.name for path in SKILL_MDS] == [
         "doctor-visit-summary",
         "healthmes-capture",
+        "healthmes-nutrition",
         "healthmes-planner",
         "healthmes-sleep",
         "healthmes-stress",
