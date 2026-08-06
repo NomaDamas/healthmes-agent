@@ -3,7 +3,7 @@ import XCTest
 // End-to-end UI tests for the issue-#10 daily loop, driven against a REAL
 // paired healthmes instance (see README "Live smoke test"): briefing home
 // renders live glance/alerts data, tab navigation works, and the §8.5
-// Apply button drives the real accept endpoint.
+// Yes button drives the real accept endpoint.
 //
 // These tests SKIP (never fail) when the app is not paired or the instance
 // is unreachable — plain `xcodebuild test` in CI has no live server. To run
@@ -27,44 +27,57 @@ final class CompanionUITests: XCTestCase {
         return app
     }
 
+    private func tapSettingsLink(_ label: String, in app: XCUIApplication) throws {
+        let element = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", label))
+            .firstMatch
+        for _ in 0..<4 where !element.exists {
+            app.swipeUp()
+        }
+        guard element.waitForExistence(timeout: 3) else {
+            XCTFail("Settings link '\(label)' was not reachable.")
+            return
+        }
+        element.tap()
+    }
+
     /// Acceptance sketch #1: briefing home shows live data; drill into the
     /// weekly report and capture surfaces.
     func testDailyLoopSurfacesRenderAgainstLiveInstance() throws {
         let app = try launchPairedApp()
 
-        // Home: alert list carries the §8.5 grammar lines from /v1/alerts.
-        XCTAssertTrue(app.staticTexts["Alerts · last 24h"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["NOW"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["NEXT"].exists)
+        XCTAssertTrue(app.staticTexts["DECISION"].exists)
 
-        // Report tab: native weekly.json rendering.
-        app.tabBars.buttons["Report"].tap()
+        app.buttons["Plan"].tap()
+        XCTAssertTrue(app.staticTexts["THIS WEEK"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["SCHEDULE"].exists)
+        XCTAssertTrue(app.staticTexts["OPEN TASKS"].exists)
+
+        app.buttons["Decisions"].tap()
+        XCTAssertTrue(app.staticTexts["HISTORY"].waitForExistence(timeout: 15))
+
+        app.buttons["Profile"].tap()
+        try tapSettingsLink("Weekly report", in: app)
         XCTAssertTrue(app.staticTexts["Energy trend"].waitForExistence(timeout: 15))
         XCTAssertTrue(app.staticTexts["Schedule adherence"].exists)
         XCTAssertTrue(app.staticTexts["Alert digest"].exists)
-
-        // Capture tab: the three capture targets and description field.
-        app.tabBars.buttons["Capture"].tap()
-        XCTAssertTrue(app.buttons["Food"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.buttons["Medication"].exists)
-        XCTAssertTrue(app.buttons["Symptom"].exists)
-
-        // Settings tab: pairing entry + the delivery-honesty copy.
-        app.tabBars.buttons["Settings"].tap()
-        XCTAssertTrue(app.staticTexts["Native alerts"].waitForExistence(timeout: 10))
     }
 
-    /// Acceptance sketch #2/#5: ✅ Apply on a pending proposal calls the real
+    /// Acceptance sketch #2/#5: Yes on a pending proposal calls the real
     /// accept endpoint; the row resolves and the confirmation banner shows.
     /// Needs a seeded `proposed` proposal (the smoke script creates one).
     func testApplyProposalRoundTrip() throws {
         let app = try launchPairedApp()
 
-        let apply = app.buttons["Apply"].firstMatch
+        let apply = app.buttons["Yes"].firstMatch
         guard apply.waitForExistence(timeout: 10) else {
             throw XCTSkip("No pending proposal seeded — nothing to apply.")
         }
         apply.tap()
         XCTAssertTrue(
-            app.staticTexts["Proposal applied."].waitForExistence(timeout: 15),
+            app.staticTexts["Approved · calendar sync pending"].waitForExistence(timeout: 15),
             "accept endpoint round-trip should confirm in the banner"
         )
     }
@@ -74,7 +87,8 @@ final class CompanionUITests: XCTestCase {
     func testFoodCaptureRoundTrip() throws {
         let app = try launchPairedApp()
 
-        app.tabBars.buttons["Capture"].tap()
+        app.buttons["Profile"].tap()
+        try tapSettingsLink("Capture", in: app)
         let field = app.textFields.firstMatch
         guard field.waitForExistence(timeout: 10) else {
             throw XCTSkip("Capture form not reachable.")

@@ -1,0 +1,281 @@
+{% extends "ui/_base.html.j2" %}
+
+{% block title %}Dashboard — HealthMes{% endblock %}
+{% block crumb %}<span class="crumb">/ Dashboard</span>{% endblock %}
+
+{% block head %}
+<style>
+  .dashboard-head {
+    display: flex; align-items: end; justify-content: space-between;
+    gap: 1rem; margin: 0.2rem 0 1rem;
+  }
+  .dashboard-head h1 { max-width: 35rem; }
+  .dashboard-tabs {
+    position: sticky; top: 4.1rem; z-index: 10;
+    display: flex; gap: 0.35rem; overflow-x: auto;
+    margin: 0 -0.25rem 1rem; padding: 0.25rem;
+    scrollbar-width: none;
+  }
+  .dashboard-tabs::-webkit-scrollbar { display: none; }
+  .dashboard-tabs a {
+    flex: 0 0 auto; padding: 0.45rem 0.85rem; border-radius: 999px;
+    background: var(--glass-solid); border: 1px solid var(--glass-line);
+    color: var(--ink-2); font-size: 0.84rem; font-weight: 700;
+    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+  }
+  .dashboard-tabs a:hover { color: var(--ink); text-decoration: none; border-color: var(--brand); }
+  .dashboard-section { scroll-margin-top: 8rem; margin: 1.8rem 0 2.4rem; }
+  .section-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 1rem; margin-bottom: 0.7rem;
+  }
+  .section-head h2 { margin: 0; font-size: 1.28rem; }
+  .section-head a { font-size: 0.82rem; font-weight: 700; }
+  .dashboard-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.85rem; }
+  .dashboard-grid > .card { margin: 0; min-width: 0; }
+  .primary-card { grid-column: 1 / -1; padding: clamp(1.2rem, 3vw, 1.7rem); }
+  .status-line {
+    font-size: clamp(1.35rem, 4vw, 2.05rem); line-height: 1.35;
+    letter-spacing: -0.025em; font-weight: 780; max-width: 38rem;
+  }
+  .status-meta { display: flex; gap: 0.45rem; flex-wrap: wrap; margin-top: 1rem; }
+  .energy-pill {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    border-radius: 999px; background: var(--brand-soft);
+    color: var(--brand-deep); padding: 0.28rem 0.7rem;
+    font-size: 0.78rem; font-weight: 750;
+  }
+  .energy-dot { width: 0.48rem; height: 0.48rem; border-radius: 50%; background: currentColor; }
+  .proposal-title { font-size: 1.08rem; font-weight: 760; line-height: 1.45; }
+  .proposal-time { font-size: 1.25rem; font-weight: 760; margin-top: 0.35rem; }
+  .simple-list { list-style: none; margin: 0; padding: 0; }
+  .simple-list li {
+    display: grid; grid-template-columns: minmax(4.8rem, auto) minmax(0, 1fr);
+    gap: 0.75rem; padding: 0.72rem 0; border-bottom: 1px solid var(--line-soft);
+  }
+  .simple-list li:last-child { border-bottom: 0; }
+  .simple-list time { color: var(--ink-3); font-size: 0.77rem; white-space: nowrap; }
+  .simple-list strong { display: block; line-height: 1.45; overflow-wrap: anywhere; }
+  .goal-row { padding: 0.72rem 0; border-bottom: 1px solid var(--line-soft); }
+  .goal-row:last-child { border-bottom: 0; }
+  .goal-top { display: flex; justify-content: space-between; gap: 0.8rem; }
+  .progress-track { height: 0.4rem; margin-top: 0.45rem; background: var(--surface-2); border-radius: 999px; overflow: hidden; }
+  .progress-track span { display: block; height: 100%; background: var(--brand); }
+  a.decision-row {
+    display: block; padding: 0.78rem 0; border-bottom: 1px solid var(--line-soft);
+    color: inherit;
+  }
+  a.decision-row:last-child { border-bottom: 0; }
+  a.decision-row:hover { text-decoration: none; }
+  a.decision-row strong { display: block; overflow-wrap: anywhere; }
+  .decision-meta { display: flex; gap: 0.45rem; align-items: center; margin-top: 0.35rem; }
+  details.progressive { margin-top: 0.7rem; border-top: 1px solid var(--line-soft); padding-top: 0.65rem; }
+  details.progressive summary { cursor: pointer; color: var(--ink-2); font-size: 0.82rem; font-weight: 700; }
+  .empty { padding: 1rem 0; color: var(--ink-2); }
+  .advanced-links { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0.55rem; margin-top: 0.8rem; }
+  .advanced-links a {
+    display: block; border: 1px solid var(--line-soft); border-radius: 12px;
+    background: var(--surface-2); padding: 0.7rem 0.8rem; color: var(--ink);
+  }
+  .advanced-links a:hover { border-color: var(--brand); text-decoration: none; }
+  @media (max-width: 700px) {
+    .dashboard-head { align-items: start; flex-direction: column; }
+    .dashboard-tabs { position: static; }
+    .dashboard-grid { grid-template-columns: 1fr; }
+    .primary-card { grid-column: auto; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="dashboard-head">
+  <div>
+    <p class="eyebrow">{{ dashboard.local_today.isoformat() }} · {{ dashboard.timezone }}</p>
+    <h1>{{ dashboard.headline }}</h1>
+  </div>
+  <p class="muted">업데이트 {{ format_rel(dashboard.generated_at) }}</p>
+</div>
+
+<nav class="dashboard-tabs" aria-label="Dashboard sections">
+  <a href="{{ app_path('/dashboard') }}{{ token_qs }}#today">Today</a>
+  <a href="{{ app_path('/dashboard/plan') }}{{ token_qs }}#plan">Plan</a>
+  <a href="{{ app_path('/dashboard/decisions') }}{{ token_qs }}#decisions">Decisions</a>
+  <a href="{{ app_path('/dashboard/history') }}{{ token_qs }}#history">History</a>
+</nav>
+
+<section class="dashboard-section" id="today" aria-labelledby="today-title">
+  <div class="section-head">
+    <h2 id="today-title">Today</h2>
+    <a href="{{ app_path('/sleep') }}{{ token_qs }}">수면 검토</a>
+  </div>
+  <div class="dashboard-grid">
+    <article class="card primary-card">
+      <p class="eyebrow">지금</p>
+      <p class="status-line">{{ dashboard.headline }}</p>
+      <div class="status-meta">
+        <span class="energy-pill"><span class="energy-dot"></span>
+          에너지 {{ dashboard.energy.score if dashboard.energy.score is not none else "측정 중" }}
+        </span>
+        {% if dashboard.alert_count %}
+        <span class="badge">확인할 알림 {{ dashboard.alert_count }}</span>
+        {% endif %}
+      </div>
+      <details class="progressive">
+        <summary>상태 자세히</summary>
+        <p class="muted">신뢰도 {{ dashboard.energy.confidence }} · 저장된 시간별 에너지 샘플만 사용합니다.</p>
+        {% if dashboard.alert_summary %}<p>{{ dashboard.alert_summary }}</p>{% endif %}
+      </details>
+    </article>
+
+    <article class="card">
+      <h2>결정할 것</h2>
+      {% if dashboard.pending_proposals %}
+        {% set proposal = dashboard.pending_proposals[0] %}
+        <p class="proposal-title">{{ proposal.task_title }} 일정을 조정할까요?</p>
+        <p class="proposal-time">{{ format_local(proposal.starts_at) }}</p>
+        {% if proposal.decision_url %}
+        <p><a class="btn" href="{{ proposal.decision_url }}">왜? 자세히 보기</a></p>
+        {% endif %}
+        <details class="progressive">
+          <summary>시간과 만료 보기</summary>
+          <p class="muted">{{ format_local(proposal.starts_at) }} → {{ format_local(proposal.ends_at) }}</p>
+          {% if proposal.expires_at %}<p class="muted">만료 {{ format_local(proposal.expires_at) }}</p>{% endif %}
+          <p class="muted">알림·iPhone·Watch의 Yes/No와 동일한 제안입니다.</p>
+        </details>
+      {% else %}
+        <p class="empty">지금 결정할 제안이 없습니다.</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <h2>다음 일정</h2>
+      {% if dashboard.next_blocks %}
+      <ul class="simple-list">
+        {% for block in dashboard.next_blocks %}
+        <li>
+          <time>{{ format_local(block.start) }}</time>
+          <span><strong>{{ block.title or "제목 없는 일정" }}</strong>
+            <span class="muted">{{ block.source }}</span></span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty">다가오는 일정이 없습니다.</p>
+      {% endif %}
+    </article>
+  </div>
+</section>
+
+<section class="dashboard-section" id="plan" aria-labelledby="plan-title">
+  <div class="section-head">
+    <h2 id="plan-title">Plan</h2>
+    <a href="{{ app_path('/connect') }}{{ token_qs }}">캘린더 연결</a>
+  </div>
+  <div class="dashboard-grid">
+    <article class="card">
+      <h2>이번 주 목표</h2>
+      {% if dashboard.goals %}
+        {% for goal in dashboard.goals %}
+        <div class="goal-row">
+          <div class="goal-top">
+            <strong>{{ goal.title }}</strong>
+            <span class="muted">{{ goal.done_tasks }}/{{ goal.total_tasks }}</span>
+          </div>
+          {% set pct = (goal.done_tasks * 100 / goal.total_tasks) if goal.total_tasks else 0 %}
+          <div class="progress-track" role="progressbar"
+            aria-label="{{ goal.title }}"
+            aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ pct|round|int }}">
+            <span style="width:{{ pct }}%"></span>
+          </div>
+        </div>
+        {% endfor %}
+      {% else %}
+      <p class="empty">이번 주 활성 목표가 없습니다.</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <h2>앞으로 7일</h2>
+      {% if dashboard.plan_events %}
+      <ul class="simple-list">
+        {% for event in dashboard.plan_events %}
+        <li>
+          <time>{{ format_local(event.starts_at) }}</time>
+          <span><strong>{{ event.title }}</strong>
+            <span class="muted">{{ "HealthMes" if event.is_agent_created else event.source }}</span></span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty">동기화된 일정이 없습니다.</p>
+      {% endif %}
+    </article>
+  </div>
+</section>
+
+<section class="dashboard-section" id="decisions" aria-labelledby="decisions-title">
+  <div class="section-head">
+    <h2 id="decisions-title">Decisions</h2>
+    <a href="{{ dashboard.decisions_url }}">전체 보기</a>
+  </div>
+  <article class="card">
+    {% if dashboard.recent_decisions %}
+      {% for decision in dashboard.recent_decisions %}
+      <a class="decision-row" href="{{ decision.url }}">
+        <strong>{{ decision.summary }}</strong>
+        <span class="decision-meta">
+          <span class="badge kind-{{ decision.kind }}">{{ kind_labels.get(decision.kind, decision.kind) }}</span>
+          <span class="muted">{{ format_rel(decision.created_at) }}</span>
+        </span>
+      </a>
+      {% endfor %}
+    {% else %}
+    <p class="empty">아직 기록된 판단이 없습니다.</p>
+    {% endif %}
+  </article>
+</section>
+
+<section class="dashboard-section" id="history" aria-labelledby="history-title">
+  <div class="section-head">
+    <h2 id="history-title">History</h2>
+    <a href="{{ dashboard.weekly_url }}">주간 리포트 열기</a>
+  </div>
+  <div class="dashboard-grid">
+    <article class="card">
+      <h2>이번 주 결과</h2>
+      <div class="stats">
+        <div class="stat"><span class="value">{{ dashboard.weekly.energy.overall_avg if dashboard.weekly.energy.overall_avg is not none else "—" }}</span><span class="label">평균 에너지</span></div>
+        <div class="stat"><span class="value">{{ dashboard.weekly.schedule.acceptance_pct if dashboard.weekly.schedule.acceptance_pct is not none else "—" }}{% if dashboard.weekly.schedule.acceptance_pct is not none %}%{% endif %}</span><span class="label">제안 수용률</span></div>
+        <div class="stat"><span class="value">{{ dashboard.weekly.decisions.count }}</span><span class="label">판단 기록</span></div>
+      </div>
+      <details class="progressive">
+        <summary>집계 기준</summary>
+        <p class="muted">{{ dashboard.weekly.week_start }}부터 {{ dashboard.weekly.week_end }}까지 저장된 결과입니다. 없는 데이터는 추정하지 않습니다.</p>
+      </details>
+    </article>
+
+    <article class="card">
+      <h2>최근 배운 점</h2>
+      {% if dashboard.recent_insights %}
+        {% for insight in dashboard.recent_insights %}
+        <div class="goal-row">
+          <strong>{{ insight.statement }}</strong>
+          <p class="muted">{{ format_rel(insight.created_at) }}{% if insight.confidence is not none %} · confidence {{ "%.0f"|format(insight.confidence * 100) }}%{% endif %}</p>
+        </div>
+        {% endfor %}
+      {% else %}
+      <p class="empty">아직 비교할 인사이트가 없습니다.</p>
+      {% endif %}
+    </article>
+  </div>
+</section>
+
+<details class="card progressive">
+  <summary>Advanced · 연결과 데이터 관리</summary>
+  <div class="advanced-links">
+    <a href="{{ app_path('/connect') }}{{ token_qs }}"><strong>Connections</strong><br><span class="muted">Google · iCloud · Wearables</span></a>
+    <span><strong>Storage</strong><br><span class="muted">소유자 인증이 필요한 로컬 관리 기능</span></span>
+    <a href="{{ app_path('/sleep') }}{{ token_qs }}"><strong>Actual sleep</strong><br><span class="muted">수면과 캘린더 검토</span></a>
+  </div>
+</details>
+{% endblock %}

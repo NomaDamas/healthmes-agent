@@ -80,6 +80,12 @@ targets:
           HealthMes instance.
         NSMicrophoneUsageDescription: >-
           Voice memos are uploaded only to your own HealthMes instance.
+        NSSpeechRecognitionUsageDescription: >-
+          HealthMes turns your spoken goal or task into a Plan item without
+          offering a text-command composer.
+        NSFaceIDUsageDescription: >-
+          HealthMes verifies that it is you before applying a calendar
+          decision from the lock screen.
         # Focus-block Live Activity (polling-updated; no push channel).
         NSSupportsLiveActivities: true
         NSSupportsLiveActivitiesFrequentUpdates: false
@@ -147,6 +153,7 @@ targets:
     resources:
       - Resources/Localizable.xcstrings
     dependencies:
+      - sdk: LocalAuthentication.framework
       - sdk: UserNotifications.framework
       - sdk: UserNotificationsUI.framework
     settings:

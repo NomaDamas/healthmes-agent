@@ -1,17 +1,17 @@
 import SwiftUI
 
-/// HealthMes menu bar app (issue #11): the briefing lives in the status bar
-/// where deep-work hours happen. Local-first — the paired base URL is the
-/// only network destination in the whole target.
+/// Full HealthMes Mac product plus the existing glance surfaces.
 @main
 @MainActor
 struct HealthMesMacApp: App {
     @StateObject private var store: GlanceStore
     @StateObject private var notifications: MacNotificationManager
+    @StateObject private var router: MacAppRouter
 
     init() {
         let store = GlanceStore()
         let notifications = MacNotificationManager.shared
+        let router = MacAppRouter()
         notifications.bootstrap()
         store.onAlertsRefreshed = { alerts, proposals in
             notifications.process(alerts: alerts, pendingProposals: proposals)
@@ -19,11 +19,25 @@ struct HealthMesMacApp: App {
         store.start()
         _store = StateObject(wrappedValue: store)
         _notifications = StateObject(wrappedValue: notifications)
+        _router = StateObject(wrappedValue: router)
     }
 
     var body: some Scene {
+        WindowGroup(id: "healthmes-main") {
+            MacDashboardRootView(
+                glanceStore: store,
+                notifications: notifications
+            )
+            .environmentObject(router)
+        }
+        .defaultSize(width: 1_180, height: 760)
+        .commands {
+            HealthMesMacCommands(router: router)
+        }
+
         MenuBarExtra {
             BriefingPopoverView(store: store)
+                .environmentObject(router)
         } label: {
             MenuBarLabel(store: store)
         }
@@ -32,6 +46,33 @@ struct HealthMesMacApp: App {
         Settings {
             PairingSettingsView(store: store, notifications: notifications)
         }
+    }
+}
+
+struct HealthMesMacCommands: Commands {
+    @ObservedObject var router: MacAppRouter
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(after: .newItem) {
+            Button("Open HealthMes") {
+                openMainWindow(section: .today)
+            }
+            .keyboardShortcut("1", modifiers: [.command])
+
+            Button("Speak to HealthMes") {
+                openWindow(id: "healthmes-main")
+                NSApp.activate(ignoringOtherApps: true)
+                router.requestSpeak()
+            }
+            .keyboardShortcut(" ", modifiers: [.command, .shift])
+        }
+    }
+
+    private func openMainWindow(section: MacAppSection) {
+        router.section = section
+        openWindow(id: "healthmes-main")
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 

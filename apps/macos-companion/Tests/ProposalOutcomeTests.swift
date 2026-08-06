@@ -4,8 +4,45 @@ import XCTest
 /// popover buttons and notification actions share this mapping.
 final class ProposalOutcomeTests: XCTestCase {
     func testSuccessMapsPerAction() {
-        XCTAssertEqual(ProposalOutcome.from(action: .accept, error: nil), .applied)
-        XCTAssertEqual(ProposalOutcome.from(action: .decline, error: nil), .kept)
+        XCTAssertEqual(
+            ProposalOutcome.from(
+                action: .accept,
+                resolvedStatus: .accepted,
+                error: nil
+            ),
+            .accepted
+        )
+        XCTAssertEqual(
+            ProposalOutcome.from(
+                action: .accept,
+                resolvedStatus: .pushed,
+                error: nil
+            ),
+            .applied
+        )
+        XCTAssertEqual(
+            ProposalOutcome.from(
+                action: .decline,
+                resolvedStatus: .declined,
+                error: nil
+            ),
+            .kept
+        )
+    }
+
+    func testUnconfirmedSuccessDoesNotClaimAnOutcome() {
+        XCTAssertEqual(
+            ProposalOutcome.from(
+                action: .accept,
+                resolvedStatus: .proposed,
+                error: nil
+            ),
+            .failed
+        )
+        XCTAssertEqual(
+            ProposalOutcome.from(action: .accept, resolvedStatus: nil, error: nil),
+            .failed
+        )
     }
 
     func testInvalidTransitionBecomesAlreadyResolvedWithServerStatus() {
@@ -48,6 +85,19 @@ final class ProposalOutcomeTests: XCTestCase {
                 error: .server(statusCode: 404, code: "not_found", message: "no", detail: nil)
             ),
             .failed
+        )
+    }
+
+    func testExpiredErrorStaysExpired() {
+        let error = HealthMesAPIError.server(
+            statusCode: 409,
+            code: "proposal_expired",
+            message: "proposal expired",
+            detail: nil
+        )
+        XCTAssertEqual(
+            ProposalOutcome.from(action: .accept, error: error),
+            .expired
         )
     }
 }

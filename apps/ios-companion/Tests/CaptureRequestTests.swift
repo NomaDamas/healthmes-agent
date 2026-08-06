@@ -243,6 +243,7 @@ final class CaptureRequestTests: XCTestCase {
               "proposed_end": "2026-07-10T10:30:00Z",
               "status": "proposed",
               "decision_record_id": null,
+              "healthmes_kind": "planned_sleep",
               "accept_resolution_token": "accept-token",
               "decline_resolution_token": "decline-token"
             }
@@ -251,6 +252,7 @@ final class CaptureRequestTests: XCTestCase {
         XCTAssertEqual(proposal.status, .proposed)
         XCTAssertTrue(proposal.isActionable)
         XCTAssertNil(proposal.decisionRecordId)
+        XCTAssertEqual(proposal.healthmesKind, "planned_sleep")
         XCTAssertEqual(proposal.resolutionToken(for: .accept), "accept-token")
         XCTAssertEqual(proposal.resolutionToken(for: .decline), "decline-token")
         XCTAssertEqual(

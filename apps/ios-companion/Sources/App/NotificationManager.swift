@@ -234,7 +234,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                 if let decisionURL {
                     AppRouter.shared.openDecision(decisionURL)
                 } else {
-                    AppRouter.shared.tab = .home
+                    AppRouter.shared.tab = .today
                 }
                 completionHandler()
             }
@@ -280,15 +280,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                     // delegate, which cannot reliably distinguish the device.
                     surface: "apple_notification"
                 )
-                let title =
-                    proposal.status == .accepted
-                    ? String(localized: "Calendar change approved")
-                    : String(localized: "Calendar change declined")
                 await postOutcome(
-                    title: title,
-                    body: proposal.status == .accepted
-                        ? String(localized: "HealthMes recorded Yes. Calendar sync will apply it.")
-                        : String(localized: "HealthMes recorded No. The calendar stays unchanged.")
+                    title: ProposalStatusPresentation.label(for: proposal.status),
+                    body: ProposalStatusPresentation.detail(for: proposal.status)
                 )
             } catch let error as HealthMesAPIError where error.isAlreadyResolved {
                 await postOutcome(

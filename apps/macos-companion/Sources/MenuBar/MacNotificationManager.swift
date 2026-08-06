@@ -10,10 +10,10 @@ import UserNotifications
 /// there is no push relay by design (local-first), so Telegram remains the
 /// guaranteed-delivery channel. The Settings toggle says exactly that.
 ///
-/// ✅ Apply / ❌ Keep actions are attached only when the alert response carries
+/// No / Yes actions are attached only when the alert response carries
 /// its exact pending proposal id, and they call the real accept/decline
 /// endpoints from the action handler.
-/// ✏️ Adjust and plain clicks open the decision viewer in the browser.
+/// Plain clicks open the decision viewer in the browser.
 @MainActor
 public final class MacNotificationManager: NSObject, ObservableObject {
     public static let shared = MacNotificationManager()
@@ -21,9 +21,8 @@ public final class MacNotificationManager: NSObject, ObservableObject {
     public static let enabledDefaultsKey = "healthmes.mac.notificationsEnabled"
 
     enum ActionID {
-        static let apply = "HEALTHMES_APPLY"
-        static let adjust = "HEALTHMES_ADJUST"
-        static let keep = "HEALTHMES_KEEP"
+        static let yes = "HEALTHMES_YES"
+        static let no = "HEALTHMES_NO"
     }
 
     @Published public private(set) var authorizationDenied = false
@@ -93,6 +92,7 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             let content = AlertNotificationContent.from(alert: alert)
             let unContent = UNMutableNotificationContent()
             unContent.title = content.title
+            unContent.subtitle = content.subtitle
             unContent.body = content.body
             unContent.categoryIdentifier = content.categoryID
             unContent.threadIdentifier = content.threadID
@@ -110,24 +110,19 @@ public final class MacNotificationManager: NSObject, ObservableObject {
     }
 
     private func registerCategories(_ center: UNUserNotificationCenter) {
-        let apply = UNNotificationAction(
-            identifier: ActionID.apply,
-            title: String(localized: "proposal.apply"),
-            options: []
+        let no = UNNotificationAction(
+            identifier: ActionID.no,
+            title: String(localized: "No"),
+            options: [.authenticationRequired]
         )
-        let adjust = UNNotificationAction(
-            identifier: ActionID.adjust,
-            title: String(localized: "proposal.adjust"),
-            options: []
-        )
-        let keep = UNNotificationAction(
-            identifier: ActionID.keep,
-            title: String(localized: "proposal.keep"),
-            options: []
+        let yes = UNNotificationAction(
+            identifier: ActionID.yes,
+            title: String(localized: "Yes"),
+            options: [.authenticationRequired]
         )
         let actionable = UNNotificationCategory(
             identifier: AlertNotificationContent.actionableCategoryID,
-            actions: [apply, adjust, keep],
+            actions: [no, yes],
             intentIdentifiers: [],
             options: []
         )
@@ -145,20 +140,26 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             .flatMap(URL.init(string:))
 
         switch actionIdentifier {
-        case ActionID.apply, ActionID.keep:
+        case ActionID.yes, ActionID.no:
             guard
                 let proposalID = userInfo[AlertNotificationContent.userInfoProposalID]
                     .flatMap(UUID.init(uuidString:))
             else { return }
-            let action: ProposalAction = actionIdentifier == ActionID.apply ? .accept : .decline
+            let action: ProposalAction = actionIdentifier == ActionID.yes ? .accept : .decline
             let outcome: ProposalOutcome
             do {
                 let proposal = try await api.getProposal(proposalID)
                 if proposal.isActionable {
-                    _ = try await api.resolveProposal(proposal, action: action)
-                    outcome = ProposalOutcome.from(action: action, error: nil)
+                    let resolved = try await api.resolveProposal(
+                        proposal, action: action, surface: "mac_notification"
+                    )
+                    outcome = ProposalOutcome.from(
+                        action: action,
+                        resolvedStatus: resolved.status,
+                        error: nil
+                    )
                 } else {
-                    outcome = .alreadyResolved(status: "resolved")
+                    outcome = .alreadyResolved(status: proposal.status.rawValue)
                 }
             } catch let error as HealthMesAPIError {
                 outcome = ProposalOutcome.from(action: action, error: error)
@@ -167,12 +168,16 @@ public final class MacNotificationManager: NSObject, ObservableObject {
             }
             postOutcomeNotification(outcome)
 
-        case ActionID.adjust, UNNotificationDefaultActionIdentifier:
-            // Desktop mapping of ✏️ Adjust / tap-through: the decision viewer
-            // in the browser ("why this?" — §8.5 line 5). Placeholder until a
-            // native adjust surface exists (docs/design/WATCH-NOTIFICATIONS.ko.md).
+        case UNNotificationDefaultActionIdentifier:
             if let decisionURL {
-                NSWorkspace.shared.open(decisionURL)
+                if
+                    let pairing = PairingStore.shared.load(),
+                    ViewerURL.hasSameOrigin(decisionURL, as: pairing.baseURL)
+                {
+                    NSWorkspace.shared.open(
+                        ViewerURL.authenticate(decisionURL, pairing: pairing)
+                    )
+                }
             } else {
                 NSApp.activate(ignoringOtherApps: true)
             }
@@ -186,10 +191,14 @@ public final class MacNotificationManager: NSObject, ObservableObject {
         guard let center else { return }
         let content = UNMutableNotificationContent()
         switch outcome {
+        case .accepted:
+            content.title = String(localized: "proposal.accepted")
         case .applied:
             content.title = String(localized: "proposal.applied")
         case .kept:
             content.title = String(localized: "proposal.declined")
+        case .expired:
+            content.title = String(localized: "proposal.expired")
         case .alreadyResolved(let status):
             content.title = String(localized: "proposal.alreadyResolved \(status)")
         case .failed:

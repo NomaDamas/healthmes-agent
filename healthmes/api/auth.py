@@ -6,11 +6,11 @@ POSTs over LAN, Telegram alert links open in the phone browser). The
 reconciliation is a single shared bearer token (``Settings.api_token``):
 
 - When configured, :class:`BearerTokenMiddleware` requires
-  ``Authorization: Bearer <token>`` on **every** request — all ``/v1``
+  ``Authorization: Bearer <token>`` on protected requests — all ``/v1``
   routers, the bare plan-verbatim paths, and ``POST /mcp``. The Android
   collector already sends this header (apps/android-usage .../IngestClient.kt).
-- ``GET /health`` stays open (compose healthcheck / liveness probe; it leaks
-  nothing).
+- ``GET /health``, the static ``GET /`` landing, and the credential-checking
+  ``/unlock`` form stay open. None of them reads protected health data.
 - Human-facing viewer pages (``GET /decisions...``, the weekly report under
   ``GET /reports/...``, the vendored ``/static/mermaid.min.js`` they load, and
   the stored media files under ``GET /v1/media/...`` those pages embed)
@@ -34,7 +34,7 @@ import hashlib
 import hmac
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from healthmes.api.errors import error_body
@@ -47,7 +47,9 @@ from healthmes.config import Settings
 
 __all__ = [
     "BearerTokenMiddleware",
+    "HUMAN_VIEWER_PATH_PREFIXES",
     "install_auth",
+    "is_human_viewer_path",
     "viewer_token",
     "viewer_url",
 ]
@@ -56,7 +58,9 @@ __all__ = [
 # "/" is the static landing shell — it renders links only (no data, no
 # credentials in markup; healthmes/api/decisions.py::landing), so exposing it
 # leaks nothing while giving humans an entry point on the public host.
-OPEN_PATHS = frozenset({"/health", "/"})
+# "/unlock" validates a submitted API token itself, then redirects with only
+# the derived read-only viewer credential.
+OPEN_PATHS = frozenset({"/health", "/", "/unlock"})
 
 # Path prefixes of the human-facing viewer surface that may authenticate via
 # the derived ?token= query credential (browser links cannot carry headers).
@@ -66,9 +70,11 @@ OPEN_PATHS = frozenset({"/health", "/"})
 # photos/voice notes via <img>/<audio> tags. Uploading (POST /v1/media, no
 # trailing slash — not matched by the prefix) stays bearer-only. "/connect"
 # is the read-only calendar-connection status page (healthmes/api/connect.py
-# — status + instructions, no secrets rendered, no write routes exist under
-# the prefix).
+# — status + instructions, no secrets rendered, and viewer credentials apply
+# only to GET/HEAD. Storage follows the same read-only rule; its writes still
+# require a loopback local session and CSRF token.
 VIEWER_PATH_PREFIXES = (
+    "/dashboard",
     "/decisions",
     "/static/",
     "/reports",
@@ -76,10 +82,25 @@ VIEWER_PATH_PREFIXES = (
     "/connect",
     "/sleep",
 )
+HUMAN_VIEWER_PATH_PREFIXES = (
+    "/dashboard",
+    "/decisions",
+    "/reports",
+    "/connect",
+    "/sleep",
+    "/storage",
+)
 LOCAL_SESSION_BOOTSTRAP_POST_PATHS = frozenset(
     {"/connect/unlock", "/sleep/unlock"}
 )
 _VIEWER_TOKEN_CONTEXT = b"healthmes-viewer:"
+
+
+def _matches_path_prefix(path: str, prefix: str) -> bool:
+    """Match a route prefix without granting similarly named sibling routes."""
+    return path == prefix or (
+        prefix.endswith("/") and path.startswith(prefix)
+    ) or path.startswith(f"{prefix}/")
 
 
 def viewer_token(api_token: str) -> str:
@@ -135,13 +156,14 @@ def _header(scope: Scope, name: bytes) -> str | None:
 
 
 class BearerTokenMiddleware:
-    """Rejects unauthenticated requests with the standard 401 error envelope."""
+    """Reject APIs with JSON 401 and human viewer pages with a friendly HTML 401."""
 
     def __init__(
         self,
         app: ASGIApp,
         api_token: str,
         local_sessions: LocalSessionStore,
+        settings: Settings,
     ) -> None:
         if not api_token:
             raise ValueError("BearerTokenMiddleware requires a non-empty token")
@@ -149,10 +171,15 @@ class BearerTokenMiddleware:
         self._token = api_token
         self._viewer_token = viewer_token(api_token)
         self._local_sessions = local_sessions
+        self._settings = settings
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or self._is_authorized(scope):
             await self._app(scope, receive, send)
+            return
+        if self._should_render_unlock(scope):
+            response = self._viewer_unlock_response(scope)
+            await response(scope, receive, send)
             return
         response = JSONResponse(
             status_code=401,
@@ -188,7 +215,9 @@ class BearerTokenMiddleware:
             if session is not None:
                 self._mark_local_session_authenticated(scope)
                 return True
-        if scope.get("method") in ("GET", "HEAD") and path.startswith(VIEWER_PATH_PREFIXES):
+        if scope.get("method") in ("GET", "HEAD") and any(
+            _matches_path_prefix(path, prefix) for prefix in VIEWER_PATH_PREFIXES
+        ):
             return self._query_token_ok(scope)
         return False
 
@@ -198,6 +227,31 @@ class BearerTokenMiddleware:
             if hmac.compare_digest(candidate, self._viewer_token):
                 return True
         return False
+
+    @staticmethod
+    def _should_render_unlock(scope: Scope) -> bool:
+        path = scope.get("path", "")
+        return (
+            scope.get("method") in ("GET", "HEAD")
+            and is_human_viewer_path(path)
+        )
+
+    def _viewer_unlock_response(self, scope: Scope) -> HTMLResponse:
+        # Imported lazily to avoid the auth -> dashboard -> auth import cycle.
+        from healthmes.api.dashboard import render_viewer_unlock_html
+
+        path = scope.get("path", "")
+        query = scope.get("query_string", b"").decode("latin-1")
+        target = f"{path}?{query}" if query else path
+        return HTMLResponse(
+            render_viewer_unlock_html(self._settings, target),
+            status_code=401,
+            headers={
+                "WWW-Authenticate": "Bearer",
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+            },
+        )
 
     @staticmethod
     def _is_local_browser_path(path: str) -> bool:
@@ -227,5 +281,16 @@ def install_auth(app, settings: Settings) -> bool:
         BearerTokenMiddleware,
         api_token=token,
         local_sessions=app.state.local_sessions,
+        settings=settings,
     )
     return True
+
+
+def is_human_viewer_path(path: str) -> bool:
+    """Whether ``path`` is an HTML surface that should fail with friendly UX."""
+    if path.endswith(".json"):
+        return False
+    return any(
+        _matches_path_prefix(path, prefix)
+        for prefix in HUMAN_VIEWER_PATH_PREFIXES
+    )

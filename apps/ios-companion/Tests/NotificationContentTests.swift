@@ -1,8 +1,9 @@
 import XCTest
 
 // The §8.5 grammar → notification-content mapping must be deterministic and
-// line-faithful: observation = title, evidence + proposal = body lines,
-// buttons only when a real proposal is attached, decision link in userInfo.
+// line-faithful: actionable proposal = title, observation/evidence = context,
+// buttons only when a real proposal and its action are attached, decision
+// link in userInfo.
 
 final class NotificationContentTests: XCTestCase {
     private let alertID = UUID(uuidString: "5b6a1c2d-93e4-4f58-a1c0-5b8e2f7d9a41")!
@@ -26,8 +27,10 @@ final class NotificationContentTests: XCTestCase {
             alert: fullAlert, pendingProposalID: proposalID
         )
 
-        // Legacy alerts are compacted defensively for the smallest watch.
-        XCTAssertEqual(content.title, "Recovery 38 today.")
+        // Legacy alerts still put the concrete action before Yes/No.
+        XCTAssertTrue(content.title.hasPrefix("Move the 14:00 block"))
+        XCTAssertTrue(content.title.hasSuffix("?"))
+        XCTAssertEqual(content.subtitle, "Recovery 38 today.")
         XCTAssertLessThanOrEqual(content.body.count, 32)
         XCTAssertFalse(content.body.contains("\n"))
         XCTAssertTrue(content.body.hasPrefix("baseline_days 14"))
@@ -103,7 +106,10 @@ final class NotificationContentTests: XCTestCase {
 
         let content = AlertNotificationContent.from(alert: alert)
 
-        XCTAssertEqual(content.title, "Move Deep Work?")
+        XCTAssertEqual(
+            content.title,
+            AlertNotificationContent.questionLine(card.proposedAction)
+        )
         XCTAssertEqual(content.subtitle, "Sleep debt is high")
         XCTAssertTrue(content.body.hasPrefix("→ "))
         XCTAssertFalse(content.body.contains("\n"))
@@ -123,6 +129,145 @@ final class NotificationContentTests: XCTestCase {
         XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionAfter])
         XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionEndsAt])
         XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionExpiresAt])
+    }
+
+    func testDecisionPromptMapsRealServerKindsHonestly() {
+        func card(kind: String, action: String = "Use the server action") -> DecisionCard {
+            DecisionCard(
+                decisionId: alertID,
+                proposalId: proposalID,
+                kind: kind,
+                severity: "coaching",
+                title: "Wind down",
+                observationShort: "Recovery is low",
+                evidenceShort: nil,
+                proposedAction: action,
+                before: nil,
+                after: Date(),
+                endsAt: Date().addingTimeInterval(3_600),
+                expiresAt: Date().addingTimeInterval(600),
+                decisionUrl: nil
+            )
+        }
+
+        XCTAssertEqual(
+            AlertNotificationContent.decisionPrompt(for: card(kind: "schedule_change")),
+            "Use the server action?"
+        )
+        XCTAssertEqual(
+            AlertNotificationContent.decisionPrompt(for: card(kind: "planned_sleep")),
+            "Use the server action?"
+        )
+        XCTAssertEqual(
+            AlertNotificationContent.decisionPrompt(for: card(kind: "actual_sleep")),
+            "Use the server action?"
+        )
+        XCTAssertEqual(
+            AlertNotificationContent.decisionPrompt(for: card(kind: "future_kind")),
+            "Use the server action?"
+        )
+        XCTAssertEqual(
+            AlertNotificationContent.decisionPrompt(
+                for: card(kind: "schedule_change", action: "")
+            ),
+            "Move Wind down?"
+        )
+        XCTAssertEqual(
+            AlertNotificationContent.questionLine("Move Deep Work to 4 PM."),
+            "Move Deep Work to 4 PM?"
+        )
+    }
+
+    func testDecisionCardURLOverridesLegacyURL() {
+        let cardURL = "https://healthmes.example/decisions/exact"
+        let card = DecisionCard(
+            decisionId: alertID,
+            proposalId: proposalID,
+            kind: "schedule_change",
+            severity: "normal",
+            title: "Deep Work",
+            observationShort: "Recovery is low",
+            evidenceShort: nil,
+            proposedAction: "Move it?",
+            before: nil,
+            after: Date(),
+            endsAt: Date().addingTimeInterval(3_600),
+            expiresAt: Date().addingTimeInterval(600),
+            decisionUrl: cardURL
+        )
+        let alert = AlertItem(
+            id: alertID,
+            ruleId: "rule",
+            firedAt: Date(),
+            summary: "summary",
+            proposal: nil,
+            evidence: nil,
+            decisionUrl: "https://healthmes.example/decisions/legacy",
+            proposalId: proposalID,
+            decisionCard: card
+        )
+
+        let content = AlertNotificationContent.from(alert: alert)
+        XCTAssertEqual(
+            content.userInfo[AlertNotificationContent.userInfoDecisionURL],
+            cardURL
+        )
+    }
+
+    func testProposalIDWithoutActionDoesNotExposeBlindYesNoControls() {
+        let alert = AlertItem(
+            id: alertID,
+            ruleId: "missing-action",
+            firedAt: Date(),
+            summary: "Recovery is low.",
+            proposal: nil,
+            evidence: nil,
+            decisionUrl: nil,
+            proposalId: proposalID
+        )
+
+        let content = AlertNotificationContent.from(alert: alert)
+
+        XCTAssertEqual(content.title, "Recovery is low.")
+        XCTAssertEqual(content.categoryID, AlertNotificationContent.infoCategoryID)
+        XCTAssertEqual(
+            content.userInfo[AlertNotificationContent.userInfoProposalID],
+            proposalID.uuidString.lowercased()
+        )
+    }
+
+    func testBlankDecisionCardActionDoesNotExposeBlindYesNoControls() {
+        let card = DecisionCard(
+            decisionId: alertID,
+            proposalId: proposalID,
+            kind: "schedule_change",
+            severity: "coaching",
+            title: "Deep Work",
+            observationShort: "Recovery is low",
+            evidenceShort: nil,
+            proposedAction: "  ",
+            before: nil,
+            after: Date(),
+            endsAt: Date().addingTimeInterval(3_600),
+            expiresAt: Date().addingTimeInterval(600),
+            decisionUrl: nil
+        )
+        let alert = AlertItem(
+            id: alertID,
+            ruleId: "missing-card-action",
+            firedAt: Date(),
+            summary: "Recovery is low.",
+            proposal: nil,
+            evidence: nil,
+            decisionUrl: nil,
+            proposalId: proposalID,
+            decisionCard: card
+        )
+
+        let content = AlertNotificationContent.from(alert: alert)
+
+        XCTAssertEqual(content.title, "Recovery is low.")
+        XCTAssertEqual(content.categoryID, AlertNotificationContent.infoCategoryID)
     }
 
     func testEvidenceLineIsSortedAndTypeStable() {
@@ -148,7 +293,8 @@ final class NotificationContentTests: XCTestCase {
             AlertsPage.self, from: Data(contentsOf: url)
         )
         let content = AlertNotificationContent.from(alert: page.data[0])
-        XCTAssertEqual(content.title, "Recovery 38 today.")
+        XCTAssertTrue(content.title.hasPrefix("Move the 14:00 block"))
+        XCTAssertTrue(content.title.hasSuffix("?"))
         XCTAssertLessThanOrEqual(content.body.count, 32)
         XCTAssertFalse(content.body.contains("\n"))
         XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)

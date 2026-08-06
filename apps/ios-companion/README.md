@@ -1,10 +1,9 @@
 # HealthMes iOS/watchOS Companion
 
-Full native companion app for HealthMes Agent (GitHub issue #10, building on
-the #7 glance plumbing): live the whole daily loop on the phone — see the
-briefing, act on an alert, capture food/medication, check "why?" — with
-Telegram optional rather than required. Plus the #7 surfaces: WidgetKit
-home/lock-screen widgets and the watchOS app + complications.
+Full native companion app for HealthMes Agent (issues #7, #10, #91, and
+#108). The iPhone presents a shared product core — **Today, Plan,
+Decisions** — around a prominent voice-only **Speak** action. Apple Watch
+remains a deliberately smaller three-second Yes/No decision remote.
 
 Local-first, like `apps/android-usage`: the paired base URL is the **only**
 network destination in the whole project — no third-party endpoint, no
@@ -13,17 +12,28 @@ WatchConnectivity and then talks to the instance directly.
 
 ## What the app does
 
-- **Briefing home** — energy score + hand-drawn 24 h curve (honest gaps for
-  `null` hours, current-hour marker), next blocks, pending schedule
-  proposals with a real §8.5 button row, unresolved-alert list, latest
-  decision link. Pull-to-refresh; the glance leg stays ETag-cheap (304).
+- **Issue #108 core IA** — Today defaults to Now / Next / Decision; Plan
+  reads real weekly goals, tasks, mirrored calendar events, and pending
+  proposals; Decisions separates pending actions from honest resolved
+  history. Profile/Settings keeps pairing, notifications, weekly reports,
+  and capture out of the daily path.
+- **Voice-only Speak** — no text-command composer. On-device speech
+  recognition creates a real task (`POST /v1/tasks`) or weekly goal
+  (`POST /v1/goals`). General agent conversation remains unavailable until
+  the server exposes a supported voice-command contract; the app does not
+  fake one.
+- **Today** — one Now energy state, one Next calendar block, and one
+  explicit decision question. Yes/No calls the real schedule endpoint;
+  reasoning and the exact web decision remain progressively disclosed.
+  Pull-to-refresh keeps the glance leg ETag-cheap (304).
 - **Alert list in §8.5 grammar** (`GET /v1/alerts`) — observation line
   (`summary`), evidence line rendered from the `evidence` facts, proposal
   line, relative fired-time, "Why this?" → in-app decision viewer. Lines the
   payload does not carry are dropped, never invented.
-- **Real alert actions** — ✅ Apply → `POST /v1/schedule/proposals/{id}/accept`,
-  ❌ Keep as is → `…/decline`, ✏️ Adjust → proposal detail sheet. A second
-  tap elsewhere (or in Telegram) surfaces as the server's 409
+- **Real decision actions** — Yes →
+  `POST /v1/schedule/proposals/{id}/accept`, No → `…/decline`; the in-app
+  detail sheet retains the longer Apply/Keep wording where context is
+  visible. A second tap elsewhere (or in Telegram) surfaces as the server's 409
   `invalid_transition` → rendered "Already resolved (accepted/declined)".
   App actions return the action-scoped `resolution_token` from the authenticated
   pending-proposal response.
@@ -44,13 +54,12 @@ WatchConnectivity and then talks to the instance directly.
   uploaded `media_path`, so Retry never re-uploads or loses data. Medical
   captures send capture metadata only (`context.capture`); the server
   attaches its own health snapshot (`context.health`).
-- **Native notifications** (parity with Android's `AlertNotifier`) —
+- **Native notifications** (issue #91, parity with Android's `AlertNotifier`) —
   BGAppRefreshTask + foreground sync poll `GET /v1/alerts`, diff against a
   seen-store (exactly-once per alert), and post local notifications in the
   §8.5 grammar: observation title, evidence+proposal body, per-rule thread.
-  ✅/✏️/❌ actions are attached **only when exactly one pending proposal
-  exists** (no alert→proposal FK exists yet, so that is the only case where
-  "Apply" is unambiguous) and call the real endpoints from the action
+  No/Yes actions are attached only to the exact `proposal_id` correlated by
+  the server and call the real endpoints from the action
   handler, confirming with an outcome notification. Tap-through opens the
   decision viewer. Badge = unresolved count.
 - **Live Activity** — current focus block (from glance `next_blocks`) on
@@ -87,6 +96,9 @@ deliverable: `docs/design/WATCH-NOTIFICATIONS.ko.md` (design system:
 | `GET /v1/briefing/glance` (ETag/304, max-age 300) | home, widgets, watch, Live Activity |
 | `GET /v1/alerts?hours=24` (§8.5 grammar items) | home alert list, notifications |
 | `GET /v1/schedule/proposals?status=proposed` + `POST …/{id}/accept\|decline` | proposal cards, notification actions |
+| `GET /v1/goals`, `POST /v1/goals` | Plan goals, spoken weekly goals |
+| `GET /v1/tasks`, `POST /v1/tasks` | Plan tasks, spoken tasks |
+| `GET /v1/schedule/events?start=…&end=…` | Plan calendar timeline |
 | `GET /reports/weekly.json` | report tab |
 | `POST /v1/media` (multipart `file`) + `GET /v1/media/{path}` | capture upload / preview URL |
 | `POST /v1/food-logs`, `POST /v1/medical-records` | capture save |
@@ -233,7 +245,7 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
   serve` on :8199, seeded alert/proposal/energy rows): briefing home
   rendered live data; Report tab rendered live `weekly.json`; Capture form
   saved a real food log (`source: "ios-app"` row verified server-side);
-  ✅ Apply flipped the seeded proposal to `accepted` server-side and the
+  Yes flipped the seeded proposal to `accepted` server-side and the
   accepted block then appeared in glance `next_blocks`. Tests self-skip
   (never fail) without a live pairing, so plain CI runs stay green.
 - **Capture chain proven with the app's own bytes**: `Sources/Shared`

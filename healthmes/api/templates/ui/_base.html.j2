@@ -309,6 +309,16 @@
     background: var(--glass-solid); box-shadow: var(--shadow);
   }
   .ambience { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+  @media (max-width: 760px) {
+    .site-inner { flex-wrap: wrap; }
+    nav.site-nav {
+      order: 3; width: 100%; margin-left: 0; overflow-x: auto;
+      scrollbar-width: none;
+    }
+    nav.site-nav::-webkit-scrollbar { display: none; }
+    nav.site-nav a { flex: 0 0 auto; }
+    .ambience { margin-left: auto; }
+  }
   @media (max-width: 480px) {
     .season-picker button { font-size: 0.82rem; padding: 0.16rem 0.3rem; }
   }
@@ -551,15 +561,15 @@
 <a class="skip" href="#main">본문으로 건너뛰기</a>
 <header class="site">
   <div class="site-inner">
-    <a class="brand" href="/decisions{{ token_qs }}" aria-label="HealthMes 제안 기록으로 이동">
+    <a class="brand" href="{{ app_path('/dashboard') }}{{ token_qs }}" aria-label="HealthMes Dashboard로 이동">
       <span class="brand-dot" aria-hidden="true"></span>HealthMes{% block crumb %}{% endblock %}
     </a>
     <nav class="site-nav" aria-label="주요 페이지">
-      <a href="/decisions{{ token_qs }}"{% if active_nav == "decisions" %} aria-current="page"{% endif %}>제안 기록</a>
-      <a href="/reports/weekly{{ token_qs }}"{% if active_nav == "weekly" %} aria-current="page"{% endif %}>주간 리포트</a>
-      <a href="/sleep{{ token_qs }}"{% if active_nav == "sleep" %} aria-current="page"{% endif %}>Actual sleep</a>
-      <a href="/connect{{ token_qs }}"{% if active_nav == "connect" %} aria-current="page"{% endif %}>연결</a>
-      <a href="/storage{{ token_qs }}"{% if active_nav == "storage" %} aria-current="page"{% endif %}>저장</a>
+      <a href="{{ app_path('/dashboard') }}{{ token_qs }}"{% if active_nav == "dashboard" %} aria-current="page"{% endif %}>Dashboard</a>
+      <a href="{{ app_path('/decisions') }}{{ token_qs }}"{% if active_nav == "decisions" %} aria-current="page"{% endif %}>Decisions</a>
+      <a href="{{ app_path('/reports/weekly') }}{{ token_qs }}"{% if active_nav == "weekly" %} aria-current="page"{% endif %}>History</a>
+      <a href="{{ app_path('/sleep') }}{{ token_qs }}"{% if active_nav == "sleep" %} aria-current="page"{% endif %}>Actual sleep</a>
+      <a href="{{ app_path('/connect') }}{{ token_qs }}"{% if active_nav == "connect" %} aria-current="page"{% endif %}>Settings</a>
     </nav>
     <div class="ambience no-print">
       <div class="season-picker" role="group" aria-label="계절 배경 선택" data-season-picker hidden>
@@ -580,7 +590,7 @@
 {% block content %}{% endblock %}
 </main>
 <footer class="site-foot">
-  HealthMes · 모든 건강 데이터는 이 기기에만 머뭅니다 — local-first, no cloud.
+  HealthMes · 데이터 위치와 동기화 범위는 선택한 저장 모드와 연결 설정을 따릅니다.
 </footer>
 <script>
 (function () {

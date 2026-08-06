@@ -14,20 +14,29 @@ struct DecisionSheetTarget: Identifiable {
 }
 
 enum AppTab: Hashable {
-    case home
-    case report
-    case capture
-    case settings
+    case today
+    case plan
+    case decisions
 }
 
-/// Central navigation state: tab selection, the in-app decision viewer
-/// sheet, and the proposal-detail sheet. Notification taps and
+enum AppModal: String, Identifiable {
+    case speak
+    case settings
+    case report
+    case capture
+
+    var id: String { rawValue }
+}
+
+/// Central navigation state: core product selection, modal tools, the
+/// in-app decision viewer sheet, and the proposal-detail sheet. Notification taps and
 /// `healthmes://` deep links (widgets, Live Activity) land here.
 @MainActor
 final class AppRouter: ObservableObject {
     static let shared = AppRouter()
 
-    @Published var tab: AppTab = .home
+    @Published var tab: AppTab = .today
+    @Published var modal: AppModal?
     @Published var decisionSheet: DecisionSheetTarget?
     @Published var proposalSheetID: UUID?
 
@@ -35,11 +44,17 @@ final class AppRouter: ObservableObject {
     /// that come from server payloads (glance/alerts/reports) or pass the
     /// deep-link host check reach this point.
     func openDecision(_ url: URL) {
-        decisionSheet = DecisionSheetTarget(url: url)
+        guard
+            let pairing = PairingStore.shared.load(),
+            Self.isAllowedViewerURL(url)
+        else { return }
+        decisionSheet = DecisionSheetTarget(
+            url: ViewerURL.authenticate(url, pairing: pairing)
+        )
     }
 
     func openProposalDetail(_ id: UUID) {
-        tab = .home
+        tab = .decisions
         proposalSheetID = id
     }
 
@@ -56,7 +71,7 @@ final class AppRouter: ObservableObject {
                 let targetURL = URL(string: target),
                 Self.isAllowedViewerURL(targetURL)
             else {
-                tab = .home
+                tab = .today
                 return
             }
             openDecision(targetURL)
@@ -65,16 +80,18 @@ final class AppRouter: ObservableObject {
                 let raw = Self.queryValue(of: url, name: "id"),
                 let id = UUID(uuidString: raw)
             else {
-                tab = .home
+                tab = .today
                 return
             }
             openProposalDetail(id)
         case "capture":
-            tab = .capture
+            modal = .capture
         case "report":
-            tab = .report
+            modal = .report
+        case "speak":
+            modal = .speak
         default:
-            tab = .home
+            tab = .today
         }
     }
 
@@ -95,6 +112,6 @@ final class AppRouter: ObservableObject {
             scheme == "http" || scheme == "https",
             let pairing = PairingStore.shared.load()
         else { return false }
-        return url.host?.lowercased() == pairing.baseURL.host?.lowercased()
+        return ViewerURL.hasSameOrigin(url, as: pairing.baseURL)
     }
 }
