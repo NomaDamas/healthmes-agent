@@ -75,7 +75,7 @@ Telegram (phone + watch)          decision viewer (web)
   weights renormalize; components always sum exactly to the score.
 - Hourly persist job + `GET /cognitive-energy/forecast?date=` (24 windows
   with full component breakdowns).
-- 19 MCP tools the agent decides with: `get_health_scores`,
+- MCP tools the agent decides with: `get_health_scores`,
   `get_daily_readiness_context`, `get_personal_baselines`,
   `get_cognitive_energy_forecast`, `get_stress_timeline` (stress segments
   joined with calendar + app usage), `compare_impact` (does factor X move
@@ -89,10 +89,19 @@ Telegram (phone + watch)          decision viewer (web)
   explicitly authorized OpenAI, Gemini, Anthropic, or xAI provider. The
   structured payload is stored intact as a `WellnessEvent`; photo, observation,
   and confirmation each have independent retention. The current bounded slice
-  extracts caffeine evidence only, not full nutrition. Text and voice nutrition
-  analysis are not implemented. Five MCP tools expose estimates and accept
-  trusted owner confirmations; a daily caffeine total is returned only after
-  every item and the complete local day are explicitly confirmed.
+  extracts caffeine evidence only, not full nutrition. A device-neutral intake
+  engine wraps photo observations and accepts exact text entries or locally
+  produced voice transcripts without treating any capture as consumed. REST
+  and MCP adapters preserve intent, explicit consumption outcomes, reusable
+  nutrient facts, prospective decision requests, evidence references, and
+  agent decisions. Raw text/transcripts/media remain short-lived while durable
+  outcomes and decision requests retain sanitized structured snapshots. Writes
+  use caller-owned idempotency UUIDs plus permanent non-content tombstones that
+  prevent reuse after raw expiry, and decision context is immutable after
+  request creation. Automatic text nutrition extraction and server-side voice
+  transcription are not implemented. The original caffeine tools still return
+  a daily total only after every item and the complete local day are explicitly
+  confirmed; generic caffeine decisions cannot emit actionable proposals.
 - Decision viewer: every proactive decision is a `decision_record` tree
   rendered as a Mermaid flowchart at `/decisions/{id}` (vendored Mermaid,
   no CDN), with a paginated index at `/decisions`.

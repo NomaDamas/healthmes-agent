@@ -142,7 +142,14 @@ sake의 `NutritionObservation` 구조를 평탄화하거나 기존 `FoodLog`로 
 `WellnessEvent.payload`에 원형 그대로 저장한다. 사진 원본은
 `nutrition_media`, 구조화 관측값은 `nutrition_observation`, 사용자 확인은
 `nutrition_confirmation`으로 분리해 각 보존정책을 독립 적용한다. HealthMes가
-별도의 경쟁 음식 스키마를 만들거나 관측값을 자동으로 사실로 승격하지 않는다.
+별도의 경쟁 사진분석 스키마를 만들거나 관측값을 자동으로 사실로 승격하지 않는다.
+
+HealthMes의 `IntakeInteraction`은 sake 분석 위의 오케스트레이션 계약이다. 사진,
+텍스트, 로컬 음성 transcript를 같은 식사 맥락으로 찾게 하지만 sake payload를
+복사하거나 변경하지 않는다. `먹은 기록`, `먹기 전 후보`, `분석 전용`, `계획`,
+`비교` intent를 분리하고 실제 섭취는 별도 `IntakeOutcome`이 있어야만 확정한다.
+에이전트는 MCP 검색과 `IntakeDecisionRequest`의 evidence ID를 통해 이후 판단에
+같은 기록을 재사용한다.
 
 ## 저장 및 보존 전략
 

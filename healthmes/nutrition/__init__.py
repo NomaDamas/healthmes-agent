@@ -15,6 +15,21 @@ from healthmes.nutrition.contracts import (
     observation_from_payload,
     observation_to_payload,
 )
+from healthmes.nutrition.intake_contracts import (
+    CaptureModality,
+    DecisionScope,
+    DecisionStatus,
+    EvidenceOrigin,
+    IntakeDecision,
+    IntakeDecisionRequest,
+    IntakeIntent,
+    IntakeInteraction,
+    IntakeOutcome,
+    IntakeOutcomeStatus,
+    NormalizedIntakeItem,
+    NutrientFact,
+    StructuredIntakeSnapshot,
+)
 
 __all__ = [
     "CaffeineConfirmation",
@@ -28,6 +43,19 @@ __all__ = [
     "NutritionObservation",
     "ObservationStatus",
     "VisionProvenance",
+    "CaptureModality",
+    "DecisionScope",
+    "DecisionStatus",
+    "EvidenceOrigin",
+    "IntakeDecision",
+    "IntakeDecisionRequest",
+    "IntakeIntent",
+    "IntakeInteraction",
+    "IntakeOutcome",
+    "IntakeOutcomeStatus",
+    "NormalizedIntakeItem",
+    "NutrientFact",
+    "StructuredIntakeSnapshot",
     "observation_from_payload",
     "observation_to_payload",
 ]

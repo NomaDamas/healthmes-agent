@@ -12,8 +12,8 @@
 지원하지 않는 것
   전체 영양소(열량, 탄수화물, 단백질, 지방, 미량영양소)
   재료와 레시피 추론
-  텍스트 영양 기록 분석
-  음성 영양 기록 전사/분석
+  텍스트에서 영양소를 자동 추출
+  음성 파일을 서버에서 자동 전사
 ```
 
 `NutritionObservation`은 일반적인 음식/음료 후보와 제공량을 담을 수 있지만,
@@ -23,6 +23,14 @@
 음성 파일은 `POST /v1/media`로 저장할 수 있지만
 `POST /v1/nutrition-observations/analyze`는 이미지 형식만 받는다. 기존
 `FoodLog`도 별도 계약이며, sake 관찰을 `FoodLog`로 평탄화하지 않는다.
+
+상위 `IntakeInteraction` 엔진은 텍스트 원문과 로컬에서 만든 음성 transcript를
+단기 capture로 받을 수 있다. 섭취 확인과 판단 요청에는 원문·transcript·미디어
+경로를 제외한 구조화 snapshot만 장기 보존한다. 구조화된 영양소가 함께 들어오면
+출처와 confidence를 보존하지만, HealthMes가 텍스트나 음성에서 영양소를
+자동으로 만들었다는 뜻은 아니다. 상세 계약은
+[`NUTRITION-INTERACTION-ENGINE.ko.md`](NUTRITION-INTERACTION-ENGINE.ko.md)를
+따른다.
 
 ## 실행 구조
 
@@ -130,8 +138,8 @@ MCP가 확인된 카페인 데이터만 의사결정 기능에 제공
 
 ## 후속 작업
 
-1. 텍스트와 음성을 공통 `CaptureObservation`으로 정규화하는 계약을 설계한다.
-2. 음성은 로컬 전사 후 원문, 전사문, 사용자의 수정본 provenance를 분리한다.
-3. 전체 영양소는 sake가 새 버전의 schema와 확인 규칙을 정의한 뒤 추가한다.
+1. 음성 파일에서 transcript를 만드는 로컬 전사 adapter를 연결한다.
+2. 텍스트·음성 영양소 자동 추출은 별도 analyzer 계약과 확인 규칙으로 추가한다.
+3. 전체 영양소 사진 추출은 sake가 새 버전 schema를 정의한 뒤 추가한다.
 4. 실제 provider 자격 증명으로 opt-in integration test를 별도 실행한다.
 5. HEIC의 로컬 변환 경로를 추가한 뒤 원격 provider에도 동일 이미지를 보낸다.

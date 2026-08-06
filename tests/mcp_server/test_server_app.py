@@ -29,11 +29,17 @@ TRANCHE_3_TOOLS = {
     "list_medical_records",
 }
 NUTRITION_TOOLS = {
+    "capture_intake_interaction",
+    "confirm_intake_outcome",
     "get_recent_nutrition_observations",
     "get_caffeine_observations",
     "get_known_caffeine_intake_for_day",
+    "get_intake_decision_context",
     "confirm_photo_caffeine_observation",
     "confirm_photo_caffeine_day",
+    "record_intake_decision",
+    "request_intake_decision",
+    "search_intake_records",
 }
 CALENDAR_ADJUSTMENT_TOOLS = {
     "evaluate_morning_calendar_nudge",

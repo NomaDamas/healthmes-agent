@@ -53,7 +53,7 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -83,6 +83,34 @@ from healthmes.nutrition.contracts import (
     ConfirmationStatus,
     ConfirmedCaffeineItem,
     DailyIntakeConfirmation,
+)
+from healthmes.nutrition.intake_contracts import (
+    CaptureModality,
+    DecisionScope,
+    DecisionStatus,
+    IntakeDecision,
+    IntakeDecisionRequest,
+    IntakeIntent,
+    IntakeInteraction,
+    IntakeOutcome,
+    IntakeOutcomeStatus,
+    NormalizedIntakeItem,
+)
+from healthmes.nutrition.intake_query import (
+    decision_context,
+    interaction_view,
+    search_intake_history,
+)
+from healthmes.nutrition.intake_service import (
+    IntakeInteractionError,
+    create_interaction,
+    create_photo_interaction,
+    get_decision_request,
+    operation_fingerprint,
+    persist_decision,
+    persist_decision_request,
+    persist_outcome,
+    persisted_decision_for_operation,
 )
 from healthmes.nutrition.query import (
     caffeine_observations_for_day,
@@ -114,6 +142,8 @@ from healthmes.store import (
 )
 from healthmes.store import enums as store_enums
 from healthmes.trusted_session import verify_trusted_session_proof
+
+_NORMALIZED_INTAKE_ITEMS = TypeAdapter(tuple[NormalizedIntakeItem, ...])
 
 # ---------------------------------------------------------------------------
 # Vocabulary grounded in vendor/open-wearables (do not invent values)
@@ -2940,6 +2970,392 @@ def confirm_photo_caffeine_day(
         "confirmation_id": str(confirmation.confirmation_id),
         "local_date": date,
         "total_intake_complete": total_intake_complete,
+    }
+
+
+def _parse_normalized_intake_items(
+    values: list[dict[str, Any]] | None,
+) -> tuple[NormalizedIntakeItem, ...]:
+    try:
+        return _NORMALIZED_INTAKE_ITEMS.validate_python(values or [])
+    except ValidationError as exc:
+        raise ToolError(f"items do not match the nutrition schema: {exc}") from exc
+
+
+@mcp.tool
+def capture_intake_interaction(
+    operation_id: str,
+    intent: str,
+    modality: str,
+    source_text: str | None = None,
+    observed_at: str | None = None,
+    media_path: str | None = None,
+    nutrition_observation_id: str | None = None,
+    items: list[dict[str, Any]] | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Create a device-neutral food interaction from photo, text, or voice.
+
+    A capture is an observation, not proof of consumption. ``photo`` adapts
+    one existing sake observation; ``text`` stores the owner's exact entry;
+    ``voice`` requires both the local audio token and its local transcript.
+    """
+    try:
+        parsed_intent = IntakeIntent(intent)
+    except ValueError as exc:
+        raise ToolError(
+            f"intent must be one of {[value.value for value in IntakeIntent]}"
+        ) from exc
+    try:
+        parsed_modality = CaptureModality(modality)
+    except ValueError as exc:
+        raise ToolError(
+            f"modality must be one of {[value.value for value in CaptureModality]}"
+        ) from exc
+    raw_items = items or []
+    proof_arguments = {
+        "operation_id": operation_id,
+        "intent": intent,
+        "modality": modality,
+        "source_text": source_text,
+        "observed_at": observed_at,
+        "media_path": media_path,
+        "nutrition_observation_id": nutrition_observation_id,
+        "items": raw_items,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="capture_intake_interaction",
+        arguments=proof_arguments,
+    )
+    if parsed_modality is CaptureModality.PHOTO and raw_items:
+        raise ToolError("photo items must come from the stored sake observation")
+    parsed_items = _parse_normalized_intake_items(raw_items)
+    parsed_operation_id = _parse_uuid(operation_id, "operation_id")
+    fingerprint = operation_fingerprint(proof_arguments)
+    captured_at = (
+        _parse_datetime_utc(observed_at, "observed_at")
+        if observed_at is not None
+        else dt.datetime.now(dt.UTC)
+    )
+    timezone = _local_timezone()
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    try:
+        with _store_session() as session:
+            if parsed_modality is CaptureModality.PHOTO:
+                if nutrition_observation_id is None:
+                    raise ToolError(
+                        "photo requires nutrition_observation_id"
+                    )
+                interaction = create_photo_interaction(
+                    session,
+                    _active_settings(),
+                    observation_id=_parse_uuid(
+                        nutrition_observation_id,
+                        "nutrition_observation_id",
+                    ),
+                    operation_id=parsed_operation_id,
+                    operation_fingerprint=fingerprint,
+                    intent=parsed_intent,
+                    source="telegram-owner",
+                    recorded_at=dt.datetime.now(dt.UTC),
+                    source_text=source_text,
+                )
+            else:
+                interaction = IntakeInteraction(
+                    interaction_id=parsed_operation_id,
+                    operation_fingerprint=fingerprint,
+                    intent=parsed_intent,
+                    modality=parsed_modality,
+                    observed_at=captured_at,
+                    recorded_at=dt.datetime.now(dt.UTC),
+                    timezone=timezone_name,
+                    source="telegram-owner",
+                    source_text=source_text,
+                    media_path=media_path,
+                    nutrition_observation_id=None,
+                    items=parsed_items,
+                )
+                create_interaction(
+                    session, _active_settings(), interaction
+                )
+            view = interaction_view(session, interaction.interaction_id)
+    except IntakeInteractionError as exc:
+        raise ToolError(str(exc)) from exc
+    assert view is not None
+    return {"status": "ok", "interaction": view}
+
+
+@mcp.tool
+def confirm_intake_outcome(
+    operation_id: str,
+    interaction_id: str,
+    status: str,
+    consumed_at: str | None = None,
+    corrected_items: list[dict[str, Any]] | None = None,
+    note: str | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Record whether an observed or proposed food was actually consumed."""
+    try:
+        parsed_status = IntakeOutcomeStatus(status)
+    except ValueError as exc:
+        raise ToolError(
+            f"status must be one of {[value.value for value in IntakeOutcomeStatus]}"
+        ) from exc
+    raw_items = corrected_items or []
+    proof_arguments = {
+        "operation_id": operation_id,
+        "interaction_id": interaction_id,
+        "status": status,
+        "consumed_at": consumed_at,
+        "corrected_items": raw_items,
+        "note": note,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="confirm_intake_outcome",
+        arguments=proof_arguments,
+    )
+    parsed_interaction_id = _parse_uuid(interaction_id, "interaction_id")
+    parsed_operation_id = _parse_uuid(operation_id, "operation_id")
+    parsed_items = _parse_normalized_intake_items(raw_items)
+    outcome = IntakeOutcome(
+        outcome_id=parsed_operation_id,
+        operation_fingerprint=operation_fingerprint(proof_arguments),
+        interaction_id=parsed_interaction_id,
+        status=parsed_status,
+        confirmed_at=dt.datetime.now(dt.UTC),
+        source="telegram-owner",
+        consumed_at=(
+            _parse_datetime_utc(consumed_at, "consumed_at")
+            if consumed_at is not None
+            else None
+        ),
+        corrected_items=parsed_items,
+        note=note,
+    )
+    try:
+        with _store_session() as session:
+            persist_outcome(session, outcome)
+            view = interaction_view(session, parsed_interaction_id)
+    except IntakeInteractionError as exc:
+        raise ToolError(str(exc)) from exc
+    assert view is not None
+    return {"status": "ok", "interaction": view}
+
+
+@mcp.tool
+def search_intake_records(
+    start: str | None = None,
+    end: str | None = None,
+    intent: str | None = None,
+    modality: str | None = None,
+    confirmed_only: bool = False,
+    nutrient: str | None = None,
+    query: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Search reusable food context without returning photo or audio bytes."""
+    if not 1 <= limit <= 500:
+        raise ToolError("limit must be between 1 and 500")
+    start_at = _parse_datetime_utc(start, "start") if start else None
+    end_at = _parse_datetime_utc(end, "end") if end else None
+    if start_at is not None and end_at is not None and start_at >= end_at:
+        raise ToolError("start must be before end")
+    try:
+        parsed_intent = IntakeIntent(intent) if intent is not None else None
+        parsed_modality = (
+            CaptureModality(modality) if modality is not None else None
+        )
+    except ValueError as exc:
+        raise ToolError("intent or modality is unsupported") from exc
+    with _store_session() as session:
+        return search_intake_history(
+            session,
+            start=start_at,
+            end=end_at,
+            intent=parsed_intent,
+            modality=parsed_modality,
+            confirmed_only=confirmed_only,
+            nutrient=nutrient,
+            query=query,
+            limit=limit,
+        )
+
+
+@mcp.tool
+def request_intake_decision(
+    operation_id: str,
+    interaction_id: str,
+    scope: str,
+    question: str | None = None,
+    intended_consumption_at: str | None = None,
+    compare_interaction_ids: list[str] | None = None,
+    lookback_days: int = 14,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Create a durable decision request and return its bounded evidence context."""
+    if not 1 <= lookback_days <= 90:
+        raise ToolError("lookback_days must be between 1 and 90")
+    try:
+        parsed_scope = DecisionScope(scope)
+    except ValueError as exc:
+        raise ToolError(
+            f"scope must be one of {[value.value for value in DecisionScope]}"
+        ) from exc
+    compare_values = compare_interaction_ids or []
+    proof_arguments = {
+        "operation_id": operation_id,
+        "interaction_id": interaction_id,
+        "scope": scope,
+        "question": question,
+        "intended_consumption_at": intended_consumption_at,
+        "compare_interaction_ids": compare_values,
+        "lookback_days": lookback_days,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="request_intake_decision",
+        arguments=proof_arguments,
+    )
+    parsed_interaction_id = _parse_uuid(interaction_id, "interaction_id")
+    parsed_operation_id = _parse_uuid(operation_id, "operation_id")
+    compare_ids = tuple(
+        _parse_uuid(value, f"compare_interaction_ids[{index}]")
+        for index, value in enumerate(compare_values)
+    )
+    request = IntakeDecisionRequest(
+        request_id=parsed_operation_id,
+        operation_fingerprint=operation_fingerprint(proof_arguments),
+        interaction_id=parsed_interaction_id,
+        scope=parsed_scope,
+        requested_at=dt.datetime.now(dt.UTC),
+        source="telegram-owner",
+        question=question,
+        intended_consumption_at=(
+            _parse_datetime_utc(
+                intended_consumption_at, "intended_consumption_at"
+            )
+            if intended_consumption_at is not None
+            else None
+        ),
+        compare_interaction_ids=compare_ids,
+        lookback_days=lookback_days,
+    )
+    try:
+        with _store_session() as session:
+            persist_decision_request(session, request)
+            context = decision_context(
+                session,
+                request_id=request.request_id,
+            )
+    except IntakeInteractionError as exc:
+        raise ToolError(str(exc)) from exc
+    assert context is not None
+    return context
+
+
+@mcp.tool
+def get_intake_decision_context(
+    request_id: str,
+) -> dict[str, Any]:
+    """Read a previously stored food-decision request and its current context."""
+    with _store_session() as session:
+        context = decision_context(
+            session,
+            request_id=_parse_uuid(request_id, "request_id"),
+        )
+    if context is None:
+        raise ToolError("intake decision request not found")
+    return context
+
+
+@mcp.tool
+def record_intake_decision(
+    operation_id: str,
+    request_id: str,
+    status: str,
+    summary: str,
+    evidence_event_ids: list[str],
+    limitations: list[str] | None = None,
+    recommendation: dict[str, Any] | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Persist an agent decision with exact evidence references and limitations."""
+    try:
+        parsed_status = DecisionStatus(status)
+    except ValueError as exc:
+        raise ToolError(
+            f"status must be one of {[value.value for value in DecisionStatus]}"
+        ) from exc
+    parsed_request_id = _parse_uuid(request_id, "request_id")
+    proof_arguments = {
+        "operation_id": operation_id,
+        "request_id": request_id,
+        "status": status,
+        "summary": summary,
+        "evidence_event_ids": evidence_event_ids,
+        "limitations": limitations,
+        "recommendation": recommendation,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="record_intake_decision",
+        arguments=proof_arguments,
+    )
+    parsed_operation_id = _parse_uuid(operation_id, "operation_id")
+    parsed_evidence_ids = tuple(
+        _parse_uuid(value, f"evidence_event_ids[{index}]")
+        for index, value in enumerate(evidence_event_ids)
+    )
+    with _store_session() as session:
+        try:
+            existing = persisted_decision_for_operation(
+                session,
+                decision_id=parsed_operation_id,
+                operation_fingerprint=operation_fingerprint(
+                    proof_arguments
+                ),
+            )
+        except IntakeInteractionError as exc:
+            raise ToolError(str(exc)) from exc
+        if existing is not None:
+            return {
+                "status": "ok",
+                "decision_id": str(existing.decision_id),
+                "interaction_id": str(existing.interaction_id),
+                "scope": existing.scope.value,
+                "decision_status": existing.status.value,
+            }
+        request_entry = get_decision_request(session, parsed_request_id)
+        if request_entry is None:
+            raise ToolError("intake decision request not found")
+        request = request_entry[1]
+        decision = IntakeDecision(
+            decision_id=parsed_operation_id,
+            operation_fingerprint=operation_fingerprint(proof_arguments),
+            request_id=parsed_request_id,
+            interaction_id=request.interaction_id,
+            scope=request.scope,
+            status=parsed_status,
+            decided_at=dt.datetime.now(dt.UTC),
+            source="healthmes-agent",
+            summary=summary,
+            evidence_event_ids=parsed_evidence_ids,
+            limitations=tuple(limitations or []),
+            recommendation=recommendation,
+        )
+        try:
+            persist_decision(session, decision)
+        except IntakeInteractionError as exc:
+            raise ToolError(str(exc)) from exc
+    return {
+        "status": "ok",
+        "decision_id": str(decision.decision_id),
+        "interaction_id": str(decision.interaction_id),
+        "scope": decision.scope.value,
+        "decision_status": decision.status.value,
     }
 
 
