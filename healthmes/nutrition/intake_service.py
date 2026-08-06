@@ -8,9 +8,11 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from math import isfinite
+from pathlib import Path
+from threading import RLock
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -27,6 +29,7 @@ from healthmes.nutrition.intake_contracts import (
     DecisionScope,
     DecisionStatus,
     EvidenceOrigin,
+    IntakeAnalysisProvenance,
     IntakeDecision,
     IntakeDecisionRequest,
     IntakeIntent,
@@ -50,14 +53,23 @@ from healthmes.nutrition.repository import (
     latest_nutrition_reviews,
     storage_object_for_media,
 )
+from healthmes.nutrition.schema import (
+    SCHEMA_VERSION,
+    TEXT_PROMPT_VERSION,
+    VLMExtraction,
+)
+from healthmes.nutrition.transcription import NutritionTranscriber
+from healthmes.nutrition.vision import VisionProvider
 from healthmes.storage import classify_storage_object, ensure_default_policies
 from healthmes.store import RetentionPolicy, WellnessEvent
 
 INTERACTION_EVENT = "nutrition.interaction.v1"
+RAW_CAPTURE_EVENT = "nutrition.raw-capture.v1"
 OPERATION_EVENT = "nutrition.operation.v1"
 OUTCOME_EVENT = "nutrition.intake-outcome.v1"
 DECISION_REQUEST_EVENT = "nutrition.decision-request.v1"
 DECISION_EVENT = "nutrition.decision.v1"
+OUTCOME_RAW_EVENT = "nutrition.outcome-raw.v1"
 
 HIGH_RISK_SCOPES = frozenset(
     {DecisionScope.ALLERGY_SAFETY, DecisionScope.MEDICATION_INTERACTION}
@@ -66,6 +78,7 @@ MAX_SOURCE_TEXT_CHARS = 12_000
 MAX_DECISION_SUMMARY_CHARS = 8_000
 MAX_RECOMMENDATION_BYTES = 64 * 1024
 MAX_OPERATION_FINGERPRINT_CHARS = 64
+MAX_CAPTURE_CLOCK_SKEW = timedelta(minutes=5)
 HIGH_RISK_SUMMARY = (
     "The generic HealthMes wellness engine does not provide allergy or "
     "medication-interaction safety decisions."
@@ -92,6 +105,136 @@ class IntakeOperationConflict(IntakeInteractionError):
     pass
 
 
+class IntakeAnalysisInProgress(IntakeOperationConflict):
+    pass
+
+
+_ANALYSIS_RESERVATIONS = "nutrition_analysis_reservations"
+_STATIC_ANALYSIS_RESERVATIONS: dict[
+    tuple[int, uuid.UUID],
+    dict[str, Any],
+] = {}
+_STATIC_ANALYSIS_RESERVATIONS_LOCK = RLock()
+
+
+def _tracked_analysis_reservations(
+    session: Session,
+) -> dict[uuid.UUID, str]:
+    return session.info.setdefault(_ANALYSIS_RESERVATIONS, {})
+
+
+def _uses_process_local_reservations(session: Session) -> bool:
+    return session.get_bind().dialect.name == "sqlite"
+
+
+def _pop_static_analysis_reservation(
+    session: Session,
+    *,
+    interaction_id: uuid.UUID,
+    reservation_token: str,
+    restore_marker: bool = False,
+) -> None:
+    key = (id(session.get_bind()), interaction_id)
+    with _STATIC_ANALYSIS_RESERVATIONS_LOCK:
+        reservation = _STATIC_ANALYSIS_RESERVATIONS.get(key)
+        if (
+            reservation is None
+            or reservation["reservation_token"] != reservation_token
+        ):
+            return
+        _STATIC_ANALYSIS_RESERVATIONS.pop(key, None)
+    if restore_marker:
+        marker = reservation.get("marker")
+        prior_payload = reservation.get("prior_payload")
+        if marker is not None and prior_payload is not None:
+            marker.payload = prior_payload
+
+
+def _claim_process_local_persistence(
+    session: Session,
+    *,
+    interaction: IntakeInteraction,
+    reservation_token: str,
+) -> None:
+    key = (id(session.get_bind()), interaction.interaction_id)
+    now = datetime.now(UTC)
+    with _STATIC_ANALYSIS_RESERVATIONS_LOCK:
+        reservation = _STATIC_ANALYSIS_RESERVATIONS.get(key)
+        if (
+            reservation is None
+            or reservation["operation_fingerprint"]
+            != interaction.operation_fingerprint
+            or reservation["reservation_token"] != reservation_token
+            or reservation["lease_expires_at"] <= now
+        ):
+            raise IntakeAnalysisInProgress(
+                "intake interaction analysis reservation is stale"
+            )
+        reservation["state"] = "persisting"
+
+
+@event.listens_for(Session, "after_commit")
+def _clear_committed_analysis_reservations(session: Session) -> None:
+    if session.in_nested_transaction():
+        return
+    reservations = session.info.pop(_ANALYSIS_RESERVATIONS, {})
+    if _uses_process_local_reservations(session):
+        for interaction_id, reservation_token in reservations.items():
+            _pop_static_analysis_reservation(
+                session,
+                interaction_id=interaction_id,
+                reservation_token=reservation_token,
+            )
+
+
+@event.listens_for(Session, "after_soft_rollback")
+def _release_rolled_back_analysis_reservations(
+    session: Session,
+    previous_transaction: Any,
+) -> None:
+    if previous_transaction.nested:
+        return
+    reservations = session.info.pop(_ANALYSIS_RESERVATIONS, {})
+    if _uses_process_local_reservations(session):
+        for interaction_id, reservation_token in reservations.items():
+            _pop_static_analysis_reservation(
+                session,
+                interaction_id=interaction_id,
+                reservation_token=reservation_token,
+            )
+        return
+    for interaction_id, reservation_token in reservations.items():
+            _release_interaction_analysis(
+                session,
+                interaction_id=interaction_id,
+                reservation_token=reservation_token,
+            )
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _release_closed_analysis_reservations(
+    session: Session,
+    transaction: Any,
+) -> None:
+    if transaction.parent is not None or session.in_transaction():
+        return
+    reservations = session.info.pop(_ANALYSIS_RESERVATIONS, {})
+    if _uses_process_local_reservations(session):
+        for interaction_id, reservation_token in reservations.items():
+            _pop_static_analysis_reservation(
+                session,
+                interaction_id=interaction_id,
+                reservation_token=reservation_token,
+            )
+        return
+    for interaction_id, reservation_token in reservations.items():
+        _release_interaction_analysis(
+            session,
+            interaction_id=interaction_id,
+            reservation_token=reservation_token,
+        )
+
+
 def operation_fingerprint(value: dict[str, Any]) -> str:
     """Return a stable digest for caller-controlled idempotency input."""
 
@@ -108,6 +251,12 @@ def operation_fingerprint(value: dict[str, Any]) -> str:
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         raise IntakeInteractionError("timestamps must include a UTC offset")
+    return value.astimezone(UTC)
+
+
+def _stored_as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
 
 
@@ -162,6 +311,20 @@ def _idempotent_existing(
     return event
 
 
+def _reject_expired_idempotent(
+    event: WellnessEvent,
+    *,
+    operation_name: str,
+) -> None:
+    if (
+        event.expires_at is not None
+        and _stored_as_utc(event.expires_at) <= datetime.now(UTC)
+    ):
+        raise IntakeOperationConflict(
+            f"expired {operation_name} cannot be retried"
+        )
+
+
 def _persist_event_idempotently(
     session: Session,
     event: WellnessEvent,
@@ -193,9 +356,48 @@ def _interaction_operation_record_id(interaction_id: uuid.UUID) -> str:
     return f"interaction:{interaction_id}"
 
 
+def _operation_marker(
+    *,
+    interaction_id: uuid.UUID,
+    operation_fingerprint: str,
+    recorded_at: datetime,
+    state: str,
+    reservation_token: str | None = None,
+) -> WellnessEvent:
+    payload = {
+        "operation_kind": "intake_interaction",
+        "operation_id": str(interaction_id),
+        "operation_fingerprint": operation_fingerprint,
+        "operation_state": state,
+    }
+    if reservation_token is not None:
+        payload["reservation_token"] = reservation_token
+    return WellnessEvent(
+        event_type=OPERATION_EVENT,
+        schema_version=1,
+        observed_at=recorded_at,
+        recorded_at=recorded_at,
+        timezone=None,
+        source_provider="nutrition-operation",
+        source_device=None,
+        source_record_id=_interaction_operation_record_id(interaction_id),
+        capture_method="system",
+        quality_flags=None,
+        confidence=None,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=None,
+        expires_at=None,
+        payload=payload,
+        derived_from=None,
+    )
+
+
 def _persist_interaction_operation_marker(
     session: Session,
     interaction: IntakeInteraction,
+    *,
+    reservation_token: str | None = None,
 ) -> WellnessEvent:
     record_id = _interaction_operation_record_id(interaction.interaction_id)
     existing = _idempotent_existing(
@@ -204,30 +406,49 @@ def _persist_interaction_operation_marker(
         operation_name="intake interaction",
     )
     if existing is not None:
+        state = existing.payload.get("operation_state")
+        if state == "processing":
+            if existing.payload.get("reservation_token") != reservation_token:
+                raise IntakeAnalysisInProgress(
+                    "intake interaction analysis is already in progress"
+                )
+            completed_payload = {
+                "operation_kind": "intake_interaction",
+                "operation_id": str(interaction.interaction_id),
+                "operation_fingerprint": interaction.operation_fingerprint,
+                "operation_state": "completed",
+            }
+            if _uses_process_local_reservations(session):
+                existing.payload = completed_payload
+                session.flush()
+            else:
+                completed = session.execute(
+                    update(WellnessEvent)
+                    .where(
+                        WellnessEvent.id == existing.id,
+                        WellnessEvent.payload[
+                            "operation_state"
+                        ].as_string()
+                        == "processing",
+                        WellnessEvent.payload[
+                            "reservation_token"
+                        ].as_string()
+                        == reservation_token,
+                    )
+                    .values(payload=completed_payload)
+                )
+                if completed.rowcount != 1:
+                    raise IntakeAnalysisInProgress(
+                        "intake interaction analysis reservation is stale"
+                    )
+                session.expire(existing)
         return existing
     recorded_at = _as_utc(interaction.recorded_at)
-    marker = WellnessEvent(
-        event_type=OPERATION_EVENT,
-        schema_version=1,
-        observed_at=recorded_at,
+    marker = _operation_marker(
+        interaction_id=interaction.interaction_id,
+        operation_fingerprint=interaction.operation_fingerprint,
         recorded_at=recorded_at,
-        timezone=None,
-        source_provider="nutrition-operation",
-        source_device=None,
-        source_record_id=record_id,
-        capture_method="system",
-        quality_flags=None,
-        confidence=None,
-        sensitivity="wellness",
-        consent_scope="personal",
-        retention_policy_id=None,
-        expires_at=None,
-        payload={
-            "operation_kind": "intake_interaction",
-            "operation_id": str(interaction.interaction_id),
-            "operation_fingerprint": interaction.operation_fingerprint,
-        },
-        derived_from=None,
+        state="completed",
     )
     return _persist_event_idempotently(
         session,
@@ -237,6 +458,199 @@ def _persist_interaction_operation_marker(
         operation_fingerprint=interaction.operation_fingerprint,
         operation_name="intake interaction",
     )
+
+
+def _reserve_interaction_analysis(
+    session: Session,
+    *,
+    interaction_id: uuid.UUID,
+    operation_fingerprint: str,
+    lease_seconds: float,
+) -> str:
+    reservation_token = uuid.uuid4().hex
+    now = datetime.now(UTC)
+    lease_expires_at = now + timedelta(seconds=lease_seconds)
+    bind = session.get_bind()
+    if _uses_process_local_reservations(session):
+        key = (id(bind), interaction_id)
+        with _STATIC_ANALYSIS_RESERVATIONS_LOCK:
+            active = _STATIC_ANALYSIS_RESERVATIONS.get(key)
+            if active is not None:
+                if active["operation_fingerprint"] != operation_fingerprint:
+                    raise IntakeOperationConflict(
+                        "intake interaction operation_id was already used "
+                        "with different input"
+                    )
+                if (
+                    active.get("state") == "persisting"
+                    or active["lease_expires_at"] > now
+                ):
+                    raise IntakeAnalysisInProgress(
+                        "intake interaction analysis is already in progress"
+                    )
+            with session.no_autoflush:
+                marker = session.scalar(
+                    select(WellnessEvent).where(
+                        WellnessEvent.source_provider
+                        == "nutrition-operation",
+                        WellnessEvent.source_record_id
+                        == _interaction_operation_record_id(
+                            interaction_id
+                        ),
+                    )
+                )
+            marker = _idempotent_existing(
+                marker,
+                operation_fingerprint=operation_fingerprint,
+                operation_name="intake interaction",
+            )
+            prior_payload = None
+            if marker is not None:
+                if marker.payload.get("operation_state") != "processing":
+                    raise IntakeOperationConflict(
+                        "intake interaction operation_id belongs to an "
+                        "expired capture and cannot be reused"
+                    )
+                raw_expiry = marker.payload.get("lease_expires_at")
+                try:
+                    current_expiry = datetime.fromisoformat(raw_expiry)
+                except (TypeError, ValueError):
+                    current_expiry = datetime.min.replace(tzinfo=UTC)
+                if _as_utc(current_expiry) > now:
+                    raise IntakeAnalysisInProgress(
+                        "intake interaction analysis is already in progress"
+                    )
+                prior_payload = dict(marker.payload)
+                marker.payload = {
+                    **marker.payload,
+                    "reservation_token": reservation_token,
+                    "lease_expires_at": lease_expires_at.isoformat(),
+                }
+            _STATIC_ANALYSIS_RESERVATIONS[key] = {
+                "operation_fingerprint": operation_fingerprint,
+                "reservation_token": reservation_token,
+                "lease_expires_at": lease_expires_at,
+                "state": "reserved",
+                "marker": marker,
+                "prior_payload": prior_payload,
+            }
+        return reservation_token
+
+    with Session(bind=bind) as reservation_session:
+        marker = reservation_session.scalar(
+            select(WellnessEvent)
+            .where(
+                WellnessEvent.source_provider == "nutrition-operation",
+                WellnessEvent.source_record_id
+                == _interaction_operation_record_id(interaction_id),
+            )
+            .with_for_update()
+        )
+        marker = _idempotent_existing(
+            marker,
+            operation_fingerprint=operation_fingerprint,
+            operation_name="intake interaction",
+        )
+        if marker is not None:
+            if marker.payload.get("operation_state") != "processing":
+                raise IntakeOperationConflict(
+                    "intake interaction operation_id belongs to an expired "
+                    "capture and cannot be reused"
+                )
+            raw_expiry = marker.payload.get("lease_expires_at")
+            try:
+                current_expiry = datetime.fromisoformat(raw_expiry)
+            except (TypeError, ValueError):
+                current_expiry = datetime.min.replace(tzinfo=UTC)
+            if _as_utc(current_expiry) > now:
+                raise IntakeAnalysisInProgress(
+                    "intake interaction analysis is already in progress"
+                )
+            prior_token = marker.payload.get("reservation_token")
+            replacement = {
+                **marker.payload,
+                "reservation_token": reservation_token,
+                "lease_expires_at": lease_expires_at.isoformat(),
+            }
+            claimed = reservation_session.execute(
+                update(WellnessEvent)
+                .where(
+                    WellnessEvent.id == marker.id,
+                    WellnessEvent.payload[
+                        "operation_state"
+                    ].as_string()
+                    == "processing",
+                    WellnessEvent.payload[
+                        "reservation_token"
+                    ].as_string()
+                    == prior_token,
+                    WellnessEvent.payload[
+                        "lease_expires_at"
+                    ].as_string()
+                    == raw_expiry,
+                )
+                .values(payload=replacement)
+            )
+            if claimed.rowcount != 1:
+                reservation_session.rollback()
+                raise IntakeAnalysisInProgress(
+                    "intake interaction analysis is already in progress"
+                )
+        else:
+            marker = _operation_marker(
+                interaction_id=interaction_id,
+                operation_fingerprint=operation_fingerprint,
+                recorded_at=now,
+                state="processing",
+                reservation_token=reservation_token,
+            )
+            marker.payload = {
+                **marker.payload,
+                "lease_expires_at": lease_expires_at.isoformat(),
+            }
+            reservation_session.add(marker)
+        try:
+            reservation_session.commit()
+        except IntegrityError as exc:
+            reservation_session.rollback()
+            raise IntakeAnalysisInProgress(
+                "intake interaction analysis is already in progress"
+            ) from exc
+    return reservation_token
+
+
+def _release_interaction_analysis(
+    session: Session,
+    *,
+    interaction_id: uuid.UUID,
+    reservation_token: str,
+) -> None:
+    if _uses_process_local_reservations(session):
+        _pop_static_analysis_reservation(
+            session,
+            interaction_id=interaction_id,
+            reservation_token=reservation_token,
+            restore_marker=True,
+        )
+        return
+    bind = session.get_bind()
+    with Session(bind=bind) as reservation_session:
+        marker = reservation_session.scalar(
+            select(WellnessEvent)
+            .where(
+                WellnessEvent.source_provider == "nutrition-operation",
+                WellnessEvent.source_record_id
+                == _interaction_operation_record_id(interaction_id),
+            )
+            .with_for_update()
+        )
+        if (
+            marker is not None
+            and marker.payload.get("operation_state") == "processing"
+            and marker.payload.get("reservation_token") == reservation_token
+        ):
+            reservation_session.delete(marker)
+            reservation_session.commit()
 
 
 def _validate_estimate(estimate: Estimate) -> None:
@@ -329,14 +743,25 @@ def normalize_photo_observation(
 ) -> tuple[NormalizedIntakeItem, ...]:
     """Adapt the sake observation without changing its stored payload."""
 
+    return normalize_extraction_items(
+        observation.items,
+        origin=EvidenceOrigin.VLM,
+    )
+
+
+def normalize_extraction_items(
+    items: tuple[Any, ...] | list[Any],
+    *,
+    origin: EvidenceOrigin,
+) -> tuple[NormalizedIntakeItem, ...]:
     normalized: list[NormalizedIntakeItem] = []
-    for item in observation.items:
+    for item in items:
         nutrients = tuple(
             NutrientFact(
                 nutrient=nutrient.nutrient,
                 amount=nutrient.amount,
                 confidence=nutrient.confidence,
-                origin=EvidenceOrigin.VLM,
+                origin=origin,
                 evidence_text=nutrient.amount.evidence_text,
             )
             for nutrient in item.nutrients
@@ -351,7 +776,7 @@ def normalize_photo_observation(
                     nutrient="caffeine",
                     amount=item.caffeine,
                     confidence=item.confidence,
-                    origin=EvidenceOrigin.VLM,
+                    origin=origin,
                     evidence_text=item.caffeine.evidence_text,
                 )
             )
@@ -370,6 +795,162 @@ def normalize_photo_observation(
             )
         )
     return tuple(normalized)
+
+
+def _safe_media_path(settings: Settings, media_path: str) -> Path:
+    data_root = settings.data_dir.resolve()
+    candidate = (settings.data_dir / media_path).resolve()
+    media_root = (settings.data_dir / "media").resolve()
+    if (
+        data_root not in candidate.parents
+        or media_root not in candidate.parents
+        or not candidate.is_file()
+    ):
+        raise IntakeInteractionError("media storage object is unavailable")
+    return candidate
+
+
+def create_analyzed_interaction(
+    session: Session,
+    settings: Settings,
+    *,
+    operation_id: uuid.UUID,
+    operation_fingerprint: str,
+    intent: IntakeIntent,
+    modality: CaptureModality,
+    observed_at: datetime,
+    timezone: str,
+    source: str,
+    source_text: str | None,
+    media_path: str | None,
+    recorded_at: datetime,
+    allow_remote_analysis: bool,
+    provider: VisionProvider,
+    transcriber: NutritionTranscriber | None = None,
+) -> IntakeInteraction:
+    """Analyze free text or local voice, then persist one immutable interaction."""
+
+    if modality not in {CaptureModality.TEXT, CaptureModality.VOICE}:
+        raise IntakeInteractionError(
+            "automatic capture analysis supports text or voice"
+        )
+    with session.no_autoflush:
+        existing = _existing_interaction_operation(
+            session,
+            interaction_id=operation_id,
+            operation_fingerprint=operation_fingerprint,
+            allow_processing=True,
+        )
+    if existing is not None:
+        return existing
+    reservation_token = _reserve_interaction_analysis(
+        session,
+        interaction_id=operation_id,
+        operation_fingerprint=operation_fingerprint,
+        lease_seconds=(
+            settings.nutrition_vision_timeout_seconds
+            + (
+                settings.nutrition_transcription_timeout_seconds
+                if modality is CaptureModality.VOICE
+                else 0
+            )
+            + 120
+        ),
+    )
+    _tracked_analysis_reservations(session)[operation_id] = (
+        reservation_token
+    )
+    persistence_started = False
+
+    try:
+        transcript_provider = None
+        transcript_model = None
+        analyzed_text = source_text
+        if modality is CaptureModality.TEXT:
+            if media_path is not None:
+                raise IntakeInteractionError(
+                    "text analysis cannot reference media"
+                )
+            if not analyzed_text or not analyzed_text.strip():
+                raise IntakeInteractionError(
+                    "text analysis requires source_text"
+                )
+        else:
+            if media_path is None:
+                raise IntakeInteractionError(
+                    "voice analysis requires media_path"
+                )
+            obj = storage_object_for_media(session, media_path)
+            if obj is None:
+                raise IntakeInteractionError("media storage object not found")
+            if not (obj.content_type or "").startswith("audio/"):
+                raise IntakeInteractionError(
+                    "voice analysis requires an audio storage object"
+                )
+            if transcriber is None:
+                raise IntakeInteractionError(
+                    "voice analysis requires a configured local transcriber"
+                )
+            transcript = transcriber.transcribe(
+                _safe_media_path(settings, media_path)
+            )
+            analyzed_text = transcript.text
+            transcript_provider = transcript.provider
+            transcript_model = transcript.model
+
+        assert analyzed_text is not None
+        extraction: VLMExtraction = provider.analyze_text(
+            analyzed_text,
+            allow_remote=allow_remote_analysis,
+        )
+        interaction = IntakeInteraction(
+            interaction_id=operation_id,
+            operation_fingerprint=operation_fingerprint,
+            intent=intent,
+            modality=modality,
+            observed_at=observed_at,
+            recorded_at=recorded_at,
+            timezone=timezone,
+            source=source,
+            source_text=analyzed_text,
+            media_path=media_path,
+            nutrition_observation_id=None,
+            items=normalize_extraction_items(
+                tuple(item.to_domain() for item in extraction.items),
+                origin=EvidenceOrigin.AGENT,
+            ),
+            analysis_provenance=IntakeAnalysisProvenance(
+                provider=provider.provider_name,
+                model=provider.model,
+                model_digest=provider.model_digest,
+                prompt_version=TEXT_PROMPT_VERSION,
+                schema_version=SCHEMA_VERSION,
+                analyzed_at=recorded_at,
+                transcription_provider=transcript_provider,
+                transcription_model=transcript_model,
+            ),
+            warnings=tuple(extraction.warnings),
+        )
+        persistence_started = True
+        create_interaction(
+            session,
+            settings,
+            interaction,
+            reservation_token=reservation_token,
+        )
+        return interaction
+    except Exception:
+        if not persistence_started:
+            _tracked_analysis_reservations(session).pop(
+                operation_id,
+                None,
+            )
+            _release_interaction_analysis(
+                session,
+                interaction_id=operation_id,
+                reservation_token=reservation_token,
+            )
+        raise
 
 
 def normalize_nutrition_review(
@@ -421,6 +1002,7 @@ def structured_snapshot(
                 )
                 for fact in item.nutrients
             ),
+            warnings=(),
         )
         for item in (interaction.items if items is None else items)
     )
@@ -434,7 +1016,38 @@ def structured_snapshot(
         nutrition_observation_id=interaction.nutrition_observation_id,
         items=durable_items,
         nutrition_review_id=interaction.nutrition_review_id,
-        warnings=interaction.warnings,
+        analysis_provenance=interaction.analysis_provenance,
+        warnings=(),
+    )
+
+
+def _without_raw_evidence(
+    interaction: IntakeInteraction,
+) -> IntakeInteraction:
+    return replace(
+        interaction,
+        source_text=None,
+        media_path=None,
+        items=tuple(
+            replace(
+                item,
+                serving=replace(item.serving, evidence_text=None),
+                nutrients=tuple(
+                    replace(
+                        fact,
+                        amount=replace(
+                            fact.amount,
+                            evidence_text=None,
+                        ),
+                        evidence_text=None,
+                    )
+                    for fact in item.nutrients
+                ),
+                warnings=(),
+            )
+            for item in interaction.items
+        ),
+        warnings=(),
     )
 
 
@@ -442,8 +1055,19 @@ def create_interaction(
     session: Session,
     settings: Settings,
     interaction: IntakeInteraction,
+    *,
+    reservation_token: str | None = None,
 ) -> WellnessEvent:
     _validate_operation_fingerprint(interaction.operation_fingerprint)
+    if (
+        reservation_token is not None
+        and _uses_process_local_reservations(session)
+    ):
+        _claim_process_local_persistence(
+            session,
+            interaction=interaction,
+            reservation_token=reservation_token,
+        )
     marker = _idempotent_existing(
         _event_by_source_record(
             session,
@@ -461,14 +1085,23 @@ def create_interaction(
         operation_name="intake interaction",
     )
     if existing is not None:
+        _reject_expired_idempotent(
+            existing,
+            operation_name="intake interaction",
+        )
         if marker is None:
             _persist_interaction_operation_marker(session, interaction)
         return existing
     if marker is not None:
-        raise IntakeOperationConflict(
-            "intake interaction operation_id belongs to an expired capture "
-            "and cannot be reused"
-        )
+        if marker.payload.get("operation_state") != "processing":
+            raise IntakeOperationConflict(
+                "intake interaction operation_id belongs to an expired "
+                "capture and cannot be reused"
+            )
+        if marker.payload.get("reservation_token") != reservation_token:
+            raise IntakeAnalysisInProgress(
+                "intake interaction analysis is already in progress"
+            )
 
     _validate_items(interaction.items)
     if not interaction.source.strip() or len(interaction.source) > 64:
@@ -496,6 +1129,10 @@ def create_interaction(
         )
     observed_at = _as_utc(interaction.observed_at)
     recorded_at = _as_utc(interaction.recorded_at)
+    if observed_at > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
+        raise IntakeInteractionError(
+            "observed_at cannot be more than 5 minutes in the future"
+        )
     raw_object_id = None
 
     if interaction.modality is CaptureModality.PHOTO:
@@ -552,6 +1189,18 @@ def create_interaction(
         obj = storage_object_for_media(session, interaction.media_path)
         if obj is None:
             raise IntakeInteractionError("media storage object not found")
+        existing_media_owner = session.scalar(
+            select(WellnessEvent.source_record_id).where(
+                WellnessEvent.source_provider == "nutrition-raw-capture",
+                WellnessEvent.raw_object_id == obj.id,
+                WellnessEvent.source_record_id
+                != str(interaction.interaction_id),
+            )
+        )
+        if existing_media_owner is not None:
+            raise IntakeInteractionError(
+                "media storage object already belongs to another capture"
+            )
         expected_prefix = (
             "image/"
             if interaction.modality is CaptureModality.PHOTO
@@ -571,6 +1220,15 @@ def create_interaction(
         raw_object_id = obj.id
 
     policy = _policy(session, "nutrition_observation")
+    structured_expiry = _expiry(policy, observed_at)
+    if (
+        structured_expiry is not None
+        and structured_expiry <= datetime.now(UTC)
+    ):
+        raise IntakeInteractionError(
+            "observed_at falls outside the structured retention window"
+        )
+    durable_interaction = _without_raw_evidence(interaction)
     event = WellnessEvent(
         event_type=INTERACTION_EVENT,
         schema_version=1,
@@ -581,14 +1239,14 @@ def create_interaction(
         source_device=interaction.source,
         source_record_id=str(interaction.interaction_id),
         capture_method=interaction.modality.value,
-        quality_flags={"warnings": list(interaction.warnings)},
+        quality_flags={"warning_count": len(interaction.warnings)},
         confidence=None,
         sensitivity="wellness",
         consent_scope="personal",
         retention_policy_id=policy.id,
-        expires_at=_expiry(policy, observed_at),
-        payload=interaction_to_payload(interaction),
-        raw_object_id=raw_object_id,
+        expires_at=structured_expiry,
+        payload=interaction_to_payload(durable_interaction),
+        raw_object_id=None,
         derived_from=(
             {
                 "nutrition_observation_id": str(
@@ -616,7 +1274,53 @@ def create_interaction(
         operation_fingerprint=interaction.operation_fingerprint,
         operation_name="intake interaction",
     )
-    _persist_interaction_operation_marker(session, interaction)
+    raw_policy = _policy(session, "nutrition_raw_capture")
+    raw_event = WellnessEvent(
+        event_type=RAW_CAPTURE_EVENT,
+        schema_version=1,
+        observed_at=observed_at,
+        recorded_at=recorded_at,
+        timezone=interaction.timezone,
+        source_provider="nutrition-raw-capture",
+        source_device=interaction.source,
+        source_record_id=str(interaction.interaction_id),
+        capture_method=interaction.modality.value,
+        quality_flags=None,
+        confidence=None,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=raw_policy.id,
+        expires_at=_expiry(raw_policy, observed_at),
+        payload={
+            "operation_fingerprint": interaction.operation_fingerprint,
+            "source_text": interaction.source_text,
+            "media_path": interaction.media_path,
+            "warnings": list(interaction.warnings),
+            "item_warnings": [
+                list(item.warnings) for item in interaction.items
+            ],
+        },
+        raw_object_id=raw_object_id,
+        derived_from={"interaction_id": str(interaction.interaction_id)},
+    )
+    try:
+        _persist_event_idempotently(
+            session,
+            raw_event,
+            source_provider="nutrition-raw-capture",
+            source_record_id=str(interaction.interaction_id),
+            operation_fingerprint=interaction.operation_fingerprint,
+            operation_name="intake raw capture",
+        )
+    except IntegrityError as exc:
+        raise IntakeInteractionError(
+            "media storage object already belongs to another capture"
+        ) from exc
+    _persist_interaction_operation_marker(
+        session,
+        interaction,
+        reservation_token=reservation_token,
+    )
     return stored
 
 
@@ -626,7 +1330,97 @@ def get_interaction(
     event = _event_by_source_record(
         session, "nutrition-interaction", str(interaction_id)
     )
-    return interaction_from_payload(event.payload) if event is not None else None
+    if (
+        event is None
+        or (
+            event.expires_at is not None
+            and _stored_as_utc(event.expires_at) <= datetime.now(UTC)
+        )
+    ):
+        return None
+    interaction = interaction_from_payload(event.payload)
+    raw = _event_by_source_record(
+        session,
+        "nutrition-raw-capture",
+        str(interaction_id),
+    )
+    raw_is_available = (
+        raw is not None
+        and (
+            raw.expires_at is None
+            or _stored_as_utc(raw.expires_at) > datetime.now(UTC)
+        )
+    )
+    source_text = interaction.source_text
+    media_path = interaction.media_path
+    if raw_is_available:
+        assert raw is not None
+        raw_source_text = raw.payload.get("source_text")
+        raw_media_path = raw.payload.get("media_path")
+        raw_warnings = raw.payload.get("warnings")
+        raw_item_warnings = raw.payload.get("item_warnings")
+        source_text = (
+            raw_source_text if isinstance(raw_source_text, str) else None
+        )
+        media_path = (
+            raw_media_path if isinstance(raw_media_path, str) else None
+        )
+        interaction = replace(
+            interaction,
+            warnings=(
+                tuple(
+                    warning
+                    for warning in raw_warnings
+                    if isinstance(warning, str)
+                )
+                if isinstance(raw_warnings, list)
+                else ()
+            ),
+            items=tuple(
+                replace(
+                    item,
+                    warnings=(
+                        tuple(
+                            warning
+                            for warning in raw_item_warnings[index]
+                            if isinstance(warning, str)
+                        )
+                        if (
+                            isinstance(raw_item_warnings, list)
+                            and index < len(raw_item_warnings)
+                            and isinstance(
+                                raw_item_warnings[index],
+                                list,
+                            )
+                        )
+                        else ()
+                    ),
+                )
+                for index, item in enumerate(interaction.items)
+            ),
+        )
+    else:
+        raw_policy = _policy(session, "nutrition_raw_capture")
+        raw_expiry = _expiry(raw_policy, _as_utc(interaction.observed_at))
+        if (
+            raw is not None
+            or (
+                raw_expiry is not None
+                and raw_expiry <= datetime.now(UTC)
+            )
+        ):
+            source_text = None
+            media_path = None
+            interaction = _without_raw_evidence(interaction)
+    if media_path is not None:
+        obj = storage_object_for_media(session, media_path)
+        if obj is None or obj.purged_at is not None:
+            media_path = None
+    return replace(
+        interaction,
+        source_text=source_text if isinstance(source_text, str) else None,
+        media_path=media_path if isinstance(media_path, str) else None,
+    )
 
 
 def _existing_interaction_operation(
@@ -634,6 +1428,7 @@ def _existing_interaction_operation(
     *,
     interaction_id: uuid.UUID,
     operation_fingerprint: str,
+    allow_processing: bool = False,
 ) -> IntakeInteraction | None:
     _validate_operation_fingerprint(operation_fingerprint)
     marker = _idempotent_existing(
@@ -653,8 +1448,15 @@ def _existing_interaction_operation(
         operation_name="intake interaction",
     )
     if existing is not None:
-        return interaction_from_payload(existing.payload)
+        return get_interaction(session, interaction_id)
     if marker is not None:
+        if marker.payload.get("operation_state") == "processing":
+            if allow_processing:
+                session.expire(marker)
+                return None
+            raise IntakeAnalysisInProgress(
+                "intake interaction analysis is already in progress"
+            )
         raise IntakeOperationConflict(
             "intake interaction operation_id belongs to an expired capture "
             "and cannot be reused"
@@ -701,6 +1503,14 @@ def create_photo_interaction(
         nutrition_observation_id=observation.observation_id,
         items=normalize_nutrition_review(observation, review),
         nutrition_review_id=review.review_id if review is not None else None,
+        analysis_provenance=IntakeAnalysisProvenance(
+            provider=observation.vision.provider,
+            model=observation.vision.model,
+            model_digest=observation.vision.model_digest,
+            prompt_version=observation.vision.prompt_version,
+            schema_version=observation.vision.schema_version,
+            analyzed_at=observation.vision.analyzed_at,
+        ),
         warnings=observation.warnings,
     )
     create_interaction(session, settings, interaction)
@@ -717,6 +1527,10 @@ def persist_outcome(session: Session, outcome: IntakeOutcome) -> WellnessEvent:
         operation_name="intake outcome",
     )
     if existing is not None:
+        _reject_expired_idempotent(
+            existing,
+            operation_name="intake outcome",
+        )
         return existing
     interaction = get_interaction(session, outcome.interaction_id)
     if interaction is None:
@@ -780,7 +1594,7 @@ def persist_outcome(session: Session, outcome: IntakeOutcome) -> WellnessEvent:
         payload=outcome_to_payload(durable_outcome),
         derived_from={"interaction_id": str(outcome.interaction_id)},
     )
-    return _persist_event_idempotently(
+    stored = _persist_event_idempotently(
         session,
         event,
         source_provider="nutrition-intake-outcome",
@@ -788,6 +1602,39 @@ def persist_outcome(session: Session, outcome: IntakeOutcome) -> WellnessEvent:
         operation_fingerprint=outcome.operation_fingerprint,
         operation_name="intake outcome",
     )
+    if outcome.note is not None:
+        raw_policy = _policy(session, "nutrition_raw_capture")
+        raw_event = WellnessEvent(
+            event_type=OUTCOME_RAW_EVENT,
+            schema_version=1,
+            observed_at=confirmed_at,
+            recorded_at=confirmed_at,
+            timezone=interaction.timezone,
+            source_provider="nutrition-outcome-raw",
+            source_device=outcome.source,
+            source_record_id=str(outcome.outcome_id),
+            capture_method="manual",
+            quality_flags=None,
+            confidence=None,
+            sensitivity="wellness",
+            consent_scope="personal",
+            retention_policy_id=raw_policy.id,
+            expires_at=_expiry(raw_policy, confirmed_at),
+            payload={
+                "operation_fingerprint": outcome.operation_fingerprint,
+                "note": outcome.note,
+            },
+            derived_from={"outcome_id": str(outcome.outcome_id)},
+        )
+        _persist_event_idempotently(
+            session,
+            raw_event,
+            source_provider="nutrition-outcome-raw",
+            source_record_id=str(outcome.outcome_id),
+            operation_fingerprint=outcome.operation_fingerprint,
+            operation_name="intake outcome raw note",
+        )
+    return stored
 
 
 def latest_outcome(
@@ -797,6 +1644,10 @@ def latest_outcome(
         select(WellnessEvent)
         .where(
             WellnessEvent.event_type == OUTCOME_EVENT,
+            (
+                WellnessEvent.expires_at.is_(None)
+                | (WellnessEvent.expires_at > datetime.now(UTC))
+            ),
             WellnessEvent.payload["interaction_id"].as_string()
             == str(interaction_id),
         )
@@ -806,6 +1657,20 @@ def latest_outcome(
     for row in rows:
         outcome = outcome_from_payload(row.payload)
         if outcome.interaction_id == interaction_id:
+            raw = _event_by_source_record(
+                session,
+                "nutrition-outcome-raw",
+                str(outcome.outcome_id),
+            )
+            if (
+                raw is not None
+                and (
+                    raw.expires_at is None
+                    or _stored_as_utc(raw.expires_at) > datetime.now(UTC)
+                )
+                and isinstance(raw.payload.get("note"), str)
+            ):
+                outcome = replace(outcome, note=raw.payload["note"])
             return row, outcome
     return None
 
@@ -821,7 +1686,13 @@ def list_interactions(
 ) -> list[tuple[WellnessEvent, IntakeInteraction]]:
     statement = (
         select(WellnessEvent)
-        .where(WellnessEvent.event_type == INTERACTION_EVENT)
+        .where(
+            WellnessEvent.event_type == INTERACTION_EVENT,
+            (
+                WellnessEvent.expires_at.is_(None)
+                | (WellnessEvent.expires_at > datetime.now(UTC))
+            ),
+        )
         .order_by(WellnessEvent.observed_at.desc(), WellnessEvent.created_at.desc())
     )
     if start is not None:
@@ -856,6 +1727,10 @@ def persist_decision_request(
         operation_name="intake decision request",
     )
     if existing is not None:
+        _reject_expired_idempotent(
+            existing,
+            operation_name="intake decision request",
+        )
         return existing
     interaction = get_interaction(session, request.interaction_id)
     if interaction is None:
@@ -953,7 +1828,13 @@ def get_decision_request(
     event = _event_by_source_record(
         session, "nutrition-decision-request", str(request_id)
     )
-    if event is None:
+    if (
+        event is None
+        or (
+            event.expires_at is not None
+            and _stored_as_utc(event.expires_at) <= datetime.now(UTC)
+        )
+    ):
         return None
     return event, decision_request_from_payload(event.payload)
 
@@ -968,6 +1849,10 @@ def persist_decision(session: Session, decision: IntakeDecision) -> WellnessEven
         operation_name="intake decision",
     )
     if existing is not None:
+        _reject_expired_idempotent(
+            existing,
+            operation_name="intake decision",
+        )
         return existing
     request_entry = get_decision_request(session, decision.request_id)
     if request_entry is None:
@@ -1124,6 +2009,10 @@ def latest_decision(
         select(WellnessEvent)
         .where(
             WellnessEvent.event_type == DECISION_EVENT,
+            (
+                WellnessEvent.expires_at.is_(None)
+                | (WellnessEvent.expires_at > datetime.now(UTC))
+            ),
             WellnessEvent.payload["interaction_id"].as_string()
             == str(interaction_id),
         )
@@ -1151,7 +2040,13 @@ def persisted_decision_for_operation(
         operation_fingerprint=operation_fingerprint,
         operation_name="intake decision",
     )
-    return decision_from_payload(event.payload) if event is not None else None
+    if event is None:
+        return None
+    _reject_expired_idempotent(
+        event,
+        operation_name="intake decision",
+    )
+    return decision_from_payload(event.payload)
 
 
 def resolved_items(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -37,6 +37,7 @@ from healthmes.nutrition.intake_service import (
     HIGH_RISK_SCOPES,
     IntakeInteractionError,
     IntakeOperationConflict,
+    create_analyzed_interaction,
     create_interaction,
     create_photo_interaction,
     get_decision_request,
@@ -46,9 +47,22 @@ from healthmes.nutrition.intake_service import (
     persist_outcome,
     persisted_decision_for_operation,
 )
+from healthmes.nutrition.transcription import (
+    NutritionTranscriber,
+    TranscriptionInvalidOutput,
+    TranscriptionUnavailable,
+    create_nutrition_transcriber,
+)
+from healthmes.nutrition.vision import (
+    VisionInvalidOutput,
+    VisionProvider,
+    VisionUnavailable,
+    create_vision_provider,
+)
 from healthmes.store.session import SessionDep
 
 router = APIRouter(prefix="/v1/intake-interactions", tags=["nutrition"])
+MAX_CAPTURE_CLOCK_SKEW = timedelta(minutes=5)
 
 
 class EstimateInput(BaseModel):
@@ -153,6 +167,54 @@ class CreateInteractionInput(BaseModel):
             raise ValueError("timezone must be a valid IANA timezone") from exc
         if self.observed_at.utcoffset() != self.observed_at.astimezone(timezone).utcoffset():
             raise ValueError("observed_at offset conflicts with timezone")
+        if self.observed_at.astimezone(UTC) > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
+            raise ValueError("observed_at cannot be more than 5 minutes in the future")
+        return self
+
+
+class AnalyzeInteractionInput(BaseModel):
+    operation_id: uuid.UUID
+    intent: IntakeIntent
+    modality: CaptureModality
+    observed_at: AwareDatetime
+    timezone: str = Field(min_length=1, max_length=64)
+    source: str = Field(min_length=1, max_length=64)
+    source_text: str | None = Field(default=None, max_length=12000)
+    media_path: str | None = Field(default=None, max_length=500)
+    allow_remote_analysis: bool = False
+
+    @model_validator(mode="after")
+    def validate_capture(self) -> Self:
+        if self.modality not in {
+            CaptureModality.TEXT,
+            CaptureModality.VOICE,
+        }:
+            raise ValueError(
+                "automatic interaction analysis supports text or voice"
+            )
+        try:
+            timezone = ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("timezone must be a valid IANA timezone") from exc
+        if (
+            self.observed_at.utcoffset()
+            != self.observed_at.astimezone(timezone).utcoffset()
+        ):
+            raise ValueError("observed_at offset conflicts with timezone")
+        if self.observed_at.astimezone(UTC) > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
+            raise ValueError("observed_at cannot be more than 5 minutes in the future")
+        if self.modality is CaptureModality.TEXT:
+            if not self.source_text or not self.source_text.strip():
+                raise ValueError("text analysis requires source_text")
+            if self.media_path is not None:
+                raise ValueError("text analysis cannot reference media")
+        if self.modality is CaptureModality.VOICE:
+            if self.source_text is not None:
+                raise ValueError(
+                    "voice analysis creates source_text from local transcription"
+                )
+            if self.media_path is None:
+                raise ValueError("voice analysis requires media_path")
         return self
 
 
@@ -200,6 +262,33 @@ def _raise_interaction_error(exc: IntakeInteractionError) -> None:
     ) from exc
 
 
+def _analysis_provider(request: Request, settings: Settings) -> VisionProvider:
+    override = getattr(
+        request.app.state,
+        "nutrition_analysis_provider",
+        None,
+    )
+    if override is None:
+        override = getattr(
+            request.app.state,
+            "nutrition_vision_provider",
+            None,
+        )
+    return override if override is not None else create_vision_provider(settings)
+
+
+def _transcriber(
+    request: Request,
+    settings: Settings,
+) -> NutritionTranscriber:
+    override = getattr(request.app.state, "nutrition_transcriber", None)
+    return (
+        override
+        if override is not None
+        else create_nutrition_transcriber(settings)
+    )
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_intake_interaction(
     body: CreateInteractionInput,
@@ -240,6 +329,70 @@ def create_intake_interaction(
             create_interaction(session, settings, interaction)
     except IntakeInteractionError as exc:
         _raise_interaction_error(exc)
+    session.commit()
+    view = interaction_view(session, interaction.interaction_id)
+    assert view is not None
+    return view
+
+
+@router.post("/analyze", status_code=status.HTTP_201_CREATED)
+def analyze_intake_interaction(
+    body: AnalyzeInteractionInput,
+    request: Request,
+    session: SessionDep,
+) -> dict[str, object]:
+    """Automatically structure a free-text or local voice nutrition capture."""
+
+    settings: Settings = request.app.state.settings
+    fingerprint = operation_fingerprint(body.model_dump(mode="json"))
+    try:
+        interaction = create_analyzed_interaction(
+            session,
+            settings,
+            operation_id=body.operation_id,
+            operation_fingerprint=fingerprint,
+            intent=body.intent,
+            modality=body.modality,
+            observed_at=body.observed_at.astimezone(UTC),
+            timezone=body.timezone,
+            source=body.source,
+            source_text=body.source_text,
+            media_path=body.media_path,
+            recorded_at=utc_now(),
+            allow_remote_analysis=body.allow_remote_analysis,
+            provider=_analysis_provider(request, settings),
+            transcriber=(
+                _transcriber(request, settings)
+                if body.modality is CaptureModality.VOICE
+                else None
+            ),
+        )
+    except IntakeInteractionError as exc:
+        _raise_interaction_error(exc)
+    except TranscriptionUnavailable as exc:
+        raise APIError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "transcription_unavailable",
+            str(exc),
+        ) from exc
+    except TranscriptionInvalidOutput as exc:
+        raise APIError(
+            status.HTTP_502_BAD_GATEWAY,
+            "transcription_invalid_output",
+            str(exc),
+        ) from exc
+    except VisionUnavailable as exc:
+        raise APIError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "nutrition_analysis_unavailable",
+            str(exc),
+        ) from exc
+    except VisionInvalidOutput as exc:
+        raise APIError(
+            status.HTTP_502_BAD_GATEWAY,
+            "nutrition_analysis_invalid_output",
+            str(exc),
+        ) from exc
     session.commit()
     view = interaction_view(session, interaction.interaction_id)
     assert view is not None

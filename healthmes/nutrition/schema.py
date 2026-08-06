@@ -47,8 +47,14 @@ class VLMEstimate(BaseModel):
         if self.kind is EstimateKind.EXACT:
             if self.exact is None or self.minimum is not None or self.maximum is not None:
                 raise ValueError("exact estimates require only exact")
-            if self.estimation_basis != "visible_label" or not self.evidence_text:
-                raise ValueError("exact estimates require visible-label evidence")
+            if (
+                self.estimation_basis
+                not in {"visible_label", "owner_statement"}
+                or not self.evidence_text
+            ):
+                raise ValueError(
+                    "exact estimates require visible-label or owner-statement evidence"
+                )
         elif self.kind is EstimateKind.RANGE:
             if (
                 self.exact is not None
@@ -211,3 +217,19 @@ SUPPORTED_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/heic", "ima
 
 # Kept separate so an adapter cannot accidentally accept arbitrary role text.
 USER_PROMPT: Literal["Analyze the attached intake photo."] = "Analyze the attached intake photo."
+
+TEXT_SYSTEM_PROMPT = """You extract food, beverage, supplement, and medication intake
+evidence from one owner-authored text or locally produced voice transcript. Return only
+the supplied JSON schema. Split distinct intake items. For every item estimate serving
+and the core nutrients energy, protein, carbohydrate, fat, fiber, sugar, sodium, and
+caffeine. Add other useful nutrients when supported. Use canonical lowercase snake_case
+names and canonical units: energy kcal; macronutrients g; sodium and caffeine mg.
+Use an exact value only when the owner explicitly states that numeric value; preserve the
+statement as evidence_text and use estimation_basis owner_statement. Otherwise use a
+bounded range with an explicit portion, recipe, or food-composition basis, or unknown
+when the text cannot support a bounded estimate. Never turn unknown into zero. Do not
+infer actual consumption from a question or future plan. Never diagnose, assert allergy
+safety, infer medication dose, or invent an ingredient the owner did not state. All
+values remain unconfirmed estimates, not medical advice."""
+
+TEXT_PROMPT_VERSION = "text-intake-v1"

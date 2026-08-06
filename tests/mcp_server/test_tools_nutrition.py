@@ -99,7 +99,12 @@ def _seed(store_factory, settings, observed_at):
             size_bytes=7,
             observed_at=observed_at,
         )
-        persist_observation(session, settings, observation)
+        persist_observation(
+            session,
+            settings,
+            observation,
+            request_fingerprint="fixture",
+        )
         session.commit()
     return observation
 

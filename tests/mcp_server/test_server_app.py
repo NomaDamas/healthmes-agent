@@ -29,6 +29,7 @@ TRANCHE_3_TOOLS = {
     "list_medical_records",
 }
 NUTRITION_TOOLS = {
+    "analyze_intake_capture",
     "capture_intake_interaction",
     "confirm_intake_outcome",
     "get_recent_nutrition_observations",

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
 from re import fullmatch
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -43,6 +44,9 @@ CONFIRMATION_EVENT = "nutrition.confirmation.v1"
 REVIEW_EVENT = "nutrition.review.v1"
 DAILY_CONFIRMATION_EVENT = "nutrition.daily-confirmation.v1"
 SOURCE_PROVIDER = "sake-vlm"
+RAW_OBSERVATION_EVENT = "nutrition.observation-raw.v1"
+RAW_SOURCE_PROVIDER = "sake-vlm-raw"
+MAX_CAPTURE_CLOCK_SKEW = timedelta(minutes=5)
 
 
 class NutritionRepositoryError(RuntimeError):
@@ -83,16 +87,24 @@ def _expiry(policy: RetentionPolicy, observed_at: datetime) -> datetime | None:
 
 
 def storage_object_for_media(session: Session, media_path: str) -> StorageObject | None:
+    now = datetime.now(UTC)
     return session.scalar(
         select(StorageObject).where(
             StorageObject.relative_path == media_path,
             StorageObject.purged_at.is_(None),
+            or_(
+                StorageObject.expires_at.is_(None),
+                StorageObject.expires_at > now,
+            ),
         )
     )
 
 
 def observation_for_media(
-    session: Session, storage_object_id: uuid.UUID
+    session: Session,
+    storage_object_id: uuid.UUID,
+    *,
+    request_fingerprint: str | None = None,
 ) -> NutritionObservation | None:
     row = session.scalar(
         select(WellnessEvent)
@@ -100,17 +112,71 @@ def observation_for_media(
             WellnessEvent.event_type == OBSERVATION_EVENT,
             WellnessEvent.source_provider == SOURCE_PROVIDER,
             WellnessEvent.raw_object_id == storage_object_id,
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > datetime.now(UTC),
+            ),
         )
         .order_by(WellnessEvent.recorded_at.desc())
         .limit(1)
     )
-    return observation_from_payload(row.payload) if row is not None else None
+    if row is None:
+        return None
+    if (
+        request_fingerprint is not None
+        and (
+            not isinstance(row.derived_from, dict)
+            or row.derived_from.get("request_fingerprint")
+            != request_fingerprint
+        )
+    ):
+        raise NutritionRepositoryError(
+            "media was already analyzed with different capture metadata"
+        )
+    return get_observation(session, uuid.UUID(row.source_record_id))
+
+
+def _structured_observation(
+    observation: NutritionObservation,
+) -> NutritionObservation:
+    return replace(
+        observation,
+        capture=replace(
+            observation.capture,
+            media_path="",
+            location=None,
+        ),
+        warnings=(),
+        items=tuple(
+            replace(
+                item,
+                serving=replace(item.serving, evidence_text=None),
+                caffeine=replace(item.caffeine, evidence_text=None),
+                nutrients=tuple(
+                    replace(
+                        nutrient,
+                        amount=replace(
+                            nutrient.amount,
+                            evidence_text=None,
+                        ),
+                    )
+                    for nutrient in item.nutrients
+                ),
+                label_text_candidates=(),
+                product_code_candidates=(),
+                warnings=(),
+            )
+            for item in observation.items
+        ),
+    )
 
 
 def persist_observation(
     session: Session,
     settings: Settings,
     observation: NutritionObservation,
+    *,
+    request_fingerprint: str,
 ) -> WellnessEvent:
     source_record_id = str(observation.observation_id)
     existing = session.scalar(
@@ -129,7 +195,20 @@ def persist_observation(
         raise NutritionRepositoryError("nutrition observations require an image object")
 
     observed_at = _as_utc(observation.capture.captured_at)
+    if observed_at > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
+        raise NutritionRepositoryError(
+            "captured_at cannot be more than 5 minutes in the future"
+        )
     policy = _policy(session, "nutrition_observation")
+    structured_expiry = _expiry(policy, observed_at)
+    if (
+        structured_expiry is not None
+        and structured_expiry <= datetime.now(UTC)
+    ):
+        raise NutritionRepositoryError(
+            "captured_at falls outside the observation retention window"
+        )
+    durable_observation = _structured_observation(observation)
     event = WellnessEvent(
         event_type=OBSERVATION_EVENT,
         schema_version=1,
@@ -142,26 +221,75 @@ def persist_observation(
         capture_method="photo",
         quality_flags={
             "status": observation.status.value,
-            "warnings": list(observation.warnings),
+            "warning_count": len(observation.warnings),
         },
         confidence=confidence_score(observation.confidence),
         sensitivity="wellness",
         consent_scope="personal",
         retention_policy_id=policy.id,
-        expires_at=_expiry(policy, observed_at),
-        payload=observation_to_payload(observation),
+        expires_at=structured_expiry,
+        payload=observation_to_payload(durable_observation),
         raw_object_id=obj.id,
-        derived_from={"storage_object_id": str(obj.id)},
+        derived_from={
+            "storage_object_id": str(obj.id),
+            "request_fingerprint": request_fingerprint,
+        },
     )
-    session.add(event)
-    session.flush()
-    classify_storage_object(
-        session,
-        obj,
-        data_class="nutrition_media",
+    raw_policy = _policy(session, "nutrition_media")
+    raw_event = WellnessEvent(
+        event_type=RAW_OBSERVATION_EVENT,
+        schema_version=1,
         observed_at=observed_at,
-        safe_to_purge=True,
+        recorded_at=_as_utc(observation.vision.analyzed_at),
+        timezone=observation.capture.timezone,
+        source_provider=RAW_SOURCE_PROVIDER,
+        source_device=observation.capture.source,
+        source_record_id=source_record_id,
+        capture_method="photo",
+        quality_flags=None,
+        confidence=None,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=raw_policy.id,
+        expires_at=_expiry(raw_policy, observed_at),
+        payload={"observation": observation_to_payload(observation)},
+        raw_object_id=obj.id,
+        derived_from={
+            "observation_id": source_record_id,
+            "request_fingerprint": request_fingerprint,
+        },
     )
+    try:
+        with session.begin_nested():
+            session.add_all((event, raw_event))
+            session.flush()
+            classify_storage_object(
+                session,
+                obj,
+                data_class="nutrition_media",
+                observed_at=observed_at,
+                safe_to_purge=True,
+            )
+    except IntegrityError:
+        existing = session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == OBSERVATION_EVENT,
+                WellnessEvent.raw_object_id == obj.id,
+            )
+        )
+        if existing is None:
+            raise NutritionRepositoryError(
+                "media already belongs to another nutrition observation"
+            )
+        if (
+            not isinstance(existing.derived_from, dict)
+            or existing.derived_from.get("request_fingerprint")
+            != request_fingerprint
+        ):
+            raise NutritionRepositoryError(
+                "media was already analyzed with different capture metadata"
+            )
+        return existing
     return event
 
 
@@ -173,9 +301,28 @@ def get_observation(
             WellnessEvent.event_type == OBSERVATION_EVENT,
             WellnessEvent.source_provider == SOURCE_PROVIDER,
             WellnessEvent.source_record_id == str(observation_id),
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > datetime.now(UTC),
+            ),
         )
     )
-    return observation_from_payload(row.payload) if row is not None else None
+    if row is None:
+        return None
+    raw = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == RAW_OBSERVATION_EVENT,
+            WellnessEvent.source_provider == RAW_SOURCE_PROVIDER,
+            WellnessEvent.source_record_id == str(observation_id),
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > datetime.now(UTC),
+            ),
+        )
+    )
+    if raw is not None and isinstance(raw.payload.get("observation"), dict):
+        return observation_from_payload(raw.payload["observation"])
+    return observation_from_payload(row.payload)
 
 
 def list_observations(
@@ -190,6 +337,10 @@ def list_observations(
         .where(
             WellnessEvent.event_type == OBSERVATION_EVENT,
             WellnessEvent.source_provider == SOURCE_PROVIDER,
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > datetime.now(UTC),
+            ),
         )
         .order_by(WellnessEvent.observed_at.desc(), WellnessEvent.created_at.desc())
         .limit(limit)
@@ -198,10 +349,15 @@ def list_observations(
         statement = statement.where(WellnessEvent.observed_at >= _as_utc(start))
     if end is not None:
         statement = statement.where(WellnessEvent.observed_at < _as_utc(end))
-    return [
-        observation_from_payload(row.payload)
-        for row in session.scalars(statement)
-    ]
+    observations = []
+    for row in session.scalars(statement):
+        observation = get_observation(
+            session,
+            uuid.UUID(row.source_record_id),
+        )
+        if observation is not None:
+            observations.append(observation)
+    return observations
 
 
 def persist_caffeine_confirmation(
@@ -460,6 +616,10 @@ def persist_daily_confirmation(
                 WellnessEvent.source_provider == SOURCE_PROVIDER,
                 WellnessEvent.observed_at >= start,
                 WellnessEvent.observed_at < end,
+                or_(
+                    WellnessEvent.expires_at.is_(None),
+                    WellnessEvent.expires_at > datetime.now(UTC),
+                ),
             )
         )
     }
@@ -512,6 +672,10 @@ def latest_caffeine_confirmations(
         .where(
             WellnessEvent.event_type == CONFIRMATION_EVENT,
             WellnessEvent.source_provider == "user-confirmation",
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > datetime.now(UTC),
+            ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
     )
@@ -536,6 +700,10 @@ def latest_nutrition_reviews(
         .where(
             WellnessEvent.event_type == REVIEW_EVENT,
             WellnessEvent.source_provider == "user-nutrition-review",
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > datetime.now(UTC),
+            ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
     )
@@ -558,6 +726,10 @@ def latest_daily_confirmation(
         .where(
             WellnessEvent.event_type == DAILY_CONFIRMATION_EVENT,
             WellnessEvent.source_provider == "user-confirmation",
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > datetime.now(UTC),
+            ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
     )

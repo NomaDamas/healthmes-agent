@@ -1,10 +1,16 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from healthmes.storage import register_storage_object, run_storage_maintenance
-from healthmes.store import PurgeJob, RetentionPolicy, WellnessEvent
+from healthmes.store import (
+    PurgeJob,
+    RetentionPolicy,
+    StorageObject,
+    WellnessEvent,
+)
 
 
 def test_storage_settings_bootstraps_defaults_and_measures_files(
@@ -43,6 +49,36 @@ def test_retention_update_is_persisted(client: TestClient, session) -> None:
     assert policy.retention_days == 1
 
 
+def test_retention_update_uses_the_original_object_observation_time(
+    client: TestClient,
+    session,
+    settings,
+) -> None:
+    observed = datetime(2026, 7, 1, tzinfo=UTC)
+    obj = register_storage_object(
+        session,
+        settings,
+        relative_path="media/private.m4a",
+        data_class="nutrition_media",
+        content_type="audio/m4a",
+        size_bytes=7,
+        observed_at=observed,
+    )
+    session.commit()
+
+    response = client.put(
+        "/v1/storage/settings/nutrition_media",
+        json={"preset": "1d"},
+    )
+
+    assert response.status_code == 200
+    session.expire_all()
+    stored = session.get(StorageObject, obj.id)
+    assert stored is not None
+    assert stored.retention_basis_at.replace(tzinfo=UTC) == observed
+    assert stored.expires_at.replace(tzinfo=UTC) == observed + timedelta(days=7)
+
+
 def test_wellness_event_contract_sets_expiry_and_is_idempotent(
     client: TestClient, session
 ) -> None:
@@ -64,6 +100,41 @@ def test_wellness_event_contract_sets_expiry_and_is_idempotent(
     expires = datetime.fromisoformat(first.json()["expires_at"]).replace(tzinfo=UTC)
     assert expires == observed + timedelta(days=30)
     assert len(list(session.scalars(select(WellnessEvent)))) == 1
+
+
+@pytest.mark.parametrize(
+    ("event_type", "source_provider"),
+    (
+        ("subjective_energy", "nutrition-operation"),
+        ("subjective_energy", "nutrition-outcome-raw"),
+        ("subjective_energy", "nutrition-future-internal"),
+        ("nutrition.interaction.v1", "manual"),
+    ),
+)
+def test_generic_wellness_api_rejects_internal_nutrition_namespaces(
+    client: TestClient,
+    session,
+    event_type: str,
+    source_provider: str,
+) -> None:
+    response = client.post(
+        "/v1/wellness-events",
+        json={
+            "event_type": event_type,
+            "observed_at": datetime.now(UTC).isoformat(),
+            "source_provider": source_provider,
+            "source_record_id": "reserved-namespace-attempt",
+            "data_class": "normalized",
+            "payload": {"note": "forged internal payload"},
+        },
+    )
+
+    assert response.status_code == 422
+    assert (
+        response.json()["error"]["code"]
+        == "reserved_wellness_namespace"
+    )
+    assert session.scalar(select(WellnessEvent)) is None
 
 
 def test_maintenance_dry_run_then_deletes_expired_object(

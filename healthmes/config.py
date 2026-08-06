@@ -234,6 +234,22 @@ class Settings(BaseSettings):
         gt=0,
         description="Timeout for one structured photo-analysis request.",
     )
+    nutrition_whisper_base_url: str = Field(
+        default="http://127.0.0.1:8080",
+        description="Loopback whisper.cpp server used to transcribe nutrition "
+        "voice captures. Non-loopback transcription endpoints are rejected.",
+    )
+    nutrition_transcription_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        description="Timeout for one local nutrition voice transcription.",
+    )
+    nutrition_transcription_language: str = Field(
+        default="auto",
+        min_length=1,
+        max_length=32,
+        description="Language passed to the local whisper.cpp transcription server.",
+    )
 
     # Alert hygiene (docs/PLAN.md §11: a noisy assistant gets muted within a
     # week). Consumed by healthmes/engine/triggers.py before any webhook push.

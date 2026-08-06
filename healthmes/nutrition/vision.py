@@ -6,6 +6,7 @@ import base64
 import copy
 import ipaddress
 import json
+import re
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol
@@ -13,11 +14,13 @@ from urllib.parse import urlparse
 
 import httpx
 from PIL import Image, ImageOps, UnidentifiedImageError
+from pillow_heif import register_heif_opener
 from pydantic import SecretStr, ValidationError
 
 from healthmes.config import Settings
 from healthmes.nutrition.schema import (
     SYSTEM_PROMPT,
+    TEXT_SYSTEM_PROMPT,
     USER_PROMPT,
     VLMExtraction,
 )
@@ -42,6 +45,8 @@ class VisionProvider(Protocol):
 
     def analyze(self, image_path: Path, *, allow_remote: bool) -> VLMExtraction: ...
 
+    def analyze_text(self, text: str, *, allow_remote: bool) -> VLMExtraction: ...
+
 
 def _is_loopback_url(url: str) -> bool:
     parsed = urlparse(url)
@@ -58,12 +63,22 @@ def _is_loopback_url(url: str) -> bool:
 _MIME_TYPES = {
     ".gif": "image/gif",
     ".heic": "image/heic",
+    ".heif": "image/heif",
     ".jpeg": "image/jpeg",
     ".jpg": "image/jpeg",
     ".png": "image/png",
     ".webp": "image/webp",
 }
-_REMOTE_INPUT_MIME_TYPES = frozenset({"image/gif", "image/jpeg", "image/png", "image/webp"})
+_REMOTE_INPUT_MIME_TYPES = frozenset(
+    {
+        "image/gif",
+        "image/heic",
+        "image/heif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
+)
 _SANITIZED_MIME_TYPES = frozenset({"image/jpeg", "image/png"})
 _REMOTE_MAX_DIMENSION = 4096
 _STRICT_EXTRACTION_SCHEMA: dict[str, Any] | None = None
@@ -79,6 +94,18 @@ _ANTHROPIC_UNSUPPORTED_SCHEMA_KEYS = frozenset(
         "pattern",
     }
 )
+_NUTRIENT_EVIDENCE_ALIASES = {
+    "energy": ("energy", "calorie", "calories", "열량", "칼로리"),
+    "protein": ("protein", "단백질"),
+    "carbohydrate": ("carbohydrate", "carbohydrates", "carbs", "탄수화물"),
+    "fat": ("fat", "지방"),
+    "fiber": ("fiber", "fibre", "식이섬유", "섬유질"),
+    "sugar": ("sugar", "sugars", "당류", "설탕"),
+    "sodium": ("sodium", "나트륨"),
+    "caffeine": ("caffeine", "카페인", "カフェイン", "咖啡因"),
+}
+
+register_heif_opener()
 
 
 def _image_mime_type(image_path: Path) -> str:
@@ -94,6 +121,13 @@ def _image_bytes(image_path: Path) -> tuple[str, bytes]:
         return mime_type, image_path.read_bytes()
     except OSError as exc:
         raise VisionUnavailable("vision input could not be read") from exc
+
+
+def _ollama_image(image_path: Path) -> tuple[str, bytes]:
+    mime_type = _image_mime_type(image_path)
+    if mime_type in {"image/heic", "image/heif"}:
+        return _sanitize_remote_image(image_path)
+    return _image_bytes(image_path)
 
 
 def _sanitize_remote_image(image_path: Path) -> tuple[str, bytes]:
@@ -153,6 +187,31 @@ def _remote_guard(
         )
 
 
+def _remote_text_guard(
+    *,
+    allow_remote: bool,
+    base_url: str,
+    api_key: str,
+) -> None:
+    if not allow_remote:
+        raise VisionUnavailable(
+            "remote nutrition text analysis requires explicit allow_remote_analysis=true"
+        )
+    if urlparse(base_url).scheme != "https":
+        raise VisionUnavailable("remote nutrition analysis endpoints must use HTTPS")
+    if not api_key:
+        raise VisionUnavailable("selected remote nutrition provider is not configured")
+
+
+def _validated_owner_text(text: str) -> str:
+    normalized = text.strip()
+    if not normalized:
+        raise VisionUnavailable("nutrition text must not be empty")
+    if len(normalized) > 12_000:
+        raise VisionUnavailable("nutrition text exceeds the 12000-character limit")
+    return normalized
+
+
 def _strict_extraction_schema() -> dict[str, Any]:
     global _STRICT_EXTRACTION_SCHEMA
     if _STRICT_EXTRACTION_SCHEMA is not None:
@@ -207,6 +266,7 @@ def _post_json(
     headers: dict[str, str] | None,
     timeout: float,
     transport: httpx.BaseTransport | None,
+    trust_env: bool = True,
 ) -> dict[str, Any]:
     try:
         with httpx.Client(
@@ -214,6 +274,7 @@ def _post_json(
             timeout=timeout,
             transport=transport,
             headers=headers,
+            trust_env=trust_env,
         ) as client:
             response = client.post(path, json=payload)
             response.raise_for_status()
@@ -235,6 +296,316 @@ def _validate_content(content: object) -> VLMExtraction:
         return VLMExtraction.model_validate(json.loads(content))
     except (json.JSONDecodeError, ValidationError) as exc:
         raise VisionInvalidOutput("vision response failed schema validation") from exc
+
+
+def _validate_photo_content(content: object) -> VLMExtraction:
+    extraction = _validate_content(content)
+    multi_item_names = tuple(
+        tuple(item.name_candidates)
+        or ((item.category,) if item.category else ())
+        or ("__missing_item_identity__",)
+        for item in extraction.items
+    )
+    for item_index, item in enumerate(extraction.items):
+        competing_nutrients = (
+            "caffeine",
+            *(nutrient.nutrient for nutrient in item.nutrients),
+        )
+        item_names = (
+            multi_item_names[item_index]
+            if len(extraction.items) > 1
+            else ()
+        )
+        estimates = [(item.serving, None), (item.caffeine, "caffeine")]
+        estimates.extend(
+            (nutrient.amount, nutrient.nutrient)
+            for nutrient in item.nutrients
+        )
+        for estimate, nutrient_name in estimates:
+            if estimate.kind.value != "exact":
+                continue
+            evidence = " ".join(
+                (estimate.evidence_text or "").split()
+            ).casefold()
+            if (
+                estimate.estimation_basis != "visible_label"
+                or estimate.exact is None
+                or not evidence
+                or (
+                    nutrient_name is None
+                    and (
+                        (
+                            item_names
+                            and not _evidence_has_item_exact_quantity(
+                                evidence,
+                                item_names=item_names,
+                                competing_item_names=multi_item_names,
+                                exact=estimate.exact,
+                                unit=estimate.unit,
+                            )
+                        )
+                        or (
+                            not item_names
+                            and not _evidence_has_exact_quantity(
+                                evidence,
+                                exact=estimate.exact,
+                                unit=estimate.unit,
+                            )
+                        )
+                    )
+                )
+                or (
+                    nutrient_name is not None
+                    and not _evidence_has_named_exact_quantity(
+                        evidence,
+                        nutrient=nutrient_name,
+                        exact=estimate.exact,
+                        unit=estimate.unit,
+                        item_names=item_names,
+                        competing_item_names=multi_item_names,
+                        competing_nutrients=competing_nutrients,
+                    )
+                )
+            ):
+                raise VisionInvalidOutput(
+                    "photo exact estimates require matching visible-label "
+                    "evidence"
+                )
+    return extraction
+
+
+def _evidence_has_exact_quantity(
+    evidence: str,
+    *,
+    exact: float,
+    unit: str,
+) -> bool:
+    normalized_unit = unit.strip()
+    if not normalized_unit:
+        return False
+    quantity_pattern = re.compile(
+        rf"(?<![\d.])([-+]?\d[\d,]*(?:\.\d+)?)"
+        rf"\s*{re.escape(normalized_unit)}(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    )
+    for match in quantity_pattern.findall(evidence):
+        try:
+            number = float(match.replace(",", ""))
+        except ValueError:  # pragma: no cover - regex owns the shape
+            continue
+        if abs(number - exact) <= 1e-9:
+            return True
+    return False
+
+
+def _evidence_names_nutrient(evidence: str, nutrient: str) -> bool:
+    aliases = _NUTRIENT_EVIDENCE_ALIASES.get(
+        nutrient,
+        (nutrient.replace("_", " "),),
+    )
+    for alias in aliases:
+        normalized = alias.casefold()
+        if normalized.isascii():
+            if re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(normalized)}"
+                rf"(?![A-Za-z0-9_])",
+                evidence,
+            ):
+                return True
+        elif normalized in evidence:
+            return True
+    return False
+
+
+def _evidence_has_named_exact_quantity(
+    evidence: str,
+    *,
+    nutrient: str,
+    exact: float,
+    unit: str,
+    item_names: tuple[str, ...] = (),
+    competing_item_names: tuple[tuple[str, ...], ...] = (),
+    competing_nutrients: tuple[str, ...] = (),
+) -> bool:
+    clauses = re.split(
+        r"(?:[,;|\n]+|\s+(?:and|및|그리고)\s+)",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    for clause in clauses:
+        if not clause.strip():
+            continue
+        if item_names and not _evidence_exclusively_names_item(
+            clause,
+            item_names=item_names,
+            competing_item_names=competing_item_names,
+        ):
+            continue
+        named_nutrients = {
+            candidate
+            for candidate in competing_nutrients
+            if _evidence_names_nutrient(clause, candidate)
+        }
+        if named_nutrients != {nutrient}:
+            continue
+        if _evidence_has_exact_quantity(
+            clause,
+            exact=exact,
+            unit=unit,
+        ):
+            return True
+    return False
+
+
+def _evidence_has_item_exact_quantity(
+    evidence: str,
+    *,
+    item_names: tuple[str, ...],
+    competing_item_names: tuple[tuple[str, ...], ...],
+    exact: float,
+    unit: str,
+) -> bool:
+    clauses = re.split(
+        r"(?:[,;|\n]+|\s+(?:and|및|그리고)\s+)",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    for clause in clauses:
+        if (
+            _evidence_exclusively_names_item(
+                clause,
+                item_names=item_names,
+                competing_item_names=competing_item_names,
+            )
+            and _evidence_has_exact_quantity(
+                clause,
+                exact=exact,
+                unit=unit,
+            )
+        ):
+            return True
+    return False
+
+
+def _evidence_exclusively_names_item(
+    evidence: str,
+    *,
+    item_names: tuple[str, ...],
+    competing_item_names: tuple[tuple[str, ...], ...],
+) -> bool:
+    """Assign overlapping names to the single most-specific matching item."""
+    target = tuple(" ".join(name.split()).casefold() for name in item_names)
+    matched_specificity: list[int] = []
+    for candidates in competing_item_names:
+        matches = [
+            len(" ".join(name.split()).casefold())
+            for name in candidates
+            if _evidence_names_item(evidence, name)
+        ]
+        matched_specificity.append(max(matches, default=0))
+    target_matches = [
+        len(name)
+        for name in target
+        if _evidence_names_item(evidence, name)
+    ]
+    target_specificity = max(target_matches, default=0)
+    if target_specificity == 0:
+        return False
+    highest = max(matched_specificity, default=target_specificity)
+    return (
+        target_specificity == highest
+        and matched_specificity.count(highest) == 1
+    )
+
+
+def _evidence_names_item(evidence: str, item_name: str) -> bool:
+    normalized = " ".join(item_name.split()).casefold()
+    if not normalized:
+        return False
+    if normalized.isascii():
+        return (
+            re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(normalized)}"
+                rf"(?![A-Za-z0-9_])",
+                evidence,
+            )
+            is not None
+        )
+    return normalized in evidence
+
+
+def _validate_text_content(
+    content: object,
+    owner_text: str,
+) -> VLMExtraction:
+    extraction = _validate_content(content)
+    normalized_owner = " ".join(owner_text.split()).casefold()
+    multi_item_names = tuple(
+        tuple(item.name_candidates)
+        or ((item.category,) if item.category else ())
+        or ("__missing_item_identity__",)
+        for item in extraction.items
+    )
+    for item_index, item in enumerate(extraction.items):
+        competing_nutrients = (
+            "caffeine",
+            *(nutrient.nutrient for nutrient in item.nutrients),
+        )
+        item_names = (
+            multi_item_names[item_index]
+            if len(extraction.items) > 1
+            else ()
+        )
+        estimates = [(item.serving, None), (item.caffeine, "caffeine")]
+        estimates.extend(
+            (nutrient.amount, nutrient.nutrient)
+            for nutrient in item.nutrients
+        )
+        for estimate, nutrient_name in estimates:
+            if estimate.kind.value != "exact":
+                continue
+            evidence = " ".join(
+                (estimate.evidence_text or "").split()
+            ).casefold()
+            if (
+                estimate.estimation_basis != "owner_statement"
+                or not evidence
+                or evidence not in normalized_owner
+                or estimate.exact is None
+                or not _evidence_has_exact_quantity(
+                    evidence,
+                    exact=estimate.exact,
+                    unit=estimate.unit,
+                )
+                or (
+                    nutrient_name is None
+                    and item_names
+                    and not _evidence_has_item_exact_quantity(
+                        evidence,
+                        item_names=item_names,
+                        competing_item_names=multi_item_names,
+                        exact=estimate.exact,
+                        unit=estimate.unit,
+                    )
+                )
+                or (
+                    nutrient_name is not None
+                    and not _evidence_has_named_exact_quantity(
+                        evidence,
+                        nutrient=nutrient_name,
+                        exact=estimate.exact,
+                        unit=estimate.unit,
+                        item_names=item_names,
+                        competing_item_names=multi_item_names,
+                        competing_nutrients=competing_nutrients,
+                    )
+                )
+            ):
+                raise VisionInvalidOutput(
+                    "text exact estimates require a matching numeric "
+                    "owner statement"
+                )
+    return extraction
 
 
 class _RemoteVisionProvider:
@@ -287,6 +658,14 @@ class _RemoteVisionProvider:
             if isinstance(fingerprint, str) and fingerprint.strip():
                 self.model_digest = fingerprint.strip()
 
+    def _text(self, text: str, *, allow_remote: bool) -> str:
+        _remote_text_guard(
+            allow_remote=allow_remote,
+            base_url=self.base_url,
+            api_key=self.api_key,
+        )
+        return _validated_owner_text(text)
+
 
 class OllamaVisionProvider:
     provider_name = "ollama"
@@ -304,12 +683,17 @@ class OllamaVisionProvider:
         self.transport = transport
 
     def analyze(self, image_path: Path, *, allow_remote: bool) -> VLMExtraction:
-        if not _is_loopback_url(self.base_url):
+        remote = not _is_loopback_url(self.base_url)
+        if remote:
             if not allow_remote:
                 raise VisionUnavailable("remote vision requires explicit allow_remote_vision=true")
             if urlparse(self.base_url).scheme != "https":
                 raise VisionUnavailable("remote vision endpoints must use HTTPS")
-        _, image = _image_bytes(image_path)
+        _, image = (
+            _sanitize_remote_image(image_path)
+            if remote
+            else _ollama_image(image_path)
+        )
         encoded = base64.b64encode(image).decode("ascii")
         payload = {
             "model": self.model,
@@ -332,6 +716,7 @@ class OllamaVisionProvider:
             headers=None,
             timeout=self.timeout,
             transport=self.transport,
+            trust_env=False,
         )
 
         actual_model = body.get("model")
@@ -340,8 +725,57 @@ class OllamaVisionProvider:
         digest = body.get("model_digest")
         if isinstance(digest, str) and digest.strip():
             self.model_digest = digest.strip()
-        content = body.get("message", {}).get("content") if isinstance(body, dict) else None
-        return _validate_content(content)
+        message = body.get("message")
+        if not isinstance(message, dict):
+            raise VisionInvalidOutput(
+                "ollama response message must be an object"
+            )
+        content = message.get("content")
+        return _validate_photo_content(content)
+
+    def analyze_text(self, text: str, *, allow_remote: bool) -> VLMExtraction:
+        if not _is_loopback_url(self.base_url):
+            if not allow_remote:
+                raise VisionUnavailable(
+                    "remote nutrition text analysis requires explicit "
+                    "allow_remote_analysis=true"
+                )
+            if urlparse(self.base_url).scheme != "https":
+                raise VisionUnavailable(
+                    "remote nutrition analysis endpoints must use HTTPS"
+                )
+        owner_text = _validated_owner_text(text)
+        body = _post_json(
+            base_url=self.base_url,
+            path="/api/chat",
+            payload={
+                "model": self.model,
+                "stream": False,
+                "format": VLMExtraction.model_json_schema(),
+                "messages": [
+                    {"role": "system", "content": TEXT_SYSTEM_PROMPT},
+                    {"role": "user", "content": owner_text},
+                ],
+                "options": {"temperature": 0},
+            },
+            headers=None,
+            timeout=self.timeout,
+            transport=self.transport,
+            trust_env=False,
+        )
+        actual_model = body.get("model")
+        if isinstance(actual_model, str) and actual_model.strip():
+            self.model = actual_model.strip()
+        digest = body.get("model_digest")
+        if isinstance(digest, str) and digest.strip():
+            self.model_digest = digest.strip()
+        message = body.get("message")
+        if not isinstance(message, dict):
+            raise VisionInvalidOutput(
+                "ollama response message must be an object"
+            )
+        content = message.get("content")
+        return _validate_text_content(content, owner_text)
 
 
 class OpenAIVisionProvider(_RemoteVisionProvider):
@@ -398,8 +832,47 @@ class OpenAIVisionProvider(_RemoteVisionProvider):
                     continue
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "output_text":
-                        return _validate_content(block.get("text"))
+                        return _validate_photo_content(block.get("text"))
         raise VisionInvalidOutput("vision response is missing structured text")
+
+    def analyze_text(self, text: str, *, allow_remote: bool) -> VLMExtraction:
+        owner_text = self._text(text, allow_remote=allow_remote)
+        body = _post_json(
+            base_url=self.base_url,
+            path="/v1/responses",
+            payload={
+                "model": self.model,
+                "store": False,
+                "reasoning": {"effort": "none"},
+                "instructions": TEXT_SYSTEM_PROMPT,
+                "input": owner_text,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "nutrition_observation",
+                        "strict": True,
+                        "schema": _strict_extraction_schema(),
+                    }
+                },
+            },
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=self.timeout,
+            transport=self.transport,
+        )
+        self._response_model(body, fingerprint_key="system_fingerprint")
+        output = body.get("output")
+        if isinstance(output, list):
+            for item in output:
+                content = item.get("content") if isinstance(item, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "output_text":
+                        return _validate_text_content(
+                            block.get("text"),
+                            owner_text,
+                        )
+        raise VisionInvalidOutput("nutrition response is missing structured text")
 
 
 class GeminiVisionProvider(_RemoteVisionProvider):
@@ -446,8 +919,41 @@ class GeminiVisionProvider(_RemoteVisionProvider):
             parts = content.get("parts") if isinstance(content, dict) else None
             if isinstance(parts, list) and parts:
                 part = parts[0]
-                return _validate_content(part.get("text") if isinstance(part, dict) else None)
+                return _validate_photo_content(
+                    part.get("text") if isinstance(part, dict) else None
+                )
         raise VisionInvalidOutput("vision response is missing structured text")
+
+    def analyze_text(self, text: str, *, allow_remote: bool) -> VLMExtraction:
+        owner_text = self._text(text, allow_remote=allow_remote)
+        body = _post_json(
+            base_url=self.base_url,
+            path=f"/models/{self.model}:generateContent",
+            payload={
+                "systemInstruction": {"parts": [{"text": TEXT_SYSTEM_PROMPT}]},
+                "contents": [{"role": "user", "parts": [{"text": owner_text}]}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "responseMimeType": "application/json",
+                    "responseJsonSchema": _strict_extraction_schema(),
+                },
+            },
+            headers={"x-goog-api-key": self.api_key},
+            timeout=self.timeout,
+            transport=self.transport,
+        )
+        self._response_model(body, model_key="modelVersion")
+        candidates = body.get("candidates")
+        if isinstance(candidates, list) and candidates:
+            content = candidates[0].get("content") if isinstance(candidates[0], dict) else None
+            parts = content.get("parts") if isinstance(content, dict) else None
+            if isinstance(parts, list) and parts:
+                part = parts[0]
+                return _validate_text_content(
+                    part.get("text") if isinstance(part, dict) else None,
+                    owner_text,
+                )
+        raise VisionInvalidOutput("nutrition response is missing structured text")
 
 
 class AnthropicVisionProvider(_RemoteVisionProvider):
@@ -498,8 +1004,43 @@ class AnthropicVisionProvider(_RemoteVisionProvider):
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    return _validate_content(block.get("text"))
+                    return _validate_photo_content(block.get("text"))
         raise VisionInvalidOutput("vision response is missing structured text")
+
+    def analyze_text(self, text: str, *, allow_remote: bool) -> VLMExtraction:
+        owner_text = self._text(text, allow_remote=allow_remote)
+        body = _post_json(
+            base_url=self.base_url,
+            path="/v1/messages",
+            payload={
+                "model": self.model,
+                "max_tokens": 4096,
+                "system": TEXT_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": owner_text}],
+                "output_config": {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": _anthropic_extraction_schema(),
+                    }
+                },
+            },
+            headers={
+                "anthropic-version": "2023-06-01",
+                "x-api-key": self.api_key,
+            },
+            timeout=self.timeout,
+            transport=self.transport,
+        )
+        self._response_model(body)
+        content = body.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    return _validate_text_content(
+                        block.get("text"),
+                        owner_text,
+                    )
+        raise VisionInvalidOutput("nutrition response is missing structured text")
 
 
 class XAIVisionProvider(_RemoteVisionProvider):
@@ -551,8 +1092,46 @@ class XAIVisionProvider(_RemoteVisionProvider):
         choices = body.get("choices")
         if isinstance(choices, list) and choices:
             message = choices[0].get("message") if isinstance(choices[0], dict) else None
-            return _validate_content(message.get("content") if isinstance(message, dict) else None)
+            return _validate_photo_content(
+                message.get("content") if isinstance(message, dict) else None
+            )
         raise VisionInvalidOutput("vision response is missing structured text")
+
+    def analyze_text(self, text: str, *, allow_remote: bool) -> VLMExtraction:
+        owner_text = self._text(text, allow_remote=allow_remote)
+        body = _post_json(
+            base_url=self.base_url,
+            path="/v1/chat/completions",
+            payload={
+                "model": self.model,
+                "store": False,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": TEXT_SYSTEM_PROMPT},
+                    {"role": "user", "content": owner_text},
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "nutrition_observation",
+                        "strict": True,
+                        "schema": _strict_extraction_schema(),
+                    },
+                },
+            },
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=self.timeout,
+            transport=self.transport,
+        )
+        self._response_model(body, fingerprint_key="system_fingerprint")
+        choices = body.get("choices")
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else None
+            return _validate_text_content(
+                message.get("content") if isinstance(message, dict) else None,
+                owner_text,
+            )
+        raise VisionInvalidOutput("nutrition response is missing structured text")
 
 
 def create_vision_provider(

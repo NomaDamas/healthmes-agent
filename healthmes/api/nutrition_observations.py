@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import uuid
-from datetime import UTC, date
+from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -59,6 +61,7 @@ from healthmes.nutrition.vision import (
 from healthmes.store.session import SessionDep
 
 router = APIRouter(prefix="/v1/nutrition-observations", tags=["nutrition"])
+MAX_CAPTURE_CLOCK_SKEW = timedelta(minutes=5)
 
 
 class LocationInput(BaseModel):
@@ -88,6 +91,8 @@ class AnalyzeNutritionPhoto(BaseModel):
         expected_offset = self.captured_at.astimezone(timezone).utcoffset()
         if self.captured_at.utcoffset() != expected_offset:
             raise ValueError("captured_at offset conflicts with timezone")
+        if self.captured_at.astimezone(UTC) > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
+            raise ValueError("captured_at cannot be more than 5 minutes in the future")
         required = {"captured_at", "timezone", "location"}
         if not required.issubset(self.metadata_provenance):
             raise ValueError(
@@ -274,7 +279,25 @@ def analyze_nutrition_photo(
             "unsupported_media_type",
             "nutrition analysis accepts image media only",
         )
-    existing = observation_for_media(session, obj.id)
+    request_fingerprint = sha256(
+        json.dumps(
+            body.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    try:
+        existing = observation_for_media(
+            session,
+            obj.id,
+            request_fingerprint=request_fingerprint,
+        )
+    except NutritionRepositoryError as exc:
+        raise APIError(
+            status.HTTP_409_CONFLICT,
+            "nutrition_storage_conflict",
+            str(exc),
+        ) from exc
     if existing is not None:
         return existing
 
@@ -330,7 +353,12 @@ def analyze_nutrition_photo(
         ),
     )
     try:
-        persist_observation(session, settings, observation)
+        stored = persist_observation(
+            session,
+            settings,
+            observation,
+            request_fingerprint=request_fingerprint,
+        )
     except NutritionRepositoryError as exc:
         raise APIError(
             status.HTTP_409_CONFLICT,
@@ -338,7 +366,14 @@ def analyze_nutrition_photo(
             str(exc),
         ) from exc
     session.commit()
-    return observation
+    persisted = get_observation(session, uuid.UUID(stored.source_record_id))
+    if persisted is None:  # pragma: no cover - transaction invariant
+        raise APIError(
+            status.HTTP_409_CONFLICT,
+            "nutrition_storage_conflict",
+            "stored nutrition observation is unavailable",
+        )
+    return persisted
 
 
 @router.get("", response_model=list[NutritionObservation])

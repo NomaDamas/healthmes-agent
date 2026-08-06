@@ -125,7 +125,9 @@ def _interaction_view(
     payload["is_confirmed_intake"] = bool(
         outcome is not None and outcome.status is IntakeOutcomeStatus.CONSUMED
     )
-    payload["raw_capture_available"] = True
+    payload["raw_capture_available"] = bool(
+        interaction.source_text or interaction.media_path
+    )
     return payload
 
 
@@ -156,6 +158,10 @@ def _latest_request_candidate(
         select(WellnessEvent)
         .where(
             WellnessEvent.event_type == DECISION_REQUEST_EVENT,
+            (
+                WellnessEvent.expires_at.is_(None)
+                | (WellnessEvent.expires_at > datetime.now(UTC))
+            ),
             WellnessEvent.payload["interaction_id"].as_string()
             == str(interaction_id),
         )
@@ -249,12 +255,21 @@ def search_intake_history(
 
     interaction_statement = (
         select(WellnessEvent)
-        .where(WellnessEvent.event_type == INTERACTION_EVENT)
+        .where(
+            WellnessEvent.event_type == INTERACTION_EVENT,
+            (
+                WellnessEvent.expires_at.is_(None)
+                | (WellnessEvent.expires_at > datetime.now(UTC))
+            ),
+        )
         .order_by(WellnessEvent.observed_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )
     for event in session.scalars(interaction_statement):
-        interaction = interaction_from_payload(event.payload)
+        persisted = interaction_from_payload(event.payload)
+        interaction = get_interaction(session, persisted.interaction_id)
+        if interaction is None:
+            continue
         represented_ids.add(interaction.interaction_id)
         scanned_records += 1
         outcome_entry = latest_outcome(session, interaction.interaction_id)
@@ -270,7 +285,13 @@ def search_intake_history(
     seen_outcomes: set[uuid.UUID] = set()
     outcome_statement = (
         select(WellnessEvent)
-        .where(WellnessEvent.event_type == OUTCOME_EVENT)
+        .where(
+            WellnessEvent.event_type == OUTCOME_EVENT,
+            (
+                WellnessEvent.expires_at.is_(None)
+                | (WellnessEvent.expires_at > datetime.now(UTC))
+            ),
+        )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )
@@ -296,7 +317,13 @@ def search_intake_history(
     seen_requests: set[uuid.UUID] = set()
     request_statement = (
         select(WellnessEvent)
-        .where(WellnessEvent.event_type == DECISION_REQUEST_EVENT)
+        .where(
+            WellnessEvent.event_type == DECISION_REQUEST_EVENT,
+            (
+                WellnessEvent.expires_at.is_(None)
+                | (WellnessEvent.expires_at > datetime.now(UTC))
+            ),
+        )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )
@@ -352,7 +379,13 @@ def _confirmed_history(
     sequence = 0
     statement = (
         select(WellnessEvent)
-        .where(WellnessEvent.event_type == OUTCOME_EVENT)
+        .where(
+            WellnessEvent.event_type == OUTCOME_EVENT,
+            (
+                WellnessEvent.expires_at.is_(None)
+                | (WellnessEvent.expires_at > datetime.now(UTC))
+            ),
+        )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )

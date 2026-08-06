@@ -105,6 +105,7 @@ from healthmes.nutrition.intake_query import (
 )
 from healthmes.nutrition.intake_service import (
     IntakeInteractionError,
+    create_analyzed_interaction,
     create_interaction,
     create_photo_interaction,
     get_decision_request,
@@ -124,6 +125,14 @@ from healthmes.nutrition.repository import (
     persist_caffeine_confirmation,
     persist_daily_confirmation,
     persist_nutrition_review,
+)
+from healthmes.nutrition.transcription import (
+    TranscriptionError,
+    create_nutrition_transcriber,
+)
+from healthmes.nutrition.vision import (
+    VisionError,
+    create_vision_provider,
 )
 from healthmes.store import (
     AppUsageSample,
@@ -3048,6 +3057,105 @@ def _parse_normalized_intake_items(
         return _NORMALIZED_INTAKE_ITEMS.validate_python(values or [])
     except ValidationError as exc:
         raise ToolError(f"items do not match the nutrition schema: {exc}") from exc
+
+
+@mcp.tool
+def analyze_intake_capture(
+    operation_id: str,
+    intent: str,
+    modality: str,
+    source_text: str | None = None,
+    observed_at: str | None = None,
+    media_path: str | None = None,
+    allow_remote_analysis: bool = False,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Automatically structure owner text or a local voice capture.
+
+    Voice bytes stay local and are transcribed by the configured loopback
+    whisper.cpp server. Remote nutrition analysis is opt-in per call.
+    """
+    try:
+        parsed_intent = IntakeIntent(intent)
+    except ValueError as exc:
+        raise ToolError(
+            f"intent must be one of {[value.value for value in IntakeIntent]}"
+        ) from exc
+    try:
+        parsed_modality = CaptureModality(modality)
+    except ValueError as exc:
+        raise ToolError(
+            f"modality must be one of {[value.value for value in CaptureModality]}"
+        ) from exc
+    if parsed_modality not in {
+        CaptureModality.TEXT,
+        CaptureModality.VOICE,
+    }:
+        raise ToolError("automatic capture analysis supports text or voice")
+    if parsed_modality is CaptureModality.TEXT:
+        if not source_text or not source_text.strip():
+            raise ToolError("text analysis requires source_text")
+        if media_path is not None:
+            raise ToolError("text analysis cannot reference media")
+    if parsed_modality is CaptureModality.VOICE:
+        if source_text is not None:
+            raise ToolError(
+                "voice analysis creates source_text from local transcription"
+            )
+        if media_path is None:
+            raise ToolError("voice analysis requires media_path")
+    proof_arguments = {
+        "operation_id": operation_id,
+        "intent": intent,
+        "modality": modality,
+        "source_text": source_text,
+        "observed_at": observed_at,
+        "media_path": media_path,
+        "allow_remote_analysis": allow_remote_analysis,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="analyze_intake_capture",
+        arguments=proof_arguments,
+    )
+    captured_at = (
+        _parse_datetime_utc(observed_at, "observed_at")
+        if observed_at is not None
+        else dt.datetime.now(dt.UTC)
+    )
+    timezone = _local_timezone()
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    settings = _active_settings()
+    try:
+        with _store_session() as session:
+            interaction = create_analyzed_interaction(
+                session,
+                settings,
+                operation_id=_parse_uuid(operation_id, "operation_id"),
+                operation_fingerprint=operation_fingerprint(
+                    proof_arguments
+                ),
+                intent=parsed_intent,
+                modality=parsed_modality,
+                observed_at=captured_at,
+                timezone=timezone_name,
+                source="telegram-owner",
+                source_text=source_text,
+                media_path=media_path,
+                recorded_at=dt.datetime.now(dt.UTC),
+                allow_remote_analysis=allow_remote_analysis,
+                provider=create_vision_provider(settings),
+                transcriber=(
+                    create_nutrition_transcriber(settings)
+                    if parsed_modality is CaptureModality.VOICE
+                    else None
+                ),
+            )
+            view = interaction_view(session, interaction.interaction_id)
+    except (IntakeInteractionError, TranscriptionError, VisionError) as exc:
+        raise ToolError(str(exc)) from exc
+    assert view is not None
+    return {"status": "ok", "interaction": view}
 
 
 @mcp.tool

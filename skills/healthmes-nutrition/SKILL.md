@@ -1,7 +1,7 @@
 ---
 name: healthmes-nutrition
-description: Capture photo, text, or voice-transcript food context; keep observations separate from consumption; and build evidence-bound wellness decisions.
-version: 2.1.0
+description: Automatically analyze photo, free-text, or local-voice food context; keep observations separate from consumption; and build evidence-bound wellness decisions.
+version: 2.2.0
 author: HealthMes Agent
 license: MIT
 metadata:
@@ -27,8 +27,9 @@ web, or agent surfaces can render.
   use the same generic contract.
 - A photo nutrition review can confirm, fully correct, or reject the VLM
   observation without overwriting its original provenance.
-- Voice requires a transcript produced locally before capture. This skill does
-  not claim that HealthMes transcribed the audio.
+- Free text can be automatically structured by the configured nutrition
+  provider. Voice is transcribed only by the configured loopback whisper.cpp
+  server and then follows the same text-analysis path.
 - Captured history is not proof that every meal in a day was recorded.
 - Every interaction-engine write requires a caller-generated UUID
   `operation_id`. Reuse it only for an exact retry; never reuse it for changed
@@ -43,7 +44,8 @@ web, or agent surfaces can render.
 |---|---|
 | `mcp__healthmes__get_recent_nutrition_observations` | Read photo nutrition estimates, provenance, and latest owner review |
 | `mcp__healthmes__review_photo_nutrition_observation` | Confirm, fully correct, or reject one photo nutrition observation |
-| `mcp__healthmes__capture_intake_interaction` | Store photo, exact text, or local voice-transcript context with an explicit intent |
+| `mcp__healthmes__analyze_intake_capture` | Automatically structure owner free text or a local voice capture with an explicit intent |
+| `mcp__healthmes__capture_intake_interaction` | Store a photo observation or caller-supplied reviewed structured nutrition |
 | `mcp__healthmes__confirm_intake_outcome` | Store consumed, not-consumed, or cancelled from the owner's exact reply |
 | `mcp__healthmes__search_intake_records` | Search reusable records by time, intent, modality, nutrient, confirmation, or text |
 | `mcp__healthmes__request_intake_decision` | Persist a decision request and receive its candidate/history/evidence context |
@@ -69,8 +71,10 @@ web, or agent surfaces can render.
    `review_photo_nutrition_observation` and a fresh `operation_id` before
    capture.
 3. Capture the interaction. For photo, pass the existing
-   `nutrition_observation_id`. For voice, pass the local media token and exact
-   local transcript. For text, preserve the owner's exact text.
+   `nutrition_observation_id` to `capture_intake_interaction`. For free text,
+   call `analyze_intake_capture` with the owner's exact text. For voice, pass
+   only the local audio token to `analyze_intake_capture`; HealthMes creates
+   the local transcript and structured nutrients.
 4. If the owner is logging consumption, ask for exact confirmation and call
    `confirm_intake_outcome`. Do not silently turn the capture into intake.
 5. If the owner asks before eating, call `request_intake_decision`. Use only

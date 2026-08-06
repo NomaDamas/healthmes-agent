@@ -178,7 +178,18 @@ def test_analyze_persists_sake_payload_and_reclassifies_media(
         )
     )
     assert event is not None
-    assert event.payload == body
+    assert event.payload["capture"]["media_path"] == ""
+    assert event.payload["warnings"] == []
+    assert event.payload["items"][0]["serving"]["evidence_text"] is None
+    assert event.payload["items"][0]["caffeine"]["evidence_text"] is None
+    assert event.payload["items"][0]["label_text_candidates"] == []
+    raw_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.observation-raw.v1"
+        )
+    )
+    assert raw_event is not None
+    assert raw_event.payload["observation"] == body
     assert event.source_provider == "sake-vlm"
     assert event.expires_at is not None
     obj = session.scalar(
@@ -295,6 +306,20 @@ def test_capture_context_rejects_timezone_offset_mismatch(client):
     assert "offset conflicts" in response.text
 
 
+def test_capture_context_rejects_far_future_timestamp(client):
+    media_path = _upload(client)
+    response = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(
+            media_path,
+            captured_at="2099-01-01T00:00:00Z",
+            timezone="UTC",
+        ),
+    )
+    assert response.status_code == 422
+    assert "more than 5 minutes in the future" in response.text
+
+
 def test_analysis_rejects_non_image_media(client):
     media_path = _upload(client, content=b"voice", content_type="audio/mpeg")
     response = client.post(
@@ -375,6 +400,7 @@ def test_confirmation_and_daily_completeness_are_separate_events(client, session
         event.event_type for event in events
     } == {
         "nutrition.observation.v1",
+        "nutrition.observation-raw.v1",
         "nutrition.confirmation.v1",
         "nutrition.daily-confirmation.v1",
     }
@@ -383,7 +409,13 @@ def test_confirmation_and_daily_completeness_are_separate_events(client, session
     )
     assert observation_event.payload["confirmation_status"] == "unconfirmed"
     confirmation_events = [
-        event for event in events if event.event_type != "nutrition.observation.v1"
+        event
+        for event in events
+        if event.event_type
+        in {
+            "nutrition.confirmation.v1",
+            "nutrition.daily-confirmation.v1",
+        }
     ]
     assert all(event.expires_at is None for event in confirmation_events)
 
@@ -476,3 +508,74 @@ def test_expired_photo_is_deleted_without_deleting_observation(
     assert observation.expires_at.replace(tzinfo=UTC) > datetime(
         2026, 8, 14, 8, 30, tzinfo=UTC
     )
+
+
+def test_photo_raw_evidence_expires_with_media(client, session, settings):
+    secret = "Medication X 50 mg"
+    extraction = _extraction()
+    extraction.warnings = [secret]
+    extraction.items[0].warnings = [secret]
+    extraction.items[0].label_text_candidates = [secret]
+    extraction.items[0].serving.evidence_text = secret
+    client.app.state.nutrition_vision_provider = FakeVision(
+        extraction=extraction
+    )
+    media_path = _upload(client)
+    created = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(media_path),
+    )
+    assert created.status_code == 201
+    observation_id = created.json()["observation_id"]
+    assert secret in str(created.json())
+
+    run_storage_maintenance(
+        session,
+        settings,
+        now=datetime(2026, 8, 14, 8, 30, tzinfo=UTC),
+    )
+    session.commit()
+
+    fetched = client.get(
+        f"/v1/nutrition-observations/{observation_id}"
+    )
+    assert fetched.status_code == 200
+    assert secret not in str(fetched.json())
+    assert fetched.json()["capture"]["media_path"] == ""
+
+
+def test_expired_observation_cannot_be_read_or_confirmed(client, session):
+    client.app.state.nutrition_vision_provider = FakeVision()
+    media_path = _upload(client)
+    created = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(media_path),
+    )
+    assert created.status_code == 201
+    observation_id = created.json()["observation_id"]
+    event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.observation.v1",
+            WellnessEvent.source_record_id == observation_id,
+        )
+    )
+    assert event is not None
+    event.expires_at = datetime.now(UTC)
+    session.commit()
+
+    assert (
+        client.get(
+            f"/v1/nutrition-observations/{observation_id}"
+        ).status_code
+        == 404
+    )
+    assert client.get("/v1/nutrition-observations").json() == []
+    confirmed = client.post(
+        f"/v1/nutrition-observations/{observation_id}/confirm",
+        json={
+            "status": "confirmed",
+            "source": "test",
+            "items": [{"item_index": 0, "caffeine_mg": 180}],
+        },
+    )
+    assert confirmed.status_code == 404

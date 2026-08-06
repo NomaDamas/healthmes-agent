@@ -64,6 +64,18 @@ class EvidenceOrigin(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class IntakeAnalysisProvenance:
+    provider: str
+    model: str
+    model_digest: str | None
+    prompt_version: str
+    schema_version: str
+    analyzed_at: datetime
+    transcription_provider: str | None = None
+    transcription_model: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class NutrientFact:
     nutrient: str
     amount: Estimate
@@ -97,6 +109,7 @@ class IntakeInteraction:
     nutrition_observation_id: uuid.UUID | None
     items: tuple[NormalizedIntakeItem, ...]
     nutrition_review_id: uuid.UUID | None = None
+    analysis_provenance: IntakeAnalysisProvenance | None = None
     warnings: tuple[str, ...] = ()
     schema_version: str = "intake-interaction-v1"
 
@@ -114,6 +127,7 @@ class StructuredIntakeSnapshot:
     nutrition_observation_id: uuid.UUID | None
     items: tuple[NormalizedIntakeItem, ...]
     nutrition_review_id: uuid.UUID | None = None
+    analysis_provenance: IntakeAnalysisProvenance | None = None
     warnings: tuple[str, ...] = ()
     schema_version: str = "structured-intake-snapshot-v1"
 

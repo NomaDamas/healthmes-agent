@@ -39,8 +39,8 @@ Intake Interaction Engine
 Capture
   |
   +--> photo: NutritionObservation ID 참조
-  +--> text: 사용자 원문을 단기 capture에 보존
-  +--> voice: 로컬 audio token + transcript를 단기 capture에 보존
+  +--> text: 사용자 원문 -> 선택된 영양 분석 provider
+  +--> voice: 로컬 audio token -> whisper.cpp 전사 -> 영양 분석 provider
   |
   v
 IntakeInteraction (관찰)
@@ -68,6 +68,14 @@ IntakeInteraction (관찰)
 것을 막는다. 이미 만료된 raw capture의 동일 재시도는 새 식사를 만들지 않고
 명시적 충돌을 반환한다.
 
+자동 텍스트·음성 분석은 모델 호출 전에 operation lease를 예약한다. 같은 ID의
+동시 요청은 모델을 다시 호출하지 않고 충돌로 종료한다. 단일 로컬 런타임용
+SQLite는 엔진별 프로세스 lease를 사용해 SQLite connection 공유나 write lock이
+호출자의 본 작업을 commit하지 않게 한다. PostgreSQL 같은 다중 연결 DB는 별도
+트랜잭션과 token compare-and-swap lease를 사용한다. 두 방식 모두 호출자의 본
+작업 세션을 commit/rollback하지 않는다. DB lease는 프로세스가 중단되면 provider
+timeout보다 긴 만료시각 뒤 같은 입력이 재획득할 수 있다.
+
 ## 사진 분석 및 Sake와 결합
 
 사진 입력은 `NutritionObservation`을 ID로 참조하고 이름, 제공량, 핵심
@@ -81,21 +89,31 @@ payload와 VLM provenance는 그대로 남는다. Sake 카페인 관찰은 이 �
 정정은 `IntakeOutcome.corrected_items`로 기록한다. 검토 이벤트는 원 관찰과 같은
 보존정책 및 만료시각을 사용해 원 관찰 삭제 뒤 고아 데이터로 남지 않는다.
 
-텍스트나 음성 transcript에 구조화된 영양소가 함께 제공되면
-`NutrientFact`에 다음 정보를 보존한다.
+텍스트와 음성은 `POST /v1/intake-interactions/analyze` 또는 MCP
+`analyze_intake_capture`로 자동 분석할 수 있다. 음성 bytes는 loopback
+whisper.cpp server만 사용해 로컬에서 transcript로 바꾸고, transcript를 사진과
+동일한 provider 선택(Ollama/OpenAI/Gemini/Anthropic/xAI)의 텍스트 분석 경로로
+보낸다. 원격 provider는 호출마다 `allow_remote_analysis=true`가 있어야 한다.
+
+자동 분석된 구조화 영양소는 `NutrientFact`에 다음 정보를 보존한다.
 
 ```text
 nutrient
 amount: exact | range | unknown
 unit
-origin: user | vlm | agent | label
+origin: agent
 confidence
-evidence_text
+evidence_text: 응답 검증 중 사용하며 durable 구조화 이벤트에는 원문을 복사하지 않음
 ```
 
-HealthMes는 현재 텍스트에서 영양소를 자동 추출하거나 음성을 직접 전사하지
-않는다. 디바이스 또는 로컬 에이전트가 만든 transcript와 구조화값을 검증하고
-저장하는 엔진이다.
+`analysis_provenance`에는 영양 분석 provider/model/digest/prompt/schema와
+분석시각을 저장한다. 음성은 transcription provider/model도 함께 기록한다.
+숫자 근거 문구는 원문과 같은 `nutrition_raw_capture` 보존경계로 취급한다.
+따라서 구조화 interaction에는 serving·nutrient evidence 문구를 복사하지 않고,
+raw capture가 삭제된 뒤에도 이름·수치·단위·confidence·provenance만 남는다.
+기존 `POST /v1/intake-interactions`와 MCP `capture_intake_interaction`은
+디바이스나 다른 로컬 에이전트가 이미 구조화한 값을 저장하는 수동 adapter로
+계속 지원한다.
 
 ## 검색과 컨텍스트 보존
 
@@ -121,10 +139,17 @@ ID와 limitations를 저장하므로 이후 에이전트가 무엇을 근거로 
    evidence_text 없음)
 ```
 
-원문 interaction은 `nutrition_observation` 보존정책을 유지하며 섭취나 판단 때문에
-영구 정책으로 승격되지 않는다. 확인된 섭취와 판단 요청은 원문을 복사하지 않은
-구조화 snapshot을 별도 저장하므로, 원문과 미디어가 삭제된 뒤에도 식사 사실과
-영양소 근거를 재사용할 수 있다.
+원문·transcript·미디어 참조는 별도 `nutrition_raw_capture` 이벤트에 저장되어
+기본 14일 뒤 삭제된다. 같은 interaction의 구조화 영양소와 provenance는
+`nutrition_observation` 정책으로 기본 90일 유지된다. 확인된 섭취와 판단 요청은
+원문을 복사하지 않은 구조화 snapshot을 별도 저장하므로, 원문과 미디어가 삭제된
+뒤에도 식사 사실과 영양소 근거를 재사용할 수 있다.
+
+사진 VLM의 라벨 문자열, `evidence_text`, provider warning, 위치와 미디어 경로는
+구조화 observation에 복사하지 않는다. 이 값들은 `nutrition_media` 정책을 따르는
+별도 `nutrition.observation-raw.v1` 이벤트에 저장되고 기본 7일 동안만 조회 시
+합쳐진다. 사용자가 섭취 결과에 남긴 자유 형식 note도 영구 confirmation에
+복사하지 않고 `nutrition.outcome-raw.v1` 이벤트에서 기본 14일 동안만 보존한다.
 
 과거 기록의 coverage는 `captured_records_only`다. 기록이 있다는 사실은 하루
 전체 식사가 빠짐없이 기록됐다는 뜻이 아니다. 카페인 총량 판단은 기존 sake의
@@ -142,5 +167,7 @@ ID와 limitations를 저장하므로 이후 에이전트가 무엇을 근거로 
 - 알레르기와 약물 상호작용은 일반 웰니스 엔진에서 제안하지 않고
   `unsupported`로만 기록한다. 서버가 고정된 안전 문구와 limitation을 저장하고
   호출자가 보낸 recommendation은 폐기한다.
-- UI, 자동 텍스트 영양 분석, 서버 음성 전사는 이 엔진의 구현 범위가 아니다.
+- UI는 이 엔진의 구현 범위가 아니다.
+- 음성 전사는 외부 클라우드 STT가 아니라 운영자가 로컬에 실행한 whisper.cpp
+  loopback sidecar만 허용한다.
 - 사진 전체 영양소는 VLM 추정치이며 의료적 측정값이 아니다.

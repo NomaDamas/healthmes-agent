@@ -46,11 +46,13 @@ Security rules (medical photos live here — docs/PLAN.md §9):
 import hashlib
 import re
 import uuid
+from datetime import UTC
 from pathlib import Path
 
 from fastapi import APIRouter, Request, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 
 # Starlette's type, not fastapi's subclass: ``request.form()`` (parsed by the
 # handler itself — see upload_media) yields starlette UploadFile instances.
@@ -60,6 +62,7 @@ from healthmes.api.common import utc_now
 from healthmes.api.errors import APIError, not_found
 from healthmes.config import Settings
 from healthmes.storage import register_storage_object
+from healthmes.store import StorageObject
 from healthmes.store.session import SessionDep
 
 __all__ = [
@@ -303,10 +306,40 @@ def resolve_media_file(settings: Settings, media_path: str) -> Path | None:
 
 
 @router.get("/{media_path:path}")
-def get_media(media_path: str, request: Request) -> FileResponse:
+def get_media(
+    media_path: str,
+    request: Request,
+    session: SessionDep,
+) -> FileResponse:
     """Serve a stored media file (bearer or viewer ``?token=`` — see module doc)."""
     file_path = resolve_media_file(_settings(request), media_path)
     if file_path is None:
+        raise not_found("media", media_path)
+    relative_path = (
+        media_path
+        if media_path.startswith("media/")
+        else f"media/{media_path}"
+    )
+    obj = session.scalar(
+        select(StorageObject).where(
+            StorageObject.relative_path == relative_path
+        )
+    )
+    if obj is None:
+        raise not_found("media", media_path)
+    now = utc_now()
+    if (
+        obj.purged_at is not None
+        or (
+            obj.expires_at is not None
+            and (
+                obj.expires_at.replace(tzinfo=UTC)
+                if obj.expires_at.tzinfo is None
+                else obj.expires_at.astimezone(UTC)
+            )
+            <= now
+        )
+    ):
         raise not_found("media", media_path)
     return FileResponse(
         file_path,
