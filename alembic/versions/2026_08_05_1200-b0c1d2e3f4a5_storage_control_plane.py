@@ -21,8 +21,12 @@ depends_on: str | Sequence[str] | None = None
 def _common() -> list[sa.Column]:
     return [
         sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
     ]
 
 
@@ -49,11 +53,20 @@ def upgrade() -> None:
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("safe_to_purge", sa.Boolean(), nullable=False),
         sa.Column("purged_at", sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(["retention_policy_id"], ["retention_policy.id"], ondelete="SET NULL"),
+        sa.ForeignKeyConstraint(
+            ["retention_policy_id"], ["retention_policy.id"], ondelete="SET NULL"
+        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("relative_path", name="uq_storage_object_relative_path"),
     )
-    for column in ("data_class", "sha256", "retention_policy_id", "expires_at", "safe_to_purge", "purged_at"):
+    for column in (
+        "data_class",
+        "sha256",
+        "retention_policy_id",
+        "expires_at",
+        "safe_to_purge",
+        "purged_at",
+    ):
         op.create_index(op.f(f"ix_storage_object_{column}"), "storage_object", [column])
     op.create_table(
         "wellness_event",
@@ -78,11 +91,23 @@ def upgrade() -> None:
         sa.Column("raw_object_id", sa.Uuid(), nullable=True),
         sa.Column("derived_from", JSONB, nullable=True),
         sa.ForeignKeyConstraint(["raw_object_id"], ["storage_object.id"], ondelete="SET NULL"),
-        sa.ForeignKeyConstraint(["retention_policy_id"], ["retention_policy.id"], ondelete="SET NULL"),
+        sa.ForeignKeyConstraint(
+            ["retention_policy_id"], ["retention_policy.id"], ondelete="SET NULL"
+        ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("source_provider", "source_record_id", name="uq_wellness_event_source_record"),
+        sa.UniqueConstraint(
+            "source_provider", "source_record_id", name="uq_wellness_event_source_record"
+        ),
     )
-    for column in ("event_type", "observed_at", "recorded_at", "source_provider", "retention_policy_id", "expires_at", "raw_object_id"):
+    for column in (
+        "event_type",
+        "observed_at",
+        "recorded_at",
+        "source_provider",
+        "retention_policy_id",
+        "expires_at",
+        "raw_object_id",
+    ):
         op.create_index(op.f(f"ix_wellness_event_{column}"), "wellness_event", [column])
     op.create_table(
         "storage_usage_daily",
@@ -93,10 +118,16 @@ def upgrade() -> None:
         sa.Column("bytes_used", sa.Integer(), nullable=False),
         sa.Column("object_count", sa.Integer(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("measured_on", "provider", "data_class", name="uq_storage_usage_daily_measurement"),
+        sa.UniqueConstraint(
+            "measured_on", "provider", "data_class", name="uq_storage_usage_daily_measurement"
+        ),
     )
-    op.create_index(op.f("ix_storage_usage_daily_measured_on"), "storage_usage_daily", ["measured_on"])
-    op.create_index(op.f("ix_storage_usage_daily_data_class"), "storage_usage_daily", ["data_class"])
+    op.create_index(
+        op.f("ix_storage_usage_daily_measured_on"), "storage_usage_daily", ["measured_on"]
+    )
+    op.create_index(
+        op.f("ix_storage_usage_daily_data_class"), "storage_usage_daily", ["data_class"]
+    )
     op.create_table(
         "purge_job",
         *_common(),
@@ -115,5 +146,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    for table in ("purge_job", "storage_usage_daily", "wellness_event", "storage_object", "retention_policy"):
+    for table in (
+        "purge_job",
+        "storage_usage_daily",
+        "wellness_event",
+        "storage_object",
+        "retention_policy",
+    ):
         op.drop_table(table)
