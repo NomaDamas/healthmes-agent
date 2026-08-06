@@ -20,7 +20,6 @@ enum AppTab: Hashable {
 }
 
 enum AppModal: String, Identifiable {
-    case speak
     case settings
     case report
     case capture
@@ -39,6 +38,11 @@ final class AppRouter: ObservableObject {
     @Published var modal: AppModal?
     @Published var decisionSheet: DecisionSheetTarget?
     @Published var proposalSheetID: UUID?
+    @Published private(set) var commandFocusRequest = 0
+
+    func focusCommandDock() {
+        commandFocusRequest += 1
+    }
 
     /// Open a tokenized decision/report URL in the in-app viewer. Only URLs
     /// that come from server payloads (glance/alerts/reports) or pass the
@@ -89,7 +93,7 @@ final class AppRouter: ObservableObject {
         case "report":
             modal = .report
         case "speak":
-            modal = .speak
+            focusCommandDock()
         default:
             tab = .today
         }
