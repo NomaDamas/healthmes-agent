@@ -107,10 +107,15 @@ MCP가 확인된 카페인 데이터만 의사결정 기능에 제공
   `allow_remote_vision=true`를 보내야 한다.
 - 원격 endpoint는 HTTPS만 허용한다.
 - API 키와 이미지 bytes는 오류 메시지에 포함하지 않는다.
+- 원격 전송본은 Pillow로 새 JPEG/PNG로 재인코딩해 EXIF/GPS/기기
+  메타데이터를 제거하고 최대 4096px로 제한한다. 로컬 원본은 바꾸지 않는다.
 - OpenAI와 xAI 요청은 `store: false`를 보낸다.
 - 모든 provider 출력은 동일한 Pydantic `VLMExtraction` 스키마로 재검증한다.
-- 원격 provider는 JPEG, PNG, WebP, GIF만 전송한다. HEIC는 현재 로컬
-  Ollama 경로를 사용하거나 업로드 전에 변환해야 한다.
+- 원격 입력은 JPEG, PNG, WebP, GIF를 받고 메타데이터가 제거된 JPEG/PNG로
+  전송한다. HEIC는 현재 로컬 Ollama 경로를 사용하거나 업로드 전에 변환해야
+  한다.
+- provider 응답이 실제 model 또는 fingerprint를 제공하면 저장 provenance에
+  설정값 대신 그 값을 기록한다.
 
 ## Sake 이슈 #96-#101 기록
 

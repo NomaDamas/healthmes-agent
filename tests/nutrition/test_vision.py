@@ -1,7 +1,10 @@
+import base64
 import json
+from io import BytesIO
 
 import httpx
 import pytest
+from PIL import Image
 from pydantic import SecretStr
 
 from healthmes.config import Settings
@@ -24,6 +27,51 @@ EXTRACTION = {
     "warnings": ["label unreadable"],
     "items": [],
 }
+
+
+def _write_image(path, *, with_exif=False):
+    suffix_format = {
+        ".gif": "GIF",
+        ".jpeg": "JPEG",
+        ".jpg": "JPEG",
+        ".png": "PNG",
+        ".webp": "WEBP",
+    }
+    image = Image.new("RGB", (32, 24), color=(83, 52, 31))
+    kwargs = {}
+    if with_exif:
+        exif = Image.Exif()
+        exif[0x010F] = "Sensitive Camera"
+        kwargs["exif"] = exif
+    image.save(path, format=suffix_format[path.suffix.lower()], **kwargs)
+
+
+def _assert_strict_schema(schema):
+    if isinstance(schema, dict):
+        assert "default" not in schema
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            assert schema["required"] == list(properties)
+            assert schema["additionalProperties"] is False
+        for value in schema.values():
+            _assert_strict_schema(value)
+    elif isinstance(schema, list):
+        for value in schema:
+            _assert_strict_schema(value)
+
+
+def _assert_schema_omits(schema, forbidden):
+    if isinstance(schema, dict):
+        assert not forbidden.intersection(schema)
+        for key, value in schema.items():
+            if key == "properties" and isinstance(value, dict):
+                for property_schema in value.values():
+                    _assert_schema_omits(property_schema, forbidden)
+            else:
+                _assert_schema_omits(value, forbidden)
+    elif isinstance(schema, list):
+        for value in schema:
+            _assert_schema_omits(value, forbidden)
 
 
 def test_exact_estimate_requires_visible_label_evidence():
@@ -113,7 +161,7 @@ def test_invalid_provider_json_is_controlled(tmp_path):
 
 def test_openai_adapter_uses_responses_schema_and_disables_storage(tmp_path):
     image = tmp_path / "coffee.jpg"
-    image.write_bytes(b"synthetic")
+    _write_image(image, with_exif=True)
     requests = []
 
     def handler(request):
@@ -121,6 +169,8 @@ def test_openai_adapter_uses_responses_schema_and_disables_storage(tmp_path):
         return httpx.Response(
             200,
             json={
+                "model": "gpt-5.6-sol-2026-08-01",
+                "system_fingerprint": "fp_openai",
                 "output": [
                     {
                         "type": "message",
@@ -131,7 +181,7 @@ def test_openai_adapter_uses_responses_schema_and_disables_storage(tmp_path):
                             }
                         ],
                     }
-                ]
+                ],
             },
         )
 
@@ -155,18 +205,24 @@ def test_openai_adapter_uses_responses_schema_and_disables_storage(tmp_path):
     assert payload["input"][0]["content"][1]["detail"] == "original"
     assert payload["input"][0]["content"][1]["image_url"].startswith("data:image/jpeg;base64,")
     assert payload["text"]["format"]["strict"] is True
+    _assert_strict_schema(payload["text"]["format"]["schema"])
+    assert provider.model == "gpt-5.6-sol-2026-08-01"
+    assert provider.model_digest == "fp_openai"
 
 
 def test_gemini_adapter_uses_inline_image_and_response_schema(tmp_path):
     image = tmp_path / "coffee.png"
-    image.write_bytes(b"synthetic")
+    _write_image(image)
     requests = []
 
     def handler(request):
         requests.append(request)
         return httpx.Response(
             200,
-            json={"candidates": [{"content": {"parts": [{"text": json.dumps(EXTRACTION)}]}}]},
+            json={
+                "modelVersion": "gemini-3.6-flash-20260801",
+                "candidates": [{"content": {"parts": [{"text": json.dumps(EXTRACTION)}]}}],
+            },
         )
 
     provider = GeminiVisionProvider(
@@ -185,21 +241,26 @@ def test_gemini_adapter_uses_inline_image_and_response_schema(tmp_path):
     assert request.url.path == "/v1beta/models/gemini-3.6-flash:generateContent"
     assert request.headers["x-goog-api-key"] == "gemini-secret"
     inline = payload["contents"][0]["parts"][1]["inlineData"]
-    assert inline["mimeType"] == "image/png"
+    assert inline["mimeType"] == "image/jpeg"
     assert payload["generationConfig"]["responseMimeType"] == "application/json"
     assert payload["generationConfig"]["responseJsonSchema"]["type"] == "object"
+    _assert_strict_schema(payload["generationConfig"]["responseJsonSchema"])
+    assert provider.model == "gemini-3.6-flash-20260801"
 
 
 def test_anthropic_adapter_uses_vision_block_and_output_schema(tmp_path):
     image = tmp_path / "coffee.webp"
-    image.write_bytes(b"synthetic")
+    _write_image(image)
     requests = []
 
     def handler(request):
         requests.append(request)
         return httpx.Response(
             200,
-            json={"content": [{"type": "text", "text": json.dumps(EXTRACTION)}]},
+            json={
+                "model": "claude-fable-5-20260731",
+                "content": [{"type": "text", "text": json.dumps(EXTRACTION)}],
+            },
         )
 
     provider = AnthropicVisionProvider(
@@ -219,20 +280,40 @@ def test_anthropic_adapter_uses_vision_block_and_output_schema(tmp_path):
     assert request.headers["x-api-key"] == "anthropic-secret"
     assert request.headers["anthropic-version"] == "2023-06-01"
     image_block = payload["messages"][0]["content"][0]
-    assert image_block["source"]["media_type"] == "image/webp"
+    assert image_block["source"]["media_type"] == "image/jpeg"
     assert payload["output_config"]["format"]["type"] == "json_schema"
+    schema = payload["output_config"]["format"]["schema"]
+    _assert_strict_schema(schema)
+    _assert_schema_omits(
+        schema,
+        {
+            "format",
+            "maxItems",
+            "maxLength",
+            "maximum",
+            "minItems",
+            "minLength",
+            "minimum",
+            "pattern",
+        },
+    )
+    assert provider.model == "claude-fable-5-20260731"
 
 
 def test_xai_adapter_uses_chat_schema_and_disables_storage(tmp_path):
     image = tmp_path / "coffee.jpeg"
-    image.write_bytes(b"synthetic")
+    _write_image(image)
     requests = []
 
     def handler(request):
         requests.append(request)
         return httpx.Response(
             200,
-            json={"choices": [{"message": {"content": json.dumps(EXTRACTION)}}]},
+            json={
+                "model": "grok-4.5-20260801",
+                "system_fingerprint": "fp_xai",
+                "choices": [{"message": {"content": json.dumps(EXTRACTION)}}],
+            },
         )
 
     provider = XAIVisionProvider(
@@ -255,6 +336,9 @@ def test_xai_adapter_uses_chat_schema_and_disables_storage(tmp_path):
     assert image_url["detail"] == "high"
     assert image_url["url"].startswith("data:image/jpeg;base64,")
     assert payload["response_format"]["json_schema"]["strict"] is True
+    _assert_strict_schema(payload["response_format"]["json_schema"]["schema"])
+    assert provider.model == "grok-4.5-20260801"
+    assert provider.model_digest == "fp_xai"
 
 
 @pytest.mark.parametrize(
@@ -338,7 +422,7 @@ def test_remote_adapter_rejects_heic_without_sending_image(tmp_path):
 
 def test_provider_failure_does_not_expose_secret_or_image(tmp_path):
     image = tmp_path / "coffee.jpg"
-    image.write_bytes(b"sensitive-image-bytes")
+    _write_image(image)
     provider = OpenAIVisionProvider(
         base_url="https://api.openai.test",
         api_key=SecretStr("openai-secret"),
@@ -358,3 +442,87 @@ def test_provider_failure_does_not_expose_secret_or_image(tmp_path):
     message = str(captured.value)
     assert "openai-secret" not in message
     assert "sensitive-image-bytes" not in message
+
+
+def test_remote_image_is_reencoded_without_exif(tmp_path):
+    image = tmp_path / "coffee.jpg"
+    _write_image(image, with_exif=True)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "output": [
+                    {
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(EXTRACTION),
+                            }
+                        ]
+                    }
+                ]
+            },
+        )
+
+    provider = OpenAIVisionProvider(
+        base_url="https://api.openai.test",
+        api_key=SecretStr("openai-secret"),
+        model="gpt-5.6-sol",
+        timeout=10,
+        transport=httpx.MockTransport(handler),
+    )
+
+    provider.analyze(image, allow_remote=True)
+
+    payload = json.loads(requests[0].content)
+    data_url = payload["input"][0]["content"][1]["image_url"]
+    encoded = data_url.partition(",")[2]
+    with Image.open(BytesIO(base64.b64decode(encoded))) as sent:
+        assert not sent.getexif()
+        assert max(sent.size) <= 4096
+
+
+def test_remote_provider_size_limit_is_checked_before_network(tmp_path):
+    image = tmp_path / "coffee.jpg"
+    _write_image(image)
+    provider = AnthropicVisionProvider(
+        base_url="https://anthropic.test",
+        api_key=SecretStr("anthropic-secret"),
+        model="claude-fable-5",
+        timeout=10,
+        transport=httpx.MockTransport(lambda request: pytest.fail("network must not be called")),
+    )
+    provider.max_image_bytes = 1
+
+    with pytest.raises(VisionUnavailable, match="size limit"):
+        provider.analyze(image, allow_remote=True)
+
+
+def test_gemini_binary_limit_leaves_room_for_base64_and_json():
+    encoded_bytes = 4 * ((GeminiVisionProvider.max_image_bytes + 2) // 3)
+
+    assert encoded_bytes < 20 * 1024 * 1024
+
+
+def test_http_200_with_invalid_json_is_invalid_output(tmp_path):
+    image = tmp_path / "coffee.jpg"
+    _write_image(image)
+    provider = OpenAIVisionProvider(
+        base_url="https://api.openai.test",
+        api_key=SecretStr("openai-secret"),
+        model="gpt-5.6-sol",
+        timeout=10,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=b"not-json",
+                headers={"content-type": "application/json"},
+            )
+        ),
+    )
+
+    with pytest.raises(VisionInvalidOutput, match="valid JSON"):
+        provider.analyze(image, allow_remote=True)

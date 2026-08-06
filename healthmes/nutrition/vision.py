@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import base64
+import copy
 import ipaddress
 import json
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
 import httpx
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import SecretStr, ValidationError
 
 from healthmes.config import Settings
@@ -60,17 +63,66 @@ _MIME_TYPES = {
     ".png": "image/png",
     ".webp": "image/webp",
 }
-_REMOTE_MIME_TYPES = frozenset({"image/gif", "image/jpeg", "image/png", "image/webp"})
+_REMOTE_INPUT_MIME_TYPES = frozenset({"image/gif", "image/jpeg", "image/png", "image/webp"})
+_SANITIZED_MIME_TYPES = frozenset({"image/jpeg", "image/png"})
+_REMOTE_MAX_DIMENSION = 4096
+_STRICT_EXTRACTION_SCHEMA: dict[str, Any] | None = None
+_ANTHROPIC_UNSUPPORTED_SCHEMA_KEYS = frozenset(
+    {
+        "format",
+        "maxItems",
+        "maxLength",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minimum",
+        "pattern",
+    }
+)
 
 
-def _image_bytes(image_path: Path) -> tuple[str, bytes]:
+def _image_mime_type(image_path: Path) -> str:
     mime_type = _MIME_TYPES.get(image_path.suffix.lower())
     if mime_type is None:
         raise VisionUnavailable("vision provider does not support this image type")
+    return mime_type
+
+
+def _image_bytes(image_path: Path) -> tuple[str, bytes]:
+    mime_type = _image_mime_type(image_path)
     try:
         return mime_type, image_path.read_bytes()
     except OSError as exc:
         raise VisionUnavailable("vision input could not be read") from exc
+
+
+def _sanitize_remote_image(image_path: Path) -> tuple[str, bytes]:
+    try:
+        with Image.open(image_path) as source:
+            source.seek(0)
+            image = ImageOps.exif_transpose(source)
+            image.thumbnail(
+                (_REMOTE_MAX_DIMENSION, _REMOTE_MAX_DIMENSION),
+                Image.Resampling.LANCZOS,
+            )
+            output = BytesIO()
+            has_alpha = image.mode in {"LA", "RGBA"} or (
+                image.mode == "P" and "transparency" in image.info
+            )
+            if has_alpha:
+                image.convert("RGBA").save(output, format="PNG", optimize=True)
+                mime_type = "image/png"
+            else:
+                image.convert("RGB").save(
+                    output,
+                    format="JPEG",
+                    quality=95,
+                    optimize=True,
+                )
+                mime_type = "image/jpeg"
+    except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+        raise VisionUnavailable("vision input could not be sanitized") from exc
+    return mime_type, output.getvalue()
 
 
 def _data_url(mime_type: str, image: bytes) -> str:
@@ -87,7 +139,7 @@ def _remote_guard(
     allow_remote: bool,
     base_url: str,
     api_key: str,
-    mime_type: str,
+    input_mime_type: str,
 ) -> None:
     if not allow_remote:
         raise VisionUnavailable("remote vision requires explicit allow_remote_vision=true")
@@ -95,8 +147,56 @@ def _remote_guard(
         raise VisionUnavailable("remote vision endpoints must use HTTPS")
     if not api_key:
         raise VisionUnavailable("selected remote vision provider is not configured")
-    if mime_type not in _REMOTE_MIME_TYPES:
-        raise VisionUnavailable(f"selected remote vision provider does not support {mime_type}")
+    if input_mime_type not in _REMOTE_INPUT_MIME_TYPES:
+        raise VisionUnavailable(
+            f"selected remote vision provider does not support {input_mime_type}"
+        )
+
+
+def _strict_extraction_schema() -> dict[str, Any]:
+    global _STRICT_EXTRACTION_SCHEMA
+    if _STRICT_EXTRACTION_SCHEMA is not None:
+        return copy.deepcopy(_STRICT_EXTRACTION_SCHEMA)
+
+    schema = VLMExtraction.model_json_schema()
+
+    def normalize(node: object) -> None:
+        if isinstance(node, dict):
+            node.pop("default", None)
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                node["required"] = list(properties)
+                node["additionalProperties"] = False
+            for value in node.values():
+                normalize(value)
+        elif isinstance(node, list):
+            for value in node:
+                normalize(value)
+
+    normalize(schema)
+    _STRICT_EXTRACTION_SCHEMA = schema
+    return copy.deepcopy(schema)
+
+
+def _anthropic_extraction_schema() -> dict[str, Any]:
+    schema = _strict_extraction_schema()
+
+    def normalize(node: object) -> None:
+        if isinstance(node, dict):
+            for key in _ANTHROPIC_UNSUPPORTED_SCHEMA_KEYS:
+                node.pop(key, None)
+            for key, value in node.items():
+                if key == "properties" and isinstance(value, dict):
+                    for property_schema in value.values():
+                        normalize(property_schema)
+                else:
+                    normalize(value)
+        elif isinstance(node, list):
+            for value in node:
+                normalize(value)
+
+    normalize(schema)
+    return schema
 
 
 def _post_json(
@@ -117,9 +217,12 @@ def _post_json(
         ) as client:
             response = client.post(path, json=payload)
             response.raise_for_status()
-            body = response.json()
-    except (OSError, httpx.HTTPError, ValueError) as exc:
+    except (OSError, httpx.HTTPError) as exc:
         raise VisionUnavailable("vision provider request failed") from exc
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise VisionInvalidOutput("vision response is not valid JSON") from exc
     if not isinstance(body, dict):
         raise VisionInvalidOutput("vision response must be a JSON object")
     return body
@@ -136,6 +239,7 @@ def _validate_content(content: object) -> VLMExtraction:
 
 class _RemoteVisionProvider:
     provider_name: str
+    max_image_bytes: int
 
     def __init__(
         self,
@@ -154,14 +258,34 @@ class _RemoteVisionProvider:
         self.transport = transport
 
     def _input(self, image_path: Path, *, allow_remote: bool) -> tuple[str, bytes]:
-        mime_type, image = _image_bytes(image_path)
+        input_mime_type = _image_mime_type(image_path)
         _remote_guard(
             allow_remote=allow_remote,
             base_url=self.base_url,
             api_key=self.api_key,
-            mime_type=mime_type,
+            input_mime_type=input_mime_type,
         )
+        mime_type, image = _sanitize_remote_image(image_path)
+        if mime_type not in _SANITIZED_MIME_TYPES:
+            raise VisionUnavailable(f"selected remote vision provider does not support {mime_type}")
+        if len(image) > self.max_image_bytes:
+            raise VisionUnavailable("sanitized image exceeds the selected provider size limit")
         return mime_type, image
+
+    def _response_model(
+        self,
+        body: dict[str, Any],
+        *,
+        model_key: str = "model",
+        fingerprint_key: str | None = None,
+    ) -> None:
+        actual_model = body.get(model_key)
+        if isinstance(actual_model, str) and actual_model.strip():
+            self.model = actual_model.strip()
+        if fingerprint_key is not None:
+            fingerprint = body.get(fingerprint_key)
+            if isinstance(fingerprint, str) and fingerprint.strip():
+                self.model_digest = fingerprint.strip()
 
 
 class OllamaVisionProvider:
@@ -210,12 +334,19 @@ class OllamaVisionProvider:
             transport=self.transport,
         )
 
+        actual_model = body.get("model")
+        if isinstance(actual_model, str) and actual_model.strip():
+            self.model = actual_model.strip()
+        digest = body.get("model_digest")
+        if isinstance(digest, str) and digest.strip():
+            self.model_digest = digest.strip()
         content = body.get("message", {}).get("content") if isinstance(body, dict) else None
         return _validate_content(content)
 
 
 class OpenAIVisionProvider(_RemoteVisionProvider):
     provider_name = "openai"
+    max_image_bytes = 20 * 1024 * 1024
 
     def analyze(self, image_path: Path, *, allow_remote: bool) -> VLMExtraction:
         mime_type, image = self._input(image_path, allow_remote=allow_remote)
@@ -245,13 +376,17 @@ class OpenAIVisionProvider(_RemoteVisionProvider):
                         "type": "json_schema",
                         "name": "nutrition_observation",
                         "strict": True,
-                        "schema": VLMExtraction.model_json_schema(),
+                        "schema": _strict_extraction_schema(),
                     }
                 },
             },
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout=self.timeout,
             transport=self.transport,
+        )
+        self._response_model(
+            body,
+            fingerprint_key="system_fingerprint",
         )
         output = body.get("output")
         if isinstance(output, list):
@@ -269,6 +404,9 @@ class OpenAIVisionProvider(_RemoteVisionProvider):
 
 class GeminiVisionProvider(_RemoteVisionProvider):
     provider_name = "gemini"
+    # Gemini inline requests cap the full JSON body at 20 MB. Fourteen MiB of
+    # binary expands to about 18.7 MiB in base64, leaving room for the schema.
+    max_image_bytes = 14 * 1024 * 1024
 
     def analyze(self, image_path: Path, *, allow_remote: bool) -> VLMExtraction:
         mime_type, image = self._input(image_path, allow_remote=allow_remote)
@@ -294,13 +432,14 @@ class GeminiVisionProvider(_RemoteVisionProvider):
                 "generationConfig": {
                     "temperature": 0,
                     "responseMimeType": "application/json",
-                    "responseJsonSchema": VLMExtraction.model_json_schema(),
+                    "responseJsonSchema": _strict_extraction_schema(),
                 },
             },
             headers={"x-goog-api-key": self.api_key},
             timeout=self.timeout,
             transport=self.transport,
         )
+        self._response_model(body, model_key="modelVersion")
         candidates = body.get("candidates")
         if isinstance(candidates, list) and candidates:
             content = candidates[0].get("content") if isinstance(candidates[0], dict) else None
@@ -313,6 +452,7 @@ class GeminiVisionProvider(_RemoteVisionProvider):
 
 class AnthropicVisionProvider(_RemoteVisionProvider):
     provider_name = "anthropic"
+    max_image_bytes = 5 * 1024 * 1024
 
     def analyze(self, image_path: Path, *, allow_remote: bool) -> VLMExtraction:
         mime_type, image = self._input(image_path, allow_remote=allow_remote)
@@ -342,7 +482,7 @@ class AnthropicVisionProvider(_RemoteVisionProvider):
                 "output_config": {
                     "format": {
                         "type": "json_schema",
-                        "schema": VLMExtraction.model_json_schema(),
+                        "schema": _anthropic_extraction_schema(),
                     }
                 },
             },
@@ -353,6 +493,7 @@ class AnthropicVisionProvider(_RemoteVisionProvider):
             timeout=self.timeout,
             transport=self.transport,
         )
+        self._response_model(body)
         content = body.get("content")
         if isinstance(content, list):
             for block in content:
@@ -363,6 +504,7 @@ class AnthropicVisionProvider(_RemoteVisionProvider):
 
 class XAIVisionProvider(_RemoteVisionProvider):
     provider_name = "xai"
+    max_image_bytes = 20 * 1024 * 1024
 
     def analyze(self, image_path: Path, *, allow_remote: bool) -> VLMExtraction:
         mime_type, image = self._input(image_path, allow_remote=allow_remote)
@@ -394,13 +536,17 @@ class XAIVisionProvider(_RemoteVisionProvider):
                     "json_schema": {
                         "name": "nutrition_observation",
                         "strict": True,
-                        "schema": VLMExtraction.model_json_schema(),
+                        "schema": _strict_extraction_schema(),
                     },
                 },
             },
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout=self.timeout,
             transport=self.transport,
+        )
+        self._response_model(
+            body,
+            fingerprint_key="system_fingerprint",
         )
         choices = body.get("choices")
         if isinstance(choices, list) and choices:
