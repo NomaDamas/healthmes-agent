@@ -312,9 +312,13 @@ Watch / Phone / Chat / Desktop
    - local-first, raw-first, ciphertext-only backup은 네트워크 효과는 아니지만 건강
      자동화에 필요한 신뢰 장벽을 낮춘다.
 4. **오픈 확장 생태계**
-   - metric, skill, notification policy, scheduling backend가 호환되는 생태계가
-     형성되면 분배와 학습 속도의 해자가 된다. 현재는 가능성이지 이미 존재하는 해자는
-     아니다.
+   - metric, skill, notification policy, scheduling backend뿐 아니라 공식 앱의
+     기능과 UI 연결 계약도 오픈소스로 제공한다. 개인·조직이 iOS, Android,
+     데스크톱, 웹 표면을 포크하거나 교체하면서도 동일한 저장소·MCP·판단 근거와
+     호환되게 한다.
+   - 코드 공개 자체는 해자가 아니다. 커스텀 앱, adapter, workflow가 공통 계약
+     위에서 재사용되고 개선이 다시 환원되는 생태계가 형성될 때 분배와 학습 속도의
+     보조 해자가 된다. 현재는 가능성이지 이미 존재하는 해자는 아니다.
 
 ### 현재의 냉정한 상태
 
