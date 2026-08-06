@@ -1,72 +1,95 @@
+import EventKit
 import SwiftUI
 import UserNotifications
 
-/// Settings tab: the pairing form plus notification status and the honest
-/// delivery story (OS-throttled background polling; Telegram remains the
-/// guaranteed channel).
+@MainActor
+private final class DeviceCalendarPermissionModel: ObservableObject {
+    @Published var status = EKEventStore.authorizationStatus(for: .event)
+    @Published var message: String?
+
+    private let store = EKEventStore()
+
+    func request() async {
+        do {
+            _ = try await store.requestFullAccessToEvents()
+            status = EKEventStore.authorizationStatus(for: .event)
+            message = nil
+        } catch {
+            status = EKEventStore.authorizationStatus(for: .event)
+            message = error.localizedDescription
+        }
+    }
+
+    var label: String {
+        switch status {
+        case .fullAccess, .authorized:
+            return String(localized: "Device access granted")
+        case .writeOnly:
+            return String(localized: "Write-only access")
+        case .denied, .restricted:
+            return String(localized: "Permission denied")
+        case .notDetermined:
+            return String(localized: "Not requested")
+        @unknown default:
+            return String(localized: "Unknown")
+        }
+    }
+}
+
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var notificationStatus: UNAuthorizationStatus = .notDetermined
     @State private var showAdvanced = false
+    @StateObject private var calendarPermission = DeviceCalendarPermissionModel()
 
     var body: some View {
         Form {
             Section {
                 if let pairing = PairingStore.shared.load() {
-                    LabeledContent("Connected") {
+                    readinessRow(
+                        "HealthMes instance",
+                        value: instanceMode(pairing),
+                        systemImage: "network"
+                    )
+                    readinessRow(
+                        "Health feed",
+                        value: "Via paired instance",
+                        systemImage: "heart.text.square"
+                    )
+                    readinessRow(
+                        "Apple Calendar on device",
+                        value: calendarPermission.label,
+                        systemImage: "calendar"
+                    )
+                    readinessRow(
+                        "Decision notifications",
+                        value: statusText,
+                        systemImage: "bell.badge"
+                    )
+                    readinessRow(
+                        "Apple Watch",
+                        value: "Pairing follows iPhone",
+                        systemImage: "applewatch"
+                    )
+                    LabeledContent("Instance host") {
                         Text(verbatim: pairing.baseURL.host ?? pairing.baseURL.absoluteString)
-                    }
-                    Link(destination: ViewerURL.make(pairing: pairing, pathComponents: ["dashboard"])) {
-                        Label("Open web dashboard", systemImage: "safari")
                     }
                 } else {
                     Text("Not connected")
                         .foregroundStyle(.secondary)
                 }
             } header: {
-                Text("Account")
-            }
-
-            Section {
-                Label("Apple Health data stays on your devices and paired instance.", systemImage: "heart.text.square")
-                Text("Health permission changes are managed in iOS Settings.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            } header: {
-                Text("Health")
+                Text("Ready check")
+            } footer: {
+                Text("Device calendar permission and HealthMes server synchronization are separate. A proposal is on the external calendar only after it reaches Applied.")
             }
 
             Section {
                 if let pairing = PairingStore.shared.load() {
-                    Link(destination: ViewerURL.make(pairing: pairing, pathComponents: ["connect"])) {
-                        Label("Manage Google and iCloud calendars", systemImage: "calendar.badge.clock")
+                    Link(destination: ViewerURL.make(pairing: pairing, pathComponents: ["dashboard"])) {
+                        Label("Open detailed web dashboard", systemImage: "safari")
                     }
                 }
-                Text("Approved proposals are applied by calendar sync; No leaves the calendar unchanged.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            } header: {
-                Text("Calendar")
-            }
-
-            Section {
-                Label("Pairing syncs automatically from this iPhone.", systemImage: "applewatch")
-                Text("The Watch keeps only the compact Yes/No decision remote.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            } header: {
-                Text("Apple Watch")
-            }
-
-            Section {
-                Label("Storage and retention require owner authentication on the HealthMes host.", systemImage: "externaldrive")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            } header: {
-                Text("Storage")
-            }
-
-            Section {
                 NavigationLink {
                     WeeklyReportView()
                 } label: {
@@ -78,18 +101,42 @@ struct SettingsView: View {
                     Label("Capture", systemImage: "camera")
                 }
             } header: {
-                Text("More")
-            } footer: {
-                Text("Daily essentials stay on Today, Plan, and Decisions.")
+                Text("Details")
             }
 
             Section {
                 DisclosureGroup(isExpanded: $showAdvanced) {
+                    if calendarPermission.status == .notDetermined {
+                        Button {
+                            Task { await calendarPermission.request() }
+                        } label: {
+                            Label("Request Apple Calendar access", systemImage: "calendar.badge.plus")
+                        }
+                    }
+                    if let message = calendarPermission.message {
+                        Text(verbatim: message)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                    if let pairing = PairingStore.shared.load() {
+                        Link(destination: ViewerURL.make(pairing: pairing, pathComponents: ["connect"])) {
+                            Label("Server calendar connections", systemImage: "calendar.badge.clock")
+                        }
+                        Text("Google OAuth and iCloud CalDAV configure the paired server. EventKit permission above only grants this app access to calendars already configured on this iPhone.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                     NavigationLink {
                         PairingView()
                             .navigationTitle(Text("Pairing"))
                     } label: {
                         Label("Self-host pairing and API token", systemImage: "link")
+                    }
+                    Label("Storage and retention require owner authentication on the HealthMes host.", systemImage: "externaldrive")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    LabeledContent("Version") {
+                        Text(verbatim: appVersion)
                     }
                 } label: {
                     Label("Advanced", systemImage: "slider.horizontal.3")
@@ -97,11 +144,6 @@ struct SettingsView: View {
             }
 
             Section {
-                LabeledContent {
-                    Text(verbatim: statusText)
-                } label: {
-                    Text("Notifications")
-                }
                 if notificationStatus == .notDetermined {
                     Button {
                         Task {
@@ -123,21 +165,6 @@ struct SettingsView: View {
                 Text(
                     "Native notifications come from background polling, which iOS throttles (typically a few checks per hour at best). For guaranteed, immediate delivery keep the Telegram channel — it stays the reliable path until a push relay exists."
                 )
-            }
-
-            Section {
-                LabeledContent {
-                    Text(verbatim: appVersion)
-                } label: {
-                    Text("Version")
-                }
-                Text(
-                    "Local-first: this app talks only to your paired instance. No analytics, no third-party services, no cloud relay."
-                )
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            } header: {
-                Text("About")
             }
         }
         .navigationTitle(Text("Settings"))
@@ -166,5 +193,31 @@ struct SettingsView: View {
         let version =
             Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         return version ?? "—"
+    }
+
+    private func readinessRow(
+        _ title: LocalizedStringKey,
+        value: String,
+        systemImage: String
+    ) -> some View {
+        LabeledContent {
+            Text(verbatim: value)
+                .foregroundStyle(.secondary)
+        } label: {
+            Label(title, systemImage: systemImage)
+        }
+    }
+
+    private func instanceMode(_ pairing: Pairing) -> String {
+        guard let host = pairing.baseURL.host?.lowercased() else {
+            return String(localized: "Self-host")
+        }
+        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+            return String(localized: "Local demo")
+        }
+        if pairing.baseURL.scheme?.lowercased() == "https" {
+            return String(localized: "HTTPS instance")
+        }
+        return String(localized: "LAN self-host")
     }
 }

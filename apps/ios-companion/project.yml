@@ -86,6 +86,9 @@ targets:
         NSFaceIDUsageDescription: >-
           HealthMes verifies that it is you before applying a calendar
           decision from the lock screen.
+        NSCalendarsFullAccessUsageDescription: >-
+          HealthMes checks calendars already configured on this iPhone so
+          device permission and server synchronization can be shown separately.
         # Focus-block Live Activity (polling-updated; no push channel).
         NSSupportsLiveActivities: true
         NSSupportsLiveActivitiesFrequentUpdates: false
