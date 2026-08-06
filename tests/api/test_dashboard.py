@@ -133,7 +133,7 @@ def _seed_dashboard(session) -> uuid.UUID:
     return decision.id
 
 
-def test_dashboard_renders_four_simple_sections(client, session) -> None:
+def test_dashboard_renders_single_wellness_control_canvas(client, session) -> None:
     decision_id = _seed_dashboard(session)
 
     response = client.get("/dashboard")
@@ -141,27 +141,70 @@ def test_dashboard_renders_four_simple_sections(client, session) -> None:
     assert response.status_code == 200
     assert response.headers["cache-control"] == "private, no-store"
     html = response.text
+    assert "data-control-shell" in html
+    assert 'role="tablist"' in html
+    assert 'data-lens-target="now"' in html
+    assert 'data-lens-target="adjust"' in html
+    assert 'data-lens-target="change"' in html
+    assert ">지금</strong>" in html
+    assert ">조율</strong>" in html
+    assert ">변화</strong>" in html
+    assert "dashboard-tabs" not in html
     for section in ("today", "plan", "decisions", "history"):
         assert f'id="{section}"' in html
+    for primitive in (
+        "wellness_state",
+        "impact_flow",
+        "schedule_timeline",
+        "decision_remote",
+        "proposal",
+        "goal_progress",
+        "decision_history",
+        "outcome_summary",
+        "insight_list",
+        "learning_loop",
+    ):
+        assert f'data-ui-primitive="{primitive}"' in html
     assert "Apple 앱 Live QA" in html
     assert "Deep Work" in html
     assert "짧은 수면 뒤 오후 집중 시간이 흔들렸습니다." in html
     assert f"/decisions/{decision_id}" in html
     assert "<details" in html
-    assert "Advanced · 연결과 데이터 관리" in html
+    assert '<details class="advanced" id="advanced">' in html
+    assert "Advanced · 연결, 원시 데이터, 긴 기록" in html
     assert 'role="progressbar"' in html
-    assert "만료 " in html
+    assert "응답 기한 " in html
+    assert "상태 → 계획 영향" in html
+    assert "Apple 앱에서 Yes 또는 No를 결정합니다." in html
 
 
-def test_dashboard_sections_have_direct_routes(client) -> None:
-    for path, fragment in (
-        ("/dashboard/plan", 'id="plan"'),
-        ("/dashboard/decisions", 'id="decisions"'),
-        ("/dashboard/history", 'id="history"'),
+def test_dashboard_command_dock_is_persistent_visual_and_read_only(client) -> None:
+    response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    html = response.text
+    assert 'id="command-dock"' in html
+    assert "data-command-dock" in html
+    assert "HealthMes에 말하거나 입력하기" in html
+    assert "음성·텍스트 명령과 Yes/No 실행은 iPhone 또는 Mac 앱에서 합니다." in html
+    assert 'id="command-preview"' in html
+    assert "readonly" in html
+    assert html.count("disabled") >= 2
+    assert "<form" not in html
+
+
+def test_dashboard_legacy_routes_return_same_control_surface(client) -> None:
+    for path, lens, fragment in (
+        ("/dashboard/plan", "adjust", 'id="plan"'),
+        ("/dashboard/decisions", "adjust", 'id="decisions"'),
+        ("/dashboard/history", "change", 'id="history"'),
     ):
         response = client.get(path)
         assert response.status_code == 200
+        assert "data-control-shell" in response.text
+        assert f'data-lens-target="{lens}"' in response.text
         assert fragment in response.text
+        assert "lensFromLocation" in response.text
 
 
 def test_empty_dashboard_is_honest_and_useful(client) -> None:
@@ -172,6 +215,8 @@ def test_empty_dashboard_is_honest_and_useful(client) -> None:
     assert "지금 결정할 제안이 없습니다." in response.text
     assert "이번 주 활성 목표가 없습니다." in response.text
     assert "아직 기록된 판단이 없습니다." in response.text
+    assert "없는 원인은 추정하지 않습니다." in response.text
+    assert "임의의 행동이나 건강 원인을 만들어 표시하지 않습니다." in response.text
 
 
 def test_secured_dashboard_uses_friendly_unlock_and_exact_return(settings) -> None:
@@ -268,8 +313,11 @@ def test_dashboard_links_preserve_reverse_proxy_base_path(settings) -> None:
         response = client.get("/dashboard")
 
     assert response.status_code == 200
+    assert 'href="/healthmes/dashboard#today"' in response.text
     assert 'href="/healthmes/dashboard/plan#plan"' in response.text
+    assert 'href="/healthmes/dashboard/history#history"' in response.text
     assert 'href="/healthmes/connect"' in response.text
+    assert 'href="/healthmes/sleep"' in response.text
 
 
 def test_unlock_form_preserves_reverse_proxy_base_path(settings) -> None:
@@ -313,6 +361,8 @@ def test_authenticated_dashboard_decision_links_are_read_only(settings) -> None:
         f"?token={viewer_token(TOKEN)}"
     )
     assert expected.replace("&", "&amp;") in response.text
+    lens_link = f'/dashboard/plan?token={viewer_token(TOKEN)}#plan'
+    assert f'href="{lens_link}"' in response.text
     assert TOKEN not in response.text
 
 
