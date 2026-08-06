@@ -383,6 +383,40 @@ final class ProductContractTests: XCTestCase {
         )
     }
 
+    func testWellnessSceneValidatorRejectsDuplicateItemIdentity() {
+        let duplicated = WellnessSceneItem(
+            id: "weekly-report",
+            label: "Decisions",
+            value: "4"
+        )
+        let scene = WellnessScene(
+            id: "duplicate-items",
+            lens: .change,
+            title: "Weekly outcome",
+            summary: "Metrics",
+            severity: .neutral,
+            freshness: .current,
+            modules: [
+                WellnessSceneModule(
+                    id: "weekly",
+                    kind: .outcomeCurve,
+                    title: "Weekly outcome",
+                    summary: "Metrics",
+                    items: [duplicated, duplicated]
+                )
+            ]
+        )
+
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(error as? WellnessSceneValidationError, .duplicateItemID)
+        }
+    }
+
     func testWellnessCommandParserUsesLensesAndExplicitWritePrefixes() {
         XCTAssertEqual(
             WellnessCommandParser.parse("지금 내 상태 보여줘"),

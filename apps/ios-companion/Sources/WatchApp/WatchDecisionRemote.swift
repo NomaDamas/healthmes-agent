@@ -118,8 +118,10 @@ final class WatchDecisionRemoteModel: ObservableObject {
     private let glanceClient = GlanceClient()
 
     func refresh() async {
+        // Refresh leaves the transient action/result screen and recomputes the
+        // best available proposal or wellness glance from current data.
+        result = nil
         guard PairingStore.shared.load() != nil else {
-            result = .offline
             availability = .unpaired
             glanceLine = nil
             energyScore = nil
@@ -139,7 +141,6 @@ final class WatchDecisionRemoteModel: ObservableObject {
             result = nil
         } catch {
             decision = nil
-            result = .offline
             availability = Self.availability(for: error)
         }
 

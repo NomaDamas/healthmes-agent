@@ -1462,22 +1462,22 @@ private enum MacWellnessSceneProjector {
         if let report, let breakdown {
             metrics = [
                 WellnessSceneItem(
-                    id: "weekly-report",
+                    id: "weekly-decisions",
                     label: "Decisions",
                     value: "\(report.decisions.count)"
                 ),
                 WellnessSceneItem(
-                    id: "weekly-report",
+                    id: "weekly-sync-pending",
                     label: "Sync pending",
                     value: "\(breakdown.syncPending)"
                 ),
                 WellnessSceneItem(
-                    id: "weekly-report",
+                    id: "weekly-applied",
                     label: "Calendar applied",
                     value: "\(breakdown.applied)"
                 ),
                 WellnessSceneItem(
-                    id: "weekly-report",
+                    id: "weekly-acceptance",
                     label: "Plan acceptance",
                     value: report.schedule.acceptancePct.map { "\($0)%" } ?? "—"
                 ),

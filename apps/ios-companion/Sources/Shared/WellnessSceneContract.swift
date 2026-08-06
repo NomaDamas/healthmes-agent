@@ -187,6 +187,7 @@ public struct WellnessScene: Codable, Equatable, Identifiable {
 
 public enum WellnessSceneValidationError: Error, Equatable {
     case emptyScene
+    case duplicateItemID
     case mutationWithoutProposal
     case createWithoutValue
     case unsafeWebURL
@@ -200,6 +201,10 @@ public enum WellnessSceneValidator {
     ) throws {
         guard !scene.modules.isEmpty else {
             throw WellnessSceneValidationError.emptyScene
+        }
+        let itemIDs = scene.modules.flatMap(\.items).map(\.id)
+        guard Set(itemIDs).count == itemIDs.count else {
+            throw WellnessSceneValidationError.duplicateItemID
         }
         for action in scene.actions {
             switch action.kind {
