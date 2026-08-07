@@ -74,6 +74,10 @@ def _proposal_args(
     event_start_local: dt.datetime,
     target_sleep_local: dt.datetime,
 ) -> dict[str, object]:
+    baseline_confirmed_at = min(
+        dt.datetime.now(event_start_local.tzinfo) - dt.timedelta(minutes=1),
+        event_start_local - dt.timedelta(hours=1),
+    )
     return {
         "event_id": str(event_id),
         "personal_daily_limit_mg": 300,
@@ -82,7 +86,7 @@ def _proposal_args(
         "intended_consumption_at": event_start_local.isoformat(),
         "target_sleep_at": target_sleep_local.isoformat(),
         "personal_event_baseline_mg": 100,
-        "baseline_confirmed_at": (event_start_local - dt.timedelta(hours=1)).isoformat(),
+        "baseline_confirmed_at": baseline_confirmed_at.isoformat(),
         "cutoff_before_sleep_hours": 6,
         "contraindications": [],
     }

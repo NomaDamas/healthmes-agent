@@ -1456,6 +1456,35 @@ def test_photo_adapter_keeps_sake_observation_and_maps_caffeine(
     assert conflict.status_code == 409
 
 
+def test_confirmed_photo_review_promotes_nutrients_to_user_origin(client):
+    observation_id = _photo_observation(client)
+    reviewed = client.post(
+        f"/v1/nutrition-observations/{observation_id}/review",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "confirmed",
+            "source": "desktop-web",
+        },
+    )
+    assert reviewed.status_code == 201
+    created = client.post(
+        "/v1/intake-interactions",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "intent": "log_consumed",
+            "modality": "photo",
+            "source": "ios-device",
+            "nutrition_observation_id": observation_id,
+        },
+    )
+    assert created.status_code == 201
+    assert {
+        nutrient["origin"]
+        for item in created.json()["items"]
+        for nutrient in item["nutrients"]
+    } == {"user"}
+
+
 def test_photo_review_correction_flows_into_interaction_search_and_context(
     client, session
 ):
