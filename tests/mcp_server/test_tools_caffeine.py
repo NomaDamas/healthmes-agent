@@ -34,6 +34,7 @@ from healthmes.nutrition.intake_contracts import (
 )
 from healthmes.nutrition.intake_service import (
     create_interaction,
+    create_photo_interaction,
     persist_outcome,
 )
 from healthmes.nutrition.repository import (
@@ -209,7 +210,8 @@ def _seed_confirmed_text_caffeine(
     *,
     day: dt.date,
     amount_mg: float,
-) -> uuid.UUID:
+    origin: EvidenceOrigin = EvidenceOrigin.USER,
+) -> tuple[uuid.UUID, uuid.UUID]:
     server_module.set_timezone("Asia/Seoul")
     settings = server_module._active_settings()
     local_timezone = dt.timezone(dt.timedelta(hours=9))
@@ -256,19 +258,20 @@ def _seed_confirmed_text_caffeine(
                             estimation_basis="owner_statement",
                         ),
                         confidence=Confidence.HIGH,
-                        origin=EvidenceOrigin.USER,
+                        origin=origin,
                     ),
                 ),
                 confidence=Confidence.HIGH,
             ),
         ),
     )
+    outcome_id = uuid.uuid4()
     with store_factory() as session:
         create_interaction(session, settings, interaction)
         persist_outcome(
             session,
             IntakeOutcome(
-                outcome_id=uuid.uuid4(),
+                outcome_id=outcome_id,
                 operation_fingerprint="b" * 64,
                 interaction_id=interaction_id,
                 status=IntakeOutcomeStatus.CONSUMED,
@@ -287,10 +290,11 @@ def _seed_confirmed_text_caffeine(
                 total_intake_complete=True,
                 confirmed_at=observed_at + dt.timedelta(minutes=2),
                 source="fixture-user",
+                outcome_ids=(outcome_id,),
             ),
         )
         session.commit()
-    return interaction_id
+    return interaction_id, outcome_id
 
 
 def _local_times(
@@ -385,7 +389,7 @@ class TestCaffeineProposalTool:
             end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
         )
         mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
-        interaction_id = _seed_confirmed_text_caffeine(
+        interaction_id, _ = _seed_confirmed_text_caffeine(
             store_factory,
             day=day,
             amount_mg=150.1,
@@ -409,6 +413,156 @@ class TestCaffeineProposalTool:
         assert result["facts"]["caffeine_intake"]["evidence"][0][
             "interaction_id"
         ] == str(interaction_id)
+
+    async def test_agent_estimate_is_not_promoted_to_known_intake(
+        self,
+        mcp_client,
+        call_tool,
+        mcp_env,
+        store_factory,
+        pinned_tz,
+    ):
+        day, event_start, target_sleep = _local_times(pinned_tz)
+        event_id = _seed_event(
+            store_factory,
+            start=event_start.astimezone(dt.UTC),
+            end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+        )
+        mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        _seed_confirmed_text_caffeine(
+            store_factory,
+            day=day,
+            amount_mg=125.5,
+            origin=EvidenceOrigin.AGENT,
+        )
+
+        result = await call_tool(
+            mcp_client,
+            "get_caffeine_proposal",
+            _proposal_args(
+                event_id,
+                event_start_local=event_start,
+                target_sleep_local=target_sleep,
+            ),
+        )
+
+        assert result["status"] == "insufficient_data"
+        assert result["reason"] == "missing_total_intake"
+        assert result["facts"]["caffeine_intake"]["status"] == "incomplete"
+        assert result["facts"]["caffeine_intake"][
+            "unquantified_outcome_ids"
+        ]
+
+    async def test_later_outcome_invalidates_prior_daily_confirmation(
+        self,
+        mcp_client,
+        call_tool,
+        mcp_env,
+        store_factory,
+        pinned_tz,
+    ):
+        day, event_start, target_sleep = _local_times(pinned_tz)
+        event_id = _seed_event(
+            store_factory,
+            start=event_start.astimezone(dt.UTC),
+            end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+        )
+        mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        interaction_id, _ = _seed_confirmed_text_caffeine(
+            store_factory,
+            day=day,
+            amount_mg=125,
+        )
+        with store_factory() as session:
+            persist_outcome(
+                session,
+                IntakeOutcome(
+                    outcome_id=uuid.uuid4(),
+                    operation_fingerprint="c" * 64,
+                    interaction_id=interaction_id,
+                    status=IntakeOutcomeStatus.NOT_CONSUMED,
+                    confirmed_at=dt.datetime.now(dt.UTC)
+                    + dt.timedelta(minutes=3),
+                    source="fixture-user",
+                ),
+            )
+            session.commit()
+
+        result = await call_tool(
+            mcp_client,
+            "get_caffeine_proposal",
+            _proposal_args(
+                event_id,
+                event_start_local=event_start,
+                target_sleep_local=target_sleep,
+            ),
+        )
+
+        assert result["status"] == "insufficient_data"
+        assert result["facts"]["caffeine_intake"]["status"] == "incomplete"
+        assert result["facts"]["caffeine_intake"]["confirmed_caffeine_mg"] == 0
+
+    async def test_photo_consumed_on_later_day_is_not_counted_twice(
+        self,
+        mcp_client,
+        call_tool,
+        store_factory,
+        pinned_tz,
+    ):
+        today, _, _ = _local_times(pinned_tz)
+        captured_day = today - dt.timedelta(days=1)
+        observation_id = _seed_confirmed_caffeine(
+            store_factory,
+            day=captured_day,
+            amount_mg=100,
+        )
+        interaction_id = uuid.uuid4()
+        outcome_id = uuid.uuid4()
+        with store_factory() as session:
+            create_photo_interaction(
+                session,
+                server_module._active_settings(),
+                observation_id=observation_id,
+                operation_id=interaction_id,
+                operation_fingerprint="d" * 64,
+                intent=IntakeIntent.LOG_CONSUMED,
+                source="caffeine-tool-test",
+                recorded_at=dt.datetime.now(dt.UTC),
+            )
+            persist_outcome(
+                session,
+                IntakeOutcome(
+                    outcome_id=outcome_id,
+                    operation_fingerprint="e" * 64,
+                    interaction_id=interaction_id,
+                    status=IntakeOutcomeStatus.CONSUMED,
+                    confirmed_at=dt.datetime.now(dt.UTC),
+                    source="fixture-user",
+                    consumed_at=dt.datetime.now(dt.UTC),
+                ),
+            )
+            session.commit()
+
+        captured = await call_tool(
+            mcp_client,
+            "get_known_caffeine_intake_for_day",
+            {"date": captured_day.isoformat()},
+        )
+        consumed = await call_tool(
+            mcp_client,
+            "get_known_caffeine_intake_for_day",
+            {"date": today.isoformat()},
+        )
+
+        assert captured["status"] == "incomplete"
+        assert captured["confirmed_caffeine_mg"] == 0
+        assert captured["outcome_state_count"] == 1
+        assert consumed["status"] == "incomplete"
+        assert consumed["confirmed_caffeine_mg"] == 0
+        assert consumed["evidence"][0]["nutrition_observation_id"] == str(
+            observation_id
+        )
+        assert consumed["evidence"][0]["outcome_id"] == str(outcome_id)
 
     async def test_unknown_event_fails_closed_without_provider_lookup(
         self,

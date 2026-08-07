@@ -174,6 +174,7 @@ class DailyIntakeConfirmation:
     total_intake_complete: bool
     confirmed_at: datetime
     source: str
+    outcome_ids: tuple[uuid.UUID, ...] = ()
 
 
 _OBSERVATION_ADAPTER = TypeAdapter(NutritionObservation)

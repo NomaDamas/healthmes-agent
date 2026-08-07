@@ -493,6 +493,9 @@ def test_caffeine_context_includes_confirmed_text_outcome_evidence(
             "local_date": "2026-08-06",
             "timezone": "Asia/Seoul",
             "observation_ids": [],
+            "outcome_ids": [
+                outcome.json()["latest_outcome"]["outcome_id"]
+            ],
             "total_intake_complete": True,
             "source": "desktop-web",
         },

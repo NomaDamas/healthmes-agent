@@ -237,6 +237,7 @@ class ConfirmDayInput(BaseModel):
     local_date: date
     timezone: str = Field(min_length=1, max_length=64)
     observation_ids: list[uuid.UUID] = Field(max_length=100)
+    outcome_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
     total_intake_complete: bool
     source: str = Field(min_length=1, max_length=64)
 
@@ -248,6 +249,8 @@ class ConfirmDayInput(BaseModel):
             raise ValueError("timezone must be a valid IANA timezone") from exc
         if len(self.observation_ids) != len(set(self.observation_ids)):
             raise ValueError("observation_ids must not contain duplicates")
+        if len(self.outcome_ids) != len(set(self.outcome_ids)):
+            raise ValueError("outcome_ids must not contain duplicates")
         return self
 
 
@@ -398,6 +401,7 @@ def confirm_daily_intake(
         total_intake_complete=body.total_intake_complete,
         confirmed_at=utc_now(),
         source=body.source,
+        outcome_ids=tuple(body.outcome_ids),
     )
     try:
         persist_daily_confirmation(session, confirmation)
@@ -412,6 +416,7 @@ def confirm_daily_intake(
         "confirmation_id": str(confirmation.confirmation_id),
         "local_date": confirmation.local_date.isoformat(),
         "total_intake_complete": confirmation.total_intake_complete,
+        "outcome_ids": [str(value) for value in confirmation.outcome_ids],
     }
 
 

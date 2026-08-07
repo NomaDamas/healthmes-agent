@@ -2987,11 +2987,12 @@ def get_caffeine_observations(date: str | None = None) -> dict[str, Any]:
 def get_known_caffeine_intake_for_day(
     date: str | None = None,
 ) -> dict[str, Any]:
-    """Return caffeine total only from explicitly reviewed photo observations.
+    """Return the unified confirmed caffeine ledger for one local day.
 
-    ``total_intake_complete`` is true only when a separate user confirmation
-    covers every observation for that local day. Storage presence alone never
-    proves that the user's daily intake is complete. This tool is read-only.
+    Photo values require explicit review, while text/voice/photo consumption
+    outcomes require user- or label-origin exact caffeine facts.
+    ``total_intake_complete`` is true only when a separate confirmation binds
+    every observation and latest outcome affecting the day. This is read-only.
     """
     timezone = _local_timezone()
     day = _parse_date_local(date, "date", timezone)
@@ -3152,25 +3153,36 @@ def confirm_photo_caffeine_day(
     date: str,
     observation_ids: list[str],
     total_intake_complete: bool,
+    outcome_ids: list[str] | None = None,
     trusted_session_proof: str | None = None,
 ) -> dict[str, Any]:
-    """Persist the owner's explicit statement about one day's intake coverage.
+    """Persist the owner's explicit statement about unified intake coverage.
 
-    The proof binds the exact local date, observation IDs, and completeness
-    boolean. Merely finding photos in storage never implies a complete day.
+    The compatibility name predates text and voice capture. The proof binds
+    the exact local date, photo observation IDs, latest intake outcome IDs,
+    and completeness boolean. Storage presence never implies a complete day.
     """
+    outcome_ids = outcome_ids or []
     if len(observation_ids) != len(set(observation_ids)):
         raise ToolError("observation_ids must not contain duplicates")
+    if len(outcome_ids) != len(set(outcome_ids)):
+        raise ToolError("outcome_ids must not contain duplicates")
     day = _parse_date(date, "date")
     parsed_ids = [
         _parse_uuid(value, f"observation_ids[{index}]")
         for index, value in enumerate(observation_ids)
+    ]
+    parsed_outcome_ids = [
+        _parse_uuid(value, f"outcome_ids[{index}]")
+        for index, value in enumerate(outcome_ids)
     ]
     proof_arguments = {
         "date": date,
         "observation_ids": observation_ids,
         "total_intake_complete": total_intake_complete,
     }
+    if outcome_ids:
+        proof_arguments["outcome_ids"] = outcome_ids
     _require_trusted_telegram_owner_proof(
         trusted_session_proof,
         tool_name="confirm_photo_caffeine_day",
@@ -3186,6 +3198,7 @@ def confirm_photo_caffeine_day(
         total_intake_complete=total_intake_complete,
         confirmed_at=dt.datetime.now(dt.UTC),
         source="telegram-owner",
+        outcome_ids=tuple(parsed_outcome_ids),
     )
     try:
         with _store_session() as session:
@@ -3197,6 +3210,7 @@ def confirm_photo_caffeine_day(
         "confirmation_id": str(confirmation.confirmation_id),
         "local_date": date,
         "total_intake_complete": total_intake_complete,
+        "outcome_ids": outcome_ids,
     }
 
 

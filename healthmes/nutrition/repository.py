@@ -32,6 +32,11 @@ from healthmes.nutrition.contracts import (
     observation_from_payload,
     observation_to_payload,
 )
+from healthmes.nutrition.intake_contracts import (
+    IntakeOutcome,
+    IntakeOutcomeStatus,
+    outcome_from_payload,
+)
 from healthmes.nutrition.schema import (
     CORE_NUTRIENT_UNITS,
     SUPPORTED_NUTRIENT_UNITS,
@@ -46,6 +51,8 @@ DAILY_CONFIRMATION_EVENT = "nutrition.daily-confirmation.v1"
 SOURCE_PROVIDER = "sake-vlm"
 RAW_OBSERVATION_EVENT = "nutrition.observation-raw.v1"
 RAW_SOURCE_PROVIDER = "sake-vlm-raw"
+INTAKE_OUTCOME_EVENT = "nutrition.intake-outcome.v1"
+INTAKE_OUTCOME_PROVIDER = "nutrition-intake-outcome"
 MAX_CAPTURE_CLOCK_SKEW = timedelta(minutes=5)
 
 
@@ -624,15 +631,38 @@ def persist_daily_confirmation(
         )
     }
     supplied_ids = set(confirmation.observation_ids)
+    outcome_states = intake_outcome_states_for_day(
+        session,
+        start=start,
+        end=end,
+    )
+    day_outcome_ids = {
+        outcome.outcome_id for _, outcome in outcome_states
+    }
+    supplied_outcome_ids = set(confirmation.outcome_ids)
     unknown = supplied_ids - day_ids
     if unknown:
         raise NutritionRepositoryError(
             "nutrition observations are not part of the confirmed local day: "
             + ", ".join(sorted(str(value) for value in unknown))
         )
+    unknown_outcomes = supplied_outcome_ids - day_outcome_ids
+    if unknown_outcomes:
+        raise NutritionRepositoryError(
+            "intake outcomes do not affect the confirmed local day: "
+            + ", ".join(sorted(str(value) for value in unknown_outcomes))
+        )
     if confirmation.total_intake_complete and supplied_ids != day_ids:
         raise NutritionRepositoryError(
             "complete-day confirmation must include every observation for that local day"
+        )
+    if (
+        confirmation.total_intake_complete
+        and supplied_outcome_ids != day_outcome_ids
+    ):
+        raise NutritionRepositoryError(
+            "complete-day confirmation must include every latest intake "
+            "outcome affecting that local day"
         )
     policy = _policy(session, "nutrition_confirmation")
     observed_at = _as_utc(confirmation.confirmed_at)
@@ -654,12 +684,75 @@ def persist_daily_confirmation(
         expires_at=_expiry(policy, observed_at),
         payload=daily_confirmation_to_payload(confirmation),
         derived_from={
-            "observation_ids": [str(value) for value in confirmation.observation_ids]
+            "observation_ids": [str(value) for value in confirmation.observation_ids],
+            "outcome_ids": [str(value) for value in confirmation.outcome_ids],
         },
     )
     session.add(event)
     session.flush()
     return event
+
+
+def latest_intake_outcome_states(
+    session: Session,
+) -> dict[uuid.UUID, tuple[WellnessEvent, IntakeOutcome]]:
+    rows = session.scalars(
+        select(WellnessEvent)
+        .where(
+            WellnessEvent.event_type == INTAKE_OUTCOME_EVENT,
+            WellnessEvent.source_provider == INTAKE_OUTCOME_PROVIDER,
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > datetime.now(UTC),
+            ),
+        )
+        .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
+    )
+    latest: dict[uuid.UUID, tuple[WellnessEvent, IntakeOutcome]] = {}
+    for row in rows:
+        outcome = outcome_from_payload(row.payload)
+        latest.setdefault(outcome.interaction_id, (row, outcome))
+    return latest
+
+
+def intake_outcome_states_for_day(
+    session: Session,
+    *,
+    start: datetime,
+    end: datetime,
+) -> list[tuple[WellnessEvent, IntakeOutcome]]:
+    rows = session.scalars(
+        select(WellnessEvent)
+        .where(
+            WellnessEvent.event_type == INTAKE_OUTCOME_EVENT,
+            WellnessEvent.source_provider == INTAKE_OUTCOME_PROVIDER,
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > datetime.now(UTC),
+            ),
+        )
+        .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
+    )
+    latest: dict[uuid.UUID, tuple[WellnessEvent, IntakeOutcome]] = {}
+    affected_interactions: set[uuid.UUID] = set()
+    for row in rows:
+        outcome = outcome_from_payload(row.payload)
+        latest.setdefault(outcome.interaction_id, (row, outcome))
+        if (
+            outcome.status is IntakeOutcomeStatus.CONSUMED
+            and outcome.consumed_at is not None
+            and start <= _as_utc(outcome.consumed_at) < end
+        ):
+            affected_interactions.add(outcome.interaction_id)
+        if (
+            outcome.intake_snapshot is not None
+            and start <= _as_utc(outcome.intake_snapshot.observed_at) < end
+        ):
+            affected_interactions.add(outcome.interaction_id)
+    return [
+        latest[interaction_id]
+        for interaction_id in affected_interactions
+    ]
 
 
 def latest_caffeine_confirmations(
