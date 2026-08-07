@@ -415,6 +415,7 @@ class StorageObject(Base):
     retention_policy_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("retention_policy.id", ondelete="SET NULL"), index=True
     )
+    retention_basis_at: Mapped[datetime | None] = mapped_column(index=True)
     expires_at: Mapped[datetime | None] = mapped_column(index=True)
     safe_to_purge: Mapped[bool] = mapped_column(default=False, index=True)
     purged_at: Mapped[datetime | None] = mapped_column(index=True)
@@ -429,6 +430,12 @@ class WellnessEvent(Base):
             "source_provider",
             "source_record_id",
             name="uq_wellness_event_source_record",
+        ),
+        Index(
+            "ux_wellness_event_event_type_raw_object_id",
+            "event_type",
+            "raw_object_id",
+            unique=True,
         ),
     )
 

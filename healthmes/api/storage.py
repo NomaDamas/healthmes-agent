@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any
 
 from fastapi import APIRouter, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from healthmes.api.decision_html import shell_context, template_environment
+from healthmes.api.errors import APIError
 from healthmes.api.local_session import issue_local_session, require_local_session
 from healthmes.backup.snapshot import (
     SNAPSHOT_SUFFIX,
@@ -60,8 +64,8 @@ class RetentionUpdate(BaseModel):
 
 class WellnessEventCreate(BaseModel):
     event_type: str = Field(min_length=1, max_length=64)
-    observed_at: datetime
-    recorded_at: datetime | None = None
+    observed_at: AwareDatetime
+    recorded_at: AwareDatetime | None = None
     timezone: str | None = None
     source_provider: str = Field(min_length=1, max_length=64)
     source_device: str | None = None
@@ -165,6 +169,70 @@ def maintain_storage(
 def create_wellness_event(
     body: WellnessEventCreate, session: SessionDep
 ) -> WellnessEventOut:
+    if (
+        body.event_type.startswith("nutrition.")
+        or body.source_provider.startswith("nutrition-")
+        or body.source_provider
+        in {
+            "sake-vlm",
+            "sake-vlm-raw",
+            "user-confirmation",
+            "user-nutrition-review",
+        }
+    ):
+        raise APIError(
+            422,
+            "reserved_wellness_namespace",
+            "internal nutrition event namespaces are reserved",
+        )
+    if body.data_class != "normalized":
+        raise APIError(
+            422,
+            "unsupported_wellness_data_class",
+            "external wellness events must use the normalized data class",
+        )
+    if body.observed_at.astimezone(UTC) > datetime.now(UTC) + timedelta(
+        minutes=5
+    ):
+        raise APIError(
+            422,
+            "invalid_observed_at",
+            "observed_at cannot be more than 5 minutes in the future",
+        )
+    fingerprint = sha256(
+        json.dumps(
+            body.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    def validate_existing(event: WellnessEvent) -> WellnessEventOut:
+        if (
+            event.expires_at is not None
+            and (
+                event.expires_at.replace(tzinfo=UTC)
+                if event.expires_at.tzinfo is None
+                else event.expires_at.astimezone(UTC)
+            )
+            <= datetime.now(UTC)
+        ):
+            raise APIError(
+                409,
+                "expired_wellness_event",
+                "expired wellness events cannot be retried",
+            )
+        if (
+            not isinstance(event.derived_from, dict)
+            or event.derived_from.get("_ingest_fingerprint") != fingerprint
+        ):
+            raise APIError(
+                409,
+                "wellness_event_conflict",
+                "source key was already used with different input",
+            )
+        return WellnessEventOut.model_validate(event)
+
     existing = session.scalar(
         select(WellnessEvent).where(
             WellnessEvent.source_provider == body.source_provider,
@@ -172,7 +240,7 @@ def create_wellness_event(
         )
     )
     if existing is not None:
-        return WellnessEventOut.model_validate(existing)
+        return validate_existing(existing)
     ensure_default_policies(session)
     policy = session.scalar(
         select(RetentionPolicy).where(RetentionPolicy.data_class == body.data_class)
@@ -184,6 +252,14 @@ def create_wellness_event(
         if policy.retention_days is None
         else body.observed_at + timedelta(days=policy.retention_days)
     )
+    if expires_at is not None and expires_at.astimezone(UTC) <= datetime.now(
+        UTC
+    ):
+        raise APIError(
+            422,
+            "expired_wellness_event",
+            "observed_at falls outside the retention window",
+        )
     event = WellnessEvent(
         event_type=body.event_type,
         observed_at=body.observed_at,
@@ -201,9 +277,25 @@ def create_wellness_event(
         retention_policy_id=policy.id,
         expires_at=expires_at,
         payload=body.payload,
-        derived_from=body.derived_from,
+        derived_from={
+            **(body.derived_from or {}),
+            "_ingest_fingerprint": fingerprint,
+        },
     )
-    session.add(event)
+    try:
+        with session.begin_nested():
+            session.add(event)
+            session.flush()
+    except IntegrityError:
+        existing = session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.source_provider == body.source_provider,
+                WellnessEvent.source_record_id == body.source_record_id,
+            )
+        )
+        if existing is None:
+            raise
+        return validate_existing(existing)
     session.commit()
     session.refresh(event)
     return WellnessEventOut.model_validate(event)

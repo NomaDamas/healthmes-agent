@@ -1,61 +1,117 @@
 ---
 name: healthmes-nutrition
-description: Review photo-derived intake observations, resolve uncertainty with the owner, and expose only explicitly confirmed caffeine evidence to later decision skills.
-version: 1.0.0
+description: Automatically analyze photo, free-text, or local-voice food context; keep observations separate from consumption; and build evidence-bound wellness decisions.
+version: 2.2.0
 author: HealthMes Agent
 license: MIT
 metadata:
   hermes:
-    tags: [Health, Nutrition, Food, Caffeine, Vision, Confirmation]
+    tags: [Health, Nutrition, Food, Caffeine, Vision, Voice, Decision]
     related_skills: [healthmes-capture]
 ---
 
-# HealthMes Nutrition Evidence
+# HealthMes Nutrition Interaction
 
-Use this skill after HealthMes has analyzed an uploaded food or drink photo.
-The VLM output is an unconfirmed observation, never a fact about total daily
-intake and never medical advice.
+Use this skill for food or drink capture and food-related wellness questions.
+The engine has no UI. It stores device-neutral interactions that later mobile,
+web, or agent surfaces can render.
 
-This version is deliberately caffeine-first. It does not extract calories,
-macronutrients, micronutrients, ingredients, or recipes. It also does not
-analyze text or voice nutrition entries; those require a future capture
-normalization contract before they can enter this confirmation workflow.
+## Evidence boundary
 
-## Tools
+- A photo, text entry, or voice transcript is an observation, not consumption.
+- `log_consumed` is the owner's intent, not proof that the outcome was stored.
+- Only `confirm_intake_outcome(status="consumed")` creates known intake.
+- Nutrient facts retain `origin`, `confidence`, exact/range/unknown, and units.
+- Photo analysis extracts serving plus core nutrition: energy, protein,
+  carbohydrate, fat, fiber, sugar, sodium, and caffeine. Additional nutrients
+  use the same generic contract.
+- A photo nutrition review can confirm, fully correct, or reject the VLM
+  observation without overwriting its original provenance.
+- Free text can be automatically structured by the configured nutrition
+  provider. Voice is transcribed only by the configured loopback whisper.cpp
+  server and then follows the same text-analysis path.
+- Captured history is not proof that every meal in a day was recorded.
+- Every interaction-engine write requires a caller-generated UUID
+  `operation_id`. Reuse it only for an exact retry; never reuse it for changed
+  input.
+- Raw text, transcripts, and media paths are short-lived capture data.
+  Confirmed intake and decision requests retain sanitized structured snapshots
+  without free-form notes or evidence excerpts.
+
+## Interaction tools
 
 | Tool | Purpose |
 |---|---|
-| `mcp__healthmes__get_caffeine_observations` | Read the selected local day's estimates, ranges, warnings, and provenance |
-| `mcp__healthmes__confirm_photo_caffeine_observation` | Store the owner's exact confirmation, correction, or rejection |
-| `mcp__healthmes__confirm_photo_caffeine_day` | Store whether the displayed records cover the complete day |
-| `mcp__healthmes__get_known_caffeine_intake_for_day` | Return a total only after both confirmation layers are present |
+| `mcp__healthmes__get_recent_nutrition_observations` | Read photo nutrition estimates, provenance, and latest owner review |
+| `mcp__healthmes__review_photo_nutrition_observation` | Confirm, fully correct, or reject one photo nutrition observation |
+| `mcp__healthmes__analyze_intake_capture` | Automatically structure owner free text or a local voice capture with an explicit intent |
+| `mcp__healthmes__capture_intake_interaction` | Store a photo observation or caller-supplied reviewed structured nutrition |
+| `mcp__healthmes__confirm_intake_outcome` | Store consumed, not-consumed, or cancelled from the owner's exact reply |
+| `mcp__healthmes__search_intake_records` | Search reusable records by time, intent, modality, nutrient, confirmation, or text |
+| `mcp__healthmes__request_intake_decision` | Persist a decision request and receive its candidate/history/evidence context |
+| `mcp__healthmes__get_intake_decision_context` | Reload one stored decision context |
+| `mcp__healthmes__record_intake_decision` | Persist the result with exact evidence event IDs and limitations |
+
+## Sake caffeine tools
+
+| Tool | Purpose |
+|---|---|
+| `mcp__healthmes__get_caffeine_observations` | Read photo-derived caffeine estimates and provenance |
+| `mcp__healthmes__confirm_photo_caffeine_observation` | Confirm, correct, or reject each photo caffeine value |
+| `mcp__healthmes__confirm_photo_caffeine_day` | Confirm whether the displayed photo records cover the whole local day |
+| `mcp__healthmes__get_known_caffeine_intake_for_day` | Return caffeine total only after both caffeine confirmation layers |
 
 ## Required procedure
 
-1. Read the selected day with
-   `mcp__healthmes__get_caffeine_observations`.
-2. Show each record separately. Preserve exact/range/unknown, warnings,
-   source, model provenance, and observation ID.
-3. Ask the owner to confirm or correct each caffeine amount. Do not choose a
-   point inside a range on the owner's behalf.
-4. Call `mcp__healthmes__confirm_photo_caffeine_observation` only from the
-   owner's exact live reply. The trusted-session proof is injected by the
-   gateway; never fabricate or reuse one.
-5. Ask whether the displayed observations represent all caffeine consumed
+1. Preserve the owner's intent. Use `log_consumed`, `ask_before_intake`,
+   `inspect_only`, `plan_future`, or `compare_option`; never infer a different
+   intent from the media alone.
+2. For a photo, read the observation and preserve exact/range/unknown. If the
+   owner corrects it, write a complete replacement with
+   `review_photo_nutrition_observation` and a fresh `operation_id` before
+   capture.
+3. Capture the interaction. For photo, pass the existing
+   `nutrition_observation_id` to `capture_intake_interaction`. For free text,
+   call `analyze_intake_capture` with the owner's exact text. For voice, pass
+   only the local audio token to `analyze_intake_capture`; HealthMes creates
+   the local transcript and structured nutrients.
+4. If the owner is logging consumption, ask for exact confirmation and call
+   `confirm_intake_outcome`. Do not silently turn the capture into intake.
+5. If the owner asks before eating, call `request_intake_decision`. Use only
+   the returned candidate, confirmed history, evidence IDs, and explicit
+   limitations.
+6. Record the result with `record_intake_decision`. If the owner later eats
+   the candidate, separately call `confirm_intake_outcome(status="consumed")`.
+7. For caffeine quantity decisions, keep using the sake confirmation flow.
+   Continue only when `get_known_caffeine_intake_for_day` reports both
+   `status: known` and `total_intake_complete: true`.
+8. Generate one new `operation_id` for each logical write and include it in
+   the trusted proof. Preserve the same ID only when retrying the exact input.
+
+## Sake confirmation procedure
+
+1. Read the selected day with `get_caffeine_observations`.
+2. Show each photo observation separately, preserving exact/range/unknown,
+   warnings, provenance, and observation ID.
+3. Ask the owner to confirm, correct, or reject each caffeine value. Never
+   choose a point inside a range on the owner's behalf.
+4. Call `confirm_photo_caffeine_observation` only from the owner's exact live
+   reply and its gateway-issued trusted proof.
+5. Ask whether the displayed observations represent all caffeine consumed on
    that local day.
-6. Call `mcp__healthmes__confirm_photo_caffeine_day` only from that exact
-   reply, including the exact observation IDs shown.
-7. Read `mcp__healthmes__get_known_caffeine_intake_for_day`. Continue to a
-   caffeine decision only when it returns `status: known` and
-   `total_intake_complete: true`.
+6. Call `confirm_photo_caffeine_day` with the exact observation IDs shown and
+   the owner's exact completeness reply.
 
 ## Safety rules
 
-- Storage presence is not proof of consumption or daily completeness.
-- VLM `confidence: high` is still `unconfirmed`.
-- Never turn `unknown` into zero.
-- Never silently turn a range into an exact number.
-- If records conflict, ask one short correction question and stop.
-- Do not call a caffeine proposal tool until all its independent sleep,
-  timing, population, contraindication, and personal-limit requirements are
-  also satisfied.
+- Never turn unknown into zero or choose a point inside a range.
+- Never describe agent/VLM nutrient estimates as user-confirmed nutrient facts.
+- `allergy_safety` and `medication_interaction` must be recorded as
+  `unsupported`; do not generate a wellness proposal for those scopes.
+- A caffeine decision also requires independent sleep, timing, population,
+  contraindication, product-form, and personal-limit evidence.
+- The generic `caffeine_sleep` engine may store only `insufficient_data` or
+  `unsupported`. A specialized validated policy owns proposals and no-op
+  decisions. Generic caffeine results never retain a recommendation or
+  caller-authored actionable summary.
+- If required context is missing, record `insufficient_data`, not a guess.

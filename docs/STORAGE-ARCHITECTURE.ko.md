@@ -27,13 +27,15 @@
 
 | 데이터 클래스 | 기본 보존 | 저장 내용 |
 |---|---:|---|
-| `nutrition_media` | 7일 | 업로드된 음식·음료 원본 사진 |
+| `nutrition_media` | 7일 | 원본 사진과 사진에서 읽은 라벨·근거·warning |
+| `nutrition_raw_capture` | 14일 | 식사 원문, 음성 transcript, 미디어 참조, 섭취 결과 note |
 | `nutrition_observation` | 90일 | sake VLM 구조화 관측값과 provenance |
 | `nutrition_confirmation` | 무기한 | 항목별 사용자 확인과 일일 완전성 확인 |
 
-사진이 만료되어 삭제되어도 90일 관측값과 무기한 확인 이벤트는 각자의 정책에
-따라 남는다. 사용자는 기존 `/storage` 화면 또는 `/v1/storage/settings/{data_class}`
-API에서 세 클래스를 각각 `1/7/14/30/90일/무기한`으로 바꿀 수 있다.
+사진과 원문이 만료되어 삭제되어도 90일 관측값과 무기한 확인 이벤트는 각자의
+정책에 따라 남는다. 사용자는 기존 `/storage` 화면 또는
+`/v1/storage/settings/{data_class}` API에서 네 클래스를 각각
+`1/7/14/30/90일/무기한`으로 바꿀 수 있다.
 
 iOS/Android의 저장 설정 UI와 durable upload queue는 별도 후속 작업이다.
 이번 구현의 설정 정본은 컴퓨터 Personal Data Node이며, 모바일은 향후 동일 API를

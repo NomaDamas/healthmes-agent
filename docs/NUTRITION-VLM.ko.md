@@ -1,4 +1,4 @@
-# Sake 영양 사진 관찰과 VLM Provider
+# HealthMes 영양 사진 관찰과 VLM Provider
 
 기준일: 2026-08-06
 
@@ -6,23 +6,45 @@
 
 ```text
 지원하는 것
-  사진 1장 -> 음식/음료 후보 + 제공량 추정 + 카페인 추정
-  추정값 -> 사용자 확인 -> 확인된 카페인 근거
+  사진 1장 -> 음식/음료 후보 + 제공량 + 전체 핵심 영양소 추정
+  자유 텍스트 -> 음식/음료 후보 + 제공량 + 전체 핵심 영양소 추정
+  음성 파일 -> 로컬 whisper.cpp 전사 -> 텍스트 영양소 추정
+  핵심 영양소 -> 열량, 단백질, 탄수화물, 지방, 식이섬유,
+                 당류, 나트륨, 카페인
+  유용한 추가 영양소 -> 동일한 일반 nutrient 계약으로 보존
+  추정값 -> 사용자 확인/전체 수정/거절 -> 검토된 식사 맥락
 
 지원하지 않는 것
-  전체 영양소(열량, 탄수화물, 단백질, 지방, 미량영양소)
-  재료와 레시피 추론
-  텍스트 영양 기록 분석
-  음성 영양 기록 전사/분석
+  사진에 보이지 않는 재료·알레르기·정확한 레시피의 단정
+  원격 음성 전사
 ```
 
-`NutritionObservation`은 일반적인 음식/음료 후보와 제공량을 담을 수 있지만,
-현재 구현된 영양소 필드는 `caffeine` 하나뿐이다. 따라서 이 기능을 "전체 영양
-분석"이라고 부르면 안 된다.
+`NutritionObservation` v2는 핵심 영양소를 모두 같은 `NutrientEstimate`
+목록으로 저장한다. 모델이 판단할 수 없는 값은 반드시 `unknown`이고, 읽을 수
+있는 라벨이 없는 수치는 근거가 있는 범위로만 저장한다. 카페인은 Sake의 기존
+카페인 판단 흐름과 호환되도록 전용 `caffeine` 필드에도 같은 값을 유지한다.
 
-음성 파일은 `POST /v1/media`로 저장할 수 있지만
-`POST /v1/nutrition-observations/analyze`는 이미지 형식만 받는다. 기존
-`FoodLog`도 별도 계약이며, sake 관찰을 `FoodLog`로 평탄화하지 않는다.
+사진은 `POST /v1/nutrition-observations/analyze`, 자유 텍스트와 음성은
+`POST /v1/intake-interactions/analyze`를 사용한다. 음성 파일은 먼저
+`POST /v1/media`로 저장하며 HealthMes는 등록된 audio object만 로컬
+whisper.cpp에 전달한다. 기존 `FoodLog`도 별도 계약이며, sake 관찰을
+`FoodLog`로 평탄화하지 않는다.
+
+상위 `IntakeInteraction` 엔진은 텍스트 원문을 자동 분석하고, 음성은 로컬
+전사 후 같은 분석 경로를 사용한다. 섭취 확인과 판단 요청에는
+원문·transcript·미디어 경로를 제외한 구조화 snapshot과 분석 provenance만
+장기 보존한다. 상세 계약은
+[`NUTRITION-INTERACTION-ENGINE.ko.md`](NUTRITION-INTERACTION-ENGINE.ko.md)를
+따른다.
+
+텍스트 원문, 음성 transcript, 미디어 참조는 `nutrition_raw_capture`로 기본
+14일 보존하고, 구조화 interaction은 `nutrition_observation`으로 기본 90일
+보존한다. 두 기간은 저장 설정에서 독립적으로 바꿀 수 있다.
+
+사진 분석에서 읽은 라벨 문자열, 근거 문구, warning, 위치와 미디어 경로는
+`nutrition.observation-raw.v1`으로 분리하며 `nutrition_media`와 같은 기본
+7일 보존기간을 적용한다. 90일 구조화 observation에는 이름·수치·단위·confidence와
+분석 provenance만 남는다.
 
 ## 실행 구조
 
@@ -52,7 +74,20 @@ NutritionObservation 원형 보존
     +--> StorageObject: nutrition_observation (기본 90일)
     |
     v
-사용자 카페인 항목 확인 + 하루 전체성 확인
+사용자 전체 영양 검토
+  confirmed | corrected | rejected
+    |
+    +--> nutrition.review.v1
+    +--> nutrition_observation과 같은 보존정책/만료시각
+    +--> corrected는 모든 항목과 핵심 영양소의 완전한 교체본
+    |
+    v
+IntakeInteraction 생성 시 최신 검토본 적용
+    |
+    +--> 실제 섭취 여부는 별도 IntakeOutcome
+    |
+    v
+카페인 전용 항목 확인 + 하루 전체성 확인
     |
     +--> StorageObject: nutrition_confirmation (기본 무기한)
     |
@@ -111,27 +146,23 @@ MCP가 확인된 카페인 데이터만 의사결정 기능에 제공
   메타데이터를 제거하고 최대 4096px로 제한한다. 로컬 원본은 바꾸지 않는다.
 - OpenAI와 xAI 요청은 `store: false`를 보낸다.
 - 모든 provider 출력은 동일한 Pydantic `VLMExtraction` 스키마로 재검증한다.
-- 원격 입력은 JPEG, PNG, WebP, GIF를 받고 메타데이터가 제거된 JPEG/PNG로
-  전송한다. HEIC는 현재 로컬 Ollama 경로를 사용하거나 업로드 전에 변환해야
-  한다.
+- 원격 입력은 JPEG, PNG, WebP, GIF, HEIC/HEIF를 받고 메타데이터가 제거된
+  JPEG/PNG로 재인코딩해 전송한다.
 - provider 응답이 실제 model 또는 fingerprint를 제공하면 저장 provenance에
   설정값 대신 그 값을 기록한다.
 
-## Sake 이슈 #96-#101 기록
+## Sake 이슈 #96-#101과 확장 관계
 
 | Issue | 제안과 구현 범위 |
 |---|---|
 | #96 | 기존 multipart 사진 업로드를 유지하고 분석 요청에는 media path, 촬영 시각, timezone, source, 위치 provenance, 원격 전송 동의를 넣는다. |
 | #97 | 실제 개인정보 사진 대신 privacy-safe synthetic fixture로 계약과 E2E를 검증한다. |
-| #98 | Qwen3-VL 기반 로컬 추출을 만들되 범위를 카페인 중심 음식/음료 관찰로 제한한다. 열량·매크로·미량영양소·재료·레시피는 제외한다. |
+| #98 | Qwen3-VL 기반 로컬 카페인 관찰을 최초 부분집합으로 정의했다. HealthMes v2는 이 계약을 깨지 않고 일반 영양소 목록을 추가했다. |
 | #99 | VLM 관찰은 사실이 아니므로 repository와 MCP에서 미확인 관찰과 확인된 근거의 경계를 지킨다. |
 | #100 | 사용자가 사진별 카페인 값과 하루 기록의 완전성을 각각 확인한 뒤에만 PR #95의 카페인 제안 로직이 사용할 수 있게 한다. |
 | #101 | CLI/Telegram 실제 사용 흐름으로 업로드부터 확인까지 점검한다. 자동 테스트는 synthetic E2E를 다루며 실제 계정·실모델 dogfood는 별도 운영 검증이다. |
 
-## 후속 작업
+## 운영 검증
 
-1. 텍스트와 음성을 공통 `CaptureObservation`으로 정규화하는 계약을 설계한다.
-2. 음성은 로컬 전사 후 원문, 전사문, 사용자의 수정본 provenance를 분리한다.
-3. 전체 영양소는 sake가 새 버전의 schema와 확인 규칙을 정의한 뒤 추가한다.
-4. 실제 provider 자격 증명으로 opt-in integration test를 별도 실행한다.
-5. HEIC의 로컬 변환 경로를 추가한 뒤 원격 provider에도 동일 이미지를 보낸다.
+실제 provider 자격 증명은 저장소에 포함하지 않는다. 배포 환경에서 명시적
+opt-in integration test를 실행해 계정별 모델 접근 권한과 quota를 확인한다.
