@@ -18,6 +18,7 @@ TRANCHE_1_TOOLS = {
     "resolve_schedule_proposal",
     "log_food",
     "record_decision",
+    "get_caffeine_proposal",
 }
 TRANCHE_2_TOOLS = {
     "get_cognitive_energy_forecast",

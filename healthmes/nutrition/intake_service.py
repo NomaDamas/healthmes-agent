@@ -957,8 +957,13 @@ def normalize_nutrition_review(
     observation: NutritionObservation,
     review: NutritionReview | None,
 ) -> tuple[NormalizedIntakeItem, ...]:
-    if review is None or review.status is ConfirmationStatus.CONFIRMED:
+    if review is None:
         return normalize_photo_observation(observation)
+    if review.status is ConfirmationStatus.CONFIRMED:
+        return normalize_extraction_items(
+            observation.items,
+            origin=EvidenceOrigin.USER,
+        )
     if review.status is ConfirmationStatus.REJECTED:
         raise IntakeInteractionError(
             "rejected nutrition observations cannot create interactions"

@@ -76,7 +76,19 @@ from healthmes.calendars.sleep_context import (
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.calendars.sleep_source import select_actual_sleep_rows
 from healthmes.config import Settings, get_settings, system_timezone
-from healthmes.mcp_server import adjustment_tools, arousal, impact, interpret, timeline
+from healthmes.mcp_server import (
+    adjustment_tools,
+    arousal,
+    caffeine_adapter,
+    impact,
+    interpret,
+    timeline,
+)
+from healthmes.mcp_server.caffeine_contract import (
+    CaffeineContraindication,
+    CaffeineProductForm,
+    SupportedPopulationStatus,
+)
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.nutrition.contracts import (
     CaffeineConfirmation,
@@ -514,6 +526,24 @@ def _parse_datetime_utc(value: str, field: str) -> dt.datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.UTC)
     return parsed.astimezone(dt.UTC)
+
+
+def _parse_datetime_local_aware(
+    value: str | None,
+    field: str,
+    tz: dt.tzinfo,
+) -> dt.datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ToolError(f"{field} must be ISO-8601, got {value!r}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ToolError(f"{field} must include an explicit UTC offset")
+    if parsed.utcoffset() != parsed.astimezone(tz).utcoffset():
+        raise ToolError(f"{field} UTC offset conflicts with the user timezone")
+    return parsed.astimezone(tz)
 
 
 def _parse_range_days(value: str, field: str = "range", max_days: int = MAX_RANGE_DAYS) -> int:
@@ -2479,6 +2509,126 @@ def expire_and_reconcile_calendar_adjustments() -> list[dict[str, Any]]:
         ]
 
 
+@mcp.tool
+@_with_ow_errors
+async def get_caffeine_proposal(
+    event_id: str,
+    personal_daily_limit_mg: int,
+    population_status: SupportedPopulationStatus,
+    product_form: CaffeineProductForm,
+    cutoff_before_sleep_hours: float,
+    contraindications: list[CaffeineContraindication],
+    intended_consumption_at: str | None = None,
+    target_sleep_at: str | None = None,
+    personal_event_baseline_mg: int | None = None,
+    baseline_confirmed_at: str | None = None,
+) -> dict[str, Any]:
+    """A bounded caffeine preparation proposal for one exact mirrored event.
+
+    This read-only adapter verifies `event_id`, fetches same-day wearable sleep
+    provenance, and applies the deterministic caffeine contract. Population
+    references remain separate from the user-provided daily ceiling and event
+    baseline. The result is not a safe dose, prescription, or medical advice.
+    Missing or contradictory evidence returns an honest non-proposal outcome;
+    no Calendar or provider state is mutated.
+
+    `intended_consumption_at`, `target_sleep_at`, and `baseline_confirmed_at`
+    must be ISO-8601 timestamps with an explicit UTC offset.
+    `cutoff_before_sleep_hours` and `contraindications` must be supplied from
+    explicit user-confirmed context; the adapter does not infer defaults.
+    Daily caffeine intake and completeness are read only from confirmed
+    HealthMes nutrition storage for the event's local day. Callers cannot
+    supply or override those facts.
+    """
+    tz = _local_timezone()
+    intended_consumption = _parse_datetime_local_aware(
+        intended_consumption_at,
+        "intended_consumption_at",
+        tz,
+    )
+    target_sleep = _parse_datetime_local_aware(
+        target_sleep_at,
+        "target_sleep_at",
+        tz,
+    )
+    baseline_confirmed = _parse_datetime_local_aware(
+        baseline_confirmed_at,
+        "baseline_confirmed_at",
+        tz,
+    )
+    event_uuid = _parse_uuid(event_id, "event_id")
+    with _store_session() as session:
+        event = session.get(CalendarEventMirror, event_uuid)
+        event_snapshot = (
+            {
+                "id": str(event.id),
+                "summary": event.summary,
+                "start_at": event.start_at,
+                "end_at": event.end_at,
+                "calendar_source": _enum_value(event.calendar_source),
+            }
+            if event is not None
+            else None
+        )
+
+    target_event: dict[str, Any] | None = None
+    event_start: dt.datetime | None = None
+    sleep = None
+    sleep_adapter_reason: str | None = None
+    caffeine_intake: dict[str, Any] | None = None
+    if event_snapshot is not None:
+        event_start = _ensure_utc_dt(event_snapshot["start_at"]).astimezone(tz)
+        event_end = _ensure_utc_dt(event_snapshot["end_at"]).astimezone(tz)
+        target_event = {
+            "id": event_snapshot["id"],
+            "summary": event_snapshot["summary"],
+            "start": event_start.isoformat(),
+            "end": event_end.isoformat(),
+            "calendar_source": event_snapshot["calendar_source"],
+        }
+        event_day = event_start.date()
+        user_id = await _resolve_user_id()
+        rows = await get_ow_client().collect_sleep_summaries(
+            user_id,
+            event_day.isoformat(),
+            (event_day + dt.timedelta(days=1)).isoformat(),
+        )
+        sleep, sleep_adapter_reason = caffeine_adapter.select_sleep_evidence(
+            rows,
+            event_day=event_day,
+            today=_today_local(),
+        )
+        timezone_name = getattr(tz, "key", None) or str(tz)
+        with _store_session() as session:
+            caffeine_intake = known_caffeine_for_day(
+                session,
+                local_date=event_day,
+                timezone=timezone_name,
+            )
+
+    request = caffeine_adapter.build_request(
+        event_id=event_snapshot["id"] if event_snapshot is not None else None,
+        intended_consumption_at=intended_consumption,
+        observed_at=dt.datetime.now(dt.UTC),
+        sleep=sleep,
+        caffeine_intake=caffeine_intake,
+        personal_daily_limit_mg=personal_daily_limit_mg,
+        personal_event_baseline_mg=personal_event_baseline_mg,
+        baseline_confirmed_at=baseline_confirmed,
+        target_sleep_at=target_sleep,
+        cutoff_before_sleep_hours=cutoff_before_sleep_hours,
+        population_status=population_status,
+        contraindications=contraindications,
+        product_form=product_form,
+    )
+    return caffeine_adapter.serialize_proposal(
+        request,
+        target_event=target_event,
+        sleep_adapter_reason=sleep_adapter_reason,
+        caffeine_intake=caffeine_intake,
+    )
+
+
 class ScheduleBlockIn(BaseModel):
     """One proposed time block (input of propose_schedule_blocks).
 
@@ -2837,11 +2987,12 @@ def get_caffeine_observations(date: str | None = None) -> dict[str, Any]:
 def get_known_caffeine_intake_for_day(
     date: str | None = None,
 ) -> dict[str, Any]:
-    """Return caffeine total only from explicitly reviewed photo observations.
+    """Return the unified confirmed caffeine ledger for one local day.
 
-    ``total_intake_complete`` is true only when a separate user confirmation
-    covers every observation for that local day. Storage presence alone never
-    proves that the user's daily intake is complete. This tool is read-only.
+    Photo values require explicit review, while text/voice/photo consumption
+    outcomes require user- or label-origin exact caffeine facts.
+    ``total_intake_complete`` is true only when a separate confirmation binds
+    every observation and latest outcome affecting the day. This is read-only.
     """
     timezone = _local_timezone()
     day = _parse_date_local(date, "date", timezone)
@@ -3002,25 +3153,36 @@ def confirm_photo_caffeine_day(
     date: str,
     observation_ids: list[str],
     total_intake_complete: bool,
+    outcome_ids: list[str] | None = None,
     trusted_session_proof: str | None = None,
 ) -> dict[str, Any]:
-    """Persist the owner's explicit statement about one day's intake coverage.
+    """Persist the owner's explicit statement about unified intake coverage.
 
-    The proof binds the exact local date, observation IDs, and completeness
-    boolean. Merely finding photos in storage never implies a complete day.
+    The compatibility name predates text and voice capture. The proof binds
+    the exact local date, photo observation IDs, latest intake outcome IDs,
+    and completeness boolean. Storage presence never implies a complete day.
     """
+    outcome_ids = outcome_ids or []
     if len(observation_ids) != len(set(observation_ids)):
         raise ToolError("observation_ids must not contain duplicates")
+    if len(outcome_ids) != len(set(outcome_ids)):
+        raise ToolError("outcome_ids must not contain duplicates")
     day = _parse_date(date, "date")
     parsed_ids = [
         _parse_uuid(value, f"observation_ids[{index}]")
         for index, value in enumerate(observation_ids)
+    ]
+    parsed_outcome_ids = [
+        _parse_uuid(value, f"outcome_ids[{index}]")
+        for index, value in enumerate(outcome_ids)
     ]
     proof_arguments = {
         "date": date,
         "observation_ids": observation_ids,
         "total_intake_complete": total_intake_complete,
     }
+    if outcome_ids:
+        proof_arguments["outcome_ids"] = outcome_ids
     _require_trusted_telegram_owner_proof(
         trusted_session_proof,
         tool_name="confirm_photo_caffeine_day",
@@ -3036,6 +3198,7 @@ def confirm_photo_caffeine_day(
         total_intake_complete=total_intake_complete,
         confirmed_at=dt.datetime.now(dt.UTC),
         source="telegram-owner",
+        outcome_ids=tuple(parsed_outcome_ids),
     )
     try:
         with _store_session() as session:
@@ -3047,6 +3210,7 @@ def confirm_photo_caffeine_day(
         "confirmation_id": str(confirmation.confirmation_id),
         "local_date": date,
         "total_intake_complete": total_intake_complete,
+        "outcome_ids": outcome_ids,
     }
 
 

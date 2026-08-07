@@ -540,7 +540,13 @@ def _caffeine_gate(
         timezone=timezone,
     )
     observation_ids = {
-        entry["observation_id"] for entry in gate["evidence"]
+        entry.get("observation_id") or entry.get("nutrition_observation_id")
+        for entry in gate["evidence"]
+        if isinstance(
+            entry.get("observation_id")
+            or entry.get("nutrition_observation_id"),
+            str,
+        )
     }
     confirmation_ids = {
         entry["confirmation_id"]
@@ -548,11 +554,21 @@ def _caffeine_gate(
         if entry.get("event_type") == "nutrition.confirmation.v1"
     }
     review_ids = {
-        entry["confirmation_id"]
+        entry.get("confirmation_id") or entry.get("nutrition_review_id")
         for entry in gate["evidence"]
-        if entry.get("event_type") == "nutrition.review.v1"
+        if (
+            entry.get("event_type") == "nutrition.review.v1"
+            or isinstance(entry.get("nutrition_review_id"), str)
+        )
     }
     event_ids: list[uuid.UUID] = []
+    for entry in gate["evidence"]:
+        if entry.get("event_type") != "nutrition.intake-outcome.v1":
+            continue
+        try:
+            event_ids.append(uuid.UUID(str(entry["event_id"])))
+        except (KeyError, TypeError, ValueError):
+            continue
     if observation_ids:
         event_ids.extend(
             session.scalars(

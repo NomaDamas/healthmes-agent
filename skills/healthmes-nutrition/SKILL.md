@@ -58,8 +58,8 @@ web, or agent surfaces can render.
 |---|---|
 | `mcp__healthmes__get_caffeine_observations` | Read photo-derived caffeine estimates and provenance |
 | `mcp__healthmes__confirm_photo_caffeine_observation` | Confirm, correct, or reject each photo caffeine value |
-| `mcp__healthmes__confirm_photo_caffeine_day` | Confirm whether the displayed photo records cover the whole local day |
-| `mcp__healthmes__get_known_caffeine_intake_for_day` | Return caffeine total only after both caffeine confirmation layers |
+| `mcp__healthmes__confirm_photo_caffeine_day` | Compatibility tool that binds all displayed photo IDs and latest text/voice/photo outcome IDs for the local day |
+| `mcp__healthmes__get_known_caffeine_intake_for_day` | Return a unified caffeine ledger only after nutrient values and whole-day coverage are confirmed |
 
 ## Required procedure
 
@@ -82,7 +82,10 @@ web, or agent surfaces can render.
    limitations.
 6. Record the result with `record_intake_decision`. If the owner later eats
    the candidate, separately call `confirm_intake_outcome(status="consumed")`.
-7. For caffeine quantity decisions, keep using the sake confirmation flow.
+7. For caffeine quantity decisions, review model-derived nutrient values before
+   confirming consumption. Confirm the day with every returned photo
+   observation ID and latest intake outcome ID; a later correction requires a
+   new day confirmation.
    Continue only when `get_known_caffeine_intake_for_day` reports both
    `status: known` and `total_intake_complete: true`.
 8. Generate one new `operation_id` for each logical write and include it in
@@ -90,17 +93,24 @@ web, or agent surfaces can render.
 
 ## Sake confirmation procedure
 
-1. Read the selected day with `get_caffeine_observations`.
+1. Read the selected day with both `get_caffeine_observations` and
+   `get_known_caffeine_intake_for_day`.
 2. Show each photo observation separately, preserving exact/range/unknown,
    warnings, provenance, and observation ID.
 3. Ask the owner to confirm, correct, or reject each caffeine value. Never
    choose a point inside a range on the owner's behalf.
 4. Call `confirm_photo_caffeine_observation` only from the owner's exact live
    reply and its gateway-issued trusted proof.
-5. Ask whether the displayed observations represent all caffeine consumed on
-   that local day.
-6. Call `confirm_photo_caffeine_day` with the exact observation IDs shown and
-   the owner's exact completeness reply.
+5. For text, voice, or photo outcomes with model-derived caffeine, use the
+   owner's exact correction as `corrected_items` when confirming the outcome;
+   consumption confirmation alone does not confirm a model nutrient estimate.
+6. Reload `get_known_caffeine_intake_for_day` after all reviews and outcome
+   changes. Collect every `outcome_id` from its evidence along with every photo
+   observation ID shown.
+7. Ask whether those displayed records represent all caffeine consumed on that
+   local day.
+8. Call `confirm_photo_caffeine_day` with the exact observation IDs, exact
+   latest outcome IDs, and the owner's completeness reply.
 
 ## Safety rules
 
