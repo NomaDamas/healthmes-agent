@@ -78,6 +78,22 @@ from healthmes.calendars.sleep_source import select_actual_sleep_rows
 from healthmes.config import Settings, get_settings, system_timezone
 from healthmes.mcp_server import adjustment_tools, arousal, impact, interpret, timeline
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
+from healthmes.nutrition.contracts import (
+    CaffeineConfirmation,
+    ConfirmationStatus,
+    ConfirmedCaffeineItem,
+    DailyIntakeConfirmation,
+)
+from healthmes.nutrition.query import (
+    caffeine_observations_for_day,
+    known_caffeine_for_day,
+    nutrition_observations_view,
+)
+from healthmes.nutrition.repository import (
+    NutritionRepositoryError,
+    persist_caffeine_confirmation,
+    persist_daily_confirmation,
+)
 from healthmes.store import (
     AppUsageSample,
     CalendarEventMirror,
@@ -2727,6 +2743,203 @@ def log_food(
         "food_log_id": food_log_id,
         "logged_at": logged_iso,
         "meal_type": meal_type,
+    }
+
+
+@mcp.tool
+def get_recent_nutrition_observations(
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Read recent structured photo-intake evidence and user confirmations.
+
+    Returns sake NutritionObservation payloads and opaque media tokens, never
+    image bytes or arbitrary filesystem paths. This tool is read-only.
+    """
+    if not 1 <= limit <= 500:
+        raise ToolError("limit must be between 1 and 500")
+    start_at = _parse_datetime_utc(start, "start") if start is not None else None
+    end_at = _parse_datetime_utc(end, "end") if end is not None else None
+    if start_at is not None and end_at is not None and start_at >= end_at:
+        raise ToolError("start must be before end")
+    with _store_session() as session:
+        return nutrition_observations_view(
+            session,
+            start=start_at,
+            end=end_at,
+            limit=limit,
+        )
+
+
+@mcp.tool
+def get_caffeine_observations(date: str | None = None) -> dict[str, Any]:
+    """Read photo-derived caffeine evidence for one user-local calendar day.
+
+    Ranges, unknown values, warnings, provenance, and confirmation state stay
+    explicit. The tool never converts an estimate into confirmed intake.
+    """
+    timezone = _local_timezone()
+    day = _parse_date_local(date, "date", timezone)
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    with _store_session() as session:
+        return caffeine_observations_for_day(
+            session,
+            local_date=day,
+            timezone=timezone_name,
+        )
+
+
+@mcp.tool
+def get_known_caffeine_intake_for_day(
+    date: str | None = None,
+) -> dict[str, Any]:
+    """Return caffeine total only from explicitly reviewed photo observations.
+
+    ``total_intake_complete`` is true only when a separate user confirmation
+    covers every observation for that local day. Storage presence alone never
+    proves that the user's daily intake is complete. This tool is read-only.
+    """
+    timezone = _local_timezone()
+    day = _parse_date_local(date, "date", timezone)
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    with _store_session() as session:
+        return known_caffeine_for_day(
+            session,
+            local_date=day,
+            timezone=timezone_name,
+        )
+
+
+@mcp.tool
+def confirm_photo_caffeine_observation(
+    observation_id: str,
+    status: str,
+    items: list[dict[str, Any]] | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Persist an owner's exact confirmation or rejection of one photo record.
+
+    This write requires a fresh trusted Telegram-session proof over the exact
+    arguments. VLM estimates are never silently promoted to confirmed intake.
+    """
+    if status not in {
+        ConfirmationStatus.CONFIRMED.value,
+        ConfirmationStatus.CORRECTED.value,
+        ConfirmationStatus.REJECTED.value,
+    }:
+        raise ToolError("status must be confirmed, corrected, or rejected")
+    raw_items = items or []
+    if status == ConfirmationStatus.REJECTED.value and raw_items:
+        raise ToolError("rejected observations cannot contain confirmed items")
+    if status != ConfirmationStatus.REJECTED.value and not raw_items:
+        raise ToolError("confirmed or corrected observations require item values")
+    parsed_items: list[ConfirmedCaffeineItem] = []
+    indexes: set[int] = set()
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            raise ToolError(f"items[{index}] must be an object")
+        item_index = item.get("item_index")
+        caffeine_mg = item.get("caffeine_mg")
+        if type(item_index) is not int or item_index < 0:
+            raise ToolError(f"items[{index}].item_index must be a non-negative integer")
+        if (
+            isinstance(caffeine_mg, bool)
+            or not isinstance(caffeine_mg, (int, float))
+            or caffeine_mg < 0
+        ):
+            raise ToolError(f"items[{index}].caffeine_mg must be non-negative")
+        if item_index in indexes:
+            raise ToolError("item_index values must not contain duplicates")
+        indexes.add(item_index)
+        parsed_items.append(
+            ConfirmedCaffeineItem(
+                item_index=item_index,
+                caffeine_mg=float(caffeine_mg),
+            )
+        )
+    proof_arguments = {
+        "observation_id": observation_id,
+        "status": status,
+        "items": raw_items,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="confirm_photo_caffeine_observation",
+        arguments=proof_arguments,
+    )
+    observation_uuid = _parse_uuid(observation_id, "observation_id")
+    confirmation = CaffeineConfirmation(
+        confirmation_id=uuid.uuid4(),
+        observation_id=observation_uuid,
+        status=ConfirmationStatus(status),
+        confirmed_at=dt.datetime.now(dt.UTC),
+        source="telegram-owner",
+        items=tuple(parsed_items),
+    )
+    try:
+        with _store_session() as session:
+            persist_caffeine_confirmation(session, confirmation)
+    except NutritionRepositoryError as exc:
+        raise ToolError(str(exc)) from exc
+    return {
+        "status": "ok",
+        "confirmation_id": str(confirmation.confirmation_id),
+        "observation_id": observation_id,
+        "confirmation_status": status,
+    }
+
+
+@mcp.tool
+def confirm_photo_caffeine_day(
+    date: str,
+    observation_ids: list[str],
+    total_intake_complete: bool,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Persist the owner's explicit statement about one day's intake coverage.
+
+    The proof binds the exact local date, observation IDs, and completeness
+    boolean. Merely finding photos in storage never implies a complete day.
+    """
+    if len(observation_ids) != len(set(observation_ids)):
+        raise ToolError("observation_ids must not contain duplicates")
+    day = _parse_date(date, "date")
+    parsed_ids = [
+        _parse_uuid(value, f"observation_ids[{index}]")
+        for index, value in enumerate(observation_ids)
+    ]
+    proof_arguments = {
+        "date": date,
+        "observation_ids": observation_ids,
+        "total_intake_complete": total_intake_complete,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="confirm_photo_caffeine_day",
+        arguments=proof_arguments,
+    )
+    timezone = _local_timezone()
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    confirmation = DailyIntakeConfirmation(
+        confirmation_id=uuid.uuid4(),
+        local_date=day,
+        timezone=timezone_name,
+        observation_ids=tuple(parsed_ids),
+        total_intake_complete=total_intake_complete,
+        confirmed_at=dt.datetime.now(dt.UTC),
+        source="telegram-owner",
+    )
+    try:
+        with _store_session() as session:
+            persist_daily_confirmation(session, confirmation)
+    except NutritionRepositoryError as exc:
+        raise ToolError(str(exc)) from exc
+    return {
+        "status": "ok",
+        "confirmation_id": str(confirmation.confirmation_id),
+        "local_date": date,
+        "total_intake_complete": total_intake_complete,
     }
 
 

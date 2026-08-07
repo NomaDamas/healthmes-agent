@@ -1,0 +1,289 @@
+[
+  {
+    "id": "known-label-coffee",
+    "request": {
+      "captured_at": "2026-08-06T08:30:00+09:00",
+      "timezone": "Asia/Seoul",
+      "source": "fixture",
+      "location": null,
+      "metadata_provenance": {
+        "captured_at": "fixture",
+        "timezone": "fixture",
+        "location": "unavailable"
+      }
+    },
+    "extraction": {
+      "status": "usable",
+      "confidence": "high",
+      "warnings": [],
+      "items": [
+        {
+          "intake_type": "beverage",
+          "name_candidates": ["bottled coffee"],
+          "category": "coffee",
+          "serving": {
+            "kind": "exact",
+            "unit": "ml",
+            "exact": 355,
+            "minimum": null,
+            "maximum": null,
+            "evidence_text": "355 mL",
+            "estimation_basis": "visible_label"
+          },
+          "caffeine": {
+            "kind": "exact",
+            "unit": "mg",
+            "exact": 180,
+            "minimum": null,
+            "maximum": null,
+            "evidence_text": "Caffeine 180 mg",
+            "estimation_basis": "visible_label"
+          },
+          "label_text_candidates": ["355 mL", "Caffeine 180 mg"],
+          "product_code_candidates": [],
+          "confidence": "high",
+          "warnings": []
+        }
+      ]
+    }
+  },
+  {
+    "id": "unknown-brand-bounded-ranges",
+    "request": {
+      "captured_at": "2026-08-06T10:00:00+09:00",
+      "timezone": "Asia/Seoul",
+      "source": "fixture",
+      "location": null,
+      "metadata_provenance": {
+        "captured_at": "fixture",
+        "timezone": "fixture",
+        "location": "unavailable"
+      }
+    },
+    "extraction": {
+      "status": "ambiguous",
+      "confidence": "medium",
+      "warnings": ["brand and label are not visible"],
+      "items": [
+        {
+          "intake_type": "beverage",
+          "name_candidates": ["iced brewed coffee"],
+          "category": "coffee",
+          "serving": {
+            "kind": "range",
+            "unit": "ml",
+            "exact": null,
+            "minimum": 300,
+            "maximum": 500,
+            "evidence_text": null,
+            "estimation_basis": "container_size"
+          },
+          "caffeine": {
+            "kind": "range",
+            "unit": "mg",
+            "exact": null,
+            "minimum": 80,
+            "maximum": 240,
+            "evidence_text": null,
+            "estimation_basis": "beverage_type_and_container"
+          },
+          "label_text_candidates": [],
+          "product_code_candidates": [],
+          "confidence": "medium",
+          "warnings": ["requires user confirmation"]
+        }
+      ]
+    }
+  },
+  {
+    "id": "decaf-or-mixed-caffeine",
+    "request": {
+      "captured_at": "2026-08-06T11:00:00+09:00",
+      "timezone": "Asia/Seoul",
+      "source": "fixture",
+      "location": null,
+      "metadata_provenance": {
+        "captured_at": "fixture",
+        "timezone": "fixture",
+        "location": "unavailable"
+      }
+    },
+    "extraction": {
+      "status": "ambiguous",
+      "confidence": "low",
+      "warnings": ["regular, half-caf, and decaf cannot be distinguished"],
+      "items": [
+        {
+          "intake_type": "beverage",
+          "name_candidates": ["coffee"],
+          "category": "coffee",
+          "serving": {
+            "kind": "unknown",
+            "unit": "ml",
+            "exact": null,
+            "minimum": null,
+            "maximum": null,
+            "evidence_text": null,
+            "estimation_basis": null
+          },
+          "caffeine": {
+            "kind": "unknown",
+            "unit": "mg",
+            "exact": null,
+            "minimum": null,
+            "maximum": null,
+            "evidence_text": null,
+            "estimation_basis": null
+          },
+          "label_text_candidates": [],
+          "product_code_candidates": [],
+          "confidence": "low",
+          "warnings": ["ask whether this was regular or decaf"]
+        }
+      ]
+    }
+  },
+  {
+    "id": "food-plus-drink",
+    "request": {
+      "captured_at": "2026-08-06T12:30:00+09:00",
+      "timezone": "Asia/Seoul",
+      "source": "fixture",
+      "location": null,
+      "metadata_provenance": {
+        "captured_at": "fixture",
+        "timezone": "fixture",
+        "location": "unavailable"
+      }
+    },
+    "extraction": {
+      "status": "ambiguous",
+      "confidence": "medium",
+      "warnings": ["drink label is not visible"],
+      "items": [
+        {
+          "intake_type": "food",
+          "name_candidates": ["sandwich"],
+          "category": "meal",
+          "serving": {
+            "kind": "unknown",
+            "unit": "serving",
+            "exact": null,
+            "minimum": null,
+            "maximum": null,
+            "evidence_text": null,
+            "estimation_basis": null
+          },
+          "caffeine": {
+            "kind": "unknown",
+            "unit": "mg",
+            "exact": null,
+            "minimum": null,
+            "maximum": null,
+            "evidence_text": null,
+            "estimation_basis": null
+          },
+          "label_text_candidates": [],
+          "product_code_candidates": [],
+          "confidence": "medium",
+          "warnings": []
+        },
+        {
+          "intake_type": "beverage",
+          "name_candidates": ["latte"],
+          "category": "coffee",
+          "serving": {
+            "kind": "range",
+            "unit": "ml",
+            "exact": null,
+            "minimum": 250,
+            "maximum": 450,
+            "evidence_text": null,
+            "estimation_basis": "container_size"
+          },
+          "caffeine": {
+            "kind": "range",
+            "unit": "mg",
+            "exact": null,
+            "minimum": 60,
+            "maximum": 180,
+            "evidence_text": null,
+            "estimation_basis": "beverage_type_and_container"
+          },
+          "label_text_candidates": [],
+          "product_code_candidates": [],
+          "confidence": "medium",
+          "warnings": ["requires user confirmation"]
+        }
+      ]
+    }
+  },
+  {
+    "id": "low-confidence-no-number",
+    "request": {
+      "captured_at": "2026-08-06T14:00:00+09:00",
+      "timezone": "Asia/Seoul",
+      "source": "fixture",
+      "location": null,
+      "metadata_provenance": {
+        "captured_at": "fixture",
+        "timezone": "fixture",
+        "location": "unavailable"
+      }
+    },
+    "extraction": {
+      "status": "insufficient_data",
+      "confidence": "low",
+      "warnings": ["image is too dark"],
+      "items": []
+    }
+  },
+  {
+    "id": "timezone-boundary",
+    "request": {
+      "captured_at": "2026-08-07T00:05:00+09:00",
+      "timezone": "Asia/Seoul",
+      "source": "fixture",
+      "location": null,
+      "metadata_provenance": {
+        "captured_at": "fixture",
+        "timezone": "fixture",
+        "location": "unavailable"
+      }
+    },
+    "extraction": {
+      "status": "usable",
+      "confidence": "high",
+      "warnings": [],
+      "items": [
+        {
+          "intake_type": "beverage",
+          "name_candidates": ["energy drink"],
+          "category": "energy_drink",
+          "serving": {
+            "kind": "exact",
+            "unit": "ml",
+            "exact": 250,
+            "minimum": null,
+            "maximum": null,
+            "evidence_text": "250 mL",
+            "estimation_basis": "visible_label"
+          },
+          "caffeine": {
+            "kind": "exact",
+            "unit": "mg",
+            "exact": 80,
+            "minimum": null,
+            "maximum": null,
+            "evidence_text": "Caffeine 80 mg",
+            "estimation_basis": "visible_label"
+          },
+          "label_text_candidates": ["250 mL", "Caffeine 80 mg"],
+          "product_code_candidates": [],
+          "confidence": "high",
+          "warnings": []
+        }
+      ]
+    }
+  }
+]

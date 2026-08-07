@@ -41,6 +41,11 @@ __all__ = [
     "Insight",
     "MedicalRecord",
     "TriggerEvent",
+    "WellnessEvent",
+    "RetentionPolicy",
+    "StorageObject",
+    "StorageUsageDaily",
+    "PurgeJob",
 ]
 
 
@@ -366,10 +371,9 @@ class RawIngestEvent(Base):
     Raw-first principle (docs/PLAN.md §13): the verbatim payload is written
     to ``HEALTHMES_DATA_DIR/raw_ingest/`` *before* any parsing, and this row
     records where it landed and what the best-effort interpretation did.
-    Unparseable or unmapped payloads are kept, never rejected — long-horizon
-    unstructured data becomes interpretable as models improve. Rows are
-    never updated after the ingest request finishes and never deleted by
-    application code.
+    Unparseable or unmapped payloads are accepted and retained according to
+    the user's ``raw_payload`` policy. The storage maintenance worker removes
+    the row only after its indexed file reaches ``safe_to_purge`` and expires.
     """
 
     __tablename__ = "raw_ingest_event"
@@ -384,3 +388,105 @@ class RawIngestEvent(Base):
     forward_status: Mapped[str_32] = mapped_column(default="skipped")
     forward_detail: Mapped[str_255 | None]
     records_forwarded: Mapped[int] = mapped_column(default=0)
+
+
+class RetentionPolicy(Base):
+    """User-owned retention choice for one logical data class."""
+
+    __tablename__ = "retention_policy"
+    __table_args__ = (UniqueConstraint("data_class", name="uq_retention_policy_data_class"),)
+
+    data_class: Mapped[str_64] = mapped_column(index=True)
+    retention_days: Mapped[int | None]
+    enabled: Mapped[bool] = mapped_column(default=True)
+
+
+class StorageObject(Base):
+    """Index for a large payload stored below ``HEALTHMES_DATA_DIR``."""
+
+    __tablename__ = "storage_object"
+    __table_args__ = (UniqueConstraint("relative_path", name="uq_storage_object_relative_path"),)
+
+    data_class: Mapped[str_64] = mapped_column(index=True)
+    relative_path: Mapped[str_255]
+    content_type: Mapped[str_255 | None]
+    size_bytes: Mapped[int] = mapped_column(default=0)
+    sha256: Mapped[str_64 | None] = mapped_column(index=True)
+    retention_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("retention_policy.id", ondelete="SET NULL"), index=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(index=True)
+    safe_to_purge: Mapped[bool] = mapped_column(default=False, index=True)
+    purged_at: Mapped[datetime | None] = mapped_column(index=True)
+
+
+class WellnessEvent(Base):
+    """Common envelope that indexes every wellness input without losing provenance."""
+
+    __tablename__ = "wellness_event"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_provider",
+            "source_record_id",
+            name="uq_wellness_event_source_record",
+        ),
+    )
+
+    event_type: Mapped[str_64] = mapped_column(index=True)
+    schema_version: Mapped[int] = mapped_column(default=1)
+    observed_at: Mapped[datetime] = mapped_column(index=True)
+    recorded_at: Mapped[datetime] = mapped_column(index=True)
+    timezone: Mapped[str_64 | None]
+    source_provider: Mapped[str_64] = mapped_column(index=True)
+    source_device: Mapped[str_255 | None]
+    source_record_id: Mapped[str_255]
+    capture_method: Mapped[str_32] = mapped_column(default="import")
+    quality_flags: Mapped[JSONDict | None]
+    confidence: Mapped[float | None]
+    coverage: Mapped[float | None]
+    sensitivity: Mapped[str_32] = mapped_column(default="wellness")
+    consent_scope: Mapped[str_64] = mapped_column(default="personal")
+    retention_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("retention_policy.id", ondelete="SET NULL"), index=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(index=True)
+    payload: Mapped[JSONDict]
+    raw_object_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("storage_object.id", ondelete="SET NULL"), index=True
+    )
+    derived_from: Mapped[JSONDict | None]
+
+
+class StorageUsageDaily(Base):
+    """Measured storage bytes by class and provider."""
+
+    __tablename__ = "storage_usage_daily"
+    __table_args__ = (
+        UniqueConstraint(
+            "measured_on",
+            "provider",
+            "data_class",
+            name="uq_storage_usage_daily_measurement",
+        ),
+    )
+
+    measured_on: Mapped[date] = mapped_column(index=True)
+    provider: Mapped[str_32] = mapped_column(default="local")
+    data_class: Mapped[str_64] = mapped_column(index=True)
+    bytes_used: Mapped[int] = mapped_column(default=0)
+    object_count: Mapped[int] = mapped_column(default=0)
+
+
+class PurgeJob(Base):
+    """Audit record for one retention maintenance run."""
+
+    __tablename__ = "purge_job"
+
+    started_at: Mapped[datetime] = mapped_column(index=True)
+    finished_at: Mapped[datetime | None]
+    status: Mapped[str_32] = mapped_column(default="running", index=True)
+    dry_run: Mapped[bool] = mapped_column(default=False)
+    candidates: Mapped[int] = mapped_column(default=0)
+    deleted: Mapped[int] = mapped_column(default=0)
+    bytes_reclaimed: Mapped[int] = mapped_column(default=0)
+    detail: Mapped[JSONDict | None]

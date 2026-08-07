@@ -32,11 +32,14 @@ EXPECTED_PATHS = [
     "/reports/weekly",
     "/reports/weekly.json",
     "/connect",
+    "/v1/storage/settings",
+    "/v1/storage/maintenance",
+    "/v1/wellness-events",
 ]
 
 
 def test_routers_list_covers_all_modules():
-    assert len(routers) == 17
+    assert len(routers) == 19
 
 
 def test_openapi_schema_generates_with_all_paths(client):

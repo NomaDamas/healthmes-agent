@@ -47,6 +47,12 @@ EXPECTED_TABLES = {
     "insight",
     "medical_record",
     "trigger_event",
+    "raw_ingest_event",
+    "retention_policy",
+    "storage_object",
+    "wellness_event",
+    "storage_usage_daily",
+    "purge_job",
 }
 
 
@@ -367,7 +373,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "a9b0c1d2e3f4"
+                ) == "b0c1d2e3f4a5"
         finally:
             engine.dispose()
 

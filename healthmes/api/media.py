@@ -43,6 +43,7 @@ Security rules (medical photos live here — docs/PLAN.md §9):
   path is a uniform 404 — probes learn nothing about the filesystem.
 """
 
+import hashlib
 import re
 import uuid
 from pathlib import Path
@@ -58,8 +59,15 @@ from starlette.datastructures import UploadFile
 from healthmes.api.common import utc_now
 from healthmes.api.errors import APIError, not_found
 from healthmes.config import Settings
+from healthmes.storage import register_storage_object
+from healthmes.store.session import SessionDep
 
-__all__ = ["router", "CANONICAL_CONTENT_TYPES", "MEDIA_CACHE_CONTROL"]
+__all__ = [
+    "router",
+    "CANONICAL_CONTENT_TYPES",
+    "MEDIA_CACHE_CONTROL",
+    "resolve_media_file",
+]
 
 router = APIRouter(prefix="/v1/media", tags=["media"])
 
@@ -181,7 +189,7 @@ def _payload_too_large(cap: int) -> APIError:
         }
     },
 )
-async def upload_media(request: Request) -> MediaUploadOut:
+async def upload_media(request: Request, session: SessionDep) -> MediaUploadOut:
     """Store one captured media file and return its ``media_path`` token.
 
     The token goes into ``POST /v1/food-logs`` / ``POST /v1/medical-records``
@@ -233,6 +241,7 @@ async def upload_media(request: Request) -> MediaUploadOut:
         # somehow exists, fail loudly WITHOUT unlinking the stranger's file.
         out = destination.open("xb")
         written = 0
+        digest = hashlib.sha256()
         try:
             with out:
                 # Exact per-file cap (the header gate above allows the small
@@ -243,6 +252,7 @@ async def upload_media(request: Request) -> MediaUploadOut:
                     if written > cap:
                         raise _payload_too_large(cap)
                     out.write(chunk)
+                    digest.update(chunk)
         except BaseException:
             destination.unlink(missing_ok=True)  # never leave partial files behind
             raise
@@ -255,10 +265,21 @@ async def upload_media(request: Request) -> MediaUploadOut:
     # POSIX separators by construction — the token is a URL/DB value, not an
     # OS path (healthmes/store/models.py media_path convention).
     media_path = f"media/{now:%Y}/{now:%m}/{filename}"
+    register_storage_object(
+        session,
+        settings,
+        relative_path=media_path,
+        data_class="media",
+        content_type=content_type,
+        size_bytes=written,
+        sha256=digest.hexdigest(),
+        observed_at=now,
+    )
+    session.commit()
     return MediaUploadOut(media_path=media_path, content_type=content_type, bytes=written)
 
 
-def _resolve_media_file(settings: Settings, media_path: str) -> Path | None:
+def resolve_media_file(settings: Settings, media_path: str) -> Path | None:
     """Strictly resolve ``media_path`` under ``{data_dir}/media`` (else None).
 
     Accepts the upload token (with its leading ``media/`` segment) or the
@@ -284,7 +305,7 @@ def _resolve_media_file(settings: Settings, media_path: str) -> Path | None:
 @router.get("/{media_path:path}")
 def get_media(media_path: str, request: Request) -> FileResponse:
     """Serve a stored media file (bearer or viewer ``?token=`` — see module doc)."""
-    file_path = _resolve_media_file(_settings(request), media_path)
+    file_path = resolve_media_file(_settings(request), media_path)
     if file_path is None:
         raise not_found("media", media_path)
     return FileResponse(
