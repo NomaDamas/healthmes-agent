@@ -541,6 +541,8 @@ def _parse_datetime_local_aware(
         raise ToolError(f"{field} must be ISO-8601, got {value!r}") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ToolError(f"{field} must include an explicit UTC offset")
+    if parsed.utcoffset() != parsed.astimezone(tz).utcoffset():
+        raise ToolError(f"{field} UTC offset conflicts with the user timezone")
     return parsed.astimezone(tz)
 
 

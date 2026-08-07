@@ -1,6 +1,6 @@
 ---
 name: healthmes-caffeine
-description: Prepare a bounded caffeine proposal for one exact calendar event using current sleep evidence and explicit user-confirmed caffeine limits, intake, timing, population, and safety context. Use when the user asks how much caffeine to take for a specific event or wants to dogfood the caffeine proposal flow.
+description: Prepare a bounded caffeine proposal for one exact calendar event using current sleep evidence, confirmed HealthMes nutrition storage, and explicit user-confirmed limits, timing, population, and safety context. Use when the user asks how much caffeine to take for a specific event or wants to dogfood the caffeine proposal flow.
 ---
 
 # HealthMes Caffeine
@@ -28,19 +28,17 @@ or medical advice. Never mutate Calendar or infer missing user inputs.
 Before calling the proposal tool, obtain every applicable field explicitly:
 
 1. The exact Calendar event selected from `get_schedule`.
-2. Today's total caffeine intake in milligrams across drinks, foods,
-   supplements, and medications, plus confirmation that the total is complete.
-3. The user's own daily ceiling in milligrams. Keep it labeled as a user input,
+2. The user's own daily ceiling in milligrams. Keep it labeled as a user input,
    separate from the tool's population reference.
-4. Confirmed-adult status, beverage-or-food product form, and whether any
+3. Confirmed-adult status, beverage-or-food product form, and whether any
    returned contraindication option applies: pregnancy or breastfeeding,
    trying to become pregnant, relevant medication or condition, pronounced
    sensitivity, or adverse symptoms.
-5. Intended caffeine consumption time, target sleep time, and the user's
+4. Intended caffeine consumption time, target sleep time, and the user's
    desired pre-sleep cutoff, all explicitly confirmed in local time. Never
    substitute the Calendar event start for consumption time. Convert
    timestamps to ISO-8601 with an explicit UTC offset.
-6. If the user wants a specific suggested amount rather than only an upper
+5. If the user wants a specific suggested amount rather than only an upper
    bound, their previously confirmed amount for the same exact event and the
    time they confirmed it. Never invent or transfer a baseline from another
    event.
@@ -55,13 +53,18 @@ conversation guesses, old examples, population guidance, or another event.
 2. Collect the required user evidence. A single compact grouped question is
    acceptable, but each answer must stay explicit.
 3. Call `mcp__healthmes__get_caffeine_proposal` with the exact event ID and
-   user-confirmed fields.
+   user-confirmed fields. The tool reads daily caffeine intake and completeness
+   from HealthMes nutrition storage; never pass caller-supplied replacements.
 4. Honor the returned `status` before reading recommendation numbers:
    - `proposal`: render the returned upper bound; render a suggested amount
      only when it is non-null and its basis is `personal_event_baseline`;
    - `noop`: state the returned reason and do not add a numeric suggestion;
-   - `insufficient_data` or `invalid_input`: state the exact missing or invalid
-     boundary and ask only for the evidence that can resolve it.
+   - `insufficient_data` with missing or incomplete intake: guide the user to
+     record or confirm the relevant food, drink, supplement, or medication in
+     the nutrition flow, then retry; never ask for an untracked total to pass
+     directly to this tool;
+   - other `insufficient_data` or `invalid_input`: state the exact missing or
+     invalid boundary and ask only for the evidence that can resolve it.
 5. Never calculate, round, increase, or reinterpret a returned amount.
 
 ## Response shape

@@ -450,6 +450,107 @@ def test_prospective_candidate_builds_context_without_becoming_intake(
     assert fetched["is_confirmed_intake"] is False
 
 
+def test_caffeine_context_includes_confirmed_text_outcome_evidence(
+    client, session
+):
+    consumed = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            source_text="카페인 150mg 커피를 마셨어",
+            items=[
+                {
+                    "name": "커피",
+                    "intake_type": "beverage",
+                    "serving": _estimate(1, "cup"),
+                    "nutrients": [
+                        {
+                            "nutrient": "caffeine",
+                            "amount": _estimate(150, "mg"),
+                            "confidence": "high",
+                            "origin": "user",
+                        }
+                    ],
+                    "confidence": "high",
+                }
+            ],
+        ),
+    )
+    assert consumed.status_code == 201
+    interaction_id = consumed.json()["interaction_id"]
+    outcome = client.post(
+        f"/v1/intake-interactions/{interaction_id}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "consumed",
+            "source": "ios-device",
+            "consumed_at": "2026-08-06T12:30:00+09:00",
+        },
+    )
+    assert outcome.status_code == 201
+    daily = client.post(
+        "/v1/nutrition-observations/daily-confirmations",
+        json={
+            "local_date": "2026-08-06",
+            "timezone": "Asia/Seoul",
+            "observation_ids": [],
+            "total_intake_complete": True,
+            "source": "desktop-web",
+        },
+    )
+    assert daily.status_code == 201
+
+    candidate = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            intent="ask_before_intake",
+            source_text="오후 커피를 마셔도 될까?",
+            items=[
+                {
+                    "name": "커피",
+                    "intake_type": "beverage",
+                    "serving": _estimate(1, "cup"),
+                    "nutrients": [
+                        {
+                            "nutrient": "caffeine",
+                            "amount": _estimate(100, "mg"),
+                            "confidence": "high",
+                            "origin": "user",
+                        }
+                    ],
+                    "confidence": "high",
+                }
+            ],
+        ),
+    )
+    assert candidate.status_code == 201
+    requested = client.post(
+        f"/v1/intake-interactions/{candidate.json()['interaction_id']}"
+        "/decision-requests",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "scope": "caffeine_sleep",
+            "source": "ios-device",
+            "intended_consumption_at": "2026-08-06T16:00:00+09:00",
+        },
+    )
+    assert requested.status_code == 201
+    context = client.get(
+        "/v1/intake-interactions/decision-requests/"
+        f"{requested.json()['request_id']}/context"
+    )
+    assert context.status_code == 200
+    caffeine = context.json()["specialized_evidence"]["caffeine"]
+    assert caffeine["status"] == "known"
+    assert caffeine["confirmed_caffeine_mg"] == 150
+    outcome_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.intake-outcome.v1"
+        )
+    )
+    assert outcome_event is not None
+    assert str(outcome_event.id) in context.json()["evidence_event_ids"]
+
+
 def test_high_risk_scope_cannot_store_wellness_proposal(client):
     interaction = client.post(
         "/v1/intake-interactions",

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from healthmes.nutrition.contracts import (
@@ -17,6 +18,11 @@ from healthmes.nutrition.contracts import (
     nutrition_review_to_payload,
     observation_to_payload,
 )
+from healthmes.nutrition.intake_contracts import (
+    IntakeOutcomeStatus,
+    NormalizedIntakeItem,
+    outcome_from_payload,
+)
 from healthmes.nutrition.repository import (
     latest_caffeine_confirmations,
     latest_daily_confirmation,
@@ -24,6 +30,10 @@ from healthmes.nutrition.repository import (
     list_observations,
     local_day_bounds,
 )
+from healthmes.store import WellnessEvent
+
+INTAKE_OUTCOME_EVENT = "nutrition.intake-outcome.v1"
+INTAKE_OUTCOME_PROVIDER = "nutrition-intake-outcome"
 
 
 def observation_view(
@@ -141,6 +151,62 @@ def _review_caffeine_total(
     return sum(estimate.exact for estimate in estimates if estimate.exact is not None)
 
 
+def _item_caffeine_total(
+    items: tuple[NormalizedIntakeItem, ...],
+) -> float | None:
+    total = 0.0
+    for item in items:
+        estimates = [
+            fact.amount
+            for fact in item.nutrients
+            if fact.nutrient.casefold() == "caffeine"
+        ]
+        if (
+            len(estimates) != 1
+            or estimates[0].kind is not EstimateKind.EXACT
+            or estimates[0].unit.casefold() != "mg"
+            or estimates[0].exact is None
+        ):
+            return None
+        total += estimates[0].exact
+    return total
+
+
+def _latest_consumed_outcomes_for_day(
+    session: Session,
+    *,
+    start: datetime,
+    end: datetime,
+) -> list[tuple[WellnessEvent, Any]]:
+    rows = session.scalars(
+        select(WellnessEvent)
+        .where(
+            WellnessEvent.event_type == INTAKE_OUTCOME_EVENT,
+            WellnessEvent.source_provider == INTAKE_OUTCOME_PROVIDER,
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > datetime.now(UTC),
+            ),
+        )
+        .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
+    )
+    latest: dict[uuid.UUID, tuple[WellnessEvent, Any]] = {}
+    for row in rows:
+        outcome = outcome_from_payload(row.payload)
+        if outcome.interaction_id in latest:
+            continue
+        latest[outcome.interaction_id] = (row, outcome)
+    return [
+        (row, outcome)
+        for row, outcome in latest.values()
+        if (
+            outcome.status is IntakeOutcomeStatus.CONSUMED
+            and outcome.consumed_at is not None
+            and start <= outcome.consumed_at.astimezone(UTC) < end
+        )
+    ]
+
+
 def known_caffeine_for_day(
     session: Session,
     *,
@@ -153,12 +219,56 @@ def known_caffeine_for_day(
     confirmations = latest_caffeine_confirmations(session, ids)
     reviews = latest_nutrition_reviews(session, ids)
     daily = latest_daily_confirmation(session, local_date, timezone)
+    outcomes = _latest_consumed_outcomes_for_day(
+        session,
+        start=start,
+        end=end,
+    )
 
     total_mg = 0.0
     reviewed: set[uuid.UUID] = set()
     quantified: set[uuid.UUID] = set()
+    quantified_outcomes: set[uuid.UUID] = set()
+    outcome_observation_ids: set[uuid.UUID] = set()
     evidence: list[dict[str, Any]] = []
+    latest_evidence_at: datetime | None = None
+    for row, outcome in outcomes:
+        snapshot = outcome.intake_snapshot
+        amount = (
+            _item_caffeine_total(snapshot.items)
+            if snapshot is not None
+            else None
+        )
+        if amount is not None:
+            total_mg += amount
+            quantified_outcomes.add(outcome.outcome_id)
+        if (
+            snapshot is not None
+            and snapshot.nutrition_observation_id is not None
+        ):
+            outcome_observation_ids.add(snapshot.nutrition_observation_id)
+        latest_evidence_at = max(
+            latest_evidence_at or outcome.confirmed_at,
+            outcome.confirmed_at,
+        )
+        evidence.append(
+            {
+                "event_id": str(row.id),
+                "interaction_id": str(outcome.interaction_id),
+                "outcome_id": str(outcome.outcome_id),
+                "event_type": INTAKE_OUTCOME_EVENT,
+                "status": outcome.status.value,
+                "caffeine_mg": amount,
+                "modality": (
+                    snapshot.modality.value if snapshot is not None else None
+                ),
+            }
+        )
     for observation in observations:
+        if observation.observation_id in outcome_observation_ids:
+            reviewed.add(observation.observation_id)
+            quantified.add(observation.observation_id)
+            continue
         confirmation = confirmations.get(observation.observation_id)
         review = reviews.get(observation.observation_id)
         if review is not None and (
@@ -170,6 +280,10 @@ def known_caffeine_for_day(
             if amount is not None:
                 total_mg += amount
                 quantified.add(observation.observation_id)
+            latest_evidence_at = max(
+                latest_evidence_at or review.reviewed_at,
+                review.reviewed_at,
+            )
             evidence.append(
                 {
                     "observation_id": str(observation.observation_id),
@@ -190,6 +304,10 @@ def known_caffeine_for_day(
             total_mg += amount
             reviewed.add(observation.observation_id)
             quantified.add(observation.observation_id)
+            latest_evidence_at = max(
+                latest_evidence_at or confirmation.confirmed_at,
+                confirmation.confirmed_at,
+            )
             evidence.append(
                 {
                     "observation_id": str(observation.observation_id),
@@ -202,6 +320,10 @@ def known_caffeine_for_day(
         elif confirmation.status is ConfirmationStatus.REJECTED:
             reviewed.add(observation.observation_id)
             quantified.add(observation.observation_id)
+            latest_evidence_at = max(
+                latest_evidence_at or confirmation.confirmed_at,
+                confirmation.confirmed_at,
+            )
             evidence.append(
                 {
                     "observation_id": str(observation.observation_id),
@@ -219,6 +341,13 @@ def known_caffeine_for_day(
         and daily_ids == ids
         and reviewed == ids
         and quantified == ids
+        and quantified_outcomes
+        == {outcome.outcome_id for _, outcome in outcomes}
+        and (
+            latest_evidence_at is None
+            or daily.confirmed_at.astimezone(UTC)
+            >= latest_evidence_at.astimezone(UTC)
+        )
     )
     return {
         "status": "known" if complete else "incomplete",
@@ -227,10 +356,17 @@ def known_caffeine_for_day(
         "confirmed_caffeine_mg": total_mg,
         "total_intake_complete": complete,
         "observation_count": len(observations),
+        "consumed_outcome_count": len(outcomes),
+        "ledger_entry_count": len(observations) + len(outcomes),
         "reviewed_count": len(reviewed),
         "unreviewed_observation_ids": sorted(str(value) for value in ids - reviewed),
         "unquantified_observation_ids": sorted(
             str(value) for value in ids - quantified
+        ),
+        "unquantified_outcome_ids": sorted(
+            str(outcome.outcome_id)
+            for _, outcome in outcomes
+            if outcome.outcome_id not in quantified_outcomes
         ),
         "evidence": evidence,
         "daily_confirmation_id": (

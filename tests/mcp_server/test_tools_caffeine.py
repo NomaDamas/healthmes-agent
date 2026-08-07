@@ -22,6 +22,20 @@ from healthmes.nutrition.contracts import (
     ObservationStatus,
     VisionProvenance,
 )
+from healthmes.nutrition.intake_contracts import (
+    CaptureModality,
+    EvidenceOrigin,
+    IntakeIntent,
+    IntakeInteraction,
+    IntakeOutcome,
+    IntakeOutcomeStatus,
+    NormalizedIntakeItem,
+    NutrientFact,
+)
+from healthmes.nutrition.intake_service import (
+    create_interaction,
+    persist_outcome,
+)
 from healthmes.nutrition.repository import (
     persist_caffeine_confirmation,
     persist_daily_confirmation,
@@ -190,6 +204,95 @@ def _seed_confirmed_caffeine(
     return observation.observation_id
 
 
+def _seed_confirmed_text_caffeine(
+    store_factory,
+    *,
+    day: dt.date,
+    amount_mg: float,
+) -> uuid.UUID:
+    server_module.set_timezone("Asia/Seoul")
+    settings = server_module._active_settings()
+    local_timezone = dt.timezone(dt.timedelta(hours=9))
+    local_now = dt.datetime.now(local_timezone)
+    observed_at = (
+        local_now.astimezone(dt.UTC)
+        if day == local_now.date()
+        else dt.datetime.combine(
+            day,
+            dt.time(9),
+            tzinfo=local_timezone,
+        ).astimezone(dt.UTC)
+    )
+    interaction_id = uuid.uuid4()
+    interaction = IntakeInteraction(
+        interaction_id=interaction_id,
+        operation_fingerprint="a" * 64,
+        intent=IntakeIntent.LOG_CONSUMED,
+        modality=CaptureModality.TEXT,
+        observed_at=observed_at,
+        recorded_at=observed_at,
+        timezone="Asia/Seoul",
+        source="caffeine-tool-test",
+        source_text=f"coffee {amount_mg} mg caffeine",
+        media_path=None,
+        nutrition_observation_id=None,
+        items=(
+            NormalizedIntakeItem(
+                name="coffee",
+                intake_type="beverage",
+                serving=Estimate(
+                    kind=EstimateKind.EXACT,
+                    unit="cup",
+                    exact=1,
+                    estimation_basis="owner_statement",
+                ),
+                nutrients=(
+                    NutrientFact(
+                        nutrient="caffeine",
+                        amount=Estimate(
+                            kind=EstimateKind.EXACT,
+                            unit="mg",
+                            exact=amount_mg,
+                            estimation_basis="owner_statement",
+                        ),
+                        confidence=Confidence.HIGH,
+                        origin=EvidenceOrigin.USER,
+                    ),
+                ),
+                confidence=Confidence.HIGH,
+            ),
+        ),
+    )
+    with store_factory() as session:
+        create_interaction(session, settings, interaction)
+        persist_outcome(
+            session,
+            IntakeOutcome(
+                outcome_id=uuid.uuid4(),
+                operation_fingerprint="b" * 64,
+                interaction_id=interaction_id,
+                status=IntakeOutcomeStatus.CONSUMED,
+                confirmed_at=observed_at + dt.timedelta(minutes=1),
+                source="fixture-user",
+                consumed_at=observed_at,
+            ),
+        )
+        persist_daily_confirmation(
+            session,
+            DailyIntakeConfirmation(
+                confirmation_id=uuid.uuid4(),
+                local_date=day,
+                timezone="Asia/Seoul",
+                observation_ids=(),
+                total_intake_complete=True,
+                confirmed_at=observed_at + dt.timedelta(minutes=2),
+                source="fixture-user",
+            ),
+        )
+        session.commit()
+    return interaction_id
+
+
 def _local_times(
     pinned_tz: dt.tzinfo,
     *,
@@ -266,6 +369,46 @@ class TestCaffeineProposalTool:
         with store_factory() as session:
             events = list(session.scalars(select(CalendarEventMirror)))
         assert [(event.id, event.summary) for event in events] == [(event_id, "Focused work")]
+
+    async def test_text_intake_is_included_and_decimal_mg_rounds_up(
+        self,
+        mcp_client,
+        call_tool,
+        mcp_env,
+        store_factory,
+        pinned_tz,
+    ):
+        day, event_start, target_sleep = _local_times(pinned_tz)
+        event_id = _seed_event(
+            store_factory,
+            start=event_start.astimezone(dt.UTC),
+            end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+        )
+        mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        interaction_id = _seed_confirmed_text_caffeine(
+            store_factory,
+            day=day,
+            amount_mg=150.1,
+        )
+
+        result = await call_tool(
+            mcp_client,
+            "get_caffeine_proposal",
+            _proposal_args(
+                event_id,
+                event_start_local=event_start,
+                target_sleep_local=target_sleep,
+            ),
+        )
+
+        assert result["status"] == "proposal"
+        assert result["facts"]["consumed_today_mg"] == 151
+        assert result["facts"]["remaining_daily_allowance_mg"] == 149
+        assert result["facts"]["caffeine_intake"]["confirmed_caffeine_mg"] == 150.1
+        assert result["facts"]["caffeine_intake"]["consumed_outcome_count"] == 1
+        assert result["facts"]["caffeine_intake"]["evidence"][0][
+            "interaction_id"
+        ] == str(interaction_id)
 
     async def test_unknown_event_fails_closed_without_provider_lookup(
         self,
@@ -624,5 +767,32 @@ class TestCaffeineProposalTool:
                     "cutoff_before_sleep_hours": 6,
                     "contraindications": [],
                     "target_sleep_at": "2026-08-02T23:00:00",
+                },
+            )
+
+    async def test_timezone_sensitive_inputs_reject_conflicting_offsets(
+        self,
+        mcp_client,
+        store_factory,
+        pinned_tz,
+    ):
+        _, event_start, _ = _local_times(pinned_tz)
+        event_id = _seed_event(
+            store_factory,
+            start=event_start.astimezone(dt.UTC),
+            end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+        )
+
+        with pytest.raises(ToolError, match="conflicts with the user timezone"):
+            await mcp_client.call_tool(
+                "get_caffeine_proposal",
+                {
+                    "event_id": str(event_id),
+                    "personal_daily_limit_mg": 300,
+                    "population_status": "confirmed_adult",
+                    "product_form": "beverage_or_food",
+                    "cutoff_before_sleep_hours": 6,
+                    "contraindications": [],
+                    "target_sleep_at": "2026-08-07T23:00:00+14:00",
                 },
             )
