@@ -133,7 +133,10 @@ final class CaptureRequestTests: XCTestCase {
         XCTAssertEqual(accept.httpMethod, "POST")
         XCTAssertEqual(
             try JSONSerialization.jsonObject(with: accept.httpBody!) as? [String: String],
-            ["resolution_token": "scoped-token"]
+            [
+                "resolution_token": "scoped-token",
+                "surface": "ios_app",
+            ]
         )
         let decline = try HealthMesAPI.proposalActionRequest(
             pairing: pairing,
@@ -199,6 +202,12 @@ final class CaptureRequestTests: XCTestCase {
         )
         XCTAssertFalse(other.isAlreadyResolved)
         XCTAssertNil(other.alreadyResolvedStatus)
+
+        let expired = HealthMesAPIError.server(
+            statusCode: 409, code: "proposal_expired", message: "expired", detail: nil
+        )
+        XCTAssertTrue(expired.isProposalExpired)
+        XCTAssertFalse(other.isProposalExpired)
     }
 
     func testForbiddenResolutionTokenPreservesServerError() {

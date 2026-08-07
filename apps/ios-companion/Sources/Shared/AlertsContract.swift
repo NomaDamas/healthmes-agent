@@ -42,6 +42,7 @@ public struct AlertItem: Codable, Equatable, Identifiable {
     public let evidence: [String: JSONValue]?
     public let decisionUrl: String?
     public let proposalId: UUID?
+    public let decisionCard: DecisionCard?
 
     public init(
         id: UUID,
@@ -51,7 +52,8 @@ public struct AlertItem: Codable, Equatable, Identifiable {
         proposal: String?,
         evidence: [String: JSONValue]?,
         decisionUrl: String?,
-        proposalId: UUID?
+        proposalId: UUID?,
+        decisionCard: DecisionCard? = nil
     ) {
         self.id = id
         self.ruleId = ruleId
@@ -61,6 +63,7 @@ public struct AlertItem: Codable, Equatable, Identifiable {
         self.evidence = evidence
         self.decisionUrl = decisionUrl
         self.proposalId = proposalId
+        self.decisionCard = decisionCard
     }
 
     enum CodingKeys: String, CodingKey {
@@ -72,6 +75,39 @@ public struct AlertItem: Codable, Equatable, Identifiable {
         case evidence
         case decisionUrl = "decision_url"
         case proposalId = "proposal_id"
+        case decisionCard = "decision_card"
+    }
+}
+
+public struct DecisionCard: Codable, Equatable {
+    public let decisionId: UUID
+    public let proposalId: UUID
+    public let kind: String
+    public let severity: String
+    public let title: String
+    public let observationShort: String
+    public let evidenceShort: String?
+    public let proposedAction: String
+    public let before: Date?
+    public let after: Date
+    public let endsAt: Date
+    public let expiresAt: Date
+    public let decisionUrl: String?
+
+    enum CodingKeys: String, CodingKey {
+        case decisionId = "decision_id"
+        case proposalId = "proposal_id"
+        case kind
+        case severity
+        case title
+        case observationShort = "observation_short"
+        case evidenceShort = "evidence_short"
+        case proposedAction = "proposed_action"
+        case before
+        case after
+        case endsAt = "ends_at"
+        case expiresAt = "expires_at"
+        case decisionUrl = "decision_url"
     }
 }
 

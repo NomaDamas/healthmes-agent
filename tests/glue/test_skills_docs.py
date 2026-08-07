@@ -69,6 +69,7 @@ def test_skill_dirs_all_checked() -> None:
         "doctor-visit-summary",
         "healthmes-caffeine",
         "healthmes-capture",
+        "healthmes-nutrition",
         "healthmes-planner",
         "healthmes-sleep",
         "healthmes-stress",

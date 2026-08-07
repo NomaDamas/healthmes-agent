@@ -6,6 +6,28 @@ from fastmcp.exceptions import ToolError
 from sqlalchemy import select
 
 from healthmes.mcp_server import server as server_module
+from healthmes.nutrition.contracts import (
+    CaffeineConfirmation,
+    CaptureContext,
+    Confidence,
+    ConfirmationStatus,
+    ConfirmedCaffeineItem,
+    DailyIntakeConfirmation,
+    Estimate,
+    EstimateKind,
+    IntakeItem,
+    IntakeType,
+    MetadataSource,
+    NutritionObservation,
+    ObservationStatus,
+    VisionProvenance,
+)
+from healthmes.nutrition.repository import (
+    persist_caffeine_confirmation,
+    persist_daily_confirmation,
+    persist_observation,
+)
+from healthmes.storage import register_storage_object
 from healthmes.store import CalendarEventMirror, CalendarSource
 
 
@@ -44,13 +66,128 @@ def _proposal_args(
         "product_form": "beverage_or_food",
         "intended_consumption_at": event_start_local.isoformat(),
         "target_sleep_at": target_sleep_local.isoformat(),
-        "consumed_today_mg": 100,
-        "total_intake_complete": True,
         "personal_event_baseline_mg": 100,
         "baseline_confirmed_at": (event_start_local - dt.timedelta(hours=1)).isoformat(),
         "cutoff_before_sleep_hours": 6,
         "contraindications": [],
     }
+
+
+def _seed_confirmed_caffeine(
+    store_factory,
+    *,
+    day: dt.date,
+    amount_mg: float = 100,
+) -> uuid.UUID:
+    server_module.set_timezone("Asia/Seoul")
+    settings = server_module._active_settings()
+    local_timezone = dt.timezone(dt.timedelta(hours=9))
+    local_now = dt.datetime.now(local_timezone)
+    observed_at = (
+        local_now.astimezone(dt.UTC)
+        if day == local_now.date()
+        else dt.datetime.combine(
+            day,
+            dt.time(9),
+            tzinfo=local_timezone,
+        ).astimezone(dt.UTC)
+    )
+    media_path = f"media/caffeine/{uuid.uuid4()}.jpg"
+    target = settings.data_dir / media_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"fixture")
+    observation = NutritionObservation(
+        observation_id=uuid.uuid4(),
+        capture=CaptureContext(
+            media_path=media_path,
+            captured_at=observed_at,
+            timezone="Asia/Seoul",
+            source="caffeine-tool-test",
+            location=None,
+            metadata_provenance={
+                "captured_at": MetadataSource.FIXTURE,
+                "timezone": MetadataSource.FIXTURE,
+                "location": MetadataSource.UNAVAILABLE,
+            },
+        ),
+        status=ObservationStatus.USABLE,
+        confidence=Confidence.HIGH,
+        warnings=(),
+        items=(
+            IntakeItem(
+                intake_type=IntakeType.BEVERAGE,
+                name_candidates=("coffee",),
+                category="coffee",
+                serving=Estimate(
+                    kind=EstimateKind.EXACT,
+                    unit="ml",
+                    exact=250,
+                    estimation_basis="fixture",
+                ),
+                caffeine=Estimate(
+                    kind=EstimateKind.EXACT,
+                    unit="mg",
+                    exact=amount_mg,
+                    estimation_basis="fixture",
+                ),
+                confidence=Confidence.HIGH,
+            ),
+        ),
+        vision=VisionProvenance(
+            provider="fixture",
+            model="fixture-v1",
+            model_digest="sha256:fixture",
+            prompt_version="fixture-v1",
+            schema_version="nutrition-observation-v1",
+            analyzed_at=observed_at + dt.timedelta(seconds=1),
+        ),
+    )
+    with store_factory() as session:
+        register_storage_object(
+            session,
+            settings,
+            relative_path=media_path,
+            data_class="media",
+            content_type="image/jpeg",
+            size_bytes=7,
+            observed_at=observed_at,
+        )
+        persist_observation(
+            session,
+            settings,
+            observation,
+            request_fingerprint=str(observation.observation_id),
+        )
+        persist_caffeine_confirmation(
+            session,
+            CaffeineConfirmation(
+                confirmation_id=uuid.uuid4(),
+                observation_id=observation.observation_id,
+                status=ConfirmationStatus.CONFIRMED,
+                confirmed_at=observed_at + dt.timedelta(minutes=1),
+                source="fixture-user",
+                items=(
+                    ConfirmedCaffeineItem(
+                        item_index=0,
+                        caffeine_mg=amount_mg,
+                    ),
+                ),
+            ),
+        )
+        persist_daily_confirmation(
+            session,
+            DailyIntakeConfirmation(
+                confirmation_id=uuid.uuid4(),
+                local_date=day,
+                timezone="Asia/Seoul",
+                observation_ids=(observation.observation_id,),
+                total_intake_complete=True,
+                confirmed_at=observed_at + dt.timedelta(minutes=2),
+                source="fixture-user",
+            ),
+        )
+        session.commit()
+    return observation.observation_id
 
 
 def _local_times(
@@ -65,6 +202,10 @@ def _local_times(
 
 
 class TestCaffeineProposalTool:
+    @pytest.fixture(autouse=True)
+    def _use_iana_timezone(self, mcp_env):
+        server_module.set_timezone("Asia/Seoul")
+
     async def test_current_evidence_returns_personal_baseline_proposal_without_writes(
         self,
         mcp_client,
@@ -80,6 +221,10 @@ class TestCaffeineProposalTool:
             end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
         )
         mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        observation_id = _seed_confirmed_caffeine(
+            store_factory,
+            day=day,
+        )
 
         result = await call_tool(
             mcp_client,
@@ -105,6 +250,10 @@ class TestCaffeineProposalTool:
             "source": "user_confirmed_via_agent",
         }
         assert result["facts"]["remaining_daily_allowance_mg"] == 200
+        assert result["facts"]["caffeine_intake"]["status"] == "known"
+        assert result["facts"]["caffeine_intake"]["evidence"][0][
+            "observation_id"
+        ] == str(observation_id)
         assert result["recommendation"] == {
             "maximum_additional_mg": 200,
             "suggested_additional_mg": 100,
@@ -190,8 +339,6 @@ class TestCaffeineProposalTool:
             event_start_local=event_start,
             target_sleep_local=target_sleep,
         )
-        args["consumed_today_mg"] = None
-        args["total_intake_complete"] = False
 
         result = await call_tool(mcp_client, "get_caffeine_proposal", args)
 
@@ -205,6 +352,32 @@ class TestCaffeineProposalTool:
         }
         assert result["reason"] == "missing_sleep"
         assert result["facts"]["target_event"]["start"].startswith(day.isoformat())
+        assert result["facts"]["caffeine_intake"]["status"] == "incomplete"
+        assert result["facts"]["consumed_today_mg"] is None
+        assert result["facts"]["total_intake_complete"] is False
+
+    async def test_callers_cannot_override_stored_daily_intake(
+        self,
+        mcp_client,
+        store_factory,
+        pinned_tz,
+    ):
+        _, event_start, target_sleep = _local_times(pinned_tz)
+        event_id = _seed_event(
+            store_factory,
+            start=event_start.astimezone(dt.UTC),
+            end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
+        )
+        args = _proposal_args(
+            event_id,
+            event_start_local=event_start,
+            target_sleep_local=target_sleep,
+        )
+        args["consumed_today_mg"] = 0
+        args["total_intake_complete"] = True
+
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool("get_caffeine_proposal", args)
 
     async def test_unconfirmed_baseline_returns_only_an_upper_bound(
         self,
@@ -221,6 +394,7 @@ class TestCaffeineProposalTool:
             end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
         )
         mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        _seed_confirmed_caffeine(store_factory, day=day)
         args = _proposal_args(
             event_id,
             event_start_local=event_start,
@@ -251,6 +425,7 @@ class TestCaffeineProposalTool:
             end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
         )
         mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        _seed_confirmed_caffeine(store_factory, day=day)
         args = _proposal_args(
             event_id,
             event_start_local=event_start,
@@ -279,7 +454,11 @@ class TestCaffeineProposalTool:
         monkeypatch,
     ):
         now = dt.datetime.now(pinned_tz)
-        event_start = now + dt.timedelta(hours=2)
+        event_start = dt.datetime.combine(
+            now.date(),
+            dt.time(13),
+            tzinfo=pinned_tz,
+        )
         target_sleep = event_start + dt.timedelta(hours=10)
         monkeypatch.setattr(server_module, "_today_local", lambda: event_start.date())
         event_id = _seed_event(
@@ -288,6 +467,7 @@ class TestCaffeineProposalTool:
             end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
         )
         mcp_env.add_sleep_summary(event_start.date().isoformat(), duration_minutes=374)
+        _seed_confirmed_caffeine(store_factory, day=event_start.date())
         args = _proposal_args(
             event_id,
             event_start_local=event_start,
@@ -345,6 +525,7 @@ class TestCaffeineProposalTool:
             end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
         )
         mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        _seed_confirmed_caffeine(store_factory, day=day)
         args = _proposal_args(
             event_id,
             event_start_local=event_start,
@@ -374,6 +555,7 @@ class TestCaffeineProposalTool:
             end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
         )
         mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        _seed_confirmed_caffeine(store_factory, day=day)
         args = _proposal_args(
             event_id,
             event_start_local=event_start,
@@ -403,6 +585,7 @@ class TestCaffeineProposalTool:
             end=(event_start + dt.timedelta(hours=1)).astimezone(dt.UTC),
         )
         mcp_env.add_sleep_summary(day.isoformat(), duration_minutes=374)
+        _seed_confirmed_caffeine(store_factory, day=day)
         args = _proposal_args(
             event_id,
             event_start_local=event_start,

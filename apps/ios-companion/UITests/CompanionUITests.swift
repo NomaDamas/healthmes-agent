@@ -87,4 +87,64 @@ final class CompanionUITests: XCTestCase {
             "food-log POST should round-trip against the live instance"
         )
     }
+
+    /// Visual contract for #91: the ordinary compact banner arrives first,
+    /// then expanding it reveals the glass decision remote without opening
+    /// the HealthMes app.
+    func testExpandedDecisionNotificationShowsNoAndYes() throws {
+        let app = XCUIApplication()
+        app.launchArguments += ["-healthmes-notification-demo"]
+
+        addUIInterruptionMonitor(withDescription: "Notification permission") { alert in
+            let allow = alert.buttons["허용"].exists ? alert.buttons["허용"] : alert.buttons["Allow"]
+            guard allow.exists else { return false }
+            allow.tap()
+            return true
+        }
+
+        app.launch()
+        app.tap()
+        sleep(1)
+        XCUIDevice.shared.press(.home)
+
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let notificationTitle = springboard.staticTexts["Move Deep Work?"]
+        XCTAssertTrue(
+            notificationTitle.waitForExistence(timeout: 8),
+            "The deterministic HealthMes decision notification should appear."
+        )
+        XCTAssertTrue(
+            springboard.staticTexts["Low recovery · sleep debt"].exists,
+            "The compact notification must explain the health reason immediately."
+        )
+        XCTAssertFalse(
+            springboard.buttons["healthmes-decision-yes"].exists,
+            "iOS owns the compact banner and may hide category actions until expansion."
+        )
+        let compactScreenshot = XCTAttachment(screenshot: springboard.screenshot())
+        compactScreenshot.name = "HealthMes ordinary compact banner"
+        compactScreenshot.lifetime = .keepAlways
+        add(compactScreenshot)
+
+        notificationTitle.press(forDuration: 1.5)
+
+        XCTAssertTrue(
+            springboard.staticTexts["HEALTHMES · DECISION"].waitForExistence(timeout: 5),
+            "The HealthMes content extension must render instead of a blank card."
+        )
+        XCTAssertTrue(
+            springboard.staticTexts["healthmes-decision-details"].exists,
+            "The expanded notification must expose a scrollable decision detail region."
+        )
+
+        let no = springboard.buttons["healthmes-decision-no"]
+        let yes = springboard.buttons["healthmes-decision-yes"]
+        XCTAssertTrue(no.waitForExistence(timeout: 5), "Expanded notification must show No.")
+        XCTAssertTrue(yes.waitForExistence(timeout: 5), "Expanded notification must show Yes.")
+
+        let screenshot = XCTAttachment(screenshot: springboard.screenshot())
+        screenshot.name = "HealthMes expanded decision notification"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
 }

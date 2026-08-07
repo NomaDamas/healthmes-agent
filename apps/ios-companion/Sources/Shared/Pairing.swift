@@ -18,6 +18,10 @@ import Security
 
 public enum AppGroup {
     public static let identifier = "group.com.healthmes.companion"
+    public static var keychainIdentifier: String {
+        Bundle.main.object(forInfoDictionaryKey: "HealthMesKeychainAccessGroup") as? String
+            ?? identifier
+    }
 
     public static var userDefaults: UserDefaults {
         UserDefaults(suiteName: identifier) ?? .standard
@@ -120,20 +124,20 @@ public struct KeychainTokenStore {
     public init() {}
 
     public func readToken() -> String? {
-        readToken(accessGroup: AppGroup.identifier) ?? readToken(accessGroup: nil)
+        readToken(accessGroup: AppGroup.keychainIdentifier) ?? readToken(accessGroup: nil)
     }
 
     public func writeToken(_ token: String) {
         deleteToken()
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        if add(token: trimmed, accessGroup: AppGroup.identifier) { return }
+        if add(token: trimmed, accessGroup: AppGroup.keychainIdentifier) { return }
         // Unsigned/simulator fallback: no access-group entitlement available.
         _ = add(token: trimmed, accessGroup: nil)
     }
 
     public func deleteToken() {
-        SecItemDelete(baseQuery(accessGroup: AppGroup.identifier) as CFDictionary)
+        SecItemDelete(baseQuery(accessGroup: AppGroup.keychainIdentifier) as CFDictionary)
         SecItemDelete(baseQuery(accessGroup: nil) as CFDictionary)
     }
 

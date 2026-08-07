@@ -122,6 +122,413 @@
         }
       }
     },
+    "Could not decide. Try again from the iPhone app.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "처리하지 못했습니다. iPhone 앱에서 다시 시도하세요."
+          }
+        }
+      }
+    },
+    "No recorded. Your calendar stays unchanged.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아니요로 기록했습니다. 캘린더는 그대로 유지됩니다."
+          }
+        }
+      }
+    },
+    "Recording No…": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아니요를 기록하는 중…"
+          }
+        }
+      }
+    },
+    "Recording Yes…": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "예를 기록하는 중…"
+          }
+        }
+      }
+    },
+    "Yes recorded. Calendar sync will apply the change.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "예로 기록했습니다. 캘린더 동기화가 변경을 반영합니다."
+          }
+        }
+      }
+    },
+    "Proposal expired": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "제안 만료됨"
+          }
+        }
+      }
+    },
+    "The decision window closed without a change.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "결정 시간이 지나 일정은 변경되지 않았습니다."
+          }
+        }
+      }
+    },
+    "Calendar change approved": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "일정 변경 승인됨"
+          }
+        }
+      }
+    },
+    "Calendar change declined": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "일정 변경 거절됨"
+          }
+        }
+      }
+    },
+    "Available until %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@까지 결정 가능"
+          }
+        }
+      }
+    },
+    "Choose No or Yes below": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아래에서 아니요 또는 예를 선택하세요"
+          }
+        }
+      }
+    },
+    "Health-based schedule proposal": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "건강 기반 일정 제안"
+          }
+        }
+      }
+    },
+    "Sleep debt · recovery low": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "수면 부족 · 회복 낮음"
+          }
+        }
+      }
+    },
+    "Low recovery · sleep debt": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "낮은 회복 · 수면 부족"
+          }
+        }
+      }
+    },
+    "Deep Work": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "몰입 업무"
+          }
+        }
+      }
+    },
+    "Decision expired · calendar unchanged": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "결정 만료 · 캘린더 유지"
+          }
+        }
+      }
+    },
+    "Yes recorded · calendar will update": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "예로 기록됨 · 캘린더 변경 예정"
+          }
+        }
+      }
+    },
+    "No recorded · calendar unchanged": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아니요로 기록됨 · 캘린더 유지"
+          }
+        }
+      }
+    },
+    "Could not decide · open HealthMes": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "결정 실패 · HealthMes를 여세요"
+          }
+        }
+      }
+    },
+    "Move %@?": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 옮길까요?"
+          }
+        }
+      }
+    },
+    "Move 2 PM focus?": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "2시 집중 일정 미룰까요?"
+          }
+        }
+      }
+    },
+    "Move focus block?": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "집중 일정 미룰까요?"
+          }
+        }
+      }
+    },
+    "Move the 2:00 PM focus block to tomorrow at 9:30 AM?": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "14:00 집중 업무를 내일 09:30으로 옮길까요?"
+          }
+        }
+      }
+    },
+    "→ Tomorrow · 9:30 AM": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "→ 내일 · 오전 9:30"
+          }
+        }
+      }
+    },
+    "→ %@ · %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "→ %@ · %@"
+          }
+        }
+      }
+    },
+    "Details": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "상세 정보"
+          }
+        }
+      }
+    },
+    "Details · decide by %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "상세 정보 · %@까지 결정"
+          }
+        }
+      }
+    },
+    "HRV is 18% below your baseline": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "HRV가 개인 기준선보다 18% 낮습니다"
+          }
+        }
+      }
+    },
+    "Protect recovery": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "회복 보호"
+          }
+        }
+      }
+    },
+    "What changes": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "무엇이 바뀌나요"
+          }
+        }
+      }
+    },
+    "Long-press to choose No or Yes": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "길게 눌러 아니요 / 예"
+          }
+        }
+      }
+    },
+    "New time: %@ – %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "변경 시간: %@ – %@"
+          }
+        }
+      }
+    },
+    "HealthMes recorded No. The calendar stays unchanged.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "HealthMes가 아니요를 기록했습니다. 캘린더는 그대로 유지됩니다."
+          }
+        }
+      }
+    },
+    "HealthMes recorded Yes. Calendar sync will apply it.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "HealthMes가 예를 기록했습니다. 캘린더 동기화가 반영합니다."
+          }
+        }
+      }
+    },
+    "No": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아니요"
+          }
+        }
+      }
+    },
+    "This proposal is no longer pending.": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 제안은 더 이상 대기 중이 아닙니다."
+          }
+        }
+      }
+    },
+    "Yes": {
+      "extractionState": "manual",
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "예"
+          }
+        }
+      }
+    },
     "Apply": {
       "extractionState": "manual",
       "localizations": {

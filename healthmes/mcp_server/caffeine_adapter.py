@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from math import ceil, isfinite
 from typing import Any
 
 from healthmes.mcp_server.caffeine import propose_caffeine
@@ -78,8 +79,7 @@ def build_request(
     intended_consumption_at: datetime | None,
     observed_at: datetime,
     sleep: SleepEvidence | None,
-    consumed_today_mg: int | None,
-    total_intake_complete: bool,
+    caffeine_intake: dict[str, Any] | None,
     personal_daily_limit_mg: int,
     personal_event_baseline_mg: int | None,
     baseline_confirmed_at: datetime | None,
@@ -89,6 +89,9 @@ def build_request(
     contraindications: list[CaffeineContraindication],
     product_form: CaffeineProductForm,
 ) -> CaffeineProposalRequest:
+    consumed_today_mg, total_intake_complete = _stored_caffeine_values(
+        caffeine_intake
+    )
     baseline = None
     if (
         event_id is not None
@@ -117,9 +120,7 @@ def build_request(
     return CaffeineProposalRequest(
         event_id=CalendarEventId(event_id) if event_id is not None else None,
         sleep=sleep,
-        consumed_today_mg=(
-            CaffeineMg(consumed_today_mg) if consumed_today_mg is not None else None
-        ),
+        consumed_today_mg=consumed_today_mg,
         total_intake_complete=total_intake_complete,
         population_daily_guardrail=PopulationDailyCaffeineGuardrail(
             POPULATION_DAILY_GUARDRAIL_MG,
@@ -141,6 +142,28 @@ def build_request(
         ),
         product_form=product_form,
     )
+
+
+def _stored_caffeine_values(
+    caffeine_intake: dict[str, Any] | None,
+) -> tuple[CaffeineMg | None, bool]:
+    if (
+        not isinstance(caffeine_intake, dict)
+        or caffeine_intake.get("status") != "known"
+        or caffeine_intake.get("total_intake_complete") is not True
+    ):
+        return None, False
+    amount = caffeine_intake.get("confirmed_caffeine_mg")
+    if (
+        isinstance(amount, bool)
+        or not isinstance(amount, (int, float))
+        or not isfinite(amount)
+        or amount < 0
+    ):
+        return None, False
+    # The bounded decision contract uses whole milligrams. Rounding confirmed
+    # intake upward avoids overstating the remaining allowance.
+    return CaffeineMg(ceil(amount)), True
 
 
 def _baseline_freshness(
@@ -174,6 +197,7 @@ def serialize_proposal(
     *,
     target_event: dict[str, Any] | None,
     sleep_adapter_reason: str | None,
+    caffeine_intake: dict[str, Any] | None,
 ) -> dict[str, Any]:
     proposal = propose_caffeine(request)
     return {
@@ -196,6 +220,7 @@ def serialize_proposal(
             "sleep_adapter_reason": sleep_adapter_reason,
             "consumed_today_mg": request.consumed_today_mg,
             "total_intake_complete": request.total_intake_complete,
+            "caffeine_intake": caffeine_intake,
             "population_daily_guardrail": {
                 "amount_mg": request.population_daily_guardrail.amount_mg,
                 "source": request.population_daily_guardrail.source,

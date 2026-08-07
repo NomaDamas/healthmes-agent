@@ -29,11 +29,32 @@ TRANCHE_3_TOOLS = {
     "create_medical_record",
     "list_medical_records",
 }
+NUTRITION_TOOLS = {
+    "analyze_intake_capture",
+    "capture_intake_interaction",
+    "confirm_intake_outcome",
+    "get_recent_nutrition_observations",
+    "review_photo_nutrition_observation",
+    "get_caffeine_observations",
+    "get_known_caffeine_intake_for_day",
+    "get_intake_decision_context",
+    "confirm_photo_caffeine_observation",
+    "confirm_photo_caffeine_day",
+    "record_intake_decision",
+    "request_intake_decision",
+    "search_intake_records",
+}
 CALENDAR_ADJUSTMENT_TOOLS = {
     "evaluate_morning_calendar_nudge",
     "resolve_calendar_adjustment",
 }
-EXPECTED_TOOLS = TRANCHE_1_TOOLS | TRANCHE_2_TOOLS | TRANCHE_3_TOOLS | CALENDAR_ADJUSTMENT_TOOLS
+EXPECTED_TOOLS = (
+    TRANCHE_1_TOOLS
+    | TRANCHE_2_TOOLS
+    | TRANCHE_3_TOOLS
+    | NUTRITION_TOOLS
+    | CALENDAR_ADJUSTMENT_TOOLS
+)
 
 _INITIALIZE = {
     "jsonrpc": "2.0",

@@ -16,6 +16,14 @@ struct HealthMesCompanionApp: App {
         // 3. WatchConnectivity early so a saved pairing reaches a freshly
         //    installed watch app without reopening the pairing screen.
         PhoneWatchSync.shared.activate()
+
+        #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-healthmes-notification-demo") {
+                Task {
+                    await NotificationManager.shared.postDecisionDemo()
+                }
+            }
+        #endif
     }
 
     var body: some Scene {

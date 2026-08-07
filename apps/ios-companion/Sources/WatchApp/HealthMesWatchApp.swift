@@ -7,6 +7,15 @@ struct HealthMesWatchApp: App {
     init() {
         // Receive the pairing pushed by the iPhone app (application context).
         WatchPairingReceiver.shared.activate()
+        WatchNotificationManager.shared.configure()
+
+        #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-healthmes-watch-notification-demo") {
+                Task {
+                    await WatchNotificationManager.shared.postDecisionDemo()
+                }
+            }
+        #endif
     }
 
     var body: some Scene {

@@ -161,13 +161,16 @@ def test_accept_proposal_then_second_accept_conflicts(client, session):
 
     accepted = client.post(
         f"/v1/schedule/proposals/{proposal.id}/accept",
-        json={"resolution_token": token},
+        json={"resolution_token": token, "surface": "ios_notification"},
     )
     assert accepted.status_code == 200
     assert accepted.json()["status"] == "accepted"
 
     session.expire_all()
-    assert session.get(ScheduleProposal, proposal.id).status == ProposalStatus.ACCEPTED
+    stored = session.get(ScheduleProposal, proposal.id)
+    assert stored.status == ProposalStatus.ACCEPTED
+    assert stored.decided_at is not None
+    assert stored.decision_surface == "ios_notification"
 
     again = client.post(
         f"/v1/schedule/proposals/{proposal.id}/accept",
@@ -203,14 +206,9 @@ def test_accept_invalidates_proposal_when_actual_sleep_changed(client, session):
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "actual_sleep_conflict"
-    assert response.json()["error"]["detail"] == {
-        "proposal_status": "invalidated"
-    }
+    assert response.json()["error"]["detail"] == {"proposal_status": "invalidated"}
     session.expire_all()
-    assert (
-        session.get(ScheduleProposal, proposal.id).status
-        is ProposalStatus.INVALIDATED
-    )
+    assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.INVALIDATED
 
 
 def test_invalidation_does_not_overwrite_a_resolved_proposal(session):
@@ -247,6 +245,23 @@ def test_decline_proposal(client, session):
 
     assert declined.status_code == 200
     assert declined.json()["status"] == "declined"
+
+
+def test_shared_resolver_records_non_rest_surface(session):
+    proposal, handle = _seed_proposal_with_handle(session)
+
+    resolved = resolve_schedule_proposal(
+        session,
+        proposal.id,
+        ProposalStatus.DECLINED,
+        handle,
+        HANDLE_SECRET,
+        surface="telegram",
+    )
+    session.commit()
+
+    assert resolved.decided_at is not None
+    assert resolved.decision_surface == "telegram"
 
 
 def test_proposal_actions_404_for_unknown_id(client):

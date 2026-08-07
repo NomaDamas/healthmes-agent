@@ -53,7 +53,7 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -90,6 +90,62 @@ from healthmes.mcp_server.caffeine_contract import (
     SupportedPopulationStatus,
 )
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
+from healthmes.nutrition.contracts import (
+    CaffeineConfirmation,
+    ConfirmationStatus,
+    ConfirmedCaffeineItem,
+    DailyIntakeConfirmation,
+    NutritionReview,
+    ReviewedNutritionItem,
+)
+from healthmes.nutrition.intake_contracts import (
+    CaptureModality,
+    DecisionScope,
+    DecisionStatus,
+    IntakeDecision,
+    IntakeDecisionRequest,
+    IntakeIntent,
+    IntakeInteraction,
+    IntakeOutcome,
+    IntakeOutcomeStatus,
+    NormalizedIntakeItem,
+)
+from healthmes.nutrition.intake_query import (
+    decision_context,
+    interaction_view,
+    search_intake_history,
+)
+from healthmes.nutrition.intake_service import (
+    IntakeInteractionError,
+    create_analyzed_interaction,
+    create_interaction,
+    create_photo_interaction,
+    get_decision_request,
+    operation_fingerprint,
+    persist_decision,
+    persist_decision_request,
+    persist_outcome,
+    persisted_decision_for_operation,
+)
+from healthmes.nutrition.query import (
+    caffeine_observations_for_day,
+    known_caffeine_for_day,
+    nutrition_observations_view,
+)
+from healthmes.nutrition.repository import (
+    NutritionRepositoryError,
+    persist_caffeine_confirmation,
+    persist_daily_confirmation,
+    persist_nutrition_review,
+)
+from healthmes.nutrition.transcription import (
+    TranscriptionError,
+    create_nutrition_transcriber,
+)
+from healthmes.nutrition.vision import (
+    VisionError,
+    create_vision_provider,
+)
 from healthmes.store import (
     AppUsageSample,
     CalendarEventMirror,
@@ -110,6 +166,9 @@ from healthmes.store import (
 )
 from healthmes.store import enums as store_enums
 from healthmes.trusted_session import verify_trusted_session_proof
+
+_NORMALIZED_INTAKE_ITEMS = TypeAdapter(tuple[NormalizedIntakeItem, ...])
+_REVIEWED_NUTRITION_ITEMS = TypeAdapter(tuple[ReviewedNutritionItem, ...])
 
 # ---------------------------------------------------------------------------
 # Vocabulary grounded in vendor/open-wearables (do not invent values)
@@ -2459,8 +2518,6 @@ async def get_caffeine_proposal(
     contraindications: list[CaffeineContraindication],
     intended_consumption_at: str | None = None,
     target_sleep_at: str | None = None,
-    consumed_today_mg: int | None = None,
-    total_intake_complete: bool = False,
     personal_event_baseline_mg: int | None = None,
     baseline_confirmed_at: str | None = None,
 ) -> dict[str, Any]:
@@ -2477,8 +2534,9 @@ async def get_caffeine_proposal(
     must be ISO-8601 timestamps with an explicit UTC offset.
     `cutoff_before_sleep_hours` and `contraindications` must be supplied from
     explicit user-confirmed context; the adapter does not infer defaults.
-    `consumed_today_mg` must cover drinks, foods, supplements, and medications
-    before `total_intake_complete=true`.
+    Daily caffeine intake and completeness are read only from confirmed
+    HealthMes nutrition storage for the event's local day. Callers cannot
+    supply or override those facts.
     """
     tz = _local_timezone()
     intended_consumption = _parse_datetime_local_aware(
@@ -2515,6 +2573,7 @@ async def get_caffeine_proposal(
     event_start: dt.datetime | None = None
     sleep = None
     sleep_adapter_reason: str | None = None
+    caffeine_intake: dict[str, Any] | None = None
     if event_snapshot is not None:
         event_start = _ensure_utc_dt(event_snapshot["start_at"]).astimezone(tz)
         event_end = _ensure_utc_dt(event_snapshot["end_at"]).astimezone(tz)
@@ -2537,14 +2596,20 @@ async def get_caffeine_proposal(
             event_day=event_day,
             today=_today_local(),
         )
+        timezone_name = getattr(tz, "key", None) or str(tz)
+        with _store_session() as session:
+            caffeine_intake = known_caffeine_for_day(
+                session,
+                local_date=event_day,
+                timezone=timezone_name,
+            )
 
     request = caffeine_adapter.build_request(
         event_id=event_snapshot["id"] if event_snapshot is not None else None,
         intended_consumption_at=intended_consumption,
         observed_at=dt.datetime.now(dt.UTC),
         sleep=sleep,
-        consumed_today_mg=consumed_today_mg,
-        total_intake_complete=total_intake_complete,
+        caffeine_intake=caffeine_intake,
         personal_daily_limit_mg=personal_daily_limit_mg,
         personal_event_baseline_mg=personal_event_baseline_mg,
         baseline_confirmed_at=baseline_confirmed,
@@ -2558,6 +2623,7 @@ async def get_caffeine_proposal(
         request,
         target_event=target_event,
         sleep_adapter_reason=sleep_adapter_reason,
+        caffeine_intake=caffeine_intake,
     )
 
 
@@ -2798,6 +2864,7 @@ def resolve_schedule_proposal(
                 target,
                 reply_handle,
                 _adjustment_handle_secret(),
+                surface="telegram",
             )
         except schedule_proposals.ScheduleProposalResolutionError as exc:
             if exc.code in {"not_found", "not_proposed", "invalid_handle"}:
@@ -2867,6 +2934,752 @@ def log_food(
         "food_log_id": food_log_id,
         "logged_at": logged_iso,
         "meal_type": meal_type,
+    }
+
+
+@mcp.tool
+def get_recent_nutrition_observations(
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Read recent structured photo-intake evidence and user confirmations.
+
+    Returns sake NutritionObservation payloads and opaque media tokens, never
+    image bytes or arbitrary filesystem paths. This tool is read-only.
+    """
+    if not 1 <= limit <= 500:
+        raise ToolError("limit must be between 1 and 500")
+    start_at = _parse_datetime_utc(start, "start") if start is not None else None
+    end_at = _parse_datetime_utc(end, "end") if end is not None else None
+    if start_at is not None and end_at is not None and start_at >= end_at:
+        raise ToolError("start must be before end")
+    with _store_session() as session:
+        return nutrition_observations_view(
+            session,
+            start=start_at,
+            end=end_at,
+            limit=limit,
+        )
+
+
+@mcp.tool
+def get_caffeine_observations(date: str | None = None) -> dict[str, Any]:
+    """Read photo-derived caffeine evidence for one user-local calendar day.
+
+    Ranges, unknown values, warnings, provenance, and confirmation state stay
+    explicit. The tool never converts an estimate into confirmed intake.
+    """
+    timezone = _local_timezone()
+    day = _parse_date_local(date, "date", timezone)
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    with _store_session() as session:
+        return caffeine_observations_for_day(
+            session,
+            local_date=day,
+            timezone=timezone_name,
+        )
+
+
+@mcp.tool
+def get_known_caffeine_intake_for_day(
+    date: str | None = None,
+) -> dict[str, Any]:
+    """Return caffeine total only from explicitly reviewed photo observations.
+
+    ``total_intake_complete`` is true only when a separate user confirmation
+    covers every observation for that local day. Storage presence alone never
+    proves that the user's daily intake is complete. This tool is read-only.
+    """
+    timezone = _local_timezone()
+    day = _parse_date_local(date, "date", timezone)
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    with _store_session() as session:
+        return known_caffeine_for_day(
+            session,
+            local_date=day,
+            timezone=timezone_name,
+        )
+
+
+@mcp.tool
+def confirm_photo_caffeine_observation(
+    observation_id: str,
+    status: str,
+    items: list[dict[str, Any]] | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Persist an owner's exact confirmation or rejection of one photo record.
+
+    This write requires a fresh trusted Telegram-session proof over the exact
+    arguments. VLM estimates are never silently promoted to confirmed intake.
+    """
+    if status not in {
+        ConfirmationStatus.CONFIRMED.value,
+        ConfirmationStatus.CORRECTED.value,
+        ConfirmationStatus.REJECTED.value,
+    }:
+        raise ToolError("status must be confirmed, corrected, or rejected")
+    raw_items = items or []
+    if status == ConfirmationStatus.REJECTED.value and raw_items:
+        raise ToolError("rejected observations cannot contain confirmed items")
+    if status != ConfirmationStatus.REJECTED.value and not raw_items:
+        raise ToolError("confirmed or corrected observations require item values")
+    parsed_items: list[ConfirmedCaffeineItem] = []
+    indexes: set[int] = set()
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            raise ToolError(f"items[{index}] must be an object")
+        item_index = item.get("item_index")
+        caffeine_mg = item.get("caffeine_mg")
+        if type(item_index) is not int or item_index < 0:
+            raise ToolError(f"items[{index}].item_index must be a non-negative integer")
+        if (
+            isinstance(caffeine_mg, bool)
+            or not isinstance(caffeine_mg, int | float)
+            or caffeine_mg < 0
+        ):
+            raise ToolError(f"items[{index}].caffeine_mg must be non-negative")
+        if item_index in indexes:
+            raise ToolError("item_index values must not contain duplicates")
+        indexes.add(item_index)
+        parsed_items.append(
+            ConfirmedCaffeineItem(
+                item_index=item_index,
+                caffeine_mg=float(caffeine_mg),
+            )
+        )
+    proof_arguments = {
+        "observation_id": observation_id,
+        "status": status,
+        "items": raw_items,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="confirm_photo_caffeine_observation",
+        arguments=proof_arguments,
+    )
+    observation_uuid = _parse_uuid(observation_id, "observation_id")
+    confirmation = CaffeineConfirmation(
+        confirmation_id=uuid.uuid4(),
+        observation_id=observation_uuid,
+        status=ConfirmationStatus(status),
+        confirmed_at=dt.datetime.now(dt.UTC),
+        source="telegram-owner",
+        items=tuple(parsed_items),
+    )
+    try:
+        with _store_session() as session:
+            persist_caffeine_confirmation(session, confirmation)
+    except NutritionRepositoryError as exc:
+        raise ToolError(str(exc)) from exc
+    return {
+        "status": "ok",
+        "confirmation_id": str(confirmation.confirmation_id),
+        "observation_id": observation_id,
+        "confirmation_status": status,
+    }
+
+
+@mcp.tool
+def review_photo_nutrition_observation(
+    operation_id: str,
+    observation_id: str,
+    status: str,
+    items: list[dict[str, Any]] | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Confirm, fully correct, or reject one photo nutrition observation.
+
+    Corrected items replace the VLM estimates when a later interaction is
+    created. This owner write requires a proof over the exact arguments.
+    """
+    if status not in {
+        ConfirmationStatus.CONFIRMED.value,
+        ConfirmationStatus.CORRECTED.value,
+        ConfirmationStatus.REJECTED.value,
+    }:
+        raise ToolError("status must be confirmed, corrected, or rejected")
+    raw_items = items or []
+    if status == ConfirmationStatus.CORRECTED.value and not raw_items:
+        raise ToolError("corrected reviews require complete item values")
+    if status != ConfirmationStatus.CORRECTED.value and raw_items:
+        raise ToolError(
+            "confirmed or rejected reviews cannot contain corrected items"
+        )
+    try:
+        parsed_items = _REVIEWED_NUTRITION_ITEMS.validate_python(raw_items)
+    except ValidationError as exc:
+        raise ToolError(
+            f"items do not match the nutrition review schema: {exc}"
+        ) from exc
+    proof_arguments = {
+        "operation_id": operation_id,
+        "observation_id": observation_id,
+        "status": status,
+        "items": raw_items,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="review_photo_nutrition_observation",
+        arguments=proof_arguments,
+    )
+    review = NutritionReview(
+        review_id=_parse_uuid(operation_id, "operation_id"),
+        observation_id=_parse_uuid(observation_id, "observation_id"),
+        status=ConfirmationStatus(status),
+        reviewed_at=dt.datetime.now(dt.UTC),
+        source="telegram-owner",
+        items=parsed_items,
+    )
+    try:
+        with _store_session() as session:
+            persist_nutrition_review(session, review)
+    except NutritionRepositoryError as exc:
+        raise ToolError(str(exc)) from exc
+    return {
+        "status": "ok",
+        "review_id": str(review.review_id),
+        "observation_id": observation_id,
+        "review_status": status,
+    }
+
+
+@mcp.tool
+def confirm_photo_caffeine_day(
+    date: str,
+    observation_ids: list[str],
+    total_intake_complete: bool,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Persist the owner's explicit statement about one day's intake coverage.
+
+    The proof binds the exact local date, observation IDs, and completeness
+    boolean. Merely finding photos in storage never implies a complete day.
+    """
+    if len(observation_ids) != len(set(observation_ids)):
+        raise ToolError("observation_ids must not contain duplicates")
+    day = _parse_date(date, "date")
+    parsed_ids = [
+        _parse_uuid(value, f"observation_ids[{index}]")
+        for index, value in enumerate(observation_ids)
+    ]
+    proof_arguments = {
+        "date": date,
+        "observation_ids": observation_ids,
+        "total_intake_complete": total_intake_complete,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="confirm_photo_caffeine_day",
+        arguments=proof_arguments,
+    )
+    timezone = _local_timezone()
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    confirmation = DailyIntakeConfirmation(
+        confirmation_id=uuid.uuid4(),
+        local_date=day,
+        timezone=timezone_name,
+        observation_ids=tuple(parsed_ids),
+        total_intake_complete=total_intake_complete,
+        confirmed_at=dt.datetime.now(dt.UTC),
+        source="telegram-owner",
+    )
+    try:
+        with _store_session() as session:
+            persist_daily_confirmation(session, confirmation)
+    except NutritionRepositoryError as exc:
+        raise ToolError(str(exc)) from exc
+    return {
+        "status": "ok",
+        "confirmation_id": str(confirmation.confirmation_id),
+        "local_date": date,
+        "total_intake_complete": total_intake_complete,
+    }
+
+
+def _parse_normalized_intake_items(
+    values: list[dict[str, Any]] | None,
+) -> tuple[NormalizedIntakeItem, ...]:
+    try:
+        return _NORMALIZED_INTAKE_ITEMS.validate_python(values or [])
+    except ValidationError as exc:
+        raise ToolError(f"items do not match the nutrition schema: {exc}") from exc
+
+
+@mcp.tool
+def analyze_intake_capture(
+    operation_id: str,
+    intent: str,
+    modality: str,
+    source_text: str | None = None,
+    observed_at: str | None = None,
+    media_path: str | None = None,
+    allow_remote_analysis: bool = False,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Automatically structure owner text or a local voice capture.
+
+    Voice bytes stay local and are transcribed by the configured loopback
+    whisper.cpp server. Remote nutrition analysis is opt-in per call.
+    """
+    try:
+        parsed_intent = IntakeIntent(intent)
+    except ValueError as exc:
+        raise ToolError(
+            f"intent must be one of {[value.value for value in IntakeIntent]}"
+        ) from exc
+    try:
+        parsed_modality = CaptureModality(modality)
+    except ValueError as exc:
+        raise ToolError(
+            f"modality must be one of {[value.value for value in CaptureModality]}"
+        ) from exc
+    if parsed_modality not in {
+        CaptureModality.TEXT,
+        CaptureModality.VOICE,
+    }:
+        raise ToolError("automatic capture analysis supports text or voice")
+    if parsed_modality is CaptureModality.TEXT:
+        if not source_text or not source_text.strip():
+            raise ToolError("text analysis requires source_text")
+        if media_path is not None:
+            raise ToolError("text analysis cannot reference media")
+    if parsed_modality is CaptureModality.VOICE:
+        if source_text is not None:
+            raise ToolError(
+                "voice analysis creates source_text from local transcription"
+            )
+        if media_path is None:
+            raise ToolError("voice analysis requires media_path")
+    proof_arguments = {
+        "operation_id": operation_id,
+        "intent": intent,
+        "modality": modality,
+        "source_text": source_text,
+        "observed_at": observed_at,
+        "media_path": media_path,
+        "allow_remote_analysis": allow_remote_analysis,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="analyze_intake_capture",
+        arguments=proof_arguments,
+    )
+    captured_at = (
+        _parse_datetime_utc(observed_at, "observed_at")
+        if observed_at is not None
+        else dt.datetime.now(dt.UTC)
+    )
+    timezone = _local_timezone()
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    settings = _active_settings()
+    try:
+        with _store_session() as session:
+            interaction = create_analyzed_interaction(
+                session,
+                settings,
+                operation_id=_parse_uuid(operation_id, "operation_id"),
+                operation_fingerprint=operation_fingerprint(
+                    proof_arguments
+                ),
+                intent=parsed_intent,
+                modality=parsed_modality,
+                observed_at=captured_at,
+                timezone=timezone_name,
+                source="telegram-owner",
+                source_text=source_text,
+                media_path=media_path,
+                recorded_at=dt.datetime.now(dt.UTC),
+                allow_remote_analysis=allow_remote_analysis,
+                provider=create_vision_provider(settings),
+                transcriber=(
+                    create_nutrition_transcriber(settings)
+                    if parsed_modality is CaptureModality.VOICE
+                    else None
+                ),
+            )
+            view = interaction_view(session, interaction.interaction_id)
+    except (IntakeInteractionError, TranscriptionError, VisionError) as exc:
+        raise ToolError(str(exc)) from exc
+    assert view is not None
+    return {"status": "ok", "interaction": view}
+
+
+@mcp.tool
+def capture_intake_interaction(
+    operation_id: str,
+    intent: str,
+    modality: str,
+    source_text: str | None = None,
+    observed_at: str | None = None,
+    media_path: str | None = None,
+    nutrition_observation_id: str | None = None,
+    items: list[dict[str, Any]] | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Create a device-neutral food interaction from photo, text, or voice.
+
+    A capture is an observation, not proof of consumption. ``photo`` adapts
+    one existing sake observation; ``text`` stores the owner's exact entry;
+    ``voice`` requires both the local audio token and its local transcript.
+    """
+    try:
+        parsed_intent = IntakeIntent(intent)
+    except ValueError as exc:
+        raise ToolError(
+            f"intent must be one of {[value.value for value in IntakeIntent]}"
+        ) from exc
+    try:
+        parsed_modality = CaptureModality(modality)
+    except ValueError as exc:
+        raise ToolError(
+            f"modality must be one of {[value.value for value in CaptureModality]}"
+        ) from exc
+    raw_items = items or []
+    proof_arguments = {
+        "operation_id": operation_id,
+        "intent": intent,
+        "modality": modality,
+        "source_text": source_text,
+        "observed_at": observed_at,
+        "media_path": media_path,
+        "nutrition_observation_id": nutrition_observation_id,
+        "items": raw_items,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="capture_intake_interaction",
+        arguments=proof_arguments,
+    )
+    if parsed_modality is CaptureModality.PHOTO and raw_items:
+        raise ToolError("photo items must come from the stored sake observation")
+    parsed_items = _parse_normalized_intake_items(raw_items)
+    parsed_operation_id = _parse_uuid(operation_id, "operation_id")
+    fingerprint = operation_fingerprint(proof_arguments)
+    captured_at = (
+        _parse_datetime_utc(observed_at, "observed_at")
+        if observed_at is not None
+        else dt.datetime.now(dt.UTC)
+    )
+    timezone = _local_timezone()
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    try:
+        with _store_session() as session:
+            if parsed_modality is CaptureModality.PHOTO:
+                if nutrition_observation_id is None:
+                    raise ToolError(
+                        "photo requires nutrition_observation_id"
+                    )
+                interaction = create_photo_interaction(
+                    session,
+                    _active_settings(),
+                    observation_id=_parse_uuid(
+                        nutrition_observation_id,
+                        "nutrition_observation_id",
+                    ),
+                    operation_id=parsed_operation_id,
+                    operation_fingerprint=fingerprint,
+                    intent=parsed_intent,
+                    source="telegram-owner",
+                    recorded_at=dt.datetime.now(dt.UTC),
+                    source_text=source_text,
+                )
+            else:
+                interaction = IntakeInteraction(
+                    interaction_id=parsed_operation_id,
+                    operation_fingerprint=fingerprint,
+                    intent=parsed_intent,
+                    modality=parsed_modality,
+                    observed_at=captured_at,
+                    recorded_at=dt.datetime.now(dt.UTC),
+                    timezone=timezone_name,
+                    source="telegram-owner",
+                    source_text=source_text,
+                    media_path=media_path,
+                    nutrition_observation_id=None,
+                    items=parsed_items,
+                )
+                create_interaction(
+                    session, _active_settings(), interaction
+                )
+            view = interaction_view(session, interaction.interaction_id)
+    except IntakeInteractionError as exc:
+        raise ToolError(str(exc)) from exc
+    assert view is not None
+    return {"status": "ok", "interaction": view}
+
+
+@mcp.tool
+def confirm_intake_outcome(
+    operation_id: str,
+    interaction_id: str,
+    status: str,
+    consumed_at: str | None = None,
+    corrected_items: list[dict[str, Any]] | None = None,
+    note: str | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Record whether an observed or proposed food was actually consumed."""
+    try:
+        parsed_status = IntakeOutcomeStatus(status)
+    except ValueError as exc:
+        raise ToolError(
+            f"status must be one of {[value.value for value in IntakeOutcomeStatus]}"
+        ) from exc
+    raw_items = corrected_items or []
+    proof_arguments = {
+        "operation_id": operation_id,
+        "interaction_id": interaction_id,
+        "status": status,
+        "consumed_at": consumed_at,
+        "corrected_items": raw_items,
+        "note": note,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="confirm_intake_outcome",
+        arguments=proof_arguments,
+    )
+    parsed_interaction_id = _parse_uuid(interaction_id, "interaction_id")
+    parsed_operation_id = _parse_uuid(operation_id, "operation_id")
+    parsed_items = _parse_normalized_intake_items(raw_items)
+    outcome = IntakeOutcome(
+        outcome_id=parsed_operation_id,
+        operation_fingerprint=operation_fingerprint(proof_arguments),
+        interaction_id=parsed_interaction_id,
+        status=parsed_status,
+        confirmed_at=dt.datetime.now(dt.UTC),
+        source="telegram-owner",
+        consumed_at=(
+            _parse_datetime_utc(consumed_at, "consumed_at")
+            if consumed_at is not None
+            else None
+        ),
+        corrected_items=parsed_items,
+        note=note,
+    )
+    try:
+        with _store_session() as session:
+            persist_outcome(session, outcome)
+            view = interaction_view(session, parsed_interaction_id)
+    except IntakeInteractionError as exc:
+        raise ToolError(str(exc)) from exc
+    assert view is not None
+    return {"status": "ok", "interaction": view}
+
+
+@mcp.tool
+def search_intake_records(
+    start: str | None = None,
+    end: str | None = None,
+    intent: str | None = None,
+    modality: str | None = None,
+    confirmed_only: bool = False,
+    nutrient: str | None = None,
+    query: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Search reusable food context without returning photo or audio bytes."""
+    if not 1 <= limit <= 500:
+        raise ToolError("limit must be between 1 and 500")
+    start_at = _parse_datetime_utc(start, "start") if start else None
+    end_at = _parse_datetime_utc(end, "end") if end else None
+    if start_at is not None and end_at is not None and start_at >= end_at:
+        raise ToolError("start must be before end")
+    try:
+        parsed_intent = IntakeIntent(intent) if intent is not None else None
+        parsed_modality = (
+            CaptureModality(modality) if modality is not None else None
+        )
+    except ValueError as exc:
+        raise ToolError("intent or modality is unsupported") from exc
+    with _store_session() as session:
+        return search_intake_history(
+            session,
+            start=start_at,
+            end=end_at,
+            intent=parsed_intent,
+            modality=parsed_modality,
+            confirmed_only=confirmed_only,
+            nutrient=nutrient,
+            query=query,
+            limit=limit,
+        )
+
+
+@mcp.tool
+def request_intake_decision(
+    operation_id: str,
+    interaction_id: str,
+    scope: str,
+    question: str | None = None,
+    intended_consumption_at: str | None = None,
+    compare_interaction_ids: list[str] | None = None,
+    lookback_days: int = 14,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Create a durable decision request and return its bounded evidence context."""
+    if not 1 <= lookback_days <= 90:
+        raise ToolError("lookback_days must be between 1 and 90")
+    try:
+        parsed_scope = DecisionScope(scope)
+    except ValueError as exc:
+        raise ToolError(
+            f"scope must be one of {[value.value for value in DecisionScope]}"
+        ) from exc
+    compare_values = compare_interaction_ids or []
+    proof_arguments = {
+        "operation_id": operation_id,
+        "interaction_id": interaction_id,
+        "scope": scope,
+        "question": question,
+        "intended_consumption_at": intended_consumption_at,
+        "compare_interaction_ids": compare_values,
+        "lookback_days": lookback_days,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="request_intake_decision",
+        arguments=proof_arguments,
+    )
+    parsed_interaction_id = _parse_uuid(interaction_id, "interaction_id")
+    parsed_operation_id = _parse_uuid(operation_id, "operation_id")
+    compare_ids = tuple(
+        _parse_uuid(value, f"compare_interaction_ids[{index}]")
+        for index, value in enumerate(compare_values)
+    )
+    request = IntakeDecisionRequest(
+        request_id=parsed_operation_id,
+        operation_fingerprint=operation_fingerprint(proof_arguments),
+        interaction_id=parsed_interaction_id,
+        scope=parsed_scope,
+        requested_at=dt.datetime.now(dt.UTC),
+        source="telegram-owner",
+        question=question,
+        intended_consumption_at=(
+            _parse_datetime_utc(
+                intended_consumption_at, "intended_consumption_at"
+            )
+            if intended_consumption_at is not None
+            else None
+        ),
+        compare_interaction_ids=compare_ids,
+        lookback_days=lookback_days,
+    )
+    try:
+        with _store_session() as session:
+            persist_decision_request(session, request)
+            context = decision_context(
+                session,
+                request_id=request.request_id,
+            )
+    except IntakeInteractionError as exc:
+        raise ToolError(str(exc)) from exc
+    assert context is not None
+    return context
+
+
+@mcp.tool
+def get_intake_decision_context(
+    request_id: str,
+) -> dict[str, Any]:
+    """Read a previously stored food-decision request and its current context."""
+    with _store_session() as session:
+        context = decision_context(
+            session,
+            request_id=_parse_uuid(request_id, "request_id"),
+        )
+    if context is None:
+        raise ToolError("intake decision request not found")
+    return context
+
+
+@mcp.tool
+def record_intake_decision(
+    operation_id: str,
+    request_id: str,
+    status: str,
+    summary: str,
+    evidence_event_ids: list[str],
+    limitations: list[str] | None = None,
+    recommendation: dict[str, Any] | None = None,
+    trusted_session_proof: str | None = None,
+) -> dict[str, Any]:
+    """Persist an agent decision with exact evidence references and limitations."""
+    try:
+        parsed_status = DecisionStatus(status)
+    except ValueError as exc:
+        raise ToolError(
+            f"status must be one of {[value.value for value in DecisionStatus]}"
+        ) from exc
+    parsed_request_id = _parse_uuid(request_id, "request_id")
+    proof_arguments = {
+        "operation_id": operation_id,
+        "request_id": request_id,
+        "status": status,
+        "summary": summary,
+        "evidence_event_ids": evidence_event_ids,
+        "limitations": limitations,
+        "recommendation": recommendation,
+    }
+    _require_trusted_telegram_owner_proof(
+        trusted_session_proof,
+        tool_name="record_intake_decision",
+        arguments=proof_arguments,
+    )
+    parsed_operation_id = _parse_uuid(operation_id, "operation_id")
+    parsed_evidence_ids = tuple(
+        _parse_uuid(value, f"evidence_event_ids[{index}]")
+        for index, value in enumerate(evidence_event_ids)
+    )
+    with _store_session() as session:
+        try:
+            existing = persisted_decision_for_operation(
+                session,
+                decision_id=parsed_operation_id,
+                operation_fingerprint=operation_fingerprint(
+                    proof_arguments
+                ),
+            )
+        except IntakeInteractionError as exc:
+            raise ToolError(str(exc)) from exc
+        if existing is not None:
+            return {
+                "status": "ok",
+                "decision_id": str(existing.decision_id),
+                "interaction_id": str(existing.interaction_id),
+                "scope": existing.scope.value,
+                "decision_status": existing.status.value,
+            }
+        request_entry = get_decision_request(session, parsed_request_id)
+        if request_entry is None:
+            raise ToolError("intake decision request not found")
+        request = request_entry[1]
+        decision = IntakeDecision(
+            decision_id=parsed_operation_id,
+            operation_fingerprint=operation_fingerprint(proof_arguments),
+            request_id=parsed_request_id,
+            interaction_id=request.interaction_id,
+            scope=request.scope,
+            status=parsed_status,
+            decided_at=dt.datetime.now(dt.UTC),
+            source="healthmes-agent",
+            summary=summary,
+            evidence_event_ids=parsed_evidence_ids,
+            limitations=tuple(limitations or []),
+            recommendation=recommendation,
+        )
+        try:
+            persist_decision(session, decision)
+        except IntakeInteractionError as exc:
+            raise ToolError(str(exc)) from exc
+    return {
+        "status": "ok",
+        "decision_id": str(decision.decision_id),
+        "interaction_id": str(decision.interaction_id),
+        "scope": decision.scope.value,
+        "decision_status": decision.status.value,
     }
 
 

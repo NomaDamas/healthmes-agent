@@ -30,7 +30,7 @@ from healthmes.api.briefing import ALERT_RECENT_HOURS, decision_viewer_url
 from healthmes.api.common import ensure_utc, utc_now
 from healthmes.api.pagination import Page, PageMeta, PageParamsDep
 from healthmes.config import Settings
-from healthmes.store import DecisionRecord, ProposalStatus, ScheduleProposal, TriggerEvent
+from healthmes.store import DecisionRecord, ProposalStatus, ScheduleProposal, Task, TriggerEvent
 from healthmes.store.session import SessionDep
 
 __all__ = ["router", "MAX_WINDOW_HOURS"]
@@ -39,6 +39,24 @@ router = APIRouter(prefix="/v1/alerts", tags=["alerts"])
 
 # One week of alert history is plenty for the apps' alert screens.
 MAX_WINDOW_HOURS = 24 * 7
+
+
+class DecisionCardOut(BaseModel):
+    """Platform-neutral payload for a three-second Yes/No decision."""
+
+    decision_id: uuid.UUID
+    proposal_id: uuid.UUID
+    kind: str
+    severity: str
+    title: str
+    observation_short: str
+    evidence_short: str | None
+    proposed_action: str
+    before: datetime | None
+    after: datetime
+    ends_at: datetime
+    expires_at: datetime
+    decision_url: str | None
 
 
 class AlertOut(BaseModel):
@@ -52,6 +70,7 @@ class AlertOut(BaseModel):
     evidence: dict[str, Any] | None  # evidence facts (client renders the line)
     decision_url: str | None  # "why this?" decision-viewer deep link
     proposal_id: uuid.UUID | None = None  # unique pending proposal for native actions
+    decision_card: DecisionCardOut | None = None
 
 
 def _decision_ids(
@@ -101,6 +120,61 @@ def _proposal_ids(
     }
 
 
+def _decision_cards(
+    session: Session,
+    events: list[TriggerEvent],
+    decision_ids: dict[uuid.UUID, uuid.UUID],
+    proposal_ids: dict[uuid.UUID, uuid.UUID],
+    links: dict[uuid.UUID, str],
+) -> dict[uuid.UUID, DecisionCardOut]:
+    if not proposal_ids:
+        return {}
+    proposal_rows = {
+        proposal.id: (proposal, task)
+        for proposal, task in session.execute(
+            select(ScheduleProposal, Task)
+            .join(Task, ScheduleProposal.task_id == Task.id)
+            .where(ScheduleProposal.id.in_(set(proposal_ids.values())))
+        )
+    }
+    cards: dict[uuid.UUID, DecisionCardOut] = {}
+    for event in events:
+        proposal_id = proposal_ids.get(event.id)
+        decision_id = decision_ids.get(event.id)
+        row = proposal_rows.get(proposal_id) if proposal_id is not None else None
+        if row is None or decision_id is None:
+            continue
+        proposal, task = row
+        payload = event.payload or {}
+        evidence = payload.get("evidence")
+        evidence_short = None
+        if isinstance(evidence, dict) and evidence:
+            evidence_short = " · ".join(
+                f"{key} {value}" for key, value in sorted(evidence.items())
+            )
+        starts_at = ensure_utc(proposal.proposed_start)
+        ends_at = ensure_utc(proposal.proposed_end)
+        expires_at = proposal.expires_at
+        if expires_at is None:
+            continue
+        cards[event.id] = DecisionCardOut(
+            decision_id=decision_id,
+            proposal_id=proposal.id,
+            kind=proposal.healthmes_kind or "schedule_change",
+            severity=str(payload.get("severity") or "normal"),
+            title=task.title,
+            observation_short=str(payload.get("summary") or event.rule_id),
+            evidence_short=evidence_short,
+            proposed_action=str(payload.get("proposal") or f"{task.title} 일정을 조정합니다."),
+            before=None,
+            after=starts_at,
+            ends_at=ends_at,
+            expires_at=ensure_utc(expires_at),
+            decision_url=links.get(event.id),
+        )
+    return cards
+
+
 @router.get("")
 def list_alerts(
     request: Request,
@@ -128,6 +202,13 @@ def list_alerts(
         for event_id, decision_id in decision_ids.items()
     }
     proposal_ids = _proposal_ids(session, decision_ids)
+    decision_cards = _decision_cards(
+        session,
+        window,
+        decision_ids,
+        proposal_ids,
+        links,
+    )
     data = []
     for event in window:
         payload: dict[str, Any] = event.payload or {}
@@ -146,6 +227,7 @@ def list_alerts(
                 evidence=evidence if isinstance(evidence, dict) else None,
                 decision_url=links.get(event.id),
                 proposal_id=proposal_ids.get(event.id),
+                decision_card=decision_cards.get(event.id),
             )
         )
     meta = PageMeta(

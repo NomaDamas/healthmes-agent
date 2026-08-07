@@ -13,12 +13,14 @@ from healthmes.engine.scheduler import (
     CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
     ENERGY_JOB_ID,
     SLEEP_RECONCILIATION_JOB_ID,
+    STORAGE_MAINTENANCE_JOB_ID,
     TRIGGER_JOB_ID,
     create_scheduler,
     register_backup_job,
     register_calendar_adjustment_maintenance_job,
     register_energy_job,
     register_sleep_reconciliation_job,
+    register_storage_maintenance_job,
     shutdown_scheduler,
     start_scheduler,
 )
@@ -72,6 +74,13 @@ def test_backup_job_hook_registers_weekly_cron(scheduler) -> None:
     assert fields["day_of_week"] == "sun"
     assert fields["hour"] == "3"
     assert fields["minute"] == "30"
+
+
+def test_storage_maintenance_hook_registers_hourly(scheduler) -> None:
+    job = register_storage_maintenance_job(scheduler, noop)
+    assert scheduler.get_job(STORAGE_MAINTENANCE_JOB_ID) is job
+    assert isinstance(job.trigger, IntervalTrigger)
+    assert job.trigger.interval == timedelta(minutes=60)
 
 
 def test_calendar_adjustment_maintenance_hook_registers_interval_job(scheduler) -> None:

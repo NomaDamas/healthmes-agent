@@ -15,6 +15,7 @@ import logging
 import zoneinfo
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -156,6 +157,98 @@ class Settings(BaseSettings):
         "(POST /v1/media). Uploads beyond the cap are rejected with 413 and "
         "nothing is stored. Default 15 MiB — plenty for phone photos and "
         "voice memos while keeping a LAN peer from filling the disk.",
+    )
+    nutrition_ollama_base_url: str = Field(
+        default="http://127.0.0.1:11434",
+        description="Ollama API used for local intake-photo extraction. "
+        "Non-loopback endpoints require HTTPS and allow_remote_vision on each request.",
+    )
+    nutrition_vision_provider: Literal["ollama", "openai", "gemini", "anthropic", "xai"] = Field(
+        default="ollama",
+        description="Intake-photo vision provider. Remote providers still require "
+        "allow_remote_vision=true on every analysis request.",
+    )
+    nutrition_vision_model: str = Field(
+        default="qwen3-vl:4b-instruct",
+        min_length=1,
+        description="Pinned Ollama vision model tag; mutable latest aliases are not recommended.",
+    )
+    nutrition_vision_model_digest: str | None = Field(
+        default=None,
+        description="Optional immutable model digest recorded with every observation.",
+    )
+    nutrition_openai_base_url: str = Field(
+        default="https://api.openai.com",
+        description="OpenAI API origin used for remote intake-photo extraction.",
+    )
+    nutrition_openai_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="OpenAI API key for explicitly authorized remote photo analysis.",
+    )
+    nutrition_openai_model: str = Field(
+        default="gpt-5.6-sol",
+        min_length=1,
+        description="OpenAI vision model recorded with each observation.",
+    )
+    nutrition_gemini_base_url: str = Field(
+        default="https://generativelanguage.googleapis.com/v1beta",
+        description="Gemini API base URL used for remote intake-photo extraction.",
+    )
+    nutrition_gemini_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="Gemini API key for explicitly authorized remote photo analysis.",
+    )
+    nutrition_gemini_model: str = Field(
+        default="gemini-3.6-flash",
+        min_length=1,
+        description="Gemini vision model recorded with each observation.",
+    )
+    nutrition_anthropic_base_url: str = Field(
+        default="https://api.anthropic.com",
+        description="Anthropic API origin used for remote intake-photo extraction.",
+    )
+    nutrition_anthropic_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="Anthropic API key for explicitly authorized remote photo analysis.",
+    )
+    nutrition_anthropic_model: str = Field(
+        default="claude-fable-5",
+        min_length=1,
+        description="Claude vision model recorded with each observation.",
+    )
+    nutrition_xai_base_url: str = Field(
+        default="https://api.x.ai",
+        description="xAI API origin used for remote intake-photo extraction.",
+    )
+    nutrition_xai_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="xAI API key for explicitly authorized remote photo analysis.",
+    )
+    nutrition_xai_model: str = Field(
+        default="grok-4.5",
+        min_length=1,
+        description="Grok vision model recorded with each observation.",
+    )
+    nutrition_vision_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        description="Timeout for one structured photo-analysis request.",
+    )
+    nutrition_whisper_base_url: str = Field(
+        default="http://127.0.0.1:8080",
+        description="Loopback whisper.cpp server used to transcribe nutrition "
+        "voice captures. Non-loopback transcription endpoints are rejected.",
+    )
+    nutrition_transcription_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        description="Timeout for one local nutrition voice transcription.",
+    )
+    nutrition_transcription_language: str = Field(
+        default="auto",
+        min_length=1,
+        max_length=32,
+        description="Language passed to the local whisper.cpp transcription server.",
     )
 
     # Alert hygiene (docs/PLAN.md §11: a noisy assistant gets muted within a

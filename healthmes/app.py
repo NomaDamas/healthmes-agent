@@ -29,11 +29,13 @@ from healthmes.engine.scheduler import (
     register_calendar_job,
     register_energy_job,
     register_sleep_reconciliation_job,
+    register_storage_maintenance_job,
     shutdown_scheduler,
     start_scheduler,
 )
 from healthmes.mcp_server import server as mcp_server
-from healthmes.store import dispose_engine, init_engine
+from healthmes.storage import build_storage_maintenance_job
+from healthmes.store import Base, dispose_engine, init_engine
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -56,7 +58,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Bind the process-wide store engine to *this* app's settings so
         # SessionDep / session_scope() hit the configured database instead of
         # lazily reading the environment at first use.
-        init_engine(settings)
+        engine = init_engine(settings)
+        if engine.dialect.name == "sqlite":
+            Base.metadata.create_all(engine)
         # MCP tools resolve settings through the same override hook the tests
         # use, so tools always agree with the app about endpoints/keys.
         mcp_server.set_settings(settings)
@@ -70,6 +74,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         scheduler = create_scheduler(settings)
         register_energy_job(scheduler, build_energy_job(settings))
         register_backup_job(scheduler, build_backup_job(settings))
+        register_storage_maintenance_job(
+            scheduler, build_storage_maintenance_job(settings)
+        )
         register_calendar_adjustment_maintenance_job(
             scheduler, mcp_server.expire_and_reconcile_calendar_adjustments
         )
