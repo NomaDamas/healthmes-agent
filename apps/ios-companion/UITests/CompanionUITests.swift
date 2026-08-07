@@ -2,8 +2,8 @@ import XCTest
 
 // End-to-end UI tests for the issue-#10 daily loop, driven against a REAL
 // paired healthmes instance (see README "Live smoke test"): the fixed wellness
-// canvas renders live data, same-canvas lenses work, and the §8.5
-// Yes button drives the real accept endpoint.
+// canvas renders live data, deeper views stay behind Explore, and the
+// explicit apply button drives the real accept endpoint.
 //
 // These tests SKIP (never fail) when the app is not paired or the instance
 // is unreachable — plain `xcodebuild test` in CI has no live server. To run
@@ -19,7 +19,7 @@ final class CompanionUITests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
         // Paired + reachable == the energy card appears with live data.
-        guard app.staticTexts["Cognitive energy"].waitForExistence(timeout: 15) else {
+        guard app.staticTexts["인지 에너지"].waitForExistence(timeout: 15) else {
             throw XCTSkip(
                 "No paired live instance — serve healthmes and pair first (README)."
             )
@@ -46,33 +46,38 @@ final class CompanionUITests: XCTestCase {
     func testDailyLoopSurfacesRenderAgainstLiveInstance() throws {
         let app = try launchPairedApp()
 
-        XCTAssertTrue(app.staticTexts["CURRENT STATE"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["BODY → PLAN"].exists)
+        XCTAssertTrue(app.staticTexts["HEALTH → PLAN"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["몸 → 오늘 계획"].exists)
         XCTAssertTrue(app.textFields.firstMatch.exists)
+        XCTAssertFalse(app.buttons["조율"].exists)
+        XCTAssertFalse(app.buttons["변화"].exists)
 
-        app.buttons["조율"].tap()
-        XCTAssertTrue(app.staticTexts["BODY-AWARE COORDINATION"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.staticTexts["PROTECTED CONSTRAINTS"].exists)
-        XCTAssertTrue(app.staticTexts["SCHEDULE IMPACT"].exists)
+        app.buttons["전체 보기"].tap()
+        app.buttons["일정과 목표"].tap()
+        XCTAssertTrue(app.staticTexts["DETAIL · CALENDAR & GOALS"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["보호할 목표와 할 일"].exists)
+        XCTAssertTrue(app.staticTexts["일정 영향"].exists)
 
-        app.buttons["변화"].tap()
-        XCTAssertTrue(app.staticTexts["OUTCOME LEARNING"].waitForExistence(timeout: 15))
+        app.buttons["전체 보기"].tap()
+        app.buttons["결정 결과"].tap()
+        XCTAssertTrue(app.staticTexts["DETAIL · DECISION RESULTS"].waitForExistence(timeout: 15))
         XCTAssertTrue(app.staticTexts["OUTCOME LOOP"].exists)
 
-        app.buttons["Settings"].tap()
+        app.buttons["전체 보기"].tap()
+        app.buttons["설정"].tap()
         try tapSettingsLink("Weekly report", in: app)
         XCTAssertTrue(app.staticTexts["Energy trend"].waitForExistence(timeout: 15))
         XCTAssertTrue(app.staticTexts["Schedule adherence"].exists)
         XCTAssertTrue(app.staticTexts["Alert digest"].exists)
     }
 
-    /// Acceptance sketch #2/#5: Yes on a pending proposal calls the real
+    /// Acceptance sketch #2/#5: Apply on a pending proposal calls the real
     /// accept endpoint; the row resolves and the confirmation banner shows.
     /// Needs a seeded `proposed` proposal (the smoke script creates one).
     func testApplyProposalRoundTrip() throws {
         let app = try launchPairedApp()
 
-        let apply = app.buttons["Yes"].firstMatch
+        let apply = app.buttons["변경 승인"].firstMatch
         guard apply.waitForExistence(timeout: 10) else {
             throw XCTSkip("No pending proposal seeded — nothing to apply.")
         }
@@ -88,7 +93,8 @@ final class CompanionUITests: XCTestCase {
     func testFoodCaptureRoundTrip() throws {
         let app = try launchPairedApp()
 
-        app.buttons["Settings"].tap()
+        app.buttons["전체 보기"].tap()
+        app.buttons["설정"].tap()
         try tapSettingsLink("Capture", in: app)
         let field = app.textFields["Description"]
         guard field.waitForExistence(timeout: 10) else {

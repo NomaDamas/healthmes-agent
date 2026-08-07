@@ -21,6 +21,7 @@ struct WellnessControlView: View {
     @State private var preview: CommandPreview?
     @State private var commandMessage: String?
     @State private var lastFocusRequest = 0
+    @State private var lastHomeRequest = 0
     @FocusState private var commandFocused: Bool
 
     private let moss = Color(red: 0.08, green: 0.38, blue: 0.28)
@@ -28,12 +29,14 @@ struct WellnessControlView: View {
     var body: some View {
         VStack(spacing: 0) {
             statusRail
-            lensControl
 
             ScrollView {
                 LazyVStack(spacing: 14) {
                     if let proposalBanner = briefing.proposalBanner {
                         proposalResultBanner(proposalBanner)
+                    }
+                    if lens != .now {
+                        detailContextBar
                     }
                     sceneHeader
                     sceneContent
@@ -65,12 +68,7 @@ struct WellnessControlView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    router.modal = .settings
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .accessibilityLabel(Text("Settings"))
+                exploreMenu
             }
         }
         .task { await refreshAll() }
@@ -78,6 +76,12 @@ struct WellnessControlView: View {
             guard request > lastFocusRequest else { return }
             lastFocusRequest = request
             commandFocused = true
+        }
+        .onReceive(router.$homeRequest) { request in
+            guard request > lastHomeRequest else { return }
+            lastHomeRequest = request
+            preview = nil
+            selectDetail(.now)
         }
         .onChange(of: command.transcript) { _, transcript in
             if command.isListening || !transcript.isEmpty {
@@ -114,32 +118,61 @@ struct WellnessControlView: View {
         .accessibilityElement(children: .contain)
     }
 
-    private var lensControl: some View {
-        HStack(spacing: 6) {
-            ForEach(WellnessLens.allCases) { item in
-                Button {
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        lens = item
-                        commandMessage = nil
-                    }
-                } label: {
-                    Text(verbatim: item.title)
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 9)
-                        .background(
-                            lens == item ? Color.primary.opacity(0.09) : .clear,
-                            in: Capsule()
-                        )
-                }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(lens == item ? .isSelected : [])
+    private var exploreMenu: some View {
+        Menu {
+            Button {
+                selectDetail(.now)
+            } label: {
+                Label("현재 영향", systemImage: "bolt.heart")
             }
+            .accessibilityAddTraits(lens == .now ? .isSelected : [])
+            Button {
+                selectDetail(.coordinate)
+            } label: {
+                Label("일정과 목표", systemImage: "calendar")
+            }
+            .accessibilityAddTraits(lens == .coordinate ? .isSelected : [])
+            Button {
+                selectDetail(.change)
+            } label: {
+                Label("결정 결과", systemImage: "chart.line.uptrend.xyaxis")
+            }
+            .accessibilityAddTraits(lens == .change ? .isSelected : [])
+
+            Divider()
+
+            if let pairing = PairingStore.shared.load() {
+                Link(destination: ViewerURL.make(pairing: pairing, pathComponents: ["dashboard"])) {
+                    Label("웹 대시보드", systemImage: "safari")
+                }
+            }
+            Button {
+                router.modal = .settings
+            } label: {
+                Label("설정", systemImage: "gearshape")
+            }
+        } label: {
+            Label("전체 보기", systemImage: "square.grid.2x2")
+                .font(.subheadline.weight(.semibold))
         }
-        .padding(4)
-        .background(.ultraThinMaterial, in: Capsule())
-        .padding(.horizontal, 16)
-        .padding(.top, 8)
+        .accessibilityLabel(Text("전체 보기"))
+        .accessibilityValue(Text(detailTitle(for: lens)))
+    }
+
+    private var detailContextBar: some View {
+        HStack(spacing: 10) {
+            Label(detailTitle(for: lens), systemImage: detailIcon(for: lens))
+                .font(.subheadline.weight(.semibold))
+            Spacer()
+            Button("현재로 돌아가기") {
+                selectDetail(.now)
+            }
+            .font(.caption.weight(.semibold))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(moss.opacity(0.09), in: RoundedRectangle(cornerRadius: 14))
+        .accessibilityElement(children: .contain)
     }
 
     private var sceneHeader: some View {
@@ -174,10 +207,10 @@ struct WellnessControlView: View {
 
     private var nowScene: some View {
         Group {
-            ProductCard(kicker: "Body → plan", systemImage: "bolt.heart.fill") {
+            ProductCard(kicker: "몸 → 오늘 계획", systemImage: "bolt.heart.fill") {
                 if let payload = briefing.snapshot?.payload {
                     HStack(alignment: .firstTextBaseline) {
-                        Text("Cognitive energy")
+                        Text("인지 에너지")
                             .font(.headline)
                         Spacer()
                         Text(verbatim: GlanceFormat.scoreText(payload.energy.score))
@@ -185,7 +218,7 @@ struct WellnessControlView: View {
                     }
                     Text(verbatim: bodyPlanImpact(payload))
                         .font(.body.weight(.medium))
-                    Text("Updated \(briefing.lastUpdatedText) · \(payload.energy.confidence.rawValue) confidence")
+                    Text("업데이트 \(briefing.lastUpdatedText) · 신뢰도 \(confidenceLabel(payload.energy.confidence))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
@@ -201,19 +234,39 @@ struct WellnessControlView: View {
     private var coordinateScene: some View {
         Group {
             primaryDecisionCard
-            ProductCard(kicker: "Protected constraints", systemImage: "shield.lefthalf.filled") {
-                if let goal = plan.goals.first {
-                    Label {
-                        Text(verbatim: goal.title)
-                    } icon: {
-                        Image(systemName: "scope")
-                    }
-                    .font(.headline)
-                    Text("HealthMes should preserve this goal while moving work around your current capacity.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+            ProductCard(kicker: "보호할 목표와 할 일", systemImage: "shield.lefthalf.filled") {
+                if plan.goals.isEmpty && plan.tasks.isEmpty {
+                    insufficientData("일정 조정에서 보호할 주간 목표나 할 일이 없습니다.")
                 } else {
-                    insufficientData("Add a weekly goal so schedule tradeoffs have a visible constraint.")
+                    if let goal = plan.goals.first {
+                        Label {
+                            Text(verbatim: goal.title)
+                        } icon: {
+                            Image(systemName: "scope")
+                        }
+                        .font(.headline)
+                        Text("일정을 바꾸더라도 이 주간 목표를 우선 보호합니다.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    ForEach(plan.tasks.prefix(3)) { task in
+                        if plan.goals.first != nil || task.id != plan.tasks.first?.id {
+                            Divider()
+                        }
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: task.energyDemand == "high" ? "bolt.fill" : "checkmark.circle")
+                                .foregroundStyle(task.energyDemand == "high" ? Color.orange : moss)
+                                .frame(width: 20)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(verbatim: task.title)
+                                    .font(.body.weight(.medium))
+                                Text(verbatim: taskDetail(task))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                 }
             }
             scheduleTimeline
@@ -266,7 +319,7 @@ struct WellnessControlView: View {
     }
 
     private var nextBlockCard: some View {
-        ProductCard(kicker: "Next protected block", systemImage: "calendar.day.timeline.left") {
+        ProductCard(kicker: "다음 보호 일정", systemImage: "calendar.day.timeline.left") {
             if let block = briefing.snapshot?.payload.nextBlocks.first {
                 Text(verbatim: block.title ?? String(localized: "Scheduled block"))
                     .font(.title3.weight(.semibold))
@@ -280,13 +333,13 @@ struct WellnessControlView: View {
                         .background(Color.primary.opacity(0.07), in: Capsule())
                 }
             } else {
-                insufficientData("No upcoming calendar block is available.")
+                insufficientData("예정된 캘린더 일정이 없습니다.")
             }
         }
     }
 
     private var scheduleTimeline: some View {
-        ProductCard(kicker: "Schedule impact", systemImage: "calendar") {
+        ProductCard(kicker: "일정 영향", systemImage: "calendar") {
             if plan.events.isEmpty {
                 insufficientData("No synced calendar events are available. Open Settings to inspect the connection.")
             } else {
@@ -310,7 +363,7 @@ struct WellnessControlView: View {
     }
 
     private var primaryDecisionCard: some View {
-        ProductCard(kicker: "Intervention", systemImage: "wand.and.stars") {
+        ProductCard(kicker: "지금 필요한 결정", systemImage: "wand.and.stars") {
             if let decision = briefing.pendingDecisions.first {
                 Text(verbatim: decision.prompt)
                     .font(.title3.weight(.semibold))
@@ -328,7 +381,7 @@ struct WellnessControlView: View {
                             await refreshAll()
                         }
                     } label: {
-                        Label("No", systemImage: "xmark").frame(maxWidth: .infinity)
+                        Label("유지", systemImage: "xmark").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
 
@@ -338,7 +391,7 @@ struct WellnessControlView: View {
                             await refreshAll()
                         }
                     } label: {
-                        Label("Yes", systemImage: "checkmark").frame(maxWidth: .infinity)
+                        Label("변경 승인", systemImage: "checkmark").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(moss)
@@ -349,14 +402,14 @@ struct WellnessControlView: View {
                     Button {
                         router.openDecision(url)
                     } label: {
-                        Label("Why and tradeoffs", systemImage: "arrow.up.right.square")
+                        Label("이 제안의 이유와 영향", systemImage: "arrow.up.right.square")
                     }
                     .font(.footnote.weight(.semibold))
                 }
             } else {
-                Label("No action needs approval", systemImage: "checkmark.seal")
+                Label("지금 바꿀 행동이 없습니다", systemImage: "checkmark.seal")
                     .font(.headline)
-                Text("HealthMes stays quiet when it cannot name one exact, evidence-backed change.")
+                Text("HealthMes는 근거가 있는 한 가지 변경을 찾을 때만 제안합니다.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -411,7 +464,7 @@ struct WellnessControlView: View {
                 .accessibilityLabel(Text(command.isListening ? "Stop listening" : "Speak command"))
 
                 TextField(
-                    "상태를 보여줘 · 할 일: 라이브 QA",
+                    "오늘 왜 피곤해? · 할 일: 라이브 QA",
                     text: $command.transcript,
                     axis: .vertical
                 )
@@ -472,18 +525,17 @@ struct WellnessControlView: View {
                 .font(.body.weight(.medium))
             if message.contains("지원") || message.contains("Choose") {
                 HStack {
-                    lensChip(.now)
-                    lensChip(.coordinate)
-                    lensChip(.change)
+                    detailChip(.now)
+                    detailChip(.coordinate)
+                    detailChip(.change)
                 }
             }
         }
     }
 
-    private func lensChip(_ target: WellnessLens) -> some View {
-        Button(target.title) {
-            lens = target
-            commandMessage = nil
+    private func detailChip(_ target: WellnessLens) -> some View {
+        Button(detailTitle(for: target)) {
+            selectDetail(target)
         }
         .buttonStyle(.bordered)
     }
@@ -495,15 +547,15 @@ struct WellnessControlView: View {
         commandMessage = nil
         switch intent {
         case .show(let target):
-            lens = target
-            commandMessage = "\(target.title) 관점으로 같은 HealthMes 장면을 조정했습니다."
+            selectDetail(target)
+            commandMessage = "\(detailTitle(for: target))를 현재 리모컨에 펼쳤습니다."
             command.transcript = ""
         case .createTask(let title):
             preview = CommandPreview(kind: .task, title: title)
         case .createGoal(let title):
             preview = CommandPreview(kind: .goal, title: title)
         case .clarify:
-            commandMessage = "이 UI는 임의 일정을 추측해 바꾸지 않습니다. 지금 상태, 기존 조율 제안, 변화 결과 중 하나를 선택하거나 `할 일:` 또는 `주간 목표:`로 명확히 입력하세요."
+            commandMessage = "HealthMes는 임의로 일정을 바꾸지 않습니다. 현재 몸 상태, 일정과 목표, 이전 결정 결과를 물어보거나 `할 일:` 또는 `주간 목표:`로 명확히 입력하세요."
         }
     }
 
@@ -513,8 +565,33 @@ struct WellnessControlView: View {
         await command.save()
         commandMessage = command.message
         self.preview = nil
-        lens = .coordinate
+        selectDetail(.coordinate, clearMessage: false)
         await refreshAll()
+    }
+
+    private func selectDetail(_ target: WellnessLens, clearMessage: Bool = true) {
+        withAnimation(.easeOut(duration: 0.18)) {
+            lens = target
+            if clearMessage {
+                commandMessage = nil
+            }
+        }
+    }
+
+    private func detailTitle(for target: WellnessLens) -> String {
+        switch target {
+        case .now: return "현재 영향"
+        case .coordinate: return "일정과 목표"
+        case .change: return "결정 결과"
+        }
+    }
+
+    private func detailIcon(for target: WellnessLens) -> String {
+        switch target {
+        case .now: return "bolt.heart"
+        case .coordinate: return "calendar"
+        case .change: return "chart.line.uptrend.xyaxis"
+        }
     }
 
     private func refreshAll() async {
@@ -569,40 +646,39 @@ struct WellnessControlView: View {
             return "Calendar needs attention"
         }
         if plan.events.isEmpty {
-            return "No synced events"
+            return "연동 일정 없음"
         }
-        return "Calendar data loaded"
+        return "캘린더 연동됨"
     }
 
     private var lensEyebrow: String {
         switch lens {
-        case .now: return "CURRENT STATE"
-        case .coordinate: return "BODY-AWARE COORDINATION"
-        case .change: return "OUTCOME LEARNING"
+        case .now: return "HEALTH → PLAN"
+        case .coordinate: return "DETAIL · CALENDAR & GOALS"
+        case .change: return "DETAIL · DECISION RESULTS"
         }
     }
 
     private var sceneTitle: String {
         switch lens {
         case .now:
-            return briefing.snapshot?.payload.alerts.top?.summary
-                ?? "몸이 오늘 계획에 미치는 영향"
+            return "몸이 오늘 계획에 미치는 영향"
         case .coordinate:
             return briefing.pendingDecisions.first?.prompt
-                ?? "보호할 목표와 조정 가능한 시간을 봅니다"
+                ?? "몸 상태를 지키면서 일정과 목표를 확인합니다"
         case .change:
-            return "이전 결정이 실제로 도움이 되었는지 봅니다"
+            return "이전 결정이 실제로 도움이 되었는지 확인합니다"
         }
     }
 
     private var sceneSummary: String {
         switch lens {
         case .now:
-            return "상태 수치보다 오늘 무엇을 다르게 해야 하는지를 먼저 보여줍니다."
+            return "현재 몸 상태가 오늘 일정에 미치는 영향과, 필요할 때 한 가지 행동을 보여줍니다."
         case .coordinate:
-            return "건강 상태, 주간 목표, 캘린더 제약을 한 장면에서 비교합니다."
+            return "필요할 때만 주간 목표와 캘린더 제약을 자세히 펼칩니다."
         case .change:
-            return "결정 기록과 캘린더 반영을 결과 학습의 시작점으로 구분합니다."
+            return "승인, 캘린더 반영, 이후 결과를 구분해 학습 여부를 확인합니다."
         }
     }
 
@@ -620,6 +696,22 @@ struct WellnessControlView: View {
             return "에너지를 집중 블록에 남기도록 저강도 일정을 주변에 배치하세요."
         }
         return "현재 capacity가 높은 구간을 핵심 목표에 우선 사용하세요."
+    }
+
+    private func taskDetail(_ task: TaskItem) -> String {
+        var parts = ["에너지 \(task.energyDemand)"]
+        if let minutes = task.estimatedMinutes {
+            parts.append("약 \(minutes)분")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func confidenceLabel(_ confidence: GlanceConfidence) -> String {
+        switch confidence {
+        case .high: return "높음"
+        case .medium: return "보통"
+        case .low: return "낮음"
+        }
     }
 }
 

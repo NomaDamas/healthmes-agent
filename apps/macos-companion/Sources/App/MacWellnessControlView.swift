@@ -57,15 +57,18 @@ struct MacWellnessControlView: View {
     @State private var decisionOutcome: (proposalID: UUID, outcome: ProposalOutcome)?
     @State private var resolvingProposalID: UUID?
     @State private var lastHandledSpeakRequest = 0
+    @State private var preserveMessageOnNextLensChange = false
     @FocusState private var commandFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             statusRail
-            lensControl
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    if router.lens != .now {
+                        detailContextBar
+                    }
                     sceneHeader
 
                     if let preview {
@@ -99,8 +102,13 @@ struct MacWellnessControlView: View {
             commandText = transcript
             commandFocused = true
         }
-        .onChange(of: router.lens) { _, _ in
-            message = nil
+        .onChange(of: router.lens) { oldLens, newLens in
+            guard oldLens != newLens else { return }
+            if preserveMessageOnNextLensChange {
+                preserveMessageOnNextLensChange = false
+            } else {
+                message = nil
+            }
         }
         .onDisappear {
             speech.reset()
@@ -168,6 +176,8 @@ struct MacWellnessControlView: View {
 
             Spacer(minLength: 8)
 
+            exploreMenu
+
             MacPrivacyPill(
                 isPaired: glanceStore.isPaired,
                 isStale: glanceStore.isStale
@@ -189,12 +199,6 @@ struct MacWellnessControlView: View {
             .disabled(glanceStore.isRefreshing || dashboardStore.isRefreshing)
             .accessibilityLabel(Text("Refresh HealthMes"))
 
-            Button(action: onSettings) {
-                Image(systemName: "gearshape")
-            }
-            .buttonStyle(.borderless)
-            .help("Settings")
-            .accessibilityLabel(Text("Settings"))
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
@@ -207,54 +211,54 @@ struct MacWellnessControlView: View {
         .accessibilityElement(children: .contain)
     }
 
-    private var lensControl: some View {
-        HStack(spacing: 8) {
-            Text("One canvas")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-                .tracking(1.1)
-
-            HStack(spacing: 5) {
-                ForEach(WellnessLens.allCases) { lens in
-                    Button {
-                        if reduceMotion {
-                            router.selectLens(lens)
-                        } else {
-                            withAnimation(.easeOut(duration: 0.18)) {
-                                router.selectLens(lens)
-                            }
-                        }
-                    } label: {
-                        Text(verbatim: lens.title)
-                            .font(.subheadline.weight(.semibold))
-                            .padding(.horizontal, 18)
-                            .padding(.vertical, 8)
-                            .background(
-                                router.lens == lens
-                                    ? MacHealthMesStyle.graphite
-                                    : Color.clear,
-                                in: Capsule()
-                            )
-                            .foregroundStyle(router.lens == lens ? .white : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(router.lens == lens ? .isSelected : [])
-                    .accessibilityHint(Text("Changes the perspective of the current canvas"))
-                }
+    private var exploreMenu: some View {
+        Menu {
+            Button("Current impact") {
+                selectDetail(.now)
             }
-            .padding(4)
-            .background(.thinMaterial, in: Capsule())
+            .accessibilityAddTraits(router.lens == .now ? .isSelected : [])
+            Button("Calendar & goals") {
+                selectDetail(.coordinate)
+            }
+            .accessibilityAddTraits(router.lens == .coordinate ? .isSelected : [])
+            Button("Decision results") {
+                selectDetail(.change)
+            }
+            .accessibilityAddTraits(router.lens == .change ? .isSelected : [])
 
+            Divider()
+
+            if let pairing = dashboardStore.pairing {
+                Link("Open web dashboard", destination: MacWebLinks.dashboard(pairing: pairing))
+            }
+            Button("Settings", action: onSettings)
+        } label: {
+            Label("Explore", systemImage: "square.grid.2x2")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Open calendar, goal, outcome and connection details")
+        .accessibilityLabel(Text("Explore HealthMes details"))
+        .accessibilityValue(Text(detailTitle(router.lens)))
+    }
+
+    private var detailContextBar: some View {
+        HStack(spacing: 10) {
+            Label(detailTitle(router.lens), systemImage: detailIcon(router.lens))
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(MacHealthMesStyle.graphite)
             Spacer()
-
             Text(freshnessText)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
+            Button("Back to current impact") {
+                selectDetail(.now)
+            }
+            .buttonStyle(.borderless)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(MacHealthMesStyle.moss.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
     }
 
     private var sceneHeader: some View {
@@ -375,7 +379,7 @@ struct MacWellnessControlView: View {
                         Button {
                             Task { await resolve(proposal, action: .decline) }
                         } label: {
-                            Label("No", systemImage: "xmark")
+                            Label("Keep", systemImage: "xmark")
                                 .frame(minWidth: 84)
                         }
                         .buttonStyle(.bordered)
@@ -383,7 +387,7 @@ struct MacWellnessControlView: View {
                         Button {
                             Task { await resolve(proposal, action: .accept) }
                         } label: {
-                            Label("Yes", systemImage: "checkmark")
+                            Label("Approve change", systemImage: "checkmark")
                                 .frame(minWidth: 84)
                         }
                         .buttonStyle(.borderedProminent)
@@ -640,7 +644,7 @@ struct MacWellnessControlView: View {
                 .accessibilityLabel(Text(speech.isListening ? "Stop listening" : "Speak command"))
 
                 TextField(
-                    "상태를 보여줘 · 할 일: 라이브 QA",
+                    "오늘 왜 피곤해? · 할 일: 라이브 QA",
                     text: $commandText,
                     axis: .vertical
                 )
@@ -814,10 +818,10 @@ struct MacWellnessControlView: View {
     private func handle(_ intent: WellnessCommandIntent) {
         switch intent {
         case .show(let lens):
-            router.selectLens(lens)
+            selectDetail(lens)
             commandText = ""
             message = MacControlMessage(
-                text: "\(lens.title) perspective is now emphasized on the same canvas.",
+                text: "\(detailTitle(lens)) is now open on the current control surface.",
                 tone: .neutral
             )
         case .createTask(let title):
@@ -827,7 +831,7 @@ struct MacWellnessControlView: View {
         case .clarify:
             message = MacControlMessage(
                 text:
-                    "HealthMes did not execute that command. Ask for 지금, 조율 or 변화, or use an explicit `할 일:` / `주간 목표:` prefix. Calendar moves require an existing HealthMes proposal.",
+                    "HealthMes did not execute that command. Ask about current condition, calendar and goals, or prior decision results. Use an explicit `할 일:` / `주간 목표:` prefix for writes. Calendar moves require an existing proposal.",
                 tone: .caution
             )
         }
@@ -900,7 +904,39 @@ struct MacWellnessControlView: View {
         if succeeded {
             commandText = ""
             speech.reset()
-            router.selectLens(.coordinate)
+            selectDetail(.coordinate, clearMessage: false)
+        }
+    }
+
+    private func selectDetail(_ lens: WellnessLens, clearMessage: Bool = true) {
+        if clearMessage {
+            message = nil
+            preserveMessageOnNextLensChange = false
+        } else if router.lens != lens {
+            preserveMessageOnNextLensChange = true
+        }
+        if reduceMotion {
+            router.selectLens(lens)
+        } else {
+            withAnimation(.easeOut(duration: 0.18)) {
+                router.selectLens(lens)
+            }
+        }
+    }
+
+    private func detailTitle(_ lens: WellnessLens) -> String {
+        switch lens {
+        case .now: return "Current health impact"
+        case .coordinate: return "Calendar & goals"
+        case .change: return "Decision results"
+        }
+    }
+
+    private func detailIcon(_ lens: WellnessLens) -> String {
+        switch lens {
+        case .now: return "bolt.heart"
+        case .coordinate: return "calendar"
+        case .change: return "chart.line.uptrend.xyaxis"
         }
     }
 
@@ -1043,9 +1079,9 @@ struct MacWellnessControlView: View {
 
     private var lensEyebrow: String {
         switch router.lens {
-        case .now: return "CURRENT CAPACITY"
-        case .coordinate: return "WELLNESS COORDINATION"
-        case .change: return "OUTCOME LEARNING"
+        case .now: return "HEALTH → PLAN"
+        case .coordinate: return "DETAIL · CALENDAR & GOALS"
+        case .change: return "DETAIL · DECISION RESULTS"
         }
     }
 

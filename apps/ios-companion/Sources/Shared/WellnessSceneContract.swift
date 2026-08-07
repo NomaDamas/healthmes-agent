@@ -268,12 +268,16 @@ public enum WellnessCommandParser {
             return .show(.change)
         }
         if normalized.contains("결정") || normalized.contains("조율")
-            || normalized.contains("옮") || normalized.contains("adjust")
+            || normalized.contains("일정") || normalized.contains("목표")
+            || normalized.contains("캘린더") || normalized.contains("옮")
+            || normalized.contains("adjust")
         {
             return .show(.coordinate)
         }
         if normalized.contains("지금") || normalized.contains("상태")
-            || normalized.contains("today") || normalized.contains("energy")
+            || normalized.contains("현재") || normalized.contains("피곤")
+            || normalized.contains("회복") || normalized.contains("today")
+            || normalized.contains("energy")
         {
             return .show(.now)
         }

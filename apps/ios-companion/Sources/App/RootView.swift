@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// One fixed HealthMes control shell. Lenses change the perspective of the
-/// same canvas; command input and loaded state remain in place.
+/// One fixed HealthMes control shell. Current health impact is the default;
+/// deeper calendar, goal and outcome views stay behind the Explore menu.
 struct RootView: View {
     @EnvironmentObject private var router: AppRouter
     @State private var isPaired = PairingStore.shared.load() != nil

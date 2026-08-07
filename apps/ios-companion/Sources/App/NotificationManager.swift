@@ -234,7 +234,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                 if let decisionURL {
                     AppRouter.shared.openDecision(decisionURL)
                 } else {
-                    AppRouter.shared.tab = .today
+                    AppRouter.shared.showHome()
                 }
                 completionHandler()
             }

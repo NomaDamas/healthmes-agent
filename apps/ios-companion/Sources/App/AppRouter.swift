@@ -39,9 +39,18 @@ final class AppRouter: ObservableObject {
     @Published var decisionSheet: DecisionSheetTarget?
     @Published var proposalSheetID: UUID?
     @Published private(set) var commandFocusRequest = 0
+    @Published private(set) var homeRequest = 0
 
     func focusCommandDock() {
         commandFocusRequest += 1
+    }
+
+    func showHome() {
+        tab = .today
+        modal = nil
+        decisionSheet = nil
+        proposalSheetID = nil
+        homeRequest += 1
     }
 
     /// Open a tokenized decision/report URL in the in-app viewer. Only URLs
@@ -75,7 +84,7 @@ final class AppRouter: ObservableObject {
                 let targetURL = URL(string: target),
                 Self.isAllowedViewerURL(targetURL)
             else {
-                tab = .today
+                showHome()
                 return
             }
             openDecision(targetURL)
@@ -84,7 +93,7 @@ final class AppRouter: ObservableObject {
                 let raw = Self.queryValue(of: url, name: "id"),
                 let id = UUID(uuidString: raw)
             else {
-                tab = .today
+                showHome()
                 return
             }
             openProposalDetail(id)
@@ -95,7 +104,7 @@ final class AppRouter: ObservableObject {
         case "speak":
             focusCommandDock()
         default:
-            tab = .today
+            showHome()
         }
     }
 

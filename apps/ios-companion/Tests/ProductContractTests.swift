@@ -442,6 +442,9 @@ final class ProductContractTests: XCTestCase {
             WellnessCommandParser.parse("내일 어떻게 하지?"),
             .clarify("내일 어떻게 하지?")
         )
+        XCTAssertEqual(WellnessCommandParser.parse("오늘 왜 피곤해?"), .show(.now))
+        XCTAssertEqual(WellnessCommandParser.parse("현재 영향"), .show(.now))
+        XCTAssertEqual(WellnessCommandParser.parse("일정과 목표"), .show(.coordinate))
     }
 
     func testAcceptedAndPushedStayDistinctInGeneratedUISemantics() {
@@ -458,4 +461,5 @@ final class ProductContractTests: XCTestCase {
             ProposalStatusPresentation.detail(for: .pushed)
         )
     }
+
 }
