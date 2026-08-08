@@ -1,10 +1,19 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import select
 
+from healthmes.api.auth import viewer_token
+from healthmes.app import create_app
 from healthmes.storage import register_storage_object, run_storage_maintenance
-from healthmes.store import PurgeJob, RetentionPolicy, WellnessEvent
+from healthmes.store import (
+    PurgeJob,
+    RetentionPolicy,
+    StorageObject,
+    WellnessEvent,
+)
 
 
 def test_storage_settings_bootstraps_defaults_and_measures_files(
@@ -43,6 +52,36 @@ def test_retention_update_is_persisted(client: TestClient, session) -> None:
     assert policy.retention_days == 1
 
 
+def test_retention_update_uses_the_original_object_observation_time(
+    client: TestClient,
+    session,
+    settings,
+) -> None:
+    observed = datetime(2026, 7, 1, tzinfo=UTC)
+    obj = register_storage_object(
+        session,
+        settings,
+        relative_path="media/private.m4a",
+        data_class="nutrition_media",
+        content_type="audio/m4a",
+        size_bytes=7,
+        observed_at=observed,
+    )
+    session.commit()
+
+    response = client.put(
+        "/v1/storage/settings/nutrition_media",
+        json={"preset": "1d"},
+    )
+
+    assert response.status_code == 200
+    session.expire_all()
+    stored = session.get(StorageObject, obj.id)
+    assert stored is not None
+    assert stored.retention_basis_at.replace(tzinfo=UTC) == observed
+    assert stored.expires_at.replace(tzinfo=UTC) == observed + timedelta(days=7)
+
+
 def test_wellness_event_contract_sets_expiry_and_is_idempotent(
     client: TestClient, session
 ) -> None:
@@ -64,6 +103,41 @@ def test_wellness_event_contract_sets_expiry_and_is_idempotent(
     expires = datetime.fromisoformat(first.json()["expires_at"]).replace(tzinfo=UTC)
     assert expires == observed + timedelta(days=30)
     assert len(list(session.scalars(select(WellnessEvent)))) == 1
+
+
+@pytest.mark.parametrize(
+    ("event_type", "source_provider"),
+    (
+        ("subjective_energy", "nutrition-operation"),
+        ("subjective_energy", "nutrition-outcome-raw"),
+        ("subjective_energy", "nutrition-future-internal"),
+        ("nutrition.interaction.v1", "manual"),
+    ),
+)
+def test_generic_wellness_api_rejects_internal_nutrition_namespaces(
+    client: TestClient,
+    session,
+    event_type: str,
+    source_provider: str,
+) -> None:
+    response = client.post(
+        "/v1/wellness-events",
+        json={
+            "event_type": event_type,
+            "observed_at": datetime.now(UTC).isoformat(),
+            "source_provider": source_provider,
+            "source_record_id": "reserved-namespace-attempt",
+            "data_class": "normalized",
+            "payload": {"note": "forged internal payload"},
+        },
+    )
+
+    assert response.status_code == 422
+    assert (
+        response.json()["error"]["code"]
+        == "reserved_wellness_namespace"
+    )
+    assert session.scalar(select(WellnessEvent)) is None
 
 
 def test_maintenance_dry_run_then_deletes_expired_object(
@@ -103,8 +177,117 @@ def test_maintenance_dry_run_then_deletes_expired_object(
     assert len(list(session.scalars(select(PurgeJob)))) == 2
 
 
+def test_legacy_nutrition_migration_handles_shared_media(
+    session, settings
+) -> None:
+    observed = datetime(2026, 8, 7, 9, tzinfo=UTC)
+    media = register_storage_object(
+        session,
+        settings,
+        relative_path="media/shared.jpg",
+        data_class="nutrition_media",
+        content_type="image/jpeg",
+        size_bytes=12,
+        observed_at=observed,
+    )
+    session.add_all(
+        [
+            WellnessEvent(
+                event_type="nutrition.interaction.v1",
+                observed_at=observed,
+                recorded_at=observed,
+                source_provider="nutrition-interaction",
+                source_record_id=f"legacy-{index}",
+                capture_method="photo",
+                payload={
+                    "media_path": media.relative_path,
+                    "source_text": f"shared meal {index}",
+                },
+            )
+            for index in range(2)
+        ]
+    )
+    session.commit()
+
+    report = run_storage_maintenance(
+        session,
+        settings,
+        now=datetime(2026, 8, 8, 9, tzinfo=UTC),
+    )
+    session.commit()
+
+    assert report.errors == ()
+    migrated = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == "nutrition.raw-capture.v1"
+            )
+        )
+    )
+    assert len(migrated) == 2
+    assert sum(event.raw_object_id == media.id for event in migrated) == 1
+
+
 def test_storage_web_page_renders(client: TestClient) -> None:
     response = client.get("/storage")
     assert response.status_code == 200
     assert "저장 관리" in response.text
     assert "데이터별 보존기간" in response.text
+
+
+def test_storage_nav_preserves_reverse_proxy_base_path(settings) -> None:
+    proxied = settings.model_copy(
+        update={"public_base_url": "https://example.test/healthmes"}
+    )
+    with TestClient(create_app(proxied)) as client:
+        response = client.get("/storage")
+
+    assert response.status_code == 200
+    assert 'href="/healthmes/storage"' in response.text
+    assert 'action="/storage/policy"' not in response.text
+
+
+def test_storage_supports_viewer_reads_and_local_session_writes(settings) -> None:
+    token = "storage-api-token"
+    secured = settings.model_copy(update={"api_token": SecretStr(token)})
+    application = create_app(secured)
+
+    with TestClient(application) as remote:
+        assert remote.get("/storage").status_code == 401
+        viewer = remote.get(
+            "/storage",
+            params={"token": viewer_token(token)},
+        )
+        assert viewer.status_code == 200
+        assert 'action="/storage/policy"' not in viewer.text
+
+    with TestClient(
+        application,
+        base_url="http://127.0.0.1:8100",
+    ) as local:
+        unlocked = local.post(
+            "/connect/unlock",
+            data={"api_token": token},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert unlocked.status_code == 303
+        session_id = local.cookies.get("healthmes_local_session")
+        assert session_id is not None
+
+        page = local.get("/storage")
+        assert page.status_code == 200
+        assert 'action="/storage/policy"' in page.text
+        csrf = application.state.local_sessions.get(session_id).csrf_token
+        updated = local.post(
+            "/storage/policy",
+            data={
+                "csrf": csrf,
+                "data_class": "raw_payload",
+                "preset": "7d",
+            },
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert updated.status_code == 303
+        assert updated.headers["location"] == "/storage"

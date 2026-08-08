@@ -318,6 +318,7 @@ def test_dashboard_links_preserve_reverse_proxy_base_path(settings) -> None:
     assert 'href="/healthmes/dashboard/history#history"' in response.text
     assert 'href="/healthmes/connect"' in response.text
     assert 'href="/healthmes/sleep"' in response.text
+    assert 'href="/healthmes/storage"' in response.text
 
 
 def test_unlock_form_preserves_reverse_proxy_base_path(settings) -> None:

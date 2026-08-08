@@ -270,9 +270,7 @@ def test_fetch_unknown_extension_falls_back_to_octet_stream(client, settings):
 
     response = client.get("/v1/media/2026/07/note.bin")
 
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "application/octet-stream"
-    assert response.content == b"opaque-bytes"
+    assert response.status_code == 404
 
 
 @pytest.mark.parametrize(

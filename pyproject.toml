@@ -40,6 +40,9 @@ dependencies = [
     # Multipart parsing for the capture upload (POST /v1/media, issue #10) —
     # previously only a transitive dep of fastmcp; FastAPI needs it directly.
     "python-multipart>=0.0.32",
+    # Remote vision uploads are re-encoded to strip EXIF/GPS metadata.
+    "pillow>=12.3.0,<13",
+    "pillow-heif>=1.1.0,<2",
     "segno>=1.6.6",
 ]
 

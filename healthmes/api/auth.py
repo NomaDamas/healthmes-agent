@@ -81,6 +81,7 @@ VIEWER_PATH_PREFIXES = (
     "/v1/media/",
     "/connect",
     "/sleep",
+    "/storage",
 )
 HUMAN_VIEWER_PATH_PREFIXES = (
     "/dashboard",
@@ -260,6 +261,8 @@ class BearerTokenMiddleware:
             or path.startswith("/connect/google/")
             or path == "/sleep"
             or path.startswith("/sleep/")
+            or path == "/storage"
+            or path.startswith("/storage/")
         )
 
     @staticmethod

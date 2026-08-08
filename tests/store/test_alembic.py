@@ -216,6 +216,8 @@ class TestSqliteUpgrade:
         expired_task_id = "3" * 32
         expired_proposal_id = "4" * 32
         now = datetime.now(UTC)
+        pending_start = now + timedelta(days=2)
+        expired_start = now - timedelta(days=2)
         with engine.begin() as connection:
             connection.execute(
                 task_table.insert(),
@@ -242,15 +244,15 @@ class TestSqliteUpgrade:
                     {
                         "id": proposal_id,
                         "task_id": task_id,
-                        "proposed_start": now + timedelta(days=2),
-                        "proposed_end": now + timedelta(days=2, hours=1),
+                        "proposed_start": pending_start,
+                        "proposed_end": pending_start + timedelta(hours=1),
                         "status": "proposed",
                     },
                     {
                         "id": expired_proposal_id,
                         "task_id": expired_task_id,
-                        "proposed_start": now - timedelta(days=2),
-                        "proposed_end": now - timedelta(days=2) + timedelta(hours=1),
+                        "proposed_start": expired_start,
+                        "proposed_end": expired_start + timedelta(hours=1),
                         "status": "proposed",
                     },
                 ],
@@ -373,7 +375,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "b0c1d2e3f4a5"
+                ) == "c1d2e3f4a5b6"
         finally:
             engine.dispose()
 

@@ -16,7 +16,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_SKILLS = (
     "doctor-visit-summary",
+    "healthmes-caffeine",
     "healthmes-capture",
+    "healthmes-nutrition",
     "healthmes-planner",
     "healthmes-sleep",
     "healthmes-stress",
