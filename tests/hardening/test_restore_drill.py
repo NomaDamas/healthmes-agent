@@ -18,10 +18,10 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.orm import sessionmaker
-
 from alembic.config import Config as AlembicConfig
 from alembic.script import ScriptDirectory
+from sqlalchemy.orm import sessionmaker
+
 from healthmes.backup import (
     BackupProvider,
     DataLocations,

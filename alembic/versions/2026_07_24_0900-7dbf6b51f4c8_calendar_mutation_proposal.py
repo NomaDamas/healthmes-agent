@@ -1,9 +1,8 @@
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
-
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 revision: str = "7dbf6b51f4c8"
 down_revision: str | None = "c4f8a2d91b3e"

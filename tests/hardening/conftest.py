@@ -13,11 +13,11 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from alembic import command
+from alembic.config import Config as AlembicConfig
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from alembic import command
-from alembic.config import Config as AlembicConfig
 from healthmes.store import (
     Base,
     CalendarEventMirror,

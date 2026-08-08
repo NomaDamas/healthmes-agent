@@ -16,9 +16,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
-
 from alembic import context, op
+from sqlalchemy.dialects import postgresql
 
 revision: str = "d2e3f4a5b6c7"
 down_revision: str | Sequence[str] | None = "c1d2e3f4a5b6"

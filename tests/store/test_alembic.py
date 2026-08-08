@@ -14,13 +14,13 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.orm import sessionmaker
-
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from sqlalchemy.orm import sessionmaker
+
 from healthmes.config import Settings
 from healthmes.schedule_proposals import resolution_token, verify_resolution_token
 from healthmes.storage import run_storage_maintenance

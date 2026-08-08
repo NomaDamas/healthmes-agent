@@ -15,7 +15,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 import sqlalchemy as sa
-
 from alembic import context, op
 
 revision: str = "e3f4a5b6c7d8"
