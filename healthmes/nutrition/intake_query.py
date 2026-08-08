@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from heapq import heappush, heapreplace
 from typing import Any
@@ -24,6 +25,7 @@ from healthmes.nutrition.intake_contracts import (
     StructuredIntakeSnapshot,
     decision_request_from_payload,
     interaction_from_payload,
+    interaction_review_to_payload,
     interaction_to_payload,
     outcome_from_payload,
     outcome_to_payload,
@@ -32,9 +34,12 @@ from healthmes.nutrition.intake_service import (
     DECISION_REQUEST_EVENT,
     INTERACTION_EVENT,
     OUTCOME_EVENT,
+    IntakeStorageIntegrityError,
     get_decision_request,
     get_interaction,
+    interaction_transition_versions,
     latest_decision,
+    latest_interaction_review,
     latest_outcome,
     resolved_items,
     structured_snapshot,
@@ -44,6 +49,23 @@ from healthmes.store import WellnessEvent
 
 _ITEMS_ADAPTER = TypeAdapter(tuple[NormalizedIntakeItem, ...])
 _SNAPSHOT_ADAPTER = TypeAdapter(StructuredIntakeSnapshot)
+_OUTCOME_PROVIDER = "nutrition-intake-outcome"
+
+
+def _is_maintenance_quarantined(event: WellnessEvent) -> bool:
+    return isinstance(event.quality_flags, dict) and "maintenance_quarantine" in event.quality_flags
+
+
+def _stored_payload(
+    parser: Callable[[dict[str, Any]], Any],
+    payload: dict[str, Any],
+    *,
+    record_name: str,
+) -> Any:
+    try:
+        return parser(payload)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise IntakeStorageIntegrityError(f"stored {record_name} payload is malformed") from exc
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -80,9 +102,7 @@ def _outcome_view(outcome: IntakeOutcome | None) -> dict[str, Any] | None:
         "status": outcome.status.value,
         "confirmed_at": outcome.confirmed_at.isoformat(),
         "consumed_at": (
-            outcome.consumed_at.isoformat()
-            if outcome.consumed_at is not None
-            else None
+            outcome.consumed_at.isoformat() if outcome.consumed_at is not None else None
         ),
     }
 
@@ -99,11 +119,11 @@ def _structured_view(
             "source_text": None,
             "media_path": None,
             "latest_outcome": _outcome_view(outcome),
+            "latest_review": None,
             "latest_decision": _decision_view(decision),
             "resolved_items": _item_payload(snapshot.items),
             "is_confirmed_intake": bool(
-                outcome is not None
-                and outcome.status is IntakeOutcomeStatus.CONSUMED
+                outcome is not None and outcome.status is IntakeOutcomeStatus.CONSUMED
             ),
             "raw_capture_available": False,
         }
@@ -114,37 +134,58 @@ def _structured_view(
 def _interaction_view(
     interaction: IntakeInteraction,
     outcome: IntakeOutcome | None,
+    review: Any | None,
     decision: IntakeDecision | None,
 ) -> dict[str, Any]:
     payload = interaction_to_payload(interaction)
-    payload["latest_outcome"] = (
-        outcome_to_payload(outcome) if outcome is not None else None
-    )
+    payload["latest_outcome"] = outcome_to_payload(outcome) if outcome is not None else None
+    payload["latest_review"] = interaction_review_to_payload(review) if review is not None else None
     payload["latest_decision"] = _decision_view(decision)
-    payload["resolved_items"] = _item_payload(resolved_items(interaction, outcome))
+    payload["resolved_items"] = _item_payload(resolved_items(interaction, outcome, review))
     payload["is_confirmed_intake"] = bool(
         outcome is not None and outcome.status is IntakeOutcomeStatus.CONSUMED
     )
-    payload["raw_capture_available"] = bool(
-        interaction.source_text or interaction.media_path
-    )
+    payload["raw_capture_available"] = bool(interaction.source_text or interaction.media_path)
     return payload
 
 
-def interaction_view(
-    session: Session, interaction_id: uuid.UUID
-) -> dict[str, Any] | None:
+def interaction_view(session: Session, interaction_id: uuid.UUID) -> dict[str, Any] | None:
     interaction = get_interaction(session, interaction_id)
-    outcome_entry = latest_outcome(session, interaction_id)
-    decision_entry = latest_decision(session, interaction_id)
-    outcome = outcome_entry[1] if outcome_entry is not None else None
-    decision = decision_entry[1] if decision_entry is not None else None
     if interaction is not None:
-        return _interaction_view(interaction, outcome, decision)
-    if outcome is not None and outcome.intake_snapshot is not None:
-        return _structured_view(outcome.intake_snapshot, outcome, decision)
+        outcome_entry = latest_outcome(session, interaction_id)
+        review_entry = latest_interaction_review(session, interaction_id)
+        decision_entry = latest_decision(session, interaction_id)
+        outcome = outcome_entry[1] if outcome_entry is not None else None
+        review = review_entry[1] if review_entry is not None else None
+        decision = decision_entry[1] if decision_entry is not None else None
+        return _interaction_view(interaction, outcome, review, decision)
+
+    active_outcome_id = session.scalar(
+        select(WellnessEvent.id)
+        .where(
+            WellnessEvent.event_type == OUTCOME_EVENT,
+            WellnessEvent.source_provider == _OUTCOME_PROVIDER,
+            WellnessEvent.payload["interaction_id"].as_string() == str(interaction_id),
+            (WellnessEvent.expires_at.is_(None) | (WellnessEvent.expires_at > datetime.now(UTC))),
+        )
+        .limit(1)
+    )
+    if active_outcome_id is not None:
+        outcome_entry = latest_outcome(session, interaction_id)
+        outcome = outcome_entry[1] if outcome_entry is not None else None
+        if outcome is not None and outcome.intake_snapshot is not None:
+            decision_entry = latest_decision(session, interaction_id)
+            decision = decision_entry[1] if decision_entry is not None else None
+            return _structured_view(
+                outcome.intake_snapshot,
+                outcome,
+                decision,
+            )
+
     request_candidate = _latest_request_candidate(session, interaction_id)
     if request_candidate is not None:
+        decision_entry = latest_decision(session, interaction_id)
+        decision = decision_entry[1] if decision_entry is not None else None
         request_candidate["latest_decision"] = _decision_view(decision)
         return request_candidate
     return None
@@ -158,17 +199,19 @@ def _latest_request_candidate(
         select(WellnessEvent)
         .where(
             WellnessEvent.event_type == DECISION_REQUEST_EVENT,
-            (
-                WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
-            ),
-            WellnessEvent.payload["interaction_id"].as_string()
-            == str(interaction_id),
+            (WellnessEvent.expires_at.is_(None) | (WellnessEvent.expires_at > datetime.now(UTC))),
+            WellnessEvent.payload["interaction_id"].as_string() == str(interaction_id),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
     )
     for row in rows:
-        request = decision_request_from_payload(row.payload)
+        if _is_maintenance_quarantined(row):
+            continue
+        request = _stored_payload(
+            decision_request_from_payload,
+            row.payload,
+            record_name="intake decision request",
+        )
         if request.context_snapshot is not None:
             return dict(request.context_snapshot["candidate"])
     return None
@@ -185,9 +228,7 @@ def _matches_record(
         return False
     items = record["resolved_items"]
     if nutrient_key and not any(
-        fact["nutrient"].casefold() == nutrient_key
-        for item in items
-        for fact in item["nutrients"]
+        fact["nutrient"].casefold() == nutrient_key for item in items for fact in item["nutrients"]
     ):
         return False
     if needle:
@@ -195,11 +236,7 @@ def _matches_record(
             [
                 record.get("source_text") or "",
                 *(item["name"] for item in items),
-                *(
-                    fact.get("evidence_text") or ""
-                    for item in items
-                    for fact in item["nutrients"]
-                ),
+                *(fact.get("evidence_text") or "" for item in items for fact in item["nutrients"]),
             ]
         ).casefold()
         if needle not in haystack:
@@ -257,27 +294,35 @@ def search_intake_history(
         select(WellnessEvent)
         .where(
             WellnessEvent.event_type == INTERACTION_EVENT,
-            (
-                WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
-            ),
+            (WellnessEvent.expires_at.is_(None) | (WellnessEvent.expires_at > datetime.now(UTC))),
         )
         .order_by(WellnessEvent.observed_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )
     for event in session.scalars(interaction_statement):
-        persisted = interaction_from_payload(event.payload)
+        if _is_maintenance_quarantined(event):
+            continue
+        persisted = _stored_payload(
+            interaction_from_payload,
+            event.payload,
+            record_name="intake interaction",
+        )
         interaction = get_interaction(session, persisted.interaction_id)
         if interaction is None:
             continue
         represented_ids.add(interaction.interaction_id)
         scanned_records += 1
         outcome_entry = latest_outcome(session, interaction.interaction_id)
+        review_entry = latest_interaction_review(
+            session,
+            interaction.interaction_id,
+        )
         decision_entry = latest_decision(session, interaction.interaction_id)
         include_record(
             _interaction_view(
                 interaction,
                 outcome_entry[1] if outcome_entry is not None else None,
+                review_entry[1] if review_entry is not None else None,
                 decision_entry[1] if decision_entry is not None else None,
             )
         )
@@ -287,20 +332,27 @@ def search_intake_history(
         select(WellnessEvent)
         .where(
             WellnessEvent.event_type == OUTCOME_EVENT,
-            (
-                WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
-            ),
+            (WellnessEvent.expires_at.is_(None) | (WellnessEvent.expires_at > datetime.now(UTC))),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )
     for event in session.scalars(outcome_statement):
-        outcome = outcome_from_payload(event.payload)
-        interaction_id = outcome.interaction_id
+        if _is_maintenance_quarantined(event):
+            continue
+        persisted = _stored_payload(
+            outcome_from_payload,
+            event.payload,
+            record_name="intake outcome",
+        )
+        interaction_id = persisted.interaction_id
         if interaction_id in seen_outcomes:
             continue
         seen_outcomes.add(interaction_id)
+        outcome_entry = latest_outcome(session, interaction_id)
+        if outcome_entry is None:
+            continue
+        _, outcome = outcome_entry
         if interaction_id in represented_ids or outcome.intake_snapshot is None:
             continue
         represented_ids.add(interaction_id)
@@ -319,24 +371,24 @@ def search_intake_history(
         select(WellnessEvent)
         .where(
             WellnessEvent.event_type == DECISION_REQUEST_EVENT,
-            (
-                WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
-            ),
+            (WellnessEvent.expires_at.is_(None) | (WellnessEvent.expires_at > datetime.now(UTC))),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )
     for event in session.scalars(request_statement):
-        request = decision_request_from_payload(event.payload)
+        if _is_maintenance_quarantined(event):
+            continue
+        request = _stored_payload(
+            decision_request_from_payload,
+            event.payload,
+            record_name="intake decision request",
+        )
         interaction_id = request.interaction_id
         if interaction_id in seen_requests:
             continue
         seen_requests.add(interaction_id)
-        if (
-            interaction_id in represented_ids
-            or request.context_snapshot is None
-        ):
+        if interaction_id in represented_ids or request.context_snapshot is None:
             continue
         represented_ids.add(interaction_id)
         scanned_records += 1
@@ -381,21 +433,28 @@ def _confirmed_history(
         select(WellnessEvent)
         .where(
             WellnessEvent.event_type == OUTCOME_EVENT,
-            (
-                WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
-            ),
+            (WellnessEvent.expires_at.is_(None) | (WellnessEvent.expires_at > datetime.now(UTC))),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )
     for outcome_event in session.scalars(statement):
-        outcome = outcome_from_payload(outcome_event.payload)
-        interaction_id = outcome.interaction_id
+        if _is_maintenance_quarantined(outcome_event):
+            continue
+        persisted = _stored_payload(
+            outcome_from_payload,
+            outcome_event.payload,
+            record_name="intake outcome",
+        )
+        interaction_id = persisted.interaction_id
         if interaction_id in seen:
             continue
         seen.add(interaction_id)
         scanned_latest_outcomes += 1
+        outcome_entry = latest_outcome(session, interaction_id)
+        if outcome_entry is None:
+            continue
+        outcome_event, outcome = outcome_entry
         if interaction_id in excluded:
             continue
         if outcome.status is not IntakeOutcomeStatus.CONSUMED:
@@ -438,9 +497,7 @@ def _confirmed_history(
     )
 
 
-def _interaction_event_id(
-    session: Session, interaction_id: uuid.UUID
-) -> uuid.UUID | None:
+def _interaction_event_id(session: Session, interaction_id: uuid.UUID) -> uuid.UUID | None:
     return session.scalar(
         select(WellnessEvent.id).where(
             WellnessEvent.event_type == INTERACTION_EVENT,
@@ -457,8 +514,10 @@ def _snapshot_for_interaction(
     if interaction is None:
         raise RuntimeError("decision interaction disappeared before snapshot")
     outcome_entry = latest_outcome(session, interaction_id)
+    review_entry = latest_interaction_review(session, interaction_id)
     decision_entry = latest_decision(session, interaction_id)
     outcome = outcome_entry[1] if outcome_entry is not None else None
+    review = review_entry[1] if review_entry is not None else None
     decision = decision_entry[1] if decision_entry is not None else None
     evidence_ids = []
     interaction_event_id = _interaction_event_id(session, interaction_id)
@@ -466,10 +525,22 @@ def _snapshot_for_interaction(
         evidence_ids.append(interaction_event_id)
     if outcome_entry is not None:
         evidence_ids.append(outcome_entry[0].id)
+    if review_entry is not None:
+        evidence_ids.append(review_entry[0].id)
     if decision_entry is not None:
         evidence_ids.append(decision_entry[0].id)
     return (
-        _structured_view(structured_snapshot(interaction), outcome, decision),
+        _structured_view(
+            structured_snapshot(
+                interaction,
+                items=resolved_items(interaction, outcome, review),
+            ),
+            outcome,
+            decision,
+        )
+        | {
+            "latest_review": (interaction_review_to_payload(review) if review is not None else None)
+        },
         evidence_ids,
     )
 
@@ -496,7 +567,12 @@ def _nutrition_source_event_ids(
             select(WellnessEvent.id).where(
                 WellnessEvent.event_type == "nutrition.review.v1",
                 WellnessEvent.source_provider == "user-nutrition-review",
-                WellnessEvent.source_record_id == review_id,
+                WellnessEvent.source_record_id.in_(
+                    (
+                        review_id,
+                        f"nutrition-review:{review_id}",
+                    )
+                ),
             )
         )
         if event_id is not None:
@@ -543,8 +619,7 @@ def _caffeine_gate(
         entry.get("observation_id") or entry.get("nutrition_observation_id")
         for entry in gate["evidence"]
         if isinstance(
-            entry.get("observation_id")
-            or entry.get("nutrition_observation_id"),
+            entry.get("observation_id") or entry.get("nutrition_observation_id"),
             str,
         )
     }
@@ -580,33 +655,53 @@ def _caffeine_gate(
             )
         )
     if confirmation_ids:
+        confirmation_record_ids = {
+            record_id
+            for confirmation_id in confirmation_ids
+            for record_id in (
+                confirmation_id,
+                f"caffeine-confirmation:{confirmation_id}",
+            )
+        }
         event_ids.extend(
             session.scalars(
                 select(WellnessEvent.id).where(
                     WellnessEvent.event_type == "nutrition.confirmation.v1",
                     WellnessEvent.source_provider == "user-confirmation",
-                    WellnessEvent.source_record_id.in_(confirmation_ids),
+                    WellnessEvent.source_record_id.in_(confirmation_record_ids),
                 )
             )
         )
     if review_ids:
+        review_record_ids = {
+            record_id
+            for review_id in review_ids
+            for record_id in (
+                review_id,
+                f"nutrition-review:{review_id}",
+            )
+        }
         event_ids.extend(
             session.scalars(
                 select(WellnessEvent.id).where(
                     WellnessEvent.event_type == "nutrition.review.v1",
                     WellnessEvent.source_provider == "user-nutrition-review",
-                    WellnessEvent.source_record_id.in_(review_ids),
+                    WellnessEvent.source_record_id.in_(review_record_ids),
                 )
             )
         )
     if gate["daily_confirmation_id"] is not None:
+        daily_confirmation_id = gate["daily_confirmation_id"]
         daily_event_id = session.scalar(
             select(WellnessEvent.id).where(
-                WellnessEvent.event_type
-                == "nutrition.daily-confirmation.v1",
+                WellnessEvent.event_type == "nutrition.daily-confirmation.v1",
                 WellnessEvent.source_provider == "user-confirmation",
-                WellnessEvent.source_record_id
-                == gate["daily_confirmation_id"],
+                WellnessEvent.source_record_id.in_(
+                    (
+                        daily_confirmation_id,
+                        f"daily-confirmation:{daily_confirmation_id}",
+                    )
+                ),
             )
         )
         if daily_event_id is not None:
@@ -620,21 +715,23 @@ def build_decision_context_snapshot(
     request: IntakeDecisionRequest,
     request_event_id: uuid.UUID,
 ) -> dict[str, Any]:
-    primary, primary_event_ids = _snapshot_for_interaction(
-        session, request.interaction_id
+    interaction_ids = [
+        request.interaction_id,
+        *request.compare_interaction_ids,
+    ]
+    candidate_versions = interaction_transition_versions(
+        session,
+        interaction_ids,
     )
-    primary_event_ids.extend(
-        _nutrition_source_event_ids(session, primary)
-    )
+    primary, primary_event_ids = _snapshot_for_interaction(session, request.interaction_id)
+    primary_event_ids.extend(_nutrition_source_event_ids(session, primary))
     comparisons: list[dict[str, Any]] = []
     comparison_event_ids: list[uuid.UUID] = []
     for interaction_id in request.compare_interaction_ids:
         value, event_ids = _snapshot_for_interaction(session, interaction_id)
         comparisons.append(value)
         comparison_event_ids.extend(event_ids)
-        comparison_event_ids.extend(
-            _nutrition_source_event_ids(session, value)
-        )
+        comparison_event_ids.extend(_nutrition_source_event_ids(session, value))
 
     anchor = request.intended_consumption_at or request.requested_at
     history_start = anchor - timedelta(days=request.lookback_days)
@@ -667,6 +764,7 @@ def build_decision_context_snapshot(
             "scope": request.scope.value,
             "question": request.question,
             "requested_at": request.requested_at.isoformat(),
+            "timezone": primary["timezone"],
             "intended_consumption_at": (
                 request.intended_consumption_at.isoformat()
                 if request.intended_consumption_at is not None
@@ -674,7 +772,11 @@ def build_decision_context_snapshot(
             ),
         },
         "candidate": primary,
+        "candidate_version": candidate_versions[request.interaction_id],
         "comparison_candidates": comparisons,
+        "comparison_candidate_versions": [
+            candidate_versions[interaction_id] for interaction_id in request.compare_interaction_ids
+        ],
         "confirmed_intake_history": history,
         "history_window": {
             "start": history_start.isoformat(),
@@ -684,9 +786,7 @@ def build_decision_context_snapshot(
             "query": history_coverage,
         },
         "specialized_evidence": {"caffeine": caffeine_gate},
-        "evidence_event_ids": list(
-            dict.fromkeys(str(value) for value in evidence_ids)
-        ),
+        "evidence_event_ids": list(dict.fromkeys(str(value) for value in evidence_ids)),
         "boundaries": {
             "candidate_is_not_consumed": not primary["is_confirmed_intake"],
             "history_is_not_complete_day_proof": True,
@@ -695,9 +795,7 @@ def build_decision_context_snapshot(
                 request.scope.value == "caffeine_sleep"
             ),
             "caffeine_total_intake_complete": (
-                caffeine_gate["total_intake_complete"]
-                if caffeine_gate is not None
-                else None
+                caffeine_gate["total_intake_complete"] if caffeine_gate is not None else None
             ),
         },
     }

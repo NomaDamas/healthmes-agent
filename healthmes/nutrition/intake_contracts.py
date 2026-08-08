@@ -17,6 +17,8 @@ from pydantic import TypeAdapter
 
 from healthmes.nutrition.contracts import Confidence, Estimate
 
+NUTRIENT_PROVENANCE_VERIFIED_FIELD = "nutrient_provenance_verified"
+
 
 class CaptureModality(StrEnum):
     PHOTO = "photo"
@@ -36,6 +38,12 @@ class IntakeOutcomeStatus(StrEnum):
     CONSUMED = "consumed"
     NOT_CONSUMED = "not_consumed"
     CANCELLED = "cancelled"
+
+
+class IntakeReviewStatus(StrEnum):
+    CONFIRMED = "confirmed"
+    CORRECTED = "corrected"
+    REJECTED = "rejected"
 
 
 class DecisionScope(StrEnum):
@@ -115,6 +123,18 @@ class IntakeInteraction:
 
 
 @dataclass(frozen=True, slots=True)
+class IntakeInteractionReview:
+    review_id: uuid.UUID
+    operation_fingerprint: str
+    interaction_id: uuid.UUID
+    status: IntakeReviewStatus
+    reviewed_at: datetime
+    source: str
+    items: tuple[NormalizedIntakeItem, ...] = ()
+    schema_version: str = "intake-interaction-review-v1"
+
+
+@dataclass(frozen=True, slots=True)
 class StructuredIntakeSnapshot:
     """Durable nutrition facts without raw text, transcript, or media paths."""
 
@@ -181,6 +201,7 @@ class IntakeDecision:
 
 
 _INTERACTION_ADAPTER = TypeAdapter(IntakeInteraction)
+_INTERACTION_REVIEW_ADAPTER = TypeAdapter(IntakeInteractionReview)
 _OUTCOME_ADAPTER = TypeAdapter(IntakeOutcome)
 _DECISION_REQUEST_ADAPTER = TypeAdapter(IntakeDecisionRequest)
 _DECISION_ADAPTER = TypeAdapter(IntakeDecision)
@@ -192,6 +213,18 @@ def interaction_to_payload(value: IntakeInteraction) -> dict[str, Any]:
 
 def interaction_from_payload(value: dict[str, Any]) -> IntakeInteraction:
     return _INTERACTION_ADAPTER.validate_python(value)
+
+
+def interaction_review_to_payload(
+    value: IntakeInteractionReview,
+) -> dict[str, Any]:
+    return _INTERACTION_REVIEW_ADAPTER.dump_python(value, mode="json")
+
+
+def interaction_review_from_payload(
+    value: dict[str, Any],
+) -> IntakeInteractionReview:
+    return _INTERACTION_REVIEW_ADAPTER.validate_python(value)
 
 
 def outcome_to_payload(value: IntakeOutcome) -> dict[str, Any]:

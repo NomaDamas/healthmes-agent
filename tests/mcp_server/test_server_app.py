@@ -42,6 +42,8 @@ NUTRITION_TOOLS = {
     "confirm_photo_caffeine_day",
     "record_intake_decision",
     "request_intake_decision",
+    "resolve_nutrition_confirmation",
+    "review_intake_interaction",
     "search_intake_records",
 }
 CALENDAR_ADJUSTMENT_TOOLS = {

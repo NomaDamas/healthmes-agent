@@ -10,10 +10,12 @@ from healthmes.mcp_server.caffeine_contract import (
     CaffeineContraindication,
     CaffeineMg,
     CaffeineProductForm,
+    CaffeineProposalReason,
     CaffeineProposalRequest,
     CaffeineSafetyContext,
     CaffeineTiming,
     CalendarEventId,
+    CandidateCaffeineEvidence,
     PersonalDailyCaffeineLimit,
     PersonalEventCaffeineBaseline,
     PopulationDailyCaffeineGuardrail,
@@ -88,10 +90,10 @@ def build_request(
     population_status: SupportedPopulationStatus,
     contraindications: list[CaffeineContraindication],
     product_form: CaffeineProductForm,
+    candidate_caffeine: CandidateCaffeineEvidence | None = None,
+    candidate_required: bool = False,
 ) -> CaffeineProposalRequest:
-    consumed_today_mg, total_intake_complete = _stored_caffeine_values(
-        caffeine_intake
-    )
+    consumed_today_mg, total_intake_complete = _stored_caffeine_values(caffeine_intake)
     baseline = None
     if (
         event_id is not None
@@ -141,6 +143,96 @@ def build_request(
             contraindications=frozenset(contraindications),
         ),
         product_form=product_form,
+        candidate_caffeine=candidate_caffeine,
+        candidate_required=candidate_required,
+    )
+
+
+def candidate_caffeine_from_context(
+    context: dict[str, Any] | None,
+    *,
+    decision_request_id: str,
+) -> tuple[CandidateCaffeineEvidence | None, str | None]:
+    if not isinstance(context, dict) or context.get("status") != "ok":
+        return None, "candidate_decision_context_unavailable"
+    request = context.get("request")
+    if not isinstance(request, dict) or request.get("scope") != "caffeine_sleep":
+        return None, "candidate_decision_scope_is_not_caffeine_sleep"
+    candidate = context.get("candidate")
+    if not isinstance(candidate, dict):
+        return None, "candidate_interaction_unavailable"
+    if candidate.get("intent") not in {
+        "ask_before_intake",
+        "plan_future",
+        "compare_option",
+    }:
+        return None, "candidate_intent_is_not_prospective"
+    if candidate.get("is_confirmed_intake") is True:
+        return None, "candidate_is_already_consumed"
+    review = candidate.get("latest_review")
+    if not isinstance(review, dict):
+        return None, "candidate_nutrition_requires_owner_review"
+    if review.get("status") == "rejected":
+        return None, "candidate_nutrition_review_rejected"
+    if review.get("status") not in {"confirmed", "corrected"}:
+        return None, "candidate_nutrition_review_invalid"
+    items = candidate.get("resolved_items")
+    if not isinstance(items, list):
+        return None, "candidate_nutrition_items_unavailable"
+
+    if not items:
+        return None, "candidate_caffeine_missing"
+
+    total_mg = 0.0
+    for item in items:
+        if not isinstance(item, dict):
+            return None, "candidate_nutrition_items_invalid"
+        nutrients = item.get("nutrients")
+        if not isinstance(nutrients, list):
+            return None, "candidate_nutrition_items_invalid"
+        caffeine_facts = [
+            fact
+            for fact in nutrients
+            if isinstance(fact, dict) and str(fact.get("nutrient", "")).casefold() == "caffeine"
+        ]
+        if len(caffeine_facts) != 1:
+            return (
+                None,
+                "candidate_caffeine_requires_exact_user_or_label_mg",
+            )
+        fact = caffeine_facts[0]
+        amount = fact.get("amount")
+        exact = amount.get("exact") if isinstance(amount, dict) else None
+        if (
+            fact.get("origin") not in {"user", "label"}
+            or not isinstance(amount, dict)
+            or amount.get("kind") != "exact"
+            or str(amount.get("unit", "")).casefold() != "mg"
+            or isinstance(exact, bool)
+            or not isinstance(exact, int | float)
+            or not isfinite(exact)
+            or exact < 0
+        ):
+            return (
+                None,
+                "candidate_caffeine_requires_exact_user_or_label_mg",
+            )
+        total_mg += exact
+        if not isfinite(total_mg):
+            return None, "candidate_caffeine_total_invalid"
+    interaction_id = candidate.get("interaction_id")
+    if not isinstance(interaction_id, str) or not interaction_id.strip():
+        return None, "candidate_interaction_unavailable"
+    return (
+        CandidateCaffeineEvidence(
+            interaction_id=interaction_id,
+            amount_mg=CaffeineMg(ceil(total_mg)),
+            source="confirmed_intake_decision_context",
+            source_key=(
+                f"intake-decision-request:{decision_request_id}:candidate:{interaction_id}"
+            ),
+        ),
+        None,
     )
 
 
@@ -156,7 +248,7 @@ def _stored_caffeine_values(
     amount = caffeine_intake.get("confirmed_caffeine_mg")
     if (
         isinstance(amount, bool)
-        or not isinstance(amount, (int, float))
+        or not isinstance(amount, int | float)
         or not isfinite(amount)
         or amount < 0
     ):
@@ -198,8 +290,26 @@ def serialize_proposal(
     target_event: dict[str, Any] | None,
     sleep_adapter_reason: str | None,
     caffeine_intake: dict[str, Any] | None,
+    candidate_adapter_reason: str | None = None,
 ) -> dict[str, Any]:
     proposal = propose_caffeine(request)
+    recommendation: dict[str, Any] = {
+        "maximum_additional_mg": proposal.recommendation.maximum_additional_mg,
+        "suggested_additional_mg": proposal.recommendation.suggested_additional_mg,
+        "basis": proposal.recommendation.basis.value,
+    }
+    if request.candidate_caffeine is not None:
+        if proposal.reason is CaffeineProposalReason.CANDIDATE_WITHIN_BOUNDED_LIMIT:
+            candidate_assessment = "within_bounded_limit"
+        elif proposal.reason in {
+            CaffeineProposalReason.CANDIDATE_EXCEEDS_BOUNDED_LIMIT,
+            CaffeineProposalReason.DAILY_LIMIT_REACHED,
+            CaffeineProposalReason.DAILY_LIMIT_EXCEEDED,
+        }:
+            candidate_assessment = "exceeds_bounded_limit"
+        else:
+            candidate_assessment = "not_evaluated"
+        recommendation["candidate_assessment"] = candidate_assessment
     return {
         "status": proposal.status.value,
         "facts": {
@@ -221,6 +331,18 @@ def serialize_proposal(
             "consumed_today_mg": request.consumed_today_mg,
             "total_intake_complete": request.total_intake_complete,
             "caffeine_intake": caffeine_intake,
+            "candidate_caffeine": (
+                {
+                    "interaction_id": request.candidate_caffeine.interaction_id,
+                    "amount_mg": request.candidate_caffeine.amount_mg,
+                    "source": request.candidate_caffeine.source,
+                    "source_key": request.candidate_caffeine.source_key,
+                }
+                if request.candidate_caffeine is not None
+                else None
+            ),
+            "candidate_required": request.candidate_required,
+            "candidate_adapter_reason": candidate_adapter_reason,
             "population_daily_guardrail": {
                 "amount_mg": request.population_daily_guardrail.amount_mg,
                 "source": request.population_daily_guardrail.source,
@@ -265,12 +387,9 @@ def serialize_proposal(
             "product_form": request.product_form.value,
             "effective_daily_ceiling_mg": proposal.facts.effective_daily_ceiling_mg,
             "remaining_daily_allowance_mg": (proposal.facts.remaining_daily_allowance_mg),
+            "candidate_total_after_intake_mg": (proposal.facts.candidate_total_after_intake_mg),
         },
-        "recommendation": {
-            "maximum_additional_mg": proposal.recommendation.maximum_additional_mg,
-            "suggested_additional_mg": proposal.recommendation.suggested_additional_mg,
-            "basis": proposal.recommendation.basis.value,
-        },
+        "recommendation": recommendation,
         "confidence": proposal.confidence.value,
         "reason": proposal.reason.value,
         "framing": "bounded_preparation_proposal_not_medical_advice",

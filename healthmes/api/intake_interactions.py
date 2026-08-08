@@ -23,8 +23,10 @@ from healthmes.nutrition.intake_contracts import (
     IntakeDecisionRequest,
     IntakeIntent,
     IntakeInteraction,
+    IntakeInteractionReview,
     IntakeOutcome,
     IntakeOutcomeStatus,
+    IntakeReviewStatus,
     NormalizedIntakeItem,
     NutrientFact,
 )
@@ -37,6 +39,7 @@ from healthmes.nutrition.intake_service import (
     HIGH_RISK_SCOPES,
     IntakeInteractionError,
     IntakeOperationConflict,
+    IntakeStorageIntegrityError,
     create_analyzed_interaction,
     create_interaction,
     create_photo_interaction,
@@ -44,6 +47,7 @@ from healthmes.nutrition.intake_service import (
     operation_fingerprint,
     persist_decision,
     persist_decision_request,
+    persist_interaction_review,
     persist_outcome,
     persisted_decision_for_operation,
 )
@@ -189,17 +193,12 @@ class AnalyzeInteractionInput(BaseModel):
             CaptureModality.TEXT,
             CaptureModality.VOICE,
         }:
-            raise ValueError(
-                "automatic interaction analysis supports text or voice"
-            )
+            raise ValueError("automatic interaction analysis supports text or voice")
         try:
             timezone = ZoneInfo(self.timezone)
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValueError("timezone must be a valid IANA timezone") from exc
-        if (
-            self.observed_at.utcoffset()
-            != self.observed_at.astimezone(timezone).utcoffset()
-        ):
+        if self.observed_at.utcoffset() != self.observed_at.astimezone(timezone).utcoffset():
             raise ValueError("observed_at offset conflicts with timezone")
         if self.observed_at.astimezone(UTC) > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
             raise ValueError("observed_at cannot be more than 5 minutes in the future")
@@ -210,9 +209,7 @@ class AnalyzeInteractionInput(BaseModel):
                 raise ValueError("text analysis cannot reference media")
         if self.modality is CaptureModality.VOICE:
             if self.source_text is not None:
-                raise ValueError(
-                    "voice analysis creates source_text from local transcription"
-                )
+                raise ValueError("voice analysis creates source_text from local transcription")
             if self.media_path is None:
                 raise ValueError("voice analysis requires media_path")
         return self
@@ -225,6 +222,16 @@ class OutcomeInput(BaseModel):
     consumed_at: AwareDatetime | None = None
     corrected_items: list[IntakeItemInput] = Field(default_factory=list, max_length=50)
     note: str | None = Field(default=None, max_length=2000)
+
+
+class InteractionReviewInput(BaseModel):
+    operation_id: uuid.UUID
+    status: IntakeReviewStatus
+    source: str = Field(min_length=1, max_length=64)
+    corrected_items: list[IntakeItemInput] = Field(
+        default_factory=list,
+        max_length=50,
+    )
 
 
 class DecisionRequestInput(BaseModel):
@@ -249,6 +256,12 @@ class DecisionInput(BaseModel):
 
 
 def _raise_interaction_error(exc: IntakeInteractionError) -> None:
+    if isinstance(exc, IntakeStorageIntegrityError):
+        raise APIError(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "intake_storage_integrity_error",
+            str(exc),
+        ) from exc
     if isinstance(exc, IntakeOperationConflict):
         raise APIError(
             status.HTTP_409_CONFLICT,
@@ -282,11 +295,7 @@ def _transcriber(
     settings: Settings,
 ) -> NutritionTranscriber:
     override = getattr(request.app.state, "nutrition_transcriber", None)
-    return (
-        override
-        if override is not None
-        else create_nutrition_transcriber(settings)
-    )
+    return override if override is not None else create_nutrition_transcriber(settings)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -362,9 +371,7 @@ def analyze_intake_interaction(
             allow_remote_analysis=body.allow_remote_analysis,
             provider=_analysis_provider(request, settings),
             transcriber=(
-                _transcriber(request, settings)
-                if body.modality is CaptureModality.VOICE
-                else None
+                _transcriber(request, settings) if body.modality is CaptureModality.VOICE else None
             ),
         )
     except IntakeInteractionError as exc:
@@ -411,26 +418,63 @@ def search_intake_interactions(
     query: str | None = None,
     limit: Annotated[int, Field(ge=1, le=500)] = 100,
 ) -> dict[str, object]:
-    return search_intake_history(
-        session,
-        start=start,
-        end=end,
-        intent=intent,
-        modality=modality,
-        confirmed_only=confirmed_only,
-        nutrient=nutrient,
-        query=query,
-        limit=limit,
-    )
+    try:
+        return search_intake_history(
+            session,
+            start=start,
+            end=end,
+            intent=intent,
+            modality=modality,
+            confirmed_only=confirmed_only,
+            nutrient=nutrient,
+            query=query,
+            limit=limit,
+        )
+    except IntakeStorageIntegrityError as exc:
+        _raise_interaction_error(exc)
 
 
 @router.get("/{interaction_id}")
-def get_intake_interaction(
-    interaction_id: uuid.UUID, session: SessionDep
-) -> dict[str, object]:
-    view = interaction_view(session, interaction_id)
+def get_intake_interaction(interaction_id: uuid.UUID, session: SessionDep) -> dict[str, object]:
+    try:
+        view = interaction_view(session, interaction_id)
+    except IntakeStorageIntegrityError as exc:
+        _raise_interaction_error(exc)
     if view is None:
         raise not_found("intake interaction", interaction_id)
+    return view
+
+
+@router.post(
+    "/{interaction_id}/review",
+    status_code=status.HTTP_201_CREATED,
+)
+def review_intake_interaction(
+    interaction_id: uuid.UUID,
+    body: InteractionReviewInput,
+    session: SessionDep,
+) -> dict[str, object]:
+    review = IntakeInteractionReview(
+        review_id=body.operation_id,
+        operation_fingerprint=operation_fingerprint(
+            {
+                "interaction_id": str(interaction_id),
+                **body.model_dump(mode="json"),
+            }
+        ),
+        interaction_id=interaction_id,
+        status=body.status,
+        reviewed_at=utc_now(),
+        source=body.source,
+        items=tuple(item.to_domain() for item in body.corrected_items),
+    )
+    try:
+        persist_interaction_review(session, review)
+    except IntakeInteractionError as exc:
+        _raise_interaction_error(exc)
+    session.commit()
+    view = interaction_view(session, interaction_id)
+    assert view is not None
     return view
 
 
@@ -452,11 +496,7 @@ def confirm_intake_outcome(
         status=body.status,
         confirmed_at=utc_now(),
         source=body.source,
-        consumed_at=(
-            body.consumed_at.astimezone(UTC)
-            if body.consumed_at is not None
-            else None
-        ),
+        consumed_at=(body.consumed_at.astimezone(UTC) if body.consumed_at is not None else None),
         corrected_items=tuple(item.to_domain() for item in body.corrected_items),
         note=body.note,
     )
@@ -492,11 +532,7 @@ def create_decision_request(
         requested_at=utc_now(),
         source=body.source,
         question=body.question,
-        intended_consumption_at=(
-            body.intended_consumption_at.astimezone(UTC)
-            if body.intended_consumption_at is not None
-            else None
-        ),
+        intended_consumption_at=body.intended_consumption_at,
         compare_interaction_ids=tuple(body.compare_interaction_ids),
         lookback_days=body.lookback_days,
     )
@@ -518,7 +554,10 @@ def get_decision_context(
     request_id: uuid.UUID,
     session: SessionDep,
 ) -> dict[str, object]:
-    context = decision_context(session, request_id=request_id)
+    try:
+        context = decision_context(session, request_id=request_id)
+    except IntakeStorageIntegrityError as exc:
+        _raise_interaction_error(exc)
     if context is None:
         raise not_found("intake decision request", request_id)
     return context

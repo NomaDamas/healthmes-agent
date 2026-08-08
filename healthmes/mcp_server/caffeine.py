@@ -30,7 +30,12 @@ def propose_caffeine(request: CaffeineProposalRequest | None) -> CaffeineProposa
         )
     if reason := invalid_reason(request):
         return _result(request, CaffeineProposalStatus.INVALID_INPUT, reason)
-    if request.event_id is None:
+    if request.candidate_required and request.candidate_caffeine is None:
+        return _insufficient(
+            request,
+            CaffeineProposalReason.MISSING_CANDIDATE_CAFFEINE,
+        )
+    if request.event_id is None and request.candidate_caffeine is None:
         return _insufficient(request, CaffeineProposalReason.MISSING_TARGET_EVENT)
     if request.sleep is None:
         return _insufficient(request, CaffeineProposalReason.MISSING_SLEEP)
@@ -79,7 +84,13 @@ def propose_caffeine(request: CaffeineProposalRequest | None) -> CaffeineProposa
     )
     raw_remaining = ceiling - request.consumed_today_mg
     remaining = CaffeineMg(max(0, raw_remaining))
-    if raw_remaining <= 0:
+    candidate = request.candidate_caffeine
+    candidate_total = (
+        CaffeineMg(request.consumed_today_mg + candidate.amount_mg)
+        if candidate is not None
+        else None
+    )
+    if raw_remaining < 0 or (raw_remaining == 0 and (candidate is None or candidate.amount_mg > 0)):
         reason = (
             CaffeineProposalReason.DAILY_LIMIT_REACHED
             if raw_remaining == 0
@@ -95,9 +106,35 @@ def propose_caffeine(request: CaffeineProposalRequest | None) -> CaffeineProposa
             CaffeineMg(0),
             CaffeineMg(0),
             CaffeineRecommendationBasis.NO_ADDITIONAL_CAFFEINE,
+            candidate_total=candidate_total,
         )
 
     maximum = CaffeineMg(min(request.single_dose_guardrail.amount_mg, remaining))
+    if candidate is not None:
+        if candidate.amount_mg > maximum:
+            return _result(
+                request,
+                CaffeineProposalStatus.NOOP,
+                CaffeineProposalReason.CANDIDATE_EXCEEDS_BOUNDED_LIMIT,
+                ProposalConfidence.HIGH,
+                ceiling,
+                remaining,
+                maximum,
+                basis=CaffeineRecommendationBasis.CONFIRMED_CANDIDATE,
+                candidate_total=candidate_total,
+            )
+        return _result(
+            request,
+            CaffeineProposalStatus.PROPOSAL,
+            CaffeineProposalReason.CANDIDATE_WITHIN_BOUNDED_LIMIT,
+            ProposalConfidence.HIGH,
+            ceiling,
+            remaining,
+            maximum,
+            candidate.amount_mg,
+            CaffeineRecommendationBasis.CONFIRMED_CANDIDATE,
+            candidate_total=candidate_total,
+        )
     baseline = request.personal_event_baseline
     if not current_event_baseline(baseline, request):
         return _result(
@@ -147,7 +184,13 @@ def _result(
     maximum: CaffeineMg | None = None,
     suggested: CaffeineMg | None = None,
     basis: CaffeineRecommendationBasis = CaffeineRecommendationBasis.UNAVAILABLE,
+    candidate_total: CaffeineMg | None = None,
 ) -> CaffeineProposal:
-    facts = CaffeineProposalFacts(request, ceiling, remaining)
+    facts = CaffeineProposalFacts(
+        request,
+        ceiling,
+        remaining,
+        candidate_total,
+    )
     recommendation = BoundedCaffeineRecommendation(maximum, suggested, basis)
     return CaffeineProposal(status, facts, recommendation, confidence, reason)

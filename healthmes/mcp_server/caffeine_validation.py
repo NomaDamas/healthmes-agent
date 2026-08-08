@@ -8,6 +8,7 @@ from healthmes.mcp_server.caffeine_contract import (
     CaffeineProposalRequest,
     CaffeineSafetyContext,
     CaffeineTiming,
+    CandidateCaffeineEvidence,
     EvidenceFreshness,
     PersonalDailyCaffeineLimit,
     PersonalEventCaffeineBaseline,
@@ -27,6 +28,13 @@ def invalid_reason(request: CaffeineProposalRequest) -> CaffeineProposalReason |
             return CaffeineProposalReason.INVALID_INPUT
     if request.consumed_today_mg is not None and request.consumed_today_mg < 0:
         return CaffeineProposalReason.INVALID_CONSUMED_CAFFEINE
+    if request.candidate_caffeine is not None and (
+        request.candidate_caffeine.amount_mg < 0
+        or not request.candidate_caffeine.interaction_id.strip()
+        or not request.candidate_caffeine.source.strip()
+        or not request.candidate_caffeine.source_key.strip()
+    ):
+        return CaffeineProposalReason.INVALID_CANDIDATE_CAFFEINE
     if (
         request.personal_daily_limit.amount_mg <= 0
         or not request.personal_daily_limit.source.strip()
@@ -86,6 +94,7 @@ def within_sleep_cutoff(request: CaffeineProposalRequest) -> bool | None:
 def _malformed(request: CaffeineProposalRequest) -> bool:
     sleep = request.sleep
     baseline = request.personal_event_baseline
+    candidate = request.candidate_caffeine
     timing = request.timing
     safety = request.safety_context
     limits = (
@@ -108,6 +117,7 @@ def _malformed(request: CaffeineProposalRequest) -> bool:
         )
         or (request.consumed_today_mg is not None and type(request.consumed_today_mg) is not int)
         or type(request.total_intake_complete) is not bool
+        or type(request.candidate_required) is not bool
         or any(
             type(limit) is not expected
             or type(limit.amount_mg) is not int
@@ -124,6 +134,16 @@ def _malformed(request: CaffeineProposalRequest) -> bool:
                 or type(baseline.source_key) is not str
                 or type(baseline.confirmed_at) is not datetime
                 or type(baseline.freshness) is not EvidenceFreshness
+            )
+        )
+        or (
+            candidate is not None
+            and (
+                type(candidate) is not CandidateCaffeineEvidence
+                or type(candidate.interaction_id) is not str
+                or type(candidate.amount_mg) is not int
+                or type(candidate.source) is not str
+                or type(candidate.source_key) is not str
             )
         )
         or (

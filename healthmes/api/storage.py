@@ -28,13 +28,15 @@ from healthmes.storage import (
     RETENTION_PRESETS,
     ensure_default_policies,
     measure_usage,
+    retention_policy_for_write,
     run_storage_maintenance,
     update_retention_policy,
 )
-from healthmes.store import RetentionPolicy, WellnessEvent
+from healthmes.store import WellnessEvent
 from healthmes.store.session import SessionDep
 
 router = APIRouter(tags=["storage"])
+_RESERVED_QUALITY_FLAGS = frozenset({"maintenance_quarantine"})
 
 
 def _preset(days: int | None) -> str:
@@ -119,9 +121,7 @@ def _settings_payload(session: SessionDep, settings: Settings) -> StorageSetting
             "directory": str(backup_dir.resolve()),
             "snapshot_count": len(snapshots),
             "latest_snapshot": snapshots[0].name if snapshots else None,
-            "encryption_configured": bool(
-                settings.backup_passphrase.get_secret_value()
-            ),
+            "encryption_configured": bool(settings.backup_passphrase.get_secret_value()),
         },
     )
 
@@ -151,9 +151,7 @@ def put_retention_policy(
 def maintain_storage(
     request: Request, session: SessionDep, dry_run: bool = False
 ) -> dict[str, Any]:
-    report = run_storage_maintenance(
-        session, request.app.state.settings, dry_run=dry_run
-    )
+    report = run_storage_maintenance(session, request.app.state.settings, dry_run=dry_run)
     session.commit()
     return {
         "job_id": report.job_id,
@@ -166,9 +164,14 @@ def maintain_storage(
 
 
 @router.post("/v1/wellness-events", status_code=201)
-def create_wellness_event(
-    body: WellnessEventCreate, session: SessionDep
-) -> WellnessEventOut:
+def create_wellness_event(body: WellnessEventCreate, session: SessionDep) -> WellnessEventOut:
+    reserved_quality_flags = _RESERVED_QUALITY_FLAGS.intersection(body.quality_flags or {})
+    if reserved_quality_flags:
+        raise APIError(
+            422,
+            "reserved_wellness_quality_flag",
+            "maintenance-owned wellness quality flags are reserved",
+        )
     if (
         body.event_type.startswith("nutrition.")
         or body.source_provider.startswith("nutrition-")
@@ -191,9 +194,7 @@ def create_wellness_event(
             "unsupported_wellness_data_class",
             "external wellness events must use the normalized data class",
         )
-    if body.observed_at.astimezone(UTC) > datetime.now(UTC) + timedelta(
-        minutes=5
-    ):
+    if body.observed_at.astimezone(UTC) > datetime.now(UTC) + timedelta(minutes=5):
         raise APIError(
             422,
             "invalid_observed_at",
@@ -208,15 +209,11 @@ def create_wellness_event(
     ).hexdigest()
 
     def validate_existing(event: WellnessEvent) -> WellnessEventOut:
-        if (
-            event.expires_at is not None
-            and (
-                event.expires_at.replace(tzinfo=UTC)
-                if event.expires_at.tzinfo is None
-                else event.expires_at.astimezone(UTC)
-            )
-            <= datetime.now(UTC)
-        ):
+        if event.expires_at is not None and (
+            event.expires_at.replace(tzinfo=UTC)
+            if event.expires_at.tzinfo is None
+            else event.expires_at.astimezone(UTC)
+        ) <= datetime.now(UTC):
             raise APIError(
                 409,
                 "expired_wellness_event",
@@ -241,20 +238,13 @@ def create_wellness_event(
     )
     if existing is not None:
         return validate_existing(existing)
-    ensure_default_policies(session)
-    policy = session.scalar(
-        select(RetentionPolicy).where(RetentionPolicy.data_class == body.data_class)
-    )
-    if policy is None:
-        policy = update_retention_policy(session, body.data_class, "30d")
+    policy = retention_policy_for_write(session, body.data_class)
     expires_at = (
         None
         if policy.retention_days is None
         else body.observed_at + timedelta(days=policy.retention_days)
     )
-    if expires_at is not None and expires_at.astimezone(UTC) <= datetime.now(
-        UTC
-    ):
+    if expires_at is not None and expires_at.astimezone(UTC) <= datetime.now(UTC):
         raise APIError(
             422,
             "expired_wellness_event",
@@ -302,9 +292,7 @@ def create_wellness_event(
 
 
 @router.get("/storage", response_class=HTMLResponse, include_in_schema=False)
-def storage_page(
-    request: Request, response: Response, session: SessionDep
-) -> HTMLResponse:
+def storage_page(request: Request, response: Response, session: SessionDep) -> HTMLResponse:
     settings: Settings = request.app.state.settings
     local = issue_local_session(request, response)
     payload = _settings_payload(session, settings)
@@ -341,8 +329,6 @@ async def storage_maintenance_form(
     dry_run: bool = Form(default=False),
 ) -> RedirectResponse:
     require_local_session(request, csrf_token=csrf)
-    run_storage_maintenance(
-        session, request.app.state.settings, dry_run=dry_run
-    )
+    run_storage_maintenance(session, request.app.state.settings, dry_run=dry_run)
     session.commit()
     return RedirectResponse("/storage", status_code=303)

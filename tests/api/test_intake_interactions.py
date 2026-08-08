@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, date, datetime, timedelta
+from copy import deepcopy
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta, timezone
 from threading import Event
 from time import sleep
 from types import SimpleNamespace
@@ -16,23 +18,41 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import healthmes.nutrition.intake_service as intake_service_module
+from healthmes.api import intake_interactions as intake_api_module
 from healthmes.api.intake_interactions import AnalyzeInteractionInput
 from healthmes.nutrition.contracts import (
     Confidence,
+    Estimate,
     EstimateKind,
     IntakeType,
     ObservationStatus,
 )
 from healthmes.nutrition.intake_contracts import (
+    NUTRIENT_PROVENANCE_VERIFIED_FIELD,
     CaptureModality,
+    EvidenceOrigin,
     IntakeIntent,
+    IntakeInteractionReview,
+    IntakeOutcome,
+    IntakeOutcomeStatus,
+    IntakeReviewStatus,
 )
 from healthmes.nutrition.intake_service import (
     IntakeAnalysisInProgress,
+    IntakeInteractionError,
+    IntakeStorageIntegrityError,
     create_analyzed_interaction,
+    get_interaction,
     operation_fingerprint,
+    persist_interaction_review,
+    persist_outcome,
 )
+from healthmes.nutrition.operation_integrity import result_payload_digest
 from healthmes.nutrition.query import known_caffeine_for_day
+from healthmes.nutrition.repository import (
+    InvalidInteractionTransitionChain,
+    latest_interaction_transitions,
+)
 from healthmes.nutrition.schema import VLMEstimate, VLMExtraction, VLMItem
 from healthmes.nutrition.transcription import TranscriptionResult
 from healthmes.nutrition.vision import VisionUnavailable
@@ -40,6 +60,13 @@ from healthmes.storage import run_storage_maintenance
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
 
 JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
+KST = timezone(timedelta(hours=9))
+
+
+def _future_intended_consumption() -> str:
+    return (
+        (datetime.now(UTC) + timedelta(hours=1)).astimezone(KST).replace(microsecond=0).isoformat()
+    )
 
 
 class FakeVision:
@@ -153,9 +180,7 @@ class SlowAnalysis(FakeAnalysis):
         return super().analyze_text(text, allow_remote=allow_remote)
 
 
-def _estimate(
-    exact: float, unit: str, *, basis: str = "owner_statement"
-) -> dict[str, object]:
+def _estimate(exact: float, unit: str, *, basis: str = "owner_statement") -> dict[str, object]:
     return {
         "kind": "exact",
         "unit": unit,
@@ -249,9 +274,7 @@ def _reviewed_nutrients(*, caffeine: float = 95) -> list[dict[str, object]]:
 
 
 def test_text_capture_and_consumption_are_separate_events(client, session):
-    created = client.post(
-        "/v1/intake-interactions", json=_text_interaction()
-    )
+    created = client.post("/v1/intake-interactions", json=_text_interaction())
     assert created.status_code == 201
     interaction = created.json()
     interaction_id = interaction["interaction_id"]
@@ -271,54 +294,41 @@ def test_text_capture_and_consumption_are_separate_events(client, session):
     assert confirmed.json()["is_confirmed_intake"] is True
 
     event_types = list(
-        session.scalars(
-            select(WellnessEvent.event_type).order_by(WellnessEvent.created_at)
-        )
+        session.scalars(select(WellnessEvent.event_type).order_by(WellnessEvent.created_at))
     )
     assert event_types == [
         "nutrition.interaction.v1",
         "nutrition.raw-capture.v1",
         "nutrition.operation.v1",
         "nutrition.intake-outcome.v1",
+        "nutrition.operation.v1",
+        "nutrition.interaction-transition.v1",
     ]
     interaction_event = session.scalar(
-        select(WellnessEvent).where(
-            WellnessEvent.event_type == "nutrition.interaction.v1"
-        )
+        select(WellnessEvent).where(WellnessEvent.event_type == "nutrition.interaction.v1")
     )
     assert interaction_event is not None
-    interaction_policy = session.get(
-        RetentionPolicy, interaction_event.retention_policy_id
-    )
+    interaction_policy = session.get(RetentionPolicy, interaction_event.retention_policy_id)
     assert interaction_policy is not None
     assert interaction_policy.data_class == "nutrition_observation"
     assert interaction_event.expires_at is not None
     raw_event = session.scalar(
-        select(WellnessEvent).where(
-            WellnessEvent.event_type == "nutrition.raw-capture.v1"
-        )
+        select(WellnessEvent).where(WellnessEvent.event_type == "nutrition.raw-capture.v1")
     )
     assert raw_event is not None
     raw_policy = session.get(RetentionPolicy, raw_event.retention_policy_id)
     assert raw_policy is not None
     assert raw_policy.data_class == "nutrition_raw_capture"
-    assert raw_event.payload["source_text"] == (
-        "닭가슴살 샐러드와 라테를 먹었다"
-    )
+    assert raw_event.payload["source_text"] == ("닭가슴살 샐러드와 라테를 먹었다")
     assert interaction_event.payload["source_text"] is None
     outcome_event = session.scalar(
-        select(WellnessEvent).where(
-            WellnessEvent.event_type == "nutrition.intake-outcome.v1"
-        )
+        select(WellnessEvent).where(WellnessEvent.event_type == "nutrition.intake-outcome.v1")
     )
     assert outcome_event is not None
     snapshot = outcome_event.payload["intake_snapshot"]
     assert snapshot["items"][0]["name"] == "닭가슴살 샐러드"
     assert snapshot["items"][0]["nutrients"][0]["evidence_text"] is None
-    assert (
-        snapshot["items"][0]["nutrients"][0]["amount"]["evidence_text"]
-        is None
-    )
+    assert snapshot["items"][0]["nutrients"][0]["amount"]["evidence_text"] is None
     assert outcome_event.payload["note"] is None
     assert "source_text" not in snapshot
     assert "media_path" not in snapshot
@@ -336,9 +346,7 @@ def test_text_capture_and_consumption_are_separate_events(client, session):
     assert searched.json()["records"][0]["interaction_id"] == interaction_id
 
 
-def test_prospective_candidate_builds_context_without_becoming_intake(
-    client, session
-):
+def test_prospective_candidate_builds_context_without_becoming_intake(client, session):
     created = client.post(
         "/v1/intake-interactions",
         json=_text_interaction(
@@ -378,28 +386,22 @@ def test_prospective_candidate_builds_context_without_becoming_intake(
             "scope": "caffeine_sleep",
             "source": "android-device",
             "question": "지금 마셔도 될까?",
-            "intended_consumption_at": "2026-08-06T16:00:00+09:00",
+            "intended_consumption_at": _future_intended_consumption(),
         },
     )
     assert requested.status_code == 201
     request_id = requested.json()["request_id"]
     session.expire_all()
     candidate_event = session.scalar(
-        select(WellnessEvent).where(
-            WellnessEvent.event_type == "nutrition.interaction.v1"
-        )
+        select(WellnessEvent).where(WellnessEvent.event_type == "nutrition.interaction.v1")
     )
     assert candidate_event is not None
-    candidate_policy = session.get(
-        RetentionPolicy, candidate_event.retention_policy_id
-    )
+    candidate_policy = session.get(RetentionPolicy, candidate_event.retention_policy_id)
     assert candidate_policy is not None
     assert candidate_policy.data_class == "nutrition_observation"
     assert candidate_event.expires_at is not None
 
-    context = client.get(
-        f"/v1/intake-interactions/decision-requests/{request_id}/context"
-    )
+    context = client.get(f"/v1/intake-interactions/decision-requests/{request_id}/context")
     assert context.status_code == 200
     body = context.json()
     assert body["candidate"]["interaction_id"] == interaction_id
@@ -450,8 +452,642 @@ def test_prospective_candidate_builds_context_without_becoming_intake(
     assert fetched["is_confirmed_intake"] is False
 
 
+def test_review_promotes_agent_candidate_to_user_confirmed_context(
+    client,
+    session,
+):
+    created = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            intent="ask_before_intake",
+            source_text="이 커피는 카페인 120mg 정도야",
+            items=[
+                {
+                    "name": "커피",
+                    "intake_type": "beverage",
+                    "serving": _estimate(1, "cup"),
+                    "nutrients": [
+                        {
+                            "nutrient": "caffeine",
+                            "amount": _estimate(120, "mg"),
+                            "confidence": "high",
+                            "origin": "agent",
+                        }
+                    ],
+                    "confidence": "high",
+                }
+            ],
+        ),
+    )
+    assert created.status_code == 201
+    interaction_id = created.json()["interaction_id"]
+    review_operation_id = str(uuid.uuid4())
+    review_body = {
+        "operation_id": review_operation_id,
+        "status": "confirmed",
+        "source": "ios-device",
+        "corrected_items": [],
+    }
+    reviewed = client.post(
+        f"/v1/intake-interactions/{interaction_id}/review",
+        json=review_body,
+    )
+    assert reviewed.status_code == 201
+    assert reviewed.json()["latest_review"]["status"] == "confirmed"
+    assert reviewed.json()["resolved_items"][0]["nutrients"][0]["origin"] == "user"
+    retry = client.post(
+        f"/v1/intake-interactions/{interaction_id}/review",
+        json=review_body,
+    )
+    assert retry.status_code == 201
+    assert retry.json()["latest_review"]["review_id"] == review_operation_id
+    conflict = client.post(
+        f"/v1/intake-interactions/{interaction_id}/review",
+        json={**review_body, "status": "rejected"},
+    )
+    assert conflict.status_code == 409
+
+    requested = client.post(
+        f"/v1/intake-interactions/{interaction_id}/decision-requests",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "scope": "caffeine_sleep",
+            "source": "ios-device",
+            "intended_consumption_at": _future_intended_consumption(),
+        },
+    )
+    assert requested.status_code == 201
+    context = client.get(
+        f"/v1/intake-interactions/decision-requests/{requested.json()['request_id']}/context"
+    ).json()
+    candidate = context["candidate"]
+    assert candidate["latest_review"]["status"] == "confirmed"
+    assert candidate["resolved_items"][0]["nutrients"][0]["origin"] == "user"
+    review_event = session.scalar(
+        select(WellnessEvent).where(WellnessEvent.event_type == "nutrition.interaction-review.v1")
+    )
+    assert review_event is not None
+    interaction_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.interaction.v1",
+            WellnessEvent.source_record_id == interaction_id,
+        )
+    )
+    assert interaction_event is not None
+    assert review_event.observed_at == interaction_event.observed_at
+    assert review_event.recorded_at > review_event.observed_at
+    assert str(review_event.id) in context["evidence_event_ids"]
+    retention_update = client.put(
+        "/v1/storage/settings/nutrition_observation",
+        json={"preset": "30d"},
+    )
+    assert retention_update.status_code == 200
+    session.expire_all()
+    assert review_event.expires_at == interaction_event.expires_at
+
+
+def test_review_is_rejected_after_interaction_has_an_outcome(client):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = interaction["interaction_id"]
+    outcome = client.post(
+        f"/v1/intake-interactions/{interaction_id}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "not_consumed",
+            "source": "ios-device",
+        },
+    )
+    assert outcome.status_code == 201
+
+    review = client.post(
+        f"/v1/intake-interactions/{interaction_id}/review",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "confirmed",
+            "source": "ios-device",
+        },
+    )
+
+    assert review.status_code == 422
+    assert "with an outcome cannot be reviewed" in review.text
+
+
+def test_sqlite_review_commit_serializes_outcome_snapshot(
+    client,
+    session,
+    session_factory,
+):
+    created = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = uuid.UUID(created["interaction_id"])
+    interaction = get_interaction(session, interaction_id)
+    assert interaction is not None
+    original_item = interaction.items[0]
+    corrected_fact = replace(
+        original_item.nutrients[0],
+        amount=Estimate(
+            kind=EstimateKind.EXACT,
+            unit="g",
+            exact=45,
+            estimation_basis="owner_statement",
+        ),
+        origin=EvidenceOrigin.USER,
+        evidence_text=None,
+    )
+    corrected_item = replace(
+        original_item,
+        nutrients=(corrected_fact,),
+    )
+    review = IntakeInteractionReview(
+        review_id=uuid.uuid4(),
+        operation_fingerprint=operation_fingerprint({"fixture": "review-first"}),
+        interaction_id=interaction_id,
+        status=IntakeReviewStatus.CORRECTED,
+        reviewed_at=datetime.now(UTC),
+        source="test",
+        items=(corrected_item,),
+    )
+    outcome = IntakeOutcome(
+        outcome_id=uuid.uuid4(),
+        operation_fingerprint=operation_fingerprint({"fixture": "outcome-after-review"}),
+        interaction_id=interaction_id,
+        status=IntakeOutcomeStatus.NOT_CONSUMED,
+        confirmed_at=datetime.now(UTC),
+        source="test",
+    )
+    review_flushed = Event()
+    outcome_started = Event()
+    release_review = Event()
+
+    def write_review() -> None:
+        with session_factory() as writer:
+            persist_interaction_review(writer, review)
+            review_flushed.set()
+            assert release_review.wait(timeout=5)
+            writer.commit()
+
+    def write_outcome() -> None:
+        assert review_flushed.wait(timeout=5)
+        with session_factory() as writer:
+            writer.connection().exec_driver_sql("PRAGMA busy_timeout=1")
+            outcome_started.set()
+            persist_outcome(writer, outcome)
+            writer.commit()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        review_future = pool.submit(write_review)
+        outcome_future = pool.submit(write_outcome)
+        assert review_flushed.wait(timeout=5)
+        assert outcome_started.wait(timeout=5)
+        sleep(0.05)
+        release_review.set()
+        review_future.result(timeout=5)
+        outcome_future.result(timeout=5)
+
+    session.expire_all()
+    outcome_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.intake-outcome.v1",
+            WellnessEvent.source_record_id == str(outcome.outcome_id),
+        )
+    )
+    assert outcome_event is not None
+    snapshot_nutrient = outcome_event.payload["intake_snapshot"]["items"][0]["nutrients"][0]
+    assert snapshot_nutrient["amount"]["exact"] == 45
+    assert snapshot_nutrient["origin"] == "user"
+
+
+def test_sqlite_outcome_commit_closes_concurrent_review(
+    client,
+    session,
+    session_factory,
+):
+    created = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = uuid.UUID(created["interaction_id"])
+    outcome = IntakeOutcome(
+        outcome_id=uuid.uuid4(),
+        operation_fingerprint=operation_fingerprint({"fixture": "outcome-first"}),
+        interaction_id=interaction_id,
+        status=IntakeOutcomeStatus.NOT_CONSUMED,
+        confirmed_at=datetime.now(UTC),
+        source="test",
+    )
+    review = IntakeInteractionReview(
+        review_id=uuid.uuid4(),
+        operation_fingerprint=operation_fingerprint({"fixture": "review-after-outcome"}),
+        interaction_id=interaction_id,
+        status=IntakeReviewStatus.CONFIRMED,
+        reviewed_at=datetime.now(UTC),
+        source="test",
+    )
+    outcome_flushed = Event()
+    review_started = Event()
+    release_outcome = Event()
+
+    def write_outcome() -> None:
+        with session_factory() as writer:
+            persist_outcome(writer, outcome)
+            outcome_flushed.set()
+            assert release_outcome.wait(timeout=5)
+            writer.commit()
+
+    def write_review() -> str:
+        assert outcome_flushed.wait(timeout=5)
+        with session_factory() as writer:
+            writer.connection().exec_driver_sql("PRAGMA busy_timeout=1")
+            review_started.set()
+            try:
+                persist_interaction_review(writer, review)
+            except IntakeInteractionError as exc:
+                writer.rollback()
+                return str(exc)
+            raise AssertionError("terminal outcome must close review")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcome_future = pool.submit(write_outcome)
+        review_future = pool.submit(write_review)
+        assert outcome_flushed.wait(timeout=5)
+        assert review_started.wait(timeout=5)
+        sleep(0.05)
+        release_outcome.set()
+        outcome_future.result(timeout=5)
+        review_error = review_future.result(timeout=5)
+
+    assert "with an outcome cannot be reviewed" in review_error
+    session.expire_all()
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == "nutrition.interaction-review.v1",
+                WellnessEvent.source_record_id == str(review.review_id),
+            )
+        )
+        is None
+    )
+
+
+def test_latest_review_uses_transition_revision_and_does_not_resurface(
+    client,
+    session,
+):
+    created = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = uuid.UUID(created["interaction_id"])
+    first = IntakeInteractionReview(
+        review_id=uuid.uuid4(),
+        operation_fingerprint=operation_fingerprint({"fixture": "review-revision-1"}),
+        interaction_id=interaction_id,
+        status=IntakeReviewStatus.CONFIRMED,
+        reviewed_at=datetime(2026, 8, 6, 5, tzinfo=UTC),
+        source="test",
+    )
+    second = IntakeInteractionReview(
+        review_id=uuid.uuid4(),
+        operation_fingerprint=operation_fingerprint({"fixture": "review-revision-2"}),
+        interaction_id=interaction_id,
+        status=IntakeReviewStatus.REJECTED,
+        reviewed_at=datetime(2026, 8, 6, 4, tzinfo=UTC),
+        source="test",
+    )
+
+    persist_interaction_review(session, first)
+    session.commit()
+    persist_interaction_review(session, second)
+    session.commit()
+
+    current = client.get(f"/v1/intake-interactions/{interaction_id}").json()
+    assert current["latest_review"]["review_id"] == str(second.review_id)
+    assert current["resolved_items"] == []
+
+    second_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.interaction-review.v1",
+            WellnessEvent.source_record_id == str(second.review_id),
+        )
+    )
+    assert second_event is not None
+    session.delete(second_event)
+    session.commit()
+
+    current = client.get(f"/v1/intake-interactions/{interaction_id}")
+    assert current.status_code == 500
+    assert current.json()["error"]["code"] == ("intake_storage_integrity_error")
+    assert "review result is unavailable" in current.text
+
+
+def test_latest_outcome_uses_transition_revision_and_does_not_resurface(
+    client,
+    session,
+):
+    created = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            items=[
+                {
+                    "name": "커피",
+                    "intake_type": "beverage",
+                    "serving": _estimate(1, "cup"),
+                    "nutrients": [
+                        {
+                            "nutrient": "caffeine",
+                            "amount": _estimate(100, "mg"),
+                            "confidence": "high",
+                            "origin": "user",
+                        }
+                    ],
+                    "confidence": "high",
+                }
+            ],
+        ),
+    ).json()
+    interaction_id = uuid.UUID(created["interaction_id"])
+    first = IntakeOutcome(
+        outcome_id=uuid.uuid4(),
+        operation_fingerprint=operation_fingerprint({"fixture": "outcome-revision-1"}),
+        interaction_id=interaction_id,
+        status=IntakeOutcomeStatus.CONSUMED,
+        confirmed_at=datetime(2026, 8, 6, 5, tzinfo=UTC),
+        source="test",
+        consumed_at=datetime(2026, 8, 6, 4, tzinfo=UTC),
+    )
+    second = IntakeOutcome(
+        outcome_id=uuid.uuid4(),
+        operation_fingerprint=operation_fingerprint({"fixture": "outcome-revision-2"}),
+        interaction_id=interaction_id,
+        status=IntakeOutcomeStatus.NOT_CONSUMED,
+        confirmed_at=datetime(2026, 8, 6, 3, tzinfo=UTC),
+        source="test",
+    )
+
+    persist_outcome(session, first)
+    session.commit()
+    persist_outcome(session, second)
+    session.commit()
+
+    current = client.get(f"/v1/intake-interactions/{interaction_id}").json()
+    assert current["latest_outcome"]["outcome_id"] == str(second.outcome_id)
+    assert current["latest_outcome"]["status"] == "not_consumed"
+    caffeine = known_caffeine_for_day(
+        session,
+        local_date=date(2026, 8, 6),
+        timezone="Asia/Seoul",
+    )
+    assert caffeine["confirmed_caffeine_mg"] == 0
+    assert caffeine["evidence"][0]["outcome_id"] == str(second.outcome_id)
+    assert caffeine["evidence"][0]["status"] == "not_consumed"
+
+    second_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.intake-outcome.v1",
+            WellnessEvent.source_record_id == str(second.outcome_id),
+        )
+    )
+    assert second_event is not None
+    session.delete(second_event)
+    session.commit()
+
+    current = client.get(f"/v1/intake-interactions/{interaction_id}")
+    assert current.status_code == 500
+    assert current.json()["error"]["code"] == ("intake_storage_integrity_error")
+    assert "outcome result is unavailable" in current.text
+    confirmed = client.get(
+        "/v1/intake-interactions",
+        params={"confirmed_only": True},
+    )
+    assert confirmed.status_code == 500
+    caffeine = known_caffeine_for_day(
+        session,
+        local_date=date(2026, 8, 6),
+        timezone="Asia/Seoul",
+    )
+    assert caffeine["status"] == "incomplete"
+    assert caffeine["confirmed_caffeine_mg"] == 0
+    assert caffeine["evidence"] == []
+    assert caffeine["unavailable_outcome_operation_ids"] == [str(second.outcome_id)]
+
+
+def test_expired_prospective_consumption_cannot_reconfirm_empty_day(
+    client,
+    session,
+):
+    created = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            intent="ask_before_intake",
+            items=[
+                {
+                    "name": "커피",
+                    "intake_type": "beverage",
+                    "serving": _estimate(1, "cup"),
+                    "nutrients": [
+                        {
+                            "nutrient": "caffeine",
+                            "amount": _estimate(120, "mg"),
+                            "confidence": "high",
+                            "origin": "user",
+                        }
+                    ],
+                    "confidence": "high",
+                }
+            ],
+        ),
+    ).json()
+    interaction_id = created["interaction_id"]
+    outcome = client.post(
+        f"/v1/intake-interactions/{interaction_id}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "consumed",
+            "source": "ios-device",
+            "consumed_at": "2026-08-06T12:30:00+09:00",
+        },
+    )
+    assert outcome.status_code == 201
+    outcome_id = outcome.json()["latest_outcome"]["outcome_id"]
+    initial_confirmation = client.post(
+        "/v1/nutrition-observations/daily-confirmations",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "local_date": "2026-08-06",
+            "timezone": "Asia/Seoul",
+            "observation_ids": [],
+            "outcome_ids": [outcome_id],
+            "total_intake_complete": True,
+            "source": "desktop-web",
+        },
+    )
+    assert initial_confirmation.status_code == 201
+
+    outcome_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.intake-outcome.v1",
+            WellnessEvent.source_record_id == outcome_id,
+        )
+    )
+    assert outcome_event is not None
+    session.delete(outcome_event)
+    session.commit()
+
+    empty_reconfirmation = client.post(
+        "/v1/nutrition-observations/daily-confirmations",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "local_date": "2026-08-06",
+            "timezone": "Asia/Seoul",
+            "observation_ids": [],
+            "outcome_ids": [],
+            "total_intake_complete": True,
+            "source": "desktop-web",
+        },
+    )
+    assert empty_reconfirmation.status_code == 422
+    assert "result payload is unavailable" in empty_reconfirmation.text
+
+    ledger = known_caffeine_for_day(
+        session,
+        local_date=date(2026, 8, 6),
+        timezone="Asia/Seoul",
+    )
+    assert ledger["status"] == "incomplete"
+    assert ledger["total_intake_complete"] is False
+    assert ledger["confirmed_caffeine_mg"] == 0
+    assert ledger["unavailable_outcome_operation_ids"] == [outcome_id]
+
+
+def test_followup_outcome_inherits_previous_nutrition_correction(
+    client,
+):
+    created = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            items=[
+                {
+                    "name": "커피",
+                    "intake_type": "beverage",
+                    "serving": _estimate(1, "cup"),
+                    "nutrients": [
+                        {
+                            "nutrient": "caffeine",
+                            "amount": _estimate(100, "mg"),
+                            "confidence": "high",
+                            "origin": "user",
+                        }
+                    ],
+                    "confidence": "high",
+                }
+            ],
+        ),
+    ).json()
+    interaction_id = created["interaction_id"]
+    corrected_item = {
+        "name": "커피",
+        "intake_type": "beverage",
+        "serving": _estimate(1, "cup"),
+        "nutrients": [
+            {
+                "nutrient": "caffeine",
+                "amount": _estimate(80, "mg"),
+                "confidence": "high",
+                "origin": "user",
+            }
+        ],
+        "confidence": "high",
+    }
+    first = client.post(
+        f"/v1/intake-interactions/{interaction_id}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "consumed",
+            "source": "ios-device",
+            "consumed_at": "2026-08-06T12:30:00+09:00",
+            "corrected_items": [corrected_item],
+        },
+    )
+    assert first.status_code == 201
+    assert first.json()["resolved_items"][0]["nutrients"][0]["amount"]["exact"] == 80
+
+    second = client.post(
+        f"/v1/intake-interactions/{interaction_id}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "consumed",
+            "source": "ios-device",
+            "consumed_at": "2026-08-06T13:00:00+09:00",
+        },
+    )
+    assert second.status_code == 201
+    assert second.json()["resolved_items"][0]["nutrients"][0]["amount"]["exact"] == 80
+
+
+def test_caffeine_decision_requires_snapshot_time_in_interaction_timezone(
+    client,
+):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    path = f"/v1/intake-interactions/{interaction['interaction_id']}/decision-requests"
+    base = {
+        "operation_id": str(uuid.uuid4()),
+        "scope": "caffeine_sleep",
+        "source": "ios-device",
+    }
+
+    missing = client.post(path, json=base)
+    assert missing.status_code == 422
+    assert "require intended_consumption_at" in missing.text
+
+    conflicting = client.post(
+        path,
+        json={
+            **base,
+            "operation_id": str(uuid.uuid4()),
+            "intended_consumption_at": "2026-08-06T16:00:00-07:00",
+        },
+    )
+    assert conflicting.status_code == 422
+    assert "UTC offset conflicts with the interaction timezone" in (conflicting.text)
+
+    stale = client.post(
+        path,
+        json={
+            **base,
+            "operation_id": str(uuid.uuid4()),
+            "intended_consumption_at": (datetime.now(UTC) - timedelta(minutes=10))
+            .astimezone(KST)
+            .isoformat(),
+        },
+    )
+    assert stale.status_code == 422
+    assert "cannot be more than 5 minutes in the past" in stale.text
+
+    within_clock_skew = client.post(
+        path,
+        json={
+            **base,
+            "operation_id": str(uuid.uuid4()),
+            "intended_consumption_at": (datetime.now(UTC) - timedelta(minutes=1))
+            .astimezone(KST)
+            .isoformat(),
+        },
+    )
+    assert within_clock_skew.status_code == 201
+
+
 def test_caffeine_context_includes_confirmed_text_outcome_evidence(
-    client, session
+    client,
+    session,
+    monkeypatch,
 ):
     consumed = client.post(
         "/v1/intake-interactions",
@@ -477,6 +1113,16 @@ def test_caffeine_context_includes_confirmed_text_outcome_evidence(
     )
     assert consumed.status_code == 201
     interaction_id = consumed.json()["interaction_id"]
+    review = client.post(
+        f"/v1/intake-interactions/{interaction_id}/review",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "confirmed",
+            "source": "ios-device",
+            "corrected_items": [],
+        },
+    )
+    assert review.status_code == 201
     outcome = client.post(
         f"/v1/intake-interactions/{interaction_id}/outcomes",
         json={
@@ -490,12 +1136,11 @@ def test_caffeine_context_includes_confirmed_text_outcome_evidence(
     daily = client.post(
         "/v1/nutrition-observations/daily-confirmations",
         json={
+            "operation_id": str(uuid.uuid4()),
             "local_date": "2026-08-06",
             "timezone": "Asia/Seoul",
             "observation_ids": [],
-            "outcome_ids": [
-                outcome.json()["latest_outcome"]["outcome_id"]
-            ],
+            "outcome_ids": [outcome.json()["latest_outcome"]["outcome_id"]],
             "total_intake_complete": True,
             "source": "desktop-web",
         },
@@ -526,9 +1171,14 @@ def test_caffeine_context_includes_confirmed_text_outcome_evidence(
         ),
     )
     assert candidate.status_code == 201
+    request_now = datetime(2026, 8, 6, 15, tzinfo=KST).astimezone(UTC)
+    monkeypatch.setattr(
+        intake_api_module,
+        "utc_now",
+        lambda: request_now,
+    )
     requested = client.post(
-        f"/v1/intake-interactions/{candidate.json()['interaction_id']}"
-        "/decision-requests",
+        f"/v1/intake-interactions/{candidate.json()['interaction_id']}/decision-requests",
         json={
             "operation_id": str(uuid.uuid4()),
             "scope": "caffeine_sleep",
@@ -538,20 +1188,172 @@ def test_caffeine_context_includes_confirmed_text_outcome_evidence(
     )
     assert requested.status_code == 201
     context = client.get(
-        "/v1/intake-interactions/decision-requests/"
-        f"{requested.json()['request_id']}/context"
+        f"/v1/intake-interactions/decision-requests/{requested.json()['request_id']}/context"
     )
     assert context.status_code == 200
     caffeine = context.json()["specialized_evidence"]["caffeine"]
     assert caffeine["status"] == "known"
     assert caffeine["confirmed_caffeine_mg"] == 150
     outcome_event = session.scalar(
-        select(WellnessEvent).where(
-            WellnessEvent.event_type == "nutrition.intake-outcome.v1"
-        )
+        select(WellnessEvent).where(WellnessEvent.event_type == "nutrition.intake-outcome.v1")
     )
     assert outcome_event is not None
     assert str(outcome_event.id) in context.json()["evidence_event_ids"]
+
+
+def test_unreviewed_caller_claimed_caffeine_is_not_known_intake(
+    client,
+    session,
+):
+    consumed = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            source_text="카페인 500mg 커피를 마셨어",
+            items=[
+                {
+                    "name": "커피",
+                    "intake_type": "beverage",
+                    "serving": _estimate(1, "cup"),
+                    "nutrients": [
+                        {
+                            "nutrient": "caffeine",
+                            "amount": _estimate(500, "mg"),
+                            "confidence": "high",
+                            "origin": "user",
+                        }
+                    ],
+                    "confidence": "high",
+                }
+            ],
+        ),
+    )
+    assert consumed.status_code == 201
+    outcome = client.post(
+        f"/v1/intake-interactions/{consumed.json()['interaction_id']}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "consumed",
+            "source": "ios-device",
+            "consumed_at": "2026-08-06T12:30:00+09:00",
+        },
+    )
+    assert outcome.status_code == 201
+    outcome_id = outcome.json()["latest_outcome"]["outcome_id"]
+    daily = client.post(
+        "/v1/nutrition-observations/daily-confirmations",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "local_date": "2026-08-06",
+            "timezone": "Asia/Seoul",
+            "observation_ids": [],
+            "outcome_ids": [outcome_id],
+            "total_intake_complete": True,
+            "source": "desktop-web",
+        },
+    )
+    assert daily.status_code == 201
+
+    session.expire_all()
+    caffeine = known_caffeine_for_day(
+        session,
+        local_date=date(2026, 8, 6),
+        timezone="Asia/Seoul",
+    )
+    assert caffeine["status"] == "incomplete"
+    assert caffeine["confirmed_caffeine_mg"] == 0
+    assert caffeine["unquantified_outcome_ids"] == [outcome_id]
+
+    outcome_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.intake-outcome.v1",
+            WellnessEvent.source_record_id == outcome_id,
+        )
+    )
+    marker = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.operation.v1",
+            WellnessEvent.source_record_id == f"intake-outcome:{outcome_id}",
+        )
+    )
+    assert outcome_event is not None
+    assert marker is not None
+    legacy_payload = deepcopy(outcome_event.payload)
+    legacy_payload.pop(NUTRIENT_PROVENANCE_VERIFIED_FIELD)
+    legacy_payload["intake_snapshot"]["items"][0]["nutrients"][0]["origin"] = "user"
+    outcome_event.payload = legacy_payload
+    session.delete(marker)
+    session.commit()
+
+    run_storage_maintenance(
+        session,
+        client.app.state.settings,
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+    )
+    session.commit()
+    session.expire_all()
+    legacy_caffeine = known_caffeine_for_day(
+        session,
+        local_date=date(2026, 8, 6),
+        timezone="Asia/Seoul",
+    )
+    assert legacy_caffeine["status"] == "incomplete"
+    assert legacy_caffeine["confirmed_caffeine_mg"] == 0
+    assert legacy_caffeine["unquantified_outcome_ids"] == [outcome_id]
+
+
+def test_unresolved_log_consumed_interaction_blocks_complete_day(
+    client,
+    session,
+):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            source_text="카페인 150mg 커피를 마셨어",
+            items=[
+                {
+                    "name": "커피",
+                    "intake_type": "beverage",
+                    "serving": _estimate(1, "cup"),
+                    "nutrients": [
+                        {
+                            "nutrient": "caffeine",
+                            "amount": _estimate(150, "mg"),
+                            "confidence": "high",
+                            "origin": "user",
+                        }
+                    ],
+                    "confidence": "high",
+                }
+            ],
+        ),
+    )
+    assert interaction.status_code == 201
+    interaction_id = interaction.json()["interaction_id"]
+
+    daily = client.post(
+        "/v1/nutrition-observations/daily-confirmations",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "local_date": "2026-08-06",
+            "timezone": "Asia/Seoul",
+            "observation_ids": [],
+            "outcome_ids": [],
+            "total_intake_complete": True,
+            "source": "desktop-web",
+        },
+    )
+
+    assert daily.status_code == 422
+    assert "requires an outcome for every log_consumed interaction" in (daily.text)
+    session.expire_all()
+    known = known_caffeine_for_day(
+        session,
+        local_date=date(2026, 8, 6),
+        timezone="Asia/Seoul",
+    )
+    assert known["status"] == "incomplete"
+    assert known["total_intake_complete"] is False
+    assert known["unresolved_log_consumed_interaction_ids"] == [interaction_id]
 
 
 def test_high_risk_scope_cannot_store_wellness_proposal(client):
@@ -608,9 +1410,7 @@ def test_high_risk_scope_cannot_store_wellness_proposal(client):
     assert fetched["latest_decision"]["recommendation"] is None
 
 
-def test_voice_capture_requires_local_transcript_and_indexes_audio(
-    client, session
-):
+def test_voice_capture_requires_local_transcript_and_indexes_audio(client, session):
     media_path = _upload(client, b"fake-m4a", "audio/m4a", "meal.m4a")
     missing = client.post(
         "/v1/intake-interactions",
@@ -634,9 +1434,7 @@ def test_voice_capture_requires_local_transcript_and_indexes_audio(
     )
     assert created.status_code == 201
     assert created.json()["modality"] == "voice"
-    obj = session.scalar(
-        select(StorageObject).where(StorageObject.relative_path == media_path)
-    )
+    obj = session.scalar(select(StorageObject).where(StorageObject.relative_path == media_path))
     assert obj is not None
     assert obj.data_class == "nutrition_media"
 
@@ -668,9 +1466,7 @@ def test_uploaded_media_cannot_be_reused_by_another_capture(client):
     assert "already belongs to another capture" in second.text
 
 
-def test_free_text_is_automatically_analyzed_and_retry_is_idempotent(
-    client, session
-):
+def test_free_text_is_automatically_analyzed_and_retry_is_idempotent(client, session):
     provider = FakeAnalysis()
     client.app.state.nutrition_analysis_provider = provider
     operation_id = str(uuid.uuid4())
@@ -700,9 +1496,7 @@ def test_free_text_is_automatically_analyzed_and_retry_is_idempotent(
         "transcription_provider": None,
         "transcription_model": None,
     }
-    assert provider.calls == [
-        ("아침에 바나나와 우유를 먹었어", False)
-    ]
+    assert provider.calls == [("아침에 바나나와 우유를 먹었어", False)]
 
     retried = client.post("/v1/intake-interactions/analyze", json=body)
     assert retried.status_code == 201
@@ -784,9 +1578,7 @@ def test_failed_automatic_analysis_releases_idempotency_reservation(client):
     assert len(provider.calls) == 2
 
 
-def test_analysis_failure_does_not_commit_or_rollback_caller_session(
-    client, session
-):
+def test_analysis_failure_does_not_commit_or_rollback_caller_session(client, session):
     unrelated = RetentionPolicy(
         data_class="unrelated_pending",
         retention_days=1,
@@ -816,9 +1608,7 @@ def test_analysis_failure_does_not_commit_or_rollback_caller_session(
     assert unrelated in session.new
 
 
-def test_analysis_reservation_does_not_commit_flushed_caller_state(
-    client, session
-):
+def test_analysis_reservation_does_not_commit_flushed_caller_state(client, session):
     unrelated = RetentionPolicy(
         data_class="unrelated_flushed",
         retention_days=1,
@@ -832,9 +1622,7 @@ def test_analysis_reservation_does_not_commit_flushed_caller_state(
             session,
             client.app.state.settings,
             operation_id=uuid.uuid4(),
-            operation_fingerprint=operation_fingerprint(
-                {"fixture": "flushed-input"}
-            ),
+            operation_fingerprint=operation_fingerprint({"fixture": "flushed-input"}),
             intent=IntakeIntent.LOG_CONSUMED,
             modality=CaptureModality.TEXT,
             observed_at=datetime(2026, 8, 6, 3, 30, tzinfo=UTC),
@@ -851,9 +1639,7 @@ def test_analysis_reservation_does_not_commit_flushed_caller_state(
 
     with Session(bind=session.get_bind()) as verification_session:
         remaining = verification_session.scalar(
-            select(RetentionPolicy).where(
-                RetentionPolicy.data_class == "unrelated_flushed"
-            )
+            select(RetentionPolicy).where(RetentionPolicy.data_class == "unrelated_flushed")
         )
     assert remaining is None
 
@@ -914,9 +1700,7 @@ def test_expired_analysis_lease_can_be_reclaimed(client, session):
     assert "lease_expires_at" not in marker.payload
 
 
-def test_expired_analysis_lease_has_one_concurrent_reclaimer(
-    client, session
-):
+def test_expired_analysis_lease_has_one_concurrent_reclaimer(client, session):
     provider = SlowAnalysis()
     client.app.state.nutrition_analysis_provider = provider
     operation_id = str(uuid.uuid4())
@@ -978,9 +1762,7 @@ def test_expired_analysis_lease_has_one_concurrent_reclaimer(
     assert len(provider.calls) == 1
 
 
-def test_final_transaction_rollback_releases_analysis_reservation(
-    client, session
-):
+def test_final_transaction_rollback_releases_analysis_reservation(client, session):
     operation_id = uuid.uuid4()
     fingerprint = operation_fingerprint({"fixture": "final-rollback"})
     create_analyzed_interaction(
@@ -1014,9 +1796,7 @@ def test_final_transaction_rollback_releases_analysis_reservation(
 
 def test_savepoint_rollback_keeps_analysis_reservation(client, session):
     operation_id = uuid.uuid4()
-    fingerprint = operation_fingerprint(
-        {"fixture": "savepoint-rollback"}
-    )
+    fingerprint = operation_fingerprint({"fixture": "savepoint-rollback"})
 
     class SavepointRollbackAnalysis(FakeAnalysis):
         def analyze_text(self, text, *, allow_remote):
@@ -1098,9 +1878,7 @@ def test_failed_final_commit_releases_analysis_reservation(client, session):
         session,
         client.app.state.settings,
         operation_id=operation_id,
-        operation_fingerprint=operation_fingerprint(
-            {"fixture": "failed-final-commit"}
-        ),
+        operation_fingerprint=operation_fingerprint({"fixture": "failed-final-commit"}),
         intent=IntakeIntent.LOG_CONSUMED,
         modality=CaptureModality.TEXT,
         observed_at=datetime(2026, 8, 6, 3, 30, tzinfo=UTC),
@@ -1157,15 +1935,9 @@ def test_expired_sqlite_reservation_rejects_late_owner(client, session):
     class ReclaimedDuringAnalysis(FakeAnalysis):
         def analyze_text(self, text, *, allow_remote):
             key = (id(session.get_bind()), operation_id)
-            with (
-                intake_service_module._STATIC_ANALYSIS_RESERVATIONS_LOCK
-            ):
-                reservation = (
-                    intake_service_module._STATIC_ANALYSIS_RESERVATIONS[key]
-                )
-                reservation["lease_expires_at"] = datetime.now(
-                    UTC
-                ) - timedelta(seconds=1)
+            with intake_service_module._STATIC_ANALYSIS_RESERVATIONS_LOCK:
+                reservation = intake_service_module._STATIC_ANALYSIS_RESERVATIONS[key]
+                reservation["lease_expires_at"] = datetime.now(UTC) - timedelta(seconds=1)
             with Session(bind=session.get_bind()) as winner_session:
                 create_analyzed_interaction(
                     winner_session,
@@ -1216,9 +1988,7 @@ def test_expired_sqlite_reservation_rejects_late_owner(client, session):
     session.rollback()
 
 
-def test_persisting_sqlite_reservation_cannot_be_reclaimed(
-    client, session
-):
+def test_persisting_sqlite_reservation_cannot_be_reclaimed(client, session):
     operation_id = uuid.uuid4()
     fingerprint = operation_fingerprint({"fixture": "persisting-owner"})
     token = intake_service_module._reserve_interaction_analysis(
@@ -1237,9 +2007,9 @@ def test_persisting_sqlite_reservation_cannot_be_reclaimed(
     )
     key = (id(session.get_bind()), operation_id)
     with intake_service_module._STATIC_ANALYSIS_RESERVATIONS_LOCK:
-        intake_service_module._STATIC_ANALYSIS_RESERVATIONS[key][
-            "lease_expires_at"
-        ] = datetime.now(UTC) - timedelta(seconds=1)
+        intake_service_module._STATIC_ANALYSIS_RESERVATIONS[key]["lease_expires_at"] = datetime.now(
+            UTC
+        ) - timedelta(seconds=1)
 
     with Session(bind=session.get_bind()) as contender:
         with pytest.raises(IntakeAnalysisInProgress):
@@ -1257,9 +2027,7 @@ def test_persisting_sqlite_reservation_cannot_be_reclaimed(
     )
 
 
-def test_persistent_reservation_completion_uses_token_cas(
-    client, session, monkeypatch
-):
+def test_persistent_reservation_completion_uses_token_cas(client, session, monkeypatch):
     operation_id = uuid.uuid4()
     fingerprint = operation_fingerprint({"fixture": "persistent-cas"})
     marker = WellnessEvent(
@@ -1292,9 +2060,7 @@ def test_persistent_reservation_completion_uses_token_cas(
     )
     session.add(marker)
     session.commit()
-    stale_marker = session.scalar(
-        select(WellnessEvent).where(WellnessEvent.id == marker.id)
-    )
+    stale_marker = session.scalar(select(WellnessEvent).where(WellnessEvent.id == marker.id))
     assert stale_marker is not None
 
     with Session(bind=session.get_bind()) as winner:
@@ -1371,9 +2137,7 @@ def test_session_close_releases_sqlite_analysis_reservation(client, session):
     assert retried.interaction_id == operation_id
 
 
-def test_voice_is_transcribed_locally_then_automatically_analyzed(
-    client, session
-):
+def test_voice_is_transcribed_locally_then_automatically_analyzed(client, session):
     provider = FakeAnalysis()
     transcriber = FakeTranscriber()
     client.app.state.nutrition_analysis_provider = provider
@@ -1395,26 +2159,16 @@ def test_voice_is_transcribed_locally_then_automatically_analyzed(
     assert created.status_code == 201
     payload = created.json()
     assert payload["source_text"] == "아침에 바나나와 우유를 먹었어"
-    assert payload["analysis_provenance"]["transcription_provider"] == (
-        "fixture-whisper"
-    )
-    assert payload["analysis_provenance"]["transcription_model"] == (
-        "fixture-small"
-    )
+    assert payload["analysis_provenance"]["transcription_provider"] == ("fixture-whisper")
+    assert payload["analysis_provenance"]["transcription_model"] == ("fixture-small")
     assert len(transcriber.calls) == 1
-    assert provider.calls == [
-        ("아침에 바나나와 우유를 먹었어", False)
-    ]
-    obj = session.scalar(
-        select(StorageObject).where(StorageObject.relative_path == media_path)
-    )
+    assert provider.calls == [("아침에 바나나와 우유를 먹었어", False)]
+    obj = session.scalar(select(StorageObject).where(StorageObject.relative_path == media_path))
     assert obj is not None
     assert obj.data_class == "nutrition_media"
 
 
-def test_photo_adapter_keeps_sake_observation_and_maps_caffeine(
-    client, session
-):
+def test_photo_adapter_keeps_sake_observation_and_maps_caffeine(client, session):
     observation_id = _photo_observation(client)
     operation_id = str(uuid.uuid4())
     request_body = {
@@ -1479,15 +2233,11 @@ def test_confirmed_photo_review_promotes_nutrients_to_user_origin(client):
     )
     assert created.status_code == 201
     assert {
-        nutrient["origin"]
-        for item in created.json()["items"]
-        for nutrient in item["nutrients"]
+        nutrient["origin"] for item in created.json()["items"] for nutrient in item["nutrients"]
     } == {"user"}
 
 
-def test_photo_review_correction_flows_into_interaction_search_and_context(
-    client, session
-):
+def test_photo_review_correction_flows_into_interaction_search_and_context(client, session):
     observation_id = _photo_observation(client)
     review_body = {
         "operation_id": str(uuid.uuid4()),
@@ -1498,9 +2248,7 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
                 "item_index": 0,
                 "name": "small bottled latte",
                 "intake_type": "beverage",
-                "serving": _estimate(
-                    250, "ml", basis="owner_correction"
-                ),
+                "serving": _estimate(250, "ml", basis="owner_correction"),
                 "nutrients": _reviewed_nutrients(),
                 "confidence": "high",
             }
@@ -1526,13 +2274,9 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
         },
     )
     assert conflict.status_code == 409
-    assert conflict.json()["error"]["code"] == (
-        "nutrition_review_operation_conflict"
-    )
+    assert conflict.json()["error"]["code"] == ("nutrition_review_operation_conflict")
     assert "operation_id was already used" in conflict.text
-    review_view = client.get(
-        f"/v1/nutrition-observations/{observation_id}/review"
-    )
+    review_view = client.get(f"/v1/nutrition-observations/{observation_id}/review")
     assert review_view.status_code == 200
     assert review_view.json()["review"]["status"] == "corrected"
 
@@ -1550,9 +2294,7 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
     assert created.json()["nutrition_review_id"] == reviewed.json()["review_id"]
     item = created.json()["items"][0]
     assert item["name"] == "small bottled latte"
-    nutrients = {
-        value["nutrient"]: value for value in item["nutrients"]
-    }
+    nutrients = {value["nutrient"]: value for value in item["nutrients"]}
     assert nutrients["energy"]["amount"]["exact"] == 80
     assert nutrients["caffeine"]["amount"]["exact"] == 95
     assert nutrients["caffeine"]["origin"] == "user"
@@ -1562,9 +2304,7 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
         params={"nutrient": "energy"},
     )
     assert searched.status_code == 200
-    assert searched.json()["records"][0]["resolved_items"][0]["name"] == (
-        "small bottled latte"
-    )
+    assert searched.json()["records"][0]["resolved_items"][0]["name"] == ("small bottled latte")
     decision_request = client.post(
         f"/v1/intake-interactions/{created.json()['interaction_id']}/decision-requests",
         json={
@@ -1575,14 +2315,11 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
     )
     assert decision_request.status_code == 201
     context = client.get(
-        "/v1/intake-interactions/decision-requests/"
-        f"{decision_request.json()['request_id']}/context"
+        f"/v1/intake-interactions/decision-requests/{decision_request.json()['request_id']}/context"
     )
     assert context.status_code == 200
     review_event = session.scalar(
-        select(WellnessEvent).where(
-            WellnessEvent.event_type == "nutrition.review.v1"
-        )
+        select(WellnessEvent).where(WellnessEvent.event_type == "nutrition.review.v1")
     )
     assert review_event is not None
     assert str(review_event.id) in context.json()["evidence_event_ids"]
@@ -1593,9 +2330,7 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
         )
     )
     assert observation_event is not None
-    assert review_event.retention_policy_id == (
-        observation_event.retention_policy_id
-    )
+    assert review_event.retention_policy_id == (observation_event.retention_policy_id)
     assert review_event.expires_at == observation_event.expires_at
     retention_update = client.put(
         "/v1/storage/settings/nutrition_observation",
@@ -1626,20 +2361,29 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
     )
     session.add(colliding_review)
     session.commit()
-    latest_review = client.get(
-        f"/v1/nutrition-observations/{observation_id}/review"
-    )
+    latest_review = client.get(f"/v1/nutrition-observations/{observation_id}/review")
     assert latest_review.status_code == 200
-    assert latest_review.json()["review"]["review_id"] == (
-        reviewed.json()["review_id"]
-    )
+    assert latest_review.json()["review"]["review_id"] == (reviewed.json()["review_id"])
 
+    outcome = client.post(
+        f"/v1/intake-interactions/{created.json()['interaction_id']}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "consumed",
+            "source": "galaxy-device",
+            "consumed_at": "2026-08-06T12:30:00+09:00",
+        },
+    )
+    assert outcome.status_code == 201
+    outcome_id = outcome.json()["latest_outcome"]["outcome_id"]
     daily = client.post(
         "/v1/nutrition-observations/daily-confirmations",
         json={
+            "operation_id": str(uuid.uuid4()),
             "local_date": "2026-08-06",
             "timezone": "Asia/Seoul",
-            "observation_ids": [observation_id],
+            "observation_ids": [],
+            "outcome_ids": [outcome_id],
             "total_intake_complete": True,
             "source": "desktop-web",
         },
@@ -1653,7 +2397,9 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
     )
     assert caffeine["status"] == "known"
     assert caffeine["confirmed_caffeine_mg"] == 95
-    assert caffeine["evidence"][0]["event_type"] == "nutrition.review.v1"
+    assert caffeine["evidence"][0]["event_type"] == ("nutrition.intake-outcome.v1")
+    assert caffeine["evidence"][0]["outcome_id"] == outcome_id
+    session.rollback()
 
     comparison_primary = client.post(
         "/v1/intake-interactions",
@@ -1664,8 +2410,7 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
     )
     assert comparison_primary.status_code == 201
     comparison_request = client.post(
-        f"/v1/intake-interactions/{comparison_primary.json()['interaction_id']}"
-        "/decision-requests",
+        f"/v1/intake-interactions/{comparison_primary.json()['interaction_id']}/decision-requests",
         json={
             "operation_id": str(uuid.uuid4()),
             "scope": "compare_options",
@@ -1679,12 +2424,8 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
         f"{comparison_request.json()['request_id']}/context"
     )
     assert comparison_context.status_code == 200
-    assert str(review_event.id) in (
-        comparison_context.json()["evidence_event_ids"]
-    )
-    assert str(colliding_review.id) not in (
-        comparison_context.json()["evidence_event_ids"]
-    )
+    assert str(review_event.id) in (comparison_context.json()["evidence_event_ids"])
+    assert str(colliding_review.id) not in (comparison_context.json()["evidence_event_ids"])
 
 
 def test_rejected_photo_observation_cannot_create_interaction(client):
@@ -1726,9 +2467,7 @@ def test_corrected_photo_review_requires_every_core_nutrient(client):
                     "item_index": 0,
                     "name": "small bottled latte",
                     "intake_type": "beverage",
-                    "serving": _estimate(
-                        250, "ml", basis="owner_correction"
-                    ),
+                    "serving": _estimate(250, "ml", basis="owner_correction"),
                     "nutrients": _reviewed_nutrients()[:-1],
                 }
             ],
@@ -1757,9 +2496,7 @@ def test_inspect_only_cannot_request_decision(client):
 
 
 def test_latest_not_consumed_outcome_removes_old_consumed_history(client):
-    logged = client.post(
-        "/v1/intake-interactions", json=_text_interaction()
-    ).json()
+    logged = client.post("/v1/intake-interactions", json=_text_interaction()).json()
     logged_id = logged["interaction_id"]
     consumed = client.post(
         f"/v1/intake-interactions/{logged_id}/outcomes",
@@ -1808,9 +2545,7 @@ def test_latest_not_consumed_outcome_removes_old_consumed_history(client):
 
 
 def test_consumed_outcome_rejects_future_timestamp(client):
-    interaction = client.post(
-        "/v1/intake-interactions", json=_text_interaction()
-    ).json()
+    interaction = client.post("/v1/intake-interactions", json=_text_interaction()).json()
     response = client.post(
         f"/v1/intake-interactions/{interaction['interaction_id']}/outcomes",
         json={
@@ -1824,9 +2559,7 @@ def test_consumed_outcome_rejects_future_timestamp(client):
     assert "cannot be in the future" in response.text
 
 
-def test_operation_id_is_idempotent_and_conflicts_on_different_input(
-    client, session
-):
+def test_operation_id_is_idempotent_and_conflicts_on_different_input(client, session):
     body = _text_interaction()
     first = client.post("/v1/intake-interactions", json=body)
     retry = client.post("/v1/intake-interactions", json=body)
@@ -1858,22 +2591,16 @@ def test_operation_id_is_idempotent_and_conflicts_on_different_input(
         "scope": "daily_nutrition",
         "source": "ios-device",
     }
-    request_path = (
-        f"/v1/intake-interactions/{interaction_id}/decision-requests"
-    )
+    request_path = f"/v1/intake-interactions/{interaction_id}/decision-requests"
     request = client.post(request_path, json=request_body)
     retry_request = client.post(request_path, json=request_body)
     assert request.status_code == retry_request.status_code == 201
     assert request.json()["request_id"] == retry_request.json()["request_id"]
-    request_conflict = client.post(
-        request_path, json={**request_body, "lookback_days": 7}
-    )
+    request_conflict = client.post(request_path, json={**request_body, "lookback_days": 7})
     assert request_conflict.status_code == 409
 
     request_id = request.json()["request_id"]
-    context = client.get(
-        f"/v1/intake-interactions/decision-requests/{request_id}/context"
-    ).json()
+    context = client.get(f"/v1/intake-interactions/decision-requests/{request_id}/context").json()
     decision_body = {
         "operation_id": str(uuid.uuid4()),
         "request_id": request_id,
@@ -1896,10 +2623,935 @@ def test_operation_id_is_idempotent_and_conflicts_on_different_input(
     retry_decision = client.post(decision_path, json=decision_body)
     assert decision.status_code == retry_decision.status_code == 201
     assert decision.json()["decision_id"] == retry_decision.json()["decision_id"]
-    decision_conflict = client.post(
-        decision_path, json={**decision_body, "summary": "다른 판단"}
-    )
+    decision_conflict = client.post(decision_path, json={**decision_body, "summary": "다른 판단"})
     assert decision_conflict.status_code == 409
+
+
+def test_transition_runtime_uses_canonical_source_namespace(
+    client,
+    session,
+):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = uuid.UUID(interaction["interaction_id"])
+    foreign_interaction_id = uuid.uuid4()
+    rogue_transition = WellnessEvent(
+        event_type="nutrition.interaction-transition.v1",
+        schema_version=1,
+        observed_at=datetime.now(UTC),
+        recorded_at=datetime.now(UTC),
+        timezone="Asia/Seoul",
+        source_provider="nutrition-interaction-transition",
+        source_device=None,
+        source_record_id=f"{foreign_interaction_id}:1",
+        capture_method="system",
+        quality_flags=None,
+        confidence=None,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=None,
+        expires_at=None,
+        payload={
+            "interaction_id": str(interaction_id),
+            "revision": 1,
+            "mutation_kind": "outcome",
+            "operation_id": str(uuid.uuid4()),
+            "mutation_status": "consumed",
+        },
+        derived_from={"interaction_id": str(interaction_id)},
+    )
+    session.add(rogue_transition)
+    session.commit()
+
+    assert (
+        intake_service_module.terminal_outcome_status(
+            session,
+            interaction_id,
+        )
+        is None
+    )
+    assert (
+        latest_interaction_transitions(
+            session,
+            mutation_kind="outcome",
+            interaction_ids={interaction_id},
+        )
+        == {}
+    )
+
+    outcome_id = str(uuid.uuid4())
+    response = client.post(
+        f"/v1/intake-interactions/{interaction_id}/outcomes",
+        json={
+            "operation_id": outcome_id,
+            "status": "not_consumed",
+            "source": "ios-device",
+        },
+    )
+
+    assert response.status_code == 201
+    canonical = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.source_provider == "nutrition-interaction-transition",
+            WellnessEvent.source_record_id == f"{interaction_id}:1",
+        )
+    )
+    assert canonical is not None
+    assert canonical.payload["operation_id"] == outcome_id
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.source_provider == "nutrition-interaction-transition",
+                WellnessEvent.source_record_id == f"{interaction_id}:2",
+            )
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "operation_id",
+        "mutation_kind",
+        "mutation_status",
+        "revision_gap",
+    ),
+)
+def test_transition_runtime_rejects_invalid_semantic_chain(
+    client,
+    session,
+    corruption,
+):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = uuid.UUID(interaction["interaction_id"])
+    revision = 2 if corruption == "revision_gap" else 1
+    mutation_kind = "unknown" if corruption == "mutation_kind" else "outcome"
+    mutation_status = "unknown" if corruption == "mutation_status" else "consumed"
+    operation_id = "not-a-uuid" if corruption == "operation_id" else str(uuid.uuid4())
+    event = WellnessEvent(
+        event_type="nutrition.interaction-transition.v1",
+        schema_version=1,
+        observed_at=datetime.now(UTC),
+        recorded_at=datetime.now(UTC),
+        timezone="Asia/Seoul",
+        source_provider="nutrition-interaction-transition",
+        source_device=None,
+        source_record_id=f"{interaction_id}:{revision}",
+        capture_method="system",
+        quality_flags=None,
+        confidence=None,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=None,
+        expires_at=None,
+        payload={
+            "interaction_id": str(interaction_id),
+            "revision": revision,
+            "mutation_kind": mutation_kind,
+            "operation_id": operation_id,
+            "mutation_status": mutation_status,
+        },
+        derived_from={"interaction_id": str(interaction_id)},
+    )
+    session.add(event)
+    session.commit()
+
+    with pytest.raises(
+        IntakeInteractionError,
+        match="invalid interaction transition chain",
+    ):
+        intake_service_module.terminal_outcome_status(
+            session,
+            interaction_id,
+        )
+    with pytest.raises(InvalidInteractionTransitionChain):
+        latest_interaction_transitions(
+            session,
+            mutation_kind="outcome",
+            interaction_ids={interaction_id},
+        )
+    with pytest.raises(
+        IntakeInteractionError,
+        match="invalid interaction transition chain",
+    ):
+        intake_service_module._next_interaction_transition_revision(
+            session,
+            interaction_id,
+        )
+
+    response = client.post(
+        f"/v1/intake-interactions/{interaction_id}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "not_consumed",
+            "source": "ios-device",
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "intake_storage_integrity_error"
+    assert "invalid interaction transition chain" in response.text
+    namespace_record_ids = list(
+        session.scalars(
+            select(WellnessEvent.source_record_id).where(
+                WellnessEvent.source_provider == "nutrition-interaction-transition",
+                WellnessEvent.source_record_id.like(f"{interaction_id}:%"),
+            )
+        )
+    )
+    assert namespace_record_ids == [f"{interaction_id}:{revision}"]
+
+
+def test_transition_runtime_rejects_review_after_outcome(
+    client,
+    session,
+):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = uuid.UUID(interaction["interaction_id"])
+    recorded_at = datetime.now(UTC)
+
+    def transition(
+        revision: int,
+        mutation_kind: str,
+        mutation_status: str,
+    ) -> WellnessEvent:
+        event_at = recorded_at + timedelta(seconds=revision)
+        return WellnessEvent(
+            event_type="nutrition.interaction-transition.v1",
+            schema_version=1,
+            observed_at=event_at,
+            recorded_at=event_at,
+            timezone="Asia/Seoul",
+            source_provider="nutrition-interaction-transition",
+            source_device=None,
+            source_record_id=f"{interaction_id}:{revision}",
+            capture_method="system",
+            quality_flags=None,
+            confidence=None,
+            sensitivity="wellness",
+            consent_scope="personal",
+            retention_policy_id=None,
+            expires_at=None,
+            payload={
+                "interaction_id": str(interaction_id),
+                "revision": revision,
+                "mutation_kind": mutation_kind,
+                "operation_id": str(uuid.uuid4()),
+                "mutation_status": mutation_status,
+            },
+            derived_from={"interaction_id": str(interaction_id)},
+        )
+
+    session.add_all(
+        (
+            transition(1, "outcome", "not_consumed"),
+            transition(2, "review", "confirmed"),
+        )
+    )
+    session.commit()
+
+    with pytest.raises(
+        IntakeInteractionError,
+        match="invalid interaction transition chain",
+    ):
+        intake_service_module.terminal_outcome_status(
+            session,
+            interaction_id,
+        )
+    with pytest.raises(InvalidInteractionTransitionChain):
+        latest_interaction_transitions(
+            session,
+            mutation_kind="review",
+            interaction_ids={interaction_id},
+        )
+
+    for path in (
+        f"/v1/intake-interactions/{interaction_id}",
+        "/v1/intake-interactions",
+    ):
+        response = client.get(path)
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "intake_storage_integrity_error"
+
+    response = client.post(
+        f"/v1/intake-interactions/{interaction_id}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "cancelled",
+            "source": "ios-device",
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "intake_storage_integrity_error"
+
+
+@pytest.mark.parametrize(
+    (
+        "mutation_kind",
+        "write_path",
+        "write_body",
+        "event_type",
+        "operation_prefix",
+        "mutated_status",
+    ),
+    (
+        (
+            "review",
+            "review",
+            {
+                "status": "confirmed",
+                "source": "ios-device",
+                "corrected_items": [],
+            },
+            "nutrition.interaction-review.v1",
+            "intake-review",
+            "rejected",
+        ),
+        (
+            "outcome",
+            "outcomes",
+            {
+                "status": "consumed",
+                "source": "ios-device",
+                "consumed_at": "2026-08-06T12:30:00+09:00",
+            },
+            "nutrition.intake-outcome.v1",
+            "intake-outcome",
+            "not_consumed",
+        ),
+    ),
+)
+def test_transition_status_must_match_result_payload(
+    client,
+    session,
+    mutation_kind,
+    write_path,
+    write_body,
+    event_type,
+    operation_prefix,
+    mutated_status,
+):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            intent=("ask_before_intake" if mutation_kind == "review" else "log_consumed")
+        ),
+    ).json()
+    interaction_id = interaction["interaction_id"]
+    operation_id = str(uuid.uuid4())
+    response = client.post(
+        f"/v1/intake-interactions/{interaction_id}/{write_path}",
+        json={"operation_id": operation_id, **write_body},
+    )
+    assert response.status_code == 201
+    result = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == event_type,
+            WellnessEvent.source_record_id == operation_id,
+        )
+    )
+    marker = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.source_provider == "nutrition-operation",
+            WellnessEvent.source_record_id == f"{operation_prefix}:{operation_id}",
+        )
+    )
+    assert result is not None
+    assert marker is not None
+    result.payload = {
+        **result.payload,
+        "status": mutated_status,
+        "consumed_at": (None if mutation_kind == "outcome" else result.payload.get("consumed_at")),
+    }
+    marker.payload = {
+        **marker.payload,
+        "result_payload_sha256": result_payload_digest(result.payload),
+    }
+    session.commit()
+
+    fetched = client.get(f"/v1/intake-interactions/{interaction_id}")
+
+    assert fetched.status_code == 500
+    assert fetched.json()["error"]["code"] == "intake_storage_integrity_error"
+
+
+@pytest.mark.parametrize("mutation_kind", ("review", "outcome"))
+def test_quarantined_interaction_result_is_not_authoritative(
+    client,
+    session,
+    mutation_kind,
+):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            intent=("ask_before_intake" if mutation_kind == "review" else "log_consumed")
+        ),
+    ).json()
+    interaction_id = interaction["interaction_id"]
+    if mutation_kind == "review":
+        response = client.post(
+            f"/v1/intake-interactions/{interaction_id}/review",
+            json={
+                "operation_id": str(uuid.uuid4()),
+                "status": "confirmed",
+                "source": "ios-device",
+            },
+        )
+        event_type = "nutrition.interaction-review.v1"
+    else:
+        response = client.post(
+            f"/v1/intake-interactions/{interaction_id}/outcomes",
+            json={
+                "operation_id": str(uuid.uuid4()),
+                "status": "consumed",
+                "source": "ios-device",
+                "consumed_at": "2026-08-06T12:30:00+09:00",
+            },
+        )
+        event_type = "nutrition.intake-outcome.v1"
+    assert response.status_code == 201
+    result = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == event_type,
+        )
+    )
+    assert result is not None
+    result.quality_flags = {"maintenance_quarantine": "legacy_operation_result_identity_invalid"}
+    session.commit()
+
+    fetched = client.get(f"/v1/intake-interactions/{interaction_id}")
+
+    assert fetched.status_code == 500
+    assert fetched.json()["error"]["code"] == "intake_storage_integrity_error"
+
+
+def test_malformed_stored_interaction_payload_returns_storage_integrity_error(
+    client,
+    session,
+):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(),
+    ).json()
+    event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.interaction.v1",
+            WellnessEvent.source_record_id == interaction["interaction_id"],
+        )
+    )
+    assert event is not None
+    event.payload = {**event.payload, "items": "malformed"}
+    session.commit()
+
+    fetched = client.get(f"/v1/intake-interactions/{interaction['interaction_id']}")
+
+    assert fetched.status_code == 500
+    assert fetched.json()["error"]["code"] == "intake_storage_integrity_error"
+
+
+@pytest.mark.parametrize(
+    (
+        "operation_kind",
+        "operation_prefix",
+        "event_type",
+        "source_provider",
+        "operation_id_field",
+    ),
+    (
+        (
+            "intake_interaction_review",
+            "intake-review",
+            "nutrition.interaction-review.v1",
+            "nutrition-intake-review",
+            "review_id",
+        ),
+        (
+            "intake_outcome",
+            "intake-outcome",
+            "nutrition.intake-outcome.v1",
+            "nutrition-intake-outcome",
+            "outcome_id",
+        ),
+        (
+            "intake_decision_request",
+            "intake-decision-request",
+            "nutrition.decision-request.v1",
+            "nutrition-decision-request",
+            "request_id",
+        ),
+        (
+            "intake_decision",
+            "intake-decision",
+            "nutrition.decision.v1",
+            "nutrition-decision",
+            "decision_id",
+        ),
+    ),
+)
+@pytest.mark.parametrize("corruption", ("payload_identity", "quarantine"))
+def test_completed_operation_retry_rejects_invalid_result_identity(
+    session,
+    operation_kind,
+    operation_prefix,
+    event_type,
+    source_provider,
+    operation_id_field,
+    corruption,
+):
+    operation_id = uuid.uuid4()
+    fingerprint = operation_fingerprint({"fixture": operation_kind})
+    recorded_at = datetime.now(UTC)
+    event = WellnessEvent(
+        event_type=event_type,
+        schema_version=1,
+        observed_at=recorded_at,
+        recorded_at=recorded_at,
+        timezone="Asia/Seoul",
+        source_provider=source_provider,
+        source_device="legacy-fixture",
+        source_record_id=str(operation_id),
+        capture_method="manual",
+        quality_flags=(
+            {"maintenance_quarantine": "legacy_operation_result_identity_invalid"}
+            if corruption == "quarantine"
+            else None
+        ),
+        confidence=1.0,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=None,
+        expires_at=recorded_at + timedelta(days=1),
+        payload={
+            operation_id_field: str(
+                uuid.uuid4() if corruption == "payload_identity" else operation_id
+            ),
+            "operation_fingerprint": fingerprint,
+        },
+        derived_from=None,
+    )
+    session.add(event)
+    session.commit()
+
+    with pytest.raises(
+        intake_service_module.IntakeOperationConflict,
+        match="identity is invalid",
+    ):
+        intake_service_module._existing_completed_operation_result(
+            session,
+            operation_id=operation_id,
+            operation_fingerprint=fingerprint,
+            operation_kind=operation_kind,
+            operation_name=operation_kind,
+            operation_prefix=operation_prefix,
+            result_event_type=event_type,
+            result_source_provider=source_provider,
+        )
+
+
+def test_completed_operation_retry_rejects_processing_marker(
+    session,
+):
+    operation_id = uuid.uuid4()
+    fingerprint = operation_fingerprint({"fixture": "processing-marker"})
+    recorded_at = datetime.now(UTC)
+    result = WellnessEvent(
+        event_type="nutrition.decision.v1",
+        schema_version=1,
+        observed_at=recorded_at,
+        recorded_at=recorded_at,
+        timezone=None,
+        source_provider="nutrition-decision",
+        source_device="legacy-fixture",
+        source_record_id=str(operation_id),
+        capture_method="agent",
+        quality_flags=None,
+        confidence=None,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=None,
+        expires_at=recorded_at + timedelta(days=1),
+        payload={
+            "decision_id": str(operation_id),
+            "operation_fingerprint": fingerprint,
+        },
+        derived_from=None,
+    )
+    marker = WellnessEvent(
+        event_type="nutrition.operation.v1",
+        schema_version=1,
+        observed_at=recorded_at,
+        recorded_at=recorded_at,
+        timezone=None,
+        source_provider="nutrition-operation",
+        source_device=None,
+        source_record_id=f"intake-decision:{operation_id}",
+        capture_method="system",
+        quality_flags=None,
+        confidence=None,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=None,
+        expires_at=None,
+        payload={
+            "operation_kind": "intake_decision",
+            "operation_id": str(operation_id),
+            "operation_fingerprint": fingerprint,
+            "operation_state": "processing",
+        },
+        derived_from=None,
+    )
+    session.add_all((result, marker))
+    session.commit()
+
+    with pytest.raises(
+        intake_service_module.IntakeOperationConflict,
+        match="same operation scope",
+    ):
+        intake_service_module._existing_completed_operation_result(
+            session,
+            operation_id=operation_id,
+            operation_fingerprint=fingerprint,
+            operation_kind="intake_decision",
+            operation_name="intake decision",
+            operation_prefix="intake-decision",
+            result_event_type="nutrition.decision.v1",
+            result_source_provider="nutrition-decision",
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "operation_kind",
+        "operation_prefix",
+        "event_type",
+        "source_provider",
+        "operation_id_field",
+    ),
+    (
+        (
+            "intake_interaction_review",
+            "intake-review",
+            "nutrition.interaction-review.v1",
+            "nutrition-intake-review",
+            "review_id",
+        ),
+        (
+            "intake_outcome",
+            "intake-outcome",
+            "nutrition.intake-outcome.v1",
+            "nutrition-intake-outcome",
+            "outcome_id",
+        ),
+        (
+            "intake_decision_request",
+            "intake-decision-request",
+            "nutrition.decision-request.v1",
+            "nutrition-decision-request",
+            "request_id",
+        ),
+        (
+            "intake_decision",
+            "intake-decision",
+            "nutrition.decision.v1",
+            "nutrition-decision",
+            "decision_id",
+        ),
+    ),
+)
+def test_completed_operation_retry_rejects_result_payload_digest_mismatch(
+    session,
+    operation_kind,
+    operation_prefix,
+    event_type,
+    source_provider,
+    operation_id_field,
+):
+    operation_id = uuid.uuid4()
+    fingerprint = operation_fingerprint({"fixture": operation_kind})
+    recorded_at = datetime.now(UTC)
+    original_payload = {
+        operation_id_field: str(operation_id),
+        "operation_fingerprint": fingerprint,
+        "status": "original",
+    }
+    result = WellnessEvent(
+        event_type=event_type,
+        schema_version=1,
+        observed_at=recorded_at,
+        recorded_at=recorded_at,
+        timezone=None,
+        source_provider=source_provider,
+        source_device="fixture",
+        source_record_id=str(operation_id),
+        capture_method="manual",
+        quality_flags=None,
+        confidence=None,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=None,
+        expires_at=recorded_at + timedelta(days=1),
+        payload={**original_payload, "status": "tampered"},
+        derived_from=None,
+    )
+    marker = WellnessEvent(
+        event_type="nutrition.operation.v1",
+        schema_version=1,
+        observed_at=recorded_at,
+        recorded_at=recorded_at,
+        timezone=None,
+        source_provider="nutrition-operation",
+        source_device=None,
+        source_record_id=f"{operation_prefix}:{operation_id}",
+        capture_method="system",
+        quality_flags=None,
+        confidence=None,
+        sensitivity="wellness",
+        consent_scope="personal",
+        retention_policy_id=None,
+        expires_at=None,
+        payload={
+            "operation_kind": operation_kind,
+            "operation_id": str(operation_id),
+            "operation_fingerprint": fingerprint,
+            "operation_state": "completed",
+            "result_payload_sha256": result_payload_digest(original_payload),
+        },
+        derived_from=None,
+    )
+    session.add_all((result, marker))
+    session.commit()
+
+    with pytest.raises(
+        IntakeStorageIntegrityError,
+        match="result payload digest",
+    ):
+        intake_service_module._existing_completed_operation_result(
+            session,
+            operation_id=operation_id,
+            operation_fingerprint=fingerprint,
+            operation_kind=operation_kind,
+            operation_name=operation_kind,
+            operation_prefix=operation_prefix,
+            result_event_type=event_type,
+            result_source_provider=source_provider,
+        )
+
+
+def test_completed_write_ids_cannot_be_reused_after_results_are_deleted(
+    client,
+    session,
+):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = interaction["interaction_id"]
+
+    review_body = {
+        "operation_id": str(uuid.uuid4()),
+        "status": "confirmed",
+        "source": "ios-device",
+        "corrected_items": [],
+    }
+    review_path = f"/v1/intake-interactions/{interaction_id}/review"
+    assert client.post(review_path, json=review_body).status_code == 201
+    review_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.interaction-review.v1",
+            WellnessEvent.source_record_id == review_body["operation_id"],
+        )
+    )
+    assert review_event is not None
+    session.delete(review_event)
+    session.commit()
+    assert client.post(review_path, json=review_body).status_code == 409
+
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = interaction["interaction_id"]
+    request_body = {
+        "operation_id": str(uuid.uuid4()),
+        "scope": "daily_nutrition",
+        "source": "ios-device",
+    }
+    request_path = f"/v1/intake-interactions/{interaction_id}/decision-requests"
+    requested = client.post(request_path, json=request_body)
+    assert requested.status_code == 201
+    request_id = requested.json()["request_id"]
+    context = client.get(f"/v1/intake-interactions/decision-requests/{request_id}/context").json()
+    decision_body = {
+        "operation_id": str(uuid.uuid4()),
+        "request_id": request_id,
+        "status": "insufficient_data",
+        "source": "healthmes-agent",
+        "summary": "기록 범위가 부족함",
+        "evidence_event_ids": context["evidence_event_ids"],
+    }
+    decision_path = f"/v1/intake-interactions/{interaction_id}/decisions"
+    assert client.post(decision_path, json=decision_body).status_code == 201
+    decision_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.decision.v1",
+            WellnessEvent.source_record_id == decision_body["operation_id"],
+        )
+    )
+    assert decision_event is not None
+    session.delete(decision_event)
+    session.commit()
+    assert client.post(decision_path, json=decision_body).status_code == 409
+
+    request_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.decision-request.v1",
+            WellnessEvent.source_record_id == request_body["operation_id"],
+        )
+    )
+    assert request_event is not None
+    session.delete(request_event)
+    session.commit()
+    assert client.post(request_path, json=request_body).status_code == 409
+
+    outcome_body = {
+        "operation_id": str(uuid.uuid4()),
+        "status": "not_consumed",
+        "source": "ios-device",
+    }
+    outcome_path = f"/v1/intake-interactions/{interaction_id}/outcomes"
+    assert client.post(outcome_path, json=outcome_body).status_code == 201
+    outcome_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.intake-outcome.v1",
+            WellnessEvent.source_record_id == outcome_body["operation_id"],
+        )
+    )
+    assert outcome_event is not None
+    session.delete(outcome_event)
+    session.commit()
+    assert client.post(outcome_path, json=outcome_body).status_code == 409
+
+
+def test_maintenance_backfills_terminal_outcome_before_result_deletion(
+    client,
+    session,
+):
+    interaction = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = interaction["interaction_id"]
+    outcome_body = {
+        "operation_id": str(uuid.uuid4()),
+        "status": "not_consumed",
+        "source": "ios-device",
+    }
+    outcome_path = f"/v1/intake-interactions/{interaction_id}/outcomes"
+    assert client.post(outcome_path, json=outcome_body).status_code == 201
+    marker = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.source_provider == "nutrition-operation",
+            WellnessEvent.source_record_id == f"intake-outcome:{outcome_body['operation_id']}",
+        )
+    )
+    outcome_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.intake-outcome.v1",
+            WellnessEvent.source_record_id == outcome_body["operation_id"],
+        )
+    )
+    transitions = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == "nutrition.interaction-transition.v1",
+                WellnessEvent.payload["interaction_id"].as_string() == interaction_id,
+            )
+        )
+    )
+    assert marker is not None
+    assert outcome_event is not None
+    session.delete(marker)
+    for transition in transitions:
+        session.delete(transition)
+    outcome_event.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    session.commit()
+
+    run_storage_maintenance(
+        session,
+        client.app.state.settings,
+        now=datetime.now(UTC),
+    )
+    session.commit()
+    session.expire_all()
+
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == "nutrition.intake-outcome.v1",
+                WellnessEvent.source_record_id == outcome_body["operation_id"],
+            )
+        )
+        is None
+    )
+    marker = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.source_provider == "nutrition-operation",
+            WellnessEvent.source_record_id == f"intake-outcome:{outcome_body['operation_id']}",
+        )
+    )
+    assert marker is not None
+    assert marker.payload["legacy_backfill"] is True
+    assert set(marker.payload) == {
+        "operation_kind",
+        "operation_id",
+        "operation_fingerprint",
+        "operation_state",
+        "result_payload_sha256",
+        "legacy_backfill",
+    }
+    transition = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == "nutrition.interaction-transition.v1",
+            WellnessEvent.source_provider == "nutrition-interaction-transition",
+            WellnessEvent.payload["interaction_id"].as_string() == interaction_id,
+            WellnessEvent.payload["operation_id"].as_string() == outcome_body["operation_id"],
+        )
+    )
+    assert transition is not None
+    assert transition.payload["mutation_kind"] == "outcome"
+    assert transition.payload["mutation_status"] == "not_consumed"
+    assert transition.payload["legacy_backfill"] is True
+    assert client.post(outcome_path, json=outcome_body).status_code == 409
+
+    review = client.post(
+        f"/v1/intake-interactions/{interaction_id}/review",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "confirmed",
+            "source": "ios-device",
+        },
+    )
+    assert review.status_code == 422
+    caffeine_request = client.post(
+        f"/v1/intake-interactions/{interaction_id}/decision-requests",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "scope": "caffeine_sleep",
+            "source": "ios-device",
+            "intended_consumption_at": "2026-08-08T16:00:00+09:00",
+        },
+    )
+    assert caffeine_request.status_code == 422
 
 
 def test_decision_context_is_immutable_after_new_outcome(client):
@@ -1915,10 +3567,7 @@ def test_decision_context_is_immutable_after_new_outcome(client):
             "source": "ios-device",
         },
     ).json()
-    path = (
-        "/v1/intake-interactions/decision-requests/"
-        f"{requested['request_id']}/context"
-    )
+    path = f"/v1/intake-interactions/decision-requests/{requested['request_id']}/context"
     before = client.get(path).json()
 
     confirmed = client.post(
@@ -1932,6 +3581,170 @@ def test_decision_context_is_immutable_after_new_outcome(client):
     )
     assert confirmed.status_code == 201
     assert client.get(path).json() == before
+
+
+def test_decision_context_snapshots_candidate_transition_versions(client):
+    primary = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="compare_option"),
+    ).json()
+    comparison = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            intent="compare_option",
+            source_text="두 번째 식사 후보",
+        ),
+    ).json()
+    primary_review_id = str(uuid.uuid4())
+    comparison_review_id = str(uuid.uuid4())
+    for interaction_id, review_id in (
+        (primary["interaction_id"], primary_review_id),
+        (comparison["interaction_id"], comparison_review_id),
+    ):
+        reviewed = client.post(
+            f"/v1/intake-interactions/{interaction_id}/review",
+            json={
+                "operation_id": review_id,
+                "status": "confirmed",
+                "source": "ios-device",
+            },
+        )
+        assert reviewed.status_code == 201
+
+    requested = client.post(
+        f"/v1/intake-interactions/{primary['interaction_id']}/decision-requests",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "scope": "compare_options",
+            "source": "ios-device",
+            "compare_interaction_ids": [comparison["interaction_id"]],
+        },
+    )
+    assert requested.status_code == 201
+    context = client.get(
+        f"/v1/intake-interactions/decision-requests/{requested.json()['request_id']}/context"
+    ).json()
+
+    assert context["candidate_version"] == {
+        "interaction_id": primary["interaction_id"],
+        "latest_review_operation_id": primary_review_id,
+        "latest_outcome_operation_id": None,
+    }
+    assert context["comparison_candidate_versions"] == [
+        {
+            "interaction_id": comparison["interaction_id"],
+            "latest_review_operation_id": comparison_review_id,
+            "latest_outcome_operation_id": None,
+        }
+    ]
+
+
+@pytest.mark.parametrize("mutation_kind", ("review", "outcome"))
+def test_decision_rejects_stale_candidate_snapshot(
+    client,
+    mutation_kind,
+):
+    candidate = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="ask_before_intake"),
+    ).json()
+    interaction_id = candidate["interaction_id"]
+    requested = client.post(
+        f"/v1/intake-interactions/{interaction_id}/decision-requests",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "scope": "daily_nutrition",
+            "source": "ios-device",
+        },
+    ).json()
+    context = client.get(
+        f"/v1/intake-interactions/decision-requests/{requested['request_id']}/context"
+    ).json()
+
+    if mutation_kind == "review":
+        mutation = client.post(
+            f"/v1/intake-interactions/{interaction_id}/review",
+            json={
+                "operation_id": str(uuid.uuid4()),
+                "status": "confirmed",
+                "source": "ios-device",
+            },
+        )
+    else:
+        mutation = client.post(
+            f"/v1/intake-interactions/{interaction_id}/outcomes",
+            json={
+                "operation_id": str(uuid.uuid4()),
+                "status": "not_consumed",
+                "source": "ios-device",
+            },
+        )
+    assert mutation.status_code == 201
+
+    decision = client.post(
+        f"/v1/intake-interactions/{interaction_id}/decisions",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "request_id": requested["request_id"],
+            "status": "insufficient_data",
+            "source": "healthmes-agent",
+            "summary": "기록 범위가 부족함",
+            "evidence_event_ids": context["evidence_event_ids"],
+        },
+    )
+
+    assert decision.status_code == 409
+    assert "decision request is stale" in decision.text
+
+
+def test_compare_decision_rejects_stale_comparison_snapshot(client):
+    primary = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(intent="compare_option"),
+    ).json()
+    comparison = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            intent="compare_option",
+            source_text="두 번째 식사 후보",
+        ),
+    ).json()
+    requested = client.post(
+        f"/v1/intake-interactions/{primary['interaction_id']}/decision-requests",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "scope": "compare_options",
+            "source": "ios-device",
+            "compare_interaction_ids": [comparison["interaction_id"]],
+        },
+    ).json()
+    context = client.get(
+        f"/v1/intake-interactions/decision-requests/{requested['request_id']}/context"
+    ).json()
+    reviewed = client.post(
+        f"/v1/intake-interactions/{comparison['interaction_id']}/review",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "confirmed",
+            "source": "ios-device",
+        },
+    )
+    assert reviewed.status_code == 201
+
+    decision = client.post(
+        f"/v1/intake-interactions/{primary['interaction_id']}/decisions",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "request_id": requested["request_id"],
+            "status": "insufficient_data",
+            "source": "healthmes-agent",
+            "summary": "비교 후보가 변경됨",
+            "evidence_event_ids": context["evidence_event_ids"],
+        },
+    )
+
+    assert decision.status_code == 409
+    assert "decision request is stale" in decision.text
 
 
 def test_search_reports_explicit_truncation_and_coverage(client):
@@ -1964,9 +3777,7 @@ def test_search_reports_explicit_truncation_and_coverage(client):
     }
 
 
-def test_expired_raw_capture_cannot_reuse_operation_id(
-    client, session
-):
+def test_expired_raw_capture_cannot_reuse_operation_id(client, session):
     body = _text_interaction()
     created = client.post("/v1/intake-interactions", json=body)
     assert created.status_code == 201
@@ -1993,9 +3804,7 @@ def test_expired_raw_capture_cannot_reuse_operation_id(
     assert client.get(f"/v1/intake-interactions/{interaction_id}").status_code == 404
 
 
-def test_prospective_snapshot_remains_searchable_after_raw_expiry(
-    client, session
-):
+def test_prospective_snapshot_remains_searchable_after_raw_expiry(client, session):
     candidate = client.post(
         "/v1/intake-interactions",
         json=_text_interaction(
@@ -2015,9 +3824,7 @@ def test_prospective_snapshot_remains_searchable_after_raw_expiry(
         "scope": "daily_nutrition",
         "source": "ios-device",
     }
-    request_path = (
-        f"/v1/intake-interactions/{candidate['interaction_id']}/decision-requests"
-    )
+    request_path = f"/v1/intake-interactions/{candidate['interaction_id']}/decision-requests"
     requested = client.post(request_path, json=request_body)
     assert requested.status_code == 201
     raw_event = session.scalar(
@@ -2030,9 +3837,7 @@ def test_prospective_snapshot_remains_searchable_after_raw_expiry(
     session.delete(raw_event)
     session.commit()
 
-    searched = client.get(
-        "/v1/intake-interactions", params={"query": "토마토 수프"}
-    )
+    searched = client.get("/v1/intake-interactions", params={"query": "토마토 수프"})
     assert searched.status_code == 200
     assert searched.json()["count"] == 1
     record = searched.json()["records"][0]
@@ -2045,9 +3850,7 @@ def test_prospective_snapshot_remains_searchable_after_raw_expiry(
     assert retried.json()["request_id"] == requested.json()["request_id"]
 
 
-def test_raw_text_expires_independently_from_structured_interaction(
-    client, session
-):
+def test_raw_text_expires_independently_from_structured_interaction(client, session):
     body = _text_interaction()
     created = client.post("/v1/intake-interactions", json=body)
     assert created.status_code == 201
@@ -2061,12 +3864,15 @@ def test_raw_text_expires_independently_from_structured_interaction(
     session.commit()
 
     assert report.errors == ()
-    assert session.scalar(
-        select(WellnessEvent).where(
-            WellnessEvent.event_type == "nutrition.raw-capture.v1",
-            WellnessEvent.source_record_id == interaction_id,
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == "nutrition.raw-capture.v1",
+                WellnessEvent.source_record_id == interaction_id,
+            )
         )
-    ) is None
+        is None
+    )
     structured = session.scalar(
         select(WellnessEvent).where(
             WellnessEvent.event_type == "nutrition.interaction.v1",
@@ -2081,9 +3887,7 @@ def test_raw_text_expires_independently_from_structured_interaction(
     assert fetched.json()["raw_capture_available"] is False
 
 
-def test_legacy_raw_text_is_migrated_or_removed_by_raw_policy(
-    client, session
-):
+def test_legacy_raw_text_is_migrated_or_removed_by_raw_policy(client, session):
     body = _text_interaction(
         observed_at="2026-08-01T12:30:00+09:00",
     )
@@ -2103,9 +3907,7 @@ def test_legacy_raw_text_is_migrated_or_removed_by_raw_policy(
         )
     )
     raw_policy = session.scalar(
-        select(RetentionPolicy).where(
-            RetentionPolicy.data_class == "nutrition_raw_capture"
-        )
+        select(RetentionPolicy).where(RetentionPolicy.data_class == "nutrition_raw_capture")
     )
     assert structured is not None
     assert raw is not None
@@ -2204,9 +4006,7 @@ def test_legacy_warnings_are_migrated_for_the_remaining_raw_ttl(
     assert structured.payload["items"][0]["warnings"] == []
 
 
-def test_raw_retention_removes_duplicate_structured_evidence(
-    client, session
-):
+def test_raw_retention_removes_duplicate_structured_evidence(client, session):
     owner_text = "95mg은 카페인, 나트륨은 355mg"
     body = _text_interaction(
         observed_at="2026-08-01T12:30:00+09:00",
@@ -2267,9 +4067,7 @@ def test_raw_retention_removes_duplicate_structured_evidence(
     assert nutrient["amount"]["evidence_text"] is None
 
 
-def test_legacy_evidence_only_payload_obeys_raw_retention(
-    client, session
-):
+def test_legacy_evidence_only_payload_obeys_raw_retention(client, session):
     body = _text_interaction(
         observed_at="2026-08-01T12:30:00+09:00",
     )
@@ -2289,21 +4087,15 @@ def test_legacy_evidence_only_payload_obeys_raw_retention(
         )
     )
     raw_policy = session.scalar(
-        select(RetentionPolicy).where(
-            RetentionPolicy.data_class == "nutrition_raw_capture"
-        )
+        select(RetentionPolicy).where(RetentionPolicy.data_class == "nutrition_raw_capture")
     )
     assert structured is not None
     assert raw is not None
     assert raw_policy is not None
     session.delete(raw)
     payload = dict(structured.payload)
-    payload["items"][0]["nutrients"][0]["evidence_text"] = body[
-        "source_text"
-    ]
-    payload["items"][0]["nutrients"][0]["amount"][
-        "evidence_text"
-    ] = body["source_text"]
+    payload["items"][0]["nutrients"][0]["evidence_text"] = body["source_text"]
+    payload["items"][0]["nutrients"][0]["amount"]["evidence_text"] = body["source_text"]
     structured.payload = payload
     raw_policy.retention_days = 1
     session.commit()
@@ -2364,10 +4156,7 @@ def test_expired_structured_interaction_cannot_be_read_or_promoted(
     structured.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     session.commit()
 
-    assert (
-        client.get(f"/v1/intake-interactions/{interaction_id}").status_code
-        == 404
-    )
+    assert client.get(f"/v1/intake-interactions/{interaction_id}").status_code == 404
     searched = client.get("/v1/intake-interactions")
     assert searched.status_code == 200
     assert searched.json()["count"] == 0
@@ -2436,15 +4225,10 @@ def test_expired_snapshots_cannot_restore_an_interaction(client, session):
         event.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     session.commit()
 
-    assert (
-        client.get(f"/v1/intake-interactions/{interaction_id}").status_code
-        == 404
-    )
+    assert client.get(f"/v1/intake-interactions/{interaction_id}").status_code == 404
     assert client.get("/v1/intake-interactions").json()["count"] == 0
     assert (
-        client.get(
-            f"/v1/intake-interactions/decision-requests/{request_id}/context"
-        ).status_code
+        client.get(f"/v1/intake-interactions/decision-requests/{request_id}/context").status_code
         == 404
     )
 
@@ -2456,8 +4240,7 @@ def test_expired_direct_capture_retry_returns_conflict(client, session):
     event = session.scalar(
         select(WellnessEvent).where(
             WellnessEvent.event_type == "nutrition.interaction.v1",
-            WellnessEvent.source_record_id
-            == created.json()["interaction_id"],
+            WellnessEvent.source_record_id == created.json()["interaction_id"],
         )
     )
     assert event is not None
@@ -2490,11 +4273,12 @@ def test_capture_outside_structured_retention_window_is_rejected(
 
     assert created.status_code == 422
     assert "outside the structured retention window" in created.text
-    assert session.scalar(
-        select(WellnessEvent).where(
-            WellnessEvent.event_type == "nutrition.interaction.v1"
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(WellnessEvent.event_type == "nutrition.interaction.v1")
         )
-    ) is None
+        is None
+    )
 
 
 def test_far_future_capture_is_rejected(client):
@@ -2670,23 +4454,29 @@ def test_maintenance_scrubs_legacy_warnings_from_durable_snapshots(
     )
     assert created.status_code == 201
     interaction_id = created.json()["interaction_id"]
-    assert client.post(
-        f"/v1/intake-interactions/{interaction_id}/outcomes",
-        json={
-            "operation_id": str(uuid.uuid4()),
-            "status": "consumed",
-            "source": "test",
-            "consumed_at": "2026-08-06T12:30:00+09:00",
-        },
-    ).status_code == 201
-    assert client.post(
-        f"/v1/intake-interactions/{interaction_id}/decision-requests",
-        json={
-            "operation_id": str(uuid.uuid4()),
-            "scope": "daily_nutrition",
-            "source": "test",
-        },
-    ).status_code == 201
+    assert (
+        client.post(
+            f"/v1/intake-interactions/{interaction_id}/outcomes",
+            json={
+                "operation_id": str(uuid.uuid4()),
+                "status": "consumed",
+                "source": "test",
+                "consumed_at": "2026-08-06T12:30:00+09:00",
+            },
+        ).status_code
+        == 201
+    )
+    assert (
+        client.post(
+            f"/v1/intake-interactions/{interaction_id}/decision-requests",
+            json={
+                "operation_id": str(uuid.uuid4()),
+                "scope": "daily_nutrition",
+                "source": "test",
+            },
+        ).status_code
+        == 201
+    )
     durable_events = list(
         session.scalars(
             select(WellnessEvent).where(
@@ -2699,6 +4489,21 @@ def test_maintenance_scrubs_legacy_warnings_from_durable_snapshots(
             )
         )
     )
+    marker_ids = {
+        (
+            f"intake-outcome:{event.payload['outcome_id']}"
+            if event.event_type == "nutrition.intake-outcome.v1"
+            else f"intake-decision-request:{event.payload['request_id']}"
+        )
+        for event in durable_events
+    }
+    for marker in session.scalars(
+        select(WellnessEvent).where(
+            WellnessEvent.source_provider == "nutrition-operation",
+            WellnessEvent.source_record_id.in_(marker_ids),
+        )
+    ):
+        session.delete(marker)
     for event in durable_events:
         payload = dict(event.payload)
         payload["warnings"] = [secret]

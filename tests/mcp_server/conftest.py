@@ -22,10 +22,12 @@ from healthmes.config import Settings
 from healthmes.mcp_server import server as server_module
 from healthmes.mcp_server.ow_client import OWClient
 from healthmes.store import Base, create_db_engine
+from healthmes.trusted_session import issue_trusted_session_proof
 
 USER_ID = "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e"
 API_KEY = "test-ow-api-key"
 OW_BASE_URL = "http://open-wearables.test"
+OWNER_PROOF_SECRET = "test-calendar-adjustment-secret-32-characters"
 
 # Every mcp_env test runs pinned to a fixed non-UTC timezone (KST, UTC+9) so
 # the local-tz joins of the tranche-2 tools are deterministic on any machine
@@ -350,11 +352,88 @@ def call_tool():
     """
 
     async def call(client: Client, name: str, arguments: dict | None = None) -> dict:
-        result = await client.call_tool(name, arguments or {})
+        auto_confirm = bool(getattr(arguments, "_auto_confirm_nutrition", False))
+        result = await client.call_tool(name, dict(arguments or {}))
         data = result.data if isinstance(result.data, dict) else result.structured_content
         assert isinstance(data, dict), f"tool {name} returned non-dict: {result!r}"
+        if auto_confirm:
+            assert data.get("status") == "confirmation_required"
+            handle = data.get("reply_handle")
+            assert isinstance(handle, str) and handle
+            reply_arguments = {
+                "response": f"확인 {handle}",
+                "reply_handle": handle,
+            }
+            proof = issue_trusted_session_proof(
+                OWNER_PROOF_SECRET,
+                tool_name="resolve_nutrition_confirmation",
+                arguments=reply_arguments,
+                platform="telegram",
+                chat_id="owner-chat",
+                user_id="owner-user",
+                message_id=str(uuid.uuid4()),
+            )
+            resolved = await client.call_tool(
+                "resolve_nutrition_confirmation",
+                {
+                    **reply_arguments,
+                    "trusted_session_proof": proof,
+                },
+            )
+            data = resolved.data if isinstance(resolved.data, dict) else resolved.structured_content
+            assert isinstance(data, dict), f"nutrition resolver returned non-dict: {resolved!r}"
         # Belt and braces: results must be JSON-serializable (MCP wire format).
         json.dumps(data)
         return data
 
     return call
+
+
+@pytest.fixture
+def resolve_nutrition_confirmation(call_tool):
+    """Resolve a staged nutrition action with the exact Hermes owner reply."""
+
+    async def resolve(
+        client: Client,
+        staged: dict,
+        *,
+        choice: str = "확인",
+    ) -> dict:
+        handle = staged.get("reply_handle")
+        assert staged.get("status") == "confirmation_required"
+        assert isinstance(handle, str) and handle
+        arguments = {
+            "response": f"{choice} {handle}",
+            "reply_handle": handle,
+        }
+        proof = issue_trusted_session_proof(
+            OWNER_PROOF_SECRET,
+            tool_name="resolve_nutrition_confirmation",
+            arguments=arguments,
+            platform="telegram",
+            chat_id="owner-chat",
+            user_id="owner-user",
+            message_id=str(uuid.uuid4()),
+        )
+        return await call_tool(
+            client,
+            "resolve_nutrition_confirmation",
+            {**arguments, "trusted_session_proof": proof},
+        )
+
+    return resolve
+
+
+@pytest.fixture
+def confirm_nutrition_action(call_tool, resolve_nutrition_confirmation):
+    """Stage a nutrition mutation and return its confirmed durable result."""
+
+    async def confirm(client: Client, name: str, arguments: dict) -> dict:
+        staged = await call_tool(client, name, arguments)
+        if staged.get("status") == "already_resolved":
+            result = staged.get("result")
+            assert isinstance(result, dict)
+            return result
+        return await resolve_nutrition_confirmation(client, staged)
+
+    return confirm

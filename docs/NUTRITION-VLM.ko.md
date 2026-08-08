@@ -1,6 +1,6 @@
 # HealthMes 영양 사진 관찰과 VLM Provider
 
-기준일: 2026-08-06
+기준일: 2026-08-08
 
 ## 기능 경계
 
@@ -101,7 +101,7 @@ MCP가 확인된 카페인 데이터만 의사결정 기능에 제공
 
 ## Provider와 기본 모델
 
-| Provider | 2026-08-06 기본 모델 | API 방식 |
+| Provider | 2026-08-08 기본 모델 | API 방식 |
 |---|---|---|
 | Ollama | `qwen3-vl:4b-instruct` | 로컬 `/api/chat` |
 | OpenAI | `gpt-5.6-sol` | Responses API + Structured Outputs |

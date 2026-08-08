@@ -88,20 +88,31 @@ Telegram (phone + watch)          decision viewer (web)
   the versioned `NutritionObservation` contract by local Ollama (default) or an
   explicitly authorized OpenAI, Gemini, Anthropic, or xAI provider. The
   structured payload is stored intact as a `WellnessEvent`; photo, observation,
-  and confirmation each have independent retention. The current bounded slice
-  extracts caffeine evidence only, not full nutrition. A device-neutral intake
-  engine wraps photo observations and accepts exact text entries or locally
-  produced voice transcripts without treating any capture as consumed. REST
-  and MCP adapters preserve intent, explicit consumption outcomes, reusable
-  nutrient facts, prospective decision requests, evidence references, and
-  agent decisions. Raw text/transcripts/media remain short-lived while durable
-  outcomes and decision requests retain sanitized structured snapshots. Writes
-  use caller-owned idempotency UUIDs plus permanent non-content tombstones that
-  prevent reuse after raw expiry, and decision context is immutable after
-  request creation. Automatic text nutrition extraction and server-side voice
-  transcription are not implemented. The original caffeine tools still return
-  a daily total only after every item and the complete local day are explicitly
-  confirmed; generic caffeine decisions cannot emit actionable proposals.
+  and confirmation each have independent retention. The observation contract
+  extracts serving, core nutrition, caffeine, and additional nutrients. A
+  device-neutral intake engine automatically analyzes free text and locally
+  transcribed voice, wraps photo observations, and never treats capture as
+  consumption. REST and MCP adapters preserve intent, explicit consumption
+  outcomes, modality-neutral nutrient review, reusable facts, prospective
+  decision requests, evidence references, and agent decisions. Raw
+  text/transcripts/media remain short-lived while durable outcomes and
+  decision requests retain sanitized structured snapshots. Photo analysis is
+  idempotent by media identity and request fingerprint; mutation writes use
+  caller-owned, operation-kind-scoped UUIDs plus permanent technical
+  non-content markers that normally retain only kind, UUID, request
+  fingerprint, and completion state. Malformed or source/payload-inconsistent
+  legacy results and markers are explicitly quarantined and excluded from
+  authoritative reads. Quarantine does not extend retention: expired health
+  payloads are deleted after a permanent invalidated non-content operation
+  marker is created when the canonical source identity is recoverable.
+  Separate wellness transition revisions preserve
+  review/outcome ordering and terminal candidate state independently from
+  result retention. Decision context is immutable after request creation, but
+  a later review or outcome makes the old caffeine request non-actionable. The
+  specialized caffeine route combines a confirmed prospective one-time amount
+  with the server-owned complete daily ledger; VLM/agent estimates fail closed
+  until owner review. Its final candidate and ledger checks share one locked
+  transaction. The original exact-calendar-event route remains available.
 - Decision viewer: every proactive decision is a `decision_record` tree
   rendered as a Mermaid flowchart at `/decisions/{id}` (vendored Mermaid,
   no CDN), with a paginated index at `/decisions`.
@@ -111,8 +122,10 @@ Telegram (phone + watch)          decision viewer (web)
 - Android usage collector ([`apps/android-usage/`](apps/android-usage/)):
   minimal Kotlin companion app (pairing + toggle) that buckets
   `UsageStatsManager` events hourly and uploads to
-  `POST /v1/app-usage/batch` every 30 minutes. iOS is deliberately skipped
-  (OS sandbox); the engine renormalizes without the signal.
+  `POST /v1/app-usage/batch` every 30 minutes. This is the current partial
+  implementation; canonical multi-device storage, desktop ActivityWatch/native
+  collectors, and the region-gated iOS path are specified in
+  [`docs/ACTIVITY-TELEMETRY-ARCHITECTURE.ko.md`](docs/ACTIVITY-TELEMETRY-ARCHITECTURE.ko.md).
 
 **Medical-lite & backups (Phase 3)**
 - Capture via Telegram (no new app): the `healthmes-capture` skill routes

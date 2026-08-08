@@ -145,3 +145,12 @@ mcp_servers:
           choices:
             - 적용
             - 그대로
+        resolve_nutrition_confirmation:
+          handle_argument: reply_handle
+          passthrough_argument: response
+          bind_arguments:
+            - response
+            - reply_handle
+          choices:
+            - 확인
+            - 취소

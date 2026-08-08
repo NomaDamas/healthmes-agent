@@ -9,6 +9,8 @@ from healthmes.storage.service import (
     index_raw_ingest,
     measure_usage,
     register_storage_object,
+    retention_policies_for_write,
+    retention_policy_for_write,
     run_storage_maintenance,
     update_retention_policy,
 )
@@ -22,6 +24,8 @@ __all__ = [
     "index_raw_ingest",
     "measure_usage",
     "register_storage_object",
+    "retention_policies_for_write",
+    "retention_policy_for_write",
     "run_storage_maintenance",
     "update_retention_policy",
 ]
