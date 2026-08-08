@@ -136,7 +136,7 @@ def _point_value(point: dict[str, Any]) -> Any | None:
     """
     for key in ("qty", "Avg", "avg"):
         value = point.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, int | float) and not isinstance(value, bool):
             try:
                 if math.isfinite(value):
                     return value

@@ -18,17 +18,23 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from alembic.config import Config as AlembicConfig
-from alembic.script import ScriptDirectory
 from sqlalchemy.orm import sessionmaker
 
+from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from healthmes.backup import (
     BackupProvider,
     DataLocations,
     LocalDirectoryProvider,
     WrongPassphraseError,
 )
-from healthmes.store import Base, Task, TriggerEvent, create_db_engine, session_scope
+from healthmes.store import (
+    Base,
+    Task,
+    TriggerEvent,
+    create_db_engine,
+    session_scope,
+)
 
 # Test modules cannot import from conftest under --import-mode=importlib;
 # the seeded_store fixture (a SeededStore dataclass) comes from conftest.py.
