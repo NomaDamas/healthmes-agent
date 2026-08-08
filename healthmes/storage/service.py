@@ -15,7 +15,6 @@ from sqlalchemy.orm import Session
 
 from healthmes.config import Settings
 from healthmes.store import (
-    FoodLog,
     MedicalRecord,
     PurgeJob,
     RawIngestEvent,
@@ -414,6 +413,14 @@ def _migrate_legacy_nutrition_raw_captures(
             )
         )
     )
+    linked_raw_object_ids = set(
+        session.scalars(
+            select(WellnessEvent.raw_object_id).where(
+                WellnessEvent.event_type == "nutrition.raw-capture.v1",
+                WellnessEvent.raw_object_id.is_not(None),
+            )
+        )
+    )
     legacy_events = session.scalars(
         select(WellnessEvent).where(
             WellnessEvent.source_provider == "nutrition-interaction"
@@ -462,7 +469,9 @@ def _migrate_legacy_nutrition_raw_captures(
                         StorageObject.relative_path == media_path
                     )
                 )
-                raw_object_id = obj.id if obj is not None else None
+                if obj is not None and obj.id not in linked_raw_object_ids:
+                    raw_object_id = obj.id
+                    linked_raw_object_ids.add(obj.id)
             session.add(
                 WellnessEvent(
                     event_type="nutrition.raw-capture.v1",
@@ -625,11 +634,6 @@ def run_storage_maintenance(
             if path.exists():
                 path.unlink()
             if obj.data_class in {"media", "nutrition_media"}:
-                food_rows = session.scalars(
-                    select(FoodLog).where(FoodLog.media_path == obj.relative_path)
-                )
-                for row in food_rows:
-                    row.media_path = None
                 medical_rows = session.scalars(
                     select(MedicalRecord).where(
                         MedicalRecord.media_path == obj.relative_path

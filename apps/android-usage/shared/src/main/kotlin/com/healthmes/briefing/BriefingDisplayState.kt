@@ -78,7 +78,8 @@ data class BriefingDisplayState(
          * Parses the ISO-8601 instants the server emits. Pydantic serializes
          * aware UTC datetimes with a `Z` suffix and any explicit offset
          * (`+00:00`) is accepted too — but store-backed endpoints (schedule
-         * proposals, food logs) serialize sqlite's NAIVE datetimes verbatim:
+         * proposals, intake interactions) serialize sqlite's NAIVE datetimes
+         * verbatim:
          * `2026-07-11T14:51:20.497821`, no zone designator. Every persisted
          * datetime in the healthmes store is UTC by contract, so naive parses
          * as UTC (same rule as the iOS client's `parseNaiveUTC` — found live:

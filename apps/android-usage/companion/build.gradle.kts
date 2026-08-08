@@ -13,7 +13,9 @@ plugins {
 // decision viewer (Custom Tabs, WebView fallback), camera/voice capture into
 // POST /v1/media + food/medical creates, real §8.5 notification actions
 // against the schedule-proposal endpoints, and an ongoing focus-block
-// notification. Still local-first: talks only to the paired HealthMes
+// notification. Nutrition capture uses explicit observation review and
+// outcome contracts rather than the legacy food-log create. Still
+// local-first: talks only to the paired HealthMes
 // instance; the Glance widget + 15-minute ETag-honoring refresh stay as
 // before.
 android {

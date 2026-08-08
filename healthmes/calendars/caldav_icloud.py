@@ -16,16 +16,19 @@ Credentials are runtime-only: the ``caldav`` client is only constructed in
 :meth:`CalDavCalendarBackend.connect`; the backend itself wraps an injected
 calendar collection object, so tests use fakes without any network.
 
-v1 scope note: recurring events are mirrored as their master VEVENT only
-(no expansion, recurrence exceptions collapse onto the master UID).
+Recurring resources keep the master VEVENT and detached ``RECURRENCE-ID``
+exceptions as separate mirror records. Rules are not expanded into generated
+occurrences.
 """
 
 import hashlib
 import logging
 import uuid
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Any
+from urllib.parse import quote
 
 import icalendar
 
@@ -95,8 +98,15 @@ class CalDavCalendarBackend:
 
     source = CalendarSource.CALDAV
 
-    def __init__(self, calendar: Any) -> None:
+    def __init__(
+        self,
+        calendar: Any,
+        owner_email: str | None = None,
+        local_timezone: tzinfo = UTC,
+    ) -> None:
         self._calendar = calendar
+        self._owner_email = _normalize_calendar_address(owner_email)
+        self._local_timezone = local_timezone
 
     @classmethod
     def connect(
@@ -106,12 +116,14 @@ class CalDavCalendarBackend:
         app_password: str,
         url: str = ICLOUD_CALDAV_URL,
         calendar_name: str | None = None,
+        local_timezone: tzinfo = UTC,
     ) -> "CalDavCalendarBackend":
         """Open a CalDAV session (iCloud: Apple ID + app-specific password).
 
-        Picks the named calendar when ``calendar_name`` is given, else the
-        principal's first calendar. Runtime-only: this is the single place
-        credentials are used.
+        Picks the named calendar when ``calendar_name`` is given. An unnamed
+        calendar is accepted only when the principal exposes exactly one
+        collection; choosing an arbitrary first calendar could write HealthMes
+        blocks into the wrong account calendar.
         """
         import caldav
 
@@ -119,7 +131,11 @@ class CalDavCalendarBackend:
         principal = client.principal()
         if calendar_name:
             try:
-                return cls(principal.calendar(name=calendar_name))
+                return cls(
+                    principal.calendar(name=calendar_name),
+                    owner_email=username,
+                    local_timezone=local_timezone,
+                )
             except Exception as exc:  # noqa: BLE001 - library raises broad errors
                 raise CalendarError(
                     f"caldav calendar {calendar_name!r} not found at {url}"
@@ -127,7 +143,16 @@ class CalDavCalendarBackend:
         calendars = principal.calendars()
         if not calendars:
             raise CalendarError(f"no caldav calendars available at {url}")
-        return cls(calendars[0])
+        if len(calendars) > 1:
+            raise CalendarError(
+                "multiple caldav calendars are available; set "
+                "HEALTHMES_CALDAV_CALENDAR_NAME explicitly"
+            )
+        return cls(
+            calendars[0],
+            owner_email=username,
+            local_timezone=local_timezone,
+        )
 
     # -- change feed -----------------------------------------------------
 
@@ -148,13 +173,10 @@ class CalDavCalendarBackend:
         changed: list[ExternalEvent] = []
         fingerprints: dict[str, str] = {}
         for obj in self._calendar.events():
-            parsed = self._event_from_object(obj)
-            if parsed is None:
-                continue
-            event, fingerprint = parsed
-            fingerprints[event.external_id] = fingerprint
-            if previous_fingerprints.get(event.external_id) != fingerprint:
-                changed.append(event)
+            for event, fingerprint in self._events_from_object(obj):
+                fingerprints[event.external_id] = fingerprint
+                if previous_fingerprints.get(event.external_id) != fingerprint:
+                    changed.append(event)
 
         deletions = [
             ExternalEvent(external_id=uid, deleted=True)
@@ -206,11 +228,12 @@ class CalDavCalendarBackend:
         calendar.add("prodid", "-//HealthMes Agent//healthmes//EN")
         calendar.add("version", "2.0")
         calendar.add_component(component)
+        ical = calendar.to_ical().decode("utf-8")
         try:
-            self._calendar.add_event(
-                ical=calendar.to_ical().decode("utf-8"),
-                no_overwrite=draft.identity is not None,
-            )
+            if draft.identity is not None:
+                _conditional_create(self._calendar, external_id, ical)
+            else:
+                self._calendar.add_event(ical=ical)
         except Exception as exc:  # noqa: BLE001 - caldav exposes broad DAV errors
             if draft.identity is None:
                 raise
@@ -222,17 +245,23 @@ class CalDavCalendarBackend:
                 "caldav identity key already exists or create conflicted"
             ) from exc
 
-        return ExternalEvent(
-            external_id=external_id,
-            summary=draft.summary,
-            description=draft.description,
-            start_at=draft.start_at,
-            end_at=draft.end_at,
-            is_agent_created=True,
-            agent_task_id=draft.agent_task_id,
-            identity=draft.identity,
-            healthmes_kind=draft.identity.kind if draft.identity is not None else None,
-        )
+        event = self.read_event(external_id)
+        if event.etag is None:
+            raise CalendarError(
+                "caldav create read-back returned no server ETag"
+            )
+        if (
+            event.external_id != external_id
+            or not event.is_agent_created
+            or event.summary != draft.summary
+            or event.start_at != ensure_utc(draft.start_at)
+            or event.end_at != ensure_utc(draft.end_at)
+            or event.identity != draft.identity
+        ):
+            raise CalendarConflictError(
+                "caldav create read-back did not preserve the submitted event"
+            )
+        return event
 
     def update_event(
         self,
@@ -345,11 +374,22 @@ class CalDavCalendarBackend:
             return None
 
         uid = str(component.get("UID"))
-        start_at = _component_datetime(component, "DTSTART")
+        status_value = component.get("STATUS")
+        if (
+            status_value is not None
+            and str(status_value).strip().lower() == "cancelled"
+        ):
+            return ExternalEvent(external_id=uid, deleted=True), _fingerprint(
+                obj, component
+            )
+
+        start_at = _component_datetime(
+            component, "DTSTART", self._local_timezone
+        )
         if start_at is None:
             logger.warning("skipping caldav VEVENT %s without DTSTART", uid)
             return None
-        end_at = _component_datetime(component, "DTEND")
+        end_at = _component_datetime(component, "DTEND", self._local_timezone)
         if end_at is None:
             duration = component.get("DURATION")
             if duration is not None:
@@ -360,11 +400,27 @@ class CalDavCalendarBackend:
                 is_all_day = isinstance(dtstart_value, date) and not isinstance(
                     dtstart_value, datetime
                 )
-                end_at = start_at + (timedelta(days=1) if is_all_day else timedelta())
+                if is_all_day:
+                    end_at = datetime.combine(
+                        dtstart_value + timedelta(days=1),
+                        time.min,
+                        tzinfo=self._local_timezone,
+                    ).astimezone(UTC)
+                else:
+                    end_at = start_at
 
         summary_value = component.get("SUMMARY")
         description_value = component.get("DESCRIPTION")
         is_agent = str(component.get(ICAL_AGENT_PROPERTY, "")).strip() == AGENT_TAG_VALUE
+        organizer = _calendar_address(component.get("ORGANIZER"))
+        attendees = component.get("ATTENDEE")
+        has_attendees = bool(attendees)
+        if attendees is not None and not isinstance(attendees, list):
+            has_attendees = True
+        dtstart_value = component.get("DTSTART").dt
+        is_all_day = isinstance(dtstart_value, date) and not isinstance(
+            dtstart_value, datetime
+        )
         event = ExternalEvent(
             external_id=uid,
             summary=str(summary_value) if summary_value is not None else None,
@@ -384,14 +440,87 @@ class CalDavCalendarBackend:
                 component.get(ICAL_EVENT_KIND_PROPERTY)
             ),
             etag=_object_etag(obj),
+            organizer_self=(
+                organizer is None
+                or self._owner_email is None
+                or organizer == self._owner_email
+            ),
+            has_attendees=has_attendees,
+            is_recurring=any(
+                component.get(name) is not None
+                for name in ("RRULE", "RDATE", "RECURRENCE-ID")
+            ),
+            event_type="default",
+            is_all_day=is_all_day,
+            status=(
+                str(status_value).lower()
+                if status_value is not None
+                else None
+            ),
         )
         return event, _fingerprint(obj, component)
+
+    def _events_from_object(self, obj: Any) -> list[tuple[ExternalEvent, str]]:
+        try:
+            calendar = obj.icalendar_instance
+            components = list(calendar.walk("VEVENT"))
+        except Exception:  # noqa: BLE001
+            parsed = self._event_from_object(obj)
+            return [parsed] if parsed is not None else []
+        results: list[tuple[ExternalEvent, str]] = []
+        for component in components:
+            parsed = self._event_from_component(obj, component)
+            if parsed is not None:
+                results.append(parsed)
+        return results
+
+    def _event_from_component(
+        self, obj: Any, component: Any
+    ) -> tuple[ExternalEvent, str] | None:
+        parsed = self._event_from_object(
+            SimpleNamespace(
+                icalendar_component=component,
+                props=getattr(obj, "props", None),
+                url=getattr(obj, "url", None),
+            )
+        )
+        if parsed is None:
+            return None
+        event, _ = parsed
+        recurrence_id = component.get("RECURRENCE-ID")
+        if recurrence_id is None:
+            return event, _component_fingerprint(obj, component)
+        recurrence_key = _recurrence_key(recurrence_id.dt, self._local_timezone)
+        event = ExternalEvent(
+            **{
+                field: getattr(event, field)
+                for field in ExternalEvent.__dataclass_fields__
+                if field != "external_id"
+            },
+            external_id=f"{event.external_id}::recurrence::{recurrence_key}",
+        )
+        return event, _component_fingerprint(obj, component)
 
 
 def _replace_property(component: Any, name: str, value: Any) -> None:
     """Replace an iCalendar property, letting ``add`` re-encode the value."""
     component.pop(name.upper(), None)
     component.add(name, value)
+
+
+def _normalize_calendar_address(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized.startswith("mailto:"):
+        normalized = normalized[len("mailto:") :]
+    return normalized or None
+
+
+def _calendar_address(value: object) -> str | None:
+    if value is None:
+        return None
+    return _normalize_calendar_address(str(value))
 
 
 def _object_etag(obj: Any) -> str | None:
@@ -420,6 +549,34 @@ def _conditional_delete(obj: Any, expected_etag: str) -> bool:
     return True
 
 
+def _conditional_create(calendar: Any, external_id: str, ical: str) -> None:
+    test_double = getattr(calendar, "conditional_create", None)
+    if callable(test_double):
+        test_double(external_id, ical)
+        return
+    client = getattr(calendar, "client", None)
+    url = getattr(calendar, "url", None)
+    if client is None or url is None or not hasattr(client, "request"):
+        raise CalendarError(
+            "caldav backend cannot guarantee an atomic conditional create"
+        )
+    resource_url = url.join(f"{quote(external_id, safe='')}.ics")
+    response = client.request(
+        str(resource_url),
+        method="PUT",
+        body=ical,
+        headers={
+            "If-None-Match": "*",
+            "Content-Type": "text/calendar; charset=utf-8",
+        },
+    )
+    status = getattr(response, "status", None)
+    if status == 412:
+        raise CalendarConflictError("caldav identity key already exists")
+    if status not in (200, 201, 204):
+        raise CalendarError("caldav conditional create failed")
+
+
 def _is_precondition_failure(exc: BaseException) -> bool:
     status = getattr(exc, "status_code", None)
     if status == 412:
@@ -436,11 +593,20 @@ def _fingerprint(obj: Any, component: Any) -> str:
     return hashlib.sha256(component.to_ical()).hexdigest()
 
 
-def _component_datetime(component: Any, name: str) -> datetime | None:
+def _component_fingerprint(obj: Any, component: Any) -> str:
+    etag = _object_etag(obj) or ""
+    digest = hashlib.sha256(component.to_ical()).hexdigest()
+    return f"{etag}:{digest}"
+
+
+def _component_datetime(
+    component: Any, name: str, local_timezone: tzinfo = UTC
+) -> datetime | None:
     """Read DTSTART/DTEND as an aware UTC datetime.
 
-    All-day dates map to midnight UTC and iCalendar "floating" times are
-    treated as UTC (documented convention, mirrors the Google backend).
+    All-day dates map from midnight in the configured local timezone to UTC.
+    iCalendar "floating" times are treated as UTC (documented convention,
+    mirrors the Google backend).
     """
     prop = component.get(name)
     if prop is None:
@@ -449,5 +615,11 @@ def _component_datetime(component: Any, name: str) -> datetime | None:
     if isinstance(value, datetime):
         return coerce_utc(value)
     if isinstance(value, date):
-        return datetime.combine(value, time.min, tzinfo=UTC)
+        return datetime.combine(value, time.min, tzinfo=local_timezone).astimezone(UTC)
     return None
+
+
+def _recurrence_key(value: date | datetime, local_timezone: tzinfo) -> str:
+    if isinstance(value, datetime):
+        return coerce_utc(value).isoformat()
+    return datetime.combine(value, time.min, tzinfo=local_timezone).isoformat()

@@ -28,7 +28,13 @@ from healthmes.backup import (
     LocalDirectoryProvider,
     WrongPassphraseError,
 )
-from healthmes.store import Base, Task, TriggerEvent, create_db_engine, session_scope
+from healthmes.store import (
+    Base,
+    Task,
+    TriggerEvent,
+    create_db_engine,
+    session_scope,
+)
 
 # Test modules cannot import from conftest under --import-mode=importlib;
 # the seeded_store fixture (a SeededStore dataclass) comes from conftest.py.

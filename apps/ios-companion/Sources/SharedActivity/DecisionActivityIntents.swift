@@ -65,14 +65,17 @@
                 return
             }
 
+            await update(proposalID: proposalID, status: .applying, shouldEnd: false)
+
             do {
                 let api = HealthMesAPI()
                 let pending = try await api.getProposal(id)
                 guard pending.isActionable else {
+                    let status = activityStatus(forExisting: pending)
                     await update(
                         proposalID: proposalID,
-                        status: activityStatus(for: pending.status) ?? .failed,
-                        shouldEnd: activityStatus(for: pending.status) != nil
+                        status: status,
+                        shouldEnd: true
                     )
                     return
                 }
@@ -81,36 +84,64 @@
                     action: action,
                     surface: "ios_live_activity"
                 )
-                let status: DecisionActivityStatus =
-                    resolved.status == .accepted ? .accepted : .declined
+                let status = activityStatus(forResolved: resolved.status)
                 await update(proposalID: proposalID, status: status, shouldEnd: true)
             } catch let error as HealthMesAPIError where error.isAlreadyResolved {
                 let status =
-                    error.alreadyResolvedStatus.flatMap(activityStatus(for:)) ?? .failed
+                    error.alreadyResolvedStatus.flatMap(activityStatus(forExisting:))
+                    ?? .expired
                 await update(
                     proposalID: proposalID,
                     status: status,
-                    shouldEnd: status != .failed
+                    shouldEnd: true
                 )
+            } catch let error as HealthMesAPIError where error.isProposalExpired {
+                await update(proposalID: proposalID, status: .expired, shouldEnd: true)
             } catch {
                 await update(proposalID: proposalID, status: .failed, shouldEnd: false)
             }
         }
 
-        private static func activityStatus(for status: ProposalStatus) -> DecisionActivityStatus? {
+        private static func activityStatus(
+            forExisting proposal: ProposalItem
+        ) -> DecisionActivityStatus {
+            if proposal.status == .proposed {
+                return .expired
+            }
+            return activityStatus(forExisting: proposal.status.rawValue) ?? .expired
+        }
+
+        private static func activityStatus(
+            forExisting rawStatus: String
+        ) -> DecisionActivityStatus? {
+            guard let status = ProposalStatus(rawValue: rawStatus) else { return nil }
             switch status {
-            case .accepted, .pushed:
-                .accepted
+            case .accepted:
+                return .alreadyAccepted
+            case .pushed:
+                return .alreadyPushed
             case .declined:
-                .declined
+                return .alreadyDeclined
             case .proposed, .invalidated:
-                nil
+                return .expired
             }
         }
 
-        private static func activityStatus(for rawStatus: String) -> DecisionActivityStatus? {
-            guard let status = ProposalStatus(rawValue: rawStatus) else { return nil }
-            return activityStatus(for: status)
+        private static func activityStatus(
+            forResolved status: ProposalStatus
+        ) -> DecisionActivityStatus {
+            switch status {
+            case .accepted:
+                return .accepted
+            case .pushed:
+                return .pushed
+            case .declined:
+                return .declined
+            case .proposed:
+                return .failed
+            case .invalidated:
+                return .expired
+            }
         }
 
         private static func update(

@@ -1,10 +1,8 @@
 import PhotosUI
 import SwiftUI
 
-/// Capture shortcuts (issue #10): camera / photo-picker / voice memo →
-/// `POST /v1/media` → `POST /v1/food-logs` or `/v1/medical-records`, with a
-/// description the user edits before submitting. Matches the Telegram
-/// capture skill's contract; the server attaches the health snapshot.
+/// Capture shortcuts: food photos, voice and text are structured by the
+/// nutrition engine; medical captures keep their separate record contract.
 struct CaptureView: View {
     @StateObject private var model = CaptureModel()
     @StateObject private var recorder = VoiceMemoRecorder()
@@ -14,8 +12,14 @@ struct CaptureView: View {
     var body: some View {
         Form {
             targetSection
+                .disabled(model.isFoodReviewLocked)
             attachmentSection
+                .disabled(model.isFoodReviewLocked)
             descriptionSection
+                .disabled(model.isFoodReviewLocked)
+            if model.reviewInteraction != nil {
+                reviewSection
+            }
             submitSection
         }
         .navigationTitle(Text("Capture"))
@@ -62,6 +66,11 @@ struct CaptureView: View {
                 } label: {
                     Text("Meal")
                 }
+                Toggle(
+                    "Allow configured remote nutrition model",
+                    isOn: $model.allowRemoteAnalysis
+                )
+                .font(.footnote)
             }
         } footer: {
             if model.target != .food {
@@ -197,14 +206,27 @@ struct CaptureView: View {
 
     private var descriptionSection: some View {
         Section {
-            TextField(
-                text: $model.descriptionText,
-                axis: .vertical
-            ) {
-                Text("Describe it — you can edit before saving")
+            if model.target == .food, case .voice = model.attachment {
+                Label(
+                    "Your instance transcribes the attached voice memo. Review the structured result before recording an outcome.",
+                    systemImage: "waveform"
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            } else {
+                TextField(
+                    text: $model.descriptionText,
+                    axis: .vertical
+                ) {
+                    Text(
+                        model.target == .food && model.attachment != nil
+                            ? "Optional context, e.g. half portion"
+                            : "What did you consume?"
+                    )
+                }
+                .lineLimit(3...8)
+                .accessibilityLabel(Text("Description"))
             }
-            .lineLimit(3...8)
-            .accessibilityLabel(Text("Description"))
 
             if case .voice = model.attachment, model.target != .food {
                 TextField(
@@ -221,35 +243,250 @@ struct CaptureView: View {
         }
     }
 
-    private var submitSection: some View {
+    private var reviewSection: some View {
         Section {
-            Button {
-                Task { await model.submit() }
-            } label: {
-                HStack {
+            if let observation = model.reviewObservation {
+                HStack(alignment: .firstTextBaseline) {
+                    Label("Photo analysis", systemImage: "viewfinder")
+                        .font(.callout.weight(.semibold))
                     Spacer()
-                    switch model.phase {
-                    case .uploading:
-                        ProgressView()
-                        Text("Uploading media…")
-                    case .saving:
-                        ProgressView()
-                        Text("Saving…")
-                    default:
-                        Text("Save to my instance")
-                    }
-                    Spacer()
+                    Text("\(observation.status) · \(observation.confidence)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if !observation.warnings.isEmpty {
+                    warningList(observation.warnings)
                 }
             }
-            .disabled(!model.canSubmit)
+
+            if let interaction = model.reviewInteraction {
+                ForEach(model.foodCorrections.indices, id: \.self) { index in
+                    correctionEditor(index)
+                }
+
+                if interaction.resolvedItems.isEmpty {
+                    Label(
+                        "No specific item was identified. Choose an outcome only if this capture still represents what happened.",
+                        systemImage: "questionmark.circle"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                }
+                if !interaction.warnings.isEmpty {
+                    warningList(interaction.warnings)
+                }
+            }
+
+            VStack(spacing: 10) {
+                Button {
+                    Task { await model.recordFoodOutcome(.consumed) }
+                } label: {
+                    outcomeLabel(
+                        status: .consumed,
+                        title: "Consumed",
+                        systemImage: "checkmark.circle.fill"
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+                .disabled(model.hasInvalidFoodCorrections)
+
+                Button {
+                    Task { await model.recordFoodOutcome(.notConsumed) }
+                } label: {
+                    outcomeLabel(
+                        status: .notConsumed,
+                        title: "Not consumed",
+                        systemImage: "minus.circle"
+                    )
+                }
+                .buttonStyle(.bordered)
+
+                Button(role: .cancel) {
+                    Task { await model.recordFoodOutcome(.cancelled) }
+                } label: {
+                    outcomeLabel(
+                        status: .cancelled,
+                        title: "Cancel",
+                        systemImage: "xmark.circle"
+                    )
+                }
+                .buttonStyle(.borderless)
+            }
+            .disabled(isResolvingOutcome)
+
+            if let error = model.outcomeError {
+                Label {
+                    Text(verbatim: error)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle")
+                }
+                .font(.footnote)
+                .foregroundStyle(.red)
+
+                Text("The review is still here. Retry the same action without re-analyzing.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Review analyzed intake")
+        } footer: {
+            Text(
+                "Analysis alone is not a food record. HealthMes stores consumed, not consumed, or cancelled only after you choose here."
+            )
+        }
+    }
+
+    private var isResolvingOutcome: Bool {
+        if case .resolving = model.phase { return true }
+        return false
+    }
+
+    @ViewBuilder
+    private func outcomeLabel(
+        status: IntakeOutcomeStatus,
+        title: LocalizedStringKey,
+        systemImage: String
+    ) -> some View {
+        HStack {
+            Spacer()
+            if case .resolving(let active) = model.phase, active == status {
+                ProgressView()
+            } else {
+                Label(title, systemImage: systemImage)
+            }
+            Spacer()
+        }
+    }
+
+    private func intakeItem(_ item: IntakeItemResult) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(verbatim: item.name)
+                    .font(.headline)
+                Spacer()
+                Text(item.confidence)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+            }
+            Text("\(item.intakeType) · \(item.serving.summary)")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            if !item.nutrients.isEmpty {
+                Text(
+                    item.nutrients.prefix(4).map {
+                        "\($0.nutrient) \($0.amount.summary)"
+                    }.joined(separator: " · ")
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            if !item.warnings.isEmpty {
+                warningList(item.warnings)
+            }
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func correctionEditor(_ index: Int) -> some View {
+        let correction = $model.foodCorrections[index]
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                TextField("Food or drink", text: correction.name)
+                    .font(.headline)
+                    .disabled(correction.wrappedValue.isExcluded)
+                Toggle("Exclude", isOn: correction.isExcluded)
+                    .toggleStyle(.button)
+                    .font(.caption)
+            }
+            HStack {
+                TextField("Amount", text: correction.exactAmount)
+                    .keyboardType(.decimalPad)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Unit", text: correction.unit)
+                    .textFieldStyle(.roundedBorder)
+            }
+            .disabled(correction.wrappedValue.isExcluded)
+            if correction.wrappedValue.isChanged {
+                Label(
+                    "Your correction will replace this analyzed item.",
+                    systemImage: "pencil.circle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else {
+                intakeItem(correction.wrappedValue.original)
+            }
+            if let message = correction.wrappedValue.validationMessage {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func warningList(_ warnings: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(Array(warnings.enumerated()), id: \.offset) { _, warning in
+                Label {
+                    Text(verbatim: warning)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle")
+                }
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.orange)
+    }
+
+    private var submitSection: some View {
+        Section {
+            if model.reviewInteraction == nil {
+                Button {
+                    Task { await model.submit() }
+                } label: {
+                    HStack {
+                        Spacer()
+                        switch model.phase {
+                        case .uploading:
+                            ProgressView()
+                            Text("Uploading media…")
+                        case .analyzing:
+                            ProgressView()
+                            Text("Analyzing…")
+                        case .saving:
+                            ProgressView()
+                            Text("Saving…")
+                        default:
+                            Text(
+                                model.target == .food
+                                    ? "Analyze for review"
+                                    : "Save to my instance"
+                            )
+                        }
+                        Spacer()
+                    }
+                }
+                .disabled(!model.canSubmit)
+            }
 
             switch model.phase {
-            case .saved(let kind):
-                Label {
-                    Text(savedMessage(kind))
-                } icon: {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+            case .saved(let kind, let outcome):
+                VStack(alignment: .leading, spacing: 6) {
+                    Label {
+                        Text(savedMessage(kind, outcome: outcome))
+                    } icon: {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                    if kind == .food, !model.savedIntakeItems.isEmpty {
+                        Text(model.savedIntakeItems.joined(separator: " · "))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .font(.footnote)
             case .failed(let message):
@@ -277,9 +514,18 @@ struct CaptureView: View {
         }
     }
 
-    private func savedMessage(_ kind: CaptureTarget) -> LocalizedStringKey {
+    private func savedMessage(
+        _ kind: CaptureTarget,
+        outcome: IntakeOutcomeStatus?
+    ) -> LocalizedStringKey {
         switch kind {
-        case .food: return "Food log saved."
+        case .food:
+            switch outcome {
+            case .consumed: return "Recorded as consumed."
+            case .notConsumed: return "Recorded as not consumed."
+            case .cancelled: return "Capture cancelled."
+            case nil: return "Food review completed."
+            }
         case .medication: return "Medication record saved."
         case .symptom: return "Symptom record saved."
         }

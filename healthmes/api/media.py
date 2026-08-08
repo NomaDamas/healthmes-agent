@@ -8,8 +8,8 @@ natively. The flow is two-step:
    token — the same data-dir-relative path convention every ``media_path``
    column in the store uses (healthmes/store/models.py). The Telegram capture
    path keeps writing its own files into the same tree.
-2. The app passes that ``media_path`` string to ``POST /v1/food-logs`` or
-   ``POST /v1/medical-records`` — only the path is ever stored in the
+2. The app passes that ``media_path`` string to the nutrition interaction
+   flow or ``POST /v1/medical-records`` — only the path is ever stored in the
    database, never bytes.
 
 ``GET /v1/media/{media_path}`` serves the bytes back. It accepts the exact
@@ -195,7 +195,7 @@ def _payload_too_large(cap: int) -> APIError:
 async def upload_media(request: Request, session: SessionDep) -> MediaUploadOut:
     """Store one captured media file and return its ``media_path`` token.
 
-    The token goes into ``POST /v1/food-logs`` / ``POST /v1/medical-records``
+    The token goes into a nutrition interaction or ``POST /v1/medical-records``
     (``media_path`` field) and back into ``GET /v1/media/{media_path}``.
     """
     settings = _settings(request)

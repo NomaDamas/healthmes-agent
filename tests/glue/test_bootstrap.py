@@ -7,6 +7,7 @@ docker-mode defaults. Everything runs against tmp paths — the developer's
 real ~/.hermes is never touched.
 """
 
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -101,11 +102,14 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
         REPO_ROOT / "scripts" / "healthmes_briefing_snapshot.py"
     ).read_text()
     sidecar = yaml.safe_load((hermes_home / "scripts" / "healthmes_snapshot.json").read_text())
-    assert sidecar == {"base_url": "http://localhost:8100"}  # native default
+    assert sidecar == {
+        "base_url": "http://localhost:8100",
+        "api_token": env_values["HEALTHMES_API_TOKEN"],
+    }
 
-    # No api token configured: the MCP registration carries no auth header
-    # and the sidecar carries no token key.
-    assert "headers" not in servers["healthmes"]
+    assert servers["healthmes"]["headers"] == {
+        "Authorization": f"Bearer {env_values['HEALTHMES_API_TOKEN']}"
+    }
 
     # 4. Cron briefings registered in the vendor jobs.json envelope.
     jobs_doc = yaml.safe_load((hermes_home / "cron" / "jobs.json").read_text())
@@ -315,6 +319,50 @@ def test_missing_env_file_is_created_for_secret(bootstrap, hermes_home, tmp_path
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
     assert env_file.is_file()
     assert bootstrap.load_env_file(env_file)["HEALTHMES_HERMES_WEBHOOK_SECRET"]
+    assert os.stat(env_file).st_mode & 0o777 == 0o600
+
+
+def test_env_replace_failure_cleans_private_temporary(
+    bootstrap,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("EXISTING=value\n", encoding="utf-8")
+
+    def failing_replace(source, destination):
+        assert os.stat(source).st_mode & 0o777 == 0o600
+        assert destination == env_file
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(bootstrap.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        bootstrap.upsert_env_var(env_file, "SECRET", "private")
+
+    assert env_file.read_text(encoding="utf-8") == "EXISTING=value\n"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_env_fsync_failure_cleans_private_temporary(
+    bootstrap,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("EXISTING=value\n", encoding="utf-8")
+
+    def failing_fsync(fd):
+        assert os.fstat(fd).st_mode & 0o777 == 0o600
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(bootstrap.os, "fsync", failing_fsync)
+
+    with pytest.raises(OSError, match="fsync failed"):
+        bootstrap.upsert_env_var(env_file, "SECRET", "private")
+
+    assert env_file.read_text(encoding="utf-8") == "EXISTING=value\n"
+    assert list(tmp_path.glob(".*.tmp")) == []
 
 
 def test_adjustment_secret_is_generated_separately_and_preserved(
@@ -398,7 +446,11 @@ def test_docker_mode_defaults(bootstrap, hermes_home, env_file):
     # script itself stays byte-identical to the repo copy (URL via sidecar,
     # never hardcoded — the hard localhost-default rule).
     sidecar = yaml.safe_load((hermes_home / "scripts" / "healthmes_snapshot.json").read_text())
-    assert sidecar == {"base_url": "http://healthmes:8100"}
+    env_values = bootstrap.load_env_file(env_file)
+    assert sidecar == {
+        "base_url": "http://healthmes:8100",
+        "api_token": env_values["HEALTHMES_API_TOKEN"],
+    }
 
 
 def test_env_overrides_beat_mode_defaults(bootstrap, hermes_home, env_file, monkeypatch):
@@ -418,19 +470,20 @@ def test_api_token_flows_into_mcp_headers_and_sidecar(
     rendered MCP registration carries the bearer header (mcp_tool.py url
     transports support `headers:`) and the briefing snapshot sidecar carries
     the token for its REST fetches."""
-    monkeypatch.setenv("HEALTHMES_API_TOKEN", "glue-token")
+    token = "g" * 32
+    monkeypatch.setenv("HEALTHMES_API_TOKEN", token)
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
 
     config = yaml.safe_load((hermes_home / "config.yaml").read_text())
     healthmes = config["mcp_servers"]["healthmes"]
-    assert healthmes["headers"] == {"Authorization": "Bearer glue-token"}
+    assert healthmes["headers"] == {"Authorization": f"Bearer {token}"}
 
     sidecar = yaml.safe_load(
         (hermes_home / "scripts" / "healthmes_snapshot.json").read_text()
     )
     assert sidecar == {
         "base_url": "http://localhost:8100",
-        "api_token": "glue-token",
+        "api_token": token,
     }
 
 

@@ -17,6 +17,7 @@ final class BriefingHomeModel: ObservableObject {
 
     private let glanceClient = GlanceClient()
     private let api = HealthMesAPI()
+    private var refreshGate = LatestRefreshGate()
 
     var lastUpdatedText: String {
         guard let snapshot else { return "—" }
@@ -26,23 +27,35 @@ final class BriefingHomeModel: ObservableObject {
         return formatter.string(from: snapshot.fetchedAt)
     }
 
+    var pendingDecisions: [PendingDecision] {
+        PendingDecision.correlate(alerts: alerts, proposals: pendingProposals)
+    }
+
     func refresh() async {
+        let refreshID = refreshGate.begin()
         guard PairingStore.shared.load() != nil else {
             glanceError = String(localized: "Not paired — open Settings.")
             return
         }
-        async let glanceTask: Void = refreshGlance()
-        async let alertsTask: Void = refreshAlerts()
-        async let proposalsTask: Void = refreshProposals()
-        _ = await (glanceTask, alertsTask, proposalsTask)
-    }
 
-    private func refreshGlance() async {
-        do {
-            snapshot = try await glanceClient.fetch()
+        async let glanceResult: Result<GlanceSnapshot, Error> = productRefreshResult {
+            try await glanceClient.fetch()
+        }
+        async let alertsResult: Result<AlertsPage, Error> = productRefreshResult {
+            try await api.listAlerts(hours: 24)
+        }
+        async let proposalsResult: Result<ProposalsPage, Error> = productRefreshResult {
+            try await api.listProposals(status: .proposed)
+        }
+        let results = await (glanceResult, alertsResult, proposalsResult)
+        guard refreshGate.isCurrent(refreshID) else { return }
+
+        switch results.0 {
+        case .success(let freshSnapshot):
+            snapshot = freshSnapshot
             isStale = false
             glanceError = nil
-        } catch {
+        case .failure(let error):
             if let cachedPayload = glanceClient.cache.decodedPayload(),
                 let cached = glanceClient.cache.load()
             {
@@ -58,23 +71,19 @@ final class BriefingHomeModel: ObservableObject {
                 glanceError = Self.describe(error)
             }
         }
-    }
 
-    private func refreshAlerts() async {
-        do {
-            let page = try await api.listAlerts(hours: 24)
+        switch results.1 {
+        case .success(let page):
             alerts = page.data
             alertsError = nil
-        } catch {
+        case .failure(let error):
             alertsError = Self.describe(error)
         }
-    }
 
-    private func refreshProposals() async {
-        do {
-            let page = try await api.listProposals(status: .proposed)
+        switch results.2 {
+        case .success(let page):
             pendingProposals = page.data
-        } catch {
+        case .failure:
             // The proposals section simply hides on failure (alerts carry
             // the connectivity message already).
             pendingProposals = []
@@ -89,14 +98,16 @@ final class BriefingHomeModel: ObservableObject {
         do {
             let resolved = try await api.resolveProposal(proposal, action: action)
             pendingProposals.removeAll { $0.id == proposal.id }
-            proposalBanner =
-                resolved.status == .accepted
-                ? String(localized: "Proposal applied.")
-                : String(localized: "Kept as is — proposal declined.")
+            proposalBanner = ProposalStatusPresentation.label(for: resolved.status)
+            await refresh()
         } catch let error as HealthMesAPIError where error.isAlreadyResolved {
             pendingProposals.removeAll { $0.id == proposal.id }
             let status = error.alreadyResolvedStatus ?? "resolved"
-            proposalBanner = String(localized: "Already resolved (\(status)).")
+            proposalBanner = String(
+                format: String(localized: "Already resolved (%@)."),
+                status
+            )
+            await refresh()
         } catch {
             proposalBanner = Self.describe(error)
         }

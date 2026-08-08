@@ -59,13 +59,17 @@ channel).
 - **Decision viewer**: tokenized viewer URLs open in Custom Tabs
   (native back/share); on browserless devices an in-app WebView screen with
   back + share takes over. JavaScript stays on for the Mermaid trees.
-- **Capture**: photo (ACTION_IMAGE_CAPTURE via FileProvider, or the photo
-  picker — deliberately no CameraX/no CAMERA permission) and voice memo
-  (MediaRecorder → audio/mp4) → `POST /v1/media` (multipart `file` field) →
-  `POST /v1/food-logs` or `POST /v1/medical-records` with an editable
-  description — the same contracts the Telegram capture skill uses. The
-  medical health-context snapshot is attached **server-side**; the app sends
-  capture metadata only (`context.source = "android-companion"`).
+- **Capture contracts**: photo, text, and voice nutrition inputs follow
+  analyze → owner review → interaction → explicit outcome. An analysis or
+  `log_consumed` intent never creates known intake by itself. Photo uses
+  `POST /v1/nutrition-observations/analyze`, then
+  `POST /v1/nutrition-observations/{id}/review` before
+  `POST /v1/intake-interactions`; text/voice use
+  `POST /v1/intake-interactions/analyze`. Only the owner's explicit choice
+  calls `POST /v1/intake-interactions/{id}/outcomes`. Medication and symptom
+  capture keeps `POST /v1/medical-records`; its health-context snapshot is
+  attached **server-side**, and the app sends capture metadata only
+  (`context.source = "android-companion"`).
 - **Real §8.5 notification actions**: ✅ Apply / ❌ Keep as is enqueue a
   one-shot WorkManager job that resolves the pending schedule proposal and
   calls `POST /v1/schedule/proposals/{id}/accept|decline` with the bearer
@@ -342,7 +346,8 @@ shared/src/main/kotlin/com/healthmes/api/     # issue #10 app surface
 ├── AlertsFeed.kt             # GET /v1/alerts page (§8.5 grammar lines)
 ├── WeeklyReport.kt           # GET /reports/weekly.json model + parser
 ├── Proposals.kt              # GET /v1/schedule/proposals + action paths
-└── CaptureRequests.kt        # POST /v1/food-logs & /v1/medical-records bodies
+└── CaptureRequests.kt        # nutrition analyze/review/interaction/outcome
+                              # + unchanged medical-record bodies
 
 companion/src/main/kotlin/com/healthmes/companion/
 ├── MainActivity.kt           # THE activity (singleTask; deep-link extras)

@@ -1,3 +1,4 @@
+import LocalAuthentication
 import UIKit
 import UserNotifications
 import UserNotificationsUI
@@ -14,6 +15,7 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
     private let noButton = UIButton(type: .system)
     private let yesButton = UIButton(type: .system)
     private var proposalID: UUID?
+    private var expiresAt: Date?
     private let healthGreen = UIColor(red: 0.02, green: 0.34, blue: 0.25, alpha: 1)
 
     override func viewDidLoad() {
@@ -171,13 +173,24 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
             let expiryText = info["healthmes_decision_expires_at"] as? String,
             let expiry = formatter.date(from: expiryText)
         {
+            expiresAt = expiry
             hintLabel.text = String(
                 format: String(localized: "Details · decide by %@"),
                 timeDisplay.string(from: expiry)
             )
+            if expiry <= Date() {
+                showTerminal(
+                    String(localized: "Decision expired"),
+                    color: .secondaryLabel
+                )
+                return
+            }
         } else {
+            expiresAt = nil
             hintLabel.text = String(localized: "Details")
         }
+
+        validateCurrentState()
     }
 
     private func detailText(info: [AnyHashable: Any]) -> NSAttributedString {
@@ -257,11 +270,42 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
     }
 
     private func resolve(_ action: DecisionAction) {
+        if let expiresAt, expiresAt <= Date() {
+            showTerminal(String(localized: "Decision expired"), color: .secondaryLabel)
+            return
+        }
         guard let proposalID else {
             showFailure(String(localized: "This alert has no pending proposal attached."))
             return
         }
+        authenticateAndResolve(proposalID: proposalID, action: action)
+    }
+
+    private func authenticateAndResolve(proposalID: UUID, action: DecisionAction) {
         setResolving(true, action: action)
+        let context = LAContext()
+        context.localizedCancelTitle = String(localized: "Cancel")
+        var authorizationError: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &authorizationError) else {
+            showFailure(String(localized: "Unlock the iPhone to decide."))
+            return
+        }
+        context.evaluatePolicy(
+            .deviceOwnerAuthentication,
+            localizedReason: String(localized: "Confirm this HealthMes calendar decision.")
+        ) { [weak self] approved, _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard approved else {
+                    showFailure(String(localized: "Decision not changed."))
+                    return
+                }
+                performResolution(proposalID: proposalID, action: action)
+            }
+        }
+    }
+
+    private func performResolution(proposalID: UUID, action: DecisionAction) {
         Task {
             do {
                 let status = try await NotificationDecisionResolver().resolve(
@@ -269,17 +313,29 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
                     action: action
                 )
                 await MainActor.run {
-                    hintLabel.text =
-                        status == "accepted"
-                        ? String(localized: "Yes recorded. Calendar sync will apply the change.")
-                        : String(localized: "No recorded. Your calendar stays unchanged.")
-                    hintLabel.textColor = healthGreen
+                    guard let proposalStatus = NotificationProposalStatus(rawValue: status) else {
+                        showFailure(
+                            String(localized: "Could not decide. Try again from the iPhone app.")
+                        )
+                        return
+                    }
+                    hintLabel.text = proposalStatus.message
+                    hintLabel.textColor =
+                        proposalStatus == .declined || proposalStatus == .invalidated
+                        ? .secondaryLabel
+                        : healthGreen
                     noButton.isHidden = true
                     yesButton.isHidden = true
                 }
             } catch {
                 await MainActor.run {
-                    showFailure(String(localized: "Could not decide. Try again from the iPhone app."))
+                    if let error = error as? NotificationResolutionError {
+                        showResolutionError(error)
+                    } else {
+                        showFailure(
+                            String(localized: "Could not decide. Try again from the iPhone app.")
+                        )
+                    }
                 }
             }
         }
@@ -301,6 +357,55 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         yesButton.isEnabled = true
     }
 
+    private func showTerminal(_ message: String, color: UIColor) {
+        hintLabel.text = message
+        hintLabel.textColor = color
+        noButton.isHidden = true
+        yesButton.isHidden = true
+    }
+
+    private func showResolutionError(_ error: NotificationResolutionError) {
+        switch error {
+        case .notPaired, .requestFailed:
+            showFailure(String(localized: "Could not decide. Try again from the iPhone app."))
+        case .notActionable(let status):
+            switch status {
+            case "accepted":
+                showTerminal(String(localized: "Already approved"), color: healthGreen)
+            case "pushed":
+                showTerminal(String(localized: "Applied to calendar"), color: healthGreen)
+            case "declined":
+                showTerminal(String(localized: "Already declined"), color: .secondaryLabel)
+            default:
+                showTerminal(String(localized: "Decision expired"), color: .secondaryLabel)
+            }
+        case .expired:
+            showTerminal(String(localized: "Decision expired"), color: .secondaryLabel)
+        }
+    }
+
+    private func validateCurrentState() {
+        guard let proposalID else {
+            noButton.isHidden = true
+            yesButton.isHidden = true
+            return
+        }
+        Task {
+            do {
+                let proposal = try await NotificationDecisionResolver().currentProposal(
+                    proposalID: proposalID
+                )
+                guard !proposal.isActionable else { return }
+                await MainActor.run {
+                    showResolutionError(.notActionable(status: proposal.status))
+                }
+            } catch {
+                // Keep buttons on transient validation failure. The action
+                // handler revalidates against the server before mutation.
+            }
+        }
+    }
+
 }
 
 private enum NotificationUserInfoKey {
@@ -317,8 +422,38 @@ private enum DecisionAction: String {
     case decline
 }
 
+private enum NotificationProposalStatus: String {
+    case proposed
+    case accepted
+    case pushed
+    case declined
+    case invalidated
+
+    var message: String {
+        switch self {
+        case .proposed:
+            return String(localized: "Decision not confirmed. Refresh and try again.")
+        case .accepted:
+            return String(localized: "Approved. Calendar sync is pending.")
+        case .pushed:
+            return String(localized: "Applied to calendar.")
+        case .declined:
+            return String(localized: "Declined. Your calendar stays unchanged.")
+        case .invalidated:
+            return String(localized: "Expired. Your calendar stays unchanged.")
+        }
+    }
+}
+
+private enum NotificationResolutionError: Error {
+    case notPaired
+    case notActionable(status: String)
+    case expired
+    case requestFailed
+}
+
 private struct NotificationDecisionResolver {
-    private struct Proposal: Decodable {
+    fileprivate struct Proposal: Decodable {
         let status: String
         let acceptResolutionToken: String?
         let declineResolutionToken: String?
@@ -335,11 +470,17 @@ private struct NotificationDecisionResolver {
             case .decline: declineResolutionToken
             }
         }
+
+        var isActionable: Bool {
+            status == "proposed"
+                && acceptResolutionToken != nil
+                && declineResolutionToken != nil
+        }
     }
 
     func resolve(proposalID: UUID, action: DecisionAction) async throws -> String {
         guard let pairing = PairingStore.shared.load() else {
-            throw ResolutionError.notPaired
+            throw NotificationResolutionError.notPaired
         }
         let proposalURL = pairing.baseURL.appendingPathComponent(
             "v1/schedule/proposals/\(proposalID.uuidString.lowercased())"
@@ -350,7 +491,7 @@ private struct NotificationDecisionResolver {
         try requireSuccess(proposalResponse)
         let proposal = try JSONDecoder().decode(Proposal.self, from: proposalData)
         guard proposal.status == "proposed", let token = proposal.token(for: action) else {
-            throw ResolutionError.notActionable
+            throw NotificationResolutionError.notActionable(status: proposal.status)
         }
 
         var postRequest = URLRequest(
@@ -364,8 +505,22 @@ private struct NotificationDecisionResolver {
             "surface": "ios_notification",
         ])
         let (resolvedData, resolvedResponse) = try await URLSession.shared.data(for: postRequest)
-        try requireSuccess(resolvedResponse)
+        try requireSuccess(resolvedResponse, data: resolvedData)
         return try JSONDecoder().decode(Proposal.self, from: resolvedData).status
+    }
+
+    fileprivate func currentProposal(proposalID: UUID) async throws -> Proposal {
+        guard let pairing = PairingStore.shared.load() else {
+            throw NotificationResolutionError.notPaired
+        }
+        let proposalURL = pairing.baseURL.appendingPathComponent(
+            "v1/schedule/proposals/\(proposalID.uuidString.lowercased())"
+        )
+        var request = URLRequest(url: proposalURL)
+        authorize(&request, token: pairing.token)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try requireSuccess(response, data: data)
+        return try JSONDecoder().decode(Proposal.self, from: data)
     }
 
     private func authorize(_ request: inout URLRequest, token: String?) {
@@ -375,18 +530,30 @@ private struct NotificationDecisionResolver {
         }
     }
 
-    private func requireSuccess(_ response: URLResponse) throws {
+    private func requireSuccess(_ response: URLResponse, data: Data = Data()) throws {
         guard
             let http = response as? HTTPURLResponse,
             (200...299).contains(http.statusCode)
         else {
-            throw ResolutionError.requestFailed
+            if
+                let http = response as? HTTPURLResponse,
+                http.statusCode == 409,
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let error = object["error"] as? [String: Any],
+                let code = error["code"] as? String
+            {
+                if code == "proposal_expired" {
+                    throw NotificationResolutionError.expired
+                }
+                if
+                    code == "invalid_transition",
+                    let detail = error["detail"] as? [String: Any],
+                    let current = detail["current"] as? String
+                {
+                    throw NotificationResolutionError.notActionable(status: current)
+                }
+            }
+            throw NotificationResolutionError.requestFailed
         }
-    }
-
-    private enum ResolutionError: Error {
-        case notPaired
-        case notActionable
-        case requestFailed
     }
 }

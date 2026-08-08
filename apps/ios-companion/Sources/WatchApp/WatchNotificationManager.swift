@@ -138,16 +138,68 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             do {
                 let api = HealthMesAPI()
                 let proposal = try await api.getProposal(proposalID)
-                guard proposal.isActionable else { return }
-                _ = try await api.resolveProposal(
+                guard proposal.isActionable else {
+                    await postOutcome(resultForResolvedProposal(proposal))
+                    center.removeDeliveredNotifications(withIdentifiers: [
+                        response.notification.request.identifier
+                    ])
+                    return
+                }
+                let resolved = try await api.resolveProposal(
                     proposal,
                     action: action,
                     surface: "apple_watch_notification"
                 )
+                await postOutcome(resultForStatus(resolved.status.rawValue, alreadyResolved: false))
+                center.removeDeliveredNotifications(withIdentifiers: [
+                    response.notification.request.identifier
+                ])
+            } catch let error as HealthMesAPIError where error.isAlreadyResolved {
+                await postOutcome(resultForStatus(error.alreadyResolvedStatus))
+            } catch let error as HealthMesAPIError where error.isProposalExpired {
+                await postOutcome(.expired)
             } catch {
-                // The server remains the source of truth; reopening the
-                // proposal on iPhone exposes any expired or network error.
+                await postOutcome(.offline)
             }
         }
+    }
+
+    private func resultForResolvedProposal(_ proposal: ProposalItem) -> WatchDecisionResult {
+        if proposal.status == .proposed {
+            return .expired
+        }
+        return resultForStatus(proposal.status.rawValue)
+    }
+
+    private func resultForStatus(
+        _ rawStatus: String?,
+        alreadyResolved: Bool = true
+    ) -> WatchDecisionResult {
+        guard let rawStatus, let status = ProposalStatus(rawValue: rawStatus) else {
+            return .expired
+        }
+        switch status {
+        case .accepted:
+            return alreadyResolved ? .alreadyApproved : .approved
+        case .pushed:
+            return .applied
+        case .declined:
+            return alreadyResolved ? .alreadyDeclined : .declined
+        case .proposed, .invalidated:
+            return .expired
+        }
+    }
+
+    private func postOutcome(_ result: WatchDecisionResult) async {
+        let content = UNMutableNotificationContent()
+        content.title = result.title
+        content.body = result.detail
+        content.threadIdentifier = "healthmes-watch-outcome"
+        let request = UNNotificationRequest(
+            identifier: "healthmes-watch-outcome-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        try? await UNUserNotificationCenter.current().add(request)
     }
 }

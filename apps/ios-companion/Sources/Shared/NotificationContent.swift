@@ -81,13 +81,37 @@ public struct AlertNotificationContent: Equatable {
     }
 
     public static func decisionPrompt(for card: DecisionCard) -> String {
-        // Every decision card currently comes from a schedule proposal.
-        // `kind` identifies the calendar event subtype (`schedule_change`,
-        // `planned_sleep`, `actual_sleep`, ...), not whether it is movable.
-        return String(
-            format: String(localized: "Move %@?"),
-            compactLine(card.title, limit: 22)
+        let serverAction = questionLine(card.proposedAction, limit: 34)
+        if !serverAction.isEmpty {
+            return serverAction
+        }
+        let title = compactLine(card.title, limit: 22)
+        switch card.kind {
+        case "schedule_change":
+            return String(format: String(localized: "Move %@?"), title)
+        case "planned_sleep":
+            return String(format: String(localized: "Schedule %@?"), title)
+        case "actual_sleep":
+            return String(format: String(localized: "Review %@?"), title)
+        default:
+            return String(format: String(localized: "Review %@?"), title)
+        }
+    }
+
+    public static func questionLine(_ text: String, limit: Int = 34) -> String {
+        let singleLine = text
+            .split(whereSeparator: \.isNewline)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !singleLine.isEmpty else { return "" }
+        if singleLine.hasSuffix("?") {
+            return compactLine(singleLine, limit: limit)
+        }
+        let stem = singleLine.trimmingCharacters(
+            in: CharacterSet(charactersIn: ".!。！？? ")
         )
+        guard !stem.isEmpty else { return "" }
+        return compactLine(stem, limit: max(1, limit - 1)) + "?"
     }
 
     public init(
@@ -143,7 +167,7 @@ public struct AlertNotificationContent: Equatable {
         var userInfo: [String: String] = [
             userInfoAlertID: alert.id.uuidString.lowercased()
         ]
-        if let decisionUrl = alert.decisionUrl {
+        if let decisionUrl = alert.decisionCard?.decisionUrl ?? alert.decisionUrl {
             userInfo[userInfoDecisionURL] = decisionUrl
         }
         if let exactProposalID {
@@ -165,14 +189,21 @@ public struct AlertNotificationContent: Equatable {
             userInfo[userInfoDecisionExpiresAt] = formatter.string(from: card.expiresAt)
         }
 
-        let isActionable = exactProposalID != nil
+        let actionPrompt = ProposalActionPresentation.exactPrompt(alert: alert)
+        // A proposal id is not enough for safe Yes/No controls. The user must
+        // also see the concrete mutation those controls will resolve.
+        let isActionable = exactProposalID != nil && actionPrompt != nil
         let title: String
         let subtitle: String
         let body: String
-        if let card = alert.decisionCard, isActionable {
-            title = decisionPrompt(for: card)
+        if let card = alert.decisionCard, let actionPrompt, isActionable {
+            title = actionPrompt
             subtitle = compactLine(card.observationShort, limit: 28)
             body = targetLine(after: card.after)
+        } else if let actionPrompt, isActionable {
+            title = actionPrompt
+            subtitle = compactLine(alert.summary, limit: 28)
+            body = compactLine(evidenceLine(alert.evidence) ?? "", limit: 32)
         } else {
             title = compactLine(alert.summary, limit: 26)
             subtitle = ""

@@ -31,13 +31,10 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
 
 targets:
-  # -------------------------------------------------------- menu bar app
-  # SwiftUI MenuBarExtra (LSUIElement — no Dock icon): energy score in the
-  # status item, briefing popover (curve / next blocks / alerts / decision
-  # links that open the browser), pairing Settings window (token in the
-  # Keychain via the shared PairingStore), 5-minute ETag polling through the
-  # shared GlanceClient, and optional UNUserNotificationCenter notifications
-  # rendering the §8.5 grammar with real accept/decline actions.
+  # ------------------------------------------------------ full Mac app
+  # Full-window Today / Plan / Decisions / Speak / Settings product, plus the
+  # existing MenuBarExtra glance, pairing Settings, native actionable
+  # notifications and embedded widgets.
   HealthMesMac:
     type: application
     platform: macOS
@@ -45,6 +42,7 @@ targets:
       - ../ios-companion/Sources/Shared
       - Sources/MacCore
       - Sources/MacUI
+      - Sources/App
       - Sources/MenuBar
       - path: Resources
         buildPhase: resources
@@ -57,17 +55,13 @@ targets:
       path: Support/HealthMesMac-Info.plist
       properties:
         CFBundleDisplayName: HealthMes
-        # Menu bar app: no Dock icon, no app switcher entry.
-        LSUIElement: true
         CFBundleLocalizations: [en, ko]
         ITSAppUsesNonExemptEncryption: false
-        # LAN-HTTP exception SCOPED to local networking instead of disabling
-        # ATS globally: the typical pairing target is http://<LAN-IP>:8100 —
-        # ATS never applies to IP-literal URLs anyway, and
-        # NSAllowsLocalNetworking covers .local / unqualified hostnames.
-        # Plain HTTP to a qualified public DNS name now fails CLOSED (use
-        # HTTPS there) — a tokenized viewer URL must never cross an
-        # untrusted network in clear text.
+        NSMicrophoneUsageDescription: HealthMes uses the microphone only while you speak a command.
+        NSSpeechRecognitionUsageDescription: HealthMes converts your spoken command into text so you can confirm it before anything changes.
+        # Keep ATS scoped for loopback development. Pairing validation permits
+        # HTTP only for localhost/127.0.0.0/8/::1 and requires HTTPS for every
+        # remote host, including private-LAN addresses.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
 
@@ -98,7 +92,7 @@ targets:
         CFBundleLocalizations: [en, ko]
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
-        # Scoped like the app target: LAN/.local HTTP only, no global ATS off.
+        # Scoped like the app target for loopback development only.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
 

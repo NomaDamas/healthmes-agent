@@ -77,7 +77,8 @@ HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개�
   | `compare_impact(factor, metric, window)` | "활동/음식/사람 X가 나에게 좋나?" — 태그된 이벤트 전후 지표 델타 집계 (n, 평균, confidence) |
   | `get_personal_baselines(metrics)` | 14일/90일 baseline과 현재 편차 |
   | `list_tasks / upsert_task / get_schedule / propose_schedule_blocks` | 일정 도메인 CRUD (propose-then-confirm 게이트) |
-  | `log_food / create_medical_record / record_decision` | 캡처 + 설명가능성 |
+  | `analyze_intake_capture / capture_intake_interaction / confirm_intake_outcome` | 관찰과 실제 섭취를 분리한 식사 캡처 |
+  | `create_medical_record / record_decision` | 의료 라이트 캡처 + 설명가능성 |
   - 모든 Layer B 도구는 **원시 시계열이 아닌 해석된 델타 + confidence/coverage 필드**를 반환 (토큰 절약·프라이버시·환각 방지·설명가능성 4중 이득). 데이터가 빈약하면 "insufficient_data"를 정직하게 반환.
 - **Layer C — 스킬 (얇은 판단 지침):** `healthmes-planner`(배치 룰: 에너지 높은 시간에 energy_demand=high 태스크, 회복 낮으면 운동 대신 휴식 제안 등), `healthmes-capture`, `healthmes-insight`(주간 리뷰 절차), Phase 3 `doctor-visit-summary`. **스킬 스크립트가 REST를 직접 호출하는 것 금지** — 데이터 접근이 MCP를 우회하면 decision tree 기록이 끊긴다.
 
@@ -96,8 +97,9 @@ adapter·출력 채널을 포크하거나 교체할 수 있어야 한다. 모든
 보조 해자로 본다.
 
 **소유권 메모 (2026-08-05):** 음식 분석·음식 사진 인식의 추가 개발은 sake가
-담당한다. HealthMes는 기존 음식 기록 경로만 유지하고, sake의 결과를 공통 웰니스
-입력 계약으로 받아 다른 맥락과 연결한다. 중복 모델 조사·구현은 하지 않는다.
+담당한다. HealthMes는 sake 결과를 `NutritionObservation` 원형으로 보존하고,
+사용자 검토·`IntakeInteraction`·명시적 `IntakeOutcome`을 공통 웰니스 입력
+계약으로 연결한다. 중복 모델 조사·구현은 하지 않는다.
 
 ### 지표 신뢰도 경계 (도구에 내장)
 
@@ -113,7 +115,7 @@ adapter·출력 채널을 포크하거나 교체할 수 있어야 한다. 모든
 | `task` | title, goal_id, est_minutes, deadline, energy_demand(low/med/high), status, source(user/agent) |
 | `calendar_event_mirror` | external_id, calendar_source(google/caldav), start/end, is_agent_created, agent_task_id, etag/sync_token |
 | `schedule_proposal` | task_id, proposed_start/end, status(proposed/accepted/pushed/declined), decision_record_id |
-| `food_log` | logged_at, description(LLM 생성), media_path, meal_type, source |
+| `wellness_event` nutrition 계열 | immutable observation, review, interaction, outcome + provenance/retention |
 | `app_usage_sample` | device_id, bucket_start, app_package, foreground_seconds, launches, category |
 | `cognitive_energy_estimate` | window_start/end, score(0–100), components JSONB(요인별 기여), inputs_snapshot JSONB |
 | `decision_record` | kind(schedule_change/alert/insight/capture), tree JSONB, summary, llm_model, tokens |
@@ -190,7 +192,13 @@ receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한
 
 ## 8. 음식 + 의료 라이트 캡처
 
-**Telegram 봇이 곧 캡처 앱 — 새 캡처 UI 없음.** Hermes 게이트웨이가 인바운드 사진/음성을 이미 처리. `healthmes-capture` 스킬(SKILL.md)이 지시: 미디어/음성 분류 → 음식 vs 약/증상 vs 기타 → Claude 비전/전사로 구조화된 디스크립션 생성 → MCP 도구 `log_food(...)` 또는 `create_medical_record(...)` 호출 (디스크립션 + 미디어 경로 + 타임스탬프 + 현재 건강 컨텍스트 스냅샷). 확인 메시지로 원탭 정정.
+**Telegram 봇이 캡처 표면 중 하나다.** Hermes 게이트웨이가 인바운드 사진/음성을
+분류하고 `healthmes-capture` 스킬이 음식과 의료 경로를 분리한다. 음식은
+사진 관찰 또는 텍스트·로컬 음성 분석 → 구조화 결과 표시 → 사용자
+확인/전체 수정/거절 → `IntakeInteraction` → 사용자의 별도
+`consumed|not_consumed|cancelled` 응답 순서다. 분석 결과, 사진, 침묵,
+`log_consumed` intent만으로 섭취를 확정하지 않는다. 약·증상은 기존
+`create_medical_record(...)` 로컬 경로를 유지한다.
 
 **워치 제약:** 워치 카메라는 없으므로 사진은 폰 전담. 워치는 alert 수신 + 음성 빠른답장(음성 메모 로깅 경로)으로 참여 — "워치와 폰 모두" 요구를 인터랙션 루프 수준에서 충족. 의료 기록은 Phase 3의 `doctor-visit-summary` 스킬(진료 브리핑 로컬 생성)로 연결.
 
@@ -240,8 +248,8 @@ worktree 격리의 상세 계약은
 - **종료 데모: Telegram에서 "이번 주 수면 어땠어?" → open-wearables MCP 경유 답변**
 
 **Phase 1 — MVP: 데이터 인입 + 일정 비서 + 선제 alert + 기본 인사이트 (~4–6주)**
-- 도메인 모델(weekly_goal, task, calendar_event_mirror, schedule_proposal, food_log, trigger_event, insight) + REST
-- **Layer B MCP 도구 1차분**: `get_health_scores`(벤더 MCP 갭 보충 — 스트레스·body battery·내부 점수), `get_daily_readiness_context`, `get_personal_baselines`, 일정 CRUD(`list_tasks`/`upsert_task`/`get_schedule`/`propose_schedule_blocks`), `log_food`, `record_decision`
+- 도메인 모델(weekly_goal, task, calendar_event_mirror, schedule_proposal, nutrition wellness events, trigger_event, insight) + REST
+- **Layer B MCP 도구 1차분**: `get_health_scores`(벤더 MCP 갭 보충 — 스트레스·body battery·내부 점수), `get_daily_readiness_context`, `get_personal_baselines`, 일정 CRUD(`list_tasks`/`upsert_task`/`get_schedule`/`propose_schedule_blocks`), nutrition analyze/review/interaction/outcome 도구, `record_decision`
 - `healthmes/calendars/` Google + iCloud 동기화 (§6)
 - `healthmes/engine/triggers.py` + 웹훅 push (§4), Hermes cron 브리핑
 - 스킬: `healthmes-planner`(목표 덤프→태스크 분해→배치 룰→캘린더 블록 제안→decision 기록), `healthmes-capture`(음식 경로만)
@@ -270,7 +278,7 @@ worktree 격리의 상세 계약은
 ## 검증 방법
 
 - **Phase 0:** `docker compose up` → Telegram 봇에 "이번 주 수면 어땠어?" → open-wearables MCP 도구 호출로 실데이터 답변 확인. 스모크: `curl :8100/health`, `curl :8000/docs`.
-- **Phase 1:** 주간 목표 3개를 Telegram으로 덤프 → planner가 태스크 분해 + 캘린더 블록 제안 → 승인 → Google/iCloud 캘린더에 태깅된 이벤트 생성 확인. 외부에서 이벤트 이동 → 10분 내 `schedule_changed` alert 수신 확인. 음식 사진 전송 → `food_log` 행 + 디스크립션 확인.
+- **Phase 1:** 주간 목표 3개를 Telegram으로 덤프 → planner가 태스크 분해 + 캘린더 블록 제안 → 승인 → Google/iCloud 캘린더에 태깅된 이벤트 생성 확인. 외부에서 이벤트 이동 → 10분 내 `schedule_changed` alert 수신 확인. 음식 사진 전송 → 관찰 생성 → 사용자 검토 → interaction 생성 → 별도 "먹음" 승인 전에는 confirmed intake가 없고, 승인 후에만 consumed outcome이 생기는지 확인.
 - **Phase 2:** `GET /cognitive-energy/forecast` 응답의 components 합산 검증(단위 테스트), alert 링크 → Mermaid 트리 페이지 렌더 확인, Android 기기에서 사용량 배치 인입 확인.
 - **Phase 3:** `healthmes backup create` → 새 환경 `restore` → 데모 쿼리 재통과. age 복호화 없이 스냅샷 열람 불가 확인.
 - 공통: `healthmes/`에 pytest(엔진·트리거·동기화 단위 테스트 — factory-boy/testcontainers 패턴은 open-wearables backend 테스트 컨벤션 참조).

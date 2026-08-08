@@ -47,18 +47,19 @@ final class SharedContractMacTests: XCTestCase {
         XCTAssertEqual(report.energy.days.count, 7)
         // Honest missing day stays null.
         XCTAssertNil(report.energy.days[2].avgScore)
+        XCTAssertEqual(report.schedule.displayBreakdown.syncPending, 4)
+        XCTAssertEqual(report.schedule.displayBreakdown.applied, 1)
     }
 
     func testNotificationGrammarMappingOnMacOS() throws {
-        // Legacy alerts without a structured decision card stay compact.
-        // Structured schedule proposals use title / health reason / target
-        // time, which is pinned by the iOS notification tests.
+        // Legacy alerts with a real proposal still lead with the concrete
+        // action before exposing Yes/No.
         let page = try GlanceJSON.decoder().decode(AlertsPage.self, from: fixtureData("alerts"))
         let alert = page.data[0]
 
         let plain = AlertNotificationContent.from(alert: alert)
-        XCTAssertEqual(plain.title, "Recovery 38 today.")
-        XCTAssertEqual(plain.subtitle, "")
+        XCTAssertEqual(plain.title, "Move the 14:00 block to tomorrow?")
+        XCTAssertEqual(plain.subtitle, "Recovery 38 today.")
         XCTAssertEqual(plain.body, "baseline_days 14 · hrv_delta_pc…")
         XCTAssertEqual(plain.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(plain.threadID, "deep_sleep_drop")
@@ -74,6 +75,26 @@ final class SharedContractMacTests: XCTestCase {
         XCTAssertEqual(
             actionable.userInfo[AlertNotificationContent.userInfoProposalID],
             proposalID.uuidString.lowercased()
+        )
+    }
+
+    func testProposalWithoutExactActionFailsClosedOnMacOS() {
+        let proposalID = UUID()
+        let alert = AlertItem(
+            id: UUID(),
+            ruleId: "missing-action",
+            firedAt: Date(),
+            summary: "Recovery changed.",
+            proposal: nil,
+            evidence: nil,
+            decisionUrl: nil,
+            proposalId: proposalID
+        )
+
+        XCTAssertNil(ProposalActionPresentation.exactPrompt(alert: alert))
+        XCTAssertEqual(
+            AlertNotificationContent.from(alert: alert).categoryID,
+            AlertNotificationContent.infoCategoryID
         )
     }
 

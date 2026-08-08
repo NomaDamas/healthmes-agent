@@ -7,16 +7,21 @@ import WatchConnectivity
 /// context is delivered whenever the watch app next runs.
 final class PhoneWatchSync: NSObject, WCSessionDelegate {
     static let shared = PhoneWatchSync()
+    private var pendingContext: [String: Any]?
 
     func activate() {
         guard WCSession.isSupported() else { return }
+        queuePersistedPairing()
         let session = WCSession.default
         session.delegate = self
         session.activate()
     }
 
     func pushPairing(baseURL: String, token: String) {
-        push([PairingSyncKeys.baseURL: baseURL, PairingSyncKeys.token: token])
+        push([
+            PairingSyncKeys.baseURL: baseURL,
+            PairingSyncKeys.token: token,
+        ])
     }
 
     func pushUnpair() {
@@ -25,9 +30,28 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
 
     private func push(_ context: [String: Any]) {
         guard WCSession.isSupported() else { return }
-        // Throws when no watch is paired / session not activated yet —
-        // harmless here; the pairing stays on the phone and can be re-saved.
-        try? WCSession.default.updateApplicationContext(context)
+        pendingContext = context
+        deliverPendingContext()
+    }
+
+    private func queuePersistedPairing() {
+        pendingContext = PairingSyncKeys.context(
+            for: PairingStore.shared.load()
+        )
+    }
+
+    private func deliverPendingContext() {
+        guard
+            WCSession.isSupported(),
+            WCSession.default.activationState == .activated,
+            let pendingContext
+        else { return }
+        do {
+            try WCSession.default.updateApplicationContext(pendingContext)
+            self.pendingContext = nil
+        } catch {
+            // Retained and retried after the next activation transition.
+        }
     }
 
     // MARK: WCSessionDelegate (iOS)
@@ -36,7 +60,17 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
         _ session: WCSession,
         activationDidCompleteWith activationState: WCSessionActivationState,
         error: Error?
-    ) {}
+    ) {
+        if activationState == .activated, error == nil {
+            queuePersistedPairing()
+            deliverPendingContext()
+        }
+    }
+
+    func sessionWatchStateDidChange(_ session: WCSession) {
+        queuePersistedPairing()
+        deliverPendingContext()
+    }
 
     func sessionDidBecomeInactive(_ session: WCSession) {}
 

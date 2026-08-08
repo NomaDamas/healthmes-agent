@@ -156,7 +156,7 @@ def _stored_caffeine_values(
     amount = caffeine_intake.get("confirmed_caffeine_mg")
     if (
         isinstance(amount, bool)
-        or not isinstance(amount, (int, float))
+        or not isinstance(amount, int | float)
         or not isfinite(amount)
         or amount < 0
     ):

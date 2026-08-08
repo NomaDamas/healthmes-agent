@@ -165,7 +165,7 @@ raw_ref / derived_from[]
 ## 음식 입력 담당 경계
 
 음식 사진 인식은 Sake의 카페인 관찰 계약을 하위 호환으로 포함하는 HealthMes
-`NutritionObservation` v2 계약을 사용한다. HealthMes는 이를 기존 `FoodLog`로
+`NutritionObservation` v2 계약을 사용한다. HealthMes는 이를 단일 음식 기록으로
 평탄화하지 않고 `WellnessEvent.payload`에 원형 그대로 저장한다. 사진 원본은
 `nutrition_media`, 원문·transcript는 `nutrition_raw_capture`, 구조화 관측값은
 `nutrition_observation`, 사용자 확인은 `nutrition_confirmation`으로 분리해 각

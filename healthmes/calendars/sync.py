@@ -40,6 +40,7 @@ from healthmes.calendars.base import (
     EventDraft,
     EventNotFoundError,
     ExternalEvent,
+    HealthmesEventKind,
     OwnershipError,
     calendar_identity_external_id,
     coerce_utc,
@@ -54,8 +55,8 @@ from healthmes.calendars.sleep_mirror import (
     SLEEP_UPDATE_PENDING_STATUS,
 )
 from healthmes.calendars.state import PendingDiffStore, SyncStateStore
-from healthmes.store.enums import CalendarSource
-from healthmes.store.models import CalendarEventMirror, Task
+from healthmes.store.enums import CalendarSource, ProposalStatus
+from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task
 
 __all__ = [
     "CalendarMirrorService",
@@ -274,6 +275,11 @@ class CalendarMirrorService:
         if self._pending_store is not None:
             self._pending_store.clear(source)
 
+    def preserve_diff_for_retry(self, source: CalendarSource, diff: SyncDiff) -> None:
+        """Journal a delivered diff again when downstream processing fails."""
+        if diff.has_changes:
+            self._save_pending(source, diff)
+
     def _apply_upsert(
         self,
         source: CalendarSource,
@@ -451,6 +457,7 @@ class CalendarMirrorService:
             old_start_at=coerce_utc(row.start_at),
             old_end_at=coerce_utc(row.end_at),
         )
+        self._cancel_intake_task(row)
         self._cas_delete_row(row, snapshot)
         if change.is_agent_created:
             diff.agent_modified.append(change)
@@ -493,11 +500,75 @@ class CalendarMirrorService:
                 old_start_at=coerce_utc(row.start_at),
                 old_end_at=coerce_utc(row.end_at),
             )
+            self._cancel_intake_task(row)
             self._cas_delete_row(row, snapshot)
             if change.is_agent_created:
                 diff.agent_modified.append(change)
             else:
                 diff.deleted.append(change)
+
+    def _cancel_intake_task(self, row: CalendarEventMirror) -> None:
+        if row.intake_task_id is None:
+            return
+        task = self._session.get(Task, row.intake_task_id)
+        if task is not None:
+            task.status = "cancelled"
+        proposals = self._session.scalars(
+            select(ScheduleProposal).where(
+                ScheduleProposal.task_id == row.intake_task_id,
+                ScheduleProposal.status.in_(
+                    (ProposalStatus.ACCEPTED, ProposalStatus.PUSHED)
+                ),
+            )
+        ).all()
+        for proposal in proposals:
+            if proposal.status is ProposalStatus.PUSHED:
+                identity = CalendarEventIdentity(
+                    kind=(
+                        HealthmesEventKind.PLANNED_SLEEP
+                        if proposal.healthmes_kind
+                        == HealthmesEventKind.PLANNED_SLEEP.value
+                        else HealthmesEventKind.SCHEDULE_BLOCK
+                    ),
+                    source="planner",
+                    source_key=f"proposal:{proposal.id}",
+                )
+                external_id = calendar_identity_external_id(
+                    row.calendar_source,
+                    identity,
+                )
+                owned_row = self._get_row(row.calendar_source, external_id)
+                if owned_row is not None:
+                    try:
+                        self._stage_agent_event_delete(
+                            row.calendar_source,
+                            external_id,
+                            expected_identity=identity,
+                        )
+                    except OwnershipError:
+                        logger.warning(
+                            "Refusing to delete non-owned calendar block %s while "
+                            "invalidating intake proposal %s.",
+                            external_id,
+                            proposal.id,
+                        )
+                    proposal.status = ProposalStatus.INVALIDATED
+                else:
+                    block_on_another_source = self._session.scalar(
+                        select(CalendarEventMirror.id).where(
+                            CalendarEventMirror.is_agent_created.is_(True),
+                            CalendarEventMirror.healthmes_kind
+                            == identity.kind.value,
+                            CalendarEventMirror.healthmes_source
+                            == identity.source,
+                            CalendarEventMirror.healthmes_source_key
+                            == identity.source_key,
+                        )
+                    )
+                    if block_on_another_source is None:
+                        proposal.status = ProposalStatus.INVALIDATED
+            else:
+                proposal.status = ProposalStatus.INVALIDATED
 
     # -- ownership-guarded agent writes -------------------------------------
 
@@ -584,6 +655,21 @@ class CalendarMirrorService:
         expected_identity: CalendarEventIdentity | None = None,
     ) -> None:
         """Delete an agent-created block; refuses to touch external events."""
+        self._stage_agent_event_delete(
+            source,
+            external_id,
+            expected_identity=expected_identity,
+        )
+        self._session.commit()
+
+    def _stage_agent_event_delete(
+        self,
+        source: CalendarSource,
+        external_id: str,
+        *,
+        expected_identity: CalendarEventIdentity | None = None,
+    ) -> None:
+        """Delete remotely and stage the mirror removal in the current transaction."""
         row = self._get_owned_row(source, external_id)
         expected_etag = row.etag
         if expected_identity is not None:
@@ -602,7 +688,6 @@ class CalendarMirrorService:
                 remote = self._backend_for(source).read_event(external_id)
             except EventNotFoundError:
                 self._session.delete(row)
-                self._session.commit()
                 return
             if (
                 not remote.is_agent_created
@@ -626,7 +711,6 @@ class CalendarMirrorService:
         except EventNotFoundError:
             pass
         self._session.delete(row)
-        self._session.commit()
 
     def assert_legacy_agent_event_matches(
         self,
@@ -755,6 +839,7 @@ class CalendarMirrorService:
     ) -> None:
         if (
             draft.identity is None
+            or event.etag is None
             or not event.is_agent_created
             or event.identity != draft.identity
             or event.external_id
@@ -769,7 +854,8 @@ class CalendarMirrorService:
             or event.agent_task_id != draft.agent_task_id
         ):
             raise CalendarConflictError(
-                "deterministic calendar identity exists with different content"
+                "deterministic calendar identity is missing an ETag or exists "
+                "with different content"
             )
 
     def _get_row(self, source: CalendarSource, external_id: str) -> CalendarEventMirror | None:

@@ -1,8 +1,8 @@
 """Transport-neutral sake intake-observation contract.
 
 The structured observation is the canonical representation. HealthMes stores
-it intact inside ``WellnessEvent.payload`` instead of flattening it into the
-legacy ``FoodLog`` model.
+it intact inside ``WellnessEvent.payload`` without flattening it into a
+lossy meal row.
 """
 
 from __future__ import annotations

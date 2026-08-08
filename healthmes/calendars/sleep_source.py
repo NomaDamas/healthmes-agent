@@ -73,7 +73,7 @@ async def read_actual_sleep(
 def _valid_detailed_sleep_sessions(
     rows: object,
 ) -> tuple[DetailedSleepSessionPayload, ...]:
-    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+    if not isinstance(rows, Sequence) or isinstance(rows, str | bytes | bytearray):
         return ()
     sessions: list[DetailedSleepSessionPayload] = []
     for row in rows:
@@ -83,7 +83,7 @@ def _valid_detailed_sleep_sessions(
         interval_rows = row.get("sleep_stage_intervals")
         if isinstance(interval_rows, Sequence) and not isinstance(
             interval_rows,
-            (str, bytes, bytearray),
+            str | bytes | bytearray,
         ):
             valid_intervals = []
             for interval in interval_rows:

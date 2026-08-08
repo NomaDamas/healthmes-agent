@@ -212,7 +212,7 @@ def _oura_payload_error(stage: str) -> ConnectionCard:
 
 def _mapping_rows(value: object) -> tuple[Mapping[str, Any], ...]:
     if not isinstance(value, Sequence) or isinstance(
-        value, (str, bytes, bytearray)
+        value, str | bytes | bytearray
     ):
         raise ProviderPayloadError("provider response must be a row sequence")
     if any(not isinstance(row, Mapping) for row in value):

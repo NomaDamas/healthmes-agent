@@ -22,6 +22,6 @@
   <h1>해당 결정 기록이 없습니다</h1>
   <p class="muted">No decision record with id</p>
   <p class="mono">{{ decision_id }}</p>
-  <p><a href="/decisions{{ token_qs }}">전체 결정 기록으로 돌아가기</a></p>
+  <p><a href="{{ app_path('/decisions') }}{{ token_qs }}">전체 결정 기록으로 돌아가기</a></p>
 </div>
 {% endblock %}

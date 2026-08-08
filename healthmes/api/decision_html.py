@@ -46,6 +46,7 @@ from datetime import UTC, datetime, tzinfo
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -638,8 +639,17 @@ def shell_context(settings: Settings | None) -> dict[str, Any]:
     """
     tz = resolve_timezone(settings) if settings is not None else UTC
     now = utc_now()
+    base_path = ""
+    if settings is not None:
+        base_path = urlsplit(settings.public_base_url).path.rstrip("/")
+
+    def app_path(path: str) -> str:
+        normalized = path if path.startswith("/") else f"/{path}"
+        return f"{base_path}{normalized}"
+
     return {
         "token_qs": viewer_query_suffix(settings),
+        "app_path": app_path,
         "tz_name": str(tz),
         "format_local": lambda value: format_created_local(value, tz),
         "format_rel": lambda value: format_relative(value, now),
@@ -681,15 +691,20 @@ def render_decision_list_html(
     older_offset: int | None = meta.offset + meta.limit if meta.has_more else None
     shell = shell_context(settings)
     token_pair = shell["token_qs"].replace("?", "&", 1)
+    app_path = shell["app_path"]
 
     def page_href(offset: int) -> str:
-        href = f"/decisions?limit={meta.limit}&offset={offset}"
+        href = f"{app_path('/decisions')}?limit={meta.limit}&offset={offset}"
         if kind:
             href += f"&kind={kind}"
         return href + token_pair
 
     def kind_href(value: str | None) -> str:
-        href = "/decisions" if not value else f"/decisions?kind={value}"
+        href = (
+            app_path("/decisions")
+            if not value
+            else f"{app_path('/decisions')}?kind={value}"
+        )
         if not value:
             return href + shell["token_qs"]
         return href + token_pair
@@ -725,11 +740,7 @@ def render_index_html(settings: Settings | None = None) -> str:
     ``settings`` is used ONLY to pick the seasonal backdrop from the user's
     timezone — never for credentials.
     """
-    tz = resolve_timezone(settings) if settings is not None else UTC
-    local_now = utc_now().astimezone(tz)
     template = template_environment().get_template("ui/index.html.j2")
-    return template.render(
-        token_qs="",
-        season=season_for_month(local_now.month),
-        daypart=daypart_for_hour(local_now.hour),
-    )
+    shell = shell_context(settings)
+    shell["token_qs"] = ""
+    return template.render(**shell)

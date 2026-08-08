@@ -12,15 +12,18 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
+from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy.orm import sessionmaker
 
-from alembic import command
+from healthmes.config import Settings
 from healthmes.schedule_proposals import resolution_token, verify_resolution_token
+from healthmes.storage import run_storage_maintenance
 from healthmes.store import (
     Base,
     DecisionKind,
@@ -40,7 +43,6 @@ EXPECTED_TABLES = {
     "calendar_mutation_proposal",
     "sleep_reconciliation_proposal",
     "schedule_proposal",
-    "food_log",
     "app_usage_sample",
     "cognitive_energy_estimate",
     "decision_record",
@@ -119,6 +121,8 @@ class TestOfflineRender:
     def test_render_marks_head_revision(self):
         rendered = _render_offline_upgrade("sqlite:///offline-render.db")
         assert "INSERT INTO alembic_version" in rendered
+        assert "healthmes_food_log_offline_guard" in rendered
+        assert "SELECT COUNT(*) FROM food_log" in rendered
 
     def test_legacy_cleanup_downgrade_renders_for_both_dialects(self):
         urls = (
@@ -375,7 +379,381 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c1d2e3f4a5b6"
+                ) == "e3f4a5b6c7d8"
+        finally:
+            engine.dispose()
+
+    def test_food_log_backfill_preserves_originals_and_retention(self, tmp_path):
+        database_url = f"sqlite:///{tmp_path / 'food-log-backfill.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c1d2e3f4a5b6")
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        food_log = sa.Table("food_log", metadata, autoload_with=engine)
+        storage_object = sa.Table("storage_object", metadata, autoload_with=engine)
+        first_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
+        second_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        media_id = uuid.UUID("33333333-3333-3333-3333-333333333333")
+        logged_at = datetime(2024, 2, 29, 23, 59, 58, tzinfo=UTC)
+        created_at = datetime(2024, 3, 1, 0, 0, 1, tzinfo=UTC)
+        updated_at = datetime(2024, 3, 2, 1, 2, 3, tzinfo=UTC)
+        original_rows = [
+            {
+                "id": first_id,
+                "logged_at": logged_at,
+                "description": "  김치찌개 🍲  ",
+                "media_path": "media/shared.jpg",
+                "meal_type": None,
+                "source": None,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            },
+            {
+                "id": second_id,
+                "logged_at": logged_at + timedelta(minutes=1),
+                "description": "\tLatte\n",
+                "media_path": "media/shared.jpg",
+                "meal_type": "snack",
+                "source": "ios",
+                "created_at": created_at + timedelta(seconds=1),
+                "updated_at": updated_at + timedelta(seconds=1),
+            },
+        ]
+        with engine.begin() as connection:
+            connection.execute(
+                storage_object.insert(),
+                {
+                    "id": media_id.hex,
+                    "data_class": "media",
+                    "relative_path": "media/shared.jpg",
+                    "content_type": "image/jpeg",
+                    "size_bytes": 123,
+                    "sha256": "a" * 64,
+                    "retention_basis_at": created_at,
+                    "expires_at": created_at + timedelta(days=1),
+                    "safe_to_purge": True,
+                    "purged_at": None,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                },
+            )
+            connection.execute(
+                food_log.insert(),
+                [
+                    {**row, "id": row["id"].hex}
+                    for row in original_rows
+                ],
+            )
+        engine.dispose()
+
+        command.upgrade(config, "d2e3f4a5b6c7")
+
+        engine = sa.create_engine(database_url)
+        try:
+            metadata = sa.MetaData()
+            food_log = sa.Table("food_log", metadata, autoload_with=engine)
+            wellness_event = sa.Table("wellness_event", metadata, autoload_with=engine)
+            storage_object = sa.Table("storage_object", metadata, autoload_with=engine)
+            retention_policy = sa.Table(
+                "retention_policy", metadata, autoload_with=engine
+            )
+            with engine.connect() as connection:
+                archives = connection.execute(
+                    sa.select(wellness_event).where(
+                        wellness_event.c.event_type == "legacy.food-log.v1"
+                    )
+                ).mappings().all()
+                events = connection.execute(sa.select(wellness_event)).mappings().all()
+                media = connection.execute(
+                    sa.select(storage_object).where(
+                        storage_object.c.id == media_id.hex
+                    )
+                ).mappings().one()
+                raw_events = [
+                    row
+                    for row in events
+                    if row["event_type"] == "nutrition.raw-capture.v1"
+                ]
+                policies = {
+                    row["id"]: row
+                    for row in connection.execute(
+                        sa.select(retention_policy)
+                    ).mappings()
+                }
+                assert len(archives) == 2
+                assert len(events) == 10
+                assert all(row["payload"]["sha256"] for row in archives)
+                assert all(row["expires_at"] is None for row in archives)
+                assert all(
+                    policies[row["retention_policy_id"]]["data_class"]
+                    == "legacy_food_log_archive"
+                    for row in archives
+                )
+                archived_originals = {
+                    row["source_record_id"]: row["payload"]["original"]
+                    for row in archives
+                }
+                assert archived_originals[str(first_id)]["description"] == "  김치찌개 🍲  "
+                assert archived_originals[str(first_id)]["meal_type"] is None
+                assert archived_originals[str(first_id)]["source"] is None
+                assert archived_originals[str(second_id)]["description"] == "\tLatte\n"
+                assert media["expires_at"] == (
+                    created_at + timedelta(days=1)
+                ).replace(tzinfo=None)
+                assert media["retention_basis_at"] == created_at.replace(
+                    tzinfo=None
+                )
+                assert media["safe_to_purge"] is True
+                assert all(row["raw_object_id"] is None for row in raw_events)
+                assert all(row["retention_policy_id"] is not None for row in events)
+                assert all(
+                    policies[row["retention_policy_id"]]["data_class"]
+                    == "nutrition_raw_capture"
+                    for row in raw_events
+                )
+                assert all(row["expires_at"] is not None for row in raw_events)
+                interactions = [
+                    row
+                    for row in events
+                    if row["event_type"] == "nutrition.interaction.v1"
+                ]
+                assert all(
+                    row["payload"]["modality"] == "text"
+                    and row["payload"]["nutrition_observation_id"] is None
+                    for row in interactions
+                )
+                second_interaction = next(
+                    row
+                    for row in interactions
+                    if row["source_record_id"] == str(second_id)
+                )
+                assert (
+                    second_interaction["payload"]["items"][0]["meal_type"]
+                    == "snack"
+                )
+                assert connection.scalar(sa.select(sa.func.count()).select_from(food_log)) == 2
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            assert not sa.inspect(engine).has_table("food_log")
+            maintenance_session = sessionmaker(bind=engine)()
+            try:
+                run_storage_maintenance(
+                    maintenance_session,
+                    Settings(
+                        database_url=database_url,
+                        data_dir=tmp_path / "storage",
+                    ),
+                    now=datetime(2030, 1, 1, tzinfo=UTC),
+                )
+                maintenance_session.commit()
+            finally:
+                maintenance_session.close()
+            metadata = sa.MetaData()
+            wellness_event = sa.Table(
+                "wellness_event",
+                metadata,
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                surviving_archives = connection.execute(
+                    sa.select(wellness_event).where(
+                        wellness_event.c.source_provider
+                        == "legacy-food-log-archive"
+                    )
+                ).mappings().all()
+                assert len(surviving_archives) == 2
+                assert all(row["expires_at"] is None for row in surviving_archives)
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "d2e3f4a5b6c7")
+        engine = sa.create_engine(database_url)
+        try:
+            metadata = sa.MetaData()
+            food_log = sa.Table("food_log", metadata, autoload_with=engine)
+            with engine.connect() as connection:
+                restored = connection.execute(
+                    sa.select(food_log).order_by(food_log.c.id)
+                ).mappings().all()
+            assert [
+                {
+                    "id": str(uuid.UUID(str(row["id"]))),
+                    "logged_at": row["logged_at"],
+                    "description": row["description"],
+                    "media_path": row["media_path"],
+                    "meal_type": row["meal_type"],
+                    "source": row["source"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in restored
+            ] == [
+                {
+                    "id": str(row["id"]),
+                    "logged_at": row["logged_at"].replace(tzinfo=None),
+                    "description": row["description"],
+                    "media_path": row["media_path"],
+                    "meal_type": row["meal_type"],
+                    "source": row["source"],
+                    "created_at": row["created_at"].replace(tzinfo=None),
+                    "updated_at": row["updated_at"].replace(tzinfo=None),
+                }
+                for row in original_rows
+            ]
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "c1d2e3f4a5b6")
+        engine = sa.create_engine(database_url)
+        try:
+            metadata = sa.MetaData()
+            food_log = sa.Table("food_log", metadata, autoload_with=engine)
+            wellness_event = sa.Table("wellness_event", metadata, autoload_with=engine)
+            storage_object = sa.Table("storage_object", metadata, autoload_with=engine)
+            with engine.connect() as connection:
+                restored = connection.execute(
+                    sa.select(food_log).order_by(food_log.c.id)
+                ).mappings().all()
+                restored_media = connection.execute(
+                    sa.select(storage_object).where(
+                        storage_object.c.id == media_id.hex
+                    )
+                ).mappings().one()
+                assert [row["description"] for row in restored] == [
+                    "  김치찌개 🍲  ",
+                    "\tLatte\n",
+                ]
+                assert restored_media["expires_at"] == (
+                    created_at + timedelta(days=1)
+                ).replace(tzinfo=None)
+                assert restored_media["retention_basis_at"] == created_at.replace(
+                    tzinfo=None
+                )
+                assert restored_media["safe_to_purge"] is True
+                assert connection.scalar(
+                    sa.select(sa.func.count()).select_from(wellness_event)
+                ) == 0
+        finally:
+            engine.dispose()
+
+    def test_food_log_downgrade_refuses_missing_archive(self, tmp_path):
+        database_url = f"sqlite:///{tmp_path / 'food-log-missing-archive.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c1d2e3f4a5b6")
+        engine = sa.create_engine(database_url)
+        food_log = sa.Table(
+            "food_log",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        legacy_id = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        now = datetime(2026, 8, 8, 12, tzinfo=UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                food_log.insert(),
+                {
+                    "id": legacy_id.hex,
+                    "logged_at": now,
+                    "description": "Dinner",
+                    "media_path": None,
+                    "meal_type": "dinner",
+                    "source": "ios",
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+        engine.dispose()
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        wellness_event = sa.Table(
+            "wellness_event",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                sa.delete(wellness_event).where(
+                    wellness_event.c.source_provider
+                    == "legacy-food-log-archive"
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="missing archive"):
+            command.downgrade(config, "d2e3f4a5b6c7")
+
+        engine = sa.create_engine(database_url)
+        try:
+            assert not sa.inspect(engine).has_table("food_log")
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e3f4a5b6c7d8"
+        finally:
+            engine.dispose()
+
+    def test_food_log_removal_refuses_a_corrupt_archive(self, tmp_path):
+        database_url = f"sqlite:///{tmp_path / 'food-log-corrupt.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c1d2e3f4a5b6")
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        food_log = sa.Table("food_log", metadata, autoload_with=engine)
+        now = datetime(2026, 8, 8, 12, tzinfo=UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                food_log.insert(),
+                {
+                    "id": uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").hex,
+                    "logged_at": now,
+                    "description": "Lunch",
+                    "media_path": None,
+                    "meal_type": "lunch",
+                    "source": "ios",
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+        engine.dispose()
+        command.upgrade(config, "d2e3f4a5b6c7")
+
+        engine = sa.create_engine(database_url)
+        wellness_event = sa.Table(
+            "wellness_event",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        with engine.begin() as connection:
+            archive = connection.execute(
+                sa.select(wellness_event).where(
+                    wellness_event.c.source_provider
+                    == "legacy-food-log-archive"
+                )
+            ).mappings().one()
+            corrupted = dict(archive["payload"])
+            corrupted["sha256"] = "0" * 64
+            connection.execute(
+                sa.update(wellness_event)
+                .where(wellness_event.c.id == archive["id"])
+                .values(payload=corrupted)
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="checksum mismatch"):
+            command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            assert sa.inspect(engine).has_table("food_log")
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d2e3f4a5b6c7"
         finally:
             engine.dispose()
 

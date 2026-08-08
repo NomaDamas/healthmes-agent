@@ -16,7 +16,7 @@ struct PairingView: View {
     var body: some View {
         Form {
             Section {
-                TextField(text: $baseURL, prompt: Text(verbatim: "http://192.168.1.20:8100")) {
+                TextField(text: $baseURL, prompt: Text(verbatim: "https://healthmes.example.com")) {
                     Text("Base URL")
                 }
                 .keyboardType(.URL)
@@ -31,7 +31,7 @@ struct PairingView: View {
                 Text("Your HealthMes instance")
             } footer: {
                 Text(
-                    "The URL of your own healthmes service (HEALTHMES_API_TOKEN from its .env). This is the only server this app ever contacts."
+                    "Use your HTTPS HealthMes URL. Plain HTTP is accepted only for same-device localhost development."
                 )
             }
 

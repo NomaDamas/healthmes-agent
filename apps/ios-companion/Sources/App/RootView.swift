@@ -1,8 +1,7 @@
 import SwiftUI
 
-/// Tab root of the full companion app (issue #10). Until an instance is
-/// paired, the pairing screen takes the whole window — every other surface
-/// depends on the base URL + token.
+/// One fixed HealthMes control shell. Current health impact is the default;
+/// deeper calendar, goal and outcome views stay behind the Explore menu.
 struct RootView: View {
     @EnvironmentObject private var router: AppRouter
     @State private var isPaired = PairingStore.shared.load() != nil
@@ -10,12 +9,11 @@ struct RootView: View {
     var body: some View {
         Group {
             if isPaired {
-                tabs
-            } else {
                 NavigationStack {
-                    PairingView()
-                        .navigationTitle(Text("HealthMes"))
+                    WellnessControlView()
                 }
+            } else {
+                HealthMesOnboardingView()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .healthmesPairingChanged)) { _ in
@@ -24,6 +22,22 @@ struct RootView: View {
         .sheet(item: $router.decisionSheet) { target in
             SafariView(url: target.url)
                 .ignoresSafeArea()
+        }
+        .sheet(item: $router.modal) { modal in
+            switch modal {
+            case .settings:
+                NavigationStack {
+                    SettingsView()
+                }
+            case .report:
+                NavigationStack {
+                    WeeklyReportView()
+                }
+            case .capture:
+                NavigationStack {
+                    CaptureView()
+                }
+            }
         }
         .sheet(
             item: Binding(
@@ -35,33 +49,22 @@ struct RootView: View {
                 ProposalDetailView(proposalID: target.id)
             }
         }
-    }
-
-    private var tabs: some View {
-        TabView(selection: $router.tab) {
-            NavigationStack {
-                BriefingHomeView()
+        .alert(
+            "Pairing",
+            isPresented: Binding(
+                get: { router.pairingImportMessage != nil },
+                set: { presented in
+                    if !presented {
+                        router.dismissPairingImportMessage()
+                    }
+                }
+            )
+        ) {
+            Button("OK") {
+                router.dismissPairingImportMessage()
             }
-            .tabItem { Label("Home", systemImage: "gauge.medium") }
-            .tag(AppTab.home)
-
-            NavigationStack {
-                WeeklyReportView()
-            }
-            .tabItem { Label("Report", systemImage: "chart.bar.doc.horizontal") }
-            .tag(AppTab.report)
-
-            NavigationStack {
-                CaptureView()
-            }
-            .tabItem { Label("Capture", systemImage: "camera") }
-            .tag(AppTab.capture)
-
-            NavigationStack {
-                SettingsView()
-            }
-            .tabItem { Label("Settings", systemImage: "gearshape") }
-            .tag(AppTab.settings)
+        } message: {
+            Text(router.pairingImportMessage ?? "")
         }
     }
 }

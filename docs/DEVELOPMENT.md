@@ -329,12 +329,14 @@ the minimal usage collector (docs/PLAN.md §7) that feeds
 `UsageStatsManager` buckets, WorkManager uploads every 30 minutes. It builds
 with its own vendored Gradle wrapper (JDK 17+ and Android SDK platform 35
 required; not part of the Python test suite or CI). Build, pairing and
-verification steps: `apps/android-usage/README.md`. For phone → Mac uploads
-the service must listen on the LAN: set `HEALTHMES_HOST=0.0.0.0` **and**
-`HEALTHMES_API_TOKEN=<token>` (serve refuses a non-loopback bind without a
-token — the surface carries medical data), then enter the same token in the
-app. The fragmentation term of the energy engine activates automatically
-once samples arrive; iOS is deliberately not collected.
+verification steps: `apps/android-usage/README.md`. Remote companion access
+must use an authenticated HTTPS endpoint. Mac one-click setup installs and
+pairs a loopback-only runtime by default; when
+`HEALTHMES_PUBLIC_BASE_URL=https://...` is configured, it also creates a
+signed five-minute iPhone pairing QR. Private-LAN HTTP pairing fails closed
+so a long-lived bearer token is never returned over cleartext. The
+fragmentation term of the energy engine activates automatically once samples
+arrive; iOS is deliberately not collected.
 
 ## Companion & desktop apps (issues #7 · #10 · #11)
 
@@ -453,19 +455,22 @@ shapes are pinned in `tests/api/`):
 |---|---|---|
 | `POST /v1/media` | bearer **only** | `multipart/form-data`, field name exactly `file`; client filename ignored. `Content-Length` **required** (`411` without one — chunked bodies are refused; the size cap is enforced off the header BEFORE the body is received/spooled). Content-type allowlist (jpeg/png/heic/webp images, m4a/mp3/ogg/wav audio; aliases normalized). `201 → {media_path, content_type, bytes}`; `415` (detail.allowed), `413` (cap = `HEALTHMES_MEDIA_MAX_UPLOAD_BYTES`, default 15 MiB; declared length beyond cap + 64 KiB envelope allowance is refused unread), `422` missing `file` field or empty file. Files land under `{data_dir}/media/YYYY/MM/` (UTC sharding). |
 | `GET /v1/media/{media_path}` | bearer **or** derived viewer `?token=` (GET/HEAD only) | Serves the upload back (real content type, `Cache-Control: private, max-age=86400, immutable`); decision/report pages and in-app web views can embed via `<img>`/`<audio>`. All path tricks → uniform 404. |
-| `POST /v1/nutrition-observations/analyze` | bearer | Accepts an uploaded image `media_path` plus capture time/timezone/provenance. Calls the configured Ollama/OpenAI/Gemini/Anthropic/xAI vision provider with a strict JSON schema and stores serving, core nutrients, optional additional nutrients, and provenance in `WellnessEvent.payload`. Ollama is the local default. Remote providers require a configured key, per-request `allow_remote_vision: true`, and HTTPS; there is no automatic cloud fallback. Repeating the same media returns the existing observation. Text/voice automatic nutrition analysis is not implemented. |
+| `POST /v1/nutrition-observations/analyze` | bearer | Accepts an uploaded image `media_path` plus capture time/timezone/provenance. Calls the configured Ollama/OpenAI/Gemini/Anthropic/xAI vision provider with a strict JSON schema and stores serving, core nutrients, optional additional nutrients, and provenance in `WellnessEvent.payload`. Ollama is the local default. Remote providers require a configured key, per-request `allow_remote_vision: true`, and HTTPS; there is no automatic cloud fallback. Repeating the exact request for the same media returns the existing observation. Analysis is never consumption proof. |
 | `GET /v1/nutrition-observations[/{id}]` | bearer | Reads immutable structured observations. Estimates remain exact/range/unknown and are never promoted to confirmed intake merely because they were stored. |
+| `POST /v1/nutrition-observations/{id}/review` | bearer | Stores the owner's explicit `confirmed`, full `corrected`, or `rejected` review with a caller-generated `operation_id`. Confirmed/rejected send no replacement items; corrected sends a complete item replacement. A rejected observation cannot create a photo interaction. |
+| `POST /v1/intake-interactions/analyze` | bearer | Automatically structures text or a local voice media token. Text requires `source_text`; voice requires `media_path` and is transcribed only through the configured loopback whisper.cpp service. Remote nutrition analysis is per-request opt-in. The response is an unconfirmed interaction. |
+| `POST /v1/intake-interactions` | bearer | Creates a reviewed photo interaction from `nutrition_observation_id`, or stores caller-supplied structured text/voice items. `intent=log_consumed` expresses purpose only; it does not set `is_confirmed_intake`. |
+| `POST /v1/intake-interactions/{id}/outcomes` | bearer | Stores the owner's separate `consumed`, `not_consumed`, or `cancelled` result. Only an explicit owner action may create `status=consumed`; corrections use complete structured `corrected_items`. Every logical write has a fresh `operation_id`, reused only for an exact retry. |
 | `POST /v1/nutrition-observations/{id}/confirm` | bearer | Appends a confirmed/corrected/rejected caffeine event. Confirmed/corrected requests must provide one finite non-negative `caffeine_mg` for every item in the observation. |
 | `POST /v1/nutrition-observations/daily-confirmations` | bearer | Appends a local-day coverage event. `total_intake_complete: true` is accepted only when the ID set contains every observation for that local date. |
 | `POST /v1/medical-records` | bearer | REST twin of the `create_medical_record` MCP tool (the Telegram capture-skill contract): `{kind: medication\|symptom, description, media_path?, transcript?, context?}`. The server attaches the deterministic health snapshot under `context.health` (degrades to `{status: unavailable}` when open-wearables is down — capture never fails for infra reasons); caller context is stored under `context.capture`. |
 | `GET /v1/alerts` | bearer | Alert history in glance semantics ("unresolved == recently pushed"): `?hours=1..168` (default 24), paginated `Page` envelope, newest first. Items carry the §8.5 grammar recorded at fire time (`summary`/`evidence`/`proposal`) + `decision_url`; `alerts[0]` agrees verbatim with the glance top alert (test-pinned). |
 | `POST /v1/schedule/proposals/{id}/accept` / `/decline` | bearer | The apps' ✅/❌ actions. Second tap → `409 invalid_transition` with `detail {current, requested}` (render "already resolved"); unknown id → 404. |
-| `POST /v1/food-logs` | bearer | Accepts `media_path` from `POST /v1/media` (≤500 chars). |
 
 Client caveats worth knowing (all handled by the shipped apps):
 
-- **Timestamp quirk**: store-backed endpoints (schedule proposals,
-  food-logs) serialize naive-UTC datetimes (no `Z`), while glance/alerts
+- **Timestamp quirk**: some store-backed endpoints serialize naive-UTC
+  datetimes (no `Z`), while glance/alerts
   serialize timezone-aware — clients must parse both (the shared parsers
   treat naive as UTC).
 - **No alert→proposal linkage yet**: alert items carry no
@@ -533,6 +538,14 @@ On success the credential lands in
 `{HEALTHMES_DATA_DIR}/caldav/credentials.json` with mode 600 and the CalDAV
 poll job is enabled by its presence.
 
+When both providers are connected, approved HealthMes blocks still write to
+exactly one calendar backend. Set `HEALTHMES_CALENDAR_WRITE_PROVIDER=google`
+or `caldav` to choose it; `auto` preserves the historical Google-first
+fallback. CalDAV accounts with multiple calendars must also set
+`HEALTHMES_CALDAV_CALENDAR_NAME` so HealthMes never guesses a write target.
+Google and CalDAV both support `[HM]` task intake, recurring/all-day metadata,
+cancelled-event normalization, and verified read-back after approved writes.
+
 ### Status / disconnect
 
 ```bash
@@ -564,7 +577,7 @@ corresponding integrations stay inactive.
 | Calendar adjustment confirmation handles | dedicated signing secret | `HEALTHMES_CALENDAR_ADJUSTMENT_SECRET` — generated into `.env` by `scripts/bootstrap.py`; never shared with webhook or API authentication |
 | Encrypted backups (CLI + weekly job) | a passphrase you choose (and must not lose) | `HEALTHMES_BACKUP_PASSPHRASE` in `.env`, or `--passphrase-file` |
 | Remote vault replication (ciphertext-only, optional) | S3-compatible bucket + access keys (AWS S3 / Cloudflare R2 / MinIO) | `HEALTHMES_VAULT_BUCKET` (+ `HEALTHMES_VAULT_ENDPOINT`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`/`_REGION`/`_PREFIX`); opt in with `HEALTHMES_BACKUP_PROVIDER=remote_vault` or `--provider remote` |
-| Companion & desktop apps (Android/Wear/iOS/watchOS/macOS/Windows) | the service's `HEALTHMES_API_TOKEN` (same LAN rule as the collector) | entered in each app's pairing screen together with the base URL |
+| Companion & desktop apps (Android/Wear/iOS/watchOS/macOS/Windows) | the service's `HEALTHMES_API_TOKEN` | Mac one-click setup pairs the Mac over loopback and emits a signed five-minute iPhone QR only when an HTTPS public base URL is configured; manual HTTPS base URL + token entry remains under Advanced |
 | Android usage collector | the service's `HEALTHMES_API_TOKEN` (verified server-side; required whenever the service binds beyond loopback) | entered in the app UI; sent as `Authorization: Bearer ...` |
 | API/MCP surface auth | bearer token you mint (`python3 -c "import secrets; print(secrets.token_urlsafe(32))"`) | `HEALTHMES_API_TOKEN` in `.env`; required for `HEALTHMES_HOST=0.0.0.0` and for docker compose |
 

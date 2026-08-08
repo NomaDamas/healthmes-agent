@@ -122,7 +122,8 @@ class BriefingDisplayStateTest {
 
     @Test
     fun `parses sqlite-naive store datetimes as UTC`() {
-        // Store-backed endpoints (GET /v1/schedule/proposals, food logs) on
+        // Store-backed endpoints (GET /v1/schedule/proposals, intake records)
+        // on
         // the default sqlite deployment serialize naive datetimes with NO
         // zone designator; they are UTC by store contract. This is the exact
         // shape a real instance emitted (proposals crashed without support).

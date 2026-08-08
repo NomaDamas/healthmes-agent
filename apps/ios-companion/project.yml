@@ -80,16 +80,21 @@ targets:
           HealthMes instance.
         NSMicrophoneUsageDescription: >-
           Voice memos are uploaded only to your own HealthMes instance.
+        NSSpeechRecognitionUsageDescription: >-
+          HealthMes turns your spoken goal or task into a Plan item without
+          offering a text-command composer.
+        NSFaceIDUsageDescription: >-
+          HealthMes verifies that it is you before applying a calendar
+          decision from the lock screen.
+        NSCalendarsFullAccessUsageDescription: >-
+          HealthMes checks calendars already configured on this iPhone so
+          device permission and server synchronization can be shown separately.
         # Focus-block Live Activity (polling-updated; no push channel).
         NSSupportsLiveActivities: true
         NSSupportsLiveActivitiesFrequentUpdates: false
-        # LAN-HTTP exception SCOPED to local networking instead of disabling
-        # ATS globally: the typical pairing target is http://<LAN-IP>:8100 —
-        # ATS never applies to IP-literal URLs anyway, and
-        # NSAllowsLocalNetworking covers .local / unqualified hostnames
-        # (localhost included). Plain HTTP to a qualified public DNS name
-        # fails CLOSED (use HTTPS there) — the bearer token / tokenized
-        # viewer URLs must never cross an untrusted network in clear text.
+        # Keep ATS scoped for loopback development. Pairing validation permits
+        # HTTP only for localhost/127.0.0.0/8/::1 and requires HTTPS for every
+        # remote host, including private-LAN addresses.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
     entitlements:
@@ -126,7 +131,7 @@ targets:
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
         NSSupportsLiveActivities: true
-        # Scoped like the app target: LAN/.local HTTP only, no global ATS off.
+        # Scoped like the app target for loopback development only.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
     entitlements:
@@ -147,6 +152,7 @@ targets:
     resources:
       - Resources/Localizable.xcstrings
     dependencies:
+      - sdk: LocalAuthentication.framework
       - sdk: UserNotifications.framework
       - sdk: UserNotificationsUI.framework
     settings:

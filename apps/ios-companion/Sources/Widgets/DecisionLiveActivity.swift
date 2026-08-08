@@ -146,10 +146,22 @@
             switch state.status {
             case .pending:
                 return state.reason
+            case .applying:
+                return String(localized: "Applying…")
             case .accepted:
-                return String(localized: "Yes recorded · calendar will update")
+                return String(localized: "Yes recorded · calendar sync pending")
+            case .pushed:
+                return String(localized: "Applied to calendar")
             case .declined:
                 return String(localized: "No recorded · calendar unchanged")
+            case .alreadyAccepted:
+                return String(localized: "Already approved on another device")
+            case .alreadyPushed:
+                return String(localized: "Already applied to calendar")
+            case .alreadyDeclined:
+                return String(localized: "Already declined on another device")
+            case .expired:
+                return String(localized: "Decision expired · calendar unchanged")
             case .failed:
                 return String(localized: "Could not decide · open HealthMes")
             }
@@ -158,7 +170,9 @@
         private func isActionable(
             _ context: ActivityViewContext<DecisionActivityAttributes>
         ) -> Bool {
-            context.state.status == .pending && !context.isStale
+            context.state.status == .pending
+                && !context.isStale
+                && context.state.expiresAt > Date()
         }
 
         private func countdownInterval(to end: Date) -> ClosedRange<Date> {

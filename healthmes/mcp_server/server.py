@@ -92,11 +92,21 @@ from healthmes.mcp_server.caffeine_contract import (
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.nutrition.contracts import (
     CaffeineConfirmation,
+    CaptureContext,
+    Confidence,
     ConfirmationStatus,
     ConfirmedCaffeineItem,
     DailyIntakeConfirmation,
+    Estimate,
+    EstimateKind,
+    IntakeItem,
+    IntakeType,
+    MetadataSource,
+    NutritionObservation,
     NutritionReview,
+    ObservationStatus,
     ReviewedNutritionItem,
+    VisionProvenance,
 )
 from healthmes.nutrition.intake_contracts import (
     CaptureModality,
@@ -137,6 +147,8 @@ from healthmes.nutrition.repository import (
     persist_caffeine_confirmation,
     persist_daily_confirmation,
     persist_nutrition_review,
+    persist_observation,
+    storage_object_for_media,
 )
 from healthmes.nutrition.transcription import (
     TranscriptionError,
@@ -152,7 +164,6 @@ from healthmes.store import (
     DecisionKind,
     DecisionRecord,
     EnergyDemand,
-    FoodLog,
     MedicalRecord,
     MedicalRecordKind,
     MonthlyGoal,
@@ -1396,11 +1407,13 @@ async def _arousal_hints_for(
             )
             .order_by(AppUsageSample.bucket_start)
         ).all()
-        meal_rows = session.scalars(
-            select(FoodLog)
-            .where(FoodLog.logged_at >= start_utc, FoodLog.logged_at < end_utc)
-            .order_by(FoodLog.logged_at)
-        ).all()
+        meal_history = search_intake_history(
+            session,
+            start=start_utc,
+            end=end_utc,
+            confirmed_only=True,
+            limit=None,
+        )
         events = [
             (
                 _ensure_utc_dt(row.start_at).astimezone(tz),
@@ -1419,10 +1432,17 @@ async def _arousal_hints_for(
         ]
         meals = [
             (
-                _ensure_utc_dt(row.logged_at).astimezone(tz),
-                str(row.description or "meal")[:60],
+                _ensure_utc_dt(
+                    dt.datetime.fromisoformat(
+                        record["latest_outcome"]["consumed_at"]
+                    )
+                ).astimezone(tz),
+                " · ".join(
+                    item["name"] for item in record["resolved_items"]
+                )[:60]
+                or "meal",
             )
-            for row in meal_rows
+            for record in meal_history["records"]
         ]
 
     return arousal.build_arousal_hints(
@@ -1669,17 +1689,36 @@ IMPACT_MAX_EXAMPLES = 3
 def _collect_store_occurrences(
     factor: str, start_utc: dt.datetime, end_utc: dt.datetime
 ) -> tuple[list[impact.Occurrence], dict[str, int]]:
-    """Factor occurrences from the healthmes store (food / calendar / done tasks)."""
+    """Factor occurrences from confirmed intake, calendar, and done tasks."""
     occurrences: list[impact.Occurrence] = []
-    counts = {"food_log": 0, "calendar": 0, "task": 0}
+    counts = {"nutrition_intake": 0, "calendar": 0, "task": 0}
     with _store_session() as session:
-        for row in session.scalars(
-            select(FoodLog).where(FoodLog.logged_at >= start_utc, FoodLog.logged_at < end_utc)
-        ):
-            if impact.matches(factor, row.description):
-                at = _ensure_utc_dt(row.logged_at)
-                occurrences.append(impact.Occurrence("food_log", row.description[:80], at, at))
-                counts["food_log"] += 1
+        intake_history = search_intake_history(
+            session,
+            start=start_utc,
+            end=end_utc,
+            confirmed_only=True,
+            query=factor,
+            limit=None,
+        )
+        for record in intake_history["records"]:
+            label = " · ".join(
+                item["name"] for item in record["resolved_items"]
+            )
+            at = _ensure_utc_dt(
+                dt.datetime.fromisoformat(
+                    record["latest_outcome"]["consumed_at"]
+                )
+            )
+            occurrences.append(
+                impact.Occurrence(
+                    "nutrition_intake",
+                    label[:80],
+                    at,
+                    at,
+                )
+            )
+            counts["nutrition_intake"] += 1
         for row in session.scalars(
             select(CalendarEventMirror).where(
                 CalendarEventMirror.start_at >= start_utc,
@@ -2898,18 +2937,13 @@ def resolve_schedule_proposal(
 @mcp.tool
 def log_food(
     description: str,
+    operation_id: str,
     logged_at: str | None = None,
     meal_type: str | None = None,
     media_path: str | None = None,
     source: str | None = None,
 ) -> dict[str, Any]:
-    """Log a meal/snack with its (vision/transcription-derived) description.
-
-    `meal_type` is breakfast / lunch / dinner / snack when known; `logged_at`
-    is ISO-8601 (default: now, UTC); `media_path` is the stored media file path
-    relative to the HealthMes data dir (never raw bytes); `source` names the
-    capture channel (e.g. 'telegram').
-    """
+    """Record a confirmed intake in the canonical nutrition ledger."""
     if not description.strip():
         raise ToolError("description must not be empty")
     if meal_type is not None and meal_type not in MEAL_TYPES:
@@ -2919,23 +2953,172 @@ def log_food(
         if logged_at is not None
         else dt.datetime.now(dt.UTC)
     )
-    with _store_session() as session:
-        row = FoodLog(
-            logged_at=logged_dt,
-            description=description,
-            media_path=media_path,
-            meal_type=meal_type,
-            source=source,
-        )
-        session.add(row)
-        session.flush()
-        food_log_id = str(row.id)
-        logged_iso = _iso_utc(row.logged_at)
+    recorded_at = dt.datetime.now(dt.UTC)
+    interaction_id = _parse_uuid(operation_id, "operation_id")
+    outcome_id = uuid.uuid5(interaction_id, "confirmed-consumption")
+    timezone = _local_timezone()
+    timezone_name = getattr(timezone, "key", None) or str(timezone)
+    intake_source = (source or "mcp")[:64]
+    operation_arguments = {
+        "operation_id": str(interaction_id),
+        "intent": IntakeIntent.LOG_CONSUMED.value,
+        "description": description.strip(),
+        "observed_at": _iso_utc(logged_dt),
+        "media_path": media_path,
+        "meal_type": meal_type,
+        "source": intake_source,
+    }
+    fingerprint = operation_fingerprint(operation_arguments)
+    unknown = Estimate(kind=EstimateKind.UNKNOWN, unit="serving")
+    normalized_item = NormalizedIntakeItem(
+        name=description.strip(),
+        intake_type="food",
+        serving=unknown,
+        confidence=Confidence.LOW,
+        warnings=(
+            "Captured from a user-provided description without model estimates.",
+        ),
+        meal_type=meal_type,
+    )
+    settings = _active_settings()
+    try:
+        with _store_session() as session:
+            if media_path is None:
+                interaction = IntakeInteraction(
+                    interaction_id=interaction_id,
+                    operation_fingerprint=fingerprint,
+                    intent=IntakeIntent.LOG_CONSUMED,
+                    modality=CaptureModality.TEXT,
+                    observed_at=logged_dt,
+                    recorded_at=recorded_at,
+                    timezone=timezone_name,
+                    source=intake_source,
+                    source_text=description.strip(),
+                    media_path=None,
+                    nutrition_observation_id=None,
+                    items=(normalized_item,),
+                )
+                create_interaction(session, settings, interaction)
+            else:
+                storage_object = storage_object_for_media(session, media_path)
+                if storage_object is None:
+                    raise ToolError("media storage object not found")
+                content_type = storage_object.content_type or ""
+                if content_type.startswith("image/"):
+                    observation_id = uuid.uuid5(
+                        interaction_id,
+                        "compatibility-photo-observation",
+                    )
+                    observation = NutritionObservation(
+                        observation_id=observation_id,
+                        capture=CaptureContext(
+                            media_path=media_path,
+                            captured_at=logged_dt,
+                            timezone=timezone_name,
+                            source=intake_source,
+                            location=None,
+                            metadata_provenance={
+                                "captured_at": MetadataSource.USER,
+                                "timezone": MetadataSource.USER,
+                            },
+                        ),
+                        status=ObservationStatus.USABLE,
+                        confidence=Confidence.LOW,
+                        warnings=(
+                            "Structured from the compatibility capture description.",
+                        ),
+                        items=(
+                            IntakeItem(
+                                intake_type=IntakeType.FOOD,
+                                name_candidates=(description.strip(),),
+                                category=meal_type,
+                                serving=unknown,
+                                caffeine=Estimate(
+                                    kind=EstimateKind.UNKNOWN,
+                                    unit="mg",
+                                ),
+                                confidence=Confidence.LOW,
+                            ),
+                        ),
+                        vision=VisionProvenance(
+                            provider="healthmes-description",
+                            model="provided-description",
+                            model_digest=None,
+                            prompt_version="provided-description-v1",
+                            schema_version="nutrition-observation-v2",
+                            analyzed_at=recorded_at,
+                        ),
+                    )
+                    persist_observation(
+                        session,
+                        settings,
+                        observation,
+                        request_fingerprint=fingerprint,
+                    )
+                    interaction = create_photo_interaction(
+                        session,
+                        settings,
+                        observation_id=observation_id,
+                        operation_id=interaction_id,
+                        operation_fingerprint=fingerprint,
+                        intent=IntakeIntent.LOG_CONSUMED,
+                        source=intake_source,
+                        recorded_at=recorded_at,
+                        source_text=description.strip(),
+                    )
+                elif content_type.startswith("audio/"):
+                    interaction = IntakeInteraction(
+                        interaction_id=interaction_id,
+                        operation_fingerprint=fingerprint,
+                        intent=IntakeIntent.LOG_CONSUMED,
+                        modality=CaptureModality.VOICE,
+                        observed_at=logged_dt,
+                        recorded_at=recorded_at,
+                        timezone=timezone_name,
+                        source=intake_source,
+                        source_text=description.strip(),
+                        media_path=media_path,
+                        nutrition_observation_id=None,
+                        items=(normalized_item,),
+                    )
+                    create_interaction(session, settings, interaction)
+                else:
+                    raise ToolError(
+                        "food media must be an image or audio storage object"
+                    )
+
+            outcome_arguments = {
+                "operation_id": str(outcome_id),
+                "interaction_id": str(interaction_id),
+                "status": IntakeOutcomeStatus.CONSUMED.value,
+                "consumed_at": _iso_utc(logged_dt),
+                "meal_type": meal_type,
+            }
+            outcome = IntakeOutcome(
+                outcome_id=outcome_id,
+                operation_fingerprint=operation_fingerprint(
+                    outcome_arguments
+                ),
+                interaction_id=interaction_id,
+                status=IntakeOutcomeStatus.CONSUMED,
+                confirmed_at=recorded_at,
+                source=intake_source,
+                consumed_at=logged_dt,
+                note=None,
+            )
+            persist_outcome(session, outcome)
+            view = interaction_view(session, interaction_id)
+    except (IntakeInteractionError, NutritionRepositoryError) as exc:
+        raise ToolError(str(exc)) from exc
+    assert view is not None
     return {
         "status": "ok",
-        "food_log_id": food_log_id,
-        "logged_at": logged_iso,
+        "interaction_id": str(interaction_id),
+        "outcome_id": str(outcome_id),
+        "logged_at": _iso_utc(logged_dt),
         "meal_type": meal_type,
+        "media_path": media_path,
+        "interaction": view,
     }
 
 
@@ -3449,9 +3632,10 @@ def confirm_intake_outcome(
         "interaction_id": interaction_id,
         "status": status,
         "consumed_at": consumed_at,
-        "corrected_items": raw_items,
         "note": note,
     }
+    if corrected_items is not None:
+        proof_arguments["corrected_items"] = raw_items
     _require_trusted_telegram_owner_proof(
         trusted_session_proof,
         tool_name="confirm_intake_outcome",
@@ -3473,6 +3657,7 @@ def confirm_intake_outcome(
             else None
         ),
         corrected_items=parsed_items,
+        items_corrected=corrected_items is not None,
         note=note,
     )
     try:

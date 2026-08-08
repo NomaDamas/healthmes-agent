@@ -115,6 +115,89 @@ public final class HealthMesAPI {
         return request
     }
 
+    /// `GET /v1/goals` for the current product plan.
+    public static func goalsRequest(
+        pairing: Pairing,
+        weekStart: String? = nil,
+        status: String? = nil,
+        limit: Int = 50
+    ) -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: "v1/goals", method: "GET")
+        var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+        var query = [URLQueryItem(name: "limit", value: String(limit))]
+        if let weekStart {
+            query.append(URLQueryItem(name: "week_start", value: weekStart))
+        }
+        if let status {
+            query.append(URLQueryItem(name: "status", value: status))
+        }
+        components.queryItems = query
+        request.url = components.url
+        return request
+    }
+
+    /// `GET /v1/tasks`, ordered by the server by deadline.
+    public static func tasksRequest(pairing: Pairing, limit: Int = 100) -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: "v1/tasks", method: "GET")
+        var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        request.url = components.url
+        return request
+    }
+
+    public static func decisionsRequest(pairing: Pairing, limit: Int = 100) -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: "v1/decisions", method: "GET")
+        var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "offset", value: "0"),
+        ]
+        request.url = components.url
+        return request
+    }
+
+    public static func setupReadinessRequest(pairing: Pairing) -> URLRequest {
+        baseRequest(
+            pairing: pairing,
+            path: "v1/setup/readiness",
+            method: "GET"
+        )
+    }
+
+    /// `GET /v1/schedule/events?start=…&end=…`.
+    public static func scheduleEventsRequest(
+        pairing: Pairing,
+        start: Date,
+        end: Date,
+        limit: Int = 100
+    ) -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: "v1/schedule/events", method: "GET")
+        var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        components.queryItems = [
+            URLQueryItem(name: "start", value: formatter.string(from: start)),
+            URLQueryItem(name: "end", value: formatter.string(from: end)),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        request.url = components.url
+        return request
+    }
+
+    public static func createGoalRequest(
+        pairing: Pairing,
+        body: WeeklyGoalCreateBody
+    ) throws -> URLRequest {
+        try jsonRequest(pairing: pairing, path: "v1/goals", body: body)
+    }
+
+    public static func createTaskRequest(
+        pairing: Pairing,
+        body: TaskCreateBody
+    ) throws -> URLRequest {
+        try jsonRequest(pairing: pairing, path: "v1/tasks", body: body)
+    }
+
     /// `GET /v1/schedule/proposals/{id}` — direct notification/deep-link lookup.
     public static func proposalRequest(pairing: Pairing, proposalID: UUID) -> URLRequest {
         baseRequest(
@@ -166,11 +249,50 @@ public final class HealthMesAPI {
         return request
     }
 
-    /// `POST /v1/food-logs`.
-    public static func foodLogRequest(
-        pairing: Pairing, body: FoodLogCreateBody
+    public static func nutritionPhotoAnalysisRequest(
+        pairing: Pairing,
+        body: NutritionPhotoAnalysisBody
     ) throws -> URLRequest {
-        try jsonRequest(pairing: pairing, path: "v1/food-logs", body: body)
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/nutrition-observations/analyze",
+            body: body
+        )
+    }
+
+    public static func intakeAnalysisRequest(
+        pairing: Pairing,
+        body: IntakeInteractionAnalysisBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/intake-interactions/analyze",
+            body: body
+        )
+    }
+
+    public static func photoIntakeRequest(
+        pairing: Pairing,
+        body: PhotoIntakeInteractionBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/intake-interactions",
+            body: body
+        )
+    }
+
+    public static func intakeOutcomeRequest(
+        pairing: Pairing,
+        interactionID: UUID,
+        body: IntakeOutcomeBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path:
+                "v1/intake-interactions/\(interactionID.uuidString.lowercased())/outcomes",
+            body: body
+        )
     }
 
     /// `POST /v1/medical-records` — REST twin of the create_medical_record
@@ -181,12 +303,64 @@ public final class HealthMesAPI {
         try jsonRequest(pairing: pairing, path: "v1/medical-records", body: body)
     }
 
+    public static func storageSettingsRequest(pairing: Pairing) -> URLRequest {
+        baseRequest(pairing: pairing, path: "v1/storage/settings", method: "GET")
+    }
+
+    public static func storageRetentionRequest(
+        pairing: Pairing,
+        dataClass: String,
+        preset: String
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/storage/settings/\(dataClass)",
+            method: "PUT",
+            body: StorageRetentionUpdate(preset: preset)
+        )
+    }
+
+    public static func storageMaintenanceRequest(
+        pairing: Pairing,
+        dryRun: Bool
+    ) -> URLRequest {
+        var request = baseRequest(
+            pairing: pairing,
+            path: "v1/storage/maintenance",
+            method: "POST"
+        )
+        var components = URLComponents(
+            url: request.url!,
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "dry_run", value: dryRun ? "true" : "false")
+        ]
+        request.url = components.url
+        return request
+    }
+
     static func jsonRequest<Body: Encodable>(
         pairing: Pairing, path: String, body: Body
     ) throws -> URLRequest {
-        var request = baseRequest(pairing: pairing, path: path, method: "POST")
+        try jsonRequest(
+            pairing: pairing,
+            path: path,
+            method: "POST",
+            body: body
+        )
+    }
+
+    static func jsonRequest<Body: Encodable>(
+        pairing: Pairing,
+        path: String,
+        method: String,
+        body: Body
+    ) throws -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: path, method: method)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
         request.httpBody = try encoder.encode(body)
         return request
@@ -230,6 +404,62 @@ public final class HealthMesAPI {
         )
     }
 
+    public func listGoals(
+        weekStart: String? = nil,
+        status: String? = nil
+    ) async throws -> WeeklyGoalsPage {
+        try await perform(
+            Self.goalsRequest(
+                pairing: try pairing(),
+                weekStart: weekStart,
+                status: status
+            ),
+            expecting: WeeklyGoalsPage.self
+        )
+    }
+
+    public func listTasks() async throws -> TasksPage {
+        try await perform(
+            Self.tasksRequest(pairing: try pairing()),
+            expecting: TasksPage.self
+        )
+    }
+
+    public func listDecisionRecords() async throws -> ProductDecisionsPage {
+        try await perform(
+            Self.decisionsRequest(pairing: try pairing()),
+            expecting: ProductDecisionsPage.self
+        )
+    }
+
+    public func setupReadiness() async throws -> SetupReadiness {
+        try await perform(
+            Self.setupReadinessRequest(pairing: try pairing()),
+            expecting: SetupReadiness.self
+        )
+    }
+
+    public func listScheduleEvents(start: Date, end: Date) async throws -> CalendarEventsPage {
+        try await perform(
+            Self.scheduleEventsRequest(pairing: try pairing(), start: start, end: end),
+            expecting: CalendarEventsPage.self
+        )
+    }
+
+    public func createGoal(_ body: WeeklyGoalCreateBody) async throws -> WeeklyGoalItem {
+        try await perform(
+            Self.createGoalRequest(pairing: try pairing(), body: body),
+            expecting: WeeklyGoalItem.self
+        )
+    }
+
+    public func createTask(_ body: TaskCreateBody) async throws -> TaskItem {
+        try await perform(
+            Self.createTaskRequest(pairing: try pairing(), body: body),
+            expecting: TaskItem.self
+        )
+    }
+
     public func getProposal(_ proposalID: UUID) async throws -> ProposalItem {
         try await perform(
             Self.proposalRequest(pairing: try pairing(), proposalID: proposalID),
@@ -264,10 +494,47 @@ public final class HealthMesAPI {
         )
     }
 
-    public func createFoodLog(_ body: FoodLogCreateBody) async throws -> FoodLogItem {
+    public func analyzeNutritionPhoto(
+        _ body: NutritionPhotoAnalysisBody
+    ) async throws -> NutritionObservationResult {
         try await perform(
-            Self.foodLogRequest(pairing: try pairing(), body: body),
-            expecting: FoodLogItem.self
+            Self.nutritionPhotoAnalysisRequest(
+                pairing: try pairing(),
+                body: body
+            ),
+            expecting: NutritionObservationResult.self
+        )
+    }
+
+    public func analyzeIntake(
+        _ body: IntakeInteractionAnalysisBody
+    ) async throws -> IntakeInteractionResult {
+        try await perform(
+            Self.intakeAnalysisRequest(pairing: try pairing(), body: body),
+            expecting: IntakeInteractionResult.self
+        )
+    }
+
+    public func createPhotoIntake(
+        _ body: PhotoIntakeInteractionBody
+    ) async throws -> IntakeInteractionResult {
+        try await perform(
+            Self.photoIntakeRequest(pairing: try pairing(), body: body),
+            expecting: IntakeInteractionResult.self
+        )
+    }
+
+    public func confirmIntake(
+        interactionID: UUID,
+        body: IntakeOutcomeBody
+    ) async throws -> IntakeInteractionResult {
+        try await perform(
+            Self.intakeOutcomeRequest(
+                pairing: try pairing(),
+                interactionID: interactionID,
+                body: body
+            ),
+            expecting: IntakeInteractionResult.self
         )
     }
 
@@ -277,6 +544,37 @@ public final class HealthMesAPI {
         try await perform(
             Self.medicalRecordRequest(pairing: try pairing(), body: body),
             expecting: MedicalRecordItem.self
+        )
+    }
+
+    public func storageSettings() async throws -> StorageSettingsSnapshot {
+        try await perform(
+            Self.storageSettingsRequest(pairing: try pairing()),
+            expecting: StorageSettingsSnapshot.self
+        )
+    }
+
+    public func updateStorageRetention(
+        dataClass: String,
+        preset: String
+    ) async throws -> StorageRetentionPolicy {
+        try await perform(
+            Self.storageRetentionRequest(
+                pairing: try pairing(),
+                dataClass: dataClass,
+                preset: preset
+            ),
+            expecting: StorageRetentionPolicy.self
+        )
+    }
+
+    public func maintainStorage(dryRun: Bool) async throws -> StorageMaintenanceReport {
+        try await perform(
+            Self.storageMaintenanceRequest(
+                pairing: try pairing(),
+                dryRun: dryRun
+            ),
+            expecting: StorageMaintenanceReport.self
         )
     }
 

@@ -11,6 +11,7 @@ struct WatchDecisionDetail: Identifiable {
     let before: Date?
     let after: Date?
     let endsAt: Date?
+    let expiresAt: Date?
 }
 
 @MainActor
@@ -33,6 +34,8 @@ final class WatchDecisionInbox: ObservableObject {
             after: (info[AlertNotificationContent.userInfoDecisionAfter] as? String)
                 .flatMap(formatter.date(from:)),
             endsAt: (info[AlertNotificationContent.userInfoDecisionEndsAt] as? String)
+                .flatMap(formatter.date(from:)),
+            expiresAt: (info[AlertNotificationContent.userInfoDecisionExpiresAt] as? String)
                 .flatMap(formatter.date(from:))
         )
     }
@@ -84,6 +87,11 @@ struct WatchDecisionDetailView: View {
                     Text(action)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                }
+                if let expiresAt = detail.expiresAt {
+                    Text("Available until \(expiresAt, style: .time)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

@@ -13,11 +13,26 @@ import pytest
 from fastmcp.exceptions import ToolError
 from sqlalchemy import select
 
+from healthmes.config import Settings
+from healthmes.nutrition.contracts import Confidence, Estimate, EstimateKind
+from healthmes.nutrition.intake_contracts import (
+    CaptureModality,
+    IntakeIntent,
+    IntakeInteraction,
+    IntakeOutcome,
+    IntakeOutcomeStatus,
+    NormalizedIntakeItem,
+)
+from healthmes.nutrition.intake_service import (
+    create_interaction,
+    operation_fingerprint,
+    persist_outcome,
+)
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
-    FoodLog,
     Task,
+    WellnessEvent,
 )
 
 DAY = "2026-07-08"  # local (KST) test day = UTC [07-07 15:00, 07-08 15:00)
@@ -39,9 +54,70 @@ def seed_event(
         session.commit()
 
 
-def seed_food(store_factory, description: str, logged_at_utc: dt.datetime) -> None:
+def seed_food(
+    store_factory,
+    description: str,
+    logged_at_utc: dt.datetime,
+    *,
+    consumed_at_utc: dt.datetime | None = None,
+) -> None:
+    interaction_id = uuid.uuid4()
+    outcome_id = uuid.uuid4()
+    recorded_at = dt.datetime.now(dt.UTC)
+    interaction_arguments = {
+        "interaction_id": str(interaction_id),
+        "description": description,
+        "logged_at": logged_at_utc.isoformat(),
+    }
     with store_factory() as session:
-        session.add(FoodLog(logged_at=logged_at_utc, description=description))
+        create_interaction(
+            session,
+            Settings(),
+            IntakeInteraction(
+                interaction_id=interaction_id,
+                operation_fingerprint=operation_fingerprint(
+                    interaction_arguments
+                ),
+                intent=IntakeIntent.LOG_CONSUMED,
+                modality=CaptureModality.TEXT,
+                observed_at=logged_at_utc,
+                recorded_at=recorded_at,
+                timezone="UTC",
+                source="test",
+                source_text=description,
+                media_path=None,
+                nutrition_observation_id=None,
+                items=(
+                    NormalizedIntakeItem(
+                        name=description,
+                        intake_type="food",
+                        serving=Estimate(
+                            kind=EstimateKind.UNKNOWN,
+                            unit="serving",
+                        ),
+                        confidence=Confidence.LOW,
+                    ),
+                ),
+            ),
+        )
+        persist_outcome(
+            session,
+            IntakeOutcome(
+                outcome_id=outcome_id,
+                operation_fingerprint=operation_fingerprint(
+                    {
+                        "outcome_id": str(outcome_id),
+                        "interaction_id": str(interaction_id),
+                        "status": "consumed",
+                    }
+                ),
+                interaction_id=interaction_id,
+                status=IntakeOutcomeStatus.CONSUMED,
+                confirmed_at=recorded_at,
+                source="test",
+                consumed_at=consumed_at_utc or logged_at_utc,
+            ),
+        )
         session.commit()
 
 
@@ -247,7 +323,12 @@ class TestCompareImpactNightly:
             "source": "internal_sleep_score",
         }
         assert result["occurrences"] == {
-            "matched_by_source": {"food_log": 3, "calendar": 1, "task": 0, "workout": 0},
+            "matched_by_source": {
+                "nutrition_intake": 3,
+                "calendar": 1,
+                "task": 0,
+                "workout": 0,
+            },
             "total_matched": 4,
             "used": 3,  # 3 distinct local days after dedupe
             "paired": 3,
@@ -266,7 +347,7 @@ class TestCompareImpactNightly:
         assert result["note"] == "observational association, not causation"
         first = result["examples"][0]
         assert first["occurred_on"] == "2026-07-03"
-        assert first["source"] == "food_log"
+        assert first["source"] == "nutrition_intake"
         assert first["label"] == "Red wine with dinner"
         assert (first["before"], first["after"], first["delta"]) == (80.0, 70.0, -10.0)
 
@@ -316,6 +397,43 @@ class TestCompareImpactNightly:
             "2026-07-07",
         ]
 
+    async def test_uses_consumed_time_instead_of_capture_time(
+        self, mcp_client, mcp_env, call_tool, store_factory
+    ):
+        for day in (3, 5, 6):
+            consumed_at = dt.datetime(2026, 7, day, 10, 0, tzinfo=dt.UTC)
+            seed_food(
+                store_factory,
+                "Late wine photo",
+                consumed_at - dt.timedelta(days=40),
+                consumed_at_utc=consumed_at,
+            )
+        self._seed_sleep_scores(
+            mcp_env,
+            {
+                "2026-07-03": 80,
+                "2026-07-04": 70,
+                "2026-07-05": 75,
+                "2026-07-06": 60,
+                "2026-07-07": 55,
+            },
+        )
+
+        result = await call_tool(
+            mcp_client,
+            "compare_impact",
+            {
+                "factor": "wine",
+                "metric": "sleep_score",
+                "window": "7d",
+                "end_date": DAY,
+            },
+        )
+
+        assert result["status"] == "ok"
+        assert result["occurrences"]["matched_by_source"]["nutrition_intake"] == 3
+        assert result["effect"]["n"] == 3
+
     async def test_insufficient_below_min_pairs_with_source_counts(
         self, mcp_client, mcp_env, call_tool, store_factory
     ):
@@ -351,7 +469,7 @@ class TestCompareImpactNightly:
         assert result["status"] == "insufficient_data"
         assert result["reason"] == "need_at_least_3_paired_observations"
         assert result["occurrences"]["matched_by_source"] == {
-            "food_log": 0,
+            "nutrition_intake": 0,
             "calendar": 0,
             "task": 1,
             "workout": 1,
@@ -479,7 +597,7 @@ class TestStoreSideEffectsUntouched:
             {"factor": "wine", "metric": "sleep_score", "window": "7d", "end_date": DAY},
         )
         with store_factory() as session:
-            assert session.scalars(select(FoodLog)).all() == []
+            assert session.scalars(select(WellnessEvent)).all() == []
 
 
 class TestReviewFindingFixes:
@@ -540,4 +658,3 @@ class TestReviewFindingFixes:
         assert result["status"] == "insufficient_data"
         assert result["reason"] == "insufficient_stress_samples"
         assert result["intervals"] == []
-
