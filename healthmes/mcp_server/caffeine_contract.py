@@ -49,12 +49,17 @@ class CaffeineProposalReason(StrEnum):
     UNSUPPORTED_PRODUCT_FORM = "unsupported_product_form"
     INCOMPLETE_SLEEP_PROVENANCE = "incomplete_sleep_provenance"
     INVALID_CONSUMED_CAFFEINE = "invalid_consumed_caffeine"
+    INVALID_CANDIDATE_CAFFEINE = "invalid_candidate_caffeine"
+    MISSING_CANDIDATE_CAFFEINE = "missing_candidate_caffeine"
+    CANDIDATE_WITHIN_BOUNDED_LIMIT = "candidate_within_bounded_limit"
+    CANDIDATE_EXCEEDS_BOUNDED_LIMIT = "candidate_exceeds_bounded_limit"
     INVALID_PERSONAL_LIMIT = "invalid_personal_limit"
     INVALID_INPUT = "invalid_input"
 
 
 class CaffeineRecommendationBasis(StrEnum):
     PERSONAL_EVENT_BASELINE = "personal_event_baseline"
+    CONFIRMED_CANDIDATE = "confirmed_candidate"
     UPPER_BOUND_ONLY = "upper_bound_only"
     NO_ADDITIONAL_CAFFEINE = "no_additional_caffeine"
     UNAVAILABLE = "unavailable"
@@ -125,6 +130,16 @@ class PersonalEventCaffeineBaseline:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateCaffeineEvidence:
+    """Exact owner- or label-confirmed caffeine for one prospective intake."""
+
+    interaction_id: str
+    amount_mg: CaffeineMg
+    source: str
+    source_key: str
+
+
+@dataclass(frozen=True, slots=True)
 class CaffeineTiming:
     intended_consumption_at: datetime
     target_sleep_at: datetime
@@ -150,6 +165,8 @@ class CaffeineProposalRequest:
     timing: CaffeineTiming | None
     safety_context: CaffeineSafetyContext
     product_form: CaffeineProductForm
+    candidate_caffeine: CandidateCaffeineEvidence | None = None
+    candidate_required: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +174,7 @@ class CaffeineProposalFacts:
     request: CaffeineProposalRequest | None
     effective_daily_ceiling_mg: CaffeineMg | None
     remaining_daily_allowance_mg: CaffeineMg | None
+    candidate_total_after_intake_mg: CaffeineMg | None = None
 
 
 @dataclass(frozen=True, slots=True)

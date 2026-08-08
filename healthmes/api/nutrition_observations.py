@@ -35,8 +35,11 @@ from healthmes.nutrition.contracts import (
     VisionProvenance,
     nutrition_review_to_payload,
 )
+from healthmes.nutrition.intake_service import operation_fingerprint
 from healthmes.nutrition.repository import (
+    NutritionOperationConflict,
     NutritionRepositoryError,
+    NutritionStorageIntegrityError,
     get_observation,
     latest_nutrition_reviews,
     list_observations,
@@ -95,9 +98,7 @@ class AnalyzeNutritionPhoto(BaseModel):
             raise ValueError("captured_at cannot be more than 5 minutes in the future")
         required = {"captured_at", "timezone", "location"}
         if not required.issubset(self.metadata_provenance):
-            raise ValueError(
-                "metadata_provenance requires captured_at, timezone, and location"
-            )
+            raise ValueError("metadata_provenance requires captured_at, timezone, and location")
         if (
             self.location is None
             and self.metadata_provenance["location"] is not MetadataSource.UNAVAILABLE
@@ -112,6 +113,7 @@ class ConfirmedCaffeineInput(BaseModel):
 
 
 class ConfirmObservationInput(BaseModel):
+    operation_id: uuid.UUID
     status: Literal["confirmed", "corrected", "rejected"]
     source: str = Field(min_length=1, max_length=64)
     items: list[ConfirmedCaffeineInput] = Field(default_factory=list, max_length=20)
@@ -139,11 +141,7 @@ class ReviewedEstimateInput(BaseModel):
     @model_validator(mode="after")
     def validate_shape(self) -> Self:
         if self.kind is EstimateKind.EXACT:
-            valid = (
-                self.exact is not None
-                and self.minimum is None
-                and self.maximum is None
-            )
+            valid = self.exact is not None and self.minimum is None and self.maximum is None
         elif self.kind is EstimateKind.RANGE:
             valid = (
                 self.exact is None
@@ -152,10 +150,7 @@ class ReviewedEstimateInput(BaseModel):
                 and self.minimum <= self.maximum
             )
         else:
-            valid = all(
-                value is None
-                for value in (self.exact, self.minimum, self.maximum)
-            )
+            valid = all(value is None for value in (self.exact, self.minimum, self.maximum))
         if not valid:
             raise ValueError("reviewed estimate shape is invalid")
         return self
@@ -193,9 +188,7 @@ class ReviewedNutritionItemInput(BaseModel):
     name: str = Field(min_length=1, max_length=300)
     intake_type: IntakeType
     serving: ReviewedEstimateInput
-    nutrients: list[ReviewedNutrientInput] = Field(
-        min_length=1, max_length=100
-    )
+    nutrients: list[ReviewedNutrientInput] = Field(min_length=1, max_length=100)
     confidence: Confidence = Confidence.HIGH
     warnings: list[str] = Field(default_factory=list, max_length=20)
 
@@ -215,18 +208,14 @@ class ReviewNutritionObservationInput(BaseModel):
     operation_id: uuid.UUID
     status: Literal["confirmed", "corrected", "rejected"]
     source: str = Field(min_length=1, max_length=64)
-    items: list[ReviewedNutritionItemInput] = Field(
-        default_factory=list, max_length=50
-    )
+    items: list[ReviewedNutritionItemInput] = Field(default_factory=list, max_length=50)
 
     @model_validator(mode="after")
     def validate_items(self) -> Self:
         if self.status == "corrected" and not self.items:
             raise ValueError("corrected reviews require complete item values")
         if self.status != "corrected" and self.items:
-            raise ValueError(
-                "confirmed or rejected reviews cannot contain corrected items"
-            )
+            raise ValueError("confirmed or rejected reviews cannot contain corrected items")
         indexes = [item.item_index for item in self.items]
         if len(indexes) != len(set(indexes)):
             raise ValueError("item_index values must be unique")
@@ -234,6 +223,7 @@ class ReviewNutritionObservationInput(BaseModel):
 
 
 class ConfirmDayInput(BaseModel):
+    operation_id: uuid.UUID
     local_date: date
     timezone: str = Field(min_length=1, max_length=64)
     observation_ids: list[uuid.UUID] = Field(max_length=100)
@@ -390,11 +380,10 @@ def get_nutrition_observations(
 
 
 @router.post("/daily-confirmations", status_code=status.HTTP_201_CREATED)
-def confirm_daily_intake(
-    body: ConfirmDayInput, session: SessionDep
-) -> dict[str, object]:
+def confirm_daily_intake(body: ConfirmDayInput, session: SessionDep) -> dict[str, object]:
+    operation_id = body.operation_id
     confirmation = DailyIntakeConfirmation(
-        confirmation_id=uuid.uuid4(),
+        confirmation_id=operation_id,
         local_date=body.local_date,
         timezone=body.timezone,
         observation_ids=tuple(body.observation_ids),
@@ -404,7 +393,25 @@ def confirm_daily_intake(
         outcome_ids=tuple(body.outcome_ids),
     )
     try:
-        persist_daily_confirmation(session, confirmation)
+        persist_daily_confirmation(
+            session,
+            confirmation,
+            operation_fingerprint=operation_fingerprint(
+                body.model_dump(mode="json", exclude_none=True)
+            ),
+        )
+    except NutritionOperationConflict as exc:
+        raise APIError(
+            status.HTTP_409_CONFLICT,
+            "operation_id_conflict",
+            str(exc),
+        ) from exc
+    except NutritionStorageIntegrityError as exc:
+        raise APIError(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "nutrition_storage_integrity_error",
+            str(exc),
+        ) from exc
     except NutritionRepositoryError as exc:
         raise APIError(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -436,8 +443,9 @@ def confirm_nutrition_observation(
     body: ConfirmObservationInput,
     session: SessionDep,
 ) -> dict[str, str]:
+    operation_id = body.operation_id
     confirmation = CaffeineConfirmation(
-        confirmation_id=uuid.uuid4(),
+        confirmation_id=operation_id,
         observation_id=observation_id,
         status=ConfirmationStatus(body.status),
         confirmed_at=utc_now(),
@@ -450,8 +458,30 @@ def confirm_nutrition_observation(
             for item in body.items
         ),
     )
+    fingerprint = operation_fingerprint(
+        {
+            "observation_id": str(observation_id),
+            **body.model_dump(mode="json", exclude_none=True),
+        }
+    )
     try:
-        persist_caffeine_confirmation(session, confirmation)
+        persist_caffeine_confirmation(
+            session,
+            confirmation,
+            operation_fingerprint=fingerprint,
+        )
+    except NutritionOperationConflict as exc:
+        raise APIError(
+            status.HTTP_409_CONFLICT,
+            "nutrition_confirmation_operation_conflict",
+            str(exc),
+        ) from exc
+    except NutritionStorageIntegrityError as exc:
+        raise APIError(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "nutrition_storage_integrity_error",
+            str(exc),
+        ) from exc
     except NutritionRepositoryError as exc:
         if str(exc) == "nutrition observation not found":
             raise not_found("nutrition observation", observation_id) from exc
@@ -474,25 +504,42 @@ def review_nutrition_observation(
     body: ReviewNutritionObservationInput,
     session: SessionDep,
 ) -> dict[str, str]:
+    operation_id = body.operation_id
     review = NutritionReview(
-        review_id=body.operation_id,
+        review_id=operation_id,
         observation_id=observation_id,
         status=ConfirmationStatus(body.status),
         reviewed_at=utc_now(),
         source=body.source,
         items=tuple(item.to_domain() for item in body.items),
     )
+    fingerprint = operation_fingerprint(
+        {
+            "observation_id": str(observation_id),
+            **body.model_dump(mode="json", exclude_none=True),
+        }
+    )
     try:
-        persist_nutrition_review(session, review)
+        persist_nutrition_review(
+            session,
+            review,
+            operation_fingerprint=fingerprint,
+        )
+    except NutritionOperationConflict as exc:
+        raise APIError(
+            status.HTTP_409_CONFLICT,
+            "nutrition_review_operation_conflict",
+            str(exc),
+        ) from exc
+    except NutritionStorageIntegrityError as exc:
+        raise APIError(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "nutrition_storage_integrity_error",
+            str(exc),
+        ) from exc
     except NutritionRepositoryError as exc:
         if str(exc) == "nutrition observation not found":
             raise not_found("nutrition observation", observation_id) from exc
-        if "operation_id was already used" in str(exc):
-            raise APIError(
-                status.HTTP_409_CONFLICT,
-                "nutrition_review_operation_conflict",
-                str(exc),
-            ) from exc
         raise APIError(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             "invalid_nutrition_review",
@@ -513,14 +560,8 @@ def get_nutrition_observation_review(
 ) -> dict[str, object]:
     if get_observation(session, observation_id) is None:
         raise not_found("nutrition observation", observation_id)
-    review = latest_nutrition_reviews(session, {observation_id}).get(
-        observation_id
-    )
+    review = latest_nutrition_reviews(session, {observation_id}).get(observation_id)
     return {
         "observation_id": str(observation_id),
-        "review": (
-            nutrition_review_to_payload(review)
-            if review is not None
-            else None
-        ),
+        "review": (nutrition_review_to_payload(review) if review is not None else None),
     }

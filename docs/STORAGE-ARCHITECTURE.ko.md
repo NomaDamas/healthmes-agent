@@ -41,6 +41,12 @@ iOS/Android의 저장 설정 UI와 durable upload queue는 별도 후속 작업�
 이번 구현의 설정 정본은 컴퓨터 Personal Data Node이며, 모바일은 향후 동일 API를
 사용한다.
 
+활동 텔레메트리는 현재 Android `app_usage_sample` 호환 경로까지만 구현되어 있다.
+이 테이블은 아직 `WellnessEvent`나 사용자 보존정책의 canonical source가 아니다.
+후속 작업은 `activity.*` 이벤트를 정본으로 저장하고 `app_usage_sample`을 기존
+인지에너지 엔진용 projection으로 전환한다. 데이터 클래스와 migration 순서는
+`docs/ACTIVITY-TELEMETRY-ARCHITECTURE.ko.md`를 따른다.
+
 ## TLDR
 
 HealthMes는 **하나의 논리적 정본인 Personal Data Node**를 둔다.
@@ -210,7 +216,7 @@ Postgres 인스턴스와 같은 Personal Data Node에 두고 HealthMes의 공통
 ```text
 event_id
 user_id
-type
+event_type
 schema_version
 observed_at
 recorded_at
@@ -312,7 +318,11 @@ HealthKit / Health Connect / 사용자 입력
 | 일·주 단위 특징 | 무기한 | 작고 장기 개인화에 필요 |
 | 목표·일정·사용자 결정·결과 | 무기한 | 개인 실행 그래프의 핵심 |
 | 사용자 작성 의료 기록 | 명시적 선택 | 일반 TTL 자동 적용 금지 |
-| 삭제 tombstone | 30일 | 다른 기기의 삭제 부활 방지 |
+| 최소 삭제 ledger | 무기한* | 삭제 generation·watermark만 보존해 복원·지연 업로드의 부활 방지 |
+
+`*` account/device/content 평문이 없는 opaque metadata만 남긴다. 모든 등록
+replica, queue, backup generation이 deletion watermark를 넘었다는 증거가 있을
+때에만 compact할 수 있으며, 일반 사용자 TTL preset의 적용 대상이 아니다.
 
 ### 핵심 원칙
 
@@ -351,6 +361,61 @@ raw-first
 - 보존기간을 줄이면 예상 삭제량을 보여주고 24시간 grace를 둔다.
 - “즉시 삭제”는 grace 없이 파일 삭제와 키 폐기를 수행한다.
 - `무기한`은 무제한 무료가 아니라 사용자 로컬 예산 또는 클라우드 quota 안에서 동작한다.
+
+### 정책 변경과 쓰기의 동시성
+
+새 이벤트·객체 writer와 보존정책 변경은 `expires_at`을 계산하기 전에 같은
+데이터 클래스의 transaction-scoped lock을 잡는다. 따라서 한 쓰기가 오래된
+정책 ID와 새 만료시각을 섞거나, 반대로 새 정책 ID와 오래된 만료시각을 섞을 수
+없다. writer는 잠금 시점의 정책을 일관되게 적용하고, 정책 변경 transaction은
+기존의 아직 만료되지 않은 데이터까지 같은 기준 시각으로 다시 계산한다.
+
+```text
+공통 writer
+  → 필요한 data class를 정렬
+  → retention policy lock
+  → policy ID와 expires_at 계산
+  → event/object 저장
+  → commit 또는 rollback에서 잠금 해제
+
+정책 변경
+  → 같은 retention policy lock
+  → policy 갱신
+  → 기존 active row의 expires_at 재계산
+  → commit 또는 rollback에서 잠금 해제
+```
+
+- PostgreSQL은 기존 `retention_policy` 행을 `FOR UPDATE`로 잠근다.
+- 아직 정책 행이 없으면 data class별 transaction advisory lock 아래에서 한 번만
+  생성한 뒤 행 잠금을 유지한다.
+- 파일 기반 SQLite는 같은 DB 경로에 대해 process-wide `RLock`과 POSIX advisory
+  sidecar-file lock을 transaction 종료까지 유지한다. 따라서 서로 다른 engine과
+  HealthMes 프로세스도 한 컴퓨터 안에서는 같은 nutrition/retention critical
+  section을 직렬화한다. in-memory SQLite는 process-local이며, 여러 호스트 또는
+  높은 동시성의 Personal Data Node는 PostgreSQL을 사용한다.
+- 여러 data class를 함께 쓰는 작업은 이름순으로 잠가 deadlock을 피한다.
+- 영양 write와 maintenance는 `nutrition ledger → retention policy` 순서를
+  공통으로 사용한다.
+
+### 손상된 legacy 행의 격리
+
+maintenance는 migration이나 purge보다 먼저 legacy `WellnessEvent`의 `payload`와
+`quality_flags`가 JSON object인지 검사한다. 둘 중 하나라도 object가 아니면 해당
+행에 `maintenance_quarantine=legacy_json_document_invalid`를 기록하고 그 행만
+migration·권위 있는 조회에서 제외한다. 다른 정상 행의 migration과 삭제는
+계속 실행되므로 한 개의 오래된 손상 레코드가 전체 유지보수를 막지 않는다.
+
+`maintenance_quarantine`은 maintenance 전용 예약 flag다. 일반 wellness ingest는
+이 값을 직접 만들 수 없으며, 운영자가 원문을 수리한 뒤 다음 maintenance가
+검증을 통과해야만 격리를 제거할 수 있다. 단, 격리는 사용자가 선택한 보존기간을
+연장하지 않는다. 만료 전에는 복구 기회를 주지만 만료 시 health payload는
+삭제한다. canonical nutrition operation ID를 확인할 수 있으면 종류와 UUID,
+`invalidated` 상태만 담은 영구 비내용 marker를 먼저 남겨 같은 ID의 부활을
+막는다. 손상된 confirmation도 같은 방식의 opaque terminal tombstone만 남긴다.
+
+maintenance `dry_run`은 전체 작업을 DB savepoint 안에서 실행한 뒤 rollback한다.
+따라서 quarantine, 미등록 파일 index, 사용량 측정, purge job을 포함한 어떤
+DB 변경도 남기지 않고 후보 수만 반환한다.
 
 ## 7. 용량 관리
 
@@ -543,6 +608,7 @@ Enterprise 계약
 ```text
 사용자 삭제 요청
 → 로컬 tombstone 기록
+→ collector credential 폐기와 device generation cutoff
 → 다른 기기에 삭제 전파
 → cloud ciphertext 삭제 예약
 → grace 종료 후 실제 삭제
@@ -553,7 +619,7 @@ Enterprise 계약
 
 - 활성 객체 삭제
 - 관련 data key 폐기
-- sync tombstone 유지
+- 최소 sync deletion ledger 유지
 - 복구 불가 확인
 - 법적 보존 대상이 있다면 사전에 사용자·조직 정책으로 명시
 
@@ -564,6 +630,7 @@ Enterprise 계약
 - 최신 snapshot 다운로드
 - 무결성 검사
 - Personal Data Node 복원
+- deletion ledger를 먼저 적용
 - 마지막 snapshot 이후 이벤트를 sync replay
 
 ## 13. Worktree와 브랜치 격리

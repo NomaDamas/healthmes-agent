@@ -332,6 +332,7 @@ def test_adjustment_secret_is_generated_separately_and_preserved(
     assert "secret" not in proof_config
     assert set(proof_config["confirmations"]) == {
         "resolve_calendar_adjustment",
+        "resolve_nutrition_confirmation",
         "resolve_schedule_proposal",
     }
 

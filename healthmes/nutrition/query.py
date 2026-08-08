@@ -18,19 +18,22 @@ from healthmes.nutrition.contracts import (
     observation_to_payload,
 )
 from healthmes.nutrition.intake_contracts import (
+    NUTRIENT_PROVENANCE_VERIFIED_FIELD,
     EvidenceOrigin,
     IntakeOutcome,
     IntakeOutcomeStatus,
     NormalizedIntakeItem,
 )
+from healthmes.nutrition.ledger_lock import lock_nutrition_ledger
 from healthmes.nutrition.repository import (
-    intake_outcome_states_for_day,
+    intake_outcome_ledger_for_day,
+    interaction_owned_observation_ids,
     latest_caffeine_confirmations,
     latest_daily_confirmation,
-    latest_intake_outcome_states,
     latest_nutrition_reviews,
     list_observations,
     local_day_bounds,
+    unresolved_log_consumed_interaction_ids_for_day,
 )
 
 INTAKE_OUTCOME_EVENT = "nutrition.intake-outcome.v1"
@@ -48,9 +51,7 @@ def observation_view(
         else None
     )
     payload["latest_nutrition_review"] = (
-        nutrition_review_to_payload(nutrition_review)
-        if nutrition_review is not None
-        else None
+        nutrition_review_to_payload(nutrition_review) if nutrition_review is not None else None
     )
     return payload
 
@@ -89,6 +90,7 @@ def caffeine_observations_for_day(
     start, end = local_day_bounds(local_date, timezone)
     observations = list_observations(session, start=start, end=end, limit=500)
     ids = {observation.observation_id for observation in observations}
+    interaction_owned_ids = interaction_owned_observation_ids(session, ids)
     confirmations = latest_caffeine_confirmations(session, ids)
     reviews = latest_nutrition_reviews(session, ids)
     records: list[dict[str, Any]] = []
@@ -98,24 +100,24 @@ def caffeine_observations_for_day(
             review is not None
             and review.status is ConfirmationStatus.CORRECTED
             and any(
-                nutrient.nutrient == "caffeine"
-                and nutrient.amount.kind is not EstimateKind.UNKNOWN
+                nutrient.nutrient == "caffeine" and nutrient.amount.kind is not EstimateKind.UNKNOWN
                 for item in review.items
                 for nutrient in item.nutrients
             )
         )
         if not has_reviewed_caffeine and not any(
-            item.caffeine.kind is not EstimateKind.UNKNOWN
-            for item in observation.items
+            item.caffeine.kind is not EstimateKind.UNKNOWN for item in observation.items
         ):
             continue
-        records.append(
-            observation_view(
-                observation,
-                confirmations.get(observation.observation_id),
-                review,
-            )
+        record = observation_view(
+            observation,
+            confirmations.get(observation.observation_id),
+            review,
         )
+        record["legacy_daily_confirmation_eligible"] = (
+            observation.observation_id not in interaction_owned_ids
+        )
+        records.append(record)
     return {
         "status": "ok",
         "local_date": local_date.isoformat(),
@@ -134,18 +136,14 @@ def _review_caffeine_total(
     if review.status is ConfirmationStatus.CORRECTED:
         estimates = [
             nutrient.amount
-            for item in sorted(
-                review.items, key=lambda value: value.item_index
-            )
+            for item in sorted(review.items, key=lambda value: value.item_index)
             for nutrient in item.nutrients
             if nutrient.nutrient == "caffeine"
         ]
     else:
         estimates = [item.caffeine for item in observation.items]
     if len(estimates) != len(observation.items) or any(
-        estimate.kind is not EstimateKind.EXACT
-        or estimate.exact is None
-        for estimate in estimates
+        estimate.kind is not EstimateKind.EXACT or estimate.exact is None for estimate in estimates
     ):
         return None
     return sum(estimate.exact for estimate in estimates if estimate.exact is not None)
@@ -153,13 +151,15 @@ def _review_caffeine_total(
 
 def _item_caffeine_total(
     items: tuple[NormalizedIntakeItem, ...],
+    *,
+    nutrient_provenance_verified: bool,
 ) -> float | None:
+    if not nutrient_provenance_verified:
+        return None
     total = 0.0
     for item in items:
         estimates = [
-            fact.amount
-            for fact in item.nutrients
-            if fact.nutrient.casefold() == "caffeine"
+            fact.amount for fact in item.nutrients if fact.nutrient.casefold() == "caffeine"
         ]
         if (
             len(estimates) != 1
@@ -167,9 +167,7 @@ def _item_caffeine_total(
             or estimates[0].unit.casefold() != "mg"
             or estimates[0].exact is None
             or next(
-                fact.origin
-                for fact in item.nutrients
-                if fact.nutrient.casefold() == "caffeine"
+                fact.origin for fact in item.nutrients if fact.nutrient.casefold() == "caffeine"
             )
             not in {EvidenceOrigin.USER, EvidenceOrigin.LABEL}
         ):
@@ -197,29 +195,42 @@ def known_caffeine_for_day(
     local_date: date,
     timezone: str,
 ) -> dict[str, Any]:
+    lock_nutrition_ledger(session)
     start, end = local_day_bounds(local_date, timezone)
-    observations = list_observations(session, start=start, end=end, limit=500)
+    captured_observations = list_observations(
+        session,
+        start=start,
+        end=end,
+        limit=500,
+    )
+    captured_ids = {observation.observation_id for observation in captured_observations}
+    interaction_owned_ids = interaction_owned_observation_ids(
+        session,
+        captured_ids,
+    )
+    observations = [
+        observation
+        for observation in captured_observations
+        if observation.observation_id not in interaction_owned_ids
+    ]
     ids = {observation.observation_id for observation in observations}
     confirmations = latest_caffeine_confirmations(session, ids)
     reviews = latest_nutrition_reviews(session, ids)
     daily = latest_daily_confirmation(session, local_date, timezone)
-    outcome_states = intake_outcome_states_for_day(
+    outcome_states, unavailable_outcome_ids = intake_outcome_ledger_for_day(
         session,
         start=start,
         end=end,
     )
-    latest_outcomes = latest_intake_outcome_states(session)
-
+    unresolved_interaction_ids = unresolved_log_consumed_interaction_ids_for_day(
+        session,
+        start=start,
+        end=end,
+    )
     total_mg = 0.0
     reviewed: set[uuid.UUID] = set()
     quantified: set[uuid.UUID] = set()
     quantified_outcomes: set[uuid.UUID] = set()
-    outcome_observation_ids = {
-        snapshot.nutrition_observation_id
-        for _, outcome in latest_outcomes.values()
-        if (snapshot := outcome.intake_snapshot) is not None
-        and snapshot.nutrition_observation_id is not None
-    }
     evidence: list[dict[str, Any]] = []
     latest_evidence_at: datetime | None = None
     consumed_outcome_count = 0
@@ -231,7 +242,12 @@ def known_caffeine_for_day(
             end=end,
         )
         amount = (
-            _item_caffeine_total(snapshot.items)
+            _item_caffeine_total(
+                snapshot.items,
+                nutrient_provenance_verified=(
+                    row.payload.get(NUTRIENT_PROVENANCE_VERIFIED_FIELD) is True
+                ),
+            )
             if snapshot is not None and included_in_total
             else None
         )
@@ -253,33 +269,24 @@ def known_caffeine_for_day(
                 "status": outcome.status.value,
                 "caffeine_mg": amount if included_in_total else 0.0,
                 "included_in_total": included_in_total,
-                "modality": (
-                    snapshot.modality.value if snapshot is not None else None
-                ),
+                "modality": (snapshot.modality.value if snapshot is not None else None),
                 "nutrition_observation_id": (
                     str(snapshot.nutrition_observation_id)
-                    if snapshot is not None
-                    and snapshot.nutrition_observation_id is not None
+                    if snapshot is not None and snapshot.nutrition_observation_id is not None
                     else None
                 ),
                 "nutrition_review_id": (
                     str(snapshot.nutrition_review_id)
-                    if snapshot is not None
-                    and snapshot.nutrition_review_id is not None
+                    if snapshot is not None and snapshot.nutrition_review_id is not None
                     else None
                 ),
             }
         )
     for observation in observations:
-        if observation.observation_id in outcome_observation_ids:
-            reviewed.add(observation.observation_id)
-            quantified.add(observation.observation_id)
-            continue
         confirmation = confirmations.get(observation.observation_id)
         review = reviews.get(observation.observation_id)
         if review is not None and (
-            confirmation is None
-            or review.reviewed_at > confirmation.confirmed_at
+            confirmation is None or review.reviewed_at > confirmation.confirmed_at
         ):
             reviewed.add(observation.observation_id)
             amount = _review_caffeine_total(observation, review)
@@ -342,9 +349,7 @@ def known_caffeine_for_day(
 
     daily_ids = set(daily.observation_ids) if daily is not None else set()
     daily_outcome_ids = set(daily.outcome_ids) if daily is not None else set()
-    outcome_state_ids = {
-        outcome.outcome_id for _, outcome in outcome_states
-    }
+    outcome_state_ids = {outcome.outcome_id for _, outcome in outcome_states}
     included_outcome_ids = {
         outcome.outcome_id
         for _, outcome in outcome_states
@@ -357,12 +362,12 @@ def known_caffeine_for_day(
         and reviewed == ids
         and quantified == ids
         and daily_outcome_ids == outcome_state_ids
-        and quantified_outcomes
-        == included_outcome_ids
+        and quantified_outcomes == included_outcome_ids
+        and not unavailable_outcome_ids
+        and not unresolved_interaction_ids
         and (
             latest_evidence_at is None
-            or daily.confirmed_at.astimezone(UTC)
-            >= latest_evidence_at.astimezone(UTC)
+            or daily.confirmed_at.astimezone(UTC) >= latest_evidence_at.astimezone(UTC)
         )
     )
     return {
@@ -372,22 +377,26 @@ def known_caffeine_for_day(
         "confirmed_caffeine_mg": total_mg,
         "total_intake_complete": complete,
         "observation_count": len(observations),
+        "captured_observation_count": len(captured_observations),
+        "interaction_owned_observation_ids": sorted(str(value) for value in interaction_owned_ids),
         "consumed_outcome_count": consumed_outcome_count,
         "outcome_state_count": len(outcome_states),
+        "unresolved_log_consumed_interaction_ids": sorted(
+            str(value) for value in unresolved_interaction_ids
+        ),
         "ledger_entry_count": len(observations) + consumed_outcome_count,
         "reviewed_count": len(reviewed),
         "unreviewed_observation_ids": sorted(str(value) for value in ids - reviewed),
-        "unquantified_observation_ids": sorted(
-            str(value) for value in ids - quantified
-        ),
+        "unquantified_observation_ids": sorted(str(value) for value in ids - quantified),
         "unquantified_outcome_ids": sorted(
             str(outcome.outcome_id)
             for _, outcome in outcome_states
             if _outcome_is_consumed_in_day(outcome, start=start, end=end)
             and outcome.outcome_id not in quantified_outcomes
         ),
-        "evidence": evidence,
-        "daily_confirmation_id": (
-            str(daily.confirmation_id) if daily is not None else None
+        "unavailable_outcome_operation_ids": sorted(
+            str(value) for value in unavailable_outcome_ids
         ),
+        "evidence": evidence,
+        "daily_confirmation_id": (str(daily.confirmation_id) if daily is not None else None),
     }

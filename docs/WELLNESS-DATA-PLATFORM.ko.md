@@ -121,16 +121,20 @@ HealthMes는 엔진뿐 아니라 앱에서 사용하는 기능과 연결 계약�
 ```text
 event_id
 user_id
-type / schema_version
+event_type / schema_version
 observed_at / recorded_at / timezone
 source_provider / source_device / source_record_id
-value / unit / normalized_value
 confidence / coverage / quality_flags
 capture_method: sensor | photo | voice | text | import | inferred
 consent_scope / sensitivity
-retention_class / expires_at
-raw_ref / derived_from[]
+retention_policy_id / expires_at
+payload
+raw_object_id / derived_from[]
 ```
+
+이 이름들이 공통 `WellnessEvent`의 canonical envelope다. 입력별 value/unit은
+별도 최상위 필드가 아니라 versioned `payload` 안에 두고, retention class 이름은
+`retention_policy_id`가 가리키는 정책 레코드로 관리한다.
 
 `confidence`는 모델의 확률 하나가 아니다. 센서 착용 여부, 측정 조건, 데이터
 누락률, 사용자의 확인 여부를 함께 반영해야 한다. 추론값은 관측값과 별도 타입으로
@@ -138,12 +142,12 @@ raw_ref / derived_from[]
 
 ## 오픈소스 도입 후보
 
-별 수는 2026-08-04 조사 시점의 대략적인 GitHub 표시값이다. 인기도 신호일 뿐
+별 수는 2026-08-08 조사 시점의 대략적인 GitHub 표시값이다. 인기도 신호일 뿐
 품질·보안·라이선스 적합성을 대신하지 않는다.
 
 | 후보 | 대략적 인기 | 사용처 | 통합 방식 | 판단 |
 |---|---:|---|---|---|
-| ActivityWatch | 17.8k★ | macOS/Windows/Linux 앱·웹 사용과 AFK | 로컬 REST/이벤트 import | **P0 추천** |
+| ActivityWatch | 18.5k★ | macOS/Windows/Linux 앱·웹 사용과 AFK | localhost sidecar REST/이벤트 import | **P0 추천** |
 | wger | 6.1k★ | 운동 루틴, 세트, 영양 기록 | REST adapter, 별도 서비스 | **P1 추천** |
 | Gadgetbridge | 4.5k★ | Android에서 클라우드 없이 다양한 웨어러블 연결 | export/IPC adapter | **P1, Android 보완** |
 | OpenTracks | 활발한 OSS | GPS 운동 경로·고도·속도 | GPX/KML import | **P1 선택** |
@@ -152,6 +156,10 @@ raw_ref / derived_from[]
 | Nightscout | 2.4k★ | 개인 CGM 데이터 | read-only REST adapter | **P2, 의료 경계 필요** |
 | Open mHealth schemas | 표준 중심 | 건강 데이터 공통 스키마 참고 | 어휘/단위 매핑 참고 | **계약 설계에 추천** |
 | Medplum/Fasten Health | FHIR 생태계 | 의료기관 기록·개인 PHR 연결 | 독립 adapter/service | **P2 검토** |
+
+컴퓨터·휴대폰 활동 데이터의 공통 event, privacy level, 교차기기 session,
+ActivityWatch 도입 경계, 2026년 EU 한정 iOS `FamilyActivityData` 조건은
+`docs/ACTIVITY-TELEMETRY-ARCHITECTURE.ko.md`를 따른다.
 
 ### 라이선스 원칙
 
@@ -194,8 +202,12 @@ HealthMes의 `IntakeInteraction`은 영양 관찰 위의 오케스트레이션 �
 | 일/주 단위 특징과 quality 통계 | 사용자 삭제 전까지 | 크기가 작고 장기 개인화에 필요 |
 | 결정·승인·수정·거절·결과 | 사용자 삭제 전까지 | HealthMes의 핵심 실행 그래프 |
 | 사용자 작성 의료 기록 | 자동 삭제 안 함 | 일반 웰니스 TTL과 분리, 명시적 삭제 |
-| 삭제 tombstone | 30일 | 여러 기기에서 삭제가 다시 살아나는 문제 방지 |
+| 최소 삭제 ledger | 무기한* | 삭제 generation·watermark만 보존해 복원·지연 업로드의 부활 방지 |
 | 암호화 백업 | 7 daily + 4 weekly + 12 monthly | 단순 age TTL보다 복구 지점과 비용 균형 |
+
+`*` content, app, domain, 건강값을 담지 않는 opaque metadata만 남긴다. 모든
+등록 replica, queue, backup generation이 deletion watermark를 넘었다는 증거가
+있을 때만 compact하며 일반 데이터 보존 preset과 분리한다.
 
 사용자는 각 계층을 `1일 / 7일 / 14일 / 30일 / 90일 / 무기한`으로 바꿀 수
 있어야 한다. 단, 저장 기간을 늘리는 UI는 예상 용량을 먼저 보여준다.

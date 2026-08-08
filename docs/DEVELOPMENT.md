@@ -453,14 +453,60 @@ shapes are pinned in `tests/api/`):
 |---|---|---|
 | `POST /v1/media` | bearer **only** | `multipart/form-data`, field name exactly `file`; client filename ignored. `Content-Length` **required** (`411` without one — chunked bodies are refused; the size cap is enforced off the header BEFORE the body is received/spooled). Content-type allowlist (jpeg/png/heic/webp images, m4a/mp3/ogg/wav audio; aliases normalized). `201 → {media_path, content_type, bytes}`; `415` (detail.allowed), `413` (cap = `HEALTHMES_MEDIA_MAX_UPLOAD_BYTES`, default 15 MiB; declared length beyond cap + 64 KiB envelope allowance is refused unread), `422` missing `file` field or empty file. Files land under `{data_dir}/media/YYYY/MM/` (UTC sharding). |
 | `GET /v1/media/{media_path}` | bearer **or** derived viewer `?token=` (GET/HEAD only) | Serves the upload back (real content type, `Cache-Control: private, max-age=86400, immutable`); decision/report pages and in-app web views can embed via `<img>`/`<audio>`. All path tricks → uniform 404. |
-| `POST /v1/nutrition-observations/analyze` | bearer | Accepts an uploaded image `media_path` plus capture time/timezone/provenance. Calls the configured Ollama/OpenAI/Gemini/Anthropic/xAI vision provider with a strict JSON schema and stores serving, core nutrients, optional additional nutrients, and provenance in `WellnessEvent.payload`. Ollama is the local default. Remote providers require a configured key, per-request `allow_remote_vision: true`, and HTTPS; there is no automatic cloud fallback. Repeating the same media returns the existing observation. Text/voice automatic nutrition analysis is not implemented. |
+| `POST /v1/nutrition-observations/analyze` | bearer | Accepts an uploaded image `media_path` plus capture time/timezone/provenance. Calls the configured Ollama/OpenAI/Gemini/Anthropic/xAI vision provider with a strict JSON schema and stores serving, core nutrients, optional additional nutrients, and provenance in `WellnessEvent.payload`. Ollama is the local default. Remote providers require a configured key, per-request `allow_remote_vision: true`, and HTTPS; there is no automatic cloud fallback. Repeating the same media returns the existing observation. |
 | `GET /v1/nutrition-observations[/{id}]` | bearer | Reads immutable structured observations. Estimates remain exact/range/unknown and are never promoted to confirmed intake merely because they were stored. |
-| `POST /v1/nutrition-observations/{id}/confirm` | bearer | Appends a confirmed/corrected/rejected caffeine event. Confirmed/corrected requests must provide one finite non-negative `caffeine_mg` for every item in the observation. |
-| `POST /v1/nutrition-observations/daily-confirmations` | bearer | Appends a local-day coverage event. `total_intake_complete: true` is accepted only when the ID set contains every observation for that local date. |
+| `POST /v1/nutrition-observations/{id}/confirm` | bearer | Idempotently appends a confirmed/corrected/rejected caffeine event with a caller-owned `operation_id`. Confirmed/corrected requests must provide one finite non-negative `caffeine_mg` for every item in the observation. Exact retries return the original event; same-ID/different-input retries return `409`, and a permanent non-content operation marker prevents ID reuse after result expiry. |
+| `POST /v1/nutrition-observations/{id}/review` | bearer | Idempotently confirms, fully corrects, or rejects the complete photo nutrition observation with a caller-owned `operation_id`. The original VLM observation remains immutable. Exact retries return the original review; conflicting reuse returns `409`, and the operation marker outlives the retained review. |
+| `POST /v1/nutrition-observations/daily-confirmations` | bearer | Idempotent local-day coverage write with caller-owned `operation_id`. `total_intake_complete: true` requires every legacy-eligible observation ID, every latest intake outcome ID affecting the day, and no unresolved `log_consumed` interaction. Exact retries return the original event; same-ID/different-input retries return `409`. |
+| `POST /v1/intake-interactions/analyze` | bearer | Automatically structures owner free text with the configured nutrition model, or transcribes a local voice token through the configured loopback whisper.cpp server before the same text analysis. Capture remains separate from consumption. |
+| `POST /v1/intake-interactions/{id}/review` | bearer | Confirms, fully corrects, or rejects model-derived nutrients for photo/text/voice interactions. A stored outcome closes this review path; later corrections use a new outcome or interaction. |
 | `POST /v1/medical-records` | bearer | REST twin of the `create_medical_record` MCP tool (the Telegram capture-skill contract): `{kind: medication\|symptom, description, media_path?, transcript?, context?}`. The server attaches the deterministic health snapshot under `context.health` (degrades to `{status: unavailable}` when open-wearables is down — capture never fails for infra reasons); caller context is stored under `context.capture`. |
 | `GET /v1/alerts` | bearer | Alert history in glance semantics ("unresolved == recently pushed"): `?hours=1..168` (default 24), paginated `Page` envelope, newest first. Items carry the §8.5 grammar recorded at fire time (`summary`/`evidence`/`proposal`) + `decision_url`; `alerts[0]` agrees verbatim with the glance top alert (test-pinned). |
 | `POST /v1/schedule/proposals/{id}/accept` / `/decline` | bearer | The apps' ✅/❌ actions. Second tap → `409 invalid_transition` with `detail {current, requested}` (render "already resolved"); unknown id → 404. |
 | `POST /v1/food-logs` | bearer | Accepts `media_path` from `POST /v1/media` (≤500 chars). |
+
+Photo analysis uses media identity plus a request fingerprint rather than an
+`operation_id`. Other nutrition mutation IDs are scoped to the write kind, not
+one global nutrition UUID namespace. Clients should still generate a fresh
+UUID for every logical mutation. Photo-operation results use a write-kind
+prefix; interaction-engine results use a write-kind-specific source provider
+with a UUID-only record ID. Both forms keep the complete source identity
+write-kind-scoped, and UUID-only legacy photo rows remain readable and
+retryable while their retained result exists. Permanent technical
+`nutrition.operation.v1` markers normally retain only operation kind, UUID,
+request fingerprint, and completion state. Maintenance backfills pre-marker
+legacy results before purging them and strips older health-semantic marker
+metadata. A malformed or source/payload-inconsistent legacy result is
+fail-closed: maintenance sets `quality_flags.maintenance_quarantine`, does not
+expose the row through authoritative reads, and gives a canonical operation
+source identity a permanent invalidated non-content marker before the health
+payload reaches its retention deadline. A
+malformed or incompatible legacy transition marker is quarantined the same way
+and temporarily keeps the semantic fields until a later repair can create the
+durable transition. The `maintenance_quarantine` quality flag is reserved for
+this internal repair flow and generic wellness ingest cannot set it. Quarantine
+never extends a user-selected retention period: expired health payloads are
+deleted, while only technical operation identity remains. Storage maintenance
+dry-run executes in a rolled-back savepoint and does not persist quarantine,
+index, usage, or purge-job changes.
+Interaction review/outcome writes append separate immutable wellness
+`nutrition.interaction-transition.v1` revisions so an expired outcome cannot
+reopen review or a prospective caffeine request. A review created after a
+caffeine decision request also invalidates that request, and proposal execution
+locks the candidate and rechecks both transition state and the daily ledger in
+one final database transaction before returning.
+Outcome transitions retain only the non-nutrient
+`interaction_observed_at`/`outcome_consumed_at` projection needed to identify
+which local day remains affected after a retained result expires. If the latest
+outcome payload is unavailable, the daily ledger reports the operation ID as
+unavailable and cannot be confirmed complete; it never reconstructs nutrients
+from the transition. Retention policy updates and writers use the same
+transaction-scoped data-class locks before deriving expiry. PostgreSQL uses
+row locks plus a creation advisory lock, while file-backed SQLite combines a
+process-wide `RLock` with a POSIX advisory sidecar-file lock to serialize
+separate engines and processes using the same database file. In-memory SQLite
+is process-local. Nutrition paths acquire the unified ledger lock before
+retention locks.
 
 Client caveats worth knowing (all handled by the shipped apps):
 

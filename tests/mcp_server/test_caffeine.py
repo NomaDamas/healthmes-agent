@@ -21,6 +21,7 @@ from healthmes.mcp_server.caffeine_contract import (
     CaffeineSafetyContext,
     CaffeineTiming,
     CalendarEventId,
+    CandidateCaffeineEvidence,
     PersonalDailyCaffeineLimit,
     PersonalEventCaffeineBaseline,
     PopulationDailyCaffeineGuardrail,
@@ -111,6 +112,121 @@ def test_valid_inputs_return_personalized_bounded_proposal() -> None:
         confidence=ProposalConfidence.MEDIUM,
         reason=CaffeineProposalReason.PERSONAL_EVENT_BASELINE_APPLIED,
     )
+
+
+def test_confirmed_candidate_can_replace_calendar_event_baseline() -> None:
+    request = replace(
+        _valid_request(),
+        event_id=None,
+        personal_event_baseline=None,
+        candidate_caffeine=CandidateCaffeineEvidence(
+            interaction_id="candidate-interaction",
+            amount_mg=CaffeineMg(120),
+            source="confirmed_intake_decision_context",
+            source_key="decision-request:candidate-interaction",
+        ),
+        candidate_required=True,
+    )
+
+    result = propose_caffeine(request)
+
+    assert result.status is CaffeineProposalStatus.PROPOSAL
+    assert result.reason is CaffeineProposalReason.CANDIDATE_WITHIN_BOUNDED_LIMIT
+    assert result.facts.remaining_daily_allowance_mg == 200
+    assert result.facts.candidate_total_after_intake_mg == 220
+    assert result.recommendation == BoundedCaffeineRecommendation(
+        maximum_additional_mg=CaffeineMg(200),
+        suggested_additional_mg=CaffeineMg(120),
+        basis=CaffeineRecommendationBasis.CONFIRMED_CANDIDATE,
+    )
+
+
+def test_candidate_above_bound_returns_noop_for_the_item_as_is() -> None:
+    request = replace(
+        _valid_request(),
+        event_id=None,
+        personal_event_baseline=None,
+        candidate_caffeine=CandidateCaffeineEvidence(
+            interaction_id="candidate-interaction",
+            amount_mg=CaffeineMg(220),
+            source="confirmed_intake_decision_context",
+            source_key="decision-request:candidate-interaction",
+        ),
+        candidate_required=True,
+    )
+
+    result = propose_caffeine(request)
+
+    assert result.status is CaffeineProposalStatus.NOOP
+    assert result.reason is CaffeineProposalReason.CANDIDATE_EXCEEDS_BOUNDED_LIMIT
+    assert result.facts.candidate_total_after_intake_mg == 320
+    assert result.recommendation == BoundedCaffeineRecommendation(
+        maximum_additional_mg=CaffeineMg(200),
+        suggested_additional_mg=None,
+        basis=CaffeineRecommendationBasis.CONFIRMED_CANDIDATE,
+    )
+
+
+def test_zero_caffeine_candidate_is_within_zero_remaining_allowance() -> None:
+    request = replace(
+        _valid_request(),
+        event_id=None,
+        personal_event_baseline=None,
+        consumed_today_mg=CaffeineMg(300),
+        candidate_caffeine=CandidateCaffeineEvidence(
+            interaction_id="decaf-candidate",
+            amount_mg=CaffeineMg(0),
+            source="confirmed_intake_decision_context",
+            source_key="decision-request:decaf-candidate",
+        ),
+        candidate_required=True,
+    )
+
+    result = propose_caffeine(request)
+
+    assert result.status is CaffeineProposalStatus.PROPOSAL
+    assert result.reason is CaffeineProposalReason.CANDIDATE_WITHIN_BOUNDED_LIMIT
+    assert result.facts.remaining_daily_allowance_mg == 0
+    assert result.facts.candidate_total_after_intake_mg == 300
+    assert result.recommendation == BoundedCaffeineRecommendation(
+        maximum_additional_mg=CaffeineMg(0),
+        suggested_additional_mg=CaffeineMg(0),
+        basis=CaffeineRecommendationBasis.CONFIRMED_CANDIDATE,
+    )
+
+
+def test_candidate_route_fails_closed_without_confirmed_candidate_amount() -> None:
+    result = propose_caffeine(
+        replace(
+            _valid_request(),
+            event_id=None,
+            personal_event_baseline=None,
+            candidate_caffeine=None,
+            candidate_required=True,
+        )
+    )
+
+    assert result.status is CaffeineProposalStatus.INSUFFICIENT_DATA
+    assert result.reason is CaffeineProposalReason.MISSING_CANDIDATE_CAFFEINE
+    assert result.recommendation.maximum_additional_mg is None
+
+
+def test_negative_candidate_caffeine_is_invalid() -> None:
+    request = replace(
+        _valid_request(),
+        candidate_caffeine=CandidateCaffeineEvidence(
+            interaction_id="candidate-interaction",
+            amount_mg=CaffeineMg(-1),
+            source="confirmed_intake_decision_context",
+            source_key="decision-request:candidate-interaction",
+        ),
+        candidate_required=True,
+    )
+
+    result = propose_caffeine(request)
+
+    assert result.status is CaffeineProposalStatus.INVALID_INPUT
+    assert result.reason is CaffeineProposalReason.INVALID_CANDIDATE_CAFFEINE
 
 
 def test_consumed_at_daily_limit_returns_zero_mg_noop() -> None:

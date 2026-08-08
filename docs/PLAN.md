@@ -185,8 +185,23 @@ receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한
 
 ## 7. 앱사용 추적 — 현실 점검
 
-- **Android (MVP 경로):** 최소 컴패니언 앱 `apps/android-usage/` (Kotlin, 페어링+토글 한 화면). `UsageStatsManager.queryEvents` + WorkManager 30분 주기 → 시간별 버킷을 `POST /v1/app-usage/batch`로 전송. ~1주 작업량.
-- **iOS: DeviceActivity/Screen Time API는 데이터 오프디바이스 반출 불가** (샌드박스 확장 안에서만 렌더). **권장: MVP에서 스킵** — 엔진이 신호 없이 재정규화. 옵션으로 주간 Screen Time 스크린샷을 Telegram 봇에 보내면 비전 모델이 대략적 버킷으로 추출하는 습관을 문서화 (capture 스킬 덕에 거의 공짜). 네이티브 iOS 추적은 만들지 않음.
+- **현재 Android:** `apps/android-usage/`가
+  `UsageStatsManager.queryEvents`를 시간별 package/foreground/launch/category로
+  묶고 WorkManager로 `POST /v1/app-usage/batch`에 전송한다. 이것은 아직
+  `app_usage_sample` 호환 경로이며 공통 `WellnessEvent`·보존정책 migration은
+  후속 작업이다.
+- **Desktop P0:** ActivityWatch를 localhost sidecar로 읽고 title/URL을 edge에서
+  삭제·축약한 뒤 HealthMes canonical activity event로 저장한다. 필요 플랫폼은
+  이후 macOS/Windows native collector로 교체할 수 있다.
+- **iOS/iPadOS:** 2026년 기준 EU의 iOS/iPadOS 26 이상에서만 별도 entitlement와
+  `approvedWithDataAccess` 승인을 받은 `FamilyActivityData` 경로를 조건부
+  검토한다. 미국 등 비EU에서는 off-device Screen Time export를 전제로 하지
+  않고 신호가 없으면 엔진 factor를 제외한다.
+- **공통 privacy 기본값:** category, active duration, switches, idle/lock만
+  저장한다. 키 입력, 클립보드, 알림 본문, 화면 픽셀, full URL은 수집하지 않는다.
+
+이벤트 계약, OS별 제한, 교차기기 세션화, 보존정책, 구현 순서는
+`docs/ACTIVITY-TELEMETRY-ARCHITECTURE.ko.md`를 기준으로 한다.
 
 ## 8. 음식 + 의료 라이트 캡처
 
