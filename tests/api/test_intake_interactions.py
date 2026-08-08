@@ -336,6 +336,49 @@ def test_text_capture_and_consumption_are_separate_events(client, session):
     assert searched.json()["records"][0]["interaction_id"] == interaction_id
 
 
+def test_outcome_distinguishes_omitted_from_explicit_empty_corrections(client):
+    unchanged = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(),
+    )
+    assert unchanged.status_code == 201
+    unchanged_id = unchanged.json()["interaction_id"]
+    preserved = client.post(
+        f"/v1/intake-interactions/{unchanged_id}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "consumed",
+            "source": "ios-device",
+            "consumed_at": "2026-08-06T12:30:00+09:00",
+        },
+    )
+    assert preserved.status_code == 201
+    assert [item["name"] for item in preserved.json()["resolved_items"]] == [
+        "닭가슴살 샐러드"
+    ]
+    assert preserved.json()["latest_outcome"]["items_corrected"] is False
+
+    excluded = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(operation_id=str(uuid.uuid4())),
+    )
+    assert excluded.status_code == 201
+    excluded_id = excluded.json()["interaction_id"]
+    emptied = client.post(
+        f"/v1/intake-interactions/{excluded_id}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "consumed",
+            "source": "ios-device",
+            "consumed_at": "2026-08-06T12:30:00+09:00",
+            "corrected_items": [],
+        },
+    )
+    assert emptied.status_code == 201
+    assert emptied.json()["resolved_items"] == []
+    assert emptied.json()["latest_outcome"]["items_corrected"] is True
+
+
 def test_prospective_candidate_builds_context_without_becoming_intake(
     client, session
 ):

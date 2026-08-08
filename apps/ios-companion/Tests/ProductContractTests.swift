@@ -88,6 +88,10 @@ final class ProductContractTests: XCTestCase {
             HealthMesAPI.decisionsRequest(pairing: pairing).url?.absoluteString,
             "https://healthmes.example/v1/decisions?limit=100&offset=0"
         )
+        XCTAssertEqual(
+            HealthMesAPI.setupReadinessRequest(pairing: pairing).url?.absoluteString,
+            "https://healthmes.example/v1/setup/readiness"
+        )
 
         let start = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-06T00:00:00Z"))
         let end = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-13T00:00:00Z"))
@@ -99,6 +103,38 @@ final class ProductContractTests: XCTestCase {
             ).url?.absoluteString,
             "https://healthmes.example/v1/schedule/events"
                 + "?start=2026-08-06T00:00:00Z&end=2026-08-13T00:00:00Z&limit=100"
+        )
+    }
+
+    func testSetupReadinessDecodesIndependentComponents() throws {
+        let json = """
+            {
+              "overall": "action_required",
+              "checks": [
+                {
+                  "key": "calendar_google",
+                  "label": "Google Calendar",
+                  "state": "ready",
+                  "detail": "connected"
+                },
+                {
+                  "key": "calendar_icloud",
+                  "label": "iCloud Calendar",
+                  "state": "action_required",
+                  "detail": "connect once"
+                }
+              ]
+            }
+            """
+        let readiness = try GlanceJSON.decoder().decode(
+            SetupReadiness.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(readiness.overall, .actionRequired)
+        XCTAssertEqual(readiness.check("calendar_google")?.state, .ready)
+        XCTAssertEqual(
+            readiness.check("calendar_icloud")?.state,
+            .actionRequired
         )
     }
 

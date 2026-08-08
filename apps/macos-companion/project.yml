@@ -59,13 +59,9 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         NSMicrophoneUsageDescription: HealthMes uses the microphone only while you speak a command.
         NSSpeechRecognitionUsageDescription: HealthMes converts your spoken command into text so you can confirm it before anything changes.
-        # LAN-HTTP exception SCOPED to local networking instead of disabling
-        # ATS globally: the typical pairing target is http://<LAN-IP>:8100 —
-        # ATS never applies to IP-literal URLs anyway, and
-        # NSAllowsLocalNetworking covers .local / unqualified hostnames.
-        # Plain HTTP to a qualified public DNS name now fails CLOSED (use
-        # HTTPS there) — a tokenized viewer URL must never cross an
-        # untrusted network in clear text.
+        # Keep ATS scoped for loopback development. Pairing validation permits
+        # HTTP only for localhost/127.0.0.0/8/::1 and requires HTTPS for every
+        # remote host, including private-LAN addresses.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
 
@@ -96,7 +92,7 @@ targets:
         CFBundleLocalizations: [en, ko]
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
-        # Scoped like the app target: LAN/.local HTTP only, no global ATS off.
+        # Scoped like the app target for loopback development only.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
 

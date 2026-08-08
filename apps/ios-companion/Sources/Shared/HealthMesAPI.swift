@@ -156,6 +156,14 @@ public final class HealthMesAPI {
         return request
     }
 
+    public static func setupReadinessRequest(pairing: Pairing) -> URLRequest {
+        baseRequest(
+            pairing: pairing,
+            path: "v1/setup/readiness",
+            method: "GET"
+        )
+    }
+
     /// `GET /v1/schedule/events?start=…&end=…`.
     public static func scheduleEventsRequest(
         pairing: Pairing,
@@ -241,11 +249,50 @@ public final class HealthMesAPI {
         return request
     }
 
-    /// `POST /v1/food-logs`.
-    public static func foodLogRequest(
-        pairing: Pairing, body: FoodLogCreateBody
+    public static func nutritionPhotoAnalysisRequest(
+        pairing: Pairing,
+        body: NutritionPhotoAnalysisBody
     ) throws -> URLRequest {
-        try jsonRequest(pairing: pairing, path: "v1/food-logs", body: body)
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/nutrition-observations/analyze",
+            body: body
+        )
+    }
+
+    public static func intakeAnalysisRequest(
+        pairing: Pairing,
+        body: IntakeInteractionAnalysisBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/intake-interactions/analyze",
+            body: body
+        )
+    }
+
+    public static func photoIntakeRequest(
+        pairing: Pairing,
+        body: PhotoIntakeInteractionBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/intake-interactions",
+            body: body
+        )
+    }
+
+    public static func intakeOutcomeRequest(
+        pairing: Pairing,
+        interactionID: UUID,
+        body: IntakeOutcomeBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path:
+                "v1/intake-interactions/\(interactionID.uuidString.lowercased())/outcomes",
+            body: body
+        )
     }
 
     /// `POST /v1/medical-records` — REST twin of the create_medical_record
@@ -256,10 +303,61 @@ public final class HealthMesAPI {
         try jsonRequest(pairing: pairing, path: "v1/medical-records", body: body)
     }
 
+    public static func storageSettingsRequest(pairing: Pairing) -> URLRequest {
+        baseRequest(pairing: pairing, path: "v1/storage/settings", method: "GET")
+    }
+
+    public static func storageRetentionRequest(
+        pairing: Pairing,
+        dataClass: String,
+        preset: String
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/storage/settings/\(dataClass)",
+            method: "PUT",
+            body: StorageRetentionUpdate(preset: preset)
+        )
+    }
+
+    public static func storageMaintenanceRequest(
+        pairing: Pairing,
+        dryRun: Bool
+    ) -> URLRequest {
+        var request = baseRequest(
+            pairing: pairing,
+            path: "v1/storage/maintenance",
+            method: "POST"
+        )
+        var components = URLComponents(
+            url: request.url!,
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "dry_run", value: dryRun ? "true" : "false")
+        ]
+        request.url = components.url
+        return request
+    }
+
     static func jsonRequest<Body: Encodable>(
         pairing: Pairing, path: String, body: Body
     ) throws -> URLRequest {
-        var request = baseRequest(pairing: pairing, path: path, method: "POST")
+        try jsonRequest(
+            pairing: pairing,
+            path: path,
+            method: "POST",
+            body: body
+        )
+    }
+
+    static func jsonRequest<Body: Encodable>(
+        pairing: Pairing,
+        path: String,
+        method: String,
+        body: Body
+    ) throws -> URLRequest {
+        var request = baseRequest(pairing: pairing, path: path, method: method)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -334,6 +432,13 @@ public final class HealthMesAPI {
         )
     }
 
+    public func setupReadiness() async throws -> SetupReadiness {
+        try await perform(
+            Self.setupReadinessRequest(pairing: try pairing()),
+            expecting: SetupReadiness.self
+        )
+    }
+
     public func listScheduleEvents(start: Date, end: Date) async throws -> CalendarEventsPage {
         try await perform(
             Self.scheduleEventsRequest(pairing: try pairing(), start: start, end: end),
@@ -389,10 +494,47 @@ public final class HealthMesAPI {
         )
     }
 
-    public func createFoodLog(_ body: FoodLogCreateBody) async throws -> FoodLogItem {
+    public func analyzeNutritionPhoto(
+        _ body: NutritionPhotoAnalysisBody
+    ) async throws -> NutritionObservationResult {
         try await perform(
-            Self.foodLogRequest(pairing: try pairing(), body: body),
-            expecting: FoodLogItem.self
+            Self.nutritionPhotoAnalysisRequest(
+                pairing: try pairing(),
+                body: body
+            ),
+            expecting: NutritionObservationResult.self
+        )
+    }
+
+    public func analyzeIntake(
+        _ body: IntakeInteractionAnalysisBody
+    ) async throws -> IntakeInteractionResult {
+        try await perform(
+            Self.intakeAnalysisRequest(pairing: try pairing(), body: body),
+            expecting: IntakeInteractionResult.self
+        )
+    }
+
+    public func createPhotoIntake(
+        _ body: PhotoIntakeInteractionBody
+    ) async throws -> IntakeInteractionResult {
+        try await perform(
+            Self.photoIntakeRequest(pairing: try pairing(), body: body),
+            expecting: IntakeInteractionResult.self
+        )
+    }
+
+    public func confirmIntake(
+        interactionID: UUID,
+        body: IntakeOutcomeBody
+    ) async throws -> IntakeInteractionResult {
+        try await perform(
+            Self.intakeOutcomeRequest(
+                pairing: try pairing(),
+                interactionID: interactionID,
+                body: body
+            ),
+            expecting: IntakeInteractionResult.self
         )
     }
 
@@ -402,6 +544,37 @@ public final class HealthMesAPI {
         try await perform(
             Self.medicalRecordRequest(pairing: try pairing(), body: body),
             expecting: MedicalRecordItem.self
+        )
+    }
+
+    public func storageSettings() async throws -> StorageSettingsSnapshot {
+        try await perform(
+            Self.storageSettingsRequest(pairing: try pairing()),
+            expecting: StorageSettingsSnapshot.self
+        )
+    }
+
+    public func updateStorageRetention(
+        dataClass: String,
+        preset: String
+    ) async throws -> StorageRetentionPolicy {
+        try await perform(
+            Self.storageRetentionRequest(
+                pairing: try pairing(),
+                dataClass: dataClass,
+                preset: preset
+            ),
+            expecting: StorageRetentionPolicy.self
+        )
+    }
+
+    public func maintainStorage(dryRun: Bool) async throws -> StorageMaintenanceReport {
+        try await perform(
+            Self.storageMaintenanceRequest(
+                pairing: try pairing(),
+                dryRun: dryRun
+            ),
+            expecting: StorageMaintenanceReport.self
         )
     }
 

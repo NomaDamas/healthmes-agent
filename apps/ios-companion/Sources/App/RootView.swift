@@ -49,8 +49,24 @@ struct RootView: View {
                 ProposalDetailView(proposalID: target.id)
             }
         }
+        .alert(
+            "Pairing",
+            isPresented: Binding(
+                get: { router.pairingImportMessage != nil },
+                set: { presented in
+                    if !presented {
+                        router.dismissPairingImportMessage()
+                    }
+                }
+            )
+        ) {
+            Button("OK") {
+                router.dismissPairingImportMessage()
+            }
+        } message: {
+            Text(router.pairingImportMessage ?? "")
+        }
     }
-
 }
 
 struct ProposalSheetTarget: Identifiable {

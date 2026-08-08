@@ -217,7 +217,7 @@ def search_intake_history(
     confirmed_only: bool = False,
     nutrient: str | None = None,
     query: str | None = None,
-    limit: int = 100,
+    limit: int | None = 100,
 ) -> dict[str, Any]:
     needle = query.strip().casefold() if query else None
     nutrient_key = nutrient.strip().casefold() if nutrient else None
@@ -229,10 +229,15 @@ def search_intake_history(
 
     def include_record(record: dict[str, Any]) -> None:
         nonlocal matching_records, sequence
-        observed_at = _as_utc(datetime.fromisoformat(record["observed_at"]))
-        if start is not None and observed_at < _as_utc(start):
+        effective_at = _as_utc(datetime.fromisoformat(record["observed_at"]))
+        if confirmed_only:
+            outcome = record.get("latest_outcome")
+            consumed_at = outcome.get("consumed_at") if outcome else None
+            if consumed_at is not None:
+                effective_at = _as_utc(datetime.fromisoformat(consumed_at))
+        if start is not None and effective_at < _as_utc(start):
             return
-        if end is not None and observed_at >= _as_utc(end):
+        if end is not None and effective_at >= _as_utc(end):
             return
         if intent is not None and record["intent"] != intent.value:
             return
@@ -247,8 +252,10 @@ def search_intake_history(
             return
         matching_records += 1
         sequence += 1
-        entry = (observed_at.timestamp(), sequence, record)
-        if len(selected) < limit + 1:
+        entry = (effective_at.timestamp(), sequence, record)
+        if limit is None:
+            heappush(selected, entry)
+        elif len(selected) < limit + 1:
             heappush(selected, entry)
         elif entry[:2] > selected[0][:2]:
             heapreplace(selected, entry)
@@ -348,14 +355,20 @@ def search_intake_history(
         include_record(record)
 
     ordered = sorted(selected, key=lambda value: value[:2], reverse=True)
-    records = [record for _timestamp, _sequence, record in ordered[:limit]]
+    records = [
+        record
+        for _timestamp, _sequence, record in (
+            ordered if limit is None else ordered[:limit]
+        )
+    ]
+    truncated = limit is not None and matching_records > limit
     return {
         "status": "ok",
         "count": len(records),
         "records": records,
-        "truncated": matching_records > limit,
+        "truncated": truncated,
         "coverage": {
-            "complete": matching_records <= limit,
+            "complete": not truncated,
             "scanned_records": scanned_records,
             "matching_records": matching_records,
             "result_limit": limit,

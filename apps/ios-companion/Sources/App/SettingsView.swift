@@ -40,6 +40,8 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var notificationStatus: UNAuthorizationStatus = .notDetermined
     @State private var showAdvanced = false
+    @State private var serverReadiness: SetupReadiness?
+    @State private var readinessError: String?
     @StateObject private var calendarPermission = DeviceCalendarPermissionModel()
 
     var body: some View {
@@ -53,18 +55,23 @@ struct SettingsView: View {
                     )
                     readinessRow(
                         "Health feed",
-                        value: "Via paired instance",
+                        value: readinessValue("health"),
                         systemImage: "heart.text.square"
                     )
                     readinessRow(
                         "Google Calendar",
-                        value: "HealthMes server connection",
+                        value: readinessValue("calendar_google"),
                         systemImage: "g.circle"
                     )
                     readinessRow(
-                        "Apple Calendar",
-                        value: calendarPermission.label,
+                        "Apple Calendar sync",
+                        value: readinessValue("calendar_icloud"),
                         systemImage: "calendar"
+                    )
+                    readinessRow(
+                        "Device calendar access",
+                        value: calendarPermission.label,
+                        systemImage: "iphone"
                     )
                     readinessRow(
                         "Decision notifications",
@@ -78,6 +85,11 @@ struct SettingsView: View {
                     )
                     LabeledContent("Instance host") {
                         Text(verbatim: pairing.baseURL.host ?? pairing.baseURL.absoluteString)
+                    }
+                    if let readinessError {
+                        Text(verbatim: readinessError)
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
                     }
                 } else {
                     Text("Not connected")
@@ -137,9 +149,11 @@ struct SettingsView: View {
                     } label: {
                         Label("Self-host pairing and API token", systemImage: "link")
                     }
-                    Label("Storage and retention require owner authentication on the HealthMes host.", systemImage: "externaldrive")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                    NavigationLink {
+                        StorageAdvancedView()
+                    } label: {
+                        Label("Storage and retention", systemImage: "externaldrive")
+                    }
                     LabeledContent("Version") {
                         Text(verbatim: appVersion)
                     }
@@ -180,6 +194,7 @@ struct SettingsView: View {
         }
         .task {
             notificationStatus = await NotificationManager.shared.authorizationStatus()
+            await loadReadiness()
         }
     }
 
@@ -210,6 +225,29 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
         } label: {
             Label(title, systemImage: systemImage)
+        }
+    }
+
+    private func readinessValue(_ key: String) -> String {
+        guard let check = serverReadiness?.check(key) else {
+            return String(localized: "Checking…")
+        }
+        switch check.state {
+        case .ready:
+            return String(localized: "Ready")
+        case .actionRequired:
+            return check.detail
+        case .blocked:
+            return String(localized: "Blocked · \(check.detail)")
+        }
+    }
+
+    private func loadReadiness() async {
+        do {
+            serverReadiness = try await HealthMesAPI().setupReadiness()
+            readinessError = nil
+        } catch {
+            readinessError = String(localized: "Could not verify server readiness.")
         }
     }
 

@@ -501,20 +501,17 @@ def _cmd_import_apple(args: argparse.Namespace) -> int:
 
 def _cmd_connect_qr(_args: argparse.Namespace) -> int:
     settings = _cli_settings()
-    from healthmes.pairing import build_pairing_url, render_terminal_qr
+    from datetime import UTC, datetime
 
-    payload = build_pairing_url(settings)
-    print(render_terminal_qr(payload))
-    print(f"payload: {payload}")
-    if not settings.api_token.get_secret_value().strip():
-        print(
-            "note: no HEALTHMES_API_TOKEN configured — the QR pairs URL only "
-            "(fine for a loopback-only instance)."
-        )
+    from healthmes.pairing import issue_pairing_grant, render_terminal_qr
+
+    grant = issue_pairing_grant(settings)
+    print(render_terminal_qr(grant.deep_link))
+    expires = datetime.fromtimestamp(grant.expires_at, tz=UTC).isoformat()
+    print(f"one-time pairing QR expires at {expires}")
     print(
-        "Scan with the HealthMes companion app, or copy the url/token into "
-        "a bridge app (e.g. Health Auto Export → REST API target "
-        f"{settings.public_base_url.rstrip('/')}/v1/ingest/healthkit)."
+        "Scan with the HealthMes companion app. The QR contains a short-lived "
+        "one-time grant, not the API bearer token."
     )
     return 0
 

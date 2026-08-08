@@ -15,7 +15,6 @@ from sqlalchemy.orm import Session
 
 from healthmes.config import Settings
 from healthmes.store import (
-    FoodLog,
     MedicalRecord,
     PurgeJob,
     RawIngestEvent,
@@ -635,11 +634,6 @@ def run_storage_maintenance(
             if path.exists():
                 path.unlink()
             if obj.data_class in {"media", "nutrition_media"}:
-                food_rows = session.scalars(
-                    select(FoodLog).where(FoodLog.media_path == obj.relative_path)
-                )
-                for row in food_rows:
-                    row.media_path = None
                 medical_rows = session.scalars(
                     select(MedicalRecord).where(
                         MedicalRecord.media_path == obj.relative_path

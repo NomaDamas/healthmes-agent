@@ -46,14 +46,17 @@ WatchConnectivity and then talks to the instance directly.
   viewer links (native Done/share come free). Links always come from the
   paired instance's own payloads; `healthmes://decision?url=…` deep links
   are additionally host-checked against the pairing.
-- **Capture** — camera (device only) / photo picker / voice memo →
-  `POST /v1/media` (multipart, field `file`; photos re-encoded to JPEG,
-  memos AAC-in-m4a = `audio/mp4`) → `POST /v1/food-logs` or
-  `POST /v1/medical-records` with a description the user edits first.
-  Offline-friendly: a failed step keeps text + attachment + any already-
-  uploaded `media_path`, so Retry never re-uploads or loses data. Medical
-  captures send capture metadata only (`context.capture`); the server
-  attaches its own health snapshot (`context.health`).
+- **Capture** — camera (device only) / photo picker / text / voice memo.
+  Nutrition follows analyze → user review → interaction → explicit outcome:
+  photos use `POST /v1/nutrition-observations/analyze` and
+  `POST /v1/nutrition-observations/{id}/review`; text/voice use
+  `POST /v1/intake-interactions/analyze`; only a separate
+  `POST /v1/intake-interactions/{id}/outcomes` records consumed,
+  not-consumed, or cancelled. Analysis and `log_consumed` intent are not
+  consumption proof. Medication/symptom capture keeps
+  `POST /v1/medical-records`. Offline retry must retain the same operation
+  IDs, timestamp, media token, and stage so it cannot duplicate a meal or
+  silently skip review.
 - **Native notifications** (issue #91, parity with Android's `AlertNotifier`) —
   BGAppRefreshTask + foreground sync poll `GET /v1/alerts`, diff against a
   seen-store (exactly-once per alert), and post local notifications in the
@@ -101,7 +104,10 @@ deliverable: `docs/design/WATCH-NOTIFICATIONS.ko.md` (design system:
 | `GET /v1/schedule/events?start=…&end=…` | Plan calendar timeline |
 | `GET /reports/weekly.json` | report tab |
 | `POST /v1/media` (multipart `file`) + `GET /v1/media/{path}` | capture upload / preview URL |
-| `POST /v1/food-logs`, `POST /v1/medical-records` | capture save |
+| `POST /v1/nutrition-observations/analyze` + `POST …/{id}/review` | photo analysis and explicit owner review |
+| `POST /v1/intake-interactions/analyze`, `POST /v1/intake-interactions` | text/voice analysis and reviewed photo capture |
+| `POST /v1/intake-interactions/{id}/outcomes` | explicit consumed/not-consumed/cancelled result |
+| `POST /v1/medical-records` | medication/symptom capture |
 
 Contracts are pinned twice: Swift decoding tests against
 `Tests/Fixtures/{glance,alerts,weekly_report}.json`, and those same three
@@ -111,8 +117,8 @@ fixture sets validate against the server's pydantic models in CI —
 `weekly_report.json` against `WeeklyReportOut`. Editing any fixture without
 running the Python suite will fail the server-side pinning test.
 
-Datetime note: glance/alerts serialize aware-UTC (`…Z`); store-backed
-endpoints (proposals, food logs) serialize sqlite's **naive** UTC datetimes
+Datetime note: glance/alerts serialize aware-UTC (`…Z`); some store-backed
+endpoints serialize sqlite's **naive** UTC datetimes
 (`2026-07-11T14:23:10.355753`). `GlanceJSON.parseISO8601` accepts both —
 found live, covered by `testAcceptsNaiveUTCTimestamps`.
 
@@ -168,29 +174,26 @@ xcodebuild test … -only-testing:HealthMesCompanionUITests
 
 ## Pairing flow
 
-1. Serve your instance. Same-machine simulator: `http://127.0.0.1:8100`
-   works with no token (loopback-open). Real devices need the LAN bind:
-   `HEALTHMES_HOST=0.0.0.0` **and** `HEALTHMES_API_TOKEN=<token>` in `.env`.
-2. First launch shows the pairing screen (later: Settings → Instance
-   pairing): base URL + token → **Save pairing** → **Test connection**
-   performs a real glance fetch. Saving also requests notification
-   permission and primes the alert seen-store so old alerts never replay.
-3. Widgets read the pairing through the App Group
+1. In the Mac app, choose **Settings → Set up this Mac**.
+2. Scan the five-minute QR with the iPhone Camera. iOS opens
+   `healthmes://pair`, exchanges the signed one-time code, stores the returned
+   token in Keychain, shows the connection result, and starts the first sync.
+   The QR never contains the long-lived bearer token.
+3. Advanced users can still enter an existing instance's base URL and token
+   manually under **Settings → Advanced → Self-host pairing**.
+4. Widgets read the pairing through the App Group
    (`group.com.healthmes.companion`); the token lives in the Keychain (App
    Group access group, unsigned-simulator fallback documented in
    `Pairing.swift`). The watch gets it over WatchConnectivity.
-4. **Unpair** clears pairing, snapshot cache, seen-alerts store and the watch.
+5. **Unpair** clears pairing, snapshot cache, seen-alerts store and the watch.
 
-Plain-HTTP note: the ATS exception is **scoped to local networking**
-(`NSAllowsLocalNetworking`, not a global `NSAllowsArbitraryLoads`): the
-typical target `http://<LAN-IP>:8100` works regardless (ATS never applies
-to IP-literal URLs), and `.local`/unqualified hostnames — `localhost`
-included — are allowed. Plain HTTP to a qualified public DNS name (e.g. a
-Tailscale MagicDNS name) fails closed — use HTTPS there; the bearer token
-and tokenized viewer URLs must never cross an untrusted network in clear
-text. (Android's `usesCleartextTraffic` stays global: its pairing host is
-user-typed at runtime, and Android's network-security-config can only
-allowlist statically known domains.)
+Transport policy: production pairing requires **HTTPS**. Plain HTTP is
+accepted only for same-device loopback hosts (`localhost`, `127.0.0.0/8`,
+`::1`) used by local development and the Mac runtime. Private-LAN HTTP is
+rejected before a long-lived bearer token can be stored or returned. The
+scoped `NSAllowsLocalNetworking` entitlement remains for loopback tooling;
+it is not permission to pair over cleartext LAN. A Mac setup QR is offered
+to iPhone only when the configured public base URL is HTTPS.
 
 ## Layout
 
@@ -209,7 +212,7 @@ Sources/Shared/              # PLATFORM-AGNOSTIC (Foundation+Security only;
   AlertsContract.swift         GET /v1/alerts models + Page envelope
   ReportContract.swift         GET /reports/weekly.json models
   ScheduleContract.swift       proposals + accept/decline vocabulary
-  CaptureContract.swift        media upload + food/medical bodies
+  CaptureContract.swift        media + nutrition staged-write + medical bodies
   HealthMesAPI.swift           request builders + client + error envelope
   NotificationContent.swift    §8.5 grammar → notification content (pure)
   SeenAlertsStore.swift        exactly-once alert notification bookkeeping
@@ -243,11 +246,12 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
   200→304 flow.
 - **UI acceptance tests against a LIVE instance** (`python -m healthmes
   serve` on :8199, seeded alert/proposal/energy rows): briefing home
-  rendered live data; Report tab rendered live `weekly.json`; Capture form
-  saved a real food log (`source: "ios-app"` row verified server-side);
-  Yes flipped the seeded proposal to `accepted` server-side and the
-  accepted block then appeared in glance `next_blocks`. Tests self-skip
-  (never fail) without a live pairing, so plain CI runs stay green.
+  rendered live data; Report tab rendered live `weekly.json`; Yes flipped
+  the seeded proposal to `accepted` server-side and the accepted block then
+  appeared in glance `next_blocks`. The earlier capture smoke predates the
+  review-first nutrition contract and is not evidence for the current
+  analyze/review/outcome flow; that flow requires a new live QA pass. Tests
+  self-skip (never fail) without a live pairing, so plain CI runs stay green.
 - **Capture chain proven with the app's own bytes**: `Sources/Shared`
   compiled verbatim into a macOS CLI (also proving the issue-#11 reuse
   claim), which uploaded via `POST /v1/media` (201), created a medical

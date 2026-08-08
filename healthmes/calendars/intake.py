@@ -25,7 +25,7 @@ def intake_title(summary: str | None) -> str | None:
 
 def is_intake_eligible(mirror: CalendarEventMirror) -> bool:
     return bool(
-        mirror.calendar_source is CalendarSource.GOOGLE
+        mirror.calendar_source in (CalendarSource.GOOGLE, CalendarSource.CALDAV)
         and intake_title(mirror.summary) is not None
         and not mirror.is_agent_created
         and mirror.organizer_self
@@ -48,7 +48,7 @@ def intake_revision(mirror: CalendarEventMirror) -> str:
 def intake_calendar_tasks(
     session: Session, source: CalendarSource, local_timezone: tzinfo
 ) -> tuple[Task, ...]:
-    if source is not CalendarSource.GOOGLE:
+    if source not in (CalendarSource.GOOGLE, CalendarSource.CALDAV):
         return ()
 
     mirrors = session.scalars(
@@ -74,7 +74,12 @@ def intake_calendar_tasks(
 
         if mirror.is_all_day:
             est_minutes = None
-            exclusive_end_date = coerce_utc(mirror.end_at).date()
+            end_at = coerce_utc(mirror.end_at)
+            exclusive_end_date = (
+                end_at.astimezone(local_timezone).date()
+                if mirror.calendar_source is CalendarSource.CALDAV
+                else end_at.date()
+            )
             deadline = (
                 datetime.combine(exclusive_end_date, time.min, tzinfo=local_timezone)
                 - timedelta(microseconds=1)

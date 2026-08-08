@@ -261,6 +261,54 @@ def test_dashboard_renders_main_nutrition_interaction(client) -> None:
     assert "1건" in response.text
 
 
+def test_dashboard_confirmed_count_is_not_limited_to_latest_five(client) -> None:
+    now = datetime.now(UTC)
+    for index in range(7):
+        created = client.post(
+            "/v1/intake-interactions",
+            json={
+                "operation_id": str(uuid.uuid4()),
+                "intent": "log_consumed",
+                "modality": "text",
+                "observed_at": (now - timedelta(minutes=index)).isoformat(),
+                "timezone": "UTC",
+                "source": "ios-device",
+                "source_text": f"확인된 식사 {index}",
+                "items": [
+                    {
+                        "name": f"확인된 식사 {index}",
+                        "intake_type": "food",
+                        "serving": {
+                            "kind": "exact",
+                            "unit": "serving",
+                            "exact": 1,
+                            "estimation_basis": "owner_statement",
+                        },
+                        "nutrients": [],
+                        "confidence": "high",
+                    }
+                ],
+            },
+        )
+        assert created.status_code == 201
+        interaction_id = created.json()["interaction_id"]
+        outcome = client.post(
+            f"/v1/intake-interactions/{interaction_id}/outcomes",
+            json={
+                "operation_id": str(uuid.uuid4()),
+                "status": "consumed",
+                "source": "ios-device",
+                "consumed_at": (now - timedelta(minutes=index)).isoformat(),
+            },
+        )
+        assert outcome.status_code == 201
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    assert "확인 완료 7건" in response.text
+
+
 def test_secured_dashboard_uses_friendly_unlock_and_exact_return(settings) -> None:
     with _secured_client(settings) as client:
         locked = client.get(

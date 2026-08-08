@@ -18,7 +18,7 @@ struct PairingSettingsView: View {
     var body: some View {
         Form {
             Section {
-                TextField(text: $baseURLText, prompt: Text(verbatim: "http://192.168.1.20:8100")) {
+                TextField(text: $baseURLText, prompt: Text(verbatim: "https://healthmes.example.com")) {
                     Text("settings.baseURL")
                 }
                 .textFieldStyle(.roundedBorder)

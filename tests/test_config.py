@@ -35,6 +35,7 @@ ALL_ENV_VARS = [
     "HEALTHMES_GOOGLE_CALENDAR_ENABLED",
     "HEALTHMES_GOOGLE_CALENDAR_ID",
     "HEALTHMES_GOOGLE_POLL_MINUTES",
+    "HEALTHMES_CALENDAR_WRITE_PROVIDER",
     "HEALTHMES_CALDAV_ENABLED",
     "HEALTHMES_CALDAV_URL",
     "HEALTHMES_CALDAV_USERNAME",
@@ -89,6 +90,7 @@ def test_defaults(monkeypatch) -> None:
     assert settings.google_calendar_enabled is False
     assert settings.google_calendar_id == "primary"
     assert settings.google_poll_minutes == 5
+    assert settings.calendar_write_provider == "auto"
     assert settings.caldav_enabled is False
     assert settings.caldav_url == "https://caldav.icloud.com"
     assert settings.caldav_username == ""
@@ -141,6 +143,7 @@ def test_calendar_and_ow_user_settings_from_env(monkeypatch) -> None:
     monkeypatch.setenv("HEALTHMES_GOOGLE_CALENDAR_ENABLED", "true")
     monkeypatch.setenv("HEALTHMES_GOOGLE_CALENDAR_ID", "work@example.com")
     monkeypatch.setenv("HEALTHMES_GOOGLE_POLL_MINUTES", "3")
+    monkeypatch.setenv("HEALTHMES_CALENDAR_WRITE_PROVIDER", "caldav")
     monkeypatch.setenv("HEALTHMES_CALDAV_ENABLED", "true")
     monkeypatch.setenv("HEALTHMES_CALDAV_URL", "https://dav.example.com")
     monkeypatch.setenv("HEALTHMES_CALDAV_USERNAME", "me@example.com")
@@ -154,6 +157,7 @@ def test_calendar_and_ow_user_settings_from_env(monkeypatch) -> None:
     assert settings.google_calendar_enabled is True
     assert settings.google_calendar_id == "work@example.com"
     assert settings.google_poll_minutes == 3
+    assert settings.calendar_write_provider == "caldav"
     assert settings.caldav_enabled is True
     assert settings.caldav_url == "https://dav.example.com"
     assert settings.caldav_username == "me@example.com"

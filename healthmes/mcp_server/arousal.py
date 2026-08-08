@@ -47,7 +47,7 @@ WAKING_END_HOUR = 23
 HR_OBSERVATION_SPAN_MINUTES = 6  # one HR sample vouches for at most this span
 MIN_COVERAGE_FOR_MEDIUM = 0.30  # of the waking window observed while quiet
 MIN_COVERAGE = 0.10  # below → insufficient_data
-MEAL_CONTEXT_WINDOW_MINUTES = 45  # food_log entries this close are context
+MEAL_CONTEXT_WINDOW_MINUTES = 45  # confirmed intake this close is context
 
 STATUS_OK = "ok"
 STATUS_INSUFFICIENT = "insufficient_data"

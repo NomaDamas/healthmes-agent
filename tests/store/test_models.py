@@ -22,7 +22,6 @@ from healthmes.store import (
     DecisionKind,
     DecisionRecord,
     EnergyDemand,
-    FoodLog,
     Insight,
     MedicalRecord,
     MedicalRecordKind,
@@ -513,25 +512,6 @@ class TestCalendarMutationProposal:
         loaded = session.get(CalendarMutationProposal, proposal_id)
         assert loaded.proposal_decision_record_id is None
         assert loaded.outcome_decision_record_id is None
-
-
-class TestFoodLog:
-    def test_roundtrip(self, session):
-        log = _roundtrip(
-            session,
-            FoodLog(
-                logged_at=T0,
-                description="Bibimbap with extra vegetables, ~650 kcal",
-                media_path="media/food/2026-07-06-lunch.jpg",
-                meal_type="lunch",
-                source="telegram",
-            ),
-        )
-        assert log.logged_at == T0
-        assert log.description.startswith("Bibimbap")
-        assert log.media_path == "media/food/2026-07-06-lunch.jpg"
-        assert log.meal_type == "lunch"
-        assert log.source == "telegram"
 
 
 class TestAppUsageSample:

@@ -40,6 +40,7 @@ final class AppRouter: ObservableObject {
     @Published var proposalSheetID: UUID?
     @Published private(set) var commandFocusRequest = 0
     @Published private(set) var homeRequest = 0
+    @Published private(set) var pairingImportMessage: String?
 
     func focusCommandDock() {
         commandFocusRequest += 1
@@ -51,6 +52,10 @@ final class AppRouter: ObservableObject {
         decisionSheet = nil
         proposalSheetID = nil
         homeRequest += 1
+    }
+
+    func dismissPairingImportMessage() {
+        pairingImportMessage = nil
     }
 
     /// Open a tokenized decision/report URL in the in-app viewer. Only URLs
@@ -103,8 +108,41 @@ final class AppRouter: ObservableObject {
             modal = .report
         case "speak":
             focusCommandDock()
+        case "pair":
+            Task { await importPairing(url) }
         default:
             showHome()
+        }
+    }
+
+    private func importPairing(_ url: URL) async {
+        do {
+            let exchanged = try await PairingExchangeClient().exchange(url)
+            let pairing = try PairingStore.shared.save(
+                baseURLString: exchanged.baseURL.absoluteString,
+                token: exchanged.token ?? ""
+            )
+            PhoneWatchSync.shared.pushPairing(
+                baseURL: pairing.baseURL.absoluteString,
+                token: pairing.token ?? ""
+            )
+            pairingImportMessage = "Connected to \(pairing.baseURL.host ?? "HealthMes")."
+            NotificationCenter.default.post(
+                name: .healthmesPairingChanged,
+                object: nil
+            )
+            showHome()
+            Task {
+                _ = await NotificationManager.shared.requestAuthorization()
+                BackgroundRefreshManager.shared.schedule()
+                await RefreshCoordinator.shared.sync(isForeground: true)
+            }
+        } catch let error as PairingError {
+            pairingImportMessage = error.localizedDescription
+            modal = .settings
+        } catch {
+            pairingImportMessage = "HealthMes could not complete pairing. Try again."
+            modal = .settings
         }
     }
 

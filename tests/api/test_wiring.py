@@ -16,7 +16,6 @@ EXPECTED_PATHS = [
     "/v1/schedule/proposals",
     "/v1/schedule/proposals/{proposal_id}/accept",
     "/v1/schedule/proposals/{proposal_id}/decline",
-    "/v1/food-logs",
     "/v1/medical-records",
     "/v1/medical-records/{record_id}",
     "/v1/media",

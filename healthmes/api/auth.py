@@ -61,6 +61,7 @@ __all__ = [
 # "/unlock" validates a submitted API token itself, then redirects with only
 # the derived read-only viewer credential.
 OPEN_PATHS = frozenset({"/health", "/", "/unlock"})
+OPEN_POST_PATHS = frozenset({"/v1/setup/pairing/exchange"})
 
 # Path prefixes of the human-facing viewer surface that may authenticate via
 # the derived ?token= query credential (browser links cannot carry headers).
@@ -197,6 +198,8 @@ class BearerTokenMiddleware:
     def _is_authorized(self, scope: Scope) -> bool:
         path = scope.get("path", "")
         if path in OPEN_PATHS:
+            return True
+        if scope.get("method") == "POST" and path in OPEN_POST_PATHS:
             return True
         if (
             scope.get("method") == "POST"

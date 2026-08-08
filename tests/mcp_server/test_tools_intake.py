@@ -224,7 +224,6 @@ async def test_text_capture_confirmation_and_search(
         "interaction_id": interaction_id,
         "status": "consumed",
         "consumed_at": "2026-08-06T03:30:00Z",
-        "corrected_items": [],
         "note": None,
     }
     confirmed = await call_tool(

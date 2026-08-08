@@ -642,7 +642,7 @@
           <div class="primitive-head">
             <h3>오늘 섭취</h3>
             <span class="badge">
-              {{ dashboard.nutrition.interaction_count + dashboard.nutrition.legacy_log_count }}건
+              {{ dashboard.nutrition.interaction_count }}건
             </span>
           </div>
           {% if dashboard.nutrition.latest_items %}
@@ -653,9 +653,6 @@
           </div>
           <p class="muted">
             확인 완료 {{ dashboard.nutrition.confirmed_count }}건
-            {% if dashboard.nutrition.legacy_log_count %}
-            · 기존 식사 기록 {{ dashboard.nutrition.legacy_log_count }}건
-            {% endif %}
           </p>
           {% else %}
           <p class="empty-state">오늘 기록된 식사나 섭취가 없습니다.</p>

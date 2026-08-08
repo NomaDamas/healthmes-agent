@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from healthmes.api.auth import is_human_viewer_path, viewer_token, viewer_url
@@ -34,7 +34,6 @@ from healthmes.nutrition.intake_query import search_intake_history
 from healthmes.store import (
     CalendarEventMirror,
     DecisionRecord,
-    FoodLog,
     Insight,
     ProposalStatus,
     ScheduleProposal,
@@ -97,7 +96,6 @@ class DashboardInsight:
 class DashboardNutrition:
     interaction_count: int
     confirmed_count: int
-    legacy_log_count: int
     latest_items: tuple[str, ...]
 
 
@@ -272,8 +270,12 @@ def _nutrition_summary(
         limit=5,
     )
     records = history["records"]
-    confirmed_count = sum(
-        1 for record in records if record.get("is_confirmed_intake") is True
+    confirmed_history = search_intake_history(
+        session,
+        start=start,
+        end=end,
+        confirmed_only=True,
+        limit=1,
     )
     latest_items: list[str] = []
     for record in records:
@@ -286,28 +288,11 @@ def _nutrition_summary(
         if len(latest_items) == 3:
             break
 
-    legacy_log_count = session.scalar(
-        select(func.count())
-        .select_from(FoodLog)
-        .where(FoodLog.logged_at >= start, FoodLog.logged_at < end)
-    ) or 0
-    legacy_rows = session.scalars(
-        select(FoodLog)
-        .where(FoodLog.logged_at >= start, FoodLog.logged_at < end)
-        .order_by(FoodLog.logged_at.desc(), FoodLog.created_at.desc())
-        .limit(5)
-    ).all()
-    if not latest_items:
-        latest_items.extend(
-            row.description.strip()
-            for row in legacy_rows[:3]
-            if row.description.strip()
-        )
-
     return DashboardNutrition(
         interaction_count=int(history["coverage"]["matching_records"]),
-        confirmed_count=confirmed_count,
-        legacy_log_count=legacy_log_count,
+        confirmed_count=int(
+            confirmed_history["coverage"]["matching_records"]
+        ),
         latest_items=tuple(latest_items),
     )
 

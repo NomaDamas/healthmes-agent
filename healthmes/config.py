@@ -301,6 +301,12 @@ class Settings(BaseSettings):
         description="Polling interval for Google Calendar incremental sync "
         "(syncToken; docs/PLAN.md §6 says 5 minutes).",
     )
+    calendar_write_provider: Literal["auto", "google", "caldav"] = Field(
+        default="auto",
+        description="Calendar provider that receives approved HealthMes blocks. "
+        "'auto' preserves the historical Google-first fallback; choose "
+        "'google' or 'caldav' when both providers are connected.",
+    )
     caldav_enabled: bool = Field(
         default=False,
         description="Enable the iCloud CalDAV mirror backend "
@@ -321,8 +327,8 @@ class Settings(BaseSettings):
     )
     caldav_calendar_name: str | None = Field(
         default=None,
-        description="Display name of the CalDAV calendar to mirror; None picks "
-        "the principal's default calendar.",
+        description="Display name of the CalDAV calendar to mirror. May be omitted "
+        "only when the principal exposes exactly one calendar.",
     )
     caldav_poll_minutes: int = Field(
         default=10,

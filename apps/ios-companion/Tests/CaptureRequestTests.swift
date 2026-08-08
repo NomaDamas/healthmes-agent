@@ -2,7 +2,8 @@ import XCTest
 
 // Request-builder tests for the capture/action endpoints. Everything here is
 // pure (no network): the bytes and URLs must match the server contracts in
-// healthmes/api/media.py, food.py, medical.py, schedule.py, alerts.py.
+// healthmes/api/media.py, intake_interactions.py, medical.py, schedule.py,
+// alerts.py.
 
 final class CaptureRequestTests: XCTestCase {
     private let pairing = Pairing(
@@ -74,23 +75,452 @@ final class CaptureRequestTests: XCTestCase {
         )
     }
 
-    func testFoodLogRequestBody() throws {
-        let request = try HealthMesAPI.foodLogRequest(
-            pairing: pairing,
-            body: FoodLogCreateBody(
-                description: "Bibimbap with extra vegetables",
-                mediaPath: "media/2026/07/abc.jpg",
-                mealType: "lunch",
-                source: "ios-app"
+    func testTextNutritionAnalysisUsesAwareStableCaptureInputs() throws {
+        let operationID = UUID(
+            uuidString: "11111111-2222-3333-4444-555555555555"
+        )!
+        let observedAt = try XCTUnwrap(
+            ISO8601DateFormatter().date(
+                from: "2026-08-05T23:30:00Z"
             )
         )
-        XCTAssertEqual(request.url?.absoluteString, "http://192.168.1.20:8100/v1/food-logs")
+        let request = try HealthMesAPI.intakeAnalysisRequest(
+            pairing: pairing,
+            body: IntakeInteractionAnalysisBody(
+                operationID: operationID,
+                modality: "text",
+                observedAt: observedAt,
+                timezone: "Asia/Seoul",
+                source: "ios-app-text",
+                sourceText: "Bibimbap with extra vegetables",
+                mediaPath: nil,
+                allowRemoteAnalysis: false
+            )
+        )
+        XCTAssertEqual(
+            request.url?.absoluteString,
+            "http://192.168.1.20:8100/v1/intake-interactions/analyze"
+        )
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
         let decoded = try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any]
-        XCTAssertEqual(decoded?["description"] as? String, "Bibimbap with extra vegetables")
-        XCTAssertEqual(decoded?["media_path"] as? String, "media/2026/07/abc.jpg")
-        XCTAssertEqual(decoded?["meal_type"] as? String, "lunch")
-        XCTAssertEqual(decoded?["source"] as? String, "ios-app")
+        XCTAssertEqual(decoded?["operation_id"] as? String, operationID.uuidString)
+        XCTAssertEqual(decoded?["intent"] as? String, "log_consumed")
+        XCTAssertEqual(decoded?["modality"] as? String, "text")
+        XCTAssertEqual(decoded?["observed_at"] as? String, "2026-08-06T08:30:00.000+09:00")
+        XCTAssertEqual(decoded?["timezone"] as? String, "Asia/Seoul")
+        XCTAssertEqual(decoded?["source_text"] as? String, "Bibimbap with extra vegetables")
+        XCTAssertNil(decoded?["media_path"])
+    }
+
+    func testVoiceNutritionUsesMediaAndOmitsSourceText() throws {
+        let request = try HealthMesAPI.intakeAnalysisRequest(
+            pairing: pairing,
+            body: IntakeInteractionAnalysisBody(
+                operationID: UUID(
+                    uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+                )!,
+                modality: "voice",
+                observedAt: Date(timeIntervalSince1970: 1_786_000_000),
+                timezone: "Asia/Seoul",
+                source: "mac-app-voice",
+                sourceText: nil,
+                mediaPath: "media/2026/08/voice.wav",
+                allowRemoteAnalysis: false
+            )
+        )
+        let decoded = try JSONSerialization.jsonObject(
+            with: request.httpBody!
+        ) as? [String: Any]
+        XCTAssertEqual(decoded?["modality"] as? String, "voice")
+        XCTAssertEqual(
+            decoded?["media_path"] as? String,
+            "media/2026/08/voice.wav"
+        )
+        XCTAssertNil(decoded?["source_text"])
+    }
+
+    func testPhotoInteractionOmitsManualItems() throws {
+        let request = try HealthMesAPI.photoIntakeRequest(
+            pairing: pairing,
+            body: PhotoIntakeInteractionBody(
+                operationID: UUID(
+                    uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+                )!,
+                source: "ios-app-photo",
+                sourceText: "half portion",
+                nutritionObservationID: UUID(
+                    uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF"
+                )!
+            )
+        )
+        let decoded = try JSONSerialization.jsonObject(
+            with: request.httpBody!
+        ) as? [String: Any]
+        XCTAssertEqual(decoded?["modality"] as? String, "photo")
+        XCTAssertEqual(decoded?["source_text"] as? String, "half portion")
+        XCTAssertNil(decoded?["items"])
+    }
+
+    func testOutcomeStatusIsExplicitAndUnchangedItemsAreOmitted() throws {
+        let interactionID = UUID(
+            uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF"
+        )!
+        let request = try HealthMesAPI.intakeOutcomeRequest(
+            pairing: pairing,
+            interactionID: interactionID,
+            body: IntakeOutcomeBody(
+                operationID: UUID(
+                    uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+                )!,
+                status: .notConsumed,
+                source: "ios-app",
+                consumedAt: nil,
+                note: nil
+            )
+        )
+        let decoded = try JSONSerialization.jsonObject(
+            with: request.httpBody!
+        ) as? [String: Any]
+        XCTAssertEqual(decoded?["status"] as? String, "not_consumed")
+        XCTAssertNil(decoded?["consumed_at"])
+        XCTAssertNil(decoded?["corrected_items"])
+        XCTAssertNil(decoded?["note"])
+    }
+
+    func testCorrectedItemsUseStructuredOutcomeContract() throws {
+        let item = IntakeItemResult(
+            name: "bibimbap",
+            intakeType: "food",
+            serving: IntakeServingResult(
+                kind: "exact",
+                unit: "g",
+                exact: 320,
+                minimum: nil,
+                maximum: nil,
+                evidenceText: "user corrected portion",
+                estimationBasis: "user"
+            ),
+            nutrients: [
+                IntakeNutrientFactResult(
+                    nutrient: "energy",
+                    amount: IntakeServingResult(
+                        kind: "range",
+                        unit: "kcal",
+                        exact: nil,
+                        minimum: 420,
+                        maximum: 520,
+                        evidenceText: nil,
+                        estimationBasis: "database"
+                    ),
+                    confidence: "medium",
+                    origin: "user",
+                    evidenceText: "portion corrected during review"
+                )
+            ],
+            confidence: "high",
+            warnings: []
+        )
+        let request = try HealthMesAPI.intakeOutcomeRequest(
+            pairing: pairing,
+            interactionID: UUID(),
+            body: IntakeOutcomeBody(
+                operationID: UUID(),
+                status: .consumed,
+                source: "ios-app",
+                consumedAt: Date(timeIntervalSince1970: 1_786_000_000),
+                correctedItems: [item],
+                note: nil
+            )
+        )
+
+        let decoded = try JSONSerialization.jsonObject(
+            with: request.httpBody!
+        ) as? [String: Any]
+        let correctedItems = decoded?["corrected_items"] as? [[String: Any]]
+        let corrected = try XCTUnwrap(correctedItems?.first)
+        XCTAssertEqual(corrected["name"] as? String, "bibimbap")
+        XCTAssertEqual(corrected["intake_type"] as? String, "food")
+        XCTAssertNotNil(corrected["serving"] as? [String: Any])
+        let nutrients = corrected["nutrients"] as? [[String: Any]]
+        XCTAssertEqual(nutrients?.first?["nutrient"] as? String, "energy")
+    }
+
+    func testNutritionCorrectionRenamesItemWithoutDiscardingNutrients() {
+        var correction = NutritionItemCorrectionDraft(
+            item: nutritionCorrectionFixture()
+        )
+        correction.name = "beef bibimbap"
+
+        XCTAssertTrue(correction.isChanged)
+        XCTAssertEqual(correction.correctedItem?.name, "beef bibimbap")
+        XCTAssertEqual(correction.correctedItem?.nutrients.count, 1)
+    }
+
+    func testNutritionCorrectionClearsNutrientsWhenServingChanges() {
+        var correction = NutritionItemCorrectionDraft(
+            item: nutritionCorrectionFixture()
+        )
+        correction.exactAmount = "420"
+        correction.unit = "g"
+
+        let corrected = correction.correctedItem
+        XCTAssertTrue(correction.isChanged)
+        XCTAssertEqual(corrected?.serving.exact, 420)
+        XCTAssertEqual(corrected?.serving.unit, "g")
+        XCTAssertEqual(corrected?.nutrients, [])
+        XCTAssertTrue(
+            corrected?.warnings.contains(
+                "Serving corrected by user; nutrients require recalculation."
+            ) == true
+        )
+    }
+
+    func testNutritionCorrectionExcludesMisidentifiedItem() {
+        var correction = NutritionItemCorrectionDraft(
+            item: nutritionCorrectionFixture()
+        )
+        correction.isExcluded = true
+
+        XCTAssertTrue(correction.isChanged)
+        XCTAssertNil(correction.correctedItem)
+    }
+
+    func testNutritionCorrectionRejectsInvalidServingInsteadOfFallingBack() {
+        var correction = NutritionItemCorrectionDraft(
+            item: nutritionCorrectionFixture()
+        )
+        correction.exactAmount = "zero"
+
+        XCTAssertTrue(correction.isChanged)
+        XCTAssertFalse(correction.isValid)
+        XCTAssertNotNil(correction.validationMessage)
+        XCTAssertNil(correction.correctedItem)
+    }
+
+    func testNutritionCorrectionAcceptsCommaDecimal() {
+        var correction = NutritionItemCorrectionDraft(
+            item: nutritionCorrectionFixture()
+        )
+        correction.exactAmount = "420,5"
+
+        XCTAssertTrue(correction.isValid)
+        XCTAssertEqual(correction.correctedItem?.serving.exact, 420.5)
+    }
+
+    func testUnchangedNutritionCorrectionKeepsOriginalItem() {
+        let original = nutritionCorrectionFixture()
+        let correction = NutritionItemCorrectionDraft(item: original)
+
+        XCTAssertFalse(correction.isChanged)
+        XCTAssertEqual(correction.correctedItem, original)
+    }
+
+    func testNutritionDraftReusesRetryIdentity() {
+        let interactionID = UUID(
+            uuidString: "11111111-2222-3333-4444-555555555555"
+        )!
+        let observedAt = Date(timeIntervalSince1970: 1_786_000_000)
+        var draft = NutritionCaptureDraft(
+            interactionOperationID: interactionID,
+            modality: .voice,
+            observedAt: observedAt,
+            timezone: "Asia/Seoul",
+            source: "ios-app-voice"
+        )
+        draft.uploadedMediaPath = "media/2026/08/voice.m4a"
+
+        let first = draft.outcome(
+            for: .consumed,
+            now: Date(timeIntervalSince1970: 1_786_000_100)
+        )
+        let retry = draft.outcome(
+            for: .consumed,
+            now: Date(timeIntervalSince1970: 1_786_000_200)
+        )
+        let changed = draft.outcome(
+            for: .cancelled,
+            now: Date(timeIntervalSince1970: 1_786_000_300)
+        )
+
+        XCTAssertEqual(draft.interactionOperationID, interactionID)
+        XCTAssertEqual(draft.observedAt, observedAt)
+        XCTAssertEqual(draft.timezone, "Asia/Seoul")
+        XCTAssertEqual(
+            draft.uploadedMediaPath,
+            "media/2026/08/voice.m4a"
+        )
+        XCTAssertEqual(first, retry)
+        XCTAssertNotEqual(changed.operationID, first.operationID)
+        XCTAssertEqual(changed.status, .cancelled)
+    }
+
+    func testNutritionDraftChangesOutcomeIdentityWhenCorrectionsChange() {
+        let original = nutritionCorrectionFixture()
+        let renamed = IntakeItemResult(
+            name: "beef bibimbap",
+            intakeType: original.intakeType,
+            serving: original.serving,
+            nutrients: original.nutrients,
+            confidence: original.confidence,
+            warnings: original.warnings
+        )
+        var draft = NutritionCaptureDraft(
+            modality: .text,
+            source: "ios-app-text"
+        )
+
+        let first = draft.outcome(
+            for: .consumed,
+            correctedItems: [original],
+            note: "meal_type=lunch",
+            now: Date(timeIntervalSince1970: 1_786_000_100)
+        )
+        let retry = draft.outcome(
+            for: .consumed,
+            correctedItems: [original],
+            note: "meal_type=lunch",
+            now: Date(timeIntervalSince1970: 1_786_000_200)
+        )
+        let corrected = draft.outcome(
+            for: .consumed,
+            correctedItems: [renamed],
+            note: "meal_type=lunch",
+            now: Date(timeIntervalSince1970: 1_786_000_300)
+        )
+
+        XCTAssertEqual(first, retry)
+        XCTAssertNotEqual(first.operationID, corrected.operationID)
+        XCTAssertEqual(corrected.correctedItems, [renamed])
+        XCTAssertEqual(corrected.actedAt, Date(timeIntervalSince1970: 1_786_000_300))
+    }
+
+    private func nutritionCorrectionFixture() -> IntakeItemResult {
+        IntakeItemResult(
+            name: "bibimbap",
+            intakeType: "food",
+            serving: IntakeServingResult(
+                kind: "exact",
+                unit: "g",
+                exact: 320,
+                minimum: nil,
+                maximum: nil,
+                evidenceText: "visual estimate",
+                estimationBasis: "model"
+            ),
+            nutrients: [
+                IntakeNutrientFactResult(
+                    nutrient: "energy",
+                    amount: IntakeServingResult(
+                        kind: "range",
+                        unit: "kcal",
+                        exact: nil,
+                        minimum: 420,
+                        maximum: 520,
+                        evidenceText: nil,
+                        estimationBasis: "database"
+                    ),
+                    confidence: "medium",
+                    origin: "vlm",
+                    evidenceText: nil
+                )
+            ],
+            confidence: "medium",
+            warnings: ["portion estimated"]
+        )
+    }
+
+    func testPhotoObservationAndInteractionExposeReviewDetails() throws {
+        let observationJSON = """
+            {
+              "observation_id": "01234567-89ab-cdef-0123-456789abcdef",
+              "status": "usable",
+              "confidence": "medium",
+              "warnings": ["portion estimated"],
+              "items": [{
+                "intake_type": "food",
+                "name_candidates": ["bibimbap"],
+                "category": "meal",
+                "serving": {
+                  "kind": "range",
+                  "unit": "g",
+                  "exact": null,
+                  "minimum": 350,
+                  "maximum": 450,
+                  "evidence_text": null,
+                  "estimation_basis": "visual"
+                },
+                "caffeine": {
+                  "kind": "unknown",
+                  "unit": "mg",
+                  "exact": null,
+                  "minimum": null,
+                  "maximum": null,
+                  "evidence_text": null,
+                  "estimation_basis": null
+                },
+                "nutrients": [],
+                "confidence": "medium",
+                "warnings": []
+              }],
+              "confirmation_status": "unconfirmed"
+            }
+            """
+        let observation = try GlanceJSON.decoder().decode(
+            NutritionObservationResult.self,
+            from: Data(observationJSON.utf8)
+        )
+        XCTAssertEqual(observation.items.first?.nameCandidates, ["bibimbap"])
+        XCTAssertEqual(observation.items.first?.serving.summary, "350–450 g")
+
+        let interactionJSON = """
+            {
+              "interaction_id": "11111111-2222-3333-4444-555555555555",
+              "modality": "photo",
+              "source_text": "half portion",
+              "resolved_items": [{
+                "name": "bibimbap",
+                "intake_type": "food",
+                "serving": {
+                  "kind": "range",
+                  "unit": "g",
+                  "exact": null,
+                  "minimum": 175,
+                  "maximum": 225,
+                  "evidence_text": "half portion",
+                  "estimation_basis": "user_context"
+                },
+                "nutrients": [{
+                  "nutrient": "energy",
+                  "amount": {
+                    "kind": "range",
+                    "unit": "kcal",
+                    "exact": null,
+                    "minimum": 280,
+                    "maximum": 380,
+                    "evidence_text": null,
+                    "estimation_basis": "model"
+                  },
+                  "confidence": "medium",
+                  "origin": "vlm",
+                  "evidence_text": null
+                }],
+                "confidence": "medium",
+                "warnings": ["portion estimated"]
+              }],
+              "warnings": [],
+              "is_confirmed_intake": false
+            }
+            """
+        let interaction = try GlanceJSON.decoder().decode(
+            IntakeInteractionResult.self,
+            from: Data(interactionJSON.utf8)
+        )
+        XCTAssertFalse(interaction.isConfirmedIntake)
+        XCTAssertEqual(interaction.resolvedItems.first?.name, "bibimbap")
+        XCTAssertEqual(
+            interaction.resolvedItems.first?.nutrients.first?.amount.summary,
+            "280–380 kcal"
+        )
     }
 
     func testMedicalRecordRequestBodyKeepsContextCaptureOnly() throws {

@@ -8,6 +8,9 @@ struct MacSettingsView: View {
 
     @State private var notificationsEnabled = MacNotificationManager.shared.isEnabled
     @State private var showAdvanced = false
+    @State private var serverReadiness: SetupReadiness?
+    @State private var readinessError: String?
+    @StateObject private var setup = MacSetupCoordinator()
 
     var body: some View {
         ScrollView {
@@ -22,6 +25,10 @@ struct MacSettingsView: View {
                     columns: [GridItem(.adaptive(minimum: 280), spacing: 16)],
                     spacing: 16
                 ) {
+                    MacSetupView(
+                        coordinator: setup,
+                        glanceStore: glanceStore
+                    )
                     connectionCard
                     calendarCard
                     notificationsCard
@@ -34,6 +41,12 @@ struct MacSettingsView: View {
                         notifications: notifications
                     )
                     .padding(.top, 12)
+                    Divider()
+                        .padding(.vertical, 12)
+                    MacStorageAdvancedView()
+                    Divider()
+                        .padding(.vertical, 12)
+                    MacSetupAdvancedView(coordinator: setup)
                 } label: {
                     Label("Advanced · self-host and diagnostics", systemImage: "slider.horizontal.3")
                         .font(.headline)
@@ -43,6 +56,7 @@ struct MacSettingsView: View {
             }
             .padding(32)
         }
+        .task { await loadReadiness() }
     }
 
     private var calendarCard: some View {
@@ -50,8 +64,8 @@ struct MacSettingsView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Google and iCloud")
                     .font(.title2.weight(.semibold))
-                Label("Google Calendar", systemImage: "g.circle")
-                Label("Apple Calendar (iCloud)", systemImage: "calendar")
+                readinessLabel("calendar_google", fallback: "Google Calendar", icon: "g.circle")
+                readinessLabel("calendar_icloud", fallback: "Apple Calendar (iCloud)", icon: "calendar")
                 if let pairing = dashboardStore.pairing {
                     Link(destination: MacWebLinks.connections(pairing: pairing)) {
                         Label("Manage calendars", systemImage: "arrow.up.right.square")
@@ -78,6 +92,21 @@ struct MacSettingsView: View {
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                if let health = serverReadiness?.check("health") {
+                    Label(
+                        health.state == .ready ? "Health data ready" : health.detail,
+                        systemImage: health.state == .ready
+                            ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                    )
+                    .foregroundStyle(
+                        health.state == .ready ? MacHealthMesStyle.moss : .orange
+                    )
+                }
+                if let readinessError {
+                    Text(verbatim: readinessError)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 if let pairing = dashboardStore.pairing {
                     Link(destination: MacWebLinks.dashboard(pairing: pairing)) {
                         Label("Open web dashboard", systemImage: "safari")
@@ -142,5 +171,36 @@ struct MacSettingsView: View {
             )
         else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    @ViewBuilder
+    private func readinessLabel(
+        _ key: String,
+        fallback: String,
+        icon: String
+    ) -> some View {
+        if let check = serverReadiness?.check(key) {
+            Label(
+                check.state == .ready ? "\(fallback) · Ready" : check.detail,
+                systemImage: check.state == .ready
+                    ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+            )
+            .foregroundStyle(
+                check.state == .ready ? MacHealthMesStyle.moss : .orange
+            )
+        } else {
+            Label(fallback, systemImage: icon)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func loadReadiness() async {
+        guard glanceStore.isPaired else { return }
+        do {
+            serverReadiness = try await HealthMesAPI().setupReadiness()
+            readinessError = nil
+        } catch {
+            readinessError = "Could not verify setup readiness."
+        }
     }
 }

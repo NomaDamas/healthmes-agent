@@ -46,21 +46,21 @@ final class CompanionUITests: XCTestCase {
     func testDailyLoopSurfacesRenderAgainstLiveInstance() throws {
         let app = try launchPairedApp()
 
-        XCTAssertTrue(app.staticTexts["HEALTH → PLAN"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["몸 → 오늘 계획"].exists)
+        XCTAssertTrue(app.staticTexts["몸 → 오늘 계획"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["인지 에너지"].exists)
         XCTAssertTrue(app.textFields.firstMatch.exists)
         XCTAssertFalse(app.buttons["조율"].exists)
         XCTAssertFalse(app.buttons["변화"].exists)
 
         app.buttons["전체 보기"].tap()
         app.buttons["일정과 목표"].tap()
-        XCTAssertTrue(app.staticTexts["DETAIL · CALENDAR & GOALS"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["일정과 목표"].waitForExistence(timeout: 15))
         XCTAssertTrue(app.staticTexts["보호할 목표와 할 일"].exists)
         XCTAssertTrue(app.staticTexts["일정 영향"].exists)
 
         app.buttons["전체 보기"].tap()
         app.buttons["결정 결과"].tap()
-        XCTAssertTrue(app.staticTexts["DETAIL · DECISION RESULTS"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["결정 결과"].waitForExistence(timeout: 15))
         XCTAssertTrue(app.staticTexts["OUTCOME LOOP"].exists)
 
         app.buttons["전체 보기"].tap()
@@ -88,8 +88,7 @@ final class CompanionUITests: XCTestCase {
         )
     }
 
-    /// Capture round-trip without media: type a description, save, expect
-    /// the success row (POST /v1/food-logs against the live instance).
+    /// Nutrition capture requires analysis followed by an explicit owner outcome.
     func testFoodCaptureRoundTrip() throws {
         let app = try launchPairedApp()
 
@@ -102,10 +101,15 @@ final class CompanionUITests: XCTestCase {
         }
         field.tap()
         field.typeText("UITest kimbap roll")
-        app.buttons["Save to my instance"].tap()
+        app.buttons["Analyze for review"].tap()
+        let consumed = app.buttons["Consumed"]
+        guard consumed.waitForExistence(timeout: 30) else {
+            throw XCTSkip("Nutrition provider is not configured for live UI QA.")
+        }
+        consumed.tap()
         XCTAssertTrue(
-            app.staticTexts["Food log saved."].waitForExistence(timeout: 15),
-            "food-log POST should round-trip against the live instance"
+            app.staticTexts["Recorded as consumed."].waitForExistence(timeout: 15),
+            "explicit consumed outcome should round-trip against the live instance"
         )
     }
 

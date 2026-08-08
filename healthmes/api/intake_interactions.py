@@ -223,7 +223,10 @@ class OutcomeInput(BaseModel):
     status: IntakeOutcomeStatus
     source: str = Field(min_length=1, max_length=64)
     consumed_at: AwareDatetime | None = None
-    corrected_items: list[IntakeItemInput] = Field(default_factory=list, max_length=50)
+    corrected_items: list[IntakeItemInput] | None = Field(
+        default=None,
+        max_length=50,
+    )
     note: str | None = Field(default=None, max_length=2000)
 
 
@@ -457,7 +460,10 @@ def confirm_intake_outcome(
             if body.consumed_at is not None
             else None
         ),
-        corrected_items=tuple(item.to_domain() for item in body.corrected_items),
+        corrected_items=tuple(
+            item.to_domain() for item in (body.corrected_items or ())
+        ),
+        items_corrected=body.corrected_items is not None,
         note=body.note,
     )
     try:

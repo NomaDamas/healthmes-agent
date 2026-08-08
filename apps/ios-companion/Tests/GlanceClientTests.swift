@@ -171,12 +171,286 @@ final class GlanceClientBehaviourTests: XCTestCase {
         XCTAssertThrowsError(try PairingStore.normalizeBaseURL(""))
     }
 
+    func testPairingDeepLinkContainsOneTimeCodeNotToken() throws {
+        let url = try XCTUnwrap(
+            URL(
+                string:
+                    "healthmes://pair?url=https%3A%2F%2Fhealthmes.example.com&code=one-time-code"
+            )
+        )
+
+        let payload = try PairingDeepLink.parse(url)
+
+        XCTAssertEqual(
+            payload.baseURL.absoluteString,
+            "https://healthmes.example.com"
+        )
+        XCTAssertEqual(payload.code, "one-time-code")
+        let request = try PairingExchangeClient.request(for: payload)
+        XCTAssertEqual(
+            request.url?.absoluteString,
+            "https://healthmes.example.com/v1/setup/pairing/exchange"
+        )
+        XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+        XCTAssertFalse(String(data: request.httpBody!, encoding: .utf8)!.contains("token"))
+    }
+
+    func testPairingDeepLinkRejectsPlainHTTPAndLegacyToken() throws {
+        XCTAssertThrowsError(
+            try PairingDeepLink.parse(
+                XCTUnwrap(
+                    URL(
+                        string:
+                            "healthmes://pair?url=http%3A%2F%2Fexample.com&code=one-time-code"
+                    )
+                )
+            )
+        )
+        XCTAssertThrowsError(
+            try PairingDeepLink.parse(
+                XCTUnwrap(
+                    URL(
+                        string:
+                            "healthmes://pair?url=https%3A%2F%2Fhealthmes.example.com&token=secret"
+                    )
+                )
+            )
+        )
+        XCTAssertThrowsError(
+            try PairingDeepLink.parse(
+                XCTUnwrap(
+                    URL(
+                        string:
+                            "healthmes://pair?url=http%3A%2F%2F192.168.1.20%3A8100&code=one-time-code"
+                    )
+                )
+            )
+        )
+        XCTAssertNoThrow(
+            try PairingDeepLink.parse(
+                XCTUnwrap(
+                    URL(
+                        string:
+                            "healthmes://pair?url=http%3A%2F%2F127.0.0.1%3A8100&code=one-time-code"
+                    )
+                )
+            )
+        )
+    }
+
+    func testLoopbackPolicyAcceptsOnlyLocalhostIPv6AndExact127Slash8() {
+        for host in [
+            "localhost",
+            "::1",
+            "[::1]",
+            "127.0.0.1",
+            "127.255.255.255",
+        ] {
+            XCTAssertTrue(PairingStore.isLoopbackHost(host), host)
+        }
+        for host in [
+            "127",
+            "127.0.0",
+            "127.0.0.256",
+            "127.attacker.example",
+            "127.0.0.1.attacker.example",
+            "126.255.255.255",
+            "128.0.0.1",
+        ] {
+            XCTAssertFalse(PairingStore.isLoopbackHost(host), host)
+        }
+    }
+
+    func testPairingStoreAllowsTokenlessLoopbackButRequiresHTTPSAndTokenRemotely() throws {
+        let (store, defaults, credentials, suiteName) = try makePairingStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let local = try store.save(
+            baseURLString: "http://127.0.0.1:8100",
+            token: " "
+        )
+        XCTAssertNil(local.token)
+        XCTAssertNil(credentials.token)
+        XCTAssertEqual(store.load(), local)
+
+        XCTAssertThrowsError(
+            try store.save(
+                baseURLString: "https://healthmes.example.com",
+                token: ""
+            )
+        ) { error in
+            XCTAssertEqual(error as? PairingError, .tokenRequired)
+        }
+        XCTAssertThrowsError(
+            try store.save(
+                baseURLString: "http://192.168.1.20:8100",
+                token: "secret"
+            )
+        ) { error in
+            XCTAssertEqual(error as? PairingError, .insecureBaseURL)
+        }
+
+        let remote = try store.save(
+            baseURLString: "https://healthmes.example.com",
+            token: " secret "
+        )
+        XCTAssertEqual(remote.token, "secret")
+        XCTAssertEqual(credentials.token, "secret")
+    }
+
+    func testPairingStoreLoadRemovesLegacyInsecurePairingAndCredential() throws {
+        let (store, defaults, credentials, suiteName) = try makePairingStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(
+            "http://192.168.1.20:8100",
+            forKey: "healthmes.pairing.baseURL"
+        )
+        credentials.token = "legacy-secret"
+
+        XCTAssertNil(store.load())
+        XCTAssertNil(
+            defaults.string(forKey: "healthmes.pairing.baseURL")
+        )
+        XCTAssertNil(credentials.token)
+    }
+
+    func testPairingStoreLoadRemovesRemoteHTTPSPairingWithoutToken() throws {
+        let (store, defaults, credentials, suiteName) = try makePairingStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(
+            "https://healthmes.example.com",
+            forKey: "healthmes.pairing.baseURL"
+        )
+        credentials.token = nil
+
+        XCTAssertNil(store.load())
+        XCTAssertNil(
+            defaults.string(forKey: "healthmes.pairing.baseURL")
+        )
+    }
+
+    func testPairingStoreRestoresPreviousCredentialWhenReplacementFails() throws {
+        let (store, defaults, credentials, suiteName) = try makePairingStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let original = try store.save(
+            baseURLString: "https://old.healthmes.example",
+            token: "old-secret"
+        )
+        credentials.failNextWrite = true
+
+        XCTAssertThrowsError(
+            try store.save(
+                baseURLString: "https://new.healthmes.example",
+                token: "new-secret"
+            )
+        ) { error in
+            XCTAssertEqual(error as? PairingError, .credentialStorageFailed)
+        }
+        XCTAssertEqual(store.load(), original)
+        XCTAssertEqual(credentials.token, "old-secret")
+    }
+
+    func testPairingStoreRestoresPreviousCredentialAfterReadBackMismatch() throws {
+        let (store, defaults, credentials, suiteName) = try makePairingStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let original = try store.save(
+            baseURLString: "https://old.healthmes.example",
+            token: "old-secret"
+        )
+        credentials.corruptReadAfterNextWrite = true
+
+        XCTAssertThrowsError(
+            try store.save(
+                baseURLString: "https://new.healthmes.example",
+                token: "new-secret"
+            )
+        ) { error in
+            XCTAssertEqual(error as? PairingError, .credentialStorageFailed)
+        }
+        XCTAssertEqual(store.load(), original)
+        XCTAssertEqual(credentials.token, "old-secret")
+    }
+
+    func testWatchPairingContextCanBeRebuiltFromPersistedPairing() {
+        let pairing = Pairing(
+            baseURL: URL(string: "https://healthmes.example.com")!,
+            token: "secret"
+        )
+
+        XCTAssertEqual(
+            PairingSyncKeys.context(for: pairing)[PairingSyncKeys.baseURL]
+                as? String,
+            "https://healthmes.example.com"
+        )
+        XCTAssertEqual(
+            PairingSyncKeys.context(for: pairing)[PairingSyncKeys.token]
+                as? String,
+            "secret"
+        )
+        XCTAssertEqual(
+            PairingSyncKeys.context(for: nil)[PairingSyncKeys.baseURL]
+                as? String,
+            ""
+        )
+        XCTAssertEqual(
+            PairingSyncKeys.context(for: nil)[PairingSyncKeys.token]
+                as? String,
+            ""
+        )
+    }
+
+    func testPairingExchangeReportsExpiredAndConsumedCodes() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let client = PairingExchangeClient(
+            session: URLSession(configuration: configuration)
+        )
+        let deepLink = try XCTUnwrap(
+            URL(
+                string:
+                    "healthmes://pair?url=https%3A%2F%2Fhealthmes.example.com&code=one-time-code"
+            )
+        )
+
+        for (status, expected) in [
+            (409, PairingError.pairingCodeConsumed),
+            (410, PairingError.pairingCodeExpired),
+        ] {
+            StubURLProtocol.handler = { _ in (status, [:], Data()) }
+            do {
+                _ = try await client.exchange(deepLink)
+                XCTFail("Expected pairing exchange to fail with HTTP \(status)")
+            } catch let error as PairingError {
+                XCTAssertEqual(error, expected)
+            }
+        }
+        StubURLProtocol.handler = nil
+    }
+
     func testCacheControlMaxAgeParsing() {
         XCTAssertEqual(GlanceClient.maxAgeSeconds(fromCacheControl: "private, max-age=300"), 300)
         XCTAssertEqual(GlanceClient.maxAgeSeconds(fromCacheControl: "MAX-AGE=60"), 60)
         XCTAssertNil(GlanceClient.maxAgeSeconds(fromCacheControl: "private"))
         XCTAssertNil(GlanceClient.maxAgeSeconds(fromCacheControl: nil))
         XCTAssertNil(GlanceClient.maxAgeSeconds(fromCacheControl: "max-age=oops"))
+    }
+
+    private func makePairingStore() throws -> (
+        PairingStore,
+        UserDefaults,
+        FakePairingTokenStore,
+        String
+    ) {
+        let suiteName = "healthmes-pairing-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        let credentials = FakePairingTokenStore()
+        return (
+            PairingStore(defaults: defaults, keychain: credentials),
+            defaults,
+            credentials,
+            suiteName
+        )
     }
 
     /// End-to-end conditional-GET flow against a stubbed transport:
@@ -235,6 +509,38 @@ final class GlanceClientBehaviourTests: XCTestCase {
         } catch GlanceClientError.unauthorized(let status) {
             XCTAssertEqual(status, 401)
         }
+    }
+}
+
+final class FakePairingTokenStore: PairingTokenStoring {
+    var token: String?
+    var failNextWrite = false
+    var corruptReadAfterNextWrite = false
+    private var nextReadOverride: String?
+
+    func readToken() -> String? {
+        if let nextReadOverride {
+            self.nextReadOverride = nil
+            return nextReadOverride
+        }
+        return token
+    }
+
+    func writeToken(_ token: String) throws {
+        if failNextWrite {
+            failNextWrite = false
+            throw PairingError.credentialStorageFailed
+        }
+        self.token = token
+        if corruptReadAfterNextWrite {
+            corruptReadAfterNextWrite = false
+            nextReadOverride = "read-back-mismatch"
+        }
+    }
+
+    func deleteToken() {
+        token = nil
+        nextReadOverride = nil
     }
 }
 

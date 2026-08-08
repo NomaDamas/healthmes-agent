@@ -154,24 +154,28 @@ widget gallery (unsigned-build caveat below).
 
 ## Pairing
 
-1. Serve your instance. Same machine: `http://127.0.0.1:8100` works with
-   no token (loopback-open). Another machine on your LAN needs
-   `HEALTHMES_HOST=0.0.0.0` **and** `HEALTHMES_API_TOKEN=<token>`.
-2. Open the app → **Settings → Advanced**, or use the status item:
-   base URL + token → **Save & test** performs a real glance fetch and
-   reports the failure reason if any.
-3. Storage: base URL in the app-group `UserDefaults` suite
+1. Open **Settings → Set up this Mac**. HealthMes downloads its managed
+   runtime into `~/Library/Application Support/HealthMes/runtime-source`,
+   creates a private mode-0600 configuration, installs the local service,
+   and pairs the Mac app.
+2. Scan the displayed five-minute QR with the iPhone Camera. The QR contains
+   a signed one-time code, never the bearer token; the iPhone app exchanges
+   it once and passes the pairing to Apple Watch.
+3. Existing self-hosted instances can still be entered under
+   **Settings → Advanced → self-host pairing**.
+4. Storage: base URL in the app-group `UserDefaults` suite
    (`group.com.healthmes.companion` — shared with the widget and read, URL
    half only, by the saver); token in the login **Keychain** via the shared
    `PairingStore`. **Unpair** clears pairing, snapshot cache and the
    alert seen-store.
 
-Plain-HTTP note: the ATS exception is **scoped to local networking**
-(`NSAllowsLocalNetworking`, not a global `NSAllowsArbitraryLoads`): the
-typical target `http://<LAN-IP>:8100` works regardless (ATS never applies
-to IP-literal URLs), and `.local`/unqualified hostnames are allowed. Plain
-HTTP to a qualified public DNS name fails closed — use HTTPS there (a
-tokenized viewer URL must never cross an untrusted network in clear text).
+Transport policy: production pairing requires **HTTPS**. Plain HTTP is
+accepted only for same-device loopback hosts (`localhost`, `127.0.0.0/8`,
+`::1`). The default one-click install therefore pairs the Mac app with its
+loopback runtime. Private-LAN HTTP cannot exchange or store the long-lived
+bearer token. If `HEALTHMES_PUBLIC_BASE_URL` is a valid HTTPS URL, setup also
+shows the expiring iPhone QR; otherwise it reports that iPhone pairing still
+needs an HTTPS endpoint.
 
 ## Privacy toggle (issue #11 requirement)
 

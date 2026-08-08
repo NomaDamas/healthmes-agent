@@ -1,7 +1,7 @@
 """Pure before/after delta aggregation for the ``compare_impact`` tool.
 
 "Does factor X agree with me?" is answered deterministically (docs/PLAN.md
-1.5): occurrences of a factor are collected from tagged records (food logs,
+1.5): occurrences of a factor are collected from confirmed nutrition intake,
 calendar events, done tasks, workouts), a metric is compared before vs after
 each occurrence, and only the aggregate (n, mean delta, spread, confidence)
 is returned — the LLM never sees raw series and never invents statistics.
@@ -52,12 +52,12 @@ MIN_PAIRED_OBSERVATIONS = 3
 class Occurrence:
     """One tagged occurrence of the factor (aware UTC datetimes).
 
-    ``end == start`` for instantaneous records (a food log); spans (calendar
+    ``end == start`` for instantaneous records (nutrition intake); spans (calendar
     events, workouts) keep their real end so "after" starts after the
     occurrence is over.
     """
 
-    source: str  # "food_log" | "calendar" | "task" | "workout"
+    source: str  # "nutrition_intake" | "calendar" | "task" | "workout"
     label: str
     start: datetime
     end: datetime

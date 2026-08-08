@@ -92,6 +92,7 @@ class NormalizedIntakeItem:
     nutrients: tuple[NutrientFact, ...] = ()
     confidence: Confidence = Confidence.LOW
     warnings: tuple[str, ...] = ()
+    meal_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +143,7 @@ class IntakeOutcome:
     source: str
     consumed_at: datetime | None = None
     corrected_items: tuple[NormalizedIntakeItem, ...] = ()
+    items_corrected: bool = False
     note: str | None = None
     intake_snapshot: StructuredIntakeSnapshot | None = None
     schema_version: str = "intake-outcome-v1"

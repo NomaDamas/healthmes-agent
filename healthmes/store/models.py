@@ -34,7 +34,6 @@ __all__ = [
     "CalendarEventMirror",
     "ScheduleProposal",
     "CalendarMutationProposal",
-    "FoodLog",
     "AppUsageSample",
     "CognitiveEnergyEstimate",
     "DecisionRecord",
@@ -236,18 +235,6 @@ class CalendarMutationProposal(Base):
     )
     response_channel: Mapped[str_32 | None]
     receipt: Mapped[JSONDict | None]
-
-
-class FoodLog(Base):
-    """A captured meal/snack with an LLM-generated description (docs/PLAN.md §8)."""
-
-    __tablename__ = "food_log"
-
-    logged_at: Mapped[datetime] = mapped_column(index=True)
-    description: Mapped[str]
-    media_path: Mapped[str | None]
-    meal_type: Mapped[str_32 | None]
-    source: Mapped[str_32 | None]
 
 
 class AppUsageSample(Base):
