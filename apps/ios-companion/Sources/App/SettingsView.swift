@@ -57,7 +57,12 @@ struct SettingsView: View {
                         systemImage: "heart.text.square"
                     )
                     readinessRow(
-                        "Apple Calendar on device",
+                        "Google Calendar",
+                        value: "HealthMes server connection",
+                        systemImage: "g.circle"
+                    )
+                    readinessRow(
+                        "Apple Calendar",
                         value: calendarPermission.label,
                         systemImage: "calendar"
                     )

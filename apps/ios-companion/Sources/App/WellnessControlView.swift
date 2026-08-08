@@ -38,7 +38,6 @@ struct WellnessControlView: View {
                     if lens != .now {
                         detailContextBar
                     }
-                    sceneHeader
                     sceneContent
                     if let preview {
                         commandPreview(preview)
@@ -173,24 +172,6 @@ struct WellnessControlView: View {
         .padding(.vertical, 10)
         .background(moss.opacity(0.09), in: RoundedRectangle(cornerRadius: 14))
         .accessibilityElement(children: .contain)
-    }
-
-    private var sceneHeader: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text(verbatim: lensEyebrow)
-                .font(.caption.weight(.bold))
-                .tracking(1.2)
-                .foregroundStyle(moss)
-            Text(verbatim: sceneTitle)
-                .font(.system(.title2, design: .rounded).weight(.bold))
-                .fixedSize(horizontal: false, vertical: true)
-            Text(verbatim: sceneSummary)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
@@ -352,7 +333,11 @@ struct WellnessControlView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(verbatim: event.summary ?? "Untitled event")
                                 .font(.body.weight(.medium))
-                            Text(verbatim: event.isAgentCreated ? "HealthMes-managed" : event.calendarSource)
+                            Text(
+                                verbatim: event.isAgentCreated
+                                    ? "HealthMes-managed"
+                                    : calendarName(event.calendarSource)
+                            )
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -651,37 +636,6 @@ struct WellnessControlView: View {
         return "캘린더 연동됨"
     }
 
-    private var lensEyebrow: String {
-        switch lens {
-        case .now: return "HEALTH → PLAN"
-        case .coordinate: return "DETAIL · CALENDAR & GOALS"
-        case .change: return "DETAIL · DECISION RESULTS"
-        }
-    }
-
-    private var sceneTitle: String {
-        switch lens {
-        case .now:
-            return "몸이 오늘 계획에 미치는 영향"
-        case .coordinate:
-            return briefing.pendingDecisions.first?.prompt
-                ?? "몸 상태를 지키면서 일정과 목표를 확인합니다"
-        case .change:
-            return "이전 결정이 실제로 도움이 되었는지 확인합니다"
-        }
-    }
-
-    private var sceneSummary: String {
-        switch lens {
-        case .now:
-            return "현재 몸 상태가 오늘 일정에 미치는 영향과, 필요할 때 한 가지 행동을 보여줍니다."
-        case .coordinate:
-            return "필요할 때만 주간 목표와 캘린더 제약을 자세히 펼칩니다."
-        case .change:
-            return "승인, 캘린더 반영, 이후 결과를 구분해 학습 여부를 확인합니다."
-        }
-    }
-
     private func bodyPlanImpact(_ payload: GlancePayload) -> String {
         if let summary = payload.alerts.top?.summary {
             return summary
@@ -713,6 +667,17 @@ struct WellnessControlView: View {
         case .low: return "낮음"
         }
     }
+
+    private func calendarName(_ source: String) -> String {
+        switch source.lowercased() {
+        case "google":
+            return "Google Calendar"
+        case "caldav", "icloud":
+            return "Apple Calendar"
+        default:
+            return source
+        }
+    }
 }
 
 struct HealthMesOnboardingView: View {
@@ -732,7 +697,8 @@ struct HealthMesOnboardingView: View {
 
                     setupRow("계정과 안전한 인스턴스", detail: "관리형 HTTPS 연결은 아직 배포 준비가 필요합니다.", image: "person.crop.circle")
                     setupRow("건강 데이터", detail: "HealthKit 권한과 데이터 신선도를 확인합니다.", image: "heart.text.square")
-                    setupRow("Apple Calendar", detail: "기기 권한과 HealthMes 서버 동기화는 별도 상태로 표시합니다.", image: "calendar")
+                    setupRow("Google Calendar", detail: "Google 계정으로 HealthMes 서버에 연결합니다.", image: "g.circle")
+                    setupRow("Apple Calendar", detail: "iPhone 권한과 iCloud 서버 동기화를 함께 확인합니다.", image: "calendar")
                     setupRow("알림과 Apple Watch", detail: "손목과 잠금화면에서 제안을 승인합니다.", image: "applewatch")
 
                     Button("관리형 HealthMes로 계속") {}

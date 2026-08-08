@@ -117,20 +117,6 @@
   .control-shell[data-enhanced="true"] .scene-panel:not([data-active="true"]) {
     display: none;
   }
-  .scene-intro {
-    display: flex;
-    align-items: flex-end;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 0.5rem 0.2rem 0.2rem;
-  }
-  .scene-intro h2 {
-    margin: 0.16rem 0 0;
-    font-size: clamp(1.18rem, 3vw, 1.48rem);
-    letter-spacing: -0.02em;
-  }
-  .scene-intro p:last-child { max-width: 32rem; text-align: right; }
-
   .primitive {
     min-width: 0;
     margin: 0;
@@ -476,8 +462,6 @@
     .control-head { align-items: flex-start; flex-direction: column; }
     .control-meta { justify-content: flex-start; }
     .lens-bar { position: static; }
-    .scene-intro { align-items: flex-start; flex-direction: column; }
-    .scene-intro p:last-child { text-align: left; }
     .wellness-flow,
     .scene-grid,
     .scene-grid.equal { grid-template-columns: 1fr; }
@@ -509,10 +493,7 @@
 {% block content %}
 <div class="control-shell" data-control-shell data-enhanced="false">
   <header class="control-head">
-    <div>
-      <p class="eyebrow">{{ dashboard.local_today.isoformat() }} · {{ dashboard.timezone }}</p>
-      <h1>몸의 상태가 오늘 계획을 어떻게 바꿔야 하는지 봅니다.</h1>
-    </div>
+    <p class="eyebrow">{{ dashboard.local_today.isoformat() }} · {{ dashboard.timezone }}</p>
     <div class="control-meta" aria-label="대시보드 상태">
       <span class="state-chip">업데이트 {{ format_rel(dashboard.generated_at) }}</span>
       <span class="state-chip read-only">웹 읽기 전용</span>
@@ -560,14 +541,6 @@
                aria-labelledby="lens-now"
                data-lens-panel="now"
                data-active="true">
-        <div class="scene-intro">
-          <div>
-            <p class="primitive-label">상태 → 계획 영향</p>
-            <h2>오늘의 몸과 일정은 하나의 장면입니다.</h2>
-          </div>
-          <p class="muted">저장된 건강·알림·일정만 사용하며, 없는 원인은 추정하지 않습니다.</p>
-        </div>
-
         <article class="primitive primary-state" data-ui-primitive="wellness_state">
           <span class="primitive-label">현재 상태</span>
           <h3>{{ dashboard.headline }}</h3>
@@ -664,6 +637,30 @@
             {% endif %}
           </article>
         </div>
+
+        <article class="primitive primitive-body" data-ui-primitive="nutrition_summary">
+          <div class="primitive-head">
+            <h3>오늘 섭취</h3>
+            <span class="badge">
+              {{ dashboard.nutrition.interaction_count + dashboard.nutrition.legacy_log_count }}건
+            </span>
+          </div>
+          {% if dashboard.nutrition.latest_items %}
+          <div class="constraint-strip" aria-label="최근 식사 기록">
+            {% for item in dashboard.nutrition.latest_items %}
+            <span class="constraint">{{ item }}</span>
+            {% endfor %}
+          </div>
+          <p class="muted">
+            확인 완료 {{ dashboard.nutrition.confirmed_count }}건
+            {% if dashboard.nutrition.legacy_log_count %}
+            · 기존 식사 기록 {{ dashboard.nutrition.legacy_log_count }}건
+            {% endif %}
+          </p>
+          {% else %}
+          <p class="empty-state">오늘 기록된 식사나 섭취가 없습니다.</p>
+          {% endif %}
+        </article>
       </section>
 
       <section class="scene-panel"
@@ -672,14 +669,6 @@
                aria-labelledby="lens-adjust"
                data-lens-panel="adjust"
                data-active="false">
-        <div class="scene-intro">
-          <div>
-            <p class="primitive-label">제안 → 비교 → 승인</p>
-            <h2>몸을 보호하면서 목표를 지키는 조정안을 봅니다.</h2>
-          </div>
-          <p class="muted">웹은 조정안을 설명하고, 실제 승인·거절은 Apple 앱의 동일 proposal에서 처리합니다.</p>
-        </div>
-
         <div class="scene-grid">
           <article class="primitive primitive-body" data-ui-primitive="proposal">
             <div class="primitive-head">
@@ -742,6 +731,14 @@
             <h3>앞으로 7일</h3>
             <a href="{{ app_path('/connect') }}{{ token_qs }}">캘린더 연결 확인</a>
           </div>
+          <div class="constraint-strip" aria-label="캘린더 연결 상태">
+            {% for connection in dashboard.calendar_connections %}
+            <a class="constraint"
+               href="{{ app_path('/connect') }}{{ token_qs }}">
+              {{ connection.label }} · {{ "연결됨" if connection.connected else "설정 필요" }}
+            </a>
+            {% endfor %}
+          </div>
           {% if dashboard.plan_events %}
           <ul class="timeline">
             {% for event in dashboard.plan_events %}
@@ -797,14 +794,6 @@
                aria-labelledby="lens-change"
                data-lens-panel="change"
                data-active="false">
-        <div class="scene-intro">
-          <div>
-            <p class="primitive-label">결과 → 패턴 → 다음 판단</p>
-            <h2>이전 선택이 실제로 도움이 되었는지 봅니다.</h2>
-          </div>
-          <p class="muted">상관관계를 인과관계로 과장하지 않고, 저장된 결과만 비교합니다.</p>
-        </div>
-
         <article class="primitive primitive-body" data-ui-primitive="outcome_summary">
           <div class="primitive-head">
             <h3>이번 주 결과</h3>

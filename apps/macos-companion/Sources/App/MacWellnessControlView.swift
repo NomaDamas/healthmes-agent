@@ -69,7 +69,6 @@ struct MacWellnessControlView: View {
                     if router.lens != .now {
                         detailContextBar
                     }
-                    sceneHeader
 
                     if let preview {
                         commandPreview(preview)
@@ -259,36 +258,6 @@ struct MacWellnessControlView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 11)
         .background(MacHealthMesStyle.moss.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
-    }
-
-    private var sceneHeader: some View {
-        let scene = projectedScene
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Text(verbatim: lensEyebrow)
-                    .font(.caption.weight(.bold))
-                    .tracking(1.5)
-                    .foregroundStyle(severityColor(scene.severity))
-
-                Text("STATE → IMPACT → ACTION → OUTCOME")
-                    .font(.caption2.monospaced().weight(.medium))
-                    .foregroundStyle(.tertiary)
-            }
-
-            Text(verbatim: scene.title)
-                .font(.system(size: 34, weight: .semibold, design: .rounded))
-                .foregroundStyle(MacHealthMesStyle.graphite)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Text(verbatim: scene.summary)
-                .font(.title3)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: 760, alignment: .leading)
-        }
-        .id("scene-header-\(scene.id)")
-        .transition(.opacity)
-        .accessibilityElement(children: .combine)
     }
 
     private var sceneModules: some View {
@@ -1750,12 +1719,32 @@ private enum MacWellnessSceneProjector {
         let calendarError = dashboardErrors.first(where: { $0.hasPrefix("Calendar:") })
         var items: [WellnessSceneItem] = []
         if !events.isEmpty {
+            let googleCount = events.filter {
+                $0.calendarSource.lowercased() == "google"
+            }.count
+            let appleCount = events.filter {
+                ["caldav", "icloud"].contains($0.calendarSource.lowercased())
+            }.count
             items.append(
                 WellnessSceneItem(
                     id: "calendar-visible",
                     label: "Mirrored",
                     value: "\(events.count) visible events",
                     detail: "This proves API data was loaded, not that every provider is healthy."
+                )
+            )
+            items.append(
+                WellnessSceneItem(
+                    id: "calendar-google",
+                    label: "Google Calendar",
+                    value: "\(googleCount) mirrored events"
+                )
+            )
+            items.append(
+                WellnessSceneItem(
+                    id: "calendar-apple",
+                    label: "Apple Calendar",
+                    value: "\(appleCount) mirrored events"
                 )
             )
         }

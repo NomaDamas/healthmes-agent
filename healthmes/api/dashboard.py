@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from healthmes.api.auth import is_human_viewer_path, viewer_token, viewer_url
@@ -26,12 +26,15 @@ from healthmes.api.briefing import (
     decision_viewer_url,
 )
 from healthmes.api.common import ensure_utc, utc_now
+from healthmes.api.connection_status import ConnectionCard, build_connection_cards
 from healthmes.api.decision_html import shell_context, template_environment
 from healthmes.api.reports import WeeklyReportOut, build_weekly_report
 from healthmes.config import Settings, resolve_timezone
+from healthmes.nutrition.intake_query import search_intake_history
 from healthmes.store import (
     CalendarEventMirror,
     DecisionRecord,
+    FoodLog,
     Insight,
     ProposalStatus,
     ScheduleProposal,
@@ -91,6 +94,14 @@ class DashboardInsight:
 
 
 @dataclass(frozen=True, slots=True)
+class DashboardNutrition:
+    interaction_count: int
+    confirmed_count: int
+    legacy_log_count: int
+    latest_items: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class DashboardView:
     generated_at: datetime
     timezone: str
@@ -105,6 +116,8 @@ class DashboardView:
     pending_proposals: list[DashboardProposal]
     recent_decisions: list[DashboardDecision]
     recent_insights: list[DashboardInsight]
+    calendar_connections: list[ConnectionCard]
+    nutrition: DashboardNutrition
     weekly: WeeklyReportOut
     decisions_url: str
     weekly_url: str
@@ -249,10 +262,61 @@ def _recent_insights(session: Session) -> list[DashboardInsight]:
     ]
 
 
+def _nutrition_summary(
+    session: Session, start: datetime, end: datetime
+) -> DashboardNutrition:
+    history = search_intake_history(
+        session,
+        start=start,
+        end=end,
+        limit=5,
+    )
+    records = history["records"]
+    confirmed_count = sum(
+        1 for record in records if record.get("is_confirmed_intake") is True
+    )
+    latest_items: list[str] = []
+    for record in records:
+        for item in record.get("resolved_items", []):
+            name = str(item.get("name", "")).strip()
+            if name and name not in latest_items:
+                latest_items.append(name)
+            if len(latest_items) == 3:
+                break
+        if len(latest_items) == 3:
+            break
+
+    legacy_log_count = session.scalar(
+        select(func.count())
+        .select_from(FoodLog)
+        .where(FoodLog.logged_at >= start, FoodLog.logged_at < end)
+    ) or 0
+    legacy_rows = session.scalars(
+        select(FoodLog)
+        .where(FoodLog.logged_at >= start, FoodLog.logged_at < end)
+        .order_by(FoodLog.logged_at.desc(), FoodLog.created_at.desc())
+        .limit(5)
+    ).all()
+    if not latest_items:
+        latest_items.extend(
+            row.description.strip()
+            for row in legacy_rows[:3]
+            if row.description.strip()
+        )
+
+    return DashboardNutrition(
+        interaction_count=int(history["coverage"]["matching_records"]),
+        confirmed_count=confirmed_count,
+        legacy_log_count=legacy_log_count,
+        latest_items=tuple(latest_items),
+    )
+
+
 def build_dashboard(session: Session, settings: Settings, now: datetime) -> DashboardView:
     """Build the four dashboard sections from existing persisted read models."""
     tz = resolve_timezone(settings)
     local_today, start, end = _local_window(now, settings, days=7)
+    _, _, today_end = _local_window(now, settings, days=1)
     energy = _energy_block(session, tz, now)
     alerts = _alerts_block(session, settings, now)
     alert_summary = alerts.top.summary if alerts.top is not None else None
@@ -271,6 +335,8 @@ def build_dashboard(session: Session, settings: Settings, now: datetime) -> Dash
         pending_proposals=_pending_proposals(session, settings, now),
         recent_decisions=_recent_decisions(session, settings),
         recent_insights=_recent_insights(session),
+        calendar_connections=build_connection_cards(settings),
+        nutrition=_nutrition_summary(session, start, today_end),
         weekly=weekly,
         decisions_url=viewer_url(settings, "/decisions"),
         weekly_url=viewer_url(settings, "/reports/weekly"),

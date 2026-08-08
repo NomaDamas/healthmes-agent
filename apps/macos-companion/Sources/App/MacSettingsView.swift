@@ -50,9 +50,8 @@ struct MacSettingsView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Google and iCloud")
                     .font(.title2.weight(.semibold))
-                Text("Review connection status and finish calendar setup in the web interface.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                Label("Google Calendar", systemImage: "g.circle")
+                Label("Apple Calendar (iCloud)", systemImage: "calendar")
                 if let pairing = dashboardStore.pairing {
                     Link(destination: MacWebLinks.connections(pairing: pairing)) {
                         Label("Manage calendars", systemImage: "arrow.up.right.square")
