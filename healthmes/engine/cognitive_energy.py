@@ -86,6 +86,7 @@ from typing import Any, Protocol
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from healthmes.activity.repository import legacy_app_usage_cutoff
 from healthmes.config import Settings
 from healthmes.mcp_server import interpret
 from healthmes.store.models import (
@@ -1414,13 +1415,17 @@ def load_store_day_context(session: Session, day: date) -> StoreDayContext:
     usage_start = day_start - timedelta(
         hours=USAGE_PRESENCE_LOOKBACK_HOURS, minutes=FRAGMENTATION_LOOKBACK_MINUTES
     )
-    usage_rows = session.scalars(
-        select(AppUsageSample)
-        .where(
-            AppUsageSample.bucket_start >= usage_start,
-            AppUsageSample.bucket_start < day_end,
+    usage_statement = select(AppUsageSample).where(
+        AppUsageSample.bucket_start >= usage_start,
+        AppUsageSample.bucket_start < day_end,
+    )
+    usage_cutoff = legacy_app_usage_cutoff(session)
+    if usage_cutoff is not None:
+        usage_statement = usage_statement.where(
+            AppUsageSample.bucket_start > usage_cutoff
         )
-        .order_by(AppUsageSample.bucket_start)
+    usage_rows = session.scalars(
+        usage_statement.order_by(AppUsageSample.bucket_start)
     ).all()
     usage = tuple(
         UsageBucket(

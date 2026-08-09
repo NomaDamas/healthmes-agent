@@ -26,6 +26,7 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.engine.cognitive_energy import CognitiveEnergyEngine, OwRows
+from healthmes.storage import update_retention_policy
 from healthmes.store import (
     AppUsageSample,
     Base,
@@ -60,7 +61,11 @@ def engine() -> Iterator[Engine]:
 
 @pytest.fixture
 def session_factory(engine: Engine) -> sessionmaker[Session]:
-    return sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    with factory() as session:
+        update_retention_policy(session, "activity_raw", "forever")
+        session.commit()
+    return factory
 
 
 @pytest.fixture

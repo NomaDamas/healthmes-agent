@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
+from healthmes.storage import update_retention_policy
 from healthmes.store import AppUsageSample
 
 README_PATH = Path(__file__).resolve().parents[2] / "apps" / "android-usage" / "README.md"
@@ -48,6 +49,13 @@ def payload() -> dict:
     return _documented_json(PAYLOAD_MARKER)
 
 
+@pytest.fixture(autouse=True)
+def historical_wire_example_retention(session):
+    """The pinned README timestamp tests schema, not today's retention cutoff."""
+    update_retention_policy(session, "activity_raw", "forever")
+    session.commit()
+
+
 def test_readme_payload_round_trips_through_ingest(client, session, payload):
     documented_ack = _documented_json(ACK_MARKER)
 
@@ -77,7 +85,12 @@ def test_readme_payload_reupload_is_idempotent_upsert(client, session, payload):
 
     assert first.status_code == second.status_code == 200
     accepted = first.json()["accepted"]
-    assert second.json() == {"accepted": accepted, "created": 0, "updated": accepted}
+    assert second.json() == {
+        "accepted": accepted,
+        "created": 0,
+        "updated": accepted,
+        "suppressed": 0,
+    }
     assert len(session.scalars(select(AppUsageSample)).all()) == accepted
 
 
@@ -86,6 +99,9 @@ def test_readme_payload_matches_collector_invariants(payload):
     assert 1 <= len(payload["samples"]) <= 1000
     assert 1 <= len(payload["device_id"]) <= 64
     assert payload["device_id"].startswith("android-")
+    assert isinstance(payload["collection_revision"], int)
+    assert payload["collection_revision"] >= 0
+    assert isinstance(payload["timezone"], str)
     for sample in payload["samples"]:
         # Top-of-hour UTC instants with a Z suffix (java.time.Instant.toString()).
         assert sample["bucket_start"].endswith("Z")

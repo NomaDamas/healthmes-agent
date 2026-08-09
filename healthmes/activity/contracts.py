@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,9 +18,21 @@ from pydantic import (
     model_validator,
 )
 
+RESERVED_ACTIVITY_PROVIDER_NAMES = frozenset(
+    {"activitywatch", "android-usage", "ios-device-activity"}
+)
+
 
 def _utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
+
+
+def is_reserved_activity_provider(value: str) -> bool:
+    normalized = value.casefold()
+    return (
+        normalized in RESERVED_ACTIVITY_PROVIDER_NAMES
+        or normalized.startswith("healthmes-activity-")
+    )
 
 
 def validate_timezone(value: str) -> str:
@@ -91,6 +103,7 @@ class AppIntervalRecord(BaseModel):
 
     kind: Literal["app_interval"] = "app_interval"
     source_record_id: str = Field(min_length=1, max_length=255)
+    source_group_id: str | None = Field(default=None, max_length=255)
     start_at: AwareDatetime
     end_at: AwareDatetime
     state: ActivityState
@@ -159,6 +172,14 @@ class ActivityBatchIn(BaseModel):
             raise ValueError("unavailable collectors cannot submit activity records")
         if self.platform is ActivityPlatform.IOS and self.capability is ActivityCapability.DETAILED:
             raise ValueError("iOS detailed app timelines are not an MVP capability")
+        if self.capability is ActivityCapability.AGGREGATE and any(
+            not isinstance(record, AppHourRecord) for record in self.records
+        ):
+            raise ValueError("aggregate collectors may submit only app_hour records")
+        if self.capability is ActivityCapability.DETAILED and any(
+            not isinstance(record, AppIntervalRecord) for record in self.records
+        ):
+            raise ValueError("detailed collectors may submit only app_interval records")
         return self
 
 
@@ -168,6 +189,7 @@ class ActivityBatchOut(BaseModel):
     updated: int
     duplicates: int
     excluded: int
+    tombstoned: int = 0
     affected_dates: list[str]
 
 
@@ -285,6 +307,7 @@ class IOSCapabilityReport(BaseModel):
     permission_status: ActivityPermissionStatus
     reason: str | None = Field(default=None, max_length=255)
     collected_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))
+    collection_revision: int | None = Field(default=None, ge=0)
     samples: list[IOSAggregateSample] = Field(default_factory=list, max_length=5000)
 
     @field_validator("timezone")
@@ -307,6 +330,8 @@ class IOSCapabilityReport(BaseModel):
         )
         if not available and self.samples:
             raise ValueError("unavailable or denied iOS reports must not contain samples")
+        if self.samples and self.collection_revision is None:
+            raise ValueError("iOS reports with samples require collection_revision")
         return self
 
 
@@ -342,6 +367,12 @@ class ActivityWatchImportRequest(BaseModel):
             raise ValueError("start_at and end_at must be provided together")
         if self.start_at is not None and self.end_at is not None and self.start_at >= self.end_at:
             raise ValueError("start_at must be before end_at")
+        if (
+            self.start_at is not None
+            and self.end_at is not None
+            and self.end_at - self.start_at > timedelta(days=7)
+        ):
+            raise ValueError("one ActivityWatch import cannot exceed 7 days")
         return self
 
 
@@ -389,6 +420,12 @@ class ActivityContextResolveRequest(BaseModel):
             raise ValueError("start and end must be provided together")
         if self.start is not None and self.end is not None and self.start >= self.end:
             raise ValueError("start must be before end")
+        if (
+            self.start is not None
+            and self.end is not None
+            and self.end - self.start > timedelta(days=1)
+        ):
+            raise ValueError("one activity context window cannot exceed 24 hours")
         return self
 
 

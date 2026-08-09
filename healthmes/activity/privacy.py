@@ -19,9 +19,54 @@ BLOCKED_PERMISSION_STATES = {
     ActivityPermissionStatus.UNAVAILABLE.value,
 }
 
+CONTROLLED_CATEGORIES = frozenset(
+    {
+        "accessibility",
+        "audio",
+        "browser",
+        "communication",
+        "desktop",
+        "development",
+        "education",
+        "entertainment",
+        "finance",
+        "fitness",
+        "game",
+        "health",
+        "image",
+        "maps",
+        "navigation",
+        "news",
+        "other",
+        "productivity",
+        "research",
+        "shopping",
+        "social",
+        "system",
+        "travel",
+        "uncategorized",
+        "utilities",
+        "video",
+    }
+)
+
+CATEGORY_ALIASES = {
+    "games": "game",
+    "map": "maps",
+    "utility": "utilities",
+}
+
 
 def normalized_app_id(value: str) -> str:
     return value.strip().casefold()
+
+
+def normalized_category(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    normalized = value.strip().casefold().replace("_", "-").replace(" ", "-")
+    normalized = CATEGORY_ALIASES.get(normalized, normalized)
+    return normalized if normalized in CONTROLLED_CATEGORIES else "other"
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -94,5 +139,9 @@ def filter_records(
         if app_id is not None and normalized_app_id(app_id) in excluded:
             excluded_count += 1
             continue
-        allowed.append(record)
+        allowed.append(
+            record.model_copy(
+                update={"category": normalized_category(record.category)}
+            )
+        )
     return allowed, excluded_count, gate

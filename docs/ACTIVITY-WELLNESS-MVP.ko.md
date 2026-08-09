@@ -204,11 +204,60 @@ MVP는 복잡한 rule engine을 만들지 않고 다음 세 가지 제어만 구
 ```
 
 - 제외 규칙은 source device에서 event 생성 전에 적용한다.
+- 수집기는 OS 활동을 읽기 전에 서버의 최신 collection config를 조회하고,
+  응답의 `config_revision`을 ingest payload의 `collection_revision`으로 넣는다.
+- 공개 canonical ingest와 Android legacy ingest는 revision을 생략할 수 없다.
+  iOS도 sample을 제출할 때는 revision이 필수다. ActivityWatch adapter는 서버가
+  현재 revision을 주입한다.
+- `activitywatch`, `android-usage`, `ios-device-activity` provider 이름은 각
+  내장 adapter 전용이다. 공개 canonical endpoint에서 같은 이름을 직접
+  제출해 provenance를 위조할 수 없다.
+- config revision이 바뀌면 Android 수집기는 이전 revision의 watermark와
+  backfill 구간을 버리고 변경 시각부터 새 수집 구간을 시작한다.
+  `collection_generation + config_revision + collection_since + watermark`는
+  하나의 동기식 encrypted preference commit으로 저장하며 실패하면 OS 데이터를
+  읽지 않는다. 따라서 crash가 값의 일부만 남겨 제외·중지 이전 활동을 새
+  설정으로 읽는 일을 막는다.
+- Android의 민감 경계 commit은 먼저 별도 일반 `SharedPreferences`에
+  quarantine latch를 동기식으로 arm하고, encrypted state를 commit한 뒤,
+  마지막으로 latch를 해제하는 2단계 순서를 따른다. encrypted commit 또는
+  latch 해제가 실패하면 이미 durable한 latch가 process 재시작 뒤에도
+  periodic/one-shot 활동 upload를 차단하고, `collection_enabled=false`를
+  최선 저장한 뒤 WorkManager를 모두 취소한다. latch arm 자체가 실패하면
+  encrypted state를 건드리지 않고 현재 process에서 즉시 수집을 중단한다.
+  사용자가 명시적으로 다시 켜서 새 경계 commit에 성공한 경우에만 quarantine을
+  해제한다.
+- 모든 hard boundary 변경은 `collection_generation`을 증가시킨다. worker가
+  UsageStats를 읽는 동안 generation이 바뀌면 읽은 snapshot을 폐기한다.
+  network I/O 동안 collection-state lock을 잡지 않는다. 대신 각 HTTP chunk
+  직전과 최종 watermark commit 직전에 권한과 generation을 다시 확인한다.
+  이미 시작된 한 HTTP request는 완료될 수 있지만, 저장된 새 경계 뒤에는 다음
+  chunk와 watermark가 진행되지 않으며 permission observer와 앱 thread도 긴
+  network timeout에 막히지 않는다.
+- Android의 제외 앱은 시간 bucket 생성과 category 조회 전에 source에서
+  제거한다. 서버는 같은 제외 규칙과 revision을 다시 검증한다.
 - raw window title, full URL, keystroke, click coordinate, clipboard,
   notification body와 화면 픽셀은 수집하지 않는다.
-- 수집기 권한이 취소되면 즉시 중지하고 `permission_revoked` 상태를 노출한다.
+- Android Usage Access 설정을 앱에서 열기 전, process-lifetime AppOps
+  listener가 변경을 볼 때, 앱 화면이 resume될 때와 worker가 실행될 때마다
+  로컬 수집 경계를 원자적으로 다시 세운다. 관찰한 revoke에는
+  `permission_status=revoked`를 보고하고, 관찰한 regrant는 그 시각부터 새
+  수집 구간을 시작한다. worker는 OS read 전과 upload 전에도 권한을 다시
+  확인한다.
+- Android 수집기는 권한이 다시 허용되면 먼저
+  `permission_status=granted`를 보고하고, 그 응답에 포함된 최신 collection
+  config를 적용한 뒤에만 OS 데이터를 읽는다. 이 순서로 서버의
+  `permission_revoked` gate를 안전하게 해제하며 설정·권한 상태를 우회하지
+  않는다.
+- Android 공개 API는 과거 Usage Access grant interval을 제공하지 않는다.
+  따라서 앱 설정 진입도, HealthMes process 실행도 전혀 없는 동안 외부 시스템
+  설정에서 revoke와 regrant가 모두 끝난 경우에는 그 짧은 권한 공백을 사후
+  탐지할 수 없다. foreground service로 상시 감시하지 않는 MVP의 명시적
+  플랫폼 한계이며, 그런 구간까지 절대 탐지한다고 주장하지 않는다.
 - 설정 API는 권한 요청 상태, 마지막 수집, 마지막 업로드, queue age와
   coverage를 반환한다.
+- 설정, runtime status와 adapter cursor는 서로 덮어쓰지 않는 독립
+  `WellnessEvent`로 저장하고 하나의 read contract로 합쳐 반환한다.
 - 설정 화면, 권한 버튼과 플랫폼 UI는 별도 device-team branch가 소유한다.
 
 ## 7. 최소 파생 activity context
@@ -337,9 +386,11 @@ Activity policy가 카페인 용량을 계산하지 않고, caffeine policy가 �
 **`ACT-MVP-04 Android Canonical Adapter`**
 
 - 기존 `/v1/app-usage/batch`를 canonical event로 투영
+- OS 활동을 읽기 전 collection config/revision 확인과 source-side 앱 제외
 - 기존 cognitive-energy read model과 결과 호환
 
-완료 조건: 현재 Android collector를 바꾸지 않아도 canonical store에 쌓인다.
+완료 조건: 보강된 Android collector가 privacy revision을 지키면서 compatibility
+table과 canonical store에 원자적으로 투영한다.
 
 **`ACT-MVP-05 ActivityWatch Desktop Adapter`**
 
@@ -426,8 +477,10 @@ focus/overwork/recovery summaries
 HealthMes context API/MCP + skill contract
 ```
 
-이 경로가 소유자 실데이터로 동작하고, 누락을 0으로 가장하지 않으며, 제외 앱이
-저장·context·로그에 나타나지 않을 때 MVP를 완료한 것으로 본다.
+엔진 MVP는 결정론적 fixture와 public contract로 이 경로를 증명하고, 누락을
+0으로 가장하지 않으며, 제외 앱이 저장·context·로그에 나타나지 않을 때 완료한
+것으로 본다. 소유자 실데이터와 실제 기기에서의 end-to-end dogfood는 device
+UI PR이 이 엔진 계약을 연결한 뒤 수행하는 별도 제품 검증 단계다.
 
 ## 13. 구현 계약
 
@@ -466,14 +519,112 @@ agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
   `raw_event_count + SHA-256 digest`로 크기가 제한된다.
 - daily coverage는 데이터가 존재한 hour만이 아니라 local day 전체
   23/24/25시간을 분모로 사용한다.
-- focus coverage는 요청한 전체 구간을 분모로 사용하며 부분 hour는 비례값과
-  limitation을 함께 반환한다.
-- 수동 raw 삭제는 summary 직접 삭제 옵션과 관계없이 영향을 받은 날짜를
-  재집계해 삭제된 활동이 파생 context에 남지 않게 한다.
+- focus coverage는 요청한 전체 구간을 분모로 사용한다. 부분 hour는 보존된
+  raw event로 정확히 다시 계산하고, raw가 이미 만료됐다면 비례 추정하지 않고
+  `partial_hour_requires_raw`로 실패한다.
+- focus 구간에 일부 raw만 남고 이전 구간은 hourly summary에만 남아 있으면
+  남은 raw만으로 전체 구간을 `exact`라고 표시하지 않는다. local-day summary의
+  raw provenance가 완전할 때만 raw exact 경로를 사용하고, 그렇지 않으면
+  장기 hourly summary로 전환하거나 coverage 부족을 명시한다.
+- raw 보존기간을 벗어난 late upload는 저장하지 않고 conflict로 거부한다.
+  만료된 raw·hourly·daily event는 maintenance가 아직 실행되지 않았어도
+  REST와 MCP read path에서 노출하지 않는다.
+- activity raw 보존기간을 줄이면 canonical raw의 expiry를 다시 계산하는 것과
+  동시에 이미 만료된 Android compatibility row를 즉시 삭제한다. 보존기간을
+  더 길게 늘리거나 무기한으로 바꿔도 이전의 더 짧은 정책에서 이미 만료된
+  compatibility row는 먼저 물리 삭제해 다시 나타나지 않는다. scheduler가
+  멈춰 있어도 cognitive-energy, insight와 MCP의 legacy read path는 같은
+  retention cutoff보다 오래된 row를 읽지 않는다.
+- retention 변경과 storage maintenance는 activity ingest/delete와 같은
+  process-local write lock을 사용하고, REST·웹·scheduler 경로는 database
+  commit이 끝날 때까지 lock을 유지한다. 정책 변경 직전의 규칙으로 뒤늦게
+  activity row가 commit되는 경쟁을 막는다.
+- collector 시계 오염이 장기 저장과 summary expiry를 미래로 밀지 않도록
+  `collected_at`, hourly bucket 시작과 detailed interval 종료가 서버 시계보다
+  1분 넘게 미래면 `activity_future_data`로 거부한다. 기존 버전이 남긴 미래
+  row는 device/global 전체 삭제에서 함께 제거한다.
+- 수동 raw 삭제는 재전송으로 복구되지 않도록 영구 tombstone을 먼저 만들고,
+  summary 직접 삭제 옵션과 관계없이 영향을 받은 local date/timezone scope를
+  재집계한다. 범위 삭제와 전체 삭제 모두 실제로 지우는 모든 canonical raw와
+  Android compatibility row의 `(provider, device, source_record_id)`를
+  SHA-256 identity tombstone에 500개씩 나눠 기록한다. 따라서 같은 source
+  identity의 timestamp를 삭제 범위 밖으로 바꿔도 복구되지 않지만, 삭제 이후
+  새로운 source identity의 정상 활동은 저장된다.
+- targeted 삭제에 필요한 raw provenance가 이미 만료돼 기존 장기 summary를
+  정확히 다시 만들 수 없으면 삭제와 tombstone 생성을 모두 `409`로
+  fail-closed한다.
+- 일반 재집계도 현재 raw의 개수만 늘었다는 이유로 provenance가 불완전한
+  장기 summary를 덮어쓰지 않는다. 기존 summary의 raw provenance가 이미
+  불완전한 local scope를 바꾸려는 ingest는 저장 전 상태로 롤백하고 `409`로
+  거부한다. 정확한 duplicate 재전송은 변경이 아니므로 계속 멱등 처리한다.
+- ActivityWatch와 Android legacy backfill의 chunk/page는 각 단계마다 summary를
+  갱신해 다음 단계가 항상 완전한 provenance에서 시작한다.
+- Android legacy startup backfill이 이미 불완전해진 summary provenance를
+  만나면 해당 legacy row는 보류하고 기존 summary를 보존한다. 한 scope의
+  마이그레이션 충돌 때문에 서비스 기동이나 다른 device/page 마이그레이션을
+  중단하지 않는다.
 - collection on/off, 앱 제외, pause/resume, permission, queue, coverage와
   capability 상태는 UI 독립 REST 계약으로 제공한다.
+- 한 provider/device가 같은 시간 구간에 hourly aggregate와 detailed interval을
+  함께 보내면 중복 계산을 막기 위해 ingest를 거부한다.
+- ActivityWatch는 최신 호환 bucket을 선택하고 한 번에 최대 7일만 가져온다.
+  AFK bucket이 없거나 AFK/not-AFK event가 요청 구간 전체를 gap 없이 덮지
+  못하면 아무것도 저장하지 않고 cursor도 전진시키지 않는다. 반환된 source
+  event가 요청 범위를 넘어도 저장 interval은 정확히 `[start, end)`로 자르고,
+  source event identity는 import window와 무관하게 안정적으로 유지한다.
+  하나의 원본 window event에서 나온 여러 AFK 교차 조각에는 공통
+  `source_group_id`를 저장한다. AFK event ID가 바뀌어 canonical row identity가
+  교체되어도 launch 소유권은 이 그룹 안에서 정확히 한 번만 유지된다.
+- 자동 cursor overlap 안에서 처음 늦게 발견된 source event도 launch를
+  보존한다. 중복 방지는 cursor 이전 launch를 무조건 0으로 만드는 방식이 아니라
+  기존 canonical identity와 `source_group_id` reconciliation이 담당한다.
+- 각 ActivityWatch import 범위는 그 범위의 authoritative snapshot이므로,
+  이전 행의 범위 밖 조각만 보존하고 겹치는 부분은 현재 source 결과로
+  원자적으로 교체한다. 따라서 자동 cursor의 5분 overlap과 explicit repair
+  모두 source event의 연장·축소·삭제 정정을 반영하면서 launch 수의 멱등성을
+  유지한다. 동일한 middle repair를 반복할 때 범위 시작과 정확히 맞닿은 왼쪽
+  launch-owner 조각은 읽기 전용 ownership context로 조회하며, 그 범위 밖
+  조각을 삭제하거나 다시 쓰지 않고 전체 그룹의 launch를 정확히 1회로 유지한다.
+- source가 빈 결과를 반환하고 해당 범위의 raw가 이미 만료됐더라도 장기
+  summary를 0으로 덮지 않는다. 요청 범위가 덮는 모든 local-day scope의 raw
+  provenance를 먼저 확인하고, 불완전하면 repair 전체를 fail-closed한다.
+- 같은 source identity가 7일 reconciliation lookback 밖의 날짜로 이동하거나,
+  repair가 다른 timezone의 보존 조각을 만들면 ingest 결과의 이전·신규
+  date/timezone scope를 모두 모아 summary를 재생성한다. 과거 날짜 summary나
+  새 timezone summary를 stale 상태로 남기지 않는다.
+- 처음 명시 범위로 가져올 때는 자동 cursor를 초기화할 수 있지만, cursor가
+  생긴 뒤의 explicit repair는 그 cursor를 앞이나 뒤로 움직이지 않는다.
+  repair한 과거 시각 때문에 다음 자동 import가 7일 제한을 넘거나, 미래
+  repair 때문에 아직 수집하지 않은 구간을 건너뛰는 일을 막는다.
+- 명시적 ActivityWatch 범위의 미래 시각, 역전 또는 7일 초과는 source discovery
+  전에 검증하고 `422 invalid_activitywatch_range`로 반환한다. deterministic
+  caller 오류를 localhost upstream 장애인 `502`로 가장하지 않는다.
+- iOS는 OS가 허용한 aggregate 또는 명시적 unavailable 상태만 받으며 detailed
+  app timeline이나 가짜 0분을 만들지 않는다.
+- Activity maintenance REST는 호출자가 임의의 `now`를 주입할 수 없고 서버
+  시계만 사용한다. 테스트와 scheduler 내부 함수만 명시적 기준 시각을 받는다.
+- Android uploader는 stale revision, collection race와 concurrent write
+  conflict만 재시도한다. 보존기간 초과와 source mode 충돌처럼 반복해도
+  해결되지 않는 sample-level `409`는 실패 chunk를 이분 탐색해 실제 거부된
+  단일 sample만 버리고 이후 시간순 sample을 계속 보낸다. 불완전 summary
+  provenance는 하루 summary scope 전체의 충돌이므로 sample-local로 격리하지
+  않고 watermark를 멈춘다. 이 격리는 명시적으로 허용한 conflict code에만
+  적용하며, code가 없거나 malformed 또는 unknown인 `409`도 sample을 버리지
+  않고 fail-closed한다.
+  transient/unknown 오류에서는 이미 성공한 chunk가 있어도 watermark를
+  전진시키지 않아 전체 source range가 멱등 재시도된다.
+- Android uploader는 network I/O 동안 collection-state lock을 잡지 않는다.
+  permission 또는 generation이 바뀌면 다음 chunk 전에 pass를 취소하고
+  watermark를 전진시키지 않는다. 마지막 chunk 중 경계가 바뀐 경우에도 성공
+  응답 뒤 generation을 다시 확인하므로 이전 snapshot을 완료 처리하지 않는다.
 - Activity summary, focus, overwork와 bounded cross-domain resolver는 REST와
   MCP에서 같은 결정론적 엔진을 사용한다.
+- Open Wearables readiness의 freshness는 최상위 필드뿐 아니라
+  `sleep_debt.last_night.recorded_at` 같은 중첩 근거까지 재귀적으로 계산한다.
+  유효한 수면 시각이 있는데 `unavailable`로 낮추지 않는다.
+- `caffeine_for_focus` resolver는 활동 context만 있다는 이유로 판단 가능 상태가
+  되지 않는다. 같은 local day의 카페인 후보 근거와 완료 확인된 당일 섭취
+  ledger가 모두 있을 때만 `decision_ready=true`를 반환한다.
 
 실제 iOS/Android/macOS/Watch 화면, 디바이스 dogfood, 실시간 동기화와 Hermes
 adaptation은 이 완료 선언에 포함되지 않는다.

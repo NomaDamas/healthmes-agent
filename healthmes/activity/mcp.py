@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from datetime import UTC, date, datetime, tzinfo
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Any
 
 from fastmcp import FastMCP
@@ -17,7 +17,10 @@ from healthmes.activity.context import (
     overwork_context,
 )
 from healthmes.activity.contracts import ActivityContextResolveRequest
-from healthmes.activity.resolver import resolve_wellness_context as resolve_context
+from healthmes.activity.resolver import WellnessContextRangeError
+from healthmes.activity.resolver import (
+    resolve_wellness_context as resolve_context,
+)
 
 StoreSessionFactory = Callable[[], AbstractContextManager[Session]]
 TimezoneResolver = Callable[[], tzinfo]
@@ -77,6 +80,10 @@ def register_activity_tools(
         end_at = _aware(end, "end")
         if start_at >= end_at:
             raise ToolError("start must be before end")
+        if end_at - start_at > timedelta(days=1):
+            raise ToolError("focus window cannot exceed 24 hours")
+        if end_at > datetime.now(UTC) + timedelta(minutes=1):
+            raise ToolError("future activity is unknown")
         with store_session_factory() as session:
             return focus_context(
                 session,
@@ -135,9 +142,12 @@ def register_activity_tools(
             return result
 
         with store_session_factory() as session:
-            return await resolve_context(
-                session,
-                request,
-                default_timezone=timezone,
-                wearable_reader=wearable,
-            )
+            try:
+                return await resolve_context(
+                    session,
+                    request,
+                    default_timezone=timezone,
+                    wearable_reader=wearable,
+                )
+            except WellnessContextRangeError as exc:
+                raise ToolError(str(exc)) from exc

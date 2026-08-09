@@ -1,14 +1,18 @@
 from datetime import UTC, date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import select
 
 from healthmes.activity.aggregation import (
     get_daily_summary,
     local_day_bounds,
+    personal_baseline_delta,
     rebuild_affected_days,
     rebuild_day_summaries,
     summarize_window,
 )
+from healthmes.activity.android import android_batch
 from healthmes.activity.context import (
     activity_summary_context,
     focus_context,
@@ -21,15 +25,22 @@ from healthmes.activity.contracts import (
     AppIntervalRecord,
 )
 from healthmes.activity.maintenance import (
+    ActivityDeletionUnsafeError,
     delete_activity_data,
     run_activity_maintenance,
 )
 from healthmes.activity.repository import (
     APP_INTERVAL_EVENT,
     DAY_SUMMARY_EVENT,
+    DELETION_TOMBSTONE_EVENT,
     HOUR_SUMMARY_EVENT,
+    ensure_activity_policies,
+    persist_activity_record,
 )
-from healthmes.activity.service import ingest_activity_batch
+from healthmes.activity.service import (
+    ActivitySummaryProvenanceError,
+    ingest_activity_batch,
+)
 from healthmes.storage import update_retention_policy
 from healthmes.store import AppUsageSample, WellnessEvent
 
@@ -46,7 +57,6 @@ def _interval_batch(
         platform=ActivityPlatform.MACOS,
         capability=ActivityCapability.DETAILED,
         timezone=timezone_name,
-        collected_at=datetime(2026, 8, 1, 23, 59, tzinfo=UTC),
         records=records,
     )
 
@@ -267,6 +277,7 @@ def test_natural_raw_expiry_keeps_longer_lived_hourly_and_daily_summaries(sessio
                 )
             ]
         ),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
     )
     session.add(
         AppUsageSample(
@@ -311,6 +322,318 @@ def test_natural_raw_expiry_keeps_longer_lived_hourly_and_daily_summaries(sessio
     assert raw_count == 0
     assert hourly_count == 1
     assert daily_count == 1
+
+
+def test_shortening_activity_raw_retention_deletes_expired_legacy_rows_immediately(
+    session,
+) -> None:
+    now = datetime.now(UTC)
+    session.add(
+        AppUsageSample(
+            device_id="legacy-expired-on-policy-change",
+            bucket_start=now - timedelta(days=2),
+            app_package="legacy",
+            foreground_seconds=60,
+            launches=1,
+            category="productivity",
+        )
+    )
+    session.flush()
+
+    update_retention_policy(session, "activity_raw", "1d")
+
+    assert (
+        session.scalar(
+            select(AppUsageSample).where(
+                AppUsageSample.device_id
+                == "legacy-expired-on-policy-change"
+            )
+        )
+        is None
+    )
+
+
+def test_switching_activity_raw_retention_to_forever_does_not_resurrect_legacy_rows(
+    session,
+) -> None:
+    now = datetime.now(UTC)
+    update_retention_policy(session, "activity_raw", "1d")
+    session.add_all(
+        [
+            AppUsageSample(
+                device_id="legacy-expired-before-forever",
+                bucket_start=now - timedelta(days=2),
+                app_package="expired",
+                foreground_seconds=60,
+                launches=1,
+                category="productivity",
+            ),
+            AppUsageSample(
+                device_id="legacy-retained-before-forever",
+                bucket_start=now - timedelta(hours=12),
+                app_package="retained",
+                foreground_seconds=60,
+                launches=1,
+                category="productivity",
+            ),
+        ]
+    )
+    session.flush()
+
+    update_retention_policy(session, "activity_raw", "forever")
+
+    rows = list(
+        session.scalars(
+            select(AppUsageSample).order_by(AppUsageSample.app_package)
+        )
+    )
+    assert [row.app_package for row in rows] == ["retained"]
+
+
+@pytest.mark.parametrize("device_id", ("desktop-future-delete", None))
+def test_unbounded_delete_removes_preexisting_future_activity(
+    session,
+    device_id,
+) -> None:
+    future = datetime(2026, 8, 3, 10, tzinfo=UTC)
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id=f"future-delete-{device_id}",
+                    start_at=future,
+                    end_at=future + timedelta(hours=1),
+                    state="active",
+                    app_id="editor",
+                )
+            ],
+            device_id="desktop-future-delete",
+        ),
+        now=future + timedelta(hours=2),
+    )
+    session.add(
+        AppUsageSample(
+            device_id="desktop-future-delete",
+            bucket_start=future,
+            app_package="legacy",
+            foreground_seconds=60,
+            launches=1,
+            category="productivity",
+        )
+    )
+    session.flush()
+
+    report = delete_activity_data(
+        session,
+        device_id=device_id,
+        start=None,
+        end=None,
+        include_summaries=True,
+        include_control=False,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    assert report.raw_events_deleted == 1
+    assert report.compatibility_rows_deleted == 1
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+        is None
+    )
+    assert session.scalar(select(AppUsageSample)) is None
+
+    replay = ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id=f"future-delete-{device_id}",
+                    start_at=future,
+                    end_at=future + timedelta(hours=1),
+                    state="active",
+                    app_id="editor",
+                )
+            ],
+            device_id="desktop-future-delete",
+        ),
+        now=future + timedelta(hours=2),
+    )
+    tombstone = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == DELETION_TOMBSTONE_EVENT,
+            WellnessEvent.source_record_id.not_like("%:identities:%"),
+        )
+    )
+
+    assert replay.response.accepted == 0
+    assert replay.response.tombstoned == 1
+    assert tombstone is not None
+    assert tombstone.payload["end"] == "2026-08-01T12:00:00+00:00"
+    assert tombstone.payload["identity_digest_count"] >= 1
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+        is None
+    )
+
+    new_activity = ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id=f"new-after-delete-{device_id}",
+                    start_at=future + timedelta(hours=2),
+                    end_at=future + timedelta(hours=3),
+                    state="active",
+                    app_id="editor",
+                )
+            ],
+            device_id="desktop-future-delete",
+        ),
+        now=future + timedelta(hours=4),
+    )
+
+    assert new_activity.response.created == 1
+    assert new_activity.response.tombstoned == 0
+
+
+def test_unbounded_delete_tombstones_future_legacy_android_identity(
+    session,
+) -> None:
+    future = datetime(2026, 8, 3, 10, tzinfo=UTC)
+    session.add(
+        AppUsageSample(
+            device_id="legacy-future-delete",
+            bucket_start=future,
+            app_package="com.example.queued",
+            foreground_seconds=300,
+            launches=1,
+            category="productivity",
+        )
+    )
+    session.flush()
+
+    delete_activity_data(
+        session,
+        device_id="legacy-future-delete",
+        start=None,
+        end=None,
+        include_summaries=True,
+        include_control=False,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    replay = ingest_activity_batch(
+        session,
+        android_batch(
+            device_id="legacy-future-delete",
+            timezone="UTC",
+            samples=[
+                SimpleNamespace(
+                    bucket_start=future,
+                    app_package="com.example.queued",
+                    foreground_seconds=300,
+                    launches=1,
+                    category="productivity",
+                )
+            ],
+            collected_at=future + timedelta(hours=1),
+        ),
+        now=future + timedelta(hours=2),
+    )
+    new_activity = ingest_activity_batch(
+        session,
+        android_batch(
+            device_id="legacy-future-delete",
+            timezone="UTC",
+            samples=[
+                SimpleNamespace(
+                    bucket_start=future + timedelta(hours=3),
+                    app_package="com.example.new",
+                    foreground_seconds=300,
+                    launches=1,
+                    category="productivity",
+                )
+            ],
+            collected_at=future + timedelta(hours=4),
+        ),
+        now=future + timedelta(hours=5),
+    )
+
+    assert replay.response.accepted == 0
+    assert replay.response.tombstoned == 1
+    assert new_activity.response.created == 1
+    assert new_activity.response.tombstoned == 0
+
+
+def test_deleted_source_identity_cannot_move_beyond_the_deleted_range(
+    session,
+) -> None:
+    original = AppIntervalRecord(
+        source_record_id="stable-source-identity",
+        start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        state="active",
+        app_id="editor",
+    )
+    ingest_activity_batch(
+        session,
+        _interval_batch([original], device_id="desktop-moved-replay"),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    delete_activity_data(
+        session,
+        device_id="desktop-moved-replay",
+        start=datetime(2026, 8, 1, 9, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        include_summaries=True,
+        include_control=False,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    moved_replay = ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                original.model_copy(
+                    update={
+                        "start_at": datetime(2026, 8, 1, 13, tzinfo=UTC),
+                        "end_at": datetime(2026, 8, 1, 14, tzinfo=UTC),
+                    }
+                )
+            ],
+            device_id="desktop-moved-replay",
+        ),
+        now=datetime(2026, 8, 1, 15, tzinfo=UTC),
+    )
+    new_identity = ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                original.model_copy(
+                    update={
+                        "source_record_id": "new-source-identity",
+                        "start_at": datetime(2026, 8, 1, 13, tzinfo=UTC),
+                        "end_at": datetime(2026, 8, 1, 14, tzinfo=UTC),
+                    }
+                )
+            ],
+            device_id="desktop-moved-replay",
+        ),
+        now=datetime(2026, 8, 1, 15, tzinfo=UTC),
+    )
+
+    assert moved_replay.response.accepted == 0
+    assert moved_replay.response.tombstoned == 1
+    assert new_identity.response.created == 1
+    assert new_identity.response.tombstoned == 0
 
 
 def test_daily_coverage_uses_the_full_local_day_as_denominator(session) -> None:
@@ -386,7 +709,7 @@ def test_focus_coverage_uses_the_entire_requested_window(session) -> None:
     assert focus["coverage"] == 0.2
 
 
-def test_partial_hour_focus_metrics_are_prorated_and_marked(session) -> None:
+def test_partial_hour_focus_metrics_use_exact_retained_raw_window(session) -> None:
     ingest_activity_batch(
         session,
         _interval_batch(
@@ -412,9 +735,9 @@ def test_partial_hour_focus_metrics_are_prorated_and_marked(session) -> None:
 
     assert focus["status"] == "ok"
     assert focus["metrics"]["total_active_minutes"] == 30.0
-    assert focus["metrics"]["app_launches_or_switches"] == 2
+    assert focus["metrics"]["app_launches_or_switches"] == 0
     assert focus["coverage"] == 0.5
-    assert "partial_hour_metrics_prorated" in focus["limitations"]
+    assert "exact_window_from_retained_raw_events" in focus["limitations"]
 
 
 def test_daily_summary_provenance_is_bounded_and_records_capability(session) -> None:
@@ -479,6 +802,7 @@ def test_following_daily_summary_survives_baseline_refresh_after_raw_expiry(
                     )
                 ]
             ),
+            now=datetime(2026, 8, 1 + offset, 12, tzinfo=UTC),
         )
 
     run_activity_maintenance(
@@ -504,3 +828,373 @@ def test_following_daily_summary_survives_baseline_refresh_after_raw_expiry(
 
     assert surviving is not None
     assert surviving.payload["total_active_minutes"] == 60.0
+
+
+def test_active_time_wins_when_source_reports_overlapping_idle(session) -> None:
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="active",
+                    start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                ),
+                AppIntervalRecord(
+                    source_record_id="contradictory-idle",
+                    start_at=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 11, 30, tzinfo=UTC),
+                    state="idle",
+                ),
+            ]
+        ),
+        rebuild_summaries=False,
+    )
+    events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+    )
+
+    summary = summarize_window(
+        events,
+        start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        timezone="UTC",
+    )
+
+    assert summary["total_active_minutes"] == 60.0
+    assert summary["idle_and_break_minutes"] == 30.0
+    assert "active_idle_overlap_resolved_active_wins" in summary["limitations"]
+
+
+def test_personal_baseline_ignores_days_below_minimum_coverage(session) -> None:
+    for offset, hours in ((0, 6), (1, 6), (2, 1)):
+        day = 29 + offset
+        ingest_activity_batch(
+            session,
+            _interval_batch(
+                [
+                    AppIntervalRecord(
+                        source_record_id=f"baseline-{offset}",
+                        start_at=datetime(2026, 7, day, 9, tzinfo=UTC),
+                        end_at=datetime(2026, 7, day, 9 + hours, tzinfo=UTC),
+                        state="active",
+                        app_id="editor",
+                    )
+                ]
+            ),
+            now=datetime(2026, 7, day, 20, tzinfo=UTC),
+        )
+
+    baseline = personal_baseline_delta(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+        current_minutes=300,
+        lookback_days=3,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    assert baseline == {
+        "status": "insufficient_data",
+        "days_with_data": 2,
+        "required_days": 3,
+        "lookback_days": 3,
+    }
+
+
+def test_expired_raw_is_not_used_for_partial_focus_before_maintenance(
+    session,
+) -> None:
+    update_retention_policy(session, "activity_raw", "1d")
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="expired-partial-focus",
+                    start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                    launches=4,
+                )
+            ]
+        ),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    focus = focus_context(
+        session,
+        start=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 11, 30, tzinfo=UTC),
+        timezone="UTC",
+        now=datetime(2026, 8, 3, tzinfo=UTC),
+    )
+
+    assert focus["status"] == "insufficient_data"
+    assert focus["reason"] == "partial_hour_requires_raw"
+    assert focus["evidence_ids"] == []
+
+
+def test_focus_uses_hourly_summaries_when_only_later_raw_is_retained(
+    session,
+) -> None:
+    update_retention_policy(session, "activity_raw", "1d")
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="mixed-retention-morning",
+                    start_at=datetime(2026, 8, 1, 9, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                    launches=2,
+                ),
+                AppIntervalRecord(
+                    source_record_id="mixed-retention-evening",
+                    start_at=datetime(2026, 8, 1, 18, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 19, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                    launches=3,
+                ),
+            ]
+        ),
+        now=datetime(2026, 8, 1, 20, tzinfo=UTC),
+    )
+
+    focus = focus_context(
+        session,
+        start=datetime(2026, 8, 1, 9, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 19, tzinfo=UTC),
+        timezone="UTC",
+        now=datetime(2026, 8, 2, 12, tzinfo=UTC),
+    )
+
+    assert focus["status"] == "insufficient_data"
+    assert focus["reason"] == "low_source_coverage"
+    assert focus["coverage"] == 0.2
+    assert "exact_window_from_retained_raw_events" not in focus["limitations"]
+
+
+def test_default_rebuild_preserves_summary_when_raw_provenance_is_incomplete(
+    session,
+) -> None:
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="original-a",
+                    start_at=datetime(2026, 8, 1, 9, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                ),
+                AppIntervalRecord(
+                    source_record_id="original-b",
+                    start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                ),
+            ]
+        ),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    original_summary = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == DAY_SUMMARY_EVENT
+        )
+    )
+    removed = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == APP_INTERVAL_EVENT,
+            WellnessEvent.source_record_id == "original-b",
+        )
+    )
+    assert original_summary is not None
+    assert removed is not None
+    original_id = original_summary.id
+    session.delete(removed)
+    session.flush()
+    # Build a repository-level inconsistent state to prove the defensive
+    # default rebuild itself remains lossless. The service layer now rejects
+    # this transition before persistence.
+    raw_policy = ensure_activity_policies(session)["activity_raw"]
+    unguarded_batch = _interval_batch(
+        [
+            AppIntervalRecord(
+                source_record_id="new-c",
+                start_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                end_at=datetime(2026, 8, 1, 11, 30, tzinfo=UTC),
+                state="active",
+                app_id="editor",
+            ),
+            AppIntervalRecord(
+                source_record_id="new-d",
+                start_at=datetime(2026, 8, 1, 12, tzinfo=UTC),
+                end_at=datetime(2026, 8, 1, 12, 30, tzinfo=UTC),
+                state="active",
+                app_id="editor",
+            ),
+        ]
+    )
+    for record in unguarded_batch.records:
+        persist_activity_record(
+            session,
+            unguarded_batch,
+            record,
+            raw_policy=raw_policy,
+        )
+
+    rebuilt = rebuild_day_summaries(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+        force_rebuild=False,
+        now=datetime(2026, 8, 1, 13, tzinfo=UTC),
+    )
+
+    assert rebuilt is not None
+    assert rebuilt.id == original_id
+    assert rebuilt.payload["total_active_minutes"] == 120.0
+    assert rebuilt.derived_from["raw_event_count"] == 2
+
+
+def test_ingest_rejects_change_when_same_day_raw_provenance_is_incomplete(
+    session,
+) -> None:
+    update_retention_policy(session, "activity_raw", "1d")
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="expired-morning",
+                    start_at=datetime(2026, 8, 1, 9, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                ),
+                AppIntervalRecord(
+                    source_record_id="retained-evening",
+                    start_at=datetime(2026, 8, 1, 18, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 19, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                ),
+            ]
+        ),
+        now=datetime(2026, 8, 1, 20, tzinfo=UTC),
+    )
+
+    with pytest.raises(ActivitySummaryProvenanceError):
+        ingest_activity_batch(
+            session,
+            _interval_batch(
+                [
+                    AppIntervalRecord(
+                        source_record_id="retained-evening",
+                        start_at=datetime(2026, 8, 1, 18, tzinfo=UTC),
+                        end_at=datetime(2026, 8, 1, 18, 30, tzinfo=UTC),
+                        state="active",
+                        app_id="editor",
+                    )
+                ]
+            ),
+            allow_replace=True,
+            now=datetime(2026, 8, 2, 12, tzinfo=UTC),
+        )
+
+    duplicate = ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="retained-evening",
+                    start_at=datetime(2026, 8, 1, 18, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 19, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                )
+            ]
+        ),
+        allow_replace=True,
+        now=datetime(2026, 8, 2, 12, tzinfo=UTC),
+    )
+
+    session.expire_all()
+    retained = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == APP_INTERVAL_EVENT,
+            WellnessEvent.source_record_id == "retained-evening",
+        )
+    )
+    _, summary = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+    )
+    hourly = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == HOUR_SUMMARY_EVENT
+            )
+        )
+    )
+
+    assert retained is not None
+    assert duplicate.response.duplicates == 1
+    assert retained.payload["end_at"] == "2026-08-01T19:00:00+00:00"
+    assert summary["total_active_minutes"] == 120.0
+    assert len(hourly) == 2
+
+
+def test_targeted_delete_fails_closed_when_raw_provenance_has_expired(
+    session,
+) -> None:
+    update_retention_policy(session, "activity_raw", "1d")
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="expired-delete-evidence",
+                    start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                )
+            ]
+        ),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    with pytest.raises(ActivityDeletionUnsafeError):
+        delete_activity_data(
+            session,
+            device_id="desktop-1",
+            start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+            end=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+            include_summaries=True,
+            include_control=False,
+            now=datetime(2026, 8, 3, tzinfo=UTC),
+        )
+
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DELETION_TOMBSTONE_EVENT
+            )
+        )
+        is None
+    )

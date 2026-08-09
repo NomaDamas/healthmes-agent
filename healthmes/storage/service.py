@@ -10,11 +10,13 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from healthmes.activity.locking import activity_write_lock
 from healthmes.config import Settings
 from healthmes.store import (
+    AppUsageSample,
     FoodLog,
     MedicalRecord,
     PurgeJob,
@@ -65,8 +67,10 @@ def build_storage_maintenance_job(settings: Settings):
     """Return the scheduler-safe zero-argument lifecycle job."""
 
     def job() -> None:
-        with session_scope() as session:
-            run_storage_maintenance(session, settings)
+        # session_scope commits before the outer lock is released.
+        with activity_write_lock():
+            with session_scope() as session:
+                run_storage_maintenance(session, settings)
 
     return job
 
@@ -91,6 +95,13 @@ def ensure_default_policies(session: Session) -> list[RetentionPolicy]:
 
 
 def update_retention_policy(
+    session: Session, data_class: str, preset: str
+) -> RetentionPolicy:
+    with activity_write_lock():
+        return _update_retention_policy(session, data_class, preset)
+
+
+def _update_retention_policy(
     session: Session, data_class: str, preset: str
 ) -> RetentionPolicy:
     if preset not in RETENTION_PRESETS:
@@ -159,6 +170,29 @@ def _recalculate_expiry(
         ):
             continue
         event.expires_at = _expiry(policy, event.observed_at)
+    if (
+        policy.data_class == "activity_raw"
+        and policy.enabled
+    ):
+        finite_windows = [
+            days
+            for days in (
+                previous_retention_days,
+                policy.retention_days,
+            )
+            if days is not None
+        ]
+        retention_days = min(finite_windows) if finite_windows else None
+        if retention_days is not None:
+            # Rows already hidden by the previous finite policy are physical
+            # history, not dormant data that may reappear when switching to
+            # forever. Permanently remove that expired compatibility tail.
+            cutoff = current - timedelta(days=retention_days)
+            session.execute(
+                delete(AppUsageSample).where(
+                    AppUsageSample.bucket_start <= cutoff
+                )
+            )
 
 
 def register_storage_object(
@@ -587,6 +621,22 @@ def _migrate_legacy_nutrition_raw_captures(
 
 
 def run_storage_maintenance(
+    session: Session,
+    settings: Settings,
+    *,
+    dry_run: bool = False,
+    now: datetime | None = None,
+) -> StorageMaintenanceReport:
+    with activity_write_lock():
+        return _run_storage_maintenance(
+            session,
+            settings,
+            dry_run=dry_run,
+            now=now,
+        )
+
+
+def _run_storage_maintenance(
     session: Session,
     settings: Settings,
     *,

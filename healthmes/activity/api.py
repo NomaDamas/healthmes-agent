@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -12,9 +12,10 @@ from sqlalchemy.orm import Session
 
 from healthmes.activity.activitywatch import (
     ActivityWatchError,
+    ActivityWatchRequestError,
     import_activitywatch,
 )
-from healthmes.activity.aggregation import rebuild_affected_days, rebuild_day_summaries
+from healthmes.activity.aggregation import rebuild_affected_days
 from healthmes.activity.context import (
     activity_summary_context,
     focus_context,
@@ -34,22 +35,34 @@ from healthmes.activity.contracts import (
     ActivityWatchImportRequest,
     AppHourRecord,
     IOSCapabilityReport,
+    is_reserved_activity_provider,
 )
 from healthmes.activity.identity import scoped_source_record_id
 from healthmes.activity.maintenance import (
+    ActivityDeletionUnsafeError,
     delete_activity_data,
     run_activity_maintenance,
 )
 from healthmes.activity.repository import (
     ActivityConflictError,
+    ActivityWriteConflictError,
+    activity_write_lock,
     get_control_payload,
     serialize_collection_state,
     update_collection_config,
     update_collection_status,
 )
-from healthmes.activity.resolver import resolve_wellness_context
+from healthmes.activity.resolver import (
+    WellnessContextRangeError,
+    resolve_wellness_context,
+)
 from healthmes.activity.service import (
+    MAX_FUTURE_SKEW,
     ActivityCollectionBlockedError,
+    ActivityFutureDataError,
+    ActivityLateDataError,
+    ActivitySourceModeConflictError,
+    ActivitySummaryProvenanceError,
     StaleCollectionRevisionError,
     ingest_activity_batch,
 )
@@ -58,7 +71,6 @@ from healthmes.config import resolve_timezone
 from healthmes.store.session import SessionDep
 
 router = APIRouter(tags=["activity"])
-
 
 def _timezone(request: Request, explicit: str | None = None) -> str:
     if explicit is not None:
@@ -104,8 +116,9 @@ def put_collection(
     body: ActivityCollectionUpdate,
     session: SessionDep,
 ) -> ActivityCollectionOut:
-    payload = update_collection_config(session, device_id, body)
-    return _commit_collection(session, payload)
+    with activity_write_lock():
+        payload = update_collection_config(session, device_id, body)
+        return _commit_collection(session, payload)
 
 
 @router.post("/v1/activity/devices/{device_id}/pause")
@@ -116,12 +129,13 @@ def pause_collection(
 ) -> ActivityCollectionOut:
     if body.until <= datetime.now(UTC):
         raise APIError(422, "invalid_pause", "pause deadline must be in the future")
-    payload = update_collection_config(
-        session,
-        device_id,
-        ActivityCollectionUpdate(paused_until=body.until),
-    )
-    return _commit_collection(session, payload)
+    with activity_write_lock():
+        payload = update_collection_config(
+            session,
+            device_id,
+            ActivityCollectionUpdate(paused_until=body.until),
+        )
+        return _commit_collection(session, payload)
 
 
 @router.post("/v1/activity/devices/{device_id}/resume")
@@ -129,12 +143,13 @@ def resume_collection(
     device_id: str,
     session: SessionDep,
 ) -> ActivityCollectionOut:
-    payload = update_collection_config(
-        session,
-        device_id,
-        ActivityCollectionUpdate(paused_until=None),
-    )
-    return _commit_collection(session, payload)
+    with activity_write_lock():
+        payload = update_collection_config(
+            session,
+            device_id,
+            ActivityCollectionUpdate(paused_until=None),
+        )
+        return _commit_collection(session, payload)
 
 
 @router.post("/v1/activity/devices/{device_id}/status")
@@ -143,8 +158,9 @@ def post_collection_status(
     body: ActivityCollectionStatusUpdate,
     session: SessionDep,
 ) -> ActivityCollectionOut:
-    payload = update_collection_status(session, device_id, body)
-    return _commit_collection(session, payload)
+    with activity_write_lock():
+        payload = update_collection_status(session, device_id, body)
+        return _commit_collection(session, payload)
 
 
 @router.post("/v1/activity/events/batch")
@@ -152,16 +168,43 @@ def post_activity_batch(
     body: ActivityBatchIn,
     session: SessionDep,
 ) -> ActivityBatchOut:
-    try:
-        result = ingest_activity_batch(session, body)
-    except ActivityCollectionBlockedError as exc:
-        raise APIError(409, "activity_collection_blocked", exc.reason) from exc
-    except StaleCollectionRevisionError as exc:
-        raise APIError(409, "stale_collection_revision", str(exc)) from exc
-    except ActivityConflictError as exc:
-        raise APIError(409, "activity_source_conflict", str(exc)) from exc
-    session.commit()
-    return result.response
+    if body.collection_revision is None:
+        raise APIError(
+            422,
+            "activity_collection_revision_required",
+            "public activity ingest requires collection_revision",
+        )
+    if is_reserved_activity_provider(body.source_provider):
+        raise APIError(
+            422,
+            "activity_provider_reserved",
+            "built-in activity providers are available only through their adapters",
+        )
+    with activity_write_lock():
+        try:
+            result = ingest_activity_batch(session, body)
+        except ActivityCollectionBlockedError as exc:
+            raise APIError(409, "activity_collection_blocked", exc.reason) from exc
+        except StaleCollectionRevisionError as exc:
+            raise APIError(409, "stale_collection_revision", str(exc)) from exc
+        except ActivityConflictError as exc:
+            raise APIError(409, "activity_source_conflict", str(exc)) from exc
+        except ActivityLateDataError as exc:
+            raise APIError(409, "activity_outside_retention", str(exc)) from exc
+        except ActivityFutureDataError as exc:
+            raise APIError(409, "activity_future_data", str(exc)) from exc
+        except ActivitySourceModeConflictError as exc:
+            raise APIError(409, "activity_source_mode_conflict", str(exc)) from exc
+        except ActivitySummaryProvenanceError as exc:
+            raise APIError(
+                409,
+                "activity_summary_requires_complete_raw",
+                str(exc),
+            ) from exc
+        except ActivityWriteConflictError as exc:
+            raise APIError(409, "activity_write_conflict", str(exc)) from exc
+        session.commit()
+        return result.response
 
 
 @router.post("/v1/activity/activitywatch/import")
@@ -169,20 +212,40 @@ def post_activitywatch_import(
     body: ActivityWatchImportRequest,
     session: SessionDep,
 ) -> ActivityBatchOut:
-    try:
-        result = import_activitywatch(session, body)
-    except ActivityCollectionBlockedError as exc:
-        raise APIError(409, "activity_collection_blocked", exc.reason) from exc
-    except StaleCollectionRevisionError as exc:
-        raise APIError(409, "stale_collection_revision", str(exc)) from exc
-    except (ActivityWatchError, httpx.HTTPError) as exc:
-        raise APIError(
-            502,
-            "activitywatch_error",
-            f"ActivityWatch import failed: {exc}",
-        ) from exc
-    session.commit()
-    return ActivityBatchOut.model_validate(result.response)
+    with activity_write_lock():
+        try:
+            with session.begin_nested():
+                result = import_activitywatch(session, body)
+        except ActivityCollectionBlockedError as exc:
+            raise APIError(409, "activity_collection_blocked", exc.reason) from exc
+        except StaleCollectionRevisionError as exc:
+            raise APIError(409, "stale_collection_revision", str(exc)) from exc
+        except ActivityLateDataError as exc:
+            raise APIError(409, "activity_outside_retention", str(exc)) from exc
+        except ActivityFutureDataError as exc:
+            raise APIError(409, "activity_future_data", str(exc)) from exc
+        except ActivitySourceModeConflictError as exc:
+            raise APIError(409, "activity_source_mode_conflict", str(exc)) from exc
+        except ActivitySummaryProvenanceError as exc:
+            raise APIError(
+                409,
+                "activity_summary_requires_complete_raw",
+                str(exc),
+            ) from exc
+        except ActivityWatchRequestError as exc:
+            raise APIError(
+                422,
+                "invalid_activitywatch_range",
+                str(exc),
+            ) from exc
+        except (ActivityWatchError, httpx.HTTPError) as exc:
+            raise APIError(
+                502,
+                "activitywatch_error",
+                f"ActivityWatch import failed: {exc}",
+            ) from exc
+        session.commit()
+        return ActivityBatchOut.model_validate(result.response)
 
 
 @router.post("/v1/activity/ios/report")
@@ -190,29 +253,19 @@ def post_ios_report(
     body: IOSCapabilityReport,
     session: SessionDep,
 ) -> ActivityBatchOut:
-    uploaded_at = datetime.now(UTC)
-    status = update_collection_status(
-        session,
-        body.device_id,
-        ActivityCollectionStatusUpdate(
-            platform=ActivityPlatform.IOS,
-            capability=body.capability,
-            permission_status=body.permission_status,
-            status_reason=body.reason,
-            last_uploaded_at=uploaded_at,
-            last_collected_at=(
-                body.collected_at
-                if body.capability.value == "aggregate"
-                and body.permission_status.value == "granted"
-                else None
-            ),
-        ),
-        now=uploaded_at,
-    )
-    available = body.capability.value == "aggregate" and body.permission_status.value == "granted"
-    if not available or not body.samples:
-        session.commit()
-        return ActivityBatchOut(
+    with activity_write_lock():
+        uploaded_at = datetime.now(UTC)
+        if body.collected_at > uploaded_at + MAX_FUTURE_SKEW:
+            raise APIError(
+                409,
+                "activity_future_data",
+                "iOS collected_at is beyond the allowed one-minute clock skew",
+            )
+        available = (
+            body.capability.value == "aggregate"
+            and body.permission_status.value == "granted"
+        )
+        response = ActivityBatchOut(
             accepted=0,
             created=0,
             updated=0,
@@ -220,38 +273,74 @@ def post_ios_report(
             excluded=0,
             affected_dates=[],
         )
-    batch = ActivityBatchIn(
-        source_provider="ios-device-activity",
-        source_device=body.device_id,
-        platform=ActivityPlatform.IOS,
-        capability=body.capability,
-        timezone=body.timezone,
-        collected_at=body.collected_at,
-        collection_revision=int(status.get("config_revision", 0)),
-        records=[
-            AppHourRecord(
-                source_record_id=scoped_source_record_id(
-                    prefix="ios-hour",
-                    device_id=body.device_id,
-                    source_record_id=sample.source_record_id,
-                ),
-                bucket_start=sample.bucket_start,
-                app_id=sample.opaque_app_token or f"category:{sample.category}",
-                foreground_seconds=sample.foreground_seconds,
-                launches=sample.launches,
-                category=sample.category,
-                coverage_seconds=sample.coverage_seconds,
-                bucket_complete=True,
-            )
-            for sample in body.samples
-        ],
-    )
-    try:
-        result = ingest_activity_batch(session, batch, allow_replace=True)
-    except ActivityCollectionBlockedError as exc:
-        raise APIError(409, "activity_collection_blocked", exc.reason) from exc
-    session.commit()
-    return result.response
+        try:
+            with session.begin_nested():
+                update_collection_status(
+                    session,
+                    body.device_id,
+                    ActivityCollectionStatusUpdate(
+                        platform=ActivityPlatform.IOS,
+                        capability=body.capability,
+                        permission_status=body.permission_status,
+                        status_reason=body.reason,
+                        last_uploaded_at=uploaded_at,
+                        last_collected_at=(
+                            body.collected_at if available else None
+                        ),
+                    ),
+                    now=uploaded_at,
+                )
+                if available and body.samples:
+                    batch = ActivityBatchIn(
+                        source_provider="ios-device-activity",
+                        source_device=body.device_id,
+                        platform=ActivityPlatform.IOS,
+                        capability=body.capability,
+                        timezone=body.timezone,
+                        collected_at=body.collected_at,
+                        collection_revision=body.collection_revision,
+                        records=[
+                            AppHourRecord(
+                                source_record_id=scoped_source_record_id(
+                                    prefix="ios-hour",
+                                    device_id=body.device_id,
+                                    source_record_id=sample.source_record_id,
+                                ),
+                                bucket_start=sample.bucket_start,
+                                app_id=sample.opaque_app_token
+                                or f"category:{sample.category}",
+                                foreground_seconds=sample.foreground_seconds,
+                                launches=sample.launches,
+                                category=sample.category,
+                                coverage_seconds=sample.coverage_seconds,
+                                bucket_complete=True,
+                            )
+                            for sample in body.samples
+                        ],
+                    )
+                    response = ingest_activity_batch(
+                        session,
+                        batch,
+                        allow_replace=True,
+                    ).response
+        except ActivityCollectionBlockedError as exc:
+            raise APIError(409, "activity_collection_blocked", exc.reason) from exc
+        except StaleCollectionRevisionError as exc:
+            raise APIError(409, "stale_collection_revision", str(exc)) from exc
+        except ActivityLateDataError as exc:
+            raise APIError(409, "activity_outside_retention", str(exc)) from exc
+        except ActivityFutureDataError as exc:
+            raise APIError(409, "activity_future_data", str(exc)) from exc
+        except ActivitySourceModeConflictError as exc:
+            raise APIError(409, "activity_source_mode_conflict", str(exc)) from exc
+        except ActivitySummaryProvenanceError as exc:
+            raise APIError(
+                409,
+                "activity_summary_requires_complete_raw",
+                str(exc),
+            ) from exc
+        session.commit()
+        return response
 
 
 @router.get("/v1/activity/summary")
@@ -263,13 +352,7 @@ def get_activity_summary(
 ) -> dict[str, Any]:
     zone = _timezone(request, timezone)
     day = local_date or datetime.now(ZoneInfo(zone)).date()
-    context = activity_summary_context(session, day=day, timezone=zone)
-    if context["status"] == "insufficient_data":
-        rebuilt = rebuild_day_summaries(session, day=day, timezone=zone)
-        if rebuilt is not None:
-            session.commit()
-            context = activity_summary_context(session, day=day, timezone=zone)
-    return context
+    return activity_summary_context(session, day=day, timezone=zone)
 
 
 @router.get("/v1/activity/focus-context")
@@ -284,6 +367,10 @@ def get_focus_context(
         raise APIError(422, "invalid_time_range", "start and end must include timezone offsets")
     if start >= end:
         raise APIError(422, "invalid_time_range", "start must be before end")
+    if end - start > timedelta(days=1):
+        raise APIError(422, "invalid_time_range", "focus window cannot exceed 24 hours")
+    if end.astimezone(UTC) > datetime.now(UTC) + timedelta(minutes=1):
+        raise APIError(422, "invalid_time_range", "future activity is unknown")
     return focus_context(
         session,
         start=start.astimezone(UTC),
@@ -323,12 +410,15 @@ async def post_wellness_context(
 
         return await get_daily_readiness_context(day.isoformat())
 
-    return await resolve_wellness_context(
-        session,
-        body,
-        default_timezone=zone,
-        wearable_reader=wearable_reader,
-    )
+    try:
+        return await resolve_wellness_context(
+            session,
+            body,
+            default_timezone=zone,
+            wearable_reader=wearable_reader,
+        )
+    except WellnessContextRangeError as exc:
+        raise APIError(422, "invalid_context_range", str(exc)) from exc
 
 
 @router.post("/v1/activity/data/delete")
@@ -337,47 +427,56 @@ def post_delete_activity(
     body: ActivityDeleteRequest,
     session: SessionDep,
 ) -> dict[str, Any]:
-    report = delete_activity_data(
-        session,
-        device_id=body.device_id,
-        start=body.start,
-        end=body.end,
-        include_summaries=body.include_summaries,
-        include_control=body.include_control,
-    )
-    by_timezone: dict[str, set[date]] = {}
-    for scope in report.affected_scopes:
-        by_timezone.setdefault(scope.timezone, set()).add(scope.day)
-    for zone, days in by_timezone.items():
-        rebuild_affected_days(
-            session,
-            days=days,
-            timezone=zone,
-        )
-    session.commit()
-    return {
-        "raw_events_deleted": report.raw_events_deleted,
-        "summary_events_deleted": report.summary_events_deleted,
-        "control_events_deleted": report.control_events_deleted,
-        "compatibility_rows_deleted": report.compatibility_rows_deleted,
-        "affected_dates": [value.isoformat() for value in report.affected_dates],
-    }
+    with activity_write_lock():
+        try:
+            report = delete_activity_data(
+                session,
+                device_id=body.device_id,
+                start=body.start,
+                end=body.end,
+                include_summaries=body.include_summaries,
+                include_control=body.include_control,
+            )
+        except ActivityDeletionUnsafeError as exc:
+            raise APIError(
+                409,
+                "activity_deletion_requires_complete_raw",
+                str(exc),
+            ) from exc
+        except ValueError as exc:
+            raise APIError(422, "invalid_delete_range", str(exc)) from exc
+        by_timezone: dict[str, set[date]] = {}
+        for scope in report.affected_scopes:
+            by_timezone.setdefault(scope.timezone, set()).add(scope.day)
+        for zone, days in by_timezone.items():
+            rebuild_affected_days(
+                session,
+                days=days,
+                timezone=zone,
+                force_rebuild=True,
+            )
+        session.commit()
+        return {
+            "raw_events_deleted": report.raw_events_deleted,
+            "summary_events_deleted": report.summary_events_deleted,
+            "control_events_deleted": report.control_events_deleted,
+            "compatibility_rows_deleted": report.compatibility_rows_deleted,
+            "affected_dates": [
+                value.isoformat() for value in report.affected_dates
+            ],
+            "tombstone_id": report.tombstone_id,
+        }
 
 
 @router.post("/v1/activity/maintenance")
 def post_activity_maintenance(
     session: SessionDep,
-    now: datetime | None = None,
 ) -> ActivityMaintenanceOut:
-    if now is not None and now.tzinfo is None:
-        raise APIError(422, "invalid_now", "now must include a timezone offset")
-    report = run_activity_maintenance(
-        session,
-        now=now.astimezone(UTC) if now is not None else None,
-    )
-    session.commit()
-    return ActivityMaintenanceOut(
-        expired_events_deleted=report.expired_events_deleted,
-        compatibility_rows_deleted=report.compatibility_rows_deleted,
-        affected_dates=[value.isoformat() for value in report.affected_dates],
-    )
+    with activity_write_lock():
+        report = run_activity_maintenance(session)
+        session.commit()
+        return ActivityMaintenanceOut(
+            expired_events_deleted=report.expired_events_deleted,
+            compatibility_rows_deleted=report.compatibility_rows_deleted,
+            affected_dates=[value.isoformat() for value in report.affected_dates],
+        )

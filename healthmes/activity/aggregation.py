@@ -24,6 +24,7 @@ from healthmes.activity.repository import (
     SUMMARY_PROVIDER,
     as_utc,
     ensure_activity_policies,
+    event_is_expired,
     upsert_summary_event,
 )
 from healthmes.store import WellnessEvent
@@ -32,6 +33,7 @@ LATE_START_HOUR = 22
 LATE_END_HOUR = 6
 BASELINE_DAYS = 7
 MIN_BASELINE_DAYS = 3
+MIN_BASELINE_COVERAGE = 0.25
 
 
 def timezone_name(value: str | tzinfo) -> str:
@@ -133,6 +135,8 @@ class DeviceHour:
     has_idle_data: bool = False
     has_unknown_coverage: bool = False
     source_overflow: bool = False
+    mixed_source_modes: bool = False
+    active_idle_overlap: bool = False
     evidence_ids: list[str] = field(default_factory=list)
 
 
@@ -141,10 +145,11 @@ def _query_raw_events(
     *,
     start: datetime,
     end: datetime,
+    now: datetime | None = None,
 ) -> list[WellnessEvent]:
     # Intervals are capped at 24 hours by the ingest contract; the pad catches
     # an interval that starts before the requested window and overlaps it.
-    return list(
+    rows = list(
         session.scalars(
             select(WellnessEvent)
             .where(
@@ -155,6 +160,7 @@ def _query_raw_events(
             .order_by(WellnessEvent.observed_at, WellnessEvent.id)
         )
     )
+    return [row for row in rows if not event_is_expired(row, now=now)]
 
 
 def _overlap_fraction(
@@ -230,6 +236,8 @@ def _apply_hour_events(
     end: datetime,
 ) -> None:
     if target.has_interval_data:
+        if events:
+            target.mixed_source_modes = True
         return
     window_seconds = (end - start).total_seconds()
     for event in events:
@@ -369,11 +377,20 @@ def summarize_window(
                 }
             target.active_seconds = active_union
         if target.idle_spans:
-            target.idle_seconds = _union_seconds(
+            raw_idle_union = _union_seconds(
                 target.idle_spans,
                 start=start,
                 end=end,
             )
+            combined_union = _union_seconds(
+                [*target.active_spans, *target.idle_spans],
+                start=start,
+                end=end,
+            )
+            if target.active_seconds + raw_idle_union > combined_union + 0.001:
+                target.active_idle_overlap = True
+            # Active device use wins over contradictory idle/locked spans.
+            target.idle_seconds = max(0.0, combined_union - target.active_seconds)
         _apply_hour_events(target, hour_events[key], start=start, end=end)
         if target.coverage_spans:
             target.known_coverage_seconds = _union_seconds(
@@ -417,6 +434,10 @@ def summarize_window(
         limitations.append("hourly_aggregate_cannot_reconstruct_exact_focus_blocks")
     if any(row.source_overflow for row in devices):
         limitations.append("source_reported_seconds_exceeded_bucket")
+    if any(row.mixed_source_modes for row in devices):
+        limitations.append("interval_source_takes_precedence_over_hourly_for_device")
+    if any(row.active_idle_overlap for row in devices):
+        limitations.append("active_idle_overlap_resolved_active_wins")
     local_start = start.astimezone(zone)
     return {
         "status": "ok" if devices else "insufficient_data",
@@ -462,6 +483,31 @@ def _public_summary(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if not key.startswith("_")}
 
 
+def evidence_digest(evidence_ids: Iterable[str]) -> str:
+    return hashlib.sha256(
+        "\n".join(sorted(set(evidence_ids))).encode("utf-8")
+    ).hexdigest()
+
+
+def _summary_provenance_matches(
+    event: WellnessEvent,
+    evidence_ids: Iterable[str],
+) -> bool:
+    derived = event.derived_from if isinstance(event.derived_from, dict) else {}
+    evidence = sorted(set(evidence_ids))
+    return (
+        derived.get("raw_event_count") == len(evidence)
+        and derived.get("raw_evidence_sha256") == evidence_digest(evidence)
+    )
+
+
+def _summary_can_be_rebuilt_without_loss(
+    event: WellnessEvent,
+    evidence_ids: Iterable[str],
+) -> bool:
+    return _summary_provenance_matches(event, evidence_ids)
+
+
 def _baseline_payload(
     session: Session,
     *,
@@ -485,6 +531,7 @@ def personal_baseline_delta(
     timezone: str | tzinfo,
     current_minutes: float,
     lookback_days: int,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     if not 1 <= lookback_days <= 90:
         raise ValueError("lookback_days must be between 1 and 90")
@@ -509,7 +556,14 @@ def personal_baseline_delta(
             summary_day = date.fromisoformat(raw_date)
         except ValueError:
             continue
-        if start_day <= summary_day < day and row.payload.get("status") == "ok":
+        coverage = row.payload.get("source_coverage", {}).get("ratio")
+        if (
+            start_day <= summary_day < day
+            and row.payload.get("status") == "ok"
+            and not event_is_expired(row, now=now)
+            and coverage is not None
+            and float(coverage) >= MIN_BASELINE_COVERAGE
+        ):
             values.append(float(row.payload.get("total_active_minutes", 0)))
     required_days = min(MIN_BASELINE_DAYS, lookback_days)
     if len(values) < required_days:
@@ -536,11 +590,32 @@ def rebuild_day_summaries(
     *,
     day: date,
     timezone: str | tzinfo,
+    force_rebuild: bool = False,
+    now: datetime | None = None,
 ) -> WellnessEvent | None:
     name = timezone_name(timezone)
     start, end = local_day_bounds(day, timezone)
     policies = ensure_activity_policies(session)
-    events = _query_raw_events(session, start=start, end=end)
+    events = _query_raw_events(session, start=start, end=end, now=now)
+    existing_day = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.source_provider == SUMMARY_PROVIDER,
+            WellnessEvent.source_record_id == _summary_source_id("day", name, start),
+        )
+    )
+    day_probe = summarize_window(
+        events,
+        start=start,
+        end=end,
+        timezone=timezone,
+    )
+    current_evidence = day_probe.get("_evidence_event_ids", [])
+    if (
+        existing_day is not None
+        and not force_rebuild
+        and not _summary_can_be_rebuilt_without_loss(existing_day, current_evidence)
+    ):
+        return existing_day
     existing_hourly = [
         row
         for row in session.scalars(
@@ -580,9 +655,7 @@ def rebuild_day_summaries(
             payload=payload,
             derived_from={
                 "raw_event_count": len(evidence),
-                "raw_evidence_sha256": hashlib.sha256(
-                    "\n".join(evidence).encode("utf-8")
-                ).hexdigest(),
+                "raw_evidence_sha256": evidence_digest(evidence),
             },
             policy=policies[ACTIVITY_HOURLY_CLASS],
         )
@@ -594,12 +667,6 @@ def rebuild_day_summaries(
         if stale.id not in rebuilt_hourly_ids:
             session.delete(stale)
 
-    existing_day = session.scalar(
-        select(WellnessEvent).where(
-            WellnessEvent.source_provider == SUMMARY_PROVIDER,
-            WellnessEvent.source_record_id == _summary_source_id("day", name, start),
-        )
-    )
     if not hour_payloads:
         if existing_day is not None:
             session.delete(existing_day)
@@ -724,9 +791,7 @@ def rebuild_day_summaries(
         payload=payload,
         derived_from={
             "raw_event_count": len(evidence_ids),
-            "raw_evidence_sha256": hashlib.sha256(
-                "\n".join(evidence_ids).encode("utf-8")
-            ).hexdigest(),
+            "raw_evidence_sha256": evidence_digest(evidence_ids),
             "hour_summary_ids": [str(event.id) for event in hourly_events],
         },
         policy=policies[ACTIVITY_DAILY_CLASS],
@@ -739,11 +804,19 @@ def rebuild_affected_days(
     days: Iterable[date],
     timezone: str | tzinfo,
     refresh_following_baselines: bool = True,
+    force_rebuild: bool = False,
+    now: datetime | None = None,
 ) -> list[WellnessEvent]:
     primary = set(days)
     rebuilt: list[WellnessEvent] = []
     for day in sorted(primary):
-        event = rebuild_day_summaries(session, day=day, timezone=timezone)
+        event = rebuild_day_summaries(
+            session,
+            day=day,
+            timezone=timezone,
+            force_rebuild=force_rebuild,
+            now=now,
+        )
         if event is not None:
             rebuilt.append(event)
     if not refresh_following_baselines:
@@ -763,6 +836,8 @@ def rebuild_affected_days(
                 session,
                 day=day,
                 timezone=timezone,
+                force_rebuild=False,
+                now=now,
             )
         if event is not None:
             rebuilt.append(event)
@@ -783,6 +858,59 @@ def _daily_summary_event(
             WellnessEvent.source_record_id == _summary_source_id("day", name, start),
         )
     )
+
+
+def summary_raw_provenance_complete(
+    session: Session,
+    *,
+    day: date,
+    timezone: str | tzinfo,
+    now: datetime | None = None,
+) -> bool:
+    name = timezone_name(timezone)
+    start, end = local_day_bounds(day, timezone)
+    events = _query_raw_events(session, start=start, end=end, now=now)
+    daily = _daily_summary_event(session, day=day, timezone=timezone)
+    if daily is not None and not event_is_expired(daily, now=now):
+        probe = summarize_window(
+            events,
+            start=start,
+            end=end,
+            timezone=timezone,
+        )
+        return _summary_provenance_matches(
+            daily,
+            probe.get("_evidence_event_ids", []),
+        )
+    hourly = [
+        row
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == HOUR_SUMMARY_EVENT,
+                WellnessEvent.source_provider == SUMMARY_PROVIDER,
+                WellnessEvent.observed_at >= start,
+                WellnessEvent.observed_at < end,
+            )
+        )
+        if row.timezone == name and not event_is_expired(row, now=now)
+    ]
+    for row in hourly:
+        row_start = as_utc(row.observed_at)
+        row_end = _parse_datetime(row.payload.get("window", {}).get("end"))
+        if row_end is None or row_end <= row_start:
+            row_end = min(row_start + timedelta(hours=1), end)
+        probe = summarize_window(
+            events,
+            start=row_start,
+            end=row_end,
+            timezone=timezone,
+        )
+        if not _summary_provenance_matches(
+            row,
+            probe.get("_evidence_event_ids", []),
+        ):
+            return False
+    return True
 
 
 def refresh_existing_day_baseline(
@@ -814,7 +942,7 @@ def get_daily_summary(
 ) -> tuple[WellnessEvent | None, dict[str, Any]]:
     name = timezone_name(timezone)
     row = _daily_summary_event(session, day=day, timezone=timezone)
-    if row is None:
+    if row is None or event_is_expired(row):
         return None, {
             "status": "insufficient_data",
             "date": day.isoformat(),
@@ -853,5 +981,39 @@ def list_hourly_summaries(
     return [
         row
         for row in rows
-        if row.timezone == name and as_utc(row.observed_at) + timedelta(hours=1) > window_start
+        if (
+            row.timezone == name
+            and not event_is_expired(row)
+            and as_utc(row.observed_at) + timedelta(hours=1) > window_start
+        )
     ]
+
+
+def raw_window_summary(
+    session: Session,
+    *,
+    start: datetime,
+    end: datetime,
+    timezone: str | tzinfo,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    events = _query_raw_events(
+        session,
+        start=as_utc(start),
+        end=as_utc(end),
+        now=now,
+    )
+    summary = summarize_window(
+        events,
+        start=start,
+        end=end,
+        timezone=timezone,
+    )
+    evidence_ids = set(summary.get("_evidence_event_ids", []))
+    selected = [row for row in events if str(row.id) in evidence_ids]
+    summary["_freshest_recorded_at"] = (
+        max(as_utc(row.recorded_at) for row in selected).isoformat()
+        if selected
+        else None
+    )
+    return summary

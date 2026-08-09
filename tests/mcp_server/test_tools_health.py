@@ -142,6 +142,10 @@ class TestDailyReadinessContext:
             "recorded_at": "2026-07-08T16:10:00+09:00",
         }
         assert sleep["source"] == "internal_sleep_score"
+        assert result["freshness"] == {
+            "recorded_at": "2026-07-08T07:10:00+00:00",
+            "status": "derived_from_readiness_blocks",
+        }
 
         hrv = result["hrv"]
         assert hrv["status"] == "ok"

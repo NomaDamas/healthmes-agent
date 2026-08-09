@@ -103,6 +103,12 @@ HealthMes
 집중과 과로 맥락을 소유한다. 상위 HealthMes decision은 두 정책의 숫자를
 재계산하거나 섞지 않고 함께 설명한다.
 
+이 결합은 "데이터가 하나라도 있다"를 "판단 가능"으로 바꾸지 않는다.
+예를 들어 `caffeine_for_focus`는 같은 local day에 연결된 카페인 후보와
+사용자가 완료 확인한 당일 섭취 ledger가 모두 있어야 `decision_ready`다.
+활동, 웨어러블 또는 일정 맥락은 이 전문 안전 조건을 대신하지 않고 대안과
+설명을 보강한다.
+
 ## 3. 이 해자가 쌓이는 데이터
 
 입력의 개수만으로 해자가 생기지 않는다. 다음 연결이 반복되어야 한다.
@@ -193,6 +199,22 @@ MVP는 모든 데이터를 자유롭게 LLM에 넣는 범용 context engine을 �
 
 질문에 필요하지 않은 영역은 읽지 않는다. raw 앱 이름, window title, URL,
 사진 bytes, voice bytes와 wearable raw timeseries를 agent context에 넣지 않는다.
+
+각 입력 엔진은 독립적으로 수집·정규화·저장된다. Activity Ingest가 Open
+Wearables, 캘린더나 식사 데이터를 다시 수집하지 않는다. 교차 영역 해자는
+입력 파이프라인을 하나로 뒤섞는 데 있지 않고, 공통 `WellnessEvent` 저장과
+bounded resolver에서 필요한 파생 context만 결합하는 데 있다.
+
+```text
+activity collector -> activity context --------┐
+Open Wearables -> wearable context ------------┤
+nutrition engine -> nutrition/caffeine policy -┼-> HealthMes resolver
+calendar -> calendar/time context -------------┘
+```
+
+resolver는 날짜, freshness, coverage와 evidence가 맞지 않는 영역을
+`insufficient_data` 또는 `unavailable`로 남긴다. 유효한 다른 영역의 context는
+보존하지만, 빠진 전문 정책 입력을 추측해서 최종 판단을 만들지는 않는다.
 
 ## 6. 검증 기준
 

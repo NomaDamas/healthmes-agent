@@ -102,6 +102,7 @@ boundary
 HealthMes context의 다음 필드는 삭제하거나 숨기지 않는다.
 
 - `status`
+- `decision_ready`
 - `evidence_ids` 또는 최상위 `evidence`
 - `freshness`
 - `coverage` 또는 `source_coverage`
@@ -110,6 +111,10 @@ HealthMes context의 다음 필드는 삭제하거나 숨기지 않는다.
 
 `status=insufficient_data` 또는 `unavailable`은 사용시간 0, 정상 또는 안전으로
 바꾸지 않는다.
+
+`decision_ready=false`도 단순 경고가 아니다. runtime은 이를 행동 가능한
+승인이나 안전 판단으로 렌더링하지 않고, 어떤 전문 입력이 더 필요한지
+`limitations`와 함께 설명해야 한다.
 
 ## 5. Specialized-policy boundary
 
@@ -133,6 +138,17 @@ HealthMes resolver
 "마셔도 안전하다"고 말해서는 안 된다. 후보와 안전 입력이 갖춰진 별도 caffeine
 policy 결과를 보존해서 설명하고, activity context는 휴식이나 과로 대안을
 추가하는 데만 사용한다.
+
+현재 `caffeine_for_focus`의 `decision_ready=true` 조건은 다음과 같다.
+
+1. 요청된 nutrition interaction이 `caffeine_sleep` scope다.
+2. 후보 식품에서 숫자가 있는 `exact` 또는 `range` 카페인 값이 `mg`
+   단위로 확인된다. `unknown`, 잘못된 단위와 숫자 없는 값은 근거가 아니다.
+3. 후보와 요청 날짜가 resolver의 같은 local day에 속한다.
+4. 당일 카페인 섭취 ledger와 caffeine boundary가 모두 완료 확인됐다.
+
+wearable, activity, calendar 또는 time context가 충분해도 위 조건을
+대체하지 않는다.
 
 ## 6. Privacy contract
 
@@ -158,6 +174,13 @@ freshness와 limitation이다. 제외된 앱은 raw storage, summary, context와
 4. 상관관계를 원인으로 표현하지 않는다.
 5. 전문 정책 결과가 없으면 숫자 proposal을 만들지 않는다.
 6. 사용자의 질문과 관계없는 영역을 추가 조회하지 않는다.
+7. 날짜가 다른 wearable 또는 nutrition context를 현재 질문의 근거로 쓰지 않는다.
+8. 만료된 summary나 raw event를 maintenance 전이라도 읽거나 복원하지 않는다.
+9. 중첩 readiness block에 유효한 `recorded_at`, `freshest_at` 또는
+   `observed_at`이 있으면 freshness를 재귀적으로 보존하고 `unavailable`로
+   바꾸지 않는다.
+10. raw 보존 경계를 걸친 focus 구간은 provenance가 완전할 때만 `exact`로
+    표현한다. 일부 최신 raw만으로 과거 summary 구간을 누락하지 않는다.
 
 ## 8. Adapter acceptance
 
@@ -167,6 +190,7 @@ freshness와 limitation이다. 제외된 앱은 raw storage, summary, context와
 - app identity 없이 context를 렌더링한다.
 - evidence, freshness, coverage와 limitations를 보존한다.
 - `insufficient_data`를 0으로 바꾸지 않는다.
+- `decision_ready=false`를 승인 가능한 proposal로 바꾸지 않는다.
 - `caffeine_for_focus`에서 caffeine policy 숫자를 재계산하지 않는다.
 - REST, database 또는 vendored Hermes 내부를 직접 우회하지 않는다.
 

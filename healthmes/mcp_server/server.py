@@ -59,6 +59,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes import schedule_proposals
 from healthmes.activity.mcp import register_activity_tools
+from healthmes.activity.repository import legacy_app_usage_cutoff
 from healthmes.calendars.adjustments import (
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
@@ -990,17 +991,69 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
 
     core_blocks = (sleep_block, hrv_block, stress_block, charge_block)
     any_ok = any(block.get("status") == interpret.STATUS_OK for block in core_blocks)
-    return {
-        "status": interpret.STATUS_OK if any_ok else interpret.STATUS_INSUFFICIENT,
-        "date": as_of.isoformat(),
-        "baseline_window_days": interpret.BASELINE_WINDOW_DAYS,
-        "confidence": interpret.overall_confidence(core_blocks),
+    readiness_blocks = {
         "sleep_debt": sleep_block,
         "actual_sleep": actual_sleep_block,
         "hrv": hrv_block,
         "stress": stress_block,
         "charge": charge_block,
         "yesterday_load": load_block,
+    }
+    usable_blocks = sum(
+        block.get("status") == interpret.STATUS_OK
+        for block in readiness_blocks.values()
+    )
+    freshness_candidates: list[dt.datetime] = []
+
+    def collect_freshness(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, raw in node.items():
+                if key in {
+                    "recorded_at",
+                    "freshest_at",
+                    "observed_at",
+                } and isinstance(raw, str):
+                    try:
+                        parsed = dt.datetime.fromisoformat(raw)
+                    except ValueError:
+                        continue
+                    if parsed.tzinfo is not None:
+                        freshness_candidates.append(parsed.astimezone(dt.UTC))
+                else:
+                    collect_freshness(raw)
+        elif isinstance(node, list):
+            for raw in node:
+                collect_freshness(raw)
+
+    collect_freshness(readiness_blocks)
+    return {
+        "status": interpret.STATUS_OK if any_ok else interpret.STATUS_INSUFFICIENT,
+        "date": as_of.isoformat(),
+        "baseline_window_days": interpret.BASELINE_WINDOW_DAYS,
+        "confidence": interpret.overall_confidence(core_blocks),
+        **readiness_blocks,
+        "evidence_ids": [],
+        "freshness": {
+            "recorded_at": (
+                max(freshness_candidates).isoformat()
+                if freshness_candidates
+                else None
+            ),
+            "status": (
+                "derived_from_readiness_blocks"
+                if freshness_candidates
+                else "unavailable"
+            ),
+        },
+        "coverage": {
+            "status": "readiness_blocks",
+            "ratio": round(usable_blocks / len(readiness_blocks), 4),
+            "usable_blocks": usable_blocks,
+            "total_blocks": len(readiness_blocks),
+        },
+        "limitations": [
+            "open_wearables_readiness_does_not_expose_stable_evidence_ids"
+        ],
     }
 
 
@@ -1381,6 +1434,7 @@ async def _arousal_hints_for(
         }
 
     with _store_session() as session:
+        usage_cutoff = legacy_app_usage_cutoff(session)
         event_rows = session.scalars(
             select(CalendarEventMirror)
             .where(
@@ -1389,13 +1443,17 @@ async def _arousal_hints_for(
             )
             .order_by(CalendarEventMirror.start_at)
         ).all()
-        usage_rows = session.scalars(
-            select(AppUsageSample)
-            .where(
-                AppUsageSample.bucket_start >= start_utc - dt.timedelta(minutes=60),
-                AppUsageSample.bucket_start < end_utc,
+        usage_statement = select(AppUsageSample).where(
+            AppUsageSample.bucket_start
+            >= start_utc - dt.timedelta(minutes=60),
+            AppUsageSample.bucket_start < end_utc,
+        )
+        if usage_cutoff is not None:
+            usage_statement = usage_statement.where(
+                AppUsageSample.bucket_start > usage_cutoff
             )
-            .order_by(AppUsageSample.bucket_start)
+        usage_rows = session.scalars(
+            usage_statement.order_by(AppUsageSample.bucket_start)
         ).all()
         meal_rows = session.scalars(
             select(FoodLog)
@@ -1557,6 +1615,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
         }
 
     with _store_session() as session:
+        usage_cutoff = legacy_app_usage_cutoff(session)
         event_rows = session.scalars(
             select(CalendarEventMirror)
             .where(
@@ -1565,13 +1624,17 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
             )
             .order_by(CalendarEventMirror.start_at)
         ).all()
-        usage_rows = session.scalars(
-            select(AppUsageSample)
-            .where(
-                AppUsageSample.bucket_start >= start_utc - dt.timedelta(minutes=60),
-                AppUsageSample.bucket_start < end_utc,
+        usage_statement = select(AppUsageSample).where(
+            AppUsageSample.bucket_start
+            >= start_utc - dt.timedelta(minutes=60),
+            AppUsageSample.bucket_start < end_utc,
+        )
+        if usage_cutoff is not None:
+            usage_statement = usage_statement.where(
+                AppUsageSample.bucket_start > usage_cutoff
             )
-            .order_by(AppUsageSample.bucket_start)
+        usage_rows = session.scalars(
+            usage_statement.order_by(AppUsageSample.bucket_start)
         ).all()
         events = [
             (

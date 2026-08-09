@@ -100,17 +100,29 @@ class MainActivity : AppCompatActivity() {
                 setSwitchSilently(false)
                 return
             }
-            prefs.collectionEnabled = true
+            if (!prefs.updateCollectionEnabled(true)) {
+                UploadScheduling.disable(this)
+                setSwitchSilently(false)
+                refreshStatus()
+                return
+            }
             UploadScheduling.enable(this)
             UploadScheduling.uploadNow(this)
         } else {
-            prefs.collectionEnabled = false
+            prefs.updateCollectionEnabled(false)
             UploadScheduling.disable(this)
         }
         refreshStatus()
     }
 
     private fun uploadNow() {
+        if (prefs.collectionQuarantined) {
+            UploadScheduling.disable(this)
+            prefs.lastResult =
+                "Collection quarantined after a persistence failure; re-enable explicitly."
+            refreshStatus()
+            return
+        }
         if (prefs.serverUrl.isNullOrBlank()) {
             toast(R.string.toast_pair_first)
             return

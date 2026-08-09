@@ -5,10 +5,11 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, timedelta, tzinfo
+from math import isfinite
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from healthmes.activity.aggregation import local_day_bounds, timezone_name
@@ -19,6 +20,7 @@ from healthmes.activity.context import (
     recovery_activity_context,
 )
 from healthmes.activity.contracts import ActivityContextResolveRequest
+from healthmes.calendars.base import HealthmesEventKind
 from healthmes.nutrition.intake_query import decision_context as nutrition_decision_context
 from healthmes.nutrition.query import known_caffeine_for_day
 from healthmes.store import CalendarEventMirror
@@ -39,16 +41,29 @@ DOMAIN_SELECTION: dict[str, tuple[str, ...]] = {
         "time",
     ),
 }
+MAX_FUTURE_SKEW = timedelta(minutes=1)
+
+
+class WellnessContextRangeError(ValueError):
+    pass
 
 
 def _timezone_name(value: str | tzinfo) -> str:
     return timezone_name(value)
 
 
-def _parse_day(value: str | None, timezone: str | tzinfo) -> date:
+def _parse_day(
+    value: str | None,
+    timezone: str | tzinfo,
+    *,
+    start: datetime | None = None,
+    now: datetime | None = None,
+) -> date:
     if value is not None:
         return date.fromisoformat(value)
-    return datetime.now(_zone(timezone)).date()
+    if start is not None:
+        return start.astimezone(_zone(timezone)).date()
+    return (now or datetime.now(UTC)).astimezone(_zone(timezone)).date()
 
 
 def _zone(value: str | tzinfo) -> tzinfo:
@@ -69,6 +84,12 @@ def calendar_context(
             .where(
                 CalendarEventMirror.start_at < end,
                 CalendarEventMirror.end_at > start,
+                CalendarEventMirror.is_all_day.is_(False),
+                or_(
+                    CalendarEventMirror.healthmes_kind.is_(None),
+                    CalendarEventMirror.healthmes_kind
+                    != HealthmesEventKind.ACTUAL_SLEEP.value,
+                ),
             )
             .order_by(CalendarEventMirror.start_at)
         )
@@ -157,19 +178,71 @@ def nutrition_context(
                 "evidence_ids": [],
                 "limitations": ["candidate_food_context_missing"],
                 "freshness": {"recorded_at": None, "status": "unavailable"},
+                "coverage": {"status": "no_data", "ratio": None},
+                "decision_ready": False,
             }
+        request_context = context.get("request", {})
+        specialized = context.get("specialized_evidence", {})
+        caffeine = specialized.get("caffeine")
+        boundaries = context.get("boundaries", {})
+        failures: list[str] = []
+        if request_context.get("scope") != "caffeine_sleep":
+            failures.append("nutrition_request_scope_is_not_caffeine_sleep")
+        anchor_raw = (
+            request_context.get("intended_consumption_at")
+            or request_context.get("requested_at")
+        )
+        try:
+            anchor = datetime.fromisoformat(str(anchor_raw))
+            if anchor.tzinfo is None:
+                raise ValueError
+        except (TypeError, ValueError):
+            failures.append("nutrition_request_time_missing")
+        else:
+            if anchor.astimezone(ZoneInfo(timezone)).date() != day:
+                failures.append("nutrition_request_date_mismatch")
+        if not isinstance(caffeine, dict):
+            failures.append("caffeine_specialized_evidence_missing")
+        elif caffeine.get("total_intake_complete") is not True:
+            failures.append("caffeine_day_not_confirmed_complete")
+        if boundaries.get("caffeine_total_intake_complete") is not True:
+            failures.append("caffeine_boundary_not_complete")
+        candidate = context.get("candidate", {})
+        has_candidate_caffeine = any(
+            str(fact.get("nutrient") or "").casefold() in {"caffeine", "카페인"}
+            and _known_caffeine_amount(fact.get("amount"))
+            for item in candidate.get("resolved_items", [])
+            if isinstance(item, dict)
+            for fact in item.get("nutrients", [])
+            if isinstance(fact, dict)
+        )
+        if not has_candidate_caffeine:
+            failures.append("candidate_caffeine_estimate_missing")
         evidence_ids = [
             str(value) for value in context.get("evidence_event_ids", []) if value is not None
         ]
         return {
-            "status": str(context.get("status", "ok")),
+            "status": "ok" if not failures else "insufficient_data",
             "kind": "intake_decision_context",
             "context": context,
             "evidence_ids": evidence_ids,
-            "limitations": list(context.get("limitations") or []),
+            "decision_ready": not failures,
+            "reason": failures[0] if failures else None,
+            "limitations": sorted(
+                {
+                    *list(context.get("limitations") or []),
+                    *failures,
+                }
+            ),
             "freshness": {
                 "recorded_at": context.get("request", {}).get("requested_at"),
                 "status": "stored_decision_context",
+            },
+            "coverage": {
+                "status": "complete_day_confirmation"
+                if not failures
+                else "incomplete",
+                "ratio": 1.0 if not failures else None,
             },
         }
     ledger = known_caffeine_for_day(
@@ -183,20 +256,172 @@ def nutrition_context(
         if item.get("event_id") or item.get("confirmation_id")
     ]
     return {
-        "status": str(ledger.get("status", "incomplete")),
+        "status": "insufficient_data",
         "kind": "confirmed_caffeine_ledger",
         "context": ledger,
         "evidence_ids": evidence_ids,
+        "decision_ready": False,
+        "reason": "candidate_caffeine_context_missing",
         "limitations": (
-            []
+            ["candidate_caffeine_context_missing"]
             if ledger.get("total_intake_complete") is True
-            else ["caffeine_day_not_confirmed_complete"]
+            else [
+                "candidate_caffeine_context_missing",
+                "caffeine_day_not_confirmed_complete",
+            ]
         ),
         "freshness": {
             "recorded_at": None,
             "status": "confirmed_ledger_snapshot",
         },
+        "coverage": {
+            "status": (
+                "complete_day_confirmation"
+                if ledger.get("total_intake_complete") is True
+                else "incomplete"
+            ),
+            "ratio": (
+                1.0 if ledger.get("total_intake_complete") is True else None
+            ),
+        },
     }
+
+
+def _known_caffeine_amount(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if str(value.get("unit") or "").casefold() != "mg":
+        return False
+
+    def finite_nonnegative(key: str) -> float | None:
+        number = value.get(key)
+        if isinstance(number, bool) or not isinstance(number, int | float):
+            return None
+        result = float(number)
+        return result if isfinite(result) and result >= 0 else None
+
+    kind = str(value.get("kind") or "").casefold()
+    if kind == "exact":
+        return finite_nonnegative("exact") is not None
+    if kind == "range":
+        minimum = finite_nonnegative("minimum")
+        maximum = finite_nonnegative("maximum")
+        return (
+            minimum is not None
+            and maximum is not None
+            and minimum <= maximum
+        )
+    return False
+
+
+def _normalize_wearable_context(
+    value: dict[str, Any],
+    *,
+    day: date,
+) -> dict[str, Any]:
+    context = dict(value)
+    limitations = list(context.get("limitations") or [])
+    if context.get("date") not in {None, day.isoformat()}:
+        return {
+            "status": "insufficient_data",
+            "reason": "wearable_context_date_mismatch",
+            "date": context.get("date"),
+            "evidence_ids": [],
+            "freshness": {"recorded_at": None, "status": "unavailable"},
+            "coverage": {"status": "no_matching_day", "ratio": None},
+            "limitations": [
+                "wearable_context_date_mismatch",
+                "open_wearables_context_not_combined",
+            ],
+        }
+    evidence_ids = list(context.get("evidence_ids") or [])
+    block_names = (
+        "sleep_debt",
+        "actual_sleep",
+        "hrv",
+        "stress",
+        "charge",
+        "yesterday_load",
+    )
+    blocks = [
+        context[name]
+        for name in block_names
+        if isinstance(context.get(name), dict)
+    ]
+    usable_blocks = [
+        block for block in blocks if block.get("status") == "ok"
+    ]
+    if "coverage" not in context:
+        context["coverage"] = {
+            "status": "readiness_blocks",
+            "ratio": (
+                round(len(usable_blocks) / len(blocks), 4)
+                if blocks
+                else None
+            ),
+            "usable_blocks": len(usable_blocks),
+            "total_blocks": len(blocks),
+        }
+    def collect_timestamps(node: Any, timestamps: list[str]) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if key in {
+                    "recorded_at",
+                    "freshest_at",
+                    "observed_at",
+                } and isinstance(item, str):
+                    try:
+                        parsed = datetime.fromisoformat(item)
+                    except ValueError:
+                        pass
+                    else:
+                        if parsed.tzinfo is not None:
+                            timestamps.append(
+                                parsed.astimezone(UTC).isoformat()
+                            )
+                else:
+                    collect_timestamps(item, timestamps)
+        elif isinstance(node, list):
+            for item in node:
+                collect_timestamps(item, timestamps)
+
+    explicit_timestamps: list[str] = []
+    collect_timestamps(context.get("freshness"), explicit_timestamps)
+    if not explicit_timestamps:
+        timestamps: list[str] = []
+        collect_timestamps(blocks, timestamps)
+        context["freshness"] = {
+            "recorded_at": max(timestamps) if timestamps else None,
+            "status": "derived_from_readiness_blocks"
+            if timestamps
+            else "unavailable",
+        }
+    if not evidence_ids:
+        limitations.append("wearable_readiness_evidence_ids_unavailable")
+    context["evidence_ids"] = evidence_ids
+    context["limitations"] = sorted(set(limitations))
+    return context
+
+
+def _validate_context_window(
+    request: ActivityContextResolveRequest,
+    *,
+    day: date,
+    zone: tzinfo,
+    now: datetime,
+) -> None:
+    if request.start is None or request.end is None:
+        return
+    if request.end > now + MAX_FUTURE_SKEW:
+        raise WellnessContextRangeError("future activity is unknown")
+    start_day = request.start.astimezone(zone).date()
+    end_day = (
+        request.end - timedelta(microseconds=1)
+    ).astimezone(zone).date()
+    if start_day != day or end_day != day:
+        raise WellnessContextRangeError(
+            "activity window and selected date must refer to the same local day"
+        )
 
 
 def _compound_activity_context(
@@ -235,8 +460,19 @@ async def resolve_wellness_context(
     timezone_value: str | tzinfo = request.timezone or default_timezone
     timezone = _timezone_name(timezone_value)
     zone = _zone(timezone_value)
-    day = _parse_day(request.date, zone)
     current = (now or datetime.now(UTC)).astimezone(UTC)
+    day = _parse_day(
+        request.date,
+        zone,
+        start=request.start,
+        now=current,
+    )
+    _validate_context_window(
+        request,
+        day=day,
+        zone=zone,
+        now=current,
+    )
     selected = DOMAIN_SELECTION[request.question_kind]
     contexts: dict[str, Any] = {}
 
@@ -266,6 +502,7 @@ async def resolve_wellness_context(
                     start=effective_start,
                     end=effective_end,
                     timezone=timezone_value,
+                    now=current,
                 )
         elif request.question_kind == "recovery":
             contexts["activity"] = recovery_activity_context(
@@ -283,6 +520,7 @@ async def resolve_wellness_context(
                     start=effective_start,
                     end=effective_end,
                     timezone=timezone_value,
+                    now=current,
                 )
                 if effective_end > effective_start
                 else {
@@ -323,7 +561,10 @@ async def resolve_wellness_context(
             }
         else:
             try:
-                contexts["wearable"] = await wearable_reader(day)
+                contexts["wearable"] = _normalize_wearable_context(
+                    await wearable_reader(day),
+                    day=day,
+                )
             except Exception as exc:  # runtime boundary: one source must not erase the rest
                 contexts["wearable"] = {
                     "status": "unavailable",
@@ -384,7 +625,13 @@ async def resolve_wellness_context(
         if isinstance(context, dict)
     }
     usable = {"ok", "known"}
-    if not any(status in usable for status in domain_statuses.values()):
+    decision_ready = (
+        request.question_kind != "caffeine_for_focus"
+        or contexts.get("nutrition", {}).get("decision_ready") is True
+    )
+    if not decision_ready:
+        overall_status = "insufficient_data"
+    elif not any(status in usable for status in domain_statuses.values()):
         overall_status = "insufficient_data"
     elif all(status in usable for status in domain_statuses.values()):
         overall_status = "ok"
@@ -399,6 +646,7 @@ async def resolve_wellness_context(
         "not_selected_domains": [domain for domain in ALL_DOMAINS if domain not in selected],
         "contexts": contexts,
         "domain_statuses": domain_statuses,
+        "decision_ready": decision_ready,
         "evidence": [
             {"domain": domain, "id": str(evidence_id)}
             for domain, context in contexts.items()

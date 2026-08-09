@@ -13,6 +13,8 @@ from healthmes.activity.aggregation import (
     list_hourly_summaries,
     local_day_bounds,
     personal_baseline_delta,
+    raw_window_summary,
+    summary_raw_provenance_complete,
     timezone_name,
 )
 
@@ -39,6 +41,28 @@ def _tz(value: str | tzinfo) -> tzinfo:
 
 def _timezone_name(value: str | tzinfo) -> str:
     return timezone_name(value)
+
+
+def _raw_window_provenance_complete(
+    session: Session,
+    *,
+    start: datetime,
+    end: datetime,
+    timezone: str | tzinfo,
+    now: datetime | None,
+) -> bool:
+    zone = _tz(timezone)
+    first = start.astimezone(zone).date()
+    last = (end - timedelta(microseconds=1)).astimezone(zone).date()
+    return all(
+        summary_raw_provenance_complete(
+            session,
+            day=first + timedelta(days=offset),
+            timezone=timezone,
+            now=now,
+        )
+        for offset in range((last - first).days + 1)
+    )
 
 
 def activity_summary_context(
@@ -94,6 +118,7 @@ def _combine_hourly(
     has_known_coverage = False
     limitations: set[str] = set()
     selected_rows = []
+    has_partial_row = False
     for row in rows:
         payload = row.payload
         row_start = _summary_window_boundary(
@@ -114,6 +139,10 @@ def _combine_hourly(
         row_seconds = (row_end - row_start).total_seconds()
         overlap_seconds = (overlap_end - overlap_start).total_seconds()
         fraction = overlap_seconds / row_seconds if row_seconds > 0 else 0.0
+        if fraction < 1.0:
+            has_partial_row = True
+            limitations.add("partial_hour_requires_retained_raw_events")
+            continue
         active += float(payload.get("total_active_minutes") or 0) * fraction
         launches += int(payload.get("app_launches_or_switches") or 0) * fraction
         longest = payload.get("longest_active_block_minutes")
@@ -126,13 +155,15 @@ def _combine_hourly(
                 overlap_seconds,
                 float(coverage.get("known_seconds") or 0) * fraction,
             )
-        if fraction < 1.0:
-            limitations.add("partial_hour_metrics_prorated")
         limitations.update(payload.get("limitations", []))
-    if not selected_rows:
+    if not selected_rows or has_partial_row:
         return {
             "status": "insufficient_data",
-            "reason": "no_activity_summary",
+            "reason": (
+                "partial_hour_requires_raw"
+                if has_partial_row
+                else "no_activity_summary"
+            ),
             "active_minutes": 0.0,
             "launches": 0,
             "longest_block": None,
@@ -184,19 +215,53 @@ def focus_context(
     start: datetime,
     end: datetime,
     timezone: str | tzinfo,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     name = _timezone_name(timezone)
-    rows = list_hourly_summaries(
+    raw = raw_window_summary(
         session,
         start=start,
         end=end,
         timezone=timezone,
+        now=now,
     )
-    combined = _combine_hourly(
-        rows,
+    if raw["status"] == "ok" and _raw_window_provenance_complete(
+        session,
         start=start,
         end=end,
-    )
+        timezone=timezone,
+        now=now,
+    ):
+        combined = {
+            "status": "ok",
+            "active_minutes": float(raw.get("total_active_minutes") or 0),
+            "launches": int(raw.get("app_launches_or_switches") or 0),
+            "longest_block": raw.get("longest_active_block_minutes"),
+            "coverage": raw.get("source_coverage", {}).get("ratio"),
+            "evidence_ids": list(raw.get("_evidence_event_ids", [])),
+            "freshness": {
+                "recorded_at": raw.get("_freshest_recorded_at"),
+                "status": "retained_raw_window",
+            },
+            "limitations": sorted(
+                {
+                    *raw.get("limitations", []),
+                    "exact_window_from_retained_raw_events",
+                }
+            ),
+        }
+    else:
+        rows = list_hourly_summaries(
+            session,
+            start=start,
+            end=end,
+            timezone=timezone,
+        )
+        combined = _combine_hourly(
+            rows,
+            start=start,
+            end=end,
+        )
     if (
         combined["status"] != "ok"
         or combined["active_minutes"] <= 0

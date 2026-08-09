@@ -1,10 +1,15 @@
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from healthmes.storage import register_storage_object, run_storage_maintenance
+from healthmes.storage import (
+    register_storage_object,
+    run_storage_maintenance,
+    update_retention_policy,
+)
 from healthmes.store import (
     PurgeJob,
     RetentionPolicy,
@@ -115,6 +120,9 @@ def test_wellness_event_contract_sets_expiry_and_is_idempotent(
         ("activity.app-hour.v1", "manual"),
         ("subjective_energy", "activitywatch"),
         ("subjective_energy", "healthmes-activity-aggregator"),
+        ("subjective_energy", "ActivityWatch"),
+        ("subjective_energy", "HEALTHMES-ACTIVITY-AGGREGATOR"),
+        ("subjective_energy", "healthmes-activity-deletion"),
     ),
 )
 def test_generic_wellness_api_rejects_internal_domain_namespaces(
@@ -178,6 +186,32 @@ def test_maintenance_dry_run_then_deletes_expired_object(
     assert not target.exists()
     assert obj.purged_at is not None
     assert len(list(session.scalars(select(PurgeJob)))) == 2
+
+
+def test_retention_and_maintenance_enter_the_activity_write_lock(
+    session,
+    settings,
+    monkeypatch,
+) -> None:
+    transitions: list[str] = []
+
+    @contextmanager
+    def tracked_lock():
+        transitions.append("enter")
+        try:
+            yield
+        finally:
+            transitions.append("exit")
+
+    monkeypatch.setattr(
+        "healthmes.storage.service.activity_write_lock",
+        tracked_lock,
+    )
+
+    update_retention_policy(session, "activity_raw", "14d")
+    run_storage_maintenance(session, settings, dry_run=True)
+
+    assert transitions == ["enter", "exit", "enter", "exit"]
 
 
 def test_storage_web_page_renders(client: TestClient) -> None:

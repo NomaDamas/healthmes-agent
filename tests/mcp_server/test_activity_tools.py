@@ -1,6 +1,8 @@
 import datetime as dt
 import json
 
+from sqlalchemy import select
+
 from healthmes.activity.aggregation import rebuild_day_summaries
 from healthmes.activity.contracts import (
     ActivityBatchIn,
@@ -8,7 +10,9 @@ from healthmes.activity.contracts import (
     ActivityPlatform,
     AppIntervalRecord,
 )
+from healthmes.activity.repository import DAY_SUMMARY_EVENT
 from healthmes.activity.service import ingest_activity_batch
+from healthmes.store import WellnessEvent
 
 
 def _seed_activity(store_factory, pinned_tz) -> None:
@@ -125,3 +129,30 @@ async def test_resolver_tool_selects_only_activity_for_activity_summary(
         "association_is_not_causation",
         "context_only_not_a_final_wellness_decision",
     ]
+
+
+async def test_expired_activity_summary_is_hidden_from_mcp_before_maintenance(
+    mcp_client,
+    call_tool,
+    store_factory,
+    pinned_tz,
+) -> None:
+    _seed_activity(store_factory, pinned_tz)
+    with store_factory() as session:
+        daily = session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT
+            )
+        )
+        assert daily is not None
+        daily.expires_at = dt.datetime(2026, 8, 2, tzinfo=dt.UTC)
+        session.commit()
+
+    result = await call_tool(
+        mcp_client,
+        "get_activity_summary",
+        {"date": "2026-08-01"},
+    )
+
+    assert result["status"] == "insufficient_data"
+    assert result["reason"] == "no_activity_summary"

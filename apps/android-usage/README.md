@@ -227,6 +227,8 @@ by `tests/api/test_android_readme_contract.py`):
 ```json
 {
   "device_id": "android-3f9c2a7b41e8d05c",
+  "timezone": "Asia/Seoul",
+  "collection_revision": 0,
   "samples": [
     {
       "bucket_start": "2026-07-09T10:00:00Z",
@@ -267,21 +269,62 @@ First-time ingest acknowledgement:
 {
   "accepted": 4,
   "created": 4,
-  "updated": 0
+  "updated": 0,
+  "suppressed": 0
 }
 ```
 
 Upload semantics (why re-sending is safe):
 
 - The worker keeps a **watermark** (top of the hour of the last successful
-  upload) in encrypted prefs. Each run re-queries events from
-  `watermark − 6 h` (lookback for sessions crossing the watermark; first run
-  backfills ~24 h, hard cap 7 days) and re-sends every recomputed bucket,
-  including the still-growing current hour.
+  upload) and an explicit **collection boundary** in encrypted prefs. The
+  first config-approved run starts at that boundary and never reads
+  pre-consent history. Later runs re-query from
+  `max(collection boundary, watermark − 6 h, now − 7 days)` and re-send every
+  recomputed bucket, including the still-growing current hour.
+- Every upload carries the IANA `timezone` and the `collection_revision` from
+  the config refreshed immediately before the OS usage read. The refresh is a
+  permission-status POST whose response contains the latest config. Missing
+  or stale revisions are rejected; a privacy-setting change starts a new
+  collection boundary instead of replaying pre-change history. Generation,
+  revision, boundary, and watermark are written in one synchronous encrypted
+  preference commit.
+- Every sensitive boundary commit is two-phase: first arm a non-sensitive
+  quarantine latch in separate ordinary `SharedPreferences`, then commit the
+  encrypted state, then clear the latch. If the encrypted commit or clear
+  fails, the already-durable latch survives process restart, blocks periodic
+  and one-shot activity uploads, best-effort writes
+  `collection_enabled=false`, and cancels both WorkManager jobs. If arming
+  itself fails, the encrypted state is not touched and the current process
+  stops collection. Only an explicit user re-enable may clear quarantine
+  after a fresh boundary commits successfully.
+- The app closes its current collection window before opening Usage Access
+  settings, on every observed AppOps transition, on activity resume, and in
+  the worker. Observed revoke/regrant transitions each establish a fresh
+  boundary. The worker reports `revoked` or `granted`, refreshes server config,
+  and checks permission again before OS read and before upload.
+- Every hard boundary increments a local collection generation. A worker
+  discards an OS snapshot if that generation changed while reading it.
+  Network I/O never holds the collection-state lock. Instead, the uploader
+  rechecks permission and generation before every HTTP chunk and again before
+  committing the watermark. A boundary can therefore stop the next chunk
+  immediately without blocking the permission observer or the app thread;
+  an HTTP request that had already started may finish, but no later chunk or
+  watermark crosses the persisted boundary, and the source range remains
+  replay-safe.
 - The server **upserts** on `(device_id, bucket_start, app_package)` with
   last-write-wins, so repeated uploads are idempotent; a second POST of the
-  example above answers `{"accepted": 3, "created": 0, "updated": 3}`.
+  example above answers
+  `{"accepted": 4, "created": 0, "updated": 4, "suppressed": 0}`.
 - Batches are chunked at 500 samples per POST (server cap: 1000).
+- A deterministic sample-level `409` is isolated by bisecting the failed
+  chunk. Only the single rejected sample is discarded, later chronological
+  chunks continue, and the watermark advances only after the whole pass has
+  either uploaded or isolated every sample. Network/server failures keep the
+  watermark unchanged so the full source range is retried.
+- Only an explicit allowlist of known sample-local conflict codes may be
+  isolated. A missing, malformed, or unknown `409` code stops the pass without
+  discarding samples or advancing the watermark.
 - `foreground_seconds` is clamped to 3600 per bucket; a `launch` is a
   background→foreground transition attributed to the bucket of the resume.
 - `category` is Android's `ApplicationInfo.category` mapped to stable labels
@@ -300,10 +343,16 @@ Upload semantics (why re-sending is safe):
 3. Tap **Open usage access settings** — this deep-links to
    *Settings → Special app access → Usage access* — and enable
    **HealthMes Usage**. This is a "special access" permission
-   (`PACKAGE_USAGE_STATS`); it cannot be granted via a runtime dialog.
+   (`PACKAGE_USAGE_STATS`); it cannot be granted via a runtime dialog. Opening
+   this screen first closes the current readable window, and returning creates
+   a second boundary under the permission state the app observes.
 4. Flip **Collect & upload app usage**. This schedules the periodic upload
    (every 30 min, network required, exponential backoff on failure) and fires
-   one upload immediately.
+   one upload immediately. The worker reports permission before reading
+   UsageStats; a revoked state resets the local readable boundary. If the
+   status reports quarantine after a storage failure, switch collection on
+   explicitly to establish a new boundary; repeated **Upload now** taps cannot
+   bypass it.
 5. Verify with **Upload now**, then check the status line and your server:
    `curl http://<server>:8100/docs` → `POST /v1/app-usage/batch`, or query the
    `app_usage_sample` table.
@@ -311,7 +360,13 @@ Upload semantics (why re-sending is safe):
 ### Permission & platform caveats
 
 - **Usage access** exposes app usage history to this app; grant it consciously.
-  Revoking it stops collection (the worker reports "Usage access not granted").
+  Observed revocation stops collection, resets the local readable boundary,
+  and reports the revoked state to HealthMes. Android exposes only the current
+  AppOps state, not historical grant intervals. If the user revokes and
+  regrants entirely in external system settings while the HealthMes process
+  never runs and the app's settings link was not used, Android provides no
+  supported way to reconstruct that missed transition. This MVP documents
+  that platform limit instead of claiming impossible historical detection.
 - **QUERY_ALL_PACKAGES** is declared so the app can resolve the category of
   other packages on Android 11+. Fine for a sideloaded personal tool, but it
   is a restricted permission on Google Play — this app is not meant for Play

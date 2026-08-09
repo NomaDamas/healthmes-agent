@@ -9,6 +9,7 @@ the serve entrypoint refuses non-loopback binds.
 """
 
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -30,18 +31,25 @@ def app_client(settings):
         Base.metadata.create_all(get_engine())
         yield client
 
-PAYLOAD = {
-    "device_id": "android-abc123",
-    "samples": [
-        {
-            "bucket_start": "2026-07-09T10:00:00Z",
-            "app_package": "com.slack",
-            "foreground_seconds": 600,
-            "launches": 4,
-            "category": "productivity",
-        }
-    ],
-}
+def fresh_payload() -> dict:
+    bucket = (datetime.now(UTC) - timedelta(hours=1)).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return {
+        "device_id": "android-abc123",
+        "collection_revision": 0,
+        "samples": [
+            {
+                "bucket_start": bucket.isoformat().replace("+00:00", "Z"),
+                "app_package": "com.slack",
+                "foreground_seconds": 600,
+                "launches": 4,
+                "category": "productivity",
+            }
+        ],
+    }
 
 
 @pytest.fixture
@@ -74,11 +82,12 @@ class TestTokenRequired:
     def test_android_ingest_header_is_verified(self, secured_client) -> None:
         # The collector sends Authorization: Bearer <token> (IngestClient.kt);
         # the server now actually checks it.
-        anonymous = secured_client.post("/v1/app-usage/batch", json=PAYLOAD)
+        payload = fresh_payload()
+        anonymous = secured_client.post("/v1/app-usage/batch", json=payload)
         assert anonymous.status_code == 401
 
         authorized = secured_client.post(
-            "/v1/app-usage/batch", json=PAYLOAD, headers=bearer()
+            "/v1/app-usage/batch", json=payload, headers=bearer()
         )
         assert authorized.status_code == 200
         assert authorized.json()["accepted"] == 1

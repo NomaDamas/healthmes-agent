@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import delete, select
 from starlette.status import HTTP_422_UNPROCESSABLE_CONTENT, HTTP_502_BAD_GATEWAY
 
+from healthmes.activity.repository import legacy_app_usage_cutoff
 from healthmes.api.common import ensure_utc, utc_now
 from healthmes.api.errors import APIError
 from healthmes.api.insight_focus import KIND_FOCUS_DROP_BY_HOUR, compute_focus_drop
@@ -301,14 +302,18 @@ def recompute_insights(
             .order_by(CognitiveEnergyEstimate.window_start)
         ).all()
     )
+    usage_statement = select(AppUsageSample).where(
+        AppUsageSample.bucket_start >= window_start,
+        AppUsageSample.bucket_start < window_end,
+    )
+    usage_cutoff = legacy_app_usage_cutoff(session)
+    if usage_cutoff is not None:
+        usage_statement = usage_statement.where(
+            AppUsageSample.bucket_start > usage_cutoff
+        )
     usage = list(
         session.scalars(
-            select(AppUsageSample)
-            .where(
-                AppUsageSample.bucket_start >= window_start,
-                AppUsageSample.bucket_start < window_end,
-            )
-            .order_by(AppUsageSample.bucket_start)
+            usage_statement.order_by(AppUsageSample.bucket_start)
         ).all()
     )
 
