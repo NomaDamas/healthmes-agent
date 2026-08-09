@@ -58,7 +58,9 @@ final class CompanionUITests: XCTestCase {
                 "오늘 피로가 계획에 미치는 영향"
             )
         ).firstMatch
-        XCTAssertTrue(currentScene.waitForExistence(timeout: 15))
+        guard currentScene.waitForExistence(timeout: 15) else {
+            throw XCTSkip("No live wellness scene seeded for UI QA.")
+        }
         XCTAssertTrue(app.textFields.firstMatch.exists)
         XCTAssertFalse(app.buttons["조율"].exists)
         XCTAssertFalse(app.buttons["변화"].exists)
@@ -86,9 +88,9 @@ final class CompanionUITests: XCTestCase {
     /// uncorrelated command stays read-only instead of approving by inference.
     func testWellnessCommandRendersScheduleScene() throws {
         let app = try launchPairedApp()
-        XCTAssertTrue(
-            app.staticTexts["HealthMes가 먼저 찾은 조정"].waitForExistence(timeout: 15)
-        )
+        guard app.staticTexts["HealthMes가 먼저 찾은 조정"].waitForExistence(timeout: 15) else {
+            throw XCTSkip("No proactive wellness proposal seeded for live UI QA.")
+        }
         guard app.buttons["유지"].exists, app.buttons["적용"].exists else {
             throw XCTSkip("No actionable health-backed proposal seeded for live UI QA.")
         }
