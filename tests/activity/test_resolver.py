@@ -308,6 +308,10 @@ def _nutrition_snapshot(
     complete: bool = True,
     include_candidate: bool = True,
     candidate_amount: dict | None = None,
+    ledger_status: str | None = None,
+    ledger_date: str = "2026-08-01",
+    ledger_timezone: str = "UTC",
+    confirmed_caffeine_mg: object = 0.0,
 ) -> dict:
     amount = (
         candidate_amount
@@ -338,7 +342,16 @@ def _nutrition_snapshot(
         },
         "specialized_evidence": {
             "caffeine": {
-                "status": "known" if complete else "incomplete",
+                "status": (
+                    ledger_status
+                    if ledger_status is not None
+                    else "known"
+                    if complete
+                    else "incomplete"
+                ),
+                "local_date": ledger_date,
+                "timezone": ledger_timezone,
+                "confirmed_caffeine_mg": confirmed_caffeine_mg,
                 "total_intake_complete": complete,
             }
         },
@@ -386,6 +399,26 @@ def test_caffeine_nutrition_context_is_ready_only_with_complete_matching_evidenc
         (
             _nutrition_snapshot(complete=False),
             "caffeine_day_not_confirmed_complete",
+        ),
+        (
+            _nutrition_snapshot(ledger_status="incomplete"),
+            "caffeine_ledger_status_not_known",
+        ),
+        (
+            _nutrition_snapshot(ledger_date="2026-07-31"),
+            "caffeine_ledger_date_mismatch",
+        ),
+        (
+            _nutrition_snapshot(ledger_timezone="Asia/Seoul"),
+            "caffeine_ledger_timezone_mismatch",
+        ),
+        (
+            _nutrition_snapshot(confirmed_caffeine_mg=None),
+            "caffeine_ledger_amount_missing",
+        ),
+        (
+            _nutrition_snapshot(confirmed_caffeine_mg=float("nan")),
+            "caffeine_ledger_amount_missing",
         ),
         (
             _nutrition_snapshot(include_candidate=False),

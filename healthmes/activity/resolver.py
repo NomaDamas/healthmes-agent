@@ -205,6 +205,19 @@ def nutrition_context(
             failures.append("caffeine_specialized_evidence_missing")
         elif caffeine.get("total_intake_complete") is not True:
             failures.append("caffeine_day_not_confirmed_complete")
+        elif caffeine.get("status") != "known":
+            failures.append("caffeine_ledger_status_not_known")
+        elif caffeine.get("local_date") != day.isoformat():
+            failures.append("caffeine_ledger_date_mismatch")
+        elif caffeine.get("timezone") != timezone:
+            failures.append("caffeine_ledger_timezone_mismatch")
+        elif (
+            _finite_nonnegative_number(
+                caffeine.get("confirmed_caffeine_mg")
+            )
+            is None
+        ):
+            failures.append("caffeine_ledger_amount_missing")
         if boundaries.get("caffeine_total_intake_complete") is not True:
             failures.append("caffeine_boundary_not_complete")
         candidate = context.get("candidate", {})
@@ -293,25 +306,25 @@ def _known_caffeine_amount(value: object) -> bool:
     if str(value.get("unit") or "").casefold() != "mg":
         return False
 
-    def finite_nonnegative(key: str) -> float | None:
-        number = value.get(key)
-        if isinstance(number, bool) or not isinstance(number, int | float):
-            return None
-        result = float(number)
-        return result if isfinite(result) and result >= 0 else None
-
     kind = str(value.get("kind") or "").casefold()
     if kind == "exact":
-        return finite_nonnegative("exact") is not None
+        return _finite_nonnegative_number(value.get("exact")) is not None
     if kind == "range":
-        minimum = finite_nonnegative("minimum")
-        maximum = finite_nonnegative("maximum")
+        minimum = _finite_nonnegative_number(value.get("minimum"))
+        maximum = _finite_nonnegative_number(value.get("maximum"))
         return (
             minimum is not None
             and maximum is not None
             and minimum <= maximum
         )
     return False
+
+
+def _finite_nonnegative_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    result = float(value)
+    return result if isfinite(result) and result >= 0 else None
 
 
 def _normalize_wearable_context(

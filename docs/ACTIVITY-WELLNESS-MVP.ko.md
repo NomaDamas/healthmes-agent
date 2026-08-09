@@ -588,6 +588,9 @@ agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
 - source가 빈 결과를 반환하고 해당 범위의 raw가 이미 만료됐더라도 장기
   summary를 0으로 덮지 않는다. 요청 범위가 덮는 모든 local-day scope의 raw
   provenance를 먼저 확인하고, 불완전하면 repair 전체를 fail-closed한다.
+- source JSON 또는 window/AFK event 한 행이라도 malformed면 해당 범위를
+  빈 authoritative snapshot으로 해석하지 않는다. reconciliation 전에 import
+  전체를 중단하고 REST에서는 `502 activitywatch_error`로 반환한다.
 - 같은 source identity가 7일 reconciliation lookback 밖의 날짜로 이동하거나,
   repair가 다른 timezone의 보존 조각을 만들면 ingest 결과의 이전·신규
   date/timezone scope를 모두 모아 summary를 재생성한다. 과거 날짜 summary나
@@ -623,8 +626,10 @@ agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
   `sleep_debt.last_night.recorded_at` 같은 중첩 근거까지 재귀적으로 계산한다.
   유효한 수면 시각이 있는데 `unavailable`로 낮추지 않는다.
 - `caffeine_for_focus` resolver는 활동 context만 있다는 이유로 판단 가능 상태가
-  되지 않는다. 같은 local day의 카페인 후보 근거와 완료 확인된 당일 섭취
-  ledger가 모두 있을 때만 `decision_ready=true`를 반환한다.
+  되지 않는다. 같은 local day와 timezone의 카페인 후보 근거,
+  `status=known`인 specialist ledger의 유한한 0 이상
+  `confirmed_caffeine_mg`, 완료 확인된 당일 섭취 boundary가 모두 있을 때만
+  `decision_ready=true`를 반환한다.
 
 실제 iOS/Android/macOS/Watch 화면, 디바이스 dogfood, 실시간 동기화와 Hermes
 adaptation은 이 완료 선언에 포함되지 않는다.

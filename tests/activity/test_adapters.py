@@ -1,10 +1,12 @@
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
 from healthmes.activity.activitywatch import (
+    ActivityWatchClient,
     ActivityWatchError,
     import_activitywatch,
     normalize_activitywatch_events,
@@ -88,6 +90,55 @@ def test_activitywatch_source_ids_are_namespaced_per_device() -> None:
     )
 
     assert first[0].source_record_id != second[0].source_record_id
+
+
+def test_activitywatch_client_translates_malformed_json() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=b"{")
+    )
+    client = ActivityWatchClient(
+        "http://127.0.0.1:5600",
+        transport=transport,
+    )
+
+    with pytest.raises(ActivityWatchError, match="not valid JSON"):
+        client.list_buckets()
+
+
+@pytest.mark.parametrize(
+    "window_event",
+    (
+        {
+            "id": 1,
+            "timestamp": "not-a-time",
+            "duration": 3600,
+            "data": {"app": "Code"},
+        },
+        {
+            "id": 1,
+            "timestamp": "2026-08-01T10:00:00Z",
+            "duration": "bad",
+            "data": {"app": "Code"},
+        },
+        {
+            "id": 1,
+            "timestamp": "2026-08-01T10:00:00Z",
+            "duration": 3600,
+            "data": {},
+        },
+    ),
+)
+def test_activitywatch_rejects_malformed_window_events(
+    window_event: dict,
+) -> None:
+    with pytest.raises(ActivityWatchError, match="window event is malformed"):
+        normalize_activitywatch_events(
+            device_id="mac-malformed",
+            window_bucket_id="window",
+            window_events=[window_event],
+            afk_bucket_id=None,
+            afk_events=[],
+        )
 
 
 def test_activitywatch_afk_intersection_produces_active_and_idle_intervals() -> None:
@@ -1107,6 +1158,79 @@ def test_activitywatch_empty_repair_fails_closed_after_raw_provenance_expires(
             WellnessEvent.event_type == DAY_SUMMARY_EVENT
         )
     )
+    assert daily is not None
+    assert daily.payload["total_active_minutes"] == 60.0
+
+
+def test_activitywatch_malformed_repair_preserves_existing_raw_and_summary(
+    session,
+) -> None:
+    class MalformedRepairClient:
+        malformed = False
+
+        def list_buckets(self):
+            return {
+                "window": {"type": "currentwindow"},
+                "afk": {"type": "afkstatus"},
+            }
+
+        def get_events(self, bucket_id, *, start, end):
+            if bucket_id == "window":
+                return [
+                    {
+                        "id": 1,
+                        "timestamp": "2026-08-01T10:00:00Z",
+                        "duration": "bad" if self.malformed else 3600,
+                        "data": {"app": "Code", "title": "discarded"},
+                    }
+                ]
+            return [
+                {
+                    "id": 2,
+                    "timestamp": start.isoformat(),
+                    "duration": (end - start).total_seconds(),
+                    "data": {"status": "not-afk"},
+                }
+            ]
+
+    client = MalformedRepairClient()
+    request = ActivityWatchImportRequest(
+        device_id="mac-malformed-repair",
+        platform=ActivityPlatform.MACOS,
+        timezone="UTC",
+        start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    import_activitywatch(
+        session,
+        request,
+        client=client,
+        now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    client.malformed = True
+
+    with pytest.raises(ActivityWatchError, match="window event is malformed"):
+        import_activitywatch(
+            session,
+            request,
+            client=client,
+            now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        )
+
+    raw = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+    )
+    daily = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == DAY_SUMMARY_EVENT
+        )
+    )
+    assert len(raw) == 1
+    assert raw[0].payload["end_at"] == "2026-08-01T11:00:00+00:00"
     assert daily is not None
     assert daily.payload["total_active_minutes"] == 60.0
 

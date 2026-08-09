@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from math import isfinite
 from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -126,10 +127,14 @@ class ActivityWatchClient:
         with self._client() as client:
             response = client.get("/api/0/buckets/")
             response.raise_for_status()
-        payload = response.json()
+        payload = _response_json(response, response_kind="buckets")
         if not isinstance(payload, dict):
             raise ActivityWatchError("ActivityWatch buckets response must be an object")
-        return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+        if any(not isinstance(value, dict) for value in payload.values()):
+            raise ActivityWatchError(
+                "ActivityWatch buckets response contains a malformed bucket"
+            )
+        return {str(key): value for key, value in payload.items()}
 
     def get_events(
         self,
@@ -148,10 +153,27 @@ class ActivityWatchClient:
                 },
             )
             response.raise_for_status()
-        payload = response.json()
+        payload = _response_json(response, response_kind="events")
         if not isinstance(payload, list):
             raise ActivityWatchError("ActivityWatch events response must be a list")
-        return [value for value in payload if isinstance(value, dict)]
+        if any(not isinstance(value, dict) for value in payload):
+            raise ActivityWatchError(
+                "ActivityWatch events response contains a malformed event"
+            )
+        return list(payload)
+
+
+def _response_json(
+    response: httpx.Response,
+    *,
+    response_kind: str,
+) -> Any:
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise ActivityWatchError(
+            f"ActivityWatch {response_kind} response is not valid JSON"
+        ) from exc
 
 
 def _bucket_type(value: dict[str, Any]) -> str:
@@ -194,19 +216,42 @@ class AWSpan:
     data: dict[str, Any]
 
 
-def _event_span(value: dict[str, Any]) -> AWSpan | None:
+def _event_span(
+    value: object,
+    *,
+    event_kind: str,
+) -> AWSpan:
+    if not isinstance(value, dict):
+        raise ActivityWatchError(
+            f"ActivityWatch {event_kind} event is malformed"
+        )
     timestamp = value.get("timestamp")
     duration = value.get("duration")
     data = value.get("data")
-    if not isinstance(timestamp, str) or not isinstance(duration, int | float):
-        return None
-    if not isinstance(data, dict) or duration <= 0:
-        return None
+    if (
+        not isinstance(timestamp, str)
+        or isinstance(duration, bool)
+        or not isinstance(duration, int | float)
+        or not isinstance(data, dict)
+    ):
+        raise ActivityWatchError(
+            f"ActivityWatch {event_kind} event is malformed"
+        )
+    duration_seconds = float(duration)
+    if not isfinite(duration_seconds) or duration_seconds <= 0:
+        raise ActivityWatchError(
+            f"ActivityWatch {event_kind} event is malformed"
+        )
     try:
-        start = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(UTC)
-    except ValueError:
-        return None
-    end = start + timedelta(seconds=float(duration))
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError
+        start = parsed.astimezone(UTC)
+        end = start + timedelta(seconds=duration_seconds)
+    except (OverflowError, ValueError):
+        raise ActivityWatchError(
+            f"ActivityWatch {event_kind} event is malformed"
+        ) from None
     safe_data = {key: data[key] for key in ("app", "status") if isinstance(data.get(key), str)}
     raw_id = value.get("id")
     if raw_id is None:
@@ -214,6 +259,32 @@ def _event_span(value: dict[str, Any]) -> AWSpan | None:
             f"{timestamp}|{sorted(safe_data.items())}".encode()
         ).hexdigest()[:24]
     return AWSpan(str(raw_id), start, end, safe_data)
+
+
+def _window_spans(events: list[dict[str, Any]]) -> list[AWSpan]:
+    spans: list[AWSpan] = []
+    for value in events:
+        span = _event_span(value, event_kind="window")
+        app = span.data.get("app")
+        if not isinstance(app, str) or not app.strip():
+            raise ActivityWatchError(
+                "ActivityWatch window event is malformed"
+            )
+        spans.append(span)
+    return spans
+
+
+def _afk_spans(events: list[dict[str, Any]]) -> list[AWSpan]:
+    spans: list[AWSpan] = []
+    for value in events:
+        span = _event_span(value, event_kind="AFK")
+        status = str(span.data.get("status") or "").casefold()
+        if status not in {"afk", "not-afk"}:
+            raise ActivityWatchError(
+                "ActivityWatch AFK event is malformed"
+            )
+        spans.append(span)
+    return spans
 
 
 def _intersections(
@@ -241,13 +312,7 @@ def _continuous_afk_coverage_end(
 ) -> datetime:
     cursor = start
     spans = sorted(
-        (
-            span
-            for value in events
-            if (span := _event_span(value)) is not None
-            and str(span.data.get("status") or "").casefold()
-            in {"afk", "not-afk"}
-        ),
+        _afk_spans(events),
         key=lambda span: (span.start, span.end, span.event_id),
     )
     for span in spans:
@@ -295,28 +360,18 @@ def normalize_activitywatch_events(
             "ActivityWatch launch boundary requires a normalization range"
         )
     windows = sorted(
-        (
-            span
-            for value in window_events
-            if (span := _event_span(value)) is not None
-        ),
+        _window_spans(window_events),
         key=lambda span: (span.start, span.end, span.event_id),
     )
     afk = sorted(
-        (
-            span
-            for value in afk_events
-            if (span := _event_span(value)) is not None
-        ),
+        _afk_spans(afk_events),
         key=lambda span: (span.start, span.end, span.event_id),
     )
     if afk_bucket_id is not None and not afk:
         return []
     records: list[AppIntervalRecord] = []
     for window in windows:
-        app = window.data.get("app")
-        if not isinstance(app, str) or not app.strip():
-            continue
+        app = window.data["app"]
         bounded_start = (
             max(window.start, range_start)
             if range_start is not None

@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
+import httpx
 from sqlalchemy import select
 
 from healthmes.activity.repository import (
@@ -549,6 +550,39 @@ def test_activitywatch_import_rejects_future_range_as_client_error(
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_activitywatch_range"
+
+
+def test_activitywatch_malformed_upstream_json_returns_502(
+    client,
+    monkeypatch,
+) -> None:
+    def malformed_client(self):
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"{")
+        )
+        return httpx.Client(
+            base_url=self.base_url,
+            transport=transport,
+        )
+
+    monkeypatch.setattr(
+        "healthmes.activity.activitywatch.ActivityWatchClient._client",
+        malformed_client,
+    )
+
+    response = client.post(
+        "/v1/activity/activitywatch/import",
+        json={
+            "device_id": "mac-malformed-json",
+            "platform": "macos",
+            "timezone": "UTC",
+            "start_at": "2026-08-01T10:00:00Z",
+            "end_at": "2026-08-01T11:00:00Z",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "activitywatch_error"
 
 
 def test_generic_ingest_cannot_bypass_ios_detailed_capability_boundary(client) -> None:

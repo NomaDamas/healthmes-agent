@@ -145,7 +145,9 @@ policy 결과를 보존해서 설명하고, activity context는 휴식이나 과
 2. 후보 식품에서 숫자가 있는 `exact` 또는 `range` 카페인 값이 `mg`
    단위로 확인된다. `unknown`, 잘못된 단위와 숫자 없는 값은 근거가 아니다.
 3. 후보와 요청 날짜가 resolver의 같은 local day에 속한다.
-4. 당일 카페인 섭취 ledger와 caffeine boundary가 모두 완료 확인됐다.
+4. 같은 local day와 timezone의 specialist 카페인 ledger가 `status=known`이고,
+   `confirmed_caffeine_mg`가 유한한 0 이상 숫자이며, 당일 섭취 ledger와
+   caffeine boundary가 모두 완료 확인됐다.
 
 wearable, activity, calendar 또는 time context가 충분해도 위 조건을
 대체하지 않는다.
