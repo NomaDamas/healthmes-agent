@@ -30,6 +30,9 @@ def test_storage_settings_bootstraps_defaults_and_measures_files(
     assert policies["raw_payload"] == "14d"
     assert policies["media"] == "7d"
     assert policies["aggregate"] == "forever"
+    assert policies["activity_raw"] == "14d"
+    assert policies["activity_hourly"] == "90d"
+    assert policies["activity_daily"] == "forever"
     assert body["backup"]["provider"] == "local"
     assert body["backup"]["snapshot_count"] == 0
 
@@ -109,9 +112,12 @@ def test_wellness_event_contract_sets_expiry_and_is_idempotent(
         ("subjective_energy", "nutrition-outcome-raw"),
         ("subjective_energy", "nutrition-future-internal"),
         ("nutrition.interaction.v1", "manual"),
+        ("activity.app-hour.v1", "manual"),
+        ("subjective_energy", "activitywatch"),
+        ("subjective_energy", "healthmes-activity-aggregator"),
     ),
 )
-def test_generic_wellness_api_rejects_internal_nutrition_namespaces(
+def test_generic_wellness_api_rejects_internal_domain_namespaces(
     client: TestClient,
     session,
     event_type: str,

@@ -7,6 +7,8 @@
 >
 > **범위:** 휴대전화·노트북·데스크톱 사용 활동의 수집, 저장, 최소 가공,
 > 프라이버시 제어, HealthMes 판단 인터페이스. UI와 Hermes adaptation은 제외한다.
+>
+> **Skill 계약:** `contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`
 
 ## TLDR
 
@@ -426,3 +428,52 @@ HealthMes context API/MCP + skill contract
 
 이 경로가 소유자 실데이터로 동작하고, 누락을 0으로 가장하지 않으며, 제외 앱이
 저장·context·로그에 나타나지 않을 때 MVP를 완료한 것으로 본다.
+
+## 13. 구현 계약
+
+```text
+healthmes/activity/
+  canonical contracts + privacy + adapters
+  aggregation + retention + context resolver
+  REST + MCP interfaces
+
+tests/activity/
+  deterministic engine and contract fixtures
+
+tests/api/ and tests/mcp_server/
+  public interface and composition fixtures
+```
+
+구현은 공통 `WellnessEvent` 저장소를 사용하며 별도 activity silo를 만들지 않는다.
+기존 Android hourly collector는 compatibility table을 유지하면서 같은 입력을
+canonical activity event로 투영한다. ActivityWatch와 iOS capability adapter도
+같은 envelope를 사용한다.
+
+agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
+[`HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`](contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md)
+를 canonical contract로 사용한다. 실제 UI, device dogfood와 Hermes adaptation은
+이 구현 완료 조건과 분리된 후속 작업이다.
+
+## 14. 엔진 구현 상태
+
+2026-08-09 기준으로 UI를 제외한 이 문서의 MVP 엔진 범위는 구현되어 있다.
+
+- Android, ActivityWatch와 iOS capability 입력은 같은 `WellnessEvent` 저장소를
+  사용한다.
+- 기본 보존은 raw 14일, hourly summary 90일, daily summary 무기한이며 기존
+  `1/7/14/30/90일/무기한` storage setting으로 변경할 수 있다.
+- hourly와 daily summary의 provenance는 raw ID 전체를 복제하지 않고
+  `raw_event_count + SHA-256 digest`로 크기가 제한된다.
+- daily coverage는 데이터가 존재한 hour만이 아니라 local day 전체
+  23/24/25시간을 분모로 사용한다.
+- focus coverage는 요청한 전체 구간을 분모로 사용하며 부분 hour는 비례값과
+  limitation을 함께 반환한다.
+- 수동 raw 삭제는 summary 직접 삭제 옵션과 관계없이 영향을 받은 날짜를
+  재집계해 삭제된 활동이 파생 context에 남지 않게 한다.
+- collection on/off, 앱 제외, pause/resume, permission, queue, coverage와
+  capability 상태는 UI 독립 REST 계약으로 제공한다.
+- Activity summary, focus, overwork와 bounded cross-domain resolver는 REST와
+  MCP에서 같은 결정론적 엔진을 사용한다.
+
+실제 iOS/Android/macOS/Watch 화면, 디바이스 dogfood, 실시간 동기화와 Hermes
+adaptation은 이 완료 선언에 포함되지 않는다.

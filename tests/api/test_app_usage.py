@@ -2,7 +2,8 @@
 
 from sqlalchemy import select
 
-from healthmes.store import AppUsageSample
+from healthmes.activity.repository import APP_HOUR_EVENT, DAY_SUMMARY_EVENT
+from healthmes.store import AppUsageSample, WellnessEvent
 
 
 def _batch(samples):
@@ -37,6 +38,15 @@ def test_batch_ingest_creates_rows(client, session):
     assert slack.foreground_seconds == 340
     assert slack.launches == 9
     assert slack.category == "communication"
+    canonical = session.scalars(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == APP_HOUR_EVENT
+        )
+    ).all()
+    assert {row.payload["app_id"] for row in canonical} == {
+        "com.slack",
+        "com.google.maps",
+    }
 
 
 def test_batch_ingest_upserts_growing_bucket(client, session):
@@ -50,6 +60,13 @@ def test_batch_ingest_upserts_growing_bucket(client, session):
     assert len(rows) == 1
     assert rows[0].foreground_seconds == 900
     assert rows[0].launches == 15
+    canonical = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == APP_HOUR_EVENT
+        )
+    )
+    assert canonical is not None
+    assert canonical.payload["foreground_seconds"] == 900
 
 
 def test_batch_ingest_dedupes_within_payload_last_wins(client, session):
@@ -73,6 +90,25 @@ def test_batch_ingest_same_bucket_different_devices_kept_apart(client, session):
 
     assert response.json() == {"accepted": 1, "created": 1, "updated": 0}
     assert len(session.scalars(select(AppUsageSample)).all()) == 2
+
+
+def test_legacy_overflow_is_clamped_in_canonical_summary(client, session):
+    overflow = {**SAMPLE_SLACK, "foreground_seconds": 7200}
+
+    response = client.post("/v1/app-usage/batch", json=_batch([overflow]))
+
+    assert response.status_code == 200
+    legacy = session.scalar(select(AppUsageSample))
+    summary = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == DAY_SUMMARY_EVENT
+        )
+    )
+    assert legacy is not None
+    assert legacy.foreground_seconds == 7200
+    assert summary is not None
+    assert summary.payload["total_active_minutes"] == 60.0
+    assert "source_reported_seconds_exceeded_bucket" in summary.payload["limitations"]
 
 
 def test_batch_ingest_validation_errors(client):

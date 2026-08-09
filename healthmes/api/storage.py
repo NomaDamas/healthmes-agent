@@ -171,7 +171,16 @@ def create_wellness_event(
 ) -> WellnessEventOut:
     if (
         body.event_type.startswith("nutrition.")
+        or body.event_type.startswith("activity.")
         or body.source_provider.startswith("nutrition-")
+        or body.source_provider
+        in {
+            "activitywatch",
+            "android-usage",
+            "ios-device-activity",
+            "healthmes-activity-control",
+            "healthmes-activity-aggregator",
+        }
         or body.source_provider
         in {
             "sake-vlm",
@@ -183,7 +192,7 @@ def create_wellness_event(
         raise APIError(
             422,
             "reserved_wellness_namespace",
-            "internal nutrition event namespaces are reserved",
+            "internal nutrition and activity event namespaces are reserved",
         )
     if body.data_class != "normalized":
         raise APIError(

@@ -95,6 +95,15 @@ adapter·출력 채널을 포크하거나 교체할 수 있어야 한다. 모든
 우회할 수 없다. 코드 공개 자체보다 호환되는 커스텀 앱과 기여가 늘어나는 생태계를
 보조 해자로 본다.
 
+**활동 텔레메트리와 교차 영역 판단 계약:** 휴대전화·컴퓨터 activity는
+[`ACTIVITY-WELLNESS-MVP.ko.md`](ACTIVITY-WELLNESS-MVP.ko.md)의 self-hosted
+MVP 경계를 따르고, 모호한 질문의 domain selection은
+[`MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md`](MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md),
+agent/device 연결은
+[`HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`](contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md)
+를 canonical contract로 사용한다. Activity Ingest는 Open Wearables를 다시
+수집하지 않으며 두 context는 HealthMes resolver에서만 결합한다.
+
 **소유권 메모 (2026-08-05):** 음식 분석·음식 사진 인식의 추가 개발은 sake가
 담당한다. HealthMes는 기존 음식 기록 경로만 유지하고, sake의 결과를 공통 웰니스
 입력 계약으로 받아 다른 맥락과 연결한다. 중복 모델 조사·구현은 하지 않는다.

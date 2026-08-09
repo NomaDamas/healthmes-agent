@@ -45,6 +45,9 @@ DEFAULT_RETENTION: dict[str, str] = {
     "aggregate": "forever",
     "decision": "forever",
     "medical_record": "forever",
+    "activity_raw": "14d",
+    "activity_hourly": "90d",
+    "activity_daily": "forever",
 }
 
 

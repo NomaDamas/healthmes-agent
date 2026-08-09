@@ -5,6 +5,7 @@
 > **지위:** HealthMes의 잠재적 해자에 대한 소유자 결정 기록.
 >
 > **관련 문서:** `ACTIVITY-WELLNESS-MVP.ko.md`,
+> `contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`,
 > `WELLNESS-DATA-PLATFORM.ko.md`, `COMPETITIVE-LANDSCAPE.ko.md`
 
 ## 한 줄
@@ -208,3 +209,15 @@ MVP는 모든 데이터를 자유롭게 LLM에 넣는 범용 context engine을 �
 HealthMes의 해자는 "데이터를 많이 모은다"가 아니라
 **필요한 데이터를 정확히 선택하고, 전문 경계를 지키면서, 개인의 행동과 결과까지
 연결하는 반복 가능한 의사결정 구조**가 될 때 형성된다.
+
+## 7. 보조 해자: 오픈 앱 커스터마이징
+
+교차 영역 판단 엔진과 별개로, 공식 앱의 기능과 UI 연결 계약도 오픈소스로
+제공하는 것을 보조 해자로 둔다. iOS, Android, 데스크톱과 웹 앱은 교체 불가능한
+단일 클라이언트가 아니라 같은 저장, 권한, provenance, retention과 MCP/Skill
+계약을 사용하는 참조 구현이다.
+
+개인과 조직은 화면, 알림, 승인 workflow, 입력 adapter와 출력 채널을 포크하거나
+교체할 수 있지만 HealthMes의 privacy와 전문 정책 경계는 우회할 수 없다. 해자는
+코드를 숨기는 데 있지 않고, 호환 가능한 입력과 앱이 늘어나도 하나의 검증 가능한
+웰니스 context로 결합되는 생태계에 있다.

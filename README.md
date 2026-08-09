@@ -298,6 +298,12 @@ export HEALTHMES_BACKUP_PROVIDER=remote_vault    # weekly job replicates too
 Developer guide (run paths, credentials, tests, CI, vendor sync):
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
+Activity telemetry architecture, cross-domain moat, and runtime-independent
+skill contract:
+[`docs/ACTIVITY-WELLNESS-MVP.ko.md`](docs/ACTIVITY-WELLNESS-MVP.ko.md),
+[`docs/MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md`](docs/MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md),
+[`docs/contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`](docs/contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md).
+
 ## References
 
 This project is based on and references:

@@ -58,6 +58,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes import schedule_proposals
+from healthmes.activity.mcp import register_activity_tools
 from healthmes.calendars.adjustments import (
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
@@ -4045,6 +4046,14 @@ def record_decision(
         "schedule_proposal_ids": [str(value) for value in proposal_uuids],
         "viewer_url": viewer_url(_active_settings(), f"/decisions/{decision_id}"),
     }
+
+
+register_activity_tools(
+    mcp,
+    store_session_factory=_store_session,
+    timezone_resolver=_local_timezone,
+    readiness_reader=get_daily_readiness_context,
+)
 
 
 # ---------------------------------------------------------------------------

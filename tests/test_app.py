@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from healthmes import __version__
+from healthmes.activity.maintenance import ACTIVITY_MAINTENANCE_JOB_ID
 from healthmes.app import create_app
 from healthmes.config import Settings
 from healthmes.engine.scheduler import (
@@ -147,6 +148,7 @@ class TestSchedulerWiring:
                 BACKUP_JOB_ID,
                 CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
                 STORAGE_MAINTENANCE_JOB_ID,
+                ACTIVITY_MAINTENANCE_JOB_ID,
             }
         assert not scheduler.running
         assert app.state.scheduler is None
@@ -176,6 +178,7 @@ class TestSchedulerWiring:
                 CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
                 SLEEP_RECONCILIATION_JOB_ID,
                 STORAGE_MAINTENANCE_JOB_ID,
+                ACTIVITY_MAINTENANCE_JOB_ID,
                 calendar_job_id(CalendarSource.GOOGLE),
                 calendar_job_id(CalendarSource.CALDAV),
             }
@@ -210,5 +213,6 @@ class TestSchedulerWiring:
             BACKUP_JOB_ID,
             CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
             STORAGE_MAINTENANCE_JOB_ID,
+            ACTIVITY_MAINTENANCE_JOB_ID,
         }
         assert not prepared.running
