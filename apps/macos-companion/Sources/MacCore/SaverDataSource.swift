@@ -13,12 +13,7 @@ import Foundation
 /// nothing else). README documents the consequence: the saver needs the
 /// menu bar app (or widget) alive to stay fresh.
 public struct SaverDataSource {
-    /// DUPLICATED CONTRACT STRING — mirrors the private
-    /// `PairingStore.baseURLDefaultsKey` in
-    /// apps/ios-companion/Sources/Shared/Pairing.swift (the saver must
-    /// detect "paired" without the Keychain half of the pairing).
-    /// Integrator note: make that constant public in Shared and delete this
-    /// copy.
+    /// The saver detects pairing without touching Keychain.
     public static let pairedBaseURLDefaultsKey = "healthmes.pairing.baseURL"
 
     private let cache: GlanceSnapshotCache
@@ -34,7 +29,8 @@ public struct SaverDataSource {
 
     public func briefing(hideNumbers: Bool, now: Date = Date()) -> SaverBriefing {
         let isPaired = defaults.string(forKey: Self.pairedBaseURLDefaultsKey) != nil
-        let cached = cache.load()
+        let identity = PairingStore.persistedCacheIdentity(defaults: defaults)
+        let cached = identity.flatMap { cache.load(for: $0) }
         let payload = cached.flatMap { try? GlanceJSON.decodePayload($0.payloadData) }
         return SaverBriefing.make(
             payload: payload,

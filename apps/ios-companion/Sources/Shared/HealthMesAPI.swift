@@ -184,6 +184,25 @@ public final class HealthMesAPI {
         return request
     }
 
+    public static func wellnessSceneRequest(
+        pairing: Pairing,
+        query: String,
+        source: WellnessSceneRequest.Source = .user,
+        proposalID: UUID? = nil,
+        decisionRecordID: UUID? = nil
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/wellness/scenes",
+            body: WellnessSceneRequest(
+                query: query,
+                source: source,
+                proposalID: proposalID,
+                decisionRecordID: decisionRecordID
+            )
+        )
+    }
+
     public static func createGoalRequest(
         pairing: Pairing,
         body: WeeklyGoalCreateBody
@@ -385,21 +404,46 @@ public final class HealthMesAPI {
     public func listAlerts(hours: Int = 24, limit: Int = 50, offset: Int = 0)
         async throws -> AlertsPage
     {
+        try await listAlerts(
+            pairing: try pairing(),
+            hours: hours,
+            limit: limit,
+            offset: offset
+        )
+    }
+
+    public func listAlerts(
+        pairing: Pairing,
+        hours: Int = 24,
+        limit: Int = 50,
+        offset: Int = 0
+    ) async throws -> AlertsPage {
         let request = Self.alertsRequest(
-            pairing: try pairing(), hours: hours, limit: limit, offset: offset
+            pairing: pairing, hours: hours, limit: limit, offset: offset
         )
         return try await perform(request, expecting: AlertsPage.self)
     }
 
     public func weeklyReport() async throws -> WeeklyReport {
+        try await weeklyReport(pairing: try pairing())
+    }
+
+    public func weeklyReport(pairing: Pairing) async throws -> WeeklyReport {
         try await perform(
-            Self.weeklyReportRequest(pairing: try pairing()), expecting: WeeklyReport.self
+            Self.weeklyReportRequest(pairing: pairing), expecting: WeeklyReport.self
         )
     }
 
     public func listProposals(status: ProposalStatus? = nil) async throws -> ProposalsPage {
+        try await listProposals(pairing: try pairing(), status: status)
+    }
+
+    public func listProposals(
+        pairing: Pairing,
+        status: ProposalStatus? = nil
+    ) async throws -> ProposalsPage {
         try await perform(
-            Self.proposalsRequest(pairing: try pairing(), status: status),
+            Self.proposalsRequest(pairing: pairing, status: status),
             expecting: ProposalsPage.self
         )
     }
@@ -408,9 +452,21 @@ public final class HealthMesAPI {
         weekStart: String? = nil,
         status: String? = nil
     ) async throws -> WeeklyGoalsPage {
+        try await listGoals(
+            pairing: try pairing(),
+            weekStart: weekStart,
+            status: status
+        )
+    }
+
+    public func listGoals(
+        pairing: Pairing,
+        weekStart: String? = nil,
+        status: String? = nil
+    ) async throws -> WeeklyGoalsPage {
         try await perform(
             Self.goalsRequest(
-                pairing: try pairing(),
+                pairing: pairing,
                 weekStart: weekStart,
                 status: status
             ),
@@ -419,15 +475,23 @@ public final class HealthMesAPI {
     }
 
     public func listTasks() async throws -> TasksPage {
+        try await listTasks(pairing: try pairing())
+    }
+
+    public func listTasks(pairing: Pairing) async throws -> TasksPage {
         try await perform(
-            Self.tasksRequest(pairing: try pairing()),
+            Self.tasksRequest(pairing: pairing),
             expecting: TasksPage.self
         )
     }
 
     public func listDecisionRecords() async throws -> ProductDecisionsPage {
+        try await listDecisionRecords(pairing: try pairing())
+    }
+
+    public func listDecisionRecords(pairing: Pairing) async throws -> ProductDecisionsPage {
         try await perform(
-            Self.decisionsRequest(pairing: try pairing()),
+            Self.decisionsRequest(pairing: pairing),
             expecting: ProductDecisionsPage.self
         )
     }
@@ -440,29 +504,102 @@ public final class HealthMesAPI {
     }
 
     public func listScheduleEvents(start: Date, end: Date) async throws -> CalendarEventsPage {
+        try await listScheduleEvents(
+            pairing: try pairing(),
+            start: start,
+            end: end
+        )
+    }
+
+    public func listScheduleEvents(
+        pairing: Pairing,
+        start: Date,
+        end: Date
+    ) async throws -> CalendarEventsPage {
         try await perform(
-            Self.scheduleEventsRequest(pairing: try pairing(), start: start, end: end),
+            Self.scheduleEventsRequest(pairing: pairing, start: start, end: end),
             expecting: CalendarEventsPage.self
         )
     }
 
+    public func createWellnessScene(
+        query: String,
+        source: WellnessSceneRequest.Source = .user,
+        proposalID: UUID? = nil,
+        decisionRecordID: UUID? = nil
+    ) async throws -> WellnessScene {
+        try await createWellnessScene(
+            query: query,
+            source: source,
+            proposalID: proposalID,
+            decisionRecordID: decisionRecordID,
+            pairing: try pairing()
+        )
+    }
+
+    public func createWellnessScene(
+        query: String,
+        source: WellnessSceneRequest.Source = .user,
+        proposalID: UUID? = nil,
+        decisionRecordID: UUID? = nil,
+        pairing: Pairing
+    ) async throws -> WellnessScene {
+        let scene = try await perform(
+            Self.wellnessSceneRequest(
+                pairing: pairing,
+                query: query,
+                source: source,
+                proposalID: proposalID,
+                decisionRecordID: decisionRecordID
+            ),
+            expecting: WellnessScene.self
+        )
+        try WellnessSceneValidator.validate(
+            scene,
+            pairedBaseURL: pairing.baseURL,
+            expectedProposalID: proposalID
+        )
+        return scene
+    }
+
     public func createGoal(_ body: WeeklyGoalCreateBody) async throws -> WeeklyGoalItem {
+        try await createGoal(body, pairing: try pairing())
+    }
+
+    public func createGoal(
+        _ body: WeeklyGoalCreateBody,
+        pairing: Pairing
+    ) async throws -> WeeklyGoalItem {
         try await perform(
-            Self.createGoalRequest(pairing: try pairing(), body: body),
+            Self.createGoalRequest(pairing: pairing, body: body),
             expecting: WeeklyGoalItem.self
         )
     }
 
     public func createTask(_ body: TaskCreateBody) async throws -> TaskItem {
+        try await createTask(body, pairing: try pairing())
+    }
+
+    public func createTask(
+        _ body: TaskCreateBody,
+        pairing: Pairing
+    ) async throws -> TaskItem {
         try await perform(
-            Self.createTaskRequest(pairing: try pairing(), body: body),
+            Self.createTaskRequest(pairing: pairing, body: body),
             expecting: TaskItem.self
         )
     }
 
     public func getProposal(_ proposalID: UUID) async throws -> ProposalItem {
+        try await getProposal(proposalID, pairing: try pairing())
+    }
+
+    public func getProposal(
+        _ proposalID: UUID,
+        pairing: Pairing
+    ) async throws -> ProposalItem {
         try await perform(
-            Self.proposalRequest(pairing: try pairing(), proposalID: proposalID),
+            Self.proposalRequest(pairing: pairing, proposalID: proposalID),
             expecting: ProposalItem.self
         )
     }
@@ -472,12 +609,26 @@ public final class HealthMesAPI {
         action: ProposalAction,
         surface: String = "ios_app"
     ) async throws -> ProposalItem {
+        try await resolveProposal(
+            proposal,
+            action: action,
+            surface: surface,
+            pairing: try pairing()
+        )
+    }
+
+    public func resolveProposal(
+        _ proposal: ProposalItem,
+        action: ProposalAction,
+        surface: String = "ios_app",
+        pairing: Pairing
+    ) async throws -> ProposalItem {
         guard let resolutionToken = proposal.resolutionToken(for: action) else {
             throw HealthMesAPIError.httpStatus(422)
         }
         return try await perform(
             Self.proposalActionRequest(
-                pairing: try pairing(),
+                pairing: pairing,
                 proposalID: proposal.id,
                 action: action,
                 resolutionToken: resolutionToken,
@@ -617,6 +768,37 @@ public final class HealthMesAPI {
             )
         }
         return HealthMesAPIError.httpStatus(statusCode)
+    }
+}
+
+public struct WellnessSceneRequest: Codable, Equatable {
+    public enum Source: String, Codable {
+        case user
+        case proactive
+    }
+
+    public let query: String
+    public let source: Source
+    public let proposalID: UUID?
+    public let decisionRecordID: UUID?
+
+    public init(
+        query: String,
+        source: Source = .user,
+        proposalID: UUID? = nil,
+        decisionRecordID: UUID? = nil
+    ) {
+        self.query = query
+        self.source = source
+        self.proposalID = proposalID
+        self.decisionRecordID = decisionRecordID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case query
+        case source
+        case proposalID = "proposal_id"
+        case decisionRecordID = "decision_record_id"
     }
 }
 

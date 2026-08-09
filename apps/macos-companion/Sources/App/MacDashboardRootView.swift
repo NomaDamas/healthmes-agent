@@ -56,7 +56,8 @@ struct MacDashboardRootView: View {
         .task {
             await refreshAll(force: glanceStore.payload == nil)
         }
-        .onChange(of: glanceStore.isPaired) { _, _ in
+        .onChange(of: glanceStore.pairingRevision) { _, _ in
+            dashboardStore.resetForPairingChange()
             Task { await dashboardStore.refresh() }
         }
     }

@@ -112,65 +112,181 @@ final class WatchDecisionRemoteModel: ObservableObject {
     @Published var glanceLine: String?
     @Published var energyScore: Int?
     @Published var wellnessImpact: String?
+    @Published var upcomingEvents: [CalendarEventItem] = []
+    @Published var timezone = TimeZone.current.identifier
+    @Published var isDecisionContextReady = false
     @Published var availability: WatchWellnessAvailability = .offline
 
     private let api = HealthMesAPI()
     private let glanceClient = GlanceClient()
+    private var refreshOperationGate = PairingOperationGate()
+    private var resolutionOperationGate = PairingOperationGate()
 
     func refresh() async {
         // Refresh leaves the transient action/result screen and recomputes the
         // best available proposal or wellness glance from current data.
+        resolutionOperationGate.invalidate()
+        applyingAction = nil
         result = nil
-        guard PairingStore.shared.load() != nil else {
-            availability = .unpaired
-            glanceLine = nil
-            energyScore = nil
-            wellnessImpact = String(localized: "Connect HealthMes on iPhone first.")
+        decision = nil
+        isDecisionContextReady = false
+        guard let pairingSnapshot = PairingStore.shared.load() else {
+            clearForUnpaired()
             return
         }
+        let refreshOperation = refreshOperationGate.begin(pairing: pairingSnapshot)
         isLoading = true
-        defer { isLoading = false }
-        do {
-            async let alertsCall = api.listAlerts(hours: 24)
-            async let proposalsCall = api.listProposals(status: .proposed)
-            let (alerts, proposals) = try await (alertsCall, proposalsCall)
+        defer {
+            if refreshOperationGate.isCurrent(
+                refreshOperation,
+                pairing: PairingStore.shared.load()
+            ) {
+                isLoading = false
+            }
+        }
+        async let alertsResult: Result<AlertsPage, Error> = productRefreshResult {
+            try await api.listAlerts(pairing: pairingSnapshot, hours: 24)
+        }
+        async let proposalsResult: Result<ProposalsPage, Error> = productRefreshResult {
+            try await api.listProposals(pairing: pairingSnapshot, status: .proposed)
+        }
+        async let eventsResult: Result<CalendarEventsPage, Error> = productRefreshResult {
+            try await api.listScheduleEvents(
+                pairing: pairingSnapshot,
+                start: Date(),
+                end: Date().addingTimeInterval(24 * 60 * 60)
+            )
+        }
+        let controlResults = await (
+            alertsResult,
+            proposalsResult,
+            eventsResult
+        )
+        guard
+            refreshOperationGate.isCurrent(
+                refreshOperation,
+                pairing: PairingStore.shared.load()
+            )
+        else {
+            if PairingStore.shared.load() == nil {
+                clearForUnpaired()
+            }
+            return
+        }
+        var controlAvailability: WatchWellnessAvailability?
+
+        switch (controlResults.0, controlResults.1) {
+        case (.success(let alerts), .success(let proposals)):
             decision = PendingDecision.correlate(
                 alerts: alerts.data,
                 proposals: proposals.data
             ).first
-            result = nil
-        } catch {
+        case (.failure(let error), _), (_, .failure(let error)):
             decision = nil
-            availability = Self.availability(for: error)
+            controlAvailability = Self.availability(for: error)
         }
 
+        switch controlResults.2 {
+        case .success(let events):
+            upcomingEvents = events.data
+        case .failure:
+            // Calendar detail is supplementary. A valid proposal remains
+            // actionable even when the event list cannot be refreshed.
+            upcomingEvents = []
+        }
+        result = nil
+
         do {
-            let glance = try await glanceClient.fetch()
+            let glance = try await glanceClient.fetch(pairing: pairingSnapshot)
+            guard
+                refreshOperationGate.isCurrent(
+                    refreshOperation,
+                    pairing: PairingStore.shared.load()
+                )
+            else {
+                if PairingStore.shared.load() == nil {
+                    clearForUnpaired()
+                }
+                return
+            }
             energyScore = glance.payload.energy.score
             wellnessImpact = Self.impact(for: glance.payload.energy.score)
             glanceLine = GlanceFormat.nextBlockLine(glance.payload)
-            availability = .current
+            timezone = glance.payload.timezone
+            isDecisionContextReady = true
+            availability = controlAvailability ?? .current
         } catch {
-            if let cached = GlanceSnapshotCache.shared.decodedPayload() {
+            guard
+                refreshOperationGate.isCurrent(
+                    refreshOperation,
+                    pairing: PairingStore.shared.load()
+                )
+            else {
+                if PairingStore.shared.load() == nil {
+                    clearForUnpaired()
+                }
+                return
+            }
+            if let cached = GlanceSnapshotCache.shared.decodedPayload(for: pairingSnapshot) {
                 energyScore = cached.energy.score
                 wellnessImpact = Self.impact(for: cached.energy.score)
                 glanceLine = GlanceFormat.nextBlockLine(cached)
-                availability = .stale
+                timezone = cached.timezone
+                isDecisionContextReady = true
+                availability = controlAvailability ?? .stale
             } else {
                 energyScore = nil
                 wellnessImpact = String(localized: "Not enough health data to adjust the plan.")
-                availability = Self.availability(for: error)
+                availability = controlAvailability ?? Self.availability(for: error)
             }
         }
     }
 
     func resolve(_ action: ProposalAction) async {
-        guard let decision else { return }
+        guard
+            applyingAction == nil,
+            isDecisionContextReady,
+            let decision,
+            let pairingSnapshot = PairingStore.shared.load()
+        else {
+            if PairingStore.shared.load() == nil {
+                clearForUnpaired()
+            }
+            return
+        }
+        refreshOperationGate.invalidate()
+        let resolutionOperation = resolutionOperationGate.begin(
+            pairing: pairingSnapshot,
+            proposalID: decision.id
+        )
         applyingAction = action
         result = nil
-        defer { applyingAction = nil }
+        defer {
+            if resolutionOperationGate.isCurrent(
+                resolutionOperation,
+                pairing: PairingStore.shared.load(),
+                proposalID: decision.id
+            ) {
+                applyingAction = nil
+            }
+        }
         do {
-            let current = try await api.getProposal(decision.id)
+            let current = try await api.getProposal(
+                decision.id,
+                pairing: pairingSnapshot
+            )
+            guard
+                resolutionOperationGate.isCurrent(
+                    resolutionOperation,
+                    pairing: PairingStore.shared.load(),
+                    proposalID: decision.id
+                )
+            else {
+                if PairingStore.shared.load() == nil {
+                    clearForUnpaired()
+                }
+                return
+            }
             guard current.isActionable else {
                 result = Self.result(for: current)
                 self.decision = nil
@@ -179,19 +295,100 @@ final class WatchDecisionRemoteModel: ObservableObject {
             let resolved = try await api.resolveProposal(
                 current,
                 action: action,
-                surface: "apple_watch_app"
+                surface: "apple_watch_app",
+                pairing: pairingSnapshot
             )
+            guard
+                resolutionOperationGate.isCurrent(
+                    resolutionOperation,
+                    pairing: PairingStore.shared.load(),
+                    proposalID: decision.id
+                )
+            else {
+                if PairingStore.shared.load() == nil {
+                    clearForUnpaired()
+                }
+                return
+            }
             result = Self.result(for: resolved.status)
             self.decision = nil
         } catch let error as HealthMesAPIError where error.isAlreadyResolved {
+            guard
+                resolutionOperationGate.isCurrent(
+                    resolutionOperation,
+                    pairing: PairingStore.shared.load(),
+                    proposalID: decision.id
+                )
+            else {
+                if PairingStore.shared.load() == nil {
+                    clearForUnpaired()
+                }
+                return
+            }
             result = Self.result(for: error.alreadyResolvedStatus)
             self.decision = nil
         } catch let error as HealthMesAPIError where error.isProposalExpired {
+            guard
+                resolutionOperationGate.isCurrent(
+                    resolutionOperation,
+                    pairing: PairingStore.shared.load(),
+                    proposalID: decision.id
+                )
+            else {
+                if PairingStore.shared.load() == nil {
+                    clearForUnpaired()
+                }
+                return
+            }
             result = .expired
             self.decision = nil
         } catch {
+            guard
+                resolutionOperationGate.isCurrent(
+                    resolutionOperation,
+                    pairing: PairingStore.shared.load(),
+                    proposalID: decision.id
+                )
+            else {
+                if PairingStore.shared.load() == nil {
+                    clearForUnpaired()
+                }
+                return
+            }
             result = .offline
         }
+    }
+
+    func pairingDidChange() {
+        refreshOperationGate.invalidate()
+        resolutionOperationGate.invalidate()
+        decision = nil
+        isLoading = false
+        applyingAction = nil
+        result = nil
+        glanceLine = nil
+        energyScore = nil
+        wellnessImpact = nil
+        upcomingEvents = []
+        timezone = TimeZone.current.identifier
+        isDecisionContextReady = false
+        availability = PairingStore.shared.load() == nil ? .unpaired : .offline
+    }
+
+    private func clearForUnpaired() {
+        refreshOperationGate.invalidate()
+        resolutionOperationGate.invalidate()
+        decision = nil
+        isLoading = false
+        applyingAction = nil
+        result = nil
+        glanceLine = nil
+        energyScore = nil
+        upcomingEvents = []
+        timezone = TimeZone.current.identifier
+        isDecisionContextReady = false
+        availability = .unpaired
+        wellnessImpact = String(localized: "Connect HealthMes on iPhone first.")
     }
 
     private static func result(for proposal: ProposalItem) -> WatchDecisionResult {
@@ -257,10 +454,10 @@ struct WatchDecisionRemoteView: View {
 
     var body: some View {
         Group {
-            if let decision = model.decision {
-                pending(decision)
-            } else if let result = model.result {
+            if let result = model.result {
                 resultView(result)
+            } else if let decision = model.decision {
+                pending(decision)
             } else if model.isLoading {
                 ProgressView()
             } else {
@@ -270,51 +467,106 @@ struct WatchDecisionRemoteView: View {
         .sheet(item: $detail) { detail in
             WatchDecisionDetailView(detail: detail)
         }
+        .environment(\.timeZone, TimeZone(identifier: model.timezone) ?? .current)
     }
 
     private func pending(_ decision: PendingDecision) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(decision.reason ?? String(localized: "Health-based plan"))
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+        VStack(spacing: 5) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("SCHEDULE CHANGE")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if let score = model.energyScore {
+                            Text(verbatim: "\(score)%")
+                                .font(.caption2.bold().monospacedDigit())
+                                .foregroundStyle(energyTint(score))
+                                .accessibilityLabel(Text("Cognitive energy"))
+                                .accessibilityValue(Text(verbatim: "\(score) percent"))
+                        }
+                    }
 
-            Text(verbatim: decision.prompt)
-                .font(.headline)
-                .lineLimit(2)
-                .minimumScaleFactor(0.82)
-                .fixedSize(horizontal: false, vertical: true)
+                    Text(verbatim: decision.watchActionTitle)
+                        .font(.headline.weight(.semibold))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.82)
+                        .fixedSize(horizontal: false, vertical: true)
 
-            Text(verbatim: ProposalFormat.compactWindowLine(decision.proposal))
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.78)
+                    if let reason = decision.watchReason {
+                        Text(verbatim: reason)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    if !model.isDecisionContextReady {
+                        Label("Confirming calendar time", systemImage: "clock")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    } else if let before = decision.card?.before {
+                        HStack(spacing: 5) {
+                            watchTime(before)
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "arrow.right")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.orange)
+                            watchTime(decision.card?.after ?? decision.proposal.proposedStart)
+                                .foregroundStyle(.primary)
+                        }
+                        .font(.system(.caption, design: .rounded).weight(.bold))
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(Text("Schedule moves"))
+                    } else {
+                        Text(
+                            verbatim: ProposalFormat.watchWindowLine(
+                                decision.proposal,
+                                timeZone: TimeZone(identifier: model.timezone)
+                                    ?? .autoupdatingCurrent
+                            )
+                        )
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.72)
+                    }
+
+                    Button {
+                        detail = WatchDecisionDetail(
+                            decision: decision,
+                            timezone: model.timezone
+                        )
+                    } label: {
+                        Label("Why?", systemImage: "info.circle")
+                            .font(.caption2.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .accessibilityHint(Text("Shows the reason and supporting evidence"))
+                }
+            }
+            .scrollIndicators(.hidden)
+            .frame(maxHeight: .infinity, alignment: .top)
 
             HStack(spacing: 7) {
                 decisionButton(
                     title: "No",
                     image: "xmark",
                     action: .decline,
-                    prominent: false
+                    prominent: false,
+                    accessibilityLabel: "Reject: \(decision.primaryActionText)"
                 )
                 decisionButton(
                     title: "Yes",
                     image: "checkmark",
                     action: .accept,
-                    prominent: true
+                    prominent: true,
+                    accessibilityLabel: "Approve: \(decision.primaryActionText)"
                 )
             }
-
-            Button {
-                detail = WatchDecisionDetail(decision: decision)
-            } label: {
-                Text("Why?")
-                    .font(.caption2)
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .padding(.top, 2)
+            .background(.ultraThinMaterial)
         }
     }
 
@@ -322,15 +574,26 @@ struct WatchDecisionRemoteView: View {
         title: LocalizedStringKey,
         image: String,
         action: ProposalAction,
-        prominent: Bool
+        prominent: Bool,
+        accessibilityLabel: String
     ) -> some View {
         Group {
             if prominent {
-                decisionButtonContent(title: title, image: image, action: action)
+                decisionButtonContent(
+                    title: title,
+                    image: image,
+                    action: action,
+                    accessibilityLabel: accessibilityLabel
+                )
                     .buttonStyle(.borderedProminent)
                     .tint(.green)
             } else {
-                decisionButtonContent(title: title, image: image, action: action)
+                decisionButtonContent(
+                    title: title,
+                    image: image,
+                    action: action,
+                    accessibilityLabel: accessibilityLabel
+                )
                     .buttonStyle(.bordered)
                     .tint(.secondary)
             }
@@ -340,7 +603,8 @@ struct WatchDecisionRemoteView: View {
     private func decisionButtonContent(
         title: LocalizedStringKey,
         image: String,
-        action: ProposalAction
+        action: ProposalAction,
+        accessibilityLabel: String
     ) -> some View {
         Button {
             Task { await model.resolve(action) }
@@ -350,11 +614,23 @@ struct WatchDecisionRemoteView: View {
                     ProgressView()
                 } else {
                     Label(title, systemImage: image)
+                        .font(.headline)
                 }
             }
-            .frame(maxWidth: .infinity, minHeight: 38)
+            .frame(
+                maxWidth: .infinity,
+                minHeight: WatchDecisionLayoutPolicy.minimumButtonHeight
+            )
         }
-        .disabled(model.applyingAction != nil)
+        .disabled(model.applyingAction != nil || !model.isDecisionContextReady)
+        .accessibilityLabel(Text(verbatim: accessibilityLabel))
+        .accessibilityHint(
+            Text(
+                model.isDecisionContextReady
+                    ? "Acts on the exact proposal shown above"
+                    : "Waits until the calendar timezone is confirmed"
+            )
+        )
     }
 
     private func resultView(_ result: WatchDecisionResult) -> some View {
@@ -394,21 +670,45 @@ struct WatchDecisionRemoteView: View {
                     }
                 }
 
+                if let energyScore = model.energyScore {
+                    GeometryReader { proxy in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.primary.opacity(0.12))
+                            Capsule()
+                                .fill(energyScore < 45 ? Color.orange : Color.green)
+                                .frame(
+                                    width: proxy.size.width
+                                        * CGFloat(min(max(energyScore, 0), 100)) / 100
+                                )
+                        }
+                    }
+                    .frame(height: 7)
+                    .accessibilityHidden(true)
+                }
+
                 Text(verbatim: model.wellnessImpact ?? String(localized: "Checking body-to-plan impact…"))
                     .font(.headline)
                     .lineLimit(3)
                     .minimumScaleFactor(0.78)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if let glanceLine = model.glanceLine {
-                    Label {
-                        Text(verbatim: glanceLine)
-                            .lineLimit(2)
-                    } icon: {
-                        Image(systemName: "calendar")
+                if !model.upcomingEvents.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(model.upcomingEvents.prefix(3)) { event in
+                            HStack(spacing: 5) {
+                                Text(event.startAt, format: .dateTime.hour().minute())
+                                    .font(.caption2.bold().monospacedDigit())
+                                    .frame(width: 38, alignment: .leading)
+                                Text(verbatim: event.summary ?? String(localized: "Scheduled block"))
+                                    .font(.caption)
+                                    .lineLimit(1)
+                            }
+                        }
                     }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                } else if let glanceLine = model.glanceLine {
+                    Label(glanceLine, systemImage: "calendar")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Label(
@@ -426,13 +726,28 @@ struct WatchDecisionRemoteView: View {
             }
         }
     }
+
+    private func watchTime(_ date: Date) -> Text {
+        Text(date, format: .dateTime.weekday(.abbreviated).hour().minute())
+    }
+
+    private func energyTint(_ score: Int) -> Color {
+        if score < 45 {
+            return .orange
+        }
+        if score < 70 {
+            return .yellow
+        }
+        return .green
+    }
 }
 
 private extension WatchDecisionDetail {
-    init(decision: PendingDecision) {
+    init(decision: PendingDecision, timezone: String) {
+        let timeZone = TimeZone(identifier: timezone) ?? .autoupdatingCurrent
         self.init(
             prompt: decision.prompt,
-            target: ProposalFormat.windowLine(decision.proposal),
+            target: ProposalFormat.windowLine(decision.proposal, timeZone: timeZone),
             observation: decision.card?.observationShort ?? decision.alert?.summary,
             evidence: decision.card?.evidenceShort,
             action: decision.card?.proposedAction,

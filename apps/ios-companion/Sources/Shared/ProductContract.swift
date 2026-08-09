@@ -189,6 +189,98 @@ public struct LatestRefreshGate {
     }
 }
 
+public struct PairingOperationToken: Equatable {
+    fileprivate let generation: UInt
+    public let pairing: Pairing
+    public let proposalID: UUID?
+
+    fileprivate init(generation: UInt, pairing: Pairing, proposalID: UUID?) {
+        self.generation = generation
+        self.pairing = pairing
+        self.proposalID = proposalID
+    }
+}
+
+/// Invalidates delayed async completions when a newer operation or pairing
+/// supersedes the state they were created for.
+public struct PairingOperationGate {
+    private var generation: UInt = 0
+
+    public init() {}
+
+    public mutating func begin(
+        pairing: Pairing,
+        proposalID: UUID? = nil
+    ) -> PairingOperationToken {
+        generation &+= 1
+        return PairingOperationToken(
+            generation: generation,
+            pairing: pairing,
+            proposalID: proposalID
+        )
+    }
+
+    public mutating func invalidate() {
+        generation &+= 1
+    }
+
+    public func isCurrent(
+        _ token: PairingOperationToken,
+        pairing: Pairing?,
+        proposalID: UUID? = nil
+    ) -> Bool {
+        guard token.generation == generation, token.pairing == pairing else {
+            return false
+        }
+        guard let proposalID else { return true }
+        return token.proposalID == proposalID
+    }
+}
+
+/// Prevents a polling response captured before or during proposal resolution
+/// from restoring a proposal that another request already resolved.
+public struct ResolutionAwareRefreshGate {
+    private var refreshGeneration: UInt = 0
+    private var resolutionGeneration: UInt = 0
+    private var activeResolutions: Set<UInt> = []
+
+    public init() {}
+
+    public mutating func beginRefresh() -> UInt {
+        refreshGeneration &+= 1
+        return refreshGeneration
+    }
+
+    public mutating func beginResolution() -> UInt {
+        resolutionGeneration &+= 1
+        activeResolutions.insert(resolutionGeneration)
+        refreshGeneration &+= 1
+        return resolutionGeneration
+    }
+
+    @discardableResult
+    public mutating func finishResolution(_ token: UInt) -> Bool {
+        guard activeResolutions.remove(token) != nil else { return false }
+        refreshGeneration &+= 1
+        return true
+    }
+
+    public mutating func invalidate() {
+        resolutionGeneration &+= 1
+        activeResolutions.removeAll()
+        refreshGeneration &+= 1
+    }
+
+    public func canApplyRefresh(_ token: UInt) -> Bool {
+        activeResolutions.isEmpty && token == refreshGeneration
+    }
+}
+
+public enum WatchDecisionLayoutPolicy {
+    public static let minimumButtonHeight: Double = 42
+    public static let keepsActionsOutsideScrollContent = true
+}
+
 public func productRefreshResult<Value>(
     _ operation: () async throws -> Value
 ) async -> Result<Value, Error> {

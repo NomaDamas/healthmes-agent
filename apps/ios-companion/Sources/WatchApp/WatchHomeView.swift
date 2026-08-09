@@ -10,6 +10,12 @@ struct WatchHomeView: View {
         WatchDecisionRemoteView(model: model)
             .padding(.horizontal, 2)
             .task { await model.refresh() }
+            .onReceive(
+                NotificationCenter.default.publisher(for: .healthmesPairingChanged)
+            ) { _ in
+                model.pairingDidChange()
+                Task { await model.refresh() }
+            }
         .sheet(item: $decisionInbox.detail) { detail in
             WatchDecisionDetailView(detail: detail)
         }

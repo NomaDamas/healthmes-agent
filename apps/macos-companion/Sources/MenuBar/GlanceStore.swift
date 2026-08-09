@@ -23,6 +23,7 @@ public final class GlanceStore: ObservableObject {
     @Published public private(set) var hasLoadedAlerts = false
     @Published public private(set) var pendingProposals: [ProposalItem] = []
     @Published public private(set) var isPaired: Bool
+    @Published public private(set) var pairingRevision: UInt = 0
     @Published public private(set) var isRefreshing = false
 
     /// Hook for the notification manager: fires after every alerts refresh
@@ -34,6 +35,8 @@ public final class GlanceStore: ObservableObject {
     private let pairingStore: PairingStore
     private var nextGlanceRefresh = Date.distantPast
     private var timer: Timer?
+    private var refreshGate = LatestRefreshGate()
+    private var proposalRefreshGate = ResolutionAwareRefreshGate()
 
     public init(
         client: GlanceClient = GlanceClient(),
@@ -66,32 +69,40 @@ public final class GlanceStore: ObservableObject {
 
     /// One full refresh: glance (conditional GET) + alerts + proposals.
     public func refresh(force: Bool) async {
-        isPaired = pairingStore.load() != nil
-        guard isPaired else {
-            payload = nil
-            alerts = []
-            hasLoadedAlerts = false
-            pendingProposals = []
-            errorKey = nil
+        let refreshID = refreshGate.begin()
+        guard let pairingSnapshot = pairingStore.load() else {
+            resetAccountState(isPaired: false)
             return
         }
-        guard !isRefreshing else { return }
+        isPaired = true
         isRefreshing = true
-        defer { isRefreshing = false }
+        defer {
+            if refreshGate.isCurrent(refreshID) {
+                isRefreshing = false
+            }
+        }
 
         do {
-            let snapshot = try await client.fetch()
+            let snapshot = try await client.fetch(pairing: pairingSnapshot)
+            guard refreshIsCurrent(refreshID, pairing: pairingSnapshot) else { return }
             payload = snapshot.payload
             isStale = false
             lastFetched = snapshot.fetchedAt
             nextGlanceRefresh = snapshot.nextRefresh
             errorKey = nil
         } catch {
+            guard refreshIsCurrent(refreshID, pairing: pairingSnapshot) else { return }
             // Honest stale fallback: last cached payload + explicit marker.
-            if let cached = client.cache.decodedPayload() {
+            if let cached = client.cache.decodedPayload(
+                for: pairingSnapshot,
+                pairingStore: pairingStore
+            ) {
                 payload = cached
                 isStale = true
-                lastFetched = client.cache.load()?.fetchedAt
+                lastFetched = client.cache.load(
+                    for: pairingSnapshot,
+                    pairingStore: pairingStore
+                )?.fetchedAt
             }
             if case GlanceClientError.unauthorized = error {
                 errorKey = "error.unauthorized"
@@ -102,16 +113,37 @@ public final class GlanceStore: ObservableObject {
             nextGlanceRefresh = Date().addingTimeInterval(60)
         }
 
-        await refreshAlertsAndProposals()
+        await refreshAlertsAndProposals(
+            pairing: pairingSnapshot,
+            refreshID: refreshID
+        )
     }
 
-    private func refreshAlertsAndProposals() async {
+    private func refreshAlertsAndProposals(
+        pairing: Pairing,
+        refreshID: UInt? = nil
+    ) async {
+        let proposalRefreshID = proposalRefreshGate.beginRefresh()
         do {
-            let page = try await api.listAlerts(hours: 24, limit: 20, offset: 0)
-            let proposals = try await api.listProposals(status: .proposed)
+            async let alertsPage = api.listAlerts(
+                pairing: pairing,
+                hours: 24,
+                limit: 20,
+                offset: 0
+            )
+            async let proposals = api.listProposals(
+                pairing: pairing,
+                status: .proposed
+            )
+            let (page, proposalPage) = try await (alertsPage, proposals)
+            guard
+                pairingStore.load() == pairing,
+                refreshID.map(refreshGate.isCurrent) ?? true,
+                proposalRefreshGate.canApplyRefresh(proposalRefreshID)
+            else { return }
             alerts = page.data
             hasLoadedAlerts = true
-            pendingProposals = proposals.data
+            pendingProposals = proposalPage.data
             onAlertsRefreshed?(alerts, pendingProposals)
         } catch {
             // Keep the last known lists; the glance error banner already
@@ -120,21 +152,47 @@ public final class GlanceStore: ObservableObject {
     }
 
     /// Real decision behaviour (Yes → accept, No → decline).
-    public func resolve(_ proposal: ProposalItem, action: ProposalAction) async -> ProposalOutcome {
+    public func resolve(
+        _ proposal: ProposalItem,
+        action: ProposalAction,
+        pairing: Pairing? = nil
+    ) async -> ProposalOutcome {
+        guard let pairingSnapshot = pairing ?? pairingStore.load() else {
+            return .failed
+        }
+        let resolutionID = proposalRefreshGate.beginResolution()
         do {
             let resolved = try await api.resolveProposal(
-                proposal, action: action, surface: "mac_app"
+                proposal,
+                action: action,
+                surface: "mac_app",
+                pairing: pairingSnapshot
             )
-            await refreshAlertsAndProposals()
+            guard pairingStore.load() == pairingSnapshot else {
+                _ = proposalRefreshGate.finishResolution(resolutionID)
+                return .failed
+            }
+            guard proposalRefreshGate.finishResolution(resolutionID) else {
+                return .failed
+            }
+            await refreshAlertsAndProposals(pairing: pairingSnapshot)
             return ProposalOutcome.from(
                 action: action,
                 resolvedStatus: resolved.status,
                 error: nil
             )
         } catch let error as HealthMesAPIError {
-            await refreshAlertsAndProposals()
+            guard pairingStore.load() == pairingSnapshot else {
+                _ = proposalRefreshGate.finishResolution(resolutionID)
+                return .failed
+            }
+            guard proposalRefreshGate.finishResolution(resolutionID) else {
+                return .failed
+            }
+            await refreshAlertsAndProposals(pairing: pairingSnapshot)
             return ProposalOutcome.from(action: action, error: error)
         } catch {
+            _ = proposalRefreshGate.finishResolution(resolutionID)
             return .failed
         }
     }
@@ -142,8 +200,11 @@ public final class GlanceStore: ObservableObject {
     /// Pairing flow used by Settings: save, then prove it with a live fetch.
     public func pair(baseURLString: String, token: String) async throws {
         _ = try pairingStore.save(baseURLString: baseURLString, token: token)
+        _ = refreshGate.begin()
+        proposalRefreshGate.invalidate()
         client.cache.clear()
-        isPaired = true
+        pairingRevision &+= 1
+        resetAccountState(isPaired: true)
         nextGlanceRefresh = .distantPast
         await refresh(force: true)
         if let errorKey {
@@ -152,17 +213,29 @@ public final class GlanceStore: ObservableObject {
     }
 
     public func unpair() {
+        _ = refreshGate.begin()
+        proposalRefreshGate.invalidate()
         pairingStore.clear()
         client.cache.clear()
         SeenAlertsStore.shared.clear()
+        pairingRevision &+= 1
+        resetAccountState(isPaired: false)
+    }
+
+    private func resetAccountState(isPaired: Bool) {
         payload = nil
         alerts = []
         hasLoadedAlerts = false
         pendingProposals = []
-        isPaired = false
+        self.isPaired = isPaired
         isStale = false
         lastFetched = nil
         errorKey = nil
+        isRefreshing = false
+    }
+
+    private func refreshIsCurrent(_ refreshID: UInt, pairing: Pairing) -> Bool {
+        refreshGate.isCurrent(refreshID) && pairingStore.load() == pairing
     }
 
     /// Minutes since the last successful fetch (footer honesty line).

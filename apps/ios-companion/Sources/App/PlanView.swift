@@ -13,10 +13,11 @@ final class PlanModel: ObservableObject {
 
     private let api = HealthMesAPI()
     private var refreshGate = LatestRefreshGate()
+    private var resolutionTokens: [UUID: UUID] = [:]
 
     func refresh(now: Date = Date()) async {
         let refreshID = refreshGate.begin()
-        guard PairingStore.shared.load() != nil else {
+        guard let pairingSnapshot = PairingStore.shared.load() else {
             message = String(localized: "Not paired — open Settings.")
             isLoading = false
             return
@@ -34,19 +35,23 @@ final class PlanModel: ObservableObject {
         let weekStart = ProductDateFormat.weekStart(containing: now, calendar: calendar)
 
         async let goalsResult = productRefreshResult {
-            try await api.listGoals(weekStart: weekStart)
+            try await api.listGoals(pairing: pairingSnapshot, weekStart: weekStart)
         }
         async let tasksResult = productRefreshResult {
-            try await api.listTasks()
+            try await api.listTasks(pairing: pairingSnapshot)
         }
         async let eventsResult = productRefreshResult {
-            try await api.listScheduleEvents(start: start, end: end)
+            try await api.listScheduleEvents(
+                pairing: pairingSnapshot,
+                start: start,
+                end: end
+            )
         }
         async let proposalsResult = productRefreshResult {
-            try await api.listProposals(status: .proposed)
+            try await api.listProposals(pairing: pairingSnapshot, status: .proposed)
         }
         async let alertsResult = productRefreshResult {
-            try await api.listAlerts(hours: 168)
+            try await api.listAlerts(pairing: pairingSnapshot, hours: 168)
         }
 
         let results = await (
@@ -56,7 +61,10 @@ final class PlanModel: ObservableObject {
             proposalsResult,
             alertsResult
         )
-        guard refreshGate.isCurrent(refreshID) else { return }
+        guard
+            refreshGate.isCurrent(refreshID),
+            PairingStore.shared.load() == pairingSnapshot
+        else { return }
 
         var errors: [String] = []
         switch results.0 {
@@ -92,15 +100,44 @@ final class PlanModel: ObservableObject {
         message = errors.isEmpty ? nil : errors.joined(separator: "\n")
     }
 
-    func resolve(_ proposal: ProposalItem, action: ProposalAction) async {
+    func resolve(
+        _ proposal: ProposalItem,
+        action: ProposalAction,
+        pairing: Pairing? = nil
+    ) async {
+        guard let pairingSnapshot = pairing ?? PairingStore.shared.load() else {
+            message = String(localized: "Not paired — open Settings.")
+            return
+        }
+        let resolutionToken = UUID()
+        resolutionTokens[proposal.id] = resolutionToken
         busyProposalIDs.insert(proposal.id)
-        defer { busyProposalIDs.remove(proposal.id) }
+        defer {
+            if resolutionTokens[proposal.id] == resolutionToken {
+                resolutionTokens[proposal.id] = nil
+                busyProposalIDs.remove(proposal.id)
+            }
+        }
         do {
-            let resolved = try await api.resolveProposal(proposal, action: action)
+            let resolved = try await api.resolveProposal(
+                proposal,
+                action: action,
+                pairing: pairingSnapshot
+            )
+            guard resolutionIsCurrent(
+                proposal.id,
+                token: resolutionToken,
+                pairing: pairingSnapshot
+            ) else { return }
             proposals.removeAll { $0.id == proposal.id }
             message = ProposalStatusPresentation.label(for: resolved.status)
             await refresh()
         } catch let error as HealthMesAPIError where error.isAlreadyResolved {
+            guard resolutionIsCurrent(
+                proposal.id,
+                token: resolutionToken,
+                pairing: pairingSnapshot
+            ) else { return }
             proposals.removeAll { $0.id == proposal.id }
             message = String(
                 format: String(localized: "Already resolved (%@)."),
@@ -108,11 +145,43 @@ final class PlanModel: ObservableObject {
             )
             await refresh()
         } catch let error as HealthMesAPIError where error.isProposalExpired {
+            guard resolutionIsCurrent(
+                proposal.id,
+                token: resolutionToken,
+                pairing: pairingSnapshot
+            ) else { return }
             proposals.removeAll { $0.id == proposal.id }
             message = String(localized: "Expired · calendar unchanged")
         } catch {
+            guard resolutionIsCurrent(
+                proposal.id,
+                token: resolutionToken,
+                pairing: pairingSnapshot
+            ) else { return }
             message = BriefingHomeModel.describe(error)
         }
+    }
+
+    func resetForPairingChange() {
+        _ = refreshGate.begin()
+        resolutionTokens.removeAll()
+        goals = []
+        tasks = []
+        events = []
+        proposals = []
+        alerts = []
+        busyProposalIDs = []
+        message = nil
+        isLoading = false
+    }
+
+    private func resolutionIsCurrent(
+        _ proposalID: UUID,
+        token: UUID,
+        pairing: Pairing
+    ) -> Bool {
+        resolutionTokens[proposalID] == token
+            && PairingStore.shared.load() == pairing
     }
 }
 
@@ -154,6 +223,10 @@ struct PlanView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .healthmesPlanChanged)) { _ in
+            Task { await model.refresh() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .healthmesPairingChanged)) { _ in
+            model.resetForPairingChange()
             Task { await model.refresh() }
         }
     }

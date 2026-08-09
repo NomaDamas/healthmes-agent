@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private enum MacCommandWriteKind {
@@ -56,6 +57,11 @@ struct MacWellnessControlView: View {
     @State private var message: MacControlMessage?
     @State private var decisionOutcome: (proposalID: UUID, outcome: ProposalOutcome)?
     @State private var resolvingProposalID: UUID?
+    @State private var generatedScene: WellnessScene?
+    @State private var generatedSceneOperation: PairingOperationToken?
+    @State private var isGeneratingScene = false
+    @State private var sceneOperationGate = PairingOperationGate()
+    @State private var resolutionOperationGate = PairingOperationGate()
     @State private var lastHandledSpeakRequest = 0
     @State private var preserveMessageOnNextLensChange = false
     @FocusState private var commandFocused: Bool
@@ -103,6 +109,9 @@ struct MacWellnessControlView: View {
         }
         .onChange(of: router.lens) { oldLens, newLens in
             guard oldLens != newLens else { return }
+            if generatedScene?.lens != newLens {
+                invalidateGeneratedScene()
+            }
             if preserveMessageOnNextLensChange {
                 preserveMessageOnNextLensChange = false
             } else {
@@ -111,6 +120,37 @@ struct MacWellnessControlView: View {
         }
         .onDisappear {
             speech.reset()
+        }
+        .onChange(of: glanceStore.pairingRevision) { _, _ in
+            invalidateGeneratedScene()
+            resolutionOperationGate.invalidate()
+            resolvingProposalID = nil
+            decisionOutcome = nil
+            message = nil
+            preview = nil
+            Task { await refreshAllAndScene() }
+        }
+        .task {
+            if generatedScene == nil, glanceStore.isPaired {
+                await refreshAllAndScene()
+            }
+        }
+        .onChange(of: glanceStore.pendingProposals) { _, proposals in
+            guard let proposal = ProactiveProposalSelection.firstEligible(in: proposals) else {
+                if generatedSceneOperation?.proposalID != nil {
+                    invalidateGeneratedScene()
+                }
+                return
+            }
+            guard generatedSceneOperation?.proposalID != proposal.id else { return }
+            Task {
+                await loadScene(
+                    "\(proposal.id) 일정 제안을 현재 상태 기준으로 검토해줘",
+                    source: .proactive,
+                    proposalID: proposal.id,
+                    decisionRecordID: proposal.decisionRecordId
+                )
+            }
         }
     }
 
@@ -183,7 +223,7 @@ struct MacWellnessControlView: View {
             )
 
             Button {
-                Task { await onRefresh(true) }
+                Task { await refreshAllAndScene() }
             } label: {
                 if glanceStore.isRefreshing || dashboardStore.isRefreshing {
                     ProgressView()
@@ -261,11 +301,22 @@ struct MacWellnessControlView: View {
     }
 
     private var sceneModules: some View {
-        let scene = projectedScene
-        return VStack(spacing: 14) {
-            ForEach(scene.modules) { module in
-                moduleView(module, scene: scene)
-                    .id("\(scene.id)-\(module.id)")
+        VStack(spacing: 14) {
+            if isGeneratingScene {
+                ProgressView("Composing health, calendar and goal context…")
+                    .frame(maxWidth: .infinity, minHeight: 220)
+            } else if let generatedScene {
+                MacWellnessSceneRenderer(
+                    scene: generatedScene,
+                    resolvingProposalID: resolvingProposalID,
+                    onAction: handleSceneAction
+                )
+            } else {
+                let scene = projectedScene
+                ForEach(scene.modules) { module in
+                    moduleView(module, scene: scene)
+                        .id("\(scene.id)-\(module.id)")
+                }
             }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: router.lens)
@@ -286,8 +337,48 @@ struct MacWellnessControlView: View {
             outcomeModule(module)
         case .calendarSync:
             calendarSyncModule(module)
-        case .planImpact, .alternatives, .capacityMap, .clarification, .fallback:
+        case .proposalPreview:
+            proposalPreviewModule(module, scene: scene)
+        case .planImpact, .alternatives, .capacityMap, .clarification, .fallback,
+             .capacityBar, .energyCurve, .calendarCanvas, .scheduleComparison,
+             .timeSeries, .baselineBand, .comparisonBar, .factorContribution,
+             .eventAlignedTrend, .goalTrajectory, .decisionOutcome,
+             .nutritionEvidence:
             standardModule(module)
+        }
+    }
+
+    private func proposalPreviewModule(
+        _ module: WellnessSceneModule,
+        scene: WellnessScene
+    ) -> some View {
+        MacWellnessModuleCard(module: module, accent: MacHealthMesStyle.amber) {
+            if let preview = WellnessProposalPreview(module: module) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(verbatim: preview.task)
+                        .font(.title3.weight(.semibold))
+                    Label {
+                        Text(verbatim: preview.localizedWindow(timezone: scene.timezone))
+                    } icon: {
+                        Image(systemName: "calendar.badge.clock")
+                    }
+                    .font(.callout.weight(.semibold))
+                    if let reason = preview.reason {
+                        Label {
+                            Text(verbatim: reason)
+                        } icon: {
+                            Image(systemName: "waveform.path.ecg")
+                        }
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    }
+                    Text("Nothing changes until you approve this exact proposal.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                missingData("No exact schedule proposal is available.")
+            }
         }
     }
 
@@ -770,7 +861,7 @@ struct MacWellnessControlView: View {
         case .refresh:
             commandText = ""
             Task {
-                await onRefresh(true)
+                await refreshAllAndScene()
                 message = MacControlMessage(
                     text: "Health, calendar and decision state refreshed.",
                     tone: .success
@@ -788,21 +879,16 @@ struct MacWellnessControlView: View {
         switch intent {
         case .show(let lens):
             selectDetail(lens)
+            let query = commandText
             commandText = ""
-            message = MacControlMessage(
-                text: "\(detailTitle(lens)) is now open on the current control surface.",
-                tone: .neutral
-            )
+            Task { await loadScene(query) }
         case .createTask(let title):
             presentPreview(kind: .task, title: title)
         case .createGoal(let title):
             presentPreview(kind: .goal, title: title)
-        case .clarify:
-            message = MacControlMessage(
-                text:
-                    "HealthMes did not execute that command. Ask about current condition, calendar and goals, or prior decision results. Use an explicit `할 일:` / `주간 목표:` prefix for writes. Calendar moves require an existing proposal.",
-                tone: .caution
-            )
+        case .clarify(let query):
+            commandText = ""
+            Task { await loadScene(query) }
         }
     }
 
@@ -854,6 +940,7 @@ struct MacWellnessControlView: View {
     }
 
     private func confirm(_ preview: MacCommandPreview) async {
+        guard let pairingSnapshot = dashboardStore.pairing else { return }
         let succeeded: Bool
         switch preview.kind {
         case .task:
@@ -861,6 +948,7 @@ struct MacWellnessControlView: View {
         case .goal:
             succeeded = await dashboardStore.createGoal(title: preview.title)
         }
+        guard dashboardStore.pairing == pairingSnapshot else { return }
 
         let result = dashboardStore.planSaveMessage
             ?? (succeeded ? "Saved to HealthMes." : "HealthMes could not save this item.")
@@ -878,6 +966,7 @@ struct MacWellnessControlView: View {
     }
 
     private func selectDetail(_ lens: WellnessLens, clearMessage: Bool = true) {
+        invalidateGeneratedScene()
         if clearMessage {
             message = nil
             preserveMessageOnNextLensChange = false
@@ -909,18 +998,236 @@ struct MacWellnessControlView: View {
         }
     }
 
-    private func resolve(_ proposal: ProposalItem, action: ProposalAction) async {
-        guard resolvingProposalID == nil else { return }
+    @discardableResult
+    private func resolve(
+        _ proposal: ProposalItem,
+        action: ProposalAction,
+        pairing: Pairing? = nil
+    ) async -> Bool {
+        guard
+            resolvingProposalID == nil,
+            let pairingSnapshot = pairing ?? dashboardStore.pairing
+        else { return false }
+        let resolutionOperation = resolutionOperationGate.begin(
+            pairing: pairingSnapshot,
+            proposalID: proposal.id
+        )
         resolvingProposalID = proposal.id
-        defer { resolvingProposalID = nil }
+        defer {
+            if resolutionOperationGate.isCurrent(
+                resolutionOperation,
+                pairing: dashboardStore.pairing,
+                proposalID: proposal.id
+            ) {
+                resolvingProposalID = nil
+            }
+        }
 
-        let outcome = await glanceStore.resolve(proposal, action: action)
+        let outcome = await glanceStore.resolve(
+            proposal,
+            action: action,
+            pairing: pairingSnapshot
+        )
+        guard resolutionOperationGate.isCurrent(
+            resolutionOperation,
+            pairing: dashboardStore.pairing,
+            proposalID: proposal.id
+        ) else { return false }
         decisionOutcome = (proposal.id, outcome)
         await dashboardStore.refresh()
+        guard resolutionOperationGate.isCurrent(
+            resolutionOperation,
+            pairing: dashboardStore.pairing,
+            proposalID: proposal.id
+        ) else { return false }
         message = MacControlMessage(
             text: proposalOutcomeText(outcome),
             tone: proposalOutcomeTone(outcome)
         )
+        return true
+    }
+
+    private func loadScene(
+        _ query: String,
+        source: WellnessSceneRequest.Source = .user,
+        proposalID: UUID? = nil,
+        decisionRecordID: UUID? = nil,
+        clearMessage: Bool = true
+    ) async {
+        generatedScene = nil
+        generatedSceneOperation = nil
+        isGeneratingScene = true
+        if clearMessage {
+            message = nil
+        }
+        guard let pairingSnapshot = dashboardStore.pairing else {
+            isGeneratingScene = false
+            message = MacControlMessage(
+                text: "Connect a HealthMes instance before loading wellness insights.",
+                tone: .caution
+            )
+            return
+        }
+        let sceneOperation = sceneOperationGate.begin(
+            pairing: pairingSnapshot,
+            proposalID: proposalID
+        )
+        defer {
+            if sceneOperationGate.isCurrent(
+                sceneOperation,
+                pairing: dashboardStore.pairing
+            ) {
+                isGeneratingScene = false
+            }
+        }
+        do {
+            let scene = try await HealthMesAPI().createWellnessScene(
+                query: query,
+                source: source,
+                proposalID: proposalID,
+                decisionRecordID: decisionRecordID,
+                pairing: pairingSnapshot
+            )
+            guard
+                sceneOperationGate.isCurrent(
+                    sceneOperation,
+                    pairing: dashboardStore.pairing
+                )
+            else { return }
+            generatedScene = scene
+            generatedSceneOperation = sceneOperation
+            router.selectLens(scene.lens)
+        } catch {
+            guard
+                sceneOperationGate.isCurrent(
+                    sceneOperation,
+                    pairing: dashboardStore.pairing
+                )
+            else { return }
+            generatedScene = nil
+            generatedSceneOperation = nil
+            message = MacControlMessage(
+                text: "HealthMes could not compose this wellness scene. Check the paired connection and try again.",
+                tone: .caution
+            )
+        }
+    }
+
+    private func handleSceneAction(_ action: WellnessSceneAction) {
+        switch action.kind {
+        case .acceptProposal, .declineProposal:
+            guard
+                let sceneOperation = generatedSceneOperation,
+                sceneOperationGate.isCurrent(
+                    sceneOperation,
+                    pairing: dashboardStore.pairing
+                ),
+                generatedScene?.allowsProposalActions == true,
+                let proposalID = action.proposalID,
+                sceneOperation.proposalID == nil
+                    || sceneOperation.proposalID == proposalID,
+                let proposal = glanceStore.pendingProposals.first(where: {
+                    $0.id == proposalID && $0.isActionable
+                })
+            else {
+                message = MacControlMessage(
+                    text: "This proposal is no longer actionable. Refresh the scene.",
+                    tone: .caution
+                )
+                return
+            }
+            let proposalAction: ProposalAction =
+                action.kind == .acceptProposal ? .accept : .decline
+            Task {
+                let completed = await resolve(
+                    proposal,
+                    action: proposalAction,
+                    pairing: sceneOperation.pairing
+                )
+                guard
+                    completed,
+                    generatedSceneOperation == sceneOperation,
+                    sceneOperationGate.isCurrent(
+                        sceneOperation,
+                        pairing: dashboardStore.pairing,
+                        proposalID: sceneOperation.proposalID
+                    )
+                else { return }
+                generatedScene = nil
+                generatedSceneOperation = nil
+                selectDetail(.change, clearMessage: false)
+            }
+        case .refresh:
+            Task {
+                await refreshAllAndScene()
+            }
+        case .switchLens:
+            if let value = action.value, let lens = WellnessLens(rawValue: value) {
+                selectDetail(lens)
+            }
+        case .openWebDetail:
+            openAuthenticatedWebDetail(action.url)
+        case .modifyProposal, .createTask, .createGoal:
+            break
+        }
+    }
+
+    private func refreshAllAndScene() async {
+        invalidateGeneratedScene()
+        guard let pairingSnapshot = dashboardStore.pairing else { return }
+        let refreshOperation = sceneOperationGate.begin(pairing: pairingSnapshot)
+        await onRefresh(true)
+        guard sceneOperationGate.isCurrent(
+            refreshOperation,
+            pairing: dashboardStore.pairing
+        ) else { return }
+        if let proposal = ProactiveProposalSelection.firstEligible(
+            in: glanceStore.pendingProposals
+        ) {
+            await loadScene(
+                "\(proposal.id) 일정 제안을 현재 상태 기준으로 검토해줘",
+                source: .proactive,
+                proposalID: proposal.id,
+                decisionRecordID: proposal.decisionRecordId
+            )
+        } else {
+            await loadScene(sceneQuery(for: router.lens))
+        }
+    }
+
+    private func invalidateGeneratedScene() {
+        sceneOperationGate.invalidate()
+        generatedScene = nil
+        generatedSceneOperation = nil
+        isGeneratingScene = false
+    }
+
+    private func openAuthenticatedWebDetail(_ rawURL: URL?) {
+        guard
+            let rawURL,
+            let pairing = dashboardStore.pairing,
+            ViewerURL.hasSameOrigin(rawURL, as: pairing.baseURL)
+        else {
+            message = MacControlMessage(
+                text: "HealthMes blocked a web detail URL outside the paired instance.",
+                tone: .caution
+            )
+            return
+        }
+        NSWorkspace.shared.open(
+            ViewerURL.authenticate(rawURL, pairing: pairing)
+        )
+    }
+
+    private func sceneQuery(for lens: WellnessLens) -> String {
+        switch lens {
+        case .now:
+            return "현재 몸 상태와 오늘 일정의 영향을 보여줘"
+        case .coordinate:
+            return "이번 주 일정과 목표를 현재 가용 에너지 기준으로 보여줘"
+        case .change:
+            return "최근 상태와 결정 결과에서 확인 가능한 변화만 보여줘"
+        }
     }
 
     @ViewBuilder
@@ -1096,11 +1403,15 @@ struct MacWellnessControlView: View {
 
     private func moduleAccent(_ kind: WellnessModuleKind) -> Color {
         switch kind {
-        case .decision, .calendarSync, .clarification:
+        case .decision, .calendarSync, .clarification, .proposalPreview:
             return MacHealthMesStyle.amber
-        case .healthState, .constraints, .capacityMap, .outcomeCurve, .goalImpact:
+        case .healthState, .constraints, .capacityMap, .outcomeCurve, .goalImpact,
+             .capacityBar, .energyCurve, .timeSeries, .baselineBand,
+             .comparisonBar, .factorContribution, .eventAlignedTrend,
+             .goalTrajectory, .decisionOutcome, .nutritionEvidence:
             return MacHealthMesStyle.moss
-        case .planImpact, .scheduleTimeline, .alternatives, .fallback:
+        case .planImpact, .scheduleTimeline, .alternatives, .fallback,
+             .calendarCanvas, .scheduleComparison:
             return MacHealthMesStyle.graphite
         }
     }
@@ -1235,6 +1546,14 @@ private struct MacWellnessModuleCard<Content: View>: View {
         case .clarification: return "checkmark.shield"
         case .decision: return "wand.and.stars"
         case .calendarSync: return "calendar.badge.clock"
+        case .capacityBar: return "gauge.with.dots.needle.50percent"
+        case .energyCurve, .timeSeries, .eventAlignedTrend: return "chart.xyaxis.line"
+        case .calendarCanvas, .scheduleComparison: return "calendar"
+        case .baselineBand, .comparisonBar, .factorContribution: return "chart.bar.xaxis"
+        case .goalTrajectory: return "scope"
+        case .decisionOutcome: return "arrow.triangle.2.circlepath"
+        case .nutritionEvidence: return "fork.knife"
+        case .proposalPreview: return "calendar.badge.clock"
         case .fallback: return "questionmark.diamond"
         }
     }
@@ -1631,18 +1950,28 @@ private enum MacWellnessSceneProjector {
 
         var items = [
             WellnessSceneItem(
-                id: "proposal-\(proposal.id.uuidString)",
+                id: "proposal-id",
+                label: "proposal_id",
+                value: proposal.id.uuidString
+            ),
+            WellnessSceneItem(
+                id: "proposal-task",
                 label: "Exact action",
                 value: prompt,
-                detail:
+                detail: nil
+            ),
+            WellnessSceneItem(
+                id: "proposal-window",
+                label: "Proposed time",
+                value:
                     "\(proposal.proposedStart.healthMesShortDateTime)–\(proposal.proposedEnd.healthMesShortTime)"
             )
         ]
         if let observation = alert?.decisionCard?.observationShort ?? alert?.summary {
             items.append(
                 WellnessSceneItem(
-                    id: "alert-\(alert?.id.uuidString ?? UUID().uuidString)",
-                    label: "What changed",
+                    id: "proposal-reason",
+                    label: "Why now",
                     value: observation
                 )
             )
@@ -1660,8 +1989,8 @@ private enum MacWellnessSceneProjector {
         }
 
         return WellnessSceneModule(
-            id: "decision",
-            kind: .decision,
+            id: "proposal-preview",
+            kind: .proposalPreview,
             title: "One reversible intervention",
             summary:
                 "No changes occur until Yes. Approval may still be waiting for calendar sync.",

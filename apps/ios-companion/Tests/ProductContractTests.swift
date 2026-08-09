@@ -104,6 +104,30 @@ final class ProductContractTests: XCTestCase {
             "https://healthmes.example/v1/schedule/events"
                 + "?start=2026-08-06T00:00:00Z&end=2026-08-13T00:00:00Z&limit=100"
         )
+
+        let proposalID = UUID(uuidString: "91000000-0000-0000-0000-000000000091")!
+        let decisionID = UUID(uuidString: "92000000-0000-0000-0000-000000000092")!
+        let scene = try HealthMesAPI.wellnessSceneRequest(
+            pairing: pairing,
+            query: "언제 집중 업무를 해야 해?",
+            source: .proactive,
+            proposalID: proposalID,
+            decisionRecordID: decisionID
+        )
+        XCTAssertEqual(
+            scene.url?.absoluteString,
+            "https://healthmes.example/v1/wellness/scenes"
+        )
+        XCTAssertEqual(scene.httpMethod, "POST")
+        let sceneBody = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: try XCTUnwrap(scene.httpBody)
+            ) as? [String: String]
+        )
+        XCTAssertEqual(sceneBody["query"], "언제 집중 업무를 해야 해?")
+        XCTAssertEqual(sceneBody["source"], "proactive")
+        XCTAssertEqual(sceneBody["proposal_id"], proposalID.uuidString.uppercased())
+        XCTAssertEqual(sceneBody["decision_record_id"], decisionID.uuidString.uppercased())
     }
 
     func testSetupReadinessDecodesIndependentComponents() throws {
@@ -239,6 +263,8 @@ final class ProductContractTests: XCTestCase {
         )
         XCTAssertEqual(alert.exactDecisionRecordID, decisionID)
         XCTAssertEqual(decisions.first?.prompt, "Schedule wind down?")
+        XCTAssertEqual(decisions.first?.watchActionTitle, "Wind down")
+        XCTAssertEqual(decisions.first?.watchReason, "Sleep debt is rising")
         XCTAssertEqual(
             ProposalStatusPresentation.label(for: .accepted),
             "Approved · calendar sync pending"
@@ -282,6 +308,8 @@ final class ProductContractTests: XCTestCase {
             PendingDecision.correlate(alerts: [alert], proposals: [proposal]).first
         )
         XCTAssertEqual(decision.prompt, "Move Deep Work to 4 PM?")
+        XCTAssertEqual(decision.watchActionTitle, "Schedule adjustment")
+        XCTAssertEqual(decision.watchReason, "Schedule pressure changed.")
         XCTAssertNil(ProposalActionPresentation.exactPrompt(alert: nil))
         XCTAssertTrue(
             PendingDecision.correlate(alerts: [], proposals: [proposal]).isEmpty
@@ -335,6 +363,50 @@ final class ProductContractTests: XCTestCase {
         )
     }
 
+    func testCompactProposalWindowUsesSceneTimezoneInsteadOfDeviceTimezone() throws {
+        let start = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-09T21:37:00Z"))
+        let now = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-09T14:00:00Z"))
+        let proposal = ProposalItem(
+            id: UUID(),
+            taskId: UUID(),
+            proposedStart: start,
+            proposedEnd: start.addingTimeInterval(5_400),
+            status: .proposed,
+            decisionRecordId: UUID(),
+            acceptResolutionToken: "accept",
+            declineResolutionToken: "decline"
+        )
+
+        let utc = ProposalFormat.compactWindowLine(
+            proposal,
+            now: now,
+            timeZone: try XCTUnwrap(TimeZone(identifier: "UTC"))
+        )
+        let seoul = ProposalFormat.compactWindowLine(
+            proposal,
+            now: now,
+            timeZone: try XCTUnwrap(TimeZone(identifier: "Asia/Seoul"))
+        )
+
+        XCTAssertTrue(utc.hasPrefix("Today"))
+        XCTAssertTrue(seoul.hasPrefix("Tomorrow"))
+        XCTAssertNotEqual(utc, seoul)
+        XCTAssertFalse(
+            ProposalFormat.watchWindowLine(
+                proposal,
+                now: now,
+                timeZone: try XCTUnwrap(TimeZone(identifier: "UTC"))
+            ).contains("Today")
+        )
+        XCTAssertTrue(
+            ProposalFormat.watchWindowLine(
+                proposal,
+                now: now,
+                timeZone: try XCTUnwrap(TimeZone(identifier: "Asia/Seoul"))
+            ).hasPrefix("Tomorrow")
+        )
+    }
+
     func testLatestRefreshGateRejectsOlderCompletion() {
         var gate = LatestRefreshGate()
         let first = gate.begin()
@@ -342,6 +414,109 @@ final class ProductContractTests: XCTestCase {
 
         XCTAssertFalse(gate.isCurrent(first))
         XCTAssertTrue(gate.isCurrent(second))
+    }
+
+    func testPairingOperationGateRejectsOldGenerationAndCredentialChange() {
+        let firstPairing = Pairing(
+            baseURL: URL(string: "https://healthmes.example")!,
+            token: "first-token"
+        )
+        let changedCredential = Pairing(
+            baseURL: firstPairing.baseURL,
+            token: "second-token"
+        )
+        let proposalID = UUID()
+        var gate = PairingOperationGate()
+        let first = gate.begin(pairing: firstPairing, proposalID: proposalID)
+
+        XCTAssertTrue(
+            gate.isCurrent(first, pairing: firstPairing, proposalID: proposalID)
+        )
+        XCTAssertFalse(
+            gate.isCurrent(first, pairing: changedCredential, proposalID: proposalID)
+        )
+        XCTAssertFalse(
+            gate.isCurrent(first, pairing: firstPairing, proposalID: UUID())
+        )
+
+        _ = gate.begin(pairing: firstPairing, proposalID: proposalID)
+        XCTAssertFalse(
+            gate.isCurrent(first, pairing: firstPairing, proposalID: proposalID)
+        )
+    }
+
+    func testResolutionAwareRefreshGateRejectsPollsAroundResolution() {
+        var gate = ResolutionAwareRefreshGate()
+        let beforeResolution = gate.beginRefresh()
+        let resolution = gate.beginResolution()
+        let duringResolution = gate.beginRefresh()
+
+        XCTAssertFalse(gate.canApplyRefresh(beforeResolution))
+        XCTAssertFalse(gate.canApplyRefresh(duringResolution))
+        XCTAssertTrue(gate.finishResolution(resolution))
+        XCTAssertFalse(gate.canApplyRefresh(duringResolution))
+
+        let afterResolution = gate.beginRefresh()
+        XCTAssertTrue(gate.canApplyRefresh(afterResolution))
+    }
+
+    func testResolutionAwareRefreshGateAllowsConcurrentResolutionsToFinish() {
+        var gate = ResolutionAwareRefreshGate()
+        let first = gate.beginResolution()
+        let second = gate.beginResolution()
+
+        XCTAssertTrue(gate.finishResolution(second))
+        XCTAssertTrue(gate.finishResolution(first))
+        XCTAssertFalse(gate.finishResolution(first))
+
+        let refresh = gate.beginRefresh()
+        XCTAssertTrue(gate.canApplyRefresh(refresh))
+    }
+
+    func testStaleResolutionCannotInvalidateCurrentAccountResolution() {
+        var gate = ResolutionAwareRefreshGate()
+        let previousAccount = gate.beginResolution()
+        gate.invalidate()
+        let currentAccount = gate.beginResolution()
+
+        XCTAssertFalse(gate.finishResolution(previousAccount))
+        XCTAssertTrue(gate.finishResolution(currentAccount))
+    }
+
+    func testProactiveProposalSelectionRequiresDecisionRecordCorrelation() {
+        let now = Date()
+        let uncorrelated = ProposalItem(
+            id: UUID(),
+            taskId: UUID(),
+            proposedStart: now,
+            proposedEnd: now.addingTimeInterval(1_800),
+            status: .proposed,
+            decisionRecordId: nil,
+            acceptResolutionToken: "accept",
+            declineResolutionToken: "decline"
+        )
+        let correlated = ProposalItem(
+            id: UUID(),
+            taskId: UUID(),
+            proposedStart: now.addingTimeInterval(3_600),
+            proposedEnd: now.addingTimeInterval(5_400),
+            status: .proposed,
+            decisionRecordId: UUID(),
+            acceptResolutionToken: "accept",
+            declineResolutionToken: "decline"
+        )
+
+        XCTAssertFalse(uncorrelated.canComposeProactiveScene)
+        XCTAssertEqual(
+            ProactiveProposalSelection.firstEligible(in: [uncorrelated, correlated])?.id,
+            correlated.id
+        )
+        XCTAssertFalse(
+            ProactiveProposalSelection.containsEligibleProposal(
+                id: uncorrelated.id,
+                in: [uncorrelated, correlated]
+            )
+        )
     }
 
     func testProductRefreshResultKeepsSuccessAndFailureIndependent() async {
@@ -453,6 +628,813 @@ final class ProductContractTests: XCTestCase {
         }
     }
 
+    func testWellnessSceneDecodesTrustedVisualizationContract() throws {
+        let json = """
+            {
+              "schema_version": "1",
+              "id": "focus:1",
+              "intent": "find_focus_window",
+              "lens": "coordinate",
+              "title": "집중 업무를 보호할 시간",
+              "summary": "오전 가용량이 높습니다.",
+              "severity": "supportive",
+              "freshness": "current",
+              "confidence": {
+                "level": "medium",
+                "coverage": "에너지 12/24시간 · 캘린더 1건",
+                "limitations": ["오후 표본이 적습니다."]
+              },
+              "modules": [{
+                "id": "calendar",
+                "kind": "calendar_canvas",
+                "title": "Apple · Google Calendar",
+                "summary": "실제 일정과 제안을 함께 표시합니다.",
+                "items": [],
+                "visualization": {
+                  "kind": "calendar_canvas",
+                  "unit": null,
+                  "minimum": null,
+                  "maximum": null,
+                  "series": [],
+                  "events": [{
+                    "id": "google:1",
+                    "title": "핵심 문서 작성",
+                    "starts_at": "2026-08-09T09:00:00Z",
+                    "ends_at": "2026-08-09T10:30:00Z",
+                    "provider": "google",
+                    "is_healthmes_managed": false,
+                    "energy_demand": "high",
+                    "status": "current"
+                  }]
+                },
+                "accessibility_summary": "캘린더 일정 1건"
+              }],
+              "actions": [],
+              "generated_at": "2026-08-09T00:00:00Z",
+              "timezone": "Asia/Seoul"
+            }
+            """
+
+        let scene = try GlanceJSON.decoder().decode(
+            WellnessScene.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(scene.schemaVersion, "1")
+        XCTAssertEqual(scene.intent, "find_focus_window")
+        XCTAssertEqual(scene.timezone, "Asia/Seoul")
+        XCTAssertEqual(scene.confidence.level, .medium)
+        XCTAssertEqual(scene.modules.first?.visualization?.kind, .calendarCanvas)
+        XCTAssertEqual(
+            scene.modules.first?.visualization?.events.first?.provider,
+            "google"
+        )
+        XCTAssertEqual(
+            scene.modules.first?.visualization?.events.first?.energyDemand,
+            "high"
+        )
+        XCTAssertNoThrow(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL
+            )
+        )
+    }
+
+    func testWellnessSceneDecodesProactiveProposalPreview() throws {
+        let proposalID = UUID(uuidString: "803aee59-99e0-478f-88eb-bcb6ae28acde")!
+        let json = """
+            {
+              "schema_version": "1",
+              "id": "proactive:1",
+              "intent": "proactive_intervention",
+              "lens": "coordinate",
+              "title": "HealthMes가 먼저 찾은 조정",
+              "summary": "승인 전 제안이 있습니다.",
+              "severity": "action",
+              "freshness": "current",
+              "confidence": {
+                "level": "low",
+                "coverage": "정확히 연결된 제안 1건",
+                "limitations": []
+              },
+              "modules": [{
+                "id": "proposal-preview",
+                "kind": "proposal_preview",
+                "title": "승인 전 일정 블록",
+                "summary": "제안된 블록을 승인 전 미리보기로 표시합니다.",
+                "items": [{
+                  "id": "proposal-id",
+                  "label": "proposal_id",
+                  "value": "\(proposalID.uuidString.lowercased())",
+                  "detail": null
+                }, {
+                  "id": "proposal-task",
+                  "label": "일정",
+                  "value": "핵심 문서 작성",
+                  "detail": null
+                }, {
+                  "id": "proposal-window",
+                  "label": "제안 시간",
+                  "value": "2026-08-09T09:00:00Z/2026-08-09T10:00:00Z",
+                  "detail": null
+                }],
+                "visualization": null,
+                "accessibility_summary": "승인 전 일정 블록"
+              }],
+              "actions": [{
+                "id": "accept:\(proposalID.uuidString.lowercased())",
+                "kind": "accept_proposal",
+                "label": "적용",
+                "proposal_id": "\(proposalID.uuidString.lowercased())",
+                "url": null
+              }],
+              "generated_at": "2026-08-09T00:00:00Z",
+              "timezone": "Asia/Seoul"
+            }
+            """
+
+        let scene = try GlanceJSON.decoder().decode(
+            WellnessScene.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(scene.modules.first?.kind, .proposalPreview)
+        XCTAssertEqual(scene.exactMutationPreview?.task, "핵심 문서 작성")
+        XCTAssertEqual(
+            scene.exactMutationPreview?.dateInterval?.duration,
+            3_600
+        )
+        let localizedWindow = try XCTUnwrap(
+            scene.exactMutationPreview?.localizedWindow(timezone: scene.timezone)
+        )
+        XCTAssertFalse(localizedWindow.contains("T09:00:00"))
+        XCTAssertFalse(localizedWindow.contains(proposalID.uuidString.lowercased()))
+        XCTAssertNoThrow(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL,
+                expectedProposalID: proposalID
+            )
+        )
+    }
+
+    func testWellnessSceneValidatorRejectsMutationWithoutExactActionPreview() {
+        let proposalID = UUID()
+        let scene = WellnessScene(
+            id: "missing-exact-action",
+            lens: .coordinate,
+            title: "Schedule change",
+            summary: "Approval requested",
+            severity: .action,
+            freshness: .current,
+            confidence: WellnessConfidence(level: .high, coverage: "proposal"),
+            modules: [
+                WellnessSceneModule(
+                    id: "proposal-preview",
+                    kind: .proposalPreview,
+                    title: "Proposal",
+                    summary: "Missing task and window",
+                    items: [
+                        WellnessSceneItem(
+                            id: "proposal-id",
+                            label: "proposal_id",
+                            value: proposalID.uuidString
+                        )
+                    ]
+                )
+            ],
+            actions: [
+                WellnessSceneAction(
+                    id: "accept",
+                    kind: .acceptProposal,
+                    label: "Apply",
+                    proposalID: proposalID
+                )
+            ]
+        )
+
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL,
+                expectedProposalID: proposalID
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? WellnessSceneValidationError,
+                .missingExactProposalPreview
+            )
+        }
+    }
+
+    func testWellnessSceneDecodesCalendarOwnershipAndProviderStatus() throws {
+        let json = """
+            {
+              "schema_version": "1",
+              "id": "calendar:metadata",
+              "intent": "review_schedule",
+              "lens": "coordinate",
+              "title": "캘린더",
+              "summary": "실제 provider 상태를 보존합니다.",
+              "severity": "neutral",
+              "freshness": "current",
+              "confidence": {
+                "level": "medium",
+                "coverage": "캘린더 1건",
+                "limitations": []
+              },
+              "modules": [{
+                "id": "calendar",
+                "kind": "calendar_canvas",
+                "title": "Calendar",
+                "summary": "Metadata",
+                "items": [],
+                "visualization": {
+                  "kind": "calendar_canvas",
+                  "unit": null,
+                  "minimum": null,
+                  "maximum": null,
+                  "series": [],
+                  "events": [{
+                    "id": "google:owned",
+                    "title": "Team sync",
+                    "starts_at": "2026-08-09T09:00:00Z",
+                    "ends_at": "2026-08-09T10:00:00Z",
+                    "provider": "google",
+                    "is_healthmes_managed": false,
+                    "energy_demand": "medium",
+                    "is_all_day": false,
+                    "is_recurring": true,
+                    "is_locked": true,
+                    "has_attendees": true,
+                    "organizer_self": false,
+                    "provider_status": "confirmed",
+                    "status": "current"
+                  }]
+                },
+                "accessibility_summary": "캘린더 일정 1건"
+              }],
+              "actions": [],
+              "generated_at": "2026-08-09T00:00:00Z",
+              "timezone": "America/Los_Angeles"
+            }
+            """
+
+        let scene = try GlanceJSON.decoder().decode(
+            WellnessScene.self,
+            from: Data(json.utf8)
+        )
+        let event = try XCTUnwrap(
+            scene.modules.first?.visualization?.events.first
+        )
+
+        XCTAssertEqual(scene.timezone, "America/Los_Angeles")
+        XCTAssertEqual(event.energyDemand, "medium")
+        XCTAssertFalse(event.organizerSelf)
+        XCTAssertEqual(event.providerStatus, "confirmed")
+        XCTAssertTrue(event.isRecurring)
+        XCTAssertTrue(event.isLocked)
+        XCTAssertTrue(event.hasAttendees)
+        XCTAssertNoThrow(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL
+            )
+        )
+    }
+
+    func testWellnessSceneValidatorRejectsModuleVisualizationMismatch() {
+        let scene = WellnessScene(
+            id: "mismatch",
+            lens: .now,
+            title: "Mismatch",
+            summary: "Mismatch",
+            severity: .neutral,
+            freshness: .current,
+            modules: [
+                WellnessSceneModule(
+                    id: "capacity",
+                    kind: .capacityBar,
+                    title: "Capacity",
+                    summary: "Capacity",
+                    visualization: WellnessVisualization(
+                        kind: .comparisonBar,
+                        series: [
+                            WellnessSeries(
+                                id: "capacity",
+                                label: "Capacity",
+                                points: [WellnessPoint(label: "Now", value: 62)]
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
+
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? WellnessSceneValidationError,
+                .moduleVisualizationMismatch
+            )
+        }
+    }
+
+    func testWellnessSceneValidatorRejectsDuplicateVisualizationIdentity() {
+        let duplicated = WellnessSeries(
+            id: "energy",
+            label: "Energy",
+            points: [WellnessPoint(label: "09", value: 60)]
+        )
+        let scene = WellnessScene(
+            id: "duplicate-series",
+            lens: .now,
+            title: "Energy",
+            summary: "Energy",
+            severity: .neutral,
+            freshness: .current,
+            modules: [
+                WellnessSceneModule(
+                    id: "energy",
+                    kind: .timeSeries,
+                    title: "Energy",
+                    summary: "Energy",
+                    visualization: WellnessVisualization(
+                        kind: .timeSeries,
+                        series: [duplicated, duplicated]
+                    )
+                )
+            ]
+        )
+
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? WellnessSceneValidationError,
+                .duplicateVisualizationID
+            )
+        }
+    }
+
+    func testWellnessSceneValidatorRejectsInvalidCalendarEventRange() {
+        let start = Date()
+        let scene = WellnessScene(
+            id: "invalid-event-range",
+            lens: .coordinate,
+            title: "Calendar",
+            summary: "Invalid event",
+            severity: .neutral,
+            freshness: .current,
+            modules: [
+                WellnessSceneModule(
+                    id: "calendar",
+                    kind: .calendarCanvas,
+                    title: "Calendar",
+                    summary: "Invalid event",
+                    visualization: WellnessVisualization(
+                        kind: .calendarCanvas,
+                        events: [
+                            WellnessCalendarEvent(
+                                id: "google:invalid",
+                                title: "Invalid",
+                                startsAt: start,
+                                endsAt: start,
+                                provider: "google",
+                                isHealthMesManaged: false
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
+
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? WellnessSceneValidationError,
+                .invalidCalendarEventRange
+            )
+        }
+    }
+
+    func testWellnessSceneValidatorFailsClosedForNonCurrentProposalActions() {
+        let proposalID = UUID()
+        for freshness in [
+            WellnessFreshness.stale,
+            .insufficientData,
+            .offline,
+        ] {
+            let scene = WellnessScene(
+                id: "non-current-\(freshness.rawValue)",
+                lens: .coordinate,
+                title: "Schedule",
+                summary: "No stale action",
+                severity: .action,
+                freshness: freshness,
+                confidence: WellnessConfidence(
+                    level: freshness == .insufficientData ? .insufficientData : .low,
+                    coverage: "Incomplete"
+                ),
+                modules: [
+                    WellnessSceneModule(
+                        id: "decision",
+                        kind: .decision,
+                        title: "Decision",
+                        summary: "Blocked"
+                    )
+                ],
+                actions: [
+                    WellnessSceneAction(
+                        id: "accept",
+                        kind: .acceptProposal,
+                        label: "Yes",
+                        proposalID: proposalID
+                    )
+                ]
+            )
+
+            XCTAssertFalse(scene.allowsProposalActions)
+            XCTAssertThrowsError(
+                try WellnessSceneValidator.validate(
+                    scene,
+                    pairedBaseURL: pairing.baseURL
+                )
+            ) { error in
+                XCTAssertEqual(
+                    error as? WellnessSceneValidationError,
+                    .nonCurrentMutation
+                )
+            }
+        }
+    }
+
+    func testWellnessSceneValidatorRejectsUnexpectedProposalIdentity() {
+        let shownProposalID = UUID()
+        let differentProposalID = UUID()
+        let scene = WellnessScene(
+            id: "proposal-mismatch",
+            lens: .coordinate,
+            title: "Schedule",
+            summary: "Review this exact proposal",
+            severity: .action,
+            freshness: .current,
+            modules: [
+                WellnessSceneModule(
+                    id: "decision",
+                    kind: .decision,
+                    title: "Decision",
+                    summary: "Exact proposal"
+                )
+            ],
+            actions: [
+                WellnessSceneAction(
+                    id: "accept",
+                    kind: .acceptProposal,
+                    label: "Yes",
+                    proposalID: differentProposalID
+                )
+            ]
+        )
+
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL,
+                expectedProposalID: shownProposalID
+            )
+        ) { error in
+            XCTAssertEqual(error as? WellnessSceneValidationError, .proposalMismatch)
+        }
+    }
+
+    func testWellnessSceneValidatorRejectsDuplicateCalendarIdentityAcrossModules() {
+        let start = Date()
+        let duplicatedEvent = WellnessCalendarEvent(
+            id: "google:same-event",
+            title: "Deep Work",
+            startsAt: start,
+            endsAt: start.addingTimeInterval(3_600),
+            provider: "google",
+            isHealthMesManaged: false
+        )
+        let scene = WellnessScene(
+            id: "duplicate-calendar-event",
+            lens: .coordinate,
+            title: "Calendar",
+            summary: "Duplicate event",
+            severity: .neutral,
+            freshness: .current,
+            modules: [
+                WellnessSceneModule(
+                    id: "calendar",
+                    kind: .calendarCanvas,
+                    title: "Calendar",
+                    summary: "Current",
+                    visualization: WellnessVisualization(
+                        kind: .calendarCanvas,
+                        events: [duplicatedEvent]
+                    )
+                ),
+                WellnessSceneModule(
+                    id: "comparison",
+                    kind: .scheduleComparison,
+                    title: "Comparison",
+                    summary: "Proposed",
+                    visualization: WellnessVisualization(
+                        kind: .scheduleComparison,
+                        events: [duplicatedEvent]
+                    )
+                ),
+            ]
+        )
+
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? WellnessSceneValidationError,
+                .duplicateVisualizationID
+            )
+        }
+    }
+
+    func testWellnessSceneValidatorRejectsEmptyOutOfRangeAndMisalignedSeries() {
+        func scene(_ visualization: WellnessVisualization) -> WellnessScene {
+            WellnessScene(
+                id: UUID().uuidString,
+                lens: .now,
+                title: "Energy",
+                summary: "Series",
+                severity: .neutral,
+                freshness: .current,
+                modules: [
+                    WellnessSceneModule(
+                        id: "energy",
+                        kind: .timeSeries,
+                        title: "Energy",
+                        summary: "Series",
+                        visualization: visualization
+                    )
+                ]
+            )
+        }
+
+        let empty = scene(
+            WellnessVisualization(
+                kind: .timeSeries,
+                series: [
+                    WellnessSeries(
+                        id: "empty",
+                        label: "Energy",
+                        points: [WellnessPoint(label: "09", value: nil)]
+                    )
+                ]
+            )
+        )
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(empty, pairedBaseURL: pairing.baseURL)
+        ) { error in
+            XCTAssertEqual(error as? WellnessSceneValidationError, .emptyVisualization)
+        }
+
+        let outOfRange = scene(
+            WellnessVisualization(
+                kind: .timeSeries,
+                minimum: 0,
+                maximum: 100,
+                series: [
+                    WellnessSeries(
+                        id: "overflow",
+                        label: "Energy",
+                        points: [WellnessPoint(label: "09", value: 150)]
+                    )
+                ]
+            )
+        )
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                outOfRange,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? WellnessSceneValidationError,
+                .visualizationValueOutOfRange
+            )
+        }
+
+        let misaligned = scene(
+            WellnessVisualization(
+                kind: .timeSeries,
+                series: [
+                    WellnessSeries(
+                        id: "primary",
+                        label: "Energy",
+                        points: [WellnessPoint(label: "09", value: 60)]
+                    ),
+                    WellnessSeries(
+                        id: "secondary",
+                        label: "Stress",
+                        points: [WellnessPoint(label: "10", value: 40)]
+                    ),
+                ]
+            )
+        )
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                misaligned,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(error as? WellnessSceneValidationError, .inconsistentXAxis)
+        }
+    }
+
+    func testWellnessSceneValidatorRejectsEmptyAndInvalidVisualizations() {
+        let emptyCalendar = WellnessScene(
+            id: "empty-calendar",
+            lens: .coordinate,
+            title: "Calendar",
+            summary: "No data",
+            severity: .neutral,
+            freshness: .insufficientData,
+            modules: [
+                WellnessSceneModule(
+                    id: "calendar",
+                    kind: .calendarCanvas,
+                    title: "Calendar",
+                    summary: "No data",
+                    visualization: WellnessVisualization(kind: .calendarCanvas)
+                )
+            ]
+        )
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                emptyCalendar,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(error as? WellnessSceneValidationError, .emptyVisualization)
+        }
+
+        let invalidRange = WellnessScene(
+            id: "invalid-range",
+            lens: .now,
+            title: "Energy",
+            summary: "Invalid",
+            severity: .neutral,
+            freshness: .current,
+            modules: [
+                WellnessSceneModule(
+                    id: "energy",
+                    kind: .energyCurve,
+                    title: "Energy",
+                    summary: "Invalid",
+                    visualization: WellnessVisualization(
+                        kind: .energyCurve,
+                        minimum: 100,
+                        maximum: 0,
+                        series: [
+                            WellnessSeries(
+                                id: "energy",
+                                label: "Energy",
+                                points: [WellnessPoint(label: "09", value: 70)]
+                            )
+                        ]
+                    )
+                )
+            ]
+        )
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                invalidRange,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? WellnessSceneValidationError,
+                .invalidVisualizationRange
+            )
+        }
+    }
+
+    func testScheduleComparisonAcceptsEventOnlyVisualization() throws {
+        let start = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-09T09:00:00Z"))
+        let comparison = WellnessVisualization(
+            kind: .scheduleComparison,
+            events: [
+                WellnessCalendarEvent(
+                    id: "proposal:1",
+                    title: "Deep Work",
+                    startsAt: start,
+                    endsAt: start.addingTimeInterval(3_600),
+                    provider: "healthmes",
+                    isHealthMesManaged: true,
+                    status: .proposed
+                )
+            ]
+        )
+        let scene = WellnessScene(
+            id: "schedule-comparison",
+            lens: .coordinate,
+            title: "Schedule change",
+            summary: "New block",
+            severity: .action,
+            freshness: .current,
+            modules: [
+                WellnessSceneModule(
+                    id: "comparison",
+                    kind: .scheduleComparison,
+                    title: "Before and after",
+                    summary: "New block",
+                    visualization: comparison
+                )
+            ]
+        )
+
+        XCTAssertNoThrow(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL
+            )
+        )
+    }
+
+    func testDisplayPolicyKeepsCalendarWhenItIsThirdVisualization() {
+        func module(_ id: String, _ kind: WellnessVisualizationKind) -> WellnessSceneModule {
+            let visualization: WellnessVisualization
+            if kind == .calendarCanvas {
+                visualization = WellnessVisualization(
+                    kind: kind,
+                    events: [
+                        WellnessCalendarEvent(
+                            id: "google:1",
+                            title: "Meeting",
+                            startsAt: Date(),
+                            endsAt: Date().addingTimeInterval(1_800),
+                            provider: "google",
+                            isHealthMesManaged: false
+                        )
+                    ]
+                )
+            } else {
+                visualization = WellnessVisualization(
+                    kind: kind,
+                    series: [
+                        WellnessSeries(
+                            id: id,
+                            label: id,
+                            points: [WellnessPoint(label: "now", value: 50)]
+                        )
+                    ]
+                )
+            }
+            return WellnessSceneModule(
+                id: id,
+                kind: WellnessModuleKind(rawValue: kind.rawValue) ?? .fallback,
+                title: id,
+                summary: id,
+                visualization: visualization
+            )
+        }
+        let scene = WellnessScene(
+            id: "priority",
+            lens: .coordinate,
+            title: "Priority",
+            summary: "Priority",
+            severity: .supportive,
+            freshness: .current,
+            modules: [
+                module("energy", .energyCurve),
+                module("goals", .comparisonBar),
+                module("calendar", .calendarCanvas),
+            ]
+        )
+
+        let visible = WellnessSceneDisplayPolicy.visibleModules(
+            in: scene,
+            maximumVisualizations: 2
+        )
+
+        XCTAssertEqual(visible.map(\.id), ["energy", "calendar"])
+    }
+
     func testWellnessCommandParserUsesLensesAndExplicitWritePrefixes() {
         XCTAssertEqual(
             WellnessCommandParser.parse("지금 내 상태 보여줘"),
@@ -495,6 +1477,14 @@ final class ProductContractTests: XCTestCase {
         XCTAssertNotEqual(
             ProposalStatusPresentation.detail(for: .accepted),
             ProposalStatusPresentation.detail(for: .pushed)
+        )
+    }
+
+    func testWatchDecisionLayoutKeepsThreeSecondActionsPinned() {
+        XCTAssertTrue(WatchDecisionLayoutPolicy.keepsActionsOutsideScrollContent)
+        XCTAssertGreaterThanOrEqual(
+            WatchDecisionLayoutPolicy.minimumButtonHeight,
+            42
         )
     }
 

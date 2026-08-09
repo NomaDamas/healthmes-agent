@@ -20,6 +20,12 @@ struct WellnessControlView: View {
     @State private var lens: WellnessLens = .now
     @State private var preview: CommandPreview?
     @State private var commandMessage: String?
+    @State private var generatedScene: WellnessScene?
+    @State private var generatedSceneOperation: PairingOperationToken?
+    @State private var isGeneratingScene = false
+    @State private var sceneOperationGate = PairingOperationGate()
+    @State private var resolutionOperationGate = PairingOperationGate()
+    @State private var resolvingSceneProposalID: UUID?
     @State private var lastFocusRequest = 0
     @State private var lastHomeRequest = 0
     @FocusState private var commandFocused: Bool
@@ -63,6 +69,7 @@ struct WellnessControlView: View {
                 endPoint: .bottomTrailing
             )
         )
+        .accessibilityIdentifier("healthmes-wellness-control")
         .navigationTitle(Text("HealthMes"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -86,6 +93,17 @@ struct WellnessControlView: View {
             if command.isListening || !transcript.isEmpty {
                 commandFocused = true
             }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .healthmesPairingChanged)
+        ) { _ in
+            invalidateGeneratedScene()
+            resolutionOperationGate.invalidate()
+            resolvingSceneProposalID = nil
+            briefing.resetForPairingChange()
+            plan.resetForPairingChange()
+            decisions.resetForPairingChange()
+            Task { await refreshAll() }
         }
         .onDisappear { command.reset() }
     }
@@ -176,13 +194,28 @@ struct WellnessControlView: View {
 
     @ViewBuilder
     private var sceneContent: some View {
-        switch lens {
-        case .now:
-            nowScene
-        case .coordinate:
-            coordinateScene
-        case .change:
-            changeScene
+        if isGeneratingScene {
+            ProductCard(kicker: "Wellness insight", systemImage: "sparkles") {
+                ProgressView("건강·일정·목표를 함께 보고 있습니다…")
+            }
+        } else if let generatedScene {
+            WellnessSceneRenderer(
+                scene: generatedScene,
+                maximumVisualizations: 2,
+                busyProposalIDs: briefing.busyProposalIDs.union(
+                    resolvingSceneProposalID.map { [$0] } ?? []
+                ),
+                onAction: handleSceneAction
+            )
+        } else {
+            switch lens {
+            case .now:
+                nowScene
+            case .coordinate:
+                coordinateScene
+            case .change:
+                changeScene
+            }
         }
     }
 
@@ -455,6 +488,7 @@ struct WellnessControlView: View {
                 )
                 .lineLimit(1...3)
                 .focused($commandFocused)
+                .accessibilityIdentifier("healthmes-command-input")
                 .textFieldStyle(.plain)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
@@ -533,14 +567,16 @@ struct WellnessControlView: View {
         switch intent {
         case .show(let target):
             selectDetail(target)
-            commandMessage = "\(detailTitle(for: target))를 현재 리모컨에 펼쳤습니다."
+            let query = command.transcript
             command.transcript = ""
+            Task { await loadScene(query: query) }
         case .createTask(let title):
             preview = CommandPreview(kind: .task, title: title)
         case .createGoal(let title):
             preview = CommandPreview(kind: .goal, title: title)
-        case .clarify:
-            commandMessage = "HealthMes는 임의로 일정을 바꾸지 않습니다. 현재 몸 상태, 일정과 목표, 이전 결정 결과를 물어보거나 `할 일:` 또는 `주간 목표:`로 명확히 입력하세요."
+        case .clarify(let query):
+            command.transcript = ""
+            Task { await loadScene(query: query) }
         }
     }
 
@@ -555,6 +591,7 @@ struct WellnessControlView: View {
     }
 
     private func selectDetail(_ target: WellnessLens, clearMessage: Bool = true) {
+        invalidateGeneratedScene()
         withAnimation(.easeOut(duration: 0.18)) {
             lens = target
             if clearMessage {
@@ -580,10 +617,172 @@ struct WellnessControlView: View {
     }
 
     private func refreshAll() async {
+        invalidateGeneratedScene()
+        guard let pairingSnapshot = PairingStore.shared.load() else { return }
+        let refreshOperation = sceneOperationGate.begin(pairing: pairingSnapshot)
         async let briefingRefresh: Void = briefing.refresh()
         async let planRefresh: Void = plan.refresh()
         async let decisionsRefresh: Void = decisions.refresh()
         _ = await (briefingRefresh, planRefresh, decisionsRefresh)
+        guard sceneOperationGate.isCurrent(
+            refreshOperation,
+            pairing: PairingStore.shared.load()
+        ) else { return }
+        if let proposal = ProactiveProposalSelection.firstEligible(
+            in: briefing.pendingProposals
+        ) {
+            await loadScene(
+                query: "\(proposal.id) 일정 제안을 현재 상태 기준으로 검토해줘",
+                source: .proactive,
+                proposalID: proposal.id,
+                decisionRecordID: proposal.decisionRecordId
+            )
+        } else {
+            await loadScene(query: sceneQuery(for: lens))
+        }
+    }
+
+    private func loadScene(
+        query: String,
+        source: WellnessSceneRequest.Source = .user,
+        proposalID: UUID? = nil,
+        decisionRecordID: UUID? = nil
+    ) async {
+        generatedScene = nil
+        generatedSceneOperation = nil
+        isGeneratingScene = true
+        commandMessage = nil
+        guard let pairingSnapshot = PairingStore.shared.load() else {
+            isGeneratingScene = false
+            commandMessage = "HealthMes 연결을 먼저 설정해 주세요."
+            return
+        }
+        let sceneOperation = sceneOperationGate.begin(
+            pairing: pairingSnapshot,
+            proposalID: proposalID
+        )
+        defer {
+            if sceneOperationGate.isCurrent(
+                sceneOperation,
+                pairing: PairingStore.shared.load()
+            ) {
+                isGeneratingScene = false
+            }
+        }
+        do {
+            let scene = try await HealthMesAPI().createWellnessScene(
+                query: query,
+                source: source,
+                proposalID: proposalID,
+                decisionRecordID: decisionRecordID,
+                pairing: pairingSnapshot
+            )
+            guard
+                sceneOperationGate.isCurrent(
+                    sceneOperation,
+                    pairing: PairingStore.shared.load()
+                )
+            else { return }
+            lens = scene.lens
+            generatedScene = scene
+            generatedSceneOperation = sceneOperation
+        } catch {
+            guard
+                sceneOperationGate.isCurrent(
+                    sceneOperation,
+                    pairing: PairingStore.shared.load()
+                )
+            else { return }
+            generatedScene = nil
+            generatedSceneOperation = nil
+            commandMessage = "Wellness insight를 불러오지 못했습니다. 연결 상태를 확인한 뒤 다시 시도하세요."
+        }
+    }
+
+    private func handleSceneAction(_ action: WellnessSceneAction) {
+        switch action.kind {
+        case .acceptProposal, .declineProposal:
+            guard
+                let sceneOperation = generatedSceneOperation,
+                sceneOperationGate.isCurrent(
+                    sceneOperation,
+                    pairing: PairingStore.shared.load()
+                ),
+                generatedScene?.allowsProposalActions == true,
+                let proposalID = action.proposalID,
+                sceneOperation.proposalID == nil
+                    || sceneOperation.proposalID == proposalID,
+                resolvingSceneProposalID == nil,
+                let proposal = briefing.pendingProposals.first(where: {
+                    $0.id == proposalID && $0.isActionable
+                })
+            else {
+                commandMessage = "이 제안은 더 이상 승인할 수 없습니다. 새로고침해 주세요."
+                return
+            }
+            resolvingSceneProposalID = proposalID
+            let proposalAction: ProposalAction =
+                action.kind == .acceptProposal ? .accept : .decline
+            let resolutionOperation = resolutionOperationGate.begin(
+                pairing: sceneOperation.pairing,
+                proposalID: proposalID
+            )
+            Task {
+                await briefing.resolve(
+                    proposal,
+                    action: proposalAction,
+                    pairing: sceneOperation.pairing
+                )
+                guard resolutionOperationGate.isCurrent(
+                    resolutionOperation,
+                    pairing: PairingStore.shared.load(),
+                    proposalID: proposalID
+                ) else { return }
+                resolvingSceneProposalID = nil
+                guard
+                    generatedSceneOperation == sceneOperation,
+                    sceneOperationGate.isCurrent(
+                        sceneOperation,
+                        pairing: PairingStore.shared.load(),
+                        proposalID: sceneOperation.proposalID
+                    )
+                else { return }
+                await refreshAll()
+            }
+        case .openWebDetail:
+            if let url = action.url {
+                router.openDecision(url)
+            }
+        case .refresh:
+            Task {
+                generatedScene = nil
+                await refreshAll()
+            }
+        case .switchLens:
+            if let value = action.value, let target = WellnessLens(rawValue: value) {
+                selectDetail(target)
+            }
+        case .modifyProposal, .createTask, .createGoal:
+            commandMessage = "이 동작은 확인 가능한 기존 흐름에서만 실행됩니다."
+        }
+    }
+
+    private func invalidateGeneratedScene() {
+        sceneOperationGate.invalidate()
+        generatedScene = nil
+        generatedSceneOperation = nil
+        isGeneratingScene = false
+    }
+
+    private func sceneQuery(for lens: WellnessLens) -> String {
+        switch lens {
+        case .now:
+            return "현재 몸 상태와 오늘 일정의 영향을 보여줘"
+        case .coordinate:
+            return "이번 주 일정과 목표를 현재 가용 에너지 기준으로 보여줘"
+        case .change:
+            return "최근 상태와 결정 결과에서 확인 가능한 변화만 보여줘"
+        }
     }
 
     private func statusPill(title: String, systemImage: String, color: Color) -> some View {

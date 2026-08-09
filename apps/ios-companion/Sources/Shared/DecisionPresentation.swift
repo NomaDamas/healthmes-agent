@@ -38,6 +38,34 @@ public struct PendingDecision: Identifiable, Equatable {
         alert?.exactDecisionURL
     }
 
+    public var primaryActionText: String {
+        prompt
+    }
+
+    public var watchActionTitle: String {
+        if let title = card?.title.trimmingCharacters(in: .whitespacesAndNewlines),
+            !title.isEmpty
+        {
+            return AlertNotificationContent.compactLine(title, limit: 28)
+        }
+        return String(localized: "Schedule adjustment")
+    }
+
+    public var watchReason: String? {
+        let value = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value, !value.isEmpty else { return nil }
+        return AlertNotificationContent.compactLine(value, limit: 42)
+    }
+
+    public var secondaryContextTitle: String? {
+        guard
+            let title = card?.title.trimmingCharacters(in: .whitespacesAndNewlines),
+            !title.isEmpty,
+            title.caseInsensitiveCompare(prompt) != .orderedSame
+        else { return nil }
+        return title
+    }
+
     public static func correlate(
         alerts: [AlertItem],
         proposals: [ProposalItem]

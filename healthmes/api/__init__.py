@@ -38,6 +38,7 @@ from healthmes.api import (
     sleep,
     storage,
     tasks,
+    wellness_scenes,
 )
 from healthmes.api.errors import install_error_handlers
 
@@ -59,6 +60,7 @@ routers: list[APIRouter] = [
     decisions.router,
     app_usage.router,
     briefing.router,
+    wellness_scenes.router,
     dashboard.router,
     alerts.router,
     reports.router,

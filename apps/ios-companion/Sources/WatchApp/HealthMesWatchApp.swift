@@ -54,12 +54,16 @@ final class WatchPairingReceiver: NSObject, WCSessionDelegate {
     private func applyContext(_ context: [String: Any]) {
         guard let baseURL = context[PairingSyncKeys.baseURL] as? String else { return }
         let token = context[PairingSyncKeys.token] as? String ?? ""
+        guard PairingContextApplication.apply(
+            baseURLString: baseURL,
+            token: token
+        ) else { return }
         if baseURL.isEmpty {
-            PairingStore.shared.clear()
             GlanceSnapshotCache.shared.clear()
-        } else {
-            _ = try? PairingStore.shared.save(baseURLString: baseURL, token: token)
         }
-        WidgetCenter.shared.reloadAllTimelines()
+        Task { @MainActor in
+            NotificationCenter.default.post(name: .healthmesPairingChanged, object: nil)
+            WidgetCenter.shared.reloadAllTimelines()
+        }
     }
 }

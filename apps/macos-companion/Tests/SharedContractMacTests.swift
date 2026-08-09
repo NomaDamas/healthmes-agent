@@ -105,8 +105,14 @@ final class SharedContractMacTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let payloadData = try fixtureData("glance")
+        let pairing = Pairing(
+            baseURL: URL(string: "https://healthmes.example")!,
+            token: "owner-token"
+        )
         cache.store(
             CachedGlance(
+                pairingFingerprint: pairing.cacheFingerprint,
+                pairingGeneration: 1,
                 etag: "\"abc123\"",
                 fetchedAt: Date(timeIntervalSince1970: 1_780_000_000),
                 maxAgeSeconds: 300,
@@ -116,6 +122,54 @@ final class SharedContractMacTests: XCTestCase {
         let loaded = try XCTUnwrap(cache.load())
         XCTAssertEqual(loaded.etag, "\"abc123\"")
         XCTAssertEqual(loaded.maxAgeSeconds, 300)
-        XCTAssertEqual(cache.decodedPayload()?.energy.score, 58)
+        let identity = PairingCacheIdentity(
+            fingerprint: pairing.cacheFingerprint,
+            generation: 1
+        )
+        XCTAssertEqual(cache.decodedPayload(for: identity)?.energy.score, 58)
+        let other = Pairing(
+            baseURL: URL(string: "https://healthmes.example")!,
+            token: "different-owner"
+        )
+        XCTAssertNil(
+            cache.decodedPayload(
+                for: PairingCacheIdentity(
+                    fingerprint: other.cacheFingerprint,
+                    generation: 1
+                )
+            )
+        )
+    }
+
+    func testGlanceSnapshotCacheRejectsOlderSameAccountWrite() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("healthmes-cache-order-\(UUID().uuidString)")
+        let cache = GlanceSnapshotCache(fileURL: directory.appendingPathComponent("snapshot.json"))
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payloadData = try fixtureData("glance")
+        let fingerprint = Pairing(
+            baseURL: URL(string: "https://healthmes.example")!,
+            token: "owner-token"
+        ).cacheFingerprint
+        let newer = CachedGlance(
+            pairingFingerprint: fingerprint,
+            pairingGeneration: 4,
+            etag: "\"newer\"",
+            fetchedAt: Date(timeIntervalSince1970: 1_780_000_200),
+            maxAgeSeconds: 300,
+            payloadData: payloadData
+        )
+        let older = CachedGlance(
+            pairingFingerprint: fingerprint,
+            pairingGeneration: 4,
+            etag: "\"older\"",
+            fetchedAt: Date(timeIntervalSince1970: 1_780_000_100),
+            maxAgeSeconds: 300,
+            payloadData: payloadData
+        )
+
+        XCTAssertTrue(cache.store(newer))
+        XCTAssertFalse(cache.store(older))
+        XCTAssertEqual(cache.load()?.etag, "\"newer\"")
     }
 }

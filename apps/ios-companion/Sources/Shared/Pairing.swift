@@ -1,5 +1,21 @@
+import CryptoKit
 import Foundation
 import Security
+
+public extension Notification.Name {
+    /// Posted whenever the active HealthMes account or credential changes.
+    static let healthmesPairingChanged = Notification.Name("healthmes.pairing.changed")
+}
+
+public struct PairingCacheIdentity: Codable, Equatable {
+    public let fingerprint: String
+    public let generation: UInt64
+
+    public init(fingerprint: String, generation: UInt64) {
+        self.fingerprint = fingerprint
+        self.generation = generation
+    }
+}
 
 // Pairing = the base URL + bearer token of the user's OWN healthmes
 // instance. Local-first contract (issue #7): this URL is the only network
@@ -10,17 +26,25 @@ import Security
 //   - API token  -> Keychain, using the App Group identifier as the keychain
 //                   access group so the widget extension can read it too.
 //
-// Unsigned simulator builds (CODE_SIGNING_ALLOWED=NO) have no entitlement to
-// enforce; SecItem calls that reject the access group (-34018) fall back to
-// the app's default keychain so development keeps working. On a signed
-// device build the access-group path is the real one — not yet verified on
-// hardware (see README).
+// Unsigned simulator and local Mac builds have no access-group entitlement.
+// They use the app's default keychain directly so startup never waits on an
+// invalid group query. Signed builds use the shared group only when the
+// entitlement is actually present.
 
 public enum AppGroup {
     public static let identifier = "group.com.healthmes.companion"
     public static var keychainIdentifier: String {
         Bundle.main.object(forInfoDictionaryKey: "HealthMesKeychainAccessGroup") as? String
             ?? identifier
+    }
+
+    public static var keychainAccessGroupForCurrentPlatform: String? {
+        #if os(macOS)
+            // The Mac companion project intentionally builds unsigned.
+            return nil
+        #else
+            return keychainIdentifier
+        #endif
     }
 
     public static var userDefaults: UserDefaults {
@@ -83,6 +107,33 @@ public struct Pairing: Equatable {
         self.baseURL = baseURL
         let trimmed = token?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.token = (trimmed?.isEmpty ?? true) ? nil : trimmed
+    }
+
+    public var cacheFingerprint: String {
+        let material = baseURL.absoluteString + "\u{0}" + (token ?? "")
+        return SHA256.hash(data: Data(material.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
+public enum PairingContextApplication {
+    @discardableResult
+    public static func apply(
+        baseURLString: String,
+        token: String,
+        pairingStore: PairingStore = .shared
+    ) -> Bool {
+        if baseURLString.isEmpty {
+            pairingStore.clear()
+            return true
+        }
+        do {
+            _ = try pairingStore.save(baseURLString: baseURLString, token: token)
+            return true
+        } catch {
+            return false
+        }
     }
 }
 
@@ -238,6 +289,8 @@ public final class PairingStore {
     public static let shared = PairingStore()
 
     private static let baseURLDefaultsKey = "healthmes.pairing.baseURL"
+    public static let fingerprintDefaultsKey = "healthmes.pairing.fingerprint"
+    public static let generationDefaultsKey = "healthmes.pairing.generation"
 
     private let defaults: UserDefaults
     private let keychain: PairingTokenStoring
@@ -326,7 +379,9 @@ public final class PairingStore {
             return nil
         }
         defaults.set(url.absoluteString, forKey: Self.baseURLDefaultsKey)
-        return Pairing(baseURL: url, token: token)
+        let pairing = Pairing(baseURL: url, token: token)
+        _ = ensureCacheIdentity(for: pairing)
+        return pairing
     }
 
     @discardableResult
@@ -341,6 +396,15 @@ public final class PairingStore {
         }
 
         let previousToken = keychain.readToken()
+        let pairing = Pairing(baseURL: url, token: trimmedToken)
+        let existingURL = defaults.string(forKey: Self.baseURLDefaultsKey)
+            .flatMap { try? Self.normalizeBaseURL($0) }
+        let existingToken = Pairing(baseURL: url, token: previousToken).token
+        if existingURL == url, existingToken == pairing.token {
+            defaults.set(url.absoluteString, forKey: Self.baseURLDefaultsKey)
+            _ = ensureCacheIdentity(for: pairing)
+            return pairing
+        }
         if trimmedToken.isEmpty {
             keychain.deleteToken()
         } else {
@@ -355,12 +419,69 @@ public final class PairingStore {
             }
         }
         defaults.set(url.absoluteString, forKey: Self.baseURLDefaultsKey)
-        return Pairing(baseURL: url, token: trimmedToken)
+        let nextGeneration = incrementedGeneration()
+        defaults.set(pairing.cacheFingerprint, forKey: Self.fingerprintDefaultsKey)
+        defaults.set(NSNumber(value: nextGeneration), forKey: Self.generationDefaultsKey)
+        return pairing
     }
 
     public func clear() {
+        let hadPairingState =
+            defaults.object(forKey: Self.baseURLDefaultsKey) != nil
+            || defaults.object(forKey: Self.fingerprintDefaultsKey) != nil
+            || keychain.readToken() != nil
+        let nextGeneration = hadPairingState ? incrementedGeneration() : nil
         defaults.removeObject(forKey: Self.baseURLDefaultsKey)
+        defaults.removeObject(forKey: Self.fingerprintDefaultsKey)
+        if let nextGeneration {
+            defaults.set(NSNumber(value: nextGeneration), forKey: Self.generationDefaultsKey)
+        }
         keychain.deleteToken()
+    }
+
+    public func cacheIdentity(for pairing: Pairing) -> PairingCacheIdentity? {
+        guard load() == pairing else { return nil }
+        return persistedCacheIdentity()
+    }
+
+    public static func persistedCacheIdentity(
+        defaults: UserDefaults = AppGroup.userDefaults
+    ) -> PairingCacheIdentity? {
+        guard
+            let fingerprint = defaults.string(forKey: fingerprintDefaultsKey),
+            !fingerprint.isEmpty,
+            let number = defaults.object(forKey: generationDefaultsKey) as? NSNumber,
+            number.uint64Value > 0
+        else { return nil }
+        return PairingCacheIdentity(
+            fingerprint: fingerprint,
+            generation: number.uint64Value
+        )
+    }
+
+    private func ensureCacheIdentity(for pairing: Pairing) -> PairingCacheIdentity {
+        if let identity = persistedCacheIdentity(),
+            identity.fingerprint == pairing.cacheFingerprint
+        {
+            return identity
+        }
+        let identity = PairingCacheIdentity(
+            fingerprint: pairing.cacheFingerprint,
+            generation: incrementedGeneration()
+        )
+        defaults.set(identity.fingerprint, forKey: Self.fingerprintDefaultsKey)
+        defaults.set(NSNumber(value: identity.generation), forKey: Self.generationDefaultsKey)
+        return identity
+    }
+
+    private func persistedCacheIdentity() -> PairingCacheIdentity? {
+        Self.persistedCacheIdentity(defaults: defaults)
+    }
+
+    private func incrementedGeneration() -> UInt64 {
+        let current =
+            (defaults.object(forKey: Self.generationDefaultsKey) as? NSNumber)?.uint64Value ?? 0
+        return current == UInt64.max ? 1 : current + 1
     }
 
     private func restoreToken(_ token: String?) {
@@ -379,13 +500,24 @@ public struct KeychainTokenStore: PairingTokenStoring {
     public init() {}
 
     public func readToken() -> String? {
-        readToken(accessGroup: AppGroup.keychainIdentifier) ?? readToken(accessGroup: nil)
+        if
+            let accessGroup = AppGroup.keychainAccessGroupForCurrentPlatform,
+            let token = readToken(accessGroup: accessGroup)
+        {
+            return token
+        }
+        return readToken(accessGroup: nil)
     }
 
     public func writeToken(_ token: String) throws {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw PairingError.credentialStorageFailed }
-        if upsert(token: trimmed, accessGroup: AppGroup.keychainIdentifier) { return }
+        if
+            let accessGroup = AppGroup.keychainAccessGroupForCurrentPlatform,
+            upsert(token: trimmed, accessGroup: accessGroup)
+        {
+            return
+        }
         // Unsigned/simulator fallback: no access-group entitlement available.
         guard upsert(token: trimmed, accessGroup: nil) else {
             throw PairingError.credentialStorageFailed
@@ -393,7 +525,9 @@ public struct KeychainTokenStore: PairingTokenStoring {
     }
 
     public func deleteToken() {
-        SecItemDelete(baseQuery(accessGroup: AppGroup.keychainIdentifier) as CFDictionary)
+        if let accessGroup = AppGroup.keychainAccessGroupForCurrentPlatform {
+            SecItemDelete(baseQuery(accessGroup: accessGroup) as CFDictionary)
+        }
         SecItemDelete(baseQuery(accessGroup: nil) as CFDictionary)
     }
 

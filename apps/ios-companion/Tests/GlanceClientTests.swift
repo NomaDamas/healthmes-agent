@@ -136,6 +136,17 @@ final class GlanceContractDecodingTests: XCTestCase {
 }
 
 final class GlanceClientBehaviourTests: XCTestCase {
+    func testAppGroupUsesPlatformAppropriateKeychainAccessGroup() {
+        #if os(macOS)
+            XCTAssertNil(AppGroup.keychainAccessGroupForCurrentPlatform)
+        #else
+            XCTAssertEqual(
+                AppGroup.keychainAccessGroupForCurrentPlatform,
+                AppGroup.keychainIdentifier
+            )
+        #endif
+    }
+
     private let pairing = Pairing(
         baseURL: URL(string: "http://192.168.1.20:8100")!,
         token: "secret-token"
@@ -298,6 +309,25 @@ final class GlanceClientBehaviourTests: XCTestCase {
         XCTAssertEqual(credentials.token, "secret")
     }
 
+    func testSavingIdenticalPairingPreservesCacheGeneration() throws {
+        let (store, defaults, _, suiteName) = try makePairingStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let pairing = try store.save(
+            baseURLString: "https://healthmes.example.com",
+            token: "secret"
+        )
+        let first = try XCTUnwrap(store.cacheIdentity(for: pairing))
+
+        let repeated = try store.save(
+            baseURLString: "https://healthmes.example.com/",
+            token: " secret "
+        )
+        let second = try XCTUnwrap(store.cacheIdentity(for: repeated))
+
+        XCTAssertEqual(repeated, pairing)
+        XCTAssertEqual(second, first)
+    }
+
     func testPairingStoreLoadRemovesLegacyInsecurePairingAndCredential() throws {
         let (store, defaults, credentials, suiteName) = try makePairingStore()
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -369,6 +399,25 @@ final class GlanceClientBehaviourTests: XCTestCase {
         }
         XCTAssertEqual(store.load(), original)
         XCTAssertEqual(credentials.token, "old-secret")
+    }
+
+    func testPairingContextApplicationDoesNotReplaceAccountWhenStorageFails() throws {
+        let (store, defaults, credentials, suiteName) = try makePairingStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let original = try store.save(
+            baseURLString: "https://first.healthmes.example",
+            token: "first-token"
+        )
+        credentials.failNextWrite = true
+
+        XCTAssertFalse(
+            PairingContextApplication.apply(
+                baseURLString: "https://second.healthmes.example",
+                token: "second-token",
+                pairingStore: store
+            )
+        )
+        XCTAssertEqual(store.load(), original)
     }
 
     func testWatchPairingContextCanBeRebuiltFromPersistedPairing() {
@@ -472,7 +521,17 @@ final class GlanceClientBehaviourTests: XCTestCase {
                 .appendingPathComponent("glance-test-\(UUID().uuidString).json")
         )
         defer { cache.clear() }
-        let client = GlanceClient(session: URLSession(configuration: configuration), cache: cache)
+        let (pairingStore, defaults, _, suiteName) = try makePairingStore()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let activePairing = try pairingStore.save(
+            baseURLString: "https://healthmes.example",
+            token: "secret-token"
+        )
+        let client = GlanceClient(
+            session: URLSession(configuration: configuration),
+            cache: cache,
+            pairingStore: pairingStore
+        )
 
         // First poll: unconditional, answered 200.
         StubURLProtocol.handler = { request in
@@ -483,7 +542,7 @@ final class GlanceClientBehaviourTests: XCTestCase {
             return (200, headers, body)
         }
         let now = Date(timeIntervalSince1970: 1_783_606_980)
-        let first = try await client.fetch(pairing: pairing, now: now)
+        let first = try await client.fetch(pairing: activePairing, now: now)
         XCTAssertFalse(first.revalidated)
         XCTAssertEqual(first.payload.energy.score, 58)
         XCTAssertEqual(first.nextRefresh, now.addingTimeInterval(300))
@@ -495,7 +554,7 @@ final class GlanceClientBehaviourTests: XCTestCase {
             return (304, headers, Data())
         }
         let later = now.addingTimeInterval(600)
-        let second = try await client.fetch(pairing: pairing, now: later)
+        let second = try await client.fetch(pairing: activePairing, now: later)
         XCTAssertTrue(second.revalidated)
         XCTAssertEqual(second.payload, first.payload)
         XCTAssertEqual(second.nextRefresh, later.addingTimeInterval(300))
@@ -504,7 +563,7 @@ final class GlanceClientBehaviourTests: XCTestCase {
         // Token rejection surfaces as .unauthorized.
         StubURLProtocol.handler = { _ in (401, [:], Data()) }
         do {
-            _ = try await client.fetch(pairing: pairing, now: later)
+            _ = try await client.fetch(pairing: activePairing, now: later)
             XCTFail("expected unauthorized")
         } catch GlanceClientError.unauthorized(let status) {
             XCTAssertEqual(status, 401)

@@ -23,7 +23,7 @@ import argparse
 import hashlib
 import sys
 import uuid
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -154,8 +154,10 @@ def wipe(session) -> int:
     n += session.query(WeeklyGoal).filter(
         WeeklyGoal.id.in_(DEMO_GOAL_IDS)
     ).delete(synchronize_session=False)
+    tz = _tz()
+    local_today = datetime.now(tz).date()
     week_ago_utc0 = naive_utc(
-        datetime.combine(date.today() - timedelta(days=6), time.min, tzinfo=_tz())
+        datetime.combine(local_today - timedelta(days=6), time.min, tzinfo=tz)
     )
     demo_energy = [
         e
@@ -176,9 +178,9 @@ def wipe(session) -> int:
 
 def seed(session) -> dict[str, str]:
     tz = _tz()
-    today = date.today()
-    week_start = today - timedelta(days=today.weekday())
     now_local = datetime.now(tz)
+    today = now_local.date()
+    week_start = today - timedelta(days=today.weekday())
 
     goal = WeeklyGoal(
         id=DEMO_GOAL_IDS[0],
@@ -281,16 +283,31 @@ def seed(session) -> dict[str, str]:
             {
                 "id": "in1",
                 "type": "input",
-                "label": "야간 수면 점수 68 (14일 평균 79)",
-                "detail": "open-wearables 내부 4-요소 수면 점수",
-                "children": [],
-            },
-            {
-                "id": "in2",
-                "type": "input",
-                "label": "오후 스트레스 71 (baseline+38%)",
-                "detail": "Garmin 스트레스, 13:20-14:40 구간",
-                "children": [],
+                "label": "health evidence",
+                "detail": {
+                    "sleep_confidence": "high",
+                    "recovery_confidence": "medium",
+                    "sleep_score": 68,
+                    "sleep_baseline": 79,
+                    "stress": 71,
+                    "stress_baseline_delta_percent": 38,
+                },
+                "children": [
+                    {
+                        "id": "in1-sleep",
+                        "type": "input",
+                        "label": "야간 수면 점수 68 (14일 평균 79)",
+                        "detail": "open-wearables 내부 4-요소 수면 점수",
+                        "children": [],
+                    },
+                    {
+                        "id": "in1-stress",
+                        "type": "input",
+                        "label": "오후 스트레스 71 (baseline+38%)",
+                        "detail": "Garmin 스트레스, 13:20-14:40 구간",
+                        "children": [],
+                    },
+                ],
             },
             {
                 "id": "in3",

@@ -125,6 +125,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # entrypoint then refuses non-loopback binds (healthmes/__main__.py).
     install_auth(app, settings)
 
+    @app.middleware("http")
+    async def _wellness_scene_no_store(request, call_next):
+        """Keep wellness inputs and proposal identities out of all caches."""
+        response = await call_next(request)
+        if request.url.path == "/v1/wellness/scenes":
+            response.headers["Cache-Control"] = "private, no-store"
+        return response
+
     # Serve the MCP app from the router's *default* handler (the last resort
     # invoked only when no FastAPI route matched). The bare-mount recipe
     # (`app.mount("", mcp_app)`, proven by tests/mcp_server/test_server_app.py)

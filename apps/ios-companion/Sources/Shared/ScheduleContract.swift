@@ -80,9 +80,26 @@ public struct ProposalItem: Codable, Equatable, Identifiable {
             && acceptResolutionToken != nil
             && declineResolutionToken != nil
     }
+
+    public var canComposeProactiveScene: Bool {
+        isActionable && decisionRecordId != nil
+    }
 }
 
 public typealias ProposalsPage = APIPage<ProposalItem>
+
+public enum ProactiveProposalSelection {
+    public static func firstEligible(in proposals: [ProposalItem]) -> ProposalItem? {
+        proposals.first(where: \.canComposeProactiveScene)
+    }
+
+    public static func containsEligibleProposal(
+        id: UUID,
+        in proposals: [ProposalItem]
+    ) -> Bool {
+        proposals.contains { $0.id == id && $0.canComposeProactiveScene }
+    }
+}
 
 public enum ProposalAction: String {
     case accept

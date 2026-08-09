@@ -17,9 +17,14 @@ final class CompanionUITests: XCTestCase {
 
     private func launchPairedApp() throws -> XCUIApplication {
         let app = XCUIApplication()
+        app.launchArguments += [
+            "-healthmes-ui-test-base-url",
+            "http://127.0.0.1:8201",
+        ]
         app.launch()
-        // Paired + reachable == the energy card appears with live data.
-        guard app.staticTexts["인지 에너지"].waitForExistence(timeout: 15) else {
+        // Wait for the stable control-canvas contract. The initial body card
+        // can be replaced immediately by a generated wellness scene.
+        guard app.otherElements["healthmes-wellness-control"].waitForExistence(timeout: 15) else {
             throw XCTSkip(
                 "No paired live instance — serve healthmes and pair first (README)."
             )
@@ -46,8 +51,14 @@ final class CompanionUITests: XCTestCase {
     func testDailyLoopSurfacesRenderAgainstLiveInstance() throws {
         let app = try launchPairedApp()
 
-        XCTAssertTrue(app.staticTexts["몸 → 오늘 계획"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["인지 에너지"].exists)
+        let currentScene = app.staticTexts.matching(
+            NSPredicate(
+                format: "label == %@ OR label == %@",
+                "HealthMes가 먼저 찾은 조정",
+                "오늘 피로가 계획에 미치는 영향"
+            )
+        ).firstMatch
+        XCTAssertTrue(currentScene.waitForExistence(timeout: 15))
         XCTAssertTrue(app.textFields.firstMatch.exists)
         XCTAssertFalse(app.buttons["조율"].exists)
         XCTAssertFalse(app.buttons["변화"].exists)
@@ -71,13 +82,48 @@ final class CompanionUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Alert digest"].exists)
     }
 
+    /// The seeded proactive proposal exposes real controls, while a later
+    /// uncorrelated command stays read-only instead of approving by inference.
+    func testWellnessCommandRendersScheduleScene() throws {
+        let app = try launchPairedApp()
+        XCTAssertTrue(
+            app.staticTexts["HealthMes가 먼저 찾은 조정"].waitForExistence(timeout: 15)
+        )
+        guard app.buttons["유지"].exists, app.buttons["적용"].exists else {
+            throw XCTSkip("No actionable health-backed proposal seeded for live UI QA.")
+        }
+
+        let command = app.textFields.firstMatch
+        XCTAssertTrue(command.exists)
+
+        command.tap()
+        command.typeText("adjust today schedule")
+        app.buttons["Run command"].tap()
+
+        XCTAssertTrue(
+            app.staticTexts["현재 몸 상태에 맞춘 일정 조율"].waitForExistence(timeout: 15)
+        )
+        XCTAssertTrue(app.staticTexts["일정 블록 제안"].exists)
+        XCTAssertFalse(app.buttons["유지"].exists)
+        XCTAssertFalse(app.buttons["적용"].exists)
+
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "HealthMes generative schedule scene"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
     /// Acceptance sketch #2/#5: Apply on a pending proposal calls the real
     /// accept endpoint; the row resolves and the confirmation banner shows.
     /// Needs a seeded `proposed` proposal (the smoke script creates one).
-    func testApplyProposalRoundTrip() throws {
+    func testZZApplyProposalRoundTrip() throws {
         let app = try launchPairedApp()
 
-        let apply = app.buttons["변경 승인"].firstMatch
+        let generatedApply = app.buttons["적용"].firstMatch
+        let legacyApply = app.buttons["변경 승인"].firstMatch
+        let apply = generatedApply.waitForExistence(timeout: 10)
+            ? generatedApply
+            : legacyApply
         guard apply.waitForExistence(timeout: 10) else {
             throw XCTSkip("No pending proposal seeded — nothing to apply.")
         }

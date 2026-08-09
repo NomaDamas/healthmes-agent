@@ -23,8 +23,12 @@ public final class MacDecisionAPI {
     }
 
     public func listDecisions() async throws -> MacDecisionsPage {
+        try await listDecisions(pairing: try pairing())
+    }
+
+    public func listDecisions(pairing: Pairing) async throws -> MacDecisionsPage {
         try await perform(
-            Self.decisionsRequest(pairing: try pairing()), expecting: MacDecisionsPage.self
+            Self.decisionsRequest(pairing: pairing), expecting: MacDecisionsPage.self
         )
     }
 

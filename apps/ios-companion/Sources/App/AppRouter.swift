@@ -1,12 +1,6 @@
 import Foundation
 import SwiftUI
 
-extension Notification.Name {
-    /// Posted by the pairing screen after save/unpair so every surface
-    /// (root gate, home model, watch sync) reloads its pairing-derived state.
-    static let healthmesPairingChanged = Notification.Name("healthmes.pairing.changed")
-}
-
 /// A URL wrapped for `.sheet(item:)` presentation.
 struct DecisionSheetTarget: Identifiable {
     let id = UUID()

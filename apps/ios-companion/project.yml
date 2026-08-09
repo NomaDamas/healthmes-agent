@@ -47,6 +47,7 @@ targets:
     dependencies:
       - target: HealthMesWidgets
       - target: HealthMesNotificationContent
+      - target: HealthMesWatchApp
     settings:
       base:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -184,11 +185,10 @@ targets:
           - $(AppIdentifierPrefix)group.com.healthmes.companion
 
   # ------------------------------------------------------------- watchOS app
-  # Modern single-target watch app. Declared as companion of the iOS app so
-  # WatchConnectivity can push the pairing from the phone; it can also run
-  # (and fetch) independently once paired. NOT embedded into the iOS app —
-  # distribution embedding is out of scope until real-device signing exists
-  # (README "not yet verified").
+  # Modern single-target watch app. It is embedded in the iOS companion so
+  # paired simulator and signed-device installs preserve the counterpart
+  # relationship required by WatchConnectivity. It can also fetch
+  # independently after receiving the pairing from the phone.
   HealthMesWatchApp:
     type: application
     platform: watchOS

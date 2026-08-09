@@ -17,6 +17,8 @@ final class MacDashboardStore: ObservableObject {
     private let api: HealthMesAPI
     private let decisionAPI: MacDecisionAPI
     private let pairingStore: PairingStore
+    private var refreshGate = LatestRefreshGate()
+    private var saveGeneration: UInt = 0
 
     init(
         api: HealthMesAPI = HealthMesAPI(),
@@ -33,72 +35,109 @@ final class MacDashboardStore: ObservableObject {
     }
 
     func refresh() async {
-        guard pairing != nil else {
-            clear()
+        let refreshID = refreshGate.begin()
+        guard let pairingSnapshot = pairing else {
+            resetForPairingChange()
             return
         }
-        guard !isRefreshing else { return }
+        let visibleCalendarRange = Self.visibleCalendarRange()
         isRefreshing = true
-        defer { isRefreshing = false }
+        defer {
+            if refreshGate.isCurrent(refreshID) {
+                isRefreshing = false
+            }
+        }
 
-        var errors: [String] = []
-        do {
-            goals = try await api.listGoals(
+        async let goalsResult: Result<WeeklyGoalsPage, Error> = productRefreshResult {
+            try await api.listGoals(
+                pairing: pairingSnapshot,
                 weekStart: ProductDateFormat.weekStart(containing: Date()),
                 status: "active"
-            ).data
-        } catch {
-            errors.append(describe(error, surface: "Goals"))
+            )
         }
-        do {
-            tasks = try await api.listTasks().data
-        } catch {
-            errors.append(describe(error, surface: "Tasks"))
+        async let tasksResult: Result<TasksPage, Error> = productRefreshResult {
+            try await api.listTasks(pairing: pairingSnapshot)
         }
-        do {
-            let range = Self.visibleCalendarRange()
-            events = try await api.listScheduleEvents(
-                start: range.start, end: range.end
-            ).data
-        } catch {
-            errors.append(describe(error, surface: "Calendar"))
+        async let eventsResult: Result<CalendarEventsPage, Error> = productRefreshResult {
+            return try await api.listScheduleEvents(
+                pairing: pairingSnapshot,
+                start: visibleCalendarRange.start,
+                end: visibleCalendarRange.end
+            )
         }
-        do {
-            decisions = try await decisionAPI.listDecisions().data
-        } catch {
-            errors.append(describe(error, surface: "Decisions"))
+        async let decisionsResult: Result<MacDecisionsPage, Error> = productRefreshResult {
+            try await decisionAPI.listDecisions(pairing: pairingSnapshot)
         }
-        do {
-            weeklyReport = try await api.weeklyReport()
-        } catch {
+        async let reportResult: Result<WeeklyReport, Error> = productRefreshResult {
+            try await api.weeklyReport(pairing: pairingSnapshot)
+        }
+        let results = await (
+            goalsResult,
+            tasksResult,
+            eventsResult,
+            decisionsResult,
+            reportResult
+        )
+        guard
+            refreshGate.isCurrent(refreshID),
+            pairing == pairingSnapshot
+        else { return }
+
+        var errors: [String] = []
+        switch results.0 {
+        case .success(let page): goals = page.data
+        case .failure(let error): errors.append(describe(error, surface: "Goals"))
+        }
+        switch results.1 {
+        case .success(let page): tasks = page.data
+        case .failure(let error): errors.append(describe(error, surface: "Tasks"))
+        }
+        switch results.2 {
+        case .success(let page): events = page.data
+        case .failure(let error): errors.append(describe(error, surface: "Calendar"))
+        }
+        switch results.3 {
+        case .success(let page): decisions = page.data
+        case .failure(let error): errors.append(describe(error, surface: "Decisions"))
+        }
+        switch results.4 {
+        case .success(let report): weeklyReport = report
+        case .failure(let error):
             errors.append(describe(error, surface: "Weekly report"))
         }
-
         errorMessages = errors
         lastUpdated = Date()
     }
 
     @discardableResult
     func createTask(title: String) async -> Bool {
-        await savePlanItem(
+        guard let pairingSnapshot = pairing else { return false }
+        return await savePlanItem(
             title: title,
+            pairing: pairingSnapshot,
             successMessage: String(localized: "Task added to Plan")
         ) { title in
-            _ = try await api.createTask(TaskCreateBody(title: title))
+            _ = try await api.createTask(
+                TaskCreateBody(title: title),
+                pairing: pairingSnapshot
+            )
         }
     }
 
     @discardableResult
     func createGoal(title: String) async -> Bool {
-        await savePlanItem(
+        guard let pairingSnapshot = pairing else { return false }
+        return await savePlanItem(
             title: title,
+            pairing: pairingSnapshot,
             successMessage: String(localized: "Weekly goal added to Plan")
         ) { title in
             _ = try await api.createGoal(
                 WeeklyGoalCreateBody(
                     weekStart: ProductDateFormat.weekStart(containing: Date()),
                     title: title
-                )
+                ),
+                pairing: pairingSnapshot
             )
         }
     }
@@ -110,28 +149,46 @@ final class MacDashboardStore: ObservableObject {
 
     private func savePlanItem(
         title: String,
+        pairing: Pairing,
         successMessage: String,
         operation: (String) async throws -> Void
     ) async -> Bool {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isSavingPlanItem else { return false }
+        saveGeneration &+= 1
+        let generation = saveGeneration
         isSavingPlanItem = true
         planSaveMessage = nil
         planSaveSucceeded = false
-        defer { isSavingPlanItem = false }
+        defer {
+            if generation == saveGeneration {
+                isSavingPlanItem = false
+            }
+        }
         do {
             try await operation(trimmed)
+            guard generation == saveGeneration, self.pairing == pairing else {
+                return false
+            }
             planSaveMessage = successMessage
             planSaveSucceeded = true
             await refresh()
+            guard generation == saveGeneration, self.pairing == pairing else {
+                return false
+            }
             return true
         } catch {
+            guard generation == saveGeneration, self.pairing == pairing else {
+                return false
+            }
             planSaveMessage = describe(error, surface: "Plan")
             return false
         }
     }
 
-    private func clear() {
+    func resetForPairingChange() {
+        _ = refreshGate.begin()
+        saveGeneration &+= 1
         goals = []
         tasks = []
         events = []
@@ -139,6 +196,10 @@ final class MacDashboardStore: ObservableObject {
         weeklyReport = nil
         errorMessages = []
         lastUpdated = nil
+        isRefreshing = false
+        isSavingPlanItem = false
+        planSaveMessage = nil
+        planSaveSucceeded = false
     }
 
     private func describe(_ error: Error, surface: String) -> String {
