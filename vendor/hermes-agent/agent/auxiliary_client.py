@@ -105,7 +105,14 @@ from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_lengt
 from agent.process_bootstrap import build_keepalive_http_client
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
-from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
+from utils import (
+    base_url_host_matches,
+    base_url_hostname,
+    env_float,
+    is_truthy_value,
+    model_forces_max_completion_tokens,
+    normalize_proxy_env_vars,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2184,6 +2191,33 @@ def _read_main_base_url() -> str:
     return ""
 
 
+def _read_smart_model_routing() -> tuple[str, Optional[str], bool]:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        return "", None, False
+
+    routing = cfg.get("smart_model_routing") if isinstance(cfg, dict) else None
+    if not isinstance(routing, dict):
+        return "", None, False
+
+    enabled = routing.get("enabled", False)
+    if isinstance(enabled, str):
+        enabled = is_truthy_value(enabled)
+    else:
+        enabled = bool(enabled)
+    if not enabled:
+        return "", None, False
+
+    forced_provider = str(routing.get("force_provider") or "").strip().lower()
+    if not forced_provider:
+        return "", None, False
+
+    forced_model = str(routing.get("force_model") or "").strip() or None
+    return forced_provider, forced_model, True
+
+
 def _read_main_api_key_if_same_host(aux_base_url: str) -> str:
     """Return the main api_key only when *aux_base_url* points at the same
     host as the main model's base_url.
@@ -3708,6 +3742,13 @@ def _try_payment_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    if _read_smart_model_routing()[2]:
+        logger.debug(
+            "Auxiliary %s: smart_model_routing is enabled; skipping payment fallback",
+            task or "call",
+        )
+        return None, None, ""
+
     # Normalise the failed provider label for matching.
     skip = failed_provider.lower().strip()
     # Also skip Step-1 main-provider path if it maps to the same backend.
@@ -3764,6 +3805,9 @@ def _try_main_agent_model_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    if _read_smart_model_routing()[2]:
+        return None, None, ""
+
     main_provider = (_read_main_provider() or "").strip()
     main_model = (_read_main_model() or "").strip()
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
@@ -4138,6 +4182,26 @@ def _resolve_auto(
         runtime_api_key = _RUNTIME_MAIN_API_KEY
     if not runtime_api_mode and _RUNTIME_MAIN_API_MODE:
         runtime_api_mode = _RUNTIME_MAIN_API_MODE
+
+    _sm_provider, _sm_model, _sm_enabled = _read_smart_model_routing()
+    if _sm_enabled and _sm_provider:
+        client, resolved = resolve_provider_client(
+            provider=_sm_provider,
+            model=_sm_model,
+        )
+        if client is not None:
+            logger.info(
+                "Auxiliary auto-detect: using smart routing provider=%s model=%s",
+                _sm_provider,
+                resolved or _sm_model or "default",
+            )
+            return client, resolved or _sm_model
+        logger.warning(
+            "Auxiliary auto-detect: smart routing provider=%r is unavailable; "
+            "skipping all fallback providers",
+            _sm_provider,
+        )
+        return None, None
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"

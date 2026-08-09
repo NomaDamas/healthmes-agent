@@ -51,16 +51,16 @@ class TestRuntimeEnablement:
         assert jobs.enabled_sources(settings) == (CalendarSource.GOOGLE,)
         assert jobs.write_source(settings) is CalendarSource.GOOGLE
 
-    def test_both_runtime_connections_keep_google_as_writer(self, settings) -> None:
+    def test_both_runtime_connections_prefer_icloud_as_writer(self, settings) -> None:
         write_google_token(settings.data_dir)
         creds.save_caldav_credentials(
             settings.data_dir, username="me@icloud.com", app_password="pw", url="https://c.test"
         )
         assert jobs.enabled_sources(settings) == (
-            CalendarSource.GOOGLE,
             CalendarSource.CALDAV,
+            CalendarSource.GOOGLE,
         )
-        assert jobs.write_source(settings) is CalendarSource.GOOGLE
+        assert jobs.write_source(settings) is CalendarSource.CALDAV
 
     def test_broken_google_token_does_not_enable(self, settings) -> None:
         token = settings.data_dir / "google" / "calendar_token.json"
@@ -73,8 +73,8 @@ class TestRuntimeEnablement:
             update={"google_calendar_enabled": True, "caldav_enabled": True}
         )
         assert jobs.enabled_sources(enabled) == (
-            CalendarSource.GOOGLE,
             CalendarSource.CALDAV,
+            CalendarSource.GOOGLE,
         )
 
 

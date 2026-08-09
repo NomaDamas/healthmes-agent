@@ -238,6 +238,101 @@ class TestTrustedSessionProof:
         assert signed.items() >= arguments.items()
         assert signed["trusted_session_proof"].count(".") == 1
 
+    def test_staged_calendar_approval_receives_proof(self, monkeypatch):
+        from gateway.session_context import (
+            clear_session_vars,
+            set_session_vars,
+            set_trusted_tool_approvals,
+        )
+        from tools.mcp_tool import _trusted_session_call_arguments
+
+        monkeypatch.setenv(
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+            "vendor-test-secret-at-least-32-characters",
+        )
+        arguments = {
+            "proposal_id": "proposal-1",
+            "action": "accept",
+            "reply_handle": "handle-1",
+        }
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="chat-1",
+            user_id="user-1",
+            message_id="message-1",
+            message_text="1 승인",
+        )
+        try:
+            set_trusted_tool_approvals(
+                (
+                    (
+                        "resolve_schedule_proposal",
+                        (
+                            ("proposal_id", "proposal-1"),
+                            ("action", "accept"),
+                            ("reply_handle", "handle-1"),
+                        ),
+                    ),
+                )
+            )
+            signed = _trusted_session_call_arguments(
+                self._server(),
+                "resolve_schedule_proposal",
+                arguments,
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert signed.items() >= arguments.items()
+        assert signed["trusted_session_proof"].count(".") == 1
+
+    def test_staged_calendar_approval_rejects_changed_arguments(self, monkeypatch):
+        from gateway.session_context import (
+            clear_session_vars,
+            set_session_vars,
+            set_trusted_tool_approvals,
+        )
+        from tools.mcp_tool import _trusted_session_call_arguments
+
+        monkeypatch.setenv(
+            "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
+            "vendor-test-secret-at-least-32-characters",
+        )
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="chat-1",
+            user_id="user-1",
+            message_id="message-1",
+            message_text="1 승인",
+        )
+        arguments = {
+            "proposal_id": "proposal-1",
+            "action": "accept",
+            "reply_handle": "changed-handle",
+        }
+        try:
+            set_trusted_tool_approvals(
+                (
+                    (
+                        "resolve_schedule_proposal",
+                        (
+                            ("proposal_id", "proposal-1"),
+                            ("action", "accept"),
+                            ("reply_handle", "handle-1"),
+                        ),
+                    ),
+                )
+            )
+            unsigned = _trusted_session_call_arguments(
+                self._server(),
+                "resolve_schedule_proposal",
+                arguments,
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert unsigned == arguments
+
     @pytest.mark.parametrize(
         "session",
         [

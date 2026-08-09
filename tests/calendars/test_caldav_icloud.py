@@ -33,6 +33,10 @@ class NotFoundError(Exception):
     """Stub matching caldav.lib.error.NotFoundError by class name."""
 
 
+class PreconditionFailedError(Exception):
+    status_code = 412
+
+
 class FakeDavResponse:
     def __init__(self, status: int, headers: dict[str, str] | None = None) -> None:
         self.status = status
@@ -385,6 +389,65 @@ class TestCreateEvent:
         assert len(calendar.objects) == 1
         assert len(calendar.added_icals) == 1
 
+    def test_identity_create_falls_back_when_icloud_rejects_uid_report(
+        self, backend, calendar, monkeypatch
+    ) -> None:
+        draft = EventDraft(
+            summary="수면 (실제)",
+            start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+            end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+            identity=CalendarEventIdentity(
+                kind=HealthmesEventKind.ACTUAL_SLEEP,
+                source="oura",
+                source_key="oura:2026-07-26",
+            ),
+        )
+
+        def rejected_uid_report(_: str) -> FakeCalDavObject:
+            raise PreconditionFailedError("iCloud rejected UID REPORT")
+
+        monkeypatch.setattr(calendar, "event_by_uid", rejected_uid_report)
+
+        created = backend.create_event(draft)
+
+        assert created.identity == draft.identity
+        assert len(calendar.added_icals) == 1
+
+    def test_identity_create_uses_conditional_put_when_icloud_rejects_save(
+        self, backend, calendar, monkeypatch
+    ) -> None:
+        draft = EventDraft(
+            summary="수면 (실제)",
+            start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
+            end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
+            identity=CalendarEventIdentity(
+                kind=HealthmesEventKind.ACTUAL_SLEEP,
+                source="oura",
+                source_key="oura:2026-07-26",
+            ),
+        )
+        writes: list[tuple[str, str, dict[str, str]]] = []
+
+        def rejected_uid_report(_: str) -> FakeCalDavObject:
+            raise PreconditionFailedError("iCloud rejected UID REPORT")
+
+        def rejected_add_event(**_: object) -> FakeCalDavObject:
+            raise PreconditionFailedError("412 Precondition Failed")
+
+        class ConditionalClient:
+            def put(self, url: object, body: str, headers: dict[str, str]) -> FakeDavResponse:
+                writes.append((str(url), body, headers))
+                return FakeDavResponse(201)
+
+        monkeypatch.setattr(calendar, "event_by_uid", rejected_uid_report)
+        monkeypatch.setattr(calendar, "add_event", rejected_add_event)
+        calendar.client = ConditionalClient()
+
+        created = backend.create_event(draft)
+
+        assert created.identity == draft.identity
+        assert writes[0][2]["If-None-Match"] == "*"
+
     def test_identity_create_does_not_overwrite_a_concurrent_foreign_event(
         self, backend, calendar, monkeypatch
     ) -> None:
@@ -500,6 +563,21 @@ class TestUpdateAndDelete:
         backend.delete_event("mine@healthmes")
         assert calendar.deleted_uids == ["mine@healthmes"]
         assert "mine@healthmes" not in calendar.objects
+
+    def test_delete_loads_a_missing_etag_before_conditional_delete(
+        self, backend, calendar, monkeypatch
+    ) -> None:
+        obj = calendar.put(make_component("mine@healthmes", agent=True), etag=None)
+
+        def load() -> FakeCalDavObject:
+            obj.props[ETAG_PROPERTY_TAG] = '"loaded"'
+            return obj
+
+        monkeypatch.setattr(obj, "load", load, raising=False)
+
+        backend.delete_event("mine@healthmes")
+
+        assert calendar.deleted_uids == ["mine@healthmes"]
 
     def test_delete_refuses_untagged_event(self, backend, calendar) -> None:
         calendar.put(make_component("theirs", agent=False))

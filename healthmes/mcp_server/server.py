@@ -70,7 +70,7 @@ from healthmes.calendars.adjustments import (
 from healthmes.calendars.approval import ApprovalCalendar, calendar_approval_target
 from healthmes.calendars.base import CalendarError, HealthmesEventKind
 from healthmes.calendars.google import GoogleCalendarBackend
-from healthmes.calendars.jobs import _build_backend, write_source
+from healthmes.calendars.jobs import _build_backend, build_calendar_job, write_source
 from healthmes.calendars.sleep_context import (
     actual_sleep_context,
     actual_sleep_observation_context,
@@ -85,6 +85,7 @@ from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_sing
 from healthmes.store import (
     AppUsageSample,
     CalendarEventMirror,
+    CalendarSource,
     DecisionKind,
     DecisionRecord,
     EnergyDemand,
@@ -2597,7 +2598,58 @@ def resolve_schedule_proposal(
             "proposal_status": _enum_value(proposal.status),
             "calendar_write": "queued" if target is ProposalStatus.ACCEPTED else "unchanged",
         }
+    if target is ProposalStatus.ACCEPTED:
+        result.update(_flush_accepted_schedule_proposal(proposal_uuid))
     return {"status": "ok", "proposal": result}
+
+
+def _flush_accepted_schedule_proposal(proposal_id: uuid.UUID) -> dict[str, Any]:
+    settings = _active_settings()
+    source = write_source(settings)
+    if source is None:
+        return {"calendar_write": "queued", "provider_read_back": False}
+    build_calendar_job(settings, source, is_write_backend=True)()
+    with _store_session() as session:
+        proposal = session.get(ScheduleProposal, proposal_id)
+        if proposal is None or proposal.status is not ProposalStatus.PUSHED:
+            return {
+                "calendar_write": "queued",
+                "calendar_provider": source.value,
+                "provider_read_back": False,
+            }
+        row = session.scalars(
+            select(CalendarEventMirror).where(
+                CalendarEventMirror.calendar_source == source,
+                CalendarEventMirror.agent_task_id == proposal.task_id,
+                CalendarEventMirror.is_agent_created.is_(True),
+            )
+        ).first()
+        external_id = row.external_id if row is not None else None
+    if source is not CalendarSource.CALDAV or external_id is None:
+        return {
+            "calendar_write": "queued",
+            "calendar_provider": source.value,
+            "provider_read_back": False,
+        }
+    try:
+        events, _ = _build_backend(settings, source).list_changes(None)
+    except Exception:
+        return {
+            "calendar_write": "queued",
+            "calendar_provider": source.value,
+            "provider_read_back": False,
+        }
+    if any(event.external_id == external_id for event in events):
+        return {
+            "calendar_write": "confirmed",
+            "calendar_provider": source.value,
+            "provider_read_back": True,
+        }
+    return {
+        "calendar_write": "queued",
+        "calendar_provider": source.value,
+        "provider_read_back": False,
+    }
 
 
 @mcp.tool

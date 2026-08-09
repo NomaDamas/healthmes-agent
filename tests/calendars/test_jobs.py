@@ -11,7 +11,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
-from healthmes.calendars.base import EventDraft, HealthmesEventKind
+from healthmes.calendars.apple_google_mirror import mirror_apple_events_to_google
+from healthmes.calendars.base import CalendarEventIdentity, EventDraft, HealthmesEventKind
 from healthmes.calendars.intake import MAX_INTAKE_TITLE_LENGTH, intake_title
 from healthmes.calendars.jobs import (
     build_calendar_job,
@@ -62,20 +63,20 @@ class TestEnablement:
         assert specs[0].interval_minutes == enabled.google_poll_minutes
         assert write_source(enabled) is CalendarSource.GOOGLE
 
-    def test_both_enabled_builds_both_with_google_as_writer(self, settings) -> None:
+    def test_both_enabled_builds_icloud_before_google_with_icloud_as_writer(self, settings) -> None:
         enabled = settings.model_copy(
             update={"google_calendar_enabled": True, "caldav_enabled": True}
         )
         specs = build_calendar_jobs(enabled)
         assert [spec.source for spec in specs] == [
-            CalendarSource.GOOGLE,
             CalendarSource.CALDAV,
+            CalendarSource.GOOGLE,
         ]
         assert [spec.interval_minutes for spec in specs] == [
-            enabled.google_poll_minutes,
             enabled.caldav_poll_minutes,
+            enabled.google_poll_minutes,
         ]
-        assert write_source(enabled) is CalendarSource.GOOGLE
+        assert write_source(enabled) is CalendarSource.CALDAV
 
     def test_caldav_only_is_the_writer(self, settings) -> None:
         enabled = settings.model_copy(update={"caldav_enabled": True})
@@ -85,6 +86,85 @@ class TestEnablement:
 
 
 class TestJobRun:
+    def test_accepted_block_writes_to_apple_before_google_mirror(
+        self, settings, session_factory, session, fake_backend_factory
+    ) -> None:
+        settings = settings.model_copy(
+            update={"caldav_enabled": True, "google_calendar_enabled": True}
+        )
+        task = Task(title="Founder — Wedge 후보 3개와 인터뷰 질문 정리")
+        session.add(task)
+        session.flush()
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=utc(2026, 8, 10, 1),
+            proposed_end=utc(2026, 8, 10, 3),
+            status=ProposalStatus.ACCEPTED,
+        )
+        session.add(proposal)
+        session.commit()
+        apple = fake_backend_factory(CalendarSource.CALDAV)
+        google = fake_backend_factory(CalendarSource.GOOGLE)
+        apple_job = build_calendar_job(
+            settings,
+            CalendarSource.CALDAV,
+            is_write_backend=True,
+            backend_factory=lambda: apple,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+        )
+        google_job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=False,
+            backend_factory=lambda: google,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+        )
+
+        apple_job()
+        google_job()
+        google_job()
+
+        session.expire_all()
+        assert session.get(ScheduleProposal, proposal.id).status is ProposalStatus.PUSHED
+        assert [draft.summary for draft in apple.created_drafts] == [task.title]
+        assert [draft.summary for draft in google.created_drafts] == [task.title]
+
+    def test_apple_writer_is_mirrored_once_to_google(
+        self, session, fake_backend_factory
+    ) -> None:
+        apple = fake_backend_factory(CalendarSource.CALDAV)
+        google = fake_backend_factory(CalendarSource.GOOGLE)
+        apple_service = CalendarMirrorService(
+            session, [apple], InMemorySyncStateStore()
+        )
+        apple_row = apple_service.create_agent_event(
+            CalendarSource.CALDAV,
+            EventDraft(
+                summary="보호 수면 — 7시간",
+                start_at=utc(2026, 8, 10, 16),
+                end_at=utc(2026, 8, 10, 23),
+                identity=CalendarEventIdentity(
+                    kind=HealthmesEventKind.PLANNED_SLEEP,
+                    source="planner",
+                    source_key="proposal:apple-first",
+                ),
+            ),
+        )
+        google_service = CalendarMirrorService(
+            session, [google], InMemorySyncStateStore()
+        )
+
+        assert mirror_apple_events_to_google(google_service, session) == 1
+        assert mirror_apple_events_to_google(google_service, session) == 0
+        assert [draft.summary for draft in google.created_drafts] == ["보호 수면 — 7시간"]
+        assert google.created_drafts[0].identity == CalendarEventIdentity(
+            kind=HealthmesEventKind.PLANNED_SLEEP,
+            source="apple_calendar_mirror",
+            source_key=f"caldav:{apple_row.id}",
+        )
+
     def test_google_hm_event_creates_one_linked_task(
         self, settings, session_factory, session, fake_backend, make_event
     ) -> None:

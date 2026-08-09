@@ -112,6 +112,18 @@ def test_local_start_syncs_resolved_ow_key_into_hermes_before_apps() -> None:
     )
 
 
+def test_local_start_uses_the_hermes_calendar_proof_secret_before_healthmes() -> None:
+    text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+    start_body = _function_body(text, "cmd_start")
+    sync_body = _function_body(text, "sync_hermes_calendar_adjustment_secret")
+
+    assert 'HERMES_HOME_DIR/.env' in sync_body
+    assert "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET" in sync_body
+    assert start_body.index("sync_hermes_calendar_adjustment_secret") < start_body.index(
+        'start_process "HealthMes"'
+    )
+
+
 def test_local_runtime_starts_and_supervises_open_wearables_beat() -> None:
     dev_text = SCRIPT.read_text(encoding="utf-8")
     local_text = LOCAL_SCRIPT.read_text(encoding="utf-8")

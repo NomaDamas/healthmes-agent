@@ -48,6 +48,7 @@ from agent.tool_guardrails import (
     ToolGuardrailDecision,
 )
 from hermes_cli.config import cfg_get
+from hermes_cli.config import load_config
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from utils import base_url_host_matches, is_truthy_value
@@ -184,6 +185,32 @@ def _normalized_custom_base_url(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip().rstrip("/")
+
+
+def _read_smart_model_routing() -> tuple[str, str, bool]:
+    try:
+        cfg = load_config()
+    except Exception:
+        return "", "", False
+
+    routing = cfg.get("smart_model_routing") if isinstance(cfg, dict) else None
+    if not isinstance(routing, dict):
+        return "", "", False
+
+    enabled = routing.get("enabled", False)
+    if isinstance(enabled, str):
+        enabled = is_truthy_value(enabled)
+    else:
+        enabled = bool(enabled)
+    if not enabled:
+        return "", "", False
+
+    forced_provider = str(routing.get("force_provider") or "").strip().lower()
+    if not forced_provider:
+        return "", "", False
+
+    forced_model = str(routing.get("force_model") or "").strip()
+    return forced_provider, forced_model, True
 
 
 def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
@@ -380,6 +407,13 @@ def init_agent(
             remain skipped.
     """
     _install_safe_stdio()
+
+    _smart_provider, _smart_model, _smart_enabled = _read_smart_model_routing()
+    if _smart_enabled and _smart_provider:
+        if not isinstance(provider, str) or not provider.strip() or provider.strip().lower() == "openrouter":
+            provider = _smart_provider
+            if _smart_model:
+                model = _smart_model
 
     agent.model = model
     agent.max_iterations = max_iterations
@@ -973,6 +1007,11 @@ def init_agent(
                 # When the user explicitly chose a non-OpenRouter provider
                 # but no credentials were found, fail fast with a clear
                 # message instead of silently routing through OpenRouter.
+                if _smart_enabled:
+                    raise RuntimeError(
+                        "Smart model routing is enabled, but no configured primary provider "
+                        "client could be created. OpenRouter fallback is disabled."
+                    )
                 _explicit = (agent.provider or "").strip().lower()
                 if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                     # Look up the actual env var name from the provider

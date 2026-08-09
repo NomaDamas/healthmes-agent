@@ -91,6 +91,11 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 _SESSION_MESSAGE_TEXT: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_TEXT", default=_UNSET)
+TrustedToolApproval = tuple[str, tuple[tuple[str, str | None], ...]]
+_SESSION_TRUSTED_TOOL_APPROVALS: ContextVar[tuple[TrustedToolApproval, ...]] = ContextVar(
+    "HERMES_SESSION_TRUSTED_TOOL_APPROVALS",
+    default=(),
+)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
@@ -205,6 +210,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_MESSAGE_TEXT.set(message_text),
+        _SESSION_TRUSTED_TOOL_APPROVALS.set(()),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
@@ -249,6 +255,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_TRUSTED_TOOL_APPROVALS.set(())
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -294,6 +301,7 @@ def reset_session_vars() -> None:
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_MESSAGE_TEXT.set(_UNSET)
+    _SESSION_TRUSTED_TOOL_APPROVALS.set(())
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
@@ -335,6 +343,19 @@ def get_session_env(name: str, default: str = "") -> str:
 def get_session_message_text() -> str:
     value = _SESSION_MESSAGE_TEXT.get()
     return "" if value is _UNSET else value
+
+
+def set_trusted_tool_approvals(approvals: tuple[TrustedToolApproval, ...]) -> None:
+    """Authorize exact confirmation-tool arguments for the active message only."""
+    _SESSION_TRUSTED_TOOL_APPROVALS.set(approvals)
+
+
+def has_trusted_tool_approval(
+    tool_name: str,
+    bound_arguments: tuple[tuple[str, str | None], ...],
+) -> bool:
+    """Return whether the current live session approved this exact tool call."""
+    return (tool_name, bound_arguments) in _SESSION_TRUSTED_TOOL_APPROVALS.get()
 
 
 def async_delivery_supported() -> bool:

@@ -138,7 +138,11 @@ def _trusted_session_call_arguments(
     if not isinstance(confirmation, dict):
         return arguments
 
-    from gateway.session_context import get_session_env, get_session_message_text
+    from gateway.session_context import (
+        get_session_env,
+        get_session_message_text,
+        has_trusted_tool_approval,
+    )
 
     session = {
         "platform": get_session_env("HERMES_SESSION_PLATFORM"),
@@ -154,6 +158,7 @@ def _trusted_session_call_arguments(
     handle = arguments.get(handle_argument) if isinstance(handle_argument, str) else None
     if not isinstance(handle, str) or not handle:
         return arguments
+    bind_arguments = confirmation.get("bind_arguments")
     passthrough_argument = confirmation.get("passthrough_argument")
     if isinstance(passthrough_argument, str):
         choices = confirmation.get("choices")
@@ -168,12 +173,18 @@ def _trusted_session_call_arguments(
         choices = confirmation.get("choices")
         action = arguments.get(action_argument) if isinstance(action_argument, str) else None
         prefix = choices.get(action) if isinstance(choices, dict) else None
-        if not isinstance(prefix, str) or message_text != f"{prefix} {handle}":
+        approved_arguments = tuple(
+            (name, value if isinstance(value := arguments.get(name), str) else None)
+            for name in bind_arguments
+            if isinstance(name, str)
+        ) if isinstance(bind_arguments, list) else ()
+        direct_confirmation = isinstance(prefix, str) and message_text == f"{prefix} {handle}"
+        staged_approval = has_trusted_tool_approval(tool_name, approved_arguments)
+        if not direct_confirmation and not staged_approval:
             return arguments
 
     secret_env = config.get("secret_env")
     secret = os.environ.get(secret_env, "") if isinstance(secret_env, str) else ""
-    bind_arguments = confirmation.get("bind_arguments")
     if not isinstance(secret, str) or len(secret) < 32 or not isinstance(bind_arguments, list):
         return arguments
     bound_arguments = {

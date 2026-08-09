@@ -15,8 +15,8 @@ turns the (fully tested) backend/service library into running behavior:
 - Every run syncs that backend into ``calendar_event_mirror`` (the trigger
   sweep's ``schedule_changed`` rule and the energy engine's meeting-load
   factor read the mirror; the sync itself is enough — no push here).
-- The **write backend** (Google when enabled, else CalDAV — one designated
-  writer so the same block is never created twice) additionally pushes
+- The **write backend** (CalDAV/iCloud when enabled, else Google — one
+  designated writer so the same block is never created twice) additionally pushes
   ``accepted`` schedule proposals to the external calendar as tagged agent
   blocks and advances them to ``pushed`` — the contract promised by
   ``healthmes/api/schedule.py`` and skills/healthmes-planner/SKILL.md
@@ -28,23 +28,16 @@ credential can never take down the scheduler loop.
 """
 
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars import creds
-from healthmes.calendars.base import (
-    CalendarAuthError,
-    CalendarBackend,
-    CalendarEventIdentity,
-    EventDraft,
-    HealthmesEventKind,
-    coerce_utc,
-    parse_event_kind,
-)
+from healthmes.calendars.apple_google_mirror import mirror_apple_events_to_google
+from healthmes.calendars.base import CalendarAuthError, CalendarBackend
 from healthmes.calendars.intake import intake_calendar_tasks
+from healthmes.calendars.proposal_push import push_accepted_proposals
 from healthmes.calendars.state import (
     FilePendingDiffStore,
     FileSyncStateStore,
@@ -53,8 +46,7 @@ from healthmes.calendars.state import (
 )
 from healthmes.calendars.sync import CalendarMirrorService, SyncDiff
 from healthmes.config import Settings, resolve_timezone
-from healthmes.store.enums import CalendarSource, ProposalStatus
-from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task
+from healthmes.store.enums import CalendarSource
 from healthmes.store.session import session_scope
 
 __all__ = [
@@ -86,7 +78,7 @@ def calendar_job_id(source: CalendarSource) -> str:
 def enabled_sources(settings: Settings) -> tuple[CalendarSource, ...]:
     """Backends enabled by settings OR connected via ``healthmes connect``.
 
-    Write-preference order (Google first). "Connected" means the runtime
+    Write-preference order (CalDAV/iCloud first, then Google). "Connected" means the runtime
     token/creds file under ``Settings.data_dir`` exists and is usable
     (healthmes/calendars/creds.py) — establishing a connection with the CLI
     is enough, no ``.env`` edit required. The settings flags keep working
@@ -94,10 +86,10 @@ def enabled_sources(settings: Settings) -> tuple[CalendarSource, ...]:
     per-run until credentials appear, exactly as before).
     """
     sources: list[CalendarSource] = []
-    if settings.google_calendar_enabled or creds.google_connected(settings.data_dir):
-        sources.append(CalendarSource.GOOGLE)
     if settings.caldav_enabled or creds.load_caldav_credentials(settings.data_dir) is not None:
         sources.append(CalendarSource.CALDAV)
+    if settings.google_calendar_enabled or creds.google_connected(settings.data_dir):
+        sources.append(CalendarSource.GOOGLE)
     return tuple(sources)
 
 
@@ -131,109 +123,6 @@ def _build_backend(settings: Settings, source: CalendarSource) -> CalendarBacken
         url=resolved.url,
         calendar_name=settings.caldav_calendar_name,
     )
-
-
-def _accepted_proposals(session: Session) -> Iterator[tuple[ScheduleProposal, Task]]:
-    rows = session.execute(
-        select(ScheduleProposal, Task)
-        .join(Task, ScheduleProposal.task_id == Task.id)
-        .where(ScheduleProposal.status == ProposalStatus.ACCEPTED)
-        .order_by(ScheduleProposal.proposed_start)
-    )
-    yield from ((proposal, task) for proposal, task in rows)
-
-
-def _existing_agent_block(
-    session: Session,
-    source: CalendarSource,
-    task_id: object,
-    proposal: ScheduleProposal,
-) -> CalendarEventMirror | None:
-    """Return the trusted agent mirror row already written for this proposal.
-
-    Matches an agent-created row for the same task/source whose times equal the
-    proposal's — the fingerprint of the block a prior (crashed) poll already
-    created remotely. Times are compared in Python via ``coerce_utc`` because
-    sqlite round-trips ``DateTime`` columns as naive UTC.
-    """
-    candidates = (
-        session.execute(
-            select(CalendarEventMirror).where(
-                CalendarEventMirror.calendar_source == source,
-                CalendarEventMirror.agent_task_id == task_id,
-                CalendarEventMirror.is_agent_created.is_(True),
-            )
-        )
-        .scalars()
-        .all()
-    )
-    start = coerce_utc(proposal.proposed_start)
-    end = coerce_utc(proposal.proposed_end)
-    for row in candidates:
-        if coerce_utc(row.start_at) == start and coerce_utc(row.end_at) == end:
-            return row
-    return None
-
-
-def push_accepted_proposals(
-    service: CalendarMirrorService, session: Session, source: CalendarSource
-) -> int:
-    """Write every ``accepted`` proposal to the calendar; advance to ``pushed``.
-
-    Each proposal is pushed independently: the remote create commits the
-    mirror row first, then the status flips to ``pushed`` and commits. A crash
-    between the two leaves the proposal ``accepted`` — but the next poll now
-    detects the already-written agent block and reuses it instead of creating a
-    duplicate, so the retry is idempotent (never a second remote event, never a
-    lost one). A failing backend call leaves the proposal untouched for retry.
-    """
-    pushed = 0
-    for proposal, task in list(_accepted_proposals(session)):
-        row = _existing_agent_block(session, source, task.id, proposal)
-        if row is None:
-            identity = CalendarEventIdentity(
-                kind=parse_event_kind(proposal.healthmes_kind)
-                or HealthmesEventKind.TASK_BLOCK,
-                source="planner",
-                source_key=f"proposal:{proposal.id}",
-            )
-            draft = EventDraft(
-                summary=task.title,
-                start_at=coerce_utc(proposal.proposed_start),
-                end_at=coerce_utc(proposal.proposed_end),
-                agent_task_id=task.id,
-                identity=identity,
-            )
-            try:
-                row = service.create_agent_event(source, draft)
-            except Exception:
-                logger.exception(
-                    "Pushing proposal %s (%s) to %s failed; retrying next poll.",
-                    proposal.id,
-                    task.title,
-                    source.value,
-                )
-                continue
-        else:
-            logger.info(
-                "Proposal %s already has agent block %s on %s; finishing the "
-                "interrupted status advance instead of re-creating it.",
-                proposal.id,
-                row.external_id,
-                source.value,
-            )
-        proposal.status = ProposalStatus.PUSHED
-        task.status = "scheduled"
-        session.commit()
-        pushed += 1
-        logger.info(
-            "Proposal %s pushed to %s as event %s (%s).",
-            proposal.id,
-            source.value,
-            row.external_id,
-            task.title,
-        )
-    return pushed
 
 
 def build_calendar_job(
@@ -282,6 +171,11 @@ def build_calendar_job(
                 intake_calendar_tasks(session, source, resolve_timezone(settings))
                 if is_write_backend:
                     push_accepted_proposals(service, session, source)
+                elif (
+                    source is CalendarSource.GOOGLE
+                    and write_source(settings) is CalendarSource.CALDAV
+                ):
+                    mirror_apple_events_to_google(service, session)
                 return diff
         except Exception:
             logger.exception(

@@ -96,6 +96,14 @@ load_runtime_env() {
     set +a
 }
 
+sync_hermes_calendar_adjustment_secret() {
+    local hermes_env="$HERMES_HOME_DIR/.env" secret
+    [ -r "$hermes_env" ] || return
+    secret="$({ awk -F= '$1 == "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET" { print substr($0, index($0, "=") + 1); exit }' "$hermes_env"; })"
+    [ -n "$secret" ] || return
+    export HEALTHMES_CALENDAR_ADJUSTMENT_SECRET="$secret"
+}
+
 resolve_ow_api_key() {
     [ -n "${HEALTHMES_OW_API_KEY:-}" ] && return
     local psql_bin api_key
@@ -212,6 +220,7 @@ cmd_update() {
 
 cmd_start() {
     load_runtime_env
+    sync_hermes_calendar_adjustment_secret
     bash "$REPO_ROOT/scripts/dev_mac.sh" services-start
     resolve_ow_api_key
     sync_hermes_ow_api_key

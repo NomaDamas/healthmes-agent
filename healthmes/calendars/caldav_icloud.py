@@ -206,14 +206,19 @@ class CalDavCalendarBackend:
         calendar.add("prodid", "-//HealthMes Agent//healthmes//EN")
         calendar.add("version", "2.0")
         calendar.add_component(component)
+        ical_text = calendar.to_ical().decode("utf-8")
         try:
             self._calendar.add_event(
-                ical=calendar.to_ical().decode("utf-8"),
+                ical=ical_text,
                 no_overwrite=draft.identity is not None,
             )
         except Exception as exc:  # noqa: BLE001 - caldav exposes broad DAV errors
             if draft.identity is None:
                 raise
+            if _is_precondition_failure(exc):
+                return self._create_identity_event_with_conditional_put(
+                    external_id, draft, ical_text
+                )
             try:
                 self.read_event(external_id)
             except EventNotFoundError:
@@ -231,6 +236,34 @@ class CalDavCalendarBackend:
             agent_task_id=draft.agent_task_id,
             identity=draft.identity,
             healthmes_kind=draft.identity.kind if draft.identity is not None else None,
+        )
+
+    def _create_identity_event_with_conditional_put(
+        self, external_id: str, draft: EventDraft, ical_text: str
+    ) -> ExternalEvent:
+        client = getattr(self._calendar, "client", None)
+        calendar_url = getattr(self._calendar, "url", None)
+        if client is None or calendar_url is None or not hasattr(client, "put"):
+            raise CalendarError("caldav backend cannot perform a conditional create")
+        response = client.put(
+            calendar_url.join(f"{external_id}.ics"),
+            ical_text,
+            headers={"Content-Type": "text/calendar; charset=utf-8", "If-None-Match": "*"},
+        )
+        status = getattr(response, "status", None)
+        if status == 412:
+            raise CalendarConflictError("caldav identity key already exists or create conflicted")
+        if status not in (200, 201, 204):
+            raise CalendarError("caldav conditional create failed")
+        return ExternalEvent(
+            external_id=external_id,
+            summary=draft.summary,
+            start_at=draft.start_at,
+            end_at=draft.end_at,
+            is_agent_created=True,
+            agent_task_id=draft.agent_task_id,
+            identity=draft.identity,
+            healthmes_kind=draft.identity.kind,
         )
 
     def update_event(
@@ -286,6 +319,9 @@ class CalDavCalendarBackend:
                 f"caldav event {external_id!r} is not {expected_kind.value}"
             )
         delete_etag = expected_etag or _object_etag(obj)
+        if delete_etag is None and callable(getattr(obj, "load", None)):
+            obj.load()
+            delete_etag = _object_etag(obj)
         if delete_etag is None:
             raise CalendarConflictError(
                 "caldav event has no ETag for conditional delete"
@@ -320,7 +356,18 @@ class CalDavCalendarBackend:
         except Exception as exc:  # noqa: BLE001 - library raises broad errors
             if _is_caldav_not_found(exc):
                 raise EventNotFoundError(f"caldav event {external_id!r} not found") from exc
-            raise
+            if not _is_precondition_failure(exc):
+                raise
+            obj = next(
+                (
+                    candidate
+                    for candidate in self._calendar.events()
+                    if str(candidate.icalendar_component.get("UID")) == external_id
+                ),
+                None,
+            )
+            if obj is None:
+                raise EventNotFoundError(f"caldav event {external_id!r} not found") from exc
         component = obj.icalendar_component
         if str(component.get(ICAL_AGENT_PROPERTY, "")).strip() != AGENT_TAG_VALUE:
             raise OwnershipError(
@@ -420,7 +467,7 @@ def _is_precondition_failure(exc: BaseException) -> bool:
     if status == 412:
         return True
     reason = getattr(exc, "reason", "")
-    return isinstance(reason, str) and "412" in reason
+    return (isinstance(reason, str) and "412" in reason) or "412" in str(exc)
 
 
 def _fingerprint(obj: Any, component: Any) -> str:
