@@ -4,17 +4,19 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfoNotFoundError
 
 import httpx
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Path, Query, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from healthmes.activity.activitywatch import (
     ActivityWatchError,
     ActivityWatchRequestError,
+    StaleActivityWatchImportError,
     import_activitywatch,
+    prepare_activitywatch_import,
 )
 from healthmes.activity.aggregation import rebuild_affected_days
 from healthmes.activity.context import (
@@ -25,6 +27,7 @@ from healthmes.activity.context import (
 from healthmes.activity.contracts import (
     ActivityBatchIn,
     ActivityBatchOut,
+    ActivityCapability,
     ActivityCollectionOut,
     ActivityCollectionStatusUpdate,
     ActivityCollectionUpdate,
@@ -73,18 +76,22 @@ from healthmes.api.errors import APIError
 from healthmes.config import resolve_timezone
 from healthmes.store import WellnessEvent
 from healthmes.store.session import SessionDep
+from healthmes.timezones import parse_timezone
 
 router = APIRouter(tags=["activity"])
+CollectionDeviceId = Annotated[str, Path(min_length=1, max_length=255)]
+
 
 def _timezone(request: Request, explicit: str | None = None) -> str:
     if explicit is not None:
         try:
-            ZoneInfo(explicit)
+            parse_timezone(explicit)
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise APIError(
                 422,
                 "invalid_timezone",
-                f"timezone is not a valid IANA name: {explicit!r}",
+                "timezone is not a valid IANA name or UTC offset: "
+                f"{explicit!r}",
             ) from exc
         return explicit
     try:
@@ -166,7 +173,7 @@ def _scope_public_batch_source_ids(
 
 @router.get("/v1/activity/devices/{device_id}/collection")
 def get_collection(
-    device_id: str,
+    device_id: CollectionDeviceId,
     session: SessionDep,
 ) -> ActivityCollectionOut:
     payload = get_control_payload(session, device_id)
@@ -175,7 +182,7 @@ def get_collection(
 
 @router.put("/v1/activity/devices/{device_id}/collection")
 def put_collection(
-    device_id: str,
+    device_id: CollectionDeviceId,
     body: ActivityCollectionUpdate,
     session: SessionDep,
 ) -> ActivityCollectionOut:
@@ -186,7 +193,7 @@ def put_collection(
 
 @router.post("/v1/activity/devices/{device_id}/pause")
 def pause_collection(
-    device_id: str,
+    device_id: CollectionDeviceId,
     body: ActivityPauseRequest,
     session: SessionDep,
 ) -> ActivityCollectionOut:
@@ -203,7 +210,7 @@ def pause_collection(
 
 @router.post("/v1/activity/devices/{device_id}/resume")
 def resume_collection(
-    device_id: str,
+    device_id: CollectionDeviceId,
     session: SessionDep,
 ) -> ActivityCollectionOut:
     with activity_write_lock():
@@ -217,7 +224,7 @@ def resume_collection(
 
 @router.post("/v1/activity/devices/{device_id}/status")
 def post_collection_status(
-    device_id: str,
+    device_id: CollectionDeviceId,
     body: ActivityCollectionStatusUpdate,
     session: SessionDep,
 ) -> ActivityCollectionOut:
@@ -226,21 +233,26 @@ def post_collection_status(
         "status_observed_at",
         "collection_generation",
     }
-    if (
-        body.platform is ActivityPlatform.ANDROID
-        and bool(boundary_fields & body.model_fields_set)
-        and (
-            body.permission_status is None
-            or body.status_observed_at is None
-            or body.collection_generation is None
-        )
+    boundary_touched = bool(boundary_fields & body.model_fields_set)
+    generation_touched = "collection_generation" in body.model_fields_set
+    if (body.platform is ActivityPlatform.ANDROID and boundary_touched) or (
+        generation_touched
     ):
-        raise APIError(
-            422,
-            "activity_status_boundary_required",
-            "Android status boundary requires permission_status, "
-            "status_observed_at, and collection_generation",
+        complete_android_boundary = (
+            body.platform is ActivityPlatform.ANDROID
+            and body.capability is ActivityCapability.AGGREGATE
+            and body.permission_status is not None
+            and body.status_observed_at is not None
+            and body.collection_generation is not None
         )
+        if not complete_android_boundary:
+            raise APIError(
+                422,
+                "activity_status_boundary_required",
+                "Android status boundary requires platform=android, "
+                "capability=aggregate, permission_status, status_observed_at, "
+                "and collection_generation",
+            )
     observed_at = body.status_observed_at
     current = datetime.now(UTC)
     if observed_at is not None and observed_at > current + MAX_FUTURE_SKEW:
@@ -309,40 +321,46 @@ def post_activitywatch_import(
     body: ActivityWatchImportRequest,
     session: SessionDep,
 ) -> ActivityBatchOut:
-    with activity_write_lock():
-        try:
-            with session.begin_nested():
-                result = import_activitywatch(session, body)
-        except ActivityCollectionBlockedError as exc:
-            raise APIError(409, "activity_collection_blocked", exc.reason) from exc
-        except StaleCollectionRevisionError as exc:
-            raise APIError(409, "stale_collection_revision", str(exc)) from exc
-        except ActivityLateDataError as exc:
-            raise APIError(409, "activity_outside_retention", str(exc)) from exc
-        except ActivityFutureDataError as exc:
-            raise APIError(409, "activity_future_data", str(exc)) from exc
-        except ActivitySourceModeConflictError as exc:
-            raise APIError(409, "activity_source_mode_conflict", str(exc)) from exc
-        except ActivitySummaryProvenanceError as exc:
-            raise APIError(
-                409,
-                "activity_summary_requires_complete_raw",
-                str(exc),
-            ) from exc
-        except ActivityWatchRequestError as exc:
-            raise APIError(
-                422,
-                "invalid_activitywatch_range",
-                str(exc),
-            ) from exc
-        except (ActivityWatchError, httpx.HTTPError) as exc:
-            raise APIError(
-                502,
-                "activitywatch_error",
-                f"ActivityWatch import failed: {exc}",
-            ) from exc
-        session.commit()
-        return ActivityBatchOut.model_validate(result.response)
+    try:
+        prepared = prepare_activitywatch_import(session, body)
+        with activity_write_lock():
+            result = import_activitywatch(
+                session,
+                body,
+                prepared=prepared,
+            )
+            session.commit()
+    except ActivityCollectionBlockedError as exc:
+        raise APIError(409, "activity_collection_blocked", exc.reason) from exc
+    except StaleCollectionRevisionError as exc:
+        raise APIError(409, "stale_collection_revision", str(exc)) from exc
+    except StaleActivityWatchImportError as exc:
+        raise APIError(409, "stale_activitywatch_import", str(exc)) from exc
+    except ActivityLateDataError as exc:
+        raise APIError(409, "activity_outside_retention", str(exc)) from exc
+    except ActivityFutureDataError as exc:
+        raise APIError(409, "activity_future_data", str(exc)) from exc
+    except ActivitySourceModeConflictError as exc:
+        raise APIError(409, "activity_source_mode_conflict", str(exc)) from exc
+    except ActivitySummaryProvenanceError as exc:
+        raise APIError(
+            409,
+            "activity_summary_requires_complete_raw",
+            str(exc),
+        ) from exc
+    except ActivityWatchRequestError as exc:
+        raise APIError(
+            422,
+            "invalid_activitywatch_range",
+            str(exc),
+        ) from exc
+    except (ActivityWatchError, httpx.HTTPError) as exc:
+        raise APIError(
+            502,
+            "activitywatch_error",
+            f"ActivityWatch import failed: {exc}",
+        ) from exc
+    return ActivityBatchOut.model_validate(result.response)
 
 
 @router.post("/v1/activity/ios/report")
@@ -449,7 +467,7 @@ def get_activity_summary(
     timezone: str | None = None,
 ) -> dict[str, Any]:
     zone = _timezone(request, timezone)
-    day = local_date or datetime.now(ZoneInfo(zone)).date()
+    day = local_date or datetime.now(parse_timezone(zone)).date()
     return activity_summary_context(session, day=day, timezone=zone)
 
 
@@ -486,7 +504,7 @@ def get_overwork_context(
     timezone: str | None = None,
 ) -> dict[str, Any]:
     zone = _timezone(request, timezone)
-    day = local_date or datetime.now(ZoneInfo(zone)).date()
+    day = local_date or datetime.now(parse_timezone(zone)).date()
     return overwork_context(
         session,
         day=day,

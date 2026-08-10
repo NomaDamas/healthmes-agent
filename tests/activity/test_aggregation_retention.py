@@ -5,8 +5,12 @@ import pytest
 from sqlalchemy import select
 
 from healthmes.activity.aggregation import (
+    LEGACY_SUMMARY_REASON,
+    SUMMARY_DERIVATION_VERSION,
+    evidence_digest,
     get_daily_summary,
     local_day_bounds,
+    migrate_activity_summary_derivations,
     personal_baseline_delta,
     rebuild_affected_days,
     rebuild_day_summaries,
@@ -22,6 +26,7 @@ from healthmes.activity.contracts import (
     ActivityBatchIn,
     ActivityCapability,
     ActivityPlatform,
+    AppHourRecord,
     AppIntervalRecord,
 )
 from healthmes.activity.maintenance import (
@@ -30,6 +35,7 @@ from healthmes.activity.maintenance import (
     run_activity_maintenance,
 )
 from healthmes.activity.repository import (
+    APP_HOUR_EVENT,
     APP_INTERVAL_EVENT,
     DAY_SUMMARY_EVENT,
     DELETION_TOMBSTONE_EVENT,
@@ -41,7 +47,10 @@ from healthmes.activity.service import (
     ActivitySummaryProvenanceError,
     ingest_activity_batch,
 )
-from healthmes.storage import update_retention_policy
+from healthmes.storage import (
+    run_storage_maintenance,
+    update_retention_policy,
+)
 from healthmes.store import AppUsageSample, WellnessEvent
 
 
@@ -190,6 +199,79 @@ def test_daily_device_count_unions_devices_across_separate_hours(session) -> Non
     assert daily.payload["device_count"] == 2
 
 
+def test_same_device_id_from_different_providers_stays_separate(session) -> None:
+    shared_device_id = "shared-provider-local-id"
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="provider-detailed",
+            source_device=shared_device_id,
+            platform=ActivityPlatform.MACOS,
+            capability=ActivityCapability.DETAILED,
+            timezone="UTC",
+            records=[
+                AppIntervalRecord(
+                    source_record_id="provider-detailed-interval",
+                    start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                )
+            ],
+        ),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="provider-hourly",
+            source_device=shared_device_id,
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            records=[
+                AppHourRecord(
+                    source_record_id="provider-hourly-bucket",
+                    bucket_start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    app_id="browser",
+                    foreground_seconds=20 * 60,
+                    coverage_seconds=3600,
+                )
+            ],
+        ),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type.in_(
+                    (APP_INTERVAL_EVENT, APP_HOUR_EVENT)
+                )
+            )
+        )
+    )
+
+    summary = summarize_window(
+        events,
+        start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        timezone="UTC",
+    )
+    daily = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == DAY_SUMMARY_EVENT,
+        )
+    )
+
+    assert summary["total_active_minutes"] == 50.0
+    assert summary["device_count"] == 2
+    assert len(summary["_evidence_event_ids"]) == 2
+    assert "cross_device_overlap_not_deduplicated" in summary["limitations"]
+    assert daily is not None
+    assert daily.payload["device_count"] == 2
+    assert daily.derived_from["raw_event_count"] == 2
+
+
 def test_local_day_bounds_handle_dst_spring_and_fall_days() -> None:
     spring_start, spring_end = local_day_bounds(
         date(2026, 3, 8),
@@ -237,6 +319,181 @@ def test_fixed_offset_timezone_is_supported_by_context_contract(session) -> None
     assert context["status"] == "ok"
     assert context["timezone"] == "UTC+09:00"
     assert context["total_active_minutes"] == 60.0
+
+
+def test_fixed_offset_timezone_name_can_be_reused_for_day_bounds() -> None:
+    fixed_kst_name = str(timezone(timedelta(hours=9)))
+
+    start, end = local_day_bounds(
+        date(2026, 8, 1),
+        fixed_kst_name,
+    )
+
+    assert fixed_kst_name == "UTC+09:00"
+    assert start == datetime(2026, 7, 31, 15, tzinfo=UTC)
+    assert end == datetime(2026, 8, 1, 15, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "timezone_order",
+    (
+        ("UTC+09:00", "Asia/Seoul"),
+        ("Asia/Seoul", "UTC+09:00"),
+    ),
+)
+def test_fixed_offset_summary_refreshes_for_equivalent_iana_ingest(
+    session,
+    timezone_order,
+) -> None:
+    current = datetime(2026, 8, 1, 12, tzinfo=UTC)
+    for index, timezone_name in enumerate(timezone_order):
+        ingest_activity_batch(
+            session,
+            _interval_batch(
+                [
+                    AppIntervalRecord(
+                        source_record_id=f"offset-alias-{index}",
+                        start_at=datetime(
+                            2026,
+                            8,
+                            1,
+                            1 + index,
+                            tzinfo=UTC,
+                        ),
+                        end_at=datetime(
+                            2026,
+                            8,
+                            1,
+                            2 + index,
+                            tzinfo=UTC,
+                        ),
+                        state="active",
+                        app_id=f"editor-{index}",
+                    )
+                ],
+                device_id=f"offset-device-{index}",
+                timezone_name=timezone_name,
+            ),
+            now=current,
+        )
+
+    fixed_event, fixed_summary = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC+09:00",
+        now=current,
+    )
+    raw_events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+    )
+
+    assert fixed_event is not None
+    assert fixed_summary["total_active_minutes"] == 120.0
+    assert fixed_event.derived_from["raw_event_count"] == 2
+    assert fixed_event.derived_from["raw_evidence_sha256"] == evidence_digest(
+        str(event.id) for event in raw_events
+    )
+
+
+def test_deleting_iana_raw_refreshes_equivalent_fixed_offset_summary(
+    session,
+) -> None:
+    current = datetime(2026, 8, 1, 12, tzinfo=UTC)
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="fixed-offset-keep",
+                    start_at=datetime(2026, 8, 1, 1, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 2, tzinfo=UTC),
+                    state="active",
+                    app_id="fixed-editor",
+                )
+            ],
+            device_id="fixed-offset-device",
+            timezone_name="UTC+09:00",
+        ),
+        now=current,
+    )
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="iana-delete",
+                    start_at=datetime(2026, 8, 1, 2, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 3, tzinfo=UTC),
+                    state="active",
+                    app_id="iana-editor",
+                )
+            ],
+            device_id="iana-delete-device",
+            timezone_name="Asia/Seoul",
+        ),
+        now=current,
+    )
+
+    before_event, before_summary = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC+09:00",
+        now=current,
+    )
+    assert before_event is not None
+    assert before_summary["total_active_minutes"] == 120.0
+    assert before_event.derived_from["raw_event_count"] == 2
+
+    report = delete_activity_data(
+        session,
+        device_id="iana-delete-device",
+        start=None,
+        end=None,
+        include_summaries=False,
+        include_control=False,
+        now=current,
+    )
+    by_timezone: dict[str, set[date]] = {}
+    for scope in report.affected_scopes:
+        by_timezone.setdefault(scope.timezone, set()).add(scope.day)
+    for timezone_name, days in by_timezone.items():
+        rebuild_affected_days(
+            session,
+            days=days,
+            timezone=timezone_name,
+            force_rebuild=True,
+            now=current,
+        )
+
+    fixed_event, fixed_summary = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC+09:00",
+        now=current,
+    )
+    remaining_raw = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+    )
+
+    assert report.raw_events_deleted == 1
+    assert any(
+        scope.timezone == "UTC+09:00"
+        for scope in report.affected_scopes
+    )
+    assert fixed_event is not None
+    assert fixed_summary["total_active_minutes"] == 60.0
+    assert fixed_event.derived_from["raw_event_count"] == 1
+    assert fixed_event.derived_from["raw_evidence_sha256"] == evidence_digest(
+        str(event.id) for event in remaining_raw
+    )
 
 
 def test_missing_activity_is_not_reported_as_zero(session) -> None:
@@ -811,19 +1068,158 @@ def test_daily_summary_provenance_is_bounded_and_records_capability(session) -> 
     assert daily.payload["capabilities"] == ["detailed"]
     assert hourly.payload["capabilities"] == ["detailed"]
     assert set(hourly.derived_from) == {
+        "derivation_version",
         "raw_event_count",
         "raw_evidence_sha256",
     }
+    assert (
+        hourly.derived_from["derivation_version"]
+        == SUMMARY_DERIVATION_VERSION
+    )
     assert hourly.derived_from["raw_event_count"] == 10
     assert len(hourly.derived_from["raw_evidence_sha256"]) == 64
     assert set(daily.derived_from) == {
+        "derivation_version",
         "raw_event_count",
         "raw_evidence_sha256",
         "hour_summary_ids",
     }
+    assert (
+        daily.derived_from["derivation_version"]
+        == SUMMARY_DERIVATION_VERSION
+    )
     assert daily.derived_from["raw_event_count"] == 10
     assert len(daily.derived_from["raw_evidence_sha256"]) == 64
     assert "event_ids" not in daily.derived_from
+
+
+def test_legacy_summary_migration_reaggregates_complete_raw_by_provider_device(
+    session,
+) -> None:
+    for provider in ("desktop-provider-a", "desktop-provider-b"):
+        ingest_activity_batch(
+            session,
+            ActivityBatchIn(
+                source_provider=provider,
+                source_device="shared-device-id",
+                platform=ActivityPlatform.MACOS,
+                capability=ActivityCapability.DETAILED,
+                timezone="UTC",
+                records=[
+                    AppIntervalRecord(
+                        source_record_id=f"{provider}-active",
+                        start_at=datetime(2026, 8, 1, 9, tzinfo=UTC),
+                        end_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                        state="active",
+                        app_id="editor",
+                    )
+                ],
+            ),
+            now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        )
+
+    summaries = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type.in_(
+                    (HOUR_SUMMARY_EVENT, DAY_SUMMARY_EVENT)
+                )
+            )
+        )
+    )
+    for summary in summaries:
+        summary.derived_from = {
+            key: value
+            for key, value in summary.derived_from.items()
+            if key != "derivation_version"
+        }
+        payload = dict(summary.payload)
+        payload["total_active_minutes"] = 60.0
+        payload["device_count"] = 1
+        summary.payload = payload
+    session.flush()
+
+    report = migrate_activity_summary_derivations(
+        session,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    _, daily = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    assert report.migrated_scopes == 1
+    assert report.incompatible_scopes == 0
+    assert daily["status"] == "ok"
+    assert daily["total_active_minutes"] == 120.0
+    assert daily["device_count"] == 2
+
+
+def test_legacy_summary_without_complete_raw_is_blocked_not_republished(
+    session,
+) -> None:
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="legacy-missing-raw",
+                    start_at=datetime(2026, 8, 1, 9, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                )
+            ]
+        ),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    for summary in session.scalars(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type.in_(
+                (HOUR_SUMMARY_EVENT, DAY_SUMMARY_EVENT)
+            )
+        )
+    ):
+        summary.derived_from = {
+            key: value
+            for key, value in summary.derived_from.items()
+            if key != "derivation_version"
+        }
+    raw = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == APP_INTERVAL_EVENT
+        )
+    )
+    assert raw is not None
+    session.delete(raw)
+    session.flush()
+
+    report = migrate_activity_summary_derivations(
+        session,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    event, daily = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    focus = focus_context(
+        session,
+        start=datetime(2026, 8, 1, 9, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    assert report.migrated_scopes == 0
+    assert report.incompatible_scopes == 1
+    assert event is None
+    assert daily["reason"] == LEGACY_SUMMARY_REASON
+    assert focus["status"] == "insufficient_data"
+    assert focus["reason"] == LEGACY_SUMMARY_REASON
 
 
 def test_following_daily_summary_survives_baseline_refresh_after_raw_expiry(
@@ -947,6 +1343,200 @@ def test_personal_baseline_ignores_days_below_minimum_coverage(session) -> None:
         "days_with_data": 2,
         "required_days": 3,
         "lookback_days": 3,
+    }
+
+
+def test_historical_rebuild_uses_one_injected_clock_for_baseline(session) -> None:
+    update_retention_policy(session, "activity_daily", "7d")
+    for day in range(20, 24):
+        ingest_activity_batch(
+            session,
+            _interval_batch(
+                [
+                    AppIntervalRecord(
+                        source_record_id=f"historical-baseline-{day}",
+                        start_at=datetime(2026, 7, day, 0, tzinfo=UTC),
+                        end_at=datetime(2026, 7, day, 12, tzinfo=UTC),
+                        state="active",
+                        app_id="editor",
+                    )
+                ]
+            ),
+            now=datetime(2026, 7, day, 13, tzinfo=UTC),
+        )
+
+    target = next(
+        row
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT,
+            )
+        )
+        if row.payload.get("date") == "2026-07-23"
+    )
+
+    assert target.payload["seven_day_baseline_delta"] == {
+        "status": "ok",
+        "days_with_data": 3,
+        "lookback_days": 7,
+        "baseline_minutes": 720.0,
+        "delta_minutes": 0.0,
+        "delta_percent": 0.0,
+    }
+
+
+def test_daily_retention_refreshes_following_baselines(session) -> None:
+    update_retention_policy(session, "activity_daily", "7d")
+    for day in range(6, 10):
+        ingest_activity_batch(
+            session,
+            _interval_batch(
+                [
+                    AppIntervalRecord(
+                        source_record_id=f"retained-baseline-{day}",
+                        start_at=datetime(2026, 8, day, 0, tzinfo=UTC),
+                        end_at=datetime(2026, 8, day, 12, tzinfo=UTC),
+                        state="active",
+                        app_id="editor",
+                    )
+                ]
+            ),
+            now=datetime(2026, 8, day, 13, tzinfo=UTC),
+        )
+
+    target = next(
+        row
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT,
+            )
+        )
+        if row.payload.get("date") == "2026-08-09"
+    )
+    assert target.payload["seven_day_baseline_delta"]["status"] == "ok"
+
+    report = run_activity_maintenance(
+        session,
+        now=datetime(2026, 8, 15, 12, tzinfo=UTC),
+    )
+    session.refresh(target)
+
+    assert report.expired_events_deleted >= 3
+    assert target.payload["seven_day_baseline_delta"] == {
+        "status": "insufficient_data",
+        "days_with_data": 0,
+        "required_days": 3,
+        "lookback_days": 7,
+    }
+
+
+def test_storage_maintenance_delegates_activity_expiry_before_generic_purge(
+    session,
+    settings,
+) -> None:
+    update_retention_policy(session, "activity_daily", "7d")
+    for day in range(6, 10):
+        ingest_activity_batch(
+            session,
+            _interval_batch(
+                [
+                    AppIntervalRecord(
+                        source_record_id=f"storage-baseline-{day}",
+                        start_at=datetime(2026, 8, day, 0, tzinfo=UTC),
+                        end_at=datetime(2026, 8, day, 12, tzinfo=UTC),
+                        state="active",
+                        app_id="editor",
+                    )
+                ]
+            ),
+            now=datetime(2026, 8, day, 13, tzinfo=UTC),
+        )
+
+    target = next(
+        row
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT,
+            )
+        )
+        if row.payload.get("date") == "2026-08-09"
+    )
+    assert target.payload["seven_day_baseline_delta"]["status"] == "ok"
+
+    run_storage_maintenance(
+        session,
+        settings,
+        now=datetime(2026, 8, 15, 12, tzinfo=UTC),
+    )
+    session.refresh(target)
+
+    assert target.payload["seven_day_baseline_delta"] == {
+        "status": "insufficient_data",
+        "days_with_data": 0,
+        "required_days": 3,
+        "lookback_days": 7,
+    }
+
+
+def test_daily_retention_refreshes_fixed_offset_following_baselines(
+    session,
+) -> None:
+    update_retention_policy(session, "activity_daily", "7d")
+    fixed_kst = timezone(timedelta(hours=9))
+    fixed_kst_name = str(fixed_kst)
+    for local_day in range(6, 10):
+        local_start = datetime(2026, 8, local_day, tzinfo=fixed_kst)
+        ingest_activity_batch(
+            session,
+            _interval_batch(
+                [
+                    AppIntervalRecord(
+                        source_record_id=f"fixed-retained-baseline-{local_day}",
+                        start_at=local_start.astimezone(UTC),
+                        end_at=(local_start + timedelta(hours=12)).astimezone(UTC),
+                        state="active",
+                        app_id="editor",
+                    )
+                ],
+                timezone_name="Asia/Seoul",
+            ),
+            rebuild_summaries=False,
+            now=(local_start + timedelta(hours=13)).astimezone(UTC),
+        )
+        rebuild_day_summaries(
+            session,
+            day=date(2026, 8, local_day),
+            timezone=fixed_kst,
+            force_rebuild=True,
+            now=(local_start + timedelta(hours=13)).astimezone(UTC),
+        )
+
+    target = next(
+        row
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT,
+            )
+        )
+        if (
+            row.payload.get("date") == "2026-08-09"
+            and row.timezone == fixed_kst_name
+        )
+    )
+    assert target.payload["seven_day_baseline_delta"]["status"] == "ok"
+
+    report = run_activity_maintenance(
+        session,
+        now=datetime(2026, 8, 15, 12, tzinfo=UTC),
+    )
+    session.refresh(target)
+
+    assert report.expired_events_deleted >= 3
+    assert target.payload["seven_day_baseline_delta"] == {
+        "status": "insufficient_data",
+        "days_with_data": 0,
+        "required_days": 3,
+        "lookback_days": 7,
     }
 
 

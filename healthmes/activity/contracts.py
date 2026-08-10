@@ -6,7 +6,6 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Any, Literal
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
     AwareDatetime,
@@ -17,6 +16,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from healthmes.timezones import parse_timezone
 
 RESERVED_ACTIVITY_PROVIDER_NAMES = frozenset(
     {"activitywatch", "android-usage", "ios-device-activity"}
@@ -37,9 +38,12 @@ def is_reserved_activity_provider(value: str) -> bool:
 
 def validate_timezone(value: str) -> str:
     try:
-        ZoneInfo(value)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(f"timezone must be a valid IANA name, got {value!r}") from exc
+        parse_timezone(value)
+    except ValueError as exc:
+        raise ValueError(
+            "timezone must be a valid IANA name or UTC offset, "
+            f"got {value!r}"
+        ) from exc
     return value
 
 

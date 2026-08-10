@@ -46,7 +46,6 @@ import logging
 import os
 import re
 import uuid
-import zoneinfo
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
@@ -167,6 +166,7 @@ from healthmes.store import (
     session_scope,
 )
 from healthmes.store import enums as store_enums
+from healthmes.timezones import parse_timezone
 from healthmes.trusted_session import verify_trusted_session_proof
 
 _NORMALIZED_INTAKE_ITEMS = TypeAdapter(tuple[NormalizedIntakeItem, ...])
@@ -287,7 +287,7 @@ def set_timezone(tz: dt.tzinfo | str | None) -> None:
     """Pin the user-local timezone (tests / wiring); None restores resolution."""
     global _timezone_override
     if isinstance(tz, str):
-        tz = zoneinfo.ZoneInfo(tz)
+        tz = parse_timezone(tz)
     _timezone_override = tz
 
 
@@ -357,22 +357,21 @@ async def _resolve_user_id() -> str:
 def _local_timezone() -> dt.tzinfo:
     """The user's local timezone (all tranche-2 joins happen in it).
 
-    Order: explicit override -> ``Settings.timezone`` (IANA name; field
-    pending in the shared config, see needs) -> ``HEALTHMES_TIMEZONE`` env
-    var -> the machine's local timezone. A configured-but-invalid name is a
-    loud error, never a silent UTC fallback (silent guessing corrupts every
-    date join).
+    Order: explicit override -> ``Settings.timezone`` -> ``HEALTHMES_TIMEZONE``
+    -> the machine's local timezone. IANA names and stable ``UTC+09:00``
+    offsets are accepted. Invalid values fail loudly instead of silently
+    corrupting local-day joins.
     """
     if _timezone_override is not None:
         return _timezone_override
     name = getattr(_active_settings(), "timezone", None) or os.environ.get("HEALTHMES_TIMEZONE")
     if name:
         try:
-            return zoneinfo.ZoneInfo(str(name))
-        except (zoneinfo.ZoneInfoNotFoundError, ValueError) as exc:
+            return parse_timezone(str(name))
+        except ValueError as exc:
             raise ToolError(
-                f"Configured timezone {name!r} is not a valid IANA name "
-                "(HEALTHMES_TIMEZONE, e.g. 'Asia/Seoul')."
+                f"Configured timezone {name!r} is not a valid IANA name or "
+                "UTC fixed offset (e.g. 'Asia/Seoul' or 'UTC+09:00')."
             ) from exc
     return system_timezone()
 

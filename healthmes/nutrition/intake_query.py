@@ -6,7 +6,6 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from heapq import heappush, heapreplace
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import TypeAdapter
 from sqlalchemy import select
@@ -41,6 +40,7 @@ from healthmes.nutrition.intake_service import (
 )
 from healthmes.nutrition.query import known_caffeine_for_day
 from healthmes.store import WellnessEvent
+from healthmes.timezones import parse_timezone
 
 _ITEMS_ADAPTER = TypeAdapter(tuple[NormalizedIntakeItem, ...])
 _SNAPSHOT_ADAPTER = TypeAdapter(StructuredIntakeSnapshot)
@@ -514,8 +514,8 @@ def _caffeine_gate(
     if request.scope.value != "caffeine_sleep":
         return None, []
     try:
-        local_timezone = ZoneInfo(timezone)
-    except (ZoneInfoNotFoundError, ValueError):
+        local_timezone = parse_timezone(timezone)
+    except ValueError:
         return (
             {
                 "status": "unavailable",
@@ -529,7 +529,7 @@ def _caffeine_gate(
                 "unquantified_observation_ids": [],
                 "evidence": [],
                 "daily_confirmation_id": None,
-                "reason": "interaction timezone is not an IANA timezone",
+                "reason": "interaction timezone is invalid",
             },
             [],
         )

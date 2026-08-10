@@ -123,6 +123,13 @@ class TestMcpWiring:
             assert mcp_server._active_settings() is settings
         assert mcp_server._settings_override is None
 
+    def test_lifespan_accepts_fixed_offset_timezone(self, settings) -> None:
+        fixed = settings.model_copy(update={"timezone": "UTC+09:00"})
+        app = create_app(fixed)
+
+        with TestClient(app):
+            assert str(mcp_server._local_timezone()) == "UTC+09:00"
+
 
 class TestSchedulerWiring:
     def test_disabled_scheduler_stays_off(self, settings) -> None:

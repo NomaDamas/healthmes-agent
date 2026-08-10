@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.repository import (
     ACTIVITY_DAILY_CLASS,
     ACTIVITY_HOURLY_CLASS,
@@ -28,12 +29,24 @@ from healthmes.activity.repository import (
     upsert_summary_event,
 )
 from healthmes.store import WellnessEvent
+from healthmes.timezones import (
+    is_fixed_offset_timezone_name,
+    parse_timezone,
+)
 
 LATE_START_HOUR = 22
 LATE_END_HOUR = 6
 BASELINE_DAYS = 7
 MIN_BASELINE_DAYS = 3
 MIN_BASELINE_COVERAGE = 0.25
+SUMMARY_DERIVATION_VERSION = 2
+LEGACY_SUMMARY_REASON = "legacy_activity_summary_incompatible"
+
+
+@dataclass(frozen=True, slots=True)
+class ActivitySummaryMigrationReport:
+    migrated_scopes: int
+    incompatible_scopes: int
 
 
 def timezone_name(value: str | tzinfo) -> str:
@@ -44,7 +57,7 @@ def timezone_name(value: str | tzinfo) -> str:
 
 
 def local_day_bounds(day: date, timezone: str | tzinfo) -> tuple[datetime, datetime]:
-    tz = ZoneInfo(timezone) if isinstance(timezone, str) else timezone
+    tz = parse_timezone(timezone)
     start = datetime.combine(day, time.min, tzinfo=tz).astimezone(UTC)
     end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz).astimezone(UTC)
     return start, end
@@ -111,8 +124,18 @@ def _union_seconds(
     return total
 
 
-def _device_key(device_id: str | None) -> str:
-    value = device_id or "unknown-device"
+def _device_key(
+    source_provider: str | None,
+    device_id: str | None,
+) -> str:
+    value = json.dumps(
+        [
+            source_provider or "unknown-provider",
+            device_id or "unknown-device",
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
@@ -162,8 +185,11 @@ def _query_raw_events(
         )
     )
     requested_name = timezone_name(timezone)
-    requested_zone = ZoneInfo(timezone) if isinstance(timezone, str) else timezone
-    allow_offset_alias = not isinstance(timezone, str)
+    requested_zone = parse_timezone(timezone)
+    allow_offset_alias = (
+        not isinstance(timezone, str)
+        or is_fixed_offset_timezone_name(timezone)
+    )
     matching = []
     for row in rows:
         if event_is_expired(row, now=now) or row.timezone is None:
@@ -174,8 +200,8 @@ def _query_raw_events(
         if not allow_offset_alias:
             continue
         try:
-            source_zone = ZoneInfo(row.timezone)
-        except (ValueError, ZoneInfoNotFoundError):
+            source_zone = parse_timezone(row.timezone)
+        except ValueError:
             continue
         observed = as_utc(row.observed_at)
         if (
@@ -375,12 +401,12 @@ def summarize_window(
     start = as_utc(start)
     end = as_utc(end)
     name = timezone_name(timezone)
-    zone = ZoneInfo(timezone) if isinstance(timezone, str) else timezone
+    zone = parse_timezone(timezone)
     by_device: dict[str, DeviceHour] = {}
     interval_events: dict[str, list[WellnessEvent]] = defaultdict(list)
     hour_events: dict[str, list[WellnessEvent]] = defaultdict(list)
     for event in events:
-        key = _device_key(event.source_device)
+        key = _device_key(event.source_provider, event.source_device)
         by_device.setdefault(key, DeviceHour(device_key=key))
         if event.event_type == APP_INTERVAL_EVENT:
             interval_events[key].append(event)
@@ -525,6 +551,14 @@ def _summary_provenance_matches(
     )
 
 
+def summary_has_current_derivation(event: WellnessEvent) -> bool:
+    derived = event.derived_from if isinstance(event.derived_from, dict) else {}
+    return (
+        derived.get("derivation_version")
+        == SUMMARY_DERIVATION_VERSION
+    )
+
+
 def _summary_can_be_rebuilt_without_loss(
     event: WellnessEvent,
     evidence_ids: Iterable[str],
@@ -538,6 +572,7 @@ def _baseline_payload(
     day: date,
     timezone: str,
     current_minutes: float,
+    now: datetime,
 ) -> dict[str, Any]:
     return personal_baseline_delta(
         session,
@@ -545,6 +580,7 @@ def _baseline_payload(
         timezone=timezone,
         current_minutes=current_minutes,
         lookback_days=BASELINE_DAYS,
+        now=now,
     )
 
 
@@ -559,6 +595,7 @@ def personal_baseline_delta(
 ) -> dict[str, Any]:
     if not 1 <= lookback_days <= 90:
         raise ValueError("lookback_days must be between 1 and 90")
+    current = as_utc(now or datetime.now(UTC))
     name = timezone_name(timezone)
     start_day = day - timedelta(days=lookback_days)
     rows = list(
@@ -584,7 +621,8 @@ def personal_baseline_delta(
         if (
             start_day <= summary_day < day
             and row.payload.get("status") == "ok"
-            and not event_is_expired(row, now=now)
+            and summary_has_current_derivation(row)
+            and not event_is_expired(row, now=current)
             and coverage is not None
             and float(coverage) >= MIN_BASELINE_COVERAGE
         ):
@@ -617,6 +655,8 @@ def rebuild_day_summaries(
     force_rebuild: bool = False,
     now: datetime | None = None,
 ) -> WellnessEvent | None:
+    current = as_utc(now or datetime.now(UTC))
+    lock_activity_write_plane(session)
     name = timezone_name(timezone)
     start, end = local_day_bounds(day, timezone)
     policies = ensure_activity_policies(session)
@@ -625,7 +665,7 @@ def rebuild_day_summaries(
         start=start,
         end=end,
         timezone=timezone,
-        now=now,
+        now=current,
     )
     existing_day = session.scalar(
         select(WellnessEvent).where(
@@ -686,6 +726,7 @@ def rebuild_day_summaries(
             timezone=name,
             payload=payload,
             derived_from={
+                "derivation_version": SUMMARY_DERIVATION_VERSION,
                 "raw_event_count": len(evidence),
                 "raw_evidence_sha256": evidence_digest(evidence),
             },
@@ -730,7 +771,7 @@ def rebuild_day_summaries(
         if known_coverage and day_expected_seconds
         else None
     )
-    local_tz = ZoneInfo(timezone) if isinstance(timezone, str) else timezone
+    local_tz = parse_timezone(timezone)
     late_minutes = sum(
         float(payload["total_active_minutes"])
         for payload in hour_payloads
@@ -790,6 +831,7 @@ def rebuild_day_summaries(
             day=day,
             timezone=name,
             current_minutes=active_minutes,
+            now=current,
         ),
         "source_coverage": {
             "status": (
@@ -822,6 +864,7 @@ def rebuild_day_summaries(
         timezone=name,
         payload=payload,
         derived_from={
+            "derivation_version": SUMMARY_DERIVATION_VERSION,
             "raw_event_count": len(evidence_ids),
             "raw_evidence_sha256": evidence_digest(evidence_ids),
             "hour_summary_ids": [str(event.id) for event in hourly_events],
@@ -839,6 +882,7 @@ def rebuild_affected_days(
     force_rebuild: bool = False,
     now: datetime | None = None,
 ) -> list[WellnessEvent]:
+    current = as_utc(now or datetime.now(UTC))
     primary = set(days)
     rebuilt: list[WellnessEvent] = []
     for day in sorted(primary):
@@ -847,7 +891,7 @@ def rebuild_affected_days(
             day=day,
             timezone=timezone,
             force_rebuild=force_rebuild,
-            now=now,
+            now=current,
         )
         if event is not None:
             rebuilt.append(event)
@@ -862,6 +906,7 @@ def rebuild_affected_days(
             session,
             day=day,
             timezone=timezone,
+            now=current,
         )
         if event is None:
             event = rebuild_day_summaries(
@@ -869,7 +914,7 @@ def rebuild_affected_days(
                 day=day,
                 timezone=timezone,
                 force_rebuild=False,
-                now=now,
+                now=current,
             )
         if event is not None:
             rebuilt.append(event)
@@ -951,14 +996,95 @@ def summary_raw_provenance_complete(
     return True
 
 
+def _legacy_summary_scopes(
+    session: Session,
+    *,
+    now: datetime,
+) -> set[tuple[date, str]]:
+    scopes: set[tuple[date, str]] = set()
+    rows = session.scalars(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type.in_(
+                (HOUR_SUMMARY_EVENT, DAY_SUMMARY_EVENT)
+            ),
+            WellnessEvent.source_provider == SUMMARY_PROVIDER,
+        )
+    )
+    for row in rows:
+        if (
+            summary_has_current_derivation(row)
+            or event_is_expired(row, now=now)
+        ):
+            continue
+        timezone = row.timezone
+        if not isinstance(timezone, str):
+            continue
+        try:
+            zone = parse_timezone(timezone)
+        except ValueError:
+            continue
+        raw_day = row.payload.get("date")
+        if row.event_type == DAY_SUMMARY_EVENT and isinstance(raw_day, str):
+            try:
+                day = date.fromisoformat(raw_day)
+            except ValueError:
+                continue
+        else:
+            day = as_utc(row.observed_at).astimezone(zone).date()
+        scopes.add((day, timezone))
+    return scopes
+
+
+def migrate_activity_summary_derivations(
+    session: Session,
+    *,
+    now: datetime | None = None,
+) -> ActivitySummaryMigrationReport:
+    """Rebuild compatible legacy summaries and leave unsafe ones unreadable."""
+    current = as_utc(now or datetime.now(UTC))
+    lock_activity_write_plane(session)
+    migrated = 0
+    incompatible = 0
+    for day, timezone in sorted(
+        _legacy_summary_scopes(session, now=current)
+    ):
+        if not summary_raw_provenance_complete(
+            session,
+            day=day,
+            timezone=timezone,
+            now=current,
+        ):
+            incompatible += 1
+            continue
+        rebuilt = rebuild_day_summaries(
+            session,
+            day=day,
+            timezone=timezone,
+            force_rebuild=True,
+            now=current,
+        )
+        if rebuilt is None or not summary_has_current_derivation(rebuilt):
+            incompatible += 1
+            continue
+        migrated += 1
+    session.flush()
+    return ActivitySummaryMigrationReport(
+        migrated_scopes=migrated,
+        incompatible_scopes=incompatible,
+    )
+
+
 def refresh_existing_day_baseline(
     session: Session,
     *,
     day: date,
     timezone: str | tzinfo,
+    now: datetime | None = None,
 ) -> WellnessEvent | None:
+    current = as_utc(now or datetime.now(UTC))
+    lock_activity_write_plane(session)
     event = _daily_summary_event(session, day=day, timezone=timezone)
-    if event is None:
+    if event is None or not summary_has_current_derivation(event):
         return None
     payload = dict(event.payload)
     payload["seven_day_baseline_delta"] = _baseline_payload(
@@ -966,6 +1092,7 @@ def refresh_existing_day_baseline(
         day=day,
         timezone=timezone_name(timezone),
         current_minutes=float(payload.get("total_active_minutes") or 0),
+        now=current,
     )
     event.payload = payload
     session.flush()
@@ -977,10 +1104,11 @@ def get_daily_summary(
     *,
     day: date,
     timezone: str | tzinfo,
+    now: datetime | None = None,
 ) -> tuple[WellnessEvent | None, dict[str, Any]]:
     name = timezone_name(timezone)
     row = _daily_summary_event(session, day=day, timezone=timezone)
-    if row is None or event_is_expired(row):
+    if row is None or event_is_expired(row, now=now):
         return None, {
             "status": "insufficient_data",
             "date": day.isoformat(),
@@ -992,6 +1120,21 @@ def get_daily_summary(
             },
             "limitations": ["missing_is_not_zero"],
         }
+    if not summary_has_current_derivation(row):
+        return None, {
+            "status": "insufficient_data",
+            "date": day.isoformat(),
+            "timezone": name,
+            "reason": LEGACY_SUMMARY_REASON,
+            "source_coverage": {
+                "status": "incompatible_summary",
+                "ratio": None,
+            },
+            "limitations": [
+                "missing_is_not_zero",
+                LEGACY_SUMMARY_REASON,
+            ],
+        }
     return row, _public_summary(row.payload)
 
 
@@ -1001,6 +1144,7 @@ def list_hourly_summaries(
     start: datetime,
     end: datetime,
     timezone: str | tzinfo,
+    now: datetime | None = None,
 ) -> list[WellnessEvent]:
     name = timezone_name(timezone)
     rows = list(
@@ -1021,10 +1165,38 @@ def list_hourly_summaries(
         for row in rows
         if (
             row.timezone == name
-            and not event_is_expired(row)
+            and not event_is_expired(row, now=now)
+            and summary_has_current_derivation(row)
             and as_utc(row.observed_at) + timedelta(hours=1) > window_start
         )
     ]
+
+
+def legacy_hourly_summary_present(
+    session: Session,
+    *,
+    start: datetime,
+    end: datetime,
+    timezone: str | tzinfo,
+    now: datetime | None = None,
+) -> bool:
+    name = timezone_name(timezone)
+    window_start = as_utc(start)
+    rows = session.scalars(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == HOUR_SUMMARY_EVENT,
+            WellnessEvent.source_provider == SUMMARY_PROVIDER,
+            WellnessEvent.observed_at >= window_start - timedelta(hours=1),
+            WellnessEvent.observed_at < as_utc(end),
+        )
+    )
+    return any(
+        row.timezone == name
+        and not event_is_expired(row, now=now)
+        and not summary_has_current_derivation(row)
+        and as_utc(row.observed_at) + timedelta(hours=1) > window_start
+        for row in rows
+    )
 
 
 def raw_window_summary(

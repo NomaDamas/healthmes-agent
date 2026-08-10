@@ -5,6 +5,14 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from healthmes.activity.contracts import (
+    ActivityBatchIn,
+    ActivityCapability,
+    ActivityPlatform,
+    AppIntervalRecord,
+)
+from healthmes.activity.repository import DAY_SUMMARY_EVENT
+from healthmes.activity.service import ingest_activity_batch
 from healthmes.storage import (
     register_storage_object,
     run_storage_maintenance,
@@ -55,6 +63,80 @@ def test_retention_update_is_persisted(client: TestClient, session) -> None:
     )
     assert policy is not None
     assert policy.retention_days == 1
+
+
+def test_daily_retention_update_immediately_refreshes_rest_baseline(
+    client: TestClient,
+    session,
+    monkeypatch,
+) -> None:
+    current = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    for day in range(1, 5):
+        start = datetime(2026, 8, day, 0, tzinfo=UTC)
+        ingest_activity_batch(
+            session,
+            ActivityBatchIn(
+                source_provider="retention-rest-test",
+                source_device="desktop-retention-rest",
+                platform=ActivityPlatform.MACOS,
+                capability=ActivityCapability.DETAILED,
+                timezone="UTC",
+                records=[
+                    AppIntervalRecord(
+                        source_record_id=f"retention-rest-{day}",
+                        start_at=start,
+                        end_at=start + timedelta(hours=12),
+                        state="active",
+                        app_id="editor",
+                    )
+                ],
+            ),
+            now=start + timedelta(hours=13),
+        )
+    session.commit()
+
+    target = next(
+        row
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT
+            )
+        )
+        if row.payload.get("date") == "2026-08-04"
+    )
+    assert target.payload["seven_day_baseline_delta"]["status"] == "ok"
+    monkeypatch.setattr(
+        "healthmes.storage.service._now",
+        lambda: current,
+    )
+
+    updated = client.put(
+        "/v1/storage/settings/activity_daily",
+        json={"preset": "7d"},
+    )
+    summary = client.get(
+        "/v1/activity/summary",
+        params={"date": "2026-08-04", "timezone": "UTC"},
+    )
+
+    assert updated.status_code == 200
+    assert summary.status_code == 200
+    assert summary.json()["seven_day_baseline_delta"] == {
+        "status": "insufficient_data",
+        "days_with_data": 0,
+        "required_days": 3,
+        "lookback_days": 7,
+    }
+    session.expire_all()
+    remaining_days = {
+        row.payload.get("date")
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT
+            )
+        )
+    }
+    assert remaining_days == {"2026-08-04"}
 
 
 def test_retention_update_uses_the_original_object_observation_time(

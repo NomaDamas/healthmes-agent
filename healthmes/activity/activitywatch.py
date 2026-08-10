@@ -8,8 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from math import isfinite
 from typing import Any
-from urllib.parse import urlparse
-from zoneinfo import ZoneInfo
+from urllib.parse import quote, urlparse
 
 import httpx
 from pydantic import ValidationError
@@ -30,15 +29,24 @@ from healthmes.activity.contracts import (
     AppIntervalRecord,
 )
 from healthmes.activity.identity import scoped_source_record_id
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.activity.privacy import collection_gate, filter_records
 from healthmes.activity.repository import (
     APP_INTERVAL_EVENT,
+    ActivityChangeWindow,
     ActivityLocalScope,
+    advance_activitywatch_import_fence,
     event_bounds,
     event_is_expired,
     event_scopes,
+    fixed_offset_summary_scopes_by_change,
+    get_activitywatch_import_fence,
     get_control_payload,
     parse_optional_datetime,
+    record_bounds,
     record_scopes,
     tombstoned_record_ids,
     update_collection_status,
@@ -48,9 +56,11 @@ from healthmes.activity.service import (
     ActivityCollectionBlockedError,
     ActivityIngestResult,
     ActivitySummaryProvenanceError,
+    StaleCollectionRevisionError,
     ingest_activity_batch,
 )
 from healthmes.store import WellnessEvent
+from healthmes.timezones import parse_timezone
 
 ACTIVITYWATCH_PROVIDER = "activitywatch"
 DEFAULT_LOOKBACK = timedelta(days=1)
@@ -66,6 +76,10 @@ class ActivityWatchError(RuntimeError):
 
 class ActivityWatchRequestError(ActivityWatchError):
     """A deterministic caller range error, not an upstream source failure."""
+
+
+class StaleActivityWatchImportError(ValueError):
+    """A newer import or privacy/deletion boundary superseded this snapshot."""
 
 
 def _validate_import_range(
@@ -122,6 +136,7 @@ class ActivityWatchClient:
             base_url=self.base_url,
             transport=self.transport,
             timeout=self.timeout,
+            trust_env=False,
         )
 
     def list_buckets(self) -> dict[str, dict[str, Any]]:
@@ -144,9 +159,14 @@ class ActivityWatchClient:
         start: datetime,
         end: datetime,
     ) -> list[dict[str, Any]]:
+        if not bucket_id or bucket_id in {".", ".."}:
+            raise ActivityWatchError(
+                "ActivityWatch bucket ID must be one non-dot path segment"
+            )
+        bucket_path = quote(bucket_id, safe="")
         with self._client() as client:
             response = client.get(
-                f"/api/0/buckets/{bucket_id}/events",
+                f"/api/0/buckets/{bucket_path}/events",
                 params={
                     "start": start.astimezone(UTC).isoformat(),
                     "end": end.astimezone(UTC).isoformat(),
@@ -484,7 +504,7 @@ def _range_scopes(
     end: datetime,
     timezone: str,
 ) -> set[ActivityLocalScope]:
-    zone = ZoneInfo(timezone)
+    zone = parse_timezone(timezone)
     first = start.astimezone(zone).date()
     last = (end - timedelta(microseconds=1)).astimezone(zone).date()
     return {
@@ -723,6 +743,43 @@ def _reconcile_activitywatch_range(
         for row in existing_rows
         for scope in event_scopes(row)
     )
+    alias_changes = [
+        ActivityChangeWindow(
+            key="authoritative-range",
+            start=start,
+            end=end,
+            timezone=timezone,
+        )
+    ]
+    for record in incoming_by_id.values():
+        record_start, record_end = record_bounds(record)
+        alias_changes.append(
+            ActivityChangeWindow(
+                key=f"incoming:{record.source_record_id}",
+                start=record_start,
+                end=record_end,
+                timezone=timezone,
+            )
+        )
+    for row in existing_rows:
+        row_start, row_end = event_bounds(row)
+        alias_changes.append(
+            ActivityChangeWindow(
+                key=f"existing:{row.id}",
+                start=row_start,
+                end=row_end,
+                timezone=row.timezone or "UTC",
+            )
+        )
+    affected_scopes.update(
+        scope
+        for scopes in fixed_offset_summary_scopes_by_change(
+            session,
+            alias_changes,
+            now=now,
+        ).values()
+        for scope in scopes
+    )
     incomplete = [
         scope
         for scope in sorted(affected_scopes)
@@ -841,18 +898,32 @@ def _reconcile_activitywatch_range(
     )
 
 
-def import_activitywatch(
+@dataclass(frozen=True, slots=True)
+class ActivityWatchPreparedImport:
+    current: datetime
+    initial_state: dict[str, Any]
+    import_sequence: int
+    window_bucket: str
+    afk_bucket: str
+    cursor_key: str
+    start: datetime
+    end: datetime
+    records: tuple[AppIntervalRecord, ...]
+
+
+def prepare_activitywatch_import(
     session: Session,
     request: ActivityWatchImportRequest,
     *,
     client: ActivityWatchClient | None = None,
     now: datetime | None = None,
-) -> ActivityIngestResult:
+) -> ActivityWatchPreparedImport:
+    """Reserve latest-started-wins ordering, then read localhost without locks.
+
+    The reservation is intentionally committed before network I/O. Callers
+    must treat this adapter operation as its own transaction boundary.
+    """
     current = (now or datetime.now(UTC)).astimezone(UTC)
-    state = get_control_payload(session, request.device_id, platform=request.platform)
-    gate = collection_gate(state, now=current)
-    if not gate.allowed:
-        raise ActivityCollectionBlockedError(gate.reason or "collection_blocked")
     if request.end_at is not None and request.end_at > current + MAX_FUTURE_SKEW:
         raise ActivityWatchRequestError(
             "ActivityWatch import end cannot be in the future"
@@ -863,6 +934,25 @@ def import_activitywatch(
             end=request.end_at or current,
             current=current,
         )
+    with activity_write_lock():
+        lock_activity_write_plane(session)
+        state = get_control_payload(
+            session,
+            request.device_id,
+            platform=request.platform,
+            lock=True,
+        )
+        gate = collection_gate(state, now=current)
+        if not gate.allowed:
+            raise ActivityCollectionBlockedError(
+                gate.reason or "collection_blocked"
+            )
+        import_sequence = advance_activitywatch_import_fence(
+            session,
+            request.device_id,
+            now=current,
+        )
+        session.commit()
     aw = client or ActivityWatchClient(str(request.base_url))
     buckets = aw.list_buckets()
     window_bucket = _select_bucket(
@@ -914,6 +1004,79 @@ def import_activitywatch(
         # back to exactly one launch.
         launch_start=start,
     )
+    return ActivityWatchPreparedImport(
+        current=current,
+        initial_state=state,
+        import_sequence=import_sequence,
+        window_bucket=window_bucket,
+        afk_bucket=afk_bucket,
+        cursor_key=cursor_key,
+        start=start,
+        end=end,
+        records=tuple(records),
+    )
+
+
+def import_activitywatch(
+    session: Session,
+    request: ActivityWatchImportRequest,
+    *,
+    client: ActivityWatchClient | None = None,
+    now: datetime | None = None,
+    prepared: ActivityWatchPreparedImport | None = None,
+) -> ActivityIngestResult:
+    if prepared is None:
+        prepared = prepare_activitywatch_import(
+            session,
+            request,
+            client=client,
+            now=now,
+        )
+        with activity_write_lock():
+            return import_activitywatch(
+                session,
+                request,
+                prepared=prepared,
+            )
+
+    current = prepared.current
+    state = dict(prepared.initial_state)
+    afk_bucket = prepared.afk_bucket
+    cursor_key = prepared.cursor_key
+    start = prepared.start
+    end = prepared.end
+    records = list(prepared.records)
+    lock_activity_write_plane(session)
+    latest_state = get_control_payload(
+        session,
+        request.device_id,
+        platform=request.platform,
+        lock=True,
+    )
+    latest_gate = collection_gate(latest_state, now=current)
+    if not latest_gate.allowed:
+        raise ActivityCollectionBlockedError(
+            latest_gate.reason or "collection_blocked"
+        )
+    initial_revision = int(state.get("config_revision", 0))
+    latest_revision = int(latest_state.get("config_revision", 0))
+    if latest_revision != initial_revision:
+        raise StaleCollectionRevisionError(
+            f"collector configuration revision {initial_revision} "
+            f"does not match server revision {latest_revision}"
+        )
+    latest_sequence = get_activitywatch_import_fence(
+        session,
+        request.device_id,
+        lock=True,
+    )
+    if latest_sequence != prepared.import_sequence:
+        raise StaleActivityWatchImportError(
+            "ActivityWatch import sequence "
+            f"{prepared.import_sequence} was superseded by "
+            f"{latest_sequence!r}"
+        )
+    state = latest_state
     filtered, excluded, _ = filter_records(records, state, now=current)
     tombstoned_ids = tombstoned_record_ids(
         session,

@@ -7,7 +7,6 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from math import isfinite
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -24,6 +23,7 @@ from healthmes.calendars.base import HealthmesEventKind
 from healthmes.nutrition.intake_query import decision_context as nutrition_decision_context
 from healthmes.nutrition.query import known_caffeine_for_day
 from healthmes.store import CalendarEventMirror
+from healthmes.timezones import parse_timezone
 
 WearableReader = Callable[[date], Awaitable[dict[str, Any]]]
 
@@ -67,7 +67,7 @@ def _parse_day(
 
 
 def _zone(value: str | tzinfo) -> tzinfo:
-    return ZoneInfo(value) if isinstance(value, str) else value
+    return parse_timezone(value)
 
 
 def calendar_context(
@@ -199,7 +199,7 @@ def nutrition_context(
         except (TypeError, ValueError):
             failures.append("nutrition_request_time_missing")
         else:
-            if anchor.astimezone(ZoneInfo(timezone)).date() != day:
+            if anchor.astimezone(parse_timezone(timezone)).date() != day:
                 failures.append("nutrition_request_date_mismatch")
         if not isinstance(caffeine, dict):
             failures.append("caffeine_specialized_evidence_missing")
@@ -327,18 +327,195 @@ def _finite_nonnegative_number(value: object) -> float | None:
     return result if isfinite(result) and result >= 0 else None
 
 
+_WEARABLE_TOP_LEVEL_SCALARS = frozenset(
+    {
+        "status",
+        "reason",
+        "date",
+        "baseline_window_days",
+        "confidence",
+    }
+)
+_WEARABLE_BLOCK_SCALARS: dict[str, frozenset[str]] = {
+    "sleep_debt": frozenset(
+        {
+            "status",
+            "reason",
+            "confidence",
+            "date",
+            "source",
+            "recorded_at",
+            "observed_at",
+            "window_days",
+            "nights_counted",
+            "coverage",
+            "index",
+        }
+    ),
+    "actual_sleep": frozenset(
+        {
+            "status",
+            "reason",
+            "confidence",
+            "date",
+            "local_date",
+            "start",
+            "wake_time",
+            "duration_minutes",
+            "time_in_bed_minutes",
+            "source",
+            "freshness",
+            "earliest_available_work_time",
+            "recorded_at",
+            "observed_at",
+        }
+    ),
+    "hrv": frozenset(
+        {
+            "status",
+            "reason",
+            "confidence",
+            "date",
+            "score",
+            "source",
+            "recorded_at",
+            "observed_at",
+            "window_days",
+            "n_days",
+            "coverage",
+            "stale_days",
+            "baseline_median",
+            "delta",
+            "delta_pct",
+            "z_score",
+            "variant",
+            "unit",
+        }
+    ),
+    "stress": frozenset(
+        {
+            "status",
+            "reason",
+            "confidence",
+            "date",
+            "source",
+            "recorded_at",
+            "observed_at",
+            "value",
+            "scale",
+            "observed_on",
+            "stale_days",
+        }
+    ),
+    "charge": frozenset(
+        {
+            "status",
+            "reason",
+            "confidence",
+            "date",
+            "source",
+            "recorded_at",
+            "observed_at",
+            "value",
+            "freshest_at",
+        }
+    ),
+    "yesterday_load": frozenset(
+        {
+            "status",
+            "reason",
+            "confidence",
+            "date",
+            "source",
+            "recorded_at",
+            "observed_at",
+            "workouts",
+            "total_minutes",
+            "total_calories_kcal",
+            "max_avg_heart_rate_bpm",
+        }
+    ),
+}
+_WEARABLE_LAST_NIGHT_SCALARS = frozenset(
+    {"date", "score", "recorded_at", "observed_at"}
+)
+_WEARABLE_CURRENT_SCALARS = frozenset(
+    {"date", "value", "unit", "qualifier", "recorded_at", "observed_at"}
+)
+_WEARABLE_CHARGE_ENTRY_SCALARS = frozenset(
+    {
+        "category",
+        "provider",
+        "value",
+        "qualifier",
+        "observed_on",
+        "recorded_at",
+    }
+)
+_WEARABLE_FRESHNESS_SCALARS = frozenset({"recorded_at", "status"})
+_WEARABLE_COVERAGE_SCALARS = frozenset(
+    {"status", "ratio", "usable_blocks", "total_blocks"}
+)
+
+
+def _safe_context_scalar(value: object) -> bool:
+    if value is None or isinstance(value, str | bool | int):
+        return True
+    return isinstance(value, float) and isfinite(value)
+
+
+def _allowlisted_scalars(
+    value: dict[str, Any],
+    allowed: frozenset[str],
+) -> dict[str, Any]:
+    return {
+        key: value[key]
+        for key in allowed
+        if key in value and _safe_context_scalar(value[key])
+    }
+
+
+def _normalize_wearable_block(
+    name: str,
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    block = _allowlisted_scalars(value, _WEARABLE_BLOCK_SCALARS[name])
+    last_night = value.get("last_night")
+    if isinstance(last_night, dict):
+        block["last_night"] = _allowlisted_scalars(
+            last_night,
+            _WEARABLE_LAST_NIGHT_SCALARS,
+        )
+    current = value.get("current")
+    if isinstance(current, dict):
+        block["current"] = _allowlisted_scalars(
+            current,
+            _WEARABLE_CURRENT_SCALARS,
+        )
+    if name == "charge" and isinstance(value.get("entries"), list):
+        block["entries"] = [
+            _allowlisted_scalars(entry, _WEARABLE_CHARGE_ENTRY_SCALARS)
+            for entry in value["entries"]
+            if isinstance(entry, dict)
+        ]
+    if name == "yesterday_load" and isinstance(value.get("types"), list):
+        block["types"] = [
+            item for item in value["types"] if isinstance(item, str)
+        ]
+    return block
+
+
 def _normalize_wearable_context(
     value: dict[str, Any],
     *,
     day: date,
 ) -> dict[str, Any]:
-    context = dict(value)
-    limitations = list(context.get("limitations") or [])
-    if context.get("date") not in {None, day.isoformat()}:
+    raw_date = value.get("date")
+    if raw_date not in {None, day.isoformat()}:
         return {
             "status": "insufficient_data",
             "reason": "wearable_context_date_mismatch",
-            "date": context.get("date"),
+            "date": raw_date if isinstance(raw_date, str) else None,
             "evidence_ids": [],
             "freshness": {"recorded_at": None, "status": "unavailable"},
             "coverage": {"status": "no_matching_day", "ratio": None},
@@ -347,15 +524,22 @@ def _normalize_wearable_context(
                 "open_wearables_context_not_combined",
             ],
         }
-    evidence_ids = list(context.get("evidence_ids") or [])
-    block_names = (
-        "sleep_debt",
-        "actual_sleep",
-        "hrv",
-        "stress",
-        "charge",
-        "yesterday_load",
-    )
+    context = _allowlisted_scalars(value, _WEARABLE_TOP_LEVEL_SCALARS)
+    limitations = [
+        item
+        for item in value.get("limitations", [])
+        if isinstance(item, str)
+    ] if isinstance(value.get("limitations"), list) else []
+    evidence_ids = [
+        item
+        for item in value.get("evidence_ids", [])
+        if isinstance(item, str)
+    ] if isinstance(value.get("evidence_ids"), list) else []
+    block_names = tuple(_WEARABLE_BLOCK_SCALARS)
+    for name in block_names:
+        raw_block = value.get(name)
+        if isinstance(raw_block, dict):
+            context[name] = _normalize_wearable_block(name, raw_block)
     blocks = [
         context[name]
         for name in block_names
@@ -364,6 +548,14 @@ def _normalize_wearable_context(
     usable_blocks = [
         block for block in blocks if block.get("status") == "ok"
     ]
+    raw_coverage = value.get("coverage")
+    if isinstance(raw_coverage, dict):
+        coverage = _allowlisted_scalars(
+            raw_coverage,
+            _WEARABLE_COVERAGE_SCALARS,
+        )
+        if coverage:
+            context["coverage"] = coverage
     if "coverage" not in context:
         context["coverage"] = {
             "status": "readiness_blocks",
@@ -375,6 +567,7 @@ def _normalize_wearable_context(
             "usable_blocks": len(usable_blocks),
             "total_blocks": len(blocks),
         }
+
     def collect_timestamps(node: Any, timestamps: list[str]) -> None:
         if isinstance(node, dict):
             for key, item in node.items():
@@ -398,6 +591,14 @@ def _normalize_wearable_context(
             for item in node:
                 collect_timestamps(item, timestamps)
 
+    raw_freshness = value.get("freshness")
+    if isinstance(raw_freshness, dict):
+        freshness = _allowlisted_scalars(
+            raw_freshness,
+            _WEARABLE_FRESHNESS_SCALARS,
+        )
+        if freshness:
+            context["freshness"] = freshness
     explicit_timestamps: list[str] = []
     collect_timestamps(context.get("freshness"), explicit_timestamps)
     if not explicit_timestamps:
@@ -495,6 +696,7 @@ async def resolve_wellness_context(
                 session,
                 day=day,
                 timezone=timezone_value,
+                now=current,
             )
         elif request.question_kind == "focus":
             start, end = local_day_bounds(day, timezone_value)
@@ -522,6 +724,7 @@ async def resolve_wellness_context(
                 session,
                 day=day,
                 timezone=timezone_value,
+                now=current,
             )
         elif request.question_kind == "caffeine_for_focus":
             start, end = local_day_bounds(day, timezone_value)
@@ -552,6 +755,7 @@ async def resolve_wellness_context(
                     day=day,
                     timezone=timezone_value,
                     lookback_days=request.lookback_days,
+                    now=current,
                 ),
             )
         else:
@@ -560,6 +764,7 @@ async def resolve_wellness_context(
                 day=day,
                 timezone=timezone_value,
                 lookback_days=request.lookback_days,
+                now=current,
             )
 
     if "wearable" in selected:

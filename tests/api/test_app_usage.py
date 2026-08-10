@@ -5,7 +5,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
-from healthmes.activity.repository import APP_HOUR_EVENT, DAY_SUMMARY_EVENT
+from healthmes.activity.contracts import ActivityCollectionStatusUpdate
+from healthmes.activity.repository import (
+    APP_HOUR_EVENT,
+    DAY_SUMMARY_EVENT,
+    update_collection_status,
+)
 from healthmes.store import AppUsageSample, WellnessEvent
 
 
@@ -439,6 +444,80 @@ def test_batch_requires_registered_current_generation(client, session):
         == "activity_collection_generation_unregistered"
     )
     assert session.scalar(select(AppUsageSample)) is None
+
+
+@pytest.mark.parametrize(
+    ("device_id", "status_payload"),
+    (
+        (
+            "android-missing-boundary",
+            {
+                "collection_generation": 4,
+            },
+        ),
+        (
+            "android-spoofed-platform",
+            {
+                "platform": "ios",
+                "capability": "aggregate",
+                "permission_status": "granted",
+                "status_observed_at": "2026-08-01T09:00:00Z",
+                "collection_generation": 4,
+            },
+        ),
+        (
+            "android-unknown-permission",
+            {
+                "platform": "android",
+                "capability": "aggregate",
+                "permission_status": "unknown",
+                "status_observed_at": "2026-08-01T09:00:00Z",
+                "collection_generation": 4,
+            },
+        ),
+    ),
+    ids=("missing-fields", "spoofed-platform", "unknown-permission"),
+)
+def test_batch_rejects_malformed_persisted_android_boundary(
+    client,
+    session,
+    device_id,
+    status_payload,
+):
+    update_collection_status(
+        session,
+        device_id,
+        ActivityCollectionStatusUpdate.model_validate(status_payload),
+        now=datetime(2026, 8, 1, 9, tzinfo=UTC),
+    )
+    session.commit()
+
+    response = client.post(
+        "/v1/app-usage/batch",
+        json={
+            **_batch([SAMPLE_SLACK]),
+            "device_id": device_id,
+            "collection_generation": 4,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "activity_android_boundary_invalid"
+    assert (
+        session.scalar(
+            select(AppUsageSample).where(AppUsageSample.device_id == device_id)
+        )
+        is None
+    )
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT,
+                WellnessEvent.source_device == device_id,
+            )
+        )
+        is None
+    )
 
 
 def test_revoke_blocks_delayed_grant_and_previous_generation_batch(

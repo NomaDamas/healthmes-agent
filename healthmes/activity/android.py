@@ -17,6 +17,7 @@ from healthmes.activity.contracts import (
     AppHourRecord,
 )
 from healthmes.activity.identity import device_namespace
+from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.repository import (
     ACTIVITY_RAW_CLASS,
     activity_write_lock,
@@ -163,6 +164,7 @@ def backfill_android_canonical_events(
 ) -> ActivityIngestResult | None:
     current = (now or datetime.now(UTC)).astimezone(UTC)
     with activity_write_lock():
+        lock_activity_write_plane(session)
         raw_policy = ensure_activity_policies(session)[ACTIVITY_RAW_CLASS]
         last_id = None
         found_rows = False

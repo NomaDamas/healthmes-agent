@@ -1,8 +1,9 @@
 import json
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 
 from healthmes.activity.contracts import (
     ActivityBatchIn,
@@ -11,6 +12,7 @@ from healthmes.activity.contracts import (
     ActivityPlatform,
     AppIntervalRecord,
 )
+from healthmes.activity.repository import DAY_SUMMARY_EVENT
 from healthmes.activity.resolver import (
     WellnessContextRangeError,
     calendar_context,
@@ -19,7 +21,31 @@ from healthmes.activity.resolver import (
 )
 from healthmes.activity.service import ingest_activity_batch
 from healthmes.calendars.base import HealthmesEventKind
-from healthmes.store import CalendarEventMirror, CalendarSource
+from healthmes.nutrition.contracts import (
+    Confidence,
+    DailyIntakeConfirmation,
+    Estimate,
+    EstimateKind,
+)
+from healthmes.nutrition.intake_contracts import (
+    CaptureModality,
+    DecisionScope,
+    EvidenceOrigin,
+    IntakeDecisionRequest,
+    IntakeIntent,
+    IntakeInteraction,
+    IntakeOutcome,
+    IntakeOutcomeStatus,
+    NormalizedIntakeItem,
+    NutrientFact,
+)
+from healthmes.nutrition.intake_service import (
+    create_interaction,
+    persist_decision_request,
+    persist_outcome,
+)
+from healthmes.nutrition.repository import persist_daily_confirmation
+from healthmes.store import CalendarEventMirror, CalendarSource, WellnessEvent
 
 
 def _seed_activity(session) -> None:
@@ -44,6 +70,137 @@ def _seed_activity(session) -> None:
             ],
         ),
     )
+
+
+def _seed_fixed_offset_caffeine_request(
+    session,
+    settings,
+) -> uuid.UUID:
+    timezone = "UTC+09:00"
+    consumed_id = uuid.uuid4()
+    consumed_at = datetime.fromisoformat("2026-08-01T09:00:00+09:00")
+    caffeine_item = NormalizedIntakeItem(
+        name="morning coffee",
+        intake_type="beverage",
+        serving=Estimate(
+            kind=EstimateKind.EXACT,
+            unit="cup",
+            exact=1,
+            estimation_basis="owner_statement",
+        ),
+        nutrients=(
+            NutrientFact(
+                nutrient="caffeine",
+                amount=Estimate(
+                    kind=EstimateKind.EXACT,
+                    unit="mg",
+                    exact=80,
+                    estimation_basis="owner_statement",
+                ),
+                confidence=Confidence.HIGH,
+                origin=EvidenceOrigin.USER,
+            ),
+        ),
+        confidence=Confidence.HIGH,
+    )
+    create_interaction(
+        session,
+        settings,
+        IntakeInteraction(
+            interaction_id=consumed_id,
+            operation_fingerprint="a" * 64,
+            intent=IntakeIntent.LOG_CONSUMED,
+            modality=CaptureModality.TEXT,
+            observed_at=consumed_at,
+            recorded_at=consumed_at,
+            timezone=timezone,
+            source="resolver-test",
+            source_text="80 mg caffeine coffee",
+            media_path=None,
+            nutrition_observation_id=None,
+            items=(caffeine_item,),
+        ),
+    )
+    outcome_id = uuid.uuid4()
+    persist_outcome(
+        session,
+        IntakeOutcome(
+            outcome_id=outcome_id,
+            operation_fingerprint="b" * 64,
+            interaction_id=consumed_id,
+            status=IntakeOutcomeStatus.CONSUMED,
+            confirmed_at=consumed_at + timedelta(minutes=1),
+            source="resolver-test",
+            consumed_at=consumed_at,
+        ),
+    )
+    persist_daily_confirmation(
+        session,
+        DailyIntakeConfirmation(
+            confirmation_id=uuid.uuid4(),
+            local_date=date(2026, 8, 1),
+            timezone=timezone,
+            observation_ids=(),
+            outcome_ids=(outcome_id,),
+            total_intake_complete=True,
+            confirmed_at=consumed_at + timedelta(minutes=2),
+            source="resolver-test",
+        ),
+    )
+
+    candidate_id = uuid.uuid4()
+    candidate_at = datetime.fromisoformat("2026-08-01T15:00:00+09:00")
+    candidate_item = NormalizedIntakeItem(
+        name="afternoon coffee",
+        intake_type="beverage",
+        serving=caffeine_item.serving,
+        nutrients=(
+            NutrientFact(
+                nutrient="caffeine",
+                amount=Estimate(
+                    kind=EstimateKind.EXACT,
+                    unit="mg",
+                    exact=100,
+                    estimation_basis="owner_statement",
+                ),
+                confidence=Confidence.HIGH,
+                origin=EvidenceOrigin.USER,
+            ),
+        ),
+        confidence=Confidence.HIGH,
+    )
+    create_interaction(
+        session,
+        settings,
+        IntakeInteraction(
+            interaction_id=candidate_id,
+            operation_fingerprint="c" * 64,
+            intent=IntakeIntent.ASK_BEFORE_INTAKE,
+            modality=CaptureModality.TEXT,
+            observed_at=candidate_at,
+            recorded_at=candidate_at,
+            timezone=timezone,
+            source="resolver-test",
+            source_text="Can I drink this coffee?",
+            media_path=None,
+            nutrition_observation_id=None,
+            items=(candidate_item,),
+        ),
+    )
+    request_id = uuid.uuid4()
+    persist_decision_request(
+        session,
+        IntakeDecisionRequest(
+            request_id=request_id,
+            operation_fingerprint="d" * 64,
+            interaction_id=candidate_id,
+            scope=DecisionScope.CAFFEINE_SLEEP,
+            requested_at=candidate_at,
+            source="resolver-test",
+            intended_consumption_at=candidate_at,
+        ),
+    )
+    return request_id
 
 
 async def test_single_domain_request_does_not_read_unselected_wearables(session) -> None:
@@ -73,6 +230,38 @@ async def test_single_domain_request_does_not_read_unselected_wearables(session)
     ]
     assert result["contexts"]["activity"]["total_active_minutes"] == 60.0
     assert "private.app.identity" not in json.dumps(result)
+
+
+async def test_resolver_uses_actual_fixed_offset_caffeine_request(
+    session,
+    settings,
+) -> None:
+    request_id = _seed_fixed_offset_caffeine_request(session, settings)
+
+    result = await resolve_wellness_context(
+        session,
+        ActivityContextResolveRequest(
+            question_kind="caffeine_for_focus",
+            date="2026-08-01",
+            start=datetime(2026, 8, 1, 1, tzinfo=UTC),
+            end=datetime(2026, 8, 1, 2, tzinfo=UTC),
+            timezone="UTC+09:00",
+            nutrition_request_id=request_id,
+        ),
+        default_timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    nutrition = result["contexts"]["nutrition"]
+    assert nutrition["status"] == "ok"
+    assert nutrition["decision_ready"] is True
+    assert nutrition["context"]["request"]["request_id"] == str(request_id)
+    assert (
+        nutrition["context"]["specialized_evidence"]["caffeine"][
+            "confirmed_caffeine_mg"
+        ]
+        == 80
+    )
 
 
 async def test_one_domain_failure_does_not_erase_other_focus_context(session) -> None:
@@ -159,6 +348,27 @@ async def test_caffeine_for_focus_selects_bounded_cross_domain_context(session) 
     assert "private.app.identity" not in json.dumps(result)
 
 
+async def test_caffeine_for_focus_supports_public_fixed_offset_timezone(session) -> None:
+    result = await resolve_wellness_context(
+        session,
+        ActivityContextResolveRequest(
+            question_kind="caffeine_for_focus",
+            date="2026-08-01",
+            start=datetime(2026, 8, 1, 1, tzinfo=UTC),
+            end=datetime(2026, 8, 1, 2, tzinfo=UTC),
+            timezone="UTC+09:00",
+        ),
+        default_timezone="UTC",
+        now=datetime(2026, 8, 1, 3, tzinfo=UTC),
+    )
+
+    assert result["timezone"] == "UTC+09:00"
+    assert result["contexts"]["nutrition"]["kind"] == "confirmed_caffeine_ledger"
+    assert result["contexts"]["nutrition"]["context"]["local_date"] == "2026-08-01"
+    assert result["contexts"]["nutrition"]["context"]["timezone"] == "UTC+09:00"
+    assert result["contexts"]["time"]["local_now"] == "2026-08-01T12:00:00+09:00"
+
+
 async def test_resolver_uses_injected_now_for_an_implicit_local_date(session) -> None:
     result = await resolve_wellness_context(
         session,
@@ -169,6 +379,91 @@ async def test_resolver_uses_injected_now_for_an_implicit_local_date(session) ->
 
     assert result["date"] == "2026-08-02"
     assert result["timezone"] == "Asia/Seoul"
+
+
+@pytest.mark.parametrize("question_kind", ("overwork", "caffeine_for_focus"))
+async def test_resolver_uses_injected_now_for_overwork_expiry(
+    session,
+    question_kind,
+) -> None:
+    for observed_day in (
+        date(2026, 7, 29),
+        date(2026, 7, 30),
+        date(2026, 7, 31),
+        date(2026, 8, 1),
+    ):
+        start = datetime.combine(observed_day, datetime.min.time(), tzinfo=UTC)
+        ingest_activity_batch(
+            session,
+            ActivityBatchIn(
+                source_provider="resolver-expiry",
+                source_device="desktop-expiry",
+                platform=ActivityPlatform.MACOS,
+                capability=ActivityCapability.DETAILED,
+                timezone="UTC",
+                records=[
+                    AppIntervalRecord(
+                        source_record_id=f"resolver-expiry-{observed_day}",
+                        start_at=start,
+                        end_at=start + timedelta(hours=12),
+                        state="active",
+                        app_id="editor",
+                    )
+                ],
+            ),
+            now=start + timedelta(hours=13),
+        )
+
+    wall_clock_expired_at = datetime.now(UTC) - timedelta(minutes=1)
+    assert wall_clock_expired_at > datetime(2026, 8, 1, 12, tzinfo=UTC)
+    daily_rows = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT,
+            )
+        )
+    )
+    assert len(daily_rows) == 4
+    for row in daily_rows:
+        row.expires_at = wall_clock_expired_at
+    session.flush()
+
+    request = ActivityContextResolveRequest(
+        question_kind=question_kind,
+        date="2026-08-01",
+        start=(
+            datetime(2026, 8, 1, 9, tzinfo=UTC)
+            if question_kind == "caffeine_for_focus"
+            else None
+        ),
+        end=(
+            datetime(2026, 8, 1, 10, tzinfo=UTC)
+            if question_kind == "caffeine_for_focus"
+            else None
+        ),
+    )
+    result = await resolve_wellness_context(
+        session,
+        request,
+        default_timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    activity = result["contexts"]["activity"]
+    overwork = (
+        activity["overwork"]
+        if question_kind == "caffeine_for_focus"
+        else activity
+    )
+
+    assert overwork["status"] == "ok"
+    assert overwork["metrics"]["lookback_baseline_delta"] == {
+        "status": "ok",
+        "days_with_data": 3,
+        "lookback_days": 7,
+        "baseline_minutes": 720.0,
+        "delta_minutes": 0.0,
+        "delta_percent": 0.0,
+    }
 
 
 async def test_resolver_rejects_a_window_from_another_local_date(session) -> None:

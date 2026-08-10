@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -21,24 +20,29 @@ from healthmes.activity.contracts import (
     ActivityRecord,
     AppHourRecord,
 )
+from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.privacy import CollectionGate, filter_records
 from healthmes.activity.repository import (
     ACTIVITY_RAW_CLASS,
     APP_HOUR_EVENT,
     APP_INTERVAL_EVENT,
+    ActivityChangeWindow,
     ActivityLocalScope,
     activity_write_lock,
     ensure_activity_policies,
     event_bounds,
     event_expiry,
     event_scopes,
+    fixed_offset_summary_scopes_by_change,
     get_control_payload,
     persist_activity_record,
+    record_bounds,
     record_scopes,
     tombstoned_record_ids,
     update_collection_status,
 )
 from healthmes.store import WellnessEvent
+from healthmes.timezones import parse_timezone
 
 MAX_FUTURE_SKEW = timedelta(minutes=1)
 
@@ -77,7 +81,7 @@ class ActivityIngestResult:
 
 
 def _record_dates(record: ActivityRecord, timezone: str) -> set[date]:
-    zone = ZoneInfo(timezone)
+    zone = parse_timezone(timezone)
     start = record.bucket_start if isinstance(record, AppHourRecord) else record.start_at
     end = (
         record.bucket_start + timedelta(hours=1)
@@ -96,8 +100,9 @@ def prepare_activity_batch(
     batch: ActivityBatchIn,
     *,
     now: datetime | None = None,
+    control_payload: dict[str, object] | None = None,
 ) -> tuple[ActivityBatchIn, int, int, CollectionGate]:
-    state = get_control_payload(
+    state = control_payload or get_control_payload(
         session,
         batch.source_device,
         platform=batch.platform,
@@ -235,12 +240,26 @@ def _reject_overlapping_source_mode(
 def _potential_summary_scopes(
     session: Session,
     batch: ActivityBatchIn,
-) -> set[ActivityLocalScope]:
-    scopes = {
-        scope
+    *,
+    now: datetime,
+) -> dict[str, set[ActivityLocalScope]]:
+    scopes_by_record = {
+        record.source_record_id: set(
+            record_scopes(record, batch.timezone)
+        )
         for record in batch.records
-        for scope in record_scopes(record, batch.timezone)
     }
+    changes: list[ActivityChangeWindow] = []
+    for record in batch.records:
+        start, end = record_bounds(record)
+        changes.append(
+            ActivityChangeWindow(
+                key=record.source_record_id,
+                start=start,
+                end=end,
+                timezone=batch.timezone,
+            )
+        )
     source_record_ids = sorted(
         {record.source_record_id for record in batch.records}
     )
@@ -255,8 +274,27 @@ def _potential_summary_scopes(
             )
         )
         for row in rows:
-            scopes.update(event_scopes(row))
-    return scopes
+            key = str(row.source_record_id)
+            if key not in scopes_by_record:
+                continue
+            scopes_by_record[key].update(event_scopes(row))
+            start, end = event_bounds(row)
+            changes.append(
+                ActivityChangeWindow(
+                    key=key,
+                    start=start,
+                    end=end,
+                    timezone=row.timezone or "UTC",
+                )
+            )
+    aliases = fixed_offset_summary_scopes_by_change(
+        session,
+        changes,
+        now=now,
+    )
+    for key, scopes in aliases.items():
+        scopes_by_record.setdefault(key, set()).update(scopes)
+    return scopes_by_record
 
 
 def ingest_activity_batch(
@@ -274,17 +312,24 @@ def ingest_activity_batch(
 ) -> ActivityIngestResult:
     current = (now or datetime.now(UTC)).astimezone(UTC)
     with activity_write_lock():
+        lock_activity_write_plane(session)
         _reject_future_data(batch, now=current)
-        if already_filtered:
-            filtered = batch
-            excluded = excluded_count
-            tombstoned = tombstoned_count
-        else:
-            filtered, excluded, tombstoned, _ = prepare_activity_batch(
-                session,
-                batch,
-                now=current,
-            )
+        control_payload = get_control_payload(
+            session,
+            batch.source_device,
+            platform=batch.platform,
+            lock=True,
+        )
+        filtered, newly_excluded, newly_tombstoned, _ = prepare_activity_batch(
+            session,
+            batch,
+            now=current,
+            control_payload=control_payload,
+        )
+        excluded = newly_excluded + (excluded_count if already_filtered else 0)
+        tombstoned = newly_tombstoned + (
+            tombstoned_count if already_filtered else 0
+        )
         raw_policy = ensure_activity_policies(session)[ACTIVITY_RAW_CLASS]
         _reject_expired_late_data(
             filtered.records,
@@ -292,7 +337,16 @@ def ingest_activity_batch(
             now=current,
         )
         _reject_overlapping_source_mode(session, filtered)
-        potential_scopes = _potential_summary_scopes(session, filtered)
+        potential_scopes_by_record = _potential_summary_scopes(
+            session,
+            filtered,
+            now=current,
+        )
+        potential_scopes = {
+            scope
+            for scopes in potential_scopes_by_record.values()
+            for scope in scopes
+        }
         unsafe_scopes = {
             scope
             for scope in potential_scopes
@@ -326,7 +380,10 @@ def ingest_activity_batch(
                     duplicates += 1
                 if result.state in {"created", "updated"}:
                     changed_scopes.update(
-                        record_scopes(record, filtered.timezone)
+                        potential_scopes_by_record.get(
+                            record.source_record_id,
+                            (),
+                        )
                     )
                     changed_scopes.update(result.previous_scopes)
 

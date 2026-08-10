@@ -9,9 +9,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -27,10 +26,17 @@ from healthmes.activity.contracts import (
     AppHourRecord,
     AppIntervalRecord,
 )
-from healthmes.activity.locking import activity_write_lock
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.activity.privacy import BLOCKED_PERMISSION_STATES, collection_gate
 from healthmes.storage import ensure_default_policies
 from healthmes.store import RetentionPolicy, WellnessEvent
+from healthmes.timezones import (
+    is_fixed_offset_timezone_name,
+    parse_timezone,
+)
 
 APP_HOUR_EVENT = "activity.app-hour.v1"
 APP_INTERVAL_EVENT = "activity.app-interval.v1"
@@ -41,6 +47,7 @@ COLLECTION_CONTROL_EVENT = "activity.collection-control.v1"
 COLLECTION_CONFIG_EVENT = "activity.collection-config.v1"
 COLLECTION_STATUS_EVENT = "activity.collection-status.v1"
 COLLECTION_CURSOR_EVENT = "activity.collection-cursor.v1"
+ACTIVITYWATCH_IMPORT_FENCE_EVENT = "activity.activitywatch-import-fence.v1"
 DELETION_TOMBSTONE_EVENT = "activity.deletion-tombstone.v1"
 DELETION_IDENTITY_CHUNK_SIZE = 500
 
@@ -64,6 +71,10 @@ CONTROL_EVENT_TYPES = (
     COLLECTION_STATUS_EVENT,
     COLLECTION_CURSOR_EVENT,
 )
+# The import fence is deliberately not a public collection-control event.
+# User control-state deletion must preserve it so an old prepared snapshot can
+# never become current again after the visible control rows are reset.
+CONTROL_LOCK_PREFIX = "healthmes:activity:control:"
 
 class ActivityConflictError(ValueError):
     """A source identity was reused for different immutable input."""
@@ -76,6 +87,14 @@ class ActivityWriteConflictError(RuntimeError):
 @dataclass(frozen=True, order=True, slots=True)
 class ActivityLocalScope:
     day: date
+    timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityChangeWindow:
+    key: str
+    start: datetime
+    end: datetime
     timezone: str
 
 
@@ -118,7 +137,7 @@ def record_scopes(
     record: ActivityRecord,
     timezone: str,
 ) -> tuple[ActivityLocalScope, ...]:
-    zone = ZoneInfo(timezone)
+    zone = parse_timezone(timezone)
     start, end = record_bounds(record)
     first = start.astimezone(zone).date()
     last = (end - timedelta(microseconds=1)).astimezone(zone).date()
@@ -149,9 +168,9 @@ def event_bounds(event: WellnessEvent) -> tuple[datetime, datetime]:
         raw_day = event.payload.get("date")
         if isinstance(raw_day, str):
             try:
-                zone = ZoneInfo(timezone)
+                zone = parse_timezone(timezone)
                 day = date.fromisoformat(raw_day)
-            except (ValueError, ZoneInfoNotFoundError):
+            except ValueError:
                 pass
             else:
                 day_start = datetime.combine(day, datetime.min.time(), tzinfo=zone)
@@ -167,10 +186,10 @@ def event_bounds(event: WellnessEvent) -> tuple[datetime, datetime]:
 def event_scopes(event: WellnessEvent) -> tuple[ActivityLocalScope, ...]:
     timezone = event.timezone or str(event.payload.get("timezone") or "UTC")
     try:
-        zone = ZoneInfo(timezone)
-    except (ValueError, ZoneInfoNotFoundError):
+        zone = parse_timezone(timezone)
+    except ValueError:
         timezone = "UTC"
-        zone = ZoneInfo("UTC")
+        zone = parse_timezone("UTC")
     start, end = event_bounds(event)
     first = start.astimezone(zone).date()
     last = (end - timedelta(microseconds=1)).astimezone(zone).date()
@@ -190,6 +209,61 @@ def event_is_expired(
 ) -> bool:
     expires_at = parse_optional_datetime(event.expires_at)
     return expires_at is not None and expires_at <= as_utc(now or datetime.now(UTC))
+
+
+def fixed_offset_summary_scopes_by_change(
+    session: Session,
+    changes: Iterable[ActivityChangeWindow],
+    *,
+    now: datetime | None = None,
+) -> dict[str, set[ActivityLocalScope]]:
+    """Map raw changes to materialized fixed-offset summaries they can affect."""
+    current = as_utc(now or datetime.now(UTC))
+    normalized: list[tuple[ActivityChangeWindow, datetime, datetime, Any]] = []
+    scopes_by_key: dict[str, set[ActivityLocalScope]] = {}
+    for change in changes:
+        scopes_by_key.setdefault(change.key, set())
+        start = as_utc(change.start)
+        end = as_utc(change.end)
+        if end <= start:
+            continue
+        try:
+            source_zone = parse_timezone(change.timezone)
+        except ValueError:
+            continue
+        normalized.append((change, start, end, source_zone))
+    if not normalized:
+        return scopes_by_key
+
+    summaries = [
+        row
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type.in_(SUMMARY_EVENT_TYPES),
+                WellnessEvent.source_provider == SUMMARY_PROVIDER,
+            )
+        )
+        if (
+            isinstance(row.timezone, str)
+            and is_fixed_offset_timezone_name(row.timezone)
+            and not event_is_expired(row, now=current)
+        )
+    ]
+    for summary in summaries:
+        assert summary.timezone is not None
+        target_zone = parse_timezone(summary.timezone)
+        summary_start, summary_end = event_bounds(summary)
+        summary_scopes = event_scopes(summary)
+        for change, start, end, source_zone in normalized:
+            if end <= summary_start or start >= summary_end:
+                continue
+            if (
+                start.astimezone(source_zone).utcoffset()
+                != start.astimezone(target_zone).utcoffset()
+            ):
+                continue
+            scopes_by_key[change.key].update(summary_scopes)
+    return scopes_by_key
 
 
 def ensure_activity_policies(session: Session) -> dict[str, RetentionPolicy]:
@@ -578,6 +652,20 @@ def default_control_payload(
     }
 
 
+def lock_activity_control_device(session: Session, device_id: str) -> None:
+    """Serialize one device's control boundary across PostgreSQL processes."""
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    session.execute(
+        text(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended(:control_key, 0)"
+            ")"
+        ),
+        {"control_key": f"{CONTROL_LOCK_PREFIX}{device_id}"},
+    )
+
+
 def get_control_event(session: Session, device_id: str) -> WellnessEvent | None:
     current = session.scalar(
         select(WellnessEvent).where(
@@ -617,26 +705,33 @@ def _typed_control_event(
         WellnessEvent.source_record_id == _control_source_id(device_id, kind),
     )
     if lock:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update().execution_options(
+            populate_existing=True
+        )
     return session.scalar(statement)
 
 
 def _legacy_control_payload(
     session: Session,
     device_id: str,
+    *,
+    lock: bool = False,
 ) -> dict[str, Any]:
-    event = session.scalar(
-        select(WellnessEvent).where(
-            WellnessEvent.event_type == COLLECTION_CONTROL_EVENT,
-            WellnessEvent.source_provider == CONTROL_PROVIDER,
-            WellnessEvent.source_record_id.in_(
-                (
-                    _control_source_id(device_id),
-                    f"device:{hashlib.sha256(device_id.encode('utf-8')).hexdigest()[:32]}",
-                )
-            ),
-        )
+    statement = select(WellnessEvent).where(
+        WellnessEvent.event_type == COLLECTION_CONTROL_EVENT,
+        WellnessEvent.source_provider == CONTROL_PROVIDER,
+        WellnessEvent.source_record_id.in_(
+            (
+                _control_source_id(device_id),
+                f"device:{hashlib.sha256(device_id.encode('utf-8')).hexdigest()[:32]}",
+            )
+        ),
     )
+    if lock:
+        statement = statement.with_for_update().execution_options(
+            populate_existing=True
+        )
+    event = session.scalar(statement)
     return dict(event.payload) if event is not None and isinstance(event.payload, dict) else {}
 
 
@@ -645,16 +740,20 @@ def get_control_payload(
     device_id: str,
     *,
     platform: ActivityPlatform = ActivityPlatform.UNKNOWN,
+    lock: bool = False,
 ) -> dict[str, Any]:
+    if lock:
+        lock_activity_control_device(session, device_id)
     payload = {
         **default_control_payload(device_id, platform=platform),
-        **_legacy_control_payload(session, device_id),
+        **_legacy_control_payload(session, device_id, lock=lock),
     }
     status_event = _typed_control_event(
         session,
         device_id,
         event_type=COLLECTION_STATUS_EVENT,
         kind="status",
+        lock=lock,
     )
     if status_event is not None and isinstance(status_event.payload, dict):
         payload.update(status_event.payload)
@@ -663,16 +762,20 @@ def get_control_payload(
         device_id,
         event_type=COLLECTION_CONFIG_EVENT,
         kind="config",
+        lock=lock,
     )
     if config_event is not None and isinstance(config_event.payload, dict):
         payload.update(config_event.payload)
-    cursor_rows = session.scalars(
-        select(WellnessEvent).where(
-            WellnessEvent.event_type == COLLECTION_CURSOR_EVENT,
-            WellnessEvent.source_provider == CONTROL_PROVIDER,
-            WellnessEvent.source_device == device_id,
-        )
+    cursor_statement = select(WellnessEvent).where(
+        WellnessEvent.event_type == COLLECTION_CURSOR_EVENT,
+        WellnessEvent.source_provider == CONTROL_PROVIDER,
+        WellnessEvent.source_device == device_id,
     )
+    if lock:
+        cursor_statement = cursor_statement.with_for_update().execution_options(
+            populate_existing=True
+        )
+    cursor_rows = session.scalars(cursor_statement)
     cursors = dict(payload.get("cursors") or {})
     for row in cursor_rows:
         cursor_key = row.payload.get("cursor_key")
@@ -693,6 +796,7 @@ def _persist_control_payload(
     source_record_id: str,
     now: datetime | None = None,
 ) -> WellnessEvent:
+    lock_activity_control_device(session, device_id)
     current = as_utc(now or datetime.now(UTC))
     event = session.scalar(
         select(WellnessEvent)
@@ -741,6 +845,108 @@ def _persist_control_payload(
     return event
 
 
+def get_activitywatch_import_fence(
+    session: Session,
+    device_id: str,
+    *,
+    lock: bool = False,
+) -> int | None:
+    """Return the private latest-started ActivityWatch import sequence."""
+    if lock:
+        lock_activity_control_device(session, device_id)
+    event = _typed_control_event(
+        session,
+        device_id,
+        event_type=ACTIVITYWATCH_IMPORT_FENCE_EVENT,
+        kind="activitywatch-import-fence",
+        lock=lock,
+    )
+    if event is None:
+        return None
+    value = event.payload.get("sequence")
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 1
+    ):
+        raise ActivityWriteConflictError(
+            "ActivityWatch import fence is malformed"
+        )
+    return value
+
+
+def advance_activitywatch_import_fence(
+    session: Session,
+    device_id: str,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Invalidate older prepared snapshots and return a new device sequence."""
+    lock_activity_write_plane(session)
+    lock_activity_control_device(session, device_id)
+    current = get_activitywatch_import_fence(
+        session,
+        device_id,
+        lock=True,
+    )
+    sequence = (current or 0) + 1
+    _persist_control_payload(
+        session,
+        device_id,
+        {
+            "device_id": device_id,
+            "sequence": sequence,
+        },
+        event_type=ACTIVITYWATCH_IMPORT_FENCE_EVENT,
+        source_record_id=_control_source_id(
+            device_id,
+            "activitywatch-import-fence",
+        ),
+        now=now,
+    )
+    return sequence
+
+
+def invalidate_activitywatch_imports(
+    session: Session,
+    *,
+    device_id: str | None,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Fence in-flight ActivityWatch snapshots before a committed deletion."""
+    lock_activity_write_plane(session)
+    if device_id is not None:
+        return {
+            device_id: advance_activitywatch_import_fence(
+                session,
+                device_id,
+                now=now,
+            )
+        }
+
+    device_ids = sorted(
+        {
+            str(value)
+            for value in session.scalars(
+                select(WellnessEvent.source_device).where(
+                    WellnessEvent.event_type
+                    == ACTIVITYWATCH_IMPORT_FENCE_EVENT,
+                    WellnessEvent.source_provider == CONTROL_PROVIDER,
+                    WellnessEvent.source_device.is_not(None),
+                )
+            )
+        }
+    )
+    return {
+        value: advance_activitywatch_import_fence(
+            session,
+            value,
+            now=now,
+        )
+        for value in device_ids
+    }
+
+
 def _control_payload_for_update(
     session: Session,
     device_id: str,
@@ -762,7 +968,7 @@ def _control_payload_for_update(
             for key, value in event.payload.items()
             if key in allowed_keys
         }
-    legacy = _legacy_control_payload(session, device_id)
+    legacy = _legacy_control_payload(session, device_id, lock=True)
     return {key: value for key, value in legacy.items() if key in allowed_keys}
 
 
@@ -774,6 +980,8 @@ def update_collection_config(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     with activity_write_lock():
+        lock_activity_write_plane(session)
+        lock_activity_control_device(session, device_id)
         for attempt in range(2):
             payload = {
                 "device_id": device_id,
@@ -807,6 +1015,11 @@ def update_collection_config(
                     changed = True
             if changed:
                 payload["config_revision"] = int(payload.get("config_revision", 0)) + 1
+                advance_activitywatch_import_fence(
+                    session,
+                    device_id,
+                    now=now,
+                )
             try:
                 _persist_control_payload(
                     session,
@@ -836,6 +1049,8 @@ def update_collection_status(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     with activity_write_lock():
+        lock_activity_write_plane(session)
+        lock_activity_control_device(session, device_id)
         current = as_utc(now or datetime.now(UTC))
         for attempt in range(2):
             payload = {
@@ -881,6 +1096,12 @@ def update_collection_status(
                     payload[key] = value.value
                 else:
                     payload[key] = value
+            if boundary_update:
+                advance_activitywatch_import_fence(
+                    session,
+                    device_id,
+                    now=current,
+                )
             try:
                 _persist_control_payload(
                     session,
@@ -912,6 +1133,8 @@ def update_cursor(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     with activity_write_lock():
+        lock_activity_write_plane(session)
+        lock_activity_control_device(session, device_id)
         payload = {
             "device_id": device_id,
             "platform": platform.value,

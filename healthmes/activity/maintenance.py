@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.job import Job
 from apscheduler.jobstores.base import JobLookupError
@@ -13,30 +12,40 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from healthmes.activity.aggregation import summary_raw_provenance_complete
+from healthmes.activity.aggregation import (
+    BASELINE_DAYS,
+    refresh_existing_day_baseline,
+    summary_raw_provenance_complete,
+)
 from healthmes.activity.android import (
     ANDROID_PROVIDER,
     android_source_record_id,
 )
+from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.repository import (
     ACTIVITY_RAW_CLASS,
     CONTROL_EVENT_TYPES,
     CONTROL_PROVIDER,
+    DAY_SUMMARY_EVENT,
     RAW_EVENT_TYPES,
     SUMMARY_EVENT_TYPES,
     SUMMARY_PROVIDER,
+    ActivityChangeWindow,
     activity_source_identity_digest,
     activity_write_lock,
     as_utc,
     create_deletion_tombstone,
     ensure_activity_policies,
+    fixed_offset_summary_scopes_by_change,
     get_control_event,
+    invalidate_activitywatch_imports,
 )
 from healthmes.activity.repository import (
     event_bounds as repository_event_bounds,
 )
 from healthmes.store import AppUsageSample, WellnessEvent
 from healthmes.store.session import session_scope
+from healthmes.timezones import parse_timezone
 
 ACTIVITY_MAINTENANCE_JOB_ID = "healthmes-activity-maintenance"
 
@@ -76,8 +85,8 @@ def _event_bounds(event: WellnessEvent) -> tuple[datetime, datetime]:
 def _event_scopes(event: WellnessEvent) -> set[ActivitySummaryScope]:
     timezone = event.timezone or "UTC"
     try:
-        zone = ZoneInfo(timezone)
-    except (ZoneInfoNotFoundError, ValueError):
+        zone = parse_timezone(timezone)
+    except ValueError:
         timezone = "UTC"
         zone = UTC
     start, end = _event_bounds(event)
@@ -110,6 +119,7 @@ def run_activity_maintenance(
     now: datetime | None = None,
 ) -> ActivityMaintenanceReport:
     with activity_write_lock():
+        lock_activity_write_plane(session)
         current = as_utc(now or datetime.now(UTC))
         policies = ensure_activity_policies(session)
         expired = list(
@@ -127,6 +137,25 @@ def run_activity_maintenance(
             if event.event_type in RAW_EVENT_TYPES
             for scope in _event_scopes(event)
         }
+        expired_daily_scopes: set[ActivitySummaryScope] = set()
+        for event in expired:
+            if (
+                event.event_type != DAY_SUMMARY_EVENT
+                or not isinstance(event.payload, dict)
+            ):
+                continue
+            raw_day = event.payload.get("date")
+            timezone = event.payload.get("timezone")
+            if not isinstance(raw_day, str) or not isinstance(timezone, str):
+                continue
+            try:
+                expired_day = date.fromisoformat(raw_day)
+                parse_timezone(timezone)
+            except ValueError:
+                continue
+            expired_daily_scopes.add(
+                ActivitySummaryScope(day=expired_day, timezone=timezone)
+            )
         for event in expired:
             session.delete(event)
 
@@ -139,6 +168,21 @@ def run_activity_maintenance(
             )
             compatibility_deleted = int(result.rowcount or 0)
         session.flush()
+        following_scopes = {
+            ActivitySummaryScope(
+                day=scope.day + timedelta(days=offset),
+                timezone=scope.timezone,
+            )
+            for scope in expired_daily_scopes
+            for offset in range(1, BASELINE_DAYS + 1)
+        }
+        for scope in sorted(following_scopes):
+            refresh_existing_day_baseline(
+                session,
+                day=scope.day,
+                timezone=scope.timezone,
+                now=current,
+            )
         return ActivityMaintenanceReport(
             expired_events_deleted=len(expired),
             compatibility_rows_deleted=compatibility_deleted,
@@ -188,6 +232,7 @@ def delete_activity_data(
     now: datetime | None = None,
 ) -> ActivityDeleteReport:
     with activity_write_lock():
+        lock_activity_write_plane(session)
         current = as_utc(now or datetime.now(UTC))
         effective_end = min(as_utc(end), current) if end is not None else current
         selection_end = (
@@ -219,6 +264,29 @@ def delete_activity_data(
         affected_scopes = {
             scope for row in raw_rows for scope in _event_scopes(row)
         }
+        alias_changes: list[ActivityChangeWindow] = []
+        for row in raw_rows:
+            row_start, row_end = _event_bounds(row)
+            alias_changes.append(
+                ActivityChangeWindow(
+                    key=str(row.id),
+                    start=row_start,
+                    end=row_end,
+                    timezone=row.timezone or "UTC",
+                )
+            )
+        affected_scopes.update(
+            ActivitySummaryScope(
+                day=scope.day,
+                timezone=scope.timezone,
+            )
+            for scopes in fixed_offset_summary_scopes_by_change(
+                session,
+                alias_changes,
+                now=current,
+            ).values()
+            for scope in scopes
+        )
 
         all_summary_rows = list(
             session.scalars(
@@ -293,6 +361,11 @@ def delete_activity_data(
                 )
             )
 
+        invalidate_activitywatch_imports(
+            session,
+            device_id=device_id,
+            now=current,
+        )
         tombstone = create_deletion_tombstone(
             session,
             device_id=device_id,

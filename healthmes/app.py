@@ -10,16 +10,23 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from sqlalchemy.orm import Session
 from starlette.types import Receive, Scope, Send
 
 from healthmes import __version__
 from healthmes.activity import api as activity_api
+from healthmes.activity.aggregation import (
+    migrate_activity_summary_derivations,
+)
 from healthmes.activity.android import backfill_android_canonical_events
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.activity.maintenance import (
     build_activity_maintenance_job,
     register_activity_maintenance_job,
 )
-from healthmes.activity.repository import ensure_activity_policies
 from healthmes.api import include_all
 from healthmes.api.auth import install_auth
 from healthmes.api.google_oauth import install_google_oauth
@@ -43,6 +50,21 @@ from healthmes.engine.scheduler import (
 from healthmes.mcp_server import server as mcp_server
 from healthmes.storage import build_storage_maintenance_job
 from healthmes.store import Base, dispose_engine, init_engine, session_scope
+
+
+def _initialize_activity_storage(
+    session: Session,
+    *,
+    timezone: str,
+) -> None:
+    """Bootstrap activity policies and derivations under the global write lock."""
+    with activity_write_lock():
+        lock_activity_write_plane(session)
+        backfill_android_canonical_events(
+            session,
+            timezone=timezone,
+        )
+        migrate_activity_summary_derivations(session)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -69,8 +91,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if engine.dialect.name == "sqlite":
             Base.metadata.create_all(engine)
         with session_scope() as session:
-            ensure_activity_policies(session)
-            backfill_android_canonical_events(
+            _initialize_activity_storage(
                 session,
                 timezone=str(resolve_timezone(settings)),
             )

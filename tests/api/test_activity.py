@@ -1,6 +1,8 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import pytest
 from sqlalchemy import select
 
 from healthmes.activity.contracts import ActivityBatchIn
@@ -471,6 +473,97 @@ def test_android_permission_status_can_recover_from_revoked_to_granted(client) -
     assert granted.json()["status_reason"] is None
     assert granted.json()["effective_collecting"] is True
     assert granted.json()["blocked_reason"] is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"collection_generation": 1},
+        {
+            "platform": "ios",
+            "capability": "aggregate",
+            "permission_status": "granted",
+            "status_observed_at": "2026-08-01T12:00:00Z",
+            "collection_generation": 1,
+        },
+        {
+            "platform": "android",
+            "capability": "detailed",
+            "permission_status": "granted",
+            "status_observed_at": "2026-08-01T12:00:00Z",
+            "collection_generation": 1,
+        },
+        {
+            "platform": "android",
+            "permission_status": "granted",
+            "status_observed_at": "2026-08-01T12:00:00Z",
+            "collection_generation": 1,
+        },
+    ),
+    ids=("generation-only", "ios-spoof", "wrong-capability", "missing-capability"),
+)
+def test_public_generation_status_requires_complete_android_boundary(
+    client,
+    session,
+    payload,
+) -> None:
+    device_id = "android-incomplete-boundary"
+
+    response = client.post(
+        f"/v1/activity/devices/{device_id}/status",
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "activity_status_boundary_required"
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.source_device == device_id,
+            )
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "suffix", "body"),
+    (
+        ("GET", "collection", None),
+        ("PUT", "collection", {}),
+        (
+            "POST",
+            "pause",
+            {"until": (datetime.now(UTC) + timedelta(days=1)).isoformat()},
+        ),
+        ("POST", "resume", None),
+        ("POST", "status", {}),
+    ),
+)
+def test_collection_device_paths_reject_ids_longer_than_storage_column(
+    client,
+    session,
+    method,
+    suffix,
+    body,
+) -> None:
+    device_id = "d" * 256
+
+    response = client.request(
+        method,
+        f"/v1/activity/devices/{device_id}/{suffix}",
+        json=body,
+    )
+
+    assert response.status_code == 422
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.source_device == device_id,
+            )
+        )
+        is None
+    )
 
 
 def test_ios_aggregate_hour_can_be_revised_without_duplicate_rows(client, session) -> None:
@@ -1124,3 +1217,86 @@ def test_maintenance_ignores_caller_supplied_future_clock(client, session) -> No
     assert maintained.status_code == 200
     assert maintained.json()["expired_events_deleted"] == 0
     assert session.get(WellnessEvent, raw.id) is not None
+
+
+def test_wellness_context_rest_drops_unregistered_wearable_fields(
+    client,
+    monkeypatch,
+) -> None:
+    from healthmes.mcp_server import server as server_module
+
+    async def malicious_readiness(date: str | None = None) -> dict:
+        return {
+            "status": "ok",
+            "date": date,
+            "raw_timeseries": [{"secret": "rest-raw-secret"}],
+            "sleep_debt": {
+                "status": "ok",
+                "index": 20.0,
+                "last_night": {
+                    "date": date,
+                    "score": 80.0,
+                    "raw_sample": "rest-nested-secret",
+                },
+                "raw_timeseries": [1, 2, 3],
+            },
+            "charge": {
+                "status": "ok",
+                "entries": [
+                    {
+                        "category": "body_battery",
+                        "provider": "garmin",
+                        "value": 60.0,
+                        "raw_payload": "rest-entry-secret",
+                    }
+                ],
+            },
+            "limitations": [],
+        }
+
+    monkeypatch.setattr(
+        server_module,
+        "get_daily_readiness_context",
+        malicious_readiness,
+    )
+
+    response = client.post(
+        "/v1/wellness-context/resolve",
+        json={
+            "question_kind": "focus",
+            "date": "2026-08-01",
+            "start": "2026-08-01T09:00:00Z",
+            "end": "2026-08-01T10:00:00Z",
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 200
+    wearable = response.json()["contexts"]["wearable"]
+    assert wearable["sleep_debt"]["index"] == 20.0
+    assert wearable["charge"]["entries"][0]["value"] == 60.0
+    serialized = json.dumps(wearable)
+    assert "raw_timeseries" not in serialized
+    assert "raw_sample" not in serialized
+    assert "raw_payload" not in serialized
+    assert "rest-raw-secret" not in serialized
+
+
+def test_wellness_context_rest_supports_fixed_offset_caffeine_day(client) -> None:
+    response = client.post(
+        "/v1/wellness-context/resolve",
+        json={
+            "question_kind": "caffeine_for_focus",
+            "date": "2026-08-01",
+            "start": "2026-08-01T01:00:00Z",
+            "end": "2026-08-01T02:00:00Z",
+            "timezone": "UTC+09:00",
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["timezone"] == "UTC+09:00"
+    assert result["contexts"]["nutrition"]["kind"] == "confirmed_caffeine_ledger"
+    assert result["contexts"]["nutrition"]["context"]["local_date"] == "2026-08-01"
+    assert result["contexts"]["nutrition"]["context"]["timezone"] == "UTC+09:00"

@@ -15,7 +15,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from healthmes.activity.android import android_batch, android_source_record_id
-from healthmes.activity.contracts import ActivityPlatform, validate_timezone
+from healthmes.activity.contracts import (
+    ActivityCapability,
+    ActivityPermissionStatus,
+    ActivityPlatform,
+    validate_timezone,
+)
+from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.repository import (
     ActivityConflictError,
     activity_write_lock,
@@ -90,10 +96,11 @@ def ingest_batch(
     }
 
     with activity_write_lock():
+        lock_activity_write_plane(session)
         state = get_control_payload(
             session,
             body.device_id,
-            platform=ActivityPlatform.ANDROID,
+            lock=True,
         )
         current_generation = state.get("collection_generation")
         if current_generation is None:
@@ -109,6 +116,18 @@ def ingest_batch(
                 "stale_collection_generation",
                 f"collector generation {body.collection_generation} does not match "
                 f"server generation {current_generation}",
+            )
+        if (
+            state.get("platform") != ActivityPlatform.ANDROID.value
+            or state.get("capability") != ActivityCapability.AGGREGATE.value
+            or state.get("permission_status")
+            != ActivityPermissionStatus.GRANTED.value
+        ):
+            raise APIError(
+                409,
+                "activity_android_boundary_invalid",
+                "Android collector boundary must be registered as "
+                "android, aggregate, and granted before uploading",
             )
         samples = list(deduped.values())
         timezone = body.timezone or str(

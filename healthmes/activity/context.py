@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
 from healthmes.activity.aggregation import (
+    LEGACY_SUMMARY_REASON,
     get_daily_summary,
+    legacy_hourly_summary_present,
     list_hourly_summaries,
     local_day_bounds,
     personal_baseline_delta,
@@ -17,6 +18,7 @@ from healthmes.activity.aggregation import (
     summary_raw_provenance_complete,
     timezone_name,
 )
+from healthmes.timezones import parse_timezone
 
 FOCUS_FRAGMENTED_LAUNCHES_PER_HOUR = 12.0
 FOCUS_SUSTAINED_BLOCK_MINUTES = 45.0
@@ -36,7 +38,7 @@ def _recorded_at(value: datetime) -> str:
 
 
 def _tz(value: str | tzinfo) -> tzinfo:
-    return ZoneInfo(value) if isinstance(value, str) else value
+    return parse_timezone(value)
 
 
 def _timezone_name(value: str | tzinfo) -> str:
@@ -70,8 +72,14 @@ def activity_summary_context(
     *,
     day: date,
     timezone: str | tzinfo,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    event, payload = get_daily_summary(session, day=day, timezone=timezone)
+    event, payload = get_daily_summary(
+        session,
+        day=day,
+        timezone=timezone,
+        now=now,
+    )
     return {
         **payload,
         "evidence_ids": [str(event.id)] if event is not None else [],
@@ -256,12 +264,30 @@ def focus_context(
             start=start,
             end=end,
             timezone=timezone,
+            now=now,
         )
         combined = _combine_hourly(
             rows,
             start=start,
             end=end,
         )
+        if (
+            combined.get("reason") == "no_activity_summary"
+            and legacy_hourly_summary_present(
+                session,
+                start=start,
+                end=end,
+                timezone=timezone,
+                now=now,
+            )
+        ):
+            combined["reason"] = LEGACY_SUMMARY_REASON
+            combined["limitations"] = sorted(
+                {
+                    *combined.get("limitations", []),
+                    LEGACY_SUMMARY_REASON,
+                }
+            )
     if (
         combined["status"] != "ok"
         or combined["active_minutes"] <= 0
@@ -325,9 +351,15 @@ def overwork_context(
     day: date,
     timezone: str | tzinfo,
     lookback_days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     name = _timezone_name(timezone)
-    event, summary = get_daily_summary(session, day=day, timezone=timezone)
+    event, summary = get_daily_summary(
+        session,
+        day=day,
+        timezone=timezone,
+        now=now,
+    )
     if event is None:
         return {
             **summary,
@@ -365,6 +397,7 @@ def overwork_context(
         timezone=name,
         current_minutes=total,
         lookback_days=lookback_days,
+        now=now,
     )
     if total >= OVERWORK_TOTAL_MINUTES:
         signals.append(
@@ -434,8 +467,14 @@ def recovery_activity_context(
     *,
     day: date,
     timezone: str | tzinfo,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    summary = activity_summary_context(session, day=day, timezone=timezone)
+    summary = activity_summary_context(
+        session,
+        day=day,
+        timezone=timezone,
+        now=now,
+    )
     if summary["status"] != "ok":
         return {
             "status": "insufficient_data",

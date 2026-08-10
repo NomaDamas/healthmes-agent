@@ -1,4 +1,5 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -8,9 +9,15 @@ from sqlalchemy import select
 from healthmes.activity.activitywatch import (
     ActivityWatchClient,
     ActivityWatchError,
+    StaleActivityWatchImportError,
     import_activitywatch,
     normalize_activitywatch_events,
+    prepare_activitywatch_import,
     validate_loopback_base_url,
+)
+from healthmes.activity.aggregation import (
+    get_daily_summary,
+    rebuild_day_summaries,
 )
 from healthmes.activity.android import (
     android_source_record_id,
@@ -18,17 +25,23 @@ from healthmes.activity.android import (
     ingest_android_samples,
 )
 from healthmes.activity.contracts import (
+    ActivityCapability,
+    ActivityCollectionStatusUpdate,
     ActivityCollectionUpdate,
+    ActivityPermissionStatus,
     ActivityPlatform,
     ActivityWatchImportRequest,
     IOSCapabilityReport,
 )
+from healthmes.activity.maintenance import delete_activity_data
 from healthmes.activity.repository import (
     APP_HOUR_EVENT,
     APP_INTERVAL_EVENT,
     DAY_SUMMARY_EVENT,
+    get_activitywatch_import_fence,
     get_control_payload,
     update_collection_config,
+    update_collection_status,
 )
 from healthmes.activity.service import (
     ActivityCollectionBlockedError,
@@ -104,6 +117,159 @@ def test_activitywatch_client_translates_malformed_json() -> None:
 
     with pytest.raises(ActivityWatchError, match="not valid JSON"):
         client.list_buckets()
+
+
+def test_activitywatch_client_ignores_environment_proxy(
+    monkeypatch,
+) -> None:
+    real_client = httpx.Client
+    observed_trust_env: list[object] = []
+
+    def client_factory(*args, **kwargs):
+        observed_trust_env.append(kwargs.get("trust_env"))
+        kwargs["transport"] = httpx.MockTransport(
+            lambda request: httpx.Response(200, json={})
+        )
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setattr(
+        "healthmes.activity.activitywatch.httpx.Client",
+        client_factory,
+    )
+
+    buckets = ActivityWatchClient(
+        "http://127.0.0.1:5600",
+    ).list_buckets()
+
+    assert buckets == {}
+    assert observed_trust_env == [False]
+
+
+@pytest.mark.parametrize("explicit_bucket_ids", (False, True))
+def test_activitywatch_bucket_ids_are_one_encoded_url_segment(
+    session,
+    explicit_bucket_ids,
+) -> None:
+    window_bucket = "window/../../settings?probe=1#fragment%2F"
+    afk_bucket = "afk/../status?probe=2#fragment%2F"
+    expected_paths = {
+        f"/api/0/buckets/{quote(window_bucket, safe='')}/events",
+        f"/api/0/buckets/{quote(afk_bucket, safe='')}/events",
+    }
+    event_paths: list[str] = []
+    event_queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw_path = request.url.raw_path.split(b"?", 1)[0].decode("ascii")
+        if raw_path == "/api/0/buckets/":
+            return httpx.Response(
+                200,
+                json={
+                    window_bucket: {"type": "currentwindow"},
+                    afk_bucket: {"type": "afkstatus"},
+                },
+            )
+        event_paths.append(raw_path)
+        event_queries.append(request.url.query.decode("ascii"))
+        if raw_path == f"/api/0/buckets/{quote(window_bucket, safe='')}/events":
+            return httpx.Response(
+                200,
+                json=[_window_event(title="discarded", event_id=1)],
+            )
+        if raw_path == f"/api/0/buckets/{quote(afk_bucket, safe='')}/events":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 2,
+                        "timestamp": "2026-08-01T10:00:00Z",
+                        "duration": 3600,
+                        "data": {"status": "not-afk"},
+                    }
+                ],
+            )
+        return httpx.Response(404)
+
+    result = import_activitywatch(
+        session,
+        ActivityWatchImportRequest(
+            device_id=f"mac-encoded-{explicit_bucket_ids}",
+            platform=ActivityPlatform.MACOS,
+            timezone="UTC",
+            start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+            end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+            window_bucket_id=(
+                window_bucket if explicit_bucket_ids else None
+            ),
+            afk_bucket_id=afk_bucket if explicit_bucket_ids else None,
+        ),
+        client=ActivityWatchClient(
+            "http://127.0.0.1:5600",
+            transport=httpx.MockTransport(handler),
+        ),
+        now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+
+    assert result.response.accepted == 1
+    assert set(event_paths) == expected_paths
+    assert all("probe=" not in query for query in event_queries)
+    assert all("fragment" not in query for query in event_queries)
+
+
+@pytest.mark.parametrize("explicit_bucket_ids", (False, True))
+@pytest.mark.parametrize("invalid_bucket_id", (".", ".."))
+def test_activitywatch_rejects_dot_only_bucket_ids_before_event_read(
+    session,
+    explicit_bucket_ids,
+    invalid_bucket_id,
+) -> None:
+    event_reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal event_reads
+        raw_path = request.url.raw_path.split(b"?", 1)[0].decode("ascii")
+        if raw_path == "/api/0/buckets/":
+            return httpx.Response(
+                200,
+                json={
+                    invalid_bucket_id: {"type": "currentwindow"},
+                    "afk": {"type": "afkstatus"},
+                },
+            )
+        event_reads += 1
+        return httpx.Response(500)
+
+    with pytest.raises(
+        ActivityWatchError,
+        match="one non-dot path segment",
+    ):
+        import_activitywatch(
+            session,
+            ActivityWatchImportRequest(
+                device_id=(
+                    f"mac-dot-bucket-{explicit_bucket_ids}-"
+                    f"{len(invalid_bucket_id)}"
+                ),
+                platform=ActivityPlatform.MACOS,
+                timezone="UTC",
+                start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                window_bucket_id=(
+                    invalid_bucket_id if explicit_bucket_ids else None
+                ),
+                afk_bucket_id="afk" if explicit_bucket_ids else None,
+            ),
+            client=ActivityWatchClient(
+                "http://127.0.0.1:5600",
+                transport=httpx.MockTransport(handler),
+            ),
+            now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        )
+
+    assert event_reads == 0
 
 
 @pytest.mark.parametrize(
@@ -261,6 +427,262 @@ def test_activitywatch_checks_privacy_gate_before_localhost_read(session) -> Non
         )
 
     assert raised.value.reason == "collection_disabled"
+
+
+@pytest.mark.parametrize(
+    ("boundary_change", "expected_reason"),
+    (
+        ("disable", "collection_disabled"),
+        ("revoke", "permission_revoked"),
+    ),
+)
+def test_activitywatch_rechecks_privacy_boundary_after_localhost_read(
+    session,
+    boundary_change,
+    expected_reason,
+) -> None:
+    device_id = f"mac-race-{boundary_change}"
+
+    class BoundaryChangingClient:
+        changed = False
+
+        def list_buckets(self):
+            return {
+                "window": {"type": "currentwindow"},
+                "afk": {"type": "afkstatus"},
+            }
+
+        def get_events(self, bucket_id, *, start, end):
+            if not self.changed:
+                self.changed = True
+                if boundary_change == "disable":
+                    update_collection_config(
+                        session,
+                        device_id,
+                        ActivityCollectionUpdate(enabled=False),
+                    )
+                else:
+                    update_collection_status(
+                        session,
+                        device_id,
+                        ActivityCollectionStatusUpdate(
+                            platform=ActivityPlatform.MACOS,
+                            capability=ActivityCapability.DETAILED,
+                            permission_status=ActivityPermissionStatus.REVOKED,
+                            status_observed_at=datetime(
+                                2026,
+                                8,
+                                1,
+                                10,
+                                30,
+                                tzinfo=UTC,
+                            ),
+                        ),
+                        now=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+                    )
+            if bucket_id == "window":
+                return [_window_event(title="must not be stored", event_id=1)]
+            return [
+                {
+                    "id": 2,
+                    "timestamp": "2026-08-01T10:00:00Z",
+                    "duration": 3600,
+                    "data": {"status": "not-afk"},
+                }
+            ]
+
+    with pytest.raises(ActivityCollectionBlockedError) as raised:
+        import_activitywatch(
+            session,
+            ActivityWatchImportRequest(
+                device_id=device_id,
+                platform=ActivityPlatform.MACOS,
+                timezone="UTC",
+                start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+            ),
+            client=BoundaryChangingClient(),
+            now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        )
+
+    assert raised.value.reason == expected_reason
+    state = get_control_payload(session, device_id)
+    assert state["cursors"] == {}
+    assert state["last_uploaded_at"] is None
+    if boundary_change == "disable":
+        assert state["enabled"] is False
+    else:
+        assert state["permission_status"] == "revoked"
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type.in_(
+                    (APP_INTERVAL_EVENT, DAY_SUMMARY_EVENT)
+                )
+            )
+        )
+        is None
+    )
+
+
+def test_activitywatch_latest_started_snapshot_wins_if_it_finishes_first(
+    session,
+) -> None:
+    class SnapshotClient:
+        def __init__(self, *, include_window: bool) -> None:
+            self.include_window = include_window
+
+        def list_buckets(self):
+            return {
+                "window": {"type": "currentwindow"},
+                "afk": {"type": "afkstatus"},
+            }
+
+        def get_events(self, bucket_id, *, start, end):
+            if bucket_id == "window":
+                if not self.include_window:
+                    return []
+                return [
+                    {
+                        "id": 1,
+                        "timestamp": "2026-08-01T10:00:00Z",
+                        "duration": 3600,
+                        "data": {"app": "Code", "title": "discarded"},
+                    }
+                ]
+            return [
+                {
+                    "id": 2,
+                    "timestamp": start.isoformat(),
+                    "duration": (end - start).total_seconds(),
+                    "data": {"status": "not-afk"},
+                }
+            ]
+
+    request = ActivityWatchImportRequest(
+        device_id="mac-latest-started-wins",
+        platform=ActivityPlatform.MACOS,
+        timezone="UTC",
+        start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    old_snapshot = prepare_activitywatch_import(
+        session,
+        request,
+        client=SnapshotClient(include_window=True),
+        now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    latest_snapshot = prepare_activitywatch_import(
+        session,
+        request,
+        client=SnapshotClient(include_window=False),
+        now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+
+    latest = import_activitywatch(
+        session,
+        request,
+        prepared=latest_snapshot,
+    )
+    session.commit()
+    with pytest.raises(StaleActivityWatchImportError):
+        import_activitywatch(
+            session,
+            request,
+            prepared=old_snapshot,
+        )
+
+    state = get_control_payload(session, request.device_id)
+    stored = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type.in_(
+                    (APP_INTERVAL_EVENT, DAY_SUMMARY_EVENT)
+                )
+            )
+        )
+    )
+
+    assert latest.response.accepted == 0
+    assert stored == []
+    assert state["cursors"]["activitywatch:window"] == (
+        "2026-08-01T11:00:00+00:00"
+    )
+    assert "sequence" not in state
+
+
+def test_activitywatch_control_delete_preserves_and_advances_import_fence(
+    session,
+) -> None:
+    class SnapshotClient:
+        def list_buckets(self):
+            return {
+                "window": {"type": "currentwindow"},
+                "afk": {"type": "afkstatus"},
+            }
+
+        def get_events(self, bucket_id, *, start, end):
+            if bucket_id == "window":
+                return [
+                    {
+                        "id": 1,
+                        "timestamp": "2026-08-01T10:00:00Z",
+                        "duration": 3600,
+                        "data": {"app": "Code", "title": "discarded"},
+                    }
+                ]
+            return [
+                {
+                    "id": 2,
+                    "timestamp": start.isoformat(),
+                    "duration": (end - start).total_seconds(),
+                    "data": {"status": "not-afk"},
+                }
+            ]
+
+    request = ActivityWatchImportRequest(
+        device_id="mac-delete-fence",
+        platform=ActivityPlatform.MACOS,
+        timezone="UTC",
+        start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    prepared = prepare_activitywatch_import(
+        session,
+        request,
+        client=SnapshotClient(),
+        now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    report = delete_activity_data(
+        session,
+        device_id=request.device_id,
+        start=None,
+        end=None,
+        include_summaries=False,
+        include_control=True,
+        now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    session.commit()
+
+    assert report.control_events_deleted == 0
+    assert get_activitywatch_import_fence(
+        session,
+        request.device_id,
+    ) > prepared.import_sequence
+    with pytest.raises(StaleActivityWatchImportError):
+        import_activitywatch(
+            session,
+            request,
+            prepared=prepared,
+        )
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -1176,6 +1598,89 @@ def test_activitywatch_empty_repair_fails_closed_after_raw_provenance_expires(
     )
     assert daily is not None
     assert daily.payload["total_active_minutes"] == 60.0
+
+
+def test_activitywatch_empty_repair_rebuilds_fixed_offset_alias_summary(
+    session,
+) -> None:
+    class EmptyRepairClient:
+        include_window = True
+
+        def list_buckets(self):
+            return {
+                "window": {"type": "currentwindow"},
+                "afk": {"type": "afkstatus"},
+            }
+
+        def get_events(self, bucket_id, *, start, end):
+            if bucket_id == "window":
+                if not self.include_window:
+                    return []
+                return [
+                    {
+                        "id": 1,
+                        "timestamp": "2026-08-01T01:00:00Z",
+                        "duration": 3600,
+                        "data": {"app": "Code", "title": "discarded"},
+                    }
+                ]
+            return [
+                {
+                    "id": 2,
+                    "timestamp": start.isoformat(),
+                    "duration": (end - start).total_seconds(),
+                    "data": {"status": "not-afk"},
+                }
+            ]
+
+    current = datetime(2026, 8, 1, 2, tzinfo=UTC)
+    request = ActivityWatchImportRequest(
+        device_id="mac-fixed-offset-empty-repair",
+        platform=ActivityPlatform.MACOS,
+        timezone="Asia/Seoul",
+        start_at=datetime(2026, 8, 1, 1, tzinfo=UTC),
+        end_at=current,
+    )
+    client = EmptyRepairClient()
+    import_activitywatch(
+        session,
+        request,
+        client=client,
+        now=current,
+    )
+    rebuild_day_summaries(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC+09:00",
+        force_rebuild=True,
+        now=current,
+    )
+    before_event, before_summary = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC+09:00",
+        now=current,
+    )
+    assert before_event is not None
+    assert before_summary["total_active_minutes"] == 60.0
+
+    client.include_window = False
+    repaired = import_activitywatch(
+        session,
+        request,
+        client=client,
+        now=current,
+    )
+    after_event, after_summary = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC+09:00",
+        now=current,
+    )
+
+    assert repaired.response.accepted == 0
+    assert after_event is None
+    assert after_summary["reason"] == "no_activity_summary"
 
 
 def test_activitywatch_malformed_repair_preserves_existing_raw_and_summary(
