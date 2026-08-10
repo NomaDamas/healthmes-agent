@@ -3,6 +3,7 @@
 from healthmes.decision.compatibility import (
     decision_request_from_activity_context,
 )
+from healthmes.decision.composition import build_context_provider_registry
 from healthmes.decision.contracts import (
     CompatibilityPreset,
     ContextCoverage,
@@ -28,11 +29,39 @@ from healthmes.decision.contracts import (
     ToolCallStatus,
     source_ref_id,
 )
+from healthmes.decision.domain_providers import (
+    ActivityContextProvider,
+    CalendarContextProvider,
+    NutritionContextProvider,
+    WearableContextProvider,
+)
+from healthmes.decision.providers import (
+    ContextCapability,
+    ContextProvider,
+    ContextProviderDescriptor,
+    ContextProviderMetadata,
+    ContextProviderRegistry,
+    ContextProviderRegistryError,
+    DisabledProviderError,
+    DuplicateCapabilityError,
+    DuplicateProviderError,
+    ProvenanceSupport,
+    UnknownCapabilityError,
+    UnknownProviderError,
+)
 
 __all__ = [
+    "ActivityContextProvider",
+    "CalendarContextProvider",
     "CompatibilityPreset",
+    "ContextCapability",
     "ContextCoverage",
     "ContextFreshness",
+    "ContextProvider",
+    "ContextProviderDescriptor",
+    "ContextProviderMetadata",
+    "ContextProviderRegistry",
+    "ContextProviderRegistryError",
     "ContextQuery",
     "ContextResult",
     "ContextStatus",
@@ -44,14 +73,23 @@ __all__ = [
     "DecisionRequest",
     "DecisionResult",
     "DecisionStatus",
+    "DisabledProviderError",
+    "DuplicateCapabilityError",
+    "DuplicateProviderError",
     "ExecutionScope",
     "FreshnessStatus",
+    "NutritionContextProvider",
     "PersistenceStatus",
     "PrivacyLevel",
+    "ProvenanceSupport",
     "RuntimeMetadata",
     "SourceRef",
     "ToolCallRecord",
     "ToolCallStatus",
+    "UnknownCapabilityError",
+    "UnknownProviderError",
+    "WearableContextProvider",
+    "build_context_provider_registry",
     "decision_request_from_activity_context",
     "source_ref_id",
 ]
