@@ -75,10 +75,12 @@ open_wearables_listener_pid() {
 }
 
 open_wearables_listener_is_managed() {
-    local pid=$1 parent command
+    local pid=$1 parent command process_cwd
     while [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ]; do
         command="$(ps -o command= -p "$pid" 2>/dev/null || true)"
-        [[ "$command" == *"fastapi dev app/main.py"* || "$command" == *"fastapi run app/main.py"* ]] && return 0
+        process_cwd="$(lsof -n -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ { sub(/^n/, ""); print; exit }')"
+        [[ "$command" == *"fastapi dev app/main.py"* || "$command" == *"fastapi run app/main.py"* ]] \
+            && [ "$process_cwd" = "$REPO_ROOT/vendor/open-wearables/backend" ] && return 0
         parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
         [ "$parent" != "$pid" ] || break
         pid="$parent"
