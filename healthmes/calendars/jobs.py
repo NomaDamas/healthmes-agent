@@ -38,6 +38,7 @@ from healthmes.calendars.apple_google_mirror import mirror_apple_events_to_googl
 from healthmes.calendars.base import CalendarAuthError, CalendarBackend
 from healthmes.calendars.intake import intake_calendar_tasks
 from healthmes.calendars.proposal_push import push_accepted_proposals
+from healthmes.calendars.runtime_status import record_calendar_status
 from healthmes.calendars.state import (
     FilePendingDiffStore,
     FileSyncStateStore,
@@ -176,8 +177,19 @@ def build_calendar_job(
                     and write_source(settings) is CalendarSource.CALDAV
                 ):
                     mirror_apple_events_to_google(service, session)
+                record_calendar_status(
+                    settings.data_dir,
+                    source,
+                    mode=("write" if is_write_backend else "mirror"),
+                )
                 return diff
-        except Exception:
+        except Exception as exc:
+            record_calendar_status(
+                settings.data_dir,
+                source,
+                mode=("write" if is_write_backend else "mirror"),
+                error=exc,
+            )
             logger.exception(
                 "Calendar sync for %s failed; next interval will retry.", source.value
             )

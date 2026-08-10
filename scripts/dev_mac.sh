@@ -19,7 +19,7 @@
 #   test             uv run pytest -q
 #   ow               best-effort native boot of vendor/open-wearables backend
 #                    (uv sync + scripts/start/app.sh; migrations + seeds +
-#                    `fastapi dev` when ENVIRONMENT=local)
+#                    a single `fastapi run` listener)
 #   ow-worker        celery worker of the open-wearables backend
 #                    (requires redis from services-start)
 #   ow-beat          celery beat scheduler of the open-wearables backend
@@ -302,7 +302,7 @@ cmd_ow() {
     info "booting open-wearables backend (migrations + seeds + API on \${API_PORT:-8000})"
     info "svix webhook registration may retry/skip — no svix server in this stack (non-fatal)"
     cd "$OW_BACKEND_DIR"
-    exec bash scripts/start/app.sh
+    ENVIRONMENT=production exec bash scripts/start/app.sh
 }
 
 cmd_ow_worker() {

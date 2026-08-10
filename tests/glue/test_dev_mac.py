@@ -108,7 +108,7 @@ def test_local_start_syncs_resolved_ow_key_into_hermes_before_apps() -> None:
         "sync_hermes_ow_api_key"
     )
     assert start_body.index("sync_hermes_ow_api_key") < start_body.index(
-        'start_process "Open Wearables"'
+        "start_open_wearables"
     )
 
 
@@ -144,6 +144,23 @@ def test_local_runtime_starts_and_supervises_open_wearables_beat() -> None:
     assert '"$BEAT_PID"' in daemon_body
     assert 'stop_process "Open Wearables beat"' in stop_body
     assert 'service_status "Open Wearables beat"' in status_body
+
+
+def test_local_runtime_adopts_the_open_wearables_listener_pid() -> None:
+    text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+    body = _function_body(text, "start_open_wearables")
+    listener_body = _function_body(text, "open_wearables_listener_pid")
+    assert "open_wearables_listener_pid" in body
+    assert 'printf \'%s\\n\' "$listener_pid" >"$OW_PID"' in body
+    assert 'Open Wearables port ${API_PORT:-8000} is already owned' in body
+    assert 'ps -o ppid= -p "$pid"' in listener_body
+    assert 'printf \'%s\\n\' "$pid"' in listener_body
+    assert "open_wearables_listener_is_managed" in body
+
+
+def test_local_open_wearables_boots_a_single_production_listener() -> None:
+    body = _function_body(SCRIPT.read_text(encoding="utf-8"), "cmd_ow")
+    assert "ENVIRONMENT=production exec bash scripts/start/app.sh" in body
 
 
 def test_manual_mac_runtime_exposes_open_wearables_beat_target() -> None:

@@ -55,6 +55,65 @@ start_process() {
     info "$name started (pid $(<"$pid_file"))"
 }
 
+open_wearables_listener_pid() {
+    local -a pids
+    local pid parent candidate
+    while read -r pid; do
+        [ -n "$pid" ] && pids+=("$pid")
+    done < <(lsof -nP -iTCP:"${API_PORT:-8000}" -sTCP:LISTEN -t 2>/dev/null)
+    [ "${#pids[@]}" -gt 0 ] || return
+    for pid in "${pids[@]}"; do
+        parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+        for candidate in "${pids[@]}"; do
+            if [ "$parent" = "$candidate" ]; then
+                printf '%s\n' "$pid"
+                return
+            fi
+        done
+    done
+    printf '%s\n' "${pids[0]}"
+}
+
+open_wearables_listener_is_managed() {
+    local pid=$1 parent command
+    while [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ]; do
+        command="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+        [[ "$command" == *"fastapi dev app/main.py"* ]] && return 0
+        parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+        [ "$parent" != "$pid" ] || break
+        pid="$parent"
+    done
+    return 1
+}
+
+start_open_wearables() {
+    local listener_pid
+    if pid_running "$OW_PID"; then
+        info "Open Wearables already running (pid $(<"$OW_PID"))"
+        return
+    fi
+    listener_pid="$(open_wearables_listener_pid)"
+    if [ -n "$listener_pid" ]; then
+        open_wearables_listener_is_managed "$listener_pid" \
+            || die "Open Wearables port ${API_PORT:-8000} is already owned by pid $listener_pid"
+        printf '%s\n' "$listener_pid" >"$OW_PID"
+        info "Open Wearables listener adopted (pid $listener_pid)"
+        return
+    fi
+    start_process "Open Wearables" "$OW_PID" "$OW_LOG" \
+        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        listener_pid="$(open_wearables_listener_pid)"
+        if [ -n "$listener_pid" ]; then
+            printf '%s\n' "$listener_pid" >"$OW_PID"
+            info "Open Wearables listener adopted (pid $listener_pid)"
+            return
+        fi
+        sleep 1
+    done
+    die "Open Wearables did not open port ${API_PORT:-8000}; see $OW_LOG"
+}
+
 stop_process() {
     local name=$1 pid_file=$2 pid child process_pid still_running
     local -a pids
@@ -224,8 +283,7 @@ cmd_start() {
     bash "$REPO_ROOT/scripts/dev_mac.sh" services-start
     resolve_ow_api_key
     sync_hermes_ow_api_key
-    start_process "Open Wearables" "$OW_PID" "$OW_LOG" \
-        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow"
+    start_open_wearables
     start_process "Open Wearables worker" "$WORKER_PID" "$WORKER_LOG" \
         "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow-worker"
     start_process "Open Wearables beat" "$BEAT_PID" "$BEAT_LOG" \
