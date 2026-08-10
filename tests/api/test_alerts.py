@@ -158,12 +158,9 @@ def test_decision_links_use_exact_trigger_correlation(client, seeded):
     assert alerts[0]["decision_url"].endswith(f"/decisions/{DECISION_TOP_ID}")
     assert alerts[1]["decision_url"].endswith(f"/decisions/{DECISION_EARLY_ID}")
 
-    # The list must agree with the glance widget contract verbatim.
-    assert glance_alerts["unresolved_count"] == len(alerts) == 2
-    assert glance_alerts["top"]["id"] == alerts[0]["id"]
-    assert glance_alerts["top"]["rule_id"] == alerts[0]["rule_id"]
-    assert glance_alerts["top"]["summary"] == alerts[0]["summary"]
-    assert glance_alerts["top"]["decision_url"] == alerts[0]["decision_url"]
+    # History remains visible, while glance counts only actionable proposals.
+    assert len(alerts) == 2
+    assert glance_alerts == {"unresolved_count": 0, "top": None}
 
 
 def test_proposal_alert_resolves_its_direct_target_beyond_first_page(
@@ -215,6 +212,7 @@ def test_proposal_alert_resolves_its_direct_target_beyond_first_page(
 
     with frozen():
         alert = client.get(ALERTS, params={"limit": 1}).json()["data"][0]
+        glance_before = client.get("/v1/briefing/glance").json()["alerts"]
         first_page = client.get(
             "/v1/schedule/proposals",
             params={"status": "proposed", "limit": 50, "offset": 0},
@@ -225,6 +223,8 @@ def test_proposal_alert_resolves_its_direct_target_beyond_first_page(
     assert alert["decision_card"]["proposal_id"] == str(target_id)
     assert alert["decision_card"]["title"] == "Task 50"
     assert alert["decision_card"]["after"].startswith("2026-07-10T00:50:00")
+    assert glance_before["unresolved_count"] == 1
+    assert glance_before["top"]["id"] == str(event.id)
     assert str(target_id) not in {row["id"] for row in first_page["data"]}
     assert first_page["pagination"]["total_count"] == 51
     assert direct.status_code == 200
@@ -239,6 +239,11 @@ def test_proposal_alert_resolves_its_direct_target_beyond_first_page(
 
     assert resolved.status_code == 200
     assert resolved.json()["status"] == "accepted"
+    with frozen():
+        assert client.get("/v1/briefing/glance").json()["alerts"] == {
+            "unresolved_count": 0,
+            "top": None,
+        }
 
 
 def test_expired_proposal_is_not_exposed_as_an_alert_action(client, session):

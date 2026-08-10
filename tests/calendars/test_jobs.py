@@ -36,6 +36,7 @@ from healthmes.calendars.sync import CalendarMirrorService
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
+    DecisionRecord,
     ProposalStatus,
     ScheduleProposal,
     Task,
@@ -286,6 +287,10 @@ class TestJobRun:
         )
         assert session.get(Task, task.id).status == "scheduled"
         assert mirror.is_agent_created is False
+        outcome = session.query(DecisionRecord).one()
+        assert outcome.tree["detail"]["proposal_id"] == str(proposal.id)
+        assert outcome.tree["detail"]["calendar_source"] == "google"
+        assert outcome.tree["detail"]["calendar_write"] is True
 
     def test_changed_timed_intake_invalidates_instead_of_creating_duplicate(
         self,

@@ -37,7 +37,7 @@ services:
       HEALTHMES_DB_USER: healthmes
       HEALTHMES_DB_PASSWORD: healthmes
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U open-wearables -d open-wearables"]
       interval: 5s
@@ -46,13 +46,15 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
+    restart: unless-stopped
 
   redis:
     image: redis:8
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
+    restart: unless-stopped
 
   ow-backend:
     # Mirrors the `app` service of vendor/open-wearables/docker-compose.yml.
@@ -74,13 +76,13 @@ services:
       - DB_HOST=postgres
       - REDIS_HOST=redis
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_started
-    restart: on-failure
+    restart: unless-stopped
 
   ow-worker:
     # Mirrors the `celery-worker` service of the vendor compose.
@@ -97,7 +99,7 @@ services:
       - redis
       - postgres
       - ow-backend
-    restart: on-failure
+    restart: unless-stopped
 
   ow-beat:
     # Mirrors the `celery-beat` service of the vendor compose. The worker
@@ -115,7 +117,7 @@ services:
       - redis
       - postgres
       - ow-backend
-    restart: on-failure
+    restart: unless-stopped
 
   ow-mcp:
     # vendor/open-wearables/mcp has no Dockerfile and its entrypoint
@@ -148,10 +150,10 @@ services:
     volumes:
       - ./vendor/open-wearables/mcp:/srv/ow-mcp:ro
     ports:
-      - "${OW_MCP_PORT:-8200}:8200"
+      - "127.0.0.1:${OW_MCP_PORT:-8200}:8200"
     depends_on:
       - ow-backend
-    restart: on-failure
+    restart: unless-stopped
 
   healthmes:
     build:
@@ -190,11 +192,11 @@ services:
     volumes:
       - healthmes_data:/data
     ports:
-      - "${HEALTHMES_PORT:-8100}:8100"
+      - "127.0.0.1:${HEALTHMES_PORT:-8100}:8100"
     depends_on:
       postgres:
         condition: service_healthy
-    restart: on-failure
+    restart: unless-stopped
 
   hermes:
     # Grounded in vendor/hermes-agent/docker-compose.yml (`gateway` service):
@@ -225,7 +227,7 @@ services:
       # Webhook platform (gateway/platforms/webhook.py, default port 8644):
       # healthmes reaches it in-cluster at hermes:8644; published for local
       # smoke tests.
-      - "${HERMES_WEBHOOK_PORT:-8644}:8644"
+      - "127.0.0.1:${HERMES_WEBHOOK_PORT:-8644}:8644"
     depends_on:
       - healthmes
     command: ["gateway", "run"]

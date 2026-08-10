@@ -22,12 +22,14 @@ from healthmes.calendars.jobs import build_calendar_jobs
 from healthmes.calendars.sleep_job import build_sleep_reconciliation_job
 from healthmes.config import Settings, get_settings
 from healthmes.engine.cognitive_energy import build_energy_job
+from healthmes.engine.planner import PLANNER_INTERVAL_MINUTES, build_planner_job
 from healthmes.engine.scheduler import (
     create_scheduler,
     register_backup_job,
     register_calendar_adjustment_maintenance_job,
     register_calendar_job,
     register_energy_job,
+    register_planner_job,
     register_sleep_reconciliation_job,
     register_storage_maintenance_job,
     shutdown_scheduler,
@@ -84,6 +86,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             register_calendar_job(
                 scheduler, spec.job, job_id=spec.job_id, minutes=spec.interval_minutes
             )
+        register_planner_job(
+            scheduler,
+            build_planner_job(settings),
+            minutes=PLANNER_INTERVAL_MINUTES,
+        )
         sleep_job = build_sleep_reconciliation_job(settings)
         if sleep_job is not None:
             register_sleep_reconciliation_job(scheduler, sleep_job)

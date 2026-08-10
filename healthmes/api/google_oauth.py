@@ -9,6 +9,7 @@ from typing import Protocol
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 
+from healthmes.api.calendar_runtime import refresh_calendar_jobs
 from healthmes.api.local_session import (
     LocalBrowserSession,
     authenticated_local_session,
@@ -115,6 +116,7 @@ async def google_oauth_callback(request: Request, state: str = "") -> RedirectRe
     flow.fetch_token(authorization_response=str(request.url))
     settings: Settings = request.app.state.settings
     save_credentials(flow.credentials, google_token_path(settings.data_dir))
+    refresh_calendar_jobs(request.app)
     return RedirectResponse("/connect?google=connected", status_code=303)
 
 
@@ -129,6 +131,7 @@ async def disconnect_google(request: Request) -> RedirectResponse:
     await _authorized_local(request)
     settings: Settings = request.app.state.settings
     creds.delete_google_token(settings.data_dir)
+    refresh_calendar_jobs(request.app)
     return RedirectResponse("/connect?google=disconnected", status_code=303)
 
 

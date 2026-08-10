@@ -261,7 +261,7 @@ class BearerTokenMiddleware:
     def _is_local_browser_path(path: str) -> bool:
         return (
             path == "/connect"
-            or path.startswith("/connect/google/")
+            or path.startswith("/connect/")
             or path == "/sleep"
             or path.startswith("/sleep/")
             or path == "/storage"

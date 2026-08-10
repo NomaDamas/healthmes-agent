@@ -65,6 +65,10 @@ from healthmes.calendars.state import (
 from healthmes.calendars.sync import CalendarMirrorService, SyncDiff
 from healthmes.calendars.write_lock import calendar_write_lock
 from healthmes.config import Settings, resolve_timezone
+from healthmes.schedule_outcomes import (
+    record_calendar_push_outcome,
+    record_invalidation_outcome,
+)
 from healthmes.store.enums import CalendarSource, ProposalStatus
 from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task
 from healthmes.store.session import session_scope
@@ -382,6 +386,11 @@ def push_accepted_proposals(
                 intake_row = _timed_intake_block(session, proposal)
             except CalendarConflictError as exc:
                 proposal.status = ProposalStatus.INVALIDATED
+                record_invalidation_outcome(
+                    session,
+                    proposal,
+                    reason=f"timed_intake_conflict:{exc}",
+                )
                 session.commit()
                 logger.warning(
                     "Proposal %s invalidated because its timed intake event "
@@ -454,6 +463,11 @@ def push_accepted_proposals(
                             raise
                         continue
                 proposal.status = ProposalStatus.INVALIDATED
+                record_invalidation_outcome(
+                    session,
+                    proposal,
+                    reason=f"sleep_conflict_before_push:{violation}",
+                )
                 session.commit()
                 logger.warning(
                     "Proposal %s invalidated before calendar push: %s",
@@ -464,6 +478,13 @@ def push_accepted_proposals(
             if intake_row is not None:
                 proposal.status = ProposalStatus.PUSHED
                 task.status = "scheduled"
+                record_calendar_push_outcome(
+                    session,
+                    proposal,
+                    source,
+                    provider_event_id=intake_row.external_id,
+                    reused_existing=True,
+                )
                 session.commit()
                 pushed += 1
                 logger.info(
@@ -477,6 +498,13 @@ def push_accepted_proposals(
             if legacy_row is not None:
                 proposal.status = ProposalStatus.PUSHED
                 task.status = "scheduled"
+                record_calendar_push_outcome(
+                    session,
+                    proposal,
+                    source,
+                    provider_event_id=legacy_row.external_id,
+                    reused_existing=True,
+                )
                 session.commit()
                 pushed += 1
                 logger.info(
@@ -536,6 +564,11 @@ def push_accepted_proposals(
                         raise
                     continue
                 proposal.status = ProposalStatus.INVALIDATED
+                record_invalidation_outcome(
+                    session,
+                    proposal,
+                    reason=f"sleep_conflict_after_create:{post_create_violation}",
+                )
                 session.commit()
                 logger.warning(
                     "Proposal %s invalidated after calendar create: %s",
@@ -545,6 +578,13 @@ def push_accepted_proposals(
                 continue
             proposal.status = ProposalStatus.PUSHED
             task.status = "scheduled"
+            record_calendar_push_outcome(
+                session,
+                proposal,
+                source,
+                provider_event_id=row.external_id,
+                reused_existing=reused_existing,
+            )
             session.commit()
             pushed += 1
             logger.info(
@@ -605,6 +645,11 @@ def _cleanup_cancelled_pushed_proposals(
                 if block_on_another_source is not None:
                     continue
             proposal.status = ProposalStatus.INVALIDATED
+            record_invalidation_outcome(
+                session,
+                proposal,
+                reason="source_task_cancelled",
+            )
             session.commit()
             cleaned += 1
     return cleaned

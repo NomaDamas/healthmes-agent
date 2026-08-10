@@ -10,6 +10,11 @@ network destination in the whole project — no third-party endpoint, no
 analytics, no push relay. The watch receives the pairing from the phone over
 WatchConnectivity and then talks to the instance directly.
 
+The paired instance is expected to run continuously on the user's Mac or
+Linux machine. A physical iPhone cannot reach that machine through
+`localhost`; production pairing requires a trusted HTTPS
+`HEALTHMES_PUBLIC_BASE_URL`.
+
 ## What the app does
 
 - **Issue #108 core IA** — Today defaults to Now / Next / Decision; Plan
@@ -69,6 +74,13 @@ WatchConnectivity and then talks to the instance directly.
   the lock screen / Dynamic Island with timer progress; started on
   foreground refresh, updated by the background task, `staleDate = block
   end` so iOS dims it when no budget arrives. Polling only — no push token.
+- **Apple Health sync** — the iPhone requests read access for supported
+  heart, HRV, respiratory, oxygen, activity, distance, wrist-temperature,
+  sleep-stage, and workout samples. Incremental anchored queries upload the
+  native `healthmes.healthkit.v1` contract; anchors advance only after a
+  successful server response. Observer queries, hourly background delivery,
+  app activation, and first pairing all request a sync. Apple Watch samples
+  are read once through the phone's HealthKit store.
 - **Localization & accessibility** — all app strings ko+en via
   `Resources/Localizable.xcstrings` (server-provided text renders
   verbatim); Dynamic Type throughout (verified at accessibility-large);
@@ -108,6 +120,14 @@ deliverable: `docs/design/WATCH-NOTIFICATIONS.ko.md` (design system:
 | `POST /v1/intake-interactions/analyze`, `POST /v1/intake-interactions` | text/voice analysis and reviewed photo capture |
 | `POST /v1/intake-interactions/{id}/outcomes` | explicit consumed/not-consumed/cancelled result |
 | `POST /v1/medical-records` | medication/symptom capture |
+| `POST /v1/ingest/healthkit` (`healthmes.healthkit.v1`) | native HealthKit upload |
+
+HealthKit anchors advance only after the paired personal server confirms that
+the verbatim batch is durably stored. Open Wearables normalization remains
+asynchronous and replayable from that raw source. HealthKit deletion
+tombstones are retained in the native payload and raw store; the current
+Open Wearables SDK contract has no deletion endpoint, so normalized
+derivatives may remain until that upstream contract adds deletion support.
 
 Contracts are pinned twice: Swift decoding tests against
 `Tests/Fixtures/{glance,alerts,weekly_report}.json`, and those same three
@@ -278,6 +298,9 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
   support them but starting requires app-foreground timing not driven in
   tests), notification banner delivery + action buttons under a real OS
   budget (content builder unit-tested; delivery path not UI-automated).
+- **HealthKit hardware behavior is unproven.** Authorization and query code
+  compile, but real permission prompts, observer cadence, anchored-query
+  recovery, and Apple Watch-origin samples require a signed hardware QA pass.
 - **WatchConnectivity pairing sync** still not exercised end-to-end (needs
   a paired phone+watch simulator pair or hardware); the watch app renders
   its "not paired" guidance until the first sync lands. Watch surfaces

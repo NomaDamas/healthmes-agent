@@ -29,6 +29,15 @@
   .conn-actions .secondary {
     border-color: var(--line); background: var(--surface); color: var(--ink);
   }
+  .conn-secret-form {
+    display: grid; gap: 0.65rem; max-width: 34rem; margin-top: 0.7rem;
+  }
+  .conn-secret-form label { display: grid; gap: 0.25rem; font-weight: 700; }
+  .conn-secret-form input {
+    border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 0.62rem 0.75rem; background: var(--surface); color: var(--ink);
+    font: inherit;
+  }
 </style>
 {% endblock %}
 
@@ -43,6 +52,9 @@
 {% endif %}
 {% if google_result %}
 <p class="conn-note">Google Calendar: {{ google_result }}</p>
+{% endif %}
+{% if icloud_result %}
+<p class="conn-note">Apple Calendar: {{ icloud_result }}</p>
 {% endif %}
 {% if local_unlock_url %}
 <section class="card">
@@ -82,6 +94,31 @@
       <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
       <button type="submit">이 Mac에서 Google 로그인</button>
     </form>
+    {% endif %}
+  {% endif %}
+  {% if cal.key == "icloud" and local_session %}
+    {% if cal.connected and cal.disconnect_allowed %}
+    <form class="conn-actions" method="post" action="/connect/icloud/disconnect">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <button class="secondary" type="submit">Apple Calendar 연결 해제</button>
+    </form>
+    {% elif cal.connected %}
+    <p class="conn-note">.env에서 자격증명을 제거한 뒤 HealthMes를 다시 시작하세요.</p>
+    {% else %}
+    <form class="conn-secret-form" method="post" action="/connect/icloud">
+      <input type="hidden" name="csrf" value="{{ local_session.csrf_token }}">
+      <label>Apple ID
+        <input name="username" type="email" autocomplete="username" required>
+      </label>
+      <label>앱 전용 암호
+        <input name="app_password" type="password" autocomplete="new-password" required>
+      </label>
+      <div class="conn-actions">
+        <button type="submit">Apple Calendar 연결</button>
+      </div>
+    </form>
+    <p class="conn-note">이 값은 이 머신의 owner-only credential 파일에만 저장되며
+      화면과 로그에는 다시 표시되지 않습니다.</p>
     {% endif %}
   {% endif %}
   {% if not cal.connected and cal.command %}

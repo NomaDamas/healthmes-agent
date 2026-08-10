@@ -43,6 +43,7 @@ struct SettingsView: View {
     @State private var serverReadiness: SetupReadiness?
     @State private var readinessError: String?
     @StateObject private var calendarPermission = DeviceCalendarPermissionModel()
+    @StateObject private var healthKit = HealthKitSyncManager.shared
 
     var body: some View {
         Form {
@@ -54,8 +55,8 @@ struct SettingsView: View {
                         systemImage: "network"
                     )
                     readinessRow(
-                        "Health feed",
-                        value: readinessValue("health"),
+                        "Apple Health",
+                        value: healthKit.statusText,
                         systemImage: "heart.text.square"
                     )
                     readinessRow(
@@ -99,6 +100,32 @@ struct SettingsView: View {
                 Text("Ready check")
             } footer: {
                 Text("Device calendar permission and HealthMes server synchronization are separate. A proposal is on the external calendar only after it reaches Applied.")
+            }
+
+            Section {
+                if healthKit.state == .notRequested {
+                    Button {
+                        Task { await healthKit.requestAuthorizationAndSync() }
+                    } label: {
+                        Label("Connect Apple Health", systemImage: "heart.badge.plus")
+                    }
+                } else {
+                    Button {
+                        Task { await healthKit.sync() }
+                    } label: {
+                        Label("Sync Apple Health now", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .disabled(healthKit.state == .syncing)
+                }
+                if case .failed(let message) = healthKit.state {
+                    Text(verbatim: message)
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
+            } header: {
+                Text("Apple Health")
+            } footer: {
+                Text("Apple Watch data is collected once through iPhone HealthKit and uploaded only to your paired HealthMes instance.")
             }
 
             Section {

@@ -343,6 +343,85 @@ def test_dispatching_event_retries_with_same_correlation_id(
     assert stored.alert_sent is True
 
 
+def test_pending_hygiene_event_uses_standard_delivery_gates(
+    settings, session_factory
+) -> None:
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        event = TriggerEvent(
+            fired_at=utc(now),
+            rule_id="deterministic_planner",
+            dedup_key="planner:task-1:2026-07-09T15:00:00+00:00",
+            alert_sent=False,
+            payload={
+                "summary": "Deep work 일정을 제안했습니다.",
+                "proposal": "캘린더에 추가할까요?",
+                "evidence": {"slot": "15:00"},
+                "push": {"state": "pending_hygiene"},
+            },
+        )
+        with session_factory() as session:
+            session.add(event)
+            session.commit()
+            event_id = event.id
+
+        sender = FakeAlertSender()
+        report = make_evaluator(
+            settings,
+            session_factory,
+            sender,
+            rules=(),
+        ).evaluate_once()
+
+    assert [outcome.status for outcome in report.outcomes] == ["pushed"]
+    assert sender.sent[0][2] == event_id
+    [stored] = all_events(session_factory)
+    assert stored.alert_sent is True
+
+
+def test_pending_hygiene_event_is_suppressed_during_quiet_hours(
+    settings, session_factory
+) -> None:
+    quiet = settings.model_copy(
+        update={
+            "quiet_hours_start": time(22, 0),
+            "quiet_hours_end": time(7, 0),
+        }
+    )
+    with freeze_time("2026-07-09 23:00:00"):
+        now = local_now()
+        with session_factory() as session:
+            session.add(
+                TriggerEvent(
+                    fired_at=utc(now),
+                    rule_id="deterministic_planner",
+                    dedup_key="planner:task-2:2026-07-10T09:00:00+00:00",
+                    alert_sent=False,
+                    payload={
+                        "summary": "Plan",
+                        "proposal": "Apply?",
+                        "evidence": {},
+                        "push": {"state": "pending_hygiene"},
+                    },
+                )
+            )
+            session.commit()
+
+        sender = FakeAlertSender()
+        report = make_evaluator(
+            quiet,
+            session_factory,
+            sender,
+            rules=(),
+        ).evaluate_once()
+
+    assert [outcome.status for outcome in report.outcomes] == ["suppressed"]
+    assert sender.sent == []
+    [stored] = all_events(session_factory)
+    assert stored.alert_sent is False
+    assert stored.payload["push"]["suppressed_reason"] == "quiet_hours"
+
+
 def test_retryable_result_is_recovered_without_rule_refiring(
     settings, session_factory
 ) -> None:

@@ -33,6 +33,7 @@ class ConnectionCard:
     link_url: str = ""
     notes: tuple[str, ...] = ()
     badge_label: str = ""
+    disconnect_allowed: bool = True
 
 
 class OpenWearablesStatusReader(Protocol):
@@ -176,7 +177,13 @@ def _icloud_card(settings: Settings) -> ConnectionCard:
             if resolved.source == "env"
             else "CLI로 저장된 CalDAV credential 사용 중"
         )
-        return ConnectionCard("icloud", "iCloud 캘린더 (CalDAV)", True, detail)
+        return ConnectionCard(
+            "icloud",
+            "iCloud 캘린더 (CalDAV)",
+            True,
+            detail,
+            disconnect_allowed=resolved.source != "env",
+        )
     return ConnectionCard(
         "icloud",
         "iCloud 캘린더 (CalDAV)",

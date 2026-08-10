@@ -1,0 +1,20 @@
+services:
+  healthmes:
+    network_mode: host
+    ports: !reset []
+    environment:
+      - HEALTHMES_DATABASE_URL=postgresql+psycopg://healthmes:healthmes@127.0.0.1:5432/healthmes
+      - HEALTHMES_OW_BASE_URL=http://127.0.0.1:8000
+      - HEALTHMES_HERMES_WEBHOOK_URL=http://127.0.0.1:8644/webhooks/healthmes-alerts
+      - HEALTHMES_DATA_DIR=/data
+      - HEALTHMES_PORT=${HEALTHMES_PORT:-8100}
+      - HEALTHMES_HOST=127.0.0.1
+      - HEALTHMES_API_TOKEN=${HEALTHMES_API_TOKEN:-}
+      - HEALTHMES_CALENDAR_ADJUSTMENT_SECRET=${HEALTHMES_CALENDAR_ADJUSTMENT_SECRET:-}
+      - HEALTHMES_TELEGRAM_OWNER_USER_ID=${HEALTHMES_TELEGRAM_OWNER_USER_ID:-}
+      - HEALTHMES_TELEGRAM_OWNER_CHAT_ID=${HEALTHMES_TELEGRAM_OWNER_CHAT_ID:-}
+      - HEALTHMES_TIMEZONE=${HEALTHMES_TIMEZONE:-}
+
+  hermes:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

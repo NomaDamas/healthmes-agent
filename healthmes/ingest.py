@@ -9,7 +9,8 @@ ordered:
    ``HEALTHMES_DATA_DIR/raw_ingest/YYYY/MM/DD/`` (owner-only files) and
    indexed in ``raw_ingest_event`` *before* anything tries to read it.
    This is the only stage that can fail the request.
-2. ``transform_hae`` — best-effort mapping of a Health Auto Export-style
+2. ``transform_healthkit`` — accept the native HealthMes iOS contract, or
+   best-effort map a Health Auto Export-style
    payload (the de-facto contract of off-the-shelf HealthKit auto-export
    apps) to the open-wearables mobile-SDK sync contract
    (``vendor/open-wearables/.../schemas/providers/mobile_sdk/sync_request.py``).
@@ -192,10 +193,43 @@ def transform_hae(payload: Any) -> list[dict[str, Any]]:
     return records
 
 
+def transform_healthkit(
+    payload: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Return open-wearables SDK arrays from a supported HealthKit payload.
+
+    ``healthmes.healthkit.v1`` is emitted by the native iPhone app and already
+    uses the open-wearables record shapes. Health Auto Export remains a
+    backwards-compatible bridge and maps quantity metrics only.
+    """
+    if isinstance(payload, dict) and payload.get("schema") == "healthmes.healthkit.v1":
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return [], [], [], "healthmes-ios/1"
+
+        def rows(key: str) -> list[dict[str, Any]]:
+            value = data.get(key)
+            if not isinstance(value, list):
+                return []
+            return [row for row in value if isinstance(row, dict)]
+
+        sdk_version = payload.get("sdkVersion")
+        return (
+            rows("records"),
+            rows("sleep"),
+            rows("workouts"),
+            sdk_version if isinstance(sdk_version, str) and sdk_version else "healthmes-ios/1",
+        )
+    return transform_hae(payload), [], [], "healthmes-bridge/1"
+
+
 def forward_sdk_sync(
     settings: Settings,
     records: list[dict[str, Any]],
     *,
+    sleep: list[dict[str, Any]] | None = None,
+    workouts: list[dict[str, Any]] | None = None,
+    sdk_version: str = "healthmes-bridge/1",
     user_id: str,
     timeout: float = 60.0,
     transport: httpx.BaseTransport | None = None,
@@ -215,9 +249,13 @@ def forward_sdk_sync(
 
     body = {
         "provider": "apple",
-        "sdkVersion": "healthmes-bridge/1",
+        "sdkVersion": sdk_version,
         "syncTimestamp": datetime.now(UTC).isoformat(),
-        "data": {"records": records, "sleep": [], "workouts": []},
+        "data": {
+            "records": records,
+            "sleep": sleep or [],
+            "workouts": workouts or [],
+        },
     }
     url = f"{settings.ow_base_url.rstrip('/')}/api/v1/sdk/users/{user_id}/sync"
     try:

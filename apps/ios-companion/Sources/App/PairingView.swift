@@ -109,6 +109,7 @@ struct PairingView: View {
                     SeenAlertsStore.shared.deferPrimingUntilNextFeed()
                 }
                 BackgroundRefreshManager.shared.schedule()
+                await HealthKitSyncManager.shared.requestAuthorizationAndSync()
             }
         } catch {
             status = error.localizedDescription

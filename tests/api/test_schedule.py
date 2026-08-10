@@ -15,6 +15,7 @@ from healthmes.schedule_proposals import (
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
+    DecisionRecord,
     ProposalStatus,
     ScheduleProposal,
     Task,
@@ -171,6 +172,10 @@ def test_accept_proposal_then_second_accept_conflicts(client, session):
     assert stored.status == ProposalStatus.ACCEPTED
     assert stored.decided_at is not None
     assert stored.decision_surface == "ios_notification"
+    outcome = session.query(DecisionRecord).one()
+    assert outcome.tree["detail"]["proposal_id"] == str(proposal.id)
+    assert outcome.tree["detail"]["status"] == "accepted"
+    assert outcome.tree["detail"]["surface"] == "ios_notification"
 
     again = client.post(
         f"/v1/schedule/proposals/{proposal.id}/accept",

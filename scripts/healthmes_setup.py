@@ -16,16 +16,18 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 SCHEMA = "healthmes.setup.v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_SCRIPT = REPO_ROOT / "scripts" / "healthmes_local.sh"
+LINUX_SCRIPT = REPO_ROOT / "scripts" / "healthmes_linux.sh"
 BOOTSTRAP_SCRIPT = REPO_ROOT / "scripts" / "bootstrap.py"
 ENV_FILE = REPO_ROOT / ".env"
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
@@ -63,13 +65,14 @@ def emit(event: SetupEvent, *, json_output: bool) -> None:
 
 def preflight() -> list[SetupEvent]:
     events: list[SetupEvent] = []
-    if platform.system() != "Darwin":
+    system = platform.system()
+    if system not in {"Darwin", "Linux"}:
         events.append(
             SetupEvent(
                 "preflight",
                 "platform",
                 "failed",
-                "HealthMes local install currently requires macOS.",
+                "HealthMes self-host install requires macOS or Linux.",
                 platform.platform(),
             )
         )
@@ -79,17 +82,24 @@ def preflight() -> list[SetupEvent]:
             "preflight",
             "platform",
             "ready",
-            "Supported macOS detected.",
-            f"{platform.mac_ver()[0]} · {platform.machine()}",
+            f"Supported {system} detected.",
+            (
+                f"{platform.mac_ver()[0]} · {platform.machine()}"
+                if system == "Darwin"
+                else platform.platform()
+            ),
         )
     )
-    for command, required in (
+    commands: list[tuple[str, bool]] = [
         ("bash", True),
         ("git", True),
         ("python3", True),
-        ("brew", True),
-        ("uv", False),
-    ):
+    ]
+    if system == "Darwin":
+        commands.extend((("brew", True), ("uv", False)))
+    else:
+        commands.extend((("docker", True), ("systemctl", True)))
+    for command, required in commands:
         path = shutil.which(command)
         if path:
             events.append(
@@ -229,6 +239,8 @@ def ensure_environment(*, json_output: bool, dry_run: bool) -> None:
             "HEALTHMES_PUBLIC_BASE_URL",
             f"http://127.0.0.1:{port}",
         )
+    _upsert_env(ENV_FILE, "HEALTHMES_SCHEDULER_ENABLED", "true")
+    _upsert_env(ENV_FILE, "HEALTHMES_NATIVE_ALERT_DELIVERY", "true")
     ENV_FILE.chmod(0o600)
     emit(
         SetupEvent(
@@ -238,7 +250,7 @@ def ensure_environment(*, json_output: bool, dry_run: bool) -> None:
             (
                 "Using the configured HTTPS instance URL."
                 if public_base_url.lower().startswith("https://")
-                else "Local runtime is limited to this Mac until an HTTPS URL is configured."
+                else "Local runtime is limited to this machine until an HTTPS URL is configured."
             ),
         ),
         json_output=json_output,
@@ -261,7 +273,8 @@ def prepare_runtime(
     ]
     if blockers:
         raise SetupFailure(blockers[0].message)
-    if shutil.which("uv") is None:
+    system = platform.system()
+    if system == "Darwin" and shutil.which("uv") is None:
         run_command(
             action,
             "dependency_uv",
@@ -270,10 +283,36 @@ def prepare_runtime(
             dry_run=dry_run,
         )
     ensure_environment(json_output=json_output, dry_run=dry_run)
-    run_command(
-        action,
-        "bootstrap",
-        [
+    if system == "Linux":
+        if not dry_run:
+            port = _load_env(ENV_FILE).get("HEALTHMES_PORT", "8100").strip() or "8100"
+            _upsert_env(
+                ENV_FILE,
+                "HEALTHMES_MCP_URL",
+                f"http://host.docker.internal:{port}/mcp",
+            )
+        bootstrap_command = [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "-v",
+            f"{REPO_ROOT}:/work",
+            "-w",
+            "/work",
+            "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+            "uv",
+            "run",
+            "python",
+            "scripts/bootstrap.py",
+            "--mode",
+            "docker",
+            "--env-file",
+            "/work/.env",
+        ]
+    else:
+        bootstrap_command = [
             "uv",
             "run",
             "python",
@@ -282,7 +321,11 @@ def prepare_runtime(
             "native",
             "--env-file",
             str(ENV_FILE),
-        ],
+        ]
+    run_command(
+        action,
+        "bootstrap",
+        bootstrap_command,
         json_output=json_output,
         dry_run=dry_run,
     )
@@ -342,14 +385,20 @@ def verify(*, json_output: bool) -> bool:
         or _load_env(ENV_FILE).get("HEALTHMES_PORT")
         or "8100"
     )
-    try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/health",
-            timeout=3,
-        ) as response:
-            healthy = response.status == 200
-    except (OSError, urllib.error.URLError):
-        healthy = False
+    healthy = False
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/health",
+                timeout=3,
+            ) as response:
+                healthy = response.status == 200
+        except (OSError, urllib.error.URLError):
+            healthy = False
+        if healthy:
+            break
+        time.sleep(2)
     emit(
         SetupEvent(
             "verify",
@@ -382,8 +431,13 @@ def issue_pairing_links(*, json_output: bool) -> None:
             "'phone_expires_at': phone.expires_at if phone else None}))",
         )
     )
+    command = (
+        ["docker", "compose", "exec", "-T", "healthmes", "python", "-c", code]
+        if platform.system() == "Linux"
+        else ["uv", "run", "python", "-c", code]
+    )
     result = subprocess.run(
-        ["uv", "run", "python", "-c", code],
+        command,
         cwd=REPO_ROOT,
         text=True,
         capture_output=True,
@@ -444,6 +498,10 @@ def issue_pairing_links(*, json_output: bool) -> None:
         )
 
 
+def runtime_script() -> Path:
+    return LINUX_SCRIPT if platform.system() == "Linux" else LOCAL_SCRIPT
+
+
 def install(*, json_output: bool, dry_run: bool) -> None:
     prepare_runtime(
         "install",
@@ -453,7 +511,7 @@ def install(*, json_output: bool, dry_run: bool) -> None:
     run_command(
         "install",
         "runtime_install",
-        ["bash", str(LOCAL_SCRIPT), "install"],
+        ["bash", str(runtime_script()), "install"],
         json_output=json_output,
         dry_run=dry_run,
     )
@@ -468,16 +526,16 @@ def diagnostics(*, json_output: bool) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / (
         "setup-"
-        + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")  # noqa: UP017
         + ".json"
     )
     commands = {
         "git": ["git", "-C", str(REPO_ROOT), "status", "--short", "--branch"],
-        "runtime": ["bash", str(LOCAL_SCRIPT), "status"],
+        "runtime": ["bash", str(runtime_script()), "status"],
     }
     report: dict[str, object] = {
         "schema": SCHEMA,
-        "created_at": datetime.now(UTC).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017
         "platform": platform.platform(),
         "commands": {},
     }
@@ -544,7 +602,7 @@ def main(argv: list[str] | None = None) -> int:
             run_command(
                 "repair",
                 "runtime_repair",
-                ["bash", str(LOCAL_SCRIPT), "install"],
+                ["bash", str(runtime_script()), "install"],
                 json_output=args.json,
                 dry_run=args.dry_run,
             )
@@ -559,7 +617,7 @@ def main(argv: list[str] | None = None) -> int:
             run_command(
                 "update",
                 "runtime_update",
-                ["bash", str(LOCAL_SCRIPT), "update"],
+                ["bash", str(runtime_script()), "update"],
                 json_output=args.json,
                 dry_run=args.dry_run,
             )
@@ -571,7 +629,7 @@ def main(argv: list[str] | None = None) -> int:
             run_command(
                 "uninstall",
                 "runtime_uninstall",
-                ["bash", str(LOCAL_SCRIPT), "uninstall"],
+                ["bash", str(runtime_script()), "uninstall"],
                 json_output=args.json,
                 dry_run=args.dry_run,
             )

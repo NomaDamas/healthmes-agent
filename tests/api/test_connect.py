@@ -115,6 +115,75 @@ def test_connected_states_render_without_secrets(client, settings) -> None:
     assert str(settings.data_dir) not in text
 
 
+def test_local_session_can_connect_and_disconnect_icloud_without_rendering_secrets(
+    settings, monkeypatch
+) -> None:
+    secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
+    validated = []
+    monkeypatch.setattr(
+        creds,
+        "validate_caldav_connection",
+        lambda **kwargs: validated.append(kwargs) or "1 calendar",
+    )
+    with TestClient(
+        create_app(secured),
+        base_url="http://127.0.0.1:8100",
+    ) as local:
+        unlock = local.post(
+            "/connect/unlock",
+            data={"api_token": TOKEN},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert unlock.status_code == 303
+        page = local.get("/connect")
+        csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+        assert csrf is not None
+
+        connected = local.post(
+            "/connect/icloud",
+            data={
+                "csrf": csrf.group(1),
+                "username": "me@icloud.com",
+                "app_password": APP_PASSWORD,
+            },
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert connected.status_code == 303
+        assert connected.headers["location"] == "/connect?icloud=connected"
+        assert validated[0]["username"] == "me@icloud.com"
+        saved = creds.load_caldav_credentials(settings.data_dir)
+        assert saved is not None and saved.app_password == APP_PASSWORD
+
+        rendered = local.get("/connect").text
+        assert "me@icloud.com" not in rendered
+        assert APP_PASSWORD not in rendered
+        csrf = re.search(
+            r'action="/connect/icloud/disconnect".*?name="csrf" value="([^"]+)"',
+            rendered,
+            re.S,
+        )
+        assert csrf is not None
+        disconnected = local.post(
+            "/connect/icloud/disconnect",
+            data={"csrf": csrf.group(1)},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert disconnected.status_code == 303
+        assert creds.load_caldav_credentials(settings.data_dir) is None
+
+
+def test_remote_viewer_never_gets_icloud_secret_form(settings) -> None:
+    secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
+    with TestClient(create_app(secured)) as remote:
+        page = remote.get("/connect", params={"token": viewer_token(TOKEN)})
+        assert page.status_code == 200
+        assert 'name="app_password"' not in page.text
+        assert 'action="/connect/icloud"' not in page.text
+
+
 def test_mixed_state_renders_per_calendar(client, settings) -> None:
     connect_icloud(settings.data_dir)
     text = client.get("/connect").text

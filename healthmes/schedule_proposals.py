@@ -7,6 +7,10 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from healthmes.calendars.adjustments_logic import verify_reply_handle
+from healthmes.schedule_outcomes import (
+    record_invalidation_outcome,
+    record_resolution_outcome,
+)
 from healthmes.store.enums import ProposalStatus
 from healthmes.store.models import ScheduleProposal
 
@@ -182,20 +186,24 @@ def resolve_schedule_proposal(
     if expires_at is None or current >= expires_at:
         raise ScheduleProposalResolutionError("expired")
     if session.get_bind().dialect.name == "postgresql":
-        return _transition_locked_postgres(
+        resolved = _transition_locked_postgres(
             session,
             proposal_id,
             target,
             now,
             normalized_surface,
         )
-    return _transition_compare_and_swap(
-        session,
-        proposal,
-        target,
-        current,
-        normalized_surface,
-    )
+    else:
+        resolved = _transition_compare_and_swap(
+            session,
+            proposal,
+            target,
+            current,
+            normalized_surface,
+        )
+    record_resolution_outcome(session, resolved, target)
+    session.flush()
+    return resolved
 
 
 def normalize_decision_surface(value: str | None) -> str:
@@ -228,15 +236,19 @@ def invalidate_schedule_proposal(
         raise ScheduleProposalResolutionError("not_found")
     current = _as_utc(now or dt.datetime.now(dt.UTC))
     if session.get_bind().dialect.name == "postgresql":
-        return _transition_locked_postgres(
+        invalidated = _transition_locked_postgres(
             session,
             proposal_id,
             ProposalStatus.INVALIDATED,
             now,
         )
-    return _transition_compare_and_swap(
-        session,
-        proposal,
-        ProposalStatus.INVALIDATED,
-        current,
-    )
+    else:
+        invalidated = _transition_compare_and_swap(
+            session,
+            proposal,
+            ProposalStatus.INVALIDATED,
+            current,
+        )
+    record_invalidation_outcome(session, invalidated, reason="system_invalidation")
+    session.flush()
+    return invalidated

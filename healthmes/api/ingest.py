@@ -24,7 +24,7 @@ from healthmes.ingest import (
     IngestForwardError,
     forward_sdk_sync,
     store_raw,
-    transform_hae,
+    transform_healthkit,
 )
 from healthmes.storage import index_raw_ingest
 from healthmes.store.session import SessionDep
@@ -38,11 +38,15 @@ class IngestAck(BaseModel):
     """What happened to one accepted payload (raw storage is the contract)."""
 
     raw_id: str
+    durable: bool
     sha256: str
     size_bytes: int
     parse_status: Literal["parsed", "stored_unparsed"]
     forward_status: str
     records_forwarded: int
+    sleep_forwarded: int = 0
+    workouts_forwarded: int = 0
+    deletions_received: int = 0
 
 
 async def _read_capped_body(request: Request) -> bytes:
@@ -91,9 +95,19 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
     except (json.JSONDecodeError, UnicodeDecodeError):
         event.parse_status = "stored_unparsed"
 
-    records: list[dict] = transform_hae(payload) if payload is not None else []
+    records: list[dict] = []
+    sleep: list[dict] = []
+    workouts: list[dict] = []
+    deletions: list[dict] = []
+    sdk_version = "healthmes-bridge/1"
+    if payload is not None:
+        records, sleep, workouts, sdk_version = transform_healthkit(payload)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        raw_deletions = data.get("deletions") if isinstance(data, dict) else None
+        if isinstance(raw_deletions, list):
+            deletions = [row for row in raw_deletions if isinstance(row, dict)]
     user_id = (settings.ow_user_id or "").strip()
-    if not records:
+    if not (records or sleep or workouts):
         event.forward_status = "nothing_mapped"
     elif not user_id:
         event.forward_status = "skipped_no_user"
@@ -103,13 +117,19 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
             # Thread pool: the sync HTTP client must not stall the event loop.
             await anyio.to_thread.run_sync(
                 lambda: forward_sdk_sync(
-                    settings, records, user_id=user_id, transport=transport
+                    settings,
+                    records,
+                    sleep=sleep,
+                    workouts=workouts,
+                    sdk_version=sdk_version,
+                    user_id=user_id,
+                    transport=transport,
                 )
             )
             # "queued": open-wearables ack'd (202) and parses asynchronously —
             # not a claim that the records are already normalized.
             event.forward_status = "queued"
-            event.records_forwarded = len(records)
+            event.records_forwarded = len(records) + len(sleep) + len(workouts)
         except IngestForwardError as exc:
             # Raw is durable; the forward can be replayed from it later.
             event.forward_status = "forward_failed"
@@ -119,11 +139,15 @@ async def ingest_healthkit(request: Request, session: SessionDep) -> IngestAck:
     session.commit()
     return IngestAck(
         raw_id=str(event.id),
+        durable=True,
         sha256=event.sha256,
         size_bytes=event.size_bytes,
         parse_status=event.parse_status,  # type: ignore[arg-type]
         forward_status=event.forward_status,
-        records_forwarded=event.records_forwarded,
+        records_forwarded=len(records) if event.forward_status == "queued" else 0,
+        sleep_forwarded=len(sleep) if event.forward_status == "queued" else 0,
+        workouts_forwarded=len(workouts) if event.forward_status == "queued" else 0,
+        deletions_received=len(deletions),
     )
 
 
@@ -156,9 +180,13 @@ async def ingest_raw(
     session.commit()
     return IngestAck(
         raw_id=str(event.id),
+        durable=True,
         sha256=event.sha256,
         size_bytes=event.size_bytes,
         parse_status="stored_unparsed",
         forward_status=event.forward_status,
         records_forwarded=0,
+        sleep_forwarded=0,
+        workouts_forwarded=0,
+        deletions_received=0,
     )

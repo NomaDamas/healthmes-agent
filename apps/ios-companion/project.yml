@@ -48,6 +48,7 @@ targets:
       - target: HealthMesWidgets
       - target: HealthMesNotificationContent
       - target: HealthMesWatchApp
+      - sdk: HealthKit.framework
     settings:
       base:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -71,7 +72,7 @@ targets:
             CFBundleURLSchemes: [healthmes]
         # Native alert loop: BGAppRefreshTask polls /v1/alerts (OS-throttled;
         # README documents the honesty story — Telegram stays guaranteed).
-        UIBackgroundModes: [fetch]
+        UIBackgroundModes: [fetch, processing]
         BGTaskSchedulerPermittedIdentifiers:
           - com.healthmes.companion.refresh
         # Capture shortcuts (photos re-encoded to JPEG, voice memos to m4a;
@@ -90,6 +91,9 @@ targets:
         NSCalendarsFullAccessUsageDescription: >-
           HealthMes checks calendars already configured on this iPhone so
           device permission and server synchronization can be shown separately.
+        NSHealthShareUsageDescription: >-
+          HealthMes reads health and activity data from Apple Health to make
+          wellness-aware schedule suggestions on your own paired server.
         # Focus-block Live Activity (polling-updated; no push channel).
         NSSupportsLiveActivities: true
         NSSupportsLiveActivitiesFrequentUpdates: false
@@ -105,6 +109,8 @@ targets:
           - group.com.healthmes.companion
         keychain-access-groups:
           - $(AppIdentifierPrefix)group.com.healthmes.companion
+        com.apple.developer.healthkit: true
+        com.apple.developer.healthkit.background-delivery: true
 
   # ------------------------------------------- iOS home + lock-screen widgets
   # Also hosts the focus-block Live Activity UI (ActivityKit renders live

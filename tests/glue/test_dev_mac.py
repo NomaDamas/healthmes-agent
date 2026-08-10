@@ -346,7 +346,7 @@ def test_compose_runtime_starts_open_wearables_beat() -> None:
     assert beat["command"] == "scripts/start/beat.sh"
     assert beat["environment"] == ["DB_HOST=postgres", "REDIS_HOST=redis"]
     assert set(beat["depends_on"]) == {"redis", "postgres", "ow-backend"}
-    assert beat["restart"] == "on-failure"
+    assert beat["restart"] == "unless-stopped"
 
 
 def test_runtime_docs_include_open_wearables_beat() -> None:

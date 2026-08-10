@@ -1,6 +1,7 @@
 """One-click setup exchange and readiness API."""
 
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
@@ -8,7 +9,7 @@ from pydantic import SecretStr
 
 from healthmes.app import create_app
 from healthmes.pairing import issue_pairing_grant
-from healthmes.store import Base
+from healthmes.store import Base, RawIngestEvent
 from healthmes.store.session import get_engine
 
 TOKEN = "setup-test-api-token"
@@ -69,6 +70,46 @@ def test_pairing_exchange_rejects_tampering(settings, tmp_path):
         assert response.json()["error"]["code"] == "invalid_pairing_code"
 
 
+def test_readiness_reports_real_healthkit_scheduler_and_https_state(
+    client, session, settings
+):
+    response = client.get("/v1/setup/readiness")
+    assert response.status_code == 200
+    checks = {row["key"]: row for row in response.json()["checks"]}
+    assert checks["healthkit_ingest"]["state"] == "action_required"
+    assert checks["scheduler"]["state"] == "action_required"
+    assert checks["public_https"]["state"] == "action_required"
+
+    session.add(
+        RawIngestEvent(
+            received_at=datetime.now(UTC),
+            source="healthkit-bridge",
+            content_type="application/json",
+            path="raw_ingest/test.json",
+            size_bytes=2,
+            sha256="a" * 64,
+            parse_status="parsed",
+            forward_status="queued",
+        )
+    )
+    session.commit()
+    client.app.state.settings = settings.model_copy(
+        update={
+            "scheduler_enabled": True,
+            "native_alert_delivery": True,
+            "public_base_url": "https://healthmes.example",
+        }
+    )
+
+    ready = client.get("/v1/setup/readiness").json()
+    checks = {row["key"]: row for row in ready["checks"]}
+    assert checks["health"]["state"] == "ready"
+    assert checks["healthkit_ingest"]["state"] == "ready"
+    assert checks["scheduler"]["state"] == "ready"
+    assert checks["notifications"]["state"] == "ready"
+    assert checks["public_https"]["state"] == "ready"
+
+
 def test_readiness_requires_bearer_and_reports_components(settings, tmp_path):
     with setup_client(settings, tmp_path) as (client, _configured):
         assert client.get("/v1/setup/readiness").status_code == 401
@@ -80,8 +121,11 @@ def test_readiness_requires_bearer_and_reports_components(settings, tmp_path):
         assert {check["key"] for check in body["checks"]} == {
             "instance",
             "health",
+            "healthkit_ingest",
             "calendar_google",
             "calendar_icloud",
             "notifications",
+            "scheduler",
+            "public_https",
             "storage",
         }

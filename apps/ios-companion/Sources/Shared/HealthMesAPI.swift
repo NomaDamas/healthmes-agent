@@ -164,6 +164,17 @@ public final class HealthMesAPI {
         )
     }
 
+    public static func healthKitUploadRequest(
+        pairing: Pairing,
+        payload: HealthKitIngestPayload
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path: "v1/ingest/healthkit",
+            body: payload
+        )
+    }
+
     /// `GET /v1/schedule/events?start=…&end=…`.
     public static func scheduleEventsRequest(
         pairing: Pairing,
@@ -500,6 +511,18 @@ public final class HealthMesAPI {
         try await perform(
             Self.setupReadinessRequest(pairing: try pairing()),
             expecting: SetupReadiness.self
+        )
+    }
+
+    public func uploadHealthKit(
+        _ payload: HealthKitIngestPayload
+    ) async throws -> HealthKitIngestAck {
+        try await perform(
+            Self.healthKitUploadRequest(
+                pairing: try pairing(),
+                payload: payload
+            ),
+            expecting: HealthKitIngestAck.self
         )
     }
 

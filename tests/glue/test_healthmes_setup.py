@@ -133,7 +133,7 @@ def test_prepare_runtime_stops_when_disk_preflight_requires_action(
 def test_uninstall_contract_preserves_data_by_default() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     uninstall = text.split('elif args.action == "uninstall":', 1)[1]
-    assert '["bash", str(LOCAL_SCRIPT), "uninstall"]' in uninstall
+    assert '["bash", str(runtime_script()), "uninstall"]' in uninstall
     assert "--delete-data" not in uninstall
 
 
@@ -158,6 +158,8 @@ def test_environment_generation_is_private_and_never_prints_token(
     assert len(values["HEALTHMES_API_TOKEN"]) >= 32
     assert values["HEALTHMES_HOST"] == "127.0.0.1"
     assert values["HEALTHMES_PUBLIC_BASE_URL"] == "http://127.0.0.1:8100"
+    assert values["HEALTHMES_SCHEDULER_ENABLED"] == "true"
+    assert values["HEALTHMES_NATIVE_ALERT_DELIVERY"] == "true"
     assert os.stat(env_file).st_mode & 0o777 == 0o600
     assert values["HEALTHMES_API_TOKEN"] not in capsys.readouterr().out
 
@@ -279,6 +281,62 @@ def test_repair_and_update_prepare_environment_before_runtime(monkeypatch) -> No
         ("prepare", "update"),
         ("update", "runtime_update"),
     ]
+
+
+def test_linux_preflight_uses_docker_and_systemd_not_homebrew(monkeypatch) -> None:
+    module = load_module()
+    monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(module.platform, "platform", lambda: "Linux-test")
+    class Usage:
+        free = 10 * 1024**3
+
+    monkeypatch.setattr(module.shutil, "disk_usage", lambda _: Usage())
+    monkeypatch.setattr(module.shutil, "which", lambda command: f"/usr/bin/{command}")
+
+    events = module.preflight()
+
+    keys = {event.step for event in events}
+    assert "tool_docker" in keys
+    assert "tool_systemctl" in keys
+    assert "tool_brew" not in keys
+    assert all(event.state == "ready" for event in events)
+
+
+def test_linux_prepare_uses_containerized_uv_bootstrap(monkeypatch, tmp_path) -> None:
+    module = load_module()
+    env_file = tmp_path / ".env"
+    env_file.write_text("HEALTHMES_PORT=8199\n", encoding="utf-8")
+    monkeypatch.setattr(module, "ENV_FILE", env_file)
+    monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        module,
+        "preflight",
+        lambda: [module.SetupEvent("preflight", "platform", "ready", "Linux")],
+    )
+    monkeypatch.setattr(module, "ensure_environment", lambda **kwargs: None)
+    commands = []
+    monkeypatch.setattr(
+        module,
+        "run_command",
+        lambda action, step, command, **kwargs: commands.append((step, command)),
+    )
+
+    module.prepare_runtime("install", json_output=True, dry_run=False)
+
+    assert commands[0][0] == "bootstrap"
+    assert commands[0][1][:3] == ["docker", "run", "--rm"]
+    assert "--mode" in commands[0][1]
+    assert "docker" in commands[0][1]
+    assert (
+        module._load_env(env_file)["HEALTHMES_MCP_URL"]
+        == "http://host.docker.internal:8199/mcp"
+    )
+
+
+def test_linux_runtime_adapter_is_selected(monkeypatch) -> None:
+    module = load_module()
+    monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    assert module.runtime_script() == module.LINUX_SCRIPT
 
 
 def test_verify_uses_port_from_env_file(monkeypatch, tmp_path) -> None:

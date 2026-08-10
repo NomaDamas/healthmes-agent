@@ -55,6 +55,7 @@ from healthmes.calendars.sleep_mirror import (
     SLEEP_UPDATE_PENDING_STATUS,
 )
 from healthmes.calendars.state import PendingDiffStore, SyncStateStore
+from healthmes.schedule_outcomes import record_invalidation_outcome
 from healthmes.store.enums import CalendarSource, ProposalStatus
 from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task
 
@@ -553,6 +554,11 @@ class CalendarMirrorService:
                             proposal.id,
                         )
                     proposal.status = ProposalStatus.INVALIDATED
+                    record_invalidation_outcome(
+                        self._session,
+                        proposal,
+                        reason="calendar_intake_deleted",
+                    )
                 else:
                     block_on_another_source = self._session.scalar(
                         select(CalendarEventMirror.id).where(
@@ -567,8 +573,18 @@ class CalendarMirrorService:
                     )
                     if block_on_another_source is None:
                         proposal.status = ProposalStatus.INVALIDATED
+                        record_invalidation_outcome(
+                            self._session,
+                            proposal,
+                            reason="calendar_intake_deleted",
+                        )
             else:
                 proposal.status = ProposalStatus.INVALIDATED
+                record_invalidation_outcome(
+                    self._session,
+                    proposal,
+                    reason="calendar_intake_deleted",
+                )
 
     # -- ownership-guarded agent writes -------------------------------------
 

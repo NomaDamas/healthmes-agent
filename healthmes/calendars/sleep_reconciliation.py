@@ -61,6 +61,7 @@ from healthmes.calendars.sleep_reconciliation_result import (
     updated_sleep_result,
 )
 from healthmes.calendars.write_lock import calendar_write_lock
+from healthmes.schedule_outcomes import record_invalidation_outcome
 from healthmes.store.enums import ProposalStatus
 from healthmes.store.models import CalendarEventMirror, ScheduleProposal
 
@@ -321,6 +322,11 @@ class SleepCalendarReconciler:
                 if row is not None:
                     self._session.delete(row)
                 proposal.status = ProposalStatus.INVALIDATED
+                record_invalidation_outcome(
+                    self._session,
+                    proposal,
+                    reason="actual_sleep_overlap",
+                )
                 self._session.commit()
             except Exception as exc:
                 self._session.rollback()

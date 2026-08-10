@@ -554,10 +554,46 @@ uv run healthmes connect disconnect google   # remove the stored token
 uv run healthmes connect disconnect icloud   # remove the stored credentials
 ```
 
-Future work (deliberately not built): a hosted "connect with Google" button
-in the web UI would require a registered redirect URI on this service plus
-web-flow secret handling; the `/connect` page therefore shows status +
-instructions only and performs no writes.
+The local-owner `/connect` page supports both providers. Google uses the
+registered OAuth callback and Apple accepts only an app-specific password.
+Secret forms require the loopback-only local browser session plus CSRF; a
+remote viewer never receives them. Successful connect/disconnect refreshes
+the running calendar scheduler immediately.
+
+## Self-hosted Mac/Linux runtime contract
+
+The open-source deployment target is one always-on personal Mac or Linux
+machine:
+
+```text
+iPhone HealthKit + Apple Watch
+              |
+              | authenticated HTTPS
+              v
+personal Mac/Linux HealthMes server
+  - store and raw ingest
+  - cognitive-energy and trigger jobs
+  - deterministic schedule proposal planner
+  - Apple/Google calendar mirror and approved writes
+  - web dashboard and decision history
+```
+
+Install after prerequisites:
+
+```bash
+python3 scripts/healthmes_setup.py preflight
+python3 scripts/healthmes_setup.py install
+```
+
+Linux installs `healthmes-compose.service` as a systemd user unit. Docker
+volumes and personal data survive uninstall. Run
+`sudo loginctl enable-linger "$USER"` once to start before login.
+
+Setup enables the scheduler and native alert delivery. It keeps the service
+loopback-only unless `HEALTHMES_PUBLIC_BASE_URL` already contains a trusted
+HTTPS URL. A real iPhone cannot use the server machine's `localhost`; device
+pairing therefore requires that HTTPS route. DNS, certificates, Apple
+signing, and a public tunnel remain owner-specific infrastructure.
 
 ## Real credentials — what needs what
 

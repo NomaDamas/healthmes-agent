@@ -3,8 +3,9 @@
 HealthMes Agent is a **proactive, health-aware personal assistant**: it reads
 your wearable data (11 providers via open-wearables), your calendar and your
 app usage, estimates your cognitive energy hour by hour, plans your week
-around it, and **messages you first** on Telegram when something needs to
-change — every proactive decision explorable as a flowchart in the browser.
+around it, and **asks you first** through iPhone, Apple Watch, or Telegram
+when something needs to change — every proactive decision remains
+explorable in the browser.
 
 It is glue around two unmodified vendored upstreams:
 
@@ -60,6 +61,11 @@ Telegram (phone + watch)          decision viewer (web)
   schedule changes, deadline risk) → HMAC-signed webhook → Hermes → Telegram.
   Alert hygiene built in: per-rule cooldown, daily budget, quiet hours,
   dedup keys, per-rule crash isolation.
+- Deterministic self-host planner: estimated tasks are placed only in
+  conflict-free working-hour slots. Medium/high work requires continuous
+  cognitive-energy evidence over the complete block; missing evidence fails
+  closed. It creates one approval proposal at a time and records proposal,
+  owner resolution, and provider push as explainable outcomes.
 - Hermes bootstrap (`scripts/bootstrap.py`): renders the gateway config,
   copy-installs `skills/`, registers morning/evening/weekly cron briefings.
   The 07:00 prompt calls the server-owned morning evaluator once, sends its
@@ -147,6 +153,11 @@ Telegram (phone + watch)          decision viewer (web)
   push to the watch), WidgetKit home + lock-screen widgets, watchOS app and
   accessory complications. Simulator-verified builds and tests; no signing.
   Since grown into the full iOS app (issue #10, matrix below).
+- Native Apple Health bridge: iPhone incrementally uploads supported
+  quantity, sleep-stage, and workout samples to the paired personal server.
+  HealthKit anchors advance only after a successful upload; observer queries,
+  hourly background delivery, app activation, and first pairing request sync.
+  Apple Watch samples arrive once through iPhone HealthKit.
 - Local-first throughout: the apps pair with **your own** healthmes instance
   (base URL + bearer token) and talk to nothing else; polling only, no
   APNs/FCM relay — Telegram remains the reliable push channel. All
@@ -206,7 +217,35 @@ read-only bounded preparation proposal),
 decision), `healthmes-stress` (source-aware stress/recovery evidence →
 keep/reconsider/insufficient-data decision), `doctor-visit-summary`.
 
-## Quickstart (mac-native, primary path)
+## Self-hosted runtime and one-command setup
+
+The open-source deployment assumes one always-on personal **Mac or Linux
+machine**. It owns the database, scheduler, calendar credentials, dashboard,
+and API. iPhone and Apple Watch are clients, not background servers.
+
+After platform prerequisites are present:
+
+```bash
+python3 scripts/healthmes_setup.py install
+```
+
+The command prepares private configuration, generates secrets, bootstraps
+the stack, installs the login/boot service, verifies health, and emits
+pairing information. macOS uses a per-user LaunchAgent. Linux uses a Docker
+Compose systemd user service; run `sudo loginctl enable-linger "$USER"` once
+if it must start before login. Uninstall preserves personal data and Docker
+volumes.
+
+The local dashboard is `http://127.0.0.1:8100/dashboard`. A physical iPhone
+cannot pair through the server machine's `localhost`; configure
+`HEALTHMES_PUBLIC_BASE_URL=https://...` with a trusted HTTPS route first.
+Private-LAN plain HTTP is intentionally rejected.
+
+Apple and Google Calendar are connected from the local `/connect` page.
+Apple uses an iCloud app-specific password; Google uses OAuth. Credential
+changes refresh the running calendar jobs immediately.
+
+### macOS development path
 
 Requires [uv](https://docs.astral.sh/uv/) and Homebrew; everything is
 repo-local without `brew services`; `scripts/healthmes_local.sh install`

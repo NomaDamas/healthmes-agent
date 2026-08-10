@@ -130,6 +130,7 @@ final class AppRouter: ObservableObject {
                 _ = await NotificationManager.shared.requestAuthorization()
                 BackgroundRefreshManager.shared.schedule()
                 await RefreshCoordinator.shared.sync(isForeground: true)
+                await HealthKitSyncManager.shared.requestAuthorizationAndSync()
             }
         } catch let error as PairingError {
             pairingImportMessage = error.localizedDescription

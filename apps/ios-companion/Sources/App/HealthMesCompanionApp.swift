@@ -54,7 +54,10 @@ struct HealthMesCompanionApp: App {
                 // even when iOS grants no background budget (README: the OS
                 // throttles BGAppRefreshTask; Telegram stays the guaranteed
                 // channel).
-                Task { await RefreshCoordinator.shared.sync(isForeground: true) }
+                Task {
+                    await RefreshCoordinator.shared.sync(isForeground: true)
+                    await HealthKitSyncManager.shared.resume()
+                }
             case .background:
                 BackgroundRefreshManager.shared.schedule()
             default:
