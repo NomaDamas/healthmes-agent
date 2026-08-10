@@ -221,6 +221,26 @@ def post_collection_status(
     body: ActivityCollectionStatusUpdate,
     session: SessionDep,
 ) -> ActivityCollectionOut:
+    boundary_fields = {
+        "permission_status",
+        "status_observed_at",
+        "collection_generation",
+    }
+    if (
+        body.platform is ActivityPlatform.ANDROID
+        and bool(boundary_fields & body.model_fields_set)
+        and (
+            body.permission_status is None
+            or body.status_observed_at is None
+            or body.collection_generation is None
+        )
+    ):
+        raise APIError(
+            422,
+            "activity_status_boundary_required",
+            "Android status boundary requires permission_status, "
+            "status_observed_at, and collection_generation",
+        )
     observed_at = body.status_observed_at
     current = datetime.now(UTC)
     if observed_at is not None and observed_at > current + MAX_FUTURE_SKEW:

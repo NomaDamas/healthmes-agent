@@ -87,6 +87,18 @@ class TestTokenRequired:
         anonymous = secured_client.post("/v1/app-usage/batch", json=payload)
         assert anonymous.status_code == 401
 
+        registered = secured_client.post(
+            f"/v1/activity/devices/{payload['device_id']}/status",
+            json={
+                "platform": "android",
+                "capability": "aggregate",
+                "permission_status": "granted",
+                "status_observed_at": datetime.now(UTC).isoformat(),
+                "collection_generation": payload["collection_generation"],
+            },
+            headers=bearer(),
+        )
+        assert registered.status_code == 200
         authorized = secured_client.post(
             "/v1/app-usage/batch", json=payload, headers=bearer()
         )

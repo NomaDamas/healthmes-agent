@@ -465,12 +465,79 @@ STATUS_KEYS = {
     "capability",
     "status_reason",
     "status_observed_at",
+    "collection_generation",
     "last_collected_at",
     "last_uploaded_at",
     "queue_oldest_at",
     "queue_depth",
     "coverage",
 }
+
+
+def _collection_generation(value: object) -> int | None:
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    ):
+        return value
+    return None
+
+
+def _status_boundary_is_stale(
+    *,
+    payload: dict[str, Any],
+    update: ActivityCollectionStatusUpdate,
+    incoming_observed_at: datetime,
+) -> bool:
+    existing_observed_at = parse_optional_datetime(
+        payload.get("status_observed_at")
+    )
+    existing_permission = payload.get("permission_status")
+    incoming_permission = (
+        update.permission_status.value
+        if update.permission_status is not None
+        else existing_permission
+    )
+    existing_generation = _collection_generation(
+        payload.get("collection_generation")
+    )
+    incoming_generation = update.collection_generation
+
+    if existing_generation is not None:
+        # Once a collector establishes a monotonic generation, an unversioned
+        # boundary or any lower generation must never reopen it.
+        if incoming_generation is None or incoming_generation < existing_generation:
+            return True
+        if incoming_generation > existing_generation:
+            return False
+
+        # A permission transition must advance the Android generation. Within
+        # one generation, blocked evidence wins even if a delayed grant carries
+        # a later wall-clock timestamp.
+        if (
+            existing_permission in BLOCKED_PERMISSION_STATES
+            and incoming_permission not in BLOCKED_PERMISSION_STATES
+        ):
+            return True
+        if (
+            incoming_permission in BLOCKED_PERMISSION_STATES
+            and existing_permission not in BLOCKED_PERMISSION_STATES
+        ):
+            return False
+    elif incoming_generation is not None:
+        # The first versioned observation establishes the monotonic boundary.
+        return False
+
+    if existing_observed_at is None:
+        return False
+    if incoming_observed_at < existing_observed_at:
+        return True
+    return (
+        incoming_observed_at == existing_observed_at
+        and existing_permission in BLOCKED_PERMISSION_STATES
+        and incoming_permission not in BLOCKED_PERMISSION_STATES
+    )
 
 
 def _control_source_id(device_id: str, kind: str = "legacy") -> str:
@@ -500,6 +567,7 @@ def default_control_payload(
         "capability": ActivityCapability.UNAVAILABLE.value,
         "status_reason": None,
         "status_observed_at": None,
+        "collection_generation": None,
         "last_collected_at": None,
         "last_uploaded_at": None,
         "queue_oldest_at": None,
@@ -781,37 +849,31 @@ def update_collection_status(
                 ),
             }
             values = update.model_dump(exclude_unset=True)
-            incoming_observed_at = (
-                update.status_observed_at
-                if update.status_observed_at is not None
-                else current
+            boundary_update = bool(
+                {
+                    "permission_status",
+                    "status_observed_at",
+                    "collection_generation",
+                }
+                & update.model_fields_set
             )
-            existing_observed_at = parse_optional_datetime(
-                payload.get("status_observed_at")
-            )
-            incoming_permission = (
-                update.permission_status.value
-                if update.permission_status is not None
-                else payload.get("permission_status")
-            )
-            existing_permission = payload.get("permission_status")
-            if (
-                existing_observed_at is not None
-                and (
-                    incoming_observed_at < existing_observed_at
-                    or (
-                        incoming_observed_at == existing_observed_at
-                        and existing_permission in BLOCKED_PERMISSION_STATES
-                        and incoming_permission not in BLOCKED_PERMISSION_STATES
+            if boundary_update:
+                incoming_observed_at = (
+                    update.status_observed_at
+                    if update.status_observed_at is not None
+                    else current
+                )
+                if _status_boundary_is_stale(
+                    payload=payload,
+                    update=update,
+                    incoming_observed_at=incoming_observed_at,
+                ):
+                    return get_control_payload(
+                        session,
+                        device_id,
+                        platform=update.platform or ActivityPlatform.UNKNOWN,
                     )
-                )
-            ):
-                return get_control_payload(
-                    session,
-                    device_id,
-                    platform=update.platform or ActivityPlatform.UNKNOWN,
-                )
-            values["status_observed_at"] = incoming_observed_at
+                values["status_observed_at"] = incoming_observed_at
             for key, value in values.items():
                 if isinstance(value, datetime):
                     payload[key] = iso_or_none(value)
@@ -1050,6 +1112,9 @@ def serialize_collection_state(
         "status_reason": payload.get("status_reason"),
         "status_observed_at": parse_optional_datetime(
             payload.get("status_observed_at")
+        ),
+        "collection_generation": _collection_generation(
+            payload.get("collection_generation")
         ),
         "last_collected_at": parse_optional_datetime(payload.get("last_collected_at")),
         "last_uploaded_at": parse_optional_datetime(payload.get("last_uploaded_at")),

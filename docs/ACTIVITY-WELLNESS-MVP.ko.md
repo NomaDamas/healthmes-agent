@@ -207,9 +207,9 @@ MVP는 복잡한 rule engine을 만들지 않고 다음 세 가지 제어만 구
 - 수집기는 OS 활동을 읽기 전에 서버의 최신 collection config를 조회하고,
   응답의 `config_revision`을 ingest payload의 `collection_revision`으로 넣는다.
   `enabled`, `effective_collecting`, `blocked_reason`, `excluded_apps`,
-  `config_revision`이 없거나 타입이 다르면 config 전체를 거부하고
-  `UsageStats`를 읽지 않는다. 숫자처럼 보이는 문자열도 revision으로 허용하지
-  않는 fail-closed 계약이다.
+  `config_revision`, `collection_generation`이 없거나 타입이 다르면 config
+  전체를 거부하고 `UsageStats`를 읽지 않는다. 숫자처럼 보이는 문자열도
+  revision이나 generation으로 허용하지 않는 fail-closed 계약이다.
 - 공개 canonical ingest와 Android legacy ingest는 revision을 생략할 수 없다.
   iOS도 sample을 제출할 때는 revision이 필수다. ActivityWatch adapter는 서버가
   현재 revision을 주입한다.
@@ -250,10 +250,22 @@ MVP는 복잡한 rule engine을 만들지 않고 다음 세 가지 제어만 구
   수집 구간을 시작한다. worker는 OS read 전과 upload 전에도 권한을 다시
   확인한다.
 - Android 수집기는 권한이 다시 허용되면 먼저
-  `permission_status=granted`를 보고하고, 그 응답에 포함된 최신 collection
-  config를 적용한 뒤에만 OS 데이터를 읽는다. 이 순서로 서버의
+  `permission_status=granted + status_observed_at + collection_generation`을
+  하나의 status boundary로 보고하고, 그 응답에 포함된 최신 collection
+  config를 적용한 뒤에만 OS 데이터를 읽는다. config 적용이 새 로컬
+  generation을 만들면 새 generation을 다시 등록하며, 로컬과 서버 generation이
+  안정적으로 일치한 경우에만 UsageStats를 읽는다. 이 순서로 서버의
   `permission_revoked` gate를 안전하게 해제하며 설정·권한 상태를 우회하지
   않는다.
+- Android 서버 상태는 wall-clock 시각보다 `collection_generation`을 먼저
+  비교한다. 낮은 generation은 더 늦은 timestamp를 가져도 무시하고, 같은
+  generation에서는 `revoked/denied/unavailable`이 `granted`보다 우선한다.
+  새 generation만 이전의 차단 상태를 해제할 수 있다.
+- `POST /v1/app-usage/batch`는 먼저 등록된 서버 generation과 payload의
+  `collection_generation`이 정확히 같을 때만 저장한다. 미등록 generation과
+  이전 generation batch는 `409`로 거부한다. activity ingest 성공은
+  `last_collected_at/last_uploaded_at` 같은 telemetry만 갱신하며 permission을
+  암묵적으로 `granted`로 바꾸지 않는다.
 - Android 공개 API는 과거 Usage Access grant interval을 제공하지 않는다.
   따라서 앱 설정 진입도, HealthMes process 실행도 전혀 없는 동안 외부 시스템
   설정에서 revoke와 regrant가 모두 끝난 경우에는 그 짧은 권한 공백을 사후
@@ -582,11 +594,12 @@ agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
   서로 다른 IANA timezone도 named summary에서는 섞지 않는다. 호출자가
   `UTC+09:00` 같은 fixed-offset `tzinfo`를 직접 쓰는 내부 계약에서만 해당
   관찰 시각의 offset이 같은 IANA raw event를 호환 조회한다.
-- collection status는 `status_observed_at`을 함께 저장하고 관찰 시각이 더
-  오래된 update를 무시한다. 따라서 네트워크에서 늦게 도착한 iOS `granted`
-  report가 더 최근의 `revoked` 상태를 되돌리지 못한다. 같은 관찰 시각의
-  grant/revoke 충돌은 차단 상태를 우선하며, 서버 시계보다 1분 넘게 미래인
-  public status 시각은 저장 전에 거부한다.
+- collection status는 `status_observed_at`을 함께 저장한다. iOS처럼
+  generation이 없는 status는 관찰 시각이 오래된 update를 무시하고 같은 시각의
+  grant/revoke 충돌에서는 차단 상태를 우선한다. Android는 generation을
+  1차 순서로 사용해 낮거나 같은 generation의 grant가 최신 차단 상태를
+  되돌리지 못하게 한다. 서버 시계보다 1분 넘게 미래인 public status 시각은
+  저장 전에 거부한다.
 - 공개 generic canonical ingest의 record/group identity는 source device의
   opaque namespace로 다시 scope한다. 서로 다른 기기가 같은 source-local ID를
   사용해도 한 기기의 row가 다른 기기의 row를 덮어쓰지 않는다. migration 전에
@@ -651,6 +664,9 @@ agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
   permission 또는 generation이 바뀌면 다음 chunk 전에 pass를 취소하고
   watermark를 전진시키지 않는다. 마지막 chunk 중 경계가 바뀐 경우에도 성공
   응답 뒤 generation을 다시 확인하므로 이전 snapshot을 완료 처리하지 않는다.
+- Android permission status와 batch는 같은 monotonic generation handshake를
+  사용한다. 늦게 도착한 이전 `granted` status와 이전 generation batch는 최신
+  `revoked` 뒤에 저장되거나 수집 gate를 다시 열 수 없다.
 - daily `device_count`는 한 시간의 최대 기기 수가 아니라 그 local day의 모든
   hourly evidence에 나타난 opaque device namespace의 합집합이다. 서로 다른
   시간에 활동한 기기도 빠뜨리지 않는다.

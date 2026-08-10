@@ -44,6 +44,20 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _register_documented_generation(client, payload: dict) -> None:
+    response = client.post(
+        f"/v1/activity/devices/{payload['device_id']}/status",
+        json={
+            "platform": "android",
+            "capability": "aggregate",
+            "permission_status": "granted",
+            "status_observed_at": "2026-07-09T09:59:00Z",
+            "collection_generation": payload["collection_generation"],
+        },
+    )
+    assert response.status_code == 200
+
+
 @pytest.fixture
 def payload() -> dict:
     return _documented_json(PAYLOAD_MARKER)
@@ -58,6 +72,7 @@ def historical_wire_example_retention(session):
 
 def test_readme_payload_round_trips_through_ingest(client, session, payload):
     documented_ack = _documented_json(ACK_MARKER)
+    _register_documented_generation(client, payload)
 
     response = client.post("/v1/app-usage/batch", json=payload)
 
@@ -81,6 +96,7 @@ def test_readme_payload_round_trips_through_ingest(client, session, payload):
 
 def test_readme_payload_reupload_is_idempotent_upsert(client, session, payload):
     """The collector re-sends the growing hour every run; rows must not pile up."""
+    _register_documented_generation(client, payload)
     first = client.post("/v1/app-usage/batch", json=payload)
     second = client.post("/v1/app-usage/batch", json=payload)
 

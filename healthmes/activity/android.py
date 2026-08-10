@@ -132,6 +132,7 @@ def ingest_android_samples(
     excluded_count: int = 0,
     tombstoned_count: int = 0,
     rebuild_summaries: bool = True,
+    update_permission_status: bool = False,
     now: datetime | None = None,
 ) -> ActivityIngestResult:
     return ingest_activity_batch(
@@ -149,6 +150,7 @@ def ingest_android_samples(
         excluded_count=excluded_count,
         tombstoned_count=tombstoned_count,
         rebuild_summaries=rebuild_summaries,
+        update_permission_status=update_permission_status,
         now=now,
     )
 
@@ -232,6 +234,7 @@ def backfill_android_canonical_events(
                         timezone=timezone,
                         collected_at=current,
                         collection_generation=collection_generation,
+                        update_permission_status=False,
                         now=current,
                     )
                 except (

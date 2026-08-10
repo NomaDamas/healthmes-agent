@@ -16,6 +16,8 @@ internal fun activityConflictDisposition(
 ): ActivityConflictDisposition =
     when (errorCode) {
         "stale_collection_revision",
+        "stale_collection_generation",
+        "activity_collection_generation_unregistered",
         "activity_collection_blocked",
         "activity_write_conflict",
         -> ActivityConflictDisposition.RETRY

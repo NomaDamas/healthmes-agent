@@ -15,6 +15,7 @@ data class CollectionConfig(
     val blockedReason: String?,
     val excludedApps: Set<String>,
     val configRevision: Int,
+    val collectionGeneration: Long,
 )
 
 /**
@@ -67,6 +68,8 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
     fun postPermissionStatus(
         deviceId: String,
         granted: Boolean,
+        statusObservedAt: String,
+        collectionGeneration: Long,
     ): ConfigOutcome {
         val encodedDevice = URLEncoder.encode(deviceId, StandardCharsets.UTF_8.name())
         val endpoint = endpointOrNull(
@@ -86,7 +89,11 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
             token?.takeIf { it.isNotBlank() }?.let {
                 connection.setRequestProperty("Authorization", "Bearer $it")
             }
-            val status = permissionStatusPayload(granted)
+            val status = permissionStatusPayload(
+                granted,
+                statusObservedAt,
+                collectionGeneration,
+            )
             val payload = JSONObject()
                 .put("platform", status.platform)
                 .put("capability", status.capability)
@@ -95,6 +102,8 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
                     "status_reason",
                     status.statusReason ?: JSONObject.NULL,
                 )
+                .put("status_observed_at", status.statusObservedAt)
+                .put("collection_generation", status.collectionGeneration)
                 .put("queue_depth", status.queueDepth)
                 .toString()
             connection.outputStream.use {
@@ -396,6 +405,18 @@ internal fun parseCollectionConfig(body: String): CollectionConfig {
     } ?: throw IllegalArgumentException(
         "config_revision must be a non-negative 32-bit integer",
     )
+    if (!payload.has("collection_generation")) {
+        throw IllegalArgumentException("missing collection_generation")
+    }
+    val collectionGeneration = when (
+        val generation = payload.get("collection_generation")
+    ) {
+        is Int -> generation.takeIf { it >= 0 }?.toLong()
+        is Long -> generation.takeIf { it >= 0 }
+        else -> null
+    } ?: throw IllegalArgumentException(
+        "collection_generation must be a non-negative 64-bit integer",
+    )
 
     return CollectionConfig(
         enabled = requiredBoolean("enabled"),
@@ -403,5 +424,6 @@ internal fun parseCollectionConfig(body: String): CollectionConfig {
         blockedReason = blockedReason,
         excludedApps = excludedApps,
         configRevision = configRevision,
+        collectionGeneration = collectionGeneration,
     )
 }

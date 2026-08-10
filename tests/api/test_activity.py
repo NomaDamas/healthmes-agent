@@ -440,6 +440,8 @@ def test_android_permission_status_can_recover_from_revoked_to_granted(client) -
             "capability": "aggregate",
             "permission_status": "revoked",
             "status_reason": "usage_access_revoked",
+            "status_observed_at": "2026-08-01T12:00:00Z",
+            "collection_generation": 1,
             "queue_depth": 0,
         },
     )
@@ -457,6 +459,8 @@ def test_android_permission_status_can_recover_from_revoked_to_granted(client) -
             "capability": "aggregate",
             "permission_status": "granted",
             "status_reason": None,
+            "status_observed_at": "2026-08-01T12:05:00Z",
+            "collection_generation": 2,
             "queue_depth": 0,
         },
     )
@@ -613,6 +617,7 @@ def test_collection_status_rejects_future_observation_before_update(client) -> N
             "capability": "aggregate",
             "permission_status": "revoked",
             "status_observed_at": "2100-01-01T00:00:00Z",
+            "collection_generation": 1,
         },
     )
 
@@ -623,6 +628,52 @@ def test_collection_status_rejects_future_observation_before_update(client) -> N
     ).json()
     assert state["permission_status"] == "unknown"
     assert state["status_observed_at"] is None
+
+
+def test_android_permission_status_requires_observation_and_generation(client) -> None:
+    missing_observation = client.post(
+        "/v1/activity/devices/android-boundary/status",
+        json={
+            "platform": "android",
+            "capability": "aggregate",
+            "permission_status": "granted",
+            "collection_generation": 1,
+        },
+    )
+    missing_generation = client.post(
+        "/v1/activity/devices/android-boundary/status",
+        json={
+            "platform": "android",
+            "capability": "aggregate",
+            "permission_status": "granted",
+            "status_observed_at": "2026-08-01T12:00:00Z",
+        },
+    )
+    missing_permission = client.post(
+        "/v1/activity/devices/android-boundary/status",
+        json={
+            "platform": "android",
+            "capability": "aggregate",
+            "status_observed_at": "2026-08-01T12:00:00Z",
+            "collection_generation": 1,
+        },
+    )
+
+    assert missing_observation.status_code == 422
+    assert (
+        missing_observation.json()["error"]["code"]
+        == "activity_status_boundary_required"
+    )
+    assert missing_generation.status_code == 422
+    assert (
+        missing_generation.json()["error"]["code"]
+        == "activity_status_boundary_required"
+    )
+    assert missing_permission.status_code == 422
+    assert (
+        missing_permission.json()["error"]["code"]
+        == "activity_status_boundary_required"
+    )
 
 
 def test_delayed_ios_status_cannot_override_newer_revocation(client) -> None:

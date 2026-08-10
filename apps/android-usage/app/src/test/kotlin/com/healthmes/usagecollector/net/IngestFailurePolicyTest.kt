@@ -9,6 +9,8 @@ class IngestFailurePolicyTest {
     fun `configuration and concurrent writer conflicts are retried`() {
         listOf(
             "stale_collection_revision",
+            "stale_collection_generation",
+            "activity_collection_generation_unregistered",
             "activity_collection_blocked",
             "activity_write_conflict",
         ).forEach { code ->

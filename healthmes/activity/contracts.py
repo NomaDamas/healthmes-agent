@@ -227,6 +227,11 @@ class ActivityCollectionStatusUpdate(BaseModel):
     permission_status: ActivityPermissionStatus | None = None
     status_reason: str | None = Field(default=None, max_length=255)
     status_observed_at: AwareDatetime | None = None
+    collection_generation: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**63 - 1,
+    )
     last_collected_at: AwareDatetime | None = None
     last_uploaded_at: AwareDatetime | None = None
     queue_oldest_at: AwareDatetime | None = None
@@ -272,6 +277,7 @@ class ActivityCollectionOut(BaseModel):
     capability: ActivityCapability
     status_reason: str | None
     status_observed_at: datetime | None
+    collection_generation: int | None
     last_collected_at: datetime | None
     last_uploaded_at: datetime | None
     queue_oldest_at: datetime | None

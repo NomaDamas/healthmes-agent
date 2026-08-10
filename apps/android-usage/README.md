@@ -212,7 +212,14 @@ cannot leave the device sandbox (docs/PLAN.md §7).
 
 ## Ingest contract
 
-The app POSTs to `POST {server}/v1/app-usage/batch`
+Before reading `UsageStats`, the app POSTs its current permission boundary to
+`POST {server}/v1/activity/devices/{device_id}/status`, including
+`permission_status`, `status_observed_at`, and the durable local
+`collection_generation`. It applies the returned config and repeats this
+handshake if that config creates a new local generation. It reads OS activity
+only after the server and local generation are stable and equal.
+
+The app then POSTs buckets to `POST {server}/v1/app-usage/batch`
 (`healthmes/api/app_usage.py`). Bucket starts are top-of-hour UTC instants.
 The token is sent as `Authorization: Bearer <token>` and **is verified
 server-side**: when the HealthMes service has `HEALTHMES_API_TOKEN` set
@@ -286,12 +293,12 @@ Upload semantics (why re-sending is safe):
 - Every upload carries the collection window's IANA `timezone`,
   `collection_revision`, and `collection_generation`. The config refreshed
   immediately before the OS usage read is parsed strictly: a missing or
-  wrongly typed exclusion list or required field stops before UsageStats is
-  read. Missing or stale revisions are rejected; a privacy-setting,
-  permission, or timezone change starts a new generation instead of
-  relabeling or overwriting the earlier same-hour segment. Generation,
-  revision, timezone, boundary, and watermark are written in one synchronous
-  encrypted preference commit.
+  wrongly typed exclusion list, revision, generation, or other required field
+  stops before UsageStats is read. Missing or stale revisions are rejected; a
+  privacy-setting, permission, or timezone change starts a new generation
+  instead of relabeling or overwriting the earlier same-hour segment.
+  Generation, revision, timezone, boundary, and watermark are written in one
+  synchronous encrypted preference commit.
 - Every sensitive boundary commit is two-phase: first arm a non-sensitive
   quarantine latch in separate ordinary `SharedPreferences`, then commit the
   encrypted state, then clear the latch. If the encrypted commit or clear
@@ -315,6 +322,15 @@ Upload semantics (why re-sending is safe):
   an HTTP request that had already started may finish, but no later chunk or
   watermark crosses the persisted boundary, and the source range remains
   replay-safe.
+- The server orders Android status boundaries by collection generation before
+  wall-clock time. A lower generation cannot reopen a later revoke even when
+  its request arrives with a newer timestamp, and a grant in the same
+  generation cannot override a blocked state. Only a newer durable generation
+  may represent a regrant.
+- The server accepts a batch only when its `collection_generation` exactly
+  matches the generation registered by the status handshake. An unregistered
+  or stale generation receives `409`; ingest updates collection/upload
+  telemetry but never implicitly changes permission back to `granted`.
 - The server **upserts** on
   `(device_id, collection_generation, bucket_start, app_package)` with
   last-write-wins, so repeated uploads are idempotent without overwriting an

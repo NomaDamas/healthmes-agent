@@ -3,8 +3,10 @@ package com.healthmes.usagecollector.work
 import android.content.Context
 import androidx.work.Worker
 import androidx.work.WorkerParameters
+import com.healthmes.usagecollector.CollectionWindowState
 import com.healthmes.usagecollector.CollectorPrefs
 import com.healthmes.usagecollector.UsageAccess
+import com.healthmes.usagecollector.net.CollectionConfig
 import com.healthmes.usagecollector.net.IngestClient
 import com.healthmes.usagecollector.net.UploadSample
 import com.healthmes.usagecollector.usage.HourlyBucketer
@@ -86,104 +88,98 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             )
         }
 
-        // Reporting granted before reading config also clears a previous
-        // server-side permission_revoked gate after the user regrants access.
-        val config = when (
-            val outcome = client.postPermissionStatus(
-                prefs.deviceId,
-                granted = true,
-            )
-        ) {
-            is IngestClient.ConfigOutcome.Success -> outcome.config
-            is IngestClient.ConfigOutcome.TransientFailure -> {
-                prefs.lastResult =
-                    "Permission/config refresh failed, will retry: " +
-                        "${outcome.reason} (${stamp()})"
-                return Result.retry()
+        val statusObservedAt = Instant.ofEpochMilli(nowMs).toString()
+        var stableConfig: CollectionConfig? = null
+        var stableState: CollectionWindowState? = null
+        for (attempt in 0 until MAX_BOUNDARY_SYNC_ATTEMPTS) {
+            val stateBeforeStatus = prefs.collectionWindowState()
+            // Reporting granted before reading config clears a previous
+            // server-side revoke only for this exact durable generation.
+            val config = when (
+                val outcome = client.postPermissionStatus(
+                    prefs.deviceId,
+                    granted = true,
+                    statusObservedAt = statusObservedAt,
+                    collectionGeneration = stateBeforeStatus.collectionGeneration,
+                )
+            ) {
+                is IngestClient.ConfigOutcome.Success -> outcome.config
+                is IngestClient.ConfigOutcome.TransientFailure -> {
+                    prefs.lastResult =
+                        "Permission/config refresh failed, will retry: " +
+                            "${outcome.reason} (${stamp()})"
+                    return Result.retry()
+                }
+
+                is IngestClient.ConfigOutcome.PermanentFailure -> {
+                    prefs.lastResult =
+                        "Permission/config refresh rejected: " +
+                            "${outcome.reason} (${stamp()})"
+                    return Result.failure()
+                }
+            }
+            val stateAfterStatus = prefs.collectionWindowState()
+            if (
+                config.collectionGeneration
+                != stateBeforeStatus.collectionGeneration
+                || stateAfterStatus.collectionGeneration
+                != stateBeforeStatus.collectionGeneration
+            ) {
+                return collectionWindowChanged(prefs)
             }
 
-            is IngestClient.ConfigOutcome.PermanentFailure -> {
-                prefs.lastResult =
-                    "Permission/config refresh rejected: ${outcome.reason} (${stamp()})"
-                return Result.failure()
-            }
-        }
-        var collectionState = prefs.collectionWindowState()
-        if (collectionState.collectionRevision != config.configRevision) {
-            // Never backfill across a privacy-policy change. The next run
-            // starts a fresh collection window under the new revision.
-            val watermark = HourlyBucketer.floorToHour(nowMs)
-            if (
-                !prefs.persistCollectionWindow(
-                    collectionRevision = config.configRevision,
-                    collectionSinceMs = nowMs,
-                    watermarkMs = watermark,
-                    collectionTimezone = currentTimezone,
-                )
-            ) {
-                return persistenceFailure(
-                    prefs,
-                    "Collection stopped: config boundary persistence failed (${stamp()}).",
-                )
-            }
-            collectionState = prefs.collectionWindowState()
-        }
-        if (!config.enabled || !config.effectiveCollecting) {
-            if (
-                !prefs.persistCollectionWindow(
-                    collectionRevision = config.configRevision,
-                    collectionSinceMs = 0L,
-                    watermarkMs = HourlyBucketer.floorToHour(nowMs),
-                    collectionTimezone = currentTimezone,
-                )
-            ) {
-                return persistenceFailure(
-                    prefs,
-                    "Collection stopped: blocked-state persistence failed (${stamp()}).",
-                )
-            }
-            prefs.lastResult =
-                "Collection blocked by server: ${config.blockedReason ?: "disabled"} (${stamp()})."
-            return Result.success()
-        }
-
-        if (collectionState.collectionSinceMs <= 0L) {
-            val watermark = HourlyBucketer.floorToHour(nowMs)
-            if (
-                !prefs.persistCollectionWindow(
-                    collectionRevision = config.configRevision,
-                    collectionSinceMs = nowMs,
-                    watermarkMs = watermark,
-                    collectionTimezone = currentTimezone,
-                )
-            ) {
-                return persistenceFailure(
-                    prefs,
-                    "Collection stopped: initial boundary persistence failed (${stamp()}).",
-                )
-            }
-            collectionState = prefs.collectionWindowState()
-        }
-        if (
-            timezoneBoundaryRequired(
-                storedTimezone = collectionState.collectionTimezone,
+            val blocked = !config.enabled || !config.effectiveCollecting
+            val timezoneChanged = timezoneBoundaryRequired(
+                storedTimezone = stateBeforeStatus.collectionTimezone,
                 currentTimezone = currentTimezone,
             )
-        ) {
-            if (
-                !prefs.persistCollectionWindow(
-                    collectionRevision = config.configRevision,
-                    collectionSinceMs = nowMs,
-                    watermarkMs = HourlyBucketer.floorToHour(nowMs),
-                    collectionTimezone = currentTimezone,
+            val boundaryRequired = (
+                stateBeforeStatus.collectionRevision != config.configRevision
+                    || timezoneChanged
+                    || (blocked && stateBeforeStatus.collectionSinceMs != 0L)
+                    || (!blocked && stateBeforeStatus.collectionSinceMs <= 0L)
                 )
-            ) {
-                return persistenceFailure(
-                    prefs,
-                    "Collection stopped: timezone boundary persistence failed (${stamp()}).",
-                )
+            if (boundaryRequired) {
+                val collectionSinceMs = if (blocked) 0L else nowMs
+                if (
+                    !prefs.persistCollectionWindow(
+                        collectionRevision = config.configRevision,
+                        collectionSinceMs = collectionSinceMs,
+                        watermarkMs = HourlyBucketer.floorToHour(nowMs),
+                        collectionTimezone = currentTimezone,
+                    )
+                ) {
+                    return persistenceFailure(
+                        prefs,
+                        "Collection stopped: synchronized boundary persistence " +
+                            "failed (${stamp()}).",
+                    )
+                }
+                continue
             }
-            collectionState = prefs.collectionWindowState()
+            if (blocked) {
+                prefs.lastResult =
+                    "Collection blocked by server: " +
+                        "${config.blockedReason ?: "disabled"} (${stamp()})."
+                return Result.success()
+            }
+            stableConfig = config
+            stableState = stateBeforeStatus
+            break
+        }
+        val config = stableConfig
+        val collectionState = stableState
+        if (config == null || collectionState == null) {
+            prefs.lastResult =
+                "Collection boundary changed repeatedly; will retry (${stamp()})."
+            return Result.retry()
+        }
+        if (
+            !prefs.collectionWindowIsCurrent(
+                expectedGeneration = collectionState.collectionGeneration,
+            )
+        ) {
+            return collectionWindowChanged(prefs)
         }
         if (!UsageAccess.isGranted(context)) {
             return stopForRevokedPermission(
@@ -336,13 +332,26 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                 "Collection stopped: revoked boundary persistence failed (${stamp()}).",
             )
         }
+        val revokedState = prefs.collectionWindowState()
         return when (
             val outcome = client.postPermissionStatus(
                 prefs.deviceId,
                 granted = false,
+                statusObservedAt = Instant.ofEpochMilli(nowMs).toString(),
+                collectionGeneration = revokedState.collectionGeneration,
             )
         ) {
             is IngestClient.ConfigOutcome.Success -> {
+                val currentGeneration = prefs
+                    .collectionWindowState()
+                    .collectionGeneration
+                if (
+                    outcome.config.collectionGeneration
+                    != revokedState.collectionGeneration
+                    || currentGeneration != revokedState.collectionGeneration
+                ) {
+                    return collectionWindowChanged(prefs)
+                }
                 prefs.lastResult =
                     "Usage access revoked; collection boundary reset (${stamp()})."
                 Result.success()
@@ -400,6 +409,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
          * revoked permission; it never bypasses the activity-upload gate.
          */
         const val KEY_FORCE = "force"
+        const val MAX_BOUNDARY_SYNC_ATTEMPTS = 4
 
         private val TIME_FORMAT = DateTimeFormatter.ofPattern("MMM d HH:mm")
     }

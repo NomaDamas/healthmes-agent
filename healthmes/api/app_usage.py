@@ -15,10 +15,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from healthmes.activity.android import android_batch, android_source_record_id
-from healthmes.activity.contracts import validate_timezone
+from healthmes.activity.contracts import ActivityPlatform, validate_timezone
 from healthmes.activity.repository import (
     ActivityConflictError,
     activity_write_lock,
+    get_control_payload,
 )
 from healthmes.activity.service import (
     ActivityCollectionBlockedError,
@@ -89,6 +90,26 @@ def ingest_batch(
     }
 
     with activity_write_lock():
+        state = get_control_payload(
+            session,
+            body.device_id,
+            platform=ActivityPlatform.ANDROID,
+        )
+        current_generation = state.get("collection_generation")
+        if current_generation is None:
+            raise APIError(
+                409,
+                "activity_collection_generation_unregistered",
+                "Android collector must register its current collection generation "
+                "through the permission status endpoint before uploading",
+            )
+        if body.collection_generation != int(current_generation):
+            raise APIError(
+                409,
+                "stale_collection_generation",
+                f"collector generation {body.collection_generation} does not match "
+                f"server generation {current_generation}",
+            )
         samples = list(deduped.values())
         timezone = body.timezone or str(
             resolve_timezone(request.app.state.settings)
@@ -195,6 +216,7 @@ def ingest_batch(
                     already_filtered=True,
                     excluded_count=excluded,
                     tombstoned_count=tombstoned,
+                    update_permission_status=False,
                 )
         except ActivityConflictError as exc:  # defensive: replace mode should own this
             raise APIError(409, "activity_source_conflict", str(exc)) from exc

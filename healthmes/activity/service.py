@@ -270,6 +270,7 @@ def ingest_activity_batch(
     tombstoned_count: int = 0,
     rebuild_summaries: bool = True,
     prevalidated_summary_scopes: set[ActivityLocalScope] | None = None,
+    update_permission_status: bool = False,
 ) -> ActivityIngestResult:
     current = (now or datetime.now(UTC)).astimezone(UTC)
     with activity_write_lock():
@@ -344,20 +345,26 @@ def ingest_activity_batch(
                     for day in _record_dates(record, filtered.timezone)
                 }
             )
+            status_values: dict[str, object] = {
+                "platform": filtered.platform,
+                "capability": filtered.capability,
+                "last_collected_at": filtered.collected_at,
+                "last_uploaded_at": current,
+                "queue_depth": 0,
+                "queue_oldest_at": None,
+            }
+            if update_permission_status:
+                status_values.update(
+                    {
+                        "permission_status": ActivityPermissionStatus.GRANTED,
+                        "status_reason": None,
+                        "status_observed_at": filtered.collected_at,
+                    }
+                )
             update_collection_status(
                 session,
                 filtered.source_device,
-                ActivityCollectionStatusUpdate(
-                    platform=filtered.platform,
-                    capability=filtered.capability,
-                    permission_status=ActivityPermissionStatus.GRANTED,
-                    status_reason=None,
-                    status_observed_at=filtered.collected_at,
-                    last_collected_at=filtered.collected_at,
-                    last_uploaded_at=current,
-                    queue_depth=0,
-                    queue_oldest_at=None,
-                ),
+                ActivityCollectionStatusUpdate(**status_values),
                 now=current,
             )
             if rebuild_summaries and changed_scopes:

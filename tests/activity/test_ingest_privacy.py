@@ -26,6 +26,7 @@ from healthmes.activity.repository import (
     DELETION_TOMBSTONE_EVENT,
     ActivityConflictError,
     get_control_payload,
+    parse_optional_datetime,
     serialize_collection_state,
     update_collection_config,
     update_collection_status,
@@ -242,6 +243,50 @@ def test_collection_status_exposes_queue_age_coverage_and_effective_state(sessio
     assert output["queue_age_seconds"] == 1200
     assert output["queue_depth"] == 4
     assert output["coverage"] == 0.75
+
+
+def test_ingest_updates_telemetry_without_rewriting_permission_boundary(
+    session,
+) -> None:
+    observed_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+    update_collection_status(
+        session,
+        "test-device",
+        ActivityCollectionStatusUpdate(
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            permission_status=ActivityPermissionStatus.GRANTED,
+            status_observed_at=observed_at,
+            collection_generation=4,
+        ),
+        now=observed_at,
+    )
+
+    ingest_activity_batch(
+        session,
+        _hour_batch(),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        rebuild_summaries=False,
+    )
+    payload = get_control_payload(session, "test-device")
+
+    assert payload["permission_status"] == "granted"
+    assert payload["collection_generation"] == 4
+    assert parse_optional_datetime(payload["status_observed_at"]) == observed_at
+    assert parse_optional_datetime(payload["last_collected_at"]) == datetime(
+        2026,
+        8,
+        1,
+        11,
+        tzinfo=UTC,
+    )
+    assert parse_optional_datetime(payload["last_uploaded_at"]) == datetime(
+        2026,
+        8,
+        1,
+        12,
+        tzinfo=UTC,
+    )
 
 
 def test_cross_midnight_interval_marks_both_local_dates(session) -> None:

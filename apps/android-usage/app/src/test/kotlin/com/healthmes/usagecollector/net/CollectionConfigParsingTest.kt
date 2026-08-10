@@ -16,13 +16,15 @@ class CollectionConfigParsingTest {
               "effective_collecting": true,
               "blocked_reason": null,
               "excluded_apps": ["private.app", "bank.app"],
-              "config_revision": 7
+              "config_revision": 7,
+              "collection_generation": 12
             }
             """.trimIndent(),
         )
 
         assertEquals(setOf("private.app", "bank.app"), config.excludedApps)
         assertEquals(7, config.configRevision)
+        assertEquals(12L, config.collectionGeneration)
         assertNull(config.blockedReason)
     }
 
@@ -35,7 +37,8 @@ class CollectionConfigParsingTest {
                   "enabled": true,
                   "effective_collecting": true,
                   "blocked_reason": null,
-                  "config_revision": 7
+                  "config_revision": 7,
+                  "collection_generation": 12
                 }
                 """.trimIndent(),
             )
@@ -53,7 +56,8 @@ class CollectionConfigParsingTest {
                       "effective_collecting": true,
                       "blocked_reason": null,
                       "excluded_apps": $value,
-                      "config_revision": 7
+                      "config_revision": 7,
+                      "collection_generation": 12
                     }
                     """.trimIndent(),
                 )
@@ -72,7 +76,28 @@ class CollectionConfigParsingTest {
                       "effective_collecting": true,
                       "blocked_reason": null,
                       "excluded_apps": [],
-                      "config_revision": $value
+                      "config_revision": $value,
+                      "collection_generation": 12
+                    }
+                    """.trimIndent(),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `missing or invalid collection generation fails closed`() {
+        for (entry in listOf("", ", \"collection_generation\": \"12\"", ", \"collection_generation\": -1")) {
+            assertThrows(IllegalArgumentException::class.java) {
+                parseCollectionConfig(
+                    """
+                    {
+                      "enabled": true,
+                      "effective_collecting": true,
+                      "blocked_reason": null,
+                      "excluded_apps": [],
+                      "config_revision": 7
+                      $entry
                     }
                     """.trimIndent(),
                 )

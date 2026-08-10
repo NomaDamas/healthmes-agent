@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import select
 
 from healthmes.activity.repository import APP_HOUR_EVENT, DAY_SUMMARY_EVENT
@@ -15,6 +16,38 @@ def _batch(samples):
         "collection_generation": 0,
         "samples": samples,
     }
+
+
+def _set_generation(
+    client,
+    *,
+    generation: int,
+    observed_at: str,
+    device_id: str = "pixel-8-test",
+    granted: bool = True,
+):
+    return client.post(
+        f"/v1/activity/devices/{device_id}/status",
+        json={
+            "platform": "android",
+            "capability": "aggregate",
+            "permission_status": "granted" if granted else "revoked",
+            "status_reason": None if granted else "usage_access_revoked",
+            "status_observed_at": observed_at,
+            "collection_generation": generation,
+            "queue_depth": 0,
+        },
+    )
+
+
+@pytest.fixture(autouse=True)
+def register_default_generation(client):
+    response = _set_generation(
+        client,
+        generation=0,
+        observed_at="2026-08-01T09:00:00Z",
+    )
+    assert response.status_code == 200
 
 
 SAMPLE_SLACK = {
@@ -105,6 +138,13 @@ def test_batch_ingest_dedupes_within_payload_last_wins(client, session):
 
 def test_batch_ingest_same_bucket_different_devices_kept_apart(client, session):
     client.post("/v1/app-usage/batch", json=_batch([SAMPLE_SLACK]))
+    registered = _set_generation(
+        client,
+        device_id="tab-s9-test",
+        generation=0,
+        observed_at="2026-08-01T09:00:00Z",
+    )
+    assert registered.status_code == 200
     response = client.post(
         "/v1/app-usage/batch",
         json={
@@ -193,12 +233,22 @@ def test_same_hour_privacy_generations_are_preserved(client, session):
         "launches": 1,
     }
 
+    first_status = _set_generation(
+        client,
+        generation=7,
+        observed_at="2026-08-01T09:30:00Z",
+    )
     first = client.post(
         "/v1/app-usage/batch",
         json={
             **_batch([before_boundary]),
             "collection_generation": 7,
         },
+    )
+    second_status = _set_generation(
+        client,
+        generation=8,
+        observed_at="2026-08-01T09:45:00Z",
     )
     second = client.post(
         "/v1/app-usage/batch",
@@ -208,6 +258,8 @@ def test_same_hour_privacy_generations_are_preserved(client, session):
         },
     )
 
+    assert first_status.status_code == 200
+    assert second_status.status_code == 200
     assert first.status_code == 200
     assert second.status_code == 200
     rows = list(
@@ -242,6 +294,11 @@ def test_timezone_change_keeps_collection_windows_in_separate_summaries(
     client,
     session,
 ):
+    first_status = _set_generation(
+        client,
+        generation=9,
+        observed_at="2026-08-01T09:30:00Z",
+    )
     first = client.post(
         "/v1/app-usage/batch",
         json={
@@ -256,6 +313,11 @@ def test_timezone_change_keeps_collection_windows_in_separate_summaries(
             "timezone": "Asia/Tokyo",
             "collection_generation": 9,
         },
+    )
+    second_status = _set_generation(
+        client,
+        generation=10,
+        observed_at="2026-08-01T09:45:00Z",
     )
     second = client.post(
         "/v1/app-usage/batch",
@@ -273,6 +335,8 @@ def test_timezone_change_keeps_collection_windows_in_separate_summaries(
         },
     )
 
+    assert first_status.status_code == 200
+    assert second_status.status_code == 200
     assert first.status_code == 200
     assert second.status_code == 200
     raw = list(
@@ -357,3 +421,89 @@ def test_deleted_legacy_sample_is_suppressed_on_retry(client, session):
         "suppressed": 1,
     }
     assert session.scalar(select(AppUsageSample)) is None
+
+
+def test_batch_requires_registered_current_generation(client, session):
+    response = client.post(
+        "/v1/app-usage/batch",
+        json={
+            **_batch([SAMPLE_SLACK]),
+            "device_id": "unregistered-android",
+            "collection_generation": 4,
+        },
+    )
+
+    assert response.status_code == 409
+    assert (
+        response.json()["error"]["code"]
+        == "activity_collection_generation_unregistered"
+    )
+    assert session.scalar(select(AppUsageSample)) is None
+
+
+def test_revoke_blocks_delayed_grant_and_previous_generation_batch(
+    client,
+    session,
+):
+    granted = _set_generation(
+        client,
+        generation=20,
+        observed_at="2026-08-01T10:00:00Z",
+    )
+    revoked = _set_generation(
+        client,
+        generation=21,
+        observed_at="2026-08-01T10:05:00Z",
+        granted=False,
+    )
+    delayed_grant = _set_generation(
+        client,
+        generation=20,
+        observed_at="2026-08-01T10:06:00Z",
+    )
+    same_generation_grant = _set_generation(
+        client,
+        generation=21,
+        observed_at="2026-08-01T10:07:00Z",
+    )
+    old_batch = client.post(
+        "/v1/app-usage/batch",
+        json={
+            **_batch([SAMPLE_SLACK]),
+            "collection_generation": 20,
+        },
+    )
+    state = client.get(
+        "/v1/activity/devices/pixel-8-test/collection"
+    ).json()
+
+    assert granted.status_code == 200
+    assert revoked.status_code == 200
+    assert delayed_grant.status_code == 200
+    assert delayed_grant.json()["permission_status"] == "revoked"
+    assert delayed_grant.json()["collection_generation"] == 21
+    assert same_generation_grant.status_code == 200
+    assert same_generation_grant.json()["permission_status"] == "revoked"
+    assert same_generation_grant.json()["collection_generation"] == 21
+    assert old_batch.status_code == 409
+    assert old_batch.json()["error"]["code"] == "stale_collection_generation"
+    assert state["permission_status"] == "revoked"
+    assert state["collection_generation"] == 21
+    assert session.scalar(select(AppUsageSample)) is None
+
+    regranted = _set_generation(
+        client,
+        generation=22,
+        observed_at="2026-08-01T10:10:00Z",
+    )
+    current_batch = client.post(
+        "/v1/app-usage/batch",
+        json={
+            **_batch([SAMPLE_SLACK]),
+            "collection_generation": 22,
+        },
+    )
+
+    assert regranted.status_code == 200
+    assert current_batch.status_code == 200
+    assert current_batch.json()["accepted"] == 1
