@@ -10,8 +10,8 @@ import androidx.work.WorkManager
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
+import com.healthmes.usagecollector.net.normalizedSecureServerUrl
 import com.healthmes.usagecollector.work.UploadScheduling
-import java.net.URI
 
 /**
  * The whole UI (docs/PLAN.md §7: "pairing + toggle, one screen"):
@@ -39,6 +39,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         prefs = CollectorPrefs(this)
+        if (prefs.collectionEnabled) {
+            startPrivacyGuardOrStop()
+        }
         serverUrlLayout = findViewById(R.id.server_url_layout)
         serverUrlInput = findViewById(R.id.server_url_input)
         tokenInput = findViewById(R.id.token_input)
@@ -68,16 +71,18 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (prefs.collectionEnabled) {
+            startPrivacyGuardOrStop()
+        }
         // Also refreshes after the round trip to the usage-access settings.
         refreshStatus()
     }
 
     private fun savePairing() {
-        val url = serverUrlInput.text?.toString()?.trim().orEmpty().trimEnd('/')
-        val parsed = runCatching { URI(url) }.getOrNull()
-        val scheme = parsed?.scheme?.lowercase()
-        val host = parsed?.host
-        if (url.isEmpty() || (scheme != "http" && scheme != "https") || host.isNullOrBlank()) {
+        val url = normalizedSecureServerUrl(
+            serverUrlInput.text?.toString().orEmpty(),
+        )
+        if (url == null) {
             serverUrlLayout.error = getString(R.string.error_invalid_url)
             return
         }
@@ -106,10 +111,17 @@ class MainActivity : AppCompatActivity() {
                 refreshStatus()
                 return
             }
+            if (!startPrivacyGuardOrStop()) {
+                setSwitchSilently(false)
+                refreshStatus()
+                return
+            }
             UploadScheduling.enable(this)
             UploadScheduling.uploadNow(this)
         } else {
+            UsageAccessGuardRegistry.invalidate()
             prefs.updateCollectionEnabled(false)
+            UsageAccessGuardService.stop(this)
             UploadScheduling.disable(this)
         }
         refreshStatus()
@@ -132,8 +144,22 @@ class MainActivity : AppCompatActivity() {
             UsageAccess.openSettings(this)
             return
         }
+        if (prefs.collectionEnabled && !startPrivacyGuardOrStop()) {
+            refreshStatus()
+            return
+        }
         UploadScheduling.uploadNow(this)
         toast(R.string.toast_upload_scheduled)
+    }
+
+    private fun startPrivacyGuardOrStop(): Boolean {
+        if (UsageAccessGuardService.start(this)) return true
+        UsageAccessGuardRegistry.invalidate()
+        prefs.updateCollectionEnabled(false)
+        UploadScheduling.disable(this)
+        prefs.lastResult =
+            "Collection stopped: foreground privacy guard could not start."
+        return false
     }
 
     private fun refreshStatus() {

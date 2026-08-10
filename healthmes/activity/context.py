@@ -432,16 +432,32 @@ def overwork_context(
                 "threshold_minutes": OVERWORK_BASELINE_DELTA_MINUTES,
             }
         )
-    risk = "high" if len(signals) >= 2 else "elevated" if signals else "not_elevated"
+    coverage_unknown = coverage_ratio is None
+    risk = (
+        "high"
+        if len(signals) >= 2
+        else "elevated"
+        if signals
+        else "unknown"
+        if coverage_unknown
+        else "not_elevated"
+    )
     limitations = list(summary.get("limitations", []))
-    if summary.get("source_coverage", {}).get("ratio") is None:
+    if coverage_unknown:
         limitations.append("coverage_unknown")
     return {
-        "status": "ok",
+        "status": (
+            "partial"
+            if coverage_unknown and signals
+            else "insufficient_data"
+            if coverage_unknown
+            else "ok"
+        ),
         "date": day.isoformat(),
         "timezone": name,
         "lookback_days": lookback_days,
         "risk_level": risk,
+        "reason": "unknown_source_coverage" if coverage_unknown else None,
         "signals": signals,
         "metrics": {
             "total_active_minutes": total,

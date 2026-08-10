@@ -12,7 +12,7 @@ class CollectionWindowPolicyTest {
         val revokedAtMs = 1_785_556_321_000L
 
         val boundary = revokedPermissionBoundary(revokedAtMs)
-        val queryBegin = activityQueryBegin(
+        val queryWindow = activityQueryWindow(
             collectionSinceMs = boundary.collectionSinceMs,
             watermarkMs = boundary.watermarkMs,
             nowMs = revokedAtMs + 30 * 60 * 1000,
@@ -20,7 +20,24 @@ class CollectionWindowPolicyTest {
 
         assertEquals(revokedAtMs, boundary.collectionSinceMs)
         assertTrue(boundary.watermarkMs <= revokedAtMs)
-        assertTrue(queryBegin >= revokedAtMs)
+        assertTrue(queryWindow.beginMs >= revokedAtMs)
+    }
+
+    @Test
+    fun `offline backlog is paged instead of truncated`() {
+        val nowMs = 30L * 24 * 60 * 60 * 1000
+        val window = activityQueryWindow(
+            collectionSinceMs = 0,
+            watermarkMs = 24L * 60 * 60 * 1000,
+            nowMs = nowMs,
+        )
+
+        assertEquals(18L * 60 * 60 * 1000, window.beginMs)
+        assertEquals(
+            window.beginMs + 7L * 24 * 60 * 60 * 1000,
+            window.endMs,
+        )
+        assertTrue(window.hasMoreBacklog)
     }
 
     @Test

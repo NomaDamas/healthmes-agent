@@ -467,8 +467,8 @@ def test_deleted_activity_cannot_be_restored_by_a_queued_retry(session) -> None:
     report = delete_activity_data(
         session,
         device_id="test-device",
-        start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
-        end=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+        start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 11, tzinfo=UTC),
         include_summaries=True,
         include_control=False,
         now=datetime(2026, 8, 1, 13, tzinfo=UTC),

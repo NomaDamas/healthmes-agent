@@ -367,6 +367,34 @@ def _observed_at(record: ActivityRecord) -> datetime:
     return record.start_at
 
 
+def _provisional_hour_replacement_allowed(
+    existing: WellnessEvent,
+    *,
+    batch: ActivityBatchIn,
+    record: ActivityRecord,
+) -> bool:
+    if existing.event_type != APP_HOUR_EVENT or not isinstance(record, AppHourRecord):
+        return False
+    previous = existing.payload if isinstance(existing.payload, dict) else {}
+    if previous.get("bucket_complete") is not False:
+        return False
+    if (
+        existing.source_device != batch.source_device
+        or existing.timezone != batch.timezone
+        or previous.get("bucket_start") != record.bucket_start.isoformat()
+        or previous.get("app_id") != record.app_id
+    ):
+        return False
+    previous_revision = (existing.quality_flags or {}).get("collection_revision")
+    if (
+        previous_revision is not None
+        and batch.collection_revision is not None
+        and batch.collection_revision < previous_revision
+    ):
+        return False
+    return as_utc(batch.collected_at) > as_utc(existing.recorded_at)
+
+
 def _update_existing_activity_event(
     session: Session,
     existing: WellnessEvent,
@@ -385,7 +413,11 @@ def _update_existing_activity_event(
     )
     if previous == fingerprint:
         return PersistResult(existing, "duplicate")
-    if not allow_replace:
+    if not allow_replace and not _provisional_hour_replacement_allowed(
+        existing,
+        batch=batch,
+        record=record,
+    ):
         raise ActivityConflictError(
             "source_record_id was already used with different activity input"
         )

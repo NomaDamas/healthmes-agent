@@ -677,7 +677,8 @@ def test_fixed_offset_caffeine_request_reaches_cross_domain_resolver(
     assert resolved.status_code == 200
     nutrition = resolved.json()["contexts"]["nutrition"]
     assert nutrition["status"] == "ok"
-    assert nutrition["decision_ready"] is True
+    assert nutrition["candidate_ledger_complete"] is True
+    assert nutrition["decision_ready"] is False
     assert nutrition["context"]["request"]["request_id"] == request_id
     assert (
         nutrition["context"]["specialized_evidence"]["caffeine"][

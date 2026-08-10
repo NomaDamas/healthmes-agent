@@ -189,6 +189,10 @@ For auto-reload during development:
 uv run uvicorn healthmes.app:create_app --factory --reload --port 8100
 ```
 
+Without `HEALTHMES_API_TOKEN`, the app factory accepts only actual loopback
+socket peers even if Uvicorn is accidentally bound to `0.0.0.0`. LAN, proxy,
+container, phone, and other remote clients require a token.
+
 ## Agent plane: Hermes bootstrap
 
 The Hermes gateway is configured entirely from outside `vendor/`:

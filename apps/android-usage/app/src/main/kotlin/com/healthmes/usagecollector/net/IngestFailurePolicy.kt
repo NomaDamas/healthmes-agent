@@ -24,13 +24,13 @@ internal fun activityConflictDisposition(
 
         "activity_outside_retention",
         "activity_future_data",
-        "activity_source_mode_conflict",
         "activity_source_conflict",
         -> ActivityConflictDisposition.ISOLATE_REJECTED_SAMPLE
 
-        // This conflict covers a whole summary scope, not one bad sample.
-        // Discarding one sample and advancing the watermark would lose a
-        // valid correction, so stop the batch without advancing.
+        // These conflicts cover a provider/device or summary scope, not one
+        // bad sample. Bisecting would discard every sample and then advance
+        // the watermark across data that was never accepted.
+        "activity_source_mode_conflict",
         "activity_summary_requires_complete_raw" ->
             ActivityConflictDisposition.FAIL_CLOSED
 

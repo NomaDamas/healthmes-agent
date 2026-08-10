@@ -407,8 +407,8 @@ def test_deleted_legacy_sample_is_suppressed_on_retry(client, session):
         "/v1/activity/data/delete",
         json={
             "device_id": "pixel-8-test",
-            "start": "2026-08-01T10:15:00Z",
-            "end": "2026-08-01T10:30:00Z",
+            "start": "2026-08-01T10:00:00Z",
+            "end": "2026-08-01T11:00:00Z",
             "include_summaries": True,
             "include_control": False,
             "confirm": True,

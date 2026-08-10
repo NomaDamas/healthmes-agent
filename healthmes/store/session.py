@@ -57,6 +57,10 @@ def create_db_engine(database_url: str, **engine_kwargs: Any) -> Engine:
         def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            if url.database not in _SQLITE_MEMORY_DATABASES:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()
 
         return engine

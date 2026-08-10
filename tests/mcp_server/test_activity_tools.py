@@ -274,6 +274,7 @@ async def test_resolver_tool_selects_only_activity_for_activity_summary(
         "missing_data_is_not_zero",
         "association_is_not_causation",
         "context_only_not_a_final_wellness_decision",
+        "decision_ready_requires_healthmes_decision_agent",
     ]
 
 
@@ -325,7 +326,9 @@ async def test_resolver_tool_uses_actual_fixed_offset_caffeine_request(
     nutrition = result["contexts"]["nutrition"]
     assert result["timezone"] == "UTC+09:00"
     assert nutrition["status"] == "ok"
-    assert nutrition["decision_ready"] is True
+    assert nutrition["candidate_ledger_complete"] is True
+    assert nutrition["decision_ready"] is False
+    assert result["decision_ready"] is False
     assert nutrition["context"]["request"]["request_id"] == str(request_id)
     assert (
         nutrition["context"]["specialized_evidence"]["caffeine"][

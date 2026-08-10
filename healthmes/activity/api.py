@@ -44,6 +44,7 @@ from healthmes.activity.contracts import (
 )
 from healthmes.activity.identity import scoped_source_record_id
 from healthmes.activity.maintenance import (
+    ActivityDeletionGranularityError,
     ActivityDeletionUnsafeError,
     delete_activity_data,
     run_activity_maintenance,
@@ -557,6 +558,12 @@ def post_delete_activity(
             raise APIError(
                 409,
                 "activity_deletion_requires_complete_raw",
+                str(exc),
+            ) from exc
+        except ActivityDeletionGranularityError as exc:
+            raise APIError(
+                422,
+                "activity_deletion_granularity",
                 str(exc),
             ) from exc
         except ValueError as exc:

@@ -44,23 +44,26 @@ object UsageAccess {
 
     /**
      * Opens the system "Usage access" screen after synchronously closing the
-     * current readable window. Returning from settings causes the process
-     * monitor to establish a second boundary under the observed grant state.
+     * current readable window. Returning from settings starts the foreground
+     * guard in a second boundary under the observed grant state.
      */
     fun openSettings(context: Context): Boolean {
         val prefs = CollectorPrefs(context)
         val nowMs = System.currentTimeMillis()
+        UsageAccessGuardRegistry.invalidate()
         if (
             !prefs.markUsageSettingsOpened(
                 nowMs = nowMs,
                 currentlyGranted = isGranted(context),
             )
         ) {
+            UsageAccessGuardService.stop(context)
             prefs.lastResult =
                 "Usage access settings blocked: privacy boundary could not be saved."
             UploadScheduling.disable(context)
             return false
         }
+        UsageAccessGuardService.stop(context)
         return try {
             context.startActivity(
                 Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
@@ -74,6 +77,8 @@ object UsageAccess {
             )
             if (!observation.persisted) {
                 UploadScheduling.disable(context)
+            } else if (prefs.collectionEnabled) {
+                UsageAccessGuardService.start(context)
             }
             false
         }

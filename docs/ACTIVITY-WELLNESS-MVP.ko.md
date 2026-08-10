@@ -245,12 +245,20 @@ MVP는 복잡한 rule engine을 만들지 않고 다음 세 가지 제어만 구
   제거한다. 서버는 같은 제외 규칙과 revision을 다시 검증한다.
 - raw window title, full URL, keystroke, click coordinate, clipboard,
   notification body와 화면 픽셀은 수집하지 않는다.
-- Android Usage Access 설정을 앱에서 열기 전, process-lifetime AppOps
-  listener가 변경을 볼 때, 앱 화면이 resume될 때와 worker가 실행될 때마다
-  로컬 수집 경계를 원자적으로 다시 세운다. 관찰한 revoke에는
-  `permission_status=revoked`를 보고하고, 관찰한 regrant는 그 시각부터 새
-  수집 구간을 시작한다. worker는 OS read 전과 upload 전에도 권한을 다시
-  확인한다.
+- 사용자가 보이는 Activity에서 수집을 켜면 낮은 중요도의 상시 시스템
+  알림을 가진 foreground privacy guard를 시작한다. 이 guard가 AppOps
+  listener를 소유하고, 시작할 때와 Android가 Usage Access 변경 신호를 줄
+  때마다 현재 값이 이전과 같아 보여도 새 generation과 로컬 수집 경계를
+  원자적으로 만든다.
+- guard는 경계 저장에 성공하고 현재 권한이 허용된 뒤에만 process-local
+  token을 공개한다. worker는 OS read 전후, 각 HTTP chunk 전과 watermark
+  commit 전에 같은 token과 generation이 여전히 유효한지 확인한다. process가
+  죽으면 token도 사라지므로 WorkManager만 다시 실행된 process는 UsageStats를
+  읽지 않고 일시중지한다. 앱을 다시 열어 guard가 새 generation으로 시작하기
+  전의 미관찰 구간은 가져오지 않는다.
+- Android Usage Access 설정을 열기 전에는 guard를 중지하고 현재 window를
+  닫는다. 앱 화면으로 돌아오면 새 generation에서 guard를 다시 시작한다.
+  관찰한 revoke/regrant는 새 activity를 읽기 전에 서버에 보고한다.
 - Android 수집기는 권한이 다시 허용되면 먼저
   `permission_status=granted + status_observed_at + collection_generation`을
   하나의 status boundary로 보고하고, 그 응답에 포함된 최신 collection
@@ -269,10 +277,11 @@ MVP는 복잡한 rule engine을 만들지 않고 다음 세 가지 제어만 구
   `last_collected_at/last_uploaded_at` 같은 telemetry만 갱신하며 permission을
   암묵적으로 `granted`로 바꾸지 않는다.
 - Android 공개 API는 과거 Usage Access grant interval을 제공하지 않는다.
-  따라서 앱 설정 진입도, HealthMes process 실행도 전혀 없는 동안 외부 시스템
-  설정에서 revoke와 regrant가 모두 끝난 경우에는 그 짧은 권한 공백을 사후
-  탐지할 수 없다. foreground service로 상시 감시하지 않는 MVP의 명시적
-  플랫폼 한계이며, 그런 구간까지 절대 탐지한다고 주장하지 않는다.
+  따라서 foreground guard가 없는 process에서는 과거 권한이 계속 허용됐다고
+  추정하지 않는다. Android나 사용자가 guard를 중지하면 worker는 수집을
+  일시중지하고, 사용자가 앱을 다시 열어 새 generation을 만든 시각 이후부터만
+  재개한다. 그 대신 process 종료 직전에 아직 upload하지 못한 구간도 일부
+  버릴 수 있으며, MVP는 개인정보 보호를 데이터 완전성보다 우선한다.
 - 설정 API는 권한 요청 상태, 마지막 수집, 마지막 업로드, queue age와
   coverage를 반환한다.
 - 설정, runtime status와 adapter cursor는 서로 덮어쓰지 않는 독립

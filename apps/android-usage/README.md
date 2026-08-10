@@ -179,8 +179,10 @@ haptics — is deliberately reserved for the healthcare domain expert:
   `androidx.wear.ongoing` OngoingActivity (watch-face chip etc.) remains
   deferred to the domain expert's watch UX pass, like its iOS twin
   (docs/design/WATCH-NOTIFICATIONS.ko.md).
-- Cleartext HTTP is enabled in all modules because the typical target is
-  `http://<LAN-IP>:8100` on your own network; prefer HTTPS beyond your LAN.
+- The dashboard-oriented `:companion` and `:wear` modules still permit
+  cleartext LAN URLs for their existing viewer flow. The telemetry-producing
+  `:app` usage collector is stricter: it accepts only an HTTPS origin and
+  disables Android cleartext traffic.
 
 ---
 
@@ -206,9 +208,10 @@ cannot leave the device sandbox (docs/PLAN.md §7).
   or input content, nothing inside apps.
 - The server URL and API token are stored in `EncryptedSharedPreferences`
   (AndroidKeyStore-backed AES-256-GCM), not plain-text XML.
-- Cleartext HTTP is enabled (`android:usesCleartextTraffic="true"`) because the
-  typical target is `http://<LAN-IP>:8100` on your own network. Prefer HTTPS if
-  your instance is reachable beyond your LAN.
+- The collector accepts only an `https://` base origin with no path, query,
+  fragment, or embedded credentials. Android cleartext traffic is disabled,
+  so LAN deployments must place a TLS-terminating proxy or tunnel in front of
+  HealthMes rather than sending tokens and activity over plain HTTP.
 
 ## Ingest contract
 
@@ -288,8 +291,10 @@ Upload semantics (why re-sending is safe):
   upload) and an explicit **collection boundary** in encrypted prefs. The
   first config-approved run starts at that boundary and never reads
   pre-consent history. Later runs re-query from
-  `max(collection boundary, watermark − 6 h, now − 7 days)` and re-send every
-  recomputed bucket, including the still-growing current hour.
+  `max(collection boundary, watermark − 6 h)` in pages of at most seven days
+  and re-send every recomputed bucket, including the still-growing current
+  hour. A long offline backlog is drained page by page instead of silently
+  truncating everything older than seven days.
 - Every upload carries the collection window's IANA `timezone`,
   `collection_revision`, and `collection_generation`. The config refreshed
   immediately before the OS usage read is parsed strictly: a missing or
@@ -308,11 +313,22 @@ Upload semantics (why re-sending is safe):
   itself fails, the encrypted state is not touched and the current process
   stops collection. Only an explicit user re-enable may clear quarantine
   after a fresh boundary commits successfully.
-- The app closes its current collection window before opening Usage Access
-  settings, on every observed AppOps transition, on activity resume, and in
-  the worker. Observed revoke/regrant transitions each establish a fresh
-  boundary. The worker reports `revoked` or `granted`, refreshes server config,
-  and checks permission again before OS read and before upload.
+- Enabling collection from the visible Activity starts an ongoing foreground
+  privacy guard with a low-importance system notification. The guard owns the
+  AppOps listener and creates a fresh generation when it starts and whenever
+  Android signals a Usage Access change, even when the current value appears
+  unchanged.
+- The guard publishes a process-local token only after its boundary is
+  durably committed and Usage Access is currently granted. The worker must
+  prove that this token is still active and matches the same collection
+  generation before the OS read, after the read, between HTTP chunks, and
+  before watermark commit. Process death destroys the token; a WorkManager
+  process without the foreground guard pauses instead of importing activity
+  from an unobserved permission gap.
+- Opening Usage Access settings first stops the guard and closes the current
+  window. Returning to the Activity restarts the guard in a new generation.
+  Observed revoke/regrant transitions are reported to the server before any
+  new activity is read.
 - Every hard boundary increments a local collection generation. A worker
   discards an OS snapshot if that generation changed while reading it.
   Network I/O never holds the collection-state lock. Instead, the uploader
@@ -355,11 +371,14 @@ Upload semantics (why re-sending is safe):
 
 ## Pairing & permission onboarding
 
-1. Make sure the phone can reach your HealthMes instance. Mac-native default:
-   `uv run python -m healthmes` serves on `http://<your-mac-LAN-IP>:8100`
-   (bind/port per repo `.env`); docker compose exposes the same port.
-2. Open the app, enter the server URL (e.g. `http://192.168.1.20:8100`) and
-   optionally a token, then tap **Save pairing**.
+1. Make sure the phone can reach an HTTPS origin that forwards to your
+   HealthMes instance. The native and Docker development servers listen on
+   port 8100 without terminating TLS, so a LAN deployment must put a trusted
+   TLS reverse proxy or tunnel in front of that port.
+2. Open the app, enter that origin (for example,
+   `https://healthmes.example`) and optionally a token, then tap
+   **Save pairing**. Paths, query strings, fragments, embedded credentials,
+   and `http://` URLs are rejected.
 3. Tap **Open usage access settings** — this deep-links to
    *Settings → Special app access → Usage access* — and enable
    **HealthMes Usage**. This is a "special access" permission
@@ -367,35 +386,38 @@ Upload semantics (why re-sending is safe):
    this screen first closes the current readable window, and returning creates
    a second boundary under the permission state the app observes.
 4. Flip **Collect & upload app usage**. This schedules the periodic upload
-   (every 30 min, network required, exponential backoff on failure) and fires
-   one upload immediately. The worker reports permission before reading
-   UsageStats; a revoked state resets the local readable boundary. If the
-   status reports quarantine after a storage failure, switch collection on
-   explicitly to establish a new boundary; repeated **Upload now** taps cannot
-   bypass it.
-5. Verify with **Upload now**, then check the status line and your server:
-   `curl http://<server>:8100/docs` → `POST /v1/app-usage/batch`, or query the
-   `app_usage_sample` table.
+   (every 30 min, network required, exponential backoff on failure), starts
+   the foreground privacy guard, shows its ongoing system notification, and
+   fires one upload immediately. The worker reads UsageStats only while that
+   guard's process-local token remains current. If the status reports
+   quarantine after a storage failure, switch collection on explicitly to
+   establish a new boundary; repeated **Upload now** taps cannot bypass it.
+5. Verify with **Upload now**, then check the status line and your HTTPS
+   endpoint: `curl https://<server>/docs` →
+   `POST /v1/app-usage/batch`, or query the `app_usage_sample` table.
 
 ### Permission & platform caveats
 
 - **Usage access** exposes app usage history to this app; grant it consciously.
   Observed revocation stops collection, resets the local readable boundary,
   and reports the revoked state to HealthMes. Android exposes only the current
-  AppOps state, not historical grant intervals. If the user revokes and
-  regrants entirely in external system settings while the HealthMes process
-  never runs and the app's settings link was not used, Android provides no
-  supported way to reconstruct that missed transition. This MVP documents
-  that platform limit instead of claiming impossible historical detection.
+  AppOps state, not historical grant intervals, so the ongoing foreground
+  guard is the MVP's strict privacy boundary. If Android or the user stops
+  that service, the in-memory guard token disappears and scheduled workers
+  pause. Reopening the app starts a new generation from that moment; the
+  unobserved gap is not imported.
 - **QUERY_ALL_PACKAGES** is declared so the app can resolve the category of
   other packages on Android 11+. Fine for a sideloaded personal tool, but it
   is a restricted permission on Google Play — this app is not meant for Play
   distribution.
 - **OEM battery managers** (Samsung, Xiaomi, Huawei, ...) may throttle or kill
-  periodic WorkManager jobs. If uploads stall, exempt the app from battery
+  periodic WorkManager jobs or the foreground guard. If uploads stall, exempt
+  the app from battery
   optimization (*Settings → Apps → HealthMes Usage → Battery → Unrestricted*).
-  Missed runs self-heal: the next successful run re-covers the gap (up to the
-  7-day cap) thanks to the watermark + upsert design.
+  Network-only missed runs self-heal where Android still retains the source
+  events: each successful run drains another seven-day page using the
+  watermark + upsert design. A stopped privacy guard is different: the
+  unobserved interval is deliberately skipped until the app restarts it.
 - Android only retains detailed usage events for a bounded window (days,
   OEM-dependent); if the collector is off for longer, older hours are lost.
 - An app continuously foreground across the query edge with no events inside

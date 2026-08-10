@@ -254,7 +254,9 @@ async def test_resolver_uses_actual_fixed_offset_caffeine_request(
 
     nutrition = result["contexts"]["nutrition"]
     assert nutrition["status"] == "ok"
-    assert nutrition["decision_ready"] is True
+    assert nutrition["candidate_ledger_complete"] is True
+    assert nutrition["decision_ready"] is False
+    assert result["decision_ready"] is False
     assert nutrition["context"]["request"]["request_id"] == str(request_id)
     assert (
         nutrition["context"]["specialized_evidence"]["caffeine"][
@@ -676,7 +678,8 @@ def test_caffeine_nutrition_context_is_ready_only_with_complete_matching_evidenc
     )
 
     assert result["status"] == "ok"
-    assert result["decision_ready"] is True
+    assert result["candidate_ledger_complete"] is True
+    assert result["decision_ready"] is False
     assert result["evidence_ids"] == ["nutrition-evidence"]
 
 

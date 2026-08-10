@@ -229,13 +229,14 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
         )
     }
 
-    private fun endpointOrNull(path: String): URL? =
-        try {
-            val url = URL(baseUrl.trimEnd('/') + path)
-            if (url.protocol == "http" || url.protocol == "https") url else null
+    private fun endpointOrNull(path: String): URL? {
+        val secureBase = normalizedSecureServerUrl(baseUrl) ?: return null
+        return try {
+            URL(secureBase + path)
         } catch (_: MalformedURLException) {
             null
         }
+    }
 
     private fun postChunk(
         endpoint: URL,

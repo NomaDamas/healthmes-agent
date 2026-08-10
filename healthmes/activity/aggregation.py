@@ -160,6 +160,7 @@ class DeviceHour:
     source_overflow: bool = False
     mixed_source_modes: bool = False
     active_idle_overlap: bool = False
+    has_provisional_data: bool = False
     evidence_ids: list[str] = field(default_factory=list)
 
 
@@ -316,6 +317,10 @@ def _apply_hour_events(
             target.launches += int(payload.get("launches") or 0)
         if active > 0:
             _touch_activity_bounds(target, max(bucket_start, start), min(bucket_end, end))
+        if payload.get("bucket_complete") is not True:
+            target.has_provisional_data = True
+            target.has_unknown_coverage = True
+            continue
         coverage = payload.get("coverage_seconds")
         if isinstance(coverage, int | float):
             known = min(window_seconds, max(0.0, float(coverage) * fraction))
@@ -487,6 +492,8 @@ def summarize_window(
         limitations.append("interval_source_takes_precedence_over_hourly_for_device")
     if any(row.active_idle_overlap for row in devices):
         limitations.append("active_idle_overlap_resolved_active_wins")
+    if any(row.has_provisional_data for row in devices):
+        limitations.append("provisional_hourly_activity")
     local_start = start.astimezone(zone)
     return {
         "status": "ok" if devices else "insufficient_data",
@@ -623,6 +630,8 @@ def personal_baseline_delta(
             and row.payload.get("status") == "ok"
             and summary_has_current_derivation(row)
             and not event_is_expired(row, now=current)
+            and "provisional_hourly_activity"
+            not in row.payload.get("limitations", [])
             and coverage is not None
             and float(coverage) >= MIN_BASELINE_COVERAGE
         ):

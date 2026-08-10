@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
@@ -24,6 +25,8 @@ from healthmes.activity.android import (
 from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.repository import (
     ACTIVITY_RAW_CLASS,
+    APP_HOUR_EVENT,
+    APP_INTERVAL_EVENT,
     CONTROL_EVENT_TYPES,
     CONTROL_PROVIDER,
     DAY_SUMMARY_EVENT,
@@ -78,6 +81,10 @@ class ActivityDeletionUnsafeError(ValueError):
     """A targeted deletion cannot safely rewrite a durable aggregate."""
 
 
+class ActivityDeletionGranularityError(ValueError):
+    """A coarse aggregate cannot represent the requested partial deletion."""
+
+
 def _event_bounds(event: WellnessEvent) -> tuple[datetime, datetime]:
     return repository_event_bounds(event)
 
@@ -111,6 +118,97 @@ def _event_overlaps(
     if start is not None and event_end <= as_utc(start):
         return False
     return end is None or event_start < as_utc(end)
+
+
+def _range_fully_covers_event(
+    event: WellnessEvent,
+    *,
+    start: datetime | None,
+    end: datetime | None,
+) -> bool:
+    event_start, event_end = _event_bounds(event)
+    return (
+        (start is None or as_utc(start) <= event_start)
+        and (end is None or as_utc(end) >= event_end)
+    )
+
+
+def _fragment_source_record_id(
+    event: WellnessEvent,
+    *,
+    start: datetime,
+    end: datetime,
+) -> str:
+    digest = hashlib.sha256(
+        (
+            f"{event.source_provider}|{event.source_device}|"
+            f"{event.source_record_id}|{start.isoformat()}|{end.isoformat()}"
+        ).encode()
+    ).hexdigest()[:40]
+    return f"delete-fragment-{digest}"
+
+
+def _interval_fragments_after_delete(
+    event: WellnessEvent,
+    *,
+    start: datetime | None,
+    end: datetime | None,
+    recorded_at: datetime,
+) -> list[WellnessEvent]:
+    if event.event_type != APP_INTERVAL_EVENT:
+        return []
+    event_start, event_end = _event_bounds(event)
+    delete_start = as_utc(start) if start is not None else None
+    delete_end = as_utc(end) if end is not None else None
+    spans: list[tuple[datetime, datetime, bool]] = []
+    if delete_start is not None and event_start < delete_start:
+        spans.append((event_start, min(delete_start, event_end), True))
+    if delete_end is not None and delete_end < event_end:
+        spans.append((max(delete_end, event_start), event_end, False))
+
+    fragments: list[WellnessEvent] = []
+    for fragment_start, fragment_end, keeps_original_start in spans:
+        if fragment_end <= fragment_start:
+            continue
+        payload = dict(event.payload)
+        payload["start_at"] = fragment_start.isoformat()
+        payload["end_at"] = fragment_end.isoformat()
+        if not keeps_original_start:
+            payload["launches"] = 0
+        quality_flags = dict(event.quality_flags or {})
+        quality_flags["deletion_fragment"] = True
+        fragments.append(
+            WellnessEvent(
+                event_type=event.event_type,
+                schema_version=event.schema_version,
+                observed_at=fragment_start,
+                recorded_at=recorded_at,
+                timezone=event.timezone,
+                source_provider=event.source_provider,
+                source_device=event.source_device,
+                source_record_id=_fragment_source_record_id(
+                    event,
+                    start=fragment_start,
+                    end=fragment_end,
+                ),
+                capture_method=event.capture_method,
+                quality_flags=quality_flags,
+                confidence=event.confidence,
+                coverage=event.coverage,
+                sensitivity=event.sensitivity,
+                consent_scope=event.consent_scope,
+                retention_policy_id=event.retention_policy_id,
+                expires_at=event.expires_at,
+                payload=payload,
+                raw_object_id=None,
+                derived_from={
+                    "fragment_of_event_id": str(event.id),
+                    "fragment_of_source_record_id": event.source_record_id,
+                    "fragmented_at": recorded_at.isoformat(),
+                },
+            )
+        )
+    return fragments
 
 
 def run_activity_maintenance(
@@ -261,6 +359,20 @@ def delete_activity_data(
             for row in session.scalars(raw_stmt)
             if _event_overlaps(row, start=start, end=selection_end)
         ]
+        partial_hour_rows = [
+            row
+            for row in raw_rows
+            if row.event_type == APP_HOUR_EVENT
+            and not _range_fully_covers_event(
+                row,
+                start=start,
+                end=selection_end,
+            )
+        ]
+        if partial_hour_rows:
+            raise ActivityDeletionGranularityError(
+                "hourly aggregate activity can only be deleted as complete buckets"
+            )
         affected_scopes = {
             scope for row in raw_rows for scope in _event_scopes(row)
         }
@@ -338,6 +450,18 @@ def delete_activity_data(
                 AppUsageSample.bucket_start < selection_end
             )
         compatibility_rows = list(session.scalars(usage_stmt))
+        for row in compatibility_rows:
+            bucket_end = as_utc(row.bucket_start) + timedelta(hours=1)
+            if (
+                (start is not None and as_utc(start) > as_utc(row.bucket_start))
+                or (
+                    selection_end is not None
+                    and as_utc(selection_end) < bucket_end
+                )
+            ):
+                raise ActivityDeletionGranularityError(
+                    "hourly compatibility activity can only be deleted as complete buckets"
+                )
 
         blocked_identity_digests = {
             activity_source_identity_digest(
@@ -375,6 +499,17 @@ def delete_activity_data(
             now=current,
         )
 
+        fragments = [
+            fragment
+            for row in raw_rows
+            for fragment in _interval_fragments_after_delete(
+                row,
+                start=start,
+                end=selection_end,
+                recorded_at=current,
+            )
+        ]
+        session.add_all(fragments)
         for row in raw_rows:
             session.delete(row)
         for row in compatibility_rows:

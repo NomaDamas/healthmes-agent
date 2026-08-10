@@ -320,8 +320,8 @@ def test_generic_source_scoping_preserves_legacy_deletion_tombstone(
         "/v1/activity/data/delete",
         json={
             "device_id": source_device,
-            "start": "2026-08-01T10:15:00Z",
-            "end": "2026-08-01T10:20:00Z",
+            "start": "2026-08-01T10:00:00Z",
+            "end": "2026-08-01T11:00:00Z",
             "include_summaries": True,
             "include_control": False,
             "confirm": True,
@@ -892,11 +892,15 @@ def test_partial_manual_delete_rebuilds_the_day_summary(client, session) -> None
 
     assert deleted.status_code == 200
     assert deleted.json()["raw_events_deleted"] == 1
-    assert summary.json()["total_active_minutes"] == 30.0
+    assert summary.json()["total_active_minutes"] == 55.0
     remaining = list(
         session.scalars(select(WellnessEvent).where(WellnessEvent.event_type == APP_INTERVAL_EVENT))
     )
-    assert [row.payload["app_id"] for row in remaining] == ["editor"]
+    assert sorted(row.payload["app_id"] for row in remaining) == [
+        "browser",
+        "browser",
+        "editor",
+    ]
 
 
 def test_raw_only_manual_delete_cannot_leave_a_stale_summary(client) -> None:
@@ -949,7 +953,7 @@ def test_raw_only_manual_delete_cannot_leave_a_stale_summary(client) -> None:
 
     assert deleted.status_code == 200
     assert deleted.json()["summary_events_deleted"] == 0
-    assert summary.json()["total_active_minutes"] == 30.0
+    assert summary.json()["total_active_minutes"] == 55.0
 
 
 def test_activitywatch_import_rejects_half_open_explicit_range_before_network(client) -> None:

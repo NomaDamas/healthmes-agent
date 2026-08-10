@@ -159,7 +159,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Bearer-token gate over the whole surface — REST, viewer pages AND /mcp
     # (middleware wraps the router, so the /mcp default-handler dispatch below
     # is covered too). No-op when Settings.api_token is empty; the serve
-    # entrypoint then refuses non-loopback binds (healthmes/__main__.py).
+    # entrypoint also refuses non-loopback binds; the tokenless middleware
+    # independently checks the actual socket peer so direct factory execution
+    # cannot bypass the local-only boundary.
     install_auth(app, settings)
 
     # Serve the MCP app from the router's *default* handler (the last resort

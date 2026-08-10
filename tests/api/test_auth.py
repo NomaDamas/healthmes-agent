@@ -4,8 +4,8 @@ Pins the PLAN §9 fix: with ``HEALTHMES_API_TOKEN`` set, no anonymous LAN peer
 can read medical records / health context or write through /mcp; the Android
 collector's ``Authorization: Bearer`` header is actually verified; and
 decision-viewer links stay tappable via the derived read-only ?token=.
-Without a configured token the middleware is absent (loopback dev path) and
-the serve entrypoint refuses non-loopback binds.
+Without a configured token the app factory itself is loopback-only and the
+serve entrypoint independently refuses non-loopback binds.
 """
 
 from contextlib import contextmanager
@@ -171,6 +171,28 @@ class TestNoTokenConfigured:
     def test_loopback_dev_path_stays_open(self, settings) -> None:
         with app_client(settings) as client:
             assert client.get("/v1/tasks").status_code == 200
+
+    def test_direct_factory_rejects_non_loopback_client_without_token(
+        self,
+        settings,
+    ) -> None:
+        app = create_app(settings)
+        with TestClient(app, client=("203.0.113.10", 43123)) as client:
+            Base.metadata.create_all(get_engine())
+            response = client.get("/v1/tasks")
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "local_only"
+
+    def test_direct_factory_keeps_health_open_for_non_loopback_client(
+        self,
+        settings,
+    ) -> None:
+        app = create_app(settings)
+        with TestClient(app, client=("203.0.113.10", 43123)) as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
 
     def test_serve_refuses_non_loopback_bind_without_token(self, settings) -> None:
         lan = settings.model_copy(update={"host": "0.0.0.0"})

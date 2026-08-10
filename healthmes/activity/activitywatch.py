@@ -315,6 +315,69 @@ def _afk_spans(events: list[dict[str, Any]]) -> list[AWSpan]:
     return spans
 
 
+def _merge_same_status_afk_spans(spans: list[AWSpan]) -> list[AWSpan]:
+    merged: list[AWSpan] = []
+    for span in sorted(
+        spans,
+        key=lambda value: (value.start, value.end, value.event_id),
+    ):
+        if not merged or span.start > merged[-1].end:
+            merged.append(span)
+            continue
+        previous = merged[-1]
+        status = str(previous.data["status"]).casefold()
+        identities = sorted({str(previous.event_id), str(span.event_id)})
+        end = max(previous.end, span.end)
+        identity = hashlib.sha256(
+            (
+                f"{status}|{previous.start.isoformat()}|{end.isoformat()}|"
+                f"{'|'.join(identities)}"
+            ).encode()
+        ).hexdigest()[:24]
+        merged[-1] = AWSpan(
+            event_id=f"merged-{identity}",
+            start=previous.start,
+            end=end,
+            data={"status": status},
+        )
+    return merged
+
+
+def _normalized_afk_spans(events: list[dict[str, Any]]) -> list[AWSpan]:
+    parsed = _afk_spans(events)
+    by_status = {
+        status: _merge_same_status_afk_spans(
+            [
+                span
+                for span in parsed
+                if str(span.data.get("status") or "").casefold() == status
+            ]
+        )
+        for status in ("afk", "not-afk")
+    }
+    afk = by_status["afk"]
+    active = by_status["not-afk"]
+    afk_index = active_index = 0
+    while afk_index < len(afk) and active_index < len(active):
+        afk_span = afk[afk_index]
+        active_span = active[active_index]
+        if min(afk_span.end, active_span.end) > max(
+            afk_span.start,
+            active_span.start,
+        ):
+            raise ActivityWatchError(
+                "ActivityWatch AFK timeline contains conflicting overlapping states"
+            )
+        if afk_span.end <= active_span.start:
+            afk_index += 1
+        else:
+            active_index += 1
+    return sorted(
+        [*afk, *active],
+        key=lambda value: (value.start, value.end, value.event_id),
+    )
+
+
 def _intersections(
     span: AWSpan,
     filters: list[AWSpan],
@@ -339,10 +402,7 @@ def _continuous_afk_coverage_end(
     end: datetime,
 ) -> datetime:
     cursor = start
-    spans = sorted(
-        _afk_spans(events),
-        key=lambda span: (span.start, span.end, span.event_id),
-    )
+    spans = _normalized_afk_spans(events)
     for span in spans:
         clipped_start = max(start, span.start)
         clipped_end = min(end, span.end)
@@ -391,10 +451,7 @@ def normalize_activitywatch_events(
         _window_spans(window_events),
         key=lambda span: (span.start, span.end, span.event_id),
     )
-    afk = sorted(
-        _afk_spans(afk_events),
-        key=lambda span: (span.start, span.end, span.event_id),
-    )
+    afk = _normalized_afk_spans(afk_events)
     if afk_bucket_id is not None and not afk:
         return []
     records: list[AppIntervalRecord] = []

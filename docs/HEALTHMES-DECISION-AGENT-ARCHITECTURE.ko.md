@@ -530,4 +530,3 @@ Hermes가 이미 provider, tool loop, session과 channel을 제공하므로 MVP�
 6. 행동 제안은 자동으로 `DecisionRecord`에 저장된다.
 7. Hermes 없이도 계약 테스트가 가능하고 Hermes는 교체 가능한 adapter다.
 8. UI 구현 없이 엔진과 runtime 연결의 end-to-end 테스트가 통과한다.
-

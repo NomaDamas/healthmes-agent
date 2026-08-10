@@ -30,6 +30,7 @@ from healthmes.activity.contracts import (
     AppIntervalRecord,
 )
 from healthmes.activity.maintenance import (
+    ActivityDeletionGranularityError,
     ActivityDeletionUnsafeError,
     delete_activity_data,
     run_activity_maintenance,
@@ -557,8 +558,163 @@ def test_manual_deletion_rebuilds_only_from_remaining_raw_evidence(session) -> N
     )
 
     assert report.raw_events_deleted == 1
-    assert [row.source_record_id for row in remaining] == ["keep"]
-    assert summary["total_active_minutes"] == 30.0
+    assert len(remaining) == 3
+    assert {row.source_record_id for row in remaining if row.source_record_id == "keep"} == {
+        "keep"
+    }
+    fragments = [
+        row
+        for row in remaining
+        if row.quality_flags.get("deletion_fragment") is True
+    ]
+    assert [
+        (row.payload["start_at"], row.payload["end_at"], row.payload["launches"])
+        for row in fragments
+    ] == [
+        (
+            "2026-08-01T10:00:00+00:00",
+            "2026-08-01T10:15:00+00:00",
+            0,
+        ),
+        (
+            "2026-08-01T10:20:00+00:00",
+            "2026-08-01T10:30:00+00:00",
+            0,
+        ),
+    ]
+    assert summary["total_active_minutes"] == 55.0
+
+
+def test_partial_hourly_deletion_requires_bucket_alignment(session) -> None:
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="aggregate-test",
+            source_device="phone",
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            records=[
+                AppHourRecord(
+                    source_record_id="hour",
+                    bucket_start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    app_id="browser",
+                    foreground_seconds=600,
+                    coverage_seconds=3600,
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(
+        ActivityDeletionGranularityError,
+        match="complete buckets",
+    ):
+        delete_activity_data(
+            session,
+            device_id="phone",
+            start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+            end=datetime(2026, 8, 1, 10, 20, tzinfo=UTC),
+            include_summaries=True,
+            include_control=False,
+        )
+
+
+def test_provisional_hour_can_be_finalized_but_not_reopened(session) -> None:
+    provisional = ActivityBatchIn(
+        source_provider="aggregate-test",
+        source_device="phone",
+        platform=ActivityPlatform.ANDROID,
+        capability=ActivityCapability.AGGREGATE,
+        timezone="UTC",
+        collected_at=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+        records=[
+            AppHourRecord(
+                source_record_id="mutable-hour",
+                bucket_start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                app_id="browser",
+                foreground_seconds=600,
+                coverage_seconds=1800,
+                bucket_complete=False,
+            )
+        ],
+    )
+    finalized = provisional.model_copy(
+        update={
+            "collected_at": datetime(2026, 8, 1, 11, 5, tzinfo=UTC),
+            "records": [
+                provisional.records[0].model_copy(
+                    update={
+                        "foreground_seconds": 2400,
+                        "coverage_seconds": 3600,
+                        "bucket_complete": True,
+                    }
+                )
+            ],
+        }
+    )
+
+    created = ingest_activity_batch(session, provisional)
+    updated = ingest_activity_batch(session, finalized)
+
+    assert created.response.created == 1
+    assert updated.response.updated == 1
+    _, summary = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+    )
+    assert summary["total_active_minutes"] == 40.0
+    assert "provisional_hourly_activity" not in summary["limitations"]
+
+    stale_provisional = provisional.model_copy(
+        update={
+            "collected_at": datetime(2026, 8, 1, 11, 10, tzinfo=UTC),
+        }
+    )
+    with pytest.raises(ValueError, match="source_record_id"):
+        ingest_activity_batch(session, stale_provisional)
+
+
+def test_provisional_hour_is_not_treated_as_complete_coverage(session) -> None:
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="aggregate-test",
+            source_device="phone",
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            collected_at=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+            records=[
+                AppHourRecord(
+                    source_record_id="provisional-hour",
+                    bucket_start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    app_id="browser",
+                    foreground_seconds=600,
+                    coverage_seconds=3600,
+                    bucket_complete=False,
+                )
+            ],
+        ),
+    )
+
+    _, summary = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+    )
+    overwork = overwork_context(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+    )
+
+    assert summary["source_coverage"]["ratio"] is None
+    assert "provisional_hourly_activity" in summary["limitations"]
+    assert overwork["status"] == "insufficient_data"
+    assert overwork["risk_level"] == "unknown"
+    assert overwork["reason"] == "unknown_source_coverage"
 
 
 def test_natural_raw_expiry_keeps_longer_lived_hourly_and_daily_summaries(session) -> None:

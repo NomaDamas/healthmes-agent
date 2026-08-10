@@ -6,6 +6,9 @@ import androidx.work.WorkerParameters
 import com.healthmes.usagecollector.CollectionWindowState
 import com.healthmes.usagecollector.CollectorPrefs
 import com.healthmes.usagecollector.UsageAccess
+import com.healthmes.usagecollector.UsageAccessGuardRegistry
+import com.healthmes.usagecollector.UsageAccessGuardService
+import com.healthmes.usagecollector.UsageAccessGuardToken
 import com.healthmes.usagecollector.net.CollectionConfig
 import com.healthmes.usagecollector.net.IngestClient
 import com.healthmes.usagecollector.net.UploadSample
@@ -77,15 +80,15 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         if (!permissionGrantedAtStart) {
             return stopForRevokedPermission(prefs, client, nowMs)
         }
-        val permissionObservation = prefs.observeUsageAccess(
-            granted = true,
-            nowMs = nowMs,
-        )
-        if (!permissionObservation.persisted) {
-            return persistenceFailure(
-                prefs,
-                "Collection stopped: privacy boundary persistence failed (${stamp()}).",
-            )
+        val initialGuardToken = UsageAccessGuardRegistry.snapshot()
+        if (initialGuardToken == null) {
+            prefs.lastResult =
+                "Collection paused: foreground privacy guard is not active."
+            return Result.success()
+        }
+        var guardToken: UsageAccessGuardToken = initialGuardToken
+        if (!guardAllowsCollection(prefs, guardToken)) {
+            return collectionWindowChanged(prefs)
         }
 
         val statusObservedAt = Instant.ofEpochMilli(nowMs).toString()
@@ -93,6 +96,20 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         var stableState: CollectionWindowState? = null
         for (attempt in 0 until MAX_BOUNDARY_SYNC_ATTEMPTS) {
             val stateBeforeStatus = prefs.collectionWindowState()
+            if (
+                stateBeforeStatus.collectionGeneration
+                != guardToken.collectionGeneration
+                || !guardAllowsCollection(prefs, guardToken)
+            ) {
+                return collectionWindowChanged(prefs)
+            }
+            if (!UsageAccess.isGranted(context)) {
+                return stopForRevokedPermission(
+                    prefs,
+                    client,
+                    System.currentTimeMillis(),
+                )
+            }
             // Reporting granted before reading config clears a previous
             // server-side revoke only for this exact durable generation.
             val config = when (
@@ -119,11 +136,19 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                 }
             }
             val stateAfterStatus = prefs.collectionWindowState()
+            if (!UsageAccess.isGranted(context)) {
+                return stopForRevokedPermission(
+                    prefs,
+                    client,
+                    System.currentTimeMillis(),
+                )
+            }
             if (
                 config.collectionGeneration
                 != stateBeforeStatus.collectionGeneration
                 || stateAfterStatus.collectionGeneration
                 != stateBeforeStatus.collectionGeneration
+                || !guardAllowsCollection(prefs, guardToken)
             ) {
                 return collectionWindowChanged(prefs)
             }
@@ -155,6 +180,13 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                             "failed (${stamp()}).",
                     )
                 }
+                val advanced = UsageAccessGuardRegistry.advanceGeneration(
+                    expected = guardToken,
+                    collectionGeneration = prefs
+                        .collectionWindowState()
+                        .collectionGeneration,
+                ) ?: return collectionWindowChanged(prefs)
+                guardToken = advanced
                 continue
             }
             if (blocked) {
@@ -175,9 +207,8 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             return Result.retry()
         }
         if (
-            !prefs.collectionWindowIsCurrent(
-                expectedGeneration = collectionState.collectionGeneration,
-            )
+            collectionState.collectionGeneration != guardToken.collectionGeneration
+            || !guardAllowsCollection(prefs, guardToken)
         ) {
             return collectionWindowChanged(prefs)
         }
@@ -191,7 +222,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         val collectionSinceMs = collectionState.collectionSinceMs
         val watermarkMs = collectionState.watermarkMs.takeIf { it > 0 }
             ?: collectionSinceMs
-        val queryBeginMs = activityQueryBegin(
+        val queryWindow = activityQueryWindow(
             collectionSinceMs,
             watermarkMs,
             nowMs,
@@ -199,17 +230,19 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
 
         val reader = UsageSnapshotReader(context)
         val events = SourcePrivacyFilter.filter(
-            reader.readEvents(queryBeginMs, nowMs),
+            reader.readEvents(queryWindow.beginMs, queryWindow.endMs),
             config.excludedApps,
         )
         if (
-            !prefs.collectionWindowIsCurrent(
-                expectedGeneration = collectionState.collectionGeneration,
-            )
+            !guardAllowsCollection(prefs, guardToken)
         ) {
             return collectionWindowChanged(prefs)
         }
-        val buckets = HourlyBucketer.bucket(events, queryBeginMs, nowMs)
+        val buckets = HourlyBucketer.bucket(
+            events,
+            queryWindow.beginMs,
+            queryWindow.endMs,
+        )
         if (!UsageAccess.isGranted(context)) {
             return stopForRevokedPermission(
                 prefs,
@@ -225,10 +258,13 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                     System.currentTimeMillis(),
                 )
             }
+            if (!guardAllowsCollection(prefs, guardToken)) {
+                return collectionWindowChanged(prefs)
+            }
             if (
                 !prefs.advanceWatermarkIfCurrent(
                     expectedGeneration = collectionState.collectionGeneration,
-                    watermarkMs = HourlyBucketer.floorToHour(nowMs),
+                    watermarkMs = HourlyBucketer.floorToHour(queryWindow.endMs),
                 )
             ) {
                 return watermarkFailureOrBoundaryChange(
@@ -236,7 +272,12 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                     collectionState.collectionGeneration,
                 )
             }
-            prefs.lastResult = "Nothing to upload (${stamp()})."
+            prefs.lastResult =
+                if (queryWindow.hasMoreBacklog) {
+                    "No activity in one backlog window; catch-up will continue (${stamp()})."
+                } else {
+                    "Nothing to upload (${stamp()})."
+                }
             return Result.success()
         }
 
@@ -258,9 +299,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             collectionState.collectionGeneration,
             shouldContinue = {
                 UsageAccess.isGranted(context) &&
-                    prefs.collectionWindowIsCurrent(
-                        expectedGeneration = collectionState.collectionGeneration,
-                    )
+                    guardAllowsCollection(prefs, guardToken)
             },
         )
         return when (outcome) {
@@ -272,10 +311,13 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                         System.currentTimeMillis(),
                     )
                 }
+                if (!guardAllowsCollection(prefs, guardToken)) {
+                    return collectionWindowChanged(prefs)
+                }
                 if (
                     !prefs.advanceWatermarkIfCurrent(
                         expectedGeneration = collectionState.collectionGeneration,
-                        watermarkMs = HourlyBucketer.floorToHour(nowMs),
+                        watermarkMs = HourlyBucketer.floorToHour(queryWindow.endMs),
                     )
                 ) {
                     return watermarkFailureOrBoundaryChange(
@@ -284,7 +326,10 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                     )
                 }
                 prefs.lastResult =
-                    if (outcome.samplesDiscarded == 0) {
+                    if (queryWindow.hasMoreBacklog && outcome.samplesDiscarded == 0) {
+                        "Uploaded ${outcome.samplesSent} backlog samples; " +
+                            "catch-up will continue (${stamp()})."
+                    } else if (outcome.samplesDiscarded == 0) {
                         "Uploaded ${outcome.samplesSent} samples (${stamp()})."
                     } else {
                         "Uploaded ${outcome.samplesSent}; discarded " +
@@ -322,6 +367,12 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         client: IngestClient,
         nowMs: Long,
     ): Result {
+        if (UsageAccess.isGranted(applicationContext)) {
+            prefs.lastResult =
+                "Permission changed during collection; discarded the in-flight snapshot."
+            return Result.success()
+        }
+        UsageAccessGuardRegistry.invalidate()
         val observation = prefs.observeUsageAccess(
             granted = false,
             nowMs = nowMs,
@@ -377,6 +428,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         prefs: CollectorPrefs,
         message: String,
     ): Result {
+        UsageAccessGuardService.stop(applicationContext)
         UploadScheduling.disable(applicationContext)
         prefs.lastResult = message
         return Result.failure()
@@ -399,6 +451,15 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         }
         return collectionWindowChanged(prefs)
     }
+
+    private fun guardAllowsCollection(
+        prefs: CollectorPrefs,
+        token: UsageAccessGuardToken,
+    ): Boolean =
+        UsageAccessGuardRegistry.isCurrent(token) &&
+            prefs.collectionWindowIsCurrent(
+                expectedGeneration = token.collectionGeneration,
+            )
 
     private fun stamp(): String =
         TIME_FORMAT.withZone(ZoneId.systemDefault()).format(Instant.now())

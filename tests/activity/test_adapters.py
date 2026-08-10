@@ -345,6 +345,57 @@ def test_activitywatch_afk_intersection_produces_active_and_idle_intervals() -> 
     ]
 
 
+def test_activitywatch_unions_overlapping_not_afk_events() -> None:
+    records = normalize_activitywatch_events(
+        device_id="mac-1",
+        window_bucket_id="window",
+        window_events=[_window_event(title="ignored", event_id=1)],
+        afk_bucket_id="afk",
+        afk_events=[
+            {
+                "id": 2,
+                "timestamp": "2026-08-01T10:00:00Z",
+                "duration": 3600,
+                "data": {"status": "not-afk"},
+            },
+            {
+                "id": 3,
+                "timestamp": "2026-08-01T10:30:00Z",
+                "duration": 1800,
+                "data": {"status": "not-afk"},
+            },
+        ],
+    )
+
+    assert len(records) == 1
+    assert records[0].start_at == datetime(2026, 8, 1, 10, tzinfo=UTC)
+    assert records[0].end_at == datetime(2026, 8, 1, 11, tzinfo=UTC)
+
+
+def test_activitywatch_rejects_conflicting_afk_states() -> None:
+    with pytest.raises(ActivityWatchError, match="conflicting overlapping states"):
+        normalize_activitywatch_events(
+            device_id="mac-1",
+            window_bucket_id="window",
+            window_events=[_window_event(title="ignored", event_id=1)],
+            afk_bucket_id="afk",
+            afk_events=[
+                {
+                    "id": 2,
+                    "timestamp": "2026-08-01T10:00:00Z",
+                    "duration": 3600,
+                    "data": {"status": "not-afk"},
+                },
+                {
+                    "id": 3,
+                    "timestamp": "2026-08-01T10:30:00Z",
+                    "duration": 1800,
+                    "data": {"status": "afk"},
+                },
+            ],
+        )
+
+
 @pytest.mark.parametrize(
     "platform",
     (

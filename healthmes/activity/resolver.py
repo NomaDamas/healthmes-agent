@@ -179,6 +179,7 @@ def nutrition_context(
                 "limitations": ["candidate_food_context_missing"],
                 "freshness": {"recorded_at": None, "status": "unavailable"},
                 "coverage": {"status": "no_data", "ratio": None},
+                "candidate_ledger_complete": False,
                 "decision_ready": False,
             }
         request_context = context.get("request", {})
@@ -239,7 +240,9 @@ def nutrition_context(
             "kind": "intake_decision_context",
             "context": context,
             "evidence_ids": evidence_ids,
-            "decision_ready": not failures,
+            "candidate_ledger_complete": not failures,
+            "specialist_policy_executed": False,
+            "decision_ready": False,
             "reason": failures[0] if failures else None,
             "limitations": sorted(
                 {
@@ -273,6 +276,8 @@ def nutrition_context(
         "kind": "confirmed_caffeine_ledger",
         "context": ledger,
         "evidence_ids": evidence_ids,
+        "candidate_ledger_complete": False,
+        "specialist_policy_executed": False,
         "decision_ready": False,
         "reason": "candidate_caffeine_context_missing",
         "limitations": (
@@ -663,6 +668,25 @@ def _compound_activity_context(
     }
 
 
+def _context_ready_for_preset(
+    question_kind: str,
+    selected: tuple[str, ...],
+    contexts: dict[str, Any],
+) -> bool:
+    usable = {"ok", "known"}
+    for domain in selected:
+        context = contexts.get(domain)
+        if not isinstance(context, dict) or context.get("status") not in usable:
+            return False
+        if domain != "time" and not context.get("evidence_ids"):
+            return False
+    if question_kind == "caffeine_for_focus":
+        return (
+            contexts.get("nutrition", {}).get("candidate_ledger_complete") is True
+        )
+    return True
+
+
 async def resolve_wellness_context(
     session: Session,
     request: ActivityContextResolveRequest,
@@ -843,13 +867,12 @@ async def resolve_wellness_context(
         if isinstance(context, dict)
     }
     usable = {"ok", "known"}
-    decision_ready = (
-        request.question_kind != "caffeine_for_focus"
-        or contexts.get("nutrition", {}).get("decision_ready") is True
+    context_ready = _context_ready_for_preset(
+        request.question_kind,
+        selected,
+        contexts,
     )
-    if not decision_ready:
-        overall_status = "insufficient_data"
-    elif not any(status in usable for status in domain_statuses.values()):
+    if not any(status in usable for status in domain_statuses.values()):
         overall_status = "insufficient_data"
     elif all(status in usable for status in domain_statuses.values()):
         overall_status = "ok"
@@ -864,7 +887,11 @@ async def resolve_wellness_context(
         "not_selected_domains": [domain for domain in ALL_DOMAINS if domain not in selected],
         "contexts": contexts,
         "domain_statuses": domain_statuses,
-        "decision_ready": decision_ready,
+        "context_ready": context_ready,
+        # This compatibility resolver assembles context only. Final policy,
+        # LLM synthesis, source-ref validation, and DecisionRecord persistence
+        # belong to the HealthMes Decision Agent.
+        "decision_ready": False,
         "evidence": [
             {"domain": domain, "id": str(evidence_id)}
             for domain, context in contexts.items()
@@ -890,5 +917,6 @@ async def resolve_wellness_context(
             "missing_data_is_not_zero",
             "association_is_not_causation",
             "context_only_not_a_final_wellness_decision",
+            "decision_ready_requires_healthmes_decision_agent",
         ],
     }

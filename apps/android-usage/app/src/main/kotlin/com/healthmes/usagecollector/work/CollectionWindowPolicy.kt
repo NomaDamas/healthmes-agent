@@ -8,6 +8,12 @@ internal data class CollectionBoundary(
     val watermarkMs: Long,
 )
 
+internal data class ActivityQueryWindow(
+    val beginMs: Long,
+    val endMs: Long,
+    val hasMoreBacklog: Boolean,
+)
+
 /**
  * A privacy stop creates a hard local boundary. Regranting Usage Access may
  * only query activity observed after this instant.
@@ -18,18 +24,22 @@ internal fun revokedPermissionBoundary(nowMs: Long): CollectionBoundary =
         watermarkMs = HourlyBucketer.floorToHour(nowMs),
     )
 
-internal fun activityQueryBegin(
+internal fun activityQueryWindow(
     collectionSinceMs: Long,
     watermarkMs: Long,
     nowMs: Long,
-): Long =
-    max(
+): ActivityQueryWindow {
+    val beginMs = max(
         collectionSinceMs,
-        max(
-            watermarkMs - LOOKBACK_MS,
-            nowMs - MAX_WINDOW_MS,
-        ),
+        watermarkMs - LOOKBACK_MS,
     )
+    val endMs = minOf(nowMs, beginMs + MAX_WINDOW_MS)
+    return ActivityQueryWindow(
+        beginMs = beginMs,
+        endMs = endMs,
+        hasMoreBacklog = endMs < nowMs,
+    )
+}
 
 internal fun uploadAllowed(
     collectionEnabled: Boolean,
@@ -49,6 +59,7 @@ internal fun collectionWindowLeaseAllowed(
             collectionQuarantined = collectionQuarantined,
         )
 
+/** A timezone change relabels local-day boundaries and needs a new generation. */
 internal fun timezoneBoundaryRequired(
     storedTimezone: String?,
     currentTimezone: String,

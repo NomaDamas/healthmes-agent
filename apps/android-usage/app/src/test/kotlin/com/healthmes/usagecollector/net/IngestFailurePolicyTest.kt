@@ -26,7 +26,6 @@ class IngestFailurePolicyTest {
         listOf(
             "activity_outside_retention",
             "activity_future_data",
-            "activity_source_mode_conflict",
             "activity_source_conflict",
         ).forEach { code ->
             assertEquals(
@@ -39,6 +38,7 @@ class IngestFailurePolicyTest {
     @Test
     fun `summary scope and unknown conflicts fail closed`() {
         listOf(
+            "activity_source_mode_conflict",
             "activity_summary_requires_complete_raw",
             null,
             "",

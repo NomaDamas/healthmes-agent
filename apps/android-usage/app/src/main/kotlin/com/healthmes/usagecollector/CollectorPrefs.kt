@@ -65,7 +65,7 @@ class CollectorPrefs(context: Context) {
         )
     }
 
-    /** Base URL of the user's HealthMes instance, e.g. http://192.168.1.20:8100 */
+    /** HTTPS base URL of the user's HealthMes instance. */
     var serverUrl: String?
         get() = prefs.getString(KEY_SERVER_URL, null)
         set(value) = prefs.edit { putString(KEY_SERVER_URL, value) }
@@ -237,6 +237,7 @@ class CollectorPrefs(context: Context) {
     internal fun observeUsageAccess(
         granted: Boolean,
         nowMs: Long,
+        forceBoundary: Boolean = false,
     ): PermissionObservationResult =
         synchronized(COLLECTION_STATE_LOCK) {
             if (collectionQuarantinedLocked()) {
@@ -248,7 +249,8 @@ class CollectorPrefs(context: Context) {
             }
             val current = collectionWindowStateLocked()
             val resetBoundary = (
-                current.usageSettingsPending
+                forceBoundary
+                    || current.usageSettingsPending
                     || current.usageAccessGranted == null
                     || current.usageAccessGranted != granted
                 )
@@ -453,6 +455,7 @@ class CollectorPrefs(context: Context) {
     }
 
     private fun disableSchedulingLocked() {
+        UsageAccessGuardService.stop(appContext)
         runCatching { UploadScheduling.disable(appContext) }
     }
 
