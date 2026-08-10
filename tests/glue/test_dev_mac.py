@@ -163,8 +163,8 @@ def test_local_runtime_adopts_the_open_wearables_listener_pid() -> None:
     assert 'if open_wearables_listener_is_managed "$pid"' in body
     assert 'rm -f "$OW_PID"' in body
     guard_body = _function_body(text, "open_wearables_listener_is_managed")
-    assert 'fastapi dev app/main.py' in guard_body
     assert 'fastapi run app/main.py' in guard_body
+    assert 'lsof -nP -iTCP:"${API_PORT:-8000}" -sTCP:LISTEN -t' in guard_body
     assert 'lsof -n -a -p "$pid" -d cwd -Fn' in guard_body
     assert '"$REPO_ROOT/vendor/open-wearables/backend"' in guard_body
     assert body.count('open_wearables_listener_is_managed "$listener_pid"') == 2
