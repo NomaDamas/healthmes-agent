@@ -1,5 +1,17 @@
 import Foundation
 
+enum MacSceneTimeZone {
+    static func resolve(
+        payloadTimezone: String?,
+        reportTimezone: String?,
+        fallback: TimeZone = .autoupdatingCurrent
+    ) -> TimeZone {
+        payloadTimezone.flatMap(TimeZone.init(identifier:))
+            ?? reportTimezone.flatMap(TimeZone.init(identifier:))
+            ?? fallback
+    }
+}
+
 /// Decisions are the only full-window Mac contract not yet in the shared
 /// Apple product layer. Goals, tasks and calendar events use ProductContract.
 public enum MacDecisionKind: String, Codable, CaseIterable {

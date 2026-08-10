@@ -23,6 +23,9 @@ final class HealthKitSyncManager: ObservableObject {
     private let queryLimit = 1_000
     private var observerQueries: [HKObserverQuery] = []
     private var syncInProgress = false
+    private var syncRequestedWhileActive = false
+    private var syncWaiters: [CheckedContinuation<Void, Never>] = []
+    private var syncOperationGate = PairingOperationGate()
 
     private struct QuantitySpec {
         let type: HKQuantityType
@@ -82,20 +85,56 @@ final class HealthKitSyncManager: ObservableObject {
     }
 
     func sync() async {
-        guard !syncInProgress else { return }
-        guard PairingStore.shared.load() != nil else { return }
+        if syncInProgress {
+            syncRequestedWhileActive = true
+            await withCheckedContinuation { continuation in
+                syncWaiters.append(continuation)
+            }
+            return
+        }
+        syncInProgress = true
+        repeat {
+            syncRequestedWhileActive = false
+            await performSyncPass()
+        } while syncRequestedWhileActive
+        syncInProgress = false
+        let completedWaiters = syncWaiters
+        syncWaiters.removeAll(keepingCapacity: true)
+        for waiter in completedWaiters {
+            waiter.resume()
+        }
+    }
+
+    private func performSyncPass() async {
+        guard let pairingSnapshot = PairingStore.shared.load() else { return }
         guard HKHealthStore.isHealthDataAvailable() else {
             state = .unavailable
             return
         }
-        syncInProgress = true
-        defer { syncInProgress = false }
+        let syncOperation = syncOperationGate.begin(pairing: pairingSnapshot)
         state = .syncing
         do {
             while true {
-                let batch = try await collectBatch()
+                guard isCurrent(syncOperation) else {
+                    state = .ready
+                    return
+                }
+                let batch = try await collectBatch(
+                    pairingFingerprint: pairingSnapshot.cacheFingerprint
+                )
+                guard isCurrent(syncOperation) else {
+                    state = .ready
+                    return
+                }
                 guard batch.hasChanges else { break }
-                let ack = try await api.uploadHealthKit(batch.payload)
+                let ack = try await api.uploadHealthKit(
+                    batch.payload,
+                    pairing: pairingSnapshot
+                )
+                guard isCurrent(syncOperation) else {
+                    state = .ready
+                    return
+                }
                 guard ack.durable else {
                     throw NSError(
                         domain: "HealthMes.HealthKit",
@@ -107,7 +146,11 @@ final class HealthKitSyncManager: ObservableObject {
                     )
                 }
                 for (key, anchor) in batch.anchors {
-                    saveAnchor(anchor, key: key)
+                    saveAnchor(
+                        anchor,
+                        key: key,
+                        pairingFingerprint: pairingSnapshot.cacheFingerprint
+                    )
                 }
                 let now = Date()
                 defaults.set(now, forKey: lastUploadKey)
@@ -184,7 +227,7 @@ final class HealthKitSyncManager: ObservableObject {
         }
     }
 
-    private func collectBatch() async throws -> Batch {
+    private func collectBatch(pairingFingerprint: String) async throws -> Batch {
         var metrics: [HealthKitIngestPayload.Metric] = []
         var sleepRows: [HealthKitIngestPayload.Sleep] = []
         var workouts: [HealthKitIngestPayload.Workout] = []
@@ -196,7 +239,7 @@ final class HealthKitSyncManager: ObservableObject {
             let key = spec.type.identifier
             let result = try await anchoredSamples(
                 type: spec.type,
-                anchor: loadAnchor(key: key)
+                anchor: loadAnchor(key: key, pairingFingerprint: pairingFingerprint)
             )
             metrics += result.samples.compactMap { sample in
                 guard let quantity = sample as? HKQuantitySample else { return nil }
@@ -222,7 +265,7 @@ final class HealthKitSyncManager: ObservableObject {
             let key = sleepType.identifier
             let result = try await anchoredSamples(
                 type: sleepType,
-                anchor: loadAnchor(key: key)
+                anchor: loadAnchor(key: key, pairingFingerprint: pairingFingerprint)
             )
             sleepRows += result.samples.compactMap { sample in
                 guard let category = sample as? HKCategorySample else { return nil }
@@ -246,7 +289,10 @@ final class HealthKitSyncManager: ObservableObject {
         let workoutKey = workoutType.identifier
         let workoutResult = try await anchoredSamples(
             type: workoutType,
-            anchor: loadAnchor(key: workoutKey)
+            anchor: loadAnchor(
+                key: workoutKey,
+                pairingFingerprint: pairingFingerprint
+            )
         )
         workouts += workoutResult.samples.compactMap { sample in
             guard let workout = sample as? HKWorkout else { return nil }
@@ -383,27 +429,47 @@ final class HealthKitSyncManager: ObservableObject {
         }
     }
 
-    private func anchorKey(_ key: String) -> String {
-        let pairing = PairingStore.shared.load()?.cacheFingerprint ?? "unpaired"
-        return "healthmes.healthkit.anchor.\(pairing).\(key)"
+    private func isCurrent(_ operation: PairingOperationToken) -> Bool {
+        syncOperationGate.isCurrent(
+            operation,
+            pairing: PairingStore.shared.load()
+        )
     }
 
-    private func loadAnchor(key: String) -> HKQueryAnchor? {
-        guard let data = defaults.data(forKey: anchorKey(key)) else { return nil }
+    private func anchorKey(_ key: String, pairingFingerprint: String) -> String {
+        "healthmes.healthkit.anchor.\(pairingFingerprint).\(key)"
+    }
+
+    private func loadAnchor(
+        key: String,
+        pairingFingerprint: String
+    ) -> HKQueryAnchor? {
+        guard
+            let data = defaults.data(
+                forKey: anchorKey(key, pairingFingerprint: pairingFingerprint)
+            )
+        else { return nil }
         return try? NSKeyedUnarchiver.unarchivedObject(
             ofClass: HKQueryAnchor.self,
             from: data
         )
     }
 
-    private func saveAnchor(_ anchor: HKQueryAnchor, key: String) {
+    private func saveAnchor(
+        _ anchor: HKQueryAnchor,
+        key: String,
+        pairingFingerprint: String
+    ) {
         guard
             let data = try? NSKeyedArchiver.archivedData(
                 withRootObject: anchor,
                 requiringSecureCoding: true
             )
         else { return }
-        defaults.set(data, forKey: anchorKey(key))
+        defaults.set(
+            data,
+            forKey: anchorKey(key, pairingFingerprint: pairingFingerprint)
+        )
     }
 
     private static func sleepStage(_ value: Int) -> String {

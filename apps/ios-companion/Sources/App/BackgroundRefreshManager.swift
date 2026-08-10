@@ -14,7 +14,11 @@ final class BackgroundRefreshManager {
     static let shared = BackgroundRefreshManager()
 
     /// Must match BGTaskSchedulerPermittedIdentifiers in project.yml.
-    static let taskIdentifier = "com.healthmes.companion.refresh"
+    static var taskIdentifier: String {
+        Bundle.main.object(
+            forInfoDictionaryKey: "HealthMesBackgroundRefreshIdentifier"
+        ) as? String ?? "com.healthmes.companion.refresh"
+    }
     /// The endpoint caches for 5 minutes; 15 minutes matches the WidgetKit
     /// floor used across the companions (never sooner, per the glance
     /// budget policy).

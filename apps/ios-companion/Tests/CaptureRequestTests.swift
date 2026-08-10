@@ -161,6 +161,37 @@ final class CaptureRequestTests: XCTestCase {
         XCTAssertNil(decoded?["items"])
     }
 
+    func testPhotoReviewPrecedesInteractionWithExplicitProvenance() throws {
+        let observationID = UUID(
+            uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF"
+        )!
+        let operationID = UUID(
+            uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        )!
+        let request = try HealthMesAPI.nutritionObservationReviewRequest(
+            pairing: pairing,
+            observationID: observationID,
+            body: NutritionObservationReviewBody(
+                operationID: operationID,
+                status: .confirmed,
+                source: "ios-app",
+                items: []
+            )
+        )
+
+        XCTAssertEqual(
+            request.url?.absoluteString,
+            "http://192.168.1.20:8100/v1/nutrition-observations/\(observationID.uuidString.lowercased())/review"
+        )
+        let decoded = try JSONSerialization.jsonObject(
+            with: request.httpBody!
+        ) as? [String: Any]
+        XCTAssertEqual(decoded?["operation_id"] as? String, operationID.uuidString)
+        XCTAssertEqual(decoded?["status"] as? String, "confirmed")
+        XCTAssertEqual(decoded?["source"] as? String, "ios-app")
+        XCTAssertEqual((decoded?["items"] as? [Any])?.count, 0)
+    }
+
     func testOutcomeStatusIsExplicitAndUnchangedItemsAreOmitted() throws {
         let interactionID = UUID(
             uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF"
@@ -392,6 +423,20 @@ final class CaptureRequestTests: XCTestCase {
         XCTAssertNotEqual(first.operationID, corrected.operationID)
         XCTAssertEqual(corrected.correctedItems, [renamed])
         XCTAssertEqual(corrected.actedAt, Date(timeIntervalSince1970: 1_786_000_300))
+    }
+
+    func testNutritionDraftReusesReviewIdentityUntilReviewChanges() {
+        var draft = NutritionCaptureDraft(
+            modality: .photo,
+            source: "ios-app-photo"
+        )
+        let first = draft.nutritionReview(status: .confirmed, items: [])
+        let retry = draft.nutritionReview(status: .confirmed, items: [])
+        let rejected = draft.nutritionReview(status: .rejected, items: [])
+
+        XCTAssertEqual(first, retry)
+        XCTAssertNotEqual(first.operationID, rejected.operationID)
+        XCTAssertEqual(rejected.status, .rejected)
     }
 
     private func nutritionCorrectionFixture() -> IntakeItemResult {

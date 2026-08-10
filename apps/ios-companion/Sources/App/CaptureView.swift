@@ -24,7 +24,7 @@ struct CaptureView: View {
                 .disabled(model.isFoodReviewLocked)
             attachmentSection
                 .disabled(model.isFoodReviewLocked)
-            if model.reviewInteraction != nil {
+            if model.reviewObservation != nil || model.reviewInteraction != nil {
                 reviewSection
             }
             submitSection
@@ -296,11 +296,11 @@ struct CaptureView: View {
                 }
             }
 
-            if let interaction = model.reviewInteraction {
-                ForEach(model.foodCorrections.indices, id: \.self) { index in
-                    correctionEditor(index)
-                }
+            ForEach(model.foodCorrections.indices, id: \.self) { index in
+                correctionEditor(index)
+            }
 
+            if let interaction = model.reviewInteraction {
                 if interaction.resolvedItems.isEmpty {
                     Label(
                         "No specific item was identified. Choose an outcome only if this capture still represents what happened.",
@@ -434,9 +434,11 @@ struct CaptureView: View {
                 TextField("Food or drink", text: correction.name)
                     .font(.headline)
                     .disabled(correction.wrappedValue.isExcluded)
-                Toggle("Exclude", isOn: correction.isExcluded)
-                    .toggleStyle(.button)
-                    .font(.caption)
+                if model.reviewObservation == nil {
+                    Toggle("Exclude", isOn: correction.isExcluded)
+                        .toggleStyle(.button)
+                        .font(.caption)
+                }
             }
             HStack {
                 TextField("Amount", text: correction.exactAmount)
@@ -463,6 +465,7 @@ struct CaptureView: View {
             }
         }
         .padding(.vertical, 4)
+        .disabled(model.isPhotoReviewFinalized)
     }
 
     private func warningList(_ warnings: [String]) -> some View {

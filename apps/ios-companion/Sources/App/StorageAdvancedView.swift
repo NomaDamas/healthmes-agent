@@ -17,6 +17,11 @@ struct StorageAdvancedView: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
+                    ForEach(snapshot.usage.keys.sorted(), id: \.self) { dataClass in
+                        LabeledContent(policyTitle(dataClass)) {
+                            Text(StorageSettingsModel.bytes(usageBytes(snapshot, for: dataClass)))
+                        }
+                    }
                 } header: {
                     Text("Paired HealthMes storage")
                 } footer: {
@@ -88,6 +93,19 @@ struct StorageAdvancedView: View {
                         .foregroundStyle(.orange)
                 }
             }
+
+            if let pairing = PairingStore.shared.load() {
+                Section {
+                    Link(
+                        destination: ViewerURL.make(
+                            pairing: pairing,
+                            pathComponents: ["storage"]
+                        )
+                    ) {
+                        Label("Open full storage details", systemImage: "arrow.up.right.square")
+                    }
+                }
+            }
         }
         .navigationTitle("Storage")
         .task { await model.load() }
@@ -123,5 +141,9 @@ struct StorageAdvancedView: View {
 
     private func presetTitle(_ value: String) -> String {
         value == "forever" ? "Keep forever" : value
+    }
+
+    private func usageBytes(_ snapshot: StorageSettingsSnapshot, for dataClass: String) -> Int64 {
+        snapshot.usage[dataClass]?["bytes"] ?? 0
     }
 }

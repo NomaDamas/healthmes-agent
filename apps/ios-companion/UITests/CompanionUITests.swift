@@ -54,13 +54,13 @@ final class CompanionUITests: XCTestCase {
         guard app.otherElements["healthmes-generated-scene"].waitForExistence(timeout: 15) else {
             throw XCTSkip("No live wellness scene seeded for UI QA.")
         }
-        XCTAssertTrue(app.buttons["식사 기록"].exists)
-        XCTAssertTrue(app.buttons["질문하기"].exists)
+        XCTAssertTrue(app.buttons["식사 사진"].exists)
+        XCTAssertTrue(app.buttons["지금"].exists)
+        XCTAssertTrue(app.buttons["조율"].exists)
+        XCTAssertTrue(app.buttons["변화"].exists)
         XCTAssertFalse(app.staticTexts["OUTCOME LOOP"].exists)
         XCTAssertFalse(app.staticTexts["RECENT EVIDENCE"].exists)
         XCTAssertFalse(app.buttons["전체 보기"].exists)
-
-        app.buttons["질문하기"].tap()
         XCTAssertTrue(
             app.textFields["healthmes-command-input"].waitForExistence(timeout: 3)
         )
@@ -77,7 +77,6 @@ final class CompanionUITests: XCTestCase {
             throw XCTSkip("No actionable health-backed proposal seeded for live UI QA.")
         }
 
-        app.buttons["질문하기"].tap()
         let command = app.textFields["healthmes-command-input"]
         XCTAssertTrue(command.waitForExistence(timeout: 3))
 
@@ -122,7 +121,7 @@ final class CompanionUITests: XCTestCase {
     func testFoodCaptureRoundTrip() throws {
         let app = try launchPairedApp()
 
-        app.buttons["식사 기록"].tap()
+        app.buttons["식사 사진"].tap()
         let field = app.textFields["healthmes-capture-description"]
         guard field.waitForExistence(timeout: 10) else {
             throw XCTSkip("Capture form not reachable.")
@@ -202,11 +201,11 @@ final class CompanionUITests: XCTestCase {
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let notificationTitle = springboard.staticTexts["Move Deep Work?"]
         XCTAssertTrue(
-            notificationTitle.waitForExistence(timeout: 8),
+            notificationTitle.waitForExistence(timeout: 20),
             "The deterministic HealthMes decision notification should appear."
         )
         XCTAssertTrue(
-            springboard.staticTexts["Low recovery · sleep debt"].exists,
+            springboard.staticTexts["Low recovery · sleep debt"].waitForExistence(timeout: 5),
             "The compact notification must explain the health reason immediately."
         )
         XCTAssertFalse(
@@ -218,7 +217,7 @@ final class CompanionUITests: XCTestCase {
         compactScreenshot.lifetime = .keepAlways
         add(compactScreenshot)
 
-        notificationTitle.press(forDuration: 1.5)
+        notificationTitle.press(forDuration: 2)
 
         XCTAssertTrue(
             springboard.staticTexts["HEALTHMES · DECISION"].waitForExistence(timeout: 5),

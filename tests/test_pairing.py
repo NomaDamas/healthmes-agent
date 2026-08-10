@@ -72,9 +72,53 @@ def test_pairing_grant_rejects_tampering(settings, tmp_path):
 
 
 def test_pairing_requires_authenticated_instance(settings, tmp_path):
-    configured = settings.model_copy(update={"data_dir": tmp_path})
+    configured = settings.model_copy(
+        update={
+            "data_dir": tmp_path,
+            "public_base_url": "https://healthmes.example.com",
+        }
+    )
     with pytest.raises(PairingGrantError):
         issue_pairing_grant(configured)
+
+
+@pytest.mark.parametrize(
+    "public_base_url",
+    [
+        "https://localhost:8100",
+        "https://127.0.0.1:8100",
+        "https://127.1:8100",
+        "https://127.0.1:8100",
+        "https://2130706433:8100",
+    ],
+)
+def test_remote_pairing_rejects_loopback_public_url(
+    settings,
+    tmp_path,
+    public_base_url,
+):
+    configured = secured_settings(settings, tmp_path).model_copy(
+        update={"public_base_url": public_base_url}
+    )
+
+    with pytest.raises(PairingGrantError, match="non-loopback HTTPS"):
+        issue_pairing_grant(configured, require_remote=True)
+
+
+def test_local_mac_pairing_allows_authenticated_loopback(settings, tmp_path):
+    configured = settings.model_copy(
+        update={
+            "api_token": SecretStr(TOKEN),
+            "data_dir": tmp_path,
+            "public_base_url": "http://127.0.0.1:8100",
+        }
+    )
+
+    grant = issue_pairing_grant(configured)
+
+    assert grant.deep_link.startswith(
+        "healthmes://pair?url=http%3A%2F%2F127.0.0.1%3A8100"
+    )
 
 
 def test_terminal_qr_renders(settings, tmp_path):

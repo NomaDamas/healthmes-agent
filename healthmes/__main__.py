@@ -505,7 +505,7 @@ def _cmd_connect_qr(_args: argparse.Namespace) -> int:
 
     from healthmes.pairing import issue_pairing_grant, render_terminal_qr
 
-    grant = issue_pairing_grant(settings)
+    grant = issue_pairing_grant(settings, require_remote=True)
     print(render_terminal_qr(grant.deep_link))
     expires = datetime.fromtimestamp(grant.expires_at, tz=UTC).isoformat()
     print(f"one-time pairing QR expires at {expires}")

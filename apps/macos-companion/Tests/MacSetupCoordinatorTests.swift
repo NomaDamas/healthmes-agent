@@ -45,6 +45,30 @@ final class MacSetupSupportTests: XCTestCase {
         )
     }
 
+    func testRuntimeRevisionIsPinnedAndSupportsReleaseOverride() {
+        XCTAssertEqual(
+            MacSetupSupport.runtimeRevision(
+                environment: [:],
+                bundleValue: nil
+            ),
+            MacSetupSupport.defaultRuntimeRevision
+        )
+        XCTAssertEqual(
+            MacSetupSupport.runtimeRevision(
+                environment: ["HEALTHMES_RUNTIME_REVISION": "release-commit"],
+                bundleValue: "bundle-commit"
+            ),
+            "release-commit"
+        )
+        XCTAssertEqual(
+            MacSetupSupport.runtimeRevision(
+                environment: [:],
+                bundleValue: "bundle-commit"
+            ),
+            "bundle-commit"
+        )
+    }
+
     func testPairingGrantExpiryMatchesServerBoundary() {
         let expiry = Date(timeIntervalSince1970: 1_786_000_300)
 
@@ -66,5 +90,34 @@ final class MacSetupSupportTests: XCTestCase {
                 now: expiry.addingTimeInterval(10)
             )
         )
+    }
+
+    func testReadinessMapsEveryComponentWithoutCollapsingFailures() {
+        let readiness = SetupReadiness(
+            overall: .actionRequired,
+            checks: [
+                SetupReadinessCheck(
+                    key: "instance",
+                    label: "HealthMes instance",
+                    state: .ready,
+                    detail: "Authenticated API is reachable."
+                ),
+                SetupReadinessCheck(
+                    key: "calendar_icloud",
+                    label: "Apple Calendar",
+                    state: .actionRequired,
+                    detail: "Connect iCloud CalDAV."
+                ),
+            ]
+        )
+
+        let events = MacSetupSupport.readinessEvents(readiness)
+
+        XCTAssertEqual(events.map(\.step), [
+            "readiness_instance",
+            "readiness_calendar_icloud",
+        ])
+        XCTAssertEqual(events.map(\.state), ["ready", "action_required"])
+        XCTAssertEqual(events.last?.detail, "Connect iCloud CalDAV.")
     }
 }

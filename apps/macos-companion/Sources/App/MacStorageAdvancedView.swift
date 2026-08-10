@@ -25,6 +25,23 @@ struct MacStorageAdvancedView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 170), spacing: 10)],
+                    spacing: 10
+                ) {
+                    ForEach(snapshot.usage.keys.sorted(), id: \.self) { dataClass in
+                        LabeledContent(
+                            dataClass.replacingOccurrences(of: "_", with: " ").capitalized
+                        ) {
+                            Text(
+                                StorageSettingsModel.bytes(
+                                    snapshot.usage[dataClass]?["bytes"] ?? 0
+                                )
+                            )
+                        }
+                    }
+                }
+
                 ForEach(snapshot.policies) { policy in
                     Picker(
                         policy.dataClass.replacingOccurrences(of: "_", with: " ").capitalized,
@@ -48,6 +65,16 @@ struct MacStorageAdvancedView: View {
                     {
                         Button("Review cleanup", role: .destructive) {
                             confirmCleanup = true
+                        }
+                    }
+                    if let pairing = PairingStore.shared.load() {
+                        Link(
+                            destination: ViewerURL.make(
+                                pairing: pairing,
+                                pathComponents: ["storage"]
+                            )
+                        ) {
+                            Label("Full details", systemImage: "arrow.up.right.square")
                         }
                     }
                 }

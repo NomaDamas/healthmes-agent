@@ -49,18 +49,61 @@ struct MacSetupView: View {
                         .foregroundStyle(.orange)
                 }
 
+                if coordinator.requiresDeveloperTools {
+                    Button {
+                        Task {
+                            await coordinator.requestDeveloperToolsInstallation()
+                        }
+                    } label: {
+                        Label(
+                            "Install Apple Developer Tools",
+                            systemImage: "hammer.fill"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(coordinator.isRunning)
+                    Text("Apple shows one system confirmation. After it finishes, select Set up this Mac again to continue.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if coordinator.requiresHomebrew {
+                    Button {
+                        if let url = URL(string: "https://brew.sh") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    } label: {
+                        Label(
+                            "Install Homebrew",
+                            systemImage: "shippingbox.fill"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(coordinator.isRunning)
+                    Text("The official Homebrew installer requires your visible approval. Install it, then select Set up this Mac again.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 if !coordinator.events.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
-                        ForEach(coordinator.events.filter { $0.detail == nil }.suffix(5)) {
-                            event in
-                            Label(
-                                event.message,
-                                systemImage: event.isFailure
-                                    ? "exclamationmark.circle"
-                                    : "checkmark.circle.fill"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(event.isFailure ? .orange : .secondary)
+                        ForEach(coordinator.events.suffix(8)) { event in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Label(
+                                    event.message,
+                                    systemImage: event.isFailure
+                                        ? "exclamationmark.circle"
+                                        : "checkmark.circle.fill"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(event.isFailure ? .orange : .secondary)
+                                if let detail = event.detail, !detail.isEmpty {
+                                    Text(verbatim: detail)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .padding(.leading, 20)
+                                }
+                            }
                         }
                     }
                 }

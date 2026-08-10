@@ -255,8 +255,12 @@ def test_is_loopback_host() -> None:
 
     assert is_loopback_host("127.0.0.1")
     assert is_loopback_host("127.0.0.2")
+    assert is_loopback_host("127.1")
+    assert is_loopback_host("127.0.1")
+    assert is_loopback_host("2130706433")
     assert is_loopback_host("::1")
     assert is_loopback_host("localhost")
+    assert is_loopback_host("LOCALHOST.")
     assert not is_loopback_host("0.0.0.0")
     assert not is_loopback_host("192.168.0.12")
     assert not is_loopback_host("my-laptop.local")

@@ -639,13 +639,15 @@ def shell_context(settings: Settings | None) -> dict[str, Any]:
     """
     tz = resolve_timezone(settings) if settings is not None else UTC
     now = utc_now()
-    base_path = ""
+    external_base = ""
     if settings is not None:
-        base_path = urlsplit(settings.public_base_url).path.rstrip("/")
+        public_url = urlsplit(settings.public_base_url)
+        if public_url.path.rstrip("/"):
+            external_base = settings.public_base_url.rstrip("/")
 
     def app_path(path: str) -> str:
         normalized = path if path.startswith("/") else f"/{path}"
-        return f"{base_path}{normalized}"
+        return f"{external_base}{normalized}"
 
     return {
         "token_qs": viewer_query_suffix(settings),

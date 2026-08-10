@@ -259,16 +259,20 @@ def test_environment_preserves_explicit_https_public_instance(
 
 def test_repair_and_update_prepare_environment_before_runtime(monkeypatch) -> None:
     module = load_module()
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, bool | None]] = []
     monkeypatch.setattr(
         module,
         "prepare_runtime",
-        lambda action, **kwargs: calls.append(("prepare", action)),
+        lambda action, **kwargs: calls.append(
+            ("prepare", action, kwargs.get("bootstrap"))
+        ),
     )
     monkeypatch.setattr(
         module,
         "run_command",
-        lambda action, step, command, **kwargs: calls.append((action, step)),
+        lambda action, step, command, **kwargs: calls.append(
+            (action, step, None)
+        ),
     )
     monkeypatch.setattr(module, "verify", lambda **kwargs: True)
 
@@ -276,10 +280,10 @@ def test_repair_and_update_prepare_environment_before_runtime(monkeypatch) -> No
     assert module.main(["update", "--json"]) == 0
 
     assert calls == [
-        ("prepare", "repair"),
-        ("repair", "runtime_repair"),
-        ("prepare", "update"),
-        ("update", "runtime_update"),
+        ("prepare", "repair", None),
+        ("repair", "runtime_repair", None),
+        ("prepare", "update", False),
+        ("update", "runtime_update", None),
     ]
 
 

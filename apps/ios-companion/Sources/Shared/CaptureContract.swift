@@ -157,6 +157,27 @@ public struct NutritionObservationItemResult: Codable, Equatable {
         case confidence
         case warnings
     }
+
+    public var reviewCandidate: IntakeItemResult {
+        IntakeItemResult(
+            name: nameCandidates.first
+                ?? category
+                ?? "Unidentified food or drink",
+            intakeType: intakeType,
+            serving: serving,
+            nutrients: nutrients.map {
+                IntakeNutrientFactResult(
+                    nutrient: $0.nutrient,
+                    amount: $0.amount,
+                    confidence: $0.confidence,
+                    origin: "agent",
+                    evidenceText: nil
+                )
+            },
+            confidence: confidence,
+            warnings: warnings
+        )
+    }
 }
 
 public struct NutritionObservationResult: Codable, Equatable {
@@ -174,6 +195,107 @@ public struct NutritionObservationResult: Codable, Equatable {
         case warnings
         case items
         case confirmationStatus = "confirmation_status"
+    }
+}
+
+public enum NutritionReviewStatus: String, Codable {
+    case confirmed
+    case corrected
+    case rejected
+}
+
+public struct ReviewedEstimateBody: Codable, Equatable {
+    public let kind: String
+    public let unit: String
+    public let exact: Double?
+    public let minimum: Double?
+    public let maximum: Double?
+    public let estimationBasis: String?
+
+    public init(_ value: IntakeServingResult) {
+        kind = value.kind
+        unit = value.unit
+        exact = value.exact
+        minimum = value.minimum
+        maximum = value.maximum
+        estimationBasis = value.estimationBasis
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case unit
+        case exact
+        case minimum
+        case maximum
+        case estimationBasis = "estimation_basis"
+    }
+}
+
+public struct ReviewedNutrientBody: Codable, Equatable {
+    public let nutrient: String
+    public let amount: ReviewedEstimateBody
+    public let confidence: String
+
+    public init(_ value: IntakeNutrientFactResult) {
+        nutrient = value.nutrient
+        amount = ReviewedEstimateBody(value.amount)
+        confidence = value.confidence
+    }
+}
+
+public struct ReviewedNutritionItemBody: Codable, Equatable {
+    public let itemIndex: Int
+    public let name: String
+    public let intakeType: String
+    public let serving: ReviewedEstimateBody
+    public let nutrients: [ReviewedNutrientBody]
+    public let confidence: String
+    public let warnings: [String]
+
+    public init(itemIndex: Int, item: IntakeItemResult) {
+        self.itemIndex = itemIndex
+        name = item.name
+        intakeType = item.intakeType
+        serving = ReviewedEstimateBody(item.serving)
+        nutrients = item.nutrients.map(ReviewedNutrientBody.init)
+        confidence = item.confidence
+        warnings = item.warnings
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case itemIndex = "item_index"
+        case name
+        case intakeType = "intake_type"
+        case serving
+        case nutrients
+        case confidence
+        case warnings
+    }
+}
+
+public struct NutritionObservationReviewBody: Codable, Equatable {
+    public let operationID: UUID
+    public let status: NutritionReviewStatus
+    public let source: String
+    public let items: [ReviewedNutritionItemBody]
+
+    enum CodingKeys: String, CodingKey {
+        case operationID = "operation_id"
+        case status
+        case source
+        case items
+    }
+}
+
+public struct NutritionObservationReviewResult: Codable, Equatable {
+    public let reviewID: UUID
+    public let observationID: UUID
+    public let status: NutritionReviewStatus
+
+    enum CodingKeys: String, CodingKey {
+        case reviewID = "review_id"
+        case observationID = "observation_id"
+        case status
     }
 }
 

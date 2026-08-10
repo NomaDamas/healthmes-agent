@@ -6,6 +6,7 @@ The database owns policy and audit state; payload bytes remain below
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -294,15 +295,21 @@ def _discover_unindexed(session: Session, settings: Settings) -> None:
         )
 
 
-def measure_usage(session: Session, settings: Settings) -> dict[str, dict[str, int]]:
-    root = settings.data_dir.resolve()
-    totals: dict[str, dict[str, int]] = {}
-    indexed = {
+def _usage_index(session: Session) -> dict[str, str]:
+    return {
         row.relative_path: row.data_class
         for row in session.scalars(
             select(StorageObject).where(StorageObject.purged_at.is_(None))
         )
     }
+
+
+def _scan_usage(
+    settings: Settings,
+    indexed: dict[str, str],
+) -> dict[str, dict[str, int]]:
+    root = settings.data_dir.resolve()
+    totals: dict[str, dict[str, int]] = {}
     if root.exists():
         for path in root.rglob("*"):
             if not path.is_file():
@@ -312,6 +319,13 @@ def measure_usage(session: Session, settings: Settings) -> dict[str, dict[str, i
             bucket = totals.setdefault(data_class, {"bytes": 0, "objects": 0})
             bucket["bytes"] += path.stat().st_size
             bucket["objects"] += 1
+    return totals
+
+
+def _record_usage(
+    session: Session,
+    totals: dict[str, dict[str, int]],
+) -> None:
     today = date.today()
     for data_class, values in totals.items():
         row = session.scalar(
@@ -329,6 +343,22 @@ def measure_usage(session: Session, settings: Settings) -> dict[str, dict[str, i
         row.bytes_used = values["bytes"]
         row.object_count = values["objects"]
     session.flush()
+
+
+def measure_usage(session: Session, settings: Settings) -> dict[str, dict[str, int]]:
+    totals = _scan_usage(settings, _usage_index(session))
+    _record_usage(session, totals)
+    return totals
+
+
+async def measure_usage_async(
+    session: Session,
+    settings: Settings,
+) -> dict[str, dict[str, int]]:
+    """Measure files off-loop while keeping the DB session on its owner thread."""
+    indexed = _usage_index(session)
+    totals = await asyncio.to_thread(_scan_usage, settings, indexed)
+    _record_usage(session, totals)
     return totals
 
 

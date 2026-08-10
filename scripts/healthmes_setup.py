@@ -33,7 +33,10 @@ ENV_FILE = REPO_ROOT / ".env"
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
 
 
-@dataclass(frozen=True, slots=True)
+# The Mac app may launch this thin bootstrap boundary with Apple's system
+# Python 3.9. The installed HealthMes runtime itself still uses Python 3.12+
+# through uv.
+@dataclass(frozen=True)
 class SetupEvent:
     action: str
     step: str
@@ -262,6 +265,7 @@ def prepare_runtime(
     *,
     json_output: bool,
     dry_run: bool,
+    bootstrap: bool = True,
 ) -> None:
     checks = preflight()
     for event in checks:
@@ -322,6 +326,8 @@ def prepare_runtime(
             "--env-file",
             str(ENV_FILE),
         ]
+    if not bootstrap:
+        return
     run_command(
         action,
         "bootstrap",
@@ -420,11 +426,11 @@ def issue_pairing_links(*, json_output: bool) -> None:
         (
             "import json",
             "from healthmes.config import Settings",
-            "from healthmes.pairing import issue_pairing_grant",
+            "from healthmes.pairing import is_remote_pairing_ready, issue_pairing_grant",
             "settings = Settings(_env_file='.env')",
             "mac = issue_pairing_grant(settings)",
-            "phone = issue_pairing_grant(settings) "
-            "if settings.public_base_url.startswith('https://') else None",
+            "phone = issue_pairing_grant(settings, require_remote=True) "
+            "if is_remote_pairing_ready(settings) else None",
             "print(json.dumps({'mac': mac.deep_link, "
             "'mac_expires_at': mac.expires_at, "
             "'phone': phone.deep_link if phone else None, "
@@ -613,6 +619,7 @@ def main(argv: list[str] | None = None) -> int:
                 "update",
                 json_output=args.json,
                 dry_run=args.dry_run,
+                bootstrap=False,
             )
             run_command(
                 "update",

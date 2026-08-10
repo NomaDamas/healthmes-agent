@@ -64,6 +64,7 @@ struct MacWellnessControlView: View {
     @State private var resolutionOperationGate = PairingOperationGate()
     @State private var lastHandledSpeakRequest = 0
     @State private var preserveMessageOnNextLensChange = false
+    @State private var showsNutritionCapture = false
     @FocusState private var commandFocused: Bool
 
     var body: some View {
@@ -152,6 +153,19 @@ struct MacWellnessControlView: View {
                 )
             }
         }
+        .sheet(isPresented: $showsNutritionCapture) {
+            MacSpeakView(
+                dashboardStore: dashboardStore,
+                onNavigate: { section in
+                    router.section = section
+                    showsNutritionCapture = false
+                },
+                onRefresh: {
+                    Task { await refreshAllAndScene() }
+                }
+            )
+            .frame(minWidth: 720, minHeight: 680)
+        }
     }
 
     private var atmosphere: some View {
@@ -194,6 +208,30 @@ struct MacWellnessControlView: View {
 
             Divider()
                 .frame(height: 20)
+
+            HStack(spacing: 5) {
+                ForEach(WellnessLens.allCases) { lens in
+                    Button {
+                        selectDetail(lens)
+                    } label: {
+                        Label(lens.title, systemImage: detailIcon(lens))
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.borderless)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .foregroundStyle(
+                        router.lens == lens ? Color.white : MacHealthMesStyle.graphite
+                    )
+                    .background(
+                        router.lens == lens
+                            ? MacHealthMesStyle.moss
+                            : Color.white.opacity(0.45),
+                        in: Capsule()
+                    )
+                    .accessibilityAddTraits(router.lens == lens ? .isSelected : [])
+                }
+            }
 
             statusPill(
                 energyStatus,
@@ -738,11 +776,16 @@ struct MacWellnessControlView: View {
             }
 
             HStack {
-                Text("No chat history. Commands become a scene, a preview, or a safe refusal.")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                Button {
+                    showsNutritionCapture = true
+                } label: {
+                    Label("Meal photo or intake", systemImage: "camera.fill")
+                }
+                .buttonStyle(.borderless)
+
                 Spacer()
-                Text("Task and goal writes always require confirmation.")
+
+                Text("No chat history. Commands become a scene, preview, or safe refusal.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -966,7 +1009,6 @@ struct MacWellnessControlView: View {
     }
 
     private func selectDetail(_ lens: WellnessLens, clearMessage: Bool = true) {
-        invalidateGeneratedScene()
         if clearMessage {
             message = nil
             preserveMessageOnNextLensChange = false
@@ -1562,7 +1604,7 @@ private struct MacWellnessModuleCard<Content: View>: View {
 /// Deterministic presentation adapter. This is intentionally not a planner:
 /// it only projects already-returned HealthMes data into the trusted scene
 /// catalog and validates every action before the renderer sees it.
-private enum MacWellnessSceneProjector {
+enum MacWellnessSceneProjector {
     static func makeScene(
         lens: WellnessLens,
         isPaired: Bool,
@@ -1595,6 +1637,10 @@ private enum MacWellnessSceneProjector {
             isStale: isStale,
             errorKey: errorKey
         )
+        let timeZone = MacSceneTimeZone.resolve(
+            payloadTimezone: payload?.timezone,
+            reportTimezone: report?.timezone
+        )
         let scene: WellnessScene
         switch lens {
         case .now:
@@ -1604,7 +1650,8 @@ private enum MacWellnessSceneProjector {
                 lastFetched: lastFetched,
                 alerts: alerts,
                 proposals: proposals,
-                pairing: pairing
+                pairing: pairing,
+                timeZone: timeZone
             )
         case .coordinate:
             scene = coordinateScene(
@@ -1616,7 +1663,8 @@ private enum MacWellnessSceneProjector {
                 tasks: tasks,
                 events: events,
                 dashboardErrors: dashboardErrors,
-                pairing: pairing
+                pairing: pairing,
+                timeZone: timeZone
             )
         case .change:
             scene = changeScene(
@@ -1624,12 +1672,16 @@ private enum MacWellnessSceneProjector {
                 decisions: decisions,
                 report: report,
                 dashboardErrors: dashboardErrors,
-                pairing: pairing
+                pairing: pairing,
+                timeZone: timeZone
             )
         }
 
         do {
-            try WellnessSceneValidator.validate(scene, pairedBaseURL: pairing?.baseURL)
+            try WellnessSceneValidator.validateLocalProjection(
+                scene,
+                pairedBaseURL: pairing?.baseURL
+            )
             return scene
         } catch {
             return WellnessScene.fallback(
@@ -1648,7 +1700,8 @@ private enum MacWellnessSceneProjector {
         lastFetched: Date?,
         alerts: [AlertItem],
         proposals: [ProposalItem],
-        pairing: Pairing?
+        pairing: Pairing?,
+        timeZone: TimeZone
     ) -> WellnessScene {
         let pending = proposals.first
         let alert = pending.flatMap { proposal in
@@ -1660,14 +1713,20 @@ private enum MacWellnessSceneProjector {
         let summary = bodyPlanImpact(payload)
 
         var modules: [WellnessSceneModule] = [
-            healthModule(payload: payload, lastFetched: lastFetched, summary: summary),
-            nextImpactModule(payload: payload),
+            healthModule(
+                payload: payload,
+                lastFetched: lastFetched,
+                summary: summary,
+                timeZone: timeZone
+            ),
+            nextImpactModule(payload: payload, timeZone: timeZone),
         ]
         modules.append(
             decisionModule(
                 proposal: pending,
                 alert: alert,
-                pairing: pairing
+                pairing: pairing,
+                timeZone: timeZone
             )
         )
 
@@ -1678,12 +1737,19 @@ private enum MacWellnessSceneProjector {
             summary: summary,
             severity: pending == nil ? .supportive : .action,
             freshness: freshness,
+            confidence: projectionConfidence(
+                payload: payload,
+                freshness: freshness,
+                proposal: pending,
+                alert: alert
+            ),
             modules: modules,
             actions: decisionActions(
                 proposal: pending,
                 alert: alert,
                 pairing: pairing
-            )
+            ),
+            timezone: timeZone.identifier
         )
     }
 
@@ -1696,7 +1762,8 @@ private enum MacWellnessSceneProjector {
         tasks: [TaskItem],
         events: [CalendarEventItem],
         dashboardErrors: [String],
-        pairing: Pairing?
+        pairing: Pairing?,
+        timeZone: TimeZone
     ) -> WellnessScene {
         let pending = proposals.first
         let alert = pending.flatMap { proposal in
@@ -1726,15 +1793,20 @@ private enum MacWellnessSceneProjector {
         let eventItems = Array(events.prefix(8)).map {
             WellnessSceneItem(
                 id: "event-\($0.id.uuidString)",
-                label: $0.startAt.healthMesShortTime,
+                label: $0.startAt.healthMesShortTime(in: timeZone),
                 value: $0.summary ?? "Untitled event",
                 detail:
-                    "\($0.endAt.healthMesShortTime) · \($0.isAgentCreated ? "HealthMes-managed" : $0.calendarSource)"
+                    "\($0.endAt.healthMesShortTime(in: timeZone)) · \($0.isAgentCreated ? "HealthMes-managed" : $0.calendarSource)"
             )
         }
 
         let modules = [
-            decisionModule(proposal: pending, alert: alert, pairing: pairing),
+            decisionModule(
+                proposal: pending,
+                alert: alert,
+                pairing: pairing,
+                timeZone: timeZone
+            ),
             WellnessSceneModule(
                 id: "constraints",
                 kind: .constraints,
@@ -1765,12 +1837,19 @@ private enum MacWellnessSceneProjector {
             summary: summary,
             severity: pending == nil ? .neutral : .action,
             freshness: freshness,
+            confidence: projectionConfidence(
+                payload: payload,
+                freshness: freshness,
+                proposal: pending,
+                alert: alert
+            ),
             modules: modules,
             actions: decisionActions(
                 proposal: pending,
                 alert: alert,
                 pairing: pairing
-            )
+            ),
+            timezone: timeZone.identifier
         )
     }
 
@@ -1779,7 +1858,8 @@ private enum MacWellnessSceneProjector {
         decisions: [MacDecisionSummary],
         report: WeeklyReport?,
         dashboardErrors: [String],
-        pairing: Pairing?
+        pairing: Pairing?,
+        timeZone: TimeZone
     ) -> WellnessScene {
         let breakdown = report?.schedule.displayBreakdown
         let metrics: [WellnessSceneItem]
@@ -1813,7 +1893,7 @@ private enum MacWellnessSceneProjector {
         let history = Array(decisions.prefix(8)).map {
             WellnessSceneItem(
                 id: "decision-\($0.id.uuidString)",
-                label: $0.createdAt.healthMesShortDateTime,
+                label: $0.createdAt.healthMesShortDateTime(in: timeZone),
                 value: $0.summary,
                 detail: $0.kind.rawValue.replacingOccurrences(of: "_", with: " ")
             )
@@ -1862,14 +1942,16 @@ private enum MacWellnessSceneProjector {
                     report: report
                 ),
             ],
-            actions: actions
+            actions: actions,
+            timezone: timeZone.identifier
         )
     }
 
     private static func healthModule(
         payload: GlancePayload?,
         lastFetched: Date?,
-        summary: String
+        summary: String,
+        timeZone: TimeZone
     ) -> WellnessSceneModule {
         guard let payload else {
             return WellnessSceneModule(
@@ -1898,13 +1980,16 @@ private enum MacWellnessSceneProjector {
                 WellnessSceneItem(
                     id: "freshness",
                     label: "Observed",
-                    value: lastFetched?.healthMesShortDateTime ?? "Unknown"
+                    value: lastFetched?.healthMesShortDateTime(in: timeZone) ?? "Unknown"
                 ),
             ]
         )
     }
 
-    private static func nextImpactModule(payload: GlancePayload?) -> WellnessSceneModule {
+    private static func nextImpactModule(
+        payload: GlancePayload?,
+        timeZone: TimeZone
+    ) -> WellnessSceneModule {
         guard let payload, let block = payload.nextBlocks.first else {
             return WellnessSceneModule(
                 id: "next-impact",
@@ -1922,7 +2007,8 @@ private enum MacWellnessSceneProjector {
             items: [
                 WellnessSceneItem(
                     id: "block-\(Int(block.start.timeIntervalSince1970))",
-                    label: "\(block.start.healthMesShortTime)–\(block.end.healthMesShortTime)",
+                    label:
+                        "\(block.start.healthMesShortTime(in: timeZone))–\(block.end.healthMesShortTime(in: timeZone))",
                     value: block.title ?? "Untitled block",
                     detail:
                         "\(block.energyDemand?.rawValue.capitalized ?? "Unknown") energy · \(block.source.rawValue)"
@@ -1934,7 +2020,8 @@ private enum MacWellnessSceneProjector {
     private static func decisionModule(
         proposal: ProposalItem?,
         alert: AlertItem?,
-        pairing: Pairing?
+        pairing: Pairing?,
+        timeZone: TimeZone
     ) -> WellnessSceneModule {
         guard let proposal,
             let prompt = ProposalActionPresentation.exactPrompt(alert: alert)
@@ -1964,7 +2051,7 @@ private enum MacWellnessSceneProjector {
                 id: "proposal-window",
                 label: "Proposed time",
                 value:
-                    "\(proposal.proposedStart.healthMesShortDateTime)–\(proposal.proposedEnd.healthMesShortTime)"
+                    "\(proposal.proposedStart.healthMesShortDateTime(in: timeZone))–\(proposal.proposedEnd.healthMesShortTime(in: timeZone))"
             )
         ]
         if let observation = alert?.decisionCard?.observationShort ?? alert?.summary {
@@ -2038,6 +2125,32 @@ private enum MacWellnessSceneProjector {
             )
         }
         return actions
+    }
+
+    private static func projectionConfidence(
+        payload: GlancePayload?,
+        freshness: WellnessFreshness,
+        proposal: ProposalItem?,
+        alert: AlertItem?
+    ) -> WellnessConfidence {
+        guard
+            freshness == .current,
+            payload?.energy.score != nil,
+            proposal?.isActionable == true,
+            ProposalActionPresentation.exactPrompt(alert: alert) != nil
+        else {
+            return WellnessConfidence(
+                level: .insufficientData,
+                coverage: "Local projection lacks a current correlated health decision."
+            )
+        }
+        return WellnessConfidence(
+            level: .medium,
+            coverage: "Current HealthMes health snapshot and exact correlated proposal.",
+            limitations: [
+                "The local projector does not create or recalculate calendar decisions."
+            ]
+        )
     }
 
     private static func calendarModule(

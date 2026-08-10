@@ -177,9 +177,9 @@ services:
       - HEALTHMES_DATA_DIR=/data
       - HEALTHMES_PORT=8100
       # Inside the container the service must bind all interfaces for the
-      # port mapping to work; the serve entrypoint therefore REQUIRES
-      # HEALTHMES_API_TOKEN (set it in .env) — the surface carries medical
-      # data and the published port is reachable from the LAN.
+      # loopback-only host port mapping to work; the serve entrypoint still
+      # REQUIRES HEALTHMES_API_TOKEN because a local reverse proxy or tunnel
+      # may publish this medical-data surface through authenticated HTTPS.
       - HEALTHMES_HOST=0.0.0.0
       - HEALTHMES_API_TOKEN=${HEALTHMES_API_TOKEN:-}
       - HEALTHMES_CALENDAR_ADJUSTMENT_SECRET=${HEALTHMES_CALENDAR_ADJUSTMENT_SECRET:-}

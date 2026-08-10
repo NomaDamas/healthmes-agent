@@ -72,7 +72,8 @@ final class CaptureModel: ObservableObject {
     static let mealTypes = ["breakfast", "lunch", "dinner", "snack"]
 
     var isFoodReviewLocked: Bool {
-        reviewInteraction != nil
+        reviewObservation != nil
+            || reviewInteraction != nil
             || phase == .analyzing
             || phase == .uploading
             || isResolving
@@ -93,6 +94,7 @@ final class CaptureModel: ObservableObject {
             && phase != .analyzing
             && phase != .saving
             && !isResolving
+            && reviewObservation == nil
             && reviewInteraction == nil
     }
 
@@ -141,9 +143,8 @@ final class CaptureModel: ObservableObject {
     }
 
     func recordFoodOutcome(_ status: IntakeOutcomeStatus) async {
-        guard var draft = foodDraft, let interaction = draft.interaction else {
-            return
-        }
+        guard !isResolving else { return }
+        guard var draft = foodDraft else { return }
         if status == .consumed,
             foodCorrections.contains(where: { !$0.isValid })
         {
@@ -154,7 +155,105 @@ final class CaptureModel: ObservableObject {
         let correctedItems = foodCorrections.contains(where: \.isChanged)
             ? foodCorrections.compactMap(\.correctedItem)
             : nil
-        let submittedItems = status == .consumed ? correctedItems : nil
+        if draft.modality == .photo {
+            guard let observation = draft.observation else { return }
+            if status == .cancelled, draft.review != nil {
+                outcomeError =
+                    "The photo review is already saved. Record whether it was consumed instead."
+                return
+            }
+            let reviewStatus: NutritionReviewStatus
+            let reviewItems: [ReviewedNutritionItemBody]
+            switch status {
+            case .cancelled:
+                reviewStatus = .rejected
+                reviewItems = []
+            case .notConsumed:
+                reviewStatus = .confirmed
+                reviewItems = []
+            case .consumed:
+                if correctedItems != nil {
+                    let reviewedItems = foodCorrections.compactMap(\.reviewedItem)
+                    guard
+                        reviewedItems.count == foodCorrections.count,
+                        reviewedItems.allSatisfy({ !$0.nutrients.isEmpty })
+                    else {
+                        outcomeError = "Keep every analyzed photo item and its nutrient evidence before recording it."
+                        return
+                    }
+                    reviewStatus = .corrected
+                    reviewItems = reviewedItems.enumerated().map {
+                        ReviewedNutritionItemBody(
+                            itemIndex: $0.offset,
+                            item: $0.element
+                        )
+                    }
+                } else {
+                    reviewStatus = .confirmed
+                    reviewItems = []
+                }
+            }
+
+            if draft.review == nil {
+                let pendingReview = draft.nutritionReview(
+                    status: reviewStatus,
+                    items: reviewItems
+                )
+                foodDraft = draft
+                outcomeError = nil
+                phase = .resolving(status)
+                do {
+                    draft.review = try await api.reviewNutritionObservation(
+                        observationID: observation.observationID,
+                        body: NutritionObservationReviewBody(
+                            operationID: pendingReview.operationID,
+                            status: pendingReview.status,
+                            source: "ios-app",
+                            items: pendingReview.items
+                        )
+                    )
+                    foodDraft = draft
+                } catch {
+                    foodDraft = draft
+                    phase = .reviewing
+                    outcomeError = BriefingHomeModel.describe(error)
+                    return
+                }
+            }
+
+            if status == .cancelled {
+                resetContent()
+                phase = .saved(kind: .food, outcome: .cancelled)
+                return
+            }
+
+            if draft.interaction == nil {
+                do {
+                    draft.interaction = try await api.createPhotoIntake(
+                        PhotoIntakeInteractionBody(
+                            operationID: draft.interactionOperationID,
+                            source: draft.source,
+                            sourceText: descriptionText.isEmpty
+                                ? nil
+                                : descriptionText,
+                            nutritionObservationID: observation.observationID
+                        )
+                    )
+                    foodDraft = draft
+                    reviewInteraction = draft.interaction
+                } catch {
+                    foodDraft = draft
+                    phase = .reviewing
+                    outcomeError = BriefingHomeModel.describe(error)
+                    return
+                }
+            }
+        }
+        guard let interaction = draft.interaction else { return }
+        let submittedItems =
+            status == .consumed && draft.modality != .photo
+            ? correctedItems
+            : nil
         let note = status == .consumed
             ? mealType.map { "meal_type=\($0)" }
             : nil
@@ -192,6 +291,10 @@ final class CaptureModel: ObservableObject {
 
     var hasInvalidFoodCorrections: Bool {
         foodCorrections.contains(where: { !$0.isValid })
+    }
+
+    var isPhotoReviewFinalized: Bool {
+        foodDraft?.modality == .photo && foodDraft?.review != nil
     }
 
     private func analyzeFood(text: String) async {
@@ -237,14 +340,12 @@ final class CaptureModel: ObservableObject {
                     guard let observation = draft.observation else {
                         throw HealthMesAPIError.httpStatus(422)
                     }
-                    draft.interaction = try await api.createPhotoIntake(
-                        PhotoIntakeInteractionBody(
-                            operationID: draft.interactionOperationID,
-                            source: draft.source,
-                            sourceText: text.isEmpty ? nil : text,
-                            nutritionObservationID: observation.observationID
+                    reviewObservation = observation
+                    foodCorrections = observation.items.map {
+                        NutritionItemCorrectionDraft(
+                            item: $0.reviewCandidate
                         )
-                    )
+                    }
                 case .voice:
                     guard let mediaPath = draft.uploadedMediaPath else {
                         throw HealthMesAPIError.httpStatus(422)
@@ -280,9 +381,11 @@ final class CaptureModel: ObservableObject {
 
             reviewObservation = draft.observation
             reviewInteraction = draft.interaction
-            foodCorrections = draft.interaction?.resolvedItems.map {
-                NutritionItemCorrectionDraft(item: $0)
-            } ?? []
+            if draft.modality != .photo {
+                foodCorrections = draft.interaction?.resolvedItems.map {
+                    NutritionItemCorrectionDraft(item: $0)
+                } ?? []
+            }
             phase = .reviewing
         } catch {
             foodDraft = draft

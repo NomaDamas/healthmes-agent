@@ -171,4 +171,17 @@ extension Date {
     var healthMesShortDateTime: String {
         formatted(date: .abbreviated, time: .shortened)
     }
+
+    func healthMesShortTime(in timeZone: TimeZone) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.timeZone = timeZone
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter.string(from: self)
+    }
+
+    func healthMesShortDateTime(in timeZone: TimeZone) -> String {
+        WellnessDateFormat.abbreviatedDateTime(self, timeZone: timeZone)
+    }
 }

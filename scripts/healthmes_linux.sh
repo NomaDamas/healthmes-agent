@@ -20,6 +20,10 @@ require_tools() {
     "$DOCKER_BIN" compose version >/dev/null 2>&1 \
         || die "docker compose v2 is required"
     [ -n "$SYSTEMCTL_BIN" ] || die "systemd is required"
+    (
+        cd "$REPO_ROOT"
+        "$DOCKER_BIN" compose "${COMPOSE_FILES[@]}" config >/dev/null
+    ) || die "docker compose is too old for the HealthMes Linux override"
 }
 
 wait_for_docker() {
@@ -35,13 +39,27 @@ wait_for_docker() {
     die "docker did not become ready after $DOCKER_READY_ATTEMPTS attempts"
 }
 
+systemd_quote() {
+    value="${1//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//%/%%}"
+    printf '"%s"' "$value"
+}
+
+sed_replacement() {
+    value="${1//\\/\\\\}"
+    value="${value//&/\\&}"
+    value="${value//|/\\|}"
+    printf '%s' "$value"
+}
+
 install_unit() {
     require_tools
     [ -f "$UNIT_TEMPLATE" ] || die "missing systemd unit template"
     mkdir -p "$UNIT_DIR"
-    escaped_repo="${REPO_ROOT//&/\\&}"
-    escaped_docker="${DOCKER_BIN//&/\\&}"
-    escaped_script="${BASH_SOURCE[0]//&/\\&}"
+    escaped_repo="$(sed_replacement "$(systemd_quote "$REPO_ROOT")")"
+    escaped_docker="$(sed_replacement "$(systemd_quote "$DOCKER_BIN")")"
+    escaped_script="$(sed_replacement "$(systemd_quote "${BASH_SOURCE[0]}")")"
     temporary="$(mktemp)"
     sed \
         -e "s|__REPO_ROOT__|$escaped_repo|g" \
@@ -60,6 +78,29 @@ install_unit() {
     fi
 }
 
+update_source() {
+    if [ "${HEALTHMES_MANAGED_RUNTIME:-0}" = "1" ]; then
+        return
+    fi
+    command -v git >/dev/null 2>&1 || die "git is required for update"
+    git -C "$REPO_ROOT" diff --quiet \
+        || die "working tree has changes; commit or stash first"
+    git -C "$REPO_ROOT" diff --cached --quiet \
+        || die "index has changes; commit or stash first"
+    git -C "$REPO_ROOT" pull --ff-only
+}
+
+bootstrap_runtime() {
+    "$DOCKER_BIN" run --rm \
+        --user "$(id -u):$(id -g)" \
+        -v "$REPO_ROOT:/work" \
+        -w /work \
+        ghcr.io/astral-sh/uv:python3.13-bookworm-slim \
+        uv run python scripts/bootstrap.py \
+        --mode docker \
+        --env-file /work/.env
+}
+
 case "${1:-}" in
 wait-for-docker)
     wait_for_docker
@@ -69,6 +110,8 @@ install)
     ;;
 update)
     require_tools
+    update_source
+    bootstrap_runtime
     "$DOCKER_BIN" compose "${COMPOSE_FILES[@]}" pull
     "$DOCKER_BIN" compose "${COMPOSE_FILES[@]}" build --pull
     "$SYSTEMCTL_BIN" --user restart "$UNIT_NAME"

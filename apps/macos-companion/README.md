@@ -1,18 +1,16 @@
 # HealthMes macOS Companion
 
 The macOS slice of issue #108 is a full-window HealthMes product with the
-same core information architecture as iPhone:
+same core wellness canvas as iPhone:
 
-- **Today** — simple Now / Next / Decision hierarchy, with Yes/No proposal
-  actions and optional inspector detail.
-- **Plan** — current weekly goals, open tasks, mirrored calendar events and
-  pending schedule changes.
-- **Decisions** — pending decisions, decision history, recent signals and
-  exact web-detail links.
-- **Speak** — `Shift-Command-Space` voice capture. Navigation stays local;
-  tasks and weekly goals require an explicit confirmation before REST writes.
-- **Settings** — connection, Google/iCloud calendar entry point, native
-  alerts and privacy; self-host URL/token remain under Advanced.
+- current body state and its effect on the plan
+- Apple/Google calendar time blocks and one primary intervention
+- bounded generated UI instead of a chat transcript
+- persistent voice and editable-text input
+- `Shift-Command-Space` voice capture and keyboard-first actions
+- optional inspector and exact Web detail for deeper evidence
+- Settings for connection, calendars and alerts, with self-host/storage
+  controls under Advanced
 
 The issue #11 glance surfaces remain part of the same project:
 
@@ -123,7 +121,9 @@ xcodebuild test -project HealthMesMac.xcodeproj -scheme HealthMesMac \
   -destination "platform=macOS" CODE_SIGNING_ALLOWED=NO
 ```
 
-Signing is deliberately untouched (`CODE_SIGNING_ALLOWED=NO` everywhere).
+CI remains unsigned with `CODE_SIGNING_ALLOWED=NO`. Local development builds
+may use the owner's Apple development team; no repository-owned identity or
+profile is committed.
 
 ## Install
 
@@ -155,9 +155,12 @@ widget gallery (unsigned-build caveat below).
 ## Pairing
 
 1. Open **Settings → Set up this Mac**. HealthMes downloads its managed
-   runtime into `~/Library/Application Support/HealthMes/runtime-source`,
+   runtime at the app's pinned compatible revision into
+   `~/Library/Application Support/HealthMes/runtime-source`,
    creates a private mode-0600 configuration, installs the local service,
-   and pairs the Mac app.
+   and pairs the Mac app. A stock Mac may show Apple's one-time Developer
+   Tools confirmation first; after it finishes, select setup again and the
+   remaining steps are automated.
 2. Scan the displayed five-minute QR with the iPhone Camera. The QR contains
    a signed one-time code, never the bearer token; the iPhone app exchanges
    it once and passes the pairing to Apple Watch.
@@ -229,7 +232,7 @@ Sources/MacCore/             # platform-agnostic mac logic (Foundation only)
   MacProductContracts.swift    decision summary contract only
   MacVoiceIntent.swift         deterministic voice routing, no side effects
 Sources/MacUI/               # SwiftUI curve view (popover + widgets)
-Sources/App/                 # full-window Today / Plan / Decisions / Speak /
+Sources/App/                 # one wellness canvas, persistent command dock,
                              # Settings, adaptive inspector, dashboard store
 Sources/MenuBar/             # MenuBarExtra app: store, popover, settings,
                              # UNUserNotificationCenter manager (§8.5)

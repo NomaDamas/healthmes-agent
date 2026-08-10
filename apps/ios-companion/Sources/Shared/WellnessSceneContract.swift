@@ -689,6 +689,20 @@ public enum WellnessSceneValidationError: Error, Equatable {
 }
 
 public enum WellnessSceneValidator {
+    /// Local native projections may infer the expected proposal only from
+    /// their own exact preview. Server/user-question scenes must continue to
+    /// call `validate` with an independently correlated proposal ID.
+    public static func validateLocalProjection(
+        _ scene: WellnessScene,
+        pairedBaseURL: URL?
+    ) throws {
+        try validate(
+            scene,
+            pairedBaseURL: pairedBaseURL,
+            expectedProposalID: scene.exactMutationPreview?.proposalID
+        )
+    }
+
     public static func validate(
         _ scene: WellnessScene,
         pairedBaseURL: URL?,

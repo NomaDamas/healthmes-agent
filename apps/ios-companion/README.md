@@ -1,9 +1,10 @@
 # HealthMes iOS/watchOS Companion
 
 Full native companion app for HealthMes Agent (issues #7, #10, #91, and
-#108). The iPhone presents a shared product core — **Today, Plan,
-Decisions** — around a prominent voice-only **Speak** action. Apple Watch
-remains a deliberately smaller three-second Yes/No decision remote.
+#108). The iPhone presents one bounded wellness control canvas with a
+persistent voice/editable-text dock, real calendar blocks, and one primary
+decision. Apple Watch remains a deliberately smaller three-second Yes/No
+decision remote.
 
 Local-first, like `apps/android-usage`: the paired base URL is the **only**
 network destination in the whole project — no third-party endpoint, no
@@ -17,16 +18,14 @@ Linux machine. A physical iPhone cannot reach that machine through
 
 ## What the app does
 
-- **Issue #108 core IA** — Today defaults to Now / Next / Decision; Plan
-  reads real weekly goals, tasks, mirrored calendar events, and pending
-  proposals; Decisions separates pending actions from honest resolved
-  history. Profile/Settings keeps pairing, notifications, weekly reports,
-  and capture out of the daily path.
-- **Voice-only Speak** — no text-command composer. On-device speech
-  recognition creates a real task (`POST /v1/tasks`) or weekly goal
-  (`POST /v1/goals`). General agent conversation remains unavailable until
-  the server exposes a supported voice-command contract; the app does not
-  fake one.
+- **Issue #108 core IA** — one current wellness conclusion, at most one
+  useful visualization, Apple/Google calendar blocks, one primary decision,
+  and progressive Web detail. Explore/Settings keeps history, diagnostics,
+  pairing, and storage out of the daily path.
+- **Bounded command canvas** — voice and editable text share one dock.
+  Commands return a bounded generated scene rather than an infinite chat
+  transcript. Read-only questions cannot leak mutation controls; supported
+  writes still require an exact proposal and explicit confirmation.
 - **Today** — one Now energy state, one Next calendar block, and one
   explicit decision question. Yes/No calls the real schedule endpoint;
   reasoning and the exact web decision remain progressively disclosed.
@@ -142,7 +141,7 @@ endpoints serialize sqlite's **naive** UTC datetimes
 (`2026-07-11T14:23:10.355753`). `GlanceJSON.parseISO8601` accepts both —
 found live, covered by `testAcceptsNaiveUTCTimestamps`.
 
-## Generate & build (simulator only)
+## Generate and build
 
 Requirements: Xcode 26.x with iOS **and watchOS** platform components, and
 [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
@@ -167,7 +166,11 @@ xcodebuild test -project HealthMesCompanion.xcodeproj -scheme HealthMesCompanion
   -destination "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.2" CODE_SIGNING_ALLOWED=NO
 ```
 
-Signing is deliberately untouched (`CODE_SIGNING_ALLOWED=NO` everywhere).
+CI and simulator commands remain unsigned. For hardware QA, select one
+development team for every app/extension target. If the default identifiers
+conflict with another account, override the project settings
+`HEALTHMES_BUNDLE_ID_PREFIX` and `HEALTHMES_APP_GROUP_ID`. See
+`docs/qa/APPLE-REAL-DEVICE-QA.ko.md`.
 
 ## Live smoke test (what "works" means here)
 
@@ -307,8 +310,9 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
   remain #7-era placeholders by design (expert worksheet pending).
 - **No push notifications** — polling only; APNs relay is deliberately out
   of scope (local-first). Telegram stays the guaranteed channel.
-- **No signing/distribution** — no team/profiles; the watch app is not
-  embedded into the iPhone app for distribution.
+- **No release signing/distribution** — no repository-owned team, profiles,
+  TestFlight, or App Store setup. The Watch app is embedded in the iPhone
+  target, and local developer signing is documented for hardware QA.
 - Voice-capture transcription is manual (a transcript field) — no on-device
   speech-to-text yet; the server accepts `transcript` when present.
 - Notification ✅/✏️/❌ buttons attach only when exactly one proposal is

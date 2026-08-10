@@ -1,43 +1,9 @@
-import EventKit
 import SwiftUI
 import UserNotifications
 
-@MainActor
-private final class DeviceCalendarPermissionModel: ObservableObject {
-    @Published var status = EKEventStore.authorizationStatus(for: .event)
-    @Published var message: String?
-
-    private let store = EKEventStore()
-
-    func request() async {
-        do {
-            _ = try await store.requestFullAccessToEvents()
-            status = EKEventStore.authorizationStatus(for: .event)
-            message = nil
-        } catch {
-            status = EKEventStore.authorizationStatus(for: .event)
-            message = error.localizedDescription
-        }
-    }
-
-    var label: String {
-        switch status {
-        case .fullAccess, .authorized:
-            return String(localized: "Device access granted")
-        case .writeOnly:
-            return String(localized: "Write-only access")
-        case .denied, .restricted:
-            return String(localized: "Permission denied")
-        case .notDetermined:
-            return String(localized: "Not requested")
-        @unknown default:
-            return String(localized: "Unknown")
-        }
-    }
-}
-
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @State private var notificationStatus: UNAuthorizationStatus = .notDetermined
     @State private var showAdvanced = false
     @State private var serverReadiness: SetupReadiness?
@@ -221,7 +187,15 @@ struct SettingsView: View {
         }
         .task {
             notificationStatus = await NotificationManager.shared.authorizationStatus()
+            calendarPermission.refresh()
             await loadReadiness()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            calendarPermission.refresh()
+            Task {
+                notificationStatus = await NotificationManager.shared.authorizationStatus()
+            }
         }
     }
 

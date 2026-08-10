@@ -360,10 +360,20 @@ cmd_install() {
 }
 
 cmd_update() {
-    git -C "$REPO_ROOT" diff --quiet || die "working tree has changes; commit or stash first"
-    git -C "$REPO_ROOT" diff --cached --quiet || die "index has changes; commit or stash first"
-    git -C "$REPO_ROOT" pull --ff-only
+    if [ "${HEALTHMES_MANAGED_RUNTIME:-0}" != "1" ]; then
+        git -C "$REPO_ROOT" diff --quiet \
+            || die "working tree has changes; commit or stash first"
+        git -C "$REPO_ROOT" diff --cached --quiet \
+            || die "index has changes; commit or stash first"
+        git -C "$REPO_ROOT" pull --ff-only
+    fi
     bash "$DEV_MAC_SCRIPT" setup
+    if [ -f "$LAUNCH_AGENT_PLIST" ]; then
+        start_launch_agent
+    else
+        stop_apps
+        start_apps
+    fi
     info "updated"
 }
 

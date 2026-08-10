@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import Literal
-from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -17,8 +16,9 @@ from healthmes.pairing import (
     PairingGrantError,
     PairingGrantExpired,
     exchange_pairing_grant,
+    is_remote_pairing_ready,
 )
-from healthmes.storage import measure_usage
+from healthmes.storage import measure_usage_async
 from healthmes.store import RawIngestEvent
 from healthmes.store.session import SessionDep
 
@@ -75,14 +75,14 @@ async def setup_readiness(
     settings: Settings = request.app.state.settings
     calendar_cards = build_connection_cards(settings)
     wearable = await build_oura_card(settings)
-    usage = measure_usage(session, settings)
+    usage = await measure_usage_async(session, settings)
     latest_healthkit = session.scalar(
         select(RawIngestEvent)
         .where(RawIngestEvent.source == "healthkit-bridge")
         .order_by(RawIngestEvent.received_at.desc())
         .limit(1)
     )
-    public_url = urlsplit(settings.public_base_url)
+    remote_pairing_ready = is_remote_pairing_ready(settings)
     health_ready = wearable.connected or latest_healthkit is not None
     checks = [
         ReadinessCheck(
@@ -143,15 +143,14 @@ async def setup_readiness(
         ReadinessCheck(
             key="public_https",
             label="Phone and Watch access",
-            state=(
-                "ready"
-                if public_url.scheme == "https" and bool(public_url.hostname)
-                else "action_required"
-            ),
+            state="ready" if remote_pairing_ready else "action_required",
             detail=(
                 settings.public_base_url
-                if public_url.scheme == "https" and public_url.hostname
-                else "Configure an HTTPS URL owned by this personal server."
+                if remote_pairing_ready
+                else (
+                    "Configure an authenticated, non-loopback HTTPS URL that "
+                    "your phone and watch can reach."
+                )
             ),
         ),
         ReadinessCheck(

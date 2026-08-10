@@ -57,7 +57,7 @@ struct WellnessSceneRenderer: View {
             if !sceneIsActionable {
                 Text(
                     verbatim:
-                        "마지막 분석 \(scene.generatedAt.formatted(date: .abbreviated, time: .shortened))"
+                        "마지막 분석 \(WellnessDateFormat.abbreviatedDateTime(scene.generatedAt, timeZone: sceneTimeZone))"
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -77,6 +77,10 @@ struct WellnessSceneRenderer: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(severityColor.opacity(0.22))
         }
+    }
+
+    private var sceneTimeZone: TimeZone {
+        TimeZone(identifier: scene.timezone) ?? .autoupdatingCurrent
     }
 
     private var sceneIsActionable: Bool {

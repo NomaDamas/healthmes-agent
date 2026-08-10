@@ -908,12 +908,12 @@ def test_dashboard_links_preserve_reverse_proxy_base_path(settings) -> None:
         response = client.get("/dashboard")
 
     assert response.status_code == 200
-    assert 'href="/healthmes/dashboard#today"' in response.text
-    assert 'href="/healthmes/dashboard/plan#plan"' in response.text
-    assert 'href="/healthmes/dashboard/history#history"' in response.text
-    assert 'href="/healthmes/connect"' in response.text
-    assert 'href="/healthmes/sleep"' in response.text
-    assert 'href="/healthmes/storage"' in response.text
+    assert 'href="https://example.test/healthmes/dashboard#today"' in response.text
+    assert 'href="https://example.test/healthmes/dashboard/plan#plan"' in response.text
+    assert 'href="https://example.test/healthmes/dashboard/history#history"' in response.text
+    assert 'href="https://example.test/healthmes/connect"' in response.text
+    assert 'href="https://example.test/healthmes/sleep"' in response.text
+    assert 'href="https://example.test/healthmes/storage"' in response.text
 
 
 def test_unlock_form_preserves_reverse_proxy_base_path(settings) -> None:
@@ -927,7 +927,7 @@ def test_unlock_form_preserves_reverse_proxy_base_path(settings) -> None:
         response = client.get("/dashboard")
 
     assert response.status_code == 401
-    assert 'action="/healthmes/unlock"' in response.text
+    assert 'action="https://example.test/healthmes/unlock"' in response.text
 
 
 def test_authenticated_dashboard_decision_links_are_read_only(settings) -> None:

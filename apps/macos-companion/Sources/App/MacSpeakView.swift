@@ -148,7 +148,7 @@ struct MacSpeakView: View {
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
 
-            if nutritionInteraction != nil {
+            if nutritionObservation != nil || nutritionInteraction != nil {
                 nutritionReview
             } else {
                 if let typedIntent {
@@ -342,6 +342,7 @@ struct MacSpeakView: View {
         .disabled(
             isNutritionBusy
                 || speech.capturedAudio == nil
+                || nutritionObservation != nil
                 || nutritionInteraction != nil
         )
         .help(
@@ -449,14 +450,12 @@ struct MacSpeakView: View {
                     guard let observation = draft.observation else {
                         throw HealthMesAPIError.httpStatus(422)
                     }
-                    draft.interaction = try await api.createPhotoIntake(
-                        PhotoIntakeInteractionBody(
-                            operationID: draft.interactionOperationID,
-                            source: draft.source,
-                            sourceText: normalized.isEmpty ? nil : normalized,
-                            nutritionObservationID: observation.observationID
+                    nutritionObservation = observation
+                    nutritionCorrections = observation.items.map {
+                        NutritionItemCorrectionDraft(
+                            item: $0.reviewCandidate
                         )
-                    )
+                    }
                 case .voice:
                     guard let mediaPath = draft.uploadedMediaPath else {
                         throw HealthMesAPIError.httpStatus(422)
@@ -492,9 +491,11 @@ struct MacSpeakView: View {
 
             nutritionObservation = draft.observation
             nutritionInteraction = draft.interaction
-            nutritionCorrections = draft.interaction?.resolvedItems.map {
-                NutritionItemCorrectionDraft(item: $0)
-            } ?? []
+            if draft.modality != .photo {
+                nutritionCorrections = draft.interaction?.resolvedItems.map {
+                    NutritionItemCorrectionDraft(item: $0)
+                } ?? []
+            }
             nutritionPhase = .reviewing
         } catch {
             nutritionDraft = draft
@@ -536,11 +537,8 @@ struct MacSpeakView: View {
     }
 
     private func resolveNutrition(_ status: IntakeOutcomeStatus) async {
-        guard var draft = nutritionDraft,
-            let interaction = draft.interaction
-        else {
-            return
-        }
+        guard !isNutritionBusy else { return }
+        guard var draft = nutritionDraft else { return }
         if status == .consumed,
             nutritionCorrections.contains(where: { !$0.isValid })
         {
@@ -552,7 +550,114 @@ struct MacSpeakView: View {
         let correctedItems = nutritionCorrections.contains(where: \.isChanged)
             ? nutritionCorrections.compactMap(\.correctedItem)
             : nil
-        let submittedItems = status == .consumed ? correctedItems : nil
+        if draft.modality == .photo {
+            guard let observation = draft.observation else { return }
+            if status == .cancelled, draft.review != nil {
+                nutritionOutcomeError =
+                    "The photo review is already saved. Record whether it was consumed instead."
+                return
+            }
+            let reviewStatus: NutritionReviewStatus
+            let reviewItems: [ReviewedNutritionItemBody]
+            switch status {
+            case .cancelled:
+                reviewStatus = .rejected
+                reviewItems = []
+            case .notConsumed:
+                reviewStatus = .confirmed
+                reviewItems = []
+            case .consumed:
+                if correctedItems != nil {
+                    let reviewedItems = nutritionCorrections.compactMap(\.reviewedItem)
+                    guard
+                        reviewedItems.count == nutritionCorrections.count,
+                        reviewedItems.allSatisfy({ !$0.nutrients.isEmpty })
+                    else {
+                        nutritionOutcomeError =
+                            "Keep every analyzed photo item and its nutrient evidence before recording it."
+                        return
+                    }
+                    reviewStatus = .corrected
+                    reviewItems = reviewedItems.enumerated().map {
+                        ReviewedNutritionItemBody(
+                            itemIndex: $0.offset,
+                            item: $0.element
+                        )
+                    }
+                } else {
+                    reviewStatus = .confirmed
+                    reviewItems = []
+                }
+            }
+
+            if draft.review == nil {
+                let pendingReview = draft.nutritionReview(
+                    status: reviewStatus,
+                    items: reviewItems
+                )
+                nutritionDraft = draft
+                nutritionOutcomeError = nil
+                nutritionPhase = .resolving(status)
+                do {
+                    draft.review = try await HealthMesAPI()
+                        .reviewNutritionObservation(
+                            observationID: observation.observationID,
+                            body: NutritionObservationReviewBody(
+                                operationID: pendingReview.operationID,
+                                status: pendingReview.status,
+                                source: "mac-app",
+                                items: pendingReview.items
+                            )
+                        )
+                    nutritionDraft = draft
+                } catch {
+                    nutritionDraft = draft
+                    nutritionPhase = .reviewing
+                    nutritionOutcomeError = describe(error)
+                    return
+                }
+            }
+
+            if status == .cancelled {
+                intakeMessage = "Capture cancelled."
+                commandText = ""
+                mealPhoto = nil
+                speech.reset()
+                resetNutritionDraft(keepMessage: true)
+                return
+            }
+
+            if draft.interaction == nil {
+                do {
+                    let sourceText = commandText.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    )
+                    draft.interaction = try await HealthMesAPI()
+                        .createPhotoIntake(
+                            PhotoIntakeInteractionBody(
+                                operationID: draft.interactionOperationID,
+                                source: draft.source,
+                                sourceText: sourceText.isEmpty
+                                    ? nil
+                                    : sourceText,
+                                nutritionObservationID: observation.observationID
+                            )
+                        )
+                    nutritionDraft = draft
+                    nutritionInteraction = draft.interaction
+                } catch {
+                    nutritionDraft = draft
+                    nutritionPhase = .reviewing
+                    nutritionOutcomeError = describe(error)
+                    return
+                }
+            }
+        }
+        guard let interaction = draft.interaction else { return }
+        let submittedItems =
+            status == .consumed && draft.modality != .photo
+            ? correctedItems
+            : nil
         let pending = draft.outcome(
             for: status,
             correctedItems: submittedItems,
@@ -609,21 +714,22 @@ struct MacSpeakView: View {
                 }
             }
 
-            if let interaction = nutritionInteraction {
-                if interaction.resolvedItems.isEmpty {
-                    Label(
-                        "No specific item was identified. Choose an outcome only if this capture still represents what happened.",
-                        systemImage: "questionmark.circle"
-                    )
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                } else {
-                    ForEach(nutritionCorrections.indices, id: \.self) { index in
-                        macCorrectionEditor(index)
-                    }
+            if nutritionCorrections.isEmpty {
+                Label(
+                    "No specific item was identified. Choose an outcome only if this capture still represents what happened.",
+                    systemImage: "questionmark.circle"
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            } else {
+                ForEach(nutritionCorrections.indices, id: \.self) { index in
+                    macCorrectionEditor(index)
                 }
+            }
+
+            if nutritionObservation != nil || nutritionInteraction != nil {
                 let warnings = (nutritionObservation?.warnings ?? [])
-                    + interaction.warnings
+                    + (nutritionInteraction?.warnings ?? [])
                 if !warnings.isEmpty {
                     VStack(alignment: .leading, spacing: 3) {
                         ForEach(
@@ -745,8 +851,10 @@ struct MacSpeakView: View {
                 TextField("Food or drink", text: correction.name)
                     .textFieldStyle(.roundedBorder)
                     .disabled(correction.wrappedValue.isExcluded)
-                Toggle("Exclude", isOn: correction.isExcluded)
-                    .toggleStyle(.button)
+                if nutritionObservation == nil {
+                    Toggle("Exclude", isOn: correction.isExcluded)
+                        .toggleStyle(.button)
+                }
             }
             HStack {
                 TextField("Amount", text: correction.exactAmount)
@@ -775,6 +883,10 @@ struct MacSpeakView: View {
         .background(
             MacHealthMesStyle.canvas,
             in: RoundedRectangle(cornerRadius: 12)
+        )
+        .disabled(
+            nutritionDraft?.modality == .photo
+                && nutritionDraft?.review != nil
         )
     }
 

@@ -23,9 +23,9 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
-from healthmes.config import Settings
+from healthmes.config import Settings, is_loopback_host
 
 PAIRING_GRANT_TTL_SECONDS = 300
 _PAIRING_CONTEXT = b"healthmes-pairing-v1:"
@@ -49,11 +49,25 @@ class PairingGrant:
     expires_at: int
 
 
+def is_remote_pairing_ready(settings: Settings) -> bool:
+    """Whether another physical device can safely reach this instance."""
+    api_token = settings.api_token.get_secret_value().strip()
+    public_url = urlsplit(settings.public_base_url)
+    hostname = public_url.hostname
+    return bool(
+        api_token
+        and public_url.scheme == "https"
+        and hostname
+        and not is_loopback_host(hostname)
+    )
+
+
 def issue_pairing_grant(
     settings: Settings,
     *,
     now: int | None = None,
     ttl_seconds: int = PAIRING_GRANT_TTL_SECONDS,
+    require_remote: bool = False,
 ) -> PairingGrant:
     """Create one signed, expiring, one-time pairing deep link."""
     api_token = settings.api_token.get_secret_value().strip()
@@ -61,6 +75,11 @@ def issue_pairing_grant(
         raise PairingGrantError(
             "pairing requires HEALTHMES_API_TOKEN; token-less loopback instances "
             "cannot be paired to another device"
+        )
+    if require_remote and not is_remote_pairing_ready(settings):
+        raise PairingGrantError(
+            "pairing requires a non-loopback HTTPS HEALTHMES_PUBLIC_BASE_URL "
+            "that the phone or watch can reach"
         )
     issued_at = int(time.time() if now is None else now)
     expires_at = issued_at + ttl_seconds

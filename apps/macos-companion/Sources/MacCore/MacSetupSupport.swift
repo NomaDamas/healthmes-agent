@@ -29,9 +29,24 @@ struct MacSetupEvent: Decodable, Equatable, Identifiable {
 }
 
 enum MacSetupSupport {
+    static let defaultRuntimeRevision =
+        "4f6bf8f3561a24c152f4d7bd2217b367e2ed6204"
     static let officialRepositoryURL = URL(
         string: "https://github.com/NomaDamas/healthmes-agent.git"
     )!
+
+    static func runtimeRevision(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundleValue: String? = Bundle.main.object(
+            forInfoDictionaryKey: "HealthMesRuntimeRevision"
+        ) as? String
+    ) -> String {
+        let candidate = environment["HEALTHMES_RUNTIME_REVISION"]
+            ?? bundleValue
+            ?? defaultRuntimeRevision
+        let normalized = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? defaultRuntimeRevision : normalized
+    }
 
     static func decodeEvents(_ output: String) -> [MacSetupEvent] {
         output.split(whereSeparator: \.isNewline).compactMap { line in
@@ -98,5 +113,22 @@ enum MacSetupSupport {
     ) -> Bool {
         guard let expiresAt else { return false }
         return now > expiresAt
+    }
+
+    static func readinessEvents(
+        _ readiness: SetupReadiness,
+        action: String = "verify"
+    ) -> [MacSetupEvent] {
+        readiness.checks.map { check in
+            MacSetupEvent(
+                schema: "healthmes.setup.v1",
+                action: action,
+                step: "readiness_\(check.key)",
+                state: check.state == .ready ? "ready" : "action_required",
+                message: check.label,
+                detail: check.detail,
+                expiresAt: nil
+            )
+        }
     }
 }

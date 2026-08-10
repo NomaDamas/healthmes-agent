@@ -12,6 +12,7 @@ Never hardcode docker service hostnames here.
 import datetime
 import ipaddress
 import logging
+import socket
 import zoneinfo
 from functools import lru_cache
 from pathlib import Path
@@ -489,9 +490,19 @@ def is_loopback_host(host: str) -> bool:
     Non-IP hostnames other than ``localhost`` count as non-loopback — the
     safe direction for the serve-time auth interlock.
     """
-    if host == "localhost":
+    normalized = host.strip().lower().removesuffix(".")
+    if normalized == "localhost":
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        return ipaddress.ip_address(normalized).is_loopback
     except ValueError:
+        pass
+    # URL stacks still accept historical IPv4 spellings such as 127.1 and
+    # 2130706433. Normalize them before applying the remote-pairing boundary.
+    if not normalized or any(character not in "0123456789." for character in normalized):
         return False
+    try:
+        packed = socket.inet_aton(normalized)
+    except OSError:
+        return False
+    return ipaddress.IPv4Address(packed).is_loopback

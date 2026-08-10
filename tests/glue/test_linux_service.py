@@ -23,6 +23,11 @@ def test_linux_service_is_persistent_and_preserves_data_on_uninstall() -> None:
     assert "WantedBy=default.target" in unit
     assert "DOCKER_READY_ATTEMPTS" in script
     assert "wait_for_docker" in script
+    assert '"$DOCKER_BIN" compose "${COMPOSE_FILES[@]}" config' in script
+    assert "systemd_quote" in script
+    assert "sed_replacement" in script
+    assert 'git -C "$REPO_ROOT" pull --ff-only' in script
+    assert "bootstrap_runtime" in script
 
 
 def test_compose_services_restart_after_host_reboot() -> None:

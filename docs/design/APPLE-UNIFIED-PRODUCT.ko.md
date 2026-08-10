@@ -68,7 +68,7 @@ Yes/No를 실행하거나, 캘린더를 변경하지 않는다. 음성·텍스�
 top-level 제품 구조에서 폐기한다.
 
 ```text
-Today / Plan / Decisions / Speak / Settings
+하나의 Wellness Canvas / 고정 Voice+Text Dock / Settings+Advanced
 ```
 
 문제점:

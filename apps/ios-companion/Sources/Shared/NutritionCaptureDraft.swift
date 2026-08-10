@@ -14,6 +14,12 @@ public struct PendingIntakeOutcome: Equatable {
     public let note: String?
 }
 
+public struct PendingNutritionReview: Equatable {
+    public let operationID: UUID
+    public let status: NutritionReviewStatus
+    public let items: [ReviewedNutritionItemBody]
+}
+
 public struct NutritionItemCorrectionDraft: Equatable, Identifiable {
     public let id: UUID
     public let original: IntakeItemResult
@@ -101,6 +107,31 @@ public struct NutritionItemCorrectionDraft: Equatable, Identifiable {
         )
     }
 
+    /// Complete photo-review value. The review API requires every analyzed
+    /// nutrient to remain present even when the user corrects the visible
+    /// name or serving; downstream normalization keeps those estimates
+    /// distinct from the user-edited serving.
+    public var reviewedItem: IntakeItemResult? {
+        guard !isExcluded, isValid else { return nil }
+        let normalizedName = name.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard
+            !normalizedName.isEmpty,
+            let serving = correctedServing
+        else {
+            return nil
+        }
+        return IntakeItemResult(
+            name: normalizedName,
+            intakeType: original.intakeType,
+            serving: serving,
+            nutrients: original.nutrients,
+            confidence: original.confidence,
+            warnings: original.warnings
+        )
+    }
+
     private var originalExactAmount: String {
         original.serving.exact.map {
             $0.rounded() == $0 ? String(Int($0)) : String($0)
@@ -157,6 +188,8 @@ public struct NutritionCaptureDraft: Equatable {
     public let source: String
     public var uploadedMediaPath: String?
     public var observation: NutritionObservationResult?
+    public var review: NutritionObservationReviewResult?
+    public var pendingReview: PendingNutritionReview?
     public var interaction: IntakeInteractionResult?
     public var pendingOutcome: PendingIntakeOutcome?
 
@@ -174,8 +207,29 @@ public struct NutritionCaptureDraft: Equatable {
         self.source = source
         self.uploadedMediaPath = nil
         self.observation = nil
+        self.review = nil
+        self.pendingReview = nil
         self.interaction = nil
         self.pendingOutcome = nil
+    }
+
+    public mutating func nutritionReview(
+        status: NutritionReviewStatus,
+        items: [ReviewedNutritionItemBody]
+    ) -> PendingNutritionReview {
+        if let pendingReview,
+            pendingReview.status == status,
+            pendingReview.items == items
+        {
+            return pendingReview
+        }
+        let pending = PendingNutritionReview(
+            operationID: UUID(),
+            status: status,
+            items: items
+        )
+        pendingReview = pending
+        return pending
     }
 
     /// Reuses the exact same operation ID and action timestamp when the same

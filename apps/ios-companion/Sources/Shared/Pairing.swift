@@ -32,7 +32,10 @@ public struct PairingCacheIdentity: Codable, Equatable {
 // entitlement is actually present.
 
 public enum AppGroup {
-    public static let identifier = "group.com.healthmes.companion"
+    public static var identifier: String {
+        Bundle.main.object(forInfoDictionaryKey: "HealthMesAppGroupIdentifier") as? String
+            ?? "group.com.healthmes.companion"
+    }
     public static var keychainIdentifier: String {
         Bundle.main.object(forInfoDictionaryKey: "HealthMesKeychainAccessGroup") as? String
             ?? identifier

@@ -243,7 +243,7 @@ def test_storage_nav_preserves_reverse_proxy_base_path(settings) -> None:
         response = client.get("/storage")
 
     assert response.status_code == 200
-    assert 'href="/healthmes/storage"' in response.text
+    assert 'href="https://example.test/healthmes/storage"' in response.text
     assert 'action="/storage/policy"' not in response.text
 
 

@@ -26,7 +26,6 @@ struct WellnessControlView: View {
     @State private var sceneOperationGate = PairingOperationGate()
     @State private var resolutionOperationGate = PairingOperationGate()
     @State private var resolvingSceneProposalID: UUID?
-    @State private var questionExpanded = false
     @State private var lastFocusRequest = 0
     @State private var lastHomeRequest = 0
     @FocusState private var commandFocused: Bool
@@ -79,7 +78,6 @@ struct WellnessControlView: View {
         .onReceive(router.$commandFocusRequest) { request in
             guard request > lastFocusRequest else { return }
             lastFocusRequest = request
-            questionExpanded = true
             commandFocused = true
         }
         .onReceive(router.$homeRequest) { request in
@@ -108,21 +106,44 @@ struct WellnessControlView: View {
     }
 
     private var statusRail: some View {
-        HStack(spacing: 8) {
-            statusPill(
-                title: energyStatus,
-                systemImage: "waveform.path.ecg",
-                color: briefing.isStale ? .orange : moss
-            )
-            statusPill(
-                title: calendarStatus,
-                systemImage: "calendar.badge.clock",
-                color: plan.events.isEmpty ? .secondary : moss
-            )
-            Spacer(minLength: 0)
-            Text(Date(), format: .dateTime.month(.abbreviated).day())
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                statusPill(
+                    title: energyStatus,
+                    systemImage: "waveform.path.ecg",
+                    color: briefing.isStale ? .orange : moss
+                )
+                statusPill(
+                    title: calendarStatus,
+                    systemImage: "calendar.badge.clock",
+                    color: plan.events.isEmpty ? .secondary : moss
+                )
+                Spacer(minLength: 0)
+                Text(Date(), format: .dateTime.month(.abbreviated).day())
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 6) {
+                ForEach(WellnessLens.allCases) { target in
+                    Button {
+                        selectDetail(target)
+                    } label: {
+                        Label(target.title, systemImage: detailIcon(for: target))
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 7)
+                    .foregroundStyle(lens == target ? Color.white : Color.primary)
+                    .background(
+                        lens == target ? moss : Color.primary.opacity(0.06),
+                        in: Capsule()
+                    )
+                    .accessibilityAddTraits(lens == target ? .isSelected : [])
+                }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
@@ -189,7 +210,7 @@ struct WellnessControlView: View {
                     if briefing.isStale, let snapshot = briefing.snapshot {
                         Text(
                             verbatim:
-                                "마지막 동기화 \(snapshot.fetchedAt.formatted(date: .abbreviated, time: .shortened))"
+                                "마지막 동기화 \(WellnessDateFormat.abbreviatedDateTime(snapshot.fetchedAt, timeZone: displayTimeZone))"
                         )
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -442,96 +463,81 @@ struct WellnessControlView: View {
 
     private var quickActionDock: some View {
         VStack(spacing: 8) {
-            if questionExpanded {
-                VStack(spacing: 8) {
-                    if command.isListening {
-                        HStack(spacing: 8) {
-                            Circle().fill(.red).frame(width: 7, height: 7)
-                            Text("듣고 있습니다. 보내기 전에 내용을 확인하세요.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                    }
-                    HStack(alignment: .bottom, spacing: 8) {
-                        Button {
-                            Task { await command.toggleListening() }
-                        } label: {
-                            Image(systemName: command.isListening ? "stop.fill" : "waveform")
-                                .frame(width: 40, height: 40)
-                                .foregroundStyle(command.isListening ? .white : moss)
-                                .background(
-                                    command.isListening ? Color.red : Color.primary.opacity(0.07),
-                                    in: Circle()
-                                )
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(
-                            Text(command.isListening ? "듣기 중지" : "음성으로 질문")
-                        )
-
-                        TextField(
-                            "오늘 일정에서 무엇을 바꿔야 해?",
-                            text: $command.transcript,
-                            axis: .vertical
-                        )
-                        .lineLimit(1...3)
-                        .focused($commandFocused)
-                        .accessibilityIdentifier("healthmes-command-input")
-                        .textFieldStyle(.plain)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .background(
-                            Color.primary.opacity(0.06),
-                            in: RoundedRectangle(cornerRadius: 16)
-                        )
-                        .submitLabel(.send)
-                        .onSubmit(submitCommand)
-
-                        Button(action: submitCommand) {
-                            Image(systemName: "arrow.up")
-                                .font(.body.bold())
-                                .foregroundStyle(.white)
-                                .frame(width: 40, height: 40)
-                                .background(moss, in: Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(
-                            command.transcript
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
-                                .isEmpty
-                        )
-                        .accessibilityLabel(Text("질문 보내기"))
-                    }
+            if command.isListening {
+                HStack(spacing: 8) {
+                    Circle().fill(.red).frame(width: 7, height: 7)
+                    Text("듣고 있습니다. 보내기 전에 내용을 확인하세요.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
                 }
-                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
-            HStack(spacing: 10) {
+            HStack(alignment: .bottom, spacing: 8) {
+                Button {
+                    Task { await command.toggleListening() }
+                } label: {
+                    Image(systemName: command.isListening ? "stop.fill" : "waveform")
+                        .frame(width: 40, height: 40)
+                        .foregroundStyle(command.isListening ? .white : moss)
+                        .background(
+                            command.isListening ? Color.red : Color.primary.opacity(0.07),
+                            in: Circle()
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    Text(command.isListening ? "듣기 중지" : "음성으로 질문")
+                )
+
+                TextField(
+                    "오늘 일정에서 무엇을 바꿔야 해?",
+                    text: $command.transcript,
+                    axis: .vertical
+                )
+                .lineLimit(1...3)
+                .focused($commandFocused)
+                .accessibilityIdentifier("healthmes-command-input")
+                .textFieldStyle(.plain)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    Color.primary.opacity(0.06),
+                    in: RoundedRectangle(cornerRadius: 16)
+                )
+                .submitLabel(.send)
+                .onSubmit(submitCommand)
+
+                Button(action: submitCommand) {
+                    Image(systemName: "arrow.up")
+                        .font(.body.bold())
+                        .foregroundStyle(.white)
+                        .frame(width: 40, height: 40)
+                        .background(moss, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(
+                    command.transcript
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .isEmpty
+                )
+                .accessibilityLabel(Text("질문 보내기"))
+            }
+
+            HStack {
                 Button {
                     router.modal = .capture
                 } label: {
-                    Label("식사 기록", systemImage: "camera.fill")
-                        .frame(maxWidth: .infinity)
+                    Label("식사 사진", systemImage: "camera.fill")
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.borderless)
 
-                Button {
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        questionExpanded.toggle()
-                    }
-                    if questionExpanded {
-                        commandFocused = true
-                    }
-                } label: {
-                    Label(
-                        questionExpanded ? "질문 닫기" : "질문하기",
-                        systemImage: questionExpanded ? "xmark" : "waveform"
-                    )
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(moss)
+                Spacer()
+
+                Text("대화 기록 대신 판단 화면으로 바뀝니다.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
         }
         .padding(.horizontal, 12)
@@ -662,7 +668,9 @@ struct WellnessControlView: View {
     }
 
     private func selectDetail(_ target: WellnessLens, clearMessage: Bool = true) {
-        invalidateGeneratedScene()
+        if generatedScene?.lens != target {
+            invalidateGeneratedScene()
+        }
         withAnimation(.easeOut(duration: 0.18)) {
             lens = target
             if clearMessage {

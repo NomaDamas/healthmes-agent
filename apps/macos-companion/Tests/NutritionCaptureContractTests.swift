@@ -70,6 +70,20 @@ final class NutritionCaptureContractTests: XCTestCase {
         XCTAssertEqual(first, retry)
     }
 
+    func testDraftReusesPhotoReviewIdentity() {
+        var draft = NutritionCaptureDraft(
+            modality: .photo,
+            source: "mac-app-photo"
+        )
+
+        let first = draft.nutritionReview(status: .confirmed, items: [])
+        let retry = draft.nutritionReview(status: .confirmed, items: [])
+        let changed = draft.nutritionReview(status: .rejected, items: [])
+
+        XCTAssertEqual(first, retry)
+        XCTAssertNotEqual(first.operationID, changed.operationID)
+    }
+
     func testDraftChangesOutcomeIdentityWhenCorrectionsChange() {
         let original = IntakeItemResult(
             name: "bibimbap",

@@ -7,6 +7,8 @@ final class MacSetupCoordinator: ObservableObject {
     @Published private(set) var failure: String?
     @Published private(set) var phonePairingURL: URL?
     @Published private(set) var phonePairingExpiresAt: Date?
+    @Published private(set) var requiresDeveloperTools = false
+    @Published private(set) var requiresHomebrew = false
 
     func install(glanceStore: GlanceStore) async {
         await run(.install, glanceStore: glanceStore)
@@ -26,21 +28,33 @@ final class MacSetupCoordinator: ObservableObject {
         failure = nil
         defer { isRunning = false }
         do {
-            let readiness = try await HealthMesAPI().setupReadiness()
-            events = [
-                MacSetupEvent(
-                    schema: "healthmes.setup.v1",
-                    action: "verify",
-                    step: "readiness",
-                    state: readiness.overall == .ready
-                        ? "ready" : "action_required",
-                    message: readiness.overall == .ready
-                        ? "All connected services are ready."
-                        : "Setup is connected; some services still need attention.",
-                    detail: nil,
-                    expiresAt: nil
-                )
-            ]
+            events = try await readinessEvents()
+        } catch {
+            failure = error.localizedDescription
+        }
+    }
+
+    func requestDeveloperToolsInstallation() async {
+        guard !isRunning else { return }
+        isRunning = true
+        failure = nil
+        defer { isRunning = false }
+        do {
+            let result = try await Self.execute(
+                executable: URL(fileURLWithPath: "/usr/bin/xcode-select"),
+                arguments: ["--install"],
+                currentDirectory: URL(fileURLWithPath: "/")
+            )
+            if result.status == 0 {
+                failure = "Complete Apple's installation, then select Set up this Mac again."
+            } else {
+                let detail = result.output
+                    .split(whereSeparator: \.isNewline)
+                    .last
+                    .map(String.init)
+                failure = detail
+                    ?? "Apple Developer Tools could not be requested automatically."
+            }
         } catch {
             failure = error.localizedDescription
         }
@@ -59,6 +73,8 @@ final class MacSetupCoordinator: ObservableObject {
         guard !isRunning else { return }
         isRunning = true
         failure = nil
+        requiresDeveloperTools = false
+        requiresHomebrew = false
         events = []
         if action == .install || action == .pair {
             phonePairingURL = nil
@@ -67,18 +83,26 @@ final class MacSetupCoordinator: ObservableObject {
         defer { isRunning = false }
 
         do {
+            let python = try Self.pythonExecutable()
             let root = try await Self.ensureRepository()
             let script = root.appendingPathComponent("scripts/healthmes_setup.py")
             let result = try await Self.execute(
-                executable: try Self.pythonExecutable(),
+                executable: python,
                 arguments: [
                     script.path,
                     action.rawValue,
                     "--json",
                 ],
-                currentDirectory: root
+                currentDirectory: root,
+                environment: Self.managedRuntimeEnvironment()
             )
             events = MacSetupSupport.decodeEvents(result.output)
+            requiresDeveloperTools = events.contains {
+                $0.step == "tool_python3" && $0.isFailure
+            }
+            requiresHomebrew = events.contains {
+                $0.step == "tool_brew" && $0.isFailure
+            }
             if result.status != 0 {
                 failure = events.last(where: \.isFailure)?.detail
                     ?? events.last(where: \.isFailure)?.message
@@ -87,19 +111,26 @@ final class MacSetupCoordinator: ObservableObject {
             }
             if action == .install {
                 try await completePairing(glanceStore: glanceStore)
+                events.append(contentsOf: try await readinessEvents())
             } else if action == .pair {
                 updatePhonePairing()
             }
+        } catch SetupError.pythonMissing {
+            requiresDeveloperTools = true
+            failure = SetupError.pythonMissing.localizedDescription
         } catch {
             failure = error.localizedDescription
         }
     }
 
     private static func ensureRepository() async throws -> URL {
+        let destination = MacSetupSupport.managedRepositoryRoot()
         if let existing = MacSetupSupport.repositoryRoot() {
+            if existing.standardizedFileURL == destination.standardizedFileURL {
+                try await checkoutRuntimeRevision(in: existing)
+            }
             return existing
         }
-        let destination = MacSetupSupport.managedRepositoryRoot()
         let fileManager = FileManager.default
         let parent = destination.deletingLastPathComponent()
         try fileManager.createDirectory(
@@ -114,30 +145,64 @@ final class MacSetupCoordinator: ObservableObject {
             isDirectory: true
         )
         defer { try? fileManager.removeItem(at: temporary) }
-        let result = try await execute(
+        let clone = try await execute(
             executable: URL(fileURLWithPath: "/usr/bin/git"),
             arguments: [
                 "clone",
-                "--depth",
-                "1",
-                "--branch",
-                "main",
-                "--single-branch",
+                "--filter=blob:none",
+                "--no-checkout",
                 MacSetupSupport.officialRepositoryURL.absoluteString,
                 temporary.path,
             ],
             currentDirectory: parent
         )
-        guard result.status == 0 else {
+        guard clone.status == 0 else {
             throw SetupError.cloneFailed(
-                result.output.split(whereSeparator: \.isNewline).last.map(String.init)
+                clone.output.split(whereSeparator: \.isNewline).last.map(String.init)
             )
         }
+        try await checkoutRuntimeRevision(in: temporary)
         guard MacSetupSupport.repositoryRoot(currentDirectory: temporary) != nil else {
             throw SetupError.invalidManagedCheckout(temporary)
         }
         try fileManager.moveItem(at: temporary, to: destination)
         return destination
+    }
+
+    private static func checkoutRuntimeRevision(in repository: URL) async throws {
+        let revision = MacSetupSupport.runtimeRevision()
+        let current = try await execute(
+            executable: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: ["rev-parse", "HEAD"],
+            currentDirectory: repository
+        )
+        if current.status == 0,
+            current.output.trimmingCharacters(in: .whitespacesAndNewlines) == revision
+        {
+            return
+        }
+        let fetch = try await execute(
+            executable: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: [
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                revision,
+            ],
+            currentDirectory: repository
+        )
+        guard fetch.status == 0 else {
+            throw SetupError.revisionUnavailable(revision)
+        }
+        let checkout = try await execute(
+            executable: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: ["checkout", "--detach", "FETCH_HEAD"],
+            currentDirectory: repository
+        )
+        guard checkout.status == 0 else {
+            throw SetupError.revisionUnavailable(revision)
+        }
     }
 
     private static func pythonExecutable(
@@ -187,10 +252,16 @@ final class MacSetupCoordinator: ObservableObject {
         }
     }
 
+    private func readinessEvents() async throws -> [MacSetupEvent] {
+        let readiness = try await HealthMesAPI().setupReadiness()
+        return MacSetupSupport.readinessEvents(readiness)
+    }
+
     private static func execute(
         executable: URL,
         arguments: [String],
-        currentDirectory: URL
+        currentDirectory: URL,
+        environment: [String: String]? = nil
     ) async throws -> (status: Int32, output: String) {
         try await Task.detached(priority: .userInitiated) {
             let process = Process()
@@ -198,6 +269,7 @@ final class MacSetupCoordinator: ObservableObject {
             process.executableURL = executable
             process.arguments = arguments
             process.currentDirectoryURL = currentDirectory
+            process.environment = environment
             process.standardOutput = output
             process.standardError = output
             try process.run()
@@ -209,11 +281,18 @@ final class MacSetupCoordinator: ObservableObject {
             )
         }.value
     }
+
+    private static func managedRuntimeEnvironment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        environment["HEALTHMES_MANAGED_RUNTIME"] = "1"
+        return environment
+    }
 }
 
 private enum SetupError: LocalizedError {
     case missingPairingGrant
     case cloneFailed(String?)
+    case revisionUnavailable(String)
     case invalidManagedCheckout(URL)
     case pythonMissing
 
@@ -224,10 +303,12 @@ private enum SetupError: LocalizedError {
         case .cloneFailed(let detail):
             return detail.map { "Could not download HealthMes: \($0)" }
                 ?? "Could not download HealthMes."
+        case .revisionUnavailable(let revision):
+            return "Could not download the compatible HealthMes runtime revision \(revision)."
         case .invalidManagedCheckout(let url):
             return "The managed HealthMes runtime is incomplete at \(url.path)."
         case .pythonMissing:
-            return "Python 3 is required. Install it with Homebrew, then try again."
+            return "Apple Developer Tools are required once before HealthMes can install its local runtime."
         }
     }
 }

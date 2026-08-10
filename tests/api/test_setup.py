@@ -95,6 +95,7 @@ def test_readiness_reports_real_healthkit_scheduler_and_https_state(
     session.commit()
     client.app.state.settings = settings.model_copy(
         update={
+            "api_token": SecretStr(TOKEN),
             "scheduler_enabled": True,
             "native_alert_delivery": True,
             "public_base_url": "https://healthmes.example",
@@ -108,6 +109,36 @@ def test_readiness_reports_real_healthkit_scheduler_and_https_state(
     assert checks["scheduler"]["state"] == "ready"
     assert checks["notifications"]["state"] == "ready"
     assert checks["public_https"]["state"] == "ready"
+
+
+def test_readiness_rejects_https_loopback_for_phone_and_watch(
+    client,
+    settings,
+):
+    for public_base_url in (
+        "https://localhost:8100",
+        "https://127.0.0.1:8100",
+        "https://127.1:8100",
+        "https://127.0.1:8100",
+        "https://2130706433:8100",
+    ):
+        client.app.state.settings = settings.model_copy(
+            update={
+                "api_token": SecretStr(TOKEN),
+                "public_base_url": public_base_url,
+            }
+        )
+
+        checks = {
+            row["key"]: row
+            for row in client.get(
+                "/v1/setup/readiness",
+                headers=bearer(),
+            ).json()["checks"]
+        }
+
+        assert checks["public_https"]["state"] == "action_required"
+        assert "non-loopback HTTPS URL" in checks["public_https"]["detail"]
 
 
 def test_readiness_requires_bearer_and_reports_components(settings, tmp_path):

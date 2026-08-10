@@ -290,6 +290,19 @@ public final class HealthMesAPI {
         )
     }
 
+    public static func nutritionObservationReviewRequest(
+        pairing: Pairing,
+        observationID: UUID,
+        body: NutritionObservationReviewBody
+    ) throws -> URLRequest {
+        try jsonRequest(
+            pairing: pairing,
+            path:
+                "v1/nutrition-observations/\(observationID.uuidString.lowercased())/review",
+            body: body
+        )
+    }
+
     public static func intakeAnalysisRequest(
         pairing: Pairing,
         body: IntakeInteractionAnalysisBody
@@ -517,9 +530,16 @@ public final class HealthMesAPI {
     public func uploadHealthKit(
         _ payload: HealthKitIngestPayload
     ) async throws -> HealthKitIngestAck {
+        try await uploadHealthKit(payload, pairing: try pairing())
+    }
+
+    public func uploadHealthKit(
+        _ payload: HealthKitIngestPayload,
+        pairing: Pairing
+    ) async throws -> HealthKitIngestAck {
         try await perform(
             Self.healthKitUploadRequest(
-                pairing: try pairing(),
+                pairing: pairing,
                 payload: payload
             ),
             expecting: HealthKitIngestAck.self
@@ -677,6 +697,20 @@ public final class HealthMesAPI {
                 body: body
             ),
             expecting: NutritionObservationResult.self
+        )
+    }
+
+    public func reviewNutritionObservation(
+        observationID: UUID,
+        body: NutritionObservationReviewBody
+    ) async throws -> NutritionObservationReviewResult {
+        try await perform(
+            Self.nutritionObservationReviewRequest(
+                pairing: try pairing(),
+                observationID: observationID,
+                body: body
+            ),
+            expecting: NutritionObservationReviewResult.self
         )
     }
 
