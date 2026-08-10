@@ -450,6 +450,25 @@ public struct WellnessScene: Codable, Equatable, Identifiable {
         freshness == .current && confidence.level != .insufficientData
     }
 
+    public func allowsProposalActions(for proposalID: UUID) -> Bool {
+        guard allowsProposalActions, exactProposalPreview(for: proposalID) != nil else {
+            return false
+        }
+        let proposalActions = actions.filter { action in
+            switch action.kind {
+            case .acceptProposal, .declineProposal, .modifyProposal:
+                return action.proposalID == proposalID
+            default:
+                return false
+            }
+        }
+        guard proposalActions.allSatisfy({ $0.proposalID == proposalID }) else {
+            return false
+        }
+        return proposalActions.contains { $0.kind == .acceptProposal }
+            && proposalActions.contains { $0.kind == .declineProposal }
+    }
+
     public func exactProposalPreview(for proposalID: UUID) -> WellnessProposalPreview? {
         let previews = modules.filter { $0.kind == .proposalPreview }
         guard previews.count == 1, let module = previews.first else { return nil }
@@ -575,6 +594,45 @@ public struct WellnessProposalPreview: Equatable {
 }
 
 public enum WellnessSceneDisplayPolicy {
+    public static func primaryInsightModules(
+        in scene: WellnessScene,
+        maximumInsights: Int
+    ) -> [WellnessSceneModule] {
+        guard
+            scene.freshness == .current,
+            scene.confidence.level != .insufficientData
+        else { return [] }
+        let limit = max(maximumInsights, 0)
+        return Array(
+            scene.modules
+                .filter { module in
+                    guard let visualization = module.visualization else { return false }
+                    switch visualization.kind {
+                    case .calendarCanvas, .scheduleComparison:
+                        return false
+                    case .capacityBar, .factorContribution, .goalTrajectory:
+                        return visualization.series
+                            .flatMap(\.points)
+                            .contains { $0.value != nil }
+                    case .baselineBand, .comparisonBar:
+                        return visualization.series.contains { series in
+                            series.points.contains {
+                                $0.value != nil && $0.secondaryValue != nil
+                            }
+                        }
+                    case .energyCurve, .timeSeries, .eventAlignedTrend,
+                        .decisionOutcome:
+                        return visualization.series.contains { series in
+                            series.points.filter {
+                                $0.value != nil || $0.secondaryValue != nil
+                            }.count >= 2
+                        }
+                    }
+                }
+                .prefix(limit)
+        )
+    }
+
     public static func visibleModules(
         in scene: WellnessScene,
         maximumVisualizations: Int
@@ -610,6 +668,7 @@ public enum WellnessSceneValidationError: Error, Equatable {
     case duplicateItemID
     case duplicateActionID
     case mutationWithoutProposal
+    case unexpectedMutation
     case proposalMismatch
     case multipleMutationProposals
     case createWithoutValue
@@ -762,7 +821,10 @@ public enum WellnessSceneValidator {
                 guard let proposalID = action.proposalID else {
                     throw WellnessSceneValidationError.mutationWithoutProposal
                 }
-                if let expectedProposalID, proposalID != expectedProposalID {
+                guard let expectedProposalID else {
+                    throw WellnessSceneValidationError.unexpectedMutation
+                }
+                if proposalID != expectedProposalID {
                     throw WellnessSceneValidationError.proposalMismatch
                 }
                 guard scene.allowsProposalActions else {

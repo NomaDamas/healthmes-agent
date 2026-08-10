@@ -163,6 +163,43 @@ def _seed_dashboard(session) -> uuid.UUID:
     return decision.id
 
 
+def _calendar_event(
+    *,
+    external_id: str,
+    summary: str,
+    start_at: datetime,
+    end_at: datetime,
+) -> CalendarEventMirror:
+    return CalendarEventMirror(
+        external_id=external_id,
+        calendar_source=CalendarSource.GOOGLE,
+        summary=summary,
+        start_at=start_at,
+        end_at=end_at,
+        is_agent_created=False,
+        agent_task_id=None,
+        intake_task_id=None,
+        intake_opted_out=False,
+        healthmes_kind=None,
+        healthmes_source=None,
+        healthmes_source_key=None,
+        observation_fingerprint=None,
+        sleep_local_date=None,
+        sleep_provider=None,
+        sleep_duration_minutes=None,
+        sleep_time_in_bed_minutes=None,
+        etag=None,
+        sync_token=None,
+        organizer_self=True,
+        has_attendees=False,
+        is_recurring=False,
+        event_type=None,
+        is_all_day=False,
+        is_locked=False,
+        status="confirmed",
+    )
+
+
 def test_dashboard_renders_single_wellness_control_canvas(client, session) -> None:
     decision_id = _seed_dashboard(session)
 
@@ -185,7 +222,6 @@ def test_dashboard_renders_single_wellness_control_canvas(client, session) -> No
     for primitive in (
         "capacity_bar",
         "calendar_canvas",
-        "energy_curve",
         "proposal_preview",
         "comparison_bar",
         "weekly_energy_trajectory",
@@ -198,6 +234,14 @@ def test_dashboard_renders_single_wellness_control_canvas(client, session) -> No
         "learning_loop",
     ):
         assert f'data-ui-primitive="{primitive}"' in html
+    assert "data-duration-minutes=" in html
+    assert "--duration-minutes:" in html
+    assert ".scene-panel[data-lens-panel=\"adjust\"]" not in html
+    assert ".capacity-copy p {" in html
+    hidden_rule = html.split(".capacity-copy p {", 1)[0]
+    assert ".lens-bar," not in hidden_rule
+    assert ".command-dock," not in hidden_rule
+    assert html.index("Team sync") < html.index("Deep Work")
     assert "Apple 앱 Live QA" in html
     assert "Deep Work" in html
     assert "Team sync" in html
@@ -214,11 +258,7 @@ def test_dashboard_renders_single_wellness_control_canvas(client, session) -> No
     assert "요구 에너지 high" in html
     assert "내가 주최" in html
     assert "상태 confirmed" in html
-    assert 'aria-labelledby="energy-title"' in html
-    assert 'aria-describedby="energy-desc energy-values"' in html
-    assert 'id="energy-values"' in html
-    assert html.count("data-energy-value-hour=") == 24
-    assert 'data-energy-score="54"' in html
+    assert 'data-ui-primitive="energy_curve"' not in html
     assert "데이터 없음" in html
     assert "데이터 최신성 현재 시간대" in " ".join(html.split())
     assert "현재 계약" in html
@@ -239,6 +279,70 @@ def test_dashboard_renders_single_wellness_control_canvas(client, session) -> No
     assert "@media (max-width: 500px)" in html
     assert "몸의 상태가 오늘 계획을 어떻게 바꿔야 하는지 봅니다." not in html
     assert "현재 몸 상태가 오늘 일정에 미치는 영향" not in html
+
+
+def test_dashboard_calendar_filters_proposals_to_the_visible_week(session, settings) -> None:
+    now = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+    task = Task(title="Far future review", source=TaskSource.USER)
+    session.add(task)
+    session.flush()
+    session.add(
+        ScheduleProposal(
+            task_id=task.id,
+            proposed_start=now + timedelta(days=8),
+            proposed_end=now + timedelta(days=8, hours=1),
+            status=ProposalStatus.PROPOSED,
+            expires_at=now + timedelta(hours=1),
+        )
+    )
+    session.commit()
+
+    dashboard = build_dashboard(session, settings, now)
+
+    assert [proposal.task_title for proposal in dashboard.pending_proposals] == [
+        "Far future review"
+    ]
+    assert dashboard.calendar_proposals == []
+
+
+def test_dashboard_calendar_gap_uses_latest_overlapping_end(
+    client,
+    session,
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+    monkeypatch.setattr("healthmes.api.dashboard.utc_now", lambda: now)
+    session.add_all(
+        [
+            _calendar_event(
+                external_id="long-block",
+                summary="Long block",
+                start_at=now + timedelta(hours=1),
+                end_at=now + timedelta(hours=5),
+            ),
+            _calendar_event(
+                external_id="nested-block",
+                summary="Nested block",
+                start_at=now + timedelta(hours=2),
+                end_at=now + timedelta(hours=3),
+            ),
+            _calendar_event(
+                external_id="after-nested",
+                summary="After nested",
+                start_at=now + timedelta(hours=4),
+                end_at=now + timedelta(hours=4, minutes=30),
+            ),
+        ]
+    )
+    session.commit()
+
+    html = client.get("/dashboard").text
+    event_tag = html[: html.index("After nested")].rsplit(
+        '<li class="calendar-event',
+        1,
+    )[1].split(">", 1)[0]
+
+    assert 'data-gap-minutes="0"' in event_tag
 
 
 def test_dashboard_renders_proposal_preview_without_mirrored_events(client, session) -> None:
@@ -366,6 +470,88 @@ def test_dashboard_reports_total_pending_proposals_beyond_preview_limit(client, 
     assert "4개 대기" in response.text
     assert "총 4개 중" in response.text
     assert "3개를 시간순으로 불러왔고" in response.text
+
+
+def test_dashboard_calendar_keeps_all_visible_pending_proposals(session, settings) -> None:
+    now = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+    for index in range(4):
+        task = Task(title=f"Visible proposal {index}", source=TaskSource.USER)
+        session.add(task)
+        session.flush()
+        session.add(
+            ScheduleProposal(
+                task_id=task.id,
+                proposed_start=now + timedelta(hours=index + 1),
+                proposed_end=now + timedelta(hours=index + 2),
+                status=ProposalStatus.PROPOSED,
+                expires_at=now + timedelta(days=1),
+            )
+        )
+    session.commit()
+
+    view = build_dashboard(session, settings, now)
+
+    assert len(view.pending_proposals) == 3
+    assert view.pending_proposals_truncated is True
+    assert [proposal.task_title for proposal in view.calendar_proposals] == [
+        "Visible proposal 0",
+        "Visible proposal 1",
+        "Visible proposal 2",
+        "Visible proposal 3",
+    ]
+    assert view.calendar_proposals_total == 4
+    assert view.calendar_proposals_truncated is False
+
+
+def test_dashboard_calendar_caps_visible_pending_proposals(session, settings) -> None:
+    now = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+    for index in range(101):
+        task = Task(title=f"Visible proposal {index:03d}", source=TaskSource.USER)
+        session.add(task)
+        session.flush()
+        session.add(
+            ScheduleProposal(
+                task_id=task.id,
+                proposed_start=now + timedelta(minutes=index),
+                proposed_end=now + timedelta(minutes=index + 30),
+                status=ProposalStatus.PROPOSED,
+                expires_at=now + timedelta(days=1),
+            )
+        )
+    session.commit()
+
+    view = build_dashboard(session, settings, now)
+
+    assert len(view.calendar_proposals) == 100
+    assert view.calendar_proposals_total == 101
+    assert view.calendar_proposals_truncated is True
+
+
+def test_dashboard_all_day_event_uses_fixed_readable_height(
+    client,
+    session,
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+    monkeypatch.setattr("healthmes.api.dashboard.utc_now", lambda: now)
+    event = _calendar_event(
+        external_id="all-day",
+        summary="Recovery day",
+        start_at=datetime(2026, 8, 11, 0, 0, tzinfo=UTC),
+        end_at=datetime(2026, 8, 12, 0, 0, tzinfo=UTC),
+    )
+    event.is_all_day = True
+    session.add(event)
+    session.commit()
+
+    html = client.get("/dashboard").text
+    event_tag = html[: html.index("Recovery day")].rsplit(
+        '<li class="calendar-event',
+        1,
+    )[1].split(">", 1)[0]
+
+    assert 'data-all-day="true"' in event_tag
+    assert "data-duration-minutes" not in event_tag
 
 
 def test_dashboard_provider_legend_only_lists_rendered_providers(client, session) -> None:
@@ -503,6 +689,8 @@ def test_dashboard_command_dock_is_persistent_visual_and_read_only(client) -> No
     assert "readonly" in html
     assert html.count("disabled") >= 2
     assert "<form" not in html
+    assert ".lens-bar," not in html.split(".capacity-copy p {", 1)[0]
+    assert ".command-dock," not in html.split(".capacity-copy p {", 1)[0]
 
 
 def test_dashboard_legacy_routes_return_same_control_surface(client) -> None:

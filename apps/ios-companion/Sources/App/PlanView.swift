@@ -15,7 +15,10 @@ final class PlanModel: ObservableObject {
     private var refreshGate = LatestRefreshGate()
     private var resolutionTokens: [UUID: UUID] = [:]
 
-    func refresh(now: Date = Date()) async {
+    func refresh(
+        now: Date = Date(),
+        timeZone: TimeZone = .autoupdatingCurrent
+    ) async {
         let refreshID = refreshGate.begin()
         guard let pairingSnapshot = PairingStore.shared.load() else {
             message = String(localized: "Not paired — open Settings.")
@@ -29,9 +32,19 @@ final class PlanModel: ObservableObject {
                 isLoading = false
             }
         }
-        let calendar = Calendar.autoupdatingCurrent
-        let start = calendar.startOfDay(for: now)
-        let end = calendar.date(byAdding: .day, value: 7, to: start) ?? start.addingTimeInterval(604_800)
+        var calendar = Calendar.autoupdatingCurrent
+        calendar.timeZone = timeZone
+        let window =
+            WellnessTimelinePolicy.sevenDayInterval(
+                containing: now,
+                timeZone: timeZone
+            )
+            ?? DateInterval(
+                start: calendar.startOfDay(for: now),
+                duration: 604_800
+            )
+        let start = window.start
+        let end = window.end
         let weekStart = ProductDateFormat.weekStart(containing: now, calendar: calendar)
 
         async let goalsResult = productRefreshResult {

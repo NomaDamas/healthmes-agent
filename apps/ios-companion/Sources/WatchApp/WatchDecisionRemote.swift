@@ -213,7 +213,7 @@ final class WatchDecisionRemoteModel: ObservableObject {
             wellnessImpact = Self.impact(for: glance.payload.energy.score)
             glanceLine = GlanceFormat.nextBlockLine(glance.payload)
             timezone = glance.payload.timezone
-            isDecisionContextReady = true
+            isDecisionContextReady = glance.payload.energy.score != nil
             availability = controlAvailability ?? .current
         } catch {
             guard
@@ -232,7 +232,7 @@ final class WatchDecisionRemoteModel: ObservableObject {
                 wellnessImpact = Self.impact(for: cached.energy.score)
                 glanceLine = GlanceFormat.nextBlockLine(cached)
                 timezone = cached.timezone
-                isDecisionContextReady = true
+                isDecisionContextReady = false
                 availability = controlAvailability ?? .stale
             } else {
                 energyScore = nil
@@ -245,7 +245,11 @@ final class WatchDecisionRemoteModel: ObservableObject {
     func resolve(_ action: ProposalAction) async {
         guard
             applyingAction == nil,
-            isDecisionContextReady,
+            WatchDecisionLayoutPolicy.canResolve(
+                isDecisionContextReady: isDecisionContextReady,
+                hasCurrentWellnessContext: availability == .current
+            ),
+            energyScore != nil,
             let decision,
             let pairingSnapshot = PairingStore.shared.load()
         else {
@@ -622,13 +626,19 @@ struct WatchDecisionRemoteView: View {
                 minHeight: WatchDecisionLayoutPolicy.minimumButtonHeight
             )
         }
-        .disabled(model.applyingAction != nil || !model.isDecisionContextReady)
+        .disabled(
+            model.applyingAction != nil
+                || !WatchDecisionLayoutPolicy.canResolve(
+                    isDecisionContextReady: model.isDecisionContextReady,
+                    hasCurrentWellnessContext: model.availability == .current
+                )
+        )
         .accessibilityLabel(Text(verbatim: accessibilityLabel))
         .accessibilityHint(
             Text(
-                model.isDecisionContextReady
+                model.isDecisionContextReady && model.availability == .current
                     ? "Acts on the exact proposal shown above"
-                    : "Waits until the calendar timezone is confirmed"
+                    : "Waits for current health and calendar context"
             )
         )
     }

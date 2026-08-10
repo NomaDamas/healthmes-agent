@@ -35,7 +35,7 @@ struct RootView: View {
                 }
             case .capture:
                 NavigationStack {
-                    CaptureView()
+                    CaptureView(startWithCamera: true)
                 }
             }
         }

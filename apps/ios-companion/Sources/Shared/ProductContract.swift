@@ -114,6 +114,8 @@ public struct CalendarEventItem: Codable, Equatable, Identifiable {
     public let endAt: Date
     public let isAgentCreated: Bool
     public let agentTaskId: UUID?
+    public let isAllDay: Bool
+    public let isLocked: Bool
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -124,6 +126,22 @@ public struct CalendarEventItem: Codable, Equatable, Identifiable {
         case endAt = "end_at"
         case isAgentCreated = "is_agent_created"
         case agentTaskId = "agent_task_id"
+        case isAllDay = "is_all_day"
+        case isLocked = "is_locked"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        externalId = try container.decode(String.self, forKey: .externalId)
+        calendarSource = try container.decode(String.self, forKey: .calendarSource)
+        summary = try container.decodeIfPresent(String.self, forKey: .summary)
+        startAt = try container.decode(Date.self, forKey: .startAt)
+        endAt = try container.decode(Date.self, forKey: .endAt)
+        isAgentCreated = try container.decode(Bool.self, forKey: .isAgentCreated)
+        agentTaskId = try container.decodeIfPresent(UUID.self, forKey: .agentTaskId)
+        isAllDay = try container.decodeIfPresent(Bool.self, forKey: .isAllDay) ?? false
+        isLocked = try container.decodeIfPresent(Bool.self, forKey: .isLocked) ?? false
     }
 }
 
@@ -279,6 +297,131 @@ public struct ResolutionAwareRefreshGate {
 public enum WatchDecisionLayoutPolicy {
     public static let minimumButtonHeight: Double = 42
     public static let keepsActionsOutsideScrollContent = true
+
+    public static func canResolve(
+        isDecisionContextReady: Bool,
+        hasCurrentWellnessContext: Bool
+    ) -> Bool {
+        isDecisionContextReady && hasCurrentWellnessContext
+    }
+}
+
+public enum WellnessDecisionSafety {
+    public static func canResolve(
+        hasHealthSnapshot: Bool,
+        isBriefingStale: Bool,
+        sceneAllowsActions: Bool
+    ) -> Bool {
+        hasHealthSnapshot && !isBriefingStale && sceneAllowsActions
+    }
+}
+
+public struct TimelineLaneAssignment: Equatable {
+    public let lane: Int
+    public let laneCount: Int
+
+    public init(lane: Int, laneCount: Int) {
+        self.lane = lane
+        self.laneCount = laneCount
+    }
+}
+
+public enum WellnessTimelinePolicy {
+    public static func dayInterval(containing date: Date, timeZone: TimeZone) -> DateInterval? {
+        var calendar = Calendar.autoupdatingCurrent
+        calendar.timeZone = timeZone
+        let start = calendar.startOfDay(for: date)
+        guard let end = calendar.date(byAdding: .day, value: 1, to: start) else {
+            return nil
+        }
+        return DateInterval(start: start, end: end)
+    }
+
+    public static func sevenDayInterval(
+        containing date: Date,
+        timeZone: TimeZone
+    ) -> DateInterval? {
+        var calendar = Calendar.autoupdatingCurrent
+        calendar.timeZone = timeZone
+        let start = calendar.startOfDay(for: date)
+        guard let end = calendar.date(byAdding: .day, value: 7, to: start) else {
+            return nil
+        }
+        return DateInterval(start: start, end: end)
+    }
+
+    public static func hourBounds(
+        for intervals: [DateInterval],
+        timeZone: TimeZone
+    ) -> Range<Int> {
+        guard !intervals.isEmpty else { return 8..<18 }
+        var calendar = Calendar.autoupdatingCurrent
+        calendar.timeZone = timeZone
+        let firstHour = intervals.map {
+            calendar.component(.hour, from: $0.start)
+        }.min() ?? 8
+        let lastHour = intervals.map { interval in
+            if calendar.startOfDay(for: interval.end) > calendar.startOfDay(for: interval.start) {
+                return 24
+            }
+            let components = calendar.dateComponents([.hour, .minute], from: interval.end)
+            return min((components.hour ?? 17) + ((components.minute ?? 0) > 0 ? 1 : 0), 24)
+        }.max() ?? 18
+        let lower = max(firstHour - 1, 0)
+        let upper = min(max(lastHour + 1, lower + 3), 24)
+        return lower..<upper
+    }
+
+    public static func laneAssignments(
+        for intervals: [DateInterval]
+    ) -> [TimelineLaneAssignment] {
+        guard !intervals.isEmpty else { return [] }
+        var assignments = Array(
+            repeating: TimelineLaneAssignment(lane: 0, laneCount: 1),
+            count: intervals.count
+        )
+        var clusterIndices: [Int] = []
+        var laneEnds: [Date] = []
+        var clusterEnd: Date?
+
+        func finishCluster() {
+            let laneCount = max(
+                clusterIndices.map { assignments[$0].lane }.max().map { $0 + 1 } ?? 1,
+                1
+            )
+            for index in clusterIndices {
+                assignments[index] = TimelineLaneAssignment(
+                    lane: assignments[index].lane,
+                    laneCount: laneCount
+                )
+            }
+        }
+
+        for (index, interval) in intervals.enumerated() {
+            if let currentClusterEnd = clusterEnd, interval.start >= currentClusterEnd {
+                finishCluster()
+                clusterIndices.removeAll(keepingCapacity: true)
+                laneEnds.removeAll(keepingCapacity: true)
+                clusterEnd = nil
+            }
+
+            let lane = laneEnds.firstIndex(where: { $0 <= interval.start }) ?? laneEnds.count
+            if lane == laneEnds.count {
+                laneEnds.append(interval.end)
+            } else {
+                laneEnds[lane] = interval.end
+            }
+            assignments[index] = TimelineLaneAssignment(lane: lane, laneCount: 1)
+            clusterIndices.append(index)
+            clusterEnd = max(clusterEnd ?? interval.end, interval.end)
+        }
+        finishCluster()
+        return assignments
+    }
+
+    public static func shouldUseReadableList(maxLaneCount: Int) -> Bool {
+        maxLaneCount >= 4
+    }
 }
 
 public func productRefreshResult<Value>(

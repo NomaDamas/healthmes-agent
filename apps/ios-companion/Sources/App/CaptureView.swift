@@ -4,30 +4,66 @@ import SwiftUI
 /// Capture shortcuts: food photos, voice and text are structured by the
 /// nutrition engine; medical captures keep their separate record contract.
 struct CaptureView: View {
+    let startWithCamera: Bool
+
     @StateObject private var model = CaptureModel()
     @StateObject private var recorder = VoiceMemoRecorder()
     @State private var photoItem: PhotosPickerItem?
     @State private var showCamera = false
+    @State private var didOfferInitialCamera = false
+
+    init(startWithCamera: Bool = false) {
+        self.startWithCamera = startWithCamera
+    }
 
     var body: some View {
         Form {
             targetSection
                 .disabled(model.isFoodReviewLocked)
-            attachmentSection
-                .disabled(model.isFoodReviewLocked)
             descriptionSection
+                .disabled(model.isFoodReviewLocked)
+            attachmentSection
                 .disabled(model.isFoodReviewLocked)
             if model.reviewInteraction != nil {
                 reviewSection
             }
             submitSection
         }
+        .accessibilityIdentifier("healthmes-capture-form")
         .navigationTitle(Text("Capture"))
+        .task {
+            guard
+                startWithCamera,
+                !didOfferInitialCamera,
+                CameraPicker.isAvailable
+            else { return }
+            didOfferInitialCamera = true
+            showCamera = true
+        }
         .sheet(isPresented: $showCamera) {
-            CameraPicker { image in
-                model.setPhoto(image)
+            ZStack(alignment: .topTrailing) {
+                CameraPicker(
+                    onImage: { image in
+                        model.setPhoto(image)
+                    },
+                    onDismiss: {
+                        showCamera = false
+                    }
+                )
+                .ignoresSafeArea()
+
+                Button {
+                    showCamera = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.headline)
+                        .padding(12)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .padding(12)
+                .accessibilityLabel(Text("Close camera"))
+                .accessibilityIdentifier("DismissImagePickerButton")
             }
-            .ignoresSafeArea()
         }
         .onChange(of: photoItem) { _, item in
             guard let item else { return }
@@ -226,6 +262,7 @@ struct CaptureView: View {
                 }
                 .lineLimit(3...8)
                 .accessibilityLabel(Text("Description"))
+                .accessibilityIdentifier("healthmes-capture-description")
             }
 
             if case .voice = model.attachment, model.target != .food {

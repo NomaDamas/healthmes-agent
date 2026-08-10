@@ -29,6 +29,9 @@
     display: grid;
     gap: 0.9rem;
   }
+  .capacity-copy p {
+    display: none !important;
+  }
   .wellness-header {
     display: flex;
     align-items: flex-end;
@@ -341,6 +344,20 @@
     border-left: 4px solid var(--provider-color);
     border-radius: 13px;
     background: var(--surface-2);
+  }
+  .calendar-event[data-duration-minutes] {
+    min-height: clamp(
+      3.6rem,
+      calc(var(--duration-minutes, 60) * 0.06rem),
+      13rem
+    );
+  }
+  .calendar-event[data-gap-minutes] {
+    margin-top: clamp(
+      0rem,
+      calc(var(--gap-minutes, 0) * 0.06rem),
+      7rem
+    );
   }
   .calendar-event::before {
     position: absolute;
@@ -832,6 +849,7 @@
       <h1>{{ dashboard.headline }}</h1>
     </div>
     <div class="header-state" aria-label="대시보드 상태">
+      <a class="state-chip" href="#advanced">상세 분석</a>
       <span class="state-chip">업데이트 {{ format_rel(dashboard.generated_at) }}</span>
       <span class="state-chip read-only">웹 읽기 전용</span>
     </div>
@@ -971,6 +989,9 @@
               {% endif %}
             </div>
 
+            {% set known_energy = dashboard.energy.curve_24h
+                |selectattr('score', 'ne', none)|list|length %}
+            {% if known_energy >= 6 %}
             <figure class="energy-chart" data-ui-primitive="energy_curve">
               <figcaption>
                 <strong>오늘의 시간대별 에너지</strong>
@@ -1031,67 +1052,84 @@
                 {% endfor %}
               </ol>
             </figure>
+            {% endif %}
 
-            {% if dashboard.plan_events or dashboard.pending_proposals %}
+            {% if dashboard.plan_events or dashboard.calendar_proposals %}
+            {% set calendar_items = (dashboard.plan_events + dashboard.calendar_proposals)
+                |sort(attribute='starts_at') %}
+            {% set timeline = namespace(latest_end=none) %}
             <ol class="calendar-timeline" aria-label="앞으로 7일 캘린더 일정">
-              {% for event in dashboard.plan_events %}
-              <li class="calendar-event provider-{{ event.source }}"
-                  data-calendar-provider="{{ event.source }}"
-                  data-provider-status="{{ event.status or 'unknown' }}"
-                  data-organizer-self="{{ 'true' if event.organizer_self else 'false' }}">
-                <time class="event-time" datetime="{{ event.starts_at.isoformat() }}">
-                  {% if event.is_all_day %}
+              {% for item in calendar_items %}
+              {% set gap_minutes = [((item.starts_at - timeline.latest_end).total_seconds() / 60)|round|int, 0]|max if timeline.latest_end else 0 %}
+              {% set duration_minutes = ((item.ends_at - item.starts_at).total_seconds() / 60)|round|int %}
+              {% if timeline.latest_end is none or item.ends_at > timeline.latest_end %}
+                {% set timeline.latest_end = item.ends_at %}
+              {% endif %}
+              {% if item.source is defined %}
+              <li class="calendar-event provider-{{ item.source }}"
+                  data-calendar-provider="{{ item.source }}"
+                  data-provider-status="{{ item.status or 'unknown' }}"
+                  data-organizer-self="{{ 'true' if item.organizer_self else 'false' }}"
+                  data-all-day="{{ 'true' if item.is_all_day else 'false' }}"
+                  {% if not item.is_all_day %}
+                  data-duration-minutes="{{ duration_minutes }}"
+                  {% endif %}
+                  data-gap-minutes="{{ gap_minutes }}"
+                  style="{% if not item.is_all_day %}--duration-minutes: {{ duration_minutes }}; {% endif %}--gap-minutes: {{ gap_minutes }};">
+                <time class="event-time" datetime="{{ item.starts_at.isoformat() }}">
+                  {% if item.is_all_day %}
                     종일 일정
                   {% else %}
-                    {{ format_local(event.starts_at) }}<br>
-                    {{ format_local(event.ends_at) }}
+                    {{ format_local(item.starts_at) }}<br>
+                    {{ format_local(item.ends_at) }}
                   {% endif %}
                 </time>
                 <div class="event-copy">
-                  <strong>{{ event.title }}</strong>
+                  <strong>{{ item.title }}</strong>
                   <div class="event-meta">
                     <span class="provider-badge">
-                      {% if event.source == "google" %}
+                      {% if item.source == "google" %}
                         Google Calendar
-                      {% elif event.source == "caldav" %}
+                      {% elif item.source == "caldav" %}
                         Apple / iCloud Calendar
                       {% else %}
-                        {{ event.source }}
+                        {{ item.source }}
                       {% endif %}
                     </span>
-                    {% if event.is_agent_created %}
+                    {% if item.is_agent_created %}
                     <span>HealthMes가 관리하는 블록</span>
                     {% else %}
                     <span>외부 일정 · 기본 고정</span>
                     {% endif %}
-                    {% if event.is_all_day %}<span>종일</span>{% endif %}
-                    {% if event.is_recurring %}<span>반복</span>{% endif %}
-                    {% if event.organizer_self %}
+                    {% if item.is_all_day %}<span>종일</span>{% endif %}
+                    {% if item.is_recurring %}<span>반복</span>{% endif %}
+                    {% if item.organizer_self %}
                     <span>내가 주최</span>
-                    {% elif event.has_attendees %}
+                    {% elif item.has_attendees %}
                     <span>외부 주최</span>
                     {% endif %}
-                    {% if event.is_locked %}<span>잠김</span>{% endif %}
-                    {% if event.energy_demand %}
-                    <span>요구 에너지 {{ event.energy_demand }}</span>
+                    {% if item.is_locked %}<span>잠김</span>{% endif %}
+                    {% if item.energy_demand %}
+                    <span>요구 에너지 {{ item.energy_demand }}</span>
                     {% endif %}
-                    {% if event.status %}<span>상태 {{ event.status }}</span>{% endif %}
+                    {% if item.status %}<span>상태 {{ item.status }}</span>{% endif %}
                   </div>
                 </div>
               </li>
-              {% endfor %}
-              {% if dashboard.pending_proposals %}
-                {% set preview = dashboard.pending_proposals[0] %}
+              {% else %}
                 <li class="calendar-event proposal-preview-event"
                     data-calendar-provider="healthmes"
                     data-proposal-preview
-                    data-proposal-id="{{ preview.id }}">
-                  <time class="event-time" datetime="{{ preview.starts_at.isoformat() }}">
-                    {{ format_local(preview.starts_at) }}<br>
-                    {{ format_local(preview.ends_at) }}
+                    data-proposal-id="{{ item.id }}"
+                    data-duration-minutes="{{ duration_minutes }}"
+                    data-gap-minutes="{{ gap_minutes }}"
+                    style="--duration-minutes: {{ duration_minutes }}; --gap-minutes: {{ gap_minutes }};">
+                  <time class="event-time" datetime="{{ item.starts_at.isoformat() }}">
+                    {{ format_local(item.starts_at) }}<br>
+                    {{ format_local(item.ends_at) }}
                   </time>
                   <div class="event-copy">
-                    <strong>{{ preview.task_title }} 블록 후보</strong>
+                    <strong>{{ item.task_title }} 블록 후보</strong>
                     <div class="event-meta">
                       <span class="provider-badge">HealthMes 제안</span>
                       <span>승인 전 미리보기</span>
@@ -1099,11 +1137,18 @@
                   </div>
                 </li>
               {% endif %}
+              {% endfor %}
             </ol>
             {% if dashboard.plan_events_truncated %}
             <p class="honesty-note">
               캘린더 {{ dashboard.plan_events_total }}건 중 시간순으로
               {{ dashboard.plan_events|length }}건을 표시합니다.
+            </p>
+            {% endif %}
+            {% if dashboard.calendar_proposals_truncated %}
+            <p class="honesty-note">
+              변경 제안 {{ dashboard.calendar_proposals_total }}건 중 시간순으로
+              {{ dashboard.calendar_proposals|length }}건을 표시합니다.
             </p>
             {% endif %}
             {% else %}

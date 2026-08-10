@@ -52,6 +52,7 @@ router = APIRouter(tags=["dashboard"])
 
 MAX_PLAN_EVENTS = 100
 MAX_PENDING_PROPOSALS = 3
+MAX_CALENDAR_PROPOSALS = 100
 MAX_RECENT_DECISIONS = 6
 MAX_RECENT_INSIGHTS = 3
 MAX_UNLOCK_BODY_BYTES = 16 * 1024
@@ -146,6 +147,9 @@ class DashboardView:
     calendar_sync_statuses: dict[str, CalendarSyncStatus]
     schedule_approval_available: bool
     pending_proposals: list[DashboardProposal]
+    calendar_proposals: list[DashboardProposal]
+    calendar_proposals_total: int
+    calendar_proposals_truncated: bool
     pending_proposals_total: int
     pending_proposals_truncated: bool
     recent_decisions: list[DashboardDecision]
@@ -340,14 +344,24 @@ def _decision_has_trusted_provenance(
 
 
 def _pending_proposals(
-    session: Session, settings: Settings, now: datetime
+    session: Session,
+    settings: Settings,
+    now: datetime,
+    *,
+    range_start: datetime | None = None,
+    range_end: datetime | None = None,
+    limit: int | None = MAX_PENDING_PROPOSALS,
 ) -> tuple[list[DashboardProposal], int]:
-    filters = (
+    filters = [
         ScheduleProposal.status == ProposalStatus.PROPOSED,
         ScheduleProposal.expires_at > now,
-    )
+    ]
+    if range_start is not None:
+        filters.append(ScheduleProposal.proposed_end > range_start)
+    if range_end is not None:
+        filters.append(ScheduleProposal.proposed_start < range_end)
     total = session.scalar(select(func.count()).select_from(ScheduleProposal).where(*filters)) or 0
-    rows = session.execute(
+    query = (
         select(ScheduleProposal, Task, DecisionRecord)
         .join(Task, ScheduleProposal.task_id == Task.id)
         .outerjoin(
@@ -356,8 +370,10 @@ def _pending_proposals(
         )
         .where(*filters)
         .order_by(ScheduleProposal.proposed_start, ScheduleProposal.created_at)
-        .limit(MAX_PENDING_PROPOSALS)
-    ).all()
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    rows = session.execute(query).all()
     return (
         [
             _proposal_projection(proposal, task, decision, settings, now)
@@ -505,6 +521,14 @@ def build_dashboard(session: Session, settings: Settings, now: datetime) -> Dash
         )
     )
     pending_proposals, pending_proposals_total = _pending_proposals(session, settings, now)
+    calendar_proposals, calendar_proposals_total = _pending_proposals(
+        session,
+        settings,
+        now,
+        range_start=start,
+        range_end=end,
+        limit=MAX_CALENDAR_PROPOSALS,
+    )
     calendar_sync_observed_at = _calendar_sync_observed_at(settings)
     return DashboardView(
         generated_at=now,
@@ -529,6 +553,11 @@ def build_dashboard(session: Session, settings: Settings, now: datetime) -> Dash
             len(settings.calendar_adjustment_secret.get_secret_value().strip()) >= 32
         ),
         pending_proposals=pending_proposals,
+        calendar_proposals=calendar_proposals,
+        calendar_proposals_total=calendar_proposals_total,
+        calendar_proposals_truncated=(
+            calendar_proposals_total > len(calendar_proposals)
+        ),
         pending_proposals_total=pending_proposals_total,
         pending_proposals_truncated=(pending_proposals_total > len(pending_proposals)),
         recent_decisions=_recent_decisions(session, settings),

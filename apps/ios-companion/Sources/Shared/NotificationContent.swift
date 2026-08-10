@@ -155,7 +155,9 @@ public struct AlertNotificationContent: Equatable {
         alert: AlertItem,
         pendingProposalID: UUID? = nil
     ) -> AlertNotificationContent {
-        let exactProposalID = pendingProposalID ?? alert.proposalId
+        let identityIsSafe = alert.hasConsistentProposalIdentity
+        let correlatedCard = identityIsSafe ? alert.correlatedDecisionCard : nil
+        let exactProposalID = identityIsSafe ? (pendingProposalID ?? alert.proposalId) : nil
         var bodyLines: [String] = []
         if let evidence = evidenceLine(alert.evidence) {
             bodyLines.append(evidence)
@@ -167,13 +169,13 @@ public struct AlertNotificationContent: Equatable {
         var userInfo: [String: String] = [
             userInfoAlertID: alert.id.uuidString.lowercased()
         ]
-        if let decisionUrl = alert.decisionCard?.decisionUrl ?? alert.decisionUrl {
+        if let decisionUrl = correlatedCard?.decisionUrl ?? alert.decisionUrl {
             userInfo[userInfoDecisionURL] = decisionUrl
         }
         if let exactProposalID {
             userInfo[userInfoProposalID] = exactProposalID.uuidString.lowercased()
         }
-        if let card = alert.decisionCard {
+        if let card = correlatedCard {
             let formatter = ISO8601DateFormatter()
             userInfo[userInfoDecisionTitle] = card.title
             userInfo[userInfoDecisionObservation] = card.observationShort
@@ -196,7 +198,7 @@ public struct AlertNotificationContent: Equatable {
         let title: String
         let subtitle: String
         let body: String
-        if let card = alert.decisionCard, let actionPrompt, isActionable {
+        if let card = correlatedCard, let actionPrompt, isActionable {
             title = actionPrompt
             subtitle = compactLine(card.observationShort, limit: 28)
             body = targetLine(after: card.after)

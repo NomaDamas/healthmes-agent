@@ -69,6 +69,8 @@ def test_list_events_returns_overlapping_range_ordered(client, session):
     assert [e["external_id"] for e in body["data"]] == ["overlaps-start", "inside"]
     assert body["pagination"]["total_count"] == 2
     assert body["data"][0]["calendar_source"] == "caldav"
+    assert body["data"][0]["is_all_day"] is False
+    assert body["data"][0]["is_locked"] is False
 
 
 def test_list_events_filters_by_calendar_source(client, session):

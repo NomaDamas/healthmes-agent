@@ -1,13 +1,22 @@
 import Foundation
 
 public extension AlertItem {
+    var hasConsistentProposalIdentity: Bool {
+        guard let decisionCard else { return true }
+        return proposalId == decisionCard.proposalId
+    }
+
+    var correlatedDecisionCard: DecisionCard? {
+        hasConsistentProposalIdentity ? decisionCard : nil
+    }
+
     var exactDecisionURL: URL? {
-        let raw = decisionCard?.decisionUrl ?? decisionUrl
+        let raw = correlatedDecisionCard?.decisionUrl ?? decisionUrl
         return raw.flatMap(URL.init(string:))
     }
 
     var exactDecisionRecordID: UUID? {
-        if let decisionCard {
+        if let decisionCard = correlatedDecisionCard {
             return decisionCard.decisionId
         }
         return exactDecisionURL.flatMap {
@@ -22,7 +31,14 @@ public struct PendingDecision: Identifiable, Equatable {
     public let prompt: String
 
     public var id: UUID { proposal.id }
-    public var card: DecisionCard? { alert?.decisionCard }
+    public var card: DecisionCard? { alert?.correlatedDecisionCard }
+
+    public var hasExactDecisionCorrelation: Bool {
+        guard let card else { return false }
+        return proposal.decisionRecordId == card.decisionId
+            && proposal.proposedStart == card.after
+            && proposal.proposedEnd == card.endsAt
+    }
 
     public var reason: String? {
         if let observation = card?.observationShort, !observation.isEmpty {
@@ -70,9 +86,10 @@ public struct PendingDecision: Identifiable, Equatable {
         alerts: [AlertItem],
         proposals: [ProposalItem]
     ) -> [PendingDecision] {
-        let alertsByProposal = Dictionary(
-            alerts.compactMap { alert in
-                alert.proposalId.map { ($0, alert) }
+        let alertsByProposal: [UUID: AlertItem] = Dictionary(
+            alerts.compactMap { alert -> (UUID, AlertItem)? in
+                guard alert.hasConsistentProposalIdentity else { return nil }
+                return alert.proposalId.map { ($0, alert) }
             },
             uniquingKeysWith: { first, _ in first }
         )
@@ -83,7 +100,12 @@ public struct PendingDecision: Identifiable, Equatable {
                 guard let prompt = ProposalActionPresentation.exactPrompt(alert: alert) else {
                     return nil
                 }
-                return PendingDecision(proposal: proposal, alert: alert, prompt: prompt)
+                let decision = PendingDecision(
+                    proposal: proposal,
+                    alert: alert,
+                    prompt: prompt
+                )
+                return decision.hasExactDecisionCorrelation ? decision : nil
             }
             .sorted { $0.proposal.proposedStart < $1.proposal.proposedStart }
     }
@@ -93,7 +115,8 @@ public enum ProposalActionPresentation {
     /// Returns only a server-provided action phrase. A proposal id and time
     /// window alone are not enough context to expose Yes/No safely.
     public static func exactPrompt(alert: AlertItem?) -> String? {
-        if let action = alert?.decisionCard?.proposedAction {
+        guard alert?.hasConsistentProposalIdentity != false else { return nil }
+        if let action = alert?.correlatedDecisionCard?.proposedAction {
             let question = AlertNotificationContent.questionLine(action)
             if !question.isEmpty {
                 return question

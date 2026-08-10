@@ -4,6 +4,7 @@ struct WellnessSceneRenderer: View {
     let scene: WellnessScene
     let maximumVisualizations: Int
     let busyProposalIDs: Set<UUID>
+    let showsActions: Bool
     let onAction: (WellnessSceneAction) -> Void
 
     private let moss = Color(red: 0.08, green: 0.38, blue: 0.28)
@@ -17,46 +18,57 @@ struct WellnessSceneRenderer: View {
                 moduleCard(module)
             }
 
-            if !scene.actions.isEmpty {
+            if showsActions, !scene.actions.isEmpty {
                 actionBar
             }
         }
         .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("healthmes-generated-scene")
         .environment(\.timeZone, TimeZone(identifier: scene.timezone) ?? .current)
     }
 
     private var visibleModules: [WellnessSceneModule] {
-        WellnessSceneDisplayPolicy.visibleModules(
+        WellnessSceneDisplayPolicy.primaryInsightModules(
             in: scene,
-            maximumVisualizations: maximumVisualizations
+            maximumInsights: maximumVisualizations
         )
     }
 
     private var sceneHeader: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(verbatim: scene.title)
-                    .font(.system(.title2, design: .rounded).weight(.bold))
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 8)
-                confidenceBadge
-            }
-            Text(verbatim: scene.summary)
-                .font(.body.weight(.medium))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if !scene.confidence.limitations.isEmpty {
-                DisclosureGroup("데이터 한계") {
-                    VStack(alignment: .leading, spacing: 5) {
-                        ForEach(scene.confidence.limitations, id: \.self) { limitation in
-                            Text(verbatim: limitation)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    .padding(.top, 5)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Label(
+                    sceneIsActionable ? "오늘의 판단" : "판단 보류",
+                    systemImage: sceneIsActionable
+                        ? "bolt.heart.fill"
+                        : "exclamationmark.shield.fill"
+                )
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(severityColor)
+                Spacer()
+                if !sceneIsActionable || scene.confidence.level == .low {
+                    confidenceBadge
                 }
+            }
+            Text(verbatim: sceneConclusion)
+                .font(.system(.title3, design: .rounded).weight(.semibold))
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            if !sceneIsActionable {
+                Text(
+                    verbatim:
+                        "마지막 분석 \(scene.generatedAt.formatted(date: .abbreviated, time: .shortened))"
+                )
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            }
+            if let detail = scene.actions.first(where: { $0.kind == .openWebDetail }) {
+                Button {
+                    onAction(detail)
+                } label: {
+                    Label("근거 자세히 보기", systemImage: "safari")
+                }
+                .font(.caption.weight(.semibold))
             }
         }
         .padding(16)
@@ -65,6 +77,18 @@ struct WellnessSceneRenderer: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(severityColor.opacity(0.22))
         }
+    }
+
+    private var sceneIsActionable: Bool {
+        scene.freshness == .current
+            && scene.confidence.level != .insufficientData
+    }
+
+    private var sceneConclusion: String {
+        guard sceneIsActionable else {
+            return "최신 근거가 부족해 일정 변경 결론을 내리지 않습니다."
+        }
+        return scene.summary.isEmpty ? scene.title : scene.summary
     }
 
     private var confidenceBadge: some View {
@@ -83,12 +107,6 @@ struct WellnessSceneRenderer: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(verbatim: module.title)
                     .font(.headline)
-                if module.kind != .proposalPreview {
-                    Text(verbatim: module.summary)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
             }
 
             if module.kind == .proposalPreview {

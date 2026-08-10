@@ -46,68 +46,50 @@ final class CompanionUITests: XCTestCase {
         element.tap()
     }
 
-    /// Acceptance sketch #1: briefing home shows live data; drill into the
-    /// weekly report and capture surfaces.
+    /// The iPhone default stays within the four-area wellness contract and
+    /// exposes food capture and bounded question input without old lens pages.
     func testDailyLoopSurfacesRenderAgainstLiveInstance() throws {
         let app = try launchPairedApp()
 
-        let currentScene = app.staticTexts.matching(
-            NSPredicate(
-                format: "label == %@ OR label == %@",
-                "HealthMes가 먼저 찾은 조정",
-                "오늘 피로가 계획에 미치는 영향"
-            )
-        ).firstMatch
-        guard currentScene.waitForExistence(timeout: 15) else {
+        guard app.otherElements["healthmes-generated-scene"].waitForExistence(timeout: 15) else {
             throw XCTSkip("No live wellness scene seeded for UI QA.")
         }
-        XCTAssertTrue(app.textFields.firstMatch.exists)
-        XCTAssertFalse(app.buttons["조율"].exists)
-        XCTAssertFalse(app.buttons["변화"].exists)
+        XCTAssertTrue(app.buttons["식사 기록"].exists)
+        XCTAssertTrue(app.buttons["질문하기"].exists)
+        XCTAssertFalse(app.staticTexts["OUTCOME LOOP"].exists)
+        XCTAssertFalse(app.staticTexts["RECENT EVIDENCE"].exists)
+        XCTAssertFalse(app.buttons["전체 보기"].exists)
 
-        app.buttons["전체 보기"].tap()
-        app.buttons["일정과 목표"].tap()
-        XCTAssertTrue(app.staticTexts["일정과 목표"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.staticTexts["보호할 목표와 할 일"].exists)
-        XCTAssertTrue(app.staticTexts["일정 영향"].exists)
-
-        app.buttons["전체 보기"].tap()
-        app.buttons["결정 결과"].tap()
-        XCTAssertTrue(app.staticTexts["결정 결과"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.staticTexts["OUTCOME LOOP"].exists)
-
-        app.buttons["전체 보기"].tap()
-        app.buttons["설정"].tap()
-        try tapSettingsLink("Weekly report", in: app)
-        XCTAssertTrue(app.staticTexts["Energy trend"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.staticTexts["Schedule adherence"].exists)
-        XCTAssertTrue(app.staticTexts["Alert digest"].exists)
+        app.buttons["질문하기"].tap()
+        XCTAssertTrue(
+            app.textFields["healthmes-command-input"].waitForExistence(timeout: 3)
+        )
     }
 
     /// The seeded proactive proposal exposes real controls, while a later
     /// uncorrelated command stays read-only instead of approving by inference.
     func testWellnessCommandRendersScheduleScene() throws {
         let app = try launchPairedApp()
-        guard app.staticTexts["HealthMes가 먼저 찾은 조정"].waitForExistence(timeout: 15) else {
+        guard app.otherElements["healthmes-generated-scene"].waitForExistence(timeout: 15) else {
             throw XCTSkip("No proactive wellness proposal seeded for live UI QA.")
         }
-        guard app.buttons["유지"].exists, app.buttons["적용"].exists else {
+        guard app.buttons["유지"].exists, app.buttons["변경 승인"].exists else {
             throw XCTSkip("No actionable health-backed proposal seeded for live UI QA.")
         }
 
-        let command = app.textFields.firstMatch
-        XCTAssertTrue(command.exists)
+        app.buttons["질문하기"].tap()
+        let command = app.textFields["healthmes-command-input"]
+        XCTAssertTrue(command.waitForExistence(timeout: 3))
 
         command.tap()
         command.typeText("adjust today schedule")
-        app.buttons["Run command"].tap()
+        app.buttons["질문 보내기"].tap()
 
         XCTAssertTrue(
-            app.staticTexts["현재 몸 상태에 맞춘 일정 조율"].waitForExistence(timeout: 15)
+            app.otherElements["healthmes-generated-scene"].waitForExistence(timeout: 15)
         )
-        XCTAssertTrue(app.staticTexts["일정 블록 제안"].exists)
         XCTAssertFalse(app.buttons["유지"].exists)
-        XCTAssertFalse(app.buttons["적용"].exists)
+        XCTAssertFalse(app.buttons["변경 승인"].exists)
 
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "HealthMes generative schedule scene"
@@ -140,13 +122,50 @@ final class CompanionUITests: XCTestCase {
     func testFoodCaptureRoundTrip() throws {
         let app = try launchPairedApp()
 
-        app.buttons["전체 보기"].tap()
-        app.buttons["설정"].tap()
-        try tapSettingsLink("Capture", in: app)
-        let field = app.textFields["Description"]
+        app.buttons["식사 기록"].tap()
+        let field = app.textFields["healthmes-capture-description"]
         guard field.waitForExistence(timeout: 10) else {
             throw XCTSkip("Capture form not reachable.")
         }
+        let cameraDismiss = app.buttons
+            .matching(identifier: "DismissImagePickerButton")
+            .matching(NSPredicate(format: "label == %@", "Close camera"))
+            .firstMatch
+        if cameraDismiss.waitForExistence(timeout: 3) {
+            cameraDismiss.tap()
+        }
+        let form = app.descendants(matching: .any)["healthmes-capture-form"]
+        XCTAssertTrue(
+            form.waitForExistence(timeout: 3),
+            "Capture form must expose a stable scroll container."
+        )
+        for _ in 0..<4 where !field.isHittable {
+            form.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.72))
+                .press(
+                    forDuration: 0.05,
+                    thenDragTo: form.coordinate(
+                        withNormalizedOffset: CGVector(dx: 0.5, dy: 0.42)
+                    )
+                )
+        }
+        if !field.isHittable {
+            let screenshot = XCTAttachment(screenshot: app.screenshot())
+            screenshot.name = "Food capture field not hittable"
+            screenshot.lifetime = .keepAlways
+            add(screenshot)
+
+            let hierarchy = XCTAttachment(
+                data: Data(app.debugDescription.utf8),
+                uniformTypeIdentifier: "public.plain-text"
+            )
+            hierarchy.name = "Food capture accessibility hierarchy"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+        }
+        XCTAssertTrue(
+            field.isHittable,
+            "Food description must remain reachable on the iPhone 13 mini layout."
+        )
         field.tap()
         field.typeText("UITest kimbap roll")
         app.buttons["Analyze for review"].tap()

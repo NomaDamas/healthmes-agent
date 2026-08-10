@@ -26,6 +26,7 @@ struct WellnessControlView: View {
     @State private var sceneOperationGate = PairingOperationGate()
     @State private var resolutionOperationGate = PairingOperationGate()
     @State private var resolvingSceneProposalID: UUID?
+    @State private var questionExpanded = false
     @State private var lastFocusRequest = 0
     @State private var lastHomeRequest = 0
     @FocusState private var commandFocused: Bool
@@ -41,9 +42,6 @@ struct WellnessControlView: View {
                     if let proposalBanner = briefing.proposalBanner {
                         proposalResultBanner(proposalBanner)
                     }
-                    if lens != .now {
-                        detailContextBar
-                    }
                     sceneContent
                     if let preview {
                         commandPreview(preview)
@@ -57,7 +55,7 @@ struct WellnessControlView: View {
             }
             .refreshable { await refreshAll() }
 
-            commandDock
+            quickActionDock
         }
         .background(
             LinearGradient(
@@ -69,7 +67,7 @@ struct WellnessControlView: View {
                 endPoint: .bottomTrailing
             )
         )
-        .accessibilityIdentifier("healthmes-wellness-control")
+        .environment(\.timeZone, displayTimeZone)
         .navigationTitle(Text("HealthMes"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -81,6 +79,7 @@ struct WellnessControlView: View {
         .onReceive(router.$commandFocusRequest) { request in
             guard request > lastFocusRequest else { return }
             lastFocusRequest = request
+            questionExpanded = true
             commandFocused = true
         }
         .onReceive(router.$homeRequest) { request in
@@ -121,46 +120,22 @@ struct WellnessControlView: View {
                 color: plan.events.isEmpty ? .secondary : moss
             )
             Spacer(minLength: 0)
-            if !briefing.pendingDecisions.isEmpty {
-                Text(verbatim: "\(briefing.pendingDecisions.count)")
-                    .font(.caption.bold().monospacedDigit())
-                    .padding(7)
-                    .background(Color.orange.opacity(0.18), in: Circle())
-                    .accessibilityLabel(Text("Pending decisions"))
-            }
+            Text(Date(), format: .dateTime.month(.abbreviated).day())
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(.thinMaterial)
         .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("healthmes-wellness-control")
     }
 
     private var exploreMenu: some View {
         Menu {
-            Button {
-                selectDetail(.now)
-            } label: {
-                Label("현재 영향", systemImage: "bolt.heart")
-            }
-            .accessibilityAddTraits(lens == .now ? .isSelected : [])
-            Button {
-                selectDetail(.coordinate)
-            } label: {
-                Label("일정과 목표", systemImage: "calendar")
-            }
-            .accessibilityAddTraits(lens == .coordinate ? .isSelected : [])
-            Button {
-                selectDetail(.change)
-            } label: {
-                Label("결정 결과", systemImage: "chart.line.uptrend.xyaxis")
-            }
-            .accessibilityAddTraits(lens == .change ? .isSelected : [])
-
-            Divider()
-
             if let pairing = PairingStore.shared.load() {
                 Link(destination: ViewerURL.make(pairing: pairing, pathComponents: ["dashboard"])) {
-                    Label("웹 대시보드", systemImage: "safari")
+                    Label("자세히 보기", systemImage: "safari")
                 }
             }
             Button {
@@ -169,27 +144,10 @@ struct WellnessControlView: View {
                 Label("설정", systemImage: "gearshape")
             }
         } label: {
-            Label("전체 보기", systemImage: "square.grid.2x2")
-                .font(.subheadline.weight(.semibold))
+            Image(systemName: "ellipsis.circle")
+                .font(.title3)
         }
-        .accessibilityLabel(Text("전체 보기"))
-        .accessibilityValue(Text(detailTitle(for: lens)))
-    }
-
-    private var detailContextBar: some View {
-        HStack(spacing: 10) {
-            Label(detailTitle(for: lens), systemImage: detailIcon(for: lens))
-                .font(.subheadline.weight(.semibold))
-            Spacer()
-            Button("현재로 돌아가기") {
-                selectDetail(.now)
-            }
-            .font(.caption.weight(.semibold))
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(moss.opacity(0.09), in: RoundedRectangle(cornerRadius: 14))
-        .accessibilityElement(children: .contain)
+        .accessibilityLabel(Text("더 보기"))
     }
 
     @ViewBuilder
@@ -199,49 +157,51 @@ struct WellnessControlView: View {
                 ProgressView("건강·일정·목표를 함께 보고 있습니다…")
             }
         } else if let generatedScene {
-            WellnessSceneRenderer(
-                scene: generatedScene,
-                maximumVisualizations: 2,
-                busyProposalIDs: briefing.busyProposalIDs.union(
-                    resolvingSceneProposalID.map { [$0] } ?? []
-                ),
-                onAction: handleSceneAction
-            )
-        } else {
-            switch lens {
-            case .now:
-                nowScene
-            case .coordinate:
-                coordinateScene
-            case .change:
-                changeScene
+            Group {
+                WellnessSceneRenderer(
+                    scene: generatedScene,
+                    maximumVisualizations: 1,
+                    busyProposalIDs: briefing.busyProposalIDs.union(
+                        resolvingSceneProposalID.map { [$0] } ?? []
+                    ),
+                    showsActions: false,
+                    onAction: handleSceneAction
+                )
+                primaryDecisionCard
+                todayTimeBlocks
             }
+        } else {
+            nowScene
         }
     }
 
     private var nowScene: some View {
         Group {
-            ProductCard(kicker: "몸 → 오늘 계획", systemImage: "bolt.heart.fill") {
+            ProductCard(kicker: "오늘", systemImage: "bolt.heart.fill") {
                 if let payload = briefing.snapshot?.payload {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text("인지 에너지")
-                            .font(.headline)
-                        Spacer()
-                        Text(verbatim: GlanceFormat.scoreText(payload.energy.score))
-                            .font(.system(.title, design: .rounded).bold())
-                    }
-                    Text(verbatim: bodyPlanImpact(payload))
-                        .font(.body.weight(.medium))
-                    Text("업데이트 \(briefing.lastUpdatedText) · 신뢰도 \(confidenceLabel(payload.energy.confidence))")
+                    Text(
+                        verbatim: briefing.isStale
+                            ? "판단 보류: 최신 건강 상태를 확인할 때까지 일정 변경을 제안하지 않습니다."
+                            : bodyPlanImpact(payload)
+                    )
+                        .font(.system(.title3, design: .rounded).weight(.semibold))
+                        .lineLimit(2)
+                    if briefing.isStale, let snapshot = briefing.snapshot {
+                        Text(
+                            verbatim:
+                                "마지막 동기화 \(snapshot.fetchedAt.formatted(date: .abbreviated, time: .shortened))"
+                        )
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    }
+                    capacityBar(payload)
                 } else {
                     insufficientData(briefing.glanceError ?? "Health data has not arrived yet.")
                 }
             }
 
-            nextBlockCard
             primaryDecisionCard
+            todayTimeBlocks
         }
     }
 
@@ -332,26 +292,6 @@ struct WellnessControlView: View {
         }
     }
 
-    private var nextBlockCard: some View {
-        ProductCard(kicker: "다음 보호 일정", systemImage: "calendar.day.timeline.left") {
-            if let block = briefing.snapshot?.payload.nextBlocks.first {
-                Text(verbatim: block.title ?? String(localized: "Scheduled block"))
-                    .font(.title3.weight(.semibold))
-                Text(verbatim: "\(block.start.formatted(date: .omitted, time: .shortened))–\(block.end.formatted(date: .omitted, time: .shortened))")
-                    .foregroundStyle(.secondary)
-                if let demand = block.energyDemand {
-                    Text(verbatim: "\(demand.rawValue.capitalized) energy demand")
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color.primary.opacity(0.07), in: Capsule())
-                }
-            } else {
-                insufficientData("예정된 캘린더 일정이 없습니다.")
-            }
-        }
-    }
-
     private var scheduleTimeline: some View {
         ProductCard(kicker: "일정 영향", systemImage: "calendar") {
             if plan.events.isEmpty {
@@ -382,7 +322,7 @@ struct WellnessControlView: View {
 
     private var primaryDecisionCard: some View {
         ProductCard(kicker: "지금 필요한 결정", systemImage: "wand.and.stars") {
-            if let decision = briefing.pendingDecisions.first {
+            if let decision = activeDecision {
                 Text(verbatim: decision.prompt)
                     .font(.title3.weight(.semibold))
                     .fixedSize(horizontal: false, vertical: true)
@@ -390,24 +330,23 @@ struct WellnessControlView: View {
                     Text(verbatim: reason)
                         .foregroundStyle(.secondary)
                 }
-                Text(verbatim: ProposalFormat.windowLine(decision.proposal))
+                Text(
+                    verbatim: ProposalFormat.windowLine(
+                        decision.proposal,
+                        timeZone: displayTimeZone
+                    )
+                )
                     .font(.footnote.weight(.medium))
                 HStack(spacing: 10) {
                     Button {
-                        Task {
-                            await briefing.resolve(decision.proposal, action: .decline)
-                            await refreshAll()
-                        }
+                        performSceneDecision(.declineProposal, decision: decision)
                     } label: {
                         Label("유지", systemImage: "xmark").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
 
                     Button {
-                        Task {
-                            await briefing.resolve(decision.proposal, action: .accept)
-                            await refreshAll()
-                        }
+                        performSceneDecision(.acceptProposal, decision: decision)
                     } label: {
                         Label("변경 승인", systemImage: "checkmark").frame(maxWidth: .infinity)
                     }
@@ -434,6 +373,49 @@ struct WellnessControlView: View {
         }
     }
 
+    private var activeDecision: PendingDecision? {
+        let pending = briefing.pendingDecisions
+        guard
+            let generatedScene,
+            WellnessDecisionSafety.canResolve(
+                hasHealthSnapshot: briefing.snapshot != nil,
+                isBriefingStale: briefing.isStale,
+                sceneAllowsActions: generatedScene.allowsProposalActions
+            ),
+            let sceneOperation = generatedSceneOperation,
+            sceneOperationGate.isCurrent(
+                sceneOperation,
+                pairing: PairingStore.shared.load()
+            )
+        else { return nil }
+        let proposalID =
+            generatedScene.exactMutationPreview?.proposalID
+            ?? generatedSceneOperation?.proposalID
+        guard
+            let proposalID,
+            generatedScene.allowsProposalActions(for: proposalID),
+            sceneOperation.proposalID == proposalID
+        else {
+            return nil
+        }
+        return pending.first { $0.id == proposalID }
+    }
+
+    private func performSceneDecision(
+        _ kind: WellnessActionKind,
+        decision: PendingDecision
+    ) {
+        guard
+            let action = generatedScene?.actions.first(where: {
+                $0.kind == kind && $0.proposalID == decision.id
+            })
+        else {
+            commandMessage = "이 제안은 더 이상 승인할 수 없습니다. 새로고침해 주세요."
+            return
+        }
+        handleSceneAction(action)
+    }
+
     private func proposalResultBanner(_ message: String) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: message.hasPrefix("Approved") ? "checkmark.circle.fill" : "info.circle.fill")
@@ -458,60 +440,149 @@ struct WellnessControlView: View {
         .accessibilityElement(children: .contain)
     }
 
-    private var commandDock: some View {
+    private var quickActionDock: some View {
         VStack(spacing: 8) {
-            if command.isListening {
-                HStack(spacing: 8) {
-                    Circle().fill(.red).frame(width: 7, height: 7)
-                    Text("Listening · edit the transcript before sending")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
+            if questionExpanded {
+                VStack(spacing: 8) {
+                    if command.isListening {
+                        HStack(spacing: 8) {
+                            Circle().fill(.red).frame(width: 7, height: 7)
+                            Text("듣고 있습니다. 보내기 전에 내용을 확인하세요.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                    }
+                    HStack(alignment: .bottom, spacing: 8) {
+                        Button {
+                            Task { await command.toggleListening() }
+                        } label: {
+                            Image(systemName: command.isListening ? "stop.fill" : "waveform")
+                                .frame(width: 40, height: 40)
+                                .foregroundStyle(command.isListening ? .white : moss)
+                                .background(
+                                    command.isListening ? Color.red : Color.primary.opacity(0.07),
+                                    in: Circle()
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(
+                            Text(command.isListening ? "듣기 중지" : "음성으로 질문")
+                        )
+
+                        TextField(
+                            "오늘 일정에서 무엇을 바꿔야 해?",
+                            text: $command.transcript,
+                            axis: .vertical
+                        )
+                        .lineLimit(1...3)
+                        .focused($commandFocused)
+                        .accessibilityIdentifier("healthmes-command-input")
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(
+                            Color.primary.opacity(0.06),
+                            in: RoundedRectangle(cornerRadius: 16)
+                        )
+                        .submitLabel(.send)
+                        .onSubmit(submitCommand)
+
+                        Button(action: submitCommand) {
+                            Image(systemName: "arrow.up")
+                                .font(.body.bold())
+                                .foregroundStyle(.white)
+                                .frame(width: 40, height: 40)
+                                .background(moss, in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(
+                            command.transcript
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                                .isEmpty
+                        )
+                        .accessibilityLabel(Text("질문 보내기"))
+                    }
                 }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            HStack(alignment: .bottom, spacing: 8) {
+
+            HStack(spacing: 10) {
                 Button {
-                    Task { await command.toggleListening() }
+                    router.modal = .capture
                 } label: {
-                    Image(systemName: command.isListening ? "stop.fill" : "waveform")
-                        .frame(width: 40, height: 40)
-                        .foregroundStyle(command.isListening ? .white : moss)
-                        .background(command.isListening ? Color.red : Color.primary.opacity(0.07), in: Circle())
+                    Label("식사 기록", systemImage: "camera.fill")
+                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel(Text(command.isListening ? "Stop listening" : "Speak command"))
+                .buttonStyle(.bordered)
 
-                TextField(
-                    "오늘 왜 피곤해? · 할 일: 라이브 QA",
-                    text: $command.transcript,
-                    axis: .vertical
-                )
-                .lineLimit(1...3)
-                .focused($commandFocused)
-                .accessibilityIdentifier("healthmes-command-input")
-                .textFieldStyle(.plain)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
-                .submitLabel(.send)
-                .onSubmit(submitCommand)
-
-                Button(action: submitCommand) {
-                    Image(systemName: "arrow.up")
-                        .font(.body.bold())
-                        .foregroundStyle(.white)
-                        .frame(width: 40, height: 40)
-                        .background(moss, in: Circle())
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        questionExpanded.toggle()
+                    }
+                    if questionExpanded {
+                        commandFocused = true
+                    }
+                } label: {
+                    Label(
+                        questionExpanded ? "질문 닫기" : "질문하기",
+                        systemImage: questionExpanded ? "xmark" : "waveform"
+                    )
+                    .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.plain)
-                .disabled(command.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .accessibilityLabel(Text("Run command"))
+                .buttonStyle(.borderedProminent)
+                .tint(moss)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(.bar)
         .overlay(alignment: .top) { Divider() }
+    }
+
+    private func capacityBar(_ payload: GlancePayload) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("가용 에너지")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(verbatim: GlanceFormat.scoreText(payload.energy.score))
+                    .font(.caption.bold().monospacedDigit())
+            }
+            if let rawScore = payload.energy.score {
+                GeometryReader { proxy in
+                    let score = CGFloat(min(max(rawScore, 0), 100)) / 100
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.primary.opacity(0.08))
+                        Capsule()
+                            .fill(moss)
+                            .frame(width: proxy.size.width * score)
+                    }
+                }
+                .frame(height: 12)
+                .accessibilityLabel(Text("가용 에너지"))
+                .accessibilityValue(Text(verbatim: GlanceFormat.scoreText(rawScore)))
+            } else {
+                Label("에너지 데이터 없음", systemImage: "chart.bar.xaxis")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var todayTimeBlocks: some View {
+        ProductCard(kicker: "오늘 일정", systemImage: "calendar.day.timeline.left") {
+            if plan.events.isEmpty && activeDecision == nil {
+                insufficientData("Apple 또는 Google Calendar에서 동기화된 오늘 일정이 없습니다.")
+            } else {
+                ProportionalDayTimeline(
+                    events: plan.events,
+                    decision: activeDecision,
+                    timeZone: displayTimeZone
+                )
+            }
+        }
     }
 
     private func commandPreview(_ preview: CommandPreview) -> some View {
@@ -620,10 +691,10 @@ struct WellnessControlView: View {
         invalidateGeneratedScene()
         guard let pairingSnapshot = PairingStore.shared.load() else { return }
         let refreshOperation = sceneOperationGate.begin(pairing: pairingSnapshot)
-        async let briefingRefresh: Void = briefing.refresh()
-        async let planRefresh: Void = plan.refresh()
         async let decisionsRefresh: Void = decisions.refresh()
-        _ = await (briefingRefresh, planRefresh, decisionsRefresh)
+        await briefing.refresh()
+        async let planRefresh: Void = plan.refresh(timeZone: displayTimeZone)
+        _ = await (planRefresh, decisionsRefresh)
         guard sceneOperationGate.isCurrent(
             refreshOperation,
             pairing: PairingStore.shared.load()
@@ -703,6 +774,11 @@ struct WellnessControlView: View {
         switch action.kind {
         case .acceptProposal, .declineProposal:
             guard
+                WellnessDecisionSafety.canResolve(
+                    hasHealthSnapshot: briefing.snapshot != nil,
+                    isBriefingStale: briefing.isStale,
+                    sceneAllowsActions: generatedScene?.allowsProposalActions == true
+                ),
                 let sceneOperation = generatedSceneOperation,
                 sceneOperationGate.isCurrent(
                     sceneOperation,
@@ -710,8 +786,7 @@ struct WellnessControlView: View {
                 ),
                 generatedScene?.allowsProposalActions == true,
                 let proposalID = action.proposalID,
-                sceneOperation.proposalID == nil
-                    || sceneOperation.proposalID == proposalID,
+                sceneOperation.proposalID == proposalID,
                 resolvingSceneProposalID == nil,
                 let proposal = briefing.pendingProposals.first(where: {
                     $0.id == proposalID && $0.isActionable
@@ -777,7 +852,7 @@ struct WellnessControlView: View {
     private func sceneQuery(for lens: WellnessLens) -> String {
         switch lens {
         case .now:
-            return "현재 몸 상태와 오늘 일정의 영향을 보여줘"
+            return "현재 몸 상태가 오늘 수행 능력에 주는 영향을 보여줘"
         case .coordinate:
             return "이번 주 일정과 목표를 현재 가용 에너지 기준으로 보여줘"
         case .change:
@@ -823,6 +898,14 @@ struct WellnessControlView: View {
         }
         let score = GlanceFormat.scoreText(payload.energy.score)
         return briefing.isStale ? "Energy \(score) · cached" : "Energy \(score)"
+    }
+
+    private var displayTimeZone: TimeZone {
+        let identifier =
+            generatedScene?.timezone
+            ?? briefing.snapshot?.payload.timezone
+            ?? TimeZone.autoupdatingCurrent.identifier
+        return TimeZone(identifier: identifier) ?? .autoupdatingCurrent
     }
 
     private var calendarStatus: String {
@@ -875,6 +958,352 @@ struct WellnessControlView: View {
             return "Apple Calendar"
         default:
             return source
+        }
+    }
+}
+
+private struct ProportionalDayTimeline: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    private struct Entry: Identifiable {
+        let id: String
+        let title: String
+        let startsAt: Date
+        let endsAt: Date
+        let provider: String
+        let isProposal: Bool
+        let isLocked: Bool
+        let isAllDay: Bool
+    }
+
+    private struct PositionedEntry: Identifiable {
+        let entry: Entry
+        let lane: Int
+        let laneCount: Int
+
+        var id: String { entry.id }
+    }
+
+    let events: [CalendarEventItem]
+    let decision: PendingDecision?
+    let timeZone: TimeZone
+
+    private let hourHeight: CGFloat = 54
+    private let labelWidth: CGFloat = 46
+
+    var body: some View {
+        let entries = visibleEntries
+        let allDayEntries = entries.filter(\.isAllDay)
+        let timedEntries = entries.filter { !$0.isAllDay }
+        let bounds = hourBounds(timedEntries)
+        let positioned = positionedEntries(timedEntries)
+        let maxLaneCount = positioned.map(\.laneCount).max() ?? 1
+        let height = CGFloat(bounds.upperBound - bounds.lowerBound) * hourHeight
+
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(verbatim: dayTitle(entries))
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                providerLegend(entries)
+            }
+
+            if entries.isEmpty {
+                Label(
+                    "오늘과 겹치는 일정 또는 변경 제안이 없습니다.",
+                    systemImage: "calendar.badge.checkmark"
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            } else {
+                if !allDayEntries.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("종일")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(allDayEntries) { entry in
+                            timelineBlock(entry, availableHeight: 44)
+                                .frame(minHeight: 44)
+                        }
+                    }
+                }
+
+                if !timedEntries.isEmpty,
+                    dynamicTypeSize.isAccessibilitySize
+                        || WellnessTimelinePolicy.shouldUseReadableList(
+                            maxLaneCount: maxLaneCount
+                        )
+                {
+                    accessibleTimeline(timedEntries)
+                } else if !timedEntries.isEmpty {
+                    GeometryReader { proxy in
+                        let contentWidth = max(proxy.size.width - labelWidth - 8, 1)
+
+                        ZStack(alignment: .topLeading) {
+                            ForEach(bounds.lowerBound...bounds.upperBound, id: \.self) { hour in
+                                let y = CGFloat(hour - bounds.lowerBound) * hourHeight
+                                Text(verbatim: String(format: "%02d", hour))
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: labelWidth, alignment: .leading)
+                                    .offset(y: y - 6)
+                                    .accessibilityHidden(true)
+                                Rectangle()
+                                    .fill(Color.primary.opacity(0.07))
+                                    .frame(width: contentWidth, height: 1)
+                                    .offset(x: labelWidth, y: y)
+                                    .accessibilityHidden(true)
+                            }
+
+                            ForEach(positioned) { positionedEntry in
+                                let entry = positionedEntry.entry
+                                let start = minuteOffset(
+                                    entry.startsAt,
+                                    fromHour: bounds.lowerBound
+                                )
+                                let duration = max(
+                                    entry.endsAt.timeIntervalSince(entry.startsAt) / 60,
+                                    15
+                                )
+                                let y = CGFloat(start / 60) * hourHeight
+                                let blockHeight = max(
+                                    CGFloat(duration / 60) * hourHeight,
+                                    36
+                                )
+                                let laneWidth =
+                                    contentWidth / CGFloat(positionedEntry.laneCount)
+                                let x = labelWidth + CGFloat(positionedEntry.lane) * laneWidth
+
+                                timelineBlock(entry, availableHeight: blockHeight)
+                                    .frame(
+                                        width: max(laneWidth - 6, 1),
+                                        height: blockHeight,
+                                        alignment: .topLeading
+                                    )
+                                    .offset(x: x + 3, y: y)
+                            }
+                        }
+                    }
+                    .frame(height: max(height, hourHeight * 3))
+                    .accessibilityElement(children: .contain)
+                }
+            }
+        }
+    }
+
+    private var visibleEntries: [Entry] {
+        guard
+            let day = WellnessTimelinePolicy.dayInterval(
+                containing: Date(),
+                timeZone: timeZone
+            )
+        else {
+            return []
+        }
+        let dayStart = day.start
+        let dayEnd = day.end
+        var entries = events.filter {
+            $0.endAt > dayStart && $0.startAt < dayEnd
+        }.map {
+            Entry(
+                id: $0.id.uuidString,
+                title: $0.summary ?? String(localized: "제목 없는 일정"),
+                startsAt: max($0.startAt, dayStart),
+                endsAt: min($0.endAt, dayEnd),
+                provider: $0.calendarSource,
+                isProposal: false,
+                isLocked: $0.isLocked || !$0.isAgentCreated,
+                isAllDay: $0.isAllDay
+            )
+        }
+        if let decision,
+            decision.proposal.proposedEnd > dayStart,
+            decision.proposal.proposedStart < dayEnd
+        {
+            entries.append(
+                Entry(
+                    id: "proposal-\(decision.id.uuidString)",
+                    title: decision.secondaryContextTitle ?? "HealthMes 일정 변경 제안",
+                    startsAt: max(decision.proposal.proposedStart, dayStart),
+                    endsAt: min(decision.proposal.proposedEnd, dayEnd),
+                    provider: "healthmes",
+                    isProposal: true,
+                    isLocked: false,
+                    isAllDay: false
+                )
+            )
+        }
+        return entries.sorted {
+            $0.startsAt == $1.startsAt ? $0.endsAt < $1.endsAt : $0.startsAt < $1.startsAt
+        }
+    }
+
+    private func hourBounds(_ entries: [Entry]) -> Range<Int> {
+        WellnessTimelinePolicy.hourBounds(
+            for: entries.map { DateInterval(start: $0.startsAt, end: $0.endsAt) },
+            timeZone: timeZone
+        )
+    }
+
+    private func positionedEntries(_ entries: [Entry]) -> [PositionedEntry] {
+        let assignments = WellnessTimelinePolicy.laneAssignments(
+            for: entries.map {
+                DateInterval(start: $0.startsAt, end: $0.endsAt)
+            }
+        )
+        return zip(entries, assignments).map { entry, assignment in
+            PositionedEntry(
+                entry: entry,
+                lane: assignment.lane,
+                laneCount: assignment.laneCount
+            )
+        }
+    }
+
+    private func minuteOffset(_ date: Date, fromHour: Int) -> Double {
+        let components = timelineCalendar.dateComponents(
+            [.hour, .minute],
+            from: date
+        )
+        return Double(((components.hour ?? fromHour) - fromHour) * 60 + (components.minute ?? 0))
+    }
+
+    private func dayTitle(_ entries: [Entry]) -> String {
+        guard let date = entries.first?.startsAt else {
+            return String(localized: "오늘")
+        }
+        let formatter = DateFormatter()
+        formatter.timeZone = timeZone
+        formatter.setLocalizedDateFormatFromTemplate("MMMEd")
+        return formatter.string(from: date)
+    }
+
+    private func timelineBlock(_ entry: Entry, availableHeight: CGFloat) -> some View {
+        let color = providerColor(entry.provider)
+        let duration = entry.endsAt.timeIntervalSince(entry.startsAt) / 60
+        return VStack(alignment: .leading, spacing: 2) {
+            Text(verbatim: entry.title)
+                .font(.caption.weight(.semibold))
+                .lineLimit(availableHeight < 54 ? 1 : 2)
+            if entry.isAllDay {
+                Text("종일")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if duration >= 45 {
+                Text(verbatim: timeRange(entry))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+            if availableHeight >= 72 {
+                Spacer(minLength: 0)
+                HStack(spacing: 3) {
+                    if entry.isProposal {
+                        Image(systemName: "wand.and.stars")
+                    } else if entry.isLocked {
+                        Image(systemName: "lock.fill")
+                    }
+                    Text(verbatim: providerName(entry.provider))
+                        .lineLimit(1)
+                }
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(color)
+            }
+        }
+        .padding(7)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(color.opacity(entry.isProposal ? 0.08 : 0.13))
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(
+                    color.opacity(0.8),
+                    style: StrokeStyle(
+                        lineWidth: entry.isProposal ? 1.5 : 1,
+                        dash: entry.isProposal ? [5, 4] : []
+                    )
+                )
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: accessibilitySummary(entry)))
+    }
+
+    private func accessibleTimeline(_ entries: [Entry]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(entries) { entry in
+                HStack(alignment: .top, spacing: 10) {
+                    Text(verbatim: timeRange(entry))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Text(verbatim: entry.title)
+                        .font(.body.weight(.semibold))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(10)
+                .background(
+                    providerColor(entry.provider).opacity(entry.isProposal ? 0.08 : 0.13),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(Text(verbatim: accessibilitySummary(entry)))
+            }
+        }
+    }
+
+    private var timelineCalendar: Calendar {
+        var calendar = Calendar.autoupdatingCurrent
+        calendar.timeZone = timeZone
+        return calendar
+    }
+
+    private func timeRange(_ entry: Entry) -> String {
+        let formatter = DateFormatter()
+        formatter.timeZone = timeZone
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return "\(formatter.string(from: entry.startsAt))–\(formatter.string(from: entry.endsAt))"
+    }
+
+    private func accessibilitySummary(_ entry: Entry) -> String {
+        let source = providerName(entry.provider)
+        let state = entry.isProposal
+            ? String(localized: "승인 전 변경 제안")
+            : entry.isLocked
+                ? String(localized: "고정 일정")
+                : String(localized: "조정 가능한 일정")
+        return "\(entry.title), \(timeRange(entry)), \(source), \(state)"
+    }
+
+    @ViewBuilder
+    private func providerLegend(_ entries: [Entry]) -> some View {
+        HStack(spacing: 8) {
+            ForEach(Array(Set(entries.map(\.provider))).sorted(), id: \.self) { provider in
+                HStack(spacing: 3) {
+                    Circle()
+                        .fill(providerColor(provider))
+                        .frame(width: 6, height: 6)
+                    Text(verbatim: providerName(provider))
+                }
+            }
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+    }
+
+    private func providerName(_ provider: String) -> String {
+        switch provider.lowercased() {
+        case "google": return "Google"
+        case "caldav", "icloud": return "Apple"
+        case "healthmes": return "제안"
+        default: return provider
+        }
+    }
+
+    private func providerColor(_ provider: String) -> Color {
+        switch provider.lowercased() {
+        case "google": return Color(red: 0.26, green: 0.52, blue: 0.96)
+        case "caldav", "icloud": return Color(red: 0.08, green: 0.58, blue: 0.49)
+        case "healthmes": return Color(red: 0.84, green: 0.45, blue: 0.12)
+        default: return .secondary
         }
     }
 }

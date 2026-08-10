@@ -41,7 +41,9 @@ final class ProductContractTests: XCTestCase {
                   "start_at": "2026-08-07T09:00:00Z",
                   "end_at": "2026-08-07T10:30:00Z",
                   "is_agent_created": true,
-                  "agent_task_id": null
+                  "agent_task_id": null,
+                  "is_all_day": false,
+                  "is_locked": true
                 }],
                 "pagination": {"total_count": 1, "limit": 100, "offset": 0, "has_more": false}
               }
@@ -69,6 +71,8 @@ final class ProductContractTests: XCTestCase {
         XCTAssertTrue(tasks.data.first?.isOpen == true)
         XCTAssertEqual(events.data.first?.calendarSource, "caldav")
         XCTAssertTrue(events.data.first?.isAgentCreated == true)
+        XCTAssertFalse(events.data.first?.isAllDay == true)
+        XCTAssertTrue(events.data.first?.isLocked == true)
     }
 
     func testPlanRequestBuildersMatchRESTRoutes() throws {
@@ -280,7 +284,7 @@ final class ProductContractTests: XCTestCase {
         )
     }
 
-    func testPendingDecisionUsesActualActionWithoutDecisionCard() throws {
+    func testPendingDecisionFailsClosedWithoutDecisionCard() throws {
         let proposalID = UUID(uuidString: "60000000-0000-0000-0000-000000000006")!
         let start = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-07T09:00:00Z"))
         let proposal = ProposalItem(
@@ -304,16 +308,9 @@ final class ProductContractTests: XCTestCase {
             proposalId: proposalID
         )
 
-        let decision = try XCTUnwrap(
-            PendingDecision.correlate(alerts: [alert], proposals: [proposal]).first
-        )
-        XCTAssertEqual(decision.prompt, "Move Deep Work to 4 PM?")
-        XCTAssertEqual(decision.watchActionTitle, "Schedule adjustment")
-        XCTAssertEqual(decision.watchReason, "Schedule pressure changed.")
         XCTAssertNil(ProposalActionPresentation.exactPrompt(alert: nil))
-        XCTAssertTrue(
-            PendingDecision.correlate(alerts: [], proposals: [proposal]).isEmpty
-        )
+        XCTAssertTrue(PendingDecision.correlate(alerts: [alert], proposals: [proposal]).isEmpty)
+        XCTAssertTrue(PendingDecision.correlate(alerts: [], proposals: [proposal]).isEmpty)
     }
 
     func testPendingDecisionFailsClosedForBlankActionPhrase() throws {
@@ -748,6 +745,12 @@ final class ProductContractTests: XCTestCase {
                 "label": "적용",
                 "proposal_id": "\(proposalID.uuidString.lowercased())",
                 "url": null
+              }, {
+                "id": "decline:\(proposalID.uuidString.lowercased())",
+                "kind": "decline_proposal",
+                "label": "유지",
+                "proposal_id": "\(proposalID.uuidString.lowercased())",
+                "url": null
               }],
               "generated_at": "2026-08-09T00:00:00Z",
               "timezone": "Asia/Seoul"
@@ -770,6 +773,7 @@ final class ProductContractTests: XCTestCase {
         )
         XCTAssertFalse(localizedWindow.contains("T09:00:00"))
         XCTAssertFalse(localizedWindow.contains(proposalID.uuidString.lowercased()))
+        XCTAssertTrue(scene.allowsProposalActions(for: proposalID))
         XCTAssertNoThrow(
             try WellnessSceneValidator.validate(
                 scene,
@@ -777,6 +781,17 @@ final class ProductContractTests: XCTestCase {
                 expectedProposalID: proposalID
             )
         )
+        XCTAssertThrowsError(
+            try WellnessSceneValidator.validate(
+                scene,
+                pairedBaseURL: pairing.baseURL
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? WellnessSceneValidationError,
+                .unexpectedMutation
+            )
+        }
     }
 
     func testWellnessSceneValidatorRejectsMutationWithoutExactActionPreview() {
@@ -1070,7 +1085,8 @@ final class ProductContractTests: XCTestCase {
             XCTAssertThrowsError(
                 try WellnessSceneValidator.validate(
                     scene,
-                    pairedBaseURL: pairing.baseURL
+                    pairedBaseURL: pairing.baseURL,
+                    expectedProposalID: proposalID
                 )
             ) { error in
                 XCTAssertEqual(
@@ -1435,6 +1451,92 @@ final class ProductContractTests: XCTestCase {
         XCTAssertEqual(visible.map(\.id), ["energy", "calendar"])
     }
 
+    func testPhoneInsightPolicyExcludesCalendarAndSparseOrStaleCharts() {
+        func module(
+            _ id: String,
+            _ kind: WellnessVisualizationKind,
+            values: [Double?]
+        ) -> WellnessSceneModule {
+            let visualization: WellnessVisualization
+            if kind == .calendarCanvas {
+                visualization = WellnessVisualization(
+                    kind: kind,
+                    events: [
+                        WellnessCalendarEvent(
+                            id: "google:1",
+                            title: "Meeting",
+                            startsAt: Date(),
+                            endsAt: Date().addingTimeInterval(1_800),
+                            provider: "google",
+                            isHealthMesManaged: false
+                        )
+                    ]
+                )
+            } else {
+                visualization = WellnessVisualization(
+                    kind: kind,
+                    series: [
+                        WellnessSeries(
+                            id: id,
+                            label: id,
+                            points: values.enumerated().map {
+                                WellnessPoint(label: "\($0.offset)", value: $0.element)
+                            }
+                        )
+                    ]
+                )
+            }
+            return WellnessSceneModule(
+                id: id,
+                kind: WellnessModuleKind(rawValue: kind.rawValue) ?? .fallback,
+                title: id,
+                summary: id,
+                visualization: visualization
+            )
+        }
+
+        let current = WellnessScene(
+            id: "phone-current",
+            lens: .now,
+            title: "Current",
+            summary: "Current",
+            severity: .supportive,
+            freshness: .current,
+            confidence: WellnessConfidence(level: .medium, coverage: "current"),
+            modules: [
+                module("calendar", .calendarCanvas, values: []),
+                module("sparse", .energyCurve, values: [50]),
+                module("capacity", .capacityBar, values: [62]),
+                module("trend", .timeSeries, values: [52, 61]),
+            ]
+        )
+
+        XCTAssertEqual(
+            WellnessSceneDisplayPolicy.primaryInsightModules(
+                in: current,
+                maximumInsights: 1
+            ).map(\.id),
+            ["capacity"]
+        )
+
+        let stale = WellnessScene(
+            id: "phone-stale",
+            lens: .now,
+            title: "Stale",
+            summary: "Stale",
+            severity: .neutral,
+            freshness: .stale,
+            confidence: WellnessConfidence(level: .low, coverage: "stale"),
+            modules: [module("capacity", .capacityBar, values: [62])]
+        )
+        XCTAssertTrue(
+            WellnessSceneDisplayPolicy.primaryInsightModules(
+                in: stale,
+                maximumInsights: 1
+            ).isEmpty
+        )
+    }
+
     func testWellnessCommandParserUsesLensesAndExplicitWritePrefixes() {
         XCTAssertEqual(
             WellnessCommandParser.parse("지금 내 상태 보여줘"),
@@ -1485,6 +1587,250 @@ final class ProductContractTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(
             WatchDecisionLayoutPolicy.minimumButtonHeight,
             42
+        )
+        XCTAssertTrue(
+            WatchDecisionLayoutPolicy.canResolve(
+                isDecisionContextReady: true,
+                hasCurrentWellnessContext: true
+            )
+        )
+        XCTAssertFalse(
+            WatchDecisionLayoutPolicy.canResolve(
+                isDecisionContextReady: true,
+                hasCurrentWellnessContext: false
+            )
+        )
+        XCTAssertFalse(
+            WatchDecisionLayoutPolicy.canResolve(
+                isDecisionContextReady: false,
+                hasCurrentWellnessContext: true
+            )
+        )
+    }
+
+    func testDecisionCorrelationRequiresDecisionIDAndExactTimeWindow() throws {
+        let proposalID = UUID()
+        let decisionID = UUID()
+        let start = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-10T09:00:00Z"))
+        let proposal = ProposalItem(
+            id: proposalID,
+            taskId: UUID(),
+            proposedStart: start,
+            proposedEnd: start.addingTimeInterval(3_600),
+            status: .proposed,
+            decisionRecordId: decisionID,
+            acceptResolutionToken: "accept",
+            declineResolutionToken: "decline"
+        )
+
+        func alert(decisionId: UUID, after: Date, endsAt: Date) -> AlertItem {
+            AlertItem(
+                id: UUID(),
+                ruleId: "schedule",
+                firedAt: start,
+                summary: "Recovery changed",
+                proposal: "Move Deep Work",
+                evidence: nil,
+                decisionUrl: nil,
+                proposalId: proposalID,
+                decisionCard: DecisionCard(
+                    decisionId: decisionId,
+                    proposalId: proposalID,
+                    kind: "schedule_change",
+                    severity: "coaching",
+                    title: "Deep Work",
+                    observationShort: "Recovery changed",
+                    evidenceShort: nil,
+                    proposedAction: "Move Deep Work?",
+                    before: nil,
+                    after: after,
+                    endsAt: endsAt,
+                    expiresAt: start.addingTimeInterval(600),
+                    decisionUrl: nil
+                )
+            )
+        }
+
+        XCTAssertTrue(
+            PendingDecision.correlate(
+                alerts: [alert(
+                    decisionId: UUID(),
+                    after: start,
+                    endsAt: start.addingTimeInterval(3_600)
+                )],
+                proposals: [proposal]
+            ).isEmpty
+        )
+        XCTAssertTrue(
+            PendingDecision.correlate(
+                alerts: [alert(
+                    decisionId: decisionID,
+                    after: start.addingTimeInterval(60),
+                    endsAt: start.addingTimeInterval(3_600)
+                )],
+                proposals: [proposal]
+            ).isEmpty
+        )
+        XCTAssertEqual(
+            PendingDecision.correlate(
+                alerts: [alert(
+                    decisionId: decisionID,
+                    after: start,
+                    endsAt: start.addingTimeInterval(3_600)
+                )],
+                proposals: [proposal]
+            ).map(\.id),
+            [proposalID]
+        )
+    }
+
+    func testMismatchedDecisionCardCannotCorrelateOrExposeYesNo() throws {
+        let proposalID = UUID()
+        let otherProposalID = UUID()
+        let start = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-10T09:00:00Z"))
+        let proposal = ProposalItem(
+            id: proposalID,
+            taskId: UUID(),
+            proposedStart: start,
+            proposedEnd: start.addingTimeInterval(3_600),
+            status: .proposed,
+            decisionRecordId: UUID(),
+            acceptResolutionToken: "accept",
+            declineResolutionToken: "decline"
+        )
+        let card = DecisionCard(
+            decisionId: UUID(),
+            proposalId: otherProposalID,
+            kind: "schedule_change",
+            severity: "coaching",
+            title: "Wrong proposal",
+            observationShort: "Low recovery",
+            evidenceShort: nil,
+            proposedAction: "Move Deep Work?",
+            before: nil,
+            after: start,
+            endsAt: start.addingTimeInterval(3_600),
+            expiresAt: start.addingTimeInterval(600),
+            decisionUrl: nil
+        )
+        let alert = AlertItem(
+            id: UUID(),
+            ruleId: "schedule",
+            firedAt: start,
+            summary: "Schedule changed",
+            proposal: "Move Deep Work",
+            evidence: nil,
+            decisionUrl: nil,
+            proposalId: proposalID,
+            decisionCard: card
+        )
+
+        XCTAssertFalse(alert.hasConsistentProposalIdentity)
+        XCTAssertNil(alert.correlatedDecisionCard)
+        XCTAssertTrue(
+            PendingDecision.correlate(alerts: [alert], proposals: [proposal]).isEmpty
+        )
+        let notification = AlertNotificationContent.from(alert: alert)
+        XCTAssertEqual(notification.categoryID, AlertNotificationContent.infoCategoryID)
+        XCTAssertNil(notification.userInfo[AlertNotificationContent.userInfoProposalID])
+    }
+
+    func testTimelineUsesHealthMesTimezoneAndKeepsMidnightEndVisible() throws {
+        let start = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-10T12:30:00Z"))
+        let end = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-10T15:00:00Z"))
+        let seoul = try XCTUnwrap(TimeZone(identifier: "Asia/Seoul"))
+        let losAngeles = try XCTUnwrap(TimeZone(identifier: "America/Los_Angeles"))
+
+        let seoulDay = try XCTUnwrap(
+            WellnessTimelinePolicy.dayInterval(containing: start, timeZone: seoul)
+        )
+        let losAngelesDay = try XCTUnwrap(
+            WellnessTimelinePolicy.dayInterval(containing: start, timeZone: losAngeles)
+        )
+        XCTAssertNotEqual(seoulDay.start, losAngelesDay.start)
+
+        let bounds = WellnessTimelinePolicy.hourBounds(
+            for: [DateInterval(start: start, end: end)],
+            timeZone: seoul
+        )
+        XCTAssertEqual(bounds.upperBound, 24)
+    }
+
+    func testCalendarFetchWindowUsesHealthMesTimezone() throws {
+        let instant = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-10T18:30:00Z"))
+        let seoul = try XCTUnwrap(TimeZone(identifier: "Asia/Seoul"))
+        let losAngeles = try XCTUnwrap(TimeZone(identifier: "America/Los_Angeles"))
+
+        let seoulWindow = try XCTUnwrap(
+            WellnessTimelinePolicy.sevenDayInterval(
+                containing: instant,
+                timeZone: seoul
+            )
+        )
+        let losAngelesWindow = try XCTUnwrap(
+            WellnessTimelinePolicy.sevenDayInterval(
+                containing: instant,
+                timeZone: losAngeles
+            )
+        )
+
+        XCTAssertNotEqual(seoulWindow.start, losAngelesWindow.start)
+        XCTAssertEqual(seoulWindow.duration, 7 * 24 * 60 * 60, accuracy: 1)
+        XCTAssertEqual(losAngelesWindow.duration, 7 * 24 * 60 * 60, accuracy: 1)
+    }
+
+    func testDecisionSafetyRejectsStaleOrMissingHealthContext() {
+        XCTAssertTrue(
+            WellnessDecisionSafety.canResolve(
+                hasHealthSnapshot: true,
+                isBriefingStale: false,
+                sceneAllowsActions: true
+            )
+        )
+        XCTAssertFalse(
+            WellnessDecisionSafety.canResolve(
+                hasHealthSnapshot: true,
+                isBriefingStale: true,
+                sceneAllowsActions: true
+            )
+        )
+        XCTAssertFalse(
+            WellnessDecisionSafety.canResolve(
+                hasHealthSnapshot: false,
+                isBriefingStale: false,
+                sceneAllowsActions: true
+            )
+        )
+        XCTAssertFalse(
+            WellnessDecisionSafety.canResolve(
+                hasHealthSnapshot: true,
+                isBriefingStale: false,
+                sceneAllowsActions: false
+            )
+        )
+    }
+
+    func testTimelineLaneCountsResetAfterOverlapCluster() throws {
+        let base = try XCTUnwrap(GlanceJSON.parseISO8601("2026-08-10T09:00:00Z"))
+        let intervals = [
+            DateInterval(start: base, duration: 3_600),
+            DateInterval(start: base.addingTimeInterval(900), duration: 3_600),
+            DateInterval(start: base.addingTimeInterval(7_200), duration: 1_800),
+        ]
+
+        XCTAssertEqual(
+            WellnessTimelinePolicy.laneAssignments(for: intervals),
+            [
+                TimelineLaneAssignment(lane: 0, laneCount: 2),
+                TimelineLaneAssignment(lane: 1, laneCount: 2),
+                TimelineLaneAssignment(lane: 0, laneCount: 1),
+            ]
+        )
+        XCTAssertFalse(
+            WellnessTimelinePolicy.shouldUseReadableList(maxLaneCount: 3)
+        )
+        XCTAssertTrue(
+            WellnessTimelinePolicy.shouldUseReadableList(maxLaneCount: 4)
         )
     }
 
