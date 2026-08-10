@@ -138,11 +138,15 @@ def test_local_runtime_starts_and_supervises_open_wearables_beat() -> None:
     start_body = _function_body(local_text, "cmd_start")
     daemon_body = _function_body(local_text, "cmd_daemon")
     stop_body = _function_body(local_text, "stop_apps")
+    stop_ow_body = _function_body(local_text, "stop_open_wearables")
     status_body = _function_body(local_text, "cmd_status")
 
     assert 'start_process "Open Wearables beat"' in start_body
     assert '"$BEAT_PID"' in daemon_body
     assert 'stop_process "Open Wearables beat"' in stop_body
+    assert "stop_open_wearables" in stop_body
+    assert 'open_wearables_listener_is_managed "$pid"' in stop_ow_body
+    assert 'stop_process "Open Wearables" "$OW_PID"' in stop_ow_body
     assert 'service_status "Open Wearables beat"' in status_body
 
 

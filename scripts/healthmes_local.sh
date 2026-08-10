@@ -150,6 +150,19 @@ stop_process() {
     info "$name stopped"
 }
 
+stop_open_wearables() {
+    local pid
+    if pid_running "$OW_PID"; then
+        pid="$(<"$OW_PID")"
+        if ! open_wearables_listener_is_managed "$pid"; then
+            rm -f "$OW_PID"
+            info "Open Wearables stopped without terminating an unmanaged pid"
+            return
+        fi
+    fi
+    stop_process "Open Wearables" "$OW_PID"
+}
+
 load_runtime_env() {
     set -a
     [ -f "$REPO_ROOT/.env" ] && source "$REPO_ROOT/.env"
@@ -315,7 +328,7 @@ stop_apps() {
     stop_process "HealthMes" "$HEALTHMES_PID"
     stop_process "Open Wearables beat" "$BEAT_PID"
     stop_process "Open Wearables worker" "$WORKER_PID"
-    stop_process "Open Wearables" "$OW_PID"
+    stop_open_wearables
 }
 
 cmd_stop() {
