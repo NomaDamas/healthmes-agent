@@ -79,9 +79,13 @@ class UsageSnapshotReader(context: Context) {
         @Suppress("DEPRECATION") // MOVE_TO_* are the pre-API-29 names (same int values).
         when (eventType) {
             UsageEvents.Event.MOVE_TO_FOREGROUND -> AppForegroundEvent.Kind.RESUMED
-            UsageEvents.Event.MOVE_TO_BACKGROUND,
-            EVENT_ACTIVITY_STOPPED,
-            -> AppForegroundEvent.Kind.PAUSED
+            UsageEvents.Event.MOVE_TO_BACKGROUND ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    AppForegroundEvent.Kind.PAUSED
+                } else {
+                    AppForegroundEvent.Kind.STOPPED
+                }
+            EVENT_ACTIVITY_STOPPED -> AppForegroundEvent.Kind.STOPPED
 
             else -> null
         }

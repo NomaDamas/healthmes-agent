@@ -48,12 +48,19 @@ CALENDAR_ADJUSTMENT_TOOLS = {
     "evaluate_morning_calendar_nudge",
     "resolve_calendar_adjustment",
 }
+ACTIVITY_TOOLS = {
+    "get_activity_summary",
+    "get_focus_context",
+    "get_overwork_context",
+    "resolve_wellness_context",
+}
 EXPECTED_TOOLS = (
     TRANCHE_1_TOOLS
     | TRANCHE_2_TOOLS
     | TRANCHE_3_TOOLS
     | NUTRITION_TOOLS
     | CALENDAR_ADJUSTMENT_TOOLS
+    | ACTIVITY_TOOLS
 )
 
 _INITIALIZE = {

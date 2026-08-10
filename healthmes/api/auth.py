@@ -22,9 +22,10 @@ reconciliation is a single shared bearer token (``Settings.api_token``):
 - Loopback-only Calendar write flows accept a short-lived local session only
   after a full API credential bootstraps it. A loopback proxy connection and
   attacker-controlled ``Host`` header alone never grant that session.
-- When no token is configured the middleware is not installed (the zero-setup
-  loopback dev path); ``python -m healthmes serve`` refuses to bind a
-  non-loopback host in that state (see ``healthmes/__main__.py``).
+- When no token is configured, :class:`LoopbackOnlyMiddleware` verifies the
+  actual socket peer. ``python -m healthmes serve`` also refuses a non-loopback
+  bind, so direct Uvicorn factory execution cannot bypass the local-only
+  boundary.
 
 Implemented as pure ASGI (not ``BaseHTTPMiddleware``) so the /mcp
 Streamable-HTTP responses keep streaming untouched.
@@ -42,11 +43,13 @@ from healthmes.api.local_session import (
     LOCAL_SESSION_AUTH_SCOPE_KEY,
     LocalSessionStore,
     authenticated_local_session,
+    is_loopback_scope,
 )
 from healthmes.config import Settings
 
 __all__ = [
     "BearerTokenMiddleware",
+    "LoopbackOnlyMiddleware",
     "install_auth",
     "viewer_token",
     "viewer_url",
@@ -213,8 +216,34 @@ class BearerTokenMiddleware:
         scope.setdefault("state", {})[LOCAL_SESSION_AUTH_SCOPE_KEY] = True
 
 
+class LoopbackOnlyMiddleware:
+    """Keep tokenless development traffic on the actual local socket peer."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or self._is_allowed(scope):
+            await self._app(scope, receive, send)
+            return
+        response = JSONResponse(
+            status_code=403,
+            content=error_body(
+                "local_only",
+                "HealthMes without an API token accepts loopback clients only.",
+            ),
+        )
+        await response(scope, receive, send)
+
+    @staticmethod
+    def _is_allowed(scope: Scope) -> bool:
+        if scope.get("path", "") in OPEN_PATHS:
+            return True
+        return is_loopback_scope(scope)
+
+
 def install_auth(app, settings: Settings) -> bool:
-    """Install the bearer middleware when a token is configured.
+    """Install bearer auth or a socket-peer loopback boundary.
 
     Returns True when auth is active. Called by the app factory — a single
     composition point so REST, viewer pages and /mcp are all covered by the
@@ -222,6 +251,7 @@ def install_auth(app, settings: Settings) -> bool:
     """
     token = settings.api_token.get_secret_value().strip()
     if not token:
+        app.add_middleware(LoopbackOnlyMiddleware)
         return False
     app.add_middleware(
         BearerTokenMiddleware,

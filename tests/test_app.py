@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from healthmes import __version__
+from healthmes.activity.maintenance import ACTIVITY_MAINTENANCE_JOB_ID
 from healthmes.app import create_app
 from healthmes.config import Settings
 from healthmes.engine.scheduler import (
@@ -70,7 +71,11 @@ class TestStoreWiring:
     def test_lifespan_binds_engine_to_app_settings_and_serves_rest(self, settings) -> None:
         """init_engine(settings) runs at startup so SessionDep hits the app db."""
         app = create_app(settings)
-        with TestClient(app) as client:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
             engine = get_engine()  # initialised by the lifespan, not lazily
             assert str(engine.url) == settings.database_url
             Base.metadata.create_all(engine)
@@ -93,7 +98,11 @@ class TestMcpWiring:
     def test_mcp_initialize_handshake_at_exactly_slash_mcp(self, settings) -> None:
         """The MCP session manager runs (chained lifespan) and serves POST /mcp."""
         app = create_app(settings)
-        with TestClient(app) as client:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
             response = client.post("/mcp", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
 
             assert response.status_code == 200
@@ -104,7 +113,11 @@ class TestMcpWiring:
     def test_fastapi_routes_keep_precedence_and_404s_keep_the_envelope(self, settings) -> None:
         """/health & /v1 stay FastAPI-served; unknown paths keep the envelope."""
         app = create_app(settings)
-        with TestClient(app) as client:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
             assert client.get("/health").json() == {"status": "ok"}
 
             missing = client.get("/v1/nope")
@@ -121,6 +134,13 @@ class TestMcpWiring:
         with TestClient(app):
             assert mcp_server._active_settings() is settings
         assert mcp_server._settings_override is None
+
+    def test_lifespan_accepts_fixed_offset_timezone(self, settings) -> None:
+        fixed = settings.model_copy(update={"timezone": "UTC+09:00"})
+        app = create_app(fixed)
+
+        with TestClient(app):
+            assert str(mcp_server._local_timezone()) == "UTC+09:00"
 
 
 class TestSchedulerWiring:
@@ -147,6 +167,7 @@ class TestSchedulerWiring:
                 BACKUP_JOB_ID,
                 CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
                 STORAGE_MAINTENANCE_JOB_ID,
+                ACTIVITY_MAINTENANCE_JOB_ID,
             }
         assert not scheduler.running
         assert app.state.scheduler is None
@@ -176,6 +197,7 @@ class TestSchedulerWiring:
                 CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
                 SLEEP_RECONCILIATION_JOB_ID,
                 STORAGE_MAINTENANCE_JOB_ID,
+                ACTIVITY_MAINTENANCE_JOB_ID,
                 calendar_job_id(CalendarSource.GOOGLE),
                 calendar_job_id(CalendarSource.CALDAV),
             }
@@ -210,5 +232,6 @@ class TestSchedulerWiring:
             BACKUP_JOB_ID,
             CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
             STORAGE_MAINTENANCE_JOB_ID,
+            ACTIVITY_MAINTENANCE_JOB_ID,
         }
         assert not prepared.running

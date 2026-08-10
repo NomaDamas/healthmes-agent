@@ -7,7 +7,6 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
 from re import fullmatch
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -43,6 +42,7 @@ from healthmes.nutrition.schema import (
 )
 from healthmes.storage import classify_storage_object, ensure_default_policies
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
+from healthmes.timezones import parse_timezone
 
 OBSERVATION_EVENT = "nutrition.observation.v1"
 CONFIRMATION_EVENT = "nutrition.confirmation.v1"
@@ -834,7 +834,7 @@ def latest_daily_confirmation(
 
 
 def local_day_bounds(day: date, timezone: str) -> tuple[datetime, datetime]:
-    tz = ZoneInfo(timezone)
+    tz = parse_timezone(timezone)
     start = datetime.combine(day, time.min, tzinfo=tz)
     end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz)
     return start.astimezone(UTC), end.astimezone(UTC)

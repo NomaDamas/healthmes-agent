@@ -10,9 +10,23 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from sqlalchemy.orm import Session
 from starlette.types import Receive, Scope, Send
 
 from healthmes import __version__
+from healthmes.activity import api as activity_api
+from healthmes.activity.aggregation import (
+    migrate_activity_summary_derivations,
+)
+from healthmes.activity.android import backfill_android_canonical_events
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
+from healthmes.activity.maintenance import (
+    build_activity_maintenance_job,
+    register_activity_maintenance_job,
+)
 from healthmes.api import include_all
 from healthmes.api.auth import install_auth
 from healthmes.api.google_oauth import install_google_oauth
@@ -20,7 +34,7 @@ from healthmes.api.local_session import install_local_sessions
 from healthmes.backup.local import build_backup_job
 from healthmes.calendars.jobs import build_calendar_jobs
 from healthmes.calendars.sleep_job import build_sleep_reconciliation_job
-from healthmes.config import Settings, get_settings
+from healthmes.config import Settings, get_settings, resolve_timezone
 from healthmes.engine.cognitive_energy import build_energy_job
 from healthmes.engine.scheduler import (
     create_scheduler,
@@ -35,7 +49,22 @@ from healthmes.engine.scheduler import (
 )
 from healthmes.mcp_server import server as mcp_server
 from healthmes.storage import build_storage_maintenance_job
-from healthmes.store import Base, dispose_engine, init_engine
+from healthmes.store import Base, dispose_engine, init_engine, session_scope
+
+
+def _initialize_activity_storage(
+    session: Session,
+    *,
+    timezone: str,
+) -> None:
+    """Bootstrap activity policies and derivations under the global write lock."""
+    with activity_write_lock():
+        lock_activity_write_plane(session)
+        backfill_android_canonical_events(
+            session,
+            timezone=timezone,
+        )
+        migrate_activity_summary_derivations(session)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -61,6 +90,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = init_engine(settings)
         if engine.dialect.name == "sqlite":
             Base.metadata.create_all(engine)
+        with session_scope() as session:
+            _initialize_activity_storage(
+                session,
+                timezone=str(resolve_timezone(settings)),
+            )
         # MCP tools resolve settings through the same override hook the tests
         # use, so tools always agree with the app about endpoints/keys.
         mcp_server.set_settings(settings)
@@ -74,8 +108,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         scheduler = create_scheduler(settings)
         register_energy_job(scheduler, build_energy_job(settings))
         register_backup_job(scheduler, build_backup_job(settings))
-        register_storage_maintenance_job(
-            scheduler, build_storage_maintenance_job(settings)
+        register_storage_maintenance_job(scheduler, build_storage_maintenance_job(settings))
+        register_activity_maintenance_job(
+            scheduler,
+            build_activity_maintenance_job(),
         )
         register_calendar_adjustment_maintenance_job(
             scheduler, mcp_server.expire_and_reconcile_calendar_adjustments
@@ -118,11 +154,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # REST surface: error-envelope handlers + every /v1 router + the decision
     # viewer page (idempotent — test fixtures may call it again).
     include_all(app)
+    app.include_router(activity_api.router)
 
     # Bearer-token gate over the whole surface — REST, viewer pages AND /mcp
     # (middleware wraps the router, so the /mcp default-handler dispatch below
     # is covered too). No-op when Settings.api_token is empty; the serve
-    # entrypoint then refuses non-loopback binds (healthmes/__main__.py).
+    # entrypoint also refuses non-loopback binds; the tokenless middleware
+    # independently checks the actual socket peer so direct factory execution
+    # cannot bypass the local-only boundary.
     install_auth(app, settings)
 
     # Serve the MCP app from the router's *default* handler (the last resort

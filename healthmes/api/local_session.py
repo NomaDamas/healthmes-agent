@@ -12,6 +12,7 @@ from fastapi import HTTPException, Request, Response, status
 LOCAL_SESSION_COOKIE = "healthmes_local_session"
 LOCAL_SESSION_TTL = dt.timedelta(minutes=30)
 LOCAL_SESSION_AUTH_SCOPE_KEY = "healthmes.local_session_authenticated"
+_PROXY_HEADER_NAMES = frozenset({"forwarded", "via", "x-real-ip"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,12 +89,12 @@ def authenticated_local_session(
 
 
 def is_loopback_scope(scope: dict) -> bool:
+    if _has_proxy_metadata(scope):
+        return False
     host = _host_name(_header(scope, b"host"))
     client = scope.get("client")
     client_host = client[0] if isinstance(client, tuple) and client else ""
-    return _is_loopback(host) and (
-        _is_loopback(client_host) or client_host == "testclient"
-    )
+    return _is_loopback(host) and _is_loopback_ip(client_host)
 
 
 def local_browser_url(port: int, path: str) -> str:
@@ -195,9 +196,17 @@ def _assert_same_origin(request: Request) -> None:
 
 def _header(scope: dict, name: bytes) -> str:
     for key, value in scope.get("headers", ()):
-        if key == name:
+        if key.lower() == name:
             return value.decode("latin-1")
     return ""
+
+
+def _has_proxy_metadata(scope: dict) -> bool:
+    for raw_name, _ in scope.get("headers", ()):
+        name = raw_name.decode("latin-1").strip().lower()
+        if name in _PROXY_HEADER_NAMES or name.startswith("x-forwarded-"):
+            return True
+    return False
 
 
 def _host_name(host: str) -> str:
@@ -206,11 +215,15 @@ def _host_name(host: str) -> str:
     return host.rsplit(":", 1)[0] if ":" in host else host
 
 
-def _is_loopback(value: str) -> bool:
+def _is_loopback_ip(value: str) -> bool:
     try:
         return ipaddress.ip_address(value).is_loopback
     except ValueError:
-        return value.lower() == "localhost"
+        return False
+
+
+def _is_loopback(value: str) -> bool:
+    return _is_loopback_ip(value) or value.lower() == "localhost"
 
 
 def _scope_origin(scope: dict) -> str:

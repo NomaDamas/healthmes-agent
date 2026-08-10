@@ -20,6 +20,9 @@ class HourlyBucketerTest {
     private fun paused(pkg: String, atMs: Long, activity: String? = "Main") =
         AppForegroundEvent(pkg, activity, atMs, Kind.PAUSED)
 
+    private fun stopped(pkg: String, atMs: Long, activity: String? = "Main") =
+        AppForegroundEvent(pkg, activity, atMs, Kind.STOPPED)
+
     @Test
     fun `floors timestamps to the hour`() {
         assertEquals(h1, HourlyBucketer.floorToHour(h1))
@@ -63,7 +66,9 @@ class HourlyBucketerTest {
             resumed("com.app", 600_000L, "ActivityA"),
             resumed("com.app", 720_000L, "ActivityB"),
             paused("com.app", 780_000L, "ActivityA"),
+            stopped("com.app", 800_000L, "ActivityA"),
             paused("com.app", 1_200_000L, "ActivityB"),
+            stopped("com.app", 1_220_000L, "ActivityB"),
         )
 
         val buckets = HourlyBucketer.bucket(events, h0, h1)
@@ -72,11 +77,26 @@ class HourlyBucketerTest {
     }
 
     @Test
+    fun `anonymous stop consumes its pause while another anonymous activity remains`() {
+        val events = listOf(
+            resumed("com.app", 0L, null),
+            resumed("com.app", 10_000L, null),
+            paused("com.app", 20_000L, null),
+            stopped("com.app", 21_000L, null),
+        )
+
+        val buckets = HourlyBucketer.bucket(events, h0, 60_000L)
+
+        assertEquals(listOf(UsageBucket(h0, "com.app", 60, 1)), buckets)
+    }
+
+    @Test
     fun `re-resume of the same activity does not double launch`() {
         val events = listOf(
             resumed("com.app", 600_000L),
             resumed("com.app", 700_000L),
             paused("com.app", 900_000L),
+            stopped("com.app", 920_000L),
         )
 
         val buckets = HourlyBucketer.bucket(events, h0, h1)
@@ -94,8 +114,11 @@ class HourlyBucketerTest {
     }
 
     @Test
-    fun `orphan pause counts from window start without a launch`() {
-        val events = listOf(paused("com.app", 300_000L))
+    fun `orphan pause and stop count from window start without a launch`() {
+        val events = listOf(
+            paused("com.app", 300_000L),
+            stopped("com.app", 320_000L),
+        )
 
         val buckets = HourlyBucketer.bucket(events, h0, h1)
 
@@ -103,10 +126,12 @@ class HourlyBucketerTest {
     }
 
     @Test
-    fun `repeated orphan pauses never double count`() {
+    fun `repeated orphan lifecycle pairs never double count`() {
         val events = listOf(
             paused("com.app", 300_000L, "ActivityA"),
+            stopped("com.app", 320_000L, "ActivityA"),
             paused("com.app", 600_000L, "ActivityB"),
+            stopped("com.app", 620_000L, "ActivityB"),
         )
 
         val buckets = HourlyBucketer.bucket(events, h0, h1)
@@ -119,6 +144,7 @@ class HourlyBucketerTest {
         val events = listOf(
             resumed("com.app", h1 - 60_000L), // 0:59
             paused("com.app", h1 + 60_000L), // 1:01
+            stopped("com.app", h1 + 61_000L),
         )
 
         val buckets = HourlyBucketer.bucket(events, h0, h2)
@@ -137,6 +163,7 @@ class HourlyBucketerTest {
         val events = listOf(
             resumed("com.app", 100L),
             paused("com.app", 600L),
+            stopped("com.app", 700L),
         )
 
         val buckets = HourlyBucketer.bucket(events, h0, h1)
@@ -149,6 +176,7 @@ class HourlyBucketerTest {
         val events = listOf(
             resumed("com.app", 600_000L),
             paused("com.app", 900_000L),
+            stopped("com.app", 920_000L),
             resumed("com.other", h2 + 100L), // beyond window end
         )
 
@@ -161,6 +189,7 @@ class HourlyBucketerTest {
     fun `unsorted event input is handled`() {
         val events = listOf(
             paused("com.app", 940_000L),
+            stopped("com.app", 960_000L),
             resumed("com.app", 600_000L),
         )
 
@@ -174,8 +203,10 @@ class HourlyBucketerTest {
         val events = listOf(
             resumed("com.a", 0L),
             paused("com.a", 120_000L),
+            stopped("com.a", 121_000L),
             resumed("com.b", 120_000L),
             paused("com.b", 300_000L),
+            stopped("com.b", 301_000L),
         )
 
         val buckets = HourlyBucketer.bucket(events, h0, h1)
@@ -187,5 +218,34 @@ class HourlyBucketerTest {
             ),
             buckets,
         )
+    }
+
+    @Test
+    fun `paused then stopped ends at pause rather than lifecycle cleanup`() {
+        val events = listOf(
+            resumed("com.app", 0L),
+            paused("com.app", 10_000L),
+            stopped("com.app", 20_000L),
+        )
+
+        val buckets = HourlyBucketer.bucket(events, h0, h1)
+
+        assertEquals(listOf(UsageBucket(h0, "com.app", 10, 1)), buckets)
+    }
+
+    @Test
+    fun `paused then resumed screen transition keeps one package launch`() {
+        val events = listOf(
+            resumed("com.app", 0L, "ActivityA"),
+            paused("com.app", 10_000L, "ActivityA"),
+            resumed("com.app", 11_000L, "ActivityB"),
+            stopped("com.app", 12_000L, "ActivityA"),
+            paused("com.app", 30_000L, "ActivityB"),
+            stopped("com.app", 31_000L, "ActivityB"),
+        )
+
+        val buckets = HourlyBucketer.bucket(events, h0, h1)
+
+        assertEquals(listOf(UsageBucket(h0, "com.app", 30, 1)), buckets)
     }
 }

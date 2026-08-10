@@ -110,7 +110,11 @@ def test_upload_rejects_disallowed_content_type(client, settings, declared):
 
 def test_upload_size_cap_rejects_and_removes_partial_file(settings):
     capped = settings.model_copy(update={"media_max_upload_bytes": 1000})
-    with TestClient(create_app(capped)) as client:
+    with TestClient(
+        create_app(capped),
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
         too_big = _upload(client, content=b"x" * 1001)
         assert too_big.status_code == 413
         error = too_big.json()["error"]
@@ -154,8 +158,8 @@ def _asgi_post_media(app, headers, body: bytes = b""):
         "root_path": "",
         "query_string": b"",
         "headers": headers,
-        "client": ("testclient", 50000),
-        "server": ("testserver", 80),
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8100),
     }
     anyio.run(app, scope, receive, send)
 
@@ -176,7 +180,7 @@ def test_oversized_declared_content_length_is_rejected_before_any_body_read(sett
     status_code, payload, receive_calls = _asgi_post_media(
         app,
         headers=[
-            (b"host", b"testserver"),
+            (b"host", b"127.0.0.1:8100"),
             (b"content-type", b"multipart/form-data; boundary=deadbeefcafe"),
             (b"content-length", str(5 * 1024 * 1024 * 1024).encode()),  # a "5 GB" body
         ],
@@ -198,7 +202,7 @@ def test_upload_without_content_length_is_411(settings):
     status_code, payload, receive_calls = _asgi_post_media(
         app,
         headers=[
-            (b"host", b"testserver"),
+            (b"host", b"127.0.0.1:8100"),
             (b"content-type", b"multipart/form-data; boundary=deadbeefcafe"),
         ],
     )
@@ -212,7 +216,11 @@ def test_multi_megabyte_body_is_refused_at_the_header_gate(settings):
     # Through the regular client: httpx declares the true Content-Length, so
     # a 5 MiB upload against a 1000-byte cap dies at the header check.
     capped = settings.model_copy(update={"media_max_upload_bytes": 1000})
-    with TestClient(create_app(capped)) as client:
+    with TestClient(
+        create_app(capped),
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
         response = _upload(client, content=b"x" * (5 * 1024 * 1024))
 
         assert response.status_code == 413

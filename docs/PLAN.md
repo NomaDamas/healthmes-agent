@@ -62,9 +62,15 @@ HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개�
 
 `mcp/app/tools/` = get_users, get_activity_summary, get_sleep_summary, get_workout_events, get_timeseries. **REST에는 있지만 MCP에 없는 것: `/health-scores`(스트레스·body battery·readiness·내부 수면/회복탄력성 점수 전부!), `/summaries/recovery`, `/summaries/body`, `/events/sleep`의 hypnogram, 생리주기, 워크아웃 HR/파워 존.** 심지어 MCP `get_sleep_summary`는 REST가 주는 단계/효율/HRV/호흡/SpO2 필드를 **버리고** date/start/end/duration/source만 남긴다. 즉 벤더 MCP만으로는 에이전트가 스트레스 점수를 못 본다. 벤더 MCP 포크는 금지(업스트림 sync 부담) — HealthMes MCP에 아래 Layer B로 얹는다.
 
-### 3-레이어 도구 설계 원칙
+### Decision Agent와 도구 설계 원칙
 
-**원칙: MCP 도구 = 결정론적 사실(조회·계산·해석된 델타), 스킬 = 판단 절차(어떤 도구를 언제 쓰고 어떻게 해석할지). 지표별 도구가 아니라 "의사결정 질문" 단위 도구.**
+**2026-08-10 개정:** MCP 도구는 결정론적 사실과 전문 context를 제공하고,
+HealthMes Decision Agent의 LLM이 자연어 질문을 해석해 필요한 도구를 선택한다.
+Skill은 핵심 판단 절차의 source of truth가 아니라 runtime별 연결과 표현을 돕는
+얇은 adapter다. 권한, retention, 전문 정책과 DecisionRecord 저장 의무는
+HealthMes 코드와 계약이 강제한다. 상세 구조는
+[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+를 따른다.
 
 - **Layer A — 벤더 MCP (그대로 등록):** 범용 조회 5종. 111개 시계열은 `get_timeseries(types=[...])`가 이미 커버 — 지표별 마이크로 도구 금지 (도구 선택 붕괴).
 - **Layer B — HealthMes MCP "해석된 컨텍스트" 도구 (결정론적, LLM엔 결과만):**
@@ -79,7 +85,13 @@ HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개�
   | `list_tasks / upsert_task / get_schedule / propose_schedule_blocks` | 일정 도메인 CRUD (propose-then-confirm 게이트) |
   | `log_food / create_medical_record / record_decision` | 캡처 + 설명가능성 |
   - 모든 Layer B 도구는 **원시 시계열이 아닌 해석된 델타 + confidence/coverage 필드**를 반환 (토큰 절약·프라이버시·환각 방지·설명가능성 4중 이득). 데이터가 빈약하면 "insufficient_data"를 정직하게 반환.
-- **Layer C — 스킬 (얇은 판단 지침):** `healthmes-planner`(배치 룰: 에너지 높은 시간에 energy_demand=high 태스크, 회복 낮으면 운동 대신 휴식 제안 등), `healthmes-capture`, `healthmes-insight`(주간 리뷰 절차), Phase 3 `doctor-visit-summary`. **스킬 스크립트가 REST를 직접 호출하는 것 금지** — 데이터 접근이 MCP를 우회하면 decision tree 기록이 끊긴다.
+- **Decision Layer — HealthMes Decision Agent:** LLM이 질문의 목적, 필요한 영역,
+  기간과 tool을 선택하고 첫 결과에 따라 추가 조회한다. 계산된 숫자와 전문 hard
+  boundary를 재작성하지 않고 여러 영역의 trade-off와 최종 설명을 담당한다.
+- **Runtime Layer — Hermes adapter + 얇은 Skill:** `healthmes-planner`,
+  `healthmes-capture`와 domain Skill은 Hermes의 도구 사용법, 채널 workflow와
+  표현 방식을 연결한다. Skill 스크립트가 REST나 DB를 직접 호출하는 것은 금지하며,
+  Skill 미로드로 권한·retention·전문 정책·최종 기록 보장이 사라져서는 안 된다.
 
 **다입력 플랫폼 해자:** Open Wearables 외 건강·행동·환경·일정·주관 상태·의료
 입력을 계속 추가할 수 있는 범용 인터페이스 자체를 독립적인 해자로 둔다. 모든
@@ -94,6 +106,18 @@ adapter·출력 채널을 포크하거나 교체할 수 있어야 한다. 모든
 저장소, 권한, provenance, retention, MCP/Skill 계약을 사용해야 하며 안전 경계는
 우회할 수 없다. 코드 공개 자체보다 호환되는 커스텀 앱과 기여가 늘어나는 생태계를
 보조 해자로 본다.
+
+**활동 텔레메트리와 교차 영역 판단 계약:** 휴대전화·컴퓨터 activity는
+[`ACTIVITY-WELLNESS-MVP.ko.md`](ACTIVITY-WELLNESS-MVP.ko.md)의 self-hosted
+MVP 경계를 따른다. 모호한 질문의 LLM tool selection, Context Access Layer와
+Hermes runtime 경계는
+[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md),
+해자 정의는
+[`MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md`](MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md),
+현재 고정 resolver 호환 계약은
+[`HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`](contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md)
+를 사용한다. Activity Ingest는 Open Wearables를 다시 수집하지 않으며 각 domain
+context는 Context Access Layer를 거쳐 HealthMes Decision Agent가 종합한다.
 
 **소유권 메모 (2026-08-05):** 음식 분석·음식 사진 인식의 추가 개발은 sake가
 담당한다. HealthMes는 기존 음식 기록 경로만 유지하고, sake의 결과를 공통 웰니스
@@ -114,7 +138,7 @@ adapter·출력 채널을 포크하거나 교체할 수 있어야 한다. 모든
 | `calendar_event_mirror` | external_id, calendar_source(google/caldav), start/end, is_agent_created, agent_task_id, etag/sync_token |
 | `schedule_proposal` | task_id, proposed_start/end, status(proposed/accepted/pushed/declined), decision_record_id |
 | `food_log` | logged_at, description(LLM 생성), media_path, meal_type, source |
-| `app_usage_sample` | device_id, bucket_start, app_package, foreground_seconds, launches, category |
+| `app_usage_sample` | device_id, collection_generation, bucket_start, app_package, foreground_seconds, launches, category |
 | `cognitive_energy_estimate` | window_start/end, score(0–100), components JSONB(요인별 기여), inputs_snapshot JSONB |
 | `decision_record` | kind(schedule_change/alert/insight/capture), tree JSONB, summary, llm_model, tokens |
 | `insight` | period, kind, statement, evidence JSONB, confidence |

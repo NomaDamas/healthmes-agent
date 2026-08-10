@@ -66,5 +66,9 @@ def app(settings: Settings) -> FastAPI:
 @pytest.fixture
 def client(app: FastAPI):
     """TestClient running the app's lifespan (startup/shutdown) events."""
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as test_client:
         yield test_client

@@ -7,7 +7,6 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from typing import Annotated, Literal, Self
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Request, status
 from pydantic import AwareDatetime, BaseModel, Field, model_validator
@@ -59,6 +58,7 @@ from healthmes.nutrition.vision import (
     create_vision_provider,
 )
 from healthmes.store.session import SessionDep
+from healthmes.timezones import parse_timezone
 
 router = APIRouter(prefix="/v1/nutrition-observations", tags=["nutrition"])
 MAX_CAPTURE_CLOCK_SKEW = timedelta(minutes=5)
@@ -85,9 +85,11 @@ class AnalyzeNutritionPhoto(BaseModel):
     @model_validator(mode="after")
     def validate_capture_context(self) -> Self:
         try:
-            timezone = ZoneInfo(self.timezone)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError("timezone must be a valid IANA timezone") from exc
+            timezone = parse_timezone(self.timezone)
+        except ValueError as exc:
+            raise ValueError(
+                "timezone must be a valid IANA or UTC fixed-offset timezone"
+            ) from exc
         expected_offset = self.captured_at.astimezone(timezone).utcoffset()
         if self.captured_at.utcoffset() != expected_offset:
             raise ValueError("captured_at offset conflicts with timezone")
@@ -244,9 +246,11 @@ class ConfirmDayInput(BaseModel):
     @model_validator(mode="after")
     def validate_timezone_and_ids(self) -> Self:
         try:
-            ZoneInfo(self.timezone)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError("timezone must be a valid IANA timezone") from exc
+            parse_timezone(self.timezone)
+        except ValueError as exc:
+            raise ValueError(
+                "timezone must be a valid IANA or UTC fixed-offset timezone"
+            ) from exc
         if len(self.observation_ids) != len(set(self.observation_ids)):
             raise ValueError("observation_ids must not contain duplicates")
         if len(self.outcome_ids) != len(set(self.outcome_ids)):

@@ -66,7 +66,11 @@ def _payload(summary: str, proposal: str = "Move the 14:00 block to tomorrow.") 
 @pytest.fixture
 def client(app):
     """Shared api-test app; one unfrozen priming request (see test_briefing)."""
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as test_client:
         assert test_client.get(ALERTS).status_code == 200
         yield test_client
 

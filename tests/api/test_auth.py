@@ -4,11 +4,12 @@ Pins the PLAN §9 fix: with ``HEALTHMES_API_TOKEN`` set, no anonymous LAN peer
 can read medical records / health context or write through /mcp; the Android
 collector's ``Authorization: Bearer`` header is actually verified; and
 decision-viewer links stay tappable via the derived read-only ?token=.
-Without a configured token the middleware is absent (loopback dev path) and
-the serve entrypoint refuses non-loopback binds.
+Without a configured token the app factory itself is loopback-only and the
+serve entrypoint independently refuses non-loopback binds.
 """
 
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -26,22 +27,35 @@ TOKEN = "test-api-token-123"
 @contextmanager
 def app_client(settings):
     """TestClient over the real app factory + schema on the lifespan engine."""
-    with TestClient(create_app(settings)) as client:
+    with TestClient(
+        create_app(settings),
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
         Base.metadata.create_all(get_engine())
         yield client
 
-PAYLOAD = {
-    "device_id": "android-abc123",
-    "samples": [
-        {
-            "bucket_start": "2026-07-09T10:00:00Z",
-            "app_package": "com.slack",
-            "foreground_seconds": 600,
-            "launches": 4,
-            "category": "productivity",
-        }
-    ],
-}
+
+def fresh_payload() -> dict:
+    bucket = (datetime.now(UTC) - timedelta(hours=1)).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return {
+        "device_id": "android-abc123",
+        "collection_revision": 0,
+        "collection_generation": 0,
+        "samples": [
+            {
+                "bucket_start": bucket.isoformat().replace("+00:00", "Z"),
+                "app_package": "com.slack",
+                "foreground_seconds": 600,
+                "launches": 4,
+                "category": "productivity",
+            }
+        ],
+    }
 
 
 @pytest.fixture
@@ -74,11 +88,24 @@ class TestTokenRequired:
     def test_android_ingest_header_is_verified(self, secured_client) -> None:
         # The collector sends Authorization: Bearer <token> (IngestClient.kt);
         # the server now actually checks it.
-        anonymous = secured_client.post("/v1/app-usage/batch", json=PAYLOAD)
+        payload = fresh_payload()
+        anonymous = secured_client.post("/v1/app-usage/batch", json=payload)
         assert anonymous.status_code == 401
 
+        registered = secured_client.post(
+            f"/v1/activity/devices/{payload['device_id']}/status",
+            json={
+                "platform": "android",
+                "capability": "aggregate",
+                "permission_status": "granted",
+                "status_observed_at": datetime.now(UTC).isoformat(),
+                "collection_generation": payload["collection_generation"],
+            },
+            headers=bearer(),
+        )
+        assert registered.status_code == 200
         authorized = secured_client.post(
-            "/v1/app-usage/batch", json=PAYLOAD, headers=bearer()
+            "/v1/app-usage/batch", json=payload, headers=bearer()
         )
         assert authorized.status_code == 200
         assert authorized.json()["accepted"] == 1
@@ -149,6 +176,97 @@ class TestNoTokenConfigured:
     def test_loopback_dev_path_stays_open(self, settings) -> None:
         with app_client(settings) as client:
             assert client.get("/v1/tasks").status_code == 200
+
+    def test_default_testclient_identity_is_not_a_production_exception(
+        self,
+        settings,
+    ) -> None:
+        app = create_app(settings)
+        with TestClient(app) as client:
+            response = client.get("/v1/tasks")
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "local_only"
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://healthmes.example:8100",
+            "http://203.0.113.20:8100",
+        ],
+    )
+    def test_loopback_peer_rejects_non_loopback_host(
+        self,
+        settings,
+        base_url,
+    ) -> None:
+        app = create_app(settings)
+        with TestClient(
+            app,
+            base_url=base_url,
+            client=("127.0.0.1", 43123),
+        ) as client:
+            response = client.get("/v1/tasks")
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "local_only"
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Forwarded": "for=203.0.113.10"},
+            {"X-Forwarded-For": "203.0.113.10"},
+            {"X-Forwarded-Host": "healthmes.example"},
+            {"X-Forwarded-Proto": "https"},
+            {"X-Real-IP": "203.0.113.10"},
+            {"Via": "1.1 reverse-proxy"},
+        ],
+    )
+    def test_tokenless_loopback_rejects_proxy_metadata(
+        self,
+        settings,
+        headers,
+    ) -> None:
+        app = create_app(settings)
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
+            response = client.get("/v1/tasks", headers=headers)
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "local_only"
+
+    def test_direct_factory_rejects_non_loopback_client_without_token(
+        self,
+        settings,
+    ) -> None:
+        app = create_app(settings)
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("203.0.113.10", 43123),
+        ) as client:
+            Base.metadata.create_all(get_engine())
+            response = client.get("/v1/tasks")
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "local_only"
+
+    def test_direct_factory_keeps_health_open_for_non_loopback_client(
+        self,
+        settings,
+    ) -> None:
+        app = create_app(settings)
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("203.0.113.10", 43123),
+        ) as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
 
     def test_serve_refuses_non_loopback_bind_without_token(self, settings) -> None:
         lan = settings.model_copy(update={"host": "0.0.0.0"})

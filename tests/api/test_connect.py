@@ -53,7 +53,11 @@ class FakeOpenWearables:
 @pytest.fixture
 def client(app):
     """Status page served by the shared api-test app (tokenless settings)."""
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as test_client:
         yield test_client
 
 
@@ -148,6 +152,7 @@ def test_gating_matches_viewer_pages(settings) -> None:
     with TestClient(
         create_app(secured),
         base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
     ) as loopback:
         assert loopback.get("/connect").status_code == 401
         raw_query = loopback.get(
@@ -211,6 +216,8 @@ def test_loopback_proxy_cannot_bootstrap_local_session_from_host_header(settings
     with TestClient(
         create_app(secured),
         base_url="http://proxy.test:8100",
+        client=("127.0.0.1", 43123),
+        headers={"X-Forwarded-For": "203.0.113.10"},
     ) as proxied:
         bare = proxied.get("/connect", headers={"Host": "localhost:8100"})
         assert bare.status_code == 401
@@ -242,12 +249,7 @@ def test_loopback_proxy_cannot_bootstrap_local_session_from_host_header(settings
             params={"token": viewer_token(TOKEN)},
             headers={"Host": "localhost:8100"},
         )
-        assert proxied_unlock_page.status_code == 200
-        assert (
-            'action="http://127.0.0.1:8100/connect/unlock"'
-            in proxied_unlock_page.text
-        )
-        assert TOKEN not in proxied_unlock_page.text
+        assert proxied_unlock_page.status_code == 403
         assert "healthmes_local_session" not in proxied_unlock_page.headers.get(
             "set-cookie", ""
         )
@@ -285,6 +287,7 @@ def test_local_session_cookie_is_bound_to_direct_loopback_origin(settings) -> No
     with TestClient(
         application,
         base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
     ) as direct:
         unlocked = direct.post(
             "/connect/unlock",
@@ -362,7 +365,11 @@ def test_loopback_google_oauth_connect_and_disconnect_without_secret_render(
     client_secret.write_text('{"installed":{}}', encoding="utf-8")
     app.state.google_oauth_flow_factory = lambda *_args: FakeWebFlow()
 
-    with TestClient(app, base_url="http://127.0.0.1:8100") as local:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as local:
         page = local.get("/connect")
         csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
         assert csrf is not None

@@ -214,6 +214,22 @@ def test_analyze_persists_sake_payload_and_reclassifies_media(
     assert policies["nutrition_confirmation"] is None
 
 
+def test_photo_analysis_accepts_stable_fixed_offset_timezone(client) -> None:
+    client.app.state.nutrition_vision_provider = FakeVision()
+    media_path = _upload(client)
+
+    response = client.post(
+        "/v1/nutrition-observations/analyze",
+        json=_request(
+            media_path,
+            timezone="UTC+09:00",
+        ),
+    )
+
+    assert response.status_code == 201
+    assert response.json()["capture"]["timezone"] == "UTC+09:00"
+
+
 def test_analysis_is_idempotent_per_uploaded_media(client, session):
     provider = FakeVision()
     client.app.state.nutrition_vision_provider = provider

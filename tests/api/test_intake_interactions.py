@@ -554,6 +554,140 @@ def test_caffeine_context_includes_confirmed_text_outcome_evidence(
     assert str(outcome_event.id) in context.json()["evidence_event_ids"]
 
 
+def test_fixed_offset_caffeine_request_reaches_cross_domain_resolver(
+    client,
+) -> None:
+    timezone = "UTC+09:00"
+    consumed = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            timezone=timezone,
+            source_text="카페인 80mg 커피를 마셨어",
+            items=[
+                {
+                    "name": "아침 커피",
+                    "intake_type": "beverage",
+                    "serving": _estimate(1, "cup"),
+                    "nutrients": [
+                        {
+                            "nutrient": "caffeine",
+                            "amount": _estimate(80, "mg"),
+                            "confidence": "high",
+                            "origin": "user",
+                        }
+                    ],
+                    "confidence": "high",
+                }
+            ],
+        ),
+    )
+    assert consumed.status_code == 201
+    consumed_id = consumed.json()["interaction_id"]
+    outcome = client.post(
+        f"/v1/intake-interactions/{consumed_id}/outcomes",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "status": "consumed",
+            "source": "ios-device",
+            "consumed_at": "2026-08-06T12:30:00+09:00",
+        },
+    )
+    assert outcome.status_code == 201
+
+    daily = client.post(
+        "/v1/nutrition-observations/daily-confirmations",
+        json={
+            "local_date": "2026-08-06",
+            "timezone": timezone,
+            "observation_ids": [],
+            "outcome_ids": [
+                outcome.json()["latest_outcome"]["outcome_id"]
+            ],
+            "total_intake_complete": True,
+            "source": "desktop-web",
+        },
+    )
+    assert daily.status_code == 201
+
+    candidate = client.post(
+        "/v1/intake-interactions",
+        json=_text_interaction(
+            intent="ask_before_intake",
+            timezone=timezone,
+            source_text="오후 커피를 마셔도 될까?",
+            items=[
+                {
+                    "name": "오후 커피",
+                    "intake_type": "beverage",
+                    "serving": _estimate(1, "cup"),
+                    "nutrients": [
+                        {
+                            "nutrient": "caffeine",
+                            "amount": _estimate(100, "mg"),
+                            "confidence": "high",
+                            "origin": "user",
+                        }
+                    ],
+                    "confidence": "high",
+                }
+            ],
+        ),
+    )
+    assert candidate.status_code == 201
+    requested = client.post(
+        f"/v1/intake-interactions/{candidate.json()['interaction_id']}"
+        "/decision-requests",
+        json={
+            "operation_id": str(uuid.uuid4()),
+            "scope": "caffeine_sleep",
+            "source": "ios-device",
+            "intended_consumption_at": "2026-08-06T16:00:00+09:00",
+        },
+    )
+    assert requested.status_code == 201
+    request_id = requested.json()["request_id"]
+
+    context = client.get(
+        f"/v1/intake-interactions/decision-requests/{request_id}/context"
+    )
+    assert context.status_code == 200
+    assert (
+        context.json()["specialized_evidence"]["caffeine"][
+            "confirmed_caffeine_mg"
+        ]
+        == 80
+    )
+    assert (
+        context.json()["specialized_evidence"]["caffeine"]["timezone"]
+        == timezone
+    )
+
+    resolved = client.post(
+        "/v1/wellness-context/resolve",
+        json={
+            "question_kind": "caffeine_for_focus",
+            "date": "2026-08-06",
+            "start": "2026-08-06T01:00:00Z",
+            "end": "2026-08-06T02:00:00Z",
+            "timezone": timezone,
+            "nutrition_request_id": request_id,
+        },
+    )
+
+    assert resolved.status_code == 200
+    nutrition = resolved.json()["contexts"]["nutrition"]
+    assert nutrition["status"] == "ok"
+    assert nutrition["candidate_ledger_complete"] is True
+    assert nutrition["decision_ready"] is False
+    assert nutrition["context"]["request"]["request_id"] == request_id
+    assert (
+        nutrition["context"]["specialized_evidence"]["caffeine"][
+            "confirmed_caffeine_mg"
+        ]
+        == 80
+    )
+
+
 def test_high_risk_scope_cannot_store_wellness_proposal(client):
     interaction = client.post(
         "/v1/intake-interactions",

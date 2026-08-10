@@ -266,9 +266,23 @@ def test_resolve_timezone(monkeypatch) -> None:
     seoul = _clean_settings(timezone="Asia/Seoul")
     assert resolve_timezone(seoul) == zoneinfo.ZoneInfo("Asia/Seoul")
 
+    fixed = _clean_settings(timezone="UTC+09:00")
+    assert str(resolve_timezone(fixed)) == "UTC+09:00"
+    assert resolve_timezone(fixed).utcoffset(None) == datetime.timedelta(hours=9)
+
     machine = _clean_settings(timezone=None)
     assert resolve_timezone(machine) is not None  # machine-local tz
 
     broken = _clean_settings(timezone="Not/AZone")
     with pytest.raises(zoneinfo.ZoneInfoNotFoundError):
         resolve_timezone(broken)
+
+
+def test_fixed_offset_timezone_from_environment(monkeypatch) -> None:
+    from healthmes.config import resolve_timezone
+
+    monkeypatch.setenv("HEALTHMES_TIMEZONE", "UTC+09:00")
+    settings = _clean_settings()
+
+    assert settings.timezone == "UTC+09:00"
+    assert str(resolve_timezone(settings)) == "UTC+09:00"

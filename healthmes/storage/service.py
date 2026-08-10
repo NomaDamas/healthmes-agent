@@ -10,11 +10,17 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.config import Settings
 from healthmes.store import (
+    AppUsageSample,
     FoodLog,
     MedicalRecord,
     PurgeJob,
@@ -45,6 +51,9 @@ DEFAULT_RETENTION: dict[str, str] = {
     "aggregate": "forever",
     "decision": "forever",
     "medical_record": "forever",
+    "activity_raw": "14d",
+    "activity_hourly": "90d",
+    "activity_daily": "forever",
 }
 
 
@@ -62,8 +71,10 @@ def build_storage_maintenance_job(settings: Settings):
     """Return the scheduler-safe zero-argument lifecycle job."""
 
     def job() -> None:
-        with session_scope() as session:
-            run_storage_maintenance(session, settings)
+        # session_scope commits before the outer lock is released.
+        with activity_write_lock():
+            with session_scope() as session:
+                run_storage_maintenance(session, settings)
 
     return job
 
@@ -73,6 +84,32 @@ def _now() -> datetime:
 
 
 def ensure_default_policies(session: Session) -> list[RetentionPolicy]:
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(
+            pg_insert(RetentionPolicy)
+            .values(
+                [
+                    {
+                        "data_class": data_class,
+                        "retention_days": RETENTION_PRESETS[preset],
+                        "enabled": True,
+                    }
+                    for data_class, preset in DEFAULT_RETENTION.items()
+                ]
+            )
+            .on_conflict_do_nothing(
+                index_elements=[RetentionPolicy.data_class]
+            )
+        )
+        session.flush()
+        return list(
+            session.scalars(
+                select(RetentionPolicy).order_by(
+                    RetentionPolicy.data_class
+                )
+            )
+        )
+
     policies = {row.data_class: row for row in session.scalars(select(RetentionPolicy))}
     for data_class, preset in DEFAULT_RETENTION.items():
         if data_class not in policies:
@@ -88,10 +125,33 @@ def ensure_default_policies(session: Session) -> list[RetentionPolicy]:
 
 
 def update_retention_policy(
-    session: Session, data_class: str, preset: str
+    session: Session,
+    data_class: str,
+    preset: str,
+    *,
+    now: datetime | None = None,
+) -> RetentionPolicy:
+    with activity_write_lock():
+        return _update_retention_policy(
+            session,
+            data_class,
+            preset,
+            now=now,
+        )
+
+
+def _update_retention_policy(
+    session: Session,
+    data_class: str,
+    preset: str,
+    *,
+    now: datetime | None = None,
 ) -> RetentionPolicy:
     if preset not in RETENTION_PRESETS:
         raise ValueError(f"unsupported retention preset: {preset}")
+    current = _as_utc(now or _now())
+    if data_class.startswith("activity_"):
+        lock_activity_write_plane(session)
     ensure_default_policies(session)
     policy = session.scalar(
         select(RetentionPolicy).where(RetentionPolicy.data_class == data_class)
@@ -106,7 +166,13 @@ def update_retention_policy(
         session,
         policy,
         previous_retention_days=previous_retention_days,
+        now=current,
     )
+    if data_class.startswith("activity_"):
+        session.flush()
+        from healthmes.activity.maintenance import run_activity_maintenance
+
+        run_activity_maintenance(session, now=current)
     return policy
 
 
@@ -121,8 +187,9 @@ def _recalculate_expiry(
     policy: RetentionPolicy,
     *,
     previous_retention_days: int | None,
+    now: datetime,
 ) -> None:
-    current = _now()
+    current = _as_utc(now)
     for obj in session.scalars(
         select(StorageObject).where(
             StorageObject.data_class == policy.data_class,
@@ -156,6 +223,29 @@ def _recalculate_expiry(
         ):
             continue
         event.expires_at = _expiry(policy, event.observed_at)
+    if (
+        policy.data_class == "activity_raw"
+        and policy.enabled
+    ):
+        finite_windows = [
+            days
+            for days in (
+                previous_retention_days,
+                policy.retention_days,
+            )
+            if days is not None
+        ]
+        retention_days = min(finite_windows) if finite_windows else None
+        if retention_days is not None:
+            # Rows already hidden by the previous finite policy are physical
+            # history, not dormant data that may reappear when switching to
+            # forever. Permanently remove that expired compatibility tail.
+            cutoff = current - timedelta(days=retention_days)
+            session.execute(
+                delete(AppUsageSample).where(
+                    AppUsageSample.bucket_start <= cutoff
+                )
+            )
 
 
 def register_storage_object(
@@ -590,7 +680,25 @@ def run_storage_maintenance(
     dry_run: bool = False,
     now: datetime | None = None,
 ) -> StorageMaintenanceReport:
+    with activity_write_lock():
+        return _run_storage_maintenance(
+            session,
+            settings,
+            dry_run=dry_run,
+            now=now,
+        )
+
+
+def _run_storage_maintenance(
+    session: Session,
+    settings: Settings,
+    *,
+    dry_run: bool = False,
+    now: datetime | None = None,
+) -> StorageMaintenanceReport:
     current = now or _now()
+    if not dry_run:
+        lock_activity_write_plane(session)
     ensure_default_policies(session)
     _migrate_legacy_nutrition_raw_captures(
         session,
@@ -601,6 +709,13 @@ def run_storage_maintenance(
     job = PurgeJob(started_at=current, dry_run=dry_run, status="running")
     session.add(job)
     session.flush()
+    if not dry_run:
+        # Activity retention owns summary deletion and downstream baseline
+        # refresh. Run it before the generic event purge so those scopes are
+        # still available for deterministic repair.
+        from healthmes.activity.maintenance import run_activity_maintenance
+
+        run_activity_maintenance(session, now=current)
     candidates = list(
         session.scalars(
             select(StorageObject).where(
@@ -655,6 +770,7 @@ def run_storage_maintenance(
             select(WellnessEvent).where(
                 WellnessEvent.expires_at.is_not(None),
                 WellnessEvent.expires_at <= current,
+                WellnessEvent.event_type.not_like("activity.%"),
             )
         )
         for event in expired_events:

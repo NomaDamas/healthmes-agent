@@ -15,6 +15,8 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from healthmes.activity.contracts import is_reserved_activity_provider
+from healthmes.activity.locking import activity_write_lock
 from healthmes.api.decision_html import shell_context, template_environment
 from healthmes.api.errors import APIError
 from healthmes.api.local_session import issue_local_session, require_local_session
@@ -137,42 +139,48 @@ def put_retention_policy(
     body: RetentionUpdate,
     session: SessionDep,
 ) -> RetentionPolicyOut:
-    policy = update_retention_policy(session, data_class, body.preset)
-    session.commit()
-    return RetentionPolicyOut(
-        data_class=policy.data_class,
-        preset=_preset(policy.retention_days),
-        retention_days=policy.retention_days,
-        enabled=policy.enabled,
-    )
+    with activity_write_lock():
+        policy = update_retention_policy(session, data_class, body.preset)
+        session.commit()
+        return RetentionPolicyOut(
+            data_class=policy.data_class,
+            preset=_preset(policy.retention_days),
+            retention_days=policy.retention_days,
+            enabled=policy.enabled,
+        )
 
 
 @router.post("/v1/storage/maintenance")
 def maintain_storage(
     request: Request, session: SessionDep, dry_run: bool = False
 ) -> dict[str, Any]:
-    report = run_storage_maintenance(
-        session, request.app.state.settings, dry_run=dry_run
-    )
-    session.commit()
-    return {
-        "job_id": report.job_id,
-        "dry_run": report.dry_run,
-        "candidates": report.candidates,
-        "deleted": report.deleted,
-        "bytes_reclaimed": report.bytes_reclaimed,
-        "errors": list(report.errors),
-    }
+    with activity_write_lock():
+        report = run_storage_maintenance(
+            session, request.app.state.settings, dry_run=dry_run
+        )
+        session.commit()
+        return {
+            "job_id": report.job_id,
+            "dry_run": report.dry_run,
+            "candidates": report.candidates,
+            "deleted": report.deleted,
+            "bytes_reclaimed": report.bytes_reclaimed,
+            "errors": list(report.errors),
+        }
 
 
 @router.post("/v1/wellness-events", status_code=201)
 def create_wellness_event(
     body: WellnessEventCreate, session: SessionDep
 ) -> WellnessEventOut:
+    event_type = body.event_type.casefold()
+    source_provider = body.source_provider.casefold()
     if (
-        body.event_type.startswith("nutrition.")
-        or body.source_provider.startswith("nutrition-")
-        or body.source_provider
+        event_type.startswith("nutrition.")
+        or event_type.startswith("activity.")
+        or source_provider.startswith("nutrition-")
+        or is_reserved_activity_provider(body.source_provider)
+        or source_provider
         in {
             "sake-vlm",
             "sake-vlm-raw",
@@ -183,7 +191,7 @@ def create_wellness_event(
         raise APIError(
             422,
             "reserved_wellness_namespace",
-            "internal nutrition event namespaces are reserved",
+            "internal nutrition and activity event namespaces are reserved",
         )
     if body.data_class != "normalized":
         raise APIError(
@@ -328,8 +336,9 @@ async def storage_policy_form(
     csrf: str = Form(),
 ) -> RedirectResponse:
     require_local_session(request, csrf_token=csrf)
-    update_retention_policy(session, data_class, preset)
-    session.commit()
+    with activity_write_lock():
+        update_retention_policy(session, data_class, preset)
+        session.commit()
     return RedirectResponse("/storage", status_code=303)
 
 
@@ -341,8 +350,9 @@ async def storage_maintenance_form(
     dry_run: bool = Form(default=False),
 ) -> RedirectResponse:
     require_local_session(request, csrf_token=csrf)
-    run_storage_maintenance(
-        session, request.app.state.settings, dry_run=dry_run
-    )
-    session.commit()
+    with activity_write_lock():
+        run_storage_maintenance(
+            session, request.app.state.settings, dry_run=dry_run
+        )
+        session.commit()
     return RedirectResponse("/storage", status_code=303)

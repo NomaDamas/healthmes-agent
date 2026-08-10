@@ -20,6 +20,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from healthmes.timezones import parse_timezone
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,10 +121,11 @@ class Settings(BaseSettings):
     )
     timezone: str | None = Field(
         default=None,
-        description="IANA timezone of the user (e.g. 'Asia/Seoul'); local-day "
-        "boundaries and the calendar/app-usage joins of the tranche-2 MCP tools "
-        "use it. None = the machine's local timezone (right on mac-native; "
-        "docker containers run UTC clocks, so compose forwards HEALTHMES_TIMEZONE).",
+        description="IANA timezone or UTC fixed offset of the user "
+        "(e.g. 'Asia/Seoul' or 'UTC+09:00'); local-day boundaries and the "
+        "calendar/app-usage joins of the tranche-2 MCP tools use it. "
+        "None = the machine's local timezone (right on mac-native; docker "
+        "containers run UTC clocks, so compose forwards HEALTHMES_TIMEZONE).",
     )
 
     # Delivery: proactive alerts reach the user through the Hermes webhook
@@ -462,18 +465,19 @@ def system_timezone() -> datetime.tzinfo:
 
 
 def resolve_timezone(settings: Settings) -> datetime.tzinfo:
-    """The user's local timezone: ``Settings.timezone`` (IANA) or the machine's.
+    """The user's configured timezone or the machine's local IANA timezone.
 
-    A configured-but-invalid name raises ``ZoneInfoNotFoundError`` — loud,
-    never a silent UTC fallback (silent guessing corrupts every local-day
-    join, quiet-hours window and dedup key). ``None`` (unset) means the
-    machine's local timezone: right on mac-native, where machine tz == user
-    tz; docker deployments forward ``HEALTHMES_TIMEZONE`` because container
-    clocks run UTC.
+    IANA names and stable ``UTC+09:00`` fixed offsets are accepted. A
+    configured-but-invalid value raises ``ZoneInfoNotFoundError`` for backward
+    compatibility, never a silent UTC fallback. ``None`` means the machine's
+    local timezone.
     """
     name = getattr(settings, "timezone", None)
     if name:
-        return zoneinfo.ZoneInfo(str(name))
+        try:
+            return parse_timezone(str(name))
+        except ValueError as exc:
+            raise zoneinfo.ZoneInfoNotFoundError(str(name)) from exc
     return system_timezone()
 
 

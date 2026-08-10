@@ -68,6 +68,23 @@ async def test_readiness_exposes_actual_sleep_without_changing_confidence(
         "freshness": "current",
         "earliest_available_work_time": "2026-07-08T07:00:00+09:00",
     }
+    actual_sleep_refs = [
+        source_ref
+        for source_ref in result["source_refs"]
+        if source_ref["resource_type"] == "actual_sleep"
+    ]
+    assert len(actual_sleep_refs) == 1
+    assert actual_sleep_refs[0] == {
+        "domain": "wearable",
+        "record_id": actual_sleep_refs[0]["record_id"],
+        "source_provider": "healthmes-calendar-mirror",
+        "upstream_provider": "oura",
+        "resource_type": "actual_sleep",
+        "observed_at": "2026-07-07T22:00:00+00:00",
+        "schema_version": 1,
+        "derived_by": "healthmes.actual-sleep-mirror.v1",
+    }
+    assert actual_sleep_refs[0]["record_id"] in result["evidence_ids"]
 
 
 async def test_readiness_uses_fresh_oura_sleep_before_calendar_mirror_catches_up(
@@ -104,6 +121,45 @@ async def test_readiness_uses_fresh_oura_sleep_before_calendar_mirror_catches_up
         "freshness": "current",
         "earliest_available_work_time": "2026-07-08T07:00:00+09:00",
     }
+
+
+async def test_readiness_references_only_selected_fresh_sleep_summary(
+    mcp_client,
+    mcp_env,
+    call_tool,
+) -> None:
+    mcp_env.add_sleep_summary(
+        LOCAL_DATE.isoformat(),
+        id="short-sleep",
+        start_time="2026-07-08T01:00:00+09:00",
+        end_time="2026-07-08T05:00:00+09:00",
+        duration_minutes=240,
+        time_in_bed_minutes=240,
+    )
+    mcp_env.add_sleep_summary(
+        LOCAL_DATE.isoformat(),
+        id="selected-long-sleep",
+        start_time="2026-07-07T23:30:00+09:00",
+        end_time="2026-07-08T07:00:00+09:00",
+        duration_minutes=420,
+        time_in_bed_minutes=450,
+    )
+
+    result = await call_tool(
+        mcp_client,
+        "get_daily_readiness_context",
+        {"date": LOCAL_DATE.isoformat()},
+    )
+    sleep_refs = [
+        source_ref
+        for source_ref in result["source_refs"]
+        if source_ref["resource_type"] == "sleep_summary"
+    ]
+
+    assert [source_ref["record_id"] for source_ref in sleep_refs] == [
+        "selected-long-sleep"
+    ]
+    assert "short-sleep" not in result["evidence_ids"]
 
 
 async def test_proposal_before_actual_wake_is_rejected_without_side_effects(

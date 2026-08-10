@@ -1,10 +1,23 @@
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from healthmes.storage import register_storage_object, run_storage_maintenance
+from healthmes.activity.contracts import (
+    ActivityBatchIn,
+    ActivityCapability,
+    ActivityPlatform,
+    AppIntervalRecord,
+)
+from healthmes.activity.repository import DAY_SUMMARY_EVENT
+from healthmes.activity.service import ingest_activity_batch
+from healthmes.storage import (
+    register_storage_object,
+    run_storage_maintenance,
+    update_retention_policy,
+)
 from healthmes.store import (
     PurgeJob,
     RetentionPolicy,
@@ -30,6 +43,9 @@ def test_storage_settings_bootstraps_defaults_and_measures_files(
     assert policies["raw_payload"] == "14d"
     assert policies["media"] == "7d"
     assert policies["aggregate"] == "forever"
+    assert policies["activity_raw"] == "14d"
+    assert policies["activity_hourly"] == "90d"
+    assert policies["activity_daily"] == "forever"
     assert body["backup"]["provider"] == "local"
     assert body["backup"]["snapshot_count"] == 0
 
@@ -47,6 +63,80 @@ def test_retention_update_is_persisted(client: TestClient, session) -> None:
     )
     assert policy is not None
     assert policy.retention_days == 1
+
+
+def test_daily_retention_update_immediately_refreshes_rest_baseline(
+    client: TestClient,
+    session,
+    monkeypatch,
+) -> None:
+    current = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    for day in range(1, 5):
+        start = datetime(2026, 8, day, 0, tzinfo=UTC)
+        ingest_activity_batch(
+            session,
+            ActivityBatchIn(
+                source_provider="retention-rest-test",
+                source_device="desktop-retention-rest",
+                platform=ActivityPlatform.MACOS,
+                capability=ActivityCapability.DETAILED,
+                timezone="UTC",
+                records=[
+                    AppIntervalRecord(
+                        source_record_id=f"retention-rest-{day}",
+                        start_at=start,
+                        end_at=start + timedelta(hours=12),
+                        state="active",
+                        app_id="editor",
+                    )
+                ],
+            ),
+            now=start + timedelta(hours=13),
+        )
+    session.commit()
+
+    target = next(
+        row
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT
+            )
+        )
+        if row.payload.get("date") == "2026-08-04"
+    )
+    assert target.payload["seven_day_baseline_delta"]["status"] == "ok"
+    monkeypatch.setattr(
+        "healthmes.storage.service._now",
+        lambda: current,
+    )
+
+    updated = client.put(
+        "/v1/storage/settings/activity_daily",
+        json={"preset": "7d"},
+    )
+    summary = client.get(
+        "/v1/activity/summary",
+        params={"date": "2026-08-04", "timezone": "UTC"},
+    )
+
+    assert updated.status_code == 200
+    assert summary.status_code == 200
+    assert summary.json()["seven_day_baseline_delta"] == {
+        "status": "insufficient_data",
+        "days_with_data": 0,
+        "required_days": 3,
+        "lookback_days": 7,
+    }
+    session.expire_all()
+    remaining_days = {
+        row.payload.get("date")
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT
+            )
+        )
+    }
+    assert remaining_days == {"2026-08-04"}
 
 
 def test_retention_update_uses_the_original_object_observation_time(
@@ -109,9 +199,15 @@ def test_wellness_event_contract_sets_expiry_and_is_idempotent(
         ("subjective_energy", "nutrition-outcome-raw"),
         ("subjective_energy", "nutrition-future-internal"),
         ("nutrition.interaction.v1", "manual"),
+        ("activity.app-hour.v1", "manual"),
+        ("subjective_energy", "activitywatch"),
+        ("subjective_energy", "healthmes-activity-aggregator"),
+        ("subjective_energy", "ActivityWatch"),
+        ("subjective_energy", "HEALTHMES-ACTIVITY-AGGREGATOR"),
+        ("subjective_energy", "healthmes-activity-deletion"),
     ),
 )
-def test_generic_wellness_api_rejects_internal_nutrition_namespaces(
+def test_generic_wellness_api_rejects_internal_domain_namespaces(
     client: TestClient,
     session,
     event_type: str,
@@ -172,6 +268,32 @@ def test_maintenance_dry_run_then_deletes_expired_object(
     assert not target.exists()
     assert obj.purged_at is not None
     assert len(list(session.scalars(select(PurgeJob)))) == 2
+
+
+def test_retention_and_maintenance_enter_the_activity_write_lock(
+    session,
+    settings,
+    monkeypatch,
+) -> None:
+    transitions: list[str] = []
+
+    @contextmanager
+    def tracked_lock():
+        transitions.append("enter")
+        try:
+            yield
+        finally:
+            transitions.append("exit")
+
+    monkeypatch.setattr(
+        "healthmes.storage.service.activity_write_lock",
+        tracked_lock,
+    )
+
+    update_retention_policy(session, "activity_raw", "14d")
+    run_storage_maintenance(session, settings, dry_run=True)
+
+    assert transitions == ["enter", "exit", "enter", "exit"]
 
 
 def test_storage_web_page_renders(client: TestClient) -> None:
