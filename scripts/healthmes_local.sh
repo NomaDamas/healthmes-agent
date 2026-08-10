@@ -89,10 +89,15 @@ open_wearables_listener_is_managed() {
 }
 
 start_open_wearables() {
-    local listener_pid
+    local listener_pid pid
     if pid_running "$OW_PID"; then
-        info "Open Wearables already running (pid $(<"$OW_PID"))"
-        return
+        pid="$(<"$OW_PID")"
+        if open_wearables_listener_is_managed "$pid"; then
+            info "Open Wearables already running (pid $pid)"
+            return
+        fi
+        rm -f "$OW_PID"
+        info "discarded unmanaged Open Wearables pid $pid"
     fi
     listener_pid="$(open_wearables_listener_pid)"
     if [ -n "$listener_pid" ]; then

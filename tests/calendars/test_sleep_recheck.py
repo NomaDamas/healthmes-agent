@@ -55,6 +55,19 @@ async def test_recheck_reports_date_basis_mismatch_without_writing(settings) -> 
 
 
 @pytest.mark.anyio
+async def test_recheck_reports_a_selectable_night_without_writing(settings) -> None:
+    result = await recheck_sleep_night(
+        settings,
+        date(2026, 7, 26),
+        client=FakeReader({"2026-07-26": [valid_row("2026-07-26")]}),
+    )
+
+    assert result["outcome"] == "ok"
+    assert result["selected_date"] == "2026-07-26"
+    assert result["calendar_write"] == "unchanged"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("client", "outcome"),
     [
