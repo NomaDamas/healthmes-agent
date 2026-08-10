@@ -5,6 +5,7 @@
 > **지위:** HealthMes의 잠재적 해자에 대한 소유자 결정 기록.
 >
 > **관련 문서:** `ACTIVITY-WELLNESS-MVP.ko.md`,
+> `HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`,
 > `contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`,
 > `WELLNESS-DATA-PLATFORM.ko.md`, `COMPETITIVE-LANDSCAPE.ko.md`
 
@@ -33,12 +34,11 @@ HealthMes가 만들려는 것은 이 기능들의 단순한 모음이 아니다.
 사용자의 질문
     |
     v
-HealthMes context resolver
+HealthMes Decision Agent
     |
-    +-- wearable evidence
-    +-- activity evidence
-    +-- nutrition/caffeine evidence
-    +-- calendar/time evidence
+    +-- LLM이 필요한 context tool 선택
+    +-- Context Access Layer가 권한과 privacy 검사
+    +-- domain provider가 정확한 context 반환
     +-- subjective state
     |
     v
@@ -139,11 +139,19 @@ HealthMes
 - 공통 `WellnessEvent`와 source provenance
 - 데이터별 freshness, confidence와 coverage
 - 전문 activity/nutrition/wearable/calendar policy
-- 질문별 context selection
+- context tool catalog와 접근·privacy 계약
+- HealthMes Decision Agent 요청·결과 계약
 - decision과 outcome graph
 - privacy, consent와 retention
 
-### 모델이나 agent runtime에 맡기지 않는다
+### LLM이 맡는다
+
+- 자연어 질문의 목적 해석
+- 필요한 영역, 기간과 tool 선택
+- 첫 조회 결과에 따른 추가 조회
+- 여러 영역의 trade-off와 최종 설명
+
+### LLM이나 agent runtime에 맡기지 않는다
 
 - 오늘 섭취량 합계
 - 시간과 timezone 경계
@@ -155,25 +163,30 @@ HealthMes
 ### Agent와 skill의 위치
 
 ```text
-HealthMes engine and policies
+HealthMes Decision Agent contract
         |
         v
-HealthMes context/MCP contracts
+Context Access Layer + domain tools
         |
         v
-HealthMes-owned skills
+runtime adapter
         |
         v
-Hermes or another agent runtime adapter
+Hermes or another agent runtime
 ```
 
-Hermes는 제품 전체나 동등한 판단 엔진이 아니라, 향후 HealthMes 계약을 사용하는
-교체 가능한 runtime adaptation이다. Hermes 변경은 별도 저장소와 별도 작업으로
-진행한다.
+Skill은 핵심 판단 엔진이 아니라 runtime별 도구 사용법과 표현 방식을 설명하는 얇은
+adapter다. 필수 권한, 전문 정책과 DecisionRecord 저장은 Skill에만 맡기지 않는다.
+
+Hermes는 제품 전체나 동등한 판단 엔진이 아니라 HealthMes Decision Agent 계약을
+실행하는 첫 번째 교체 가능한 runtime adapter다. 상세 경계와 마이그레이션은
+[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+를 따른다. Hermes 변경은 별도 저장소와 별도 작업으로 진행한다.
 
 ## 5. MVP 경계
 
-MVP는 모든 데이터를 자유롭게 LLM에 넣는 범용 context engine을 만들지 않는다.
+현재 MVP는 다음 호환 질문과 context 도구를 구현했다. 이 목록은 목표 제품의 질문
+종류를 제한하는 taxonomy가 아니라 기존 `question_kind` resolver의 지원 범위다.
 
 ```text
 지원 질문
@@ -197,22 +210,28 @@ MVP는 모든 데이터를 자유롭게 LLM에 넣는 범용 context engine을 �
   bounded behavior proposal
 ```
 
-질문에 필요하지 않은 영역은 읽지 않는다. raw 앱 이름, window title, URL,
-사진 bytes, voice bytes와 wearable raw timeseries를 agent context에 넣지 않는다.
+목표 구조에서는 LLM이 질문에 필요한 영역을 선택하되 Context Access Layer가
+불필요한 영역과 원본을 차단한다. 기본은 집계 context다. 앱 identity나 일정 제목은
+질문에 필요하고 사용자가 허용한 경우에만 제한적으로 사용하며, 사진과 음성 bytes는
+VLM 또는 transcription처럼 원본 분석 자체가 목적인 scoped provider 호출에만
+전달한다. 일반 최종 판단에는 구조화 결과와 `source_refs`를 사용한다.
 
 각 입력 엔진은 독립적으로 수집·정규화·저장된다. Activity Ingest가 Open
 Wearables, 캘린더나 식사 데이터를 다시 수집하지 않는다. 교차 영역 해자는
 입력 파이프라인을 하나로 뒤섞는 데 있지 않고, 공통 `WellnessEvent` 저장과
-bounded resolver에서 필요한 파생 context만 결합하는 데 있다.
+Context Access Layer를 통해 필요한 파생 context만 결합하는 데 있다.
 
 ```text
 activity collector -> activity context --------┐
 Open Wearables -> wearable context ------------┤
-nutrition engine -> nutrition/caffeine policy -┼-> HealthMes resolver
+nutrition engine -> nutrition/caffeine policy -┼-> Context Access Layer
 calendar -> calendar/time context -------------┘
+                                                    |
+                                                    v
+                                          HealthMes Decision Agent
 ```
 
-resolver는 날짜, freshness, coverage와 evidence가 맞지 않는 영역을
+Context Access Layer는 날짜, freshness, coverage와 source reference가 맞지 않는 영역을
 `insufficient_data` 또는 `unavailable`로 남긴다. 유효한 다른 영역의 context는
 보존하지만, 빠진 전문 정책 입력을 추측해서 최종 판단을 만들지는 않는다.
 

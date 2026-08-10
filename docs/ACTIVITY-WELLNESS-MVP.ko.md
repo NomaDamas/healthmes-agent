@@ -53,7 +53,8 @@ HealthMes
   +-- input adapters
   +-- WellnessEvent storage
   +-- activity/nutrition/wearable/calendar engines
-  +-- cross-domain context resolver
+  +-- Context Access Layer
+  +-- HealthMes Decision Agent contract
   +-- decision policies
   +-- REST/MCP/skill contracts
   |
@@ -62,8 +63,9 @@ HealthMes
         +-- Hermes adaptation (future)
 ```
 
-Hermes는 HealthMes와 동등한 데이터·판단 계층이 아니다. 향후 HealthMes의
-MCP와 skill 계약을 사용하는 교체 가능한 agent/channel runtime adapter다.
+Hermes는 HealthMes와 동등한 데이터·판단 계층이 아니다. 향후 HealthMes
+Decision Agent 계약과 MCP 도구를 실행하는 교체 가능한 agent/channel runtime
+adapter다. Skill은 핵심 판단 로직이 아니라 이 runtime을 연결하는 얇은 설명이다.
 이번 MVP는 Hermes 코드나 `vendor/hermes-agent/`를 변경하지 않는다.
 
 ## 2. 실행 위치와 저장 결정
@@ -309,9 +311,9 @@ recovery
 상관관계를 원인으로 단정하지 않는다. coverage가 부족하면
 `insufficient_data`를 반환한다.
 
-## 8. HealthMes 인터페이스와 skill
+## 8. HealthMes context 인터페이스
 
-MVP 엔진 인터페이스는 다음 세 read-only context로 제한한다.
+현재 Activity MVP 엔진 인터페이스는 다음 read-only context 도구를 제공한다.
 
 ```text
 get_activity_summary(date)
@@ -319,8 +321,8 @@ get_focus_context(start, end)
 get_overwork_context(date, lookback_days)
 ```
 
-계산과 정책은 HealthMes 엔진에 둔다. `healthmes-activity-wellness` skill은
-이 context를 어떤 질문에 사용할지 정의하는 얇은 HealthMes-owned 계약이다.
+계산과 정책은 HealthMes 엔진에 둔다. 이 도구들은 LLM 대신 질문을 판단하지 않고
+정확한 Activity context를 제공한다.
 
 ```text
 HealthMes activity engine
@@ -329,14 +331,21 @@ HealthMes activity engine
 HealthMes MCP/context contract
         |
         v
-healthmes-activity-wellness skill contract
+HealthMes Context Access Layer
         |
         v
-agent runtime adaptation, including Hermes (future)
+HealthMes Decision Agent
+        |
+        v
+runtime adaptation, including Hermes
 ```
 
-이번 MVP는 skill 계약과 fixture를 정의할 수 있지만 Hermes bootstrap,
-gateway, memory, channel과 vendored code adaptation은 하지 않는다.
+현재 `resolve_wellness_context(question_kind, ...)`와
+`healthmes-activity-wellness` 계약은 구현 호환용 preset이다. 목표 구조에서는 LLM
+Decision Agent가 필요한 도구를 자율적으로 선택하고, Context Access Layer는
+권한·retention·privacy와 source reference만 강제한다. 상세 개선안은
+[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+를 따른다.
 
 ## 9. 교차 영역 질문
 
@@ -365,8 +374,9 @@ HealthMes decision
 ```
 
 Activity policy가 카페인 용량을 계산하지 않고, caffeine policy가 집중도를
-추측하지 않는다. HealthMes의 상위 context resolver가 각 전문 정책의 결과와
-근거를 결합한다.
+추측하지 않는다. HealthMes Decision Agent의 LLM이 필요한 전문 도구를 선택하고
+각 정책 결과의 경계를 유지한 채 최종 설명을 결합한다. Context Access Layer는
+선택된 자료의 권한, freshness, coverage와 source reference를 검사한다.
 
 ## 10. Issue 기반 구현 순서
 
@@ -491,7 +501,7 @@ retention-aware local storage
 focus/overwork/recovery summaries
         |
         v
-HealthMes context API/MCP + skill contract
+HealthMes context API/MCP contract
 ```
 
 엔진 MVP는 결정론적 fixture와 public contract로 이 경로를 증명하고, 누락을
@@ -504,7 +514,7 @@ UI PR이 이 엔진 계약을 연결한 뒤 수행하는 별도 제품 검증 �
 ```text
 healthmes/activity/
   canonical contracts + privacy + adapters
-  aggregation + retention + context resolver
+  aggregation + retention + compatibility resolver
   REST + MCP interfaces
 
 tests/activity/
@@ -519,10 +529,13 @@ tests/api/ and tests/mcp_server/
 canonical activity event로 투영한다. ActivityWatch와 iOS capability adapter도
 같은 envelope를 사용한다.
 
-agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
+현재 고정 `question_kind` 호출자와의 호환 계약은
 [`HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`](contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md)
-를 canonical contract로 사용한다. 실제 UI, device dogfood와 Hermes adaptation은
-이 구현 완료 조건과 분리된 후속 작업이다.
+에 남긴다. 목표 자연어 판단, 자율 tool selection, Hermes adapter와 자동
+DecisionRecord 저장은
+[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+를 canonical target으로 사용한다. 실제 UI와 device dogfood는 이 엔진 구현과
+분리된 후속 작업이다.
 
 ## 14. 엔진 구현 상태
 

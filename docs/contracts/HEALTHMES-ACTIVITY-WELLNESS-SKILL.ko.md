@@ -2,10 +2,17 @@
 
 > **계약일:** 2026-08-09
 >
-> **상태:** HealthMes 엔진과 agent runtime 사이의 UI·runtime 독립 계약.
+> **상태:** 현재 구현의 UI·runtime 독립 호환 계약. 고정 `question_kind`를
+> 사용하는 기존 호출자를 보존한다.
 >
-> **소유권:** 계산, 저장, privacy, retention과 context selection은 HealthMes가
-> 소유한다. Hermes를 포함한 agent runtime adaptation은 future work다.
+> **목표 아키텍처:** 자연어 질문, LLM tool selection, Context Access Layer와
+> Hermes adapter는
+> [`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](../HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+> 를 따른다.
+>
+> **소유권:** 계산, 저장, privacy, retention과 데이터 접근 검사는 HealthMes가
+> 소유한다. 의미 기반 context selection과 최종 종합은 HealthMes Decision Agent의
+> LLM이 담당한다.
 
 ## TLDR
 
@@ -28,9 +35,9 @@ this skill contract
 future device or agent adapter
 ```
 
-이 계약은 앱 이름, window title 또는 원시 telemetry를 모델에 전달하는 skill이
-아니다. HealthMes가 계산한 작은 context를 어떤 질문에 선택하고, 근거와 한계를
-어떤 형태로 보존할지 정의한다.
+이 계약은 현재 구현된 작은 Activity context와 고정 `question_kind` preset의
+호환 shape를 정의한다. 목표 구조에서 어떤 자료가 필요한지는 LLM이 선택하고,
+Context Access Layer가 허용 범위와 source reference를 검사한다.
 
 ## 1. Capability boundary
 
@@ -38,9 +45,10 @@ future device or agent adapter
 |---|---|
 | Activity collector | OS가 허용하는 foreground/idle aggregate를 수집하고 exclude, pause와 permission 상태를 source에서 적용한다. |
 | HealthMes activity engine | canonical 저장, 보존, 시간 경계, hourly/daily 집계, focus와 overwork context를 결정론적으로 계산한다. |
-| HealthMes cross-domain resolver | 질문에 필요한 activity, wearable, calendar, nutrition과 time context만 선택한다. |
-| 이 skill 계약 | 어떤 질문에 어떤 context를 읽고 어떻게 설명할지 정의한다. 숫자를 다시 계산하지 않는다. |
-| Agent/runtime adapter | MCP 호출, 대화 채널과 UI 표현을 연결한다. HealthMes 정책을 대체하지 않는다. |
+| HealthMes compatibility resolver | 현재 `question_kind` preset에 대응하는 activity, wearable, calendar, nutrition과 time context를 조립한다. |
+| 이 skill 계약 | 현재 도구와 응답 shape를 보존한다. 목표 제품의 질문 taxonomy나 핵심 판단 엔진은 아니다. |
+| HealthMes Decision Agent | 자연어 질문을 해석하고 필요한 도구를 선택하며 여러 영역을 종합한다. |
+| Agent/runtime adapter | MCP 호출, 모델 실행, 대화 채널과 UI 표현을 연결한다. HealthMes 정책을 대체하지 않는다. |
 
 다음은 이 계약의 범위가 아니다.
 
@@ -59,16 +67,22 @@ runtime adapter는 다음 HealthMes 도구 이름을 기준으로 연결한다.
 | `get_activity_summary(date)` | 한 local day의 active, idle, late activity, category, baseline과 coverage |
 | `get_focus_context(start, end)` | 명시적 시간 구간의 sustained/fragmented/mixed focus context |
 | `get_overwork_context(date, lookback_days)` | 총 활동, 긴 연속 활동, 야간 활동과 개인 baseline 기반 과로 context |
-| `resolve_wellness_context(question_kind, ...)` | 필요한 영역만 선택하는 bounded cross-domain context |
+| `resolve_wellness_context(question_kind, ...)` | 현재 고정 preset을 위한 bounded cross-domain compatibility context |
 
 `recovery`와 `caffeine_for_focus`는 별도 raw 도구를 조합하지 않고
 `resolve_wellness_context`의 `question_kind`로 요청한다.
+
+이 제약은 현재 호환 호출자에만 적용한다. 목표 Decision Agent는 개별 typed tool을
+자율적으로 선택하고 첫 결과에 따라 추가 도구를 호출할 수 있다.
 
 이 문서의 도구 이름은 runtime-neutral canonical name이다. Hermes 등 특정
 runtime의 registry prefix는 해당 adapter가 추가하며 이 계약에 고정하지 않는다.
 REST를 직접 호출해 MCP/context 경계를 우회해서는 안 된다.
 
 ## 3. Question routing
+
+다음 표는 현재 compatibility routing의 예시다. 목표 아키텍처에서 질문 종류와
+조회 영역을 이 표로 고정하지 않는다.
 
 | 사용자 의도 | 호출 | 선택 영역 |
 |---|---|---|
@@ -78,8 +92,9 @@ REST를 직접 호출해 MCP/context 경계를 우회해서는 안 된다.
 | "지금 쉬어야 할까?" | `resolve_wellness_context(recovery)` | activity와 wearable |
 | "집중하려고 이 커피를 마셔도 될까?" | `resolve_wellness_context(caffeine_for_focus)` + 별도 caffeine policy | activity, wearable, calendar, nutrition과 time |
 
-단일 영역 질문은 선택되지 않은 영역을 읽지 않는다. 복합 질문도 모든 raw
-데이터를 모으지 않고 미리 허용된 작은 context만 선택한다.
+현재 resolver는 표의 bounded context를 사용한다. 목표 Decision Agent는 LLM이
+필요한 영역을 선택하되 Context Access Layer가 권한 없는 영역, 과도한 기간과
+불필요한 원본을 차단한다.
 
 ## 4. Response contract
 
@@ -154,7 +169,7 @@ wearable, activity, calendar 또는 time context가 충분해도 위 조건을
 
 ## 6. Privacy contract
 
-context와 agent 입력에는 다음 데이터를 포함하지 않는다.
+기본 Level 1 context와 일반 agent 입력에는 다음 데이터를 포함하지 않는다.
 
 - raw app identity
 - window title
@@ -162,11 +177,22 @@ context와 agent 입력에는 다음 데이터를 포함하지 않는다.
 - click, key, pointer coordinate
 - clipboard, notification body와 screen pixel
 - raw wearable timeseries
-- photo 또는 voice bytes
+- 일반 판단 turn의 photo 또는 voice bytes
 
 허용되는 것은 집계된 시간, category, 횟수, opaque evidence ID, coverage,
 freshness와 limitation이다. 제외된 앱은 raw storage, summary, context와 로그
 어디에도 나타나면 안 된다.
+
+다음 scoped 예외는 목표 Context Access Layer가 명시적으로 허용할 수 있다.
+
+- 사용자가 허용한 "어떤 앱이 방해했나?" 질문의 앱 identity
+- 사용자가 허용한 일정 제목
+- Nutrition VLM 분석 호출의 음식 사진
+- local transcription provider 호출의 음성 bytes
+
+이 원본은 목적이 제한된 provider 호출에만 사용하고 일반 최종 판단에는 구조화
+결과와 `source_refs`를 전달한다. window title, URL과 화면 pixel은 별도 명시적
+권한과 보존 정책 없이는 허용하지 않는다.
 
 ## 7. Failure behavior
 
@@ -189,7 +215,8 @@ freshness와 limitation이다. 제외된 앱은 raw storage, summary, context와
 미래 device/agent adapter는 다음 fixture를 통과해야 한다.
 
 - canonical tool name을 정확히 연결한다.
-- app identity 없이 context를 렌더링한다.
+- 기본 Level 1에서는 app identity 없이 context를 렌더링한다.
+- Level 2 또는 Level 3 원본은 사용자 권한과 질문 목적이 있을 때만 요청한다.
 - evidence, freshness, coverage와 limitations를 보존한다.
 - `insufficient_data`를 0으로 바꾸지 않는다.
 - `decision_ready=false`를 승인 가능한 proposal로 바꾸지 않는다.
