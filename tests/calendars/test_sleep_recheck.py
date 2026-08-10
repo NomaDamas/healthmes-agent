@@ -56,6 +56,38 @@ async def test_recheck_reports_date_basis_mismatch_without_writing(settings) -> 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
+    ("client", "outcome"),
+    [
+        (
+            FakeReader({}, connections=[{"provider": "oura", "status": "error"}]),
+            "vendor_sync_failure",
+        ),
+        (FakeReader({}), "no_provider_record"),
+        (
+            FakeReader(
+                {
+                    "2026-07-26": [
+                        {
+                            "date": "2026-07-26",
+                            "source": {"provider": "oura"},
+                            "duration_minutes": 60,
+                            "time_in_bed_minutes": 60,
+                        }
+                    ]
+                }
+            ),
+            "incomplete_record",
+        ),
+    ],
+)
+async def test_recheck_reports_non_transfer_diagnostics(settings, client, outcome) -> None:
+    result = await recheck_sleep_night(settings, date(2026, 7, 26), client=client)
+    assert result["outcome"] == outcome
+    assert result["calendar_write"] == "unchanged"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
     ("error", "outcome"),
     [
         (OWAuthError("no"), "authentication_failure"),
