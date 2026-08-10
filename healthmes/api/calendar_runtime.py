@@ -6,7 +6,6 @@ from apscheduler.jobstores.base import JobLookupError
 from fastapi import FastAPI
 
 from healthmes.calendars.jobs import build_calendar_jobs, calendar_job_id
-from healthmes.calendars.sleep_job import build_sleep_reconciliation_job
 from healthmes.engine.scheduler import (
     SLEEP_RECONCILIATION_JOB_ID,
     register_calendar_job,
@@ -37,6 +36,10 @@ def refresh_calendar_jobs(app: FastAPI) -> None:
             job_id=spec.job_id,
             minutes=spec.interval_minutes,
         )
+    # sleep_job imports API auth helpers, so loading it at module import time
+    # creates a cycle through healthmes.api.__init__ during CLI startup.
+    from healthmes.calendars.sleep_job import build_sleep_reconciliation_job
+
     sleep_job = build_sleep_reconciliation_job(app.state.settings)
     if sleep_job is None:
         try:

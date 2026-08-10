@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from types import SimpleNamespace
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -44,3 +46,14 @@ def test_refresh_is_noop_when_scheduler_is_disabled(app) -> None:
 def test_refresh_accepts_app_without_lifespan_scheduler(settings) -> None:
     app = SimpleNamespace(state=SimpleNamespace(settings=settings))
     refresh_calendar_jobs(app)
+
+
+def test_cli_entrypoint_import_has_no_calendar_runtime_cycle() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-c", "import healthmes.__main__"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
