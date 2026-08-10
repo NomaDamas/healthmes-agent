@@ -59,7 +59,7 @@ def record_calendar_status(
 def read_calendar_status(data_dir: Path) -> dict[str, dict[str, str]]:
     try:
         raw: Any = json.loads(_path(data_dir).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     if not isinstance(raw, dict):
         return {}
