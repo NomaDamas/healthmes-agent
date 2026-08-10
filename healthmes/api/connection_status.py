@@ -180,17 +180,16 @@ def _icloud_card(settings: Settings) -> ConnectionCard:
         runtime = read_calendar_status(settings.data_dir).get("caldav", {})
         if runtime.get("state") == "error":
             return ConnectionCard(
-                "icloud", "iCloud Calendar write", False,
-                f"iCloud write 동기화 실패 ({runtime.get('error_type', 'unknown')})",
+                "icloud", "Apple/iCloud Calendar write", False,
+                f"Apple/iCloud write 동기화 실패 ({runtime.get('error_type', 'unknown')})",
                 badge_label="오류",
             )
         return ConnectionCard(
-            "icloud", "iCloud Calendar write", True,
-            "iCloud write 정상" if runtime.get("state") == "ok" else detail,
+            "icloud", "Apple/iCloud Calendar write", True,
+            "Apple/iCloud write 정상" if runtime.get("state") == "ok" else detail,
         )
     return ConnectionCard(
-        "icloud",
-        "iCloud 캘린더 (CalDAV)",
+        "icloud", "Apple/iCloud Calendar write",
         False,
         "미연결 — 앱 암호 한 번 입력으로 연결됩니다 (숨김 프롬프트).",
         command=ICLOUD_CONNECT_COMMAND,

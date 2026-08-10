@@ -132,7 +132,7 @@ def test_calendar_runtime_failures_stay_on_their_own_provider_card(client, setti
     text = client.get("/connect").text
     assert "Google Calendar mirror" in text
     assert "Google mirror 동기화 실패 (RuntimeError)" in text
-    assert "iCloud Calendar write" in text
+    assert "Apple/iCloud Calendar write" in text
     assert "iCloud write 동기화 실패" not in text
 
 
