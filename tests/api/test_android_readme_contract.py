@@ -53,6 +53,7 @@ def _register_documented_generation(client, payload: dict) -> None:
             "permission_status": "granted",
             "status_observed_at": "2026-07-09T09:59:00Z",
             "collection_generation": payload["collection_generation"],
+            "pairing_revision": payload["pairing_revision"],
         },
     )
     assert response.status_code == 200
@@ -105,7 +106,7 @@ def test_readme_payload_reupload_is_idempotent_upsert(client, session, payload):
     assert second.json() == {
         "accepted": accepted,
         "created": 0,
-        "updated": accepted,
+        "updated": 0,
         "suppressed": 0,
     }
     assert len(session.scalars(select(AppUsageSample)).all()) == accepted
@@ -114,12 +115,15 @@ def test_readme_payload_reupload_is_idempotent_upsert(client, session, payload):
 def test_readme_payload_matches_collector_invariants(payload):
     """The documented example must reflect what the Android bucketer emits."""
     assert 1 <= len(payload["samples"]) <= 1000
+    assert 1 <= len(payload["bucket_snapshots"]) <= 500
     assert 1 <= len(payload["device_id"]) <= 64
-    assert payload["device_id"].startswith("android-")
+    assert payload["device_id"].startswith("android-install-")
     assert isinstance(payload["collection_revision"], int)
     assert payload["collection_revision"] >= 0
     assert isinstance(payload["collection_generation"], int)
     assert payload["collection_generation"] >= 0
+    assert isinstance(payload["pairing_revision"], int)
+    assert payload["pairing_revision"] >= 0
     assert isinstance(payload["timezone"], str)
     for sample in payload["samples"]:
         # Top-of-hour UTC instants with a Z suffix (java.time.Instant.toString()).
@@ -130,3 +134,27 @@ def test_readme_payload_matches_collector_invariants(payload):
         assert 0 <= sample["foreground_seconds"] <= 3600
         assert sample["launches"] >= 0
         assert sample["category"] is None or 1 <= len(sample["category"]) <= 64
+        assert isinstance(sample["bucket_complete"], bool)
+        assert isinstance(sample["snapshot_sequence"], int)
+        assert sample["snapshot_sequence"] >= 0
+    manifests = {
+        snapshot["bucket_start"]: snapshot
+        for snapshot in payload["bucket_snapshots"]
+    }
+    assert len(manifests) == len(payload["bucket_snapshots"])
+    for bucket_start, manifest in manifests.items():
+        assert isinstance(manifest["source_set_complete"], bool)
+        samples = [
+            sample
+            for sample in payload["samples"]
+            if sample["bucket_start"] == bucket_start
+        ]
+        assert sorted(manifest["app_packages"]) == sorted(
+            sample["app_package"] for sample in samples
+        )
+        assert all(
+            sample["bucket_complete"] == manifest["bucket_complete"]
+            and sample["snapshot_sequence"]
+            == manifest["snapshot_sequence"]
+            for sample in samples
+        )

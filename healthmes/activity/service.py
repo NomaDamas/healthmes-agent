@@ -33,12 +33,12 @@ from healthmes.activity.repository import (
     event_bounds,
     event_expiry,
     event_scopes,
+    filter_tombstoned_records,
     fixed_offset_summary_scopes_by_change,
     get_control_payload,
     persist_activity_record,
     record_bounds,
     record_scopes,
-    tombstoned_record_ids,
     update_collection_status,
 )
 from healthmes.store import WellnessEvent
@@ -116,7 +116,7 @@ def prepare_activity_batch(
     records, excluded, gate = filter_records(batch.records, state, now=now)
     if not gate.allowed:
         raise ActivityCollectionBlockedError(gate.reason or "collection_blocked")
-    tombstoned = tombstoned_record_ids(
+    tombstone_filter = filter_tombstoned_records(
         session,
         source_provider=batch.source_provider,
         device_id=batch.source_device,
@@ -124,14 +124,15 @@ def prepare_activity_batch(
     )
     filtered = batch.model_copy(
         update={
-            "records": [
-                record
-                for record in records
-                if record.source_record_id not in tombstoned
-            ]
+            "records": list(tombstone_filter.records)
         }
     )
-    return filtered, excluded, len(tombstoned), gate
+    return (
+        filtered,
+        excluded,
+        len(tombstone_filter.affected_source_record_ids),
+        gate,
+    )
 
 
 def _reject_expired_late_data(

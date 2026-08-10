@@ -118,11 +118,19 @@ HealthMes context의 다음 필드는 삭제하거나 숨기지 않는다.
 
 - `status`
 - `decision_ready`
+- `candidate_ledger_complete` (`caffeine_for_focus` nutrition context)
+- `source_refs`
 - `evidence_ids` 또는 최상위 `evidence`
 - `freshness`
 - `coverage` 또는 `source_coverage`
 - `limitations`
 - `boundaries`
+
+Compatibility resolver contract: `decision_ready=false`.
+현재 compatibility resolver는 context 조립만 담당하므로 `context_ready`나
+`candidate_ledger_complete` 값과 관계없이 `decision_ready`를 항상 `false`로
+반환한다. `source_refs`는 응답에 존재할 때 adapter가 삭제, 재작성 또는
+`evidence_ids`만으로 축소해서는 안 된다.
 
 `status=insufficient_data` 또는 `unavailable`은 사용시간 0, 정상 또는 안전으로
 바꾸지 않는다.
@@ -154,7 +162,11 @@ HealthMes resolver
 policy 결과를 보존해서 설명하고, activity context는 휴식이나 과로 대안을
 추가하는 데만 사용한다.
 
-현재 `caffeine_for_focus`의 `decision_ready=true` 조건은 다음과 같다.
+현재 `caffeine_for_focus`의 `candidate_ledger_complete=true` 조건은 다음과
+같다. 이 값은 카페인 후보와 당일 ledger가 완성됐다는 뜻이며, 최종 wellness
+판단이 끝났다는 뜻이 아니다.
+
+`candidate_ledger_complete`는 최종 판단 상태가 아니다.
 
 1. 요청된 nutrition interaction이 `caffeine_sleep` scope다.
 2. 후보 식품에서 숫자가 있는 `exact` 또는 `range` 카페인 값이 `mg`
@@ -165,7 +177,10 @@ policy 결과를 보존해서 설명하고, activity context는 휴식이나 과
    caffeine boundary가 모두 완료 확인됐다.
 
 wearable, activity, calendar 또는 time context가 충분해도 위 조건을
-대체하지 않는다.
+대체하지 않는다. 이 resolver는 context-only 계약이므로 반환하는
+`decision_ready`는 항상 `false`다. 최종 `decision_ready`와 DecisionRecord는
+후속 HealthMes Decision Agent가 LLM 종합, source reference 검증과 기록을
+완료한 뒤에만 만들 수 있다.
 
 ## 6. Privacy contract
 
@@ -217,7 +232,10 @@ freshness와 limitation이다. 제외된 앱은 raw storage, summary, context와
 - canonical tool name을 정확히 연결한다.
 - 기본 Level 1에서는 app identity 없이 context를 렌더링한다.
 - Level 2 또는 Level 3 원본은 사용자 권한과 질문 목적이 있을 때만 요청한다.
-- evidence, freshness, coverage와 limitations를 보존한다.
+- `source_refs`, evidence, freshness, coverage와 limitations를 보존한다.
+- `candidate_ledger_complete`를 최종 승인이나 `decision_ready=true`로 바꾸지
+  않는다.
+- compatibility resolver의 `decision_ready=false`를 그대로 보존한다.
 - `insufficient_data`를 0으로 바꾸지 않는다.
 - `decision_ready=false`를 승인 가능한 proposal로 바꾸지 않는다.
 - `caffeine_for_focus`에서 caffeine policy 숫자를 재계산하지 않는다.

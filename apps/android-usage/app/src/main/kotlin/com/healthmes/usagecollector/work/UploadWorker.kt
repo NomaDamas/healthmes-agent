@@ -4,13 +4,17 @@ import android.content.Context
 import androidx.work.Worker
 import androidx.work.WorkerParameters
 import com.healthmes.usagecollector.CollectionWindowState
+import com.healthmes.usagecollector.CollectionWindowUpdateResult
 import com.healthmes.usagecollector.CollectorPrefs
+import com.healthmes.usagecollector.GuardVisibilityPolicy
+import com.healthmes.usagecollector.SnapshotSequenceReservationResult
 import com.healthmes.usagecollector.UsageAccess
 import com.healthmes.usagecollector.UsageAccessGuardRegistry
 import com.healthmes.usagecollector.UsageAccessGuardService
 import com.healthmes.usagecollector.UsageAccessGuardToken
 import com.healthmes.usagecollector.net.CollectionConfig
 import com.healthmes.usagecollector.net.IngestClient
+import com.healthmes.usagecollector.net.UploadBucketSnapshot
 import com.healthmes.usagecollector.net.UploadSample
 import com.healthmes.usagecollector.usage.HourlyBucketer
 import com.healthmes.usagecollector.usage.SourcePrivacyFilter
@@ -24,17 +28,29 @@ import java.time.format.DateTimeFormatter
  * for intervals crossing the watermark), buckets them hourly, and POSTs them
  * to `POST /v1/app-usage/batch`.
  *
- * Watermark contract: on success the watermark moves to the *top of the
- * current hour*, so the still-growing hour is recomputed and re-sent on every
- * run — the server upserts on
- * (device_id, collection_generation, bucket_start, app_package) with
- * last-write-wins, which makes every upload idempotent within one collection
- * window.
+ * Watermark contract: on success the watermark moves to the top of the last
+ * queried hour, so provisional hours are recomputed on later runs. Every
+ * upload first reserves a durable, strictly increasing `snapshot_sequence`.
+ * The server accepts newer provisional snapshots in that order, treats exact
+ * replays as idempotent, rejects stale conflicts, and never reopens a completed
+ * hour within one collection generation. An event-free UsageEvents hour is
+ * sent with an incomplete source set, so it cannot erase a foreground session
+ * that began before the query lookback. The server also validates the install's
+ * pairing revision in the same ingest transaction.
  */
 class UploadWorker(appContext: Context, params: WorkerParameters) :
     Worker(appContext, params) {
 
-    override fun doWork(): Result {
+    override fun doWork(): Result =
+        UploadExecutionGate.runCancellable(
+            isCancelled = { isStopped },
+            onCancelled = { Result.success() },
+        ) {
+            doSerializedWork()
+        }
+
+    private fun doSerializedWork(): Result {
+        if (isStopped) return Result.success()
         val context = applicationContext
         val prefs = CollectorPrefs(context)
         val isOneShot = inputData.getBoolean(KEY_FORCE, false)
@@ -68,18 +84,11 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             }
             return Result.success()
         }
+        if (!GuardVisibilityPolicy.isSatisfied(context)) {
+            return stopForInvisibleGuard(prefs)
+        }
+        if (isStopped) return Result.success()
 
-        val serverUrl = prefs.serverUrl
-        if (serverUrl.isNullOrBlank()) {
-            prefs.lastResult = "Not paired: save the server URL first."
-            return Result.failure()
-        }
-        val nowMs = System.currentTimeMillis()
-        val currentTimezone = ZoneId.systemDefault().id
-        val client = IngestClient(serverUrl, prefs.token)
-        if (!permissionGrantedAtStart) {
-            return stopForRevokedPermission(prefs, client, nowMs)
-        }
         val initialGuardToken = UsageAccessGuardRegistry.snapshot()
         if (initialGuardToken == null) {
             prefs.lastResult =
@@ -87,6 +96,21 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             return Result.success()
         }
         var guardToken: UsageAccessGuardToken = initialGuardToken
+        val pairing = prefs.pairingSnapshot()
+        val serverUrl = pairing.serverUrl
+        if (serverUrl.isNullOrBlank()) {
+            prefs.lastResult = "Not paired: save the server URL first."
+            return Result.failure()
+        }
+        if (pairing.revision != guardToken.pairingRevision) {
+            return collectionWindowChanged(prefs)
+        }
+        val nowMs = System.currentTimeMillis()
+        val currentTimezone = ZoneId.systemDefault().id
+        val client = IngestClient(serverUrl, pairing.token)
+        if (!permissionGrantedAtStart) {
+            return stopForRevokedPermission(prefs, client, nowMs)
+        }
         if (!guardAllowsCollection(prefs, guardToken)) {
             return collectionWindowChanged(prefs)
         }
@@ -110,30 +134,45 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                     System.currentTimeMillis(),
                 )
             }
+            if (isStopped) return Result.success()
             // Reporting granted before reading config clears a previous
             // server-side revoke only for this exact durable generation.
-            val config = when (
-                val outcome = client.postPermissionStatus(
-                    prefs.deviceId,
-                    granted = true,
-                    statusObservedAt = statusObservedAt,
-                    collectionGeneration = stateBeforeStatus.collectionGeneration,
-                )
-            ) {
-                is IngestClient.ConfigOutcome.Success -> outcome.config
+            val statusOutcome = client.postPermissionStatus(
+                prefs.deviceId,
+                granted = true,
+                statusObservedAt = statusObservedAt,
+                collectionGeneration = stateBeforeStatus.collectionGeneration,
+                pairingRevision = stateBeforeStatus.pairingRevision,
+                shouldContinue = {
+                    sensitiveContinuationAllowed(
+                        isStopped = isStopped,
+                        permissionGranted = UsageAccess.isGranted(context),
+                        guardCurrent = guardAllowsCollection(prefs, guardToken),
+                    )
+                },
+            )
+            if (isStopped) return Result.success()
+            if (!GuardVisibilityPolicy.isSatisfied(context)) {
+                return stopForInvisibleGuard(prefs)
+            }
+            val config = when (statusOutcome) {
+                is IngestClient.ConfigOutcome.Success -> statusOutcome.config
                 is IngestClient.ConfigOutcome.TransientFailure -> {
                     prefs.lastResult =
                         "Permission/config refresh failed, will retry: " +
-                            "${outcome.reason} (${stamp()})"
+                            "${statusOutcome.reason} (${stamp()})"
                     return Result.retry()
                 }
 
                 is IngestClient.ConfigOutcome.PermanentFailure -> {
                     prefs.lastResult =
                         "Permission/config refresh rejected: " +
-                            "${outcome.reason} (${stamp()})"
+                            "${statusOutcome.reason} (${stamp()})"
                     return Result.failure()
                 }
+
+                IngestClient.ConfigOutcome.Cancelled ->
+                    return collectionWindowChanged(prefs)
             }
             val stateAfterStatus = prefs.collectionWindowState()
             if (!UsageAccess.isGranted(context)) {
@@ -144,13 +183,45 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                 )
             }
             if (
-                config.collectionGeneration
-                != stateBeforeStatus.collectionGeneration
-                || stateAfterStatus.collectionGeneration
+                stateAfterStatus.collectionGeneration
                 != stateBeforeStatus.collectionGeneration
                 || !guardAllowsCollection(prefs, guardToken)
             ) {
                 return collectionWindowChanged(prefs)
+            }
+            if (
+                config.collectionGeneration
+                != stateBeforeStatus.collectionGeneration
+            ) {
+                val recovery = prefs.recoverCollectionGenerationIfCurrent(
+                    expectedGeneration = stateBeforeStatus.collectionGeneration,
+                    serverGeneration = config.collectionGeneration,
+                    collectionRevision = config.configRevision,
+                    nowMs = nowMs,
+                    collectionTimezone = currentTimezone,
+                )
+                val recoveredState = when (recovery) {
+                    is CollectionWindowUpdateResult.Updated -> recovery.state
+                    CollectionWindowUpdateResult.Stale ->
+                        return collectionWindowChanged(prefs)
+
+                    CollectionWindowUpdateResult.Failed ->
+                        return persistenceFailure(
+                            prefs,
+                            "Collection stopped: server generation mismatch " +
+                                "requires recovery, but its boundary could not " +
+                                "be saved (${stamp()}).",
+                        )
+                }
+                val advanced = UsageAccessGuardRegistry.advanceGeneration(
+                    expected = guardToken,
+                    collectionGeneration = recoveredState.collectionGeneration,
+                ) ?: return collectionWindowChanged(prefs)
+                guardToken = advanced
+                prefs.lastResult =
+                    "Recovered server generation mismatch with a new privacy " +
+                        "boundary (${stamp()})."
+                continue
             }
 
             val blocked = !config.enabled || !config.effectiveCollecting
@@ -158,33 +229,42 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                 storedTimezone = stateBeforeStatus.collectionTimezone,
                 currentTimezone = currentTimezone,
             )
+            val clockRegressed = clockRegressionBoundaryRequired(
+                collectionSinceMs = stateBeforeStatus.collectionSinceMs,
+                watermarkMs = stateBeforeStatus.watermarkMs,
+                nowMs = nowMs,
+            )
             val boundaryRequired = (
                 stateBeforeStatus.collectionRevision != config.configRevision
                     || timezoneChanged
+                    || (!blocked && clockRegressed)
                     || (blocked && stateBeforeStatus.collectionSinceMs != 0L)
                     || (!blocked && stateBeforeStatus.collectionSinceMs <= 0L)
                 )
             if (boundaryRequired) {
                 val collectionSinceMs = if (blocked) 0L else nowMs
-                if (
-                    !prefs.persistCollectionWindow(
-                        collectionRevision = config.configRevision,
-                        collectionSinceMs = collectionSinceMs,
-                        watermarkMs = HourlyBucketer.floorToHour(nowMs),
-                        collectionTimezone = currentTimezone,
-                    )
-                ) {
-                    return persistenceFailure(
-                        prefs,
-                        "Collection stopped: synchronized boundary persistence " +
-                            "failed (${stamp()}).",
-                    )
+                val update = prefs.persistCollectionWindowIfCurrent(
+                    expectedGeneration = stateBeforeStatus.collectionGeneration,
+                    collectionRevision = config.configRevision,
+                    collectionSinceMs = collectionSinceMs,
+                    watermarkMs = HourlyBucketer.floorToHour(nowMs),
+                    collectionTimezone = currentTimezone,
+                )
+                val updatedState = when (update) {
+                    is CollectionWindowUpdateResult.Updated -> update.state
+                    CollectionWindowUpdateResult.Stale ->
+                        return collectionWindowChanged(prefs)
+
+                    CollectionWindowUpdateResult.Failed ->
+                        return persistenceFailure(
+                            prefs,
+                            "Collection stopped: synchronized boundary persistence " +
+                                "failed (${stamp()}).",
+                        )
                 }
                 val advanced = UsageAccessGuardRegistry.advanceGeneration(
                     expected = guardToken,
-                    collectionGeneration = prefs
-                        .collectionWindowState()
-                        .collectionGeneration,
+                    collectionGeneration = updatedState.collectionGeneration,
                 ) ?: return collectionWindowChanged(prefs)
                 guardToken = advanced
                 continue
@@ -210,6 +290,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             collectionState.collectionGeneration != guardToken.collectionGeneration
             || !guardAllowsCollection(prefs, guardToken)
         ) {
+            if (!GuardVisibilityPolicy.isSatisfied(context)) {
+                return stopForInvisibleGuard(prefs)
+            }
             return collectionWindowChanged(prefs)
         }
         if (!UsageAccess.isGranted(context)) {
@@ -227,10 +310,53 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             watermarkMs,
             nowMs,
         )
+        if (!queryWindow.hasReadableRange) {
+            prefs.lastResult =
+                "No readable activity interval yet; waiting for the next run (${stamp()})."
+            return Result.success()
+        }
 
         val reader = UsageSnapshotReader(context)
+        if (isStopped) return Result.success()
+        val guardedEvents = UsageAccessGuardRegistry.readIfCurrent(
+            expected = guardToken,
+            shouldContinue = {
+                sensitiveContinuationAllowed(
+                    isStopped = isStopped,
+                    permissionGranted = UsageAccess.isGranted(context),
+                    guardCurrent = guardAllowsCollection(prefs, guardToken),
+                )
+            },
+        ) {
+            reader.readEvents(queryWindow.beginMs, queryWindow.endMs)
+        }
+        if (guardedEvents == null) {
+            if (isStopped) return Result.success()
+            if (!GuardVisibilityPolicy.isSatisfied(context)) {
+                return stopForInvisibleGuard(prefs)
+            }
+            if (!UsageAccess.isGranted(context)) {
+                return stopForRevokedPermission(
+                    prefs,
+                    client,
+                    System.currentTimeMillis(),
+                )
+            }
+            return collectionWindowChanged(prefs)
+        }
+        if (isStopped) return Result.success()
+        if (!GuardVisibilityPolicy.isSatisfied(context)) {
+            return stopForInvisibleGuard(prefs)
+        }
+        if (!UsageAccess.isGranted(context)) {
+            return stopForRevokedPermission(
+                prefs,
+                client,
+                System.currentTimeMillis(),
+            )
+        }
         val events = SourcePrivacyFilter.filter(
-            reader.readEvents(queryWindow.beginMs, queryWindow.endMs),
+            guardedEvents,
             config.excludedApps,
         )
         if (
@@ -250,7 +376,37 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                 System.currentTimeMillis(),
             )
         }
-        if (buckets.isEmpty()) {
+        if (isStopped) return Result.success()
+        val snapshotSequence = when (
+            val reservation = prefs.reserveSnapshotSequenceIfCurrent(
+                expectedGeneration = collectionState.collectionGeneration,
+                wallClockMs = nowMs,
+            )
+        ) {
+            is SnapshotSequenceReservationResult.Reserved ->
+                reservation.sequence
+
+            SnapshotSequenceReservationResult.Stale ->
+                return collectionWindowChanged(prefs)
+
+            SnapshotSequenceReservationResult.Failed ->
+                return persistenceFailure(
+                    prefs,
+                    "Collection stopped: snapshot sequence persistence " +
+                        "failed (${stamp()}).",
+                )
+        }
+        if (
+            !sensitiveContinuationAllowed(
+                isStopped = isStopped,
+                permissionGranted = UsageAccess.isGranted(context),
+                guardCurrent = guardAllowsCollection(prefs, guardToken),
+            )
+        ) {
+            if (isStopped) return Result.success()
+            if (!GuardVisibilityPolicy.isSatisfied(context)) {
+                return stopForInvisibleGuard(prefs)
+            }
             if (!UsageAccess.isGranted(context)) {
                 return stopForRevokedPermission(
                     prefs,
@@ -258,61 +414,77 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                     System.currentTimeMillis(),
                 )
             }
-            if (!guardAllowsCollection(prefs, guardToken)) {
-                return collectionWindowChanged(prefs)
-            }
-            if (
-                !prefs.advanceWatermarkIfCurrent(
-                    expectedGeneration = collectionState.collectionGeneration,
-                    watermarkMs = HourlyBucketer.floorToHour(queryWindow.endMs),
-                )
-            ) {
-                return watermarkFailureOrBoundaryChange(
-                    prefs,
-                    collectionState.collectionGeneration,
-                )
-            }
-            prefs.lastResult =
-                if (queryWindow.hasMoreBacklog) {
-                    "No activity in one backlog window; catch-up will continue (${stamp()})."
-                } else {
-                    "Nothing to upload (${stamp()})."
-                }
-            return Result.success()
+            return collectionWindowChanged(prefs)
         }
-
-        val samples = buckets.map { bucket ->
-            UploadSample(
-                bucketStartIso = Instant.ofEpochMilli(bucket.bucketStartMs).toString(),
-                appPackage = bucket.packageName,
-                foregroundSeconds = bucket.foregroundSeconds,
-                launches = bucket.launches,
-                category = reader.categoryOf(bucket.packageName),
+        val bucketsByStart = buckets.groupBy { it.bucketStartMs }
+        val snapshots = bucketStartsForWindow(
+            beginMs = queryWindow.beginMs,
+            endMs = queryWindow.endMs,
+        ).map { bucketStartMs ->
+            val complete = bucketIsComplete(
+                bucketStartMs = bucketStartMs,
+                queryBeginMs = queryWindow.beginMs,
+                queryEndMs = queryWindow.endMs,
+                collectionSinceMs = collectionSinceMs,
+                nowMs = nowMs,
+            )
+            val samples = bucketsByStart[bucketStartMs].orEmpty().map { bucket ->
+                UploadSample(
+                    bucketStartIso = Instant.ofEpochMilli(bucketStartMs).toString(),
+                    appPackage = bucket.packageName,
+                    foregroundSeconds = bucket.foregroundSeconds,
+                    launches = bucket.launches,
+                    category = reader.categoryOf(bucket.packageName),
+                    bucketComplete = complete,
+                    snapshotSequence = snapshotSequence,
+                )
+            }
+            UploadBucketSnapshot(
+                bucketStartIso = Instant.ofEpochMilli(bucketStartMs).toString(),
+                bucketComplete = complete,
+                snapshotSequence = snapshotSequence,
+                sourceSetComplete = samples.isNotEmpty(),
+                samples = samples,
             )
         }
+        if (snapshots.isEmpty()) {
+            prefs.lastResult =
+                "No readable activity buckets yet; waiting for the next run (${stamp()})."
+            return Result.success()
+        }
+        if (isStopped) return Result.success()
 
         val outcome = client.postBatch(
             prefs.deviceId,
-            samples,
+            snapshots,
             collectionState.collectionTimezone ?: currentTimezone,
             config.configRevision,
             collectionState.collectionGeneration,
+            collectionState.pairingRevision,
             shouldContinue = {
-                UsageAccess.isGranted(context) &&
-                    guardAllowsCollection(prefs, guardToken)
+                sensitiveContinuationAllowed(
+                    isStopped = isStopped,
+                    permissionGranted = UsageAccess.isGranted(context),
+                    guardCurrent = guardAllowsCollection(prefs, guardToken),
+                )
             },
         )
+        if (isStopped) return Result.success()
+        if (!GuardVisibilityPolicy.isSatisfied(context)) {
+            return stopForInvisibleGuard(prefs)
+        }
         return when (outcome) {
             is IngestClient.Outcome.Success -> {
-                if (!UsageAccess.isGranted(context)) {
-                    return stopForRevokedPermission(
+                if (
+                    outcome.boundaryChangedAfterCommit
+                    || !UsageAccess.isGranted(context)
+                    || !guardAllowsCollection(prefs, guardToken)
+                ) {
+                    return committedBeforeBoundaryChanged(
                         prefs,
                         client,
-                        System.currentTimeMillis(),
+                        outcome.samplesSent,
                     )
-                }
-                if (!guardAllowsCollection(prefs, guardToken)) {
-                    return collectionWindowChanged(prefs)
                 }
                 if (
                     !prefs.advanceWatermarkIfCurrent(
@@ -326,14 +498,12 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                     )
                 }
                 prefs.lastResult =
-                    if (queryWindow.hasMoreBacklog && outcome.samplesDiscarded == 0) {
+                    if (queryWindow.hasMoreBacklog) {
                         "Uploaded ${outcome.samplesSent} backlog samples; " +
                             "catch-up will continue (${stamp()})."
-                    } else if (outcome.samplesDiscarded == 0) {
-                        "Uploaded ${outcome.samplesSent} samples (${stamp()})."
                     } else {
-                        "Uploaded ${outcome.samplesSent}; discarded " +
-                            "${outcome.samplesDiscarded} rejected samples (${stamp()})."
+                        "Uploaded ${snapshots.size} hourly snapshots with " +
+                            "${outcome.samplesSent} app rows (${stamp()})."
                     }
                 Result.success()
             }
@@ -349,7 +519,11 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             }
 
             IngestClient.Outcome.Cancelled -> {
-                if (!UsageAccess.isGranted(context)) {
+                if (isStopped) {
+                    Result.success()
+                } else if (!GuardVisibilityPolicy.isSatisfied(context)) {
+                    stopForInvisibleGuard(prefs)
+                } else if (!UsageAccess.isGranted(context)) {
                     stopForRevokedPermission(
                         prefs,
                         client,
@@ -367,37 +541,49 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         client: IngestClient,
         nowMs: Long,
     ): Result {
-        if (UsageAccess.isGranted(applicationContext)) {
+        val expectedPairingRevision = prefs.pairingSnapshot().revision
+        val observation = UsageAccessGuardRegistry.withBoundaryFence {
+            if (UsageAccess.isGranted(applicationContext)) {
+                null
+            } else {
+                prefs.observeUsageAccess(
+                    granted = false,
+                    nowMs = nowMs,
+                )
+            }
+        }
+        if (observation == null) {
             prefs.lastResult =
                 "Permission changed during collection; discarded the in-flight snapshot."
             return Result.success()
         }
-        UsageAccessGuardRegistry.invalidate()
-        val observation = prefs.observeUsageAccess(
-            granted = false,
-            nowMs = nowMs,
-        )
-        if (!observation.persisted) {
+        val revokedState = observation.committedState
+        if (!observation.persisted || revokedState == null) {
             return persistenceFailure(
                 prefs,
                 "Collection stopped: revoked boundary persistence failed (${stamp()}).",
             )
         }
-        val revokedState = prefs.collectionWindowState()
-        return when (
-            val outcome = client.postPermissionStatus(
-                prefs.deviceId,
-                granted = false,
-                statusObservedAt = Instant.ofEpochMilli(nowMs).toString(),
-                collectionGeneration = revokedState.collectionGeneration,
-            )
-        ) {
+        if (isStopped) return Result.success()
+        val statusOutcome = client.postPermissionStatus(
+            prefs.deviceId,
+            granted = false,
+            statusObservedAt = Instant.ofEpochMilli(nowMs).toString(),
+            collectionGeneration = revokedState.collectionGeneration,
+            pairingRevision = revokedState.pairingRevision,
+            shouldContinue = {
+                !isStopped &&
+                    prefs.pairingSnapshot().revision == expectedPairingRevision
+            },
+        )
+        if (isStopped) return Result.success()
+        return when (statusOutcome) {
             is IngestClient.ConfigOutcome.Success -> {
                 val currentGeneration = prefs
                     .collectionWindowState()
                     .collectionGeneration
                 if (
-                    outcome.config.collectionGeneration
+                    statusOutcome.config.collectionGeneration
                     != revokedState.collectionGeneration
                     || currentGeneration != revokedState.collectionGeneration
                 ) {
@@ -411,17 +597,79 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             is IngestClient.ConfigOutcome.TransientFailure -> {
                 prefs.lastResult =
                     "Usage access revoked; status report will retry: " +
-                        "${outcome.reason} (${stamp()})"
+                        "${statusOutcome.reason} (${stamp()})"
                 Result.retry()
             }
 
             is IngestClient.ConfigOutcome.PermanentFailure -> {
                 prefs.lastResult =
                     "Usage access revoked; status report rejected: " +
-                        "${outcome.reason} (${stamp()})"
+                        "${statusOutcome.reason} (${stamp()})"
                 Result.failure()
             }
+
+            IngestClient.ConfigOutcome.Cancelled -> Result.success()
         }
+    }
+
+    private fun committedBeforeBoundaryChanged(
+        prefs: CollectorPrefs,
+        formerClient: IngestClient,
+        samplesSent: Int,
+    ): Result {
+        val current = prefs.collectionWindowState()
+        val permissionGranted = UsageAccess.isGranted(applicationContext)
+        val reason = if (permissionGranted) {
+            "local_collection_boundary_changed"
+        } else {
+            "usage_access_revoked"
+        }
+        val closure = formerClient.postPermissionStatus(
+            prefs.deviceId,
+            granted = false,
+            statusObservedAt = Instant.ofEpochMilli(
+                System.currentTimeMillis(),
+            ).toString(),
+            collectionGeneration = current.collectionGeneration,
+            pairingRevision = current.pairingRevision,
+            statusReason = reason,
+            shouldContinue = { !isStopped },
+        )
+        val closureText = when (closure) {
+            is IngestClient.ConfigOutcome.Success ->
+                "the former server acknowledged the boundary closure request"
+
+            is IngestClient.ConfigOutcome.TransientFailure ->
+                "the former server boundary closure was not confirmed: " +
+                    closure.reason
+
+            is IngestClient.ConfigOutcome.PermanentFailure ->
+                "the former server rejected boundary closure: " +
+                    closure.reason
+
+            IngestClient.ConfigOutcome.Cancelled ->
+                "the former server boundary closure was cancelled"
+        }
+        prefs.lastResult =
+            "Server accepted $samplesSent app rows before the local boundary " +
+                "changed; $closureText. The local watermark was not advanced " +
+                "(${stamp()})."
+        return Result.success()
+    }
+
+    private fun stopForInvisibleGuard(prefs: CollectorPrefs): Result {
+        val disabled = UsageAccessGuardRegistry.withBoundaryFence {
+            prefs.updateCollectionEnabled(false)
+        }
+        UsageAccessGuardService.stop(applicationContext)
+        UploadScheduling.disable(applicationContext)
+        prefs.lastResult = if (disabled) {
+            "Collection stopped: notification permission is required " +
+                "for the visible privacy guard."
+        } else {
+            "Collection stopped: notification visibility boundary could not be saved."
+        }
+        return if (disabled) Result.success() else Result.failure()
     }
 
     private fun persistenceFailure(
@@ -436,7 +684,8 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
 
     private fun collectionWindowChanged(prefs: CollectorPrefs): Result {
         prefs.lastResult =
-            "Collection window changed; discarded the in-flight usage snapshot."
+            "Collection window changed; stopped using the in-flight local snapshot. " +
+                "A request already accepted by a server is not rolled back."
         return Result.success()
     }
 
@@ -456,9 +705,11 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         prefs: CollectorPrefs,
         token: UsageAccessGuardToken,
     ): Boolean =
-        UsageAccessGuardRegistry.isCurrent(token) &&
-            prefs.collectionWindowIsCurrent(
+        GuardVisibilityPolicy.isSatisfied(applicationContext) &&
+            UsageAccessGuardRegistry.isCurrent(token) &&
+            prefs.collectionLeaseIsCurrent(
                 expectedGeneration = token.collectionGeneration,
+                expectedPairingRevision = token.pairingRevision,
             )
 
     private fun stamp(): String =

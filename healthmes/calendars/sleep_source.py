@@ -14,7 +14,7 @@ from healthmes.calendars.sleep_observation import (
     SleepObservationNoOpReason,
     SleepStageIntervalPayload,
     SleepSummaryPayload,
-    select_actual_sleep,
+    select_actual_sleep_with_source_index,
     split_observation_at_awake_intervals,
 )
 
@@ -107,18 +107,37 @@ def select_actual_sleep_rows(
     rows: Sequence[object],
     target_date: date,
 ) -> ActualSleepObservation | SleepObservationNoOp:
+    selected, _ = select_actual_sleep_rows_with_source(
+        rows,
+        target_date,
+    )
+    return selected
+
+
+def select_actual_sleep_rows_with_source(
+    rows: Sequence[object],
+    target_date: date,
+) -> tuple[
+    ActualSleepObservation | SleepObservationNoOp,
+    Mapping[str, Any] | None,
+]:
     summaries: list[SleepSummaryPayload] = []
+    source_rows: list[Mapping[str, Any] | None] = []
     invalid_target_row = False
     for row in rows:
         try:
             summaries.append(SleepSummaryPayload.model_validate(row))
+            source_rows.append(row if isinstance(row, Mapping) else None)
         except ValidationError:
             if isinstance(row, Mapping):
                 invalid_target_row |= row.get("date") in (
                     target_date,
                     target_date.isoformat(),
                 )
-    selected = select_actual_sleep(tuple(summaries), target_date)
+    selected, source_index = select_actual_sleep_with_source_index(
+        tuple(summaries),
+        target_date,
+    )
     if (
         invalid_target_row
         and isinstance(selected, SleepObservationNoOp)
@@ -127,5 +146,15 @@ def select_actual_sleep_rows(
             SleepObservationNoOpReason.STALE,
         }
     ):
-        return SleepObservationNoOp(reason=SleepObservationNoOpReason.INCOMPLETE)
-    return selected
+        return (
+            SleepObservationNoOp(
+                reason=SleepObservationNoOpReason.INCOMPLETE
+            ),
+            None,
+        )
+    source_row = (
+        source_rows[source_index]
+        if source_index is not None
+        else None
+    )
+    return selected, source_row

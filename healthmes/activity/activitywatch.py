@@ -38,17 +38,19 @@ from healthmes.activity.repository import (
     APP_INTERVAL_EVENT,
     ActivityChangeWindow,
     ActivityLocalScope,
+    activity_fragment_source_record_id,
     advance_activitywatch_import_fence,
     event_bounds,
     event_is_expired,
     event_scopes,
+    filter_tombstoned_records,
     fixed_offset_summary_scopes_by_change,
     get_activitywatch_import_fence,
     get_control_payload,
     parse_optional_datetime,
+    range_scopes,
     record_bounds,
     record_scopes,
-    tombstoned_record_ids,
     update_collection_status,
     update_cursor,
 )
@@ -60,7 +62,6 @@ from healthmes.activity.service import (
     ingest_activity_batch,
 )
 from healthmes.store import WellnessEvent
-from healthmes.timezones import parse_timezone
 
 ACTIVITYWATCH_PROVIDER = "activitywatch"
 DEFAULT_LOOKBACK = timedelta(days=1)
@@ -302,6 +303,41 @@ def _window_spans(events: list[dict[str, Any]]) -> list[AWSpan]:
     return spans
 
 
+def _normalized_window_spans(events: list[dict[str, Any]]) -> list[AWSpan]:
+    normalized: list[AWSpan] = []
+    for span in sorted(
+        _window_spans(events),
+        key=lambda value: (value.start, value.end, value.event_id),
+    ):
+        if not normalized or span.start >= normalized[-1].end:
+            normalized.append(span)
+            continue
+        previous = normalized[-1]
+        previous_app = str(previous.data["app"]).strip()
+        current_app = str(span.data["app"]).strip()
+        if previous_app != current_app:
+            raise ActivityWatchError(
+                "ActivityWatch window timeline contains conflicting overlapping apps"
+            )
+        if span.end <= previous.end:
+            raise ActivityWatchError(
+                "ActivityWatch window timeline contains a fully-contained "
+                "same-app overlap with ambiguous source identity"
+            )
+        normalized.append(
+            AWSpan(
+                event_id=span.event_id,
+                start=previous.end,
+                end=span.end,
+                data={
+                    "app": current_app,
+                    "_continues_previous": "true",
+                },
+            )
+        )
+    return normalized
+
+
 def _afk_spans(events: list[dict[str, Any]]) -> list[AWSpan]:
     spans: list[AWSpan] = []
     for value in events:
@@ -426,6 +462,7 @@ def normalize_activitywatch_events(
     range_start: datetime | None = None,
     range_end: datetime | None = None,
     launch_start: datetime | None = None,
+    source_bounds_out: dict[str, tuple[datetime, datetime]] | None = None,
 ) -> list[AppIntervalRecord]:
     if (range_start is None) != (range_end is None):
         raise ActivityWatchError("ActivityWatch normalization range must be complete")
@@ -447,10 +484,7 @@ def normalize_activitywatch_events(
         raise ActivityWatchError(
             "ActivityWatch launch boundary requires a normalization range"
         )
-    windows = sorted(
-        _window_spans(window_events),
-        key=lambda span: (span.start, span.end, span.event_id),
-    )
+    windows = _normalized_window_spans(window_events)
     afk = _normalized_afk_spans(afk_events)
     if afk_bucket_id is not None and not afk:
         return []
@@ -476,6 +510,10 @@ def normalize_activitywatch_events(
             data=window.data,
         )
         intersections = _intersections(bounded_window, afk)
+        source_intersections = {
+            identity: (start, end)
+            for start, end, identity in _intersections(window, afk)
+        }
         source_group_id = scoped_source_record_id(
             prefix="window-group",
             device_id=device_id,
@@ -485,7 +523,7 @@ def normalize_activitywatch_events(
             range_start is None
             or range_end is None
             or launch_start <= window.start < range_end
-        )
+        ) and window.data.get("_continues_previous") != "true"
         # window.data["title"] is intentionally never copied out of this scope.
         for index, (start, end, segment_identity) in enumerate(intersections):
             identity = hashlib.sha256(
@@ -494,13 +532,14 @@ def normalize_activitywatch_events(
                     f"{segment_identity}"
                 ).encode()
             ).hexdigest()[:32]
+            source_record_id = scoped_source_record_id(
+                prefix="window",
+                device_id=device_id,
+                source_record_id=identity,
+            )
             records.append(
                 _normalized_interval_record(
-                    source_record_id=scoped_source_record_id(
-                        prefix="window",
-                        device_id=device_id,
-                        source_record_id=identity,
-                    ),
+                    source_record_id=source_record_id,
                     source_group_id=source_group_id,
                     start_at=start,
                     end_at=end,
@@ -510,6 +549,11 @@ def normalize_activitywatch_events(
                     launches=1 if index == 0 and launch_in_range else 0,
                 )
             )
+            if source_bounds_out is not None:
+                source_bounds_out[source_record_id] = source_intersections.get(
+                    segment_identity,
+                    (start, end),
+                )
     if afk_bucket_id is not None:
         for span in afk:
             if str(span.data.get("status") or "").casefold() != "afk":
@@ -529,13 +573,14 @@ def normalize_activitywatch_events(
             identity = hashlib.sha256(
                 f"{afk_bucket_id}|{span.event_id}".encode()
             ).hexdigest()[:32]
+            source_record_id = scoped_source_record_id(
+                prefix="afk",
+                device_id=device_id,
+                source_record_id=identity,
+            )
             records.append(
                 _normalized_interval_record(
-                    source_record_id=scoped_source_record_id(
-                        prefix="afk",
-                        device_id=device_id,
-                        source_record_id=identity,
-                    ),
+                    source_record_id=source_record_id,
                     start_at=bounded_start,
                     end_at=bounded_end,
                     state="idle",
@@ -544,6 +589,11 @@ def normalize_activitywatch_events(
                     launches=0,
                 )
             )
+            if source_bounds_out is not None:
+                source_bounds_out[source_record_id] = (
+                    span.start,
+                    span.end,
+                )
     records.sort(key=lambda value: (value.start_at, value.source_record_id))
     return records
 
@@ -553,24 +603,6 @@ class ActivityWatchReconciliation:
     records: tuple[AppIntervalRecord, ...]
     preserved_records: tuple[AppIntervalRecord, ...]
     affected_scopes: frozenset[ActivityLocalScope]
-
-
-def _range_scopes(
-    *,
-    start: datetime,
-    end: datetime,
-    timezone: str,
-) -> set[ActivityLocalScope]:
-    zone = parse_timezone(timezone)
-    first = start.astimezone(zone).date()
-    last = (end - timedelta(microseconds=1)).astimezone(zone).date()
-    return {
-        ActivityLocalScope(
-            day=first + timedelta(days=offset),
-            timezone=timezone,
-        )
-        for offset in range((last - first).days + 1)
-    }
 
 
 def _stored_interval_record(event: WellnessEvent) -> AppIntervalRecord:
@@ -601,22 +633,45 @@ def _fragment_record(
     end: datetime,
     keep_launch: bool,
 ) -> AppIntervalRecord:
-    digest = hashlib.sha256(
-        (
-            f"{record.source_record_id}|{start.isoformat()}|"
-            f"{end.isoformat()}"
-        ).encode()
-    ).hexdigest()[:32]
     return record.model_copy(
         update={
-            "source_record_id": scoped_source_record_id(
-                prefix="aw-fragment",
-                device_id=device_id,
-                source_record_id=digest,
+            "source_record_id": activity_fragment_source_record_id(
+                source_provider=ACTIVITYWATCH_PROVIDER,
+                source_device=device_id,
+                source_record_id=record.source_record_id,
+                start=start,
+                end=end,
+                root_start=record.start_at,
+                mutable_end_identity=True,
             ),
             "start_at": start,
             "end_at": end,
             "launches": record.launches if keep_launch else 0,
+        }
+    )
+
+
+def _clip_interval_record(
+    record: AppIntervalRecord,
+    *,
+    start: datetime,
+    end: datetime,
+) -> AppIntervalRecord | None:
+    clipped_start = max(record.start_at, start)
+    clipped_end = min(record.end_at, end)
+    if clipped_end <= clipped_start:
+        return None
+    if clipped_start == record.start_at and clipped_end == record.end_at:
+        return record
+    return record.model_copy(
+        update={
+            "start_at": clipped_start,
+            "end_at": clipped_end,
+            "launches": (
+                record.launches
+                if clipped_start == record.start_at
+                else 0
+            ),
         }
     )
 
@@ -785,7 +840,7 @@ def _reconcile_activitywatch_range(
     # The requested range is authoritative even when both the source response
     # and retained raw rows are empty. A long-lived summary may still include
     # now-expired raw evidence, so every covered local day must be prevalidated.
-    affected_scopes = _range_scopes(
+    affected_scopes = range_scopes(
         start=start,
         end=end,
         timezone=timezone,
@@ -966,6 +1021,7 @@ class ActivityWatchPreparedImport:
     start: datetime
     end: datetime
     records: tuple[AppIntervalRecord, ...]
+    source_bounds: dict[str, tuple[datetime, datetime]]
 
 
 def prepare_activitywatch_import(
@@ -1047,6 +1103,7 @@ def prepare_activitywatch_import(
             "ActivityWatch AFK coverage is unavailable or incomplete; "
             "import was not advanced"
         )
+    source_bounds: dict[str, tuple[datetime, datetime]] = {}
     records = normalize_activitywatch_events(
         device_id=request.device_id,
         window_bucket_id=window_bucket,
@@ -1060,6 +1117,7 @@ def prepare_activitywatch_import(
         # launch, while an already stored event is replaced/group-reconciled
         # back to exactly one launch.
         launch_start=start,
+        source_bounds_out=source_bounds,
     )
     return ActivityWatchPreparedImport(
         current=current,
@@ -1071,6 +1129,7 @@ def prepare_activitywatch_import(
         start=start,
         end=end,
         records=tuple(records),
+        source_bounds=source_bounds,
     )
 
 
@@ -1135,19 +1194,38 @@ def import_activitywatch(
         )
     state = latest_state
     filtered, excluded, _ = filter_records(records, state, now=current)
-    tombstoned_ids = tombstoned_record_ids(
+    tombstone_probes = [
+        record.model_copy(
+            update={
+                "start_at": bounds[0],
+                "end_at": bounds[1],
+            }
+        )
+        if (bounds := prepared.source_bounds.get(record.source_record_id))
+        is not None
+        else record
+        for record in filtered
+        if isinstance(record, AppIntervalRecord)
+    ]
+    tombstone_filter = filter_tombstoned_records(
         session,
         source_provider=ACTIVITYWATCH_PROVIDER,
         device_id=request.device_id,
-        records=filtered,
+        records=tombstone_probes,
+        allow_mutable_interval_end=True,
     )
     accepted_source_records = [
-        record
-        for record in filtered
-        if (
-            isinstance(record, AppIntervalRecord)
-            and record.source_record_id not in tombstoned_ids
+        clipped
+        for record in tombstone_filter.records
+        if isinstance(record, AppIntervalRecord)
+        and (
+            clipped := _clip_interval_record(
+                record,
+                start=start,
+                end=end,
+            )
         )
+        is not None
     ]
     created = updated = duplicates = 0
     with session.begin_nested():
@@ -1292,7 +1370,9 @@ def import_activitywatch(
                 updated=updated,
                 duplicates=duplicates,
                 excluded=excluded,
-                tombstoned=len(tombstoned_ids),
+                tombstoned=len(
+                    tombstone_filter.affected_source_record_ids
+                ),
                 affected_dates=sorted(
                     {
                         scope.day.isoformat()

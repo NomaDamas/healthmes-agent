@@ -27,9 +27,14 @@ TOKEN = "test-api-token-123"
 @contextmanager
 def app_client(settings):
     """TestClient over the real app factory + schema on the lifespan engine."""
-    with TestClient(create_app(settings)) as client:
+    with TestClient(
+        create_app(settings),
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
         Base.metadata.create_all(get_engine())
         yield client
+
 
 def fresh_payload() -> dict:
     bucket = (datetime.now(UTC) - timedelta(hours=1)).replace(
@@ -172,12 +177,77 @@ class TestNoTokenConfigured:
         with app_client(settings) as client:
             assert client.get("/v1/tasks").status_code == 200
 
+    def test_default_testclient_identity_is_not_a_production_exception(
+        self,
+        settings,
+    ) -> None:
+        app = create_app(settings)
+        with TestClient(app) as client:
+            response = client.get("/v1/tasks")
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "local_only"
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://healthmes.example:8100",
+            "http://203.0.113.20:8100",
+        ],
+    )
+    def test_loopback_peer_rejects_non_loopback_host(
+        self,
+        settings,
+        base_url,
+    ) -> None:
+        app = create_app(settings)
+        with TestClient(
+            app,
+            base_url=base_url,
+            client=("127.0.0.1", 43123),
+        ) as client:
+            response = client.get("/v1/tasks")
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "local_only"
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Forwarded": "for=203.0.113.10"},
+            {"X-Forwarded-For": "203.0.113.10"},
+            {"X-Forwarded-Host": "healthmes.example"},
+            {"X-Forwarded-Proto": "https"},
+            {"X-Real-IP": "203.0.113.10"},
+            {"Via": "1.1 reverse-proxy"},
+        ],
+    )
+    def test_tokenless_loopback_rejects_proxy_metadata(
+        self,
+        settings,
+        headers,
+    ) -> None:
+        app = create_app(settings)
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
+            response = client.get("/v1/tasks", headers=headers)
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "local_only"
+
     def test_direct_factory_rejects_non_loopback_client_without_token(
         self,
         settings,
     ) -> None:
         app = create_app(settings)
-        with TestClient(app, client=("203.0.113.10", 43123)) as client:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("203.0.113.10", 43123),
+        ) as client:
             Base.metadata.create_all(get_engine())
             response = client.get("/v1/tasks")
 
@@ -189,7 +259,11 @@ class TestNoTokenConfigured:
         settings,
     ) -> None:
         app = create_app(settings)
-        with TestClient(app, client=("203.0.113.10", 43123)) as client:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("203.0.113.10", 43123),
+        ) as client:
             response = client.get("/health")
 
         assert response.status_code == 200

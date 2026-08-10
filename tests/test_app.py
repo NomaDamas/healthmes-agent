@@ -71,7 +71,11 @@ class TestStoreWiring:
     def test_lifespan_binds_engine_to_app_settings_and_serves_rest(self, settings) -> None:
         """init_engine(settings) runs at startup so SessionDep hits the app db."""
         app = create_app(settings)
-        with TestClient(app) as client:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
             engine = get_engine()  # initialised by the lifespan, not lazily
             assert str(engine.url) == settings.database_url
             Base.metadata.create_all(engine)
@@ -94,7 +98,11 @@ class TestMcpWiring:
     def test_mcp_initialize_handshake_at_exactly_slash_mcp(self, settings) -> None:
         """The MCP session manager runs (chained lifespan) and serves POST /mcp."""
         app = create_app(settings)
-        with TestClient(app) as client:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
             response = client.post("/mcp", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
 
             assert response.status_code == 200
@@ -105,7 +113,11 @@ class TestMcpWiring:
     def test_fastapi_routes_keep_precedence_and_404s_keep_the_envelope(self, settings) -> None:
         """/health & /v1 stay FastAPI-served; unknown paths keep the envelope."""
         app = create_app(settings)
-        with TestClient(app) as client:
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
             assert client.get("/health").json() == {"status": "ok"}
 
             missing = client.get("/v1/nope")

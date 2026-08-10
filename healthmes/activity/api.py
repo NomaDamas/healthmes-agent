@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
 from zoneinfo import ZoneInfoNotFoundError
@@ -18,7 +20,10 @@ from healthmes.activity.activitywatch import (
     import_activitywatch,
     prepare_activitywatch_import,
 )
-from healthmes.activity.aggregation import rebuild_affected_days
+from healthmes.activity.aggregation import (
+    rebuild_affected_days,
+    summary_raw_provenance_complete,
+)
 from healthmes.activity.context import (
     activity_summary_context,
     focus_context,
@@ -49,11 +54,23 @@ from healthmes.activity.maintenance import (
     delete_activity_data,
     run_activity_maintenance,
 )
+from healthmes.activity.privacy import collection_gate
 from healthmes.activity.repository import (
+    APP_HOUR_EVENT,
+    ActivityChangeWindow,
     ActivityConflictError,
+    ActivityLocalScope,
     ActivityWriteConflictError,
     activity_write_lock,
+    event_bounds,
+    event_scopes,
+    fixed_offset_summary_scopes_by_change,
     get_control_payload,
+    get_ios_snapshot_fence,
+    lock_activity_write_plane,
+    parse_optional_datetime,
+    persist_ios_snapshot_fence,
+    range_scopes,
     serialize_collection_state,
     tombstoned_record_ids,
     update_collection_config,
@@ -72,6 +89,7 @@ from healthmes.activity.service import (
     ActivitySummaryProvenanceError,
     StaleCollectionRevisionError,
     ingest_activity_batch,
+    prepare_activity_batch,
 )
 from healthmes.api.errors import APIError
 from healthmes.config import resolve_timezone
@@ -81,6 +99,7 @@ from healthmes.timezones import parse_timezone
 
 router = APIRouter(tags=["activity"])
 CollectionDeviceId = Annotated[str, Path(min_length=1, max_length=255)]
+IOS_PROVIDER = "ios-device-activity"
 
 
 def _timezone(request: Request, explicit: str | None = None) -> str:
@@ -172,6 +191,178 @@ def _scope_public_batch_source_ids(
     return body.model_copy(update={"records": records})
 
 
+def _ios_snapshot_manifest_digest(body: IOSCapabilityReport) -> str:
+    assert body.snapshot_start is not None
+    assert body.snapshot_end is not None
+    payload = {
+        "snapshot_start": body.snapshot_start.isoformat(),
+        "snapshot_end": body.snapshot_end.isoformat(),
+        "timezone": body.timezone,
+        "capability": body.capability.value,
+        "permission_status": body.permission_status.value,
+        "collection_revision": body.collection_revision,
+        "collection_generation": body.collection_generation,
+        "samples": [
+            sample.model_dump(mode="json")
+            for sample in sorted(
+                body.samples,
+                key=lambda item: item.source_record_id,
+            )
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+    ).hexdigest()
+
+
+def _ios_batch(body: IOSCapabilityReport) -> ActivityBatchIn:
+    def source_identity(source_record_id: str) -> str:
+        if body.collection_generation is None:
+            return source_record_id
+        return (
+            f"generation:{body.collection_generation}:"
+            f"record:{source_record_id}"
+        )
+
+    return ActivityBatchIn(
+        source_provider=IOS_PROVIDER,
+        source_device=body.device_id,
+        platform=ActivityPlatform.IOS,
+        capability=body.capability,
+        timezone=body.timezone,
+        collected_at=body.collected_at,
+        collection_revision=body.collection_revision,
+        records=[
+            AppHourRecord(
+                source_record_id=scoped_source_record_id(
+                    prefix="ios-hour",
+                    device_id=body.device_id,
+                    source_record_id=source_identity(
+                        sample.source_record_id
+                    ),
+                ),
+                bucket_start=sample.bucket_start,
+                app_id=sample.opaque_app_token
+                or f"category:{sample.category}",
+                foreground_seconds=sample.foreground_seconds,
+                launches=sample.launches,
+                category=sample.category,
+                coverage_seconds=sample.coverage_seconds,
+                bucket_complete=True,
+                snapshot_sequence=body.snapshot_sequence,
+            )
+            for sample in body.samples
+        ],
+    )
+
+
+def _validate_ios_empty_snapshot_gate(
+    state: dict[str, Any],
+    body: IOSCapabilityReport,
+    *,
+    now: datetime,
+) -> None:
+    revision = int(state.get("config_revision", 0))
+    if body.collection_revision != revision:
+        raise StaleCollectionRevisionError(
+            f"collector configuration revision {body.collection_revision} "
+            f"does not match server revision {revision}"
+        )
+    gate = collection_gate(state, now=now)
+    if not gate.allowed:
+        raise ActivityCollectionBlockedError(
+            gate.reason or "collection_blocked"
+        )
+
+
+def _ios_authoritative_scopes(
+    session: Session,
+    *,
+    body: IOSCapabilityReport,
+    records: list[AppHourRecord],
+    existing_rows: list[WellnessEvent],
+    now: datetime,
+) -> set[ActivityLocalScope]:
+    assert body.snapshot_start is not None
+    assert body.snapshot_end is not None
+    scopes = range_scopes(
+        start=body.snapshot_start,
+        end=body.snapshot_end,
+        timezone=body.timezone,
+    )
+    scopes.update(
+        scope
+        for record in records
+        for scope in range_scopes(
+            start=record.bucket_start,
+            end=record.bucket_start + timedelta(hours=1),
+            timezone=body.timezone,
+        )
+    )
+    scopes.update(
+        scope
+        for row in existing_rows
+        for scope in event_scopes(row)
+    )
+    changes = [
+        ActivityChangeWindow(
+            key="authoritative-range",
+            start=body.snapshot_start,
+            end=body.snapshot_end,
+            timezone=body.timezone,
+        )
+    ]
+    changes.extend(
+        ActivityChangeWindow(
+            key=f"incoming:{record.source_record_id}",
+            start=record.bucket_start,
+            end=record.bucket_start + timedelta(hours=1),
+            timezone=body.timezone,
+        )
+        for record in records
+    )
+    for row in existing_rows:
+        start, end = event_bounds(row)
+        changes.append(
+            ActivityChangeWindow(
+                key=f"existing:{row.id}",
+                start=start,
+                end=end,
+                timezone=row.timezone or "UTC",
+            )
+        )
+    scopes.update(
+        scope
+        for values in fixed_offset_summary_scopes_by_change(
+            session,
+            changes,
+            now=now,
+        ).values()
+        for scope in values
+    )
+    incomplete = [
+        scope
+        for scope in sorted(scopes)
+        if not summary_raw_provenance_complete(
+            session,
+            day=scope.day,
+            timezone=scope.timezone,
+            now=now,
+        )
+    ]
+    if incomplete:
+        raise ActivitySummaryProvenanceError(
+            "iOS snapshot replacement requires retained raw provenance "
+            f"for {len(incomplete)} summary scope(s)"
+        )
+    return scopes
+
+
 @router.get("/v1/activity/devices/{device_id}/collection")
 def get_collection(
     device_id: CollectionDeviceId,
@@ -233,11 +424,14 @@ def post_collection_status(
         "permission_status",
         "status_observed_at",
         "collection_generation",
+        "pairing_revision",
     }
     boundary_touched = bool(boundary_fields & body.model_fields_set)
-    generation_touched = "collection_generation" in body.model_fields_set
+    monotonic_boundary_touched = bool(
+        {"collection_generation", "pairing_revision"} & body.model_fields_set
+    )
     if (body.platform is ActivityPlatform.ANDROID and boundary_touched) or (
-        generation_touched
+        monotonic_boundary_touched
     ):
         complete_android_boundary = (
             body.platform is ActivityPlatform.ANDROID
@@ -377,10 +571,21 @@ def post_ios_report(
                 "activity_future_data",
                 "iOS collected_at is beyond the allowed one-minute clock skew",
             )
+        if (
+            body.snapshot_end is not None
+            and body.snapshot_end > uploaded_at + MAX_FUTURE_SKEW
+        ):
+            raise APIError(
+                409,
+                "activity_future_data",
+                "iOS snapshot range extends beyond the allowed one-minute "
+                "clock skew",
+            )
         available = (
             body.capability.value == "aggregate"
             and body.permission_status.value == "granted"
         )
+        authoritative = body.snapshot_sequence is not None
         response = ActivityBatchOut(
             accepted=0,
             created=0,
@@ -391,50 +596,288 @@ def post_ios_report(
         )
         try:
             with session.begin_nested():
+                lock_activity_write_plane(session)
+                previous_state = get_control_payload(
+                    session,
+                    body.device_id,
+                    platform=ActivityPlatform.IOS,
+                    lock=True,
+                )
+                previous_collected_at = parse_optional_datetime(
+                    previous_state.get("last_collected_at")
+                )
+                snapshot_fence = get_ios_snapshot_fence(
+                    session,
+                    body.device_id,
+                    lock=True,
+                )
+                if (
+                    not authoritative
+                    and available
+                    and body.samples
+                    and snapshot_fence is not None
+                ):
+                    raise ActivityConflictError(
+                        "iOS device already uses ordered authoritative "
+                        "snapshots; sequence-less samples cannot be mixed in"
+                    )
+                if (
+                    not authoritative
+                    and available
+                    and body.samples
+                    and previous_collected_at is not None
+                    and body.collected_at < previous_collected_at
+                ):
+                    raise ActivityConflictError(
+                        "iOS aggregate report is older than the latest "
+                        "accepted device snapshot"
+                    )
+                manifest_sha256: str | None = None
+                apply_snapshot = True
+                if available and authoritative:
+                    assert body.snapshot_sequence is not None
+                    assert body.snapshot_start is not None
+                    assert body.snapshot_end is not None
+                    manifest_sha256 = _ios_snapshot_manifest_digest(body)
+                    if snapshot_fence is not None:
+                        generation_changed = (
+                            body.collection_generation
+                            != snapshot_fence.collection_generation
+                        )
+                        if generation_changed:
+                            if not body.reset_snapshot_fence:
+                                raise ActivityConflictError(
+                                    "iOS snapshot collection generation changed "
+                                    "without an authenticated fence reset"
+                                )
+                            if (
+                                snapshot_fence.collection_generation is not None
+                                and (
+                                    body.collection_generation is None
+                                    or body.collection_generation
+                                    <= snapshot_fence.collection_generation
+                                )
+                            ):
+                                raise ActivityConflictError(
+                                    "iOS snapshot fence reset requires a newer "
+                                    "collection generation"
+                                )
+                        else:
+                            if body.reset_snapshot_fence:
+                                raise ActivityConflictError(
+                                    "iOS snapshot fence reset requires a new "
+                                    "collection generation"
+                                )
+                            if body.snapshot_sequence < snapshot_fence.sequence:
+                                raise ActivityConflictError(
+                                    "iOS snapshot is older than the latest "
+                                    "accepted sequence"
+                                )
+                            if body.snapshot_sequence == snapshot_fence.sequence:
+                                if (
+                                    manifest_sha256
+                                    != snapshot_fence.manifest_sha256
+                                ):
+                                    raise ActivityConflictError(
+                                        "iOS snapshot sequence was reused with "
+                                        "different content"
+                                    )
+                                apply_snapshot = False
+                    elif body.reset_snapshot_fence:
+                        raise ActivityConflictError(
+                            "iOS snapshot fence reset requires an existing fence"
+                        )
+
+                status_values: dict[str, Any] = {
+                    "platform": ActivityPlatform.IOS,
+                    "last_uploaded_at": uploaded_at,
+                }
+                if apply_snapshot or not (available and authoritative):
+                    status_values.update(
+                        {
+                            "capability": body.capability,
+                            "permission_status": body.permission_status,
+                            "status_reason": body.reason,
+                            "status_observed_at": body.collected_at,
+                            "last_collected_at": (
+                                body.collected_at if available else None
+                            ),
+                        }
+                    )
+                    if body.collection_generation is not None:
+                        status_values["collection_generation"] = (
+                            body.collection_generation
+                        )
                 update_collection_status(
                     session,
                     body.device_id,
-                    ActivityCollectionStatusUpdate(
-                        platform=ActivityPlatform.IOS,
-                        capability=body.capability,
-                        permission_status=body.permission_status,
-                        status_reason=body.reason,
-                        status_observed_at=body.collected_at,
-                        last_uploaded_at=uploaded_at,
-                        last_collected_at=(
-                            body.collected_at if available else None
-                        ),
+                    ActivityCollectionStatusUpdate.model_validate(
+                        status_values
                     ),
                     now=uploaded_at,
                 )
-                if available and body.samples:
-                    batch = ActivityBatchIn(
-                        source_provider="ios-device-activity",
-                        source_device=body.device_id,
+                if available and authoritative:
+                    assert body.snapshot_sequence is not None
+                    assert body.snapshot_start is not None
+                    assert body.snapshot_end is not None
+                    assert manifest_sha256 is not None
+
+                    latest_state = get_control_payload(
+                        session,
+                        body.device_id,
                         platform=ActivityPlatform.IOS,
-                        capability=body.capability,
-                        timezone=body.timezone,
-                        collected_at=body.collected_at,
-                        collection_revision=body.collection_revision,
-                        records=[
-                            AppHourRecord(
-                                source_record_id=scoped_source_record_id(
-                                    prefix="ios-hour",
-                                    device_id=body.device_id,
-                                    source_record_id=sample.source_record_id,
-                                ),
-                                bucket_start=sample.bucket_start,
-                                app_id=sample.opaque_app_token
-                                or f"category:{sample.category}",
-                                foreground_seconds=sample.foreground_seconds,
-                                launches=sample.launches,
-                                category=sample.category,
-                                coverage_seconds=sample.coverage_seconds,
-                                bucket_complete=True,
-                            )
-                            for sample in body.samples
-                        ],
+                        lock=True,
                     )
+                    if body.samples:
+                        prepared, excluded, tombstoned, _ = (
+                            prepare_activity_batch(
+                                session,
+                                _ios_batch(body),
+                                now=uploaded_at,
+                                control_payload=latest_state,
+                            )
+                        )
+                    else:
+                        _validate_ios_empty_snapshot_gate(
+                            latest_state,
+                            body,
+                            now=uploaded_at,
+                        )
+                        prepared = None
+                        excluded = 0
+                        tombstoned = 0
+
+                    if not apply_snapshot:
+                        accepted = (
+                            len(prepared.records)
+                            if prepared is not None
+                            else 0
+                        )
+                        response = ActivityBatchOut(
+                            accepted=accepted,
+                            created=0,
+                            updated=0,
+                            duplicates=accepted,
+                            excluded=excluded,
+                            tombstoned=tombstoned,
+                            affected_dates=[],
+                        )
+                    else:
+                        allowed_records = (
+                            [
+                                record
+                                for record in prepared.records
+                                if isinstance(record, AppHourRecord)
+                            ]
+                            if prepared is not None
+                            else []
+                        )
+                        expected_source_ids = {
+                            record.source_record_id
+                            for record in allowed_records
+                        }
+                        existing_rows = list(
+                            session.scalars(
+                                select(WellnessEvent)
+                                .where(
+                                    WellnessEvent.event_type
+                                    == APP_HOUR_EVENT,
+                                    WellnessEvent.source_provider
+                                    == IOS_PROVIDER,
+                                    WellnessEvent.source_device
+                                    == body.device_id,
+                                    WellnessEvent.observed_at
+                                    >= body.snapshot_start,
+                                    WellnessEvent.observed_at
+                                    < body.snapshot_end,
+                                )
+                                .with_for_update()
+                                .execution_options(populate_existing=True)
+                            )
+                        )
+                        scopes = _ios_authoritative_scopes(
+                            session,
+                            body=body,
+                            records=allowed_records,
+                            existing_rows=existing_rows,
+                            now=uploaded_at,
+                        )
+                        for row in existing_rows:
+                            if row.source_record_id not in expected_source_ids:
+                                session.delete(row)
+                        session.flush()
+
+                        if prepared is not None and allowed_records:
+                            prepared = prepared.model_copy(
+                                update={"records": allowed_records}
+                            )
+                            result = ingest_activity_batch(
+                                session,
+                                prepared,
+                                allow_replace=True,
+                                now=uploaded_at,
+                                already_filtered=True,
+                                excluded_count=excluded,
+                                tombstoned_count=tombstoned,
+                                rebuild_summaries=False,
+                                prevalidated_summary_scopes=scopes,
+                            )
+                            response = result.response.model_copy(
+                                update={
+                                    "affected_dates": [
+                                        value.isoformat()
+                                        for value in sorted(
+                                            {
+                                                scope.day
+                                                for scope in scopes
+                                            }
+                                        )
+                                    ]
+                                }
+                            )
+                            scopes.update(result.changed_scopes)
+                        else:
+                            response = ActivityBatchOut(
+                                accepted=0,
+                                created=0,
+                                updated=0,
+                                duplicates=0,
+                                excluded=excluded,
+                                tombstoned=tombstoned,
+                                affected_dates=[
+                                    value.isoformat()
+                                    for value in sorted(
+                                        {scope.day for scope in scopes}
+                                    )
+                                ],
+                            )
+
+                        by_timezone: dict[str, set[date]] = {}
+                        for scope in scopes:
+                            by_timezone.setdefault(
+                                scope.timezone,
+                                set(),
+                            ).add(scope.day)
+                        for timezone, days in by_timezone.items():
+                            rebuild_affected_days(
+                                session,
+                                days=days,
+                                timezone=timezone,
+                                force_rebuild=True,
+                                now=uploaded_at,
+                            )
+                        persist_ios_snapshot_fence(
+                            session,
+                            body.device_id,
+                            collection_generation=body.collection_generation,
+                            sequence=body.snapshot_sequence,
+                            manifest_sha256=manifest_sha256,
+                            snapshot_start=body.snapshot_start,
+                            snapshot_end=body.snapshot_end,
+                            now=uploaded_at,
+                        )
+                elif available and body.samples:
+                    batch = _ios_batch(body)
                     response = ingest_activity_batch(
                         session,
                         batch,
@@ -450,6 +893,10 @@ def post_ios_report(
             raise APIError(409, "activity_future_data", str(exc)) from exc
         except ActivitySourceModeConflictError as exc:
             raise APIError(409, "activity_source_mode_conflict", str(exc)) from exc
+        except ActivityConflictError as exc:
+            raise APIError(409, "activity_source_conflict", str(exc)) from exc
+        except ActivityWriteConflictError as exc:
+            raise APIError(409, "activity_write_conflict", str(exc)) from exc
         except ActivitySummaryProvenanceError as exc:
             raise APIError(
                 409,

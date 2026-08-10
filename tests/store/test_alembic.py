@@ -92,6 +92,16 @@ def _render_offline_app_usage_generation_downgrade(database_url: str) -> str:
     return buffer.getvalue()
 
 
+def _render_offline_app_usage_snapshot_downgrade(database_url: str) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "e3f4a5b6c7d8:d2e3f4a5b6c7",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
 def test_migration_graph_has_single_head():
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
@@ -152,6 +162,23 @@ class TestOfflineRender:
         assert "_alembic_tmp_app_usage_sample" in sqlite_sql
         assert "DROP TABLE app_usage_sample" in sqlite_sql
         assert "DROP COLUMN collection_generation" in postgres_sql
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_app_usage_snapshot_downgrade_requires_online_check(
+        self,
+        database_url,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="offline downgrade cannot verify Android snapshot state",
+        ):
+            _render_offline_app_usage_snapshot_downgrade(database_url)
 
 
 class TestSqliteUpgrade:
@@ -258,9 +285,17 @@ class TestSqliteUpgrade:
             autoload_with=engine,
         )
         assert "collection_generation" in migrated.c
+        assert "bucket_complete" in migrated.c
+        assert "snapshot_sequence" in migrated.c
         with engine.begin() as connection:
             assert connection.scalar(
                 sa.select(migrated.c.collection_generation)
+            ) == 0
+            assert connection.scalar(
+                sa.select(migrated.c.bucket_complete)
+            ) is False
+            assert connection.scalar(
+                sa.select(migrated.c.snapshot_sequence)
             ) == 0
             connection.execute(
                 migrated.insert().values(
@@ -275,6 +310,30 @@ class TestSqliteUpgrade:
             )
         engine.dispose()
 
+        # e3 -> d2 removes only snapshot fields, so cross-generation rows are
+        # still lossless at this boundary.
+        command.downgrade(config, "d2e3f4a5b6c7")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        generation_rows = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        assert "collection_generation" in generation_rows.c
+        assert "bucket_complete" not in generation_rows.c
+        assert "snapshot_sequence" not in generation_rows.c
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            ) == "d2e3f4a5b6c7"
+            assert connection.scalar(
+                sa.select(sa.func.count()).select_from(generation_rows)
+            ) == 2
+        engine.dispose()
+
+        # d2 -> c1 is the boundary that would collapse generations.
         with pytest.raises(RuntimeError, match="without losing collection generations"):
             command.downgrade(config, "c1d2e3f4a5b6")
 
@@ -285,11 +344,116 @@ class TestSqliteUpgrade:
             metadata,
             autoload_with=engine,
         )
+        assert "collection_generation" in preserved.c
+        assert "bucket_complete" not in preserved.c
+        assert "snapshot_sequence" not in preserved.c
         with engine.begin() as connection:
-            assert connection.scalar(sa.select(sa.func.count()).select_from(preserved)) == 2
+            assert connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            ) == "d2e3f4a5b6c7"
+            assert connection.scalar(
+                sa.select(sa.func.count()).select_from(preserved)
+            ) == 2
             connection.execute(
                 preserved.delete().where(
                     preserved.c.collection_generation == 1
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        snapshot_rows = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                snapshot_rows.update().values(
+                    bucket_complete=True,
+                    snapshot_sequence=42,
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing Android snapshot state",
+        ):
+            command.downgrade(config, "d2e3f4a5b6c7")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        snapshot_preserved = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        assert "bucket_complete" in snapshot_preserved.c
+        assert "snapshot_sequence" in snapshot_preserved.c
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            ) == "e3f4a5b6c7d8"
+            assert connection.execute(
+                sa.select(
+                    snapshot_preserved.c.bucket_complete,
+                    snapshot_preserved.c.snapshot_sequence,
+                )
+            ).one() == (True, 42)
+            connection.execute(
+                snapshot_preserved.update().values(
+                    bucket_complete=False,
+                    snapshot_sequence=0,
+                )
+            )
+            wellness_event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            now = datetime(2026, 8, 10, tzinfo=UTC)
+            connection.execute(
+                wellness_event.insert().values(
+                    id=uuid.uuid4().hex,
+                    event_type="activity.android-bucket-snapshot.v1",
+                    schema_version=1,
+                    observed_at=now,
+                    recorded_at=now,
+                    timezone="UTC",
+                    source_provider="android-usage",
+                    source_device="android-empty-manifest",
+                    source_record_id="snapshot:empty-manifest",
+                    capture_method="derived",
+                    sensitivity="activity-control",
+                    consent_scope="personal",
+                    payload={
+                        "bucket_complete": True,
+                        "snapshot_sequence": 1,
+                        "app_count": 0,
+                    },
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing Android snapshot state",
+        ):
+            command.downgrade(config, "d2e3f4a5b6c7")
+
+        engine = sa.create_engine(database_url)
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            ) == "e3f4a5b6c7d8"
+            connection.execute(
+                sa.text(
+                    "DELETE FROM wellness_event "
+                    "WHERE event_type = 'activity.android-bucket-snapshot.v1'"
                 )
             )
         engine.dispose()
@@ -489,7 +653,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d2e3f4a5b6c7"
+                ) == "e3f4a5b6c7d8"
         finally:
             engine.dispose()
 

@@ -33,7 +33,6 @@ Streamable-HTTP responses keep streaming untouched.
 
 import hashlib
 import hmac
-import ipaddress
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from starlette.responses import JSONResponse
@@ -44,6 +43,7 @@ from healthmes.api.local_session import (
     LOCAL_SESSION_AUTH_SCOPE_KEY,
     LocalSessionStore,
     authenticated_local_session,
+    is_loopback_scope,
 )
 from healthmes.config import Settings
 
@@ -239,16 +239,7 @@ class LoopbackOnlyMiddleware:
     def _is_allowed(scope: Scope) -> bool:
         if scope.get("path", "") in OPEN_PATHS:
             return True
-        client = scope.get("client")
-        if not client:
-            return False
-        host = str(client[0]).strip()
-        if host == "testclient":
-            return True
-        try:
-            return ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            return False
+        return is_loopback_scope(scope)
 
 
 def install_auth(app, settings: Settings) -> bool:

@@ -218,7 +218,7 @@ cannot leave the device sandbox (docs/PLAN.md §7).
 Before reading `UsageStats`, the app POSTs its current permission boundary to
 `POST {server}/v1/activity/devices/{device_id}/status`, including
 `permission_status`, `status_observed_at`, and the durable local
-`collection_generation`. It applies the returned config and repeats this
+`collection_generation` plus `pairing_revision`. It applies the returned config and repeats this
 handshake if that config creates a new local generation. It reads OS activity
 only after the server and local generation are stable and equal.
 
@@ -236,38 +236,69 @@ by `tests/api/test_android_readme_contract.py`):
 <!-- ingest-payload-example -->
 ```json
 {
-  "device_id": "android-3f9c2a7b41e8d05c",
+  "device_id": "android-install-3f9c2a7b41e8d05c7a9b0c1d2e3f4a5b",
   "timezone": "Asia/Seoul",
   "collection_revision": 0,
   "collection_generation": 1,
+  "pairing_revision": 1,
+  "bucket_snapshots": [
+    {
+      "bucket_start": "2026-07-09T10:00:00Z",
+      "bucket_complete": true,
+      "snapshot_sequence": 1783573200000,
+      "source_set_complete": true,
+      "app_packages": [
+        "com.google.android.apps.maps",
+        "com.slack"
+      ]
+    },
+    {
+      "bucket_start": "2026-07-09T11:00:00Z",
+      "bucket_complete": true,
+      "snapshot_sequence": 1783573200000,
+      "source_set_complete": true,
+      "app_packages": [
+        "com.slack",
+        "org.fdroid.fdroid"
+      ]
+    }
+  ],
   "samples": [
     {
       "bucket_start": "2026-07-09T10:00:00Z",
       "app_package": "com.slack",
       "foreground_seconds": 1260,
       "launches": 9,
-      "category": "productivity"
+      "category": "productivity",
+      "bucket_complete": true,
+      "snapshot_sequence": 1783573200000
     },
     {
       "bucket_start": "2026-07-09T10:00:00Z",
       "app_package": "com.google.android.apps.maps",
       "foreground_seconds": 300,
       "launches": 2,
-      "category": "maps"
+      "category": "maps",
+      "bucket_complete": true,
+      "snapshot_sequence": 1783573200000
     },
     {
       "bucket_start": "2026-07-09T11:00:00Z",
       "app_package": "com.slack",
       "foreground_seconds": 480,
       "launches": 4,
-      "category": "productivity"
+      "category": "productivity",
+      "bucket_complete": true,
+      "snapshot_sequence": 1783573200000
     },
     {
       "bucket_start": "2026-07-09T11:00:00Z",
       "app_package": "org.fdroid.fdroid",
       "foreground_seconds": 95,
       "launches": 1,
-      "category": null
+      "category": null,
+      "bucket_complete": true,
+      "snapshot_sequence": 1783573200000
     }
   ]
 }
@@ -296,7 +327,7 @@ Upload semantics (why re-sending is safe):
   hour. A long offline backlog is drained page by page instead of silently
   truncating everything older than seven days.
 - Every upload carries the collection window's IANA `timezone`,
-  `collection_revision`, and `collection_generation`. The config refreshed
+  `collection_revision`, `collection_generation`, and `pairing_revision`. The config refreshed
   immediately before the OS usage read is parsed strictly: a missing or
   wrongly typed exclusion list, revision, generation, or other required field
   stops before UsageStats is read. Missing or stale revisions are rejected; a
@@ -317,7 +348,10 @@ Upload semantics (why re-sending is safe):
   privacy guard with a low-importance system notification. The guard owns the
   AppOps listener and creates a fresh generation when it starts and whenever
   Android signals a Usage Access change, even when the current value appears
-  unchanged.
+  unchanged. Missing Android 13+ notification permission, app-wide notification
+  disablement, or a disabled guard channel prevents both a user start and a
+  persisted-service restart; the worker also disables collection before any
+  UsageStats read if visibility was revoked later.
 - The guard publishes a process-local token only after its boundary is
   durably committed and Usage Access is currently granted. The worker must
   prove that this token is still active and matches the same collection
@@ -329,7 +363,8 @@ Upload semantics (why re-sending is safe):
   window. Returning to the Activity restarts the guard in a new generation.
   Observed revoke/regrant transitions are reported to the server before any
   new activity is read.
-- Every hard boundary increments a local collection generation. A worker
+- Every hard boundary increments a local collection generation. Pairing changes
+  also increment a monotonic pairing revision. A worker
   discards an OS snapshot if that generation changed while reading it.
   Network I/O never holds the collection-state lock. Instead, the uploader
   rechecks permission and generation before every HTTP chunk and again before
@@ -343,31 +378,53 @@ Upload semantics (why re-sending is safe):
   its request arrives with a newer timestamp, and a grant in the same
   generation cannot override a blocked state. Only a newer durable generation
   may represent a regrant.
-- The server accepts a batch only when its `collection_generation` exactly
-  matches the generation registered by the status handshake. An unregistered
-  or stale generation receives `409`; ingest updates collection/upload
+- The server accepts a batch only when its `collection_generation` and
+  `pairing_revision` exactly match the boundary registered by the status
+  handshake. The check and activity write share one server transaction, so a
+  same-server revoke or re-pair that commits first prevents an older in-flight
+  request from committing afterward. An unregistered or stale boundary
+  receives `409`; ingest updates collection/upload
   telemetry but never implicitly changes permission back to `granted`.
+- An HTTP request may already have committed before Android observes a local
+  permission or pairing change. The client reports that outcome as accepted,
+  does not advance the local watermark, and best-effort closes the former
+  server boundary; it never claims that remote data was rolled back. When
+  pairing moves to a different unreachable server, no protocol can atomically
+  revoke both independent servers. Previously committed rows remain subject to
+  that former server's retention/deletion controls, and the UI must disclose
+  an unconfirmed former-server closure instead of claiming deletion.
 - The server **upserts** on
   `(device_id, collection_generation, bucket_start, app_package)` with
-  last-write-wins, so repeated uploads are idempotent without overwriting an
-  earlier privacy window; a second POST of the example above answers
-  `{"accepted": 4, "created": 0, "updated": 4, "suppressed": 0}`.
-- Batches are chunked at 500 samples per POST (server cap: 1000).
-- A deterministic sample-level `409` is isolated by bisecting the failed
-  chunk. Only the single rejected sample is discarded, later chronological
-  chunks continue, and the watermark advances only after the whole pass has
-  either uploaded or isolated every sample. Network/server failures keep the
-  watermark unchanged so the full source range is retried.
-- Only an explicit allowlist of known sample-local conflict codes may be
-  isolated. A missing, malformed, or unknown `409` code stops the pass without
-  discarding samples or advancing the watermark.
+  an ordered `snapshot_sequence`. The collector synchronously reserves this
+  sequence in encrypted preferences before upload, so it remains strictly
+  increasing across process restart, same-millisecond runs, and wall-clock
+  rollback. A newer provisional snapshot may
+  authoritatively correct the current hour, a stale or equal conflicting
+  snapshot is rejected, and a completed hour cannot be reopened. Exact
+  replays are idempotent without overwriting an earlier privacy window; a
+  second POST of the example above answers
+  `{"accepted": 4, "created": 0, "updated": 0, "suppressed": 0}`.
+- An hour is marked `bucket_complete=true` only after the query reaches that
+  hour's end and a 15-minute settlement grace has elapsed. This keeps a newly
+  closed hour mutable long enough for delayed Android usage events to arrive.
+  If an unaligned seven-day backlog page stops partway through an old hour,
+  that final hour stays provisional and is corrected by the next overlapping
+  page before it can be sealed.
+- Requests contain at most 1000 app rows and 500 hourly manifests. One
+  hourly snapshot and all of its rows always travel together; the client
+  never splits or partially discards an authoritative hour.
+- Retryable configuration or concurrent-write `409`s keep the watermark
+  unchanged and retry the full source range. Deterministic data conflicts,
+  malformed errors, and unknown `409`s fail closed without discarding rows or
+  advancing the watermark.
 - `foreground_seconds` is clamped to 3600 per bucket; a `launch` is a
   background→foreground transition attributed to the bucket of the resume.
 - `category` is Android's `ApplicationInfo.category` mapped to stable labels
   (`game`, `audio`, `video`, `image`, `social`, `news`, `maps`,
   `productivity`, `accessibility`) or `null` when undefined.
-- `device_id` is `android-<ANDROID_ID>` (stable per device + signing key),
-  generated once and persisted.
+- `device_id` is an install-scoped `android-install-<random UUID>` generated
+  once and persisted. Reinstalling creates a new identity so a fresh client
+  cannot inherit a stale server generation.
 
 ## Pairing & permission onboarding
 
@@ -421,7 +478,12 @@ Upload semantics (why re-sending is safe):
 - Android only retains detailed usage events for a bounded window (days,
   OEM-dependent); if the collector is off for longer, older hours are lost.
 - An app continuously foreground across the query edge with no events inside
-  the window is invisible to `queryEvents`; the 6 h lookback makes this rare.
+  the window is invisible to `queryEvents`. The collector therefore marks an
+  event-free hourly manifest as `source_set_complete=false`; HealthMes treats
+  it as an unknown-source heartbeat, not authoritative proof of zero use. It
+  cannot erase or seal an earlier non-empty hour, so a long foreground session
+  may be undercounted until Android emits another lifecycle event but cannot
+  deadlock later uploads.
 
 ## Project layout
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
@@ -19,9 +18,11 @@ from healthmes.activity.aggregation import (
     summary_raw_provenance_complete,
 )
 from healthmes.activity.android import (
+    ANDROID_BUCKET_SNAPSHOT_EVENT,
     ANDROID_PROVIDER,
     android_source_record_id,
 )
+from healthmes.activity.contracts import ActivityCapability
 from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.repository import (
     ACTIVITY_RAW_CLASS,
@@ -34,6 +35,8 @@ from healthmes.activity.repository import (
     SUMMARY_EVENT_TYPES,
     SUMMARY_PROVIDER,
     ActivityChangeWindow,
+    activity_fragment_root_identity_digest,
+    activity_fragment_source_record_id,
     activity_source_identity_digest,
     activity_write_lock,
     as_utc,
@@ -41,6 +44,7 @@ from healthmes.activity.repository import (
     ensure_activity_policies,
     fixed_offset_summary_scopes_by_change,
     get_control_event,
+    get_control_payload,
     invalidate_activitywatch_imports,
 )
 from healthmes.activity.repository import (
@@ -83,6 +87,57 @@ class ActivityDeletionUnsafeError(ValueError):
 
 class ActivityDeletionGranularityError(ValueError):
     """A coarse aggregate cannot represent the requested partial deletion."""
+
+
+def _is_utc_hour_boundary(value: datetime) -> bool:
+    normalized = as_utc(value)
+    return (
+        normalized.minute == 0
+        and normalized.second == 0
+        and normalized.microsecond == 0
+    )
+
+
+def _device_supports_partial_interval_deletion(
+    session: Session,
+    *,
+    device_id: str,
+) -> bool:
+    state = get_control_payload(session, device_id)
+    capability = state.get("capability")
+    if capability == ActivityCapability.DETAILED.value:
+        return True
+    if capability in {
+        ActivityCapability.AGGREGATE.value,
+        ActivityCapability.UNAVAILABLE.value,
+    }:
+        return False
+    if session.scalar(
+        select(WellnessEvent.id)
+        .where(
+            WellnessEvent.event_type == APP_HOUR_EVENT,
+            WellnessEvent.source_device == device_id,
+        )
+        .limit(1)
+    ) is not None:
+        return False
+    if session.scalar(
+        select(AppUsageSample.id)
+        .where(AppUsageSample.device_id == device_id)
+        .limit(1)
+    ) is not None:
+        return False
+    return (
+        session.scalar(
+            select(WellnessEvent.id)
+            .where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT,
+                WellnessEvent.source_device == device_id,
+            )
+            .limit(1)
+        )
+        is not None
+    )
 
 
 def _event_bounds(event: WellnessEvent) -> tuple[datetime, datetime]:
@@ -139,13 +194,18 @@ def _fragment_source_record_id(
     start: datetime,
     end: datetime,
 ) -> str:
-    digest = hashlib.sha256(
-        (
-            f"{event.source_provider}|{event.source_device}|"
-            f"{event.source_record_id}|{start.isoformat()}|{end.isoformat()}"
-        ).encode()
-    ).hexdigest()[:40]
-    return f"delete-fragment-{digest}"
+    root_start, _ = _event_bounds(event)
+    return activity_fragment_source_record_id(
+        source_provider=str(event.source_provider),
+        source_device=str(event.source_device),
+        source_record_id=str(event.source_record_id),
+        start=start,
+        end=end,
+        root_start=root_start,
+        mutable_end_identity=(
+            str(event.source_provider) == "activitywatch"
+        ),
+    )
 
 
 def _interval_fragments_after_delete(
@@ -204,6 +264,13 @@ def _interval_fragments_after_delete(
                 derived_from={
                     "fragment_of_event_id": str(event.id),
                     "fragment_of_source_record_id": event.source_record_id,
+                    "fragment_root_identity_digest": (
+                        activity_fragment_root_identity_digest(
+                            source_provider=str(event.source_provider),
+                            source_device=str(event.source_device),
+                            source_record_id=str(event.source_record_id),
+                        )
+                    ),
                     "fragmented_at": recorded_at.isoformat(),
                 },
             )
@@ -223,7 +290,13 @@ def run_activity_maintenance(
         expired = list(
             session.scalars(
                 select(WellnessEvent).where(
-                    WellnessEvent.event_type.in_((*RAW_EVENT_TYPES, *SUMMARY_EVENT_TYPES)),
+                    WellnessEvent.event_type.in_(
+                        (
+                            *RAW_EVENT_TYPES,
+                            ANDROID_BUCKET_SNAPSHOT_EVENT,
+                            *SUMMARY_EVENT_TYPES,
+                        )
+                    ),
                     WellnessEvent.expires_at.is_not(None),
                     WellnessEvent.expires_at <= current,
                 )
@@ -340,6 +413,24 @@ def delete_activity_data(
         )
         if start is not None and as_utc(start) >= effective_end:
             raise ValueError("activity deletion range must include past time")
+        partial_hour_range = (
+            selection_end is not None
+            and (
+                (start is not None and not _is_utc_hour_boundary(start))
+                or not _is_utc_hour_boundary(selection_end)
+            )
+        )
+        if partial_hour_range and (
+            device_id is None
+            or not _device_supports_partial_interval_deletion(
+                session,
+                device_id=device_id,
+            )
+        ):
+            raise ActivityDeletionGranularityError(
+                "partial-hour deletion requires a known detailed activity device; "
+                "aggregate or unknown devices can only be deleted as complete buckets"
+            )
 
         raw_stmt = select(WellnessEvent).where(
             WellnessEvent.event_type.in_(RAW_EVENT_TYPES)
@@ -463,6 +554,16 @@ def delete_activity_data(
                     "hourly compatibility activity can only be deleted as complete buckets"
                 )
 
+        fragments = [
+            fragment
+            for row in raw_rows
+            for fragment in _interval_fragments_after_delete(
+                row,
+                start=start,
+                end=selection_end,
+                recorded_at=current,
+            )
+        ]
         blocked_identity_digests = {
             activity_source_identity_digest(
                 source_provider=str(row.source_provider),
@@ -470,7 +571,56 @@ def delete_activity_data(
                 source_record_id=str(row.source_record_id),
             )
             for row in raw_rows
+            if _range_fully_covers_event(
+                row,
+                start=start,
+                end=selection_end,
+            )
         }
+        fully_deleted_interval_roots = {
+            activity_fragment_root_identity_digest(
+                source_provider=str(row.source_provider),
+                source_device=str(row.source_device),
+                source_record_id=str(row.source_record_id),
+            )
+            for row in raw_rows
+            if row.event_type == APP_INTERVAL_EVENT
+            and _range_fully_covers_event(
+                row,
+                start=start,
+                end=selection_end,
+            )
+        }
+        surviving_interval_roots = {
+            activity_fragment_root_identity_digest(
+                source_provider=str(row.source_provider),
+                source_device=str(row.source_device),
+                source_record_id=str(row.source_record_id),
+            )
+            for row in fragments
+        }
+        if fully_deleted_interval_roots:
+            deleted_row_ids = {row.id for row in raw_rows}
+            survivor_stmt = select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT,
+            )
+            if device_id is not None:
+                survivor_stmt = survivor_stmt.where(
+                    WellnessEvent.source_device == device_id,
+                )
+            for row in session.scalars(survivor_stmt):
+                if row.id in deleted_row_ids:
+                    continue
+                root_digest = activity_fragment_root_identity_digest(
+                    source_provider=str(row.source_provider),
+                    source_device=str(row.source_device),
+                    source_record_id=str(row.source_record_id),
+                )
+                if root_digest in fully_deleted_interval_roots:
+                    surviving_interval_roots.add(root_digest)
+            blocked_identity_digests.update(
+                fully_deleted_interval_roots - surviving_interval_roots
+            )
         for row in compatibility_rows:
             blocked_identity_digests.add(
                 activity_source_identity_digest(
@@ -499,16 +649,6 @@ def delete_activity_data(
             now=current,
         )
 
-        fragments = [
-            fragment
-            for row in raw_rows
-            for fragment in _interval_fragments_after_delete(
-                row,
-                start=start,
-                end=selection_end,
-                recorded_at=current,
-            )
-        ]
         session.add_all(fragments)
         for row in raw_rows:
             session.delete(row)

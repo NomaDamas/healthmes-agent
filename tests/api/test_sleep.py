@@ -50,7 +50,11 @@ def test_local_sleep_review_applies_exact_preview_and_shows_read_back(
         "redacted-user",
         ApprovalCalendar(fake_backend, fake_backend.approval_target),
     )
-    with TestClient(app, base_url="http://127.0.0.1:8100") as client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
         preview = client.get("/sleep?date=2026-07-26")
 
         assert preview.status_code == 200
@@ -159,7 +163,11 @@ def test_applied_calendar_review_link_opens_on_authenticated_deployment(
             ),
         ),
     )
-    with TestClient(app, base_url="http://127.0.0.1:8100") as client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
         preview = client.get(
             "/sleep?date=2026-07-26",
             headers={"Authorization": f"Bearer {token}"},
@@ -229,6 +237,7 @@ def test_loopback_viewer_unlocks_sleep_without_token_in_redirect(settings) -> No
     with TestClient(
         create_app(secured),
         base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
     ) as client:
         viewer = client.get("/sleep", params={"token": viewer_token(token)})
         assert viewer.status_code == 200
@@ -268,7 +277,11 @@ def test_malformed_persisted_sleep_segment_renders_safe_error(app, session) -> N
         "redacted-user",
         ApprovalCalendar(fake_backend, fake_backend.approval_target),
     )
-    with TestClient(app, base_url="http://127.0.0.1:8100") as client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
         preview = client.get("/sleep?date=2026-07-26")
         proposal_id = uuid.UUID(_hidden(preview.text, "proposal_id"))
         proposal = session.get(SleepReconciliationProposal, proposal_id)

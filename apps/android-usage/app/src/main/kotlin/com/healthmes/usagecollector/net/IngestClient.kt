@@ -29,21 +29,38 @@ data class UploadSample(
     val foregroundSeconds: Int,
     val launches: Int,
     val category: String?,
+    val bucketComplete: Boolean = true,
+    val snapshotSequence: Long = 0L,
 )
+
+data class UploadBucketSnapshot(
+    val bucketStartIso: String,
+    val bucketComplete: Boolean,
+    val snapshotSequence: Long,
+    val sourceSetComplete: Boolean = true,
+    val samples: List<UploadSample>,
+) {
+    init {
+        require(sourceSetComplete || samples.isEmpty())
+        require(samples.all { it.bucketStartIso == bucketStartIso })
+        require(samples.all { it.bucketComplete == bucketComplete })
+        require(samples.all { it.snapshotSequence == snapshotSequence })
+        require(samples.map(UploadSample::appPackage).distinct().size == samples.size)
+    }
+}
 
 /**
  * Plain HttpURLConnection client for the HealthMes ingest endpoint — no HTTP
- * library dependency for one POST. Batches above [MAX_SAMPLES_PER_POST] are
- * chunked (the server caps one batch at 1000 samples); because ingest is an
- * upsert on (device_id, collection_generation, bucket_start, app_package),
- * re-sending after a partial failure is safe.
+ * library dependency for one POST. A clock-hour snapshot is never split
+ * across requests: the manifest and all of its app rows travel together,
+ * so the server can remove apps missing from a newer authoritative view.
  */
 class IngestClient(private val baseUrl: String, private val token: String?) {
 
     sealed class Outcome {
         data class Success(
             val samplesSent: Int,
-            val samplesDiscarded: Int = 0,
+            val boundaryChangedAfterCommit: Boolean = false,
         ) : Outcome()
 
         /** Network/server hiccup — worth a WorkManager retry with backoff. */
@@ -52,10 +69,9 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
         /** The server understood and said no (4xx) — retrying won't help. */
         data class PermanentFailure(
             val reason: String,
-            val isolateRejectedSamples: Boolean = false,
         ) : Outcome()
 
-        /** A local privacy boundary changed before the next HTTP chunk. */
+        /** A local privacy boundary changed before an HTTP request was sent. */
         data object Cancelled : Outcome()
     }
 
@@ -63,6 +79,7 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
         data class Success(val config: CollectionConfig) : ConfigOutcome()
         data class TransientFailure(val reason: String) : ConfigOutcome()
         data class PermanentFailure(val reason: String) : ConfigOutcome()
+        data object Cancelled : ConfigOutcome()
     }
 
     fun postPermissionStatus(
@@ -70,11 +87,16 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
         granted: Boolean,
         statusObservedAt: String,
         collectionGeneration: Long,
+        pairingRevision: Long,
+        statusReason: String? = if (granted) null else "usage_access_revoked",
+        shouldContinue: () -> Boolean = { true },
     ): ConfigOutcome {
+        if (!shouldContinue()) return ConfigOutcome.Cancelled
         val encodedDevice = URLEncoder.encode(deviceId, StandardCharsets.UTF_8.name())
         val endpoint = endpointOrNull(
             "/v1/activity/devices/$encodedDevice/status",
         ) ?: return ConfigOutcome.PermanentFailure("invalid server URL: $baseUrl")
+        if (!shouldContinue()) return ConfigOutcome.Cancelled
         val connection = try {
             endpoint.openConnection() as HttpURLConnection
         } catch (e: IOException) {
@@ -93,6 +115,8 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
                 granted,
                 statusObservedAt,
                 collectionGeneration,
+                pairingRevision,
+                statusReason,
             )
             val payload = JSONObject()
                 .put("platform", status.platform)
@@ -104,8 +128,10 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
                 )
                 .put("status_observed_at", status.statusObservedAt)
                 .put("collection_generation", status.collectionGeneration)
+                .put("pairing_revision", status.pairingRevision)
                 .put("queue_depth", status.queueDepth)
                 .toString()
+            if (!shouldContinue()) return ConfigOutcome.Cancelled
             connection.outputStream.use {
                 it.write(payload.toByteArray(Charsets.UTF_8))
             }
@@ -119,10 +145,15 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
         }
     }
 
-    fun getCollectionConfig(deviceId: String): ConfigOutcome {
+    fun getCollectionConfig(
+        deviceId: String,
+        shouldContinue: () -> Boolean = { true },
+    ): ConfigOutcome {
+        if (!shouldContinue()) return ConfigOutcome.Cancelled
         val encodedDevice = URLEncoder.encode(deviceId, StandardCharsets.UTF_8.name())
         val endpoint = endpointOrNull("/v1/activity/devices/$encodedDevice/collection")
             ?: return ConfigOutcome.PermanentFailure("invalid server URL: $baseUrl")
+        if (!shouldContinue()) return ConfigOutcome.Cancelled
         val connection = try {
             endpoint.openConnection() as HttpURLConnection
         } catch (e: IOException) {
@@ -171,90 +202,105 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
 
     fun postBatch(
         deviceId: String,
-        samples: List<UploadSample>,
+        snapshots: List<UploadBucketSnapshot>,
         timezone: String,
         collectionRevision: Int,
         collectionGeneration: Long,
+        pairingRevision: Long,
         shouldContinue: () -> Boolean = { true },
     ): Outcome {
         val endpoint = endpointOrNull(ENDPOINT_PATH)
             ?: return Outcome.PermanentFailure("invalid server URL: $baseUrl")
-        val ordered = samples.sortedWith(
-            compareBy<UploadSample>(
-                UploadSample::bucketStartIso,
-                UploadSample::appPackage,
-            ),
-        )
-        val result = uploadWithIsolation(
+        val ordered = snapshots.sortedBy(UploadBucketSnapshot::bucketStartIso)
+        if (ordered.any { it.samples.size > MAX_SAMPLES_PER_POST }) {
+            return Outcome.PermanentFailure(
+                "one hourly snapshot exceeds the server's " +
+                    "$MAX_SAMPLES_PER_POST-sample limit"
+            )
+        }
+        val chunks = packSnapshotChunks(
             ordered,
-            maxChunkSize = MAX_SAMPLES_PER_POST,
-            shouldContinue = shouldContinue,
-        ) { chunk ->
+            maxSamples = MAX_SAMPLES_PER_POST,
+            maxSnapshots = MAX_SNAPSHOTS_PER_POST,
+        )
+        var sent = 0
+        for (packed in chunks) {
+            if (!shouldContinue()) return Outcome.Cancelled
             when (
                 val outcome = postChunk(
                     endpoint,
                     deviceId,
-                    chunk,
+                    packed,
                     timezone,
                     collectionRevision,
                     collectionGeneration,
+                    pairingRevision,
+                    shouldContinue,
                 )
             ) {
-                is Outcome.Success -> ChunkUploadResult.Success
-                is Outcome.TransientFailure ->
-                    ChunkUploadResult.TransientFailure(outcome.reason)
-
-                is Outcome.PermanentFailure ->
-                    if (outcome.isolateRejectedSamples) {
-                        ChunkUploadResult.IsolatableFailure(outcome.reason)
-                    } else {
-                        ChunkUploadResult.PermanentFailure(outcome.reason)
+                is Outcome.Success -> {
+                    sent += outcome.samplesSent
+                    if (outcome.boundaryChangedAfterCommit) {
+                        return Outcome.Success(
+                            samplesSent = sent,
+                            boundaryChangedAfterCommit = true,
+                        )
                     }
+                }
+                is Outcome.TransientFailure -> return outcome
+                is Outcome.PermanentFailure ->
+                    return Outcome.PermanentFailure(outcome.reason)
 
-                Outcome.Cancelled -> ChunkUploadResult.Cancelled
+                Outcome.Cancelled -> return Outcome.Cancelled
             }
         }
-        if (result.cancelled) return Outcome.Cancelled
-        val failure = result.failure
-        if (failure != null) {
-            return if (failure.transient) {
-                Outcome.TransientFailure(failure.reason)
-            } else {
-                Outcome.PermanentFailure(failure.reason)
-            }
-        }
-        return Outcome.Success(
-            samplesSent = result.sent,
-            samplesDiscarded = result.discarded.size,
-        )
-    }
-
-    private fun endpointOrNull(path: String): URL? {
-        val secureBase = normalizedSecureServerUrl(baseUrl) ?: return null
-        return try {
-            URL(secureBase + path)
-        } catch (_: MalformedURLException) {
-            null
-        }
+        return Outcome.Success(samplesSent = sent)
     }
 
     private fun postChunk(
         endpoint: URL,
         deviceId: String,
-        chunk: List<UploadSample>,
+        snapshots: List<UploadBucketSnapshot>,
         timezone: String,
         collectionRevision: Int,
         collectionGeneration: Long,
+        pairingRevision: Long,
+        shouldContinue: () -> Boolean,
     ): Outcome {
+        if (!shouldContinue()) return Outcome.Cancelled
+        val samples = snapshots.flatMap(UploadBucketSnapshot::samples)
         val payload = JSONObject()
             .put("device_id", deviceId)
             .put("timezone", timezone)
             .put("collection_revision", collectionRevision)
             .put("collection_generation", collectionGeneration)
+            .put("pairing_revision", pairingRevision)
+            .put(
+                "bucket_snapshots",
+                JSONArray().apply {
+                    snapshots.forEach { snapshot ->
+                        put(
+                            JSONObject()
+                                .put("bucket_start", snapshot.bucketStartIso)
+                                .put("bucket_complete", snapshot.bucketComplete)
+                                .put("snapshot_sequence", snapshot.snapshotSequence)
+                                .put("source_set_complete", snapshot.sourceSetComplete)
+                                .put(
+                                    "app_packages",
+                                    JSONArray(
+                                        snapshot.samples
+                                            .map(UploadSample::appPackage)
+                                            .sorted(),
+                                    ),
+                                )
+                        )
+                    }
+                },
+            )
             .put(
                 "samples",
                 JSONArray().apply {
-                    chunk.forEach { sample ->
+                    samples.forEach { sample ->
                         put(
                             JSONObject()
                                 .put("bucket_start", sample.bucketStartIso)
@@ -262,6 +308,8 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
                                 .put("foreground_seconds", sample.foregroundSeconds)
                                 .put("launches", sample.launches)
                                 .put("category", sample.category ?: JSONObject.NULL)
+                                .put("bucket_complete", sample.bucketComplete)
+                                .put("snapshot_sequence", sample.snapshotSequence)
                         )
                     }
                 },
@@ -282,22 +330,17 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
             token?.takeIf { it.isNotBlank() }?.let {
                 connection.setRequestProperty("Authorization", "Bearer $it")
             }
+            if (!shouldContinue()) return Outcome.Cancelled
             connection.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
             val code = connection.responseCode
-            when {
-                code in 200..299 -> Outcome.Success(chunk.size)
+            val outcome = when {
+                code in 200..299 -> Outcome.Success(samples.size)
                 code == 409 -> {
                     val error = errorBody(connection)
                     val reason = "HTTP $code ${error.snippet}".trim()
                     when (activityConflictDisposition(error.code)) {
                         ActivityConflictDisposition.RETRY ->
                             Outcome.TransientFailure(reason)
-
-                        ActivityConflictDisposition.ISOLATE_REJECTED_SAMPLE ->
-                            Outcome.PermanentFailure(
-                                reason,
-                                isolateRejectedSamples = true,
-                            )
 
                         ActivityConflictDisposition.FAIL_CLOSED ->
                             Outcome.PermanentFailure(reason)
@@ -310,10 +353,23 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
                 else ->
                     Outcome.PermanentFailure("HTTP $code ${bodySnippet(connection)}".trim())
             }
+            postResponseBoundaryOutcome(
+                outcome,
+                boundaryStillCurrent = shouldContinue(),
+            )
         } catch (e: IOException) {
             Outcome.TransientFailure(e.message ?: e.javaClass.simpleName)
         } finally {
             connection.disconnect()
+        }
+    }
+
+    private fun endpointOrNull(path: String): URL? {
+        val secureBase = normalizedSecureServerUrl(baseUrl) ?: return null
+        return try {
+            URL(secureBase + path)
+        } catch (_: MalformedURLException) {
+            null
         }
     }
 
@@ -345,11 +401,56 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
 
     private companion object {
         const val ENDPOINT_PATH = "/v1/app-usage/batch"
-        const val MAX_SAMPLES_PER_POST = 500
+        const val MAX_SAMPLES_PER_POST = 1000
+        const val MAX_SNAPSHOTS_PER_POST = 500
         const val CONNECT_TIMEOUT_MS = 15_000
         const val READ_TIMEOUT_MS = 30_000
     }
 }
+
+internal fun packSnapshotChunks(
+    snapshots: List<UploadBucketSnapshot>,
+    maxSamples: Int,
+    maxSnapshots: Int,
+): List<List<UploadBucketSnapshot>> {
+    require(maxSamples > 0)
+    require(maxSnapshots > 0)
+    val chunks = mutableListOf<List<UploadBucketSnapshot>>()
+    var current = mutableListOf<UploadBucketSnapshot>()
+    var currentSamples = 0
+    for (snapshot in snapshots) {
+        require(snapshot.samples.size <= maxSamples)
+        val wouldOverflow = current.isNotEmpty() && (
+            current.size >= maxSnapshots ||
+                currentSamples + snapshot.samples.size > maxSamples
+            )
+        if (wouldOverflow) {
+            chunks += current.toList()
+            current = mutableListOf()
+            currentSamples = 0
+        }
+        current += snapshot
+        currentSamples += snapshot.samples.size
+    }
+    if (current.isNotEmpty()) {
+        chunks += current.toList()
+    }
+    return chunks
+}
+
+
+internal fun postResponseBoundaryOutcome(
+    outcome: IngestClient.Outcome,
+    boundaryStillCurrent: Boolean,
+): IngestClient.Outcome {
+    if (boundaryStillCurrent) return outcome
+    return if (outcome is IngestClient.Outcome.Success) {
+        outcome.copy(boundaryChangedAfterCommit = true)
+    } else {
+        IngestClient.Outcome.Cancelled
+    }
+}
+
 
 internal fun parseCollectionConfig(body: String): CollectionConfig {
     val payload = JSONObject(body)
@@ -418,7 +519,6 @@ internal fun parseCollectionConfig(body: String): CollectionConfig {
     } ?: throw IllegalArgumentException(
         "collection_generation must be a non-negative 64-bit integer",
     )
-
     return CollectionConfig(
         enabled = requiredBoolean("enabled"),
         effectiveCollecting = requiredBoolean("effective_collecting"),

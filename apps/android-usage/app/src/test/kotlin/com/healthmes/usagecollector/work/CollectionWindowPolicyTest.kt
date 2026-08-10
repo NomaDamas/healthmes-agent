@@ -2,8 +2,14 @@ package com.healthmes.usagecollector.work
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 class CollectionWindowPolicyTest {
 
@@ -38,6 +44,135 @@ class CollectionWindowPolicyTest {
             window.endMs,
         )
         assertTrue(window.hasMoreBacklog)
+    }
+
+    @Test
+    fun `unaligned backlog page keeps its final partial hour provisional`() {
+        val hourMs = 60L * 60L * 1000L
+        val collectionSinceMs = hourMs + 17L * 60L * 1000L
+        val window = activityQueryWindow(
+            collectionSinceMs = collectionSinceMs,
+            watermarkMs = collectionSinceMs,
+            nowMs = collectionSinceMs + 10L * 24L * hourMs,
+        )
+        val finalBucketStartMs = window.endMs - window.endMs % hourMs
+
+        assertTrue(window.hasMoreBacklog)
+        assertFalse(
+            bucketIsComplete(
+                bucketStartMs = finalBucketStartMs,
+                queryBeginMs = window.beginMs,
+                queryEndMs = window.endMs,
+                collectionSinceMs = collectionSinceMs,
+                nowMs = collectionSinceMs + 10L * 24L * hourMs,
+            )
+        )
+        assertTrue(
+            bucketIsComplete(
+                bucketStartMs = finalBucketStartMs - hourMs,
+                queryBeginMs = window.beginMs,
+                queryEndMs = window.endMs,
+                collectionSinceMs = collectionSinceMs,
+                nowMs = collectionSinceMs + 10L * 24L * hourMs,
+            )
+        )
+    }
+
+    @Test
+    fun `recently closed hour remains provisional during settlement grace`() {
+        val hourMs = 60L * 60L * 1000L
+        val bucketStartMs = 10L * hourMs
+        val bucketEndMs = bucketStartMs + hourMs
+
+        assertFalse(
+            bucketIsComplete(
+                bucketStartMs = bucketStartMs,
+                queryBeginMs = bucketStartMs,
+                queryEndMs = bucketEndMs,
+                collectionSinceMs = bucketStartMs,
+                nowMs = bucketEndMs + BUCKET_SETTLEMENT_GRACE_MS - 1L,
+            )
+        )
+        assertTrue(
+            bucketIsComplete(
+                bucketStartMs = bucketStartMs,
+                queryBeginMs = bucketStartMs,
+                queryEndMs = bucketEndMs,
+                collectionSinceMs = bucketStartMs,
+                nowMs = bucketEndMs + BUCKET_SETTLEMENT_GRACE_MS,
+            )
+        )
+    }
+
+    @Test
+    fun `persisted snapshot sequence advances in same millisecond and rollback`() {
+        var persistedSequence = 1_000L
+        val first = reservePersistedSnapshotSequence(
+            previousSequence = persistedSequence,
+            wallClockMs = 1_000L,
+            persist = {
+                persistedSequence = it
+                true
+            },
+        )
+        val second = reservePersistedSnapshotSequence(
+            previousSequence = checkNotNull(first),
+            wallClockMs = 900L,
+            persist = {
+                persistedSequence = it
+                true
+            },
+        )
+
+        assertEquals(1_001L, first)
+        assertEquals(1_002L, second)
+        assertEquals(1_002L, persistedSequence)
+        assertNull(
+            reservePersistedSnapshotSequence(
+                previousSequence = Long.MAX_VALUE,
+                wallClockMs = 1_100L,
+                persist = { error("overflow must not be persisted") },
+            )
+        )
+    }
+
+    @Test
+    fun `wall clock regression requests a boundary and never reverses query range`() {
+        val window = activityQueryWindow(
+            collectionSinceMs = 20_000L,
+            watermarkMs = 18_000L,
+            nowMs = 10_000L,
+        )
+
+        assertTrue(
+            clockRegressionBoundaryRequired(
+                collectionSinceMs = 20_000L,
+                watermarkMs = 18_000L,
+                nowMs = 10_000L,
+            )
+        )
+        assertEquals(10_000L, window.beginMs)
+        assertEquals(10_000L, window.endMs)
+        assertFalse(window.hasReadableRange)
+        assertTrue(window.beginMs <= window.endMs)
+    }
+
+    @Test
+    fun `stopped work cannot continue a sensitive operation`() {
+        assertFalse(
+            sensitiveContinuationAllowed(
+                isStopped = true,
+                permissionGranted = true,
+                guardCurrent = true,
+            )
+        )
+        assertTrue(
+            sensitiveContinuationAllowed(
+                isStopped = false,
+                permissionGranted = true,
+                guardCurrent = true,
+            )
+        )
     }
 
     @Test
@@ -158,5 +293,102 @@ class CollectionWindowPolicyTest {
             )
         )
         assertEquals(listOf("arm", "commit", "clear"), calls)
+    }
+
+    @Test
+    fun `cancelled waiter exits before the upload gate owner releases`() {
+        val ownerEntered = CountDownLatch(1)
+        val releaseOwner = CountDownLatch(1)
+        val waiterStarted = CountDownLatch(1)
+        val waiterFinished = CountDownLatch(1)
+        val cancelled = AtomicBoolean(false)
+        val waiterBodyInvoked = AtomicBoolean(false)
+        val waiterResult = AtomicReference<String?>()
+
+        val owner = Thread {
+            UploadExecutionGate.runCancellable(
+                isCancelled = { false },
+                onCancelled = { error("owner was unexpectedly cancelled") },
+            ) {
+                ownerEntered.countDown()
+                releaseOwner.await(5, TimeUnit.SECONDS)
+            }
+        }
+        val waiter = Thread {
+            waiterStarted.countDown()
+            waiterResult.set(
+                UploadExecutionGate.runCancellable(
+                    isCancelled = { cancelled.get() },
+                    onCancelled = { "cancelled" },
+                ) {
+                    waiterBodyInvoked.set(true)
+                    "ran"
+                }
+            )
+            waiterFinished.countDown()
+        }
+
+        owner.start()
+        assertTrue(ownerEntered.await(2, TimeUnit.SECONDS))
+        waiter.start()
+        assertTrue(waiterStarted.await(2, TimeUnit.SECONDS))
+        Thread.sleep(100)
+        assertEquals(1L, waiterFinished.count)
+
+        cancelled.set(true)
+        try {
+            assertTrue(waiterFinished.await(2, TimeUnit.SECONDS))
+            assertEquals("cancelled", waiterResult.get())
+            assertFalse(waiterBodyInvoked.get())
+        } finally {
+            releaseOwner.countDown()
+            owner.join(2_000)
+            waiter.join(2_000)
+        }
+
+        assertFalse(owner.isAlive)
+        assertFalse(waiter.isAlive)
+    }
+
+    @Test
+    fun `cancellation is checked again immediately after gate acquisition`() {
+        val cancellationChecks = AtomicInteger()
+        val bodyInvoked = AtomicBoolean(false)
+
+        val result = UploadExecutionGate.runCancellable(
+            isCancelled = { cancellationChecks.incrementAndGet() >= 2 },
+            onCancelled = { "cancelled" },
+        ) {
+            bodyInvoked.set(true)
+            "ran"
+        }
+
+        assertEquals("cancelled", result)
+        assertEquals(2, cancellationChecks.get())
+        assertFalse(bodyInvoked.get())
+    }
+
+    @Test
+    fun `snapshot buckets include empty and partial hours without splitting them`() {
+        val hourMs = 60L * 60L * 1000L
+        assertEquals(
+            listOf(0L, hourMs, 2 * hourMs),
+            bucketStartsForWindow(
+                beginMs = 15 * 60_000L,
+                endMs = 2 * hourMs + 1L,
+            ),
+        )
+    }
+
+    @Test
+    fun `empty query window produces no snapshot buckets`() {
+        val hourMs = 60L * 60L * 1000L
+        assertEquals(
+            emptyList<Long>(),
+            bucketStartsForWindow(
+                beginMs = hourMs,
+                endMs = hourMs,
+            ),
+        )
     }
 }

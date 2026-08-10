@@ -77,7 +77,11 @@ def _prime_routes(test_client: TestClient) -> None:
 @pytest.fixture
 def client(app):
     """The shared api-test app (reports router included), lifespan running."""
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as test_client:
         _prime_routes(test_client)
         yield test_client
 

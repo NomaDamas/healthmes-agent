@@ -48,6 +48,7 @@ COLLECTION_CONFIG_EVENT = "activity.collection-config.v1"
 COLLECTION_STATUS_EVENT = "activity.collection-status.v1"
 COLLECTION_CURSOR_EVENT = "activity.collection-cursor.v1"
 ACTIVITYWATCH_IMPORT_FENCE_EVENT = "activity.activitywatch-import-fence.v1"
+IOS_SNAPSHOT_FENCE_EVENT = "activity.ios-snapshot-fence.v1"
 DELETION_TOMBSTONE_EVENT = "activity.deletion-tombstone.v1"
 DELETION_IDENTITY_CHUNK_SIZE = 500
 
@@ -105,6 +106,21 @@ class PersistResult:
     previous_scopes: tuple[ActivityLocalScope, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ActivityTombstoneFilterResult:
+    records: tuple[ActivityRecord, ...]
+    affected_source_record_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class IOSSnapshotFence:
+    collection_generation: int | None
+    sequence: int
+    manifest_sha256: str
+    snapshot_start: datetime
+    snapshot_end: datetime
+
+
 def as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -148,6 +164,26 @@ def record_scopes(
         )
         for offset in range((last - first).days + 1)
     )
+
+
+def range_scopes(
+    *,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+) -> set[ActivityLocalScope]:
+    zone = parse_timezone(timezone)
+    first = as_utc(start).astimezone(zone).date()
+    last = (
+        as_utc(end) - timedelta(microseconds=1)
+    ).astimezone(zone).date()
+    return {
+        ActivityLocalScope(
+            day=first + timedelta(days=offset),
+            timezone=timezone,
+        )
+        for offset in range((last - first).days + 1)
+    }
 
 
 def event_bounds(event: WellnessEvent) -> tuple[datetime, datetime]:
@@ -313,6 +349,110 @@ def activity_source_identity_digest(
     ).hexdigest()
 
 
+ACTIVITY_FRAGMENT_PREFIX = "healthmes-activity-fragment"
+ACTIVITY_MUTABLE_FRAGMENT_VERSION = "v2m"
+
+
+def _datetime_epoch_microseconds(value: datetime) -> int:
+    normalized = as_utc(value)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    delta = normalized - epoch
+    return (
+        delta.days * 86_400_000_000
+        + delta.seconds * 1_000_000
+        + delta.microseconds
+    )
+
+
+def _fragment_identity_parts(source_record_id: str) -> list[str] | None:
+    parts = source_record_id.split(":")
+    if (
+        len(parts) == 3
+        and parts[0] == ACTIVITY_FRAGMENT_PREFIX
+        and len(parts[1]) == 64
+        and all(character in "0123456789abcdef" for character in parts[1])
+    ):
+        return parts
+    if (
+        len(parts) == 5
+        and parts[0] == ACTIVITY_FRAGMENT_PREFIX
+        and parts[1] == ACTIVITY_MUTABLE_FRAGMENT_VERSION
+        and len(parts[2]) == 64
+        and all(character in "0123456789abcdef" for character in parts[2])
+        and parts[3].lstrip("-").isdigit()
+        and parts[4].lstrip("-").isdigit()
+    ):
+        return parts
+    return None
+
+
+def activity_fragment_root_identity_digest(
+    *,
+    source_provider: str,
+    source_device: str,
+    source_record_id: str,
+) -> str:
+    """Return the original source identity across repeated fragmentation."""
+    parts = _fragment_identity_parts(source_record_id)
+    if parts is not None:
+        return parts[2] if len(parts) == 5 else parts[1]
+    return activity_source_identity_digest(
+        source_provider=source_provider,
+        source_device=source_device,
+        source_record_id=source_record_id,
+    )
+
+
+def activity_fragment_root_start_microseconds(
+    source_record_id: str,
+) -> int | None:
+    """Return the immutable root start carried by mutable-end fragments."""
+    parts = _fragment_identity_parts(source_record_id)
+    if parts is None or len(parts) != 5:
+        return None
+    return int(parts[3])
+
+
+def activity_fragment_source_record_id(
+    *,
+    source_provider: str,
+    source_device: str,
+    source_record_id: str,
+    start: datetime,
+    end: datetime,
+    root_start: datetime | None = None,
+    mutable_end_identity: bool = False,
+) -> str:
+    """Build one stable identity for deletion and reconciliation fragments."""
+    root_digest = activity_fragment_root_identity_digest(
+        source_provider=source_provider,
+        source_device=source_device,
+        source_record_id=source_record_id,
+    )
+    if mutable_end_identity:
+        carried_root_start = activity_fragment_root_start_microseconds(
+            source_record_id
+        )
+        root_start_us = (
+            carried_root_start
+            if carried_root_start is not None
+            else _datetime_epoch_microseconds(root_start or start)
+        )
+        fragment_start_us = _datetime_epoch_microseconds(start)
+        return (
+            f"{ACTIVITY_FRAGMENT_PREFIX}:"
+            f"{ACTIVITY_MUTABLE_FRAGMENT_VERSION}:"
+            f"{root_digest}:{root_start_us}:{fragment_start_us}"
+        )
+    bounds_digest = hashlib.sha256(
+        (
+            f"{root_digest}|{as_utc(start).isoformat()}|"
+            f"{as_utc(end).isoformat()}"
+        ).encode()
+    ).hexdigest()[:40]
+    return f"{ACTIVITY_FRAGMENT_PREFIX}:{root_digest}:{bounds_digest}"
+
+
 def _fingerprint(value: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -335,7 +475,7 @@ def _record_payload(
         "capability": capability.value,
     }
     if isinstance(record, AppHourRecord):
-        return {
+        payload = {
             **common,
             "kind": record.kind,
             "bucket_start": record.bucket_start.isoformat(),
@@ -346,6 +486,9 @@ def _record_payload(
             "coverage_seconds": record.coverage_seconds,
             "bucket_complete": record.bucket_complete,
         }
+        if record.snapshot_sequence is not None:
+            payload["snapshot_sequence"] = record.snapshot_sequence
+        return payload
     payload = {
         **common,
         "kind": record.kind,
@@ -392,7 +535,30 @@ def _provisional_hour_replacement_allowed(
         and batch.collection_revision < previous_revision
     ):
         return False
+    previous_sequence = int(previous.get("snapshot_sequence") or 0)
+    incoming_sequence = int(record.snapshot_sequence or 0)
+    if previous_sequence > 0 or incoming_sequence > 0:
+        return incoming_sequence > previous_sequence
+    if record.foreground_seconds < int(
+        previous.get("foreground_seconds") or 0
+    ):
+        return False
+    if record.launches < int(previous.get("launches") or 0):
+        return False
     return as_utc(batch.collected_at) > as_utc(existing.recorded_at)
+
+
+def _hour_snapshot_content(payload: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        payload.get("kind"),
+        payload.get("bucket_start"),
+        payload.get("app_id"),
+        payload.get("foreground_seconds"),
+        payload.get("launches"),
+        payload.get("category"),
+        payload.get("coverage_seconds"),
+        payload.get("bucket_complete"),
+    )
 
 
 def _update_existing_activity_event(
@@ -411,21 +577,60 @@ def _update_existing_activity_event(
         if isinstance(existing.derived_from, dict)
         else None
     )
-    if previous == fingerprint:
-        return PersistResult(existing, "duplicate")
-    if not allow_replace and not _provisional_hour_replacement_allowed(
-        existing,
-        batch=batch,
-        record=record,
+    expected_event_type = (
+        APP_HOUR_EVENT if isinstance(record, AppHourRecord) else APP_INTERVAL_EVENT
+    )
+    same_hour_content = (
+        isinstance(record, AppHourRecord)
+        and existing.event_type == APP_HOUR_EVENT
+        and isinstance(existing.payload, dict)
+        and _hour_snapshot_content(existing.payload)
+        == _hour_snapshot_content(payload)
+    )
+    if previous == fingerprint or (
+        previous is None
+        and existing.event_type == expected_event_type
+        and existing.source_device == batch.source_device
+        and existing.timezone == batch.timezone
+        and existing.payload == payload
     ):
+        return PersistResult(existing, "duplicate")
+    if same_hour_content and (
+        existing.payload.get("bucket_complete") is True
+        or int(record.snapshot_sequence or 0)
+        <= int(existing.payload.get("snapshot_sequence") or 0)
+    ):
+        return PersistResult(existing, "duplicate")
+    if (
+        isinstance(record, AppHourRecord)
+        and batch.platform != ActivityPlatform.IOS
+    ):
+        replacement_allowed = _provisional_hour_replacement_allowed(
+            existing,
+            batch=batch,
+            record=record,
+        )
+    elif batch.platform == ActivityPlatform.IOS:
+        previous_sequence = int(existing.payload.get("snapshot_sequence") or 0)
+        incoming_sequence = int(record.snapshot_sequence or 0)
+        replacement_allowed = allow_replace and (
+            incoming_sequence > previous_sequence
+            if incoming_sequence > 0
+            else (
+                previous_sequence == 0
+                and as_utc(batch.collected_at)
+                > as_utc(existing.recorded_at)
+            )
+        )
+    else:
+        replacement_allowed = allow_replace
+    if not replacement_allowed:
         raise ActivityConflictError(
             "source_record_id was already used with different activity input"
         )
     previous_scopes = event_scopes(existing)
     observed = _observed_at(record)
-    existing.event_type = (
-        APP_HOUR_EVENT if isinstance(record, AppHourRecord) else APP_INTERVAL_EVENT
-    )
+    existing.event_type = expected_event_type
     existing.observed_at = observed
     existing.recorded_at = batch.collected_at
     existing.timezone = batch.timezone
@@ -572,6 +777,7 @@ STATUS_KEYS = {
     "status_reason",
     "status_observed_at",
     "collection_generation",
+    "pairing_revision",
     "last_collected_at",
     "last_uploaded_at",
     "queue_oldest_at",
@@ -588,6 +794,16 @@ def _collection_generation(value: object) -> int | None:
     ):
         return value
     return None
+
+
+def _pairing_revision(value: object) -> int:
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    ):
+        return value
+    return 0
 
 
 def _status_boundary_is_stale(
@@ -609,6 +825,25 @@ def _status_boundary_is_stale(
         payload.get("collection_generation")
     )
     incoming_generation = update.collection_generation
+    existing_pairing_revision = _pairing_revision(
+        payload.get("pairing_revision")
+    )
+    incoming_pairing_revision = (
+        update.pairing_revision
+        if update.pairing_revision is not None
+        else (
+            0
+            if update.platform is ActivityPlatform.ANDROID
+            and incoming_generation is not None
+            else existing_pairing_revision
+        )
+    )
+
+    # Pairing revisions are monotonic on Android. Once the same HealthMes
+    # instance has observed a newer pairing, an older worker cannot reopen it
+    # even if its wall clock or permission observation arrives later.
+    if incoming_pairing_revision < existing_pairing_revision:
+        return True
 
     if existing_generation is not None:
         # Once a collector establishes a monotonic generation, an unversioned
@@ -674,6 +909,7 @@ def default_control_payload(
         "status_reason": None,
         "status_observed_at": None,
         "collection_generation": None,
+        "pairing_revision": 0,
         "last_collected_at": None,
         "last_uploaded_at": None,
         "queue_oldest_at": None,
@@ -907,6 +1143,97 @@ def get_activitywatch_import_fence(
     return value
 
 
+def get_ios_snapshot_fence(
+    session: Session,
+    device_id: str,
+    *,
+    lock: bool = False,
+) -> IOSSnapshotFence | None:
+    """Return the private ordering fence for iOS authoritative snapshots."""
+    if lock:
+        lock_activity_control_device(session, device_id)
+    event = _typed_control_event(
+        session,
+        device_id,
+        event_type=IOS_SNAPSHOT_FENCE_EVENT,
+        kind="ios-snapshot-fence",
+        lock=lock,
+    )
+    if event is None or not isinstance(event.payload, dict):
+        return None
+    sequence = event.payload.get("sequence")
+    collection_generation = _collection_generation(
+        event.payload.get("collection_generation")
+    )
+    digest = event.payload.get("manifest_sha256")
+    start = parse_optional_datetime(event.payload.get("snapshot_start"))
+    end = parse_optional_datetime(event.payload.get("snapshot_end"))
+    if (
+        not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence < 1
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or start is None
+        or end is None
+        or start >= end
+    ):
+        raise ActivityWriteConflictError("iOS snapshot fence is malformed")
+    return IOSSnapshotFence(
+        collection_generation=collection_generation,
+        sequence=sequence,
+        manifest_sha256=digest,
+        snapshot_start=start,
+        snapshot_end=end,
+    )
+
+
+def persist_ios_snapshot_fence(
+    session: Session,
+    device_id: str,
+    *,
+    collection_generation: int | None,
+    sequence: int,
+    manifest_sha256: str,
+    snapshot_start: datetime,
+    snapshot_end: datetime,
+    now: datetime | None = None,
+) -> IOSSnapshotFence:
+    if sequence < 1 or len(manifest_sha256) != 64:
+        raise ValueError("invalid iOS snapshot fence")
+    if collection_generation is not None and collection_generation < 0:
+        raise ValueError("invalid iOS snapshot collection generation")
+    start = as_utc(snapshot_start)
+    end = as_utc(snapshot_end)
+    if start >= end:
+        raise ValueError("invalid iOS snapshot range")
+    _persist_control_payload(
+        session,
+        device_id,
+        {
+            "device_id": device_id,
+            "collection_generation": collection_generation,
+            "sequence": sequence,
+            "manifest_sha256": manifest_sha256,
+            "snapshot_start": start.isoformat(),
+            "snapshot_end": end.isoformat(),
+        },
+        event_type=IOS_SNAPSHOT_FENCE_EVENT,
+        source_record_id=_control_source_id(
+            device_id,
+            "ios-snapshot-fence",
+        ),
+        now=now,
+    )
+    return IOSSnapshotFence(
+        collection_generation=collection_generation,
+        sequence=sequence,
+        manifest_sha256=manifest_sha256,
+        snapshot_start=start,
+        snapshot_end=end,
+    )
+
+
 def advance_activitywatch_import_fence(
     session: Session,
     device_id: str,
@@ -1101,6 +1428,7 @@ def update_collection_status(
                     "permission_status",
                     "status_observed_at",
                     "collection_generation",
+                    "pairing_revision",
                 }
                 & update.model_fields_set
             )
@@ -1121,6 +1449,12 @@ def update_collection_status(
                         platform=update.platform or ActivityPlatform.UNKNOWN,
                     )
                 values["status_observed_at"] = incoming_observed_at
+                if (
+                    update.platform is ActivityPlatform.ANDROID
+                    and update.collection_generation is not None
+                    and update.pairing_revision is None
+                ):
+                    values["pairing_revision"] = 0
             for key, value in values.items():
                 if isinstance(value, datetime):
                     payload[key] = iso_or_none(value)
@@ -1296,9 +1630,95 @@ def tombstoned_record_ids(
     device_id: str,
     records: list[ActivityRecord],
 ) -> set[str]:
+    return set(
+        filter_tombstoned_records(
+            session,
+            source_provider=source_provider,
+            device_id=device_id,
+            records=records,
+        ).affected_source_record_ids
+    )
+
+
+def _subtract_tombstone_ranges(
+    *,
+    start: datetime,
+    end: datetime,
+    ranges: list[tuple[datetime | None, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    spans = [(start, end)]
+    for deleted_start, deleted_end in ranges:
+        next_spans: list[tuple[datetime, datetime]] = []
+        for span_start, span_end in spans:
+            if deleted_end <= span_start or (
+                deleted_start is not None and deleted_start >= span_end
+            ):
+                next_spans.append((span_start, span_end))
+                continue
+            if deleted_start is not None and span_start < deleted_start:
+                next_spans.append(
+                    (span_start, min(span_end, deleted_start))
+                )
+            if deleted_end < span_end:
+                next_spans.append((max(span_start, deleted_end), span_end))
+        spans = [
+            (span_start, span_end)
+            for span_start, span_end in next_spans
+            if span_end > span_start
+        ]
+        if not spans:
+            break
+    return spans
+
+
+def _tombstone_fragment(
+    record: AppIntervalRecord,
+    *,
+    source_provider: str,
+    device_id: str,
+    start: datetime,
+    end: datetime,
+    mutable_end_identity: bool,
+) -> AppIntervalRecord:
+    return record.model_copy(
+        update={
+            "source_record_id": activity_fragment_source_record_id(
+                source_provider=source_provider,
+                source_device=device_id,
+                source_record_id=record.source_record_id,
+                start=start,
+                end=end,
+                root_start=record.start_at,
+                mutable_end_identity=mutable_end_identity,
+            ),
+            "start_at": start,
+            "end_at": end,
+            "launches": record.launches if start == record.start_at else 0,
+        }
+    )
+
+
+def filter_tombstoned_records(
+    session: Session,
+    *,
+    source_provider: str,
+    device_id: str,
+    records: list[ActivityRecord],
+    allow_mutable_interval_end: bool = False,
+) -> ActivityTombstoneFilterResult:
+    """Apply user-deletion tombstones without widening a partial delete.
+
+    Fully deleted source identities stay blocked even if a queued retry moves
+    them elsewhere. Range-only tombstones subtract only the deleted portion of
+    detailed intervals; hourly aggregate rows remain all-or-nothing because
+    the deletion API rejects partial-hour requests.
+    """
     tombstones = activity_deletion_tombstones(session, device_id=device_id)
     if not tombstones:
-        return set()
+        return ActivityTombstoneFilterResult(
+            records=tuple(records),
+            affected_source_record_ids=frozenset(),
+        )
     exact_digests = {
         str(digest)
         for row in tombstones
@@ -1321,7 +1741,10 @@ def tombstoned_record_ids(
                     end,
                 )
             )
-    blocked: set[str] = set()
+    accepted: list[ActivityRecord] = []
+    affected: set[str] = set()
+    expected_fragment_ids: dict[str, set[str]] = {}
+    expected_fragment_records: dict[str, list[AppIntervalRecord]] = {}
     for record in records:
         digest = activity_source_identity_digest(
             source_provider=source_provider,
@@ -1329,16 +1752,142 @@ def tombstoned_record_ids(
             source_record_id=record.source_record_id,
         )
         if digest in exact_digests:
-            blocked.add(record.source_record_id)
+            affected.add(record.source_record_id)
             continue
         record_start, record_end = record_bounds(record)
-        for start, end in ranges:
-            if start is not None and record_end <= start:
+        remaining = _subtract_tombstone_ranges(
+            start=record_start,
+            end=record_end,
+            ranges=ranges,
+        )
+        if remaining == [(record_start, record_end)]:
+            accepted.append(record)
+            continue
+        affected.add(record.source_record_id)
+        if isinstance(record, AppHourRecord):
+            if remaining:
+                raise ActivityConflictError(
+                    "hourly aggregate overlaps a partial user-deletion tombstone"
+                )
+            continue
+        fragments = [
+            _tombstone_fragment(
+                record,
+                source_provider=source_provider,
+                device_id=device_id,
+                start=fragment_start,
+                end=fragment_end,
+                mutable_end_identity=allow_mutable_interval_end,
+            )
+            for fragment_start, fragment_end in remaining
+        ]
+        accepted.extend(fragments)
+        root_digest = activity_fragment_root_identity_digest(
+            source_provider=source_provider,
+            source_device=device_id,
+            source_record_id=record.source_record_id,
+        )
+        expected_fragment_ids.setdefault(root_digest, set()).update(
+            fragment.source_record_id for fragment in fragments
+        )
+        expected_fragment_records.setdefault(root_digest, []).extend(
+            fragments
+        )
+    for root_digest, expected_ids in expected_fragment_ids.items():
+        prefix = f"{ACTIVITY_FRAGMENT_PREFIX}:{root_digest}:"
+        mutable_prefix = (
+            f"{ACTIVITY_FRAGMENT_PREFIX}:"
+            f"{ACTIVITY_MUTABLE_FRAGMENT_VERSION}:{root_digest}:"
+        )
+        existing_rows = list(
+            session.scalars(
+                select(WellnessEvent).where(
+                    WellnessEvent.event_type == APP_INTERVAL_EVENT,
+                    WellnessEvent.source_provider == source_provider,
+                    WellnessEvent.source_device == device_id,
+                    (
+                        WellnessEvent.source_record_id.like(f"{prefix}%")
+                        | WellnessEvent.source_record_id.like(
+                            f"{mutable_prefix}%"
+                        )
+                    ),
+                )
+            )
+        )
+        existing_ids = {
+            str(row.source_record_id)
+            for row in existing_rows
+        }
+        if not existing_ids:
+            continue
+        if not allow_mutable_interval_end:
+            if existing_ids == expected_ids:
                 continue
-            if record_start < end:
-                blocked.add(record.source_record_id)
-                break
-    return blocked
+            raise ActivityConflictError(
+                "activity source bounds changed after a partial user deletion; "
+                "explicit repair is required"
+            )
+        if allow_mutable_interval_end:
+            expected_records = expected_fragment_records[root_digest]
+            expected_root_starts = {
+                activity_fragment_root_start_microseconds(
+                    record.source_record_id
+                )
+                for record in expected_records
+            }
+            existing_root_starts = {
+                activity_fragment_root_start_microseconds(
+                    str(row.source_record_id)
+                )
+                for row in existing_rows
+            }
+            expected_semantics = {
+                (
+                    record.state.value,
+                    record.app_id,
+                    record.category,
+                    record.source_group_id,
+                )
+                for record in expected_records
+            }
+            existing_semantics = {
+                (
+                    str(row.payload.get("state")),
+                    row.payload.get("app_id"),
+                    row.payload.get("category"),
+                    row.payload.get("source_group_id"),
+                )
+                for row in existing_rows
+                if isinstance(row.payload, dict)
+            }
+            if (
+                len(expected_root_starts) == 1
+                and None not in expected_root_starts
+                and expected_root_starts == existing_root_starts
+                and len(expected_semantics) == 1
+                and expected_semantics == existing_semantics
+            ):
+                continue
+            if (
+                existing_ids == expected_ids
+                and existing_root_starts == {None}
+            ):
+                # Legacy exact-bound fragments remain replayable, but any
+                # mutable-bound change still fails closed.
+                continue
+        if existing_ids != expected_ids:
+            raise ActivityConflictError(
+                "activity source bounds changed after a partial user deletion; "
+                "explicit repair is required"
+            )
+        raise ActivityConflictError(
+            "activity source semantics changed after a partial user deletion; "
+            "explicit repair is required"
+        )
+    return ActivityTombstoneFilterResult(
+        records=tuple(accepted),
+        affected_source_record_ids=frozenset(affected),
+    )
 
 
 def serialize_collection_state(

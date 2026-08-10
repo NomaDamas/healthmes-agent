@@ -39,7 +39,7 @@ LATE_END_HOUR = 6
 BASELINE_DAYS = 7
 MIN_BASELINE_DAYS = 3
 MIN_BASELINE_COVERAGE = 0.25
-SUMMARY_DERIVATION_VERSION = 2
+SUMMARY_DERIVATION_VERSION = 3
 LEGACY_SUMMARY_REASON = "legacy_activity_summary_incompatible"
 
 
@@ -147,11 +147,27 @@ class DeviceHour:
     active_seconds: float = 0.0
     idle_seconds: float = 0.0
     category_seconds: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    category_upper_seconds: dict[str, float] = field(
+        default_factory=lambda: defaultdict(float)
+    )
     launches: int = 0
+    launches_upper: int = 0
     first_activity_at: datetime | None = None
     last_activity_at: datetime | None = None
     active_spans: list[tuple[datetime, datetime]] = field(default_factory=list)
     idle_spans: list[tuple[datetime, datetime]] = field(default_factory=list)
+    coarse_active_buckets: dict[
+        tuple[datetime, datetime],
+        float,
+    ] = field(default_factory=lambda: defaultdict(float))
+    coarse_category_buckets: dict[
+        tuple[datetime, datetime],
+        dict[str, float],
+    ] = field(default_factory=lambda: defaultdict(lambda: defaultdict(float)))
+    coarse_launch_buckets: dict[
+        tuple[datetime, datetime],
+        int,
+    ] = field(default_factory=lambda: defaultdict(int))
     coverage_spans: list[tuple[datetime, datetime]] = field(default_factory=list)
     known_coverage_seconds: float | None = None
     has_interval_data: bool = False
@@ -161,6 +177,7 @@ class DeviceHour:
     mixed_source_modes: bool = False
     active_idle_overlap: bool = False
     has_provisional_data: bool = False
+    has_partial_coarse_data: bool = False
     evidence_ids: list[str] = field(default_factory=list)
 
 
@@ -268,9 +285,13 @@ def _apply_interval_event(
         target.active_seconds += duration
         target.active_spans.append((clipped_start, clipped_end))
         category = payload.get("category")
-        target.category_seconds[str(category or "uncategorized")] += duration
+        category_name = str(category or "uncategorized")
+        target.category_seconds[category_name] += duration
+        target.category_upper_seconds[category_name] += duration
         if interval_start >= start and interval_start < end:
-            target.launches += int(payload.get("launches") or 0)
+            launches = int(payload.get("launches") or 0)
+            target.launches += launches
+            target.launches_upper += launches
         _touch_activity_bounds(target, clipped_start, clipped_end)
     elif state in {"idle", "locked"}:
         target.idle_seconds += duration
@@ -296,8 +317,9 @@ def _apply_hour_events(
         if bucket_start is None:
             continue
         bucket_end = bucket_start + timedelta(hours=1)
-        fraction = _overlap_fraction(bucket_start, bucket_end, start, end)
-        if fraction <= 0:
+        overlap_start = max(bucket_start, start)
+        overlap_end = min(bucket_end, end)
+        if overlap_end <= overlap_start:
             continue
         target.evidence_ids.append(str(event.id))
         platform = payload.get("platform")
@@ -309,20 +331,24 @@ def _apply_hour_events(
         source_active = float(payload.get("foreground_seconds") or 0)
         if source_active > 3600:
             target.source_overflow = True
-        active = source_active * fraction
-        target.active_seconds += active
-        category = payload.get("category")
-        target.category_seconds[str(category or "uncategorized")] += active
-        if bucket_start >= start and bucket_start < end:
-            target.launches += int(payload.get("launches") or 0)
-        if active > 0:
-            _touch_activity_bounds(target, max(bucket_start, start), min(bucket_end, end))
+        bucket = (bucket_start, bucket_end)
+        target.coarse_active_buckets[bucket] += source_active
+        category = str(payload.get("category") or "uncategorized")
+        target.coarse_category_buckets[bucket][category] += source_active
+        target.coarse_launch_buckets[bucket] += int(payload.get("launches") or 0)
+        if overlap_start > bucket_start or overlap_end < bucket_end:
+            target.has_partial_coarse_data = True
+        if source_active > 0:
+            _touch_activity_bounds(target, overlap_start, overlap_end)
         if payload.get("bucket_complete") is not True:
             target.has_provisional_data = True
             target.has_unknown_coverage = True
             continue
         coverage = payload.get("coverage_seconds")
         if isinstance(coverage, int | float):
+            overlap_seconds = (overlap_end - overlap_start).total_seconds()
+            bucket_seconds = (bucket_end - bucket_start).total_seconds()
+            fraction = overlap_seconds / bucket_seconds
             known = min(window_seconds, max(0.0, float(coverage) * fraction))
             target.known_coverage_seconds = max(
                 target.known_coverage_seconds or 0.0,
@@ -331,13 +357,52 @@ def _apply_hour_events(
         else:
             target.has_unknown_coverage = True
 
-    if target.active_seconds > window_seconds:
-        target.source_overflow = True
-        scale = window_seconds / target.active_seconds
-        target.active_seconds = window_seconds
-        target.category_seconds = {
-            key: value * scale for key, value in target.category_seconds.items()
-        }
+    for bucket, seconds in tuple(target.coarse_active_buckets.items()):
+        bucket_seconds = (bucket[1] - bucket[0]).total_seconds()
+        if seconds > bucket_seconds:
+            target.source_overflow = True
+            target.coarse_active_buckets[bucket] = bucket_seconds
+            categories = target.coarse_category_buckets[bucket]
+            category_total = sum(categories.values())
+            if category_total > 0:
+                scale = bucket_seconds / category_total
+                target.coarse_category_buckets[bucket] = {
+                    key: value * scale
+                    for key, value in categories.items()
+                }
+
+    target.active_seconds = 0.0
+    for bucket, active_seconds in target.coarse_active_buckets.items():
+        lower, _ = _bounded_bucket_value(
+            active_seconds,
+            bucket_start=bucket[0],
+            bucket_end=bucket[1],
+            start=start,
+            end=end,
+        )
+        target.active_seconds += lower
+        for category, category_active in (
+            target.coarse_category_buckets[bucket].items()
+        ):
+            category_lower, category_upper = _bounded_bucket_value(
+                category_active,
+                bucket_start=bucket[0],
+                bucket_end=bucket[1],
+                start=start,
+                end=end,
+            )
+            target.category_seconds[category] += category_lower
+            target.category_upper_seconds[category] += category_upper
+        overlap_start = max(start, bucket[0])
+        overlap_end = min(end, bucket[1])
+        if overlap_end <= overlap_start:
+            continue
+        launches = target.coarse_launch_buckets[bucket]
+        if overlap_start == bucket[0] and overlap_end == bucket[1]:
+            target.launches += launches
+            target.launches_upper += launches
+        else:
+            target.launches_upper += launches
 
 
 def _longest_span_minutes(spans: Iterable[tuple[datetime, datetime]]) -> float | None:
@@ -396,6 +461,115 @@ def _coverage_payload(
     }
 
 
+def _bounded_bucket_value(
+    value: float,
+    *,
+    bucket_start: datetime,
+    bucket_end: datetime,
+    start: datetime,
+    end: datetime,
+) -> tuple[float, float]:
+    overlap_start = max(start, bucket_start)
+    overlap_end = min(end, bucket_end)
+    if overlap_end <= overlap_start:
+        return 0.0, 0.0
+    bucket_seconds = (bucket_end - bucket_start).total_seconds()
+    overlap_seconds = (overlap_end - overlap_start).total_seconds()
+    if bucket_seconds <= 0 or overlap_seconds <= 0:
+        return 0.0, 0.0
+    bounded_value = min(bucket_seconds, max(0.0, value))
+    outside_seconds = bucket_seconds - overlap_seconds
+    lower = max(0.0, bounded_value - outside_seconds)
+    upper = min(bounded_value, overlap_seconds)
+    return lower, max(lower, upper)
+
+
+def _coarse_active_bounds(
+    row: DeviceHour,
+    *,
+    start: datetime,
+    end: datetime,
+) -> tuple[float, float]:
+    lower = 0.0
+    upper = 0.0
+    for (bucket_start, bucket_end), active_seconds in (
+        row.coarse_active_buckets.items()
+    ):
+        bucket_lower, bucket_upper = _bounded_bucket_value(
+            active_seconds,
+            bucket_start=bucket_start,
+            bucket_end=bucket_end,
+            start=start,
+            end=end,
+        )
+        lower += bucket_lower
+        upper += bucket_upper
+    window_seconds = max(0.0, (end - start).total_seconds())
+    return min(window_seconds, lower), min(window_seconds, max(lower, upper))
+
+
+def _active_time_bounds(
+    devices: Iterable[DeviceHour],
+    *,
+    start: datetime,
+    end: datetime,
+) -> tuple[float, float]:
+    rows = list(devices)
+    precise_spans = [
+        span
+        for row in rows
+        for span in row.active_spans
+    ]
+    coarse_rows = [
+        row for row in rows if row.coarse_active_buckets
+    ]
+    if not coarse_rows:
+        exact = _union_seconds(
+            precise_spans,
+            start=start,
+            end=end,
+        )
+        return exact, exact
+
+    boundaries = {start, end}
+    for row in coarse_rows:
+        for bucket_start, bucket_end in row.coarse_active_buckets:
+            boundaries.add(max(start, bucket_start))
+            boundaries.add(min(end, bucket_end))
+    ordered = sorted(
+        boundary
+        for boundary in boundaries
+        if start <= boundary <= end
+    )
+    lower = 0.0
+    upper = 0.0
+    for segment_start, segment_end in zip(ordered, ordered[1:]):
+        if segment_end <= segment_start:
+            continue
+        precise_seconds = _union_seconds(
+            precise_spans,
+            start=segment_start,
+            end=segment_end,
+        )
+        coarse_bounds = [
+            _coarse_active_bounds(
+                row,
+                start=segment_start,
+                end=segment_end,
+            )
+            for row in coarse_rows
+        ]
+        segment_seconds = (segment_end - segment_start).total_seconds()
+        lower += max(
+            [precise_seconds, *(value[0] for value in coarse_bounds)]
+        )
+        upper += min(
+            segment_seconds,
+            precise_seconds + sum(value[1] for value in coarse_bounds),
+        )
+    return lower, max(lower, upper)
+
+
 def summarize_window(
     events: Iterable[WellnessEvent],
     *,
@@ -429,6 +603,10 @@ def summarize_window(
                     category: seconds * scale
                     for category, seconds in target.category_seconds.items()
                 }
+                target.category_upper_seconds = {
+                    category: seconds * scale
+                    for category, seconds in target.category_upper_seconds.items()
+                }
             target.active_seconds = active_union
         if target.idle_spans:
             raw_idle_union = _union_seconds(
@@ -458,11 +636,32 @@ def summarize_window(
         for row in by_device.values()
         if row.evidence_ids or row.active_seconds or row.idle_seconds
     ]
-    total_active = sum(row.active_seconds for row in devices)
+    precise_spans = [
+        span for row in devices for span in row.active_spans
+    ]
+    active_lower, active_upper = _active_time_bounds(
+        devices,
+        start=start,
+        end=end,
+    )
+    active_time_bounded = active_upper - active_lower > 0.5
     categories: dict[str, float] = defaultdict(float)
+    category_uppers: dict[str, float] = defaultdict(float)
     for row in devices:
         for category, seconds in row.category_seconds.items():
             categories[category] += seconds
+        for category, seconds in row.category_upper_seconds.items():
+            category_uppers[category] += seconds
+    for category, seconds in categories.items():
+        category_uppers[category] = max(
+            seconds,
+            category_uppers.get(category, seconds),
+        )
+    launches = sum(row.launches for row in devices)
+    launches_upper = max(
+        launches,
+        sum(row.launches_upper for row in devices),
+    )
     first = min(
         (row.first_activity_at for row in devices if row.first_activity_at is not None),
         default=None,
@@ -471,8 +670,31 @@ def summarize_window(
         (row.last_activity_at for row in devices if row.last_activity_at is not None),
         default=None,
     )
-    precise_spans = [span for row in devices for span in row.active_spans]
     idle_known = any(row.has_idle_data for row in devices)
+    has_cross_device_coarse_activity = (
+        len(devices) > 1
+        and any(row.coarse_active_buckets for row in devices)
+    )
+    if idle_known and not has_cross_device_coarse_activity:
+        idle_spans = [
+            span for row in devices for span in row.idle_spans
+        ]
+        active_idle_union = _union_seconds(
+            [*precise_spans, *idle_spans],
+            start=start,
+            end=end,
+        )
+        precise_active_union = _union_seconds(
+            precise_spans,
+            start=start,
+            end=end,
+        )
+        idle_and_break_seconds: float | None = max(
+            0.0,
+            active_idle_union - precise_active_union,
+        )
+    else:
+        idle_and_break_seconds = None
     source_coverage = _coverage_payload(
         devices,
         start=start,
@@ -480,8 +702,20 @@ def summarize_window(
         window_seconds=(end - start).total_seconds(),
     )
     limitations: list[str] = []
+    if active_time_bounded and len(devices) > 1:
+        limitations.append("cross_device_activity_time_bounded")
+    if any(row.has_partial_coarse_data for row in devices):
+        limitations.extend(
+            [
+                "partial_hourly_activity_time_bounded",
+                "partial_hourly_category_totals_bounded",
+                "partial_hourly_launches_bounded",
+            ]
+        )
     if len(devices) > 1:
-        limitations.append("cross_device_overlap_not_deduplicated")
+        limitations.append("cross_device_category_totals_may_overlap")
+    if idle_known and has_cross_device_coarse_activity:
+        limitations.append("cross_device_idle_time_unresolved")
     if any(row.has_unknown_coverage for row in devices):
         limitations.append("source_coverage_unknown_for_some_devices")
     if any(hour_events.values()):
@@ -505,14 +739,44 @@ def summarize_window(
             "local_hour": local_start.hour,
             "utc_offset_minutes": int(local_start.utcoffset().total_seconds() / 60),
         },
-        "total_active_minutes": _round_minutes(total_active),
+        "total_active_minutes": _round_minutes(active_lower),
+        "active_time_range": {
+            "lower_bound_minutes": _round_minutes(active_lower),
+            "upper_bound_minutes": _round_minutes(active_upper),
+            "precision": (
+                "bounded" if active_time_bounded else "exact"
+            ),
+        },
         "category_minutes": {
             key: _round_minutes(value) for key, value in sorted(categories.items())
         },
-        "app_launches_or_switches": sum(row.launches for row in devices),
+        "category_time_ranges": {
+            key: {
+                "lower_bound_minutes": _round_minutes(
+                    categories.get(key, 0.0)
+                ),
+                "upper_bound_minutes": _round_minutes(value),
+                "precision": (
+                    "bounded"
+                    if value - categories.get(key, 0.0) > 0.5
+                    else "exact"
+                ),
+            }
+            for key, value in sorted(category_uppers.items())
+        },
+        "app_launches_or_switches": launches,
+        "app_launches_or_switches_range": {
+            "lower_bound": launches,
+            "upper_bound": launches_upper,
+            "precision": (
+                "bounded" if launches_upper != launches else "exact"
+            ),
+        },
         "longest_active_block_minutes": _longest_span_minutes(precise_spans),
         "idle_and_break_minutes": (
-            _round_minutes(sum(row.idle_seconds for row in devices)) if idle_known else None
+            _round_minutes(idle_and_break_seconds)
+            if idle_and_break_seconds is not None
+            else None
         ),
         "first_activity_at": first.isoformat() if first is not None else None,
         "last_activity_at": last.isoformat() if last is not None else None,
@@ -538,6 +802,27 @@ def _summary_source_id(kind: str, timezone: str, observed_at: datetime) -> str:
 
 def _public_summary(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if not key.startswith("_")}
+
+
+def summary_active_time_range(
+    payload: dict[str, Any],
+) -> tuple[float, float]:
+    total = max(0.0, float(payload.get("total_active_minutes") or 0))
+    raw_range = payload.get("active_time_range")
+    if not isinstance(raw_range, dict):
+        return total, total
+    lower = raw_range.get("lower_bound_minutes")
+    upper = raw_range.get("upper_bound_minutes")
+    if (
+        not isinstance(lower, int | float)
+        or isinstance(lower, bool)
+        or not isinstance(upper, int | float)
+        or isinstance(upper, bool)
+    ):
+        return total, total
+    normalized_lower = max(0.0, float(lower))
+    normalized_upper = max(normalized_lower, float(upper))
+    return normalized_lower, normalized_upper
 
 
 def evidence_digest(evidence_ids: Iterable[str]) -> str:
@@ -579,8 +864,15 @@ def _baseline_payload(
     day: date,
     timezone: str,
     current_minutes: float,
+    current_upper_minutes: float,
     now: datetime,
 ) -> dict[str, Any]:
+    if current_upper_minutes - current_minutes > 0.01:
+        return {
+            "status": "insufficient_data",
+            "reason": "cross_device_activity_time_bounded",
+            "lookback_days": BASELINE_DAYS,
+        }
     return personal_baseline_delta(
         session,
         day=day,
@@ -632,6 +924,8 @@ def personal_baseline_delta(
             and not event_is_expired(row, now=current)
             and "provisional_hourly_activity"
             not in row.payload.get("limitations", [])
+            and summary_active_time_range(row.payload)[0]
+            == summary_active_time_range(row.payload)[1]
             and coverage is not None
             and float(coverage) >= MIN_BASELINE_COVERAGE
         ):
@@ -756,12 +1050,51 @@ def rebuild_day_summaries(
         return None
 
     categories: dict[str, float] = defaultdict(float)
+    category_uppers: dict[str, float] = defaultdict(float)
     for payload in hour_payloads:
         for category, minutes in payload["category_minutes"].items():
-            categories[category] += float(minutes)
+            lower = float(minutes)
+            categories[category] += lower
+            range_payload = payload.get("category_time_ranges", {}).get(
+                category,
+                {},
+            )
+            upper = (
+                float(range_payload.get("upper_bound_minutes"))
+                if range_payload.get("upper_bound_minutes") is not None
+                else lower
+            )
+            category_uppers[category] += max(lower, upper)
+    hourly_active_ranges = [
+        summary_active_time_range(payload)
+        for payload in hour_payloads
+    ]
     active_minutes = round(
-        sum(float(payload["total_active_minutes"]) for payload in hour_payloads),
+        sum(lower for lower, _ in hourly_active_ranges),
         2,
+    )
+    active_minutes_upper = round(
+        sum(upper for _, upper in hourly_active_ranges),
+        2,
+    )
+    launches = sum(
+        int(value["app_launches_or_switches"])
+        for value in hour_payloads
+    )
+    launches_upper = sum(
+        max(
+            int(value["app_launches_or_switches"]),
+            int(
+                value.get(
+                    "app_launches_or_switches_range",
+                    {},
+                ).get(
+                    "upper_bound",
+                    value["app_launches_or_switches"],
+                )
+            ),
+        )
+        for value in hour_payloads
     )
     idle_values = [
         float(payload["idle_and_break_minutes"])
@@ -781,15 +1114,17 @@ def rebuild_day_summaries(
         else None
     )
     local_tz = parse_timezone(timezone)
-    late_minutes = sum(
-        float(payload["total_active_minutes"])
+    late_ranges = [
+        summary_active_time_range(payload)
         for payload in hour_payloads
         if (
             (hour := datetime.fromisoformat(payload["window"]["start"]).astimezone(local_tz).hour)
             >= LATE_START_HOUR
             or hour < LATE_END_HOUR
         )
-    )
+    ]
+    late_minutes = sum(lower for lower, _ in late_ranges)
+    late_minutes_upper = sum(upper for _, upper in late_ranges)
     first = min(
         (
             datetime.fromisoformat(payload["first_activity_at"])
@@ -815,15 +1150,54 @@ def rebuild_day_summaries(
     limitations = sorted(
         {limitation for payload in hour_payloads for limitation in payload.get("limitations", [])}
     )
+    baseline = _baseline_payload(
+        session,
+        day=day,
+        timezone=name,
+        current_minutes=active_minutes,
+        current_upper_minutes=active_minutes_upper,
+        now=current,
+    )
     payload = {
         "status": "ok",
         "date": day.isoformat(),
         "timezone": name,
         "total_active_minutes": active_minutes,
+        "active_time_range": {
+            "lower_bound_minutes": active_minutes,
+            "upper_bound_minutes": active_minutes_upper,
+            "precision": (
+                "exact"
+                if active_minutes_upper - active_minutes <= 0.01
+                else "bounded"
+            ),
+        },
         "category_minutes": {key: round(value, 2) for key, value in sorted(categories.items())},
-        "app_launches_or_switches": sum(
-            int(value["app_launches_or_switches"]) for value in hour_payloads
-        ),
+        "category_time_ranges": {
+            key: {
+                "lower_bound_minutes": round(
+                    categories.get(key, 0.0),
+                    2,
+                ),
+                "upper_bound_minutes": round(value, 2),
+                "precision": (
+                    "exact"
+                    if value - categories.get(key, 0.0) <= 0.01
+                    else "bounded"
+                ),
+            }
+            for key, value in sorted(category_uppers.items())
+        },
+        "app_launches_or_switches": launches,
+        "app_launches_or_switches_range": {
+            "lower_bound": launches,
+            "upper_bound": launches_upper,
+            "precision": (
+                "exact"
+                if launches_upper == launches
+                else "bounded"
+            ),
+        },
         "longest_active_block_minutes": (
             precise_longest
             if precise_longest is not None
@@ -833,15 +1207,18 @@ def rebuild_day_summaries(
         ),
         "idle_and_break_minutes": (round(sum(idle_values), 2) if idle_values else None),
         "late_activity_minutes": round(late_minutes, 2),
+        "late_activity_time_range": {
+            "lower_bound_minutes": round(late_minutes, 2),
+            "upper_bound_minutes": round(late_minutes_upper, 2),
+            "precision": (
+                "exact"
+                if late_minutes_upper - late_minutes <= 0.01
+                else "bounded"
+            ),
+        },
         "first_activity_at": first.isoformat() if first is not None else None,
         "last_activity_at": last.isoformat() if last is not None else None,
-        "seven_day_baseline_delta": _baseline_payload(
-            session,
-            day=day,
-            timezone=name,
-            current_minutes=active_minutes,
-            now=current,
-        ),
+        "seven_day_baseline_delta": baseline,
         "source_coverage": {
             "status": (
                 "unknown"
@@ -1096,11 +1473,15 @@ def refresh_existing_day_baseline(
     if event is None or not summary_has_current_derivation(event):
         return None
     payload = dict(event.payload)
+    active_minutes, active_minutes_upper = (
+        summary_active_time_range(payload)
+    )
     payload["seven_day_baseline_delta"] = _baseline_payload(
         session,
         day=day,
         timezone=timezone_name(timezone),
-        current_minutes=float(payload.get("total_active_minutes") or 0),
+        current_minutes=active_minutes,
+        current_upper_minutes=active_minutes_upper,
         now=current,
     )
     event.payload = payload

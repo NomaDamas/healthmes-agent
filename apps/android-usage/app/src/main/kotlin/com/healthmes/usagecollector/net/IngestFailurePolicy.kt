@@ -2,14 +2,13 @@ package com.healthmes.usagecollector.net
 
 internal enum class ActivityConflictDisposition {
     RETRY,
-    ISOLATE_REJECTED_SAMPLE,
     FAIL_CLOSED,
 }
 
 /**
  * Only conflicts that can change after a fresh config read or a concurrent
- * writer finishes are retried. Explicit sample-local conflicts are bisected;
- * unknown or malformed 409s stop without advancing the watermark.
+ * writer finishes are retried. Every deterministic data conflict fails the
+ * complete authoritative snapshot without advancing the watermark.
  */
 internal fun activityConflictDisposition(
     errorCode: String?,
@@ -25,11 +24,6 @@ internal fun activityConflictDisposition(
         "activity_outside_retention",
         "activity_future_data",
         "activity_source_conflict",
-        -> ActivityConflictDisposition.ISOLATE_REJECTED_SAMPLE
-
-        // These conflicts cover a provider/device or summary scope, not one
-        // bad sample. Bisecting would discard every sample and then advance
-        // the watermark across data that was never accepted.
         "activity_source_mode_conflict",
         "activity_summary_requires_complete_raw" ->
             ActivityConflictDisposition.FAIL_CLOSED

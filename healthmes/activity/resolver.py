@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from healthmes.activity.aggregation import local_day_bounds, timezone_name
 from healthmes.activity.context import (
+    MIN_CONTEXT_COVERAGE,
     activity_summary_context,
     focus_context,
     overwork_context,
@@ -457,10 +458,41 @@ _WEARABLE_CHARGE_ENTRY_SCALARS = frozenset(
         "recorded_at",
     }
 )
-_WEARABLE_FRESHNESS_SCALARS = frozenset({"recorded_at", "status"})
+_WEARABLE_FRESHNESS_SCALARS = frozenset(
+    {"recorded_at", "observed_on", "status"}
+)
 _WEARABLE_COVERAGE_SCALARS = frozenset(
     {"status", "ratio", "usable_blocks", "total_blocks"}
 )
+_WEARABLE_SOURCE_REF_SCALARS = frozenset(
+    {
+        "domain",
+        "record_id",
+        "source_provider",
+        "upstream_provider",
+        "resource_type",
+        "observed_at",
+        "schema_version",
+        "derived_by",
+    }
+)
+_WEARABLE_SOURCE_REF_RESOURCE_TYPES = frozenset(
+    {"actual_sleep", "health_score", "sleep_summary", "workout"}
+)
+_WEARABLE_SOURCE_REF_DERIVERS = {
+    ("healthmes-calendar-mirror", "actual_sleep"): (
+        "healthmes.actual-sleep-mirror.v1"
+    ),
+    ("open-wearables", "health_score"): (
+        "open-wearables.daily-readiness.v1"
+    ),
+    ("open-wearables", "sleep_summary"): (
+        "open-wearables.daily-readiness.v1"
+    ),
+    ("open-wearables", "workout"): (
+        "open-wearables.daily-readiness.v1"
+    ),
+}
 
 
 def _safe_context_scalar(value: object) -> bool:
@@ -477,6 +509,65 @@ def _allowlisted_scalars(
         key: value[key]
         for key in allowed
         if key in value and _safe_context_scalar(value[key])
+    }
+
+
+def _derived_wearable_block_freshness(
+    block: dict[str, Any],
+) -> dict[str, Any]:
+    timestamps: list[str] = []
+    observed_days: list[date] = []
+
+    def collect(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if (
+                    key
+                    in {
+                        "recorded_at",
+                        "freshest_at",
+                        "observed_at",
+                        "wake_time",
+                        "start",
+                    }
+                    and isinstance(item, str)
+                ):
+                    try:
+                        parsed = datetime.fromisoformat(item)
+                    except ValueError:
+                        continue
+                    if parsed.tzinfo is not None:
+                        timestamps.append(
+                            parsed.astimezone(UTC).isoformat()
+                        )
+                elif (
+                    key in {"date", "local_date", "observed_on"}
+                    and isinstance(item, str)
+                ):
+                    try:
+                        observed_days.append(date.fromisoformat(item))
+                    except ValueError:
+                        continue
+                elif key != "freshness":
+                    collect(item)
+        elif isinstance(node, list):
+            for item in node:
+                collect(item)
+
+    collect(block)
+    if timestamps:
+        return {
+            "recorded_at": max(timestamps),
+            "status": "derived_from_readiness_block",
+        }
+    if observed_days:
+        return {
+            "observed_on": max(observed_days).isoformat(),
+            "status": "derived_from_readiness_block",
+        }
+    return {
+        "recorded_at": None,
+        "status": "unavailable",
     }
 
 
@@ -507,20 +598,173 @@ def _normalize_wearable_block(
         block["types"] = [
             item for item in value["types"] if isinstance(item, str)
         ]
+    raw_freshness = value.get("freshness")
+    freshness = (
+        _allowlisted_scalars(
+            raw_freshness,
+            _WEARABLE_FRESHNESS_SCALARS,
+        )
+        if isinstance(raw_freshness, dict)
+        else {}
+    )
+    if (
+        not freshness
+        or freshness.get("status") == "unavailable"
+        or not (
+            isinstance(freshness.get("recorded_at"), str)
+            or isinstance(freshness.get("observed_on"), str)
+        )
+    ):
+        freshness = _derived_wearable_block_freshness(block)
+    block["freshness"] = freshness
     return block
+
+
+def _normalize_wearable_source_refs(
+    value: object,
+    *,
+    day: date,
+    now: datetime,
+    timezone: tzinfo,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: dict[tuple[str, str], dict[str, Any]] = {}
+    conflicts: set[tuple[str, str]] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        source_ref = _allowlisted_scalars(
+            item,
+            _WEARABLE_SOURCE_REF_SCALARS,
+        )
+        if (
+            source_ref.get("domain") != "wearable"
+            or not isinstance(source_ref.get("record_id"), str)
+            or not source_ref["record_id"]
+            or source_ref.get("resource_type")
+            not in _WEARABLE_SOURCE_REF_RESOURCE_TYPES
+            or not isinstance(source_ref.get("observed_at"), str)
+            or not source_ref["observed_at"]
+            or not isinstance(source_ref.get("schema_version"), int)
+            or isinstance(source_ref.get("schema_version"), bool)
+            or source_ref.get("schema_version") != 1
+        ):
+            continue
+        source_provider = source_ref.get("source_provider")
+        resource_type = source_ref.get("resource_type")
+        if (
+            not isinstance(source_provider, str)
+            or not isinstance(resource_type, str)
+            or source_ref.get("derived_by")
+            != _WEARABLE_SOURCE_REF_DERIVERS.get(
+                (source_provider, resource_type)
+            )
+            or not _valid_wearable_observed_at(
+                resource_type,
+                str(source_ref["observed_at"]),
+            )
+            or not _wearable_source_ref_in_window(
+                resource_type,
+                str(source_ref["observed_at"]),
+                day=day,
+                now=now,
+                timezone=timezone,
+            )
+        ):
+            continue
+        upstream_provider = source_ref.get("upstream_provider")
+        if (
+            upstream_provider is not None
+            and (
+                not isinstance(upstream_provider, str)
+                or not upstream_provider
+            )
+        ):
+            continue
+        key = (
+            str(source_ref["resource_type"]),
+            str(source_ref["record_id"]),
+        )
+        if key in conflicts:
+            continue
+        previous = normalized.get(key)
+        if previous is not None and previous != source_ref:
+            normalized.pop(key, None)
+            conflicts.add(key)
+            continue
+        normalized[key] = source_ref
+    return [normalized[key] for key in sorted(normalized)]
+
+
+def _valid_wearable_observed_at(
+    resource_type: str,
+    value: str,
+) -> bool:
+    if resource_type == "sleep_summary":
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            return False
+        return True
+    try:
+        observed_at = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return observed_at.tzinfo is not None
+
+
+def _wearable_source_ref_in_window(
+    resource_type: str,
+    value: str,
+    *,
+    day: date,
+    now: datetime,
+    timezone: tzinfo,
+) -> bool:
+    if resource_type == "sleep_summary":
+        try:
+            observed_day = date.fromisoformat(value)
+        except ValueError:
+            return False
+        current_day = now.astimezone(timezone).date()
+        return (
+            observed_day <= current_day
+            and day - timedelta(days=2) <= observed_day <= day
+        )
+    try:
+        observed_at = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    if observed_at.tzinfo is None or observed_at > now + MAX_FUTURE_SKEW:
+        return False
+    observed_day = observed_at.astimezone(timezone).date()
+    return day - timedelta(days=2) <= observed_day <= day
 
 
 def _normalize_wearable_context(
     value: dict[str, Any],
     *,
     day: date,
+    now: datetime | None = None,
+    timezone: tzinfo = UTC,
 ) -> dict[str, Any]:
+    current = now or datetime(
+        day.year,
+        day.month,
+        day.day,
+        23,
+        59,
+        59,
+        tzinfo=timezone,
+    ).astimezone(UTC)
     raw_date = value.get("date")
     if raw_date not in {None, day.isoformat()}:
         return {
             "status": "insufficient_data",
             "reason": "wearable_context_date_mismatch",
             "date": raw_date if isinstance(raw_date, str) else None,
+            "source_refs": [],
             "evidence_ids": [],
             "freshness": {"recorded_at": None, "status": "unavailable"},
             "coverage": {"status": "no_matching_day", "ratio": None},
@@ -535,11 +779,7 @@ def _normalize_wearable_context(
         for item in value.get("limitations", [])
         if isinstance(item, str)
     ] if isinstance(value.get("limitations"), list) else []
-    evidence_ids = [
-        item
-        for item in value.get("evidence_ids", [])
-        if isinstance(item, str)
-    ] if isinstance(value.get("evidence_ids"), list) else []
+    source_refs_supplied = "source_refs" in value
     block_names = tuple(_WEARABLE_BLOCK_SCALARS)
     for name in block_names:
         raw_block = value.get(name)
@@ -615,8 +855,26 @@ def _normalize_wearable_context(
             if timestamps
             else "unavailable",
         }
+    source_refs = _normalize_wearable_source_refs(
+        value.get("source_refs"),
+        day=day,
+        now=current,
+        timezone=timezone,
+    )
+    evidence_ids = (
+        [str(source_ref["record_id"]) for source_ref in source_refs]
+        if source_refs_supplied
+        else [
+            item
+            for item in value.get("evidence_ids", [])
+            if isinstance(item, str)
+        ]
+        if isinstance(value.get("evidence_ids"), list)
+        else []
+    )
     if not evidence_ids:
         limitations.append("wearable_readiness_evidence_ids_unavailable")
+    context["source_refs"] = source_refs
     context["evidence_ids"] = evidence_ids
     context["limitations"] = sorted(set(limitations))
     return context
@@ -672,19 +930,225 @@ def _context_ready_for_preset(
     question_kind: str,
     selected: tuple[str, ...],
     contexts: dict[str, Any],
-) -> bool:
+    *,
+    day: date,
+    now: datetime,
+    timezone: tzinfo,
+) -> tuple[bool, list[str]]:
+    blockers: set[str] = set()
     usable = {"ok", "known"}
     for domain in selected:
         context = contexts.get(domain)
         if not isinstance(context, dict) or context.get("status") not in usable:
-            return False
-        if domain != "time" and not context.get("evidence_ids"):
-            return False
+            blockers.add(f"{domain}.status_not_ready")
+            continue
+        if domain == "activity":
+            blockers.update(
+                _activity_context_readiness_blockers(
+                    context,
+                    path="activity",
+                )
+            )
+        else:
+            blockers.update(
+                _context_freshness_blockers(
+                    context,
+                    path=domain,
+                    domain=domain,
+                    day=day,
+                    now=now,
+                    timezone=timezone,
+                )
+            )
+            if domain == "wearable":
+                blockers.update(
+                    _wearable_context_readiness_blockers(
+                        context,
+                        path=domain,
+                        day=day,
+                        now=now,
+                        timezone=timezone,
+                    )
+                )
+            if (
+                domain != "time"
+                and not context.get("source_refs")
+                and not context.get("evidence_ids")
+            ):
+                blockers.add(f"{domain}.source_refs_missing")
+            blockers.update(
+                _context_coverage_blockers(
+                    context,
+                    domain=domain,
+                    path=domain,
+                )
+            )
     if question_kind == "caffeine_for_focus":
-        return (
-            contexts.get("nutrition", {}).get("candidate_ledger_complete") is True
+        if (
+            contexts.get("nutrition", {}).get("candidate_ledger_complete")
+            is not True
+        ):
+            blockers.add("nutrition.candidate_ledger_incomplete")
+    return not blockers, sorted(blockers)
+
+
+def _context_freshness_blockers(
+    context: dict[str, Any],
+    *,
+    path: str,
+    domain: str | None = None,
+    day: date | None = None,
+    now: datetime | None = None,
+    timezone: tzinfo = UTC,
+) -> set[str]:
+    freshness = context.get("freshness")
+    if not isinstance(freshness, dict):
+        return {f"{path}.freshness_missing"}
+    status = str(freshness.get("status") or "").casefold()
+    if not status or status == "unavailable" or "stale" in status:
+        return {f"{path}.freshness_not_usable"}
+    recorded_at = freshness.get("recorded_at")
+    observed_on = freshness.get("observed_on")
+    if isinstance(recorded_at, str):
+        try:
+            parsed = datetime.fromisoformat(recorded_at)
+        except ValueError:
+            return {f"{path}.freshness_timestamp_invalid"}
+        if parsed.tzinfo is None:
+            return {f"{path}.freshness_timestamp_invalid"}
+        if now is not None and parsed > now + MAX_FUTURE_SKEW:
+            return {f"{path}.freshness_timestamp_future"}
+        observed_day = parsed.astimezone(timezone).date()
+    elif isinstance(observed_on, str):
+        try:
+            observed_day = date.fromisoformat(observed_on)
+        except ValueError:
+            return {f"{path}.freshness_timestamp_invalid"}
+        if (
+            now is not None
+            and observed_day > now.astimezone(timezone).date()
+        ):
+            return {f"{path}.freshness_timestamp_future"}
+    else:
+        return {f"{path}.freshness_timestamp_missing"}
+    if (
+        domain == "wearable"
+        and day is not None
+        and not day - timedelta(days=2) <= observed_day <= day
+    ):
+        return {f"{path}.freshness_outside_requested_day"}
+    return set()
+
+
+def _wearable_context_readiness_blockers(
+    context: dict[str, Any],
+    *,
+    path: str,
+    day: date,
+    now: datetime,
+    timezone: tzinfo,
+) -> set[str]:
+    blockers: set[str] = set()
+    for name in _WEARABLE_BLOCK_SCALARS:
+        block = context.get(name)
+        if not isinstance(block, dict) or block.get("status") != "ok":
+            continue
+        blockers.update(
+            _context_freshness_blockers(
+                block,
+                path=f"{path}.{name}",
+                domain="wearable",
+                day=day,
+                now=now,
+                timezone=timezone,
+            )
         )
-    return True
+    return blockers
+
+
+def _context_coverage_ratio(context: dict[str, Any]) -> float | None:
+    raw = (
+        context.get("coverage")
+        if "coverage" in context
+        else context.get("source_coverage")
+    )
+    if isinstance(raw, int | float) and not isinstance(raw, bool):
+        return float(raw) if isfinite(float(raw)) else None
+    if isinstance(raw, dict):
+        ratio = raw.get("ratio")
+        if isinstance(ratio, int | float) and not isinstance(ratio, bool):
+            return float(ratio) if isfinite(float(ratio)) else None
+    return None
+
+
+def _context_coverage_blockers(
+    context: dict[str, Any],
+    *,
+    domain: str,
+    path: str,
+) -> set[str]:
+    ratio = _context_coverage_ratio(context)
+    if ratio is not None:
+        if not 0 <= ratio <= 1:
+            return {f"{path}.coverage_invalid"}
+        if ratio < MIN_CONTEXT_COVERAGE:
+            return {f"{path}.coverage_below_minimum"}
+        return set()
+    coverage = context.get("coverage")
+    if (
+        domain == "calendar"
+        and isinstance(coverage, dict)
+        and coverage.get("status") == "calendar_mirror_rows"
+    ):
+        return set()
+    return {f"{path}.coverage_unknown"}
+
+
+def _activity_context_readiness_blockers(
+    context: dict[str, Any],
+    *,
+    path: str,
+) -> set[str]:
+    blockers: set[str] = set()
+    children = {
+        name: value
+        for name in ("focus", "overwork")
+        if isinstance((value := context.get(name)), dict)
+    }
+    if children:
+        for name, child in children.items():
+            blockers.update(
+                _activity_context_readiness_blockers(
+                    child,
+                    path=f"{path}.{name}",
+                )
+            )
+        if len(children) != 2:
+            blockers.add(f"{path}.compound_child_missing")
+        return blockers
+
+    if context.get("status") not in {"ok", "known"}:
+        blockers.add(f"{path}.status_not_ready")
+    if not context.get("source_refs") and not context.get("evidence_ids"):
+        blockers.add(f"{path}.source_refs_missing")
+    blockers.update(_context_freshness_blockers(context, path=path))
+    limitations = {
+        str(value)
+        for value in context.get("limitations", [])
+        if isinstance(value, str)
+    }
+    if "provisional_hourly_activity" in limitations:
+        blockers.add(f"{path}.provisional_activity")
+    if "coverage_unknown" in limitations:
+        blockers.add(f"{path}.coverage_unknown")
+    if "cross_device_activity_time_bounded" in limitations:
+        blockers.add(f"{path}.cross_device_overlap_unresolved")
+    ratio = _context_coverage_ratio(context)
+    if ratio is None:
+        blockers.add(f"{path}.coverage_unknown")
+    elif ratio < MIN_CONTEXT_COVERAGE:
+        blockers.add(f"{path}.coverage_below_minimum")
+    return blockers
 
 
 async def resolve_wellness_context(
@@ -806,6 +1270,8 @@ async def resolve_wellness_context(
                 contexts["wearable"] = _normalize_wearable_context(
                     await wearable_reader(day),
                     day=day,
+                    now=current,
+                    timezone=zone,
                 )
             except Exception as exc:  # runtime boundary: one source must not erase the rest
                 contexts["wearable"] = {
@@ -867,10 +1333,13 @@ async def resolve_wellness_context(
         if isinstance(context, dict)
     }
     usable = {"ok", "known"}
-    context_ready = _context_ready_for_preset(
+    context_ready, context_readiness_blockers = _context_ready_for_preset(
         request.question_kind,
         selected,
         contexts,
+        day=day,
+        now=current,
+        timezone=zone,
     )
     if not any(status in usable for status in domain_statuses.values()):
         overall_status = "insufficient_data"
@@ -888,6 +1357,7 @@ async def resolve_wellness_context(
         "contexts": contexts,
         "domain_statuses": domain_statuses,
         "context_ready": context_ready,
+        "context_readiness_blockers": context_readiness_blockers,
         # This compatibility resolver assembles context only. Final policy,
         # LLM synthesis, source-ref validation, and DecisionRecord persistence
         # belong to the HealthMes Decision Agent.
@@ -897,6 +1367,13 @@ async def resolve_wellness_context(
             for domain, context in contexts.items()
             if isinstance(context, dict)
             for evidence_id in context.get("evidence_ids", [])
+        ],
+        "source_refs": [
+            source_ref
+            for context in contexts.values()
+            if isinstance(context, dict)
+            for source_ref in context.get("source_refs", [])
+            if isinstance(source_ref, dict)
         ],
         "freshness": {
             domain: context.get("freshness")

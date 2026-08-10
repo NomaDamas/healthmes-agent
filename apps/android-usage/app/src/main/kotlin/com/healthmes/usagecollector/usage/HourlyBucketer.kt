@@ -18,8 +18,11 @@ data class AppForegroundEvent(
         /** ACTIVITY_RESUMED / MOVE_TO_FOREGROUND. */
         RESUMED,
 
-        /** ACTIVITY_PAUSED / MOVE_TO_BACKGROUND / ACTIVITY_STOPPED. */
+        /** ACTIVITY_PAUSED. The package may still be foreground. */
         PAUSED,
+
+        /** ACTIVITY_STOPPED, or MOVE_TO_BACKGROUND on pre-Android 10. */
+        STOPPED,
     }
 }
 
@@ -52,9 +55,9 @@ data class UsageBucket(
  *   already foreground when the window started: its time is counted from the
  *   window start (or from the package's previous interval end), but no launch
  *   is recorded.
- * - Intervals still open at the window end are counted up to the window end;
- *   the caller re-queries and re-uploads the growing hour on the next run and
- *   the server upserts (last write wins).
+ * - Intervals still open at the window end are counted up to the window end.
+ *   The caller re-queries the growing hour and uploads it with a newer ordered
+ *   snapshot sequence until a fully covered hour is sealed.
  */
 object HourlyBucketer {
 
@@ -90,8 +93,14 @@ object HourlyBucketer {
 
         class Tracker {
             val resumedActivities = HashSet<String>()
+            var anonymousResumedActivities: Int = 0
+            var anonymousPausedActivities: Int = 0
             var foregroundSince: Long? = null
+            var pendingPauseAtMs: Long? = null
             var lastIntervalEndMs: Long = windowStartMs
+
+            fun hasResumedActivity(): Boolean =
+                resumedActivities.isNotEmpty() || anonymousResumedActivities > 0
         }
 
         val trackers = HashMap<String, Tracker>()
@@ -101,10 +110,9 @@ object HourlyBucketer {
 
         for (event in sorted) {
             val tracker = trackers.getOrPut(event.packageName) { Tracker() }
-            val activity = event.activityClass ?: ""
             when (event.kind) {
                 AppForegroundEvent.Kind.RESUMED -> {
-                    if (tracker.resumedActivities.isEmpty()) {
+                    if (tracker.foregroundSince == null) {
                         tracker.foregroundSince = event.timestampMs
                         launches.merge(
                             floorToHour(event.timestampMs) to event.packageName,
@@ -112,33 +120,79 @@ object HourlyBucketer {
                             Int::plus,
                         )
                     }
-                    tracker.resumedActivities.add(activity)
+                    if (event.activityClass == null) {
+                        tracker.anonymousResumedActivities += 1
+                    } else {
+                        tracker.resumedActivities.add(event.activityClass)
+                    }
+                    // Android commonly emits A.PAUSED before B.RESUMED for an
+                    // in-package screen transition. Keep the package session
+                    // open so the transition is not counted as a new launch.
+                    tracker.pendingPauseAtMs = null
                 }
 
                 AppForegroundEvent.Kind.PAUSED -> {
-                    tracker.resumedActivities.remove(activity)
-                    if (tracker.resumedActivities.isEmpty()) {
-                        // Orphan pause (foregroundSince == null): app was
-                        // foreground since before the window; count from the
-                        // last known interval end so repeated orphan pauses
-                        // never double count.
-                        val since = tracker.foregroundSince ?: tracker.lastIntervalEndMs
-                        if (event.timestampMs > since) {
-                            addInterval(event.packageName, since, event.timestampMs)
+                    if (event.activityClass == null) {
+                        if (tracker.anonymousResumedActivities > 0) {
+                            tracker.anonymousResumedActivities -= 1
+                        }
+                        tracker.anonymousPausedActivities += 1
+                    } else {
+                        tracker.resumedActivities.remove(event.activityClass)
+                    }
+                    if (!tracker.hasResumedActivity()) {
+                        tracker.pendingPauseAtMs = event.timestampMs
+                    }
+                }
+
+                AppForegroundEvent.Kind.STOPPED -> {
+                    if (event.activityClass == null) {
+                        if (tracker.anonymousPausedActivities > 0) {
+                            // PAUSED already removed this anonymous activity.
+                            tracker.anonymousPausedActivities -= 1
+                        } else if (tracker.anonymousResumedActivities > 0) {
+                            tracker.anonymousResumedActivities -= 1
+                        }
+                    } else {
+                        tracker.resumedActivities.remove(event.activityClass)
+                    }
+                    if (
+                        !tracker.hasResumedActivity() &&
+                        (
+                            tracker.foregroundSince != null ||
+                                tracker.pendingPauseAtMs != null
+                            )
+                    ) {
+                        // STOPPED can arrive after PAUSED. Attribute the end to
+                        // the pause, not the later lifecycle cleanup event.
+                        val endedAt = tracker.pendingPauseAtMs
+                            ?.coerceAtMost(event.timestampMs)
+                            ?: event.timestampMs
+                        val since = tracker.foregroundSince
+                            ?: tracker.lastIntervalEndMs
+                        if (endedAt > since) {
+                            addInterval(event.packageName, since, endedAt)
                         }
                         tracker.lastIntervalEndMs =
-                            max(tracker.lastIntervalEndMs, event.timestampMs)
+                            max(tracker.lastIntervalEndMs, endedAt)
                         tracker.foregroundSince = null
+                        tracker.pendingPauseAtMs = null
                     }
                 }
             }
         }
 
-        // Close intervals still open at the window end (app is on screen now).
+        // Close intervals still open at the window end. A final PAUSED without
+        // its STOPPED pair ends at the pause; the next overlapping query can
+        // still correct that provisional hour if a same-package resume follows.
         for ((packageName, tracker) in trackers) {
-            val since = tracker.foregroundSince
-            if (tracker.resumedActivities.isNotEmpty() && since != null && windowEndMs > since) {
-                addInterval(packageName, since, windowEndMs)
+            val endedAt = tracker.pendingPauseAtMs ?: windowEndMs
+            val since = tracker.foregroundSince ?: tracker.lastIntervalEndMs
+            if (
+                (tracker.foregroundSince != null || tracker.pendingPauseAtMs != null) &&
+                endedAt > since
+            ) {
+                addInterval(packageName, since, endedAt)
             }
         }
 

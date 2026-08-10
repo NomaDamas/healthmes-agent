@@ -568,6 +568,9 @@ DecisionRecord 저장은
 - raw 보존기간을 벗어난 late upload는 저장하지 않고 conflict로 거부한다.
   만료된 raw·hourly·daily event는 maintenance가 아직 실행되지 않았어도
   REST와 MCP read path에서 노출하지 않는다.
+- Android의 authoritative hourly manifest 상태도 raw activity와 같은 보존기간을
+  따른다. 보존기간 밖의 empty snapshot은 과거 bucket을 삭제하거나 stale 상태를
+  다시 만들 수 없도록 conflict로 거부한다.
 - activity raw 보존기간을 줄이면 canonical raw의 expiry를 다시 계산하는 것과
   동시에 이미 만료된 Android compatibility row를 즉시 삭제한다. 보존기간을
   더 길게 늘리거나 무기한으로 바꿔도 이전의 더 짧은 정책에서 이미 만료된
@@ -771,19 +774,22 @@ DecisionRecord 저장은
   전에 검증하고 `422 invalid_activitywatch_range`로 반환한다. deterministic
   caller 오류를 localhost upstream 장애인 `502`로 가장하지 않는다.
 - iOS는 OS가 허용한 aggregate 또는 명시적 unavailable 상태만 받으며 detailed
-  app timeline이나 가짜 0분을 만들지 않는다.
+  app timeline이나 가짜 0분을 만들지 않는다. 한 기기가
+  `snapshot_sequence` 기반 authoritative 모드에 들어간 뒤에는 sequence 없는
+  구형 sample 보고를 섞지 않는다. 그렇지 않으면 늦은 구형 보고가 최신
+  empty/corrected snapshot에서 제거한 행을 다시 만들 수 있으므로 요청 전체를
+  `409 activity_source_conflict`로 거부한다. 상태만 보고하는 구형 요청은 계속
+  허용한다.
 - Activity maintenance REST는 호출자가 임의의 `now`를 주입할 수 없고 서버
   시계만 사용한다. 테스트와 scheduler 내부 함수만 명시적 기준 시각을 받는다.
 - Android uploader는 stale revision, collection race와 concurrent write
-  conflict만 재시도한다. 보존기간 초과와 source mode 충돌처럼 반복해도
-  해결되지 않는 sample-level `409`는 실패 chunk를 이분 탐색해 실제 거부된
-  단일 sample만 버리고 이후 시간순 sample을 계속 보낸다. 불완전 summary
-  provenance는 하루 summary scope 전체의 충돌이므로 sample-local로 격리하지
-  않고 watermark를 멈춘다. 이 격리는 명시적으로 허용한 conflict code에만
-  적용하며, code가 없거나 malformed 또는 unknown인 `409`도 sample을 버리지
-  않고 fail-closed한다.
-  transient/unknown 오류에서는 이미 성공한 chunk가 있어도 watermark를
-  전진시키지 않아 전체 source range가 멱등 재시도된다.
+  conflict만 재시도한다. 한 시간의 manifest와 모든 app row는 같은 HTTP
+  chunk에 담기며 절대로 나누거나 일부만 버리지 않는다. 보존기간 초과,
+  source mode 충돌, malformed/unknown `409` 같은 결정적 오류는 해당 pass를
+  fail-closed하고 watermark를 멈춘다. transient 오류나 뒤쪽 chunk 실패 전에
+  앞쪽 chunk가 이미 성공했더라도 watermark를 전진시키지 않으므로 전체 source
+  range를 다시 읽고, 이미 저장된 시간은 snapshot sequence와 manifest digest로
+  멱등 처리한다.
 - Android uploader는 network I/O 동안 collection-state lock을 잡지 않는다.
   permission 또는 generation이 바뀌면 다음 chunk 전에 pass를 취소하고
   watermark를 전진시키지 않는다. 마지막 chunk 중 경계가 바뀐 경우에도 성공
@@ -817,11 +823,13 @@ DecisionRecord 저장은
   같은 기준 시각이면 실제 실행 시각과 관계없이 같은 baseline 결과를 만든다.
   bounded resolver의 activity summary, focus hourly fallback, recovery와
   overwork도 요청의 동일한 `now`를 daily expiry와 개인 baseline까지 전달한다.
-- `caffeine_for_focus` resolver는 활동 context만 있다는 이유로 판단 가능 상태가
-  되지 않는다. 같은 local day와 timezone의 카페인 후보 근거,
+- `caffeine_for_focus` resolver는 활동 context만 있다는 이유로 후보 자료가
+  완성됐다고 간주하지 않는다. 같은 local day와 timezone의 카페인 후보 근거,
   `status=known`인 specialist ledger의 유한한 0 이상
   `confirmed_caffeine_mg`, 완료 확인된 당일 섭취 boundary가 모두 있을 때만
-  `decision_ready=true`를 반환한다.
+  `candidate_ledger_complete=true`를 반환한다. 이 resolver는 context 전용이므로
+  HealthMes Decision Agent가 최종 종합·기록하기 전에는 항상
+  `decision_ready=false`다.
 
 실제 iOS/Android/macOS/Watch 화면, 디바이스 dogfood, 실시간 동기화와 Hermes
 adaptation은 이 완료 선언에 포함되지 않는다.

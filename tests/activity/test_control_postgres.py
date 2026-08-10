@@ -136,8 +136,16 @@ def test_activitywatch_rest_import_loses_race_to_privacy_boundary(
             yield session
 
     application.dependency_overrides[get_session] = override_get_session
-    import_client = TestClient(application)
-    control_client = TestClient(application)
+    import_client = TestClient(
+        application,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    )
+    control_client = TestClient(
+        application,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43124),
+    )
 
     def run_import() -> None:
         try:
@@ -314,8 +322,16 @@ def test_activitywatch_rest_rejects_older_snapshot_after_newer_empty_import(
             yield session
 
     application.dependency_overrides[get_session] = override_get_session
-    old_client = TestClient(application)
-    latest_client = TestClient(application)
+    old_client = TestClient(
+        application,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    )
+    latest_client = TestClient(
+        application,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43124),
+    )
     payload = {
         "device_id": device_id,
         "platform": "macos",
@@ -734,7 +750,12 @@ def test_concurrent_devices_serialize_one_summary_scope() -> None:
 
             assert len(raw_events) == 2
             assert daily is not None
-            assert daily.payload["total_active_minutes"] == 60.0
+            assert daily.payload["total_active_minutes"] == 30.0
+            assert daily.payload["active_time_range"] == {
+                "lower_bound_minutes": 30.0,
+                "upper_bound_minutes": 30.0,
+                "precision": "exact",
+            }
             assert daily.payload["device_count"] == 2
             assert (
                 daily.derived_from["derivation_version"]

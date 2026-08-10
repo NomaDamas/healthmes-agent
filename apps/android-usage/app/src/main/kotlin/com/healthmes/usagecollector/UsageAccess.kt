@@ -50,13 +50,13 @@ object UsageAccess {
     fun openSettings(context: Context): Boolean {
         val prefs = CollectorPrefs(context)
         val nowMs = System.currentTimeMillis()
-        UsageAccessGuardRegistry.invalidate()
-        if (
-            !prefs.markUsageSettingsOpened(
+        val marked = UsageAccessGuardRegistry.withBoundaryFence {
+            prefs.markUsageSettingsOpened(
                 nowMs = nowMs,
                 currentlyGranted = isGranted(context),
             )
-        ) {
+        }
+        if (!marked) {
             UsageAccessGuardService.stop(context)
             prefs.lastResult =
                 "Usage access settings blocked: privacy boundary could not be saved."

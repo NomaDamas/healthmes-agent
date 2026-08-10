@@ -5,16 +5,19 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
+from healthmes.activity import resolver as resolver_module
 from healthmes.activity.contracts import (
     ActivityBatchIn,
     ActivityCapability,
     ActivityContextResolveRequest,
     ActivityPlatform,
+    AppHourRecord,
     AppIntervalRecord,
 )
 from healthmes.activity.repository import DAY_SUMMARY_EVENT
 from healthmes.activity.resolver import (
     WellnessContextRangeError,
+    _context_ready_for_preset,
     calendar_context,
     nutrition_context,
     resolve_wellness_context,
@@ -230,6 +233,215 @@ async def test_single_domain_request_does_not_read_unselected_wearables(session)
     ]
     assert result["contexts"]["activity"]["total_active_minutes"] == 60.0
     assert "private.app.identity" not in json.dumps(result)
+
+
+async def test_context_ready_accepts_complete_activity_summary(session) -> None:
+    records = [
+        AppHourRecord(
+            source_record_id=f"complete-hour-{hour}",
+            bucket_start=datetime(2026, 8, 1, hour, tzinfo=UTC),
+            app_id="browser",
+            foreground_seconds=600,
+            coverage_seconds=3600,
+            bucket_complete=True,
+        )
+        for hour in range(6)
+    ]
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="resolver-complete-hour",
+            source_device="phone-complete",
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            collected_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+            records=records,
+        ),
+    )
+
+    result = await resolve_wellness_context(
+        session,
+        ActivityContextResolveRequest(
+            question_kind="activity_summary",
+            date="2026-08-01",
+        ),
+        default_timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    assert result["context_ready"] is True
+    assert result["context_readiness_blockers"] == []
+
+
+async def test_context_ready_rejects_provisional_activity(session) -> None:
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="resolver-provisional-hour",
+            source_device="phone-provisional",
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            collected_at=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+            records=[
+                AppHourRecord(
+                    source_record_id="provisional-hour",
+                    bucket_start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    app_id="browser",
+                    foreground_seconds=600,
+                    coverage_seconds=1800,
+                    bucket_complete=False,
+                )
+            ],
+        ),
+    )
+
+    result = await resolve_wellness_context(
+        session,
+        ActivityContextResolveRequest(
+            question_kind="activity_summary",
+            date="2026-08-01",
+        ),
+        default_timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    assert result["context_ready"] is False
+    assert {
+        "activity.provisional_activity",
+        "activity.coverage_unknown",
+    } <= set(result["context_readiness_blockers"])
+
+
+async def test_context_ready_rejects_missing_freshness(
+    session,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        resolver_module,
+        "activity_summary_context",
+        lambda *args, **kwargs: {
+            "status": "ok",
+            "evidence_ids": ["summary-1"],
+            "source_coverage": {"status": "known", "ratio": 1.0},
+            "freshness": {
+                "recorded_at": None,
+                "status": "unavailable",
+            },
+            "limitations": [],
+        },
+    )
+
+    result = await resolve_wellness_context(
+        session,
+        ActivityContextResolveRequest(
+            question_kind="activity_summary",
+            date="2026-08-01",
+        ),
+        default_timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    assert result["context_ready"] is False
+    assert "activity.freshness_not_usable" in result[
+        "context_readiness_blockers"
+    ]
+
+
+def test_context_ready_checks_every_compound_activity_child() -> None:
+    ready_child = {
+        "status": "ok",
+        "evidence_ids": ["activity-1"],
+        "coverage": {"status": "known", "ratio": 1.0},
+        "freshness": {
+            "recorded_at": "2026-08-01T11:00:00+00:00",
+            "status": "stored_summary",
+        },
+        "limitations": [],
+    }
+    incomplete_child = {
+        **ready_child,
+        "coverage": {"status": "unknown", "ratio": None},
+        "limitations": ["coverage_unknown"],
+    }
+
+    incomplete_ready, incomplete_blockers = _context_ready_for_preset(
+        "overwork",
+        ("activity",),
+        {
+            "activity": {
+                "status": "ok",
+                "focus": ready_child,
+                "overwork": incomplete_child,
+            }
+        },
+        day=date(2026, 8, 1),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        timezone=UTC,
+    )
+    complete_ready, complete_blockers = _context_ready_for_preset(
+        "overwork",
+        ("activity",),
+        {
+            "activity": {
+                "status": "ok",
+                "focus": ready_child,
+                "overwork": ready_child,
+            }
+        },
+        day=date(2026, 8, 1),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        timezone=UTC,
+    )
+
+    assert incomplete_ready is False
+    assert "activity.overwork.coverage_unknown" in incomplete_blockers
+    assert complete_ready is True
+    assert complete_blockers == []
+
+
+@pytest.mark.parametrize(
+    ("freshness", "coverage", "expected_blocker"),
+    [
+        (
+            "2026-08-01T08:00:00+00:00",
+            {"status": "unknown", "ratio": None},
+            "wearable.coverage_unknown",
+        ),
+        (
+            "2020-01-01T08:00:00+00:00",
+            {"status": "readiness_blocks", "ratio": 1.0},
+            "wearable.freshness_outside_requested_day",
+        ),
+    ],
+)
+def test_context_ready_rejects_unknown_or_stale_wearable_context(
+    freshness,
+    coverage,
+    expected_blocker,
+) -> None:
+    ready, blockers = _context_ready_for_preset(
+        "recovery",
+        ("wearable",),
+        {
+            "wearable": {
+                "status": "ok",
+                "source_refs": [{"record_id": "wearable-1"}],
+                "freshness": {
+                    "recorded_at": freshness,
+                    "status": "derived_from_readiness_blocks",
+                },
+                "coverage": coverage,
+            }
+        },
+        day=date(2026, 8, 1),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        timezone=UTC,
+    )
+
+    assert ready is False
+    assert expected_blocker in blockers
 
 
 async def test_resolver_uses_actual_fixed_offset_caffeine_request(
@@ -556,6 +768,328 @@ async def test_wearable_context_adds_coverage_freshness_and_evidence_limitation(
         "status": "derived_from_readiness_blocks",
     }
     assert "wearable_readiness_evidence_ids_unavailable" in wearable["limitations"]
+
+
+def test_fresh_charge_cannot_mask_stale_used_sleep_block() -> None:
+    wearable = resolver_module._normalize_wearable_context(
+        {
+            "status": "ok",
+            "date": "2026-08-01",
+            "sleep_debt": {
+                "status": "ok",
+                "recorded_at": "2026-07-20T07:00:00+00:00",
+            },
+            "charge": {
+                "status": "ok",
+                "freshest_at": "2026-08-01T09:00:00+00:00",
+            },
+            "source_refs": [
+                {
+                    "domain": "wearable",
+                    "record_id": "wearable-freshness-regression",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "garmin",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-08-01T09:00:00+00:00",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                }
+            ],
+            "freshness": {
+                "recorded_at": "2026-08-01T09:00:00+00:00",
+                "status": "derived_from_readiness_blocks",
+            },
+            "coverage": {
+                "status": "readiness_blocks",
+                "ratio": 1.0,
+            },
+        },
+        day=date(2026, 8, 1),
+    )
+
+    ready, blockers = _context_ready_for_preset(
+        "recovery",
+        ("wearable",),
+        {"wearable": wearable},
+        day=date(2026, 8, 1),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        timezone=UTC,
+    )
+
+    assert ready is False
+    assert (
+        "wearable.sleep_debt.freshness_outside_requested_day"
+        in blockers
+    )
+    assert "wearable.charge.freshness_outside_requested_day" not in blockers
+
+
+async def test_wearable_source_refs_are_allowlisted_and_drive_evidence_ids(
+    session,
+) -> None:
+    _seed_activity(session)
+
+    async def readiness(day: date):
+        return {
+            "status": "ok",
+            "date": day.isoformat(),
+            "sleep_debt": {
+                "status": "ok",
+                "recorded_at": "2026-08-01T07:00:00+00:00",
+            },
+            "source_refs": [
+                {
+                    "domain": "wearable",
+                    "record_id": "score-1",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "garmin",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-08-01T07:00:00+00:00",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                    "private_payload": {"token": "must-not-leak"},
+                },
+                {
+                    "domain": "nutrition",
+                    "record_id": "wrong-domain",
+                    "source_provider": "open-wearables",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-08-01T07:00:00+00:00",
+                    "schema_version": 1,
+                },
+                {
+                    "domain": "wearable",
+                    "record_id": "conflicted",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "garmin",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-08-01T06:00:00+00:00",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                },
+                {
+                    "domain": "wearable",
+                    "record_id": "conflicted",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "oura",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-08-01T07:00:00+00:00",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                },
+                {
+                    "domain": "wearable",
+                    "record_id": "invalid-date",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "garmin",
+                    "resource_type": "health_score",
+                    "observed_at": "not-a-date",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                },
+            ],
+            "evidence_ids": ["spoofed-legacy-id"],
+            "freshness": {
+                "recorded_at": "2026-08-01T07:00:00+00:00",
+                "status": "derived_from_readiness_blocks",
+            },
+            "coverage": {"status": "readiness_blocks", "ratio": 1.0},
+            "limitations": [],
+        }
+
+    result = await resolve_wellness_context(
+        session,
+        ActivityContextResolveRequest(
+            question_kind="focus",
+            date="2026-08-01",
+            start=datetime(2026, 8, 1, 9, tzinfo=UTC),
+            end=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        ),
+        default_timezone="UTC",
+        wearable_reader=readiness,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    wearable = result["contexts"]["wearable"]
+
+    assert wearable["source_refs"] == [
+        {
+            "domain": "wearable",
+            "record_id": "score-1",
+            "source_provider": "open-wearables",
+            "upstream_provider": "garmin",
+            "resource_type": "health_score",
+            "observed_at": "2026-08-01T07:00:00+00:00",
+            "schema_version": 1,
+            "derived_by": "open-wearables.daily-readiness.v1",
+        }
+    ]
+    assert wearable["evidence_ids"] == ["score-1"]
+    assert result["source_refs"] == wearable["source_refs"]
+    assert "private_payload" not in json.dumps(result)
+    assert "wrong-domain" not in json.dumps(result)
+    assert "conflicted" not in json.dumps(result)
+
+
+async def test_invalid_supplied_wearable_source_refs_cannot_fall_back_to_legacy_ids(
+    session,
+) -> None:
+    _seed_activity(session)
+
+    async def readiness(day: date):
+        return {
+            "status": "ok",
+            "date": day.isoformat(),
+            "sleep_debt": {
+                "status": "ok",
+                "recorded_at": "2026-08-01T07:00:00+00:00",
+            },
+            "source_refs": [
+                {
+                    "domain": "nutrition",
+                    "record_id": "wrong-domain",
+                    "source_provider": "open-wearables",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-08-01T07:00:00+00:00",
+                    "schema_version": 1,
+                },
+                {
+                    "domain": "wearable",
+                    "record_id": "bad-date",
+                    "source_provider": "open-wearables",
+                    "resource_type": "health_score",
+                    "observed_at": "not-a-date",
+                    "schema_version": 1,
+                },
+            ],
+            "evidence_ids": ["forged-legacy-id"],
+            "freshness": {
+                "recorded_at": "2026-08-01T07:00:00+00:00",
+                "status": "derived_from_readiness_blocks",
+            },
+            "coverage": {"status": "readiness_blocks", "ratio": 1.0},
+        }
+
+    result = await resolve_wellness_context(
+        session,
+        ActivityContextResolveRequest(
+            question_kind="recovery",
+            date="2026-08-01",
+        ),
+        default_timezone="UTC",
+        wearable_reader=readiness,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    wearable = result["contexts"]["wearable"]
+
+    assert wearable["source_refs"] == []
+    assert wearable["evidence_ids"] == []
+    assert "forged-legacy-id" not in json.dumps(result)
+    assert result["context_ready"] is False
+    assert (
+        "wearable.source_refs_missing"
+        in result["context_readiness_blockers"]
+    )
+    assert "invalid-date" not in json.dumps(result)
+    assert "spoofed-legacy-id" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "observed_at"),
+    (
+        ("health_score", "2030-01-01T07:00:00+00:00"),
+        ("health_score", "2026-07-20T07:00:00+00:00"),
+        ("sleep_summary", "2026-08-02"),
+    ),
+)
+async def test_wearable_source_refs_outside_request_time_are_not_usable(
+    session,
+    resource_type: str,
+    observed_at: str,
+) -> None:
+    _seed_activity(session)
+
+    async def readiness(day: date):
+        return {
+            "status": "ok",
+            "date": day.isoformat(),
+            "sleep_debt": {
+                "status": "ok",
+                "recorded_at": "2026-08-01T07:00:00+00:00",
+            },
+            "source_refs": [
+                {
+                    "domain": "wearable",
+                    "record_id": "temporally-invalid",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "garmin",
+                    "resource_type": resource_type,
+                    "observed_at": observed_at,
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                }
+            ],
+            "freshness": {
+                "recorded_at": "2026-08-01T07:00:00+00:00",
+                "status": "derived_from_readiness_blocks",
+            },
+            "coverage": {"status": "readiness_blocks", "ratio": 1.0},
+        }
+
+    result = await resolve_wellness_context(
+        session,
+        ActivityContextResolveRequest(
+            question_kind="recovery",
+            date="2026-08-01",
+        ),
+        default_timezone="UTC",
+        wearable_reader=readiness,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    wearable = result["contexts"]["wearable"]
+    assert wearable["source_refs"] == []
+    assert wearable["evidence_ids"] == []
+    assert result["context_ready"] is False
+    assert (
+        "wearable.source_refs_missing"
+        in result["context_readiness_blockers"]
+    )
+    assert "temporally-invalid" not in json.dumps(result)
+
+
+def test_previous_night_sleep_summary_source_ref_remains_valid() -> None:
+    wearable = resolver_module._normalize_wearable_context(
+        {
+            "status": "ok",
+            "date": "2026-08-01",
+            "actual_sleep": {
+                "status": "ok",
+                "recorded_at": "2026-08-01T08:00:00+00:00",
+            },
+            "source_refs": [
+                {
+                    "domain": "wearable",
+                    "record_id": "sleep-summary-previous-night",
+                    "source_provider": "open-wearables",
+                    "upstream_provider": "oura",
+                    "resource_type": "sleep_summary",
+                    "observed_at": "2026-07-31",
+                    "schema_version": 1,
+                    "derived_by": "open-wearables.daily-readiness.v1",
+                }
+            ],
+            "freshness": {
+                "recorded_at": "2026-08-01T08:00:00+00:00",
+                "status": "derived_from_readiness_blocks",
+            },
+            "coverage": {"status": "readiness_blocks", "ratio": 1.0},
+        },
+        day=date(2026, 8, 1),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        timezone=UTC,
+    )
+
+    assert wearable["evidence_ids"] == ["sleep-summary-previous-night"]
 
 
 def test_calendar_context_excludes_all_day_and_actual_sleep_rows(session) -> None:

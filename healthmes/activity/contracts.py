@@ -93,6 +93,11 @@ class AppHourRecord(BaseModel):
     category: str | None = Field(default=None, max_length=64)
     coverage_seconds: int | None = Field(default=None, ge=0, le=3600)
     bucket_complete: bool = True
+    snapshot_sequence: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**63 - 1,
+    )
 
     @field_validator("bucket_start", mode="after")
     @classmethod
@@ -236,6 +241,11 @@ class ActivityCollectionStatusUpdate(BaseModel):
         ge=0,
         le=2**63 - 1,
     )
+    pairing_revision: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**63 - 1,
+    )
     last_collected_at: AwareDatetime | None = None
     last_uploaded_at: AwareDatetime | None = None
     queue_oldest_at: AwareDatetime | None = None
@@ -321,6 +331,19 @@ class IOSCapabilityReport(BaseModel):
     reason: str | None = Field(default=None, max_length=255)
     collected_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))
     collection_revision: int | None = Field(default=None, ge=0)
+    collection_generation: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**63 - 1,
+    )
+    reset_snapshot_fence: bool = False
+    snapshot_sequence: int | None = Field(
+        default=None,
+        ge=1,
+        le=2**63 - 1,
+    )
+    snapshot_start: AwareDatetime | None = None
+    snapshot_end: AwareDatetime | None = None
     samples: list[IOSAggregateSample] = Field(default_factory=list, max_length=5000)
 
     @field_validator("timezone")
@@ -328,10 +351,18 @@ class IOSCapabilityReport(BaseModel):
     def validate_report_timezone(cls, value: str) -> str:
         return validate_timezone(value)
 
-    @field_validator("collected_at", mode="after")
+    @field_validator(
+        "collected_at",
+        "snapshot_start",
+        "snapshot_end",
+        mode="after",
+    )
     @classmethod
-    def normalize_collected_at(cls, value: datetime) -> datetime:
-        return _utc(value)
+    def normalize_report_time(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        return _utc(value) if value is not None else None
 
     @model_validator(mode="after")
     def validate_report(self) -> IOSCapabilityReport:
@@ -343,8 +374,67 @@ class IOSCapabilityReport(BaseModel):
         )
         if not available and self.samples:
             raise ValueError("unavailable or denied iOS reports must not contain samples")
+        snapshot_fields = (
+            self.snapshot_sequence,
+            self.snapshot_start,
+            self.snapshot_end,
+        )
+        authoritative = all(value is not None for value in snapshot_fields)
+        if any(value is not None for value in snapshot_fields) and not authoritative:
+            raise ValueError(
+                "iOS authoritative reports require snapshot_sequence, "
+                "snapshot_start, and snapshot_end together"
+            )
+        if authoritative and not available:
+            raise ValueError(
+                "only granted iOS aggregate reports may carry snapshots"
+            )
+        if self.samples and len(
+            {sample.source_record_id for sample in self.samples}
+        ) != len(self.samples):
+            raise ValueError(
+                "iOS snapshot samples must contain unique source_record_id values"
+            )
         if self.samples and self.collection_revision is None:
             raise ValueError("iOS reports with samples require collection_revision")
+        if authoritative and self.collection_revision is None:
+            raise ValueError(
+                "iOS authoritative reports require collection_revision"
+            )
+        if self.reset_snapshot_fence and not authoritative:
+            raise ValueError(
+                "iOS snapshot fence reset requires an authoritative report"
+            )
+        if self.reset_snapshot_fence and self.collection_generation is None:
+            raise ValueError(
+                "iOS snapshot fence reset requires collection_generation"
+            )
+        if authoritative:
+            start = self.snapshot_start
+            end = self.snapshot_end
+            assert start is not None and end is not None
+            if start >= end:
+                raise ValueError("snapshot_start must be before snapshot_end")
+            if end - start > timedelta(days=7):
+                raise ValueError("one iOS snapshot cannot exceed 7 days")
+            if any(
+                value.minute != 0
+                or value.second != 0
+                or value.microsecond != 0
+                for value in (start, end)
+            ):
+                raise ValueError(
+                    "iOS snapshot bounds must align to UTC clock hours"
+                )
+            if any(
+                sample.bucket_start < start
+                or sample.bucket_start + timedelta(hours=1) > end
+                for sample in self.samples
+            ):
+                raise ValueError(
+                    "every iOS sample must be fully contained in its "
+                    "authoritative snapshot range"
+                )
         return self
 
 

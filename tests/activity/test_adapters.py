@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from healthmes.activity.activitywatch import (
+    ACTIVITYWATCH_PROVIDER,
     ActivityWatchClient,
     ActivityWatchError,
     StaleActivityWatchImportError,
@@ -38,6 +39,7 @@ from healthmes.activity.repository import (
     APP_HOUR_EVENT,
     APP_INTERVAL_EVENT,
     DAY_SUMMARY_EVENT,
+    ActivityConflictError,
     get_activitywatch_import_fence,
     get_control_payload,
     update_collection_config,
@@ -1132,6 +1134,114 @@ def test_activitywatch_clips_source_spans_to_the_requested_window() -> None:
     ]
 
 
+def test_activitywatch_rejects_overlapping_different_window_apps() -> None:
+    with pytest.raises(
+        ActivityWatchError,
+        match="conflicting overlapping apps",
+    ):
+        normalize_activitywatch_events(
+            device_id="mac-conflicting-window",
+            window_bucket_id="window",
+            window_events=[
+                {
+                    "id": 1,
+                    "timestamp": "2026-08-01T10:00:00Z",
+                    "duration": 3600,
+                    "data": {"app": "Code"},
+                },
+                {
+                    "id": 2,
+                    "timestamp": "2026-08-01T10:30:00Z",
+                    "duration": 1800,
+                    "data": {"app": "Browser"},
+                },
+            ],
+            afk_bucket_id=None,
+            afk_events=[],
+        )
+
+
+def test_activitywatch_same_app_overlap_keeps_original_source_ids() -> None:
+    overlapping = normalize_activitywatch_events(
+        device_id="mac-overlapping-same-app",
+        window_bucket_id="window",
+        window_events=[
+            {
+                "id": 1,
+                "timestamp": "2026-08-01T10:00:00Z",
+                "duration": 2700,
+                "data": {"app": "Code"},
+            },
+            {
+                "id": 2,
+                "timestamp": "2026-08-01T10:30:00Z",
+                "duration": 1800,
+                "data": {"app": "Code"},
+            },
+        ],
+        afk_bucket_id=None,
+        afk_events=[],
+    )
+    second_source = normalize_activitywatch_events(
+        device_id="mac-overlapping-same-app",
+        window_bucket_id="window",
+        window_events=[
+            {
+                "id": 2,
+                "timestamp": "2026-08-01T10:30:00Z",
+                "duration": 1800,
+                "data": {"app": "Code"},
+            }
+        ],
+        afk_bucket_id=None,
+        afk_events=[],
+    )
+
+    assert [
+        (record.start_at, record.end_at, record.launches)
+        for record in overlapping
+    ] == [
+        (
+            datetime(2026, 8, 1, 10, tzinfo=UTC),
+            datetime(2026, 8, 1, 10, 45, tzinfo=UTC),
+            1,
+        ),
+        (
+            datetime(2026, 8, 1, 10, 45, tzinfo=UTC),
+            datetime(2026, 8, 1, 11, tzinfo=UTC),
+            0,
+        ),
+    ]
+    assert overlapping[1].source_record_id == second_source[0].source_record_id
+
+
+def test_activitywatch_rejects_fully_contained_same_app_overlap() -> None:
+    with pytest.raises(
+        ActivityWatchError,
+        match="fully-contained same-app overlap",
+    ):
+        normalize_activitywatch_events(
+            device_id="mac-contained-same-app",
+            window_bucket_id="window",
+            window_events=[
+                {
+                    "id": 1,
+                    "timestamp": "2026-08-01T10:00:00Z",
+                    "duration": 3600,
+                    "data": {"app": "Code"},
+                },
+                {
+                    "id": 2,
+                    "timestamp": "2026-08-01T10:15:00Z",
+                    "duration": 900,
+                    "data": {"app": "Code"},
+                },
+            ],
+            afk_bucket_id=None,
+            afk_events=[],
+        )
+
+
 def test_activitywatch_mutable_duration_replaces_one_canonical_row(session) -> None:
     class MutableClient:
         duration = 1800
@@ -1582,6 +1692,394 @@ def test_activitywatch_explicit_repair_preserves_only_outside_fragments(
     assert [row.payload["launches"] for row in rows] == [1, 0]
     assert daily is not None
     assert daily.payload["total_active_minutes"] == 60.0
+
+
+def test_activitywatch_reimport_preserves_fragments_outside_user_deletion(
+    session,
+) -> None:
+    class ReplayClient:
+        def list_buckets(self):
+            return {
+                "window": {"type": "currentwindow"},
+                "afk": {"type": "afkstatus"},
+            }
+
+        def get_events(self, bucket_id, *, start, end):
+            if bucket_id == "window":
+                return [
+                    {
+                        "id": 1,
+                        "timestamp": "2026-08-01T10:00:00Z",
+                        "duration": 3600,
+                        "data": {"app": "Code", "title": "discarded"},
+                    }
+                ]
+            return [
+                {
+                    "id": 2,
+                    "timestamp": start.isoformat(),
+                    "duration": (end - start).total_seconds(),
+                    "data": {"status": "not-afk"},
+                }
+            ]
+
+    client = ReplayClient()
+    request = ActivityWatchImportRequest(
+        device_id="mac-partial-delete-replay",
+        platform=ActivityPlatform.MACOS,
+        timezone="UTC",
+        start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    import_activitywatch(
+        session,
+        request,
+        client=client,
+        now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    delete_activity_data(
+        session,
+        device_id=request.device_id,
+        start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 10, 20, tzinfo=UTC),
+        include_summaries=True,
+        include_control=False,
+        now=datetime(2026, 8, 1, 11, 30, tzinfo=UTC),
+    )
+
+    replay = import_activitywatch(
+        session,
+        request,
+        client=client,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    rows = sorted(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT,
+                WellnessEvent.source_provider == ACTIVITYWATCH_PROVIDER,
+                WellnessEvent.source_device == request.device_id,
+            )
+        ),
+        key=lambda row: row.observed_at,
+    )
+    daily = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == DAY_SUMMARY_EVENT,
+        )
+    )
+
+    assert replay.response.tombstoned == 1
+    assert [
+        (row.payload["start_at"], row.payload["end_at"])
+        for row in rows
+    ] == [
+        (
+            "2026-08-01T10:00:00+00:00",
+            "2026-08-01T10:15:00+00:00",
+        ),
+        (
+            "2026-08-01T10:20:00+00:00",
+            "2026-08-01T11:00:00+00:00",
+        ),
+    ]
+    assert [row.payload["launches"] for row in rows] == [1, 0]
+    assert daily is not None
+    assert daily.payload["total_active_minutes"] == 55.0
+
+
+def test_activitywatch_cursor_overlap_keeps_partial_delete_fragments_stable(
+    session,
+) -> None:
+    class CursorClient:
+        def list_buckets(self):
+            return {
+                "window": {"type": "currentwindow"},
+                "afk": {"type": "afkstatus"},
+            }
+
+        def get_events(self, bucket_id, *, start, end):
+            if bucket_id == "window":
+                return [
+                    {
+                        "id": 1,
+                        "timestamp": "2026-08-01T10:00:00Z",
+                        "duration": 3600,
+                        "data": {"app": "Code"},
+                    }
+                ]
+            return [
+                {
+                    "id": 2,
+                    "timestamp": "2026-08-01T10:00:00Z",
+                    "duration": 7200,
+                    "data": {"status": "not-afk"},
+                }
+            ]
+
+    client = CursorClient()
+    device_id = "mac-cursor-partial-delete"
+    full_request = ActivityWatchImportRequest(
+        device_id=device_id,
+        platform=ActivityPlatform.MACOS,
+        timezone="UTC",
+        start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    import_activitywatch(
+        session,
+        full_request,
+        client=client,
+        now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    delete_activity_data(
+        session,
+        device_id=device_id,
+        start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 10, 20, tzinfo=UTC),
+        include_summaries=True,
+        include_control=False,
+        now=datetime(2026, 8, 1, 11, 1, tzinfo=UTC),
+    )
+
+    overlap = import_activitywatch(
+        session,
+        ActivityWatchImportRequest(
+            device_id=device_id,
+            platform=ActivityPlatform.MACOS,
+            timezone="UTC",
+        ),
+        client=client,
+        now=datetime(2026, 8, 1, 11, 5, tzinfo=UTC),
+    )
+    replay = import_activitywatch(
+        session,
+        full_request,
+        client=client,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    rows = sorted(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT,
+                WellnessEvent.source_provider == ACTIVITYWATCH_PROVIDER,
+                WellnessEvent.source_device == device_id,
+            )
+        ),
+        key=lambda row: row.observed_at,
+    )
+
+    assert overlap.response.tombstoned == 1
+    assert replay.response.tombstoned == 1
+    assert [
+        (row.payload["start_at"], row.payload["end_at"])
+        for row in rows
+    ] == [
+        (
+            "2026-08-01T10:00:00+00:00",
+            "2026-08-01T10:15:00+00:00",
+        ),
+        (
+            "2026-08-01T10:20:00+00:00",
+            "2026-08-01T11:00:00+00:00",
+        ),
+    ]
+
+
+def test_activitywatch_partial_delete_allows_source_duration_extension(
+    session,
+) -> None:
+    class MutableDurationClient:
+        duration = 3600
+
+        def list_buckets(self):
+            return {
+                "window": {"type": "currentwindow"},
+                "afk": {"type": "afkstatus"},
+            }
+
+        def get_events(self, bucket_id, *, start, end):
+            if bucket_id == "window":
+                return [
+                    {
+                        "id": 1,
+                        "timestamp": "2026-08-01T10:00:00Z",
+                        "duration": self.duration,
+                        "data": {"app": "Code"},
+                    }
+                ]
+            return [
+                {
+                    "id": 2,
+                    "timestamp": "2026-08-01T10:00:00Z",
+                    "duration": 7200,
+                    "data": {"status": "not-afk"},
+                }
+            ]
+
+    client = MutableDurationClient()
+    device_id = "mac-mutable-after-delete"
+    import_activitywatch(
+        session,
+        ActivityWatchImportRequest(
+            device_id=device_id,
+            platform=ActivityPlatform.MACOS,
+            timezone="UTC",
+            start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+            end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        ),
+        client=client,
+        now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    delete_activity_data(
+        session,
+        device_id=device_id,
+        start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 10, 20, tzinfo=UTC),
+        include_summaries=True,
+        include_control=False,
+        now=datetime(2026, 8, 1, 11, 1, tzinfo=UTC),
+    )
+
+    client.duration = 3900
+    result = import_activitywatch(
+        session,
+        ActivityWatchImportRequest(
+            device_id=device_id,
+            platform=ActivityPlatform.MACOS,
+            timezone="UTC",
+        ),
+        client=client,
+        now=datetime(2026, 8, 1, 11, 5, tzinfo=UTC),
+    )
+
+    rows = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT,
+                WellnessEvent.source_provider == ACTIVITYWATCH_PROVIDER,
+                WellnessEvent.source_device == device_id,
+            )
+        )
+    )
+    spans = [
+        (
+            datetime.fromisoformat(row.payload["start_at"]),
+            datetime.fromisoformat(row.payload["end_at"]),
+        )
+        for row in rows
+    ]
+    deleted_start = datetime(2026, 8, 1, 10, 15, tzinfo=UTC)
+    deleted_end = datetime(2026, 8, 1, 10, 20, tzinfo=UTC)
+
+    assert result.response.tombstoned == 1
+    assert sum(
+        (span_end - span_start).total_seconds()
+        for span_start, span_end in spans
+    ) == 3600
+    assert all(
+        span_end <= deleted_start or span_start >= deleted_end
+        for span_start, span_end in spans
+    )
+    assert max(span_end for _, span_end in spans) == datetime(
+        2026,
+        8,
+        1,
+        11,
+        5,
+        tzinfo=UTC,
+    )
+
+
+@pytest.mark.parametrize(
+    ("updated_timestamp", "updated_app"),
+    [
+        ("2026-08-01T10:05:00Z", "Code"),
+        ("2026-08-01T10:00:00Z", "Browser"),
+    ],
+)
+def test_activitywatch_partial_delete_rejects_moved_or_retyped_source(
+    session,
+    updated_timestamp,
+    updated_app,
+) -> None:
+    class MutableSourceClient:
+        timestamp = "2026-08-01T10:00:00Z"
+        app = "Code"
+
+        def list_buckets(self):
+            return {
+                "window": {"type": "currentwindow"},
+                "afk": {"type": "afkstatus"},
+            }
+
+        def get_events(self, bucket_id, *, start, end):
+            if bucket_id == "window":
+                return [
+                    {
+                        "id": 1,
+                        "timestamp": self.timestamp,
+                        "duration": 3600,
+                        "data": {"app": self.app},
+                    }
+                ]
+            return [
+                {
+                    "id": 2,
+                    "timestamp": "2026-08-01T10:00:00Z",
+                    "duration": 7200,
+                    "data": {"status": "not-afk"},
+                }
+            ]
+
+    client = MutableSourceClient()
+    device_id = f"mac-reject-mutated-{updated_app.casefold()}"
+    request = ActivityWatchImportRequest(
+        device_id=device_id,
+        platform=ActivityPlatform.MACOS,
+        timezone="UTC",
+        start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    import_activitywatch(
+        session,
+        request,
+        client=client,
+        now=datetime(2026, 8, 1, 11, tzinfo=UTC),
+    )
+    delete_activity_data(
+        session,
+        device_id=device_id,
+        start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 10, 20, tzinfo=UTC),
+        include_summaries=True,
+        include_control=False,
+        now=datetime(2026, 8, 1, 11, 1, tzinfo=UTC),
+    )
+    client.timestamp = updated_timestamp
+    client.app = updated_app
+
+    with pytest.raises(
+        ActivityConflictError,
+        match="after a partial user deletion",
+    ):
+        import_activitywatch(
+            session,
+            request.model_copy(
+                update={
+                    "end_at": datetime(
+                        2026,
+                        8,
+                        1,
+                        11,
+                        5,
+                        tzinfo=UTC,
+                    )
+                }
+            ),
+            client=client,
+            now=datetime(2026, 8, 1, 11, 5, tzinfo=UTC),
+        )
 
 
 def test_activitywatch_empty_repair_fails_closed_after_raw_provenance_expires(

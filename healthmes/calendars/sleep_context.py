@@ -15,25 +15,54 @@ def actual_sleep_context(
     local_date: dt.date,
     timezone: dt.tzinfo,
 ) -> dict[str, object]:
+    context, _ = actual_sleep_context_with_source_ref(
+        session,
+        local_date,
+        timezone,
+    )
+    return context
+
+
+def actual_sleep_context_with_source_ref(
+    session: Session,
+    local_date: dt.date,
+    timezone: dt.tzinfo,
+) -> tuple[dict[str, object], dict[str, object] | None]:
     row = _actual_sleep_for_date(session, local_date)
     if row is None:
-        return {
-            "status": "insufficient_data",
-            "reason": "no_actual_sleep_observation",
-        }
+        return (
+            {
+                "status": "insufficient_data",
+                "reason": "no_actual_sleep_observation",
+            },
+            None,
+        )
     start = coerce_utc(row.start_at).astimezone(timezone)
     wake = coerce_utc(row.end_at).astimezone(timezone)
-    return {
-        "status": "ok",
-        "local_date": local_date.isoformat(),
-        "start": start.isoformat(),
-        "wake_time": wake.isoformat(),
-        "duration_minutes": row.sleep_duration_minutes,
-        "time_in_bed_minutes": row.sleep_time_in_bed_minutes,
-        "source": row.sleep_provider or row.healthmes_source,
-        "freshness": "current",
-        "earliest_available_work_time": wake.isoformat(),
-    }
+    source = row.sleep_provider or row.healthmes_source or "unknown"
+    return (
+        {
+            "status": "ok",
+            "local_date": local_date.isoformat(),
+            "start": start.isoformat(),
+            "wake_time": wake.isoformat(),
+            "duration_minutes": row.sleep_duration_minutes,
+            "time_in_bed_minutes": row.sleep_time_in_bed_minutes,
+            "source": source,
+            "freshness": "current",
+            "earliest_available_work_time": wake.isoformat(),
+        },
+        {
+            "domain": "wearable",
+            "record_id": str(row.id),
+            "source_provider": "healthmes-calendar-mirror",
+            "upstream_provider": source,
+            "resource_type": "actual_sleep",
+            "observed_at": coerce_utc(row.end_at).isoformat(),
+            "schema_version": 1,
+            "derived_by": "healthmes.actual-sleep-mirror.v1",
+        },
+    )
 
 
 def actual_sleep_observation_context(

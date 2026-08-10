@@ -15,6 +15,7 @@ from healthmes.activity.aggregation import (
     local_day_bounds,
     personal_baseline_delta,
     raw_window_summary,
+    summary_active_time_range,
     summary_raw_provenance_complete,
     timezone_name,
 )
@@ -109,6 +110,7 @@ def _combine_hourly(
             "status": "insufficient_data",
             "reason": "no_activity_summary",
             "active_minutes": 0.0,
+            "active_minutes_upper": 0.0,
             "launches": 0,
             "longest_block": None,
             "coverage": None,
@@ -120,6 +122,7 @@ def _combine_hourly(
     window_end = end.astimezone(UTC)
     expected_seconds = (window_end - window_start).total_seconds()
     active = 0.0
+    active_upper = 0.0
     launches = 0.0
     longest_values: list[float] = []
     known_seconds = 0.0
@@ -151,7 +154,11 @@ def _combine_hourly(
             has_partial_row = True
             limitations.add("partial_hour_requires_retained_raw_events")
             continue
-        active += float(payload.get("total_active_minutes") or 0) * fraction
+        row_active, row_active_upper = summary_active_time_range(
+            payload
+        )
+        active += row_active * fraction
+        active_upper += row_active_upper * fraction
         launches += int(payload.get("app_launches_or_switches") or 0) * fraction
         longest = payload.get("longest_active_block_minutes")
         if longest is not None:
@@ -173,6 +180,7 @@ def _combine_hourly(
                 else "no_activity_summary"
             ),
             "active_minutes": 0.0,
+            "active_minutes_upper": 0.0,
             "launches": 0,
             "longest_block": None,
             "coverage": None,
@@ -188,6 +196,16 @@ def _combine_hourly(
     return {
         "status": "ok",
         "active_minutes": round(active, 2),
+        "active_minutes_upper": round(active_upper, 2),
+        "active_time_range": {
+            "lower_bound_minutes": round(active, 2),
+            "upper_bound_minutes": round(active_upper, 2),
+            "precision": (
+                "exact"
+                if active_upper - active <= 0.01
+                else "bounded"
+            ),
+        },
         "launches": int(round(launches)),
         "longest_block": max(longest_values) if longest_values else None,
         "coverage": round(coverage, 4) if coverage is not None else None,
@@ -240,9 +258,19 @@ def focus_context(
         timezone=timezone,
         now=now,
     ):
+        raw_active, raw_active_upper = summary_active_time_range(raw)
         combined = {
             "status": "ok",
-            "active_minutes": float(raw.get("total_active_minutes") or 0),
+            "active_minutes": raw_active,
+            "active_minutes_upper": raw_active_upper,
+            "active_time_range": raw.get(
+                "active_time_range",
+                {
+                    "lower_bound_minutes": raw_active,
+                    "upper_bound_minutes": raw_active_upper,
+                    "precision": "exact",
+                },
+            ),
             "launches": int(raw.get("app_launches_or_switches") or 0),
             "longest_block": raw.get("longest_active_block_minutes"),
             "coverage": raw.get("source_coverage", {}).get("ratio"),
@@ -290,7 +318,11 @@ def focus_context(
             )
     if (
         combined["status"] != "ok"
-        or combined["active_minutes"] <= 0
+        or combined.get(
+            "active_minutes_upper",
+            combined["active_minutes"],
+        )
+        <= 0
         or (combined["coverage"] is not None and combined["coverage"] < MIN_CONTEXT_COVERAGE)
     ):
         reason = combined.get("reason", "no_active_minutes")
@@ -309,10 +341,24 @@ def focus_context(
             "freshness": combined["freshness"],
             "limitations": combined["limitations"],
         }
+    active_upper = float(
+        combined.get("active_minutes_upper", combined["active_minutes"])
+    )
+    active_time_bounded = active_upper - combined["active_minutes"] > 0.01
     active_hours = combined["active_minutes"] / 60.0
-    launches_per_hour = combined["launches"] / active_hours if active_hours > 0 else 0.0
+    launches_per_hour = (
+        combined["launches"] / active_hours
+        if active_hours > 0 and not active_time_bounded
+        else None
+    )
     longest = combined["longest_block"]
-    if launches_per_hour >= FOCUS_FRAGMENTED_LAUNCHES_PER_HOUR:
+    if active_time_bounded:
+        classification = "mixed_or_unknown"
+    elif (
+        launches_per_hour is not None
+        and launches_per_hour
+        >= FOCUS_FRAGMENTED_LAUNCHES_PER_HOUR
+    ):
         classification = "fragmented"
     elif longest is not None and longest >= FOCUS_SUSTAINED_BLOCK_MINUTES:
         classification = "sustained"
@@ -323,18 +369,44 @@ def focus_context(
         limitations.append("exact_focus_blocks_unavailable_for_hourly_sources")
     if combined["coverage"] is None:
         limitations.append("coverage_unknown")
+    if active_time_bounded:
+        if (
+            "partial_hourly_activity_time_bounded"
+            in combined["limitations"]
+        ):
+            limitations.append(
+                "focus_thresholds_blocked_by_partial_hour_uncertainty"
+            )
+        else:
+            limitations.append(
+                "focus_thresholds_blocked_by_cross_device_overlap"
+            )
+    bounded_reason = None
+    if active_time_bounded:
+        bounded_reason = (
+            "partial_hourly_activity_time_bounded"
+            if "partial_hourly_activity_time_bounded"
+            in combined["limitations"]
+            else "cross_device_activity_time_bounded"
+        )
     return {
-        "status": "ok",
+        "status": "partial" if active_time_bounded else "ok",
         "window": {
             "start": start.astimezone(UTC).isoformat(),
             "end": end.astimezone(UTC).isoformat(),
             "timezone": name,
         },
         "classification": classification,
+        "reason": bounded_reason,
         "metrics": {
             "total_active_minutes": combined["active_minutes"],
+            "active_time_range": combined["active_time_range"],
             "app_launches_or_switches": combined["launches"],
-            "launches_or_switches_per_active_hour": round(launches_per_hour, 2),
+            "launches_or_switches_per_active_hour": (
+                round(launches_per_hour, 2)
+                if launches_per_hour is not None
+                else None
+            ),
             "longest_active_block_minutes": longest,
         },
         "coverage": combined["coverage"],
@@ -388,16 +460,41 @@ def overwork_context(
             "limitations": sorted(set([*summary.get("limitations", []), "low_source_coverage"])),
         }
     signals: list[dict[str, Any]] = []
-    total = float(summary.get("total_active_minutes") or 0)
+    total, total_upper = summary_active_time_range(summary)
+    total_bounded = total_upper - total > 0.01
     longest = summary.get("longest_active_block_minutes")
     late = float(summary.get("late_activity_minutes") or 0)
-    baseline = personal_baseline_delta(
-        session,
-        day=day,
-        timezone=name,
-        current_minutes=total,
-        lookback_days=lookback_days,
-        now=now,
+    raw_late_range = summary.get("late_activity_time_range")
+    late_upper = (
+        float(raw_late_range.get("upper_bound_minutes"))
+        if isinstance(raw_late_range, dict)
+        and isinstance(
+            raw_late_range.get("upper_bound_minutes"),
+            int | float,
+        )
+        and not isinstance(
+            raw_late_range.get("upper_bound_minutes"),
+            bool,
+        )
+        else late
+    )
+    late_upper = max(late, late_upper)
+    late_bounded = late_upper - late > 0.01
+    baseline = (
+        {
+            "status": "insufficient_data",
+            "reason": "cross_device_activity_time_bounded",
+            "lookback_days": lookback_days,
+        }
+        if total_bounded
+        else personal_baseline_delta(
+            session,
+            day=day,
+            timezone=name,
+            current_minutes=total,
+            lookback_days=lookback_days,
+            now=now,
+        )
     )
     if total >= OVERWORK_TOTAL_MINUTES:
         signals.append(
@@ -423,6 +520,11 @@ def overwork_context(
                 "threshold_minutes": OVERWORK_LATE_MINUTES,
             }
         )
+    threshold_uncertainties: list[str] = []
+    if total < OVERWORK_TOTAL_MINUTES <= total_upper:
+        threshold_uncertainties.append("high_total_activity")
+    if late < OVERWORK_LATE_MINUTES <= late_upper:
+        threshold_uncertainties.append("late_activity")
     delta = baseline.get("delta_minutes") if baseline.get("status") == "ok" else None
     if delta is not None and float(delta) >= OVERWORK_BASELINE_DELTA_MINUTES:
         signals.append(
@@ -433,22 +535,32 @@ def overwork_context(
             }
         )
     coverage_unknown = coverage_ratio is None
+    threshold_decision_bounded = bool(
+        threshold_uncertainties
+        or total_bounded
+        or late_bounded
+    )
     risk = (
         "high"
         if len(signals) >= 2
         else "elevated"
         if signals
         else "unknown"
-        if coverage_unknown
+        if coverage_unknown or threshold_decision_bounded
         else "not_elevated"
     )
     limitations = list(summary.get("limitations", []))
     if coverage_unknown:
         limitations.append("coverage_unknown")
+    if threshold_decision_bounded:
+        limitations.append(
+            "overwork_thresholds_blocked_by_cross_device_overlap"
+        )
     return {
         "status": (
             "partial"
-            if coverage_unknown and signals
+            if threshold_decision_bounded
+            or (coverage_unknown and signals)
             else "insufficient_data"
             if coverage_unknown
             else "ok"
@@ -457,13 +569,34 @@ def overwork_context(
         "timezone": name,
         "lookback_days": lookback_days,
         "risk_level": risk,
-        "reason": "unknown_source_coverage" if coverage_unknown else None,
+        "reason": (
+            "unknown_source_coverage"
+            if coverage_unknown
+            else "cross_device_activity_time_bounded"
+            if threshold_decision_bounded
+            else None
+        ),
         "signals": signals,
+        "threshold_uncertainties": threshold_uncertainties,
         "metrics": {
             "total_active_minutes": total,
+            "active_time_range": {
+                "lower_bound_minutes": total,
+                "upper_bound_minutes": total_upper,
+                "precision": (
+                    "bounded" if total_bounded else "exact"
+                ),
+            },
             "longest_active_block_minutes": longest,
             "idle_and_break_minutes": summary.get("idle_and_break_minutes"),
             "late_activity_minutes": late,
+            "late_activity_time_range": {
+                "lower_bound_minutes": late,
+                "upper_bound_minutes": late_upper,
+                "precision": (
+                    "bounded" if late_bounded else "exact"
+                ),
+            },
             "seven_day_baseline_delta": summary.get("seven_day_baseline_delta"),
             "lookback_baseline_delta": baseline,
         },
@@ -502,12 +635,30 @@ def recovery_activity_context(
             "coverage": summary.get("source_coverage"),
             "limitations": summary.get("limitations", []),
         }
+    active_minutes, active_minutes_upper = (
+        summary_active_time_range(summary)
+    )
+    active_time_bounded = (
+        active_minutes_upper - active_minutes > 0.01
+    )
     return {
-        "status": "ok",
+        "status": "partial" if active_time_bounded else "ok",
         "date": day.isoformat(),
         "timezone": _timezone_name(timezone),
+        "reason": (
+            "cross_device_activity_time_bounded"
+            if active_time_bounded
+            else None
+        ),
         "metrics": {
-            "total_active_minutes": summary["total_active_minutes"],
+            "total_active_minutes": active_minutes,
+            "active_time_range": {
+                "lower_bound_minutes": active_minutes,
+                "upper_bound_minutes": active_minutes_upper,
+                "precision": (
+                    "bounded" if active_time_bounded else "exact"
+                ),
+            },
             "idle_and_break_minutes": summary["idle_and_break_minutes"],
             "late_activity_minutes": summary["late_activity_minutes"],
             "longest_active_block_minutes": summary["longest_active_block_minutes"],

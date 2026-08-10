@@ -1,20 +1,20 @@
 package com.healthmes.usagecollector
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.content.SharedPreferences
-import android.provider.Settings
 import androidx.core.content.edit
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.healthmes.usagecollector.work.UploadScheduling
 import com.healthmes.usagecollector.work.collectionWindowLeaseAllowed
 import com.healthmes.usagecollector.work.commitFailClosedBoundary
+import com.healthmes.usagecollector.work.reservePersistedSnapshotSequence
 import java.time.ZoneId
 import java.util.UUID
 
 internal data class CollectionWindowState(
     val collectionGeneration: Long,
+    val pairingRevision: Long = 0L,
     val collectionRevision: Int,
     val collectionSinceMs: Long,
     val watermarkMs: Long,
@@ -23,11 +23,49 @@ internal data class CollectionWindowState(
     val usageSettingsPending: Boolean,
 )
 
+internal data class PairingSnapshot(
+    val serverUrl: String?,
+    val token: String?,
+    val revision: Long,
+)
+
+internal sealed interface PairingUpdateResult {
+    data class Updated(
+        val state: CollectionWindowState,
+        val pairing: PairingSnapshot,
+    ) : PairingUpdateResult
+
+    data class Unchanged(
+        val pairing: PairingSnapshot,
+    ) : PairingUpdateResult
+
+    data object Failed : PairingUpdateResult
+}
+
 internal data class PermissionObservationResult(
     val persisted: Boolean,
     val boundaryReset: Boolean,
     val previousGranted: Boolean?,
+    val committedState: CollectionWindowState?,
 )
+
+internal sealed interface CollectionWindowUpdateResult {
+    data class Updated(
+        val state: CollectionWindowState,
+    ) : CollectionWindowUpdateResult
+
+    data object Stale : CollectionWindowUpdateResult
+    data object Failed : CollectionWindowUpdateResult
+}
+
+internal sealed interface SnapshotSequenceReservationResult {
+    data class Reserved(
+        val sequence: Long,
+    ) : SnapshotSequenceReservationResult
+
+    data object Stale : SnapshotSequenceReservationResult
+    data object Failed : SnapshotSequenceReservationResult
+}
 
 /**
  * Encrypted at-rest store for the pairing state (server URL + ingest token),
@@ -66,14 +104,89 @@ class CollectorPrefs(context: Context) {
     }
 
     /** HTTPS base URL of the user's HealthMes instance. */
-    var serverUrl: String?
+    val serverUrl: String?
         get() = prefs.getString(KEY_SERVER_URL, null)
-        set(value) = prefs.edit { putString(KEY_SERVER_URL, value) }
 
     /** Optional API token, sent as `Authorization: Bearer <token>`. */
-    var token: String?
+    val token: String?
         get() = prefs.getString(KEY_TOKEN, null)
-        set(value) = prefs.edit { putString(KEY_TOKEN, value) }
+
+    internal fun pairingSnapshot(): PairingSnapshot =
+        synchronized(COLLECTION_STATE_LOCK) {
+            pairingSnapshotLocked()
+        }
+
+    /**
+     * Save URL and token as one hard privacy boundary.
+     *
+     * The generation and pairing revision advance in the same synchronous
+     * commit, so a worker cannot start another chunk after this update. A
+     * request already accepted by the former server cannot be rolled back
+     * locally; the worker reports that commit and best-effort closes the former
+     * server boundary.
+     */
+    internal fun updatePairing(
+        serverUrl: String,
+        token: String?,
+        nowMs: Long = System.currentTimeMillis(),
+    ): PairingUpdateResult =
+        synchronized(COLLECTION_STATE_LOCK) {
+            if (collectionQuarantinedLocked()) {
+                return@synchronized PairingUpdateResult.Failed
+            }
+            val currentPairing = pairingSnapshotLocked()
+            if (
+                currentPairing.serverUrl == serverUrl &&
+                currentPairing.token == token
+            ) {
+                return@synchronized PairingUpdateResult.Unchanged(
+                    currentPairing
+                )
+            }
+            val current = runCatching { collectionWindowStateLocked() }
+                .getOrElse {
+                    enterQuarantineLocked()
+                    return@synchronized PairingUpdateResult.Failed
+                }
+            val enabled = runCatching {
+                prefs.getBoolean(KEY_ENABLED, false)
+            }.getOrElse {
+                enterQuarantineLocked()
+                return@synchronized PairingUpdateResult.Failed
+            }
+            if (
+                current.collectionGeneration == Long.MAX_VALUE ||
+                current.pairingRevision == Long.MAX_VALUE
+            ) {
+                enterQuarantineLocked()
+                return@synchronized PairingUpdateResult.Failed
+            }
+            val target = current.copy(
+                collectionGeneration = current.collectionGeneration + 1L,
+                pairingRevision = current.pairingRevision + 1L,
+                collectionSinceMs = if (enabled) nowMs else 0L,
+                watermarkMs = floorToHour(nowMs),
+                collectionTimezone = ZoneId.systemDefault().id,
+            )
+            val editor = collectionStateEditor(target)
+                .putString(KEY_SERVER_URL, serverUrl)
+            if (token == null) {
+                editor.remove(KEY_TOKEN)
+            } else {
+                editor.putString(KEY_TOKEN, token)
+            }
+            if (!commitCollectionState(editor)) {
+                return@synchronized PairingUpdateResult.Failed
+            }
+            PairingUpdateResult.Updated(
+                state = target,
+                pairing = PairingSnapshot(
+                    serverUrl = serverUrl,
+                    token = token,
+                    revision = target.pairingRevision,
+                ),
+            )
+        }
 
     internal val collectionQuarantined: Boolean
         get() = synchronized(COLLECTION_STATE_LOCK) {
@@ -151,6 +264,21 @@ class CollectorPrefs(context: Context) {
             )
         }
 
+    internal fun collectionLeaseIsCurrent(
+        expectedGeneration: Long,
+        expectedPairingRevision: Long,
+    ): Boolean =
+        synchronized(COLLECTION_STATE_LOCK) {
+            collectionWindowIsCurrentLocked(
+                expectedGeneration = expectedGeneration,
+            ) && runCatching {
+                prefs.getLong(KEY_PAIRING_REVISION, 0L)
+            }.getOrElse {
+                enterQuarantineLocked()
+                return@synchronized false
+            } == expectedPairingRevision
+        }
+
     internal fun advanceWatermarkIfCurrent(
         expectedGeneration: Long,
         watermarkMs: Long,
@@ -163,9 +291,19 @@ class CollectorPrefs(context: Context) {
             ) {
                 return@synchronized false
             }
+            val currentWatermark = runCatching {
+                prefs.getLong(KEY_WATERMARK_MS, 0L)
+            }.getOrElse {
+                enterQuarantineLocked()
+                return@synchronized false
+            }
+            val nextWatermark = maxOf(currentWatermark, watermarkMs)
+            if (nextWatermark == currentWatermark) {
+                return@synchronized true
+            }
             val committed = runCatching {
                 prefs.edit()
-                    .putLong(KEY_WATERMARK_MS, watermarkMs)
+                    .putLong(KEY_WATERMARK_MS, nextWatermark)
                     .commit()
             }.getOrDefault(false)
             collectionStatePersistenceHealthy = committed
@@ -177,28 +315,134 @@ class CollectorPrefs(context: Context) {
      * one synchronous disk commit. Callers must stop collection when false is
      * returned.
      */
-    internal fun persistCollectionWindow(
+    internal fun persistCollectionWindowIfCurrent(
+        expectedGeneration: Long,
         collectionRevision: Int,
         collectionSinceMs: Long,
         watermarkMs: Long,
         collectionTimezone: String = ZoneId.systemDefault().id,
-    ): Boolean =
+    ): CollectionWindowUpdateResult =
         synchronized(COLLECTION_STATE_LOCK) {
             if (collectionQuarantinedLocked()) {
-                return@synchronized false
+                return@synchronized CollectionWindowUpdateResult.Failed
             }
             val current = collectionWindowStateLocked()
-            commitCollectionState(
+            if (
+                !collectionWindowIsCurrentLocked(
+                    expectedGeneration = expectedGeneration,
+                )
+            ) {
+                return@synchronized CollectionWindowUpdateResult.Stale
+            }
+            val target = current.copy(
+                collectionGeneration = current.collectionGeneration + 1,
+                collectionRevision = collectionRevision,
+                collectionSinceMs = collectionSinceMs,
+                watermarkMs = watermarkMs,
+                collectionTimezone = collectionTimezone,
+            )
+            val committed = commitCollectionState(
                 collectionStateEditor(
-                    current.copy(
-                        collectionGeneration = current.collectionGeneration + 1,
-                        collectionRevision = collectionRevision,
-                        collectionSinceMs = collectionSinceMs,
-                        watermarkMs = watermarkMs,
-                        collectionTimezone = collectionTimezone,
-                    ),
+                    target,
                 ),
             )
+            if (committed) {
+                CollectionWindowUpdateResult.Updated(target)
+            } else {
+                CollectionWindowUpdateResult.Failed
+            }
+        }
+
+    /**
+     * Move past a server generation left by an older install identity.
+     *
+     * The new generation is greater than both sides and starts at a fresh
+     * local privacy boundary. This avoids a permanent handshake loop while
+     * never relabeling activity from the mismatched generation.
+     */
+    internal fun recoverCollectionGenerationIfCurrent(
+        expectedGeneration: Long,
+        serverGeneration: Long,
+        collectionRevision: Int,
+        nowMs: Long,
+        collectionTimezone: String = ZoneId.systemDefault().id,
+    ): CollectionWindowUpdateResult =
+        synchronized(COLLECTION_STATE_LOCK) {
+            if (collectionQuarantinedLocked()) {
+                return@synchronized CollectionWindowUpdateResult.Failed
+            }
+            if (
+                !collectionWindowIsCurrentLocked(
+                    expectedGeneration = expectedGeneration,
+                )
+            ) {
+                return@synchronized CollectionWindowUpdateResult.Stale
+            }
+            val current = collectionWindowStateLocked()
+            val recoveredGeneration = recoveryCollectionGeneration(
+                localGeneration = current.collectionGeneration,
+                serverGeneration = serverGeneration,
+            ) ?: run {
+                enterQuarantineLocked()
+                return@synchronized CollectionWindowUpdateResult.Failed
+            }
+            val target = current.copy(
+                collectionGeneration = recoveredGeneration,
+                collectionRevision = collectionRevision,
+                collectionSinceMs = nowMs,
+                watermarkMs = floorToHour(nowMs),
+                collectionTimezone = collectionTimezone,
+            )
+            if (commitCollectionState(collectionStateEditor(target))) {
+                CollectionWindowUpdateResult.Updated(target)
+            } else {
+                CollectionWindowUpdateResult.Failed
+            }
+        }
+
+    /**
+     * Reserve one durable sequence for an authoritative snapshot upload.
+     *
+     * The sequence is global to this collector and synchronously committed
+     * before any network request. This keeps later snapshots strictly ordered
+     * across process restarts, same-millisecond runs, and wall-clock rollback.
+     */
+    internal fun reserveSnapshotSequenceIfCurrent(
+        expectedGeneration: Long,
+        wallClockMs: Long,
+    ): SnapshotSequenceReservationResult =
+        synchronized(COLLECTION_STATE_LOCK) {
+            if (collectionQuarantinedLocked()) {
+                return@synchronized SnapshotSequenceReservationResult.Failed
+            }
+            if (
+                !collectionWindowIsCurrentLocked(
+                    expectedGeneration = expectedGeneration,
+                )
+            ) {
+                return@synchronized SnapshotSequenceReservationResult.Stale
+            }
+            val previousSequence = runCatching {
+                prefs.getLong(KEY_SNAPSHOT_SEQUENCE, 0L)
+            }.getOrElse {
+                enterQuarantineLocked()
+                return@synchronized SnapshotSequenceReservationResult.Failed
+            }
+            val sequence = reservePersistedSnapshotSequence(
+                previousSequence = previousSequence,
+                wallClockMs = wallClockMs,
+                persist = { next ->
+                    commitCollectionState(
+                        prefs.edit().putLong(KEY_SNAPSHOT_SEQUENCE, next),
+                    )
+                },
+            ) ?: run {
+                if (!collectionQuarantinedLocked()) {
+                    enterQuarantineLocked()
+                }
+                return@synchronized SnapshotSequenceReservationResult.Failed
+            }
+            SnapshotSequenceReservationResult.Reserved(sequence)
         }
 
     /**
@@ -245,39 +489,30 @@ class CollectorPrefs(context: Context) {
                     persisted = false,
                     boundaryReset = false,
                     previousGranted = null,
+                    committedState = null,
                 )
             }
             val current = collectionWindowStateLocked()
-            val resetBoundary = (
-                forceBoundary
-                    || current.usageSettingsPending
-                    || current.usageAccessGranted == null
-                    || current.usageAccessGranted != granted
-                )
-            if (!resetBoundary && collectionStatePersistenceHealthy) {
-                return@synchronized PermissionObservationResult(
+            val plan = permissionObservationPlan(
+                current = current,
+                granted = granted,
+                nowMs = nowMs,
+                boundaryWatermarkMs = floorToHour(nowMs),
+                timezone = ZoneId.systemDefault().id,
+                forceBoundary = forceBoundary,
+            )
+            if (!plan.boundaryReset && collectionStatePersistenceHealthy) {
+                return@synchronized permissionObservationResult(
+                    plan = plan,
                     persisted = true,
-                    boundaryReset = false,
-                    previousGranted = current.usageAccessGranted,
                 )
             }
-            val target = if (resetBoundary) {
-                current.copy(
-                    collectionGeneration = current.collectionGeneration + 1,
-                    collectionSinceMs = nowMs,
-                    watermarkMs = floorToHour(nowMs),
-                    collectionTimezone = ZoneId.systemDefault().id,
-                    usageAccessGranted = granted,
-                    usageSettingsPending = false,
-                )
-            } else {
-                current
-            }
-            val persisted = commitCollectionState(collectionStateEditor(target))
-            PermissionObservationResult(
+            val persisted = commitCollectionState(
+                collectionStateEditor(plan.state),
+            )
+            permissionObservationResult(
+                plan = plan,
                 persisted = persisted,
-                boundaryReset = persisted && resetBoundary,
-                previousGranted = current.usageAccessGranted,
             )
         }
 
@@ -286,22 +521,11 @@ class CollectorPrefs(context: Context) {
         get() = prefs.getString(KEY_LAST_RESULT, null)
         set(value) = prefs.edit { putString(KEY_LAST_RESULT, value) }
 
-    /**
-     * Stable per-device identifier for the server's `device_id` (<= 64 chars).
-     * Uses ANDROID_ID (stable per device + signing key) with a random UUID
-     * fallback; generated once and persisted.
-     */
+    /** Install-scoped identifier; reinstalling cannot inherit a stale server generation. */
     val deviceId: String
-        @SuppressLint("HardwareIds")
         get() {
             prefs.getString(KEY_DEVICE_ID, null)?.let { return it }
-            val androidId = Settings.Secure.getString(
-                appContext.contentResolver,
-                Settings.Secure.ANDROID_ID,
-            )
-            val suffix = androidId?.takeIf { it.isNotBlank() }
-                ?: UUID.randomUUID().toString().replace("-", "").take(16)
-            val id = "android-$suffix".take(64)
+            val id = newInstallScopedDeviceId(UUID.randomUUID().toString())
             prefs.edit { putString(KEY_DEVICE_ID, id) }
             return id
         }
@@ -310,6 +534,7 @@ class CollectorPrefs(context: Context) {
         val values = prefs.all
         return CollectionWindowState(
             collectionGeneration = values[KEY_COLLECTION_GENERATION] as? Long ?: 0L,
+            pairingRevision = values[KEY_PAIRING_REVISION] as? Long ?: 0L,
             collectionRevision = values[KEY_COLLECTION_REVISION] as? Int ?: -1,
             collectionSinceMs = values[KEY_COLLECTION_SINCE_MS] as? Long ?: 0L,
             watermarkMs = values[KEY_WATERMARK_MS] as? Long ?: 0L,
@@ -328,6 +553,7 @@ class CollectorPrefs(context: Context) {
     ): SharedPreferences.Editor {
         val editor = prefs.edit()
             .putLong(KEY_COLLECTION_GENERATION, state.collectionGeneration)
+            .putLong(KEY_PAIRING_REVISION, state.pairingRevision)
             .putInt(KEY_COLLECTION_REVISION, state.collectionRevision)
             .putLong(KEY_COLLECTION_SINCE_MS, state.collectionSinceMs)
             .putLong(KEY_WATERMARK_MS, state.watermarkMs)
@@ -342,6 +568,15 @@ class CollectorPrefs(context: Context) {
         } else {
             editor.putBoolean(KEY_USAGE_ACCESS_GRANTED, state.usageAccessGranted)
         }
+    }
+
+    private fun pairingSnapshotLocked(): PairingSnapshot {
+        val values = prefs.all
+        return PairingSnapshot(
+            serverUrl = values[KEY_SERVER_URL] as? String,
+            token = values[KEY_TOKEN] as? String,
+            revision = values[KEY_PAIRING_REVISION] as? Long ?: 0L,
+        )
     }
 
     private fun commitCollectionState(editor: SharedPreferences.Editor): Boolean {
@@ -472,10 +707,12 @@ class CollectorPrefs(context: Context) {
         const val KEY_TOKEN = "token"
         const val KEY_ENABLED = "collection_enabled"
         const val KEY_COLLECTION_GENERATION = "collection_generation"
+        const val KEY_PAIRING_REVISION = "pairing_revision"
         const val KEY_COLLECTION_SINCE_MS = "collection_since_ms"
         const val KEY_COLLECTION_REVISION = "collection_revision"
         const val KEY_WATERMARK_MS = "watermark_ms"
         const val KEY_COLLECTION_TIMEZONE = "collection_timezone"
+        const val KEY_SNAPSHOT_SEQUENCE = "snapshot_sequence"
         const val KEY_USAGE_ACCESS_GRANTED = "usage_access_granted"
         const val KEY_USAGE_SETTINGS_PENDING = "usage_settings_pending"
         const val KEY_SAFETY_INITIALIZED = "safety_initialized"

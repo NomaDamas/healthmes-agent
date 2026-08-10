@@ -108,11 +108,18 @@ Telegram (phone + watch)          decision viewer (web)
 - Insights: template-based aggregations only (no freeform mining), including
   the focus template ("14–16h focus drop: sleep deficit + Slack 9
   launches/hour").
-- Android usage collector ([`apps/android-usage/`](apps/android-usage/)):
-  minimal Kotlin companion app (pairing + toggle) that buckets
-  `UsageStatsManager` events hourly and uploads to
-  `POST /v1/app-usage/batch` every 30 minutes. iOS is deliberately skipped
-  (OS sandbox); the engine renormalizes without the signal.
+- Activity Wellness MVP (`healthmes/activity/`): Android's Kotlin collector
+  reads `UsageStatsManager`, uploads ordered provisional/final hourly
+  snapshots, and stores them in the same `WellnessEvent` data plane used by
+  other wellness inputs. Desktop ActivityWatch data can be imported through
+  the bounded localhost adapter; automatic periodic import is not implemented.
+  iOS currently exposes only an honest aggregate/unavailable capability
+  contract, not a production Screen Time timeline collector. Retention,
+  deletion, hourly/daily aggregation, focus/overwork/recovery context, REST
+  and MCP surfaces are implemented. The compatibility resolver assembles
+  bounded context only; natural-language LLM planning, final wellness
+  judgment, automatic DecisionRecord finalization and Hermes adaptation are
+  separate Decision Agent work.
 
 **Medical-lite & backups (Phase 3)**
 - Capture via Telegram (no new app): the `healthmes-capture` skill routes

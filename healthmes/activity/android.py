@@ -36,6 +36,7 @@ from healthmes.activity.service import (
 from healthmes.store import AppUsageSample, WellnessEvent
 
 ANDROID_PROVIDER = "android-usage"
+ANDROID_BUCKET_SNAPSHOT_EVENT = "activity.android-bucket-snapshot.v1"
 BACKFILL_PAGE_SIZE = 500
 
 
@@ -45,6 +46,8 @@ class AndroidSampleLike(Protocol):
     foreground_seconds: int
     launches: int
     category: str | None
+    bucket_complete: bool
+    snapshot_sequence: int
 
 
 def android_source_record_id(
@@ -67,6 +70,27 @@ def android_source_record_id(
     return (
         f"hour:{device_namespace(device_id)}:{generation_segment}"
         f"{normalized.isoformat()}:{package_digest}"
+    )
+
+
+def android_source_record_prefix(
+    device_id: str,
+    bucket_start: datetime,
+    collection_generation: int = 0,
+) -> str:
+    if collection_generation < 0:
+        raise ValueError("collection_generation must be non-negative")
+    normalized = (
+        bucket_start.replace(tzinfo=UTC)
+        if bucket_start.tzinfo is None
+        else bucket_start.astimezone(UTC)
+    )
+    generation_segment = (
+        "" if collection_generation == 0 else f"{collection_generation}:"
+    )
+    return (
+        f"hour:{device_namespace(device_id)}:{generation_segment}"
+        f"{normalized.isoformat()}:"
     )
 
 
@@ -113,7 +137,12 @@ def android_batch(
                 # The legacy payload omits explicit collector coverage. Never
                 # claim a complete hour merely because one app row exists.
                 coverage_seconds=None,
-                bucket_complete=True,
+                bucket_complete=bool(
+                    getattr(sample, "bucket_complete", False)
+                ),
+                snapshot_sequence=int(
+                    getattr(sample, "snapshot_sequence", 0) or 0
+                ),
             )
             for sample in samples
         ],

@@ -13,7 +13,13 @@ only relative paths are stored here (``media_path`` columns).
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import BigInteger, ForeignKey, Index, UniqueConstraint, false
+from sqlalchemy import (
+    BigInteger,
+    ForeignKey,
+    Index,
+    UniqueConstraint,
+    false,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from healthmes.store.base import Base, JSONDict, str_32, str_64, str_255, string_enum
@@ -275,6 +281,15 @@ class AppUsageSample(Base):
     foreground_seconds: Mapped[int] = mapped_column(default=0)
     launches: Mapped[int] = mapped_column(default=0)
     category: Mapped[str_64 | None]
+    bucket_complete: Mapped[bool] = mapped_column(
+        default=False,
+        server_default=false(),
+    )
+    snapshot_sequence: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        server_default="0",
+    )
 
 
 class CognitiveEnergyEstimate(Base):

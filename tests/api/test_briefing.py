@@ -72,7 +72,11 @@ def _prime_routes(test_client: TestClient) -> None:
 @pytest.fixture
 def client(app):
     """The shared api-test app (briefing router included), lifespan running."""
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as test_client:
         _prime_routes(test_client)
         yield test_client
 
@@ -386,7 +390,11 @@ def seoul_client(settings, session_factory):
             db.close()
 
     application.dependency_overrides[get_session] = _override_get_session
-    with TestClient(application) as test_client:
+    with TestClient(
+        application,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as test_client:
         _prime_routes(test_client)
         yield test_client
 

@@ -1,10 +1,13 @@
 package com.healthmes.usagecollector
 
+import android.Manifest
+import android.os.Build
 import android.os.Bundle
 import android.widget.Button
 import android.widget.CompoundButton
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.work.WorkManager
 import com.google.android.material.materialswitch.MaterialSwitch
@@ -29,6 +32,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var grantButton: Button
     private lateinit var collectSwitch: MaterialSwitch
     private lateinit var statusText: TextView
+    private val notificationPermissionLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.RequestPermission(),
+        ) { granted ->
+            if (granted) {
+                onToggleCollection(true)
+            } else {
+                setSwitchSilently(false)
+                prefs.lastResult =
+                    "Collection not started: notification permission is required " +
+                        "for the visible privacy guard."
+                refreshStatus()
+            }
+        }
 
     private val switchListener = CompoundButton.OnCheckedChangeListener { _, isChecked ->
         onToggleCollection(isChecked)
@@ -87,13 +104,44 @@ class MainActivity : AppCompatActivity() {
             return
         }
         serverUrlLayout.error = null
-        prefs.serverUrl = url
-        prefs.token = tokenInput.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
-        toast(R.string.toast_pairing_saved)
+        val token = tokenInput.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        val update = UsageAccessGuardRegistry.withBoundaryFence {
+            prefs.updatePairing(url, token)
+        }
+        when (update) {
+            is PairingUpdateResult.Updated -> {
+                UploadScheduling.disable(this)
+                if (prefs.collectionEnabled && startPrivacyGuardOrStop()) {
+                    UploadScheduling.enable(this)
+                    UploadScheduling.uploadNow(this)
+                }
+                toast(R.string.toast_pairing_saved)
+            }
+
+            is PairingUpdateResult.Unchanged ->
+                toast(R.string.toast_pairing_saved)
+
+            PairingUpdateResult.Failed -> {
+                UploadScheduling.disable(this)
+                prefs.lastResult =
+                    "Pairing was not saved because its privacy boundary could not persist."
+                refreshStatus()
+            }
+        }
     }
 
     private fun onToggleCollection(enabled: Boolean) {
         if (enabled) {
+            if (
+                !GuardVisibilityPolicy.isSatisfied(this)
+                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+            ) {
+                setSwitchSilently(false)
+                notificationPermissionLauncher.launch(
+                    Manifest.permission.POST_NOTIFICATIONS,
+                )
+                return
+            }
             if (prefs.serverUrl.isNullOrBlank()) {
                 toast(R.string.toast_pair_first)
                 setSwitchSilently(false)
@@ -105,7 +153,11 @@ class MainActivity : AppCompatActivity() {
                 setSwitchSilently(false)
                 return
             }
-            if (!prefs.updateCollectionEnabled(true)) {
+            if (
+                !UsageAccessGuardRegistry.withBoundaryFence {
+                    prefs.updateCollectionEnabled(true)
+                }
+            ) {
                 UploadScheduling.disable(this)
                 setSwitchSilently(false)
                 refreshStatus()
@@ -119,8 +171,9 @@ class MainActivity : AppCompatActivity() {
             UploadScheduling.enable(this)
             UploadScheduling.uploadNow(this)
         } else {
-            UsageAccessGuardRegistry.invalidate()
-            prefs.updateCollectionEnabled(false)
+            UsageAccessGuardRegistry.withBoundaryFence {
+                prefs.updateCollectionEnabled(false)
+            }
             UsageAccessGuardService.stop(this)
             UploadScheduling.disable(this)
         }
@@ -154,8 +207,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun startPrivacyGuardOrStop(): Boolean {
         if (UsageAccessGuardService.start(this)) return true
-        UsageAccessGuardRegistry.invalidate()
-        prefs.updateCollectionEnabled(false)
+        UsageAccessGuardRegistry.withBoundaryFence {
+            prefs.updateCollectionEnabled(false)
+        }
         UploadScheduling.disable(this)
         prefs.lastResult =
             "Collection stopped: foreground privacy guard could not start."

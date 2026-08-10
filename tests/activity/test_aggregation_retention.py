@@ -25,6 +25,8 @@ from healthmes.activity.context import (
 from healthmes.activity.contracts import (
     ActivityBatchIn,
     ActivityCapability,
+    ActivityCollectionStatusUpdate,
+    ActivityPermissionStatus,
     ActivityPlatform,
     AppHourRecord,
     AppIntervalRecord,
@@ -41,8 +43,10 @@ from healthmes.activity.repository import (
     DAY_SUMMARY_EVENT,
     DELETION_TOMBSTONE_EVENT,
     HOUR_SUMMARY_EVENT,
+    ActivityConflictError,
     ensure_activity_policies,
     persist_activity_record,
+    update_collection_status,
 )
 from healthmes.activity.service import (
     ActivitySummaryProvenanceError,
@@ -200,6 +204,182 @@ def test_daily_device_count_unions_devices_across_separate_hours(session) -> Non
     assert daily.payload["device_count"] == 2
 
 
+def test_cross_device_detailed_intervals_use_wall_clock_union(session) -> None:
+    for device_id in ("desktop-a", "desktop-b"):
+        ingest_activity_batch(
+            session,
+            _interval_batch(
+                [
+                    AppIntervalRecord(
+                        source_record_id=f"{device_id}-same-hour",
+                        start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                        end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                        state="active",
+                        app_id="editor",
+                    )
+                ],
+                device_id=device_id,
+            ),
+            rebuild_summaries=False,
+        )
+    events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+    )
+
+    summary = summarize_window(
+        events,
+        start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        timezone="UTC",
+    )
+
+    assert summary["total_active_minutes"] == 60.0
+    assert summary["active_time_range"] == {
+        "lower_bound_minutes": 60.0,
+        "upper_bound_minutes": 60.0,
+        "precision": "exact",
+    }
+    assert "cross_device_activity_time_bounded" not in summary["limitations"]
+
+
+def test_partial_hourly_bucket_returns_bounds_instead_of_scaled_exact_value(
+    session,
+) -> None:
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="aggregate-test",
+            source_device="phone",
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            records=[
+                AppHourRecord(
+                    source_record_id="partial-hour",
+                    bucket_start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    app_id="reader",
+                    foreground_seconds=30 * 60,
+                    launches=6,
+                    category="reading",
+                    coverage_seconds=3600,
+                    bucket_complete=True,
+                )
+            ],
+        ),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        rebuild_summaries=False,
+    )
+    events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+    )
+
+    summary = summarize_window(
+        events,
+        start=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        timezone="UTC",
+    )
+
+    assert summary["total_active_minutes"] == 0.0
+    assert summary["active_time_range"] == {
+        "lower_bound_minutes": 0.0,
+        "upper_bound_minutes": 30.0,
+        "precision": "bounded",
+    }
+    assert summary["category_minutes"] == {"other": 0.0}
+    assert summary["category_time_ranges"] == {
+        "other": {
+            "lower_bound_minutes": 0.0,
+            "upper_bound_minutes": 30.0,
+            "precision": "bounded",
+        }
+    }
+    assert summary["app_launches_or_switches"] == 0
+    assert summary["app_launches_or_switches_range"] == {
+        "lower_bound": 0,
+        "upper_bound": 6,
+        "precision": "bounded",
+    }
+    assert "partial_hourly_activity_time_bounded" in summary["limitations"]
+    assert "partial_hourly_category_totals_bounded" in summary["limitations"]
+    assert "partial_hourly_launches_bounded" in summary["limitations"]
+
+
+@pytest.mark.parametrize(
+    ("timezone_name", "day"),
+    (
+        ("UTC+05:30", date(2026, 8, 2)),
+        ("Australia/Lord_Howe", date(2026, 4, 5)),
+    ),
+)
+def test_daily_summary_preserves_partial_category_and_launch_ranges(
+    session,
+    timezone_name,
+    day,
+) -> None:
+    start, end = local_day_bounds(day, timezone_name)
+    partial_boundary = start if start.minute else end
+    assert partial_boundary.minute == 30
+    bucket_start = partial_boundary.replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="aggregate-test",
+            source_device=f"phone-{timezone_name}",
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone=timezone_name,
+            records=[
+                AppHourRecord(
+                    source_record_id=f"partial-day-{day}",
+                    bucket_start=bucket_start,
+                    app_id="reader",
+                    foreground_seconds=30 * 60,
+                    launches=6,
+                    category="reading",
+                    coverage_seconds=3600,
+                    bucket_complete=True,
+                )
+            ],
+        ),
+        now=end + timedelta(hours=2),
+    )
+
+    _, summary = get_daily_summary(
+        session,
+        day=day,
+        timezone=timezone_name,
+        now=end + timedelta(hours=2),
+    )
+
+    assert summary["category_minutes"] == {"other": 0.0}
+    assert summary["category_time_ranges"] == {
+        "other": {
+            "lower_bound_minutes": 0.0,
+            "upper_bound_minutes": 30.0,
+            "precision": "bounded",
+        }
+    }
+    assert summary["app_launches_or_switches"] == 0
+    assert summary["app_launches_or_switches_range"] == {
+        "lower_bound": 0,
+        "upper_bound": 6,
+        "precision": "bounded",
+    }
+
+
 def test_same_device_id_from_different_providers_stays_separate(session) -> None:
     shared_device_id = "shared-provider-local-id"
     ingest_activity_batch(
@@ -264,13 +444,83 @@ def test_same_device_id_from_different_providers_stays_separate(session) -> None
         )
     )
 
-    assert summary["total_active_minutes"] == 50.0
+    assert summary["total_active_minutes"] == 30.0
+    assert summary["active_time_range"] == {
+        "lower_bound_minutes": 30.0,
+        "upper_bound_minutes": 50.0,
+        "precision": "bounded",
+    }
     assert summary["device_count"] == 2
     assert len(summary["_evidence_event_ids"]) == 2
-    assert "cross_device_overlap_not_deduplicated" in summary["limitations"]
+    assert "cross_device_activity_time_bounded" in summary["limitations"]
     assert daily is not None
     assert daily.payload["device_count"] == 2
     assert daily.derived_from["raw_event_count"] == 2
+
+
+def test_cross_device_hourly_overlap_blocks_ambiguous_overwork_threshold(
+    session,
+) -> None:
+    for device_id in ("phone", "desktop"):
+        ingest_activity_batch(
+            session,
+            ActivityBatchIn(
+                source_provider="aggregate-test",
+                source_device=device_id,
+                platform=(
+                    ActivityPlatform.ANDROID
+                    if device_id == "phone"
+                    else ActivityPlatform.WINDOWS
+                ),
+                capability=ActivityCapability.AGGREGATE,
+                timezone="UTC",
+                records=[
+                    AppHourRecord(
+                        source_record_id=f"{device_id}-{hour}",
+                        bucket_start=datetime(
+                            2026,
+                            8,
+                            1,
+                            hour,
+                            tzinfo=UTC,
+                        ),
+                        app_id="work",
+                        foreground_seconds=30 * 60,
+                        coverage_seconds=3600,
+                    )
+                    for hour in range(8, 18)
+                ],
+            ),
+            now=datetime(2026, 8, 1, 20, tzinfo=UTC),
+        )
+
+    _, summary = get_daily_summary(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+        now=datetime(2026, 8, 1, 20, tzinfo=UTC),
+    )
+    overwork = overwork_context(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+        now=datetime(2026, 8, 1, 20, tzinfo=UTC),
+    )
+
+    assert summary["total_active_minutes"] == 300.0
+    assert summary["active_time_range"] == {
+        "lower_bound_minutes": 300.0,
+        "upper_bound_minutes": 600.0,
+        "precision": "bounded",
+    }
+    assert overwork["status"] == "partial"
+    assert overwork["risk_level"] == "unknown"
+    assert overwork["threshold_uncertainties"] == [
+        "high_total_activity"
+    ]
+    assert "high_total_activity" not in {
+        signal["kind"] for signal in overwork["signals"]
+    }
 
 
 def test_local_day_bounds_handle_dst_spring_and_fall_days() -> None:
@@ -585,6 +835,80 @@ def test_manual_deletion_rebuilds_only_from_remaining_raw_evidence(session) -> N
     assert summary["total_active_minutes"] == 55.0
 
 
+def test_partial_delete_and_reingest_reuse_stable_fragment_identities(
+    session,
+) -> None:
+    original = _interval_batch(
+        [
+            AppIntervalRecord(
+                source_record_id="repeatable-delete-root",
+                start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                state="active",
+                app_id="editor",
+                launches=1,
+            )
+        ]
+    )
+    ingest_activity_batch(session, original)
+    delete_activity_data(
+        session,
+        device_id="desktop-1",
+        start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 10, 20, tzinfo=UTC),
+        include_summaries=True,
+        include_control=False,
+    )
+    first_replay = ingest_activity_batch(session, original)
+    first_rows = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+    )
+
+    delete_activity_data(
+        session,
+        device_id="desktop-1",
+        start=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 10, 35, tzinfo=UTC),
+        include_summaries=True,
+        include_control=False,
+    )
+    second_replay = ingest_activity_batch(session, original)
+    second_rows = sorted(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        ),
+        key=lambda row: row.observed_at,
+    )
+
+    assert first_replay.response.duplicates == 2
+    assert len(first_rows) == 2
+    assert second_replay.response.duplicates == 3
+    assert [
+        (row.payload["start_at"], row.payload["end_at"])
+        for row in second_rows
+    ] == [
+        (
+            "2026-08-01T10:00:00+00:00",
+            "2026-08-01T10:15:00+00:00",
+        ),
+        (
+            "2026-08-01T10:20:00+00:00",
+            "2026-08-01T10:30:00+00:00",
+        ),
+        (
+            "2026-08-01T10:35:00+00:00",
+            "2026-08-01T11:00:00+00:00",
+        ),
+    ]
+    assert len({row.source_record_id for row in second_rows}) == 3
+
+
 def test_partial_hourly_deletion_requires_bucket_alignment(session) -> None:
     ingest_activity_batch(
         session,
@@ -618,6 +942,216 @@ def test_partial_hourly_deletion_requires_bucket_alignment(session) -> None:
             include_summaries=True,
             include_control=False,
         )
+
+
+def test_empty_known_aggregate_device_rejects_partial_hour_deletion(
+    session,
+) -> None:
+    update_collection_status(
+        session,
+        "empty-phone",
+        ActivityCollectionStatusUpdate(
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            permission_status=ActivityPermissionStatus.GRANTED,
+            status_observed_at=datetime(2026, 8, 1, 9, tzinfo=UTC),
+            collection_generation=1,
+        ),
+        now=datetime(2026, 8, 1, 9, tzinfo=UTC),
+    )
+
+    with pytest.raises(
+        ActivityDeletionGranularityError,
+        match="complete buckets",
+    ):
+        delete_activity_data(
+            session,
+            device_id="empty-phone",
+            start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+            end=datetime(2026, 8, 1, 10, 20, tzinfo=UTC),
+            include_summaries=True,
+            include_control=False,
+            now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        )
+
+
+def test_unknown_device_rejects_partial_tombstone_before_future_ingest(
+    session,
+) -> None:
+    with pytest.raises(
+        ActivityDeletionGranularityError,
+        match="known detailed activity device",
+    ):
+        delete_activity_data(
+            session,
+            device_id="future-aggregate-device",
+            start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+            end=datetime(2026, 8, 1, 10, 20, tzinfo=UTC),
+            include_summaries=True,
+            include_control=False,
+            now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        )
+
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DELETION_TOMBSTONE_EVENT,
+                WellnessEvent.source_device == "future-aggregate-device",
+            )
+        )
+        is None
+    )
+
+
+def test_changed_source_bounds_after_partial_delete_fail_closed(session) -> None:
+    original = _interval_batch(
+        [
+            AppIntervalRecord(
+                source_record_id="mutable-fragment-root",
+                start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                state="active",
+                app_id="editor",
+            )
+        ]
+    )
+    ingest_activity_batch(session, original)
+    delete_activity_data(
+        session,
+        device_id="desktop-1",
+        start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 10, 20, tzinfo=UTC),
+        include_summaries=True,
+        include_control=False,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    changed = original.model_copy(
+        update={
+            "records": [
+                original.records[0].model_copy(
+                    update={
+                        "end_at": datetime(
+                            2026,
+                            8,
+                            1,
+                            11,
+                            30,
+                            tzinfo=UTC,
+                        )
+                    }
+                )
+            ]
+        }
+    )
+
+    with pytest.raises(
+        ActivityConflictError,
+        match="source bounds changed",
+    ):
+        ingest_activity_batch(session, changed)
+
+    rows = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT,
+            )
+        )
+    )
+    assert len(rows) == 2
+    assert {
+        (row.payload["start_at"], row.payload["end_at"])
+        for row in rows
+    } == {
+        (
+            "2026-08-01T10:00:00+00:00",
+            "2026-08-01T10:15:00+00:00",
+        ),
+        (
+            "2026-08-01T10:20:00+00:00",
+            "2026-08-01T11:00:00+00:00",
+        ),
+    }
+
+
+def test_fully_deleted_fragment_root_cannot_move_after_partial_delete(
+    session,
+) -> None:
+    original = _interval_batch(
+        [
+            AppIntervalRecord(
+                source_record_id="deleted-fragment-root",
+                start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                state="active",
+                app_id="editor",
+            )
+        ]
+    )
+    ingest_activity_batch(
+        session,
+        original,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    delete_activity_data(
+        session,
+        device_id="desktop-1",
+        start=datetime(2026, 8, 1, 10, 15, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 10, 20, tzinfo=UTC),
+        include_summaries=True,
+        include_control=False,
+        now=datetime(2026, 8, 1, 12, 5, tzinfo=UTC),
+    )
+    delete_activity_data(
+        session,
+        device_id="desktop-1",
+        start=datetime(2026, 8, 1, 9, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        include_summaries=True,
+        include_control=False,
+        now=datetime(2026, 8, 1, 12, 10, tzinfo=UTC),
+    )
+
+    moved = original.model_copy(
+        update={
+            "collected_at": datetime(2026, 8, 1, 14, tzinfo=UTC),
+            "records": [
+                original.records[0].model_copy(
+                    update={
+                        "start_at": datetime(
+                            2026,
+                            8,
+                            1,
+                            13,
+                            tzinfo=UTC,
+                        ),
+                        "end_at": datetime(
+                            2026,
+                            8,
+                            1,
+                            14,
+                            tzinfo=UTC,
+                        ),
+                    }
+                )
+            ],
+        }
+    )
+    replay = ingest_activity_batch(
+        session,
+        moved,
+        now=datetime(2026, 8, 1, 15, tzinfo=UTC),
+    )
+
+    assert replay.response.accepted == 0
+    assert replay.response.tombstoned == 1
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT,
+            )
+        )
+        is None
+    )
 
 
 def test_provisional_hour_can_be_finalized_but_not_reopened(session) -> None:
@@ -1195,6 +1729,58 @@ def test_partial_hour_focus_metrics_use_exact_retained_raw_window(session) -> No
     assert "exact_window_from_retained_raw_events" in focus["limitations"]
 
 
+def test_partial_hourly_focus_blocks_thresholds_on_valid_uncertainty(
+    session,
+) -> None:
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="aggregate-test",
+            source_device="phone",
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            records=[
+                AppHourRecord(
+                    source_record_id="partial-focus-aggregate",
+                    bucket_start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    app_id="reader",
+                    foreground_seconds=30 * 60,
+                    launches=6,
+                    category="reading",
+                    coverage_seconds=3600,
+                    bucket_complete=True,
+                )
+            ],
+        ),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    focus = focus_context(
+        session,
+        start=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    assert focus["status"] == "partial"
+    assert focus["reason"] == "partial_hourly_activity_time_bounded"
+    assert focus["metrics"]["active_time_range"] == {
+        "lower_bound_minutes": 0.0,
+        "upper_bound_minutes": 30.0,
+        "precision": "bounded",
+    }
+    assert (
+        "focus_thresholds_blocked_by_partial_hour_uncertainty"
+        in focus["limitations"]
+    )
+    assert (
+        "focus_thresholds_blocked_by_cross_device_overlap"
+        not in focus["limitations"]
+    )
+
+
 def test_daily_summary_provenance_is_bounded_and_records_capability(session) -> None:
     ingest_activity_batch(
         session,
@@ -1309,7 +1895,7 @@ def test_legacy_summary_migration_reaggregates_complete_raw_by_provider_device(
     assert report.migrated_scopes == 1
     assert report.incompatible_scopes == 0
     assert daily["status"] == "ok"
-    assert daily["total_active_minutes"] == 120.0
+    assert daily["total_active_minutes"] == 60.0
     assert daily["device_count"] == 2
 
 

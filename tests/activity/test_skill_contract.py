@@ -29,6 +29,9 @@ def test_activity_skill_contract_is_runtime_independent_and_complete() -> None:
 
     for response_field in (
         "`status`",
+        "`decision_ready`",
+        "`candidate_ledger_complete`",
+        "`source_refs`",
         "`evidence_ids`",
         "`freshness`",
         "`coverage`",
@@ -40,6 +43,14 @@ def test_activity_skill_contract_is_runtime_independent_and_complete() -> None:
     assert "`vendor/hermes-agent/` 수정" in text
     assert "REST를 직접 호출" in text
     assert "runtime-neutral canonical name" in text
+    assert "Compatibility resolver contract: `decision_ready=false`." in text
+    assert "`decision_ready`를 항상 `false`로" in text
+    assert "`source_refs`는 응답에 존재할 때 adapter가 삭제, 재작성 또는" in text
+    assert "`candidate_ledger_complete`는 최종 판단 상태가 아니다." in text
+    assert (
+        "`candidate_ledger_complete`를 최종 승인이나 `decision_ready=true`로"
+        in text
+    )
     assert "mcp__healthmes__" not in text
 
 

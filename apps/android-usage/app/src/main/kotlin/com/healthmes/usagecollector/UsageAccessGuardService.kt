@@ -9,7 +9,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.healthmes.usagecollector.work.UploadScheduling
@@ -28,9 +30,19 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
     private val processEpoch = UUID.randomUUID().toString()
     private lateinit var prefs: CollectorPrefs
     private lateinit var appOps: AppOpsManager
+    private lateinit var serviceLease: UsageAccessGuardLease
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile
+    private var destroyed = false
 
     override fun onCreate() {
         super.onCreate()
+        prefs = CollectorPrefs(this)
+        ensureNotificationChannel()
+        if (!GuardVisibilityPolicy.isSatisfied(this)) {
+            stopForInvisibleGuard()
+            return
+        }
         val foregroundType = if (
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
         ) {
@@ -44,8 +56,16 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
             foregroundNotification(),
             foregroundType,
         )
-        prefs = CollectorPrefs(this)
         appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+        serviceLease = UsageAccessGuardRegistry.activateService(processEpoch) {
+            mainHandler.post {
+                establishGuard(
+                    trigger = "deferred_boundary_recheck",
+                    allowPending = false,
+                    forceBoundaryWhenDenied = false,
+                )
+            }
+        }
         appOps.startWatchingMode(
             AppOpsManager.OPSTR_GET_USAGE_STATS,
             packageName,
@@ -55,6 +75,7 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
 
     @Synchronized
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (destroyed) return START_NOT_STICKY
         val state = prefs.collectionWindowState()
         val userStarted = intent?.action == ACTION_USER_START
         if (state.usageSettingsPending && !userStarted) {
@@ -72,10 +93,19 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
     }
 
     override fun onOpChanged(op: String?, packageName: String?) {
+        if (destroyed) return
         if (
             op == AppOpsManager.OPSTR_GET_USAGE_STATS
             && (packageName == null || packageName == this.packageName)
         ) {
+            if (
+                !::serviceLease.isInitialized
+                || !UsageAccessGuardRegistry.invalidateForObservedBoundary(
+                    serviceLease,
+                )
+            ) {
+                return
+            }
             establishGuard(
                 trigger = "app_ops_change",
                 allowPending = false,
@@ -87,8 +117,15 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
     private fun establishGuard(
         trigger: String,
         allowPending: Boolean,
+        forceBoundaryWhenDenied: Boolean = true,
     ) {
-        UsageAccessGuardRegistry.invalidate(processEpoch)
+        if (destroyed) return
+        if (!GuardVisibilityPolicy.isSatisfied(this)) {
+            stopForInvisibleGuard()
+            return
+        }
+        val publication = UsageAccessGuardRegistry.beginPublication(serviceLease)
+            ?: return
         if (prefs.collectionQuarantined) {
             failClosed(
                 "Collection quarantined after a persistence failure; re-enable explicitly.",
@@ -108,7 +145,10 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
         val observation = prefs.observeUsageAccess(
             granted = granted,
             nowMs = System.currentTimeMillis(),
-            forceBoundary = true,
+            // A deferred granted result closes any unobserved revoke gap.
+            // A still-denied result was already fenced by the worker and must
+            // not create an endless boundary/upload loop.
+            forceBoundary = granted || forceBoundaryWhenDenied,
         )
         if (!observation.persisted) {
             failClosed(
@@ -117,14 +157,24 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
             return
         }
 
-        val state = prefs.collectionWindowState()
-        if (granted) {
-            UsageAccessGuardRegistry.publish(
-                UsageAccessGuardToken(
-                    processEpoch = processEpoch,
-                    collectionGeneration = state.collectionGeneration,
-                )
+        val state = observation.committedState
+        if (state == null) {
+            failClosed(
+                "Collection stopped: committed privacy boundary was unavailable ($trigger).",
             )
+            return
+        }
+        if (granted) {
+            val token = UsageAccessGuardRegistry.publish(
+                publication = publication,
+                collectionGeneration = state.collectionGeneration,
+                pairingRevision = state.pairingRevision,
+            )
+            if (token == null) {
+                prefs.lastResult =
+                    "Collection boundary changed before the privacy guard became active."
+                return
+            }
             prefs.lastResult =
                 "Foreground privacy guard active; collection window reset."
         } else if (!granted) {
@@ -133,6 +183,7 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
 
         if (
             !prefs.serverUrl.isNullOrBlank()
+            && (granted || observation.boundaryReset)
         ) {
             UploadScheduling.uploadNow(this)
         }
@@ -141,10 +192,33 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
     private fun currentGuardIsUsable(state: CollectionWindowState): Boolean {
         val token = UsageAccessGuardRegistry.snapshot() ?: return false
         return token.processEpoch == processEpoch &&
+            token.serviceInstance == serviceLease.serviceInstance &&
             token.collectionGeneration == state.collectionGeneration &&
+            token.pairingRevision == state.pairingRevision &&
             !state.usageSettingsPending &&
             prefs.collectionEnabled &&
+            GuardVisibilityPolicy.isSatisfied(this) &&
             UsageAccess.isGranted(this)
+    }
+
+    private fun stopForInvisibleGuard() {
+        destroyed = true
+        val disabled = UsageAccessGuardRegistry.withBoundaryFence {
+            prefs.updateCollectionEnabled(false)
+        }
+        if (::serviceLease.isInitialized) {
+            UsageAccessGuardRegistry.closeService(serviceLease)
+        } else {
+            UsageAccessGuardRegistry.invalidate(processEpoch)
+        }
+        UploadScheduling.disable(this)
+        prefs.lastResult = if (disabled) {
+            "Collection stopped: notification permission is required " +
+                "for the visible privacy guard."
+        } else {
+            "Collection stopped: notification visibility boundary could not be saved."
+        }
+        stopSelf()
     }
 
     private fun failClosed(message: String) {
@@ -155,15 +229,8 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
     }
 
     private fun foregroundNotification(): Notification {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(
-            NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                getString(R.string.guard_notification_channel),
-                NotificationManager.IMPORTANCE_LOW,
-            )
-        )
-        return Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+        ensureNotificationChannel()
+        return Notification.Builder(this, USAGE_GUARD_NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher)
             .setContentTitle(getString(R.string.guard_notification_title))
             .setContentText(getString(R.string.guard_notification_text))
@@ -171,9 +238,24 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
             .build()
     }
 
+    private fun ensureNotificationChannel() {
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(
+                USAGE_GUARD_NOTIFICATION_CHANNEL_ID,
+                getString(R.string.guard_notification_channel),
+                NotificationManager.IMPORTANCE_LOW,
+            )
+        )
+    }
+
     @Synchronized
     override fun onDestroy() {
-        UsageAccessGuardRegistry.invalidate(processEpoch)
+        destroyed = true
+        if (::serviceLease.isInitialized) {
+            UsageAccessGuardRegistry.closeService(serviceLease)
+        } else {
+            UsageAccessGuardRegistry.invalidate(processEpoch)
+        }
         if (::appOps.isInitialized) {
             appOps.stopWatchingMode(this)
         }
@@ -189,18 +271,21 @@ class UsageAccessGuardService : Service(), AppOpsManager.OnOpChangedListener {
     companion object {
         private const val ACTION_USER_START =
             "com.healthmes.usagecollector.action.START_USAGE_GUARD"
-        private const val NOTIFICATION_CHANNEL_ID = "healthmes_usage_guard"
         private const val NOTIFICATION_ID = 4301
 
         fun start(context: Context): Boolean =
-            runCatching {
-                ContextCompat.startForegroundService(
-                    context,
-                    Intent(context, UsageAccessGuardService::class.java)
-                        .setAction(ACTION_USER_START),
-                )
-                true
-            }.getOrDefault(false)
+            if (!GuardVisibilityPolicy.isSatisfied(context)) {
+                false
+            } else {
+                runCatching {
+                    ContextCompat.startForegroundService(
+                        context,
+                        Intent(context, UsageAccessGuardService::class.java)
+                            .setAction(ACTION_USER_START),
+                    )
+                    true
+                }.getOrDefault(false)
+            }
 
         fun stop(context: Context) {
             UsageAccessGuardRegistry.invalidate()

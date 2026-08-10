@@ -22,22 +22,11 @@ class IngestFailurePolicyTest {
     }
 
     @Test
-    fun `permanent activity conflicts isolate only rejected samples`() {
+    fun `deterministic data conflicts fail the complete snapshot closed`() {
         listOf(
             "activity_outside_retention",
             "activity_future_data",
             "activity_source_conflict",
-        ).forEach { code ->
-            assertEquals(
-                ActivityConflictDisposition.ISOLATE_REJECTED_SAMPLE,
-                activityConflictDisposition(code),
-            )
-        }
-    }
-
-    @Test
-    fun `summary scope and unknown conflicts fail closed`() {
-        listOf(
             "activity_source_mode_conflict",
             "activity_summary_requires_complete_raw",
             null,
