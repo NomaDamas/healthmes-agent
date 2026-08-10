@@ -156,6 +156,9 @@ def test_local_runtime_adopts_the_open_wearables_listener_pid() -> None:
     assert 'ps -o ppid= -p "$pid"' in listener_body
     assert 'printf \'%s\\n\' "$pid"' in listener_body
     assert "open_wearables_listener_is_managed" in body
+    guard_body = _function_body(text, "open_wearables_listener_is_managed")
+    assert 'fastapi dev app/main.py' in guard_body
+    assert 'fastapi run app/main.py' in guard_body
 
 
 def test_local_open_wearables_boots_a_single_production_listener() -> None:

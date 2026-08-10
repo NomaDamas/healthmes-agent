@@ -78,7 +78,7 @@ open_wearables_listener_is_managed() {
     local pid=$1 parent command
     while [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ]; do
         command="$(ps -o command= -p "$pid" 2>/dev/null || true)"
-        [[ "$command" == *"fastapi dev app/main.py"* ]] && return 0
+        [[ "$command" == *"fastapi dev app/main.py"* || "$command" == *"fastapi run app/main.py"* ]] && return 0
         parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
         [ "$parent" != "$pid" ] || break
         pid="$parent"
