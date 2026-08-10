@@ -288,6 +288,7 @@ def delete_activity_data(
                         row.device_id,
                         row.bucket_start,
                         row.app_package,
+                        row.collection_generation,
                     ),
                 )
             )

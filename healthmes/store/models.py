@@ -13,7 +13,7 @@ only relative paths are stored here (``media_path`` columns).
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import ForeignKey, Index, UniqueConstraint, false
+from sqlalchemy import BigInteger, ForeignKey, Index, UniqueConstraint, false
 from sqlalchemy.orm import Mapped, mapped_column
 
 from healthmes.store.base import Base, JSONDict, str_32, str_64, str_255, string_enum
@@ -257,13 +257,19 @@ class AppUsageSample(Base):
     __table_args__ = (
         UniqueConstraint(
             "device_id",
+            "collection_generation",
             "bucket_start",
             "app_package",
-            name="uq_app_usage_sample_device_bucket_app",
+            name="uq_app_usage_sample_device_generation_bucket_app",
         ),
     )
 
     device_id: Mapped[str_64]
+    collection_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        server_default="0",
+    )
     bucket_start: Mapped[datetime] = mapped_column(index=True)
     app_package: Mapped[str_255]
     foreground_seconds: Mapped[int] = mapped_column(default=0)

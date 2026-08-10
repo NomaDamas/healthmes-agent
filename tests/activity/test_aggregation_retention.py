@@ -148,6 +148,48 @@ def test_overlapping_intervals_on_one_device_are_not_double_counted(session) -> 
     assert sum(summary["category_minutes"].values()) == 90.0
 
 
+def test_daily_device_count_unions_devices_across_separate_hours(session) -> None:
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="device-a-hour",
+                    start_at=datetime(2026, 8, 1, 9, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 9, 30, tzinfo=UTC),
+                    state="active",
+                    app_id="editor",
+                )
+            ],
+            device_id="desktop-a",
+        ),
+    )
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="device-b-hour",
+                    start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+                    state="active",
+                    app_id="browser",
+                )
+            ],
+            device_id="desktop-b",
+        ),
+    )
+
+    daily = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == DAY_SUMMARY_EVENT
+        )
+    )
+
+    assert daily is not None
+    assert daily.payload["device_count"] == 2
+
+
 def test_local_day_bounds_handle_dst_spring_and_fall_days() -> None:
     spring_start, spring_end = local_day_bounds(
         date(2026, 3, 8),

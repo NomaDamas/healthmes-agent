@@ -40,6 +40,7 @@ def fresh_payload() -> dict:
     return {
         "device_id": "android-abc123",
         "collection_revision": 0,
+        "collection_generation": 0,
         "samples": [
             {
                 "bucket_start": bucket.isoformat().replace("+00:00", "Z"),

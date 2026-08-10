@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import APIRouter, Query, Request
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from healthmes.activity.activitywatch import (
@@ -34,6 +35,7 @@ from healthmes.activity.contracts import (
     ActivityPlatform,
     ActivityWatchImportRequest,
     AppHourRecord,
+    AppIntervalRecord,
     IOSCapabilityReport,
     is_reserved_activity_provider,
 )
@@ -49,6 +51,7 @@ from healthmes.activity.repository import (
     activity_write_lock,
     get_control_payload,
     serialize_collection_state,
+    tombstoned_record_ids,
     update_collection_config,
     update_collection_status,
 )
@@ -68,6 +71,7 @@ from healthmes.activity.service import (
 )
 from healthmes.api.errors import APIError
 from healthmes.config import resolve_timezone
+from healthmes.store import WellnessEvent
 from healthmes.store.session import SessionDep
 
 router = APIRouter(tags=["activity"])
@@ -99,6 +103,65 @@ def _commit_collection(
 ) -> ActivityCollectionOut:
     session.commit()
     return ActivityCollectionOut.model_validate(serialize_collection_state(payload))
+
+
+def _scope_public_batch_source_ids(
+    session: Session,
+    body: ActivityBatchIn,
+) -> ActivityBatchIn:
+    legacy_tombstoned_ids = tombstoned_record_ids(
+        session,
+        source_provider=body.source_provider,
+        device_id=body.source_device,
+        records=body.records,
+    )
+    source_record_ids = {record.source_record_id for record in body.records}
+    legacy_rows = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.source_provider == body.source_provider,
+                WellnessEvent.source_record_id.in_(source_record_ids),
+                WellnessEvent.source_device == body.source_device,
+            )
+        )
+    )
+    legacy_record_ids = {
+        row.source_record_id for row in legacy_rows
+    } | legacy_tombstoned_ids
+    legacy_group_ids = {
+        str(group_id)
+        for row in legacy_rows
+        if isinstance(row.payload, dict)
+        and (group_id := row.payload.get("source_group_id")) is not None
+    }
+    records = []
+    for record in body.records:
+        updates = {
+            "source_record_id": (
+                record.source_record_id
+                if record.source_record_id in legacy_record_ids
+                else scoped_source_record_id(
+                    prefix="generic-record",
+                    device_id=body.source_device,
+                    source_record_id=record.source_record_id,
+                )
+            )
+        }
+        if (
+            isinstance(record, AppIntervalRecord)
+            and record.source_group_id is not None
+        ):
+            updates["source_group_id"] = (
+                record.source_group_id
+                if record.source_group_id in legacy_group_ids
+                else scoped_source_record_id(
+                    prefix="generic-group",
+                    device_id=body.source_device,
+                    source_record_id=record.source_group_id,
+                )
+            )
+        records.append(record.model_copy(update=updates))
+    return body.model_copy(update={"records": records})
 
 
 @router.get("/v1/activity/devices/{device_id}/collection")
@@ -158,8 +221,21 @@ def post_collection_status(
     body: ActivityCollectionStatusUpdate,
     session: SessionDep,
 ) -> ActivityCollectionOut:
+    observed_at = body.status_observed_at
+    current = datetime.now(UTC)
+    if observed_at is not None and observed_at > current + MAX_FUTURE_SKEW:
+        raise APIError(
+            409,
+            "activity_future_data",
+            "status_observed_at is beyond the allowed one-minute clock skew",
+        )
     with activity_write_lock():
-        payload = update_collection_status(session, device_id, body)
+        payload = update_collection_status(
+            session,
+            device_id,
+            body,
+            now=current,
+        )
         return _commit_collection(session, payload)
 
 
@@ -181,6 +257,7 @@ def post_activity_batch(
             "built-in activity providers are available only through their adapters",
         )
     with activity_write_lock():
+        body = _scope_public_batch_source_ids(session, body)
         try:
             result = ingest_activity_batch(session, body)
         except ActivityCollectionBlockedError as exc:
@@ -283,6 +360,7 @@ def post_ios_report(
                         capability=body.capability,
                         permission_status=body.permission_status,
                         status_reason=body.reason,
+                        status_observed_at=body.collected_at,
                         last_uploaded_at=uploaded_at,
                         last_collected_at=(
                             body.collected_at if available else None

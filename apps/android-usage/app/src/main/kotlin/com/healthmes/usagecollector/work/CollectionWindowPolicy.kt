@@ -49,6 +49,12 @@ internal fun collectionWindowLeaseAllowed(
             collectionQuarantined = collectionQuarantined,
         )
 
+internal fun timezoneBoundaryRequired(
+    storedTimezone: String?,
+    currentTimezone: String,
+): Boolean =
+    storedTimezone != currentTimezone
+
 /**
  * Persist a privacy boundary with a durable fail-closed marker already armed.
  *

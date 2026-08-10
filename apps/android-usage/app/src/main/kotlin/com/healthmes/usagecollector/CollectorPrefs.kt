@@ -10,6 +10,7 @@ import androidx.security.crypto.MasterKey
 import com.healthmes.usagecollector.work.UploadScheduling
 import com.healthmes.usagecollector.work.collectionWindowLeaseAllowed
 import com.healthmes.usagecollector.work.commitFailClosedBoundary
+import java.time.ZoneId
 import java.util.UUID
 
 internal data class CollectionWindowState(
@@ -17,6 +18,7 @@ internal data class CollectionWindowState(
     val collectionRevision: Int,
     val collectionSinceMs: Long,
     val watermarkMs: Long,
+    val collectionTimezone: String?,
     val usageAccessGranted: Boolean?,
     val usageSettingsPending: Boolean,
 )
@@ -125,6 +127,7 @@ class CollectorPrefs(context: Context) {
                         collectionGeneration = state.collectionGeneration + 1,
                         collectionSinceMs = if (value) nowMs else 0L,
                         watermarkMs = floorToHour(nowMs),
+                        collectionTimezone = ZoneId.systemDefault().id,
                     ),
                 ).putBoolean(KEY_ENABLED, value),
             )
@@ -178,6 +181,7 @@ class CollectorPrefs(context: Context) {
         collectionRevision: Int,
         collectionSinceMs: Long,
         watermarkMs: Long,
+        collectionTimezone: String = ZoneId.systemDefault().id,
     ): Boolean =
         synchronized(COLLECTION_STATE_LOCK) {
             if (collectionQuarantinedLocked()) {
@@ -191,6 +195,7 @@ class CollectorPrefs(context: Context) {
                         collectionRevision = collectionRevision,
                         collectionSinceMs = collectionSinceMs,
                         watermarkMs = watermarkMs,
+                        collectionTimezone = collectionTimezone,
                     ),
                 ),
             )
@@ -216,6 +221,7 @@ class CollectorPrefs(context: Context) {
                         collectionGeneration = current.collectionGeneration + 1,
                         collectionSinceMs = nowMs,
                         watermarkMs = floorToHour(nowMs),
+                        collectionTimezone = ZoneId.systemDefault().id,
                         usageAccessGranted = currentlyGranted,
                         usageSettingsPending = true,
                     ),
@@ -258,6 +264,7 @@ class CollectorPrefs(context: Context) {
                     collectionGeneration = current.collectionGeneration + 1,
                     collectionSinceMs = nowMs,
                     watermarkMs = floorToHour(nowMs),
+                    collectionTimezone = ZoneId.systemDefault().id,
                     usageAccessGranted = granted,
                     usageSettingsPending = false,
                 )
@@ -304,6 +311,7 @@ class CollectorPrefs(context: Context) {
             collectionRevision = values[KEY_COLLECTION_REVISION] as? Int ?: -1,
             collectionSinceMs = values[KEY_COLLECTION_SINCE_MS] as? Long ?: 0L,
             watermarkMs = values[KEY_WATERMARK_MS] as? Long ?: 0L,
+            collectionTimezone = values[KEY_COLLECTION_TIMEZONE] as? String,
             usageAccessGranted = (
                 values[KEY_USAGE_ACCESS_GRANTED] as? Boolean
                 ),
@@ -322,6 +330,11 @@ class CollectorPrefs(context: Context) {
             .putLong(KEY_COLLECTION_SINCE_MS, state.collectionSinceMs)
             .putLong(KEY_WATERMARK_MS, state.watermarkMs)
             .putBoolean(KEY_USAGE_SETTINGS_PENDING, state.usageSettingsPending)
+        if (state.collectionTimezone == null) {
+            editor.remove(KEY_COLLECTION_TIMEZONE)
+        } else {
+            editor.putString(KEY_COLLECTION_TIMEZONE, state.collectionTimezone)
+        }
         return if (state.usageAccessGranted == null) {
             editor.remove(KEY_USAGE_ACCESS_GRANTED)
         } else {
@@ -459,6 +472,7 @@ class CollectorPrefs(context: Context) {
         const val KEY_COLLECTION_SINCE_MS = "collection_since_ms"
         const val KEY_COLLECTION_REVISION = "collection_revision"
         const val KEY_WATERMARK_MS = "watermark_ms"
+        const val KEY_COLLECTION_TIMEZONE = "collection_timezone"
         const val KEY_USAGE_ACCESS_GRANTED = "usage_access_granted"
         const val KEY_USAGE_SETTINGS_PENDING = "usage_settings_pending"
         const val KEY_SAFETY_INITIALIZED = "safety_initialized"

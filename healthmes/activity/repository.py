@@ -28,7 +28,7 @@ from healthmes.activity.contracts import (
     AppIntervalRecord,
 )
 from healthmes.activity.locking import activity_write_lock
-from healthmes.activity.privacy import collection_gate
+from healthmes.activity.privacy import BLOCKED_PERMISSION_STATES, collection_gate
 from healthmes.storage import ensure_default_policies
 from healthmes.store import RetentionPolicy, WellnessEvent
 
@@ -464,6 +464,7 @@ STATUS_KEYS = {
     "permission_status",
     "capability",
     "status_reason",
+    "status_observed_at",
     "last_collected_at",
     "last_uploaded_at",
     "queue_oldest_at",
@@ -498,6 +499,7 @@ def default_control_payload(
         "permission_status": ActivityPermissionStatus.UNKNOWN.value,
         "capability": ActivityCapability.UNAVAILABLE.value,
         "status_reason": None,
+        "status_observed_at": None,
         "last_collected_at": None,
         "last_uploaded_at": None,
         "queue_oldest_at": None,
@@ -766,6 +768,7 @@ def update_collection_status(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     with activity_write_lock():
+        current = as_utc(now or datetime.now(UTC))
         for attempt in range(2):
             payload = {
                 "device_id": device_id,
@@ -778,6 +781,37 @@ def update_collection_status(
                 ),
             }
             values = update.model_dump(exclude_unset=True)
+            incoming_observed_at = (
+                update.status_observed_at
+                if update.status_observed_at is not None
+                else current
+            )
+            existing_observed_at = parse_optional_datetime(
+                payload.get("status_observed_at")
+            )
+            incoming_permission = (
+                update.permission_status.value
+                if update.permission_status is not None
+                else payload.get("permission_status")
+            )
+            existing_permission = payload.get("permission_status")
+            if (
+                existing_observed_at is not None
+                and (
+                    incoming_observed_at < existing_observed_at
+                    or (
+                        incoming_observed_at == existing_observed_at
+                        and existing_permission in BLOCKED_PERMISSION_STATES
+                        and incoming_permission not in BLOCKED_PERMISSION_STATES
+                    )
+                )
+            ):
+                return get_control_payload(
+                    session,
+                    device_id,
+                    platform=update.platform or ActivityPlatform.UNKNOWN,
+                )
+            values["status_observed_at"] = incoming_observed_at
             for key, value in values.items():
                 if isinstance(value, datetime):
                     payload[key] = iso_or_none(value)
@@ -792,7 +826,7 @@ def update_collection_status(
                     payload,
                     event_type=COLLECTION_STATUS_EVENT,
                     source_record_id=_control_source_id(device_id, "status"),
-                    now=now,
+                    now=current,
                 )
             except ActivityWriteConflictError:
                 if attempt == 0:
@@ -1014,6 +1048,9 @@ def serialize_collection_state(
         ),
         "capability": str(payload.get("capability", ActivityCapability.UNAVAILABLE.value)),
         "status_reason": payload.get("status_reason"),
+        "status_observed_at": parse_optional_datetime(
+            payload.get("status_observed_at")
+        ),
         "last_collected_at": parse_optional_datetime(payload.get("last_collected_at")),
         "last_uploaded_at": parse_optional_datetime(payload.get("last_uploaded_at")),
         "queue_oldest_at": queue_oldest,

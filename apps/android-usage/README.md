@@ -229,6 +229,7 @@ by `tests/api/test_android_readme_contract.py`):
   "device_id": "android-3f9c2a7b41e8d05c",
   "timezone": "Asia/Seoul",
   "collection_revision": 0,
+  "collection_generation": 1,
   "samples": [
     {
       "bucket_start": "2026-07-09T10:00:00Z",
@@ -282,13 +283,15 @@ Upload semantics (why re-sending is safe):
   pre-consent history. Later runs re-query from
   `max(collection boundary, watermark − 6 h, now − 7 days)` and re-send every
   recomputed bucket, including the still-growing current hour.
-- Every upload carries the IANA `timezone` and the `collection_revision` from
-  the config refreshed immediately before the OS usage read. The refresh is a
-  permission-status POST whose response contains the latest config. Missing
-  or stale revisions are rejected; a privacy-setting change starts a new
-  collection boundary instead of replaying pre-change history. Generation,
-  revision, boundary, and watermark are written in one synchronous encrypted
-  preference commit.
+- Every upload carries the collection window's IANA `timezone`,
+  `collection_revision`, and `collection_generation`. The config refreshed
+  immediately before the OS usage read is parsed strictly: a missing or
+  wrongly typed exclusion list or required field stops before UsageStats is
+  read. Missing or stale revisions are rejected; a privacy-setting,
+  permission, or timezone change starts a new generation instead of
+  relabeling or overwriting the earlier same-hour segment. Generation,
+  revision, timezone, boundary, and watermark are written in one synchronous
+  encrypted preference commit.
 - Every sensitive boundary commit is two-phase: first arm a non-sensitive
   quarantine latch in separate ordinary `SharedPreferences`, then commit the
   encrypted state, then clear the latch. If the encrypted commit or clear
@@ -312,9 +315,10 @@ Upload semantics (why re-sending is safe):
   an HTTP request that had already started may finish, but no later chunk or
   watermark crosses the persisted boundary, and the source range remains
   replay-safe.
-- The server **upserts** on `(device_id, bucket_start, app_package)` with
-  last-write-wins, so repeated uploads are idempotent; a second POST of the
-  example above answers
+- The server **upserts** on
+  `(device_id, collection_generation, bucket_start, app_package)` with
+  last-write-wins, so repeated uploads are idempotent without overwriting an
+  earlier privacy window; a second POST of the example above answers
   `{"accepted": 4, "created": 0, "updated": 4, "suppressed": 0}`.
 - Batches are chunked at 500 samples per POST (server cap: 1000).
 - A deterministic sample-level `409` is isolated by bisecting the failed

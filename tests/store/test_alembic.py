@@ -12,6 +12,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
@@ -81,6 +82,16 @@ def _render_offline_legacy_cleanup_downgrade(database_url: str) -> str:
     return buffer.getvalue()
 
 
+def _render_offline_app_usage_generation_downgrade(database_url: str) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "d2e3f4a5b6c7:c1d2e3f4a5b6",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
 def test_migration_graph_has_single_head():
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
@@ -129,6 +140,18 @@ class TestOfflineRender:
             rendered = _render_offline_legacy_cleanup_downgrade(url)
             assert "ROW_NUMBER() OVER" in rendered
             assert "ux_calendar_event_mirror_source_healthmes_source_key" in rendered
+
+    def test_app_usage_generation_downgrade_renders_for_both_dialects(self):
+        sqlite_sql = _render_offline_app_usage_generation_downgrade(
+            "sqlite:///offline-render.db"
+        )
+        postgres_sql = _render_offline_app_usage_generation_downgrade(
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes"
+        )
+
+        assert "_alembic_tmp_app_usage_sample" in sqlite_sql
+        assert "DROP TABLE app_usage_sample" in sqlite_sql
+        assert "DROP COLUMN collection_generation" in postgres_sql
 
 
 class TestSqliteUpgrade:
@@ -195,6 +218,97 @@ class TestSqliteUpgrade:
         config = _config(database_url)
         command.upgrade(config, "head")
         command.upgrade(config, "head")  # no-op, must not raise
+
+    def test_app_usage_generation_migration_preserves_rows_and_refuses_loss(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'app-usage-generation.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c1d2e3f4a5b6")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        legacy = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        bucket = datetime(2026, 8, 9, 12, tzinfo=UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                legacy.insert().values(
+                    id=uuid.uuid4().hex,
+                    device_id="android-migration",
+                    bucket_start=bucket,
+                    app_package="com.example.editor",
+                    foreground_seconds=900,
+                    launches=2,
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        migrated = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        assert "collection_generation" in migrated.c
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.select(migrated.c.collection_generation)
+            ) == 0
+            connection.execute(
+                migrated.insert().values(
+                    id=uuid.uuid4().hex,
+                    device_id="android-migration",
+                    collection_generation=1,
+                    bucket_start=bucket,
+                    app_package="com.example.editor",
+                    foreground_seconds=300,
+                    launches=1,
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="without losing collection generations"):
+            command.downgrade(config, "c1d2e3f4a5b6")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        preserved = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        with engine.begin() as connection:
+            assert connection.scalar(sa.select(sa.func.count()).select_from(preserved)) == 2
+            connection.execute(
+                preserved.delete().where(
+                    preserved.c.collection_generation == 1
+                )
+            )
+        engine.dispose()
+
+        command.downgrade(config, "c1d2e3f4a5b6")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert "collection_generation" not in {
+                column["name"]
+                for column in inspector.get_columns("app_usage_sample")
+            }
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT COUNT(*) FROM app_usage_sample")
+                ) == 1
+        finally:
+            engine.dispose()
 
     def test_legacy_pending_schedule_proposal_is_backfilled_and_resolvable(
         self,
@@ -375,7 +489,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c1d2e3f4a5b6"
+                ) == "d2e3f4a5b6c7"
         finally:
             engine.dispose()
 

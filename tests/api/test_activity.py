@@ -3,12 +3,14 @@ from datetime import UTC, datetime, timedelta
 import httpx
 from sqlalchemy import select
 
+from healthmes.activity.contracts import ActivityBatchIn
 from healthmes.activity.repository import (
     APP_HOUR_EVENT,
     APP_INTERVAL_EVENT,
     DAY_SUMMARY_EVENT,
     DELETION_TOMBSTONE_EVENT,
 )
+from healthmes.activity.service import ingest_activity_batch
 from healthmes.store import WellnessEvent
 
 
@@ -34,10 +36,11 @@ def _activity_batch(
     records: list[dict],
     *,
     collection_revision: int = 0,
+    source_device: str = "desktop-api-test",
 ) -> dict:
     return {
         "source_provider": "api-test-collector",
-        "source_device": "desktop-api-test",
+        "source_device": source_device,
         "platform": "macos",
         "capability": "aggregate",
         "timezone": "UTC",
@@ -198,6 +201,208 @@ def test_activity_ingest_rejects_built_in_adapter_provider_spoofing(client) -> N
 
         assert response.status_code == 422
         assert response.json()["error"]["code"] == "activity_provider_reserved"
+
+
+def test_generic_source_ids_are_scoped_per_device(client, session) -> None:
+    first = client.post(
+        "/v1/activity/events/batch",
+        json=_activity_batch(
+            [
+                _hour_record(
+                    source_record_id="provider-local-hour",
+                    app_id="editor.app",
+                    seconds=600,
+                )
+            ],
+            source_device="desktop-source-a",
+        ),
+    )
+    second = client.post(
+        "/v1/activity/events/batch",
+        json=_activity_batch(
+            [
+                _hour_record(
+                    source_record_id="provider-local-hour",
+                    app_id="editor.app",
+                    seconds=900,
+                )
+            ],
+            source_device="desktop-source-b",
+        ),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    rows = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+    )
+    assert len(rows) == 2
+    assert {row.source_device for row in rows} == {
+        "desktop-source-a",
+        "desktop-source-b",
+    }
+    assert len({row.source_record_id for row in rows}) == 2
+
+
+def test_generic_source_scoping_preserves_same_device_legacy_retry(
+    client,
+    session,
+) -> None:
+    legacy = ActivityBatchIn.model_validate(
+        _activity_batch(
+            [
+                _hour_record(
+                    source_record_id="legacy-provider-local-hour",
+                    app_id="editor.app",
+                    seconds=600,
+                )
+            ],
+            source_device="desktop-legacy-source",
+        )
+    )
+    ingest_activity_batch(session, legacy)
+    session.commit()
+
+    retried = client.post(
+        "/v1/activity/events/batch",
+        json=_activity_batch(
+            [
+                _hour_record(
+                    source_record_id="legacy-provider-local-hour",
+                    app_id="editor.app",
+                    seconds=600,
+                )
+            ],
+            source_device="desktop-legacy-source",
+        ),
+    )
+
+    assert retried.status_code == 200
+    rows = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].source_record_id == "legacy-provider-local-hour"
+
+
+def test_generic_source_scoping_preserves_legacy_deletion_tombstone(
+    client,
+    session,
+) -> None:
+    source_device = "desktop-legacy-deleted"
+    source_record_id = "legacy-deleted-hour"
+    legacy = ActivityBatchIn.model_validate(
+        _activity_batch(
+            [
+                _hour_record(
+                    source_record_id=source_record_id,
+                    app_id="editor.app",
+                    seconds=600,
+                )
+            ],
+            source_device=source_device,
+        )
+    )
+    ingest_activity_batch(session, legacy)
+    session.commit()
+
+    deleted = client.post(
+        "/v1/activity/data/delete",
+        json={
+            "device_id": source_device,
+            "start": "2026-08-01T10:15:00Z",
+            "end": "2026-08-01T10:20:00Z",
+            "include_summaries": True,
+            "include_control": False,
+            "confirm": True,
+        },
+    )
+    replayed = client.post(
+        "/v1/activity/events/batch",
+        json=_activity_batch(
+            [
+                _hour_record(
+                    source_record_id=source_record_id,
+                    app_id="editor.app",
+                    seconds=600,
+                )
+            ],
+            source_device=source_device,
+        ),
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.json()["raw_events_deleted"] == 1
+    assert replayed.status_code == 200
+    assert replayed.json()["accepted"] == 0
+    assert replayed.json()["tombstoned"] == 1
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT,
+                WellnessEvent.source_provider == legacy.source_provider,
+                WellnessEvent.source_device == source_device,
+            )
+        )
+        is None
+    )
+
+
+def test_generic_source_scoping_separates_other_device_from_legacy_id(
+    client,
+    session,
+) -> None:
+    legacy = ActivityBatchIn.model_validate(
+        _activity_batch(
+            [
+                _hour_record(
+                    source_record_id="shared-legacy-hour",
+                    app_id="editor.app",
+                    seconds=600,
+                )
+            ],
+            source_device="desktop-legacy-owner",
+        )
+    )
+    ingest_activity_batch(session, legacy)
+    session.commit()
+
+    created = client.post(
+        "/v1/activity/events/batch",
+        json=_activity_batch(
+            [
+                _hour_record(
+                    source_record_id="shared-legacy-hour",
+                    app_id="browser.app",
+                    seconds=300,
+                )
+            ],
+            source_device="desktop-new-owner",
+        ),
+    )
+
+    assert created.status_code == 200
+    rows = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+    )
+    assert len(rows) == 2
+    assert {row.source_device for row in rows} == {
+        "desktop-legacy-owner",
+        "desktop-new-owner",
+    }
+    assert len({row.source_record_id for row in rows}) == 2
 
 
 def test_ios_unavailable_is_status_not_fake_zero_activity(client, session) -> None:
@@ -400,6 +605,99 @@ def test_ios_report_rejects_future_collected_at_before_status_update(client) -> 
     assert status["last_uploaded_at"] is None
 
 
+def test_collection_status_rejects_future_observation_before_update(client) -> None:
+    response = client.post(
+        "/v1/activity/devices/future-status/status",
+        json={
+            "platform": "android",
+            "capability": "aggregate",
+            "permission_status": "revoked",
+            "status_observed_at": "2100-01-01T00:00:00Z",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "activity_future_data"
+    state = client.get(
+        "/v1/activity/devices/future-status/collection"
+    ).json()
+    assert state["permission_status"] == "unknown"
+    assert state["status_observed_at"] is None
+
+
+def test_delayed_ios_status_cannot_override_newer_revocation(client) -> None:
+    revoked = client.post(
+        "/v1/activity/ios/report",
+        json={
+            "device_id": "iphone-status-ordering",
+            "timezone": "UTC",
+            "capability": "aggregate",
+            "permission_status": "revoked",
+            "reason": "screen_time_revoked",
+            "collected_at": "2026-08-01T12:00:00Z",
+            "samples": [],
+        },
+    )
+    delayed_grant = client.post(
+        "/v1/activity/ios/report",
+        json={
+            "device_id": "iphone-status-ordering",
+            "timezone": "UTC",
+            "capability": "aggregate",
+            "permission_status": "granted",
+            "collected_at": "2026-08-01T11:00:00Z",
+            "samples": [],
+        },
+    )
+
+    assert revoked.status_code == 200
+    assert delayed_grant.status_code == 200
+    state = client.get(
+        "/v1/activity/devices/iphone-status-ordering/collection"
+    ).json()
+    assert state["permission_status"] == "revoked"
+    assert state["effective_collecting"] is False
+    assert state["blocked_reason"] == "permission_revoked"
+    assert datetime.fromisoformat(
+        state["status_observed_at"].replace("Z", "+00:00")
+    ) == datetime(2026, 8, 1, 12, tzinfo=UTC)
+
+
+def test_equal_time_grant_cannot_override_revocation(client) -> None:
+    observed_at = "2026-08-01T12:00:00Z"
+    revoked = client.post(
+        "/v1/activity/ios/report",
+        json={
+            "device_id": "iphone-status-tie",
+            "timezone": "UTC",
+            "capability": "aggregate",
+            "permission_status": "revoked",
+            "reason": "screen_time_revoked",
+            "collected_at": observed_at,
+            "samples": [],
+        },
+    )
+    granted = client.post(
+        "/v1/activity/ios/report",
+        json={
+            "device_id": "iphone-status-tie",
+            "timezone": "UTC",
+            "capability": "aggregate",
+            "permission_status": "granted",
+            "collected_at": observed_at,
+            "samples": [],
+        },
+    )
+
+    assert revoked.status_code == 200
+    assert granted.status_code == 200
+    state = client.get(
+        "/v1/activity/devices/iphone-status-tie/collection"
+    ).json()
+    assert state["permission_status"] == "revoked"
+    assert state["effective_collecting"] is False
+
+
 def test_partial_manual_delete_rebuilds_the_day_summary(client, session) -> None:
     created = client.post(
         "/v1/activity/events/batch",
@@ -454,7 +752,7 @@ def test_partial_manual_delete_rebuilds_the_day_summary(client, session) -> None
     remaining = list(
         session.scalars(select(WellnessEvent).where(WellnessEvent.event_type == APP_INTERVAL_EVENT))
     )
-    assert [row.source_record_id for row in remaining] == ["keep"]
+    assert [row.payload["app_id"] for row in remaining] == ["editor"]
 
 
 def test_raw_only_manual_delete_cannot_leave_a_stale_summary(client) -> None:
@@ -574,6 +872,43 @@ def test_activitywatch_malformed_upstream_json_returns_502(
         "/v1/activity/activitywatch/import",
         json={
             "device_id": "mac-malformed-json",
+            "platform": "macos",
+            "timezone": "UTC",
+            "start_at": "2026-08-01T10:00:00Z",
+            "end_at": "2026-08-01T11:00:00Z",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "activitywatch_error"
+
+
+def test_activitywatch_unrepresentable_event_returns_502(
+    client,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.activity.activitywatch.ActivityWatchClient.list_buckets",
+        lambda self: {
+            "window": {"type": "currentwindow"},
+        },
+    )
+    monkeypatch.setattr(
+        "healthmes.activity.activitywatch.ActivityWatchClient.get_events",
+        lambda self, bucket_id, *, start, end: [
+            {
+                "id": 1,
+                "timestamp": "2026-08-01T10:00:00Z",
+                "duration": 10**10_000,
+                "data": {"app": "Code"},
+            }
+        ],
+    )
+
+    response = client.post(
+        "/v1/activity/activitywatch/import",
+        json={
+            "device_id": "mac-unrepresentable-event",
             "platform": "macos",
             "timezone": "UTC",
             "start_at": "2026-08-01T10:00:00Z",

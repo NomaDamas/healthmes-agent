@@ -206,6 +206,10 @@ MVP는 복잡한 rule engine을 만들지 않고 다음 세 가지 제어만 구
 - 제외 규칙은 source device에서 event 생성 전에 적용한다.
 - 수집기는 OS 활동을 읽기 전에 서버의 최신 collection config를 조회하고,
   응답의 `config_revision`을 ingest payload의 `collection_revision`으로 넣는다.
+  `enabled`, `effective_collecting`, `blocked_reason`, `excluded_apps`,
+  `config_revision`이 없거나 타입이 다르면 config 전체를 거부하고
+  `UsageStats`를 읽지 않는다. 숫자처럼 보이는 문자열도 revision으로 허용하지
+  않는 fail-closed 계약이다.
 - 공개 canonical ingest와 Android legacy ingest는 revision을 생략할 수 없다.
   iOS도 sample을 제출할 때는 revision이 필수다. ActivityWatch adapter는 서버가
   현재 revision을 주입한다.
@@ -214,10 +218,11 @@ MVP는 복잡한 rule engine을 만들지 않고 다음 세 가지 제어만 구
   제출해 provenance를 위조할 수 없다.
 - config revision이 바뀌면 Android 수집기는 이전 revision의 watermark와
   backfill 구간을 버리고 변경 시각부터 새 수집 구간을 시작한다.
-  `collection_generation + config_revision + collection_since + watermark`는
-  하나의 동기식 encrypted preference commit으로 저장하며 실패하면 OS 데이터를
-  읽지 않는다. 따라서 crash가 값의 일부만 남겨 제외·중지 이전 활동을 새
-  설정으로 읽는 일을 막는다.
+  `collection_generation + config_revision + collection_since +
+  collection_timezone + watermark`는 하나의 동기식 encrypted preference
+  commit으로 저장하며 실패하면 OS 데이터를 읽지 않는다. 따라서 crash가 값의
+  일부만 남겨 제외·중지 이전 활동을 새 설정이나 새 timezone으로 읽는 일을
+  막는다.
 - Android의 민감 경계 commit은 먼저 별도 일반 `SharedPreferences`에
   quarantine latch를 동기식으로 arm하고, encrypted state를 commit한 뒤,
   마지막으로 latch를 해제하는 2단계 순서를 따른다. encrypted commit 또는
@@ -509,7 +514,7 @@ agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
 
 ## 14. 엔진 구현 상태
 
-2026-08-09 기준으로 UI를 제외한 이 문서의 MVP 엔진 범위는 구현되어 있다.
+2026-08-10 기준으로 UI를 제외한 이 문서의 MVP 엔진 범위는 구현되어 있다.
 
 - Android, ActivityWatch와 iOS capability 입력은 같은 `WellnessEvent` 저장소를
   사용한다.
@@ -565,6 +570,30 @@ agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
   중단하지 않는다.
 - collection on/off, 앱 제외, pause/resume, permission, queue, coverage와
   capability 상태는 UI 독립 REST 계약으로 제공한다.
+- Android compatibility row와 canonical source identity는
+  `(device, collection_generation, bucket, app)` 경계를 사용한다. 같은 시간
+  bucket 안에서 권한, privacy 설정 또는 timezone이 바뀌어도 이전 generation을
+  덮어쓰지 않고 두 구간을 모두 보존한다. 기존 row는 migration에서 generation
+  `0`으로 이관되고 기존 canonical ID와 tombstone 호환성을 위해 generation
+  `0`의 source ID 형식은 유지한다. 여러 generation을 하나로 합쳐야 하는
+  downgrade는 데이터를 자동 삭제하지 않고 명시적으로 거부한다.
+- Android가 저장한 IANA timezone 이름이 바뀌면 새 generation과 새 summary
+  identity를 만든다. `Asia/Tokyo`와 `Asia/Seoul`처럼 같은 UTC offset을 가진
+  서로 다른 IANA timezone도 named summary에서는 섞지 않는다. 호출자가
+  `UTC+09:00` 같은 fixed-offset `tzinfo`를 직접 쓰는 내부 계약에서만 해당
+  관찰 시각의 offset이 같은 IANA raw event를 호환 조회한다.
+- collection status는 `status_observed_at`을 함께 저장하고 관찰 시각이 더
+  오래된 update를 무시한다. 따라서 네트워크에서 늦게 도착한 iOS `granted`
+  report가 더 최근의 `revoked` 상태를 되돌리지 못한다. 같은 관찰 시각의
+  grant/revoke 충돌은 차단 상태를 우선하며, 서버 시계보다 1분 넘게 미래인
+  public status 시각은 저장 전에 거부한다.
+- 공개 generic canonical ingest의 record/group identity는 source device의
+  opaque namespace로 다시 scope한다. 서로 다른 기기가 같은 source-local ID를
+  사용해도 한 기기의 row가 다른 기기의 row를 덮어쓰지 않는다. migration 전에
+  저장된 unscoped ID가 같은 provider/device에 있으면 해당 ID와 group을 유지해
+  기존 재전송을 중복 row로 만들지 않는다. 이미 삭제되어 row가 없더라도 기존
+  unscoped identity의 영구 tombstone이 있으면 그 ID를 유지해 재전송을 계속
+  억제하고, 다른 기기의 충돌만 새 namespace로 분리한다.
 - 한 provider/device가 같은 시간 구간에 hourly aggregate와 detailed interval을
   함께 보내면 중복 계산을 막기 위해 ingest를 거부한다.
 - ActivityWatch는 최신 호환 bucket을 선택하고 한 번에 최대 7일만 가져온다.
@@ -591,6 +620,8 @@ agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
 - source JSON 또는 window/AFK event 한 행이라도 malformed면 해당 범위를
   빈 authoritative snapshot으로 해석하지 않는다. reconciliation 전에 import
   전체를 중단하고 REST에서는 `502 activitywatch_error`로 반환한다.
+  매우 큰 duration처럼 Python 변환은 통과해도 canonical Pydantic 계약으로
+  표현할 수 없는 값도 같은 오류 경계로 변환하며 HTTP `500`으로 새지 않는다.
 - 같은 source identity가 7일 reconciliation lookback 밖의 날짜로 이동하거나,
   repair가 다른 timezone의 보존 조각을 만들면 ingest 결과의 이전·신규
   date/timezone scope를 모두 모아 summary를 재생성한다. 과거 날짜 summary나
@@ -620,6 +651,9 @@ agent가 따라야 할 질문 routing, 응답 shape와 전문 정책 경계는
   permission 또는 generation이 바뀌면 다음 chunk 전에 pass를 취소하고
   watermark를 전진시키지 않는다. 마지막 chunk 중 경계가 바뀐 경우에도 성공
   응답 뒤 generation을 다시 확인하므로 이전 snapshot을 완료 처리하지 않는다.
+- daily `device_count`는 한 시간의 최대 기기 수가 아니라 그 local day의 모든
+  hourly evidence에 나타난 opaque device namespace의 합집합이다. 서로 다른
+  시간에 활동한 기기도 빠뜨리지 않는다.
 - Activity summary, focus, overwork와 bounded cross-domain resolver는 REST와
   MCP에서 같은 결정론적 엔진을 사용한다.
 - Open Wearables readiness의 freshness는 최상위 필드뿐 아니라

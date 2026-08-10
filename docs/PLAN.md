@@ -123,7 +123,7 @@ agent/device 연결은
 | `calendar_event_mirror` | external_id, calendar_source(google/caldav), start/end, is_agent_created, agent_task_id, etag/sync_token |
 | `schedule_proposal` | task_id, proposed_start/end, status(proposed/accepted/pushed/declined), decision_record_id |
 | `food_log` | logged_at, description(LLM 생성), media_path, meal_type, source |
-| `app_usage_sample` | device_id, bucket_start, app_package, foreground_seconds, launches, category |
+| `app_usage_sample` | device_id, collection_generation, bucket_start, app_package, foreground_seconds, launches, category |
 | `cognitive_energy_estimate` | window_start/end, score(0–100), components JSONB(요인별 기여), inputs_snapshot JSONB |
 | `decision_record` | kind(schedule_change/alert/insight/capture), tree JSONB, summary, llm_model, tokens |
 | `insight` | period, kind, statement, evidence JSONB, confidence |

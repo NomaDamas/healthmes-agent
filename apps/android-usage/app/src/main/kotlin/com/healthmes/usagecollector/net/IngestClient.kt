@@ -34,8 +34,8 @@ data class UploadSample(
  * Plain HttpURLConnection client for the HealthMes ingest endpoint — no HTTP
  * library dependency for one POST. Batches above [MAX_SAMPLES_PER_POST] are
  * chunked (the server caps one batch at 1000 samples); because ingest is an
- * upsert on (device_id, bucket_start, app_package), re-sending after a partial
- * failure is safe.
+ * upsert on (device_id, collection_generation, bucket_start, app_package),
+ * re-sending after a partial failure is safe.
  */
 class IngestClient(private val baseUrl: String, private val token: String?) {
 
@@ -145,30 +145,7 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
                 val body = connection.inputStream.use {
                     it.readBytes().toString(Charsets.UTF_8)
                 }
-                val payload = JSONObject(body)
-                val excluded = payload.optJSONArray("excluded_apps")
-                val excludedApps = buildSet {
-                    if (excluded != null) {
-                        for (index in 0 until excluded.length()) {
-                            excluded.optString(index)
-                                .trim()
-                                .takeIf { it.isNotEmpty() }
-                                ?.let(::add)
-                        }
-                    }
-                }
-                ConfigOutcome.Success(
-                    CollectionConfig(
-                        enabled = payload.optBoolean("enabled", true),
-                        effectiveCollecting =
-                            payload.optBoolean("effective_collecting", false),
-                        blockedReason =
-                            payload.optString("blocked_reason")
-                                .takeIf { it.isNotBlank() && it != "null" },
-                        excludedApps = excludedApps,
-                        configRevision = payload.optInt("config_revision", 0),
-                    ),
-                )
+                ConfigOutcome.Success(parseCollectionConfig(body))
             }
 
             code == 408 || code == 425 || code == 429 || code >= 500 ->
@@ -188,6 +165,7 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
         samples: List<UploadSample>,
         timezone: String,
         collectionRevision: Int,
+        collectionGeneration: Long,
         shouldContinue: () -> Boolean = { true },
     ): Outcome {
         val endpoint = endpointOrNull(ENDPOINT_PATH)
@@ -210,6 +188,7 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
                     chunk,
                     timezone,
                     collectionRevision,
+                    collectionGeneration,
                 )
             ) {
                 is Outcome.Success -> ChunkUploadResult.Success
@@ -255,11 +234,13 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
         chunk: List<UploadSample>,
         timezone: String,
         collectionRevision: Int,
+        collectionGeneration: Long,
     ): Outcome {
         val payload = JSONObject()
             .put("device_id", deviceId)
             .put("timezone", timezone)
             .put("collection_revision", collectionRevision)
+            .put("collection_generation", collectionGeneration)
             .put(
                 "samples",
                 JSONArray().apply {
@@ -358,4 +339,69 @@ class IngestClient(private val baseUrl: String, private val token: String?) {
         const val CONNECT_TIMEOUT_MS = 15_000
         const val READ_TIMEOUT_MS = 30_000
     }
+}
+
+internal fun parseCollectionConfig(body: String): CollectionConfig {
+    val payload = JSONObject(body)
+
+    fun requiredBoolean(key: String): Boolean {
+        if (!payload.has(key)) {
+            throw IllegalArgumentException("missing $key")
+        }
+        return payload.get(key) as? Boolean
+            ?: throw IllegalArgumentException("$key must be a boolean")
+    }
+
+    val blockedReason = when {
+        !payload.has("blocked_reason") ->
+            throw IllegalArgumentException("missing blocked_reason")
+        payload.isNull("blocked_reason") -> null
+        payload.get("blocked_reason") is String ->
+            (payload.get("blocked_reason") as String)
+                .takeIf { it.isNotBlank() }
+                ?: throw IllegalArgumentException(
+                    "blocked_reason must be non-empty or null",
+                )
+        else -> throw IllegalArgumentException(
+            "blocked_reason must be a string or null",
+        )
+    }
+
+    val excluded = payload.opt("excluded_apps") as? JSONArray
+        ?: throw IllegalArgumentException("excluded_apps must be an array")
+    val excludedApps = buildSet {
+        for (index in 0 until excluded.length()) {
+            val value = excluded.get(index) as? String
+                ?: throw IllegalArgumentException(
+                    "excluded_apps must contain only strings",
+                )
+            value.trim()
+                .takeIf { it.isNotEmpty() }
+                ?.let(::add)
+                ?: throw IllegalArgumentException(
+                    "excluded_apps must not contain blank strings",
+                )
+        }
+    }
+
+    if (!payload.has("config_revision")) {
+        throw IllegalArgumentException("missing config_revision")
+    }
+    val configRevision = when (val revision = payload.get("config_revision")) {
+        is Int -> revision.takeIf { it >= 0 }
+        is Long -> revision
+            .takeIf { it in 0..Int.MAX_VALUE.toLong() }
+            ?.toInt()
+        else -> null
+    } ?: throw IllegalArgumentException(
+        "config_revision must be a non-negative 32-bit integer",
+    )
+
+    return CollectionConfig(
+        enabled = requiredBoolean("enabled"),
+        effectiveCollecting = requiredBoolean("effective_collecting"),
+        blockedReason = blockedReason,
+        excludedApps = excludedApps,
+        configRevision = configRevision,
+    )
 }

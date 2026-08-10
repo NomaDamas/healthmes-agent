@@ -4,8 +4,9 @@ The companion app (``apps/android-usage/``) buckets
 ``UsageStatsManager.queryEvents`` output into hourly buckets and POSTs the
 batch every ~30 minutes via WorkManager. Because the current (still-growing)
 hour is re-sent on every run, ingest is an **upsert** on the natural key
-``(device_id, bucket_start, app_package)`` — matching the store's unique
-constraint — with last-write-wins values.
+``(device_id, collection_generation, bucket_start, app_package)`` — matching
+the store's unique constraint — with last-write-wins values inside one
+privacy-safe collection window.
 """
 
 from fastapi import APIRouter, Request
@@ -56,6 +57,7 @@ class AppUsageBatchIn(BaseModel):
     device_id: str = Field(min_length=1, max_length=64)
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
     collection_revision: int = Field(ge=0)
+    collection_generation: int = Field(ge=0, le=2**63 - 1)
     samples: list[AppUsageSampleIn] = Field(min_length=1, max_length=MAX_BATCH_SAMPLES)
 
     @field_validator("timezone")
@@ -96,6 +98,7 @@ def ingest_batch(
             samples=samples,
             timezone=timezone,
             collection_revision=body.collection_revision,
+            collection_generation=body.collection_generation,
         )
         try:
             filtered, excluded, tombstoned, _ = prepare_activity_batch(
@@ -117,6 +120,7 @@ def ingest_batch(
                         body.device_id,
                         sample.bucket_start,
                         sample.app_package,
+                        body.collection_generation,
                     )
                 ],
             )
@@ -125,6 +129,7 @@ def ingest_batch(
                 body.device_id,
                 sample.bucket_start,
                 sample.app_package,
+                body.collection_generation,
             )
             in allowed_records
         ]
@@ -137,6 +142,8 @@ def ingest_batch(
                         select(AppUsageSample)
                         .where(
                             AppUsageSample.device_id == body.device_id,
+                            AppUsageSample.collection_generation
+                            == body.collection_generation,
                             AppUsageSample.bucket_start
                             == sample.bucket_start,
                             AppUsageSample.app_package
@@ -147,6 +154,7 @@ def ingest_batch(
                     if existing is None:
                         row = AppUsageSample(
                             device_id=body.device_id,
+                            collection_generation=body.collection_generation,
                             bucket_start=sample.bucket_start,
                             app_package=sample.app_package,
                             foreground_seconds=sample.foreground_seconds,
@@ -165,6 +173,8 @@ def ingest_batch(
                                 .where(
                                     AppUsageSample.device_id
                                     == body.device_id,
+                                    AppUsageSample.collection_generation
+                                    == body.collection_generation,
                                     AppUsageSample.bucket_start
                                     == sample.bucket_start,
                                     AppUsageSample.app_package

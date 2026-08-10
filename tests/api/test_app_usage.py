@@ -12,6 +12,7 @@ def _batch(samples):
     return {
         "device_id": "pixel-8-test",
         "collection_revision": 0,
+        "collection_generation": 0,
         "samples": samples,
     }
 
@@ -109,6 +110,7 @@ def test_batch_ingest_same_bucket_different_devices_kept_apart(client, session):
         json={
             "device_id": "tab-s9-test",
             "collection_revision": 0,
+            "collection_generation": 0,
             "samples": [SAMPLE_SLACK],
         },
     )
@@ -167,6 +169,135 @@ def test_batch_ingest_requires_collection_revision(client):
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_batch_ingest_requires_collection_generation(client):
+    payload = _batch([SAMPLE_SLACK])
+    payload.pop("collection_generation")
+
+    response = client.post("/v1/app-usage/batch", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_same_hour_privacy_generations_are_preserved(client, session):
+    before_boundary = {
+        **SAMPLE_SLACK,
+        "foreground_seconds": 40 * 60,
+        "launches": 4,
+    }
+    after_boundary = {
+        **SAMPLE_SLACK,
+        "foreground_seconds": 10 * 60,
+        "launches": 1,
+    }
+
+    first = client.post(
+        "/v1/app-usage/batch",
+        json={
+            **_batch([before_boundary]),
+            "collection_generation": 7,
+        },
+    )
+    second = client.post(
+        "/v1/app-usage/batch",
+        json={
+            **_batch([after_boundary]),
+            "collection_generation": 8,
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    rows = list(
+        session.scalars(
+            select(AppUsageSample).order_by(
+                AppUsageSample.collection_generation
+            )
+        )
+    )
+    assert [
+        (row.collection_generation, row.foreground_seconds)
+        for row in rows
+    ] == [(7, 2400), (8, 600)]
+    canonical = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+    )
+    assert len(canonical) == 2
+    daily = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == DAY_SUMMARY_EVENT
+        )
+    )
+    assert daily is not None
+    assert daily.payload["total_active_minutes"] == 50.0
+
+
+def test_timezone_change_keeps_collection_windows_in_separate_summaries(
+    client,
+    session,
+):
+    first = client.post(
+        "/v1/app-usage/batch",
+        json={
+            **_batch(
+                [
+                    {
+                        **SAMPLE_SLACK,
+                        "foreground_seconds": 30 * 60,
+                    }
+                ]
+            ),
+            "timezone": "Asia/Tokyo",
+            "collection_generation": 9,
+        },
+    )
+    second = client.post(
+        "/v1/app-usage/batch",
+        json={
+            **_batch(
+                [
+                    {
+                        **SAMPLE_SLACK,
+                        "foreground_seconds": 10 * 60,
+                    }
+                ]
+            ),
+            "timezone": "Asia/Seoul",
+            "collection_generation": 10,
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    raw = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+    )
+    assert {row.timezone for row in raw} == {
+        "Asia/Tokyo",
+        "Asia/Seoul",
+    }
+    summaries = {
+        row.timezone: row.payload["total_active_minutes"]
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT
+            )
+        )
+    }
+    assert summaries == {
+        "Asia/Tokyo": 30.0,
+        "Asia/Seoul": 10.0,
+    }
 
 
 def test_batch_ingest_rejects_future_sample_without_persisting(client, session):

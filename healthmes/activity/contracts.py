@@ -226,6 +226,7 @@ class ActivityCollectionStatusUpdate(BaseModel):
     capability: ActivityCapability | None = None
     permission_status: ActivityPermissionStatus | None = None
     status_reason: str | None = Field(default=None, max_length=255)
+    status_observed_at: AwareDatetime | None = None
     last_collected_at: AwareDatetime | None = None
     last_uploaded_at: AwareDatetime | None = None
     queue_oldest_at: AwareDatetime | None = None
@@ -236,6 +237,7 @@ class ActivityCollectionStatusUpdate(BaseModel):
         "last_collected_at",
         "last_uploaded_at",
         "queue_oldest_at",
+        "status_observed_at",
         mode="after",
     )
     @classmethod
@@ -269,6 +271,7 @@ class ActivityCollectionOut(BaseModel):
     permission_status: ActivityPermissionStatus
     capability: ActivityCapability
     status_reason: str | None
+    status_observed_at: datetime | None
     last_collected_at: datetime | None
     last_uploaded_at: datetime | None
     queue_oldest_at: datetime | None

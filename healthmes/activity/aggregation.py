@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -145,6 +145,7 @@ def _query_raw_events(
     *,
     start: datetime,
     end: datetime,
+    timezone: str | tzinfo,
     now: datetime | None = None,
 ) -> list[WellnessEvent]:
     # Intervals are capped at 24 hours by the ingest contract; the pad catches
@@ -160,7 +161,29 @@ def _query_raw_events(
             .order_by(WellnessEvent.observed_at, WellnessEvent.id)
         )
     )
-    return [row for row in rows if not event_is_expired(row, now=now)]
+    requested_name = timezone_name(timezone)
+    requested_zone = ZoneInfo(timezone) if isinstance(timezone, str) else timezone
+    allow_offset_alias = not isinstance(timezone, str)
+    matching = []
+    for row in rows:
+        if event_is_expired(row, now=now) or row.timezone is None:
+            continue
+        if row.timezone == requested_name:
+            matching.append(row)
+            continue
+        if not allow_offset_alias:
+            continue
+        try:
+            source_zone = ZoneInfo(row.timezone)
+        except (ValueError, ZoneInfoNotFoundError):
+            continue
+        observed = as_utc(row.observed_at)
+        if (
+            observed.astimezone(source_zone).utcoffset()
+            == observed.astimezone(requested_zone).utcoffset()
+        ):
+            matching.append(row)
+    return matching
 
 
 def _overlap_fraction(
@@ -468,6 +491,7 @@ def summarize_window(
         "_evidence_event_ids": sorted(
             {event_id for row in devices for event_id in row.evidence_ids}
         ),
+        "_device_keys": sorted(row.device_key for row in devices),
         "_active_spans": [
             (span_start.isoformat(), span_end.isoformat()) for span_start, span_end in precise_spans
         ],
@@ -596,7 +620,13 @@ def rebuild_day_summaries(
     name = timezone_name(timezone)
     start, end = local_day_bounds(day, timezone)
     policies = ensure_activity_policies(session)
-    events = _query_raw_events(session, start=start, end=end, now=now)
+    events = _query_raw_events(
+        session,
+        start=start,
+        end=end,
+        timezone=timezone,
+        now=now,
+    )
     existing_day = session.scalar(
         select(WellnessEvent).where(
             WellnessEvent.source_provider == SUMMARY_PROVIDER,
@@ -632,6 +662,7 @@ def rebuild_day_summaries(
     all_evidence: set[str] = set()
     hour_payloads: list[dict[str, Any]] = []
     active_spans: list[tuple[datetime, datetime]] = []
+    day_device_keys: set[str] = set()
     for hour_start, hour_end in _hour_windows(start, end):
         payload = summarize_window(
             events,
@@ -642,6 +673,7 @@ def rebuild_day_summaries(
         if payload["status"] != "ok":
             continue
         evidence = sorted(set(payload.pop("_evidence_event_ids")))
+        day_device_keys.update(payload.pop("_device_keys", []))
         active_spans.extend(
             (datetime.fromisoformat(span_start), datetime.fromisoformat(span_end))
             for span_start, span_end in payload.pop("_active_spans", [])
@@ -772,7 +804,7 @@ def rebuild_day_summaries(
             "expected_seconds": day_expected_seconds,
             "hours_with_data": len(hour_payloads),
         },
-        "device_count": max(int(value["device_count"]) for value in hour_payloads),
+        "device_count": len(day_device_keys),
         "platforms": sorted(
             {platform for value in hour_payloads for platform in value["platforms"]}
         ),
@@ -869,7 +901,13 @@ def summary_raw_provenance_complete(
 ) -> bool:
     name = timezone_name(timezone)
     start, end = local_day_bounds(day, timezone)
-    events = _query_raw_events(session, start=start, end=end, now=now)
+    events = _query_raw_events(
+        session,
+        start=start,
+        end=end,
+        timezone=timezone,
+        now=now,
+    )
     daily = _daily_summary_event(session, day=day, timezone=timezone)
     if daily is not None and not event_is_expired(daily, now=now):
         probe = summarize_window(
@@ -1001,6 +1039,7 @@ def raw_window_summary(
         session,
         start=as_utc(start),
         end=as_utc(end),
+        timezone=timezone,
         now=now,
     )
     summary = summarize_window(

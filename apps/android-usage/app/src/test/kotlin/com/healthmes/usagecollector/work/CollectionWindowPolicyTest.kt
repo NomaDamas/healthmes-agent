@@ -61,6 +61,28 @@ class CollectionWindowPolicyTest {
     }
 
     @Test
+    fun `timezone change requires a new collection boundary`() {
+        assertTrue(
+            timezoneBoundaryRequired(
+                storedTimezone = "America/Los_Angeles",
+                currentTimezone = "Asia/Seoul",
+            )
+        )
+        assertTrue(
+            timezoneBoundaryRequired(
+                storedTimezone = null,
+                currentTimezone = "UTC",
+            )
+        )
+        assertFalse(
+            timezoneBoundaryRequired(
+                storedTimezone = "UTC",
+                currentTimezone = "UTC",
+            )
+        )
+    }
+
+    @Test
     fun `privacy state is committed only behind an armed durable quarantine`() {
         val calls = mutableListOf<String>()
 

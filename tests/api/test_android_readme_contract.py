@@ -73,6 +73,7 @@ def test_readme_payload_round_trips_through_ingest(client, session, payload):
     for row in rows:
         sample = documented[(_as_utc(row.bucket_start), row.app_package)]
         assert row.device_id == payload["device_id"]
+        assert row.collection_generation == payload["collection_generation"]
         assert row.foreground_seconds == sample["foreground_seconds"]
         assert row.launches == sample["launches"]
         assert row.category == sample["category"]
@@ -101,6 +102,8 @@ def test_readme_payload_matches_collector_invariants(payload):
     assert payload["device_id"].startswith("android-")
     assert isinstance(payload["collection_revision"], int)
     assert payload["collection_revision"] >= 0
+    assert isinstance(payload["collection_generation"], int)
+    assert payload["collection_generation"] >= 0
     assert isinstance(payload["timezone"], str)
     for sample in payload["samples"]:
         # Top-of-hour UTC instants with a Z suffix (java.time.Instant.toString()).

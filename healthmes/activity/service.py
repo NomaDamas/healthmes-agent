@@ -352,6 +352,7 @@ def ingest_activity_batch(
                     capability=filtered.capability,
                     permission_status=ActivityPermissionStatus.GRANTED,
                     status_reason=None,
+                    status_observed_at=filtered.collected_at,
                     last_collected_at=filtered.collected_at,
                     last_uploaded_at=current,
                     queue_depth=0,

@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -237,12 +238,10 @@ def _event_span(
         raise ActivityWatchError(
             f"ActivityWatch {event_kind} event is malformed"
         )
-    duration_seconds = float(duration)
-    if not isfinite(duration_seconds) or duration_seconds <= 0:
-        raise ActivityWatchError(
-            f"ActivityWatch {event_kind} event is malformed"
-        )
     try:
+        duration_seconds = float(duration)
+        if not isfinite(duration_seconds) or duration_seconds <= 0:
+            raise ValueError
         parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             raise ValueError
@@ -259,6 +258,15 @@ def _event_span(
             f"{timestamp}|{sorted(safe_data.items())}".encode()
         ).hexdigest()[:24]
     return AWSpan(str(raw_id), start, end, safe_data)
+
+
+def _normalized_interval_record(**values: Any) -> AppIntervalRecord:
+    try:
+        return AppIntervalRecord(**values)
+    except (OverflowError, ValidationError, ValueError) as exc:
+        raise ActivityWatchError(
+            "ActivityWatch event cannot be represented by the canonical contract"
+        ) from exc
 
 
 def _window_spans(events: list[dict[str, Any]]) -> list[AWSpan]:
@@ -410,7 +418,7 @@ def normalize_activitywatch_events(
                 ).encode()
             ).hexdigest()[:32]
             records.append(
-                AppIntervalRecord(
+                _normalized_interval_record(
                     source_record_id=scoped_source_record_id(
                         prefix="window",
                         device_id=device_id,
@@ -445,7 +453,7 @@ def normalize_activitywatch_events(
                 f"{afk_bucket_id}|{span.event_id}".encode()
             ).hexdigest()[:32]
             records.append(
-                AppIntervalRecord(
+                _normalized_interval_record(
                     source_record_id=scoped_source_record_id(
                         prefix="afk",
                         device_id=device_id,
@@ -1030,6 +1038,7 @@ def import_activitywatch(
                     if not accepted_source_records
                     else None
                 ),
+                status_observed_at=current,
                 last_collected_at=max(
                     end,
                     parse_optional_datetime(state.get("last_collected_at"))

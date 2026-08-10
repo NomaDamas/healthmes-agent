@@ -50,14 +50,23 @@ def android_source_record_id(
     device_id: str,
     bucket_start: datetime,
     app_package: str,
+    collection_generation: int = 0,
 ) -> str:
+    if collection_generation < 0:
+        raise ValueError("collection_generation must be non-negative")
     normalized = (
         bucket_start.replace(tzinfo=UTC)
         if bucket_start.tzinfo is None
         else bucket_start.astimezone(UTC)
     )
     package_digest = hashlib.sha256(app_package.encode("utf-8")).hexdigest()[:24]
-    return f"hour:{device_namespace(device_id)}:{normalized.isoformat()}:{package_digest}"
+    generation_segment = (
+        "" if collection_generation == 0 else f"{collection_generation}:"
+    )
+    return (
+        f"hour:{device_namespace(device_id)}:{generation_segment}"
+        f"{normalized.isoformat()}:{package_digest}"
+    )
 
 
 def android_batch(
@@ -67,6 +76,7 @@ def android_batch(
     timezone: str,
     collected_at: datetime | None = None,
     collection_revision: int | None = None,
+    collection_generation: int = 0,
 ) -> ActivityBatchIn:
     return ActivityBatchIn(
         source_provider=ANDROID_PROVIDER,
@@ -82,6 +92,13 @@ def android_batch(
                     device_id,
                     sample.bucket_start,
                     sample.app_package,
+                    int(
+                        getattr(
+                            sample,
+                            "collection_generation",
+                            collection_generation,
+                        )
+                    ),
                 ),
                 bucket_start=(
                     sample.bucket_start.replace(tzinfo=UTC)
@@ -110,6 +127,7 @@ def ingest_android_samples(
     timezone: str,
     collected_at: datetime | None = None,
     collection_revision: int | None = None,
+    collection_generation: int = 0,
     already_filtered: bool = False,
     excluded_count: int = 0,
     tombstoned_count: int = 0,
@@ -124,6 +142,7 @@ def ingest_android_samples(
             timezone=timezone,
             collected_at=collected_at,
             collection_revision=collection_revision,
+            collection_generation=collection_generation,
         ),
         allow_replace=True,
         already_filtered=already_filtered,
@@ -164,6 +183,7 @@ def backfill_android_canonical_events(
                     row.device_id,
                     row.bucket_start,
                     row.app_package,
+                    row.collection_generation,
                 )
                 for row in rows
             }
@@ -182,6 +202,7 @@ def backfill_android_canonical_events(
                     row.device_id,
                     row.bucket_start,
                     row.app_package,
+                    row.collection_generation,
                 )
                 not in existing_ids
                 and (
@@ -191,9 +212,17 @@ def backfill_android_canonical_events(
                 )
                 and as_utc(row.bucket_start) <= current + MAX_FUTURE_SKEW
             ]
-            for device_id in sorted({row.device_id for row in eligible_rows}):
+            for device_id, collection_generation in sorted(
+                {
+                    (row.device_id, row.collection_generation)
+                    for row in eligible_rows
+                }
+            ):
                 device_rows = [
-                    row for row in eligible_rows if row.device_id == device_id
+                    row
+                    for row in eligible_rows
+                    if row.device_id == device_id
+                    and row.collection_generation == collection_generation
                 ]
                 try:
                     result = ingest_android_samples(
@@ -202,6 +231,7 @@ def backfill_android_canonical_events(
                         samples=device_rows,
                         timezone=timezone,
                         collected_at=current,
+                        collection_generation=collection_generation,
                         now=current,
                     )
                 except (

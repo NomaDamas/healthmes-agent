@@ -540,6 +540,7 @@ class TestAppUsageSample:
             session,
             AppUsageSample(
                 device_id="pixel-8",
+                collection_generation=3,
                 bucket_start=T0,
                 app_package="com.slack",
                 foreground_seconds=540,
@@ -548,6 +549,7 @@ class TestAppUsageSample:
             ),
         )
         assert sample.device_id == "pixel-8"
+        assert sample.collection_generation == 3
         assert sample.bucket_start == T0
         assert sample.app_package == "com.slack"
         assert sample.foreground_seconds == 540
@@ -561,6 +563,28 @@ class TestAppUsageSample:
         with pytest.raises(IntegrityError):
             session.commit()
         session.rollback()
+
+    def test_same_bucket_is_distinct_across_collection_generations(self, session):
+        session.add(
+            AppUsageSample(
+                device_id="d",
+                collection_generation=1,
+                bucket_start=T0,
+                app_package="a",
+            )
+        )
+        session.add(
+            AppUsageSample(
+                device_id="d",
+                collection_generation=2,
+                bucket_start=T0,
+                app_package="a",
+            )
+        )
+
+        session.commit()
+
+        assert len(session.scalars(select(AppUsageSample)).all()) == 2
 
 
 class TestCognitiveEnergyEstimate:

@@ -21,8 +21,10 @@ import java.time.format.DateTimeFormatter
  *
  * Watermark contract: on success the watermark moves to the *top of the
  * current hour*, so the still-growing hour is recomputed and re-sent on every
- * run — the server upserts on (device_id, bucket_start, app_package) with
- * last-write-wins, which makes every upload idempotent.
+ * run — the server upserts on
+ * (device_id, collection_generation, bucket_start, app_package) with
+ * last-write-wins, which makes every upload idempotent within one collection
+ * window.
  */
 class UploadWorker(appContext: Context, params: WorkerParameters) :
     Worker(appContext, params) {
@@ -68,6 +70,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             return Result.failure()
         }
         val nowMs = System.currentTimeMillis()
+        val currentTimezone = ZoneId.systemDefault().id
         val client = IngestClient(serverUrl, prefs.token)
         if (!permissionGrantedAtStart) {
             return stopForRevokedPermission(prefs, client, nowMs)
@@ -115,6 +118,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                     collectionRevision = config.configRevision,
                     collectionSinceMs = nowMs,
                     watermarkMs = watermark,
+                    collectionTimezone = currentTimezone,
                 )
             ) {
                 return persistenceFailure(
@@ -130,6 +134,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                     collectionRevision = config.configRevision,
                     collectionSinceMs = 0L,
                     watermarkMs = HourlyBucketer.floorToHour(nowMs),
+                    collectionTimezone = currentTimezone,
                 )
             ) {
                 return persistenceFailure(
@@ -149,11 +154,33 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                     collectionRevision = config.configRevision,
                     collectionSinceMs = nowMs,
                     watermarkMs = watermark,
+                    collectionTimezone = currentTimezone,
                 )
             ) {
                 return persistenceFailure(
                     prefs,
                     "Collection stopped: initial boundary persistence failed (${stamp()}).",
+                )
+            }
+            collectionState = prefs.collectionWindowState()
+        }
+        if (
+            timezoneBoundaryRequired(
+                storedTimezone = collectionState.collectionTimezone,
+                currentTimezone = currentTimezone,
+            )
+        ) {
+            if (
+                !prefs.persistCollectionWindow(
+                    collectionRevision = config.configRevision,
+                    collectionSinceMs = nowMs,
+                    watermarkMs = HourlyBucketer.floorToHour(nowMs),
+                    collectionTimezone = currentTimezone,
+                )
+            ) {
+                return persistenceFailure(
+                    prefs,
+                    "Collection stopped: timezone boundary persistence failed (${stamp()}).",
                 )
             }
             collectionState = prefs.collectionWindowState()
@@ -230,8 +257,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         val outcome = client.postBatch(
             prefs.deviceId,
             samples,
-            ZoneId.systemDefault().id,
+            collectionState.collectionTimezone ?: currentTimezone,
             config.configRevision,
+            collectionState.collectionGeneration,
             shouldContinue = {
                 UsageAccess.isGranted(context) &&
                     prefs.collectionWindowIsCurrent(

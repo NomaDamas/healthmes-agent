@@ -15,6 +15,7 @@ from healthmes.activity.activitywatch import (
 from healthmes.activity.android import (
     android_source_record_id,
     backfill_android_canonical_events,
+    ingest_android_samples,
 )
 from healthmes.activity.contracts import (
     ActivityCollectionUpdate,
@@ -118,6 +119,12 @@ def test_activitywatch_client_translates_malformed_json() -> None:
             "id": 1,
             "timestamp": "2026-08-01T10:00:00Z",
             "duration": "bad",
+            "data": {"app": "Code"},
+        },
+        {
+            "id": 1,
+            "timestamp": "2026-08-01T10:00:00Z",
+            "duration": 10**10_000,
             "data": {"app": "Code"},
         },
         {
@@ -285,9 +292,18 @@ def test_android_source_identity_is_stable_and_device_scoped() -> None:
     first = android_source_record_id("pixel-1", bucket, "com.example.app")
     repeated = android_source_record_id("pixel-1", bucket, "com.example.app")
     other_device = android_source_record_id("pixel-2", bucket, "com.example.app")
+    other_generation = android_source_record_id(
+        "pixel-1",
+        bucket,
+        "com.example.app",
+        1,
+    )
 
     assert first == repeated
     assert first != other_device
+    assert first != other_generation
+    assert ":0:" not in first
+    assert ":1:" in other_generation
     assert "pixel-1" not in first
     assert "com.example.app" not in first
 
@@ -1667,6 +1683,49 @@ def test_android_backfill_pages_all_rows_and_accepts_sqlite_naive_times(
     )
     assert daily is not None
     assert daily.payload["total_active_minutes"] == 25.0
+
+
+def test_android_generation_zero_backfill_reuses_legacy_canonical_identity(
+    session,
+) -> None:
+    sample = AppUsageSample(
+        device_id="pixel-generation-zero",
+        collection_generation=0,
+        bucket_start=datetime(2026, 8, 1, 10),
+        app_package="com.example.editor",
+        foreground_seconds=600,
+        launches=1,
+        category="productivity",
+    )
+    initial = ingest_android_samples(
+        session,
+        device_id=sample.device_id,
+        samples=[sample],
+        timezone="UTC",
+        collected_at=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        collection_generation=0,
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    session.add(sample)
+    session.flush()
+
+    backfill = backfill_android_canonical_events(
+        session,
+        timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+    raw = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+    )
+
+    assert initial.response.created == 1
+    assert backfill is not None
+    assert backfill.response.created == 0
+    assert len(raw) == 1
 
 
 def test_android_backfill_skips_incomplete_summary_provenance(session) -> None:
