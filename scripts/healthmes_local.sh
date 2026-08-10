@@ -107,6 +107,8 @@ start_open_wearables() {
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         listener_pid="$(open_wearables_listener_pid)"
         if [ -n "$listener_pid" ]; then
+            open_wearables_listener_is_managed "$listener_pid" \
+                || die "Open Wearables port ${API_PORT:-8000} is already owned by pid $listener_pid"
             printf '%s\n' "$listener_pid" >"$OW_PID"
             info "Open Wearables listener adopted (pid $listener_pid)"
             return
