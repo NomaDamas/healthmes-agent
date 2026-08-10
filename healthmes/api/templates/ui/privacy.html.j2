@@ -1,0 +1,23 @@
+{% extends "ui/_base.html.j2" %}
+
+{% block title %}HealthMes Privacy Policy{% endblock %}
+
+{% block content %}
+<section class="card" aria-labelledby="privacy-title">
+  <p class="eyebrow">HealthMes · Local developer build</p>
+  <h1 id="privacy-title">Privacy Policy</h1>
+  <p>Effective date: 2026-08-10</p>
+
+  <h2>What HealthMes reads</h2>
+  <p>When you authorize WHOOP, HealthMes reads only the scopes you approve: sleep, recovery, cycles, workouts, and profile. OAuth credentials and resulting health records are stored in your local HealthMes instance.</p>
+
+  <h2>How HealthMes uses data</h2>
+  <p>HealthMes uses the records to show health context and prepare local planning suggestions. Calendar changes are made only after an explicit local approval. HealthMes does not sell health data or use it for advertising.</p>
+
+  <h2>Storage, sharing, and control</h2>
+  <p>Data remains on the local instance unless you explicitly configure an optional encrypted backup or approve a calendar update. You can revoke WHOOP access in WHOOP, and you can delete locally stored records by removing the local HealthMes data.</p>
+
+  <h2>Contact</h2>
+  <p>For this developer build, open an issue in the HealthMes repository.</p>
+</section>
+{% endblock %}

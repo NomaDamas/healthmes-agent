@@ -56,7 +56,7 @@ __all__ = [
 # "/" is the static landing shell — it renders links only (no data, no
 # credentials in markup; healthmes/api/decisions.py::landing), so exposing it
 # leaks nothing while giving humans an entry point on the public host.
-OPEN_PATHS = frozenset({"/health", "/"})
+OPEN_PATHS = frozenset({"/health", "/", "/privacy"})
 
 # Path prefixes of the human-facing viewer surface that may authenticate via
 # the derived ?token= query credential (browser links cannot carry headers).
