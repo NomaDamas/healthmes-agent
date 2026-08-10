@@ -128,7 +128,7 @@ start_open_wearables() {
 }
 
 stop_process() {
-    local name=$1 pid_file=$2 pid child process_pid still_running
+    local name=$1 pid_file=$2 expected_pid=${3:-} pid child process_pid still_running
     local -a pids
     if ! pid_running "$pid_file"; then
         rm -f "$pid_file"
@@ -136,6 +136,11 @@ stop_process() {
         return
     fi
     pid="$(<"$pid_file")"
+    if [ -n "$expected_pid" ] && [ "$pid" != "$expected_pid" ]; then
+        rm -f "$pid_file"
+        info "$name stopped without terminating a replaced pid"
+        return
+    fi
     pids=("$pid")
     while read -r child; do
         [ -n "$child" ] && pids+=("$child")
@@ -169,7 +174,7 @@ stop_open_wearables() {
             return
         fi
     fi
-    stop_process "Open Wearables" "$OW_PID"
+    stop_process "Open Wearables" "$OW_PID" "$pid"
 }
 
 load_runtime_env() {
