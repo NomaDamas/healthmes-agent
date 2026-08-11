@@ -891,6 +891,7 @@ def personal_baseline_delta(
     current_minutes: float,
     lookback_days: int,
     now: datetime | None = None,
+    include_evidence_ids: bool = False,
 ) -> dict[str, Any]:
     if not 1 <= lookback_days <= 90:
         raise ValueError("lookback_days must be between 1 and 90")
@@ -908,6 +909,7 @@ def personal_baseline_delta(
         )
     )
     values: list[float] = []
+    evidence_ids: list[str] = []
     for row in rows:
         raw_date = row.payload.get("date")
         if row.payload.get("timezone") != name or not isinstance(raw_date, str):
@@ -930,17 +932,21 @@ def personal_baseline_delta(
             and float(coverage) >= MIN_BASELINE_COVERAGE
         ):
             values.append(float(row.payload.get("total_active_minutes", 0)))
+            evidence_ids.append(str(row.id))
     required_days = min(MIN_BASELINE_DAYS, lookback_days)
     if len(values) < required_days:
-        return {
+        result = {
             "status": "insufficient_data",
             "days_with_data": len(values),
             "required_days": required_days,
             "lookback_days": lookback_days,
         }
+        if include_evidence_ids:
+            result["evidence_ids"] = evidence_ids
+        return result
     baseline = sum(values) / len(values)
     delta = current_minutes - baseline
-    return {
+    result = {
         "status": "ok",
         "days_with_data": len(values),
         "lookback_days": lookback_days,
@@ -948,6 +954,9 @@ def personal_baseline_delta(
         "delta_minutes": round(delta, 2),
         "delta_percent": round(delta / baseline * 100, 1) if baseline > 0 else None,
     }
+    if include_evidence_ids:
+        result["evidence_ids"] = evidence_ids
+    return result
 
 
 def rebuild_day_summaries(

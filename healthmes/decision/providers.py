@@ -36,8 +36,19 @@ class ContextCapability(BaseModel):
     granularities: tuple[str, ...] = Field(min_length=1, max_length=16)
     query_fields: tuple[str, ...] = Field(default=(), max_length=32)
     output_fields: tuple[str, ...] = Field(default=(), max_length=128)
+    nested_output_fields: tuple[str, ...] = Field(
+        default=(),
+        max_length=256,
+    )
+    identity_fields: tuple[str, ...] = Field(default=(), max_length=128)
+    raw_fields: tuple[str, ...] = Field(default=(), max_length=128)
+    limit_output_fields: tuple[str, ...] = Field(default=(), max_length=16)
+    limitation_codes: tuple[str, ...] = Field(default=(), max_length=128)
     parameters: tuple[str, ...] = Field(default=(), max_length=32)
     max_lookback_days: int = Field(ge=1, le=90)
+    default_lookback_days: int = Field(default=1, ge=1, le=90)
+    lookback_parameter: str | None = None
+    lookback_parameter_offset_days: int = Field(default=0, ge=0, le=1)
     privacy_levels: tuple[PrivacyLevel, ...] = Field(
         default=(PrivacyLevel.AGGREGATE,),
         min_length=1,
@@ -45,6 +56,7 @@ class ContextCapability(BaseModel):
     )
     sensitivity: str = Field(min_length=1, max_length=64)
     supports_raw: bool = False
+    allows_future: bool = False
     provenance: ProvenanceSupport = ProvenanceSupport.STABLE
     freshness_expectation: str = Field(min_length=1, max_length=255)
 
@@ -53,11 +65,20 @@ class ContextCapability(BaseModel):
         "granularities",
         "query_fields",
         "output_fields",
+        "nested_output_fields",
+        "identity_fields",
+        "raw_fields",
+        "limit_output_fields",
+        "limitation_codes",
         "parameters",
         "sensitivity",
+        "lookback_parameter",
     )
     @classmethod
     def normalize_identifiers(cls, value):
+        if value is None:
+            return None
+
         def normalize(item: str) -> str:
             cleaned = item.strip().casefold()
             if not cleaned:
@@ -94,6 +115,28 @@ class ContextCapability(BaseModel):
         if self.supports_raw and PrivacyLevel.SCOPED_RAW not in self.privacy_levels:
             raise ValueError(
                 "supports_raw capabilities must declare scoped_raw privacy"
+            )
+        if self.default_lookback_days > self.max_lookback_days:
+            raise ValueError(
+                "default_lookback_days cannot exceed max_lookback_days"
+            )
+        if (
+            self.lookback_parameter is not None
+            and self.lookback_parameter not in self.parameters
+        ):
+            raise ValueError(
+                "lookback_parameter must be declared in parameters"
+            )
+        if (
+            self.lookback_parameter_offset_days
+            and self.lookback_parameter is None
+        ):
+            raise ValueError(
+                "lookback_parameter_offset_days requires lookback_parameter"
+            )
+        if not set(self.limit_output_fields).issubset(self.output_fields):
+            raise ValueError(
+                "limit_output_fields must be declared in output_fields"
             )
         return self
 

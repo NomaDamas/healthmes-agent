@@ -44,6 +44,7 @@ from healthmes.timezones import parse_timezone
 
 _ITEMS_ADAPTER = TypeAdapter(tuple[NormalizedIntakeItem, ...])
 _SNAPSHOT_ADAPTER = TypeAdapter(StructuredIntakeSnapshot)
+_SOURCE_EVENT_IDS_KEY = "_source_event_ids"
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -129,6 +130,16 @@ def _interaction_view(
         interaction.source_text or interaction.media_path
     )
     return payload
+
+
+def _with_source_event_ids(
+    record: dict[str, Any],
+    event_ids: list[uuid.UUID],
+) -> dict[str, Any]:
+    record[_SOURCE_EVENT_IDS_KEY] = list(
+        dict.fromkeys(str(value) for value in event_ids)
+    )
+    return record
 
 
 def interaction_view(
@@ -218,14 +229,56 @@ def search_intake_history(
     nutrient: str | None = None,
     query: str | None = None,
     limit: int = 100,
+    max_scan_records: int | None = None,
+    include_source_event_ids: bool = False,
 ) -> dict[str, Any]:
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    if max_scan_records is None:
+        max_scan_records = max(1_000, limit * 20)
+    if max_scan_records < limit:
+        raise ValueError("max_scan_records must be at least limit")
     needle = query.strip().casefold() if query else None
     nutrient_key = nutrient.strip().casefold() if nutrient else None
     selected: list[tuple[float, int, dict[str, Any]]] = []
     represented_ids: set[uuid.UUID] = set()
     matching_records = 0
     scanned_records = 0
+    scanned_event_rows = 0
+    remaining_scan_records = max_scan_records
+    scan_truncated = False
     sequence = 0
+    now = datetime.now(UTC)
+    start_utc = _as_utc(start) if start is not None else None
+    end_utc = _as_utc(end) if end is not None else None
+
+    def bounded_rows(statement) -> list[WellnessEvent]:
+        nonlocal remaining_scan_records, scan_truncated, scanned_event_rows
+        if remaining_scan_records <= 0:
+            scan_truncated = True
+            return []
+        rows = list(
+            session.scalars(
+                statement.limit(remaining_scan_records + 1)
+            )
+        )
+        if len(rows) > remaining_scan_records:
+            scan_truncated = True
+            rows = rows[:remaining_scan_records]
+        remaining_scan_records -= len(rows)
+        scanned_event_rows += len(rows)
+        return rows
+
+    def add_time_bounds(statement):
+        if start_utc is not None:
+            statement = statement.where(
+                WellnessEvent.observed_at >= start_utc
+            )
+        if end_utc is not None:
+            statement = statement.where(
+                WellnessEvent.observed_at < end_utc
+            )
+        return statement
 
     def include_record(record: dict[str, Any]) -> None:
         nonlocal matching_records, sequence
@@ -259,13 +312,13 @@ def search_intake_history(
             WellnessEvent.event_type == INTERACTION_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > now)
             ),
         )
         .order_by(WellnessEvent.observed_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )
-    for event in session.scalars(interaction_statement):
+    for event in bounded_rows(add_time_bounds(interaction_statement)):
         persisted = interaction_from_payload(event.payload)
         interaction = get_interaction(session, persisted.interaction_id)
         if interaction is None:
@@ -274,12 +327,21 @@ def search_intake_history(
         scanned_records += 1
         outcome_entry = latest_outcome(session, interaction.interaction_id)
         decision_entry = latest_decision(session, interaction.interaction_id)
+        record = _interaction_view(
+            interaction,
+            outcome_entry[1] if outcome_entry is not None else None,
+            decision_entry[1] if decision_entry is not None else None,
+        )
+        source_event_ids = [event.id]
+        if outcome_entry is not None:
+            source_event_ids.append(outcome_entry[0].id)
+        if decision_entry is not None:
+            source_event_ids.append(decision_entry[0].id)
+        source_event_ids.extend(
+            _nutrition_source_event_ids(session, record)
+        )
         include_record(
-            _interaction_view(
-                interaction,
-                outcome_entry[1] if outcome_entry is not None else None,
-                decision_entry[1] if decision_entry is not None else None,
-            )
+            _with_source_event_ids(record, source_event_ids)
         )
 
     seen_outcomes: set[uuid.UUID] = set()
@@ -289,13 +351,15 @@ def search_intake_history(
             WellnessEvent.event_type == OUTCOME_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > now)
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )
-    for event in session.scalars(outcome_statement):
+    # Outcome event time is confirmation/consumption time, while the fallback
+    # record is anchored to its retained intake snapshot's observation time.
+    for event in bounded_rows(outcome_statement):
         outcome = outcome_from_payload(event.payload)
         interaction_id = outcome.interaction_id
         if interaction_id in seen_outcomes:
@@ -306,12 +370,19 @@ def search_intake_history(
         represented_ids.add(interaction_id)
         scanned_records += 1
         decision_entry = latest_decision(session, interaction_id)
+        record = _structured_view(
+            outcome.intake_snapshot,
+            outcome,
+            decision_entry[1] if decision_entry is not None else None,
+        )
+        source_event_ids = [event.id]
+        if decision_entry is not None:
+            source_event_ids.append(decision_entry[0].id)
+        source_event_ids.extend(
+            _nutrition_source_event_ids(session, record)
+        )
         include_record(
-            _structured_view(
-                outcome.intake_snapshot,
-                outcome,
-                decision_entry[1] if decision_entry is not None else None,
-            )
+            _with_source_event_ids(record, source_event_ids)
         )
 
     seen_requests: set[uuid.UUID] = set()
@@ -321,13 +392,15 @@ def search_intake_history(
             WellnessEvent.event_type == DECISION_REQUEST_EVENT,
             (
                 WellnessEvent.expires_at.is_(None)
-                | (WellnessEvent.expires_at > datetime.now(UTC))
+                | (WellnessEvent.expires_at > now)
             ),
         )
         .order_by(WellnessEvent.recorded_at.desc(), WellnessEvent.created_at.desc())
         .execution_options(yield_per=200)
     )
-    for event in session.scalars(request_statement):
+    # Request event time is when advice was requested, not when its retained
+    # candidate was observed. include_record applies the authoritative bound.
+    for event in bounded_rows(request_statement):
         request = decision_request_from_payload(event.payload)
         interaction_id = request.interaction_id
         if interaction_id in seen_requests:
@@ -345,22 +418,50 @@ def search_intake_history(
         record["latest_decision"] = _decision_view(
             decision_entry[1] if decision_entry is not None else None
         )
-        include_record(record)
+        source_event_ids = [event.id]
+        if decision_entry is not None:
+            source_event_ids.append(decision_entry[0].id)
+        source_event_ids.extend(
+            _nutrition_source_event_ids(session, record)
+        )
+        include_record(
+            _with_source_event_ids(record, source_event_ids)
+        )
 
     ordered = sorted(selected, key=lambda value: value[:2], reverse=True)
     records = [record for _timestamp, _sequence, record in ordered[:limit]]
-    return {
+    source_event_ids: list[str] = []
+    for record in records:
+        source_event_ids.extend(record.pop(_SOURCE_EVENT_IDS_KEY, []))
+    truncated = matching_records > limit or scan_truncated
+    coverage: dict[str, Any] = {
+        "complete": not truncated,
+        "scanned_records": scanned_records,
+        "matching_records": matching_records,
+        "result_limit": limit,
+    }
+    limitations: list[str] = []
+    if scan_truncated:
+        coverage.update(
+            {
+                "scan_limit": max_scan_records,
+                "scanned_event_rows": scanned_event_rows,
+            }
+        )
+        limitations.append("nutrition_history_scan_limit_reached")
+    result = {
         "status": "ok",
         "count": len(records),
         "records": records,
-        "truncated": matching_records > limit,
-        "coverage": {
-            "complete": matching_records <= limit,
-            "scanned_records": scanned_records,
-            "matching_records": matching_records,
-            "result_limit": limit,
-        },
+        "truncated": truncated,
+        "coverage": coverage,
+        "limitations": limitations,
     }
+    if include_source_event_ids:
+        result["source_event_ids"] = list(
+            dict.fromkeys(source_event_ids)
+        )
+    return result
 
 
 def _confirmed_history(

@@ -494,8 +494,10 @@ def overwork_context(
             current_minutes=total,
             lookback_days=lookback_days,
             now=now,
+            include_evidence_ids=True,
         )
     )
+    baseline_evidence_ids = list(baseline.pop("evidence_ids", []))
     if total >= OVERWORK_TOTAL_MINUTES:
         signals.append(
             {
@@ -601,7 +603,10 @@ def overwork_context(
             "lookback_baseline_delta": baseline,
         },
         "coverage": summary.get("source_coverage"),
-        "evidence_ids": [str(event.id)],
+        "evidence_ids": [
+            str(event.id),
+            *baseline_evidence_ids,
+        ],
         "freshness": {
             "recorded_at": _recorded_at(event.recorded_at),
             "status": "stored_summary",

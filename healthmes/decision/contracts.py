@@ -35,6 +35,24 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _calendar_day_count(
+    start: datetime,
+    end: datetime,
+    *,
+    timezone: str,
+) -> int:
+    zone = parse_timezone(timezone)
+    local_start = start.astimezone(zone).replace(tzinfo=None)
+    local_end = end.astimezone(zone).replace(tzinfo=None)
+    duration = local_end - local_start
+    whole_days = duration.days
+    return max(
+        1,
+        whole_days
+        + (1 if duration > timedelta(days=whole_days) else 0),
+    )
+
+
 def _identifier(value: str, *, label: str, max_length: int = 128) -> str:
     normalized = value.strip().casefold()
     if (
@@ -221,8 +239,6 @@ class DecisionContextHints(BaseModel):
         if self.start is not None and self.end is not None:
             if self.start >= self.end:
                 raise ValueError("start must be before end")
-            if self.end - self.start > timedelta(days=90):
-                raise ValueError("one decision hint range cannot exceed 90 days")
         return self
 
 
@@ -283,6 +299,22 @@ class DecisionRequest(BaseModel):
                 "timezone must be a valid IANA name or UTC offset"
             ) from exc
         return value
+
+    @model_validator(mode="after")
+    def validate_hint_range(self) -> DecisionRequest:
+        if self.hints.start is not None and self.hints.end is not None:
+            if (
+                _calendar_day_count(
+                    self.hints.start,
+                    self.hints.end,
+                    timezone=self.timezone,
+                )
+                > 90
+            ):
+                raise ValueError(
+                    "one decision hint range cannot exceed 90 local days"
+                )
+        return self
 
     @classmethod
     def from_compatibility_preset(
@@ -394,7 +426,14 @@ class ContextQuery(BaseModel):
         if self.start is not None and self.end is not None:
             if self.start >= self.end:
                 raise ValueError("start must be before end")
-            if self.end - self.start > timedelta(days=90):
+            if (
+                _calendar_day_count(
+                    self.start,
+                    self.end,
+                    timezone=self.timezone,
+                )
+                > 90
+            ):
                 raise ValueError("one context query cannot exceed 90 days")
         return self
 
@@ -561,6 +600,32 @@ class SourceRef(BaseModel):
         return self
 
 
+class RawSourceHandle(BaseModel):
+    """Opaque handle for one explicitly selected retained raw object."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_ref_id: str = Field(pattern=_SOURCE_REF_ID.pattern)
+    storage_object_id: uuid.UUID
+    content_type: str | None = Field(default=None, max_length=255)
+    size_bytes: int = Field(ge=0)
+    sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @field_validator("content_type")
+    @classmethod
+    def validate_content_type(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_text(
+            value,
+            label="content_type",
+            max_length=255,
+        )
+
+
 class ContextResult(BaseModel):
     """Policy-ready result returned by a registered context provider."""
 
@@ -572,6 +637,10 @@ class ContextResult(BaseModel):
     status: ContextStatus
     payload: dict[str, JsonValue] = Field(default_factory=dict)
     source_refs: list[SourceRef] = Field(
+        default_factory=list,
+        max_length=MAX_SOURCE_REFS,
+    )
+    raw_sources: list[RawSourceHandle] = Field(
         default_factory=list,
         max_length=MAX_SOURCE_REFS,
     )
@@ -614,15 +683,25 @@ class ContextResult(BaseModel):
         reference_ids = [item.reference_id for item in self.source_refs]
         if len(reference_ids) != len(set(reference_ids)):
             raise ValueError("source_refs must contain unique references")
+        raw_source_ids = [
+            item.storage_object_id for item in self.raw_sources
+        ]
+        if len(raw_source_ids) != len(set(raw_source_ids)):
+            raise ValueError("raw_sources must contain unique objects")
+        if any(
+            item.source_ref_id not in set(reference_ids)
+            for item in self.raw_sources
+        ):
+            raise ValueError("raw_sources must reference returned source_refs")
         if self.status is ContextStatus.DENIED and self.source_refs:
             raise ValueError("denied context must not expose source_refs")
         if self.status in {
             ContextStatus.DENIED,
             ContextStatus.UNAVAILABLE,
             ContextStatus.FAILED,
-        } and self.payload:
+        } and (self.payload or self.raw_sources):
             raise ValueError(
-                "denied, unavailable, or failed context must not expose payload"
+                "denied, unavailable, or failed context must not expose data"
             )
         if self.next_cursor is not None and not self.truncated:
             raise ValueError("next_cursor requires truncated=true")

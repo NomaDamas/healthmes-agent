@@ -21,7 +21,6 @@ from healthmes.activity.context import (
 )
 from healthmes.activity.resolver import (
     _normalize_wearable_context,
-    calendar_context,
 )
 from healthmes.calendars.base import HealthmesEventKind
 from healthmes.decision.contracts import (
@@ -45,7 +44,22 @@ from healthmes.nutrition.intake_query import (
     decision_context as nutrition_decision_context,
 )
 from healthmes.nutrition.intake_query import search_intake_history
+from healthmes.nutrition.intake_service import (
+    DECISION_EVENT,
+    DECISION_REQUEST_EVENT,
+    INTERACTION_EVENT,
+    OUTCOME_EVENT,
+)
 from healthmes.nutrition.query import known_caffeine_for_day
+from healthmes.nutrition.repository import (
+    CONFIRMATION_EVENT,
+    DAILY_CONFIRMATION_EVENT,
+    OBSERVATION_EVENT,
+    REVIEW_EVENT,
+)
+from healthmes.nutrition.repository import (
+    SOURCE_PROVIDER as NUTRITION_OBSERVATION_PROVIDER,
+)
 from healthmes.store import CalendarEventMirror, WellnessEvent
 from healthmes.timezones import parse_timezone
 
@@ -65,6 +79,291 @@ _RAW_KEYS = {
     "raw_bytes",
     "source_text",
 }
+_ACTIVITY_NESTED_FIELDS = (
+    "active_minutes",
+    "active_minutes_upper",
+    "active_time_range",
+    "app_launches_or_switches",
+    "baseline_minutes",
+    "coverage",
+    "days_with_data",
+    "delta_minutes",
+    "delta_percent",
+    "end",
+    "expected_seconds",
+    "hours_with_data",
+    "idle_and_break_minutes",
+    "kind",
+    "known_seconds",
+    "launches_or_switches_per_active_hour",
+    "late_activity_minutes",
+    "late_activity_time_range",
+    "launches",
+    "longest_active_block_minutes",
+    "longest_block",
+    "lookback_baseline_delta",
+    "lower_bound_minutes",
+    "metrics",
+    "precision",
+    "ratio",
+    "required_days",
+    "seven_day_baseline_delta",
+    "signals",
+    "start",
+    "threshold_minutes",
+    "threshold_uncertainties",
+    "total_active_minutes",
+    "timezone",
+    "upper_bound_minutes",
+    "value_minutes",
+    "window",
+)
+_NUTRITION_NESTED_FIELDS = (
+    "amount",
+    "analysis_provenance",
+    "analyzed_at",
+    "boundaries",
+    "caffeine",
+    "candidate",
+    "category",
+    "comparison_candidates",
+    "complete",
+    "confidence",
+    "confirmed_at",
+    "confirmed_caffeine_mg",
+    "confirmed_intake_history",
+    "consumed_at",
+    "consumed_outcome_count",
+    "coverage",
+    "corrected_items",
+    "candidate_is_not_consumed",
+    "caffeine_total_intake_complete",
+    "daily_confirmation_id",
+    "decided_at",
+    "decision_id",
+    "delta",
+    "end",
+    "evidence",
+    "evidence_text",
+    "estimation_basis",
+    "exact",
+    "generic_caffeine_actionable_decisions_forbidden",
+    "history_is_not_complete_day_proof",
+    "history_window",
+    "intake_type",
+    "interaction_id",
+    "intended_consumption_at",
+    "intent",
+    "intake_snapshot",
+    "is_confirmed_intake",
+    "items",
+    "kind",
+    "latest_decision",
+    "latest_outcome",
+    "ledger_entry_count",
+    "limitations",
+    "lookback_days",
+    "local_date",
+    "matching_records",
+    "maximum",
+    "medical_safety_requires_separate_policy",
+    "media_path",
+    "minimum",
+    "modality",
+    "model",
+    "model_digest",
+    "name",
+    "note",
+    "nutrient",
+    "nutrients",
+    "nutrition_observation_id",
+    "nutrition_review_id",
+    "observation_count",
+    "observed_at",
+    "operation_fingerprint",
+    "origin",
+    "outcome_id",
+    "outcome_state_count",
+    "prompt_version",
+    "provider",
+    "query",
+    "question",
+    "raw_capture_available",
+    "recommendation",
+    "recorded_at",
+    "records",
+    "request",
+    "request_id",
+    "requested_at",
+    "reason",
+    "resolved_items",
+    "result_limit",
+    "reviewed_count",
+    "schema_version",
+    "scope",
+    "scanned_latest_outcomes",
+    "scanned_records",
+    "serving",
+    "source",
+    "source_text",
+    "specialized_evidence",
+    "start",
+    "status",
+    "summary",
+    "timezone",
+    "total_intake_complete",
+    "transcription_model",
+    "transcription_provider",
+    "truncated",
+    "unit",
+    "unquantified_observation_ids",
+    "unquantified_outcome_ids",
+    "unreviewed_observation_ids",
+    "warnings",
+)
+_NUTRITION_IDENTITY_FIELDS = (
+    "analysis_provenance",
+    "daily_confirmation_id",
+    "decision_id",
+    "evidence",
+    "evidence_text",
+    "interaction_id",
+    "media_path",
+    "model",
+    "model_digest",
+    "name",
+    "note",
+    "nutrition_observation_id",
+    "nutrition_review_id",
+    "operation_fingerprint",
+    "outcome_id",
+    "provider",
+    "question",
+    "recommendation",
+    "request_id",
+    "source",
+    "source_text",
+    "summary",
+    "transcription_model",
+    "transcription_provider",
+    "unquantified_observation_ids",
+    "unquantified_outcome_ids",
+    "unreviewed_observation_ids",
+    "warnings",
+)
+_NUTRITION_RAW_FIELDS = tuple(sorted(_RAW_KEYS))
+_WEARABLE_NESTED_FIELDS = (
+    "actual_sleep",
+    "baseline_median",
+    "category",
+    "charge",
+    "confidence",
+    "coverage",
+    "current",
+    "date",
+    "delta",
+    "delta_pct",
+    "duration_minutes",
+    "earliest_available_work_time",
+    "entries",
+    "freshest_at",
+    "freshness",
+    "hrv",
+    "index",
+    "last_night",
+    "local_date",
+    "max_avg_heart_rate_bpm",
+    "n_days",
+    "nights_counted",
+    "observed_at",
+    "observed_on",
+    "provider",
+    "qualifier",
+    "ratio",
+    "reason",
+    "recorded_at",
+    "scale",
+    "score",
+    "sleep_debt",
+    "source",
+    "stale_days",
+    "start",
+    "status",
+    "stress",
+    "time_in_bed_minutes",
+    "total_blocks",
+    "total_calories_kcal",
+    "total_minutes",
+    "types",
+    "unit",
+    "usable_blocks",
+    "value",
+    "variant",
+    "wake_time",
+    "window_days",
+    "workouts",
+    "yesterday_load",
+    "z_score",
+)
+_WEARABLE_IDENTITY_FIELDS = ("provider", "source")
+_CALENDAR_NESTED_FIELDS = (
+    "end",
+    "intervals",
+    "start",
+    "timezone",
+    "window",
+    "windows",
+)
+_ACTIVITY_LIMITATION_CODES = (
+    "active_idle_overlap_resolved_active_wins",
+    "coverage_unknown",
+    "cross_device_activity_time_bounded",
+    "cross_device_category_totals_may_overlap",
+    "cross_device_idle_time_unresolved",
+    "exact_focus_blocks_unavailable_for_hourly_sources",
+    "focus_thresholds_blocked_by_cross_device_overlap",
+    "focus_thresholds_blocked_by_partial_hour_uncertainty",
+    "hourly_aggregate_cannot_reconstruct_exact_focus_blocks",
+    "interval_source_takes_precedence_over_hourly_for_device",
+    "legacy_activity_summary_incompatible",
+    "low_source_coverage",
+    "missing_is_not_zero",
+    "overwork_thresholds_blocked_by_cross_device_overlap",
+    "partial_hour_requires_retained_raw_events",
+    "partial_hourly_activity_time_bounded",
+    "partial_hourly_category_totals_bounded",
+    "partial_hourly_launches_bounded",
+    "provisional_hourly_activity",
+    "source_coverage_unknown_for_some_devices",
+    "source_reported_seconds_exceeded_bucket",
+)
+_NUTRITION_LIMITATION_CODES = (
+    "caffeine_day_not_confirmed_complete",
+    "nutrition_history_scan_limit_reached",
+    "nutrition_decision_request_not_found",
+)
+_NUTRITION_EVENT_PROVIDERS = {
+    INTERACTION_EVENT: frozenset({"nutrition-interaction"}),
+    OUTCOME_EVENT: frozenset({"nutrition-intake-outcome"}),
+    DECISION_REQUEST_EVENT: frozenset({"nutrition-decision-request"}),
+    DECISION_EVENT: frozenset({"nutrition-decision"}),
+    OBSERVATION_EVENT: frozenset({NUTRITION_OBSERVATION_PROVIDER}),
+    REVIEW_EVENT: frozenset({"user-nutrition-review"}),
+    CONFIRMATION_EVENT: frozenset({"user-confirmation"}),
+    DAILY_CONFIRMATION_EVENT: frozenset({"user-confirmation"}),
+}
+_NUTRITION_HISTORY_SCAN_MULTIPLIER = 20
+_NUTRITION_HISTORY_MIN_SCAN = 100
+_NUTRITION_HISTORY_MAX_SCAN = 5_000
+_WEARABLE_LIMITATION_CODES = (
+    "open_wearables_context_unavailable",
+    "wearable_readiness_evidence_ids_unavailable",
+    "wearable_source_refs_are_readiness_level",
+)
+_CALENDAR_LIMITATION_CODES = (
+    "calendar_mirror_completeness_unknown",
+    "calendar_titles_omitted",
+)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -72,6 +371,24 @@ def _as_utc(value: datetime) -> datetime:
         value.replace(tzinfo=UTC)
         if value.tzinfo is None
         else value.astimezone(UTC)
+    )
+
+
+def _calendar_day_count(
+    start: datetime,
+    end: datetime,
+    *,
+    timezone: str,
+) -> int:
+    zone = parse_timezone(timezone)
+    local_start = start.astimezone(zone).replace(tzinfo=None)
+    local_end = end.astimezone(zone).replace(tzinfo=None)
+    duration = local_end - local_start
+    whole_days = duration.days
+    return max(
+        1,
+        whole_days
+        + (1 if duration > timedelta(days=whole_days) else 0),
     )
 
 
@@ -259,13 +576,13 @@ def _event_observed_end(event: WellnessEvent) -> datetime | None:
 
 def _event_source_refs(
     session: Session,
-    identifiers: Sequence[Any],
+    event_ids: Sequence[Any],
     *,
     domain: str,
     derived_by: str,
     now: datetime,
 ) -> tuple[list[SourceRef], bool]:
-    raw_ids = [str(value) for value in identifiers if value is not None]
+    raw_ids = [str(value) for value in event_ids if value is not None]
     if not raw_ids:
         return [], True
     uuid_ids: list[uuid.UUID] = []
@@ -274,25 +591,27 @@ def _event_source_refs(
             uuid_ids.append(uuid.UUID(value))
         except ValueError:
             continue
-    conditions = [WellnessEvent.source_record_id.in_(raw_ids)]
-    if uuid_ids:
-        conditions.append(WellnessEvent.id.in_(uuid_ids))
+    if not uuid_ids:
+        return [], False
     rows = list(
         session.scalars(
-            select(WellnessEvent).where(or_(*conditions))
+            select(WellnessEvent).where(
+                WellnessEvent.id.in_(uuid_ids)
+            )
         )
     )
-    by_identity: dict[str, WellnessEvent] = {}
-    for row in rows:
-        by_identity[str(row.id)] = row
-        by_identity[row.source_record_id] = row
+    by_id = {str(row.id): row for row in rows}
+
     selected: list[WellnessEvent] = []
     seen: set[uuid.UUID] = set()
+    resolved_identifiers: set[str] = set()
     for identifier in raw_ids:
-        row = by_identity.get(identifier)
+        row = by_id.get(identifier)
         if row is not None and row.id not in seen:
             seen.add(row.id)
             selected.append(row)
+        if row is not None:
+            resolved_identifiers.add(identifier)
     refs = [
         SourceRef(
             domain=domain,
@@ -314,7 +633,108 @@ def _event_source_refs(
         )
         for row in selected
     ]
-    return refs, len(selected) == len(set(raw_ids))
+    return refs, len(resolved_identifiers) == len(set(raw_ids))
+
+
+def _typed_nutrition_source_refs(
+    session: Session,
+    requirements: Sequence[tuple[Any, str, bool]],
+    *,
+    derived_by: str,
+    now: datetime,
+) -> tuple[list[SourceRef], bool]:
+    normalized = [
+        (str(identifier), event_type, is_event_id)
+        for identifier, event_type, is_event_id in requirements
+        if identifier is not None
+    ]
+    if not normalized:
+        return [], True
+    source_record_ids = [
+        identifier
+        for identifier, _event_type, is_event_id in normalized
+        if not is_event_id
+    ]
+    uuid_ids: list[uuid.UUID] = []
+    for identifier, _event_type, is_event_id in normalized:
+        if not is_event_id:
+            continue
+        try:
+            uuid_ids.append(uuid.UUID(identifier))
+        except ValueError:
+            continue
+    conditions = []
+    if source_record_ids:
+        conditions.append(
+            WellnessEvent.source_record_id.in_(source_record_ids)
+        )
+    if uuid_ids:
+        conditions.append(WellnessEvent.id.in_(uuid_ids))
+    if not conditions:
+        return [], False
+    rows = list(
+        session.scalars(
+            select(WellnessEvent).where(or_(*conditions))
+        )
+    )
+    by_id = {str(row.id): row for row in rows}
+    by_source_record: dict[str, list[WellnessEvent]] = {}
+    for row in rows:
+        by_source_record.setdefault(row.source_record_id, []).append(row)
+
+    selected: list[WellnessEvent] = []
+    seen: set[uuid.UUID] = set()
+    resolved = 0
+    for identifier, event_type, is_event_id in normalized:
+        expected_providers = _NUTRITION_EVENT_PROVIDERS.get(event_type)
+        if expected_providers is None:
+            continue
+
+        def matches(row: WellnessEvent) -> bool:
+            return (
+                row.event_type == event_type
+                and row.source_provider in expected_providers
+            )
+
+        if is_event_id:
+            exact = by_id.get(identifier)
+            row = exact if exact is not None and matches(exact) else None
+        else:
+            candidates = [
+                candidate
+                for candidate in by_source_record.get(identifier, [])
+                if matches(candidate)
+            ]
+            row = candidates[0] if len(candidates) == 1 else None
+        if row is None:
+            continue
+        resolved += 1
+        if row.id not in seen:
+            seen.add(row.id)
+            selected.append(row)
+
+    refs = [
+        SourceRef(
+            domain="nutrition",
+            resource_type=row.event_type,
+            record_id=str(row.id),
+            source_provider=row.source_provider,
+            observed_start=_as_utc(row.observed_at),
+            observed_end=_event_observed_end(row),
+            schema_version=row.schema_version,
+            derived_by=derived_by,
+            freshness=(
+                FreshnessStatus.STALE
+                if row.expires_at is not None
+                and _as_utc(row.expires_at) <= now
+                else FreshnessStatus.CURRENT
+            ),
+            coverage=row.coverage,
+            sensitivity=row.sensitivity,
+        )
+        for row in selected
+    ]
+    return refs, resolved == len(normalized)
 
 
 def _calendar_source_refs(
@@ -338,6 +758,7 @@ def _calendar_source_refs(
 
 
 def _wearable_source_refs(
+    session: Session,
     raw: Mapping[str, Any],
     *,
     timezone: str,
@@ -349,24 +770,57 @@ def _wearable_source_refs(
     for value in values:
         if not isinstance(value, Mapping):
             continue
-        observed = _timestamp(value.get("observed_at"), timezone=timezone)
-        if observed is None:
-            continue
         resource_type = str(value.get("resource_type") or "")
-        observed_end = (
-            observed + timedelta(days=1)
-            if resource_type == "sleep_summary"
-            else None
+        source_provider = str(
+            value.get("source_provider") or "open-wearables"
         )
+        raw_observed = value.get("observed_at")
+        if (
+            source_provider == "healthmes-calendar-mirror"
+            and resource_type == "actual_sleep"
+        ):
+            try:
+                row_id = uuid.UUID(str(value.get("record_id") or ""))
+            except ValueError:
+                continue
+            row = session.get(CalendarEventMirror, row_id)
+            supplied_observed = _timestamp(
+                raw_observed,
+                timezone=timezone,
+            )
+            if (
+                row is None
+                or row.healthmes_kind
+                != HealthmesEventKind.ACTUAL_SLEEP.value
+                or supplied_observed != _as_utc(row.end_at)
+            ):
+                continue
+            observed = _as_utc(row.start_at)
+            observed_end = _as_utc(row.end_at)
+        elif resource_type == "sleep_summary" and isinstance(
+            raw_observed,
+            str,
+        ):
+            try:
+                observed_day = date.fromisoformat(raw_observed)
+            except ValueError:
+                continue
+            observed, observed_end = local_day_bounds(
+                observed_day,
+                timezone,
+            )
+        else:
+            observed = _timestamp(raw_observed, timezone=timezone)
+            observed_end = None
+            if observed is None:
+                continue
         try:
             refs.append(
                 SourceRef(
                     domain="wearable",
                     resource_type=resource_type,
                     record_id=str(value.get("record_id") or ""),
-                    source_provider=str(
-                        value.get("source_provider") or "open-wearables"
-                    ),
+                    source_provider=source_provider,
                     observed_start=observed,
                     observed_end=observed_end,
                     schema_version=int(value.get("schema_version") or 1),
@@ -375,7 +829,7 @@ def _wearable_source_refs(
                         if value.get("derived_by")
                         else None
                     ),
-                    freshness=FreshnessStatus.CURRENT,
+                    freshness=FreshnessStatus.UNKNOWN,
                     sensitivity="wearable",
                 )
             )
@@ -441,6 +895,22 @@ def _query_day(
     return now.astimezone(zone).date()
 
 
+def _query_anchor_day(
+    query: ContextQuery,
+    *,
+    now: datetime,
+) -> date:
+    raw = query.parameters.get("date")
+    if isinstance(raw, str):
+        return date.fromisoformat(raw)
+    zone = parse_timezone(query.timezone)
+    if query.end is not None:
+        return (
+            query.end - timedelta(microseconds=1)
+        ).astimezone(zone).date()
+    return now.astimezone(zone).date()
+
+
 def _query_window(
     query: ContextQuery,
     *,
@@ -482,14 +952,70 @@ def _validate_query(
     )
     if unsupported_parameters:
         raise ValueError("unsupported context parameters")
+    if capability.lookback_parameter is not None:
+        raw_lookback = query.parameters.get(
+            capability.lookback_parameter,
+            capability.default_lookback_days,
+        )
+        if (
+            isinstance(raw_lookback, bool)
+            or not isinstance(raw_lookback, int)
+            or not 1 <= raw_lookback <= capability.max_lookback_days
+        ):
+            raise ValueError("invalid context lookback")
+        if (
+            query.start is not None
+            and query.end is not None
+            and _calendar_day_count(
+                query.start,
+                query.end,
+                timezone=query.timezone,
+            )
+            < (
+                raw_lookback
+                + capability.lookback_parameter_offset_days
+            )
+        ):
+            raise ValueError("context range does not cover lookback")
     if (
         query.start is not None
         and query.end is not None
-        and query.end - query.start
-        > timedelta(days=capability.max_lookback_days)
+        and _calendar_day_count(
+            query.start,
+            query.end,
+            timezone=query.timezone,
+        )
+        > capability.max_lookback_days
     ):
         raise ValueError("context query exceeds provider lookback")
     return capability
+
+
+def _validate_nutrition_snapshot_window(
+    raw: Mapping[str, Any],
+    query: ContextQuery,
+) -> None:
+    if query.start is None or query.end is None:
+        return
+    history_window = raw.get("history_window")
+    if not isinstance(history_window, Mapping):
+        raise ValueError("nutrition snapshot history window is missing")
+    start = _timestamp(
+        history_window.get("start"),
+        timezone=query.timezone,
+    )
+    end = _timestamp(
+        history_window.get("end"),
+        timezone=query.timezone,
+    )
+    if (
+        start is None
+        or end is None
+        or start >= end
+        or start < query.start
+        or end > query.end
+    ):
+        raise ValueError("nutrition snapshot exceeds context range")
 
 
 class ActivityContextProvider:
@@ -522,9 +1048,11 @@ class ActivityContextProvider:
                     "source_coverage",
                     "reason",
                 ),
+                nested_output_fields=_ACTIVITY_NESTED_FIELDS,
                 parameters=("date",),
                 max_lookback_days=1,
                 sensitivity="activity-aggregate",
+                limitation_codes=_ACTIVITY_LIMITATION_CODES,
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Final or provisional local-day summary.",
             ),
@@ -544,9 +1072,11 @@ class ActivityContextProvider:
                     "metrics",
                     "boundary",
                 ),
+                nested_output_fields=_ACTIVITY_NESTED_FIELDS,
                 parameters=("date",),
                 max_lookback_days=1,
                 sensitivity="activity-aggregate",
+                limitation_codes=_ACTIVITY_LIMITATION_CODES,
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Derived from retained raw or hourly summaries.",
             ),
@@ -570,9 +1100,14 @@ class ActivityContextProvider:
                     "metrics",
                     "boundary",
                 ),
+                nested_output_fields=_ACTIVITY_NESTED_FIELDS,
                 parameters=("date", "lookback_days"),
                 max_lookback_days=90,
+                default_lookback_days=7,
+                lookback_parameter="lookback_days",
+                lookback_parameter_offset_days=1,
                 sensitivity="activity-aggregate",
+                limitation_codes=_ACTIVITY_LIMITATION_CODES,
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Current local-day summary plus trailing baseline.",
             ),
@@ -589,9 +1124,11 @@ class ActivityContextProvider:
                     "metrics",
                     "boundary",
                 ),
+                nested_output_fields=_ACTIVITY_NESTED_FIELDS,
                 parameters=("date",),
                 max_lookback_days=1,
                 sensitivity="activity-aggregate",
+                limitation_codes=_ACTIVITY_LIMITATION_CODES,
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="One local day's finalized or provisional activity.",
             ),
@@ -606,7 +1143,12 @@ class ActivityContextProvider:
         now: datetime,
     ) -> ContextResult:
         _validate_query(self.metadata, query)
-        day, start, end = _query_window(query, now=now)
+        if query.capability == "activity.overwork":
+            day = _query_anchor_day(query, now=now)
+            start, end = local_day_bounds(day, query.timezone)
+            end = min(end, now + timedelta(seconds=1))
+        else:
+            day, start, end = _query_window(query, now=now)
         if query.capability == "activity.summary":
             raw = activity_summary_context(
                 session,
@@ -682,6 +1224,10 @@ class NutritionContextProvider:
                     "limit",
                 ),
                 output_fields=("status", "count", "records"),
+                nested_output_fields=_NUTRITION_NESTED_FIELDS,
+                identity_fields=_NUTRITION_IDENTITY_FIELDS,
+                raw_fields=_NUTRITION_RAW_FIELDS,
+                limit_output_fields=("records",),
                 parameters=(
                     "confirmed_only",
                     "intent",
@@ -690,11 +1236,13 @@ class NutritionContextProvider:
                     "query",
                 ),
                 max_lookback_days=90,
+                default_lookback_days=14,
                 privacy_levels=(
                     PrivacyLevel.AGGREGATE,
                     PrivacyLevel.IDENTITY,
                 ),
                 sensitivity="nutrition",
+                limitation_codes=_NUTRITION_LIMITATION_CODES,
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Latest retained intake state at query time.",
             ),
@@ -722,9 +1270,12 @@ class NutritionContextProvider:
                     "unquantified_outcome_ids",
                     "daily_confirmation_id",
                 ),
+                nested_output_fields=_NUTRITION_NESTED_FIELDS,
+                identity_fields=_NUTRITION_IDENTITY_FIELDS,
                 parameters=("date",),
                 max_lookback_days=1,
                 sensitivity="nutrition",
+                limitation_codes=_NUTRITION_LIMITATION_CODES,
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Latest retained daily confirmation and intake outcomes.",
             ),
@@ -735,7 +1286,12 @@ class NutritionContextProvider:
                     "specialized evidence saved for an intake decision request."
                 ),
                 granularities=("summary", "record"),
-                query_fields=("timezone", "fields"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                ),
                 output_fields=(
                     "status",
                     "request",
@@ -746,13 +1302,19 @@ class NutritionContextProvider:
                     "specialized_evidence",
                     "boundaries",
                 ),
+                nested_output_fields=_NUTRITION_NESTED_FIELDS,
+                identity_fields=_NUTRITION_IDENTITY_FIELDS,
+                raw_fields=_NUTRITION_RAW_FIELDS,
                 parameters=("request_id",),
                 max_lookback_days=90,
+                default_lookback_days=15,
                 privacy_levels=(
                     PrivacyLevel.AGGREGATE,
                     PrivacyLevel.IDENTITY,
                 ),
                 sensitivity="nutrition",
+                limitation_codes=_NUTRITION_LIMITATION_CODES,
+                allows_future=True,
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Immutable request-time context snapshot.",
             ),
@@ -770,6 +1332,13 @@ class NutritionContextProvider:
         if query.capability == "nutrition.intake-history":
             intent = query.parameters.get("intent")
             modality = query.parameters.get("modality")
+            max_scan_records = min(
+                _NUTRITION_HISTORY_MAX_SCAN,
+                max(
+                    _NUTRITION_HISTORY_MIN_SCAN,
+                    query.limit * _NUTRITION_HISTORY_SCAN_MULTIPLIER,
+                ),
+            )
             raw = search_intake_history(
                 session,
                 start=query.start,
@@ -794,40 +1363,90 @@ class NutritionContextProvider:
                     else None
                 ),
                 limit=query.limit,
+                max_scan_records=max_scan_records,
+                include_source_event_ids=True,
             )
-            identifiers: list[str] = []
-            for record in raw.get("records", []):
-                if not isinstance(record, Mapping):
-                    continue
-                for key in (
-                    "interaction_id",
-                    "nutrition_observation_id",
-                    "nutrition_review_id",
-                ):
-                    if record.get(key):
-                        identifiers.append(str(record[key]))
-                outcome = record.get("latest_outcome")
-                if isinstance(outcome, Mapping) and outcome.get("outcome_id"):
-                    identifiers.append(str(outcome["outcome_id"]))
-                decision = record.get("latest_decision")
-                if isinstance(decision, Mapping) and decision.get("decision_id"):
-                    identifiers.append(str(decision["decision_id"]))
-            refs, complete = _event_source_refs(
-                session,
-                identifiers,
-                domain="nutrition",
-                derived_by="nutrition.intake-history.v1",
-                now=now,
-            )
-            raw["freshness"] = {
-                "recorded_at": max(
+            source_event_ids = raw.pop("source_event_ids", None)
+            if source_event_ids is not None:
+                refs, complete = _event_source_refs(
+                    session,
                     (
-                        str(record.get("recorded_at"))
-                        for record in raw.get("records", [])
-                        if isinstance(record, Mapping)
-                        and record.get("recorded_at")
+                        source_event_ids
+                        if isinstance(source_event_ids, Sequence)
+                        and not isinstance(source_event_ids, str | bytes)
+                        else ()
                     ),
-                    default=None,
+                    domain="nutrition",
+                    derived_by="nutrition.intake-history.v1",
+                    now=now,
+                )
+                if not isinstance(source_event_ids, Sequence) or isinstance(
+                    source_event_ids,
+                    str | bytes,
+                ):
+                    complete = False
+            else:
+                requirements: list[tuple[str, str, bool]] = []
+                for record in raw.get("records", []):
+                    if not isinstance(record, Mapping):
+                        continue
+                    for key, event_type in (
+                        ("interaction_id", INTERACTION_EVENT),
+                        ("nutrition_observation_id", OBSERVATION_EVENT),
+                        ("nutrition_review_id", REVIEW_EVENT),
+                    ):
+                        if record.get(key):
+                            requirements.append(
+                                (str(record[key]), event_type, False)
+                            )
+                    outcome = record.get("latest_outcome")
+                    if (
+                        isinstance(outcome, Mapping)
+                        and outcome.get("outcome_id")
+                    ):
+                        requirements.append(
+                            (
+                                str(outcome["outcome_id"]),
+                                OUTCOME_EVENT,
+                                False,
+                            )
+                        )
+                    decision = record.get("latest_decision")
+                    if (
+                        isinstance(decision, Mapping)
+                        and decision.get("decision_id")
+                    ):
+                        requirements.append(
+                            (
+                                str(decision["decision_id"]),
+                                DECISION_EVENT,
+                                False,
+                            )
+                        )
+                refs, complete = _typed_nutrition_source_refs(
+                    session,
+                    requirements,
+                    derived_by="nutrition.intake-history.v1",
+                    now=now,
+                )
+            recorded_times = [
+                parsed
+                for record in raw.get("records", [])
+                if isinstance(record, Mapping)
+                and (
+                    parsed := _timestamp(
+                        record.get("recorded_at"),
+                        timezone=query.timezone,
+                    )
+                )
+                is not None
+            ]
+            latest_recorded_at = max(recorded_times, default=None)
+            raw["freshness"] = {
+                "recorded_at": (
+                    latest_recorded_at.isoformat()
+                    if latest_recorded_at is not None
+                    else None
                 ),
                 "status": (
                     "stored_intake_records"
@@ -836,6 +1455,8 @@ class NutritionContextProvider:
                 ),
             }
             raw["coverage"] = raw.get("coverage", {})
+            if not raw.get("records") and not raw.get("truncated"):
+                raw["status"] = "insufficient_data"
             return _result(
                 query,
                 raw,
@@ -852,25 +1473,48 @@ class NutritionContextProvider:
                 local_date=day,
                 timezone=query.timezone,
             )
-            identifiers = [
-                str(value)
-                for entry in raw.get("evidence", [])
-                if isinstance(entry, Mapping)
-                for value in (
-                    entry.get("event_id"),
-                    entry.get("confirmation_id"),
-                    entry.get("observation_id"),
-                    entry.get("nutrition_observation_id"),
-                    entry.get("nutrition_review_id"),
-                )
-                if value is not None
-            ]
+            requirements: list[tuple[str, str, bool]] = []
+            for entry in raw.get("evidence", []):
+                if not isinstance(entry, Mapping):
+                    continue
+                event_type = str(entry.get("event_type") or "")
+                if entry.get("event_id"):
+                    requirements.append(
+                        (str(entry["event_id"]), event_type, True)
+                    )
+                for key, required_type in (
+                    ("observation_id", OBSERVATION_EVENT),
+                    ("nutrition_observation_id", OBSERVATION_EVENT),
+                    ("nutrition_review_id", REVIEW_EVENT),
+                ):
+                    if entry.get(key):
+                        requirements.append(
+                            (str(entry[key]), required_type, False)
+                        )
+                if entry.get("confirmation_id"):
+                    confirmation_type = (
+                        REVIEW_EVENT
+                        if event_type == REVIEW_EVENT
+                        else CONFIRMATION_EVENT
+                    )
+                    requirements.append(
+                        (
+                            str(entry["confirmation_id"]),
+                            confirmation_type,
+                            False,
+                        )
+                    )
             if raw.get("daily_confirmation_id"):
-                identifiers.append(str(raw["daily_confirmation_id"]))
-            refs, complete = _event_source_refs(
+                requirements.append(
+                    (
+                        str(raw["daily_confirmation_id"]),
+                        DAILY_CONFIRMATION_EVENT,
+                        False,
+                    )
+                )
+            refs, complete = _typed_nutrition_source_refs(
                 session,
-                identifiers,
-                domain="nutrition",
+                requirements,
                 derived_by="nutrition.caffeine-ledger.v1",
                 now=now,
             )
@@ -930,6 +1574,7 @@ class NutritionContextProvider:
                 ),
                 limitations=["nutrition_decision_request_not_found"],
             )
+        _validate_nutrition_snapshot_window(raw, query)
         refs, complete = _event_source_refs(
             session,
             list(raw.get("evidence_event_ids") or []),
@@ -988,9 +1633,12 @@ class WearableContextProvider:
                     "charge",
                     "yesterday_load",
                 ),
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
                 parameters=("date",),
                 max_lookback_days=1,
                 sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
                 provenance=ProvenanceSupport.PARTIAL,
                 freshness_expectation="Daily Open Wearables snapshot.",
             ),
@@ -1008,9 +1656,12 @@ class WearableContextProvider:
                     "actual_sleep",
                     "hrv",
                 ),
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
                 parameters=("date",),
                 max_lookback_days=1,
                 sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
                 provenance=ProvenanceSupport.PARTIAL,
                 freshness_expectation="Latest retained or upstream sleep observations.",
             ),
@@ -1028,9 +1679,12 @@ class WearableContextProvider:
                     "charge",
                     "yesterday_load",
                 ),
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
                 parameters=("date",),
                 max_lookback_days=1,
                 sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
                 provenance=ProvenanceSupport.PARTIAL,
                 freshness_expectation="Daily Open Wearables readiness snapshot.",
             ),
@@ -1046,9 +1700,12 @@ class WearableContextProvider:
                     "confidence",
                     "stress",
                 ),
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
                 parameters=("date",),
                 max_lookback_days=1,
                 sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
                 provenance=ProvenanceSupport.PARTIAL,
                 freshness_expectation="Latest daily stress or resilience observation.",
             ),
@@ -1065,7 +1722,6 @@ class WearableContextProvider:
         *,
         now: datetime,
     ) -> ContextResult:
-        del session
         _validate_query(self.metadata, query)
         if self._reader is None:
             return ContextResult(
@@ -1111,6 +1767,7 @@ class WearableContextProvider:
                 }
             }
         refs, complete = _wearable_source_refs(
+            session,
             raw,
             timezone=query.timezone,
         )
@@ -1202,9 +1859,12 @@ class CalendarContextProvider:
                     "last_event_at",
                     "meeting_density_per_hour",
                 ),
+                nested_output_fields=_CALENDAR_NESTED_FIELDS,
                 parameters=("date",),
                 max_lookback_days=1,
                 sensitivity="calendar-metadata",
+                limitation_codes=_CALENDAR_LIMITATION_CODES,
+                allows_future=True,
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Latest local calendar mirror state.",
             ),
@@ -1226,9 +1886,13 @@ class CalendarContextProvider:
                     "busy_minutes",
                     "intervals",
                 ),
+                nested_output_fields=_CALENDAR_NESTED_FIELDS,
+                limit_output_fields=("intervals",),
                 parameters=("date",),
                 max_lookback_days=31,
                 sensitivity="calendar-metadata",
+                limitation_codes=_CALENDAR_LIMITATION_CODES,
+                allows_future=True,
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Latest local calendar mirror state.",
             ),
@@ -1249,9 +1913,13 @@ class CalendarContextProvider:
                     "available_minutes",
                     "windows",
                 ),
+                nested_output_fields=_CALENDAR_NESTED_FIELDS,
+                limit_output_fields=("windows",),
                 parameters=("date", "minimum_minutes"),
                 max_lookback_days=31,
                 sensitivity="calendar-metadata",
+                limitation_codes=_CALENDAR_LIMITATION_CODES,
+                allows_future=True,
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Latest local calendar mirror state.",
             ),
@@ -1276,12 +1944,29 @@ class CalendarContextProvider:
             (_as_utc(row.updated_at) for row in rows),
             default=None,
         )
+        spans = _merged_spans(rows, start=start, end=end)
         if query.capability == "calendar.day-summary":
-            raw = calendar_context(
-                session,
-                day=day,
-                timezone=query.timezone,
+            busy_minutes = round(
+                sum(
+                    (span_end - span_start).total_seconds()
+                    for span_start, span_end in spans
+                )
+                / 60,
+                2,
             )
+            raw = {
+                "status": "ok" if rows else "insufficient_data",
+                "date": day.isoformat(),
+                "timezone": query.timezone,
+                "event_count": len(rows),
+                "busy_minutes": busy_minutes,
+                "first_event_at": (
+                    spans[0][0].isoformat() if spans else None
+                ),
+                "last_event_at": (
+                    spans[-1][1].isoformat() if spans else None
+                ),
+            }
             hours = max(
                 1 / 60,
                 (end - start).total_seconds() / 3600,
@@ -1291,7 +1976,6 @@ class CalendarContextProvider:
                 3,
             )
         else:
-            spans = _merged_spans(rows, start=start, end=end)
             if query.capability == "calendar.busy-intervals":
                 selected = spans[: query.limit]
                 raw = {

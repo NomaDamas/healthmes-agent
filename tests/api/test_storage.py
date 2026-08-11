@@ -70,9 +70,14 @@ def test_daily_retention_update_immediately_refreshes_rest_baseline(
     session,
     monkeypatch,
 ) -> None:
-    current = datetime(2026, 8, 10, 12, tzinfo=UTC)
-    for day in range(1, 5):
-        start = datetime(2026, 8, day, 0, tzinfo=UTC)
+    current = datetime.now(UTC)
+    target_day = current.date() - timedelta(days=6)
+    source_days = [
+        target_day - timedelta(days=offset)
+        for offset in range(3, -1, -1)
+    ]
+    for day in source_days:
+        start = datetime.combine(day, datetime.min.time(), tzinfo=UTC)
         ingest_activity_batch(
             session,
             ActivityBatchIn(
@@ -83,7 +88,7 @@ def test_daily_retention_update_immediately_refreshes_rest_baseline(
                 timezone="UTC",
                 records=[
                     AppIntervalRecord(
-                        source_record_id=f"retention-rest-{day}",
+                        source_record_id=f"retention-rest-{day.isoformat()}",
                         start_at=start,
                         end_at=start + timedelta(hours=12),
                         state="active",
@@ -102,7 +107,7 @@ def test_daily_retention_update_immediately_refreshes_rest_baseline(
                 WellnessEvent.event_type == DAY_SUMMARY_EVENT
             )
         )
-        if row.payload.get("date") == "2026-08-04"
+        if row.payload.get("date") == target_day.isoformat()
     )
     assert target.payload["seven_day_baseline_delta"]["status"] == "ok"
     monkeypatch.setattr(
@@ -116,7 +121,7 @@ def test_daily_retention_update_immediately_refreshes_rest_baseline(
     )
     summary = client.get(
         "/v1/activity/summary",
-        params={"date": "2026-08-04", "timezone": "UTC"},
+        params={"date": target_day.isoformat(), "timezone": "UTC"},
     )
 
     assert updated.status_code == 200
@@ -136,7 +141,7 @@ def test_daily_retention_update_immediately_refreshes_rest_baseline(
             )
         )
     }
-    assert remaining_days == {"2026-08-04"}
+    assert remaining_days == {target_day.isoformat()}
 
 
 def test_retention_update_uses_the_original_object_observation_time(

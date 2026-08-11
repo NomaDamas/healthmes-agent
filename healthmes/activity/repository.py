@@ -1003,13 +1003,96 @@ def _legacy_control_payload(
     return dict(event.payload) if event is not None and isinstance(event.payload, dict) else {}
 
 
+def _fresh_control_payload(
+    session: Session,
+    device_id: str,
+    *,
+    platform: ActivityPlatform,
+) -> dict[str, Any]:
+    def one_payload(statement) -> dict[str, Any]:
+        value = session.scalar(
+            statement.with_only_columns(
+                WellnessEvent.payload,
+                maintain_column_froms=True,
+            )
+        )
+        return dict(value) if isinstance(value, dict) else {}
+
+    payload = {
+        **default_control_payload(device_id, platform=platform),
+        **one_payload(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == COLLECTION_CONTROL_EVENT,
+                WellnessEvent.source_provider == CONTROL_PROVIDER,
+                WellnessEvent.source_record_id.in_(
+                    (
+                        _control_source_id(device_id),
+                        "device:"
+                        + hashlib.sha256(
+                            device_id.encode("utf-8")
+                        ).hexdigest()[:32],
+                    )
+                ),
+            )
+        ),
+    }
+    payload.update(
+        one_payload(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == COLLECTION_STATUS_EVENT,
+                WellnessEvent.source_provider == CONTROL_PROVIDER,
+                WellnessEvent.source_record_id
+                == _control_source_id(device_id, "status"),
+            )
+        )
+    )
+    payload.update(
+        one_payload(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == COLLECTION_CONFIG_EVENT,
+                WellnessEvent.source_provider == CONTROL_PROVIDER,
+                WellnessEvent.source_record_id
+                == _control_source_id(device_id, "config"),
+            )
+        )
+    )
+    cursor_payloads = session.scalars(
+        select(WellnessEvent.payload).where(
+            WellnessEvent.event_type == COLLECTION_CURSOR_EVENT,
+            WellnessEvent.source_provider == CONTROL_PROVIDER,
+            WellnessEvent.source_device == device_id,
+        )
+    )
+    cursors = dict(payload.get("cursors") or {})
+    for value in cursor_payloads:
+        if not isinstance(value, dict):
+            continue
+        cursor_key = value.get("cursor_key")
+        cursor_value = value.get("cursor_value")
+        if isinstance(cursor_key, str) and isinstance(
+            cursor_value,
+            str,
+        ):
+            cursors[cursor_key] = cursor_value
+    payload["cursors"] = cursors
+    payload["device_id"] = device_id
+    return payload
+
+
 def get_control_payload(
     session: Session,
     device_id: str,
     *,
     platform: ActivityPlatform = ActivityPlatform.UNKNOWN,
     lock: bool = False,
+    refresh: bool = False,
 ) -> dict[str, Any]:
+    if refresh and not lock:
+        return _fresh_control_payload(
+            session,
+            device_id,
+            platform=platform,
+        )
     if lock:
         lock_activity_control_device(session, device_id)
     payload = {

@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -228,6 +229,67 @@ def test_query_rejects_partial_or_reversed_ranges():
             capability="activity.summary",
             start=T1,
             end=T0,
+        )
+
+
+def test_query_accepts_one_25_hour_local_day():
+    query = ContextQuery(
+        provider_id="activity",
+        capability="activity.summary",
+        start=datetime(2025, 11, 2, 4, tzinfo=UTC),
+        end=datetime(2025, 11, 3, 5, tzinfo=UTC),
+        timezone="America/New_York",
+    )
+
+    assert query.end - query.start == timedelta(hours=25)
+
+
+def test_request_and_query_share_the_same_90_local_day_dst_boundary():
+    timezone = "America/New_York"
+    zone = ZoneInfo(timezone)
+    start = datetime(2026, 8, 9, 8, tzinfo=zone)
+    end = datetime(2026, 11, 7, 8, tzinfo=zone)
+
+    request = DecisionRequest(
+        question="Use the full retained context window.",
+        requested_at=T0,
+        timezone=timezone,
+        caller=_caller(),
+        hints=DecisionContextHints(start=start, end=end),
+    )
+    query = ContextQuery(
+        provider_id="nutrition",
+        capability="nutrition.decision-context",
+        start=start,
+        end=end,
+        timezone=timezone,
+    )
+
+    assert request.hints.end - request.hints.start == timedelta(
+        days=90,
+        hours=1,
+    )
+    assert query.end - query.start == timedelta(days=90, hours=1)
+
+    overlong_end = end + timedelta(microseconds=1)
+    with pytest.raises(ValidationError, match="90 local days"):
+        DecisionRequest(
+            question="This range is one local instant too long.",
+            requested_at=T0,
+            timezone=timezone,
+            caller=_caller(),
+            hints=DecisionContextHints(
+                start=start,
+                end=overlong_end,
+            ),
+        )
+    with pytest.raises(ValidationError, match="90 days"):
+        ContextQuery(
+            provider_id="nutrition",
+            capability="nutrition.decision-context",
+            start=start,
+            end=overlong_end,
+            timezone=timezone,
         )
 
 

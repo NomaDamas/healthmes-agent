@@ -1,5 +1,13 @@
 """HealthMes-owned contracts and orchestration for wellness decisions."""
 
+from healthmes.decision.access import (
+    AccessAuditEntry,
+    AccessOutcome,
+    ContextAccessLayer,
+    ContextAccessPolicy,
+    ContextAccessTurn,
+    DomainAccessGrant,
+)
 from healthmes.decision.compatibility import (
     decision_request_from_activity_context,
 )
@@ -23,6 +31,7 @@ from healthmes.decision.contracts import (
     FreshnessStatus,
     PersistenceStatus,
     PrivacyLevel,
+    RawSourceHandle,
     RuntimeMetadata,
     SourceRef,
     ToolCallRecord,
@@ -51,10 +60,15 @@ from healthmes.decision.providers import (
 )
 
 __all__ = [
+    "AccessAuditEntry",
+    "AccessOutcome",
     "ActivityContextProvider",
     "CalendarContextProvider",
     "CompatibilityPreset",
     "ContextCapability",
+    "ContextAccessLayer",
+    "ContextAccessPolicy",
+    "ContextAccessTurn",
     "ContextCoverage",
     "ContextFreshness",
     "ContextProvider",
@@ -74,6 +88,7 @@ __all__ = [
     "DecisionResult",
     "DecisionStatus",
     "DisabledProviderError",
+    "DomainAccessGrant",
     "DuplicateCapabilityError",
     "DuplicateProviderError",
     "ExecutionScope",
@@ -82,6 +97,7 @@ __all__ = [
     "PersistenceStatus",
     "PrivacyLevel",
     "ProvenanceSupport",
+    "RawSourceHandle",
     "RuntimeMetadata",
     "SourceRef",
     "ToolCallRecord",
