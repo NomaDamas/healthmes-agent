@@ -453,6 +453,27 @@ async def test_nutrition_decision_event_id_never_uses_semantic_fallback(
     assert result.limitations == ["provenance_incomplete"]
 
 
+async def test_nutrition_provider_rejects_string_boolean_parameter(
+    session,
+):
+    registry = ContextProviderRegistry((NutritionContextProvider(),))
+
+    result = await registry.execute(
+        session,
+        ContextQuery(
+            provider_id="nutrition",
+            capability="nutrition.intake-history",
+            start=DAY_START,
+            end=NOW,
+            parameters={"confirmed_only": "false"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.FAILED
+    assert result.limitations == ["invalid_provider_query"]
+
+
 async def test_nutrition_freshness_uses_absolute_time_across_offsets(
     session,
     monkeypatch,

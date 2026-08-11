@@ -312,6 +312,12 @@ def test_source_ref_id_is_stable_and_bound_to_provider_identity():
         SourceRef.model_validate_json(source_ref.model_dump_json())
         == source_ref
     )
+    assert source_ref_id(
+        domain=" Activity ",
+        resource_type=" HOUR_SUMMARY ",
+        source_provider=" ActivityWatch ",
+        record_id=" event-1 ",
+    ) == source_ref.reference_id
 
 
 def test_source_ref_rejects_reversed_observation_range():
@@ -332,6 +338,12 @@ def test_source_ref_rejects_forged_reference_id():
 
     with pytest.raises(ValidationError, match="does not match"):
         SourceRef.model_validate(payload)
+
+    forged_instance = _source_ref().model_copy(
+        update={"reference_id": "sr_" + ("f" * 32)}
+    )
+    with pytest.raises(ValidationError, match="does not match"):
+        SourceRef.model_validate(forged_instance)
 
 
 def test_coverage_distinguishes_zero_from_unknown():
@@ -419,6 +431,20 @@ def test_action_draft_requires_valid_source_reference():
             answer="Take a break.",
             used_source_ref_ids=["activity:event-1"],
         )
+
+
+def test_decision_draft_preserves_uncertainty_and_follow_up():
+    draft = DecisionDraft(
+        status=DecisionStatus.COMPLETED,
+        answer="The current context is mixed.",
+        confidence=0.6,
+        uncertainty="Sleep coverage is partial.",
+        follow_up_question="Should I inspect the previous week too?",
+    )
+
+    assert draft.confidence == 0.6
+    assert draft.uncertainty == "Sleep coverage is partial."
+    assert draft.follow_up_question is not None
 
 
 def test_clarification_requires_a_question_and_cannot_propose_action():

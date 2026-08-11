@@ -495,10 +495,10 @@ def source_ref_id(
 
     identity = json.dumps(
         [
-            domain.casefold(),
-            resource_type.casefold(),
-            source_provider.casefold(),
-            record_id,
+            domain.strip().casefold(),
+            resource_type.strip().casefold(),
+            source_provider.strip().casefold(),
+            record_id.strip(),
         ],
         ensure_ascii=True,
         separators=(",", ":"),
@@ -509,7 +509,11 @@ def source_ref_id(
 class SourceRef(BaseModel):
     """Traceable address of data actually returned by one context tool."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
 
     reference_id: str = Field(pattern=_SOURCE_REF_ID.pattern)
     domain: str = Field(min_length=1, max_length=64)
@@ -592,6 +596,16 @@ class SourceRef(BaseModel):
 
     @model_validator(mode="after")
     def validate_observed_range(self) -> SourceRef:
+        expected_reference_id = source_ref_id(
+            domain=self.domain,
+            resource_type=self.resource_type,
+            source_provider=self.source_provider,
+            record_id=self.record_id,
+        )
+        if self.reference_id != expected_reference_id:
+            raise ValueError(
+                "reference_id does not match the source identity"
+            )
         if (
             self.observed_end is not None
             and self.observed_end <= self.observed_start
@@ -820,6 +834,8 @@ class DecisionDraft(BaseModel):
         max_length=2_000,
     )
     confidence: float | None = Field(default=None, ge=0, le=1)
+    uncertainty: str | None = Field(default=None, max_length=2_000)
+    follow_up_question: str | None = Field(default=None, max_length=2_000)
 
     @field_validator("answer")
     @classmethod
@@ -832,9 +848,13 @@ class DecisionDraft(BaseModel):
             max_length=MAX_ANSWER_LENGTH,
         )
 
-    @field_validator("clarification_question")
+    @field_validator(
+        "clarification_question",
+        "uncertainty",
+        "follow_up_question",
+    )
     @classmethod
-    def validate_clarification_question(
+    def validate_optional_text(
         cls,
         value: str | None,
     ) -> str | None:
@@ -842,7 +862,7 @@ class DecisionDraft(BaseModel):
             return None
         return _bounded_text(
             value,
-            label="clarification_question",
+            label="decision draft text",
             max_length=2_000,
         )
 
@@ -914,6 +934,9 @@ class DecisionResult(BaseModel):
         default=None,
         max_length=2_000,
     )
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    uncertainty: str | None = Field(default=None, max_length=2_000)
+    follow_up_question: str | None = Field(default=None, max_length=2_000)
     persistence_status: PersistenceStatus = PersistenceStatus.NOT_REQUIRED
     decision_record_id: uuid.UUID | None = None
     runtime: RuntimeMetadata
@@ -933,9 +956,13 @@ class DecisionResult(BaseModel):
             max_length=MAX_ANSWER_LENGTH,
         )
 
-    @field_validator("clarification_question")
+    @field_validator(
+        "clarification_question",
+        "uncertainty",
+        "follow_up_question",
+    )
     @classmethod
-    def validate_clarification_question(
+    def validate_optional_text(
         cls,
         value: str | None,
     ) -> str | None:
@@ -943,7 +970,7 @@ class DecisionResult(BaseModel):
             return None
         return _bounded_text(
             value,
-            label="clarification_question",
+            label="decision result text",
             max_length=2_000,
         )
 

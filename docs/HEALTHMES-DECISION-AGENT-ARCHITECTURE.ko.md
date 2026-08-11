@@ -2,8 +2,9 @@
 
 > **결정일:** 2026-08-10
 >
-> **상태:** 승인된 목표 아키텍처. 현재 코드의 고정 `question_kind` resolver는
-> 호환용 구현이며 이 문서의 구조로 마이그레이션한다.
+> **상태:** 승인된 목표 아키텍처. `DEC-01`부터 `DEC-04`까지의 core 계약,
+> provider registry, Context Access Layer와 HealthMes-owned decision loop가
+> 구현되었고, 고정 `question_kind` resolver는 호환용 구현으로 남는다.
 >
 > **범위:** 엔진, 데이터 조회, LLM 판단, Hermes adaptation과 의사결정 기록.
 > 실제 iOS, Android, 데스크톱 UI는 포함하지 않는다.
@@ -36,9 +37,10 @@ Decision Finalizer
   사용한 source_refs를 검증하고 DecisionRecord를 저장한다.
 ```
 
-Hermes는 위 흐름을 실행하는 첫 번째 runtime adapter다. HealthMes는 판단 계약과
-데이터 경계를 소유하고, Hermes는 모델 호출, tool-calling loop, 세션과 전달 채널을
-제공한다.
+Hermes는 위 흐름의 모델 iteration을 실행하는 첫 번째 runtime adapter다. HealthMes는
+판단 계약, 반복 loop와 데이터 경계를 소유하고, Hermes는 모델 호출, 세션과 전달
+채널을 제공한다. Hermes의 범용 autonomous tool loop가 HealthMes loop를 대신하지
+않는다.
 
 ## 1. 왜 바꾸는가
 
@@ -97,6 +99,40 @@ HealthMesDecisionAgent
         +-- FutureNativeRuntimeAdapter
         +-- TestRuntimeAdapter
 ```
+
+실행 loop의 소유권은 다음처럼 고정한다.
+
+```text
+HealthMesDecisionAgent
+  for step in bounded_steps:
+    runtime.next_step(read_only_turn_snapshot)
+      -> tool_calls 또는 final draft 중 하나
+
+    tool_calls:
+      HealthMes가 Context Access Layer를 통해 순차 실행
+      -> 검증된 RuntimeToolExchange를 다음 snapshot에 추가
+
+    final draft:
+      실제 반환된 source_refs의 부분집합인지 검사
+      context에 source_refs가 있으면 완료 답변이 최소 하나를 명시했는지 검사
+      -> Decision Finalizer로 전달
+```
+
+Runtime에는 provider callback, DB session, registry, `consume_step()`을 주지 않는다.
+또한 전체 `DecisionRequest`를 넘기지 않는다. 모델에는 질문, 질문 시각, 시간대,
+요청 privacy level, 조회 기간 hint, 관련 기록 존재 여부와 허용된 관련 domain만
+담은 `RuntimeDecisionRequest`를 제공한다. 선택된 record가 필요한 도구에는
+turn-scoped `rr_...` alias만 보이며 HealthMes가 내부 실제 ID로 치환한다.
+`principal_id`, `session_id`, channel, request/turn ID와 실제 related record ID는
+runtime 경계를 넘지 않는다.
+도구 결과도 runtime 전용 최소 계약으로 다시 변환한다. 전체 `SourceRef`,
+raw-source handle, query UUID와 cursor는 내부 trace에만 남고 모델에는 검증된
+`source_ref_ids`, freshness, coverage, limitation과 질문에 필요한 payload만
+전달한다. payload 안에 선택 record ID가 반복되어도 동일한 `rr_...` alias로
+치환한다. UUID의 hyphen/hex/URN 및 대소문자 변형은 하나의 canonical identity로
+합쳐 한 alias만 사용한다. 권한이나 domain 불일치로 조회 도구에 연결되지 않은
+related record도 질문 문자열에서는 익명화하되 tool catalog에는 노출하지 않는다.
+따라서 step 수와 tool 실행은 모델의 자발적 준수에 의존하지 않는다.
 
 중요한 분리는 다음과 같다.
 
@@ -167,9 +203,59 @@ Context Access Layer는 다음만 강제한다.
 - 데이터가 부족하면 필요한 사실을 사용자에게 묻는다.
 - 전문 정책 결과를 재계산하지 않고 여러 영역의 trade-off를 종합한다.
 - 관찰, 불확실성, 대안과 최종 설명을 만든다.
+- 각 model iteration과 전체 deadline을 코드에서 직접 계산한다.
+- runtime에는 개인정보를 제거한 읽기 전용 `RuntimeDecisionRequest`, 허용 tool
+  catalog와 이전 tool 결과 snapshot만 제공한다.
+- runtime이 반환한 tool 요청을 직접 검증하고 Context Access Layer를 통해
+  실행한다.
 
 질문을 미리 다섯 종류로 제한하지 않는다. 필요한 도구는 질문과 첫 조회 결과에 따라
 달라질 수 있다.
+
+#### hard deadline과 실행 격리
+
+하나의 장기 실행 `HealthMesDecisionAgent`는 하나의 daemon worker event loop를
+소유한다. runtime과 provider coroutine은 이 안정된 loop에서 실행하므로 loop-bound
+client를 요청마다 다른 event loop에서 재사용하지 않는다. 같은 runtime instance의
+전체 decision turn은 직렬화되어 동시 요청의 임시 상태가 서로 섞이지 않는다. API
+event loop는 `time.sleep()` 같은 동기 블로킹 코드와 분리된 wall-clock deadline을
+소유한다. worker thread와 event loop는 `HealthMesDecisionAgent` 구성 단계에서
+미리 시작하고 ready 상태까지 확인하므로 `ask()`가 `Thread.start()`를 실행하지
+않는다. request deadline은 `ask()` 진입부터 외부 request의 strict validation,
+동기 policy resolution, provider catalog 검증, access turn 준비와 runtime/provider
+실행 전체에 적용된다. worker가 취소를 늦게 처리해도 호출자는 deadline에 맞춰
+반환받고 늦게 도착한 결과는 canonical trace에 반영되지 않는다. validation이
+끝나기 전에 timeout되면 신뢰할 수 없는 caller ID 대신 새 fallback request/turn
+UUID를 반환한다.
+
+hard timeout 뒤 async runtime이 cancellation을 정상 수용해 turn을 종료하면 같은
+worker를 재사용한다. cancellation이 끝나지 않은 경우 다음 요청의 짧고 bounded된
+확인 구간 뒤 quarantine하고 `runtime_worker_unavailable`로 실패시킨다. 같은
+agent는 새 worker를 만들지 않으므로 종료되지 않는 동기 코드가 요청마다 daemon
+thread를 하나씩 늘릴 수 없고, 한 agent에서 orphan 가능한 worker는 최대 하나다.
+운영자는 agent를 장기 실행 singleton으로 구성하고 정상 shutdown에서 `close()`를
+호출한다. active turn 중 `close()`가 호출되더라도 완료 결과를 caller future에
+전달한 뒤 loop를 종료한다.
+
+일반 caller cancellation은 hard timeout과 구분한다. 취소가 worker에서 정상적으로
+정리되면 다음 turn이 같은 loop를 재사용한다. 취소된 동기 코드가 끝나지 않아 다음
+대기 turn까지 timeout되면 worker를 quarantine해 이후 요청을 fail-fast 한다.
+
+이 경계에는 명시적인 호환성 계약이 있다.
+
+- runtime과 provider는 API event loop에 귀속된 `asyncio.Event`, task 또는 client를
+  worker 경계 밖에서 만든 뒤 공유하지 않는다.
+- async client가 필요하면 첫 worker 호출 안에서 생성해 같은 agent worker에
+  귀속하거나 worker-safe한 client factory를 사용한다.
+- SQLite session은 worker 안에서 만들며 기존 `check_same_thread=False` 설정을
+  사용한다.
+- 외부 Pydantic model instance는 신뢰하지 않는다. nested model까지 plain value로
+  변환한 뒤 validator를 다시 실행하고 deep copy한다.
+- registry는 provider metadata의 검증된 snapshot을 등록 시 보관하며, provider에는
+  canonical query가 아닌 별도의 deep copy만 전달한다.
+- `source_ref_id`는 source identity에서 다시 계산하며, gateway 정규화 뒤 동일해진
+  query는 첫 실제 조회 시각으로 고정한 turn normalization time을 기준으로 중복
+  실행하지 않는다.
 
 ### 3.4 Decision Finalizer
 
@@ -279,7 +365,7 @@ Hermes는 범용 Agent Runtime이며 HealthMes와 동등한 제품 계층이 아
 Hermes가 제공하는 기능:
 
 - LLM provider와 model 실행
-- 대화와 tool-calling 반복 loop
+- 일반 대화와 범용 tool-calling 기능
 - MCP 도구 발견과 실행
 - 세션, gateway, cron과 전달 채널
 - Skill 문서 로딩
@@ -292,15 +378,20 @@ HealthMes가 소유해야 하는 기능:
 - source reference와 finalization
 - DecisionRecord와 outcome 연결
 
-MVP에서는 `HermesRuntimeAdapter`가 Hermes의 기존 loop를 사용한다. 새 LLM runtime을
-처음부터 만들지 않는다. Hermes에 필수 generic hook이 없다면 HealthMes vendored
-tree를 직접 수정하지 않고 별도 Hermes 저장소와 PR에서 다음과 같은 범용 확장만
-제안한다.
+HealthMes 판단에서 Hermes의 전체 autonomous tool loop를 그대로 실행하면 step,
+deadline과 gateway 소유권이 다시 Hermes로 넘어가므로 사용하지 않는다.
+`HermesRuntimeAdapter.next_step()`은 HealthMes가 준 turn snapshot으로 정확히 한 번의
+모델 iteration만 실행하고, `tool_calls` 또는 final draft 중 하나를 반환해야 한다.
+
+새 provider SDK, 세션과 채널을 처음부터 다시 만들지는 않는다. Hermes에 이
+single-iteration generic hook이 없다면 HealthMes vendored tree를 직접 수정하지 않고
+별도 Hermes 저장소와 PR에서 다음 범용 확장만 제안한다.
 
 - 필수 system policy 주입 hook
-- turn 완료 후 finalizer callback
-- tool trace export
-- tool allowlist와 context scope 전달
+- structured tool-call/final response 한 번 생성
+- model usage metadata 반환
+- tool allowlist와 이전 exchange snapshot 전달
+- 외부 HealthMes driver가 cancellation과 deadline을 소유할 수 있는 호출 경계
 
 HealthMes 전용 카페인, 활동 또는 영양 규칙을 Hermes core에 넣지 않는다.
 
@@ -313,17 +404,20 @@ LLM
   "활동과 수면 자료가 필요하다"
        |
        v
-Hermes tool loop
+HermesRuntimeAdapter.next_step
+  tool 요청만 반환
        |
        v
-MCP HealthMes tools
+HealthMesDecisionAgent
+  요청 검증과 step/tool budget 적용
        |
        v
 Context Access Layer와 Domain Provider
 ```
 
 에이전트의 자율성과 MCP는 충돌하지 않는다. LLM이 어떤 도구를 언제 호출할지
-자율적으로 선택하고, MCP는 선택한 도구를 안전하게 실행한다.
+자율적으로 선택하고, HealthMes driver가 선택을 검증한 뒤 MCP 또는 in-process
+gateway로 안전하게 실행한다.
 
 아키텍처는 MCP에만 고정하지 않는다.
 
@@ -381,13 +475,13 @@ MVP는 기존 Hermes 연동을 위해 MCP 구현체만 제공해도 된다.
 
 | 항목 | 현재 코드 | 목표 |
 |---|---|---|
-| 질문 입력 | 호출자가 `question_kind` 선택 | 자연어 `DecisionRequest` |
-| 자료 선택 | 고정 `DOMAIN_SELECTION` | LLM의 반복 tool planning |
-| resolver | 선택과 조립을 함께 수행 | 호환 wrapper로 격하 |
-| Context layer | 일부 freshness/coverage 조립 | 권한과 privacy를 강제하는 Source Gateway |
+| 질문 입력 | 자연어 `DecisionRequest`; 기존 호출자는 `question_kind` 사용 가능 | 자연어를 기본값으로 정착 |
+| 자료 선택 | HealthMes-owned `next_step` loop와 호환 resolver 병존 | LLM의 반복 tool planning |
+| resolver | 호환 wrapper | 호환 기간 뒤 core 경로에서 제거 |
+| Context layer | 권한, retention, privacy, query cap과 source ref 강제 | provider completeness 지속 보강 |
 | Skill | 일부 제품 workflow와 필수 절차 포함 | 얇은 runtime adapter |
 | Hermes | MCP 연결 가능, HealthMes 전용 adapter 없음 | `HermesRuntimeAdapter` |
-| 최종 판단 | 구현되지 않음 | LLM 종합 판단 |
+| 최종 판단 | runtime-neutral structured draft loop 구현 | Hermes adapter 연결 |
 | 판단 저장 | LLM이 `record_decision`을 기억해야 함 | finalizer가 자동 저장 |
 | wearable provenance | 안정적인 evidence ID 부족 | normalized source reference 또는 mirror |
 
@@ -445,11 +539,32 @@ Nutrition, Wearable, Calendar 도구는 폐기하지 않는다. 새 Decision Age
 ### `DEC-04 HealthMes Decision Agent`
 
 - 자연어 질문을 받는 HealthMes-owned orchestration interface
-- LLM이 tool catalog에서 도구를 선택하고 반복 호출
+- HealthMes가 model iteration, step budget와 hard deadline을 직접 소유
+- runtime은 한 iteration마다 tool 요청 또는 final draft 중 하나만 반환
+- LLM이 tool catalog에서 도구를 선택하고 실제 결과에 따라 추가 요청
+- runtime에 provider callback, DB와 registry를 노출하지 않음
+- runtime history와 canonical trace를 deep snapshot으로 격리
+- 실제 tool result에 없는 source reference ID 거부
+- source reference가 있는 context를 사용한 완료 답변의 source reference 생략 거부
+- runtime request에서 caller/session/record 식별자를 제거하고 turn-scoped record
+  alias와 허용 domain만 공개
+- runtime/provider를 API event loop와 분리하고 wall-clock deadline 강제
+- worker를 구성 단계에서 prewarm하고 request validation, policy/catalog/access
+  준비에 하나의 deadline 적용
+- cooperative timeout cancellation 뒤 worker 재사용, stuck turn만 quarantine
+- active turn shutdown 시 결과 전달 후 worker loop 종료
+- 같은 runtime을 사용하는 전체 turn 직렬화와 cancellation-safe 재사용
+- provider metadata/query snapshot으로 post-filter allowlist 변조 차단
+- tool parameter마다 type, 길이, 범위, enum과 format 계약 강제
+- nested Pydantic instance를 포함한 외부 결과 전체 재검증
+- gateway normalization 후 동일한 effective query 중복 실행 거부
+- configured runtime/model identity 변경 거부
 - 부족한 자료에 대한 추가 질문
 - 전문 정책 경계를 유지한 최종 종합
 
-**종료 조건:** 같은 문장이라도 실제 context에 따라 호출 도구가 달라질 수 있다.
+**종료 조건:** 같은 문장이라도 실제 context에 따라 호출 도구가 달라지고, runtime의
+cancellation 억제, 동기 event-loop blocking, step 우회와 source ref 위조가 성공
+결과에 반영되지 않는다.
 
 ### `DEC-05 Hermes Runtime Adapter`
 
@@ -530,3 +645,9 @@ Hermes가 이미 provider, tool loop, session과 channel을 제공하므로 MVP�
 6. 행동 제안은 자동으로 `DecisionRecord`에 저장된다.
 7. Hermes 없이도 계약 테스트가 가능하고 Hermes는 교체 가능한 adapter다.
 8. UI 구현 없이 엔진과 runtime 연결의 end-to-end 테스트가 통과한다.
+9. runtime이 cancellation을 억제하거나 이전 결과 snapshot을 변경해도 반환 결과와
+   canonical trace가 deadline 이후 변하지 않는다.
+10. runtime 또는 provider가 event loop를 동기적으로 막아도 API 호출은 wall-clock
+    deadline 안에 실패로 반환된다.
+11. timeout으로 worker가 종료되지 않아도 같은 agent가 새 thread를 계속 만들지 않고
+    이후 요청을 fail-fast 한다.

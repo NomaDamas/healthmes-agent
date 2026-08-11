@@ -36,8 +36,12 @@ from healthmes.decision.contracts import (
 )
 from healthmes.decision.providers import (
     ContextCapability,
+    ContextParameterFormat,
+    ContextParameterSpec,
+    ContextParameterType,
     ContextProviderMetadata,
     ProvenanceSupport,
+    validate_context_parameters,
 )
 from healthmes.nutrition.intake_contracts import CaptureModality, IntakeIntent
 from healthmes.nutrition.intake_query import (
@@ -64,6 +68,65 @@ from healthmes.store import CalendarEventMirror, WellnessEvent
 from healthmes.timezones import parse_timezone
 
 WearableReader = Callable[[date], Awaitable[dict[str, Any]]]
+
+_DATE_PARAMETER = ContextParameterSpec(
+    name="date",
+    value_type=ContextParameterType.STRING,
+    min_length=10,
+    max_length=10,
+    format=ContextParameterFormat.DATE,
+)
+_LOOKBACK_DAYS_PARAMETER = ContextParameterSpec(
+    name="lookback_days",
+    value_type=ContextParameterType.INTEGER,
+    minimum=1,
+    maximum=90,
+)
+_CONFIRMED_ONLY_PARAMETER = ContextParameterSpec(
+    name="confirmed_only",
+    value_type=ContextParameterType.BOOLEAN,
+)
+_INTENT_PARAMETER = ContextParameterSpec(
+    name="intent",
+    value_type=ContextParameterType.STRING,
+    min_length=1,
+    max_length=64,
+    allowed_values=tuple(item.value for item in IntakeIntent),
+)
+_MODALITY_PARAMETER = ContextParameterSpec(
+    name="modality",
+    value_type=ContextParameterType.STRING,
+    min_length=1,
+    max_length=32,
+    allowed_values=tuple(item.value for item in CaptureModality),
+)
+_NUTRIENT_PARAMETER = ContextParameterSpec(
+    name="nutrient",
+    value_type=ContextParameterType.STRING,
+    min_length=1,
+    max_length=128,
+)
+_QUERY_PARAMETER = ContextParameterSpec(
+    name="query",
+    value_type=ContextParameterType.STRING,
+    min_length=1,
+    max_length=500,
+)
+_REQUEST_ID_PARAMETER = ContextParameterSpec(
+    name="request_id",
+    value_type=ContextParameterType.STRING,
+    required=True,
+    min_length=36,
+    max_length=36,
+    format=ContextParameterFormat.UUID,
+    accepts_related_record_ref=True,
+)
+_MINIMUM_MINUTES_PARAMETER = ContextParameterSpec(
+    name="minimum_minutes",
+    value_type=ContextParameterType.INTEGER,
+    minimum=1,
+    maximum=1_440,
+)
 
 _ENVELOPE_KEYS = {
     "coverage",
@@ -952,6 +1015,10 @@ def _validate_query(
     )
     if unsupported_parameters:
         raise ValueError("unsupported context parameters")
+    validate_context_parameters(
+        query.parameters,
+        capability.parameter_specs,
+    )
     if capability.lookback_parameter is not None:
         raw_lookback = query.parameters.get(
             capability.lookback_parameter,
@@ -1050,6 +1117,7 @@ class ActivityContextProvider:
                 ),
                 nested_output_fields=_ACTIVITY_NESTED_FIELDS,
                 parameters=("date",),
+                parameter_specs=(_DATE_PARAMETER,),
                 max_lookback_days=1,
                 sensitivity="activity-aggregate",
                 limitation_codes=_ACTIVITY_LIMITATION_CODES,
@@ -1074,6 +1142,7 @@ class ActivityContextProvider:
                 ),
                 nested_output_fields=_ACTIVITY_NESTED_FIELDS,
                 parameters=("date",),
+                parameter_specs=(_DATE_PARAMETER,),
                 max_lookback_days=1,
                 sensitivity="activity-aggregate",
                 limitation_codes=_ACTIVITY_LIMITATION_CODES,
@@ -1102,6 +1171,10 @@ class ActivityContextProvider:
                 ),
                 nested_output_fields=_ACTIVITY_NESTED_FIELDS,
                 parameters=("date", "lookback_days"),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _LOOKBACK_DAYS_PARAMETER,
+                ),
                 max_lookback_days=90,
                 default_lookback_days=7,
                 lookback_parameter="lookback_days",
@@ -1126,6 +1199,7 @@ class ActivityContextProvider:
                 ),
                 nested_output_fields=_ACTIVITY_NESTED_FIELDS,
                 parameters=("date",),
+                parameter_specs=(_DATE_PARAMETER,),
                 max_lookback_days=1,
                 sensitivity="activity-aggregate",
                 limitation_codes=_ACTIVITY_LIMITATION_CODES,
@@ -1235,6 +1309,13 @@ class NutritionContextProvider:
                     "nutrient",
                     "query",
                 ),
+                parameter_specs=(
+                    _CONFIRMED_ONLY_PARAMETER,
+                    _INTENT_PARAMETER,
+                    _MODALITY_PARAMETER,
+                    _NUTRIENT_PARAMETER,
+                    _QUERY_PARAMETER,
+                ),
                 max_lookback_days=90,
                 default_lookback_days=14,
                 privacy_levels=(
@@ -1273,6 +1354,7 @@ class NutritionContextProvider:
                 nested_output_fields=_NUTRITION_NESTED_FIELDS,
                 identity_fields=_NUTRITION_IDENTITY_FIELDS,
                 parameters=("date",),
+                parameter_specs=(_DATE_PARAMETER,),
                 max_lookback_days=1,
                 sensitivity="nutrition",
                 limitation_codes=_NUTRITION_LIMITATION_CODES,
@@ -1306,6 +1388,7 @@ class NutritionContextProvider:
                 identity_fields=_NUTRITION_IDENTITY_FIELDS,
                 raw_fields=_NUTRITION_RAW_FIELDS,
                 parameters=("request_id",),
+                parameter_specs=(_REQUEST_ID_PARAMETER,),
                 max_lookback_days=90,
                 default_lookback_days=15,
                 privacy_levels=(
@@ -1636,6 +1719,7 @@ class WearableContextProvider:
                 nested_output_fields=_WEARABLE_NESTED_FIELDS,
                 identity_fields=_WEARABLE_IDENTITY_FIELDS,
                 parameters=("date",),
+                parameter_specs=(_DATE_PARAMETER,),
                 max_lookback_days=1,
                 sensitivity="wearable",
                 limitation_codes=_WEARABLE_LIMITATION_CODES,
@@ -1659,6 +1743,7 @@ class WearableContextProvider:
                 nested_output_fields=_WEARABLE_NESTED_FIELDS,
                 identity_fields=_WEARABLE_IDENTITY_FIELDS,
                 parameters=("date",),
+                parameter_specs=(_DATE_PARAMETER,),
                 max_lookback_days=1,
                 sensitivity="wearable",
                 limitation_codes=_WEARABLE_LIMITATION_CODES,
@@ -1682,6 +1767,7 @@ class WearableContextProvider:
                 nested_output_fields=_WEARABLE_NESTED_FIELDS,
                 identity_fields=_WEARABLE_IDENTITY_FIELDS,
                 parameters=("date",),
+                parameter_specs=(_DATE_PARAMETER,),
                 max_lookback_days=1,
                 sensitivity="wearable",
                 limitation_codes=_WEARABLE_LIMITATION_CODES,
@@ -1703,6 +1789,7 @@ class WearableContextProvider:
                 nested_output_fields=_WEARABLE_NESTED_FIELDS,
                 identity_fields=_WEARABLE_IDENTITY_FIELDS,
                 parameters=("date",),
+                parameter_specs=(_DATE_PARAMETER,),
                 max_lookback_days=1,
                 sensitivity="wearable",
                 limitation_codes=_WEARABLE_LIMITATION_CODES,
@@ -1861,6 +1948,7 @@ class CalendarContextProvider:
                 ),
                 nested_output_fields=_CALENDAR_NESTED_FIELDS,
                 parameters=("date",),
+                parameter_specs=(_DATE_PARAMETER,),
                 max_lookback_days=1,
                 sensitivity="calendar-metadata",
                 limitation_codes=_CALENDAR_LIMITATION_CODES,
@@ -1889,6 +1977,7 @@ class CalendarContextProvider:
                 nested_output_fields=_CALENDAR_NESTED_FIELDS,
                 limit_output_fields=("intervals",),
                 parameters=("date",),
+                parameter_specs=(_DATE_PARAMETER,),
                 max_lookback_days=31,
                 sensitivity="calendar-metadata",
                 limitation_codes=_CALENDAR_LIMITATION_CODES,
@@ -1916,6 +2005,10 @@ class CalendarContextProvider:
                 nested_output_fields=_CALENDAR_NESTED_FIELDS,
                 limit_output_fields=("windows",),
                 parameters=("date", "minimum_minutes"),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _MINIMUM_MINUTES_PARAMETER,
+                ),
                 max_lookback_days=31,
                 sensitivity="calendar-metadata",
                 limitation_codes=_CALENDAR_LIMITATION_CODES,

@@ -44,6 +44,7 @@ from healthmes.decision.contracts import (
     PrivacyLevel,
     RawSourceHandle,
     SourceRef,
+    source_ref_id,
 )
 from healthmes.decision.providers import (
     ContextCapability,
@@ -51,7 +52,9 @@ from healthmes.decision.providers import (
     DisabledProviderError,
     UnknownCapabilityError,
     UnknownProviderError,
+    validate_context_parameters,
 )
+from healthmes.decision.validation import strict_model_validate
 from healthmes.nutrition.intake_service import (
     DECISION_EVENT,
     DECISION_REQUEST_EVENT,
@@ -137,6 +140,7 @@ _AUDIT_REASON_CODES = frozenset(
         "context_stale",
         "coverage_unknown",
         "domain_consent_denied",
+        "duplicate_tool_call",
         "domain_privacy_consent_denied",
         "execution_scope_denied",
         "external_source_identity_mismatch",
@@ -534,16 +538,20 @@ class ContextAccessLayer:
         request: DecisionRequest,
         *,
         policy: ContextAccessPolicy,
+        reject_duplicate_effective_queries: bool = False,
     ) -> ContextAccessTurn:
         return ContextAccessTurn(
             layer=self,
-            request=request,
-            policy=policy,
+            request=strict_model_validate(DecisionRequest, request),
+            policy=strict_model_validate(ContextAccessPolicy, policy),
+            reject_duplicate_effective_queries=(
+                reject_duplicate_effective_queries
+            ),
         )
 
 
 class ContextAccessTurn:
-    """The only provider execution surface exposed to a decision runtime."""
+    """Turn-scoped provider surface used only by the HealthMes driver."""
 
     def __init__(
         self,
@@ -551,10 +559,16 @@ class ContextAccessTurn:
         layer: ContextAccessLayer,
         request: DecisionRequest,
         policy: ContextAccessPolicy,
+        reject_duplicate_effective_queries: bool,
     ) -> None:
         self._layer = layer
         self.request = request
         self.policy = policy
+        self._normalization_now: datetime | None = None
+        self._reject_duplicate_effective_queries = (
+            reject_duplicate_effective_queries
+        )
+        self._effective_query_fingerprints: set[str] = set()
         self._trace: list[AccessAuditEntry] = []
         self._calls = 0
         self._context_bytes = 0
@@ -563,7 +577,8 @@ class ContextAccessTurn:
 
     @property
     def trace(self) -> tuple[AccessAuditEntry, ...]:
-        return tuple(self._trace)
+        with self._budget_lock:
+            return tuple(self._trace)
 
     @property
     def calls_used(self) -> int:
@@ -584,9 +599,19 @@ class ContextAccessTurn:
         self,
         session: Session,
         query: ContextQuery,
+        *,
+        ensure_active: Callable[[], None] | None = None,
     ) -> ContextResult:
+        if ensure_active is not None:
+            ensure_active()
+        query = strict_model_validate(ContextQuery, query)
+        if ensure_active is not None:
+            ensure_active()
         now = _as_utc(self._layer._clock())
         with self._budget_lock:
+            if self._normalization_now is None:
+                self._normalization_now = now
+            normalization_now = self._normalization_now
             self._calls += 1
             tool_budget_exhausted = (
                 self._calls > self.request.budget.max_tool_calls
@@ -598,16 +623,39 @@ class ContextAccessTurn:
                 reason_codes=("turn_tool_call_budget_exhausted",),
             )
 
-        preflight = self._preflight(session, query, now=now)
+        preflight = self._preflight(
+            session,
+            query,
+            now=now,
+            normalization_now=normalization_now,
+        )
+        if ensure_active is not None:
+            ensure_active()
         if isinstance(preflight, ContextResult):
             return preflight
         effective_query, capability, grant, pre_limitations = preflight
+        if self._reject_duplicate_effective_queries:
+            fingerprint = _effective_query_fingerprint(effective_query)
+            with self._budget_lock:
+                duplicate = (
+                    fingerprint in self._effective_query_fingerprints
+                )
+                if not duplicate:
+                    self._effective_query_fingerprints.add(fingerprint)
+            if duplicate:
+                return self._deny(
+                    query,
+                    effective_query=effective_query,
+                    now=now,
+                    reason_codes=("duplicate_tool_call",),
+                )
 
         try:
             result = await self._layer.registry.execute(
                 session,
                 effective_query,
                 now=now,
+                ensure_active=ensure_active,
             )
         except (
             DisabledProviderError,
@@ -620,6 +668,8 @@ class ContextAccessTurn:
                 now=now,
                 reason_codes=("provider_access_changed",),
             )
+        if ensure_active is not None:
+            ensure_active()
         postflight_now = max(
             now,
             _as_utc(self._layer._clock()),
@@ -652,6 +702,8 @@ class ContextAccessTurn:
                 now=postflight_now,
                 reason_codes=("provider_access_changed",),
             )
+        if ensure_active is not None:
+            ensure_active()
         now = postflight_now
         if grant.domain == "activity":
             query_bounds = _query_bounds(effective_query, now=now)
@@ -749,6 +801,8 @@ class ContextAccessTurn:
             grant=grant,
             now=now,
         )
+        if ensure_active is not None:
+            ensure_active()
         if source_validation[2]:
             return self._deny(
                 query,
@@ -944,6 +998,7 @@ class ContextAccessTurn:
         query: ContextQuery,
         *,
         now: datetime,
+        normalization_now: datetime,
     ) -> (
         tuple[
             ContextQuery,
@@ -1011,6 +1066,17 @@ class ContextAccessTurn:
                 query,
                 now=now,
                 reason_codes=("query_parameters_unsupported",),
+            )
+        try:
+            validate_context_parameters(
+                query.parameters,
+                capability.parameter_specs,
+            )
+        except ValueError:
+            return self._deny(
+                query,
+                now=now,
+                reason_codes=("query_parameters_invalid",),
             )
         date_range_error = _explicit_date_range_error(query)
         if date_range_error is not None:
@@ -1089,7 +1155,7 @@ class ContextAccessTurn:
             )
             limitations.append("query_limit_trimmed")
 
-        bounds = _query_bounds(effective, now=now)
+        bounds = _query_bounds(effective, now=normalization_now)
         if isinstance(bounds, str):
             return self._deny(
                 query,
@@ -1102,7 +1168,7 @@ class ContextAccessTurn:
             hint_bounds = _request_hint_bounds(
                 self.request,
                 timezone=effective.timezone,
-                now=now,
+                now=normalization_now,
             )
             if isinstance(hint_bounds, str):
                 return self._deny(
@@ -1119,7 +1185,10 @@ class ContextAccessTurn:
             ):
                 bounds = (
                     bounds[0],
-                    min(bounds[1], now + timedelta(seconds=1)),
+                    min(
+                        bounds[1],
+                        normalization_now + timedelta(seconds=1),
+                    ),
                 )
         elif effective.start is None:
             expand_default_lookback = True
@@ -1218,15 +1287,18 @@ class ContextAccessTurn:
             effective = effective.model_copy(
                 update={"start": start, "end": end}
             )
-            if not capability.allows_future and end > now + _MAX_FUTURE_SKEW:
-                if start >= now + _MAX_FUTURE_SKEW:
+            if (
+                not capability.allows_future
+                and end > normalization_now + _MAX_FUTURE_SKEW
+            ):
+                if start >= normalization_now + _MAX_FUTURE_SKEW:
                     return self._deny(
                         query,
                         effective_query=effective,
                         now=now,
                         reason_codes=("future_context_unavailable",),
                     )
-                end = now + timedelta(seconds=1)
+                end = normalization_now + timedelta(seconds=1)
                 effective = effective.model_copy(
                     update={"start": start, "end": end}
                 )
@@ -1360,31 +1432,45 @@ class ContextAccessTurn:
         payload_bytes: int = 0,
     ) -> None:
         effective = effective_query
-        self._trace.append(
-            AccessAuditEntry(
-                query_id=query.query_id,
-                provider_id=query.provider_id,
-                capability=query.capability,
-                outcome=outcome,
-                occurred_at=now,
-                reason_codes=_audit_reason_codes(reason_codes),
-                redacted_paths=_audit_redacted_paths(redacted_paths),
-                requested_privacy_level=query.privacy_level,
-                effective_privacy_level=(
-                    effective.privacy_level if effective else None
-                ),
-                requested_start=query.start,
-                requested_end=query.end,
-                effective_start=effective.start if effective else None,
-                effective_end=effective.end if effective else None,
-                requested_limit=query.limit,
-                effective_limit=effective.limit if effective else None,
-                source_ref_ids=tuple(
-                    ref.reference_id for ref in result.source_refs
-                ),
-                payload_bytes=payload_bytes,
-            )
+        entry = AccessAuditEntry(
+            query_id=query.query_id,
+            provider_id=query.provider_id,
+            capability=query.capability,
+            outcome=outcome,
+            occurred_at=now,
+            reason_codes=_audit_reason_codes(reason_codes),
+            redacted_paths=_audit_redacted_paths(redacted_paths),
+            requested_privacy_level=query.privacy_level,
+            effective_privacy_level=(
+                effective.privacy_level if effective else None
+            ),
+            requested_start=query.start,
+            requested_end=query.end,
+            effective_start=effective.start if effective else None,
+            effective_end=effective.end if effective else None,
+            requested_limit=query.limit,
+            effective_limit=effective.limit if effective else None,
+            source_ref_ids=tuple(
+                ref.reference_id for ref in result.source_refs
+            ),
+            payload_bytes=payload_bytes,
         )
+        with self._budget_lock:
+            self._trace.append(entry)
+
+
+def _effective_query_fingerprint(query: ContextQuery) -> str:
+    payload = query.model_dump(
+        mode="json",
+        exclude={"query_id", "purpose"},
+    )
+    payload["fields"] = sorted(payload["fields"])
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
 
 
 def _query_bounds(
@@ -1766,6 +1852,14 @@ def _validate_source_ref(
     now: datetime,
     allow_external: bool,
 ) -> tuple[SourceRef | None, tuple[str, ...]]:
+    expected_reference_id = source_ref_id(
+        domain=source_ref.domain,
+        resource_type=source_ref.resource_type,
+        source_provider=source_ref.source_provider,
+        record_id=source_ref.record_id,
+    )
+    if source_ref.reference_id != expected_reference_id:
+        return None, ("source_ref_identity_mismatch",)
     try:
         record_uuid = uuid.UUID(source_ref.record_id)
     except ValueError:

@@ -34,6 +34,9 @@ from healthmes.decision import (
     ContextCapability,
     ContextCoverage,
     ContextFreshness,
+    ContextParameterFormat,
+    ContextParameterSpec,
+    ContextParameterType,
     ContextProviderMetadata,
     ContextProviderRegistry,
     ContextQuery,
@@ -65,6 +68,31 @@ from healthmes.store.enums import CalendarSource
 NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 DAY_START = datetime(2026, 8, 10, tzinfo=UTC)
 DAY_END = DAY_START + timedelta(days=1)
+
+
+def _parameter_specs(
+    parameters: tuple[str, ...],
+) -> tuple[ContextParameterSpec, ...]:
+    specs = {
+        "date": ContextParameterSpec(
+            name="date",
+            value_type=ContextParameterType.STRING,
+            min_length=10,
+            max_length=10,
+            format=ContextParameterFormat.DATE,
+        ),
+        "lookback_days": ContextParameterSpec(
+            name="lookback_days",
+            value_type=ContextParameterType.INTEGER,
+            minimum=1,
+            maximum=90,
+        ),
+        "confirmed_only": ContextParameterSpec(
+            name="confirmed_only",
+            value_type=ContextParameterType.BOOLEAN,
+        ),
+    }
+    return tuple(specs[name] for name in parameters)
 
 
 class StaticProvider:
@@ -128,6 +156,7 @@ class StaticProvider:
                     limit_output_fields=limit_output_fields,
                     limitation_codes=limitation_codes,
                     parameters=parameters,
+                    parameter_specs=_parameter_specs(parameters),
                     max_lookback_days=max_lookback_days,
                     default_lookback_days=default_lookback_days,
                     lookback_parameter=lookback_parameter,
@@ -424,6 +453,52 @@ async def test_authentication_and_owner_binding_fail_closed(
     assert result.limitations == [reason]
     assert provider.queries == []
     assert turn.trace[0].outcome is AccessOutcome.DENIED
+
+
+async def test_effective_duplicate_rejection_is_opt_in(session):
+    provider = StaticProvider()
+    layer = ContextAccessLayer(
+        ContextProviderRegistry((provider,)),
+        clock=lambda: NOW,
+    )
+    turn = layer.start_turn(_request(), policy=_policy())
+
+    first = await turn.query(session, _query(limit=999))
+    second = await turn.query(session, _query(limit=1_000))
+
+    assert first.status is ContextStatus.PARTIAL
+    assert second.status is ContextStatus.PARTIAL
+    assert first.limitations == ["query_limit_trimmed"]
+    assert second.limitations == ["query_limit_trimmed"]
+    assert [query.limit for query in provider.queries] == [250, 250]
+
+
+async def test_effective_duplicate_uses_one_turn_normalization_time(session):
+    provider = StaticProvider()
+    current = NOW
+
+    def ticking_clock():
+        nonlocal current
+        current += timedelta(microseconds=100)
+        return current
+
+    layer = ContextAccessLayer(
+        ContextProviderRegistry((provider,)),
+        clock=ticking_clock,
+    )
+    turn = layer.start_turn(
+        _request(),
+        policy=_policy(),
+        reject_duplicate_effective_queries=True,
+    )
+
+    first = await turn.query(session, _query(limit=999))
+    second = await turn.query(session, _query(limit=1_000))
+
+    assert first.status is ContextStatus.PARTIAL
+    assert second.status is ContextStatus.DENIED
+    assert second.limitations == ["duplicate_tool_call"]
+    assert len(provider.queries) == 1
 
 
 async def test_domain_consent_and_provider_enablement_fail_closed(session):
@@ -2483,6 +2558,34 @@ async def test_provider_output_is_allowlisted_before_privacy_filtering(
     assert "Private App" not in audit
 
 
+async def test_provider_cannot_mutate_canonical_query_allowlist(session):
+    class MutatingProvider(StaticProvider):
+        async def query(self, session, query, *, now):
+            del session
+            query.fields.append("secret")
+            self.queries.append(query)
+            return _result(
+                query,
+                now=now,
+                payload={
+                    "value": 7,
+                    "secret": "provider-private-value",
+                },
+            )
+
+    provider = MutatingProvider(output_fields=("value",))
+    _, turn = _turn(provider)
+    query = _query().model_copy(update={"fields": ["value"]})
+
+    result = await turn.query(session, query)
+
+    assert provider.queries[0].fields == ["value", "secret"]
+    assert query.fields == ["value"]
+    assert result.payload == {"value": 7}
+    assert "provider-private-value" not in result.model_dump_json()
+    assert "provider_fields_redacted" in result.limitations
+
+
 async def test_forged_source_domain_is_denied(session):
     event = _event(domain="nutrition")
     session.add(event)
@@ -2577,6 +2680,22 @@ async def test_capability_contract_is_enforced_before_provider_execution(
 
     assert result.status is ContextStatus.DENIED
     assert result.limitations == [reason]
+    assert provider.queries == []
+
+
+async def test_parameter_types_are_enforced_before_provider_execution(
+    session,
+):
+    provider = StaticProvider(parameters=("confirmed_only",))
+    _, turn = _turn(provider)
+    query = _query().model_copy(
+        update={"parameters": {"confirmed_only": "false"}}
+    )
+
+    result = await turn.query(session, query)
+
+    assert result.status is ContextStatus.DENIED
+    assert result.limitations == ["query_parameters_invalid"]
     assert provider.queries == []
 
 
