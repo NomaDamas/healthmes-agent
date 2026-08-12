@@ -1,22 +1,27 @@
 # Extending HealthMes — a guide for domain experts
 
-This project is deliberately split so that **healthcare domain knowledge goes
-into two small, safe extension points** without touching the engine:
+This project is deliberately split so that domain calculation, cross-domain
+reasoning, and runtime presentation do not silently replace one another:
 
 | You want to add… | Extension point | Skill level |
 |---|---|---|
-| A judgment procedure ("when X and Y, advise Z") | A **skill** — one markdown file | No code |
-| A new metric / derived indicator | A **Layer B MCP tool** — one Python function | Python |
+| A channel workflow or presentation convention | A thin **skill** — one markdown file | No code |
+| A deterministic metric or specialist boundary | A **Context Provider / Layer B tool** | Python |
+| A cross-domain reasoning contract | The **HealthMes Decision Agent** policy, runtime contract, and evals | Python + prompt/eval design |
 | A new correlation report | An **insight template** | Python (SQL-ish) |
 
-The hard rule behind all three (docs/PLAN.md §1.5): **tools state deterministic
-facts, skills hold the judgment**. The LLM never computes a metric; it reads
-interpreted numbers (with confidence) and reasons about them.
+The hard boundary is: domain providers calculate exact facts and specialist
+limits; the HealthMes Decision Agent owns the LLM loop, mandatory policy,
+source validation, and finalization; skills only teach a replaceable runtime
+how to enter or present that workflow. A skill file is not an authorization,
+retention, privacy, calculation, or persistence enforcement mechanism. See
+`docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md` and
+`docs/contracts/HERMES-MODEL-ITERATION-HOOK.ko.md`.
 
-## 1. Adding a skill (no code)
+## 1. Adding a thin skill (no code)
 
 Skills are markdown instruction files the agent loads when planning, capturing,
-or answering. Each lives in `skills/<skill-name>/SKILL.md` and follows the
+or presenting an answer. Each lives in `skills/<skill-name>/SKILL.md` and follows the
 vendor format (see the five existing skills as templates —
 `skills/healthmes-planner/SKILL.md` is the richest example).
 
@@ -39,12 +44,16 @@ When the user asks about snoring, daytime sleepiness, or during weekly review.
 
 Ground rules for skill authors:
 
+- **Do not put mandatory product policy only in a skill.** Authorization,
+  retention, privacy, exact calculations, tool budgets, source-reference
+  validation, and decision persistence belong to HealthMes code.
 - **Reference tools by their registered names**: `mcp__healthmes__<tool>` and
   `mcp__open_wearables__<tool>` (double underscores).
 - **Never instruct raw REST calls** — data access must go through MCP tools so
   every decision stays reconstructable in the decision tree.
-- **Always instruct `record_decision`** after a recommendation, so the decision
-  viewer can show *why*.
+- Legacy Hermes workflows still instruct `record_decision`; the target
+  Decision Agent finalizer enforces persistence in code rather than trusting
+  this instruction alone.
 - **Respect confidence**: the tools return `confidence` / `coverage` /
   `insufficient_data` honestly; skills must gate advice on them.
 - Multiple skills are welcome — one file per clinical question keeps them

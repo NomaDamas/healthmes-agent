@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import UTC, date, datetime
 from typing import Any, Protocol, runtime_checkable
 
@@ -406,11 +407,37 @@ class RuntimeDecisionRequest(BaseModel):
         return value.astimezone(UTC)
 
 
+class RuntimeResourceBudget(BaseModel):
+    """Remaining HealthMes-owned resource budget visible to one iteration."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_tool_calls: int = Field(ge=1, le=32)
+    remaining_tool_calls: int = Field(ge=0, le=32)
+    max_source_refs: int = Field(ge=1, le=500)
+    remaining_source_refs: int = Field(ge=0, le=500)
+    max_context_bytes: int = Field(ge=1_024, le=2_000_000)
+    remaining_context_bytes: int = Field(ge=0, le=2_000_000)
+
+    @model_validator(mode="after")
+    def validate_remaining_budget(self) -> RuntimeResourceBudget:
+        pairs = (
+            (self.remaining_tool_calls, self.max_tool_calls),
+            (self.remaining_source_refs, self.max_source_refs),
+            (self.remaining_context_bytes, self.max_context_bytes),
+        )
+        if any(remaining > maximum for remaining, maximum in pairs):
+            raise ValueError("remaining runtime budget must not exceed maximum")
+        return self
+
+
 class DecisionRuntimeTurn(BaseModel):
     """Read-only snapshot for exactly one model iteration."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    request_id: uuid.UUID
+    turn_id: uuid.UUID
     request: RuntimeDecisionRequest
     system_policy: str = Field(min_length=1, max_length=16_000)
     system_policy_version: str = Field(min_length=1, max_length=128)
@@ -424,6 +451,8 @@ class DecisionRuntimeTurn(BaseModel):
     )
     step_number: int = Field(ge=1, le=32)
     remaining_steps: int = Field(ge=1, le=32)
+    resource_budget: RuntimeResourceBudget
+    deadline_ms: int = Field(ge=1)
 
     @field_validator("system_policy", "system_policy_version")
     @classmethod
@@ -481,6 +510,26 @@ class DecisionRuntime(Protocol):
         self,
         turn: DecisionRuntimeTurn,
     ) -> RuntimeStepOutput: ...
+
+
+class DecisionRuntimeError(RuntimeError):
+    """Safe runtime-boundary failure with a machine-readable code."""
+
+    def __init__(self, code: str) -> None:
+        self.code = _identifier(
+            code,
+            label="decision runtime error code",
+            max_length=128,
+        )
+        super().__init__(self.code)
+
+
+class DecisionRuntimeUnavailableError(DecisionRuntimeError):
+    """The selected runtime cannot satisfy the HealthMes iteration contract."""
+
+
+class DecisionRuntimeContractError(DecisionRuntimeError):
+    """The selected runtime returned an untrusted or malformed result."""
 
 
 class DecisionToolCallError(RuntimeError):

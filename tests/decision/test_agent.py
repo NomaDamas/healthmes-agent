@@ -33,7 +33,9 @@ from healthmes.decision import (
     DecisionContextHints,
     DecisionDraft,
     DecisionRequest,
+    DecisionRuntimeContractError,
     DecisionRuntimeTurn,
+    DecisionRuntimeUnavailableError,
     DecisionStatus,
     DomainAccessGrant,
     ExecutionScope,
@@ -268,6 +270,72 @@ async def test_agent_injects_policy_and_consent_filtered_catalog(
     ]
     assert turn.step_number == 1
     assert turn.remaining_steps == _request().budget.max_steps
+    assert turn.request_id != result.request_id
+    assert turn.turn_id != result.turn_id
+    assert turn.request_id.version == 4
+    assert turn.turn_id.version == 4
+    assert turn.resource_budget.max_tool_calls == (
+        _request().budget.max_tool_calls
+    )
+    assert turn.resource_budget.remaining_tool_calls == (
+        _request().budget.max_tool_calls
+    )
+    assert turn.resource_budget.max_source_refs == (
+        _request().budget.max_source_refs
+    )
+    assert turn.resource_budget.remaining_context_bytes == (
+        _request().budget.max_context_bytes
+    )
+    assert 1 <= turn.deadline_ms <= 1_000
+
+
+@pytest.mark.parametrize(
+    ("runtime_error", "status", "limitation"),
+    [
+        (
+            DecisionRuntimeUnavailableError(
+                "hermes_single_iteration_not_advertised"
+            ),
+            DecisionStatus.BLOCKED,
+            "hermes_single_iteration_not_advertised",
+        ),
+        (
+            DecisionRuntimeContractError(
+                "hermes_response_contract_invalid"
+            ),
+            DecisionStatus.FAILED,
+            "runtime_contract_violation",
+        ),
+    ],
+)
+async def test_agent_maps_runtime_boundary_errors_without_fallback(
+    session_factory,
+    runtime_error,
+    status,
+    limitation,
+):
+    class FailingRuntime:
+        metadata = RuntimeMetadata(
+            runtime="hermes",
+            model="test-model",
+        )
+
+        async def next_step(self, turn):
+            raise runtime_error
+
+    agent = _agent(
+        session_factory,
+        providers=(StubProvider(domain="activity"),),
+        runtime=FailingRuntime(),
+        policy=_policy("activity"),
+    )
+
+    result = await agent.ask(_request())
+
+    assert result.draft.status is status
+    assert result.draft.limitations == [limitation]
+    assert result.steps_used == 1
+    assert result.tool_trace == ()
 
 
 async def test_runtime_request_omits_caller_and_record_identifiers(
@@ -324,6 +392,12 @@ async def test_runtime_request_omits_caller_and_record_identifiers(
     assert str(request.request_id) not in serialized
     assert str(request.turn_id) not in serialized
     assert not hasattr(turn_request, "caller")
+    runtime_turn = runtime.turns[0]
+    assert runtime_turn.request_id != request.request_id
+    assert runtime_turn.turn_id != request.turn_id
+    serialized_turn = runtime_turn.model_dump_json()
+    assert str(request.request_id) not in serialized_turn
+    assert str(request.turn_id) not in serialized_turn
 
 
 async def test_related_record_is_exposed_only_as_turn_scoped_alias(
@@ -3471,6 +3545,41 @@ async def test_configured_runtime_model_cannot_change_mid_turn(
     assert result.draft.status is DecisionStatus.FAILED
     assert result.draft.limitations == ["runtime_identity_mismatch"]
     assert result.runtime.model == "expected-v1"
+
+
+async def test_configured_runtime_provider_cannot_change_mid_turn(
+    session_factory,
+):
+    class SwappingProviderRuntime:
+        metadata = RuntimeMetadata(
+            runtime="scripted",
+            model="expected-v1",
+            provider="expected-provider",
+        )
+
+        async def next_step(self, turn):
+            return RuntimeStepOutput(
+                draft=DecisionDraft(
+                    status=DecisionStatus.COMPLETED,
+                    answer="This output came from an unexpected provider.",
+                ),
+                metadata=RuntimeMetadata(
+                    runtime="scripted",
+                    model="expected-v1",
+                    provider="spoofed-provider",
+                ),
+            )
+
+    result = await _agent(
+        session_factory,
+        providers=(StubProvider(domain="activity"),),
+        runtime=SwappingProviderRuntime(),
+        policy=_policy("activity"),
+    ).ask(_request())
+
+    assert result.draft.status is DecisionStatus.FAILED
+    assert result.draft.limitations == ["runtime_identity_mismatch"]
+    assert result.runtime.provider == "expected-provider"
 
 
 async def test_missing_context_can_produce_clarification_not_zero(

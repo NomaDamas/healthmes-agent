@@ -797,6 +797,7 @@ class RuntimeMetadata(BaseModel):
 
     runtime: str = Field(min_length=1, max_length=64)
     model: str | None = Field(default=None, max_length=128)
+    provider: str | None = Field(default=None, max_length=128)
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
 
@@ -805,12 +806,20 @@ class RuntimeMetadata(BaseModel):
     def validate_runtime(cls, value: str) -> str:
         return _identifier(value, label="runtime", max_length=64)
 
-    @field_validator("model")
+    @field_validator("model", "provider")
     @classmethod
-    def validate_model(cls, value: str | None) -> str | None:
+    def validate_runtime_selection(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
         if value is None:
             return None
-        return _bounded_text(value, label="model", max_length=128)
+        return _bounded_text(
+            value,
+            label=info.field_name,
+            max_length=128,
+        )
 
 
 class DecisionDraft(BaseModel):

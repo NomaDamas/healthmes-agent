@@ -55,13 +55,16 @@ from healthmes.decision.providers import (
 from healthmes.decision.runtime import (
     ContextToolCall,
     DecisionRuntime,
+    DecisionRuntimeContractError,
     DecisionRuntimeTurn,
+    DecisionRuntimeUnavailableError,
     DecisionToolCallError,
     DecisionToolSpec,
     RuntimeContextResult,
     RuntimeDecisionContextHints,
     RuntimeDecisionRequest,
     RuntimeRelatedRecord,
+    RuntimeResourceBudget,
     RuntimeStepOutput,
     RuntimeToolExchange,
 )
@@ -1253,11 +1256,16 @@ class HealthMesDecisionAgent:
             related_records=related_records,
             runtime_aliases=runtime_aliases,
         )
+        # Caller-controlled identifiers never cross the runtime boundary.
+        runtime_request_id = uuid.uuid4()
+        runtime_turn_id = uuid.uuid4()
 
         for step_number in range(1, request.budget.max_steps + 1):
             _ensure_before_deadline(deadline)
             progress.start_step(step_number)
             runtime_turn = DecisionRuntimeTurn(
+                request_id=runtime_request_id,
+                turn_id=runtime_turn_id,
                 request=runtime_request.model_copy(deep=True),
                 system_policy=HEALTHMES_DECISION_SYSTEM_POLICY,
                 system_policy_version=(
@@ -1274,6 +1282,30 @@ class HealthMesDecisionAgent:
                 remaining_steps=(
                     request.budget.max_steps - step_number + 1
                 ),
+                resource_budget=RuntimeResourceBudget(
+                    max_tool_calls=request.budget.max_tool_calls,
+                    remaining_tool_calls=max(
+                        0,
+                        request.budget.max_tool_calls
+                        - access_turn.calls_used,
+                    ),
+                    max_source_refs=request.budget.max_source_refs,
+                    remaining_source_refs=max(
+                        0,
+                        request.budget.max_source_refs
+                        - access_turn.source_refs_used,
+                    ),
+                    max_context_bytes=request.budget.max_context_bytes,
+                    remaining_context_bytes=max(
+                        0,
+                        request.budget.max_context_bytes
+                        - access_turn.context_bytes_used,
+                    ),
+                ),
+                deadline_ms=max(
+                    1,
+                    int((deadline - monotonic()) * 1_000),
+                ),
             )
 
             try:
@@ -1289,6 +1321,27 @@ class HealthMesDecisionAgent:
                 raise
             except _HardDeadlineExceeded:
                 raise
+            except DecisionRuntimeUnavailableError as exc:
+                return self._failure_run(
+                    request,
+                    started_at=started_at,
+                    metadata=fallback_metadata,
+                    code=exc.code,
+                    status=DecisionStatus.BLOCKED,
+                    steps_used=step_number,
+                    tool_trace=executor.trace,
+                    access_trace=access_turn.trace,
+                )
+            except DecisionRuntimeContractError:
+                return self._failure_run(
+                    request,
+                    started_at=started_at,
+                    metadata=fallback_metadata,
+                    code="runtime_contract_violation",
+                    steps_used=step_number,
+                    tool_trace=executor.trace,
+                    access_trace=access_turn.trace,
+                )
             except ValidationError:
                 return self._failure_run(
                     request,
@@ -1323,6 +1376,19 @@ class HealthMesDecisionAgent:
             if (
                 fallback_metadata.model is not None
                 and output.metadata.model != fallback_metadata.model
+            ):
+                return self._failure_run(
+                    request,
+                    started_at=started_at,
+                    metadata=fallback_metadata,
+                    code="runtime_identity_mismatch",
+                    steps_used=step_number,
+                    tool_trace=executor.trace,
+                    access_trace=access_turn.trace,
+                )
+            if (
+                fallback_metadata.provider is not None
+                and output.metadata.provider != fallback_metadata.provider
             ):
                 return self._failure_run(
                     request,

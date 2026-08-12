@@ -123,8 +123,10 @@ Runtime에는 provider callback, DB session, registry, `consume_step()`을 주�
 요청 privacy level, 조회 기간 hint, 관련 기록 존재 여부와 허용된 관련 domain만
 담은 `RuntimeDecisionRequest`를 제공한다. 선택된 record가 필요한 도구에는
 turn-scoped `rr_...` alias만 보이며 HealthMes가 내부 실제 ID로 치환한다.
-`principal_id`, `session_id`, channel, request/turn ID와 실제 related record ID는
-runtime 경계를 넘지 않는다.
+`principal_id`, `session_id`, channel과 실제 related record ID는 runtime 경계를
+넘지 않는다. 외부 `DecisionRequest.request_id/turn_id`도 넘기지 않고, agent가
+turn마다 새로 생성한 opaque runtime correlation UUID만 전달한다. 이 UUID는
+응답 correlation과 감사에만 사용되며 caller/session/record identity를 담지 않는다.
 도구 결과도 runtime 전용 최소 계약으로 다시 변환한다. 전체 `SourceRef`,
 raw-source handle, query UUID와 cursor는 내부 trace에만 남고 모델에는 검증된
 `source_ref_ids`, freshness, coverage, limitation과 질문에 필요한 payload만
@@ -569,11 +571,30 @@ cancellation 억제, 동기 event-loop blocking, step 우회와 source ref 위�
 ### `DEC-05 Hermes Runtime Adapter`
 
 - HealthMes system policy를 항상 주입
-- HealthMes MCP toolset만 필요한 범위로 노출
-- Hermes tool trace를 표준 결과로 변환
-- Skill은 얇은 channel/runtime 설명으로 축소
+- request/turn ID, privacy scope, 남은 예산과 deadline을 매 iteration에 전달
+- configured model/provider identity를 매 iteration에 고정하고 응답 변경을 거부
+- canonical request fingerprint를 응답 correlation과 idempotency key에 결합
+- 정책으로 허용된 HealthMes capability만 virtual tool allowlist로 노출
+- Hermes 내부 tool prefix를 adapter의 opaque mapping으로 캡슐화
+- 정확히 한 번의 model call 뒤 unexecuted tool call 또는 draft만 수신
+- correlation, model, usage, tool allowlist와 structured output을 fail-closed 검증
+- capability discovery와 model iteration 각각에 남은 turn deadline을 강제
+- decoded HTTP response를 streaming으로 읽고 2 MB에서 즉시 중단
+- `Accept-Encoding: identity`만 허용해 압축 해제 bomb을 body read 전에 거부
+- remote HTTPS runtime은 API key 없이는 구성하지 못하게 차단
+- 명시적 capability refresh 실패 시 이전 success cache를 즉시 폐기
+- Skill 설치 여부와 무관하게 같은 mandatory policy와 결과 계약을 적용
+- Skill은 얇은 channel/runtime 설명으로 제한
+- 현재 Hermes가 single-iteration hook을 광고하지 않으면 기존 chat endpoint로
+  fallback하지 않고 명시적 unavailable 상태를 반환
+- 별도 upstream 요구사항은
+  [#139](https://github.com/NomaDamas/healthmes-agent/issues/139)와
+  [`HERMES-MODEL-ITERATION-HOOK.ko.md`](contracts/HERMES-MODEL-ITERATION-HOOK.ko.md)
+  에서 추적
 
-**종료 조건:** HealthMes core가 Hermes 내부 클래스나 tool prefix에 직접 의존하지 않는다.
+**종료 조건:** HealthMes core가 Hermes 내부 클래스나 tool prefix에 직접 의존하지
+않고, fake transport에서는 전체 iteration 계약이 통과하며, hook이 없는 실제 Hermes는
+지원되는 것처럼 가장하지 않는다.
 
 ### `DEC-06 Decision Finalizer`
 
