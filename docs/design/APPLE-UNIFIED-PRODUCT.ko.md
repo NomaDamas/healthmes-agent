@@ -7,6 +7,10 @@
 > 변경 금지 경계: HealthMes 엔진, MCP, 캘린더 worker·쓰기 계약, 인증 계약,
 > `vendor/hermes-agent/`
 
+> 후속 Target UX: 채널·카테고리·커스터마이징 canvas·Slack 방식 thread를
+> 사용하는 client-only Workspace 전환은
+> `docs/design/CHANNEL-WORKSPACE-CLIENT-UX.ko.md`를 우선 계약으로 따른다.
+
 ## TL;DR
 
 HealthMes는 Todo 앱이나 건강 점수판이 아니다. 사용자의 몸 상태가 오늘 계획에

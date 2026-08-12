@@ -78,6 +78,9 @@ struct WellnessControlView: View {
         .onReceive(router.$commandFocusRequest) { request in
             guard request > lastFocusRequest else { return }
             lastFocusRequest = request
+            if let prefill = router.consumePendingCommand() {
+                command.transcript = prefill
+            }
             commandFocused = true
         }
         .onReceive(router.$homeRequest) { request in

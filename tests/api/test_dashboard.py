@@ -200,7 +200,7 @@ def _calendar_event(
     )
 
 
-def test_dashboard_renders_single_wellness_control_canvas(client, session) -> None:
+def test_dashboard_renders_channel_workspace_with_existing_data(client, session) -> None:
     decision_id = _seed_dashboard(session)
 
     response = client.get("/dashboard")
@@ -209,16 +209,21 @@ def test_dashboard_renders_single_wellness_control_canvas(client, session) -> No
     assert response.headers["cache-control"] == "private, no-store"
     html = response.text
     assert "data-control-shell" in html
-    assert 'role="tablist"' in html
-    assert 'data-lens-target="now"' in html
-    assert 'data-lens-target="adjust"' in html
-    assert 'data-lens-target="change"' in html
-    assert ">지금</strong>" in html
-    assert ">조율</strong>" in html
-    assert ">변화</strong>" in html
-    assert "dashboard-tabs" not in html
-    for section in ("today", "plan", "decisions", "history"):
-        assert f'id="{section}"' in html
+    assert "data-workspace-shell" in html
+    assert "data-workspace-sidebar" in html
+    assert html.count("<main") == 1
+    for channel in ("overview", "calendar", "insights", "decisions", "agent"):
+        assert f'data-channel-id="{channel}"' in html
+        assert f'data-channel-panel="{channel}"' in html
+    assert "data-local-categories" in html
+    assert "data-custom-panels" in html
+    assert "data-thread-panel" in html
+    assert "data-category-dialog" in html
+    assert "data-channel-dialog" in html
+    assert "healthmes.workspace.web.v1" in html
+    assert "window.localStorage" in html
+    assert "이 브라우저에만 저장" in html
+    assert "fetch(" not in html
     for primitive in (
         "capacity_bar",
         "calendar_canvas",
@@ -236,11 +241,6 @@ def test_dashboard_renders_single_wellness_control_canvas(client, session) -> No
         assert f'data-ui-primitive="{primitive}"' in html
     assert "data-duration-minutes=" in html
     assert "--duration-minutes:" in html
-    assert ".scene-panel[data-lens-panel=\"adjust\"]" not in html
-    assert ".capacity-copy p {" in html
-    hidden_rule = html.split(".capacity-copy p {", 1)[0]
-    assert ".lens-bar," not in hidden_rule
-    assert ".command-dock," not in hidden_rule
     assert html.index("Team sync") < html.index("Deep Work")
     assert "Apple 앱 Live QA" in html
     assert "Deep Work" in html
@@ -268,15 +268,15 @@ def test_dashboard_renders_single_wellness_control_canvas(client, session) -> No
     assert "결과" in html
     assert "연결된 캘린더 쓰기 절차로 전달됩니다." in html
     assert "<details" in html
-    assert '<details class="advanced" id="advanced">' in html
+    assert '<details class="primitive advanced" id="advanced">' in html
     assert "Advanced · 연결, 원시 데이터, 진단" in html
     assert 'role="progressbar"' in html
     assert "응답 기한 " in html
     assert "Yes/No는 iPhone, Mac 또는 Apple Watch에서 실행합니다." in html
     assert "Google Calendar" in html
     assert "iCloud 캘린더 (CalDAV)" in html
-    assert "@media (max-width: 880px)" in html
-    assert "@media (max-width: 500px)" in html
+    assert "@media (max-width: 760px)" in html
+    assert "@media (max-width: 540px)" in html
     assert "몸의 상태가 오늘 계획을 어떻게 바꿔야 하는지 봅니다." not in html
     assert "현재 몸 상태가 오늘 일정에 미치는 영향" not in html
 
@@ -337,7 +337,8 @@ def test_dashboard_calendar_gap_uses_latest_overlapping_end(
     session.commit()
 
     html = client.get("/dashboard").text
-    event_tag = html[: html.index("After nested")].rsplit(
+    calendar_html = html.split('data-channel-panel="calendar"', 1)[1]
+    event_tag = calendar_html[: calendar_html.index("After nested")].rsplit(
         '<li class="calendar-event',
         1,
     )[1].split(">", 1)[0]
@@ -676,35 +677,36 @@ def test_dashboard_uses_shared_calendar_sync_boundaries(
     assert expected in normalized
 
 
-def test_dashboard_command_dock_is_persistent_visual_and_read_only(client) -> None:
+def test_dashboard_agent_canvas_is_browser_local_and_non_mutating(client) -> None:
     response = client.get("/dashboard")
 
     assert response.status_code == 200
     html = response.text
     assert 'id="command-dock"' in html
     assert "data-command-dock" in html
-    assert "HealthMes에 말하거나 입력하기" in html
-    assert "음성·텍스트 명령과 Yes/No 실행은 iPhone 또는 Mac 앱에서 합니다." in html
+    assert "Agent canvas" in html
+    assert "현재 웹 클라이언트는 HealthMes Agent 실행 API에 연결하지 않습니다." in html
+    assert "서버나 Calendar에는 반영되지 않습니다." in html
     assert 'id="command-preview"' in html
-    assert "readonly" in html
-    assert html.count("disabled") >= 2
+    assert 'data-local-draft="agent"' in html
+    assert 'data-action="submit-local-post"' in html
+    assert "window.localStorage" in html
+    assert "fetch(" not in html
     assert "<form" not in html
-    assert ".lens-bar," not in html.split(".capacity-copy p {", 1)[0]
-    assert ".command-dock," not in html.split(".capacity-copy p {", 1)[0]
 
 
 def test_dashboard_legacy_routes_return_same_control_surface(client) -> None:
-    for path, lens, fragment in (
-        ("/dashboard/plan", "adjust", 'id="plan"'),
-        ("/dashboard/decisions", "adjust", 'id="decisions"'),
-        ("/dashboard/history", "change", 'id="history"'),
+    for path, channel in (
+        ("/dashboard/plan", "calendar"),
+        ("/dashboard/decisions", "decisions"),
+        ("/dashboard/history", "insights"),
     ):
         response = client.get(path)
         assert response.status_code == 200
         assert "data-control-shell" in response.text
-        assert f'data-lens-target="{lens}"' in response.text
-        assert fragment in response.text
-        assert "lensFromLocation" in response.text
+        assert f'data-channel-panel="{channel}"' in response.text
+        assert f'#channel-{channel}"' in response.text
+        assert "channelFromLocation" in response.text
 
 
 def test_empty_dashboard_is_honest_and_useful(client) -> None:
@@ -908,9 +910,18 @@ def test_dashboard_links_preserve_reverse_proxy_base_path(settings) -> None:
         response = client.get("/dashboard")
 
     assert response.status_code == 200
-    assert 'href="https://example.test/healthmes/dashboard#today"' in response.text
-    assert 'href="https://example.test/healthmes/dashboard/plan#plan"' in response.text
-    assert 'href="https://example.test/healthmes/dashboard/history#history"' in response.text
+    assert (
+        'href="https://example.test/healthmes/dashboard#channel-overview"'
+        in response.text
+    )
+    assert (
+        'href="https://example.test/healthmes/dashboard/plan#channel-calendar"'
+        in response.text
+    )
+    assert (
+        'href="https://example.test/healthmes/dashboard/history#channel-insights"'
+        in response.text
+    )
     assert 'href="https://example.test/healthmes/connect"' in response.text
     assert 'href="https://example.test/healthmes/sleep"' in response.text
     assert 'href="https://example.test/healthmes/storage"' in response.text
@@ -952,8 +963,10 @@ def test_authenticated_dashboard_decision_links_are_read_only(settings) -> None:
     assert response.status_code == 200
     expected = f"http://healthmes.test:8100/decisions/{decision_id}?token={viewer_token(TOKEN)}"
     assert expected.replace("&", "&amp;") in response.text
-    lens_link = f"/dashboard/plan?token={viewer_token(TOKEN)}#plan"
-    assert f'href="{lens_link}"' in response.text
+    channel_link = (
+        f"/dashboard/plan?token={viewer_token(TOKEN)}#channel-calendar"
+    )
+    assert f'href="{channel_link}"' in response.text
     assert TOKEN not in response.text
 
 

@@ -3,6 +3,39 @@ import Foundation
 public enum AlertNotificationActionID {
     public static let yes = "HEALTHMES_YES"
     public static let no = "HEALTHMES_NO"
+    public static let alternative = "HEALTHMES_ALTERNATIVE"
+}
+
+public enum AlternativeCommandSyncKeys {
+    public static let command = "healthmes_alternative_command"
+}
+
+public enum AlternativeCommand {
+    public static func compose(
+        userText: String,
+        proposalID: UUID?,
+        title: String?,
+        proposedAction: String?
+    ) -> String {
+        let cleanText = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var context: [String] = []
+        if let proposalID {
+            context.append("proposal:\(proposalID.uuidString.lowercased())")
+        }
+        if let title {
+            let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty { context.append("title:\(clean)") }
+        }
+        if let proposedAction {
+            let clean = proposedAction.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty { context.append("action:\(clean)") }
+        }
+
+        let header = context.isEmpty
+            ? "Alternative request"
+            : "Alternative request [\(context.joined(separator: " | "))]"
+        return cleanText.isEmpty ? header : "\(header)\n\(cleanText)"
+    }
 }
 
 // The docs/PLAN.md §8.5 notification grammar, as data (parity with the

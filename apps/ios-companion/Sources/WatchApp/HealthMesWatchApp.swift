@@ -51,6 +51,14 @@ final class WatchPairingReceiver: NSObject, WCSessionDelegate {
         applyContext(context)
     }
 
+    #if os(iOS)
+        func sessionDidBecomeInactive(_ session: WCSession) {}
+
+        func sessionDidDeactivate(_ session: WCSession) {
+            session.activate()
+        }
+    #endif
+
     private func applyContext(_ context: [String: Any]) {
         guard let baseURL = context[PairingSyncKeys.baseURL] as? String else { return }
         let token = context[PairingSyncKeys.token] as? String ?? ""

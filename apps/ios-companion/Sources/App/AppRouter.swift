@@ -33,11 +33,27 @@ final class AppRouter: ObservableObject {
     @Published var decisionSheet: DecisionSheetTarget?
     @Published var proposalSheetID: UUID?
     @Published private(set) var commandFocusRequest = 0
+    @Published private(set) var pendingCommand: String?
     @Published private(set) var homeRequest = 0
     @Published private(set) var pairingImportMessage: String?
 
     func focusCommandDock() {
         commandFocusRequest += 1
+    }
+
+    func focusCommandDock(prefill: String) {
+        let clean = prefill.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else {
+            focusCommandDock()
+            return
+        }
+        pendingCommand = clean
+        commandFocusRequest += 1
+    }
+
+    func consumePendingCommand() -> String? {
+        defer { pendingCommand = nil }
+        return pendingCommand
     }
 
     func showHome() {

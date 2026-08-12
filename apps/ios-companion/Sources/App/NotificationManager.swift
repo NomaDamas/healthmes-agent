@@ -41,12 +41,19 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             options: protectedActionOptions,
             icon: UNNotificationActionIcon(systemImageName: "xmark.circle")
         )
+        let alternative = UNTextInputNotificationAction(
+            identifier: AlertNotificationActionID.alternative,
+            title: String(localized: "Alternative"),
+            options: [.foreground],
+            textInputButtonTitle: String(localized: "Send"),
+            textInputPlaceholder: String(localized: "Tell HealthMes another option")
+        )
         let actionable = UNNotificationCategory(
             identifier: AlertNotificationContent.actionableCategoryID,
             // Apple Watch Double Tap can invoke the first non-destructive
             // action. Default to the non-mutating choice so an accidental
             // gesture can never approve a calendar change.
-            actions: [no, yes],
+            actions: [no, alternative, yes],
             intentIdentifiers: []
         )
         let info = UNNotificationCategory(
@@ -227,6 +234,20 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             resolve(proposalID, action: .accept, completionHandler: completionHandler)
         case AlertNotificationActionID.no:
             resolve(proposalID, action: .decline, completionHandler: completionHandler)
+        case AlertNotificationActionID.alternative:
+            let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
+            let command = AlternativeCommand.compose(
+                userText: text,
+                proposalID: proposalID,
+                title: userInfo[AlertNotificationContent.userInfoDecisionTitle] as? String,
+                proposedAction: userInfo[
+                    AlertNotificationContent.userInfoDecisionAction
+                ] as? String
+            )
+            Task { @MainActor in
+                AppRouter.shared.focusCommandDock(prefill: command)
+                completionHandler()
+            }
         case UNNotificationDefaultActionIdentifier:
             // Tap-through = the §8.5 "why this?" link when the alert has a
             // decision record; home otherwise.

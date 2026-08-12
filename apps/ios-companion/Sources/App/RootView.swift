@@ -9,9 +9,7 @@ struct RootView: View {
     var body: some View {
         Group {
             if isPaired {
-                NavigationStack {
-                    WellnessControlView()
-                }
+                WorkspaceRootView()
             } else {
                 HealthMesOnboardingView()
             }

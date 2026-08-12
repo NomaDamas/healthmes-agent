@@ -5,16 +5,16 @@ struct MacDashboardRootView: View {
     @ObservedObject var notifications: MacNotificationManager
     @EnvironmentObject private var router: MacAppRouter
     @StateObject private var dashboardStore = MacDashboardStore()
-    @State private var detail: MacDetailContext?
+    @StateObject private var workspaceStore = MacWorkspaceViewModel()
 
     var body: some View {
         ZStack {
             MacHealthMesStyle.canvas
                 .ignoresSafeArea()
-            MacWellnessControlView(
+            MacWorkspaceView(
                 glanceStore: glanceStore,
                 dashboardStore: dashboardStore,
-                onSelect: { detail = $0 },
+                workspaceStore: workspaceStore,
                 onRefresh: { force in
                     await refreshAll(force: force)
                 },
@@ -24,21 +24,6 @@ struct MacDashboardRootView: View {
             )
         }
         .preferredColorScheme(.light)
-        .inspector(
-            isPresented: Binding(
-                get: { detail != nil },
-                set: { if !$0 { detail = nil } }
-            )
-        ) {
-            if let detail {
-                MacDetailInspector(
-                    detail: detail,
-                    pairing: dashboardStore.pairing,
-                    onClose: { self.detail = nil }
-                )
-                .inspectorColumnWidth(min: 300, ideal: 360, max: 460)
-            }
-        }
         .sheet(
             isPresented: Binding(
                 get: { router.isSettingsPresented },
@@ -52,12 +37,13 @@ struct MacDashboardRootView: View {
             )
             .frame(minWidth: 760, minHeight: 620)
         }
-        .frame(minWidth: 760, minHeight: 620)
+        .frame(minWidth: 980, minHeight: 680)
         .task {
             await refreshAll(force: glanceStore.payload == nil)
         }
         .onChange(of: glanceStore.pairingRevision) { _, _ in
             dashboardStore.resetForPairingChange()
+            workspaceStore.reloadForPairingChange()
             Task { await dashboardStore.refresh() }
         }
     }

@@ -72,6 +72,16 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
         deliverPendingContext()
     }
 
+    func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        guard
+            let command = userInfo[AlternativeCommandSyncKeys.command] as? String,
+            !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
+        Task { @MainActor in
+            AppRouter.shared.focusCommandDock(prefill: command)
+        }
+    }
+
     func sessionDidBecomeInactive(_ session: WCSession) {}
 
     func sessionDidDeactivate(_ session: WCSession) {

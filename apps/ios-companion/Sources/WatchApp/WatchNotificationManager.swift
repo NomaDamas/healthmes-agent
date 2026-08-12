@@ -1,5 +1,6 @@
 import Foundation
 import UserNotifications
+import WatchConnectivity
 
 final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate {
     static let shared = WatchNotificationManager()
@@ -20,10 +21,17 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             options: [.authenticationRequired],
             icon: UNNotificationActionIcon(systemImageName: "checkmark")
         )
+        let alternative = UNTextInputNotificationAction(
+            identifier: AlertNotificationActionID.alternative,
+            title: String(localized: "Alternative"),
+            options: [.foreground],
+            textInputButtonTitle: String(localized: "Send"),
+            textInputPlaceholder: String(localized: "Tell HealthMes another option")
+        )
         center.setNotificationCategories([
             UNNotificationCategory(
                 identifier: AlertNotificationContent.actionableCategoryID,
-                actions: [no, yes],
+                actions: [no, alternative, yes],
                 intentIdentifiers: []
             )
         ])
@@ -120,6 +128,29 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             action = .accept
         case AlertNotificationActionID.no:
             action = .decline
+        case AlertNotificationActionID.alternative:
+            let userInfo = response.notification.request.content.userInfo
+            let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
+            let command = AlternativeCommand.compose(
+                userText: text,
+                proposalID: proposalID,
+                title: userInfo[AlertNotificationContent.userInfoDecisionTitle] as? String,
+                proposedAction: userInfo[
+                    AlertNotificationContent.userInfoDecisionAction
+                ] as? String
+            )
+            if WCSession.isSupported() {
+                WCSession.default.transferUserInfo([
+                    AlternativeCommandSyncKeys.command: command
+                ])
+            }
+            Task { @MainActor in
+                WatchDecisionInbox.shared.present(
+                    content: response.notification.request.content
+                )
+                completionHandler()
+            }
+            return
         case UNNotificationDefaultActionIdentifier:
             Task { @MainActor in
                 WatchDecisionInbox.shared.present(
