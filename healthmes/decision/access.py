@@ -71,6 +71,11 @@ from healthmes.store import (
     WellnessEvent,
 )
 from healthmes.timezones import parse_timezone
+from healthmes.wearables.provenance import (
+    OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
+    OPEN_WEARABLES_SNAPSHOT_EVENT_TYPE,
+    OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+)
 
 _PRIVACY_RANK = {
     PrivacyLevel.AGGREGATE: 0,
@@ -126,6 +131,7 @@ _OPEN_WEARABLES_DERIVERS = {
 }
 _REFERENCE_FREE_NO_DATA_STATUSES = frozenset(
     {
+        "empty_success",
         "insufficient_data",
         "no_data",
         "not_found",
@@ -283,6 +289,7 @@ class _CalendarEventSnapshot:
     healthmes_kind: str | None
     is_all_day: bool
     status: str | None
+    updated_at: datetime
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -425,6 +432,7 @@ def _fresh_calendar_event(
             CalendarEventMirror.healthmes_kind,
             CalendarEventMirror.is_all_day,
             CalendarEventMirror.status,
+            CalendarEventMirror.updated_at,
         ).where(CalendarEventMirror.id == event_id)
     ).mappings().one_or_none()
     if row is None:
@@ -438,6 +446,7 @@ def _fresh_calendar_event(
         healthmes_kind=row["healthmes_kind"],
         is_all_day=row["is_all_day"],
         status=row["status"],
+        updated_at=row["updated_at"],
     )
 
 
@@ -946,6 +955,9 @@ class ContextAccessTurn:
                 update={
                     "source_refs": [],
                     "raw_sources": [],
+                    "observed_start": None,
+                    "observed_end": None,
+                    "collected_at": None,
                     "limitations": sorted(limitations),
                     "truncated": False,
                     "next_cursor": None,
@@ -966,6 +978,10 @@ class ContextAccessTurn:
             return normalized
 
         no_data_payload = _reference_free_no_data_payload(result)
+        verified_empty_metadata = _verified_reference_free_empty_metadata(
+            result,
+            effective_query,
+        )
         no_data_sanitized = (
             no_data_payload is not None
             and result.payload != no_data_payload
@@ -1087,13 +1103,21 @@ class ContextAccessTurn:
             limitations.add("coverage_unknown")
             if status is ContextStatus.OK:
                 status = ContextStatus.PARTIAL
-        if redacted_payload and not refs:
+        if redacted_payload and not refs and not verified_empty_metadata:
             limitations.add("source_refs_unavailable")
             if status is ContextStatus.OK:
                 status = ContextStatus.PARTIAL
         if limitations and status is ContextStatus.OK:
             status = ContextStatus.PARTIAL
 
+        observed_start, observed_end, collected_at = _source_ref_times(
+            session,
+            refs,
+        )
+        if not refs and verified_empty_metadata:
+            observed_start = result.observed_start
+            observed_end = result.observed_end
+            collected_at = result.collected_at
         normalized = ContextResult(
             query_id=result.query_id,
             provider_id=result.provider_id,
@@ -1102,15 +1126,22 @@ class ContextAccessTurn:
             payload=redacted_payload,
             source_refs=refs,
             raw_sources=raw_sources,
+            observed_start=observed_start,
+            observed_end=observed_end,
+            collected_at=collected_at,
             freshness=freshness,
             coverage=result.coverage,
             limitations=sorted(limitations),
             truncated=result.truncated,
             next_cursor=result.next_cursor,
         )
+        serialized = normalized.model_dump(mode="json")
+        for key in ("observed_start", "observed_end", "collected_at"):
+            if serialized.get(key) is None:
+                serialized.pop(key, None)
         payload_bytes = len(
             json.dumps(
-                normalized.model_dump(mode="json"),
+                serialized,
                 ensure_ascii=True,
                 separators=(",", ":"),
             ).encode()
@@ -1305,6 +1336,34 @@ class ContextAccessTurn:
                 },
                 key=str,
             )
+        )
+        wearable_content_ids = tuple(
+            sorted(
+                {
+                    content_id
+                    for row in session.execute(
+                        select(
+                            WellnessEvent.event_type,
+                            WellnessEvent.source_provider,
+                            WellnessEvent.payload,
+                        ).where(
+                            WellnessEvent.id.in_(record_ids),
+                        )
+                    )
+                    if (
+                        content_id := _wearable_observation_content_id(
+                            row[0],
+                            row[1],
+                            row[2],
+                        )
+                    )
+                    is not None
+                },
+                key=str,
+            )
+        )
+        record_ids = tuple(
+            sorted({*record_ids, *wearable_content_ids}, key=str)
         )
         if activity_refs:
             device_ids = tuple(
@@ -1776,7 +1835,8 @@ class ContextAccessTurn:
             refs.append(validated[0])
             limitations.update(validated[1])
         if result.payload and not result.source_refs:
-            limitations.add("source_refs_unavailable")
+            if not _verified_reference_free_empty_metadata(result, query):
+                limitations.add("source_refs_unavailable")
             if query.privacy_level is PrivacyLevel.SCOPED_RAW:
                 denied = True
         if (
@@ -1988,6 +2048,30 @@ def _reference_free_no_data_payload(
     if status not in _REFERENCE_FREE_NO_DATA_STATUSES:
         return None
     return {"status": status}
+
+
+def _verified_reference_free_empty_metadata(
+    result: ContextResult,
+    query: ContextQuery,
+) -> bool:
+    """Allow query-bounded completeness metadata without inventing a row ref."""
+    payload = _reference_free_no_data_payload(result)
+    if payload != {"status": "empty_success"}:
+        return False
+    if result.coverage.status is not CoverageStatus.COMPLETE:
+        return False
+    if result.freshness.as_of is None or result.collected_at is None:
+        return False
+    if result.collected_at != result.freshness.as_of:
+        return False
+    if (
+        query.start is None
+        or query.end is None
+        or result.observed_start != query.start
+        or result.observed_end != query.end
+    ):
+        return False
+    return True
 
 
 def _activity_collection_blockers(
@@ -2274,6 +2358,14 @@ def _validate_source_ref(
         else None
     )
     if event is not None:
+        wearable_limitations = _validate_wearable_observation_source(
+            session,
+            source_ref,
+            event,
+            now=now,
+        )
+        if wearable_limitations:
+            return None, wearable_limitations
         validated, limitations = _validate_wellness_event_ref(
             session,
             source_ref,
@@ -2339,6 +2431,10 @@ def _validate_source_ref(
             or _as_utc(row.start_at) != source_ref.observed_start
             or source_ref.observed_end is None
             or _as_utc(row.end_at) != source_ref.observed_end
+            or (
+                source_ref.collected_at is not None
+                and _as_utc(row.updated_at) != source_ref.collected_at
+            )
             or source_ref.coverage is not None
         ):
             return None, ("source_ref_observation_mismatch",)
@@ -2401,6 +2497,66 @@ def _validate_source_ref(
     return None, ("source_ref_record_missing",)
 
 
+def _wearable_observation_content_id(
+    event_type: object,
+    source_provider: object,
+    payload: object,
+) -> uuid.UUID | None:
+    if (
+        event_type != OPEN_WEARABLES_OBSERVATION_EVENT_TYPE
+        or source_provider != OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+        or not isinstance(payload, Mapping)
+    ):
+        return None
+    try:
+        return uuid.UUID(str(payload["snapshot_event_id"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _validate_wearable_observation_source(
+    session: Session,
+    source_ref: SourceRef,
+    event: _WellnessEventSnapshot,
+    *,
+    now: datetime,
+) -> tuple[str, ...]:
+    if event.event_type != OPEN_WEARABLES_OBSERVATION_EVENT_TYPE:
+        return ()
+    if (
+        source_ref.domain != "wearable"
+        or event.source_provider
+        != OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+        or source_ref.source_provider
+        != OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+    ):
+        return ("source_ref_identity_mismatch",)
+    content_id = _wearable_observation_content_id(
+        event.event_type,
+        event.source_provider,
+        event.payload,
+    )
+    if content_id is None:
+        return ("source_ref_identity_mismatch",)
+    content = _fresh_wellness_event(session, content_id)
+    if (
+        content is None
+        or content.event_type != OPEN_WEARABLES_SNAPSHOT_EVENT_TYPE
+        or content.source_provider
+        != OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+        or content.consent_scope != event.consent_scope
+        or content.sensitivity != event.sensitivity
+        or (
+            content.expires_at is not None
+            and _as_utc(content.expires_at) <= now
+        )
+        or event.payload.get("content_digest")
+        != (content.quality_flags or {}).get("content_digest")
+    ):
+        return ("source_ref_record_missing",)
+    return ()
+
+
 def _source_ref_record_uuid(
     source_ref: SourceRef,
 ) -> uuid.UUID | None:
@@ -2434,6 +2590,10 @@ def _validate_wellness_event_ref(
         or event.schema_version != source_ref.schema_version
         or _as_utc(event.observed_at) != source_ref.observed_start
         or expected_observed_end != source_ref.observed_end
+        or (
+            source_ref.collected_at is not None
+            and _as_utc(event.recorded_at) != source_ref.collected_at
+        )
         or event.coverage != source_ref.coverage
         or event.sensitivity != source_ref.sensitivity
     ):
@@ -2497,6 +2657,41 @@ def _overlaps_query(
         source_ref.observed_start + timedelta(microseconds=1)
     )
     return source_ref.observed_start < end and observed_end > start
+
+
+def _source_ref_times(
+    session: Session,
+    refs: Sequence[SourceRef],
+) -> tuple[datetime | None, datetime | None, datetime | None]:
+    if not refs:
+        return None, None, None
+    observed_start = min(ref.observed_start for ref in refs)
+    observed_end = max(
+        ref.observed_end or ref.observed_start for ref in refs
+    )
+    collected: list[datetime] = []
+    for ref in refs:
+        record_uuid = _source_ref_record_uuid(ref)
+        event = (
+            _fresh_wellness_event(session, record_uuid)
+            if record_uuid is not None
+            else None
+        )
+        if event is not None:
+            collected.append(_as_utc(event.recorded_at))
+            continue
+        if (
+            ref.source_provider == "healthmes-calendar-mirror"
+            and record_uuid is not None
+        ):
+            calendar = _fresh_calendar_event(session, record_uuid)
+            if calendar is not None:
+                collected.append(_as_utc(calendar.updated_at))
+    return (
+        observed_start,
+        observed_end,
+        max(collected) if collected else None,
+    )
 
 
 def _in_range_nutrition_interactions(

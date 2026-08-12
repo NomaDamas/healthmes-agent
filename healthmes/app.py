@@ -19,6 +19,7 @@ from healthmes.activity.aggregation import (
     migrate_activity_summary_derivations,
 )
 from healthmes.activity.android import backfill_android_canonical_events
+from healthmes.activity.jobs import build_activitywatch_job
 from healthmes.activity.locking import (
     activity_write_lock,
     lock_activity_write_plane,
@@ -38,6 +39,7 @@ from healthmes.config import Settings, get_settings, resolve_timezone
 from healthmes.engine.cognitive_energy import build_energy_job
 from healthmes.engine.scheduler import (
     create_scheduler,
+    register_activitywatch_job,
     register_backup_job,
     register_calendar_adjustment_maintenance_job,
     register_calendar_job,
@@ -113,6 +115,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             scheduler,
             build_activity_maintenance_job(),
         )
+        activitywatch_job = build_activitywatch_job(settings)
+        if activitywatch_job is not None:
+            register_activitywatch_job(
+                scheduler,
+                activitywatch_job,
+                minutes=settings.activitywatch_interval_minutes,
+            )
         register_calendar_adjustment_maintenance_job(
             scheduler, mcp_server.expire_and_reconcile_calendar_adjustments
         )

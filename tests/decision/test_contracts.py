@@ -332,6 +332,49 @@ def test_source_ref_rejects_reversed_observation_range():
         )
 
 
+def test_context_result_completeness_times_are_optional_and_bounded():
+    query = _query()
+    legacy = ContextResult(
+        query_id=query.query_id,
+        provider_id=query.provider_id,
+        capability=query.capability,
+        status=ContextStatus.PARTIAL,
+    )
+    complete = ContextResult(
+        query_id=query.query_id,
+        provider_id=query.provider_id,
+        capability=query.capability,
+        status=ContextStatus.OK,
+        observed_start=T0,
+        observed_end=T1,
+        collected_at=T1,
+    )
+
+    assert legacy.observed_start is None
+    assert legacy.collected_at is None
+    assert complete.observed_start == T0
+    assert complete.observed_end == T1
+    assert complete.collected_at == T1
+
+    with pytest.raises(ValidationError, match="provided together"):
+        ContextResult(
+            query_id=query.query_id,
+            provider_id=query.provider_id,
+            capability=query.capability,
+            status=ContextStatus.OK,
+            observed_start=T0,
+        )
+    with pytest.raises(ValidationError, match="must not be before"):
+        ContextResult(
+            query_id=query.query_id,
+            provider_id=query.provider_id,
+            capability=query.capability,
+            status=ContextStatus.OK,
+            observed_start=T1,
+            observed_end=T0,
+        )
+
+
 def test_source_ref_rejects_forged_reference_id():
     payload = _source_ref().model_dump(mode="json")
     payload["reference_id"] = "sr_" + ("0" * 32)

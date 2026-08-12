@@ -16,6 +16,7 @@ import zoneinfo
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -116,8 +117,63 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = Field(
         default=False,
         description="Enable the in-process APScheduler loops (10-minute trigger "
-        "sweep, hourly cognitive-energy persist, weekly backup). Keep disabled "
-        "in tests and one-off tooling.",
+        "sweep, hourly cognitive-energy persist, weekly backup, and enabled "
+        "provider collectors). Keep disabled in tests and one-off tooling.",
+    )
+    activitywatch_enabled: bool = Field(
+        default=False,
+        description="Enable periodic import from the loopback ActivityWatch "
+        "server. The global scheduler_enabled gate must also be enabled.",
+    )
+    activitywatch_interval_minutes: int = Field(
+        default=5,
+        ge=1,
+        le=24 * 60,
+        description="Minutes between ActivityWatch imports.",
+    )
+    activitywatch_device_id: str = Field(
+        default="activitywatch-desktop",
+        min_length=1,
+        max_length=255,
+        description="Stable HealthMes device identifier for this ActivityWatch collector. "
+        "Set a unique value on every computer that syncs to one HealthMes store.",
+    )
+    activitywatch_platform: Literal["macos", "windows", "linux"] = Field(
+        default="macos",
+        description="Desktop platform represented by this ActivityWatch collector.",
+    )
+    activitywatch_timezone: str | None = Field(
+        default=None,
+        max_length=64,
+        description="IANA timezone or UTC fixed offset used to bucket ActivityWatch "
+        "events. None inherits the HealthMes user timezone.",
+    )
+    activitywatch_base_url: str = Field(
+        default="http://127.0.0.1:5600",
+        description="Loopback-only ActivityWatch REST API base URL.",
+    )
+    activitywatch_window_minutes: int = Field(
+        default=24 * 60,
+        ge=1,
+        le=7 * 24 * 60,
+        description="Initial ActivityWatch lookback when no cursor exists. "
+        "Later runs resume incrementally from the stored cursor.",
+    )
+    activitywatch_timeout_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        le=300,
+        description="Bounded timeout for each ActivityWatch HTTP operation.",
+    )
+    activitywatch_window_bucket_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Optional explicit ActivityWatch current-window bucket id.",
+    )
+    activitywatch_afk_bucket_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Optional explicit ActivityWatch AFK-status bucket id.",
     )
     timezone: str | None = Field(
         default=None,
@@ -405,6 +461,9 @@ class Settings(BaseSettings):
     @field_validator(
         "ow_user_id",
         "timezone",
+        "activitywatch_timezone",
+        "activitywatch_window_bucket_id",
+        "activitywatch_afk_bucket_id",
         "backup_dir",
         "ow_database_url",
         "hermes_home",
@@ -428,6 +487,63 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("activitywatch_device_id")
+    @classmethod
+    def _validate_activitywatch_device_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("activitywatch_device_id must not be blank")
+        return value
+
+    @field_validator(
+        "activitywatch_window_bucket_id",
+        "activitywatch_afk_bucket_id",
+    )
+    @classmethod
+    def _validate_activitywatch_bucket_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value or value in {".", ".."}:
+            raise ValueError("ActivityWatch bucket IDs must be non-dot path segments")
+        return value
+
+    @field_validator("activitywatch_timezone")
+    @classmethod
+    def _validate_activitywatch_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            parse_timezone(value)
+        except ValueError as exc:
+            raise ValueError(
+                "activitywatch_timezone must be a valid IANA name or UTC offset"
+            ) from exc
+        return value
+
+    @field_validator("activitywatch_base_url")
+    @classmethod
+    def _validate_activitywatch_base_url(cls, value: str) -> str:
+        parsed = urlparse(value)
+        if parsed.scheme != "http" or parsed.hostname is None:
+            raise ValueError("activitywatch_base_url must use loopback HTTP")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("activitywatch_base_url must not contain credentials")
+        host = parsed.hostname
+        if host != "localhost":
+            try:
+                if not ipaddress.ip_address(host).is_loopback:
+                    raise ValueError(
+                        "activitywatch_base_url must be loopback-only"
+                    )
+            except ValueError as exc:
+                if "loopback-only" in str(exc):
+                    raise
+                raise ValueError(
+                    "activitywatch_base_url must be loopback-only"
+                ) from exc
+        return value.rstrip("/")
 
 
 @lru_cache(maxsize=1)

@@ -866,16 +866,28 @@ class _ToolExecutor:
         try:
             with self._session_factory() as session:
                 self._ensure_active()
-                raw_result = await self._access_turn.query(
-                    session,
-                    query,
-                    ensure_active=self._ensure_active,
-                )
+                try:
+                    raw_result = await self._access_turn.query(
+                        session,
+                        query,
+                        ensure_active=self._ensure_active,
+                    )
+                    result = strict_model_validate(
+                        ContextResult,
+                        raw_result,
+                    )
+                    self._ensure_active()
+                    if result.status in {
+                        ContextStatus.OK,
+                        ContextStatus.PARTIAL,
+                    }:
+                        session.commit()
+                    else:
+                        session.rollback()
+                except BaseException:
+                    session.rollback()
+                    raise
             self._ensure_active()
-            result = strict_model_validate(
-                ContextResult,
-                raw_result,
-            )
         except (
             asyncio.CancelledError,
             _HardDeadlineExceeded,
@@ -1869,6 +1881,9 @@ def _runtime_context_result(
         source_ref_ids=tuple(
             source_ref.reference_id for source_ref in result.source_refs
         ),
+        observed_start=result.observed_start,
+        observed_end=result.observed_end,
+        collected_at=result.collected_at,
         freshness=result.freshness.model_copy(deep=True),
         coverage=result.coverage.model_copy(deep=True),
         limitations=tuple(result.limitations),

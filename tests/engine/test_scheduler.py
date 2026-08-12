@@ -9,6 +9,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from healthmes.config import Settings
 from healthmes.engine.scheduler import (
+    ACTIVITYWATCH_JOB_ID,
     BACKUP_JOB_ID,
     CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
     ENERGY_JOB_ID,
@@ -16,6 +17,7 @@ from healthmes.engine.scheduler import (
     STORAGE_MAINTENANCE_JOB_ID,
     TRIGGER_JOB_ID,
     create_scheduler,
+    register_activitywatch_job,
     register_backup_job,
     register_calendar_adjustment_maintenance_job,
     register_energy_job,
@@ -99,6 +101,29 @@ def test_sleep_reconciliation_hook_registers_interval_job(scheduler) -> None:
     assert isinstance(job.trigger, IntervalTrigger)
     assert job.trigger.interval == timedelta(minutes=15)
     assert job.func is noop
+
+
+def test_activitywatch_hook_registers_non_overlapping_interval_job(scheduler) -> None:
+    job = register_activitywatch_job(scheduler, noop, minutes=7)
+    assert scheduler.get_job(ACTIVITYWATCH_JOB_ID) is job
+    assert isinstance(job.trigger, IntervalTrigger)
+    assert job.trigger.interval == timedelta(minutes=7)
+    assert job.func is noop
+    assert job.max_instances == 1
+    assert job.coalesce is True
+
+
+def test_activitywatch_hook_replaces_pending_duplicate(scheduler) -> None:
+    register_activitywatch_job(scheduler, noop, minutes=5)
+
+    def replacement() -> None:
+        return None
+
+    job = register_activitywatch_job(scheduler, replacement, minutes=11)
+    matches = [item for item in scheduler.get_jobs() if item.id == ACTIVITYWATCH_JOB_ID]
+    assert matches == [job]
+    assert job.func is replacement
+    assert job.trigger.interval == timedelta(minutes=11)
 
 
 def test_hooks_are_replaceable(scheduler) -> None:

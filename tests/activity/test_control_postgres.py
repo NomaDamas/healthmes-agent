@@ -24,11 +24,13 @@ from healthmes.activity.contracts import (
     ActivityPermissionStatus,
     ActivityPlatform,
     ActivityWatchImportRequest,
+    AppHourRecord,
     AppIntervalRecord,
 )
 from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.maintenance import delete_activity_data
 from healthmes.activity.repository import (
+    APP_HOUR_EVENT,
     APP_INTERVAL_EVENT,
     COLLECTION_CURSOR_EVENT,
     CONTROL_EVENT_TYPES,
@@ -756,6 +758,20 @@ def test_concurrent_devices_serialize_one_summary_scope() -> None:
                 "upper_bound_minutes": 30.0,
                 "precision": "exact",
             }
+            assert daily.payload["deduplication"] == {
+                "precision": "exact",
+                "method": "wall_clock_interval_union",
+            }
+            assert len(daily.payload["device_active_time_ranges"]) == 2
+            assert all(
+                item["active_time_range"] == {
+                    "lower_bound_minutes": 30.0,
+                    "upper_bound_minutes": 30.0,
+                    "precision": "exact",
+                }
+                and item["timeline_precision"] == "interval"
+                for item in daily.payload["device_active_time_ranges"]
+            )
             assert daily.payload["device_count"] == 2
             assert (
                 daily.derived_from["derivation_version"]
@@ -768,6 +784,115 @@ def test_concurrent_devices_serialize_one_summary_scope() -> None:
     finally:
         if worker is not None:
             worker.join(timeout=5)
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_cross_device_aggregate_summary_preserves_bounded_ranges() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_test_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    try:
+        with factory() as session:
+            for device_id, platform in (
+                ("phone", ActivityPlatform.ANDROID),
+                ("desktop", ActivityPlatform.WINDOWS),
+            ):
+                ingest_activity_batch(
+                    session,
+                    ActivityBatchIn(
+                        source_provider="aggregate-test",
+                        source_device=device_id,
+                        platform=platform,
+                        capability=ActivityCapability.AGGREGATE,
+                        timezone="UTC",
+                        collected_at=datetime(
+                            2026,
+                            8,
+                            1,
+                            11,
+                            tzinfo=UTC,
+                        ),
+                        records=[
+                            AppHourRecord(
+                                source_record_id=(
+                                    f"{device_id}-same-hour"
+                                ),
+                                bucket_start=datetime(
+                                    2026,
+                                    8,
+                                    1,
+                                    10,
+                                    tzinfo=UTC,
+                                ),
+                                app_id="reader",
+                                foreground_seconds=30 * 60,
+                                category="research",
+                                coverage_seconds=3600,
+                            )
+                        ],
+                    ),
+                    now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+                )
+            session.commit()
+
+        with factory() as session:
+            raw_events = list(
+                session.scalars(
+                    sa.select(WellnessEvent).where(
+                        WellnessEvent.event_type == APP_HOUR_EVENT
+                    )
+                )
+            )
+            daily = session.scalar(
+                sa.select(WellnessEvent).where(
+                    WellnessEvent.event_type == DAY_SUMMARY_EVENT
+                )
+            )
+
+            assert len(raw_events) == 2
+            assert daily is not None
+            assert daily.payload["active_time_range"] == {
+                "lower_bound_minutes": 30.0,
+                "upper_bound_minutes": 60.0,
+                "precision": "bounded",
+            }
+            assert daily.payload["deduplication"] == {
+                "precision": "bounded",
+                "method": "bounded_device_ranges",
+            }
+            assert len(daily.payload["device_active_time_ranges"]) == 2
+            assert daily.payload["category_minutes"] == {
+                "research": 30.0
+            }
+            assert daily.payload["category_time_ranges"] == {
+                "research": {
+                    "lower_bound_minutes": 30.0,
+                    "upper_bound_minutes": 60.0,
+                    "precision": "bounded",
+                }
+            }
+            assert daily.payload["category_attribution"] == {
+                "precision": "bounded",
+                "conflict": "none",
+                "confidence": "limited",
+            }
+    finally:
         engine.dispose()
         with admin_engine.begin() as connection:
             connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))

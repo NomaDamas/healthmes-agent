@@ -159,7 +159,213 @@ def test_overlapping_intervals_on_one_device_are_not_double_counted(session) -> 
 
     assert summary["total_active_minutes"] == 90.0
     assert summary["longest_active_block_minutes"] == 90.0
-    assert sum(summary["category_minutes"].values()) == 90.0
+    assert summary["category_time_ranges"] == {
+        "productivity": {
+            "lower_bound_minutes": 30.0,
+            "upper_bound_minutes": 60.0,
+            "precision": "bounded",
+        },
+        "research": {
+            "lower_bound_minutes": 30.0,
+            "upper_bound_minutes": 60.0,
+            "precision": "bounded",
+        },
+    }
+    assert summary["category_attribution"] == {
+        "precision": "bounded",
+        "conflict": "detected",
+        "confidence": "limited",
+    }
+
+
+def test_fully_overlapping_categories_return_uncertainty_bounds(session) -> None:
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="research-overlap",
+                    start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                    state="active",
+                    app_id="browser",
+                    category="research",
+                ),
+                AppIntervalRecord(
+                    source_record_id="social-overlap",
+                    start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                    state="active",
+                    app_id="chat",
+                    category="social",
+                ),
+            ]
+        ),
+        rebuild_summaries=False,
+    )
+    events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+    )
+
+    summary = summarize_window(
+        events,
+        start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        timezone="UTC",
+    )
+
+    assert summary["active_time_range"] == {
+        "lower_bound_minutes": 60.0,
+        "upper_bound_minutes": 60.0,
+        "precision": "exact",
+    }
+    assert summary["category_time_ranges"] == {
+        "research": {
+            "lower_bound_minutes": 0.0,
+            "upper_bound_minutes": 60.0,
+            "precision": "bounded",
+        },
+        "social": {
+            "lower_bound_minutes": 0.0,
+            "upper_bound_minutes": 60.0,
+            "precision": "bounded",
+        },
+    }
+    assert summary["category_attribution"]["conflict"] == "detected"
+
+
+def test_same_category_overlap_remains_exact_union(session) -> None:
+    ingest_activity_batch(
+        session,
+        _interval_batch(
+            [
+                AppIntervalRecord(
+                    source_record_id="research-a",
+                    start_at=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 11, tzinfo=UTC),
+                    state="active",
+                    app_id="browser",
+                    category="research",
+                ),
+                AppIntervalRecord(
+                    source_record_id="research-b",
+                    start_at=datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+                    end_at=datetime(2026, 8, 1, 11, 30, tzinfo=UTC),
+                    state="active",
+                    app_id="reader",
+                    category="research",
+                ),
+            ]
+        ),
+        rebuild_summaries=False,
+    )
+    events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_INTERVAL_EVENT
+            )
+        )
+    )
+
+    summary = summarize_window(
+        events,
+        start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        timezone="UTC",
+    )
+
+    assert summary["category_time_ranges"] == {
+        "research": {
+            "lower_bound_minutes": 90.0,
+            "upper_bound_minutes": 90.0,
+            "precision": "exact",
+        }
+    }
+    assert summary["category_attribution"]["conflict"] == "none"
+
+
+def test_mixed_precision_category_preserves_precise_union_lower_bound(
+    session,
+) -> None:
+    for device_id, start, end in (
+        (
+            "desktop-a",
+            datetime(2026, 8, 1, 10, tzinfo=UTC),
+            datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+        ),
+        (
+            "desktop-b",
+            datetime(2026, 8, 1, 10, 30, tzinfo=UTC),
+            datetime(2026, 8, 1, 11, tzinfo=UTC),
+        ),
+    ):
+        ingest_activity_batch(
+            session,
+            _interval_batch(
+                [
+                    AppIntervalRecord(
+                        source_record_id=f"{device_id}-research",
+                        start_at=start,
+                        end_at=end,
+                        state="active",
+                        app_id="browser",
+                        category="research",
+                    )
+                ],
+                device_id=device_id,
+            ),
+            rebuild_summaries=False,
+        )
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="aggregate-test",
+            source_device="phone",
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            records=[
+                AppHourRecord(
+                    source_record_id="phone-research",
+                    bucket_start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+                    app_id="reader",
+                    foreground_seconds=10 * 60,
+                    category="research",
+                    coverage_seconds=3600,
+                )
+            ],
+        ),
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        rebuild_summaries=False,
+    )
+    events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type.in_(
+                    (APP_INTERVAL_EVENT, APP_HOUR_EVENT)
+                )
+            )
+        )
+    )
+
+    summary = summarize_window(
+        events,
+        start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        timezone="UTC",
+    )
+
+    assert summary["category_time_ranges"] == {
+        "research": {
+            "lower_bound_minutes": 60.0,
+            "upper_bound_minutes": 60.0,
+            "precision": "exact",
+        }
+    }
 
 
 def test_daily_device_count_unions_devices_across_separate_hours(session) -> None:
@@ -243,7 +449,154 @@ def test_cross_device_detailed_intervals_use_wall_clock_union(session) -> None:
         "upper_bound_minutes": 60.0,
         "precision": "exact",
     }
+    assert summary["deduplication"] == {
+        "precision": "exact",
+        "method": "wall_clock_interval_union",
+    }
+    assert len(summary["device_active_time_ranges"]) == 2
+    assert {
+        item["active_time_range"]["precision"]
+        for item in summary["device_active_time_ranges"]
+    } == {"exact"}
+    assert {
+        item["timeline_precision"]
+        for item in summary["device_active_time_ranges"]
+    } == {"interval"}
+    assert all(
+        item["active_time_range"]["lower_bound_minutes"] == 60.0
+        and item["active_time_range"]["upper_bound_minutes"] == 60.0
+        for item in summary["device_active_time_ranges"]
+    )
+    assert summary["category_minutes"] == {"uncategorized": 60.0}
+    assert summary["category_time_ranges"] == {
+        "uncategorized": {
+            "lower_bound_minutes": 60.0,
+            "upper_bound_minutes": 60.0,
+            "precision": "exact",
+        }
+    }
+    assert summary["category_attribution"] == {
+        "precision": "exact",
+        "conflict": "none",
+        "confidence": "high",
+    }
     assert "cross_device_activity_time_bounded" not in summary["limitations"]
+    assert (
+        "cross_device_category_totals_may_overlap"
+        not in summary["limitations"]
+    )
+
+
+def test_cross_device_aggregate_category_is_bounded_not_summed_as_exact(
+    session,
+) -> None:
+    for device_id, platform in (
+        ("phone", ActivityPlatform.ANDROID),
+        ("desktop", ActivityPlatform.WINDOWS),
+    ):
+        ingest_activity_batch(
+            session,
+            ActivityBatchIn(
+                source_provider="aggregate-test",
+                source_device=device_id,
+                platform=platform,
+                capability=ActivityCapability.AGGREGATE,
+                timezone="UTC",
+                records=[
+                    AppHourRecord(
+                        source_record_id=f"{device_id}-same-hour",
+                        bucket_start=datetime(
+                            2026,
+                            8,
+                            1,
+                            10,
+                            tzinfo=UTC,
+                        ),
+                        app_id="reader",
+                        foreground_seconds=30 * 60,
+                        category="research",
+                        coverage_seconds=3600,
+                    )
+                ],
+            ),
+            now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+            rebuild_summaries=False,
+        )
+    events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+    )
+
+    summary = summarize_window(
+        events,
+        start=datetime(2026, 8, 1, 10, tzinfo=UTC),
+        end=datetime(2026, 8, 1, 11, tzinfo=UTC),
+        timezone="UTC",
+    )
+    daily = rebuild_day_summaries(
+        session,
+        day=date(2026, 8, 1),
+        timezone="UTC",
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    assert summary["active_time_range"] == {
+        "lower_bound_minutes": 30.0,
+        "upper_bound_minutes": 60.0,
+        "precision": "bounded",
+    }
+    assert summary["deduplication"] == {
+        "precision": "bounded",
+        "method": "bounded_device_ranges",
+    }
+    assert len(summary["device_active_time_ranges"]) == 2
+    assert all(
+        item["active_time_range"] == {
+            "lower_bound_minutes": 30.0,
+            "upper_bound_minutes": 30.0,
+            "precision": "exact",
+        }
+        and item["timeline_precision"] == "hour_bucket"
+        for item in summary["device_active_time_ranges"]
+    )
+    assert all(
+        item["device_ref"] not in {"phone", "desktop"}
+        for item in summary["device_active_time_ranges"]
+    )
+    assert summary["category_minutes"] == {"research": 30.0}
+    assert summary["category_time_ranges"] == {
+        "research": {
+            "lower_bound_minutes": 30.0,
+            "upper_bound_minutes": 60.0,
+            "precision": "bounded",
+        }
+    }
+    assert summary["category_attribution"] == {
+        "precision": "bounded",
+        "conflict": "none",
+        "confidence": "limited",
+    }
+    assert "cross_device_activity_time_bounded" in summary["limitations"]
+    assert "cross_device_category_time_bounded" in summary["limitations"]
+    assert daily is not None
+    assert daily.payload["active_time_range"] == {
+        "lower_bound_minutes": 30.0,
+        "upper_bound_minutes": 60.0,
+        "precision": "bounded",
+    }
+    assert daily.payload["deduplication"] == summary["deduplication"]
+    assert daily.payload["device_active_time_ranges"] == (
+        summary["device_active_time_ranges"]
+    )
+    assert daily.payload["category_time_ranges"] == (
+        summary["category_time_ranges"]
+    )
+    assert daily.payload["category_attribution"] == (
+        summary["category_attribution"]
+    )
 
 
 def test_partial_hourly_bucket_returns_bounds_instead_of_scaled_exact_value(

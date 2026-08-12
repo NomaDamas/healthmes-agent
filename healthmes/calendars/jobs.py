@@ -31,11 +31,12 @@ import logging
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
-from datetime import UTC, tzinfo
+from datetime import UTC, datetime, tzinfo
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars import creds
@@ -43,8 +44,10 @@ from healthmes.calendars.base import (
     CalendarAuthError,
     CalendarBackend,
     CalendarConflictError,
+    CalendarError,
     CalendarEventIdentity,
     EventDraft,
+    EventNotFoundError,
     HealthmesEventKind,
     OwnershipError,
     calendar_identity_external_id,
@@ -58,9 +61,13 @@ from healthmes.calendars.intake import (
 from healthmes.calendars.sleep_context import actual_sleep_violation
 from healthmes.calendars.state import (
     FilePendingDiffStore,
+    FileSyncHealthStore,
     FileSyncStateStore,
     PendingDiffStore,
+    SyncCoverageKind,
+    SyncHealthStore,
     SyncStateStore,
+    sync_state_coverage,
 )
 from healthmes.calendars.sync import CalendarMirrorService, SyncDiff
 from healthmes.calendars.write_lock import calendar_write_lock
@@ -523,6 +530,176 @@ def push_accepted_proposals(
     return pushed
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _calendar_sync_error_code(exc: Exception) -> str:
+    """Map an exception class to a stable code without retaining its message."""
+    if isinstance(exc, CalendarAuthError):
+        return "calendar_auth_error"
+    if isinstance(exc, CalendarConflictError):
+        return "calendar_conflict_error"
+    if isinstance(exc, EventNotFoundError):
+        return "calendar_event_not_found"
+    if isinstance(exc, OwnershipError):
+        return "calendar_ownership_error"
+    if isinstance(exc, SQLAlchemyError):
+        return "calendar_storage_error"
+    if isinstance(exc, TimeoutError):
+        return "calendar_timeout"
+    if isinstance(exc, CalendarError):
+        return "calendar_provider_error"
+    if isinstance(exc, ValueError):
+        return "calendar_invalid_data"
+    if isinstance(exc, OSError):
+        return "calendar_io_error"
+    return "calendar_sync_error"
+
+
+def _sync_health_time(clock: Callable[[], datetime]) -> datetime:
+    value = clock()
+    if value.tzinfo is None:
+        raise ValueError("calendar sync-health clock must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _record_sync_health_attempt(
+    store: SyncHealthStore,
+    source: CalendarSource,
+    clock: Callable[[], datetime],
+) -> None:
+    try:
+        store.record_attempt(source, _sync_health_time(clock))
+    except Exception:
+        logger.warning(
+            "Calendar sync-health attempt write for %s failed; continuing sync.",
+            source.value,
+            exc_info=True,
+        )
+
+
+def _record_sync_health_success(
+    store: SyncHealthStore,
+    source: CalendarSource,
+    clock: Callable[[], datetime],
+    *,
+    event_count: int | None,
+    coverage_kind: SyncCoverageKind,
+    coverage_start: datetime | None,
+    coverage_end: datetime | None,
+) -> None:
+    try:
+        store.record_success(
+            source,
+            _sync_health_time(clock),
+            event_count=event_count,
+            coverage_kind=coverage_kind,
+            coverage_start=coverage_start,
+            coverage_end=coverage_end,
+        )
+    except Exception:
+        logger.warning(
+            "Calendar sync-health success write for %s failed; sync remains successful.",
+            source.value,
+            exc_info=True,
+        )
+
+
+def _record_writeback_attempt(
+    store: SyncHealthStore,
+    source: CalendarSource,
+    clock: Callable[[], datetime],
+    *,
+    attempted_count: int,
+) -> None:
+    try:
+        store.record_writeback_attempt(
+            source,
+            _sync_health_time(clock),
+            attempted_count=attempted_count,
+        )
+    except Exception:
+        logger.warning(
+            "Calendar writeback-health attempt write for %s failed; "
+            "continuing writeback.",
+            source.value,
+            exc_info=True,
+        )
+
+
+def _record_writeback_result(
+    store: SyncHealthStore,
+    source: CalendarSource,
+    clock: Callable[[], datetime],
+    *,
+    attempted_count: int,
+    succeeded_count: int,
+    failed_count: int,
+    error_code: str | None = None,
+) -> None:
+    try:
+        store.record_writeback_result(
+            source,
+            _sync_health_time(clock),
+            attempted_count=attempted_count,
+            succeeded_count=succeeded_count,
+            failed_count=failed_count,
+            error_code=error_code,
+        )
+    except Exception:
+        logger.warning(
+            "Calendar writeback-health result write for %s failed; "
+            "writeback result remains unchanged.",
+            source.value,
+            exc_info=True,
+        )
+
+
+def _record_sync_health_failure(
+    store: SyncHealthStore,
+    source: CalendarSource,
+    clock: Callable[[], datetime],
+    error_code: str,
+) -> None:
+    try:
+        store.record_failure(
+            source,
+            _sync_health_time(clock),
+            error_code=error_code,
+        )
+    except Exception:
+        logger.warning(
+            "Calendar sync-health failure write for %s failed; scheduler will continue.",
+            source.value,
+            exc_info=True,
+        )
+
+
+def _calendar_mirror_count(
+    session: Session,
+    source: CalendarSource,
+) -> int | None:
+    """Count local mirror rows without opening a transaction on ``session``."""
+    statement = select(func.count()).select_from(CalendarEventMirror).where(
+        CalendarEventMirror.calendar_source == source
+    )
+    try:
+        bind = session.get_bind()
+        if isinstance(bind, Engine):
+            with bind.connect() as connection:
+                return int(connection.scalar(statement) or 0)
+        if isinstance(bind, Connection):
+            return int(bind.scalar(statement) or 0)
+    except Exception:
+        logger.warning(
+            "Calendar mirror count for %s failed; recording success with unknown coverage.",
+            source.value,
+            exc_info=True,
+        )
+    return None
+
+
 def build_calendar_job(
     settings: Settings,
     source: CalendarSource,
@@ -532,6 +709,8 @@ def build_calendar_job(
     session_factory: sessionmaker[Session] | None = None,
     state_store: SyncStateStore | None = None,
     pending_store: PendingDiffStore | None = None,
+    health_store: SyncHealthStore | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> Callable[[], SyncDiff | None]:
     """Zero-arg poll job for one backend (collaborators injectable for tests).
 
@@ -543,9 +722,16 @@ def build_calendar_job(
     mirror and so cannot be re-derived from row ``updated_at`` alone.
     """
     backend: CalendarBackend | None = None
+    sync_health = (
+        health_store
+        if health_store is not None
+        else FileSyncHealthStore.for_data_dir(settings.data_dir)
+    )
+    sync_clock = clock if clock is not None else _utc_now
 
     def run_calendar_sync() -> SyncDiff | None:
         nonlocal backend
+        _record_sync_health_attempt(sync_health, source, sync_clock)
         try:
             if backend is None:
                 backend = (
@@ -573,19 +759,90 @@ def build_calendar_job(
                         resolve_timezone(settings),
                     )
                     session.commit()
+                event_count = _calendar_mirror_count(session, source)
+                coverage_kind, coverage_start, coverage_end = (
+                    sync_state_coverage(store.load(source))
+                )
+                _record_sync_health_success(
+                    sync_health,
+                    source,
+                    sync_clock,
+                    event_count=event_count,
+                    coverage_kind=coverage_kind,
+                    coverage_start=coverage_start,
+                    coverage_end=coverage_end,
+                )
                 if is_write_backend:
-                    push_accepted_proposals(
-                        service,
-                        session,
-                        source,
-                        resolve_timezone(settings),
-                    )
-                return diff
-        except Exception:
+                    proposal_ids: list[UUID] = []
+                    attempted_count = 0
+                    succeeded_count = 0
+                    attempt_recorded = False
+                    try:
+                        proposal_ids = _accepted_proposal_ids(session)
+                        attempted_count = len(proposal_ids)
+                        _record_writeback_attempt(
+                            sync_health,
+                            source,
+                            sync_clock,
+                            attempted_count=attempted_count,
+                        )
+                        attempt_recorded = True
+                        succeeded_count = push_accepted_proposals(
+                            service,
+                            session,
+                            source,
+                            resolve_timezone(settings),
+                        )
+                        remaining = set(_accepted_proposal_ids(session))
+                        failed_count = len(
+                            set(proposal_ids).intersection(remaining)
+                        )
+                        _record_writeback_result(
+                            sync_health,
+                            source,
+                            sync_clock,
+                            attempted_count=attempted_count,
+                            succeeded_count=succeeded_count,
+                            failed_count=failed_count,
+                        )
+                    except Exception as exc:
+                        session.rollback()
+                        if not attempt_recorded:
+                            _record_writeback_attempt(
+                                sync_health,
+                                source,
+                                sync_clock,
+                                attempted_count=attempted_count,
+                            )
+                        _record_writeback_result(
+                            sync_health,
+                            source,
+                            sync_clock,
+                            attempted_count=attempted_count,
+                            succeeded_count=succeeded_count,
+                            failed_count=max(
+                                0,
+                                attempted_count - succeeded_count,
+                            ),
+                            error_code=_calendar_sync_error_code(exc),
+                        )
+                        logger.exception(
+                            "Calendar proposal writeback for %s failed after "
+                            "a successful inbound sync; next interval will retry.",
+                            source.value,
+                        )
+        except Exception as exc:
+            _record_sync_health_failure(
+                sync_health,
+                source,
+                sync_clock,
+                _calendar_sync_error_code(exc),
+            )
             logger.exception(
                 "Calendar sync for %s failed; next interval will retry.", source.value
             )
             return None
+        return diff
 
     return run_calendar_sync
 

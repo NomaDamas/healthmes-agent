@@ -211,6 +211,9 @@ class RuntimeContextResult(BaseModel):
     status: ContextStatus
     payload: dict[str, JsonValue] = Field(default_factory=dict)
     source_ref_ids: tuple[str, ...] = Field(default=(), max_length=500)
+    observed_start: AwareDatetime | None = None
+    observed_end: AwareDatetime | None = None
+    collected_at: AwareDatetime | None = None
     freshness: ContextFreshness = Field(default_factory=ContextFreshness)
     coverage: ContextCoverage = Field(default_factory=ContextCoverage)
     limitations: tuple[str, ...] = Field(default=(), max_length=100)
@@ -250,6 +253,19 @@ class RuntimeContextResult(BaseModel):
             raise ValueError("limitations must be unique")
         return cleaned
 
+    @field_validator(
+        "observed_start",
+        "observed_end",
+        "collected_at",
+        mode="after",
+    )
+    @classmethod
+    def normalize_completeness_time(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        return value.astimezone(UTC) if value is not None else None
+
     @model_validator(mode="after")
     def validate_result(self) -> RuntimeContextResult:
         if self.status in {
@@ -263,6 +279,18 @@ class RuntimeContextResult(BaseModel):
         if self.status is ContextStatus.DENIED and self.source_ref_ids:
             raise ValueError(
                 "denied runtime context must not expose source refs"
+            )
+        if (self.observed_start is None) != (self.observed_end is None):
+            raise ValueError(
+                "observed_start and observed_end must be provided together"
+            )
+        if (
+            self.observed_start is not None
+            and self.observed_end is not None
+            and self.observed_end < self.observed_start
+        ):
+            raise ValueError(
+                "observed_end must not be before observed_start"
             )
         return self
 

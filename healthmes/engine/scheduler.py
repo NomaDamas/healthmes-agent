@@ -15,6 +15,7 @@ jobs owned by later scopes:
   for user-confirmed external calendar adjustment proposals.
 - ``register_sleep_reconciliation_job`` — recent actual-sleep calendar upsert
   and owned planned-sleep replacement.
+- ``register_activitywatch_job`` — periodic loopback ActivityWatch import.
 
 Nothing here starts by itself: the app lifespan calls ``start_scheduler``,
 which honors ``Settings.scheduler_enabled`` (False in tests, one-off tooling
@@ -45,6 +46,7 @@ __all__ = [
     "STORAGE_MAINTENANCE_JOB_ID",
     "CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID",
     "SLEEP_RECONCILIATION_JOB_ID",
+    "ACTIVITYWATCH_JOB_ID",
     "create_scheduler",
     "register_energy_job",
     "register_backup_job",
@@ -52,6 +54,7 @@ __all__ = [
     "register_calendar_job",
     "register_calendar_adjustment_maintenance_job",
     "register_sleep_reconciliation_job",
+    "register_activitywatch_job",
     "start_scheduler",
     "shutdown_scheduler",
 ]
@@ -64,6 +67,7 @@ BACKUP_JOB_ID = "healthmes-weekly-backup"
 STORAGE_MAINTENANCE_JOB_ID = "healthmes-storage-maintenance"
 CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID = "healthmes-calendar-adjustment-maintenance"
 SLEEP_RECONCILIATION_JOB_ID = "healthmes-sleep-reconciliation"
+ACTIVITYWATCH_JOB_ID = "healthmes-activitywatch-import"
 
 # One misfired run is coalesced and allowed to start this late (seconds);
 # with max_instances=1 a slow sweep can never pile up behind itself.
@@ -233,6 +237,26 @@ def register_sleep_reconciliation_job(
         trigger=IntervalTrigger(minutes=minutes),
         id=SLEEP_RECONCILIATION_JOB_ID,
         name="HealthMes actual sleep reconciliation",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=_MISFIRE_GRACE_SECONDS,
+    )
+
+
+def register_activitywatch_job(
+    scheduler: BackgroundScheduler,
+    job: Callable[[], object],
+    *,
+    minutes: int,
+) -> Job:
+    """Register one non-overlapping periodic ActivityWatch import."""
+    _remove_job_if_present(scheduler, ACTIVITYWATCH_JOB_ID)
+    return scheduler.add_job(
+        job,
+        trigger=IntervalTrigger(minutes=minutes),
+        id=ACTIVITYWATCH_JOB_ID,
+        name="HealthMes ActivityWatch import",
         replace_existing=True,
         coalesce=True,
         max_instances=1,

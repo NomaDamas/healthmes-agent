@@ -476,6 +476,74 @@ def test_ios_unavailable_is_status_not_fake_zero_activity(client, session) -> No
     assert status.json()["last_collected_at"] is None
 
 
+def test_ios_restricted_is_blocked_status_not_fake_zero_activity(
+    client,
+    session,
+) -> None:
+    response = client.post(
+        "/v1/activity/ios/report",
+        json={
+            "device_id": "iphone-restricted-api",
+            "timezone": "Asia/Seoul",
+            "capability": "aggregate",
+            "permission_status": "restricted",
+            "reason": "family_controls_restricted",
+            "samples": [],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] == 0
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+        is None
+    )
+    status = client.get(
+        "/v1/activity/devices/iphone-restricted-api/collection"
+    ).json()
+    assert status["capability"] == "aggregate"
+    assert status["permission_status"] == "restricted"
+    assert status["effective_collecting"] is False
+    assert status["blocked_reason"] == "permission_restricted"
+    assert status["last_uploaded_at"] is not None
+    assert status["last_collected_at"] is None
+
+
+def test_ios_restricted_report_rejects_fake_zero_sample(client, session) -> None:
+    response = client.post(
+        "/v1/activity/ios/report",
+        json={
+            "device_id": "iphone-restricted-sample",
+            "timezone": "UTC",
+            "capability": "aggregate",
+            "permission_status": "restricted",
+            "reason": "family_controls_restricted",
+            "samples": [
+                {
+                    "source_record_id": "fake-zero",
+                    "bucket_start": "2026-08-01T10:00:00Z",
+                    "foreground_seconds": 0,
+                    "category": "other",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert (
+        session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT
+            )
+        )
+        is None
+    )
+
+
 def test_android_permission_status_can_recover_from_revoked_to_granted(client) -> None:
     revoked = client.post(
         "/v1/activity/devices/android-permission-recovery/status",

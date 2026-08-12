@@ -52,6 +52,11 @@ from healthmes.calendars.base import (
     parse_event_kind,
     parse_task_id,
 )
+from healthmes.calendars.state import (
+    SyncCoverageKind,
+    sync_state_coverage,
+    with_sync_state_coverage,
+)
 from healthmes.store.enums import CalendarSource
 
 __all__ = [
@@ -252,10 +257,18 @@ class GoogleCalendarBackend:
         previous = dict(sync_state or {})
         sync_token = previous.get("sync_token")
         known_ids: dict[str, str] = dict(previous.get("known_ids") or {})
+        coverage_kind, _, _ = sync_state_coverage(previous)
 
-        if sync_token:
+        if (
+            sync_token
+            and coverage_kind is SyncCoverageKind.BOUNDED_WINDOW
+        ):
             try:
-                return self._incremental_sync(str(sync_token), known_ids)
+                return self._incremental_sync(
+                    str(sync_token),
+                    known_ids,
+                    previous,
+                )
             except Exception as exc:  # noqa: BLE001 - status-based dispatch
                 if _http_status(exc) != 410:
                     raise
@@ -266,7 +279,10 @@ class GoogleCalendarBackend:
         return self._full_sync(known_ids)
 
     def _incremental_sync(
-        self, sync_token: str, known_ids: dict[str, str]
+        self,
+        sync_token: str,
+        known_ids: dict[str, str],
+        previous_state: SyncState,
     ) -> tuple[list[ExternalEvent], SyncState]:
         items, next_token = self._list_pages({"syncToken": sync_token})
         events = [self._parse_api_event(item) for item in items]
@@ -276,14 +292,30 @@ class GoogleCalendarBackend:
                 new_known.pop(event.external_id, None)
             else:
                 new_known[event.external_id] = event.etag or ""
-        return events, {"sync_token": next_token, "known_ids": new_known}
+        state: SyncState = {
+            "sync_token": next_token,
+            "known_ids": new_known,
+        }
+        coverage_kind, coverage_start, coverage_end = sync_state_coverage(
+            previous_state
+        )
+        if coverage_kind is SyncCoverageKind.BOUNDED_WINDOW:
+            return events, with_sync_state_coverage(
+                state,
+                kind=coverage_kind,
+                start=coverage_start,
+                end=coverage_end,
+            )
+        return events, state
 
     def _full_sync(self, known_ids: dict[str, str]) -> tuple[list[ExternalEvent], SyncState]:
         now = datetime.now(UTC)
+        coverage_start = now - timedelta(days=self._lookback_days)
+        coverage_end = now + timedelta(days=self._horizon_days)
         params = {
             "singleEvents": True,
-            "timeMin": _rfc3339(now - timedelta(days=self._lookback_days)),
-            "timeMax": _rfc3339(now + timedelta(days=self._horizon_days)),
+            "timeMin": _rfc3339(coverage_start),
+            "timeMax": _rfc3339(coverage_end),
         }
         items, next_token = self._list_pages(params)
         events = [self._parse_api_event(item) for item in items]
@@ -294,7 +326,12 @@ class GoogleCalendarBackend:
             for event_id in known_ids
             if event_id not in current_ids
         ]
-        return events + deletions, {"sync_token": next_token, "known_ids": current_ids}
+        return events + deletions, with_sync_state_coverage(
+            {"sync_token": next_token, "known_ids": current_ids},
+            kind=SyncCoverageKind.BOUNDED_WINDOW,
+            start=coverage_start,
+            end=coverage_end,
+        )
 
     def _list_pages(self, base_params: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
         """Drain ``events.list`` pagination; return (items, nextSyncToken)."""

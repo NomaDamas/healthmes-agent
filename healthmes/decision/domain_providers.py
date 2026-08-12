@@ -10,7 +10,7 @@ from math import isfinite
 from typing import Any
 
 from sqlalchemy import or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.activity.aggregation import local_day_bounds
 from healthmes.activity.context import (
@@ -23,6 +23,11 @@ from healthmes.activity.resolver import (
     _normalize_wearable_context,
 )
 from healthmes.calendars.base import HealthmesEventKind
+from healthmes.calendars.state import (
+    CalendarSyncHealth,
+    SyncHealthStatus,
+    SyncHealthStore,
+)
 from healthmes.decision.contracts import (
     ContextCoverage,
     ContextFreshness,
@@ -65,7 +70,15 @@ from healthmes.nutrition.repository import (
     SOURCE_PROVIDER as NUTRITION_OBSERVATION_PROVIDER,
 )
 from healthmes.store import CalendarEventMirror, WellnessEvent
+from healthmes.store.enums import CalendarSource
 from healthmes.timezones import parse_timezone
+from healthmes.wearables.provenance import (
+    OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
+    OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+    WearableSnapshot,
+    latest_retained_open_wearables_snapshot,
+    persist_open_wearables_observation,
+)
 
 WearableReader = Callable[[date], Awaitable[dict[str, Any]]]
 
@@ -148,8 +161,13 @@ _ACTIVITY_NESTED_FIELDS = (
     "active_time_range",
     "app_launches_or_switches",
     "baseline_minutes",
+    "capabilities",
+    "category_attribution",
+    "confidence",
+    "conflict",
     "coverage",
     "days_with_data",
+    "deduplication",
     "delta_minutes",
     "delta_percent",
     "end",
@@ -167,6 +185,7 @@ _ACTIVITY_NESTED_FIELDS = (
     "lookback_baseline_delta",
     "lower_bound_minutes",
     "metrics",
+    "method",
     "precision",
     "ratio",
     "required_days",
@@ -379,8 +398,11 @@ _CALENDAR_NESTED_FIELDS = (
 )
 _ACTIVITY_LIMITATION_CODES = (
     "active_idle_overlap_resolved_active_wins",
+    "category_attribution_conflict_detected",
+    "category_attribution_conflict_possible",
     "coverage_unknown",
     "cross_device_activity_time_bounded",
+    "cross_device_category_time_bounded",
     "cross_device_category_totals_may_overlap",
     "cross_device_idle_time_unresolved",
     "exact_focus_blocks_unavailable_for_hourly_sources",
@@ -421,10 +443,17 @@ _NUTRITION_HISTORY_MAX_SCAN = 5_000
 _WEARABLE_LIMITATION_CODES = (
     "open_wearables_context_unavailable",
     "wearable_readiness_evidence_ids_unavailable",
+    "wearable_snapshot_fallback_used",
+    "wearable_snapshot_persistence_failed",
+    "wearable_snapshot_writer_unavailable",
     "wearable_source_refs_are_readiness_level",
 )
 _CALENDAR_LIMITATION_CODES = (
+    "calendar_never_synced",
     "calendar_mirror_completeness_unknown",
+    "calendar_query_outside_sync_coverage",
+    "calendar_recent_sync_failure",
+    "calendar_sync_health_unavailable",
     "calendar_titles_omitted",
 )
 
@@ -683,6 +712,7 @@ def _event_source_refs(
             source_provider=row.source_provider,
             observed_start=_as_utc(row.observed_at),
             observed_end=_event_observed_end(row),
+            collected_at=_as_utc(row.recorded_at),
             schema_version=row.schema_version,
             derived_by=derived_by,
             freshness=(
@@ -784,6 +814,7 @@ def _typed_nutrition_source_refs(
             source_provider=row.source_provider,
             observed_start=_as_utc(row.observed_at),
             observed_end=_event_observed_end(row),
+            collected_at=_as_utc(row.recorded_at),
             schema_version=row.schema_version,
             derived_by=derived_by,
             freshness=(
@@ -811,6 +842,7 @@ def _calendar_source_refs(
             source_provider="healthmes-calendar-mirror",
             observed_start=_as_utc(row.start_at),
             observed_end=_as_utc(row.end_at),
+            collected_at=_as_utc(row.updated_at),
             schema_version=1,
             derived_by="calendar.context.v1",
             freshness=FreshnessStatus.UNKNOWN,
@@ -910,6 +942,9 @@ def _result(
     now: datetime,
     extra_limitations: Sequence[str] = (),
     truncated: bool = False,
+    observed_start: datetime | None = None,
+    observed_end: datetime | None = None,
+    collected_at: datetime | None = None,
 ) -> ContextResult:
     status = _status(raw)
     limitations = {
@@ -926,6 +961,11 @@ def _result(
         refs = ()
     else:
         payload = _payload(raw, query)
+    ref_start, ref_end, ref_collected = _source_ref_times(refs)
+    if refs:
+        observed_start = ref_start
+        observed_end = ref_end
+        collected_at = ref_collected
     return ContextResult(
         query_id=query.query_id,
         provider_id=query.provider_id,
@@ -933,6 +973,9 @@ def _result(
         status=status,
         payload=payload,
         source_refs=list(refs),
+        observed_start=observed_start,
+        observed_end=observed_end,
+        collected_at=collected_at,
         freshness=_freshness(
             raw,
             now=now,
@@ -941,6 +984,25 @@ def _result(
         coverage=_coverage(raw),
         limitations=sorted(limitations),
         truncated=truncated,
+    )
+
+
+def _source_ref_times(
+    refs: Sequence[SourceRef],
+) -> tuple[datetime | None, datetime | None, datetime | None]:
+    if not refs:
+        return None, None, None
+    observed_start = min(ref.observed_start for ref in refs)
+    observed_end = max(
+        ref.observed_end or ref.observed_start for ref in refs
+    )
+    collected = [
+        ref.collected_at for ref in refs if ref.collected_at is not None
+    ]
+    return (
+        observed_start,
+        observed_end,
+        max(collected) if collected else None,
     )
 
 
@@ -1112,6 +1174,8 @@ class ActivityContextProvider:
                     "late_activity_time_range",
                     "longest_active_block_minutes",
                     "app_launches_or_switches",
+                    "deduplication",
+                    "category_attribution",
                     "source_coverage",
                     "reason",
                 ),
@@ -1688,14 +1752,14 @@ class NutritionContextProvider:
 
 
 class WearableContextProvider:
-    """Normalized Open Wearables readiness data with bounded block views."""
+    """Retained Open Wearables context backed by a local immutable snapshot."""
 
     metadata = ContextProviderMetadata(
         provider_id="wearable",
         domain="wearable",
         description=(
             "Normalized sleep, HRV, stress, charge, and training-load context "
-            "read through the Open Wearables integration."
+            "mirrored into the HealthMes wellness store."
         ),
         capabilities=(
             ContextCapability(
@@ -1723,7 +1787,7 @@ class WearableContextProvider:
                 max_lookback_days=1,
                 sensitivity="wearable",
                 limitation_codes=_WEARABLE_LIMITATION_CODES,
-                provenance=ProvenanceSupport.PARTIAL,
+                provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Daily Open Wearables snapshot.",
             ),
             ContextCapability(
@@ -1747,7 +1811,7 @@ class WearableContextProvider:
                 max_lookback_days=1,
                 sensitivity="wearable",
                 limitation_codes=_WEARABLE_LIMITATION_CODES,
-                provenance=ProvenanceSupport.PARTIAL,
+                provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Latest retained or upstream sleep observations.",
             ),
             ContextCapability(
@@ -1771,7 +1835,7 @@ class WearableContextProvider:
                 max_lookback_days=1,
                 sensitivity="wearable",
                 limitation_codes=_WEARABLE_LIMITATION_CODES,
-                provenance=ProvenanceSupport.PARTIAL,
+                provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Daily Open Wearables readiness snapshot.",
             ),
             ContextCapability(
@@ -1793,14 +1857,22 @@ class WearableContextProvider:
                 max_lookback_days=1,
                 sensitivity="wearable",
                 limitation_codes=_WEARABLE_LIMITATION_CODES,
-                provenance=ProvenanceSupport.PARTIAL,
+                provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Latest daily stress or resilience observation.",
             ),
         ),
     )
 
-    def __init__(self, reader: WearableReader | None = None) -> None:
+    def __init__(
+        self,
+        reader: WearableReader | None = None,
+        *,
+        snapshot_session_factory: sessionmaker[Session] | None = None,
+    ) -> None:
         self._reader = reader
+        # Kept for source compatibility. Provider writes use the caller-owned
+        # unit of work so a second Session cannot commit unrelated SQLite data.
+        self._snapshot_session_factory = snapshot_session_factory
 
     async def query(
         self,
@@ -1810,27 +1882,32 @@ class WearableContextProvider:
         now: datetime,
     ) -> ContextResult:
         _validate_query(self.metadata, query)
-        if self._reader is None:
+        day = _query_day(query, now=now)
+        raw, snapshot, limitations = await self._snapshot_context(
+            session,
+            day=day,
+            timezone=query.timezone,
+            now=now,
+        )
+        if raw is None or snapshot is None:
             return ContextResult(
                 query_id=query.query_id,
                 provider_id=query.provider_id,
                 capability=query.capability,
-                status=ContextStatus.UNAVAILABLE,
+                status=(
+                    ContextStatus.FAILED
+                    if "wearable_snapshot_persistence_failed"
+                    in limitations
+                    else ContextStatus.UNAVAILABLE
+                ),
                 freshness=ContextFreshness(
                     status=FreshnessStatus.UNAVAILABLE
                 ),
                 coverage=ContextCoverage(
                     status=CoverageStatus.UNAVAILABLE
                 ),
-                limitations=["open_wearables_context_unavailable"],
+                limitations=sorted(limitations),
             )
-        day = _query_day(query, now=now)
-        raw = _normalize_wearable_context(
-            await self._reader(day),
-            day=day,
-            now=now,
-            timezone=parse_timezone(query.timezone),
-        )
         selected = {
             "wearable.sleep": {"sleep_debt", "actual_sleep", "hrv"},
             "wearable.recovery": {"hrv", "charge", "yesterday_load"},
@@ -1853,16 +1930,40 @@ class WearableContextProvider:
                     *selected,
                 }
             }
-        refs, complete = _wearable_source_refs(
-            session,
+        raw["limitations"] = sorted(
+            {
+                *_limitations(raw),
+                *limitations,
+            }
+        )
+        freshness = _freshness(
             raw,
+            now=now,
             timezone=query.timezone,
         )
+        refs = [
+            SourceRef(
+                domain="wearable",
+                resource_type=OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
+                record_id=str(snapshot.event_id),
+                source_provider=(
+                    OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+                ),
+                observed_start=snapshot.observed_start,
+                observed_end=snapshot.observed_end,
+                collected_at=snapshot.collected_at,
+                schema_version=1,
+                derived_by=f"{query.capability}.snapshot.v1",
+                freshness=freshness.status,
+                coverage=snapshot.coverage,
+                sensitivity="wearable",
+            )
+        ]
         return _result(
             query,
             raw,
             refs=refs,
-            refs_complete=complete,
+            refs_complete=True,
             now=now,
             extra_limitations=(
                 ("wearable_source_refs_are_readiness_level",)
@@ -1871,27 +1972,98 @@ class WearableContextProvider:
             ),
         )
 
+    async def _snapshot_context(
+        self,
+        session: Session,
+        *,
+        day: date,
+        timezone: str,
+        now: datetime,
+    ) -> tuple[
+        dict[str, Any] | None,
+        WearableSnapshot | None,
+        set[str],
+    ]:
+        limitations: set[str] = set()
+        normalized: dict[str, Any] | None = None
+        if self._reader is not None:
+            try:
+                normalized = _normalize_wearable_context(
+                    await self._reader(day),
+                    day=day,
+                    now=now,
+                    timezone=parse_timezone(timezone),
+                )
+            except Exception:
+                limitations.add("open_wearables_context_unavailable")
+
+        if (
+            normalized is not None
+            and _status(normalized)
+            not in {ContextStatus.UNAVAILABLE, ContextStatus.FAILED}
+        ):
+            try:
+                snapshot = persist_open_wearables_observation(
+                    session,
+                    normalized_context=normalized,
+                    local_day=day,
+                    timezone=timezone,
+                    collected_at=now,
+                    now=now,
+                )
+            except Exception:
+                limitations.add(
+                    "wearable_snapshot_persistence_failed"
+                )
+            else:
+                return normalized, snapshot, limitations
+        elif normalized is not None:
+            limitations.add("open_wearables_context_unavailable")
+
+        fallback = latest_retained_open_wearables_snapshot(
+            session,
+            local_day=day,
+            timezone=timezone,
+            now=now,
+        )
+        if fallback is not None:
+            limitations.add("wearable_snapshot_fallback_used")
+            if self._reader is None:
+                limitations.add("open_wearables_context_unavailable")
+            return (
+                dict(fallback.normalized_context),
+                fallback,
+                limitations,
+            )
+        if self._reader is None:
+            limitations.add("open_wearables_context_unavailable")
+        return None, None, limitations
+
 
 def _calendar_rows(
     session: Session,
     *,
     start: datetime,
     end: datetime,
+    sources: Sequence[CalendarSource] | None = None,
 ) -> list[CalendarEventMirror]:
+    statement = select(CalendarEventMirror).where(
+        CalendarEventMirror.start_at < end,
+        CalendarEventMirror.end_at > start,
+        CalendarEventMirror.is_all_day.is_(False),
+        or_(
+            CalendarEventMirror.healthmes_kind.is_(None),
+            CalendarEventMirror.healthmes_kind
+            != HealthmesEventKind.ACTUAL_SLEEP.value,
+        )
+    )
+    if sources is not None:
+        statement = statement.where(
+            CalendarEventMirror.calendar_source.in_(sources)
+        )
     return list(
         session.scalars(
-            select(CalendarEventMirror)
-            .where(
-                CalendarEventMirror.start_at < end,
-                CalendarEventMirror.end_at > start,
-                CalendarEventMirror.is_all_day.is_(False),
-                or_(
-                    CalendarEventMirror.healthmes_kind.is_(None),
-                    CalendarEventMirror.healthmes_kind
-                    != HealthmesEventKind.ACTUAL_SLEEP.value,
-                ),
-            )
-            .order_by(CalendarEventMirror.start_at)
+            statement.order_by(CalendarEventMirror.start_at)
         )
     )
 
@@ -1918,6 +2090,121 @@ def _merged_spans(
         else:
             merged[-1] = (merged[-1][0], max(merged[-1][1], span_end))
     return merged
+
+
+def _calendar_sync_states(
+    store: SyncHealthStore,
+    sources: Sequence[CalendarSource],
+) -> tuple[CalendarSyncHealth | None, ...] | None:
+    try:
+        return tuple(store.load(source) for source in sources)
+    except Exception:
+        return None
+
+
+def _calendar_completeness(
+    *,
+    rows: Sequence[CalendarEventMirror],
+    store: SyncHealthStore | None,
+    sources: Sequence[CalendarSource],
+    start: datetime,
+    end: datetime,
+) -> tuple[
+    str,
+    datetime | None,
+    dict[str, Any],
+    set[str],
+]:
+    if store is None or not sources:
+        freshness = max(
+            (_as_utc(row.updated_at) for row in rows),
+            default=None,
+        )
+        return (
+            "ok" if rows else "insufficient_data",
+            freshness,
+            {"status": "unknown", "ratio": None},
+            {"calendar_mirror_completeness_unknown"},
+        )
+    states = _calendar_sync_states(store, sources)
+    if states is None:
+        return (
+            "partial" if rows else "insufficient_data",
+            max(
+                (_as_utc(row.updated_at) for row in rows),
+                default=None,
+            ),
+            {"status": "sync_health_unavailable", "ratio": None},
+            {"calendar_sync_health_unavailable"},
+        )
+    successful = tuple(
+        state
+        for state in states
+        if state is not None
+        and state.status
+        in {SyncHealthStatus.SUCCESS, SyncHealthStatus.EMPTY_SUCCESS}
+        and state.covers(start, end)
+    )
+    failures = tuple(
+        state
+        for state in states
+        if state is not None
+        and state.status is SyncHealthStatus.RECENT_FAILURE
+    )
+    oldest_success = min(
+        (
+            state.last_success_at
+            for state in states
+            if state is not None
+            and state.last_success_at is not None
+        ),
+        default=None,
+    )
+    ratio = len(successful) / len(sources)
+    limitations: set[str] = set()
+    if failures:
+        limitations.add("calendar_recent_sync_failure")
+    if any(
+        state is None or state.status is SyncHealthStatus.NEVER_SYNCED
+        for state in states
+    ):
+        limitations.add("calendar_never_synced")
+    if any(
+        state is not None
+        and state.status
+        in {SyncHealthStatus.SUCCESS, SyncHealthStatus.EMPTY_SUCCESS}
+        and not state.covers(start, end)
+        for state in states
+    ):
+        limitations.add("calendar_query_outside_sync_coverage")
+    all_currently_successful = len(successful) == len(sources)
+    any_prior_success = any(
+        state is not None and state.last_success_at is not None
+        for state in states
+    )
+    if rows:
+        status = "ok" if all_currently_successful else "partial"
+    else:
+        status = (
+            "empty_success"
+            if all_currently_successful
+            else "insufficient_data"
+        )
+    return (
+        status,
+        oldest_success,
+        {
+            "status": (
+                "all_sources_synced"
+                if all_currently_successful
+                else "partial_source_sync"
+                if successful
+                else "unavailable"
+            ),
+            "ratio": ratio if successful or any_prior_success else None,
+        },
+        limitations,
+    )
 
 
 class CalendarContextProvider:
@@ -2019,6 +2306,15 @@ class CalendarContextProvider:
         ),
     )
 
+    def __init__(
+        self,
+        *,
+        sync_health_store: SyncHealthStore | None = None,
+        sources: Sequence[CalendarSource] = (),
+    ) -> None:
+        self._sync_health_store = sync_health_store
+        self._sources = tuple(dict.fromkeys(sources))
+
     async def query(
         self,
         session: Session,
@@ -2031,11 +2327,21 @@ class CalendarContextProvider:
         day_start, day_end = local_day_bounds(day, query.timezone)
         start = query.start or day_start
         end = query.end or day_end
-        rows = _calendar_rows(session, start=start, end=end)
+        rows = _calendar_rows(
+            session,
+            start=start,
+            end=end,
+            sources=self._sources or None,
+        )
         refs = _calendar_source_refs(rows)
-        freshness = max(
-            (_as_utc(row.updated_at) for row in rows),
-            default=None,
+        status, freshness, coverage, completeness_limitations = (
+            _calendar_completeness(
+                rows=rows,
+                store=self._sync_health_store,
+                sources=self._sources,
+                start=start,
+                end=end,
+            )
         )
         spans = _merged_spans(rows, start=start, end=end)
         if query.capability == "calendar.day-summary":
@@ -2048,7 +2354,7 @@ class CalendarContextProvider:
                 2,
             )
             raw = {
-                "status": "ok" if rows else "insufficient_data",
+                "status": status,
                 "date": day.isoformat(),
                 "timezone": query.timezone,
                 "event_count": len(rows),
@@ -2072,7 +2378,7 @@ class CalendarContextProvider:
             if query.capability == "calendar.busy-intervals":
                 selected = spans[: query.limit]
                 raw = {
-                    "status": "ok" if rows else "partial",
+                    "status": status,
                     "window": {
                         "start": start.isoformat(),
                         "end": end.isoformat(),
@@ -2114,7 +2420,7 @@ class CalendarContextProvider:
                     available.append((cursor, end))
                 selected = available[: query.limit]
                 raw = {
-                    "status": "ok" if rows else "partial",
+                    "status": status,
                     "window": {
                         "start": start.isoformat(),
                         "end": end.isoformat(),
@@ -2139,17 +2445,18 @@ class CalendarContextProvider:
                 }
         raw["freshness"] = {
             "recorded_at": freshness.isoformat() if freshness else None,
-            "status": "calendar_mirror" if freshness else "unavailable",
+            "status": (
+                "calendar_sync_success"
+                if freshness
+                else "unavailable"
+            ),
         }
-        raw["coverage"] = {
-            "status": "calendar_mirror_rows" if rows else "no_data",
-            "ratio": None,
-        }
+        raw["coverage"] = coverage
         raw["limitations"] = sorted(
             {
                 *list(raw.get("limitations") or []),
                 "calendar_titles_omitted",
-                "calendar_mirror_completeness_unknown",
+                *completeness_limitations,
             }
         )
         return _result(
@@ -2159,4 +2466,15 @@ class CalendarContextProvider:
             refs_complete=True,
             now=now,
             truncated=bool(raw.get("truncated")),
+            observed_start=(
+                start if not refs and status == "empty_success" else None
+            ),
+            observed_end=(
+                end if not refs and status == "empty_success" else None
+            ),
+            collected_at=(
+                freshness
+                if not refs and status == "empty_success"
+                else None
+            ),
         )

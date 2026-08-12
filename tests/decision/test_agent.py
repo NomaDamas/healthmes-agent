@@ -1771,6 +1771,299 @@ async def test_agent_collects_only_gateway_returned_source_refs(
     ]
 
 
+async def test_runtime_receives_gateway_derived_completeness_times(
+    session_factory,
+):
+    observed = NOW - timedelta(hours=2)
+    observed_end = NOW - timedelta(hours=1)
+    recorded = NOW - timedelta(minutes=30)
+    with session_factory() as session:
+        event = WellnessEvent(
+            event_type="activity.hour.v1",
+            schema_version=1,
+            observed_at=observed,
+            recorded_at=recorded,
+            timezone="UTC",
+            source_provider="activity",
+            source_device=None,
+            source_record_id=uuid.uuid4().hex,
+            capture_method="test",
+            quality_flags={},
+            confidence=1,
+            coverage=1,
+            sensitivity="activity",
+            consent_scope="personal",
+            retention_policy_id=None,
+            expires_at=None,
+            payload={
+                "window": {
+                    "start": observed.isoformat(),
+                    "end": observed_end.isoformat(),
+                },
+                "status": "ok",
+                "value": 1,
+            },
+            raw_object_id=None,
+            derived_from=None,
+        )
+        session.add(event)
+        session.commit()
+
+    source_ref = SourceRef(
+        domain="activity",
+        resource_type=event.event_type,
+        record_id=str(event.id),
+        source_provider=event.source_provider,
+        observed_start=observed,
+        observed_end=observed_end,
+        schema_version=event.schema_version,
+        coverage=event.coverage,
+        sensitivity=event.sensitivity,
+    )
+
+    def result_factory(query, now):
+        return ContextResult(
+            query_id=query.query_id,
+            provider_id=query.provider_id,
+            capability=query.capability,
+            status=ContextStatus.OK,
+            payload={"status": "ok", "value": 1},
+            source_refs=[source_ref],
+            observed_start=NOW - timedelta(days=10),
+            observed_end=NOW - timedelta(days=9),
+            collected_at=NOW - timedelta(days=9),
+            freshness=ContextFreshness(
+                status=FreshnessStatus.CURRENT,
+                as_of=now,
+            ),
+            coverage=ContextCoverage(
+                status=CoverageStatus.COMPLETE,
+                ratio=1,
+            ),
+        )
+
+    class CompletenessRuntime:
+        metadata = RuntimeMetadata(runtime="scripted")
+
+        async def next_step(self, turn):
+            if not turn.history:
+                return RuntimeStepOutput(
+                    tool_calls=({"capability": "activity.summary"},),
+                    metadata=self.metadata,
+                )
+            context = turn.history[0].results[0]
+            assert context.observed_start == observed
+            assert context.observed_end == observed_end
+            assert context.collected_at == recorded
+            return RuntimeStepOutput(
+                draft=DecisionDraft(
+                    status=DecisionStatus.COMPLETED,
+                    answer="The activity context is available.",
+                    used_source_ref_ids=[source_ref.reference_id],
+                ),
+                metadata=self.metadata,
+            )
+
+    result = await _agent(
+        session_factory,
+        providers=(
+            StubProvider(
+                domain="activity",
+                result_factory=result_factory,
+            ),
+        ),
+        runtime=CompletenessRuntime(),
+        policy=_policy("activity"),
+    ).ask(_request())
+
+    assert result.draft.status is DecisionStatus.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "persisted"),
+    [
+        (ContextStatus.OK, True),
+        (ContextStatus.PARTIAL, True),
+        (ContextStatus.DENIED, False),
+        (ContextStatus.FAILED, False),
+        (ContextStatus.UNAVAILABLE, False),
+    ],
+)
+async def test_provider_writes_commit_only_for_usable_context_results(
+    session_factory,
+    provider_status,
+    persisted,
+):
+    sentinel_id = uuid.uuid4()
+
+    class TransactionalProvider(StubProvider):
+        async def query(self, session, query, *, now):
+            self.calls.append(query)
+            session.add(
+                WellnessEvent(
+                    id=sentinel_id,
+                    event_type="nutrition.transaction-probe.v1",
+                    schema_version=1,
+                    observed_at=now,
+                    recorded_at=now,
+                    timezone="UTC",
+                    source_provider="transaction-probe",
+                    source_device=None,
+                    source_record_id=str(sentinel_id),
+                    capture_method="test",
+                    quality_flags={},
+                    confidence=1,
+                    coverage=1,
+                    sensitivity="nutrition",
+                    consent_scope="personal",
+                    retention_policy_id=None,
+                    expires_at=None,
+                    payload={"status": provider_status.value},
+                    raw_object_id=None,
+                    derived_from=None,
+                )
+            )
+            session.flush()
+            return ContextResult(
+                query_id=query.query_id,
+                provider_id=query.provider_id,
+                capability=query.capability,
+                status=provider_status,
+                freshness=ContextFreshness(
+                    status=(
+                        FreshnessStatus.CURRENT
+                        if provider_status
+                        in {ContextStatus.OK, ContextStatus.PARTIAL}
+                        else FreshnessStatus.UNAVAILABLE
+                    ),
+                    as_of=(
+                        now
+                        if provider_status
+                        in {ContextStatus.OK, ContextStatus.PARTIAL}
+                        else None
+                    ),
+                ),
+                coverage=ContextCoverage(
+                    status=(
+                        CoverageStatus.COMPLETE
+                        if provider_status
+                        in {ContextStatus.OK, ContextStatus.PARTIAL}
+                        else CoverageStatus.UNAVAILABLE
+                    ),
+                    ratio=(
+                        1
+                        if provider_status
+                        in {ContextStatus.OK, ContextStatus.PARTIAL}
+                        else None
+                    ),
+                ),
+                limitations=(
+                    []
+                    if provider_status is ContextStatus.OK
+                    else ["transaction_probe_result"]
+                ),
+            )
+
+    class OneQueryRuntime:
+        metadata = RuntimeMetadata(runtime="scripted")
+
+        async def next_step(self, turn):
+            if not turn.history:
+                return RuntimeStepOutput(
+                    tool_calls=({"capability": "nutrition.summary"},),
+                    metadata=self.metadata,
+                )
+            return RuntimeStepOutput(
+                draft=DecisionDraft(
+                    status=DecisionStatus.NEEDS_CLARIFICATION,
+                    clarification_question="Should I inspect another source?",
+                ),
+                metadata=self.metadata,
+            )
+
+    await _agent(
+        session_factory,
+        providers=(TransactionalProvider(domain="nutrition"),),
+        runtime=OneQueryRuntime(),
+        policy=_policy("nutrition"),
+    ).ask(_request())
+
+    with session_factory() as session:
+        assert (session.get(WellnessEvent, sentinel_id) is not None) is persisted
+
+
+async def test_malformed_provider_result_rolls_back_provider_writes(
+    session_factory,
+):
+    sentinel_id = uuid.uuid4()
+
+    class MalformedTransactionalProvider(StubProvider):
+        async def query(self, session, query, *, now):
+            self.calls.append(query)
+            session.add(
+                WellnessEvent(
+                    id=sentinel_id,
+                    event_type="nutrition.transaction-probe.v1",
+                    schema_version=1,
+                    observed_at=now,
+                    recorded_at=now,
+                    timezone="UTC",
+                    source_provider="transaction-probe",
+                    source_device=None,
+                    source_record_id=str(sentinel_id),
+                    capture_method="test",
+                    quality_flags={},
+                    confidence=1,
+                    coverage=1,
+                    sensitivity="nutrition",
+                    consent_scope="personal",
+                    retention_policy_id=None,
+                    expires_at=None,
+                    payload={"status": "malformed"},
+                    raw_object_id=None,
+                    derived_from=None,
+                )
+            )
+            session.flush()
+            valid = ContextResult(
+                query_id=query.query_id,
+                provider_id=query.provider_id,
+                capability=query.capability,
+                status=ContextStatus.OK,
+            )
+            return valid.model_copy(
+                update={"provider_id": "wrong-provider"}
+            )
+
+    class OneQueryRuntime:
+        metadata = RuntimeMetadata(runtime="scripted")
+
+        async def next_step(self, turn):
+            if not turn.history:
+                return RuntimeStepOutput(
+                    tool_calls=({"capability": "nutrition.summary"},),
+                    metadata=self.metadata,
+                )
+            assert turn.history[0].results[0].status is ContextStatus.FAILED
+            return RuntimeStepOutput(
+                draft=DecisionDraft(
+                    status=DecisionStatus.NEEDS_CLARIFICATION,
+                    clarification_question="Can I retry the failed source?",
+                ),
+                metadata=self.metadata,
+            )
+
+    await _agent(
+        session_factory,
+        providers=(MalformedTransactionalProvider(domain="nutrition"),),
+        runtime=OneQueryRuntime(),
+        policy=_policy("nutrition"),
+    ).ask(_request())
+
+    with session_factory() as session:
+        assert session.get(WellnessEvent, sentinel_id) is None
+
+
 async def test_completed_context_answer_must_declare_a_source_ref(
     session_factory,
 ):

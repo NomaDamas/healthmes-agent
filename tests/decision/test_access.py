@@ -25,6 +25,10 @@ from healthmes.activity.repository import (
     update_collection_config,
     update_collection_status,
 )
+from healthmes.calendars.state import (
+    InMemorySyncHealthStore,
+    SyncCoverageKind,
+)
 from healthmes.decision import (
     AccessOutcome,
     ActivityContextProvider,
@@ -1714,6 +1718,84 @@ async def test_external_provenance_can_be_disabled_by_policy(session):
     assert result.limitations == ["external_source_provenance_denied"]
 
 
+async def test_wearable_provider_returns_attested_local_snapshot(
+    session,
+):
+    async def reader(day):
+        return {
+            "status": "ok",
+            "date": day.isoformat(),
+            "stress": {
+                "status": "ok",
+                "value": 42,
+                "recorded_at": "2026-08-10T08:00:00+00:00",
+            },
+            "source_refs": [
+                {
+                    "domain": "wearable",
+                    "record_id": "score-1",
+                    "source_provider": "open-wearables",
+                    "resource_type": "health_score",
+                    "observed_at": "2026-08-10T08:00:00+00:00",
+                    "schema_version": 1,
+                    "derived_by": (
+                        "open-wearables.daily-readiness.v1"
+                    ),
+                }
+            ],
+            "freshness": {
+                "recorded_at": "2026-08-10T08:00:00+00:00",
+                "status": "derived_from_readiness_blocks",
+            },
+            "coverage": {
+                "status": "readiness_blocks",
+                "ratio": 1.0,
+            },
+            "limitations": [],
+        }
+
+    factory = sessionmaker(
+        bind=session.get_bind(),
+        expire_on_commit=False,
+    )
+    provider = WearableContextProvider(
+        reader,
+        snapshot_session_factory=factory,
+    )
+    registry = ContextProviderRegistry((provider,))
+    layer = ContextAccessLayer(registry, clock=lambda: NOW)
+    turn = layer.start_turn(
+        _request(),
+        policy=_policy(domain="wearable"),
+    )
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.stress",
+        timezone="UTC",
+        parameters={"date": "2026-08-10"},
+    )
+
+    result = await turn.query(session, query)
+
+    assert result.payload["stress"]["value"] == 42
+    assert len(result.source_refs) == 1
+    ref = result.source_refs[0]
+    assert ref.source_provider == "healthmes-open-wearables-mirror"
+    assert ref.record_id != "score-1"
+    assert ref.content_digest is not None
+    assert ref.collected_at == NOW
+    assert result.collected_at == NOW
+    validated, limitations = turn.revalidate_source_ref(
+        session,
+        query,
+        ref,
+        context_source_refs=result.source_refs,
+        now=NOW,
+    )
+    assert validated == ref
+    assert limitations == ("future_range_trimmed",)
+
+
 @pytest.mark.parametrize(
     ("date_value", "timezone", "expected_hours"),
     (
@@ -1946,6 +2028,69 @@ async def test_provider_freshness_is_recomputed_and_future_values_fail_closed(
     assert age_result.freshness.age_seconds == 300
     assert future_result.status is ContextStatus.DENIED
     assert future_result.limitations == ["freshness_as_of_in_future"]
+
+
+async def test_gateway_derives_completeness_times_and_rejects_forged_collection(
+    session,
+):
+    observed = datetime(2026, 8, 10, 9, tzinfo=UTC)
+    observed_end = datetime(2026, 8, 10, 10, tzinfo=UTC)
+    recorded = datetime(2026, 8, 10, 10, 5, tzinfo=UTC)
+    event = _event(
+        domain="mood",
+        observed_at=observed,
+        observed_end=observed_end,
+        recorded_at=recorded,
+    )
+    session.add(event)
+    session.flush()
+    valid_ref = _source_ref(event, domain="mood")
+
+    provider = StaticProvider(
+        result_factory=lambda query, now: _result(
+            query,
+            now=now,
+            payload={"value": 7},
+            source_refs=[valid_ref],
+        ).model_copy(
+            update={
+                "observed_start": NOW - timedelta(days=30),
+                "observed_end": NOW - timedelta(days=29),
+                "collected_at": NOW - timedelta(days=29),
+            }
+        )
+    )
+    _, turn = _turn(provider)
+
+    result = await turn.query(
+        session,
+        _query(start=observed, end=observed_end),
+    )
+
+    assert result.observed_start == observed
+    assert result.observed_end == observed_end
+    assert result.collected_at == recorded
+    assert result.source_refs[0].collected_at is None
+
+    forged_ref = valid_ref.model_copy(
+        update={"collected_at": recorded + timedelta(minutes=1)}
+    )
+    forged_provider = StaticProvider(
+        result_factory=lambda query, now: _result(
+            query,
+            now=now,
+            payload={"value": 7},
+            source_refs=[forged_ref],
+        )
+    )
+    _, forged_turn = _turn(forged_provider)
+    forged = await forged_turn.query(
+        session,
+        _query(start=observed, end=observed_end),
+    )
+
+    assert forged.status is ContextStatus.DENIED
+    assert forged.limitations == ["source_ref_identity_mismatch"]
 
 
 async def test_truncated_provider_result_is_explicitly_partial(session):
@@ -3102,7 +3247,13 @@ async def test_real_wearable_provider_preserves_actual_sleep_interval(
             "limitations": [],
         }
 
-    provider = WearableContextProvider(reader)
+    provider = WearableContextProvider(
+        reader,
+        snapshot_session_factory=sessionmaker(
+            bind=session.get_bind(),
+            expire_on_commit=False,
+        ),
+    )
     layer = ContextAccessLayer(
         ContextProviderRegistry((provider,)),
         clock=lambda: NOW,
@@ -3123,10 +3274,15 @@ async def test_real_wearable_provider_preserves_actual_sleep_interval(
     assert result.status is ContextStatus.PARTIAL
     assert len(result.source_refs) == 1
     source_ref = result.source_refs[0]
-    assert source_ref.record_id == str(row.id)
-    assert source_ref.observed_start == row.start_at
-    assert source_ref.observed_end == row.end_at
-    assert source_ref.freshness is FreshnessStatus.UNKNOWN
+    assert source_ref.record_id != str(row.id)
+    assert (
+        source_ref.source_provider
+        == "healthmes-open-wearables-mirror"
+    )
+    assert source_ref.observed_start == DAY_START
+    assert source_ref.observed_end == DAY_END
+    assert source_ref.freshness is FreshnessStatus.CURRENT
+    assert source_ref.content_digest is not None
     assert "Private sleep title" not in result.model_dump_json()
 
 
@@ -3572,6 +3728,56 @@ async def test_calendar_day_summary_uses_requested_partial_window(session):
     assert result.payload["busy_minutes"] == 60
     assert result.source_refs[0].record_id == str(morning.id)
     assert str(afternoon.id) not in result.model_dump_json()
+
+
+async def test_calendar_empty_success_metadata_survives_access_gateway(
+    session,
+):
+    health = InMemorySyncHealthStore()
+    collected_at = NOW - timedelta(minutes=1)
+    health.record_success(
+        CalendarSource.GOOGLE,
+        collected_at,
+        event_count=0,
+        coverage_kind=SyncCoverageKind.BOUNDED_WINDOW,
+        coverage_start=DAY_START,
+        coverage_end=DAY_END,
+    )
+    layer = ContextAccessLayer(
+        ContextProviderRegistry(
+            (
+                CalendarContextProvider(
+                    sync_health_store=health,
+                    sources=(CalendarSource.GOOGLE,),
+                ),
+            )
+        ),
+        clock=lambda: NOW,
+    )
+    turn = layer.start_turn(
+        _request(),
+        policy=_policy(domain="calendar"),
+    )
+
+    result = await turn.query(
+        session,
+        ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            start=DAY_START,
+            end=DAY_END,
+        ),
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload == {"status": "empty_success"}
+    assert result.source_refs == []
+    assert result.observed_start == DAY_START
+    assert result.observed_end == DAY_END
+    assert result.collected_at == collected_at
+    assert result.coverage.status is CoverageStatus.COMPLETE
+    assert "source_refs_unavailable" not in result.limitations
+    assert "stable_provenance_missing" not in result.limitations
 
 
 def test_access_policy_requires_explicit_grants_and_owner():

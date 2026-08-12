@@ -523,6 +523,7 @@ class SourceRef(BaseModel):
     source_provider: str = Field(min_length=1, max_length=128)
     observed_start: AwareDatetime
     observed_end: AwareDatetime | None = None
+    collected_at: AwareDatetime | None = None
     schema_version: int = Field(default=1, ge=1)
     derived_by: str | None = Field(default=None, max_length=128)
     freshness: FreshnessStatus = FreshnessStatus.UNKNOWN
@@ -591,7 +592,12 @@ class SourceRef(BaseModel):
             return None
         return _identifier(value, label="derived_by", max_length=128)
 
-    @field_validator("observed_start", "observed_end", mode="after")
+    @field_validator(
+        "observed_start",
+        "observed_end",
+        "collected_at",
+        mode="after",
+    )
     @classmethod
     def normalize_observed_time(
         cls,
@@ -663,6 +669,9 @@ class ContextResult(BaseModel):
         default_factory=list,
         max_length=MAX_SOURCE_REFS,
     )
+    observed_start: AwareDatetime | None = None
+    observed_end: AwareDatetime | None = None
+    collected_at: AwareDatetime | None = None
     freshness: ContextFreshness = Field(default_factory=ContextFreshness)
     coverage: ContextCoverage = Field(default_factory=ContextCoverage)
     limitations: list[str] = Field(
@@ -697,6 +706,19 @@ class ContextResult(BaseModel):
             return None
         return _bounded_text(value, label="next_cursor", max_length=512)
 
+    @field_validator(
+        "observed_start",
+        "observed_end",
+        "collected_at",
+        mode="after",
+    )
+    @classmethod
+    def normalize_completeness_time(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        return _utc(value) if value is not None else None
+
     @model_validator(mode="after")
     def validate_result(self) -> ContextResult:
         reference_ids = [item.reference_id for item in self.source_refs]
@@ -724,6 +746,18 @@ class ContextResult(BaseModel):
             )
         if self.next_cursor is not None and not self.truncated:
             raise ValueError("next_cursor requires truncated=true")
+        if (self.observed_start is None) != (self.observed_end is None):
+            raise ValueError(
+                "observed_start and observed_end must be provided together"
+            )
+        if (
+            self.observed_start is not None
+            and self.observed_end is not None
+            and self.observed_end < self.observed_start
+        ):
+            raise ValueError(
+                "observed_end must not be before observed_start"
+            )
         return self
 
 

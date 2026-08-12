@@ -15,6 +15,7 @@ from healthmes.activity.contracts import (
 
 BLOCKED_PERMISSION_STATES = {
     ActivityPermissionStatus.DENIED.value,
+    ActivityPermissionStatus.RESTRICTED.value,
     ActivityPermissionStatus.REVOKED.value,
     ActivityPermissionStatus.UNAVAILABLE.value,
 }

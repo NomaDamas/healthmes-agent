@@ -22,6 +22,11 @@ from healthmes.calendars.google import (
     google_token_path,
     load_credentials,
 )
+from healthmes.calendars.state import (
+    SyncCoverageKind,
+    sync_state_coverage,
+    with_sync_state_coverage,
+)
 
 # --- fake googleapiclient plumbing ------------------------------------------
 
@@ -214,13 +219,19 @@ class TestInitialFullSync:
         events, state = backend.list_changes(None)
 
         assert [event.external_id for event in events] == ["a", "b"]
-        assert state == {"sync_token": "tok-1", "known_ids": {"a": '"e1"', "b": '"e1"'}}
+        assert state["sync_token"] == "tok-1"
+        assert state["known_ids"] == {"a": '"e1"', "b": '"e1"'}
 
         first, second = service.list_calls
         assert first["singleEvents"] is True
         assert "timeMin" in first and "timeMax" in first
         assert "syncToken" not in first
         assert second["pageToken"] == "page-2"
+        assert sync_state_coverage(state) == (
+            SyncCoverageKind.BOUNDED_WINDOW,
+            datetime.fromisoformat(first["timeMin"]),
+            datetime.fromisoformat(first["timeMax"]),
+        )
 
     def test_no_synthetic_deletions_on_bootstrap(self, backend, service) -> None:
         service.list_responses = [{"items": [api_event("a")], "nextSyncToken": "tok-1"}]
@@ -239,7 +250,17 @@ class TestIncrementalSync:
                 "nextSyncToken": "tok-2",
             }
         ]
-        previous = {"sync_token": "tok-1", "known_ids": {"a": '"e0"', "b": '"e0"'}}
+        coverage_start = datetime(2026, 8, 1, tzinfo=UTC)
+        coverage_end = datetime(2027, 8, 1, tzinfo=UTC)
+        previous = with_sync_state_coverage(
+            {
+                "sync_token": "tok-1",
+                "known_ids": {"a": '"e0"', "b": '"e0"'},
+            },
+            kind=SyncCoverageKind.BOUNDED_WINDOW,
+            start=coverage_start,
+            end=coverage_end,
+        )
         events, state = backend.list_changes(previous)
 
         (call,) = service.list_calls
@@ -249,14 +270,28 @@ class TestIncrementalSync:
         live, gone = events
         assert live.external_id == "a" and not live.deleted
         assert gone.external_id == "b" and gone.deleted
-        assert state == {"sync_token": "tok-2", "known_ids": {"a": '"e1"'}}
+        assert state["sync_token"] == "tok-2"
+        assert state["known_ids"] == {"a": '"e1"'}
+        assert sync_state_coverage(state) == (
+            SyncCoverageKind.BOUNDED_WINDOW,
+            coverage_start,
+            coverage_end,
+        )
 
     def test_gone_410_falls_back_to_full_resync(self, backend, service) -> None:
         service.list_responses = [
             FakeStatusError(410),
             {"items": [api_event("a")], "nextSyncToken": "tok-3"},
         ]
-        previous = {"sync_token": "expired", "known_ids": {"a": '"e0"', "stale": '"e0"'}}
+        previous = with_sync_state_coverage(
+            {
+                "sync_token": "expired",
+                "known_ids": {"a": '"e0"', "stale": '"e0"'},
+            },
+            kind=SyncCoverageKind.BOUNDED_WINDOW,
+            start=datetime(2026, 8, 1, tzinfo=UTC),
+            end=datetime(2027, 8, 1, tzinfo=UTC),
+        )
         events, state = backend.list_changes(previous)
 
         # The event that vanished while the token was invalid is synthesized
@@ -265,14 +300,42 @@ class TestIncrementalSync:
             "a": False,
             "stale": True,
         }
-        assert state == {"sync_token": "tok-3", "known_ids": {"a": '"e1"'}}
+        assert state["sync_token"] == "tok-3"
+        assert state["known_ids"] == {"a": '"e1"'}
+        assert sync_state_coverage(state)[0] is SyncCoverageKind.BOUNDED_WINDOW
         assert "syncToken" in service.list_calls[0]
         assert "timeMin" in service.list_calls[1]
+
+    def test_legacy_cursor_without_coverage_forces_full_refresh(
+        self,
+        backend,
+        service,
+    ) -> None:
+        service.list_responses = [
+            {"items": [api_event("a")], "nextSyncToken": "tok-fresh"}
+        ]
+
+        _, state = backend.list_changes(
+            {"sync_token": "legacy", "known_ids": {"a": '"e0"'}}
+        )
+
+        (call,) = service.list_calls
+        assert "syncToken" not in call
+        assert "timeMin" in call and "timeMax" in call
+        assert state["sync_token"] == "tok-fresh"
+        assert sync_state_coverage(state)[0] is SyncCoverageKind.BOUNDED_WINDOW
 
     def test_non_410_errors_propagate(self, backend, service) -> None:
         service.list_responses = [FakeStatusError(500)]
         with pytest.raises(FakeStatusError):
-            backend.list_changes({"sync_token": "tok", "known_ids": {}})
+            backend.list_changes(
+                with_sync_state_coverage(
+                    {"sync_token": "tok", "known_ids": {}},
+                    kind=SyncCoverageKind.BOUNDED_WINDOW,
+                    start=datetime(2026, 8, 1, tzinfo=UTC),
+                    end=datetime(2027, 8, 1, tzinfo=UTC),
+                )
+            )
 
 
 class TestEventParsing:

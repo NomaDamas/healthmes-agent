@@ -15,6 +15,7 @@ from healthmes.activity.maintenance import ACTIVITY_MAINTENANCE_JOB_ID
 from healthmes.app import create_app
 from healthmes.config import Settings
 from healthmes.engine.scheduler import (
+    ACTIVITYWATCH_JOB_ID,
     BACKUP_JOB_ID,
     CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
     ENERGY_JOB_ID,
@@ -206,6 +207,32 @@ class TestSchedulerWiring:
             assert google_job.trigger.interval.total_seconds() == 5 * 60
             assert caldav_job.trigger.interval.total_seconds() == 10 * 60
 
+    def test_enabled_activitywatch_registers_one_job_and_shutdown_stops_it(
+        self, settings
+    ) -> None:
+        enabled = settings.model_copy(
+            update={
+                "scheduler_enabled": True,
+                "activitywatch_enabled": True,
+                "activitywatch_interval_minutes": 13,
+            }
+        )
+        app = create_app(enabled)
+        with TestClient(app):
+            scheduler = app.state.scheduler
+            assert scheduler is not None
+            matches = [
+                job
+                for job in scheduler.get_jobs()
+                if job.id == ACTIVITYWATCH_JOB_ID
+            ]
+            assert len(matches) == 1
+            assert matches[0].trigger.interval.total_seconds() == 13 * 60
+            assert matches[0].max_instances == 1
+            assert matches[0].coalesce is True
+        assert not scheduler.running
+        assert app.state.scheduler is None
+
     def test_disabled_scheduler_still_wires_jobs_without_starting(
         self, settings, monkeypatch
     ) -> None:
@@ -234,4 +261,27 @@ class TestSchedulerWiring:
             STORAGE_MAINTENANCE_JOB_ID,
             ACTIVITY_MAINTENANCE_JOB_ID,
         }
+        assert not prepared.running
+
+    def test_global_scheduler_gate_keeps_activitywatch_unstarted(
+        self, settings, monkeypatch
+    ) -> None:
+        import healthmes.app as app_module
+
+        captured = {}
+        real_start = app_module.start_scheduler
+
+        def spying_start(settings_arg, *, scheduler=None):
+            captured["scheduler"] = scheduler
+            return real_start(settings_arg, scheduler=scheduler)
+
+        monkeypatch.setattr(app_module, "start_scheduler", spying_start)
+        configured = settings.model_copy(
+            update={"activitywatch_enabled": True}
+        )
+        app = create_app(configured)
+        with TestClient(app):
+            assert app.state.scheduler is None
+        prepared = captured["scheduler"]
+        assert prepared.get_job(ACTIVITYWATCH_JOB_ID) is not None
         assert not prepared.running

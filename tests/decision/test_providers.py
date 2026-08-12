@@ -2,7 +2,12 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from sqlalchemy.orm import sessionmaker
 
+from healthmes.calendars.state import (
+    InMemorySyncHealthStore,
+    SyncCoverageKind,
+)
 from healthmes.decision import (
     ActivityContextProvider,
     CalendarContextProvider,
@@ -274,6 +279,10 @@ async def test_activity_adapter_returns_typed_stable_wellness_source_ref(
     assert result.source_refs[0].record_id == str(event.id)
     assert result.source_refs[0].source_provider == "healthmes-activity"
     assert result.source_refs[0].observed_end == DAY_END
+    assert result.source_refs[0].collected_at == NOW
+    assert result.observed_start == DAY_START
+    assert result.observed_end == DAY_END
+    assert result.collected_at == NOW
 
 
 async def test_activity_event_id_never_falls_back_to_source_record_id(
@@ -573,7 +582,18 @@ async def test_wearable_adapter_normalizes_upstream_source_reference(session):
             "limitations": [],
         }
 
-    registry = ContextProviderRegistry((WearableContextProvider(reader),))
+    snapshot_factory = sessionmaker(
+        bind=session.get_bind(),
+        expire_on_commit=False,
+    )
+    registry = ContextProviderRegistry(
+        (
+            WearableContextProvider(
+                reader,
+                snapshot_session_factory=snapshot_factory,
+            ),
+        )
+    )
     query = ContextQuery(
         provider_id="wearable",
         capability="wearable.stress",
@@ -585,8 +605,16 @@ async def test_wearable_adapter_normalizes_upstream_source_reference(session):
     assert result.status is ContextStatus.OK
     assert result.payload["stress"]["value"] == 42
     assert len(result.source_refs) == 1
-    assert result.source_refs[0].record_id == "score-1"
-    assert result.source_refs[0].source_provider == "open-wearables"
+    assert result.source_refs[0].record_id != "score-1"
+    assert (
+        result.source_refs[0].source_provider
+        == "healthmes-open-wearables-mirror"
+    )
+    assert (
+        result.source_refs[0].resource_type
+        == "wearable.open-wearables-observation.v1"
+    )
+    assert result.source_refs[0].collected_at == NOW
     assert "wearable_source_refs_are_readiness_level" in result.limitations
 
 
@@ -624,6 +652,196 @@ async def test_calendar_adapter_returns_merged_aggregate_without_titles(
     ]
     assert "Private meeting title" not in result.model_dump_json()
     assert result.source_refs[0].record_id == str(row.id)
+
+
+async def test_calendar_empty_success_is_distinct_from_never_synced(
+    session,
+):
+    health = InMemorySyncHealthStore()
+    health.record_success(
+        CalendarSource.GOOGLE,
+        NOW - timedelta(minutes=1),
+        event_count=0,
+        coverage_kind=SyncCoverageKind.BOUNDED_WINDOW,
+        coverage_start=DAY_START - timedelta(days=9),
+        coverage_end=DAY_END + timedelta(days=20),
+    )
+    provider = CalendarContextProvider(
+        sync_health_store=health,
+        sources=(CalendarSource.GOOGLE,),
+    )
+    registry = ContextProviderRegistry((provider,))
+
+    result = await registry.execute(
+        session,
+        ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            parameters={"date": "2026-08-10"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["status"] == "empty_success"
+    assert result.payload["event_count"] == 0
+    assert result.coverage.status is CoverageStatus.COMPLETE
+    assert result.coverage.ratio == 1
+    assert result.freshness.as_of == NOW - timedelta(minutes=1)
+    assert result.observed_start == DAY_START
+    assert result.observed_end == DAY_END
+    assert result.collected_at == NOW - timedelta(minutes=1)
+    assert "calendar_never_synced" not in result.limitations
+    assert "calendar_mirror_completeness_unknown" not in result.limitations
+    assert "calendar_query_outside_sync_coverage" not in result.limitations
+
+
+async def test_calendar_empty_query_outside_sync_coverage_is_not_complete(
+    session,
+):
+    health = InMemorySyncHealthStore()
+    health.record_success(
+        CalendarSource.GOOGLE,
+        NOW - timedelta(minutes=1),
+        event_count=0,
+        coverage_kind=SyncCoverageKind.BOUNDED_WINDOW,
+        coverage_start=DAY_START,
+        coverage_end=DAY_END,
+    )
+    provider = CalendarContextProvider(
+        sync_health_store=health,
+        sources=(CalendarSource.GOOGLE,),
+    )
+
+    result = await ContextProviderRegistry((provider,)).execute(
+        session,
+        ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            parameters={"date": "2026-07-01"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["status"] == "insufficient_data"
+    assert result.coverage.status is CoverageStatus.PARTIAL
+    assert result.coverage.ratio == 0
+    assert result.observed_start is None
+    assert result.observed_end is None
+    assert "calendar_query_outside_sync_coverage" in result.limitations
+
+
+async def test_calendar_multi_source_freshness_uses_oldest_watermark(
+    session,
+):
+    health = InMemorySyncHealthStore()
+    google_success = NOW - timedelta(minutes=1)
+    caldav_success = NOW - timedelta(days=3)
+    for source, succeeded_at in (
+        (CalendarSource.GOOGLE, google_success),
+        (CalendarSource.CALDAV, caldav_success),
+    ):
+        health.record_success(
+            source,
+            succeeded_at,
+            event_count=0,
+            coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+        )
+    provider = CalendarContextProvider(
+        sync_health_store=health,
+        sources=(CalendarSource.GOOGLE, CalendarSource.CALDAV),
+    )
+
+    result = await ContextProviderRegistry((provider,)).execute(
+        session,
+        ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            parameters={"date": "2026-08-10"},
+        ),
+        now=NOW,
+    )
+
+    assert result.payload["status"] == "empty_success"
+    assert result.coverage.status is CoverageStatus.COMPLETE
+    assert result.freshness.as_of == caldav_success
+    assert result.collected_at == caldav_success
+
+
+async def test_calendar_never_synced_does_not_claim_an_empty_day(
+    session,
+):
+    provider = CalendarContextProvider(
+        sync_health_store=InMemorySyncHealthStore(),
+        sources=(CalendarSource.GOOGLE,),
+    )
+    registry = ContextProviderRegistry((provider,))
+
+    result = await registry.execute(
+        session,
+        ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            parameters={"date": "2026-08-10"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["status"] == "insufficient_data"
+    assert result.coverage.status is CoverageStatus.UNKNOWN
+    assert result.freshness.status is FreshnessStatus.UNAVAILABLE
+    assert "calendar_never_synced" in result.limitations
+
+
+async def test_calendar_recent_failure_marks_retained_rows_partial(
+    session,
+):
+    row = CalendarEventMirror(
+        external_id="meeting-after-failure",
+        calendar_source=CalendarSource.GOOGLE,
+        summary="Private retained meeting",
+        start_at=datetime(2026, 8, 10, 9, tzinfo=UTC),
+        end_at=datetime(2026, 8, 10, 10, tzinfo=UTC),
+        is_all_day=False,
+    )
+    session.add(row)
+    session.flush()
+    health = InMemorySyncHealthStore()
+    health.record_success(
+        CalendarSource.GOOGLE,
+        NOW - timedelta(minutes=10),
+        event_count=1,
+        coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+    )
+    health.record_failure(
+        CalendarSource.GOOGLE,
+        NOW - timedelta(minutes=1),
+        error_code="calendar_timeout",
+    )
+    provider = CalendarContextProvider(
+        sync_health_store=health,
+        sources=(CalendarSource.GOOGLE,),
+    )
+    registry = ContextProviderRegistry((provider,))
+
+    result = await registry.execute(
+        session,
+        ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            parameters={"date": "2026-08-10"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["event_count"] == 1
+    assert result.source_refs[0].record_id == str(row.id)
+    assert result.freshness.as_of == NOW - timedelta(minutes=10)
+    assert "calendar_recent_sync_failure" in result.limitations
+    assert "Private retained meeting" not in result.model_dump_json()
 
 
 async def test_adapter_rejects_undeclared_fields_as_failed_context(session):

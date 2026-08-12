@@ -51,6 +51,11 @@ from healthmes.calendars.base import (
     parse_event_kind,
     parse_task_id,
 )
+from healthmes.calendars.state import (
+    SyncCoverageKind,
+    sync_state_coverage,
+    with_sync_state_coverage,
+)
 from healthmes.store.enums import CalendarSource
 
 __all__ = [
@@ -137,11 +142,13 @@ class CalDavCalendarBackend:
         previous = dict(sync_state or {})
         previous_fingerprints: dict[str, str] = dict(previous.get("fingerprints") or {})
         ctag = self._read_ctag()
+        coverage_kind, _, _ = sync_state_coverage(previous)
 
         if (
             sync_state is not None
             and ctag is not None
             and previous.get("ctag") == ctag
+            and coverage_kind is SyncCoverageKind.FULL_COLLECTION
         ):
             return [], previous  # collection unchanged; skip the event fetch
 
@@ -161,7 +168,10 @@ class CalDavCalendarBackend:
             for uid in previous_fingerprints
             if uid not in fingerprints
         ]
-        return changed + deletions, {"ctag": ctag, "fingerprints": fingerprints}
+        return changed + deletions, with_sync_state_coverage(
+            {"ctag": ctag, "fingerprints": fingerprints},
+            kind=SyncCoverageKind.FULL_COLLECTION,
+        )
 
     def _read_ctag(self) -> str | None:
         try:

@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import select
 
 from healthmes.calendars.base import (
+    CalendarAuthError,
     CalendarConflictError,
     CalendarEventIdentity,
     EventDraft,
@@ -30,7 +31,13 @@ from healthmes.calendars.jobs import (
     push_accepted_proposals,
     write_source,
 )
-from healthmes.calendars.state import InMemoryPendingDiffStore, InMemorySyncStateStore
+from healthmes.calendars.state import (
+    InMemoryPendingDiffStore,
+    InMemorySyncHealthStore,
+    InMemorySyncStateStore,
+    SyncCoverageKind,
+    SyncHealthStatus,
+)
 from healthmes.calendars.sync import CalendarMirrorService
 from healthmes.store import (
     CalendarEventMirror,
@@ -83,6 +90,444 @@ class TestEnablement:
 
 
 class TestJobRun:
+    def test_health_attempt_precedes_backend_construction_and_empty_success(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+    ) -> None:
+        health_store = InMemorySyncHealthStore()
+        timeline: list[str] = []
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 2),
+            ]
+        )
+
+        class OrderedHealthStore(InMemorySyncHealthStore):
+            def record_attempt(self, source, at) -> None:
+                timeline.append("attempt")
+                super().record_attempt(source, at)
+
+            def record_success(
+                self,
+                source,
+                at,
+                *,
+                event_count,
+                coverage_kind=SyncCoverageKind.UNKNOWN,
+                coverage_start=None,
+                coverage_end=None,
+            ) -> None:
+                timeline.append("success")
+                super().record_success(
+                    source,
+                    at,
+                    event_count=event_count,
+                    coverage_kind=coverage_kind,
+                    coverage_start=coverage_start,
+                    coverage_end=coverage_end,
+                )
+
+        health_store = OrderedHealthStore()
+
+        def build_backend():
+            timeline.append("backend")
+            return fake_backend
+
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=False,
+            backend_factory=build_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is not None
+        assert timeline == ["attempt", "backend", "success"]
+        health = health_store.load(fake_backend.source)
+        assert health is not None
+        assert health.status is SyncHealthStatus.EMPTY_SUCCESS
+        assert health.last_attempt_at == utc(2026, 8, 12, 9)
+        assert health.last_success_at == utc(2026, 8, 12, 9, 0, 2)
+        assert health.last_success_event_count == 0
+
+    def test_health_success_is_recorded_after_calendar_commit(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+        make_event,
+    ) -> None:
+        fake_backend.queue_changes(
+            [make_event("health-commit", summary="Private planning title")],
+            {"sync_token": "tok-1"},
+        )
+
+        class CommitObservingHealthStore(InMemorySyncHealthStore):
+            def record_success(
+                self,
+                source,
+                at,
+                *,
+                event_count,
+                coverage_kind=SyncCoverageKind.UNKNOWN,
+                coverage_start=None,
+                coverage_end=None,
+            ) -> None:
+                with session_factory() as observer:
+                    rows = observer.scalars(
+                        select(CalendarEventMirror).where(
+                            CalendarEventMirror.calendar_source == source
+                        )
+                    ).all()
+                assert [row.external_id for row in rows] == ["health-commit"]
+                assert event_count == 1
+                super().record_success(
+                    source,
+                    at,
+                    event_count=event_count,
+                    coverage_kind=coverage_kind,
+                    coverage_start=coverage_start,
+                    coverage_end=coverage_end,
+                )
+
+        health_store = CommitObservingHealthStore()
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 2),
+            ]
+        )
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=False,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is not None
+        health = health_store.load(fake_backend.source)
+        assert health is not None
+        assert health.status is SyncHealthStatus.SUCCESS
+        assert health.last_success_event_count == 1
+
+    def test_backend_failure_records_sanitized_code_without_message(
+        self,
+        settings,
+        session_factory,
+    ) -> None:
+        health_store = InMemorySyncHealthStore()
+        credential = "user@example.test:super-secret-app-password"
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 1),
+            ]
+        )
+
+        def exploding_factory():
+            raise CalendarAuthError(credential)
+
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=False,
+            backend_factory=exploding_factory,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is None
+        health = health_store.load(CalendarSource.GOOGLE)
+        assert health is not None
+        assert health.status is SyncHealthStatus.RECENT_FAILURE
+        assert health.last_error_code == "calendar_auth_error"
+        assert credential not in repr(health)
+
+    def test_success_then_failure_and_recovery_preserve_history(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+    ) -> None:
+        health_store = InMemorySyncHealthStore()
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 1),
+                utc(2026, 8, 12, 9, 5),
+                utc(2026, 8, 12, 9, 5, 1),
+                utc(2026, 8, 12, 9, 10),
+                utc(2026, 8, 12, 9, 10, 1),
+            ]
+        )
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=False,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is not None
+        original_list_changes = fake_backend.list_changes
+
+        def fail_sync(_state):
+            raise TimeoutError("private provider response")
+
+        fake_backend.list_changes = fail_sync
+        assert job() is None
+        failed = health_store.load(fake_backend.source)
+        assert failed is not None
+        assert failed.status is SyncHealthStatus.RECENT_FAILURE
+        assert failed.last_success_at == utc(2026, 8, 12, 9, 0, 1)
+        assert failed.last_error_code == "calendar_timeout"
+
+        fake_backend.list_changes = original_list_changes
+        assert job() is not None
+        recovered = health_store.load(fake_backend.source)
+        assert recovered is not None
+        assert recovered.status is SyncHealthStatus.EMPTY_SUCCESS
+        assert recovered.last_failure_at == utc(2026, 8, 12, 9, 5, 1)
+        assert recovered.last_error_code == "calendar_timeout"
+        assert recovered.last_success_at == utc(2026, 8, 12, 9, 10, 1)
+
+    @pytest.mark.parametrize(
+        "failing_method",
+        ["record_attempt", "record_success"],
+    )
+    def test_health_write_failure_does_not_mask_success(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+        failing_method,
+    ) -> None:
+        class FailingHealthStore(InMemorySyncHealthStore):
+            def record_attempt(self, source, at) -> None:
+                if failing_method == "record_attempt":
+                    raise OSError("health store unavailable")
+                super().record_attempt(source, at)
+
+            def record_success(
+                self,
+                source,
+                at,
+                *,
+                event_count,
+                coverage_kind=SyncCoverageKind.UNKNOWN,
+                coverage_start=None,
+                coverage_end=None,
+            ) -> None:
+                if failing_method == "record_success":
+                    raise OSError("health store unavailable")
+                super().record_success(
+                    source,
+                    at,
+                    event_count=event_count,
+                    coverage_kind=coverage_kind,
+                    coverage_start=coverage_start,
+                    coverage_end=coverage_end,
+                )
+
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=False,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=FailingHealthStore(),
+            clock=lambda: utc(2026, 8, 12, 9),
+        )
+
+        result = job()
+
+        assert result is not None
+        with session_factory() as persisted:
+            assert persisted.scalars(select(CalendarEventMirror)).all() == []
+
+    def test_failure_health_write_does_not_escape_scheduler(
+        self,
+        settings,
+        session_factory,
+    ) -> None:
+        class FailingHealthStore(InMemorySyncHealthStore):
+            def record_failure(self, source, at, *, error_code) -> None:
+                raise OSError("health store unavailable")
+
+        def exploding_factory():
+            raise RuntimeError("private backend failure")
+
+        job = build_calendar_job(
+            settings,
+            CalendarSource.GOOGLE,
+            is_write_backend=False,
+            backend_factory=exploding_factory,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=FailingHealthStore(),
+            clock=lambda: utc(2026, 8, 12, 9),
+        )
+
+        assert job() is None
+
+    def test_writeback_exception_does_not_replace_inbound_success(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+        monkeypatch,
+    ) -> None:
+        with session_factory() as setup:
+            task = Task(title="Retry calendar writeback")
+            setup.add(task)
+            setup.flush()
+            proposal = ScheduleProposal(
+                task_id=task.id,
+                proposed_start=utc(2026, 8, 12, 10),
+                proposed_end=utc(2026, 8, 12, 11),
+                status=ProposalStatus.ACCEPTED,
+            )
+            setup.add(proposal)
+            setup.commit()
+            proposal_id = proposal.id
+
+        health_store = InMemorySyncHealthStore()
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 1),
+                utc(2026, 8, 12, 9, 0, 2),
+                utc(2026, 8, 12, 9, 0, 3),
+            ]
+        )
+
+        def fail_writeback(*_args, **_kwargs):
+            raise TimeoutError("private provider response")
+
+        monkeypatch.setattr(
+            "healthmes.calendars.jobs.push_accepted_proposals",
+            fail_writeback,
+        )
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is not None
+        health = health_store.load(fake_backend.source)
+        assert health is not None
+        assert health.status is SyncHealthStatus.EMPTY_SUCCESS
+        assert health.last_success_at == utc(2026, 8, 12, 9, 0, 1)
+        assert health.last_failure_at is None
+        assert health.writeback_last_attempt_at == utc(
+            2026,
+            8,
+            12,
+            9,
+            0,
+            2,
+        )
+        assert health.writeback_last_failure_at == utc(
+            2026,
+            8,
+            12,
+            9,
+            0,
+            3,
+        )
+        assert health.writeback_last_error_code == "calendar_timeout"
+        assert health.writeback_attempted_count == 1
+        assert health.writeback_succeeded_count == 0
+        assert health.writeback_failed_count == 1
+        with session_factory() as persisted:
+            assert persisted.get(ScheduleProposal, proposal_id).status is (
+                ProposalStatus.ACCEPTED
+            )
+
+    def test_writeback_preparation_failure_does_not_replace_inbound_success(
+        self,
+        settings,
+        session_factory,
+        fake_backend,
+        monkeypatch,
+    ) -> None:
+        health_store = InMemorySyncHealthStore()
+        times = iter(
+            [
+                utc(2026, 8, 12, 9),
+                utc(2026, 8, 12, 9, 0, 1),
+                utc(2026, 8, 12, 9, 0, 2),
+                utc(2026, 8, 12, 9, 0, 3),
+            ]
+        )
+
+        def fail_preparation(_session):
+            raise RuntimeError("private writeback preparation failure")
+
+        monkeypatch.setattr(
+            "healthmes.calendars.jobs._accepted_proposal_ids",
+            fail_preparation,
+        )
+        job = build_calendar_job(
+            settings,
+            fake_backend.source,
+            is_write_backend=True,
+            backend_factory=lambda: fake_backend,
+            session_factory=session_factory,
+            state_store=InMemorySyncStateStore(),
+            health_store=health_store,
+            clock=lambda: next(times),
+        )
+
+        assert job() is not None
+        health = health_store.load(fake_backend.source)
+        assert health is not None
+        assert health.status is SyncHealthStatus.EMPTY_SUCCESS
+        assert health.last_success_at == utc(2026, 8, 12, 9, 0, 1)
+        assert health.last_failure_at is None
+        assert health.writeback_last_attempt_at == utc(
+            2026,
+            8,
+            12,
+            9,
+            0,
+            2,
+        )
+        assert health.writeback_last_failure_at == utc(
+            2026,
+            8,
+            12,
+            9,
+            0,
+            3,
+        )
+        assert health.writeback_last_error_code == "calendar_sync_error"
+        assert health.writeback_attempted_count == 0
+        assert health.writeback_succeeded_count == 0
+        assert health.writeback_failed_count == 0
+
     def test_intake_opt_out_is_sticky_until_hm_is_readded(self, session) -> None:
         mirror = CalendarEventMirror(
             external_id="hm-opt-out",

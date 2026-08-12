@@ -65,6 +65,7 @@ class ActivityCapability(StrEnum):
 class ActivityPermissionStatus(StrEnum):
     GRANTED = "granted"
     DENIED = "denied"
+    RESTRICTED = "restricted"
     REVOKED = "revoked"
     UNAVAILABLE = "unavailable"
     UNKNOWN = "unknown"
