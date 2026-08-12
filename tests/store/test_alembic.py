@@ -8,7 +8,10 @@ rendering, which never connects.
 
 import io
 import logging
+import os
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -102,6 +105,18 @@ def _render_offline_app_usage_snapshot_downgrade(database_url: str) -> str:
     return buffer.getvalue()
 
 
+def _render_offline_decision_agent_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "f4a5b6c7d8e9:e3f4a5b6c7d8",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
 def test_migration_graph_has_single_head():
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
@@ -136,6 +151,44 @@ class TestOfflineRender:
         assert "UUID" in rendered  # sa.Uuid became native UUID
         # enums stay portable VARCHAR: no postgres CREATE TYPE
         assert "CREATE TYPE" not in rendered
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_decision_agent_offline_render_keeps_correlation_invariant(
+        self,
+        database_url,
+    ):
+        rendered = _render_offline_upgrade(database_url)
+
+        assert (
+            "decision_agent_correlation_complete"
+            in rendered
+        )
+        assert "decision_payload_digest" in rendered
+        if database_url.startswith("sqlite"):
+            assert "_alembic_tmp_decision_record" in rendered
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_decision_agent_offline_downgrade_is_refused(
+        self,
+        database_url,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="offline downgrade cannot verify Decision Agent records",
+        ):
+            _render_offline_decision_agent_downgrade(database_url)
 
     def test_render_marks_head_revision(self):
         rendered = _render_offline_upgrade("sqlite:///offline-render.db")
@@ -224,6 +277,189 @@ class TestSqliteUpgrade:
                 context = MigrationContext.configure(connection)
                 diff = compare_metadata(context, Base.metadata)
             assert diff == []
+        finally:
+            engine.dispose()
+
+    def test_decision_agent_migration_preserves_legacy_rows_and_constraints(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'decision-agent.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "e3f4a5b6c7d8")
+
+        engine = sa.create_engine(database_url)
+        legacy_id = uuid.uuid4().hex
+        legacy = sa.Table(
+            "decision_record",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                legacy.insert().values(
+                    id=legacy_id,
+                    kind="insight",
+                    tree={
+                        "id": "legacy",
+                        "type": "llm_step",
+                        "label": "legacy decision",
+                        "children": [],
+                    },
+                    summary="legacy decision",
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        correlated_id = uuid.uuid4().hex
+        try:
+            inspector = sa.inspect(engine)
+            columns = {
+                item["name"]
+                for item in inspector.get_columns("decision_record")
+            }
+            indexes = {
+                item["name"]: item
+                for item in inspector.get_indexes("decision_record")
+            }
+            checks = {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_record"
+                )
+            }
+            assert {
+                "decision_request_id",
+                "decision_turn_id",
+                "decision_request_fingerprint",
+                "decision_payload",
+                "decision_payload_digest",
+            } <= columns
+            assert indexes[
+                "ux_decision_record_decision_request_id"
+            ]["unique"]
+            assert indexes[
+                "ux_decision_record_decision_turn_id"
+            ]["unique"]
+            assert (
+                "ck_decision_record_decision_agent_correlation_complete"
+                in checks
+            )
+
+            migrated = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                preserved = connection.execute(
+                    sa.select(migrated).where(
+                        migrated.c.id == legacy_id
+                    )
+                ).one()
+                assert preserved.decision_request_id is None
+                assert preserved.decision_turn_id is None
+                assert preserved.decision_request_fingerprint is None
+                assert preserved.decision_payload is None
+                assert preserved.decision_payload_digest is None
+
+                request_id = uuid.uuid4().hex
+                turn_id = uuid.uuid4().hex
+                connection.execute(
+                    migrated.insert().values(
+                        id=correlated_id,
+                        kind="insight",
+                        tree={
+                            "id": "new",
+                            "type": "llm_step",
+                            "label": "new decision",
+                            "children": [],
+                        },
+                        summary="new decision",
+                        decision_request_id=request_id,
+                        decision_turn_id=turn_id,
+                        decision_request_fingerprint="f" * 64,
+                        decision_payload={
+                            "schema": "healthmes.decision-private.v1"
+                        },
+                        decision_payload_digest="d" * 64,
+                    )
+                )
+
+            with pytest.raises(sa.exc.IntegrityError):
+                with engine.begin() as connection:
+                    connection.execute(
+                        migrated.insert().values(
+                            id=uuid.uuid4().hex,
+                            kind="insight",
+                            tree={
+                                "id": "partial",
+                                "type": "llm_step",
+                                "label": "invalid partial correlation",
+                                "children": [],
+                            },
+                            summary="invalid partial correlation",
+                        decision_request_id=uuid.uuid4().hex,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing Decision Agent audit and idempotency data",
+        ):
+            command.downgrade(config, "e3f4a5b6c7d8")
+
+        engine = sa.create_engine(database_url)
+        try:
+            preserved = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f4a5b6c7d8e9"
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(preserved)
+                    .where(preserved.c.id == correlated_id)
+                ) == 1
+                connection.execute(
+                    preserved.delete().where(
+                        preserved.c.id == correlated_id
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "e3f4a5b6c7d8")
+
+        engine = sa.create_engine(database_url)
+        try:
+            columns = {
+                item["name"]
+                for item in sa.inspect(engine).get_columns(
+                    "decision_record"
+                )
+            }
+            assert "decision_request_id" not in columns
+            legacy = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(legacy)
+                    .where(legacy.c.id == legacy_id)
+                ) == 1
         finally:
             engine.dispose()
 
@@ -653,7 +889,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e3f4a5b6c7d8"
+                ) == "f4a5b6c7d8e9"
         finally:
             engine.dispose()
 
@@ -885,3 +1121,269 @@ class TestSqliteUpgrade:
             assert "ux_calendar_event_mirror_source_healthmes_source_key" in indexes
         finally:
             engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_decision_agent_migration_round_trip() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_alembic_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "e3f4a5b6c7d8")
+        scoped_engine = sa.create_engine(schema_url)
+        legacy_id = uuid.uuid4()
+        try:
+            legacy = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    legacy.insert().values(
+                        id=legacy_id,
+                        kind="insight",
+                        tree={
+                            "id": "legacy",
+                            "type": "llm_step",
+                            "label": "legacy decision",
+                            "children": [],
+                        },
+                        summary="legacy decision",
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        correlated_id = uuid.uuid4()
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            columns = {
+                item["name"]
+                for item in inspector.get_columns("decision_record")
+            }
+            checks = {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_record"
+                )
+            }
+            indexes = {
+                item["name"]: item
+                for item in inspector.get_indexes("decision_record")
+            }
+            assert {
+                "decision_request_id",
+                "decision_turn_id",
+                "decision_request_fingerprint",
+                "decision_payload",
+                "decision_payload_digest",
+            } <= columns
+            assert (
+                "ck_decision_record_decision_agent_correlation_complete"
+                in checks
+            )
+            assert indexes[
+                "ux_decision_record_decision_request_id"
+            ]["unique"]
+            assert indexes[
+                "ux_decision_record_decision_turn_id"
+            ]["unique"]
+
+            migrated = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                preserved = connection.execute(
+                    sa.select(migrated).where(
+                        migrated.c.id == legacy_id
+                    )
+                ).one()
+                assert preserved.decision_request_id is None
+                assert preserved.decision_payload_digest is None
+                connection.execute(
+                    migrated.insert().values(
+                        id=correlated_id,
+                        kind="insight",
+                        tree={
+                            "id": "new",
+                            "type": "llm_step",
+                            "label": "new decision",
+                            "children": [],
+                        },
+                        summary="new decision",
+                        decision_request_id=uuid.uuid4(),
+                        decision_turn_id=uuid.uuid4(),
+                        decision_request_fingerprint="f" * 64,
+                        decision_payload={
+                            "schema": "healthmes.decision-private.v1"
+                        },
+                        decision_payload_digest="d" * 64,
+                    )
+                )
+
+            with pytest.raises(sa.exc.IntegrityError):
+                with scoped_engine.begin() as connection:
+                    connection.execute(
+                        migrated.insert().values(
+                            id=uuid.uuid4(),
+                            kind="insight",
+                            tree={
+                                "id": "partial",
+                                "type": "llm_step",
+                                "label": "invalid partial correlation",
+                                "children": [],
+                            },
+                            summary="invalid partial correlation",
+                            decision_request_id=uuid.uuid4(),
+                        )
+                    )
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing Decision Agent audit and idempotency data",
+        ):
+            command.downgrade(config, "e3f4a5b6c7d8")
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            preserved = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f4a5b6c7d8e9"
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(preserved)
+                    .where(preserved.c.id == correlated_id)
+                ) == 1
+                connection.execute(
+                    preserved.delete().where(
+                        preserved.c.id == correlated_id
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        raced_id = uuid.uuid4()
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            migrated = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as writer:
+                transaction = writer.begin()
+                writer.execute(
+                    migrated.insert().values(
+                        id=raced_id,
+                        kind="insight",
+                        tree={
+                            "id": "raced",
+                            "type": "llm_step",
+                            "label": "concurrent decision",
+                            "children": [],
+                        },
+                        summary="concurrent decision",
+                        decision_request_id=uuid.uuid4(),
+                        decision_turn_id=uuid.uuid4(),
+                        decision_request_fingerprint="a" * 64,
+                        decision_payload={
+                            "schema": "healthmes.decision-private.v1"
+                        },
+                        decision_payload_digest="b" * 64,
+                    )
+                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    downgrade = pool.submit(
+                        command.downgrade,
+                        _config(schema_url),
+                        "e3f4a5b6c7d8",
+                    )
+                    time.sleep(0.2)
+                    assert downgrade.done() is False
+                    transaction.commit()
+                    with pytest.raises(
+                        RuntimeError,
+                        match=(
+                            "without losing Decision Agent audit and "
+                            "idempotency data"
+                        ),
+                    ):
+                        downgrade.result(timeout=5)
+
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f4a5b6c7d8e9"
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(migrated)
+                    .where(migrated.c.id == raced_id)
+                ) == 1
+                connection.execute(
+                    migrated.delete().where(migrated.c.id == raced_id)
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "e3f4a5b6c7d8")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            columns = {
+                item["name"]
+                for item in inspector.get_columns("decision_record")
+            }
+            assert "decision_request_id" not in columns
+            legacy = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(legacy)
+                    .where(legacy.c.id == legacy_id)
+                ) == 1
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()

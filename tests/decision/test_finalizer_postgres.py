@@ -1,0 +1,683 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import threading
+import time
+import uuid
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+
+import pytest
+import sqlalchemy as sa
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from healthmes.activity.locking import (
+    lock_activity_write_plane,
+    postgres_activity_write_plane_guard,
+)
+from healthmes.decision import (
+    ContextAccessLayer,
+    ContextAccessPolicy,
+    ContextCapability,
+    ContextCoverage,
+    ContextFreshness,
+    ContextProviderMetadata,
+    ContextProviderRegistry,
+    ContextQuery,
+    ContextResult,
+    ContextStatus,
+    CoverageStatus,
+    DecisionAgentRun,
+    DecisionCaller,
+    DecisionDraft,
+    DecisionFinalizer,
+    DecisionRequest,
+    DecisionStatus,
+    DomainAccessGrant,
+    ExecutionScope,
+    FreshnessStatus,
+    PersistenceStatus,
+    RuntimeMetadata,
+    SourceRef,
+    ToolCallRecord,
+    ToolCallStatus,
+)
+from healthmes.store import (
+    Base,
+    DecisionRecord,
+    WellnessEvent,
+    create_db_engine,
+)
+
+_POSTGRES_URL = os.environ.get("HEALTHMES_TEST_POSTGRES_URL")
+_POSTGRES_SKIP_REASON = (
+    "requires a disposable PostgreSQL URL in "
+    "HEALTHMES_TEST_POSTGRES_URL"
+)
+_ACTIVITY_WRITE_PLANE_KEY = "healthmes:activity:write-plane:v1"
+
+pytestmark = pytest.mark.skipif(
+    not _POSTGRES_URL,
+    reason=_POSTGRES_SKIP_REASON,
+)
+
+NOW = datetime(2026, 8, 12, 6, tzinfo=UTC)
+WINDOW_START = NOW - timedelta(hours=2)
+WINDOW_END = NOW - timedelta(hours=1)
+
+
+@dataclass(frozen=True, slots=True)
+class _PostgresStore:
+    engine: Engine
+    factory: sessionmaker[Session]
+    schema: str
+
+
+class _StoredNutritionProvider:
+    metadata = ContextProviderMetadata(
+        provider_id="nutrition",
+        domain="nutrition",
+        description="Stored nutrition context for PostgreSQL finalizer tests.",
+        capabilities=(
+            ContextCapability(
+                capability="nutrition.summary",
+                description="Return one retained nutrition observation.",
+                granularities=("summary",),
+                query_fields=("start", "end", "timezone"),
+                output_fields=("caffeine_mg",),
+                max_lookback_days=7,
+                sensitivity="nutrition",
+                freshness_expectation="Stored event timestamp.",
+            ),
+        ),
+    )
+
+    def __init__(self, source_ref: SourceRef) -> None:
+        self._source_ref = source_ref
+
+    async def query(
+        self,
+        session: Session,
+        query: ContextQuery,
+        *,
+        now: datetime,
+    ) -> ContextResult:
+        del session
+        return ContextResult(
+            query_id=query.query_id,
+            provider_id=query.provider_id,
+            capability=query.capability,
+            status=ContextStatus.OK,
+            payload={"caffeine_mg": 80},
+            source_refs=[self._source_ref],
+            freshness=ContextFreshness(
+                status=FreshnessStatus.CURRENT,
+                as_of=now,
+                age_seconds=0,
+            ),
+            coverage=ContextCoverage(
+                status=CoverageStatus.COMPLETE,
+                ratio=1,
+            ),
+        )
+
+
+@contextmanager
+def _postgres_store(
+    *,
+    pool_size: int = 4,
+    pool_timeout: float = 5,
+) -> Iterator[_PostgresStore]:
+    assert _POSTGRES_URL is not None
+    admin_engine = create_db_engine(_POSTGRES_URL)
+    schema = f"hm_decision_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(schema)
+    schema_created = False
+    engine: Engine | None = None
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(sa.text(f"CREATE SCHEMA {quoted_schema}"))
+        schema_created = True
+        engine = create_db_engine(
+            _POSTGRES_URL,
+            connect_args={"options": f"-csearch_path={schema}"},
+            pool_size=pool_size,
+            max_overflow=0,
+            pool_timeout=pool_timeout,
+        )
+        Base.metadata.create_all(engine)
+        with engine.connect() as connection:
+            assert connection.scalar(sa.text("SELECT current_schema()")) == schema
+        yield _PostgresStore(
+            engine=engine,
+            factory=sessionmaker(
+                bind=engine,
+                autocommit=False,
+                autoflush=False,
+                expire_on_commit=False,
+            ),
+            schema=schema,
+        )
+    finally:
+        if engine is not None:
+            engine.dispose()
+        if schema_created:
+            with admin_engine.begin() as connection:
+                connection.execute(
+                    sa.text(f"DROP SCHEMA {quoted_schema} CASCADE")
+                )
+        admin_engine.dispose()
+
+
+def _request(
+    *,
+    request_id: uuid.UUID | None = None,
+    turn_id: uuid.UUID | None = None,
+) -> DecisionRequest:
+    return DecisionRequest(
+        request_id=request_id or uuid.uuid4(),
+        turn_id=turn_id or uuid.uuid4(),
+        question="Should I take a break before having more caffeine?",
+        requested_at=NOW,
+        timezone="UTC",
+        caller=DecisionCaller(
+            principal_id="owner",
+            authenticated=True,
+            execution_scope=ExecutionScope.LOCAL,
+        ),
+    )
+
+
+def _policy() -> ContextAccessPolicy:
+    return ContextAccessPolicy(
+        owner_principal_id="owner",
+        grants=(DomainAccessGrant(domain="nutrition"),),
+    )
+
+
+def _query() -> ContextQuery:
+    return ContextQuery(
+        provider_id="nutrition",
+        capability="nutrition.summary",
+        start=WINDOW_START,
+        end=NOW,
+        timezone="UTC",
+    )
+
+
+def _event(session: Session) -> WellnessEvent:
+    event = WellnessEvent(
+        event_type="nutrition.observation.v1",
+        schema_version=1,
+        observed_at=WINDOW_START,
+        recorded_at=WINDOW_START + timedelta(minutes=1),
+        timezone="UTC",
+        source_provider="healthmes-intake",
+        source_device=None,
+        source_record_id=uuid.uuid4().hex,
+        capture_method="text",
+        quality_flags={},
+        confidence=0.9,
+        coverage=1.0,
+        sensitivity="nutrition",
+        consent_scope="personal",
+        expires_at=None,
+        payload={
+            "window": {
+                "start": WINDOW_START.isoformat(),
+                "end": WINDOW_END.isoformat(),
+            },
+            "caffeine_mg": 80,
+        },
+        derived_from=None,
+    )
+    session.add(event)
+    session.commit()
+    return event
+
+
+def _unattested_source_ref(event: WellnessEvent) -> SourceRef:
+    return SourceRef(
+        domain="nutrition",
+        resource_type=event.event_type,
+        record_id=str(event.id),
+        source_provider=event.source_provider,
+        observed_start=event.observed_at,
+        observed_end=WINDOW_END,
+        schema_version=event.schema_version,
+        derived_by="nutrition.summary.v1",
+        freshness=FreshnessStatus.CURRENT,
+        coverage=event.coverage,
+        sensitivity=event.sensitivity,
+    )
+
+
+def _attested_context(
+    factory: sessionmaker[Session],
+    request: DecisionRequest,
+    event: WellnessEvent,
+) -> tuple[ContextQuery, ContextResult, tuple]:
+    source_ref = _unattested_source_ref(event)
+    registry = ContextProviderRegistry(
+        (_StoredNutritionProvider(source_ref),)
+    )
+    access_layer = ContextAccessLayer(registry, clock=lambda: NOW)
+    turn = access_layer.start_turn(request, policy=_policy())
+    query = _query()
+    with factory() as session:
+        result = asyncio.run(turn.query(session, query))
+        session.rollback()
+    assert result.status is ContextStatus.OK
+    assert len(result.source_refs) == 1
+    assert result.source_refs[0].content_digest is not None
+    return query, result, turn.trace
+
+
+def _run(
+    request: DecisionRequest,
+    query: ContextQuery,
+    context: ContextResult,
+    access_trace: tuple,
+) -> DecisionAgentRun:
+    source_refs = tuple(context.source_refs)
+    return DecisionAgentRun(
+        request_id=request.request_id,
+        turn_id=request.turn_id,
+        draft=DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="Take a short break before choosing more caffeine.",
+            proposed_action=True,
+            used_source_ref_ids=[
+                source_ref.reference_id for source_ref in source_refs
+            ],
+            confidence=0.8,
+            uncertainty="Only retained nutrition context was considered.",
+        ),
+        source_refs=source_refs,
+        runtime=RuntimeMetadata(
+            runtime="scripted",
+            model="decision-postgres-test-v1",
+            input_tokens=12,
+            output_tokens=8,
+        ),
+        steps_used=1,
+        tool_trace=(
+            ToolCallRecord(
+                query=query,
+                status=ToolCallStatus.COMPLETED,
+                started_at=NOW,
+                finished_at=NOW,
+                result=context,
+            ),
+        ),
+        access_trace=access_trace,
+        system_policy_version="healthmes-decision-policy.postgres-test",
+        started_at=NOW,
+        finished_at=NOW,
+    )
+
+
+def _finalizer(
+    factory: sessionmaker[Session],
+    source_ref: SourceRef,
+) -> DecisionFinalizer:
+    registry = ContextProviderRegistry(
+        (_StoredNutritionProvider(source_ref),)
+    )
+    return DecisionFinalizer(
+        access_layer=ContextAccessLayer(
+            registry,
+            clock=lambda: NOW,
+        ),
+        session_factory=factory,
+        policy_resolver=lambda _request: _policy(),
+        clock=lambda: NOW,
+    )
+
+
+def _decision_fixture(
+    store: _PostgresStore,
+) -> tuple[
+    DecisionRequest,
+    DecisionAgentRun,
+    DecisionFinalizer,
+    uuid.UUID,
+]:
+    with store.factory() as session:
+        event = _event(session)
+        event_id = event.id
+    request = _request()
+    query, context, access_trace = _attested_context(
+        store.factory,
+        request,
+        event,
+    )
+    run = _run(request, query, context, access_trace)
+    return (
+        request,
+        run,
+        _finalizer(store.factory, context.source_refs[0]),
+        event_id,
+    )
+
+
+def test_concurrent_same_request_finalization_returns_one_record_id(
+    monkeypatch,
+) -> None:
+    with _postgres_store(pool_size=2) as store:
+        request, run, finalizer, _event_id = _decision_fixture(store)
+        start = threading.Barrier(2, timeout=5)
+        monkeypatch.setattr(
+            "healthmes.decision.finalizer.activity_write_lock",
+            nullcontext,
+        )
+
+        def finalize_once():
+            start.wait()
+            return finalizer.finalize(request, run)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(finalize_once) for _ in range(2)]
+            results = [future.result(timeout=10) for future in futures]
+
+        assert {
+            result.persistence_status for result in results
+        } == {PersistenceStatus.PERSISTED}
+        record_ids = {
+            result.decision_record_id for result in results
+        }
+        assert len(record_ids) == 1
+        assert None not in record_ids
+        with store.factory() as session:
+            assert session.scalar(
+                sa.select(sa.func.count()).select_from(DecisionRecord)
+            ) == 1
+
+
+@pytest.mark.parametrize("mutation", ("delete", "content"))
+def test_stale_retry_after_source_change_fails_closed(
+    mutation: str,
+) -> None:
+    with _postgres_store() as store:
+        request, run, finalizer, event_id = _decision_fixture(store)
+        first = finalizer.finalize(request, run)
+        assert first.persistence_status is PersistenceStatus.PERSISTED
+
+        with store.factory() as session:
+            event = session.get(WellnessEvent, event_id)
+            assert event is not None
+            if mutation == "delete":
+                session.delete(event)
+            else:
+                event.payload = {
+                    **event.payload,
+                    "caffeine_mg": 300,
+                }
+            session.commit()
+
+        retry_request = request.model_copy(
+            update={"turn_id": uuid.uuid4()}
+        )
+        retry_run = run.model_copy(
+            update={
+                "turn_id": retry_request.turn_id,
+                "draft": run.draft,
+            },
+            deep=True,
+        )
+        retry = finalizer.finalize(retry_request, retry_run)
+
+        assert retry.status is DecisionStatus.FAILED
+        assert retry.proposed_action is False
+        assert retry.persistence_status is PersistenceStatus.FAILED
+        assert "decision_source_ref_revalidation_failed" in retry.limitations
+        expected = (
+            "source_ref_record_missing"
+            if mutation == "delete"
+            else "source_ref_content_changed"
+        )
+        assert expected in retry.limitations
+        assert retry.tool_trace == []
+        with store.factory() as session:
+            assert session.scalar(
+                sa.select(sa.func.count()).select_from(DecisionRecord)
+            ) == 1
+
+
+def test_postgres_activity_write_plane_guard_timeout_is_bounded() -> None:
+    with _postgres_store(pool_size=2) as store:
+        with store.factory() as blocker:
+            lock_activity_write_plane(blocker)
+            started = time.monotonic()
+            with pytest.raises(
+                TimeoutError,
+                match="timed out waiting for the activity write plane",
+            ):
+                with postgres_activity_write_plane_guard(
+                    store.engine,
+                    timeout_seconds=0.2,
+                    poll_seconds=0.02,
+                ):
+                    pytest.fail("guard unexpectedly acquired")
+            elapsed = time.monotonic() - started
+            assert 0.15 <= elapsed < 2
+            blocker.rollback()
+
+        with postgres_activity_write_plane_guard(
+            store.engine,
+            timeout_seconds=1,
+            poll_seconds=0.02,
+        ) as connection:
+            assert connection is not None
+
+
+def test_initial_guard_commit_failure_releases_advisory_lock(
+    monkeypatch,
+) -> None:
+    with _postgres_store(pool_size=1) as store:
+        original_commit = sa.engine.Connection.commit
+        commit_failed = False
+
+        def fail_initial_commit(connection):
+            nonlocal commit_failed
+            if not commit_failed:
+                commit_failed = True
+                raise RuntimeError("injected initial guard commit failure")
+            return original_commit(connection)
+
+        monkeypatch.setattr(
+            sa.engine.Connection,
+            "commit",
+            fail_initial_commit,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="injected initial guard commit failure",
+        ):
+            with postgres_activity_write_plane_guard(
+                store.engine,
+                timeout_seconds=1,
+                poll_seconds=0.02,
+            ):
+                pytest.fail("guard unexpectedly yielded")
+
+        assert commit_failed is True
+        with postgres_activity_write_plane_guard(
+            store.engine,
+            timeout_seconds=1,
+            poll_seconds=0.02,
+        ) as connection:
+            assert connection is not None
+
+
+def test_guard_result_failure_after_acquisition_releases_advisory_lock(
+    monkeypatch,
+) -> None:
+    with _postgres_store(pool_size=1) as store:
+        original_scalar = sa.engine.Connection.scalar
+        result_failed = False
+
+        def fail_after_acquisition(
+            connection,
+            statement,
+            *args,
+            **kwargs,
+        ):
+            nonlocal result_failed
+            result = original_scalar(
+                connection,
+                statement,
+                *args,
+                **kwargs,
+            )
+            if (
+                not result_failed
+                and "pg_try_advisory_lock" in str(statement)
+                and result is True
+            ):
+                result_failed = True
+                raise RuntimeError(
+                    "injected advisory lock result failure"
+                )
+            return result
+
+        monkeypatch.setattr(
+            sa.engine.Connection,
+            "scalar",
+            fail_after_acquisition,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="injected advisory lock result failure",
+        ):
+            with postgres_activity_write_plane_guard(
+                store.engine,
+                timeout_seconds=1,
+                poll_seconds=0.02,
+            ):
+                pytest.fail("guard unexpectedly yielded")
+
+        assert result_failed is True
+        with postgres_activity_write_plane_guard(
+            store.engine,
+            timeout_seconds=1,
+            poll_seconds=0.02,
+        ) as connection:
+            assert connection is not None
+
+
+def test_pool_size_one_finalization_does_not_deadlock() -> None:
+    with _postgres_store(
+        pool_size=1,
+        pool_timeout=1,
+    ) as store:
+        request, run, finalizer, _event_id = _decision_fixture(store)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(
+                finalizer.finalize,
+                request,
+                run,
+            ).result(timeout=5)
+
+        assert result.status is DecisionStatus.COMPLETED
+        assert result.persistence_status is PersistenceStatus.PERSISTED
+        with store.factory() as session:
+            assert session.scalar(
+                sa.select(sa.func.count()).select_from(DecisionRecord)
+            ) == 1
+
+
+def test_success_releases_advisory_lock_and_restores_isolation() -> None:
+    with _postgres_store(pool_size=1) as store:
+        with store.engine.connect() as connection:
+            baseline_isolation = connection.get_isolation_level()
+
+        request, run, finalizer, _event_id = _decision_fixture(store)
+        result = finalizer.finalize(request, run)
+        assert result.persistence_status is PersistenceStatus.PERSISTED
+
+        with store.engine.connect() as connection:
+            assert connection.get_isolation_level() == baseline_isolation
+            assert (
+                connection.scalar(sa.text("SHOW transaction_isolation"))
+                == baseline_isolation.casefold()
+            )
+            assert connection.scalar(
+                sa.text(
+                    "SELECT count(*) FROM pg_locks "
+                    "WHERE pid = pg_backend_pid() "
+                    "AND locktype = 'advisory'"
+                )
+            ) == 0
+            assert connection.scalar(
+                sa.text(
+                    "SELECT pg_try_advisory_lock("
+                    "hashtextextended(:write_plane_key, 0))"
+                ),
+                {"write_plane_key": _ACTIVITY_WRITE_PLANE_KEY},
+            ) is True
+            assert connection.scalar(
+                sa.text(
+                    "SELECT pg_advisory_unlock("
+                    "hashtextextended(:write_plane_key, 0))"
+                ),
+                {"write_plane_key": _ACTIVITY_WRITE_PLANE_KEY},
+            ) is True
+
+
+def test_cleanup_failure_does_not_reverse_committed_success(
+    monkeypatch,
+) -> None:
+    with _postgres_store(pool_size=1) as store:
+        original_execute = sa.engine.Connection.execute
+        original_invalidate = sa.engine.Connection.invalidate
+        unlock_failed = False
+        invalidate_failed = False
+
+        def fail_unlock(connection, statement, *args, **kwargs):
+            nonlocal unlock_failed
+            if (
+                not unlock_failed
+                and "pg_advisory_unlock" in str(statement)
+            ):
+                unlock_failed = True
+                raise RuntimeError("injected unlock failure")
+            return original_execute(connection, statement, *args, **kwargs)
+
+        def fail_invalidate(connection, exception=None):
+            nonlocal invalidate_failed
+            if not invalidate_failed:
+                invalidate_failed = True
+                raise RuntimeError("injected invalidate failure")
+            return original_invalidate(connection, exception)
+
+        monkeypatch.setattr(sa.engine.Connection, "execute", fail_unlock)
+        monkeypatch.setattr(
+            sa.engine.Connection,
+            "invalidate",
+            fail_invalidate,
+        )
+        request, run, finalizer, _event_id = _decision_fixture(store)
+
+        result = finalizer.finalize(request, run)
+
+        assert result.status is DecisionStatus.COMPLETED
+        assert result.persistence_status is PersistenceStatus.PERSISTED
+        assert result.decision_record_id is not None
+        assert unlock_failed is True
+        assert invalidate_failed is True
+        with store.factory() as session:
+            assert session.scalar(
+                sa.select(sa.func.count()).select_from(DecisionRecord)
+            ) == 1
+        with postgres_activity_write_plane_guard(
+            store.engine,
+            timeout_seconds=1,
+            poll_seconds=0.02,
+        ) as connection:
+            assert connection is not None

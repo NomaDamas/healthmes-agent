@@ -50,6 +50,13 @@ from healthmes.decision.domain_providers import (
     NutritionContextProvider,
     WearableContextProvider,
 )
+from healthmes.decision.engine import HealthMesDecisionEngine
+from healthmes.decision.finalizer import (
+    DECISION_PAYLOAD_SCHEMA,
+    DECISION_RECORD_SCHEMA,
+    DecisionFinalizer,
+    decision_request_fingerprint,
+)
 from healthmes.decision.hermes import (
     HERMES_CAPABILITIES_PATH,
     HERMES_MODEL_ITERATION_CONTRACT,
@@ -132,7 +139,10 @@ __all__ = [
     "DecisionCaller",
     "DecisionContextHints",
     "DecisionDraft",
+    "DecisionFinalizer",
     "DecisionRequest",
+    "DECISION_PAYLOAD_SCHEMA",
+    "DECISION_RECORD_SCHEMA",
     "DecisionResult",
     "DecisionRuntime",
     "DecisionRuntimeContractError",
@@ -156,6 +166,7 @@ __all__ = [
     "HERMES_MODEL_ITERATION_FEATURE",
     "HERMES_MODEL_ITERATION_PATH",
     "HealthMesDecisionAgent",
+    "HealthMesDecisionEngine",
     "HermesHttpIterationTransport",
     "HermesIterationTransport",
     "HermesModelIterationRequest",
@@ -186,6 +197,7 @@ __all__ = [
     "WearableContextProvider",
     "build_context_provider_registry",
     "decision_request_from_activity_context",
+    "decision_request_fingerprint",
     "source_ref_id",
     "validate_context_parameters",
 ]

@@ -29,6 +29,7 @@ MAX_TOOL_TRACE = 64
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _SOURCE_REF_ID = re.compile(r"^sr_[0-9a-f]{32}$")
+_CONTENT_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _utc(value: datetime) -> datetime:
@@ -526,6 +527,10 @@ class SourceRef(BaseModel):
     derived_by: str | None = Field(default=None, max_length=128)
     freshness: FreshnessStatus = FreshnessStatus.UNKNOWN
     coverage: float | None = Field(default=None, ge=0, le=1)
+    content_digest: str | None = Field(
+        default=None,
+        pattern=_CONTENT_DIGEST.pattern,
+    )
     sensitivity: str = Field(
         default="wellness",
         min_length=1,

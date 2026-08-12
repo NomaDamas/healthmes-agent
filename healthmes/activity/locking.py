@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+import logging
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
+from time import monotonic, sleep
 from typing import BinaryIO
 
 from sqlalchemy import event, text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
 
 _ACTIVITY_WRITE_LOCK = RLock()
 _ACTIVITY_WRITE_PLANE_KEY = "healthmes:activity:write-plane:v1"
 _SQLITE_FILE_LOCK_INFO_KEY = "healthmes_activity_sqlite_file_lock"
+_POSTGRES_GUARD_TIMEOUT_SECONDS = 5.0
+_POSTGRES_GUARD_POLL_SECONDS = 0.05
+_LOGGER = logging.getLogger(__name__)
 
 if os.name == "nt":  # pragma: no cover - exercised on Windows runners
     import msvcrt
@@ -108,3 +115,120 @@ def lock_activity_write_plane(session: Session) -> None:
         ),
         {"write_plane_key": _ACTIVITY_WRITE_PLANE_KEY},
     )
+
+
+@contextmanager
+def postgres_activity_write_plane_guard(
+    bind: Engine | Connection,
+    *,
+    timeout_seconds: float = _POSTGRES_GUARD_TIMEOUT_SECONDS,
+    poll_seconds: float = _POSTGRES_GUARD_POLL_SECONDS,
+) -> Iterator[Connection | None]:
+    """Hold the activity write plane before opening a serializable snapshot.
+
+    PostgreSQL transaction-scoped advisory locks establish the transaction
+    snapshot before a waiter necessarily acquires the lock. Finalization needs
+    the opposite order: wait for existing activity writers, then open the
+    serializable transaction that revalidates sources. A session-scoped lock
+    on a dedicated pooled connection provides that ordering and conflicts with
+    the existing transaction-scoped lock because both use the same key.
+    """
+
+    if bind.dialect.name != "postgresql":
+        yield None
+        return
+
+    engine = bind.engine if isinstance(bind, Connection) else bind
+    with engine.connect().execution_options(
+        isolation_level="AUTOCOMMIT"
+    ) as connection:
+        if timeout_seconds <= 0 or poll_seconds <= 0:
+            raise ValueError("PostgreSQL lock bounds must be positive")
+        lock_attempted = False
+        try:
+            deadline = monotonic() + timeout_seconds
+            acquired = False
+            while monotonic() < deadline:
+                # Cleanup starts before PostgreSQL can grant the lock. A driver
+                # or result-processing failure after server-side acquisition
+                # must not return a lock-holding connection to the pool.
+                lock_attempted = True
+                acquired = bool(
+                    connection.scalar(
+                        text(
+                            "SELECT pg_try_advisory_lock("
+                            "hashtextextended(:write_plane_key, 0)"
+                            ")"
+                        ),
+                        {"write_plane_key": _ACTIVITY_WRITE_PLANE_KEY},
+                    )
+                )
+                if acquired:
+                    break
+                sleep(
+                    min(
+                        poll_seconds,
+                        max(0.0, deadline - monotonic()),
+                    )
+                )
+            if not acquired:
+                raise TimeoutError(
+                    "timed out waiting for the activity write plane"
+                )
+            # SQLAlchemy still opens a logical transaction around AUTOCOMMIT
+            # statements. End it before changing the connection isolation
+            # level; the session-scoped advisory lock survives this boundary.
+            # Keep this inside the cleanup guard because even this logical
+            # commit can fail after PostgreSQL granted the advisory lock.
+            connection.commit()
+            # Reuse this connection for the finalization transaction. Using a
+            # second pooled connection after acquiring the guard can deadlock
+            # when concurrent waiters exhaust a small connection pool.
+            connection.execution_options(
+                isolation_level="SERIALIZABLE"
+            )
+            yield connection
+        finally:
+            if lock_attempted:
+                try:
+                    if connection.in_transaction():
+                        connection.rollback()
+                    connection.execution_options(
+                        isolation_level="AUTOCOMMIT"
+                    )
+                    connection.execute(
+                        text(
+                            "SELECT pg_advisory_unlock("
+                            "hashtextextended(:write_plane_key, 0)"
+                            ")"
+                        ),
+                        {"write_plane_key": _ACTIVITY_WRITE_PLANE_KEY},
+                    )
+                    connection.commit()
+                except Exception as exc:
+                    # Closing an invalidated PostgreSQL connection releases
+                    # every session advisory lock without changing an already
+                    # committed DecisionRecord outcome.
+                    _LOGGER.exception(
+                        "failed to clean up PostgreSQL activity write guard"
+                    )
+                    try:
+                        connection.invalidate(exc)
+                    except Exception:
+                        _LOGGER.exception(
+                            "failed to invalidate PostgreSQL activity guard "
+                            "connection"
+                        )
+                        try:
+                            # Detach prevents a physical connection that may
+                            # still hold a session advisory lock from returning
+                            # to the pool. Closing the detached checkout
+                            # discards it while preserving the committed
+                            # DecisionRecord.
+                            connection.detach()
+                            connection.close()
+                        except Exception:
+                            _LOGGER.exception(
+                                "failed to discard PostgreSQL activity guard "
+                                "connection"
+                            )

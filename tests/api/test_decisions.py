@@ -1,5 +1,7 @@
 """Tests for the decision viewer routes (JSON + placeholder HTML page)."""
 
+import uuid
+
 from healthmes.store import DecisionKind, DecisionRecord
 
 TREE = {
@@ -58,6 +60,56 @@ def test_get_decision_json_404_envelope(client):
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
+
+
+def test_private_decision_payload_is_not_exposed_by_json_or_html(
+    client,
+    session,
+):
+    private_marker = "private-question-and-query-trace"
+    record = DecisionRecord(
+        kind=DecisionKind.INSIGHT,
+        tree={
+            "id": "root",
+            "type": "llm_step",
+            "label": "Safe public answer",
+            "children": [],
+        },
+        summary="Safe public answer",
+        decision_request_id=uuid.uuid4(),
+        decision_turn_id=uuid.uuid4(),
+        decision_request_fingerprint="f" * 64,
+        decision_payload={
+            "schema": "healthmes.decision-private.v1",
+            "request": {"question": private_marker},
+            "source_refs": [
+                {
+                    "record_id": private_marker,
+                    "reference_id": "sr_" + "0" * 32,
+                }
+            ],
+            "tool_trace": [
+                {"query": {"parameters": {"secret": private_marker}}}
+            ],
+        },
+        decision_payload_digest="d" * 64,
+    )
+    session.add(record)
+    session.commit()
+
+    api_response = client.get(f"/v1/decisions/{record.id}")
+    adjacent_response = client.get(f"/decisions/{record.id}.json")
+    html_response = client.get(f"/decisions/{record.id}")
+
+    assert api_response.status_code == 200
+    assert adjacent_response.status_code == 200
+    assert html_response.status_code == 200
+    for response in (api_response, adjacent_response):
+        body = response.json()
+        assert "decision_payload" not in body
+        assert private_marker not in response.text
+    assert private_marker not in html_response.text
+    assert "Safe public answer" in html_response.text
 
 
 def test_decision_html_page_renders_tree_escaped(client, session):

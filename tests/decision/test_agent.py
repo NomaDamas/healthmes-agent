@@ -240,6 +240,18 @@ def _agent(
     )
 
 
+def _assert_gateway_attested_source_ref(
+    actual: SourceRef,
+    expected: SourceRef,
+) -> None:
+    assert actual.model_copy(
+        update={"content_digest": None},
+        deep=True,
+    ) == expected
+    assert actual.content_digest is not None
+    assert re.fullmatch(r"[0-9a-f]{64}", actual.content_digest)
+
+
 async def test_agent_injects_policy_and_consent_filtered_catalog(
     session_factory,
 ):
@@ -1749,7 +1761,11 @@ async def test_agent_collects_only_gateway_returned_source_refs(
 
     result = await agent.ask(_request())
 
-    assert result.source_refs == (source_ref,)
+    assert len(result.source_refs) == 1
+    _assert_gateway_attested_source_ref(
+        result.source_refs[0],
+        source_ref,
+    )
     assert result.draft.used_source_ref_ids == [
         source_ref.reference_id
     ]
@@ -1846,7 +1862,11 @@ async def test_completed_context_answer_must_declare_a_source_ref(
 
     assert result.draft.status is DecisionStatus.FAILED
     assert result.draft.limitations == ["runtime_source_refs_omitted"]
-    assert result.source_refs == (source_ref,)
+    assert len(result.source_refs) == 1
+    _assert_gateway_attested_source_ref(
+        result.source_refs[0],
+        source_ref,
+    )
 
 
 async def test_provider_cannot_smuggle_model_copy_forged_source_ref(
@@ -2031,7 +2051,11 @@ async def test_runtime_cannot_invent_source_reference_ids(
 
     assert result.draft.status is DecisionStatus.FAILED
     assert result.draft.limitations == ["runtime_source_ref_mismatch"]
-    assert result.source_refs == (real_ref,)
+    assert len(result.source_refs) == 1
+    _assert_gateway_attested_source_ref(
+        result.source_refs[0],
+        real_ref,
+    )
 
 
 async def test_disallowed_privacy_is_denied_by_access_layer(

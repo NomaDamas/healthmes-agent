@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -54,7 +55,10 @@ from healthmes.decision.providers import (
     UnknownProviderError,
     validate_context_parameters,
 )
-from healthmes.decision.validation import strict_model_validate
+from healthmes.decision.validation import (
+    normalize_untrusted_json,
+    strict_model_validate,
+)
 from healthmes.nutrition.intake_service import (
     DECISION_EVENT,
     DECISION_REQUEST_EVENT,
@@ -114,6 +118,7 @@ _ACTIVITY_MAX_EVENT_DURATION = timedelta(days=1)
 _WEARABLE_PROVENANCE_LOOKBACK_DAYS = 2
 _WEARABLE_SLEEP_MIN_DURATION = timedelta(hours=22)
 _WEARABLE_SLEEP_MAX_DURATION = timedelta(hours=26)
+_MAX_SOURCE_DIGEST_BYTES = 2_000_000
 _OPEN_WEARABLES_DERIVERS = {
     "health_score": "open-wearables.daily-readiness.v1",
     "sleep_summary": "open-wearables.daily-readiness.v1",
@@ -184,6 +189,8 @@ _AUDIT_REASON_CODES = frozenset(
         "scoped_raw_selection_required",
         "source_consent_scope_denied",
         "source_ref_domain_mismatch",
+        "source_ref_content_changed",
+        "source_ref_content_digest_missing",
         "source_ref_expired",
         "source_ref_identity_mismatch",
         "source_ref_observation_mismatch",
@@ -238,31 +245,44 @@ class _WellnessEventSnapshot:
     source_provider: str
     source_device: str | None
     source_record_id: str
+    capture_method: str
+    quality_flags: dict[str, Any] | None
+    confidence: float | None
     coverage: float | None
     sensitivity: str
     consent_scope: str
+    retention_policy_id: uuid.UUID | None
     expires_at: datetime | None
     payload: dict[str, Any]
     raw_object_id: uuid.UUID | None
+    derived_from: dict[str, Any] | None
 
 
 @dataclass(frozen=True, slots=True)
 class _StorageObjectSnapshot:
     id: uuid.UUID
+    data_class: str
+    relative_path: str
     content_type: str | None
     size_bytes: int
     sha256: str | None
+    retention_policy_id: uuid.UUID | None
+    retention_basis_at: datetime | None
     expires_at: datetime | None
+    safe_to_purge: bool
     purged_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
 class _CalendarEventSnapshot:
     id: uuid.UUID
+    calendar_source: str
+    external_id: str
     start_at: datetime
     end_at: datetime
     healthmes_kind: str | None
     is_all_day: bool
+    status: str | None
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -294,12 +314,17 @@ def _wellness_event_snapshot_select():
         WellnessEvent.source_provider,
         WellnessEvent.source_device,
         WellnessEvent.source_record_id,
+        WellnessEvent.capture_method,
+        WellnessEvent.quality_flags,
+        WellnessEvent.confidence,
         WellnessEvent.coverage,
         WellnessEvent.sensitivity,
         WellnessEvent.consent_scope,
+        WellnessEvent.retention_policy_id,
         WellnessEvent.expires_at,
         WellnessEvent.payload,
         WellnessEvent.raw_object_id,
+        WellnessEvent.derived_from,
     )
 
 
@@ -316,12 +341,25 @@ def _wellness_event_snapshot(
         source_provider=row["source_provider"],
         source_device=row["source_device"],
         source_record_id=row["source_record_id"],
+        capture_method=row["capture_method"],
+        quality_flags=(
+            dict(row["quality_flags"])
+            if row["quality_flags"] is not None
+            else None
+        ),
+        confidence=row["confidence"],
         coverage=row["coverage"],
         sensitivity=row["sensitivity"],
         consent_scope=row["consent_scope"],
+        retention_policy_id=row["retention_policy_id"],
         expires_at=row["expires_at"],
         payload=dict(row["payload"] or {}),
         raw_object_id=row["raw_object_id"],
+        derived_from=(
+            dict(row["derived_from"])
+            if row["derived_from"] is not None
+            else None
+        ),
     )
 
 
@@ -344,10 +382,15 @@ def _fresh_storage_object(
     row = session.execute(
         select(
             StorageObject.id,
+            StorageObject.data_class,
+            StorageObject.relative_path,
             StorageObject.content_type,
             StorageObject.size_bytes,
             StorageObject.sha256,
+            StorageObject.retention_policy_id,
+            StorageObject.retention_basis_at,
             StorageObject.expires_at,
+            StorageObject.safe_to_purge,
             StorageObject.purged_at,
         ).where(StorageObject.id == object_id)
     ).mappings().one_or_none()
@@ -355,10 +398,15 @@ def _fresh_storage_object(
         return None
     return _StorageObjectSnapshot(
         id=row["id"],
+        data_class=row["data_class"],
+        relative_path=row["relative_path"],
         content_type=row["content_type"],
         size_bytes=row["size_bytes"],
         sha256=row["sha256"],
+        retention_policy_id=row["retention_policy_id"],
+        retention_basis_at=row["retention_basis_at"],
         expires_at=row["expires_at"],
+        safe_to_purge=row["safe_to_purge"],
         purged_at=row["purged_at"],
     )
 
@@ -370,20 +418,175 @@ def _fresh_calendar_event(
     row = session.execute(
         select(
             CalendarEventMirror.id,
+            CalendarEventMirror.calendar_source,
+            CalendarEventMirror.external_id,
             CalendarEventMirror.start_at,
             CalendarEventMirror.end_at,
             CalendarEventMirror.healthmes_kind,
             CalendarEventMirror.is_all_day,
+            CalendarEventMirror.status,
         ).where(CalendarEventMirror.id == event_id)
     ).mappings().one_or_none()
     if row is None:
         return None
     return _CalendarEventSnapshot(
         id=row["id"],
+        calendar_source=str(row["calendar_source"]),
+        external_id=row["external_id"],
         start_at=row["start_at"],
         end_at=row["end_at"],
         healthmes_kind=row["healthmes_kind"],
         is_all_day=row["is_all_day"],
+        status=row["status"],
+    )
+
+
+def _canonical_content_digest(value: Mapping[str, Any]) -> str:
+    normalized = normalize_untrusted_json(
+        dict(value),
+        max_bytes=_MAX_SOURCE_DIGEST_BYTES,
+    ).value
+    encoded = json.dumps(
+        normalized,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _timestamp_or_none(value: datetime | None) -> str | None:
+    return _as_utc(value).isoformat() if value is not None else None
+
+
+def _storage_object_digest_payload(
+    raw: _StorageObjectSnapshot | None,
+) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    return {
+        "id": str(raw.id),
+        "data_class": raw.data_class,
+        "relative_path": raw.relative_path,
+        "content_type": raw.content_type,
+        "size_bytes": raw.size_bytes,
+        "sha256": raw.sha256,
+        "retention_policy_id": (
+            str(raw.retention_policy_id)
+            if raw.retention_policy_id is not None
+            else None
+        ),
+        "retention_basis_at": _timestamp_or_none(
+            raw.retention_basis_at
+        ),
+        "expires_at": _timestamp_or_none(raw.expires_at),
+        "safe_to_purge": raw.safe_to_purge,
+        "purged_at": _timestamp_or_none(raw.purged_at),
+    }
+
+
+def _wellness_event_content_digest(
+    session: Session,
+    event: _WellnessEventSnapshot,
+) -> str:
+    raw = (
+        _fresh_storage_object(session, event.raw_object_id)
+        if event.raw_object_id is not None
+        else None
+    )
+    return _canonical_content_digest(
+        {
+            "schema": "healthmes.source-content.wellness-event.v1",
+            "id": str(event.id),
+            "event_type": event.event_type,
+            "schema_version": event.schema_version,
+            "observed_at": _as_utc(event.observed_at).isoformat(),
+            "recorded_at": _as_utc(event.recorded_at).isoformat(),
+            "timezone": event.timezone,
+            "source_provider": event.source_provider,
+            "source_device": event.source_device,
+            "source_record_id": event.source_record_id,
+            "capture_method": event.capture_method,
+            "quality_flags": event.quality_flags,
+            "confidence": event.confidence,
+            "coverage": event.coverage,
+            "sensitivity": event.sensitivity,
+            "consent_scope": event.consent_scope,
+            "retention_policy_id": (
+                str(event.retention_policy_id)
+                if event.retention_policy_id is not None
+                else None
+            ),
+            "expires_at": _timestamp_or_none(event.expires_at),
+            "payload": event.payload,
+            "raw_object_id": (
+                str(event.raw_object_id)
+                if event.raw_object_id is not None
+                else None
+            ),
+            "raw_object": _storage_object_digest_payload(raw),
+            "derived_from": event.derived_from,
+        }
+    )
+
+
+def _calendar_event_content_digest(
+    event: _CalendarEventSnapshot,
+) -> str:
+    return _canonical_content_digest(
+        {
+            "schema": "healthmes.source-content.calendar-event.v1",
+            "id": str(event.id),
+            "calendar_source": event.calendar_source,
+            "external_id": event.external_id,
+            "start_at": _as_utc(event.start_at).isoformat(),
+            "end_at": _as_utc(event.end_at).isoformat(),
+            "healthmes_kind": event.healthmes_kind,
+            "is_all_day": event.is_all_day,
+            "status": event.status,
+        }
+    )
+
+
+def _current_source_content_digest(
+    session: Session,
+    source_ref: SourceRef,
+) -> str | None:
+    """Return the Gateway-owned digest for a retained local source."""
+
+    record_uuid = _source_ref_record_uuid(source_ref)
+    if record_uuid is None:
+        return None
+    event = _fresh_wellness_event(session, record_uuid)
+    if event is not None:
+        return _wellness_event_content_digest(session, event)
+    if source_ref.source_provider == "healthmes-calendar-mirror":
+        calendar_event = _fresh_calendar_event(session, record_uuid)
+        if calendar_event is not None:
+            return _calendar_event_content_digest(calendar_event)
+    return None
+
+
+def _attest_source_content(
+    source_ref: SourceRef,
+    *,
+    content_digest: str,
+    require_content_digest: bool,
+) -> tuple[SourceRef | None, tuple[str, ...]]:
+    if require_content_digest and source_ref.content_digest is None:
+        return None, ("source_ref_content_digest_missing",)
+    if (
+        source_ref.content_digest is not None
+        and source_ref.content_digest != content_digest
+    ):
+        return None, ("source_ref_content_changed",)
+    return (
+        source_ref.model_copy(
+            update={"content_digest": content_digest},
+            deep=True,
+        ),
+        (),
     )
 
 
@@ -992,6 +1195,205 @@ class ContextAccessTurn:
         )
         return normalized
 
+    def revalidate_source_ref(
+        self,
+        session: Session,
+        query: ContextQuery,
+        source_ref: SourceRef,
+        *,
+        context_source_refs: Sequence[SourceRef] = (),
+        now: datetime | None = None,
+    ) -> tuple[SourceRef | None, tuple[str, ...]]:
+        """Recheck one returned reference without invoking its provider again."""
+
+        try:
+            canonical_query = strict_model_validate(ContextQuery, query)
+            canonical_ref = strict_model_validate(SourceRef, source_ref)
+            supporting_refs = tuple(
+                strict_model_validate(SourceRef, item)
+                for item in context_source_refs
+            )
+        except Exception:
+            return None, ("source_ref_identity_mismatch",)
+
+        checked_at = _as_utc(now or self._layer._clock())
+        preflight = self._preflight(
+            session,
+            canonical_query,
+            now=checked_at,
+            normalization_now=checked_at,
+        )
+        if isinstance(preflight, ContextResult):
+            return None, tuple(
+                preflight.limitations or ("provider_access_changed",)
+            )
+        effective_query, _capability, grant, limitations = preflight
+        if canonical_ref.domain != grant.domain:
+            return None, (
+                *limitations,
+                "source_ref_domain_mismatch",
+            )
+
+        raw_bounds = _query_bounds(effective_query, now=checked_at)
+        bounds = (
+            raw_bounds
+            if not isinstance(raw_bounds, str)
+            else (None, None)
+        )
+        related_nutrition_interactions = (
+            _in_range_nutrition_interactions(
+                session,
+                supporting_refs or (canonical_ref,),
+                query_bounds=bounds,
+            )
+        )
+        validated, source_limitations = _validate_source_ref(
+            session,
+            canonical_ref,
+            grant=grant,
+            query_bounds=bounds,
+            query_timezone=effective_query.timezone,
+            privacy_level=effective_query.privacy_level,
+            selected_record_ids=frozenset(
+                self.request.hints.related_record_ids.values()
+            ),
+            related_nutrition_interactions=(
+                related_nutrition_interactions
+            ),
+            now=checked_at,
+            allow_external=self.policy.allow_external_provenance,
+            require_content_digest=True,
+        )
+        return validated, tuple(
+            sorted({*limitations, *source_limitations})
+        )
+
+    def lock_source_refs_for_finalization(
+        self,
+        session: Session,
+        source_refs: Sequence[SourceRef],
+    ) -> tuple[SourceRef, ...]:
+        """Lock current policy rows before final source validation and storage.
+
+        The finalizer owns the surrounding write transaction. This method
+        follows the existing Activity write order by locking every known
+        activity device control boundary before source and tombstone rows.
+        PostgreSQL then holds shared row locks through DecisionRecord commit;
+        SQLite relies on the caller's ``BEGIN IMMEDIATE`` transaction.
+        """
+
+        canonical = tuple(
+            strict_model_validate(SourceRef, source_ref)
+            for source_ref in source_refs
+        )
+        activity_refs = tuple(
+            source_ref
+            for source_ref in canonical
+            if source_ref.domain == "activity"
+        )
+        record_ids = tuple(
+            sorted(
+                {
+                    record_id
+                    for source_ref in canonical
+                    if (
+                        record_id := _source_ref_record_uuid(
+                            source_ref
+                        )
+                    )
+                    is not None
+                },
+                key=str,
+            )
+        )
+        if activity_refs:
+            device_ids = tuple(
+                sorted(
+                    {
+                        str(value)
+                        for value in session.scalars(
+                            select(
+                                WellnessEvent.source_device
+                            )
+                            .where(
+                                WellnessEvent.id.in_(record_ids),
+                                WellnessEvent.source_device.is_not(
+                                    None
+                                ),
+                            )
+                            .distinct()
+                        )
+                        if value is not None
+                    }
+                )
+            )
+            for device_id in device_ids:
+                get_control_payload(
+                    session,
+                    device_id,
+                    lock=True,
+                )
+
+        if session.get_bind().dialect.name != "postgresql":
+            return canonical
+
+        if not record_ids:
+            return canonical
+
+        # Retention updates lock raw objects before their WellnessEvent rows.
+        # Read the immutable relationship first, then take locks in that same
+        # order to avoid an event/raw-object lock inversion.
+        raw_object_ids = tuple(
+            sorted(
+                {
+                    row[0]
+                    for row in session.execute(
+                        select(
+                            WellnessEvent.raw_object_id
+                        ).where(
+                            WellnessEvent.id.in_(record_ids),
+                            WellnessEvent.raw_object_id.is_not(None),
+                        )
+                    )
+                    if row[0] is not None
+                },
+                key=str,
+            )
+        )
+        if raw_object_ids:
+            session.execute(
+                select(StorageObject.id)
+                .where(StorageObject.id.in_(raw_object_ids))
+                .order_by(StorageObject.id)
+                .with_for_update(read=True)
+            ).all()
+
+        session.execute(
+            select(WellnessEvent.id)
+            .where(WellnessEvent.id.in_(record_ids))
+            .order_by(WellnessEvent.id)
+            .with_for_update(read=True)
+        ).all()
+        session.execute(
+            select(CalendarEventMirror.id)
+            .where(CalendarEventMirror.id.in_(record_ids))
+            .order_by(CalendarEventMirror.id)
+            .with_for_update(read=True)
+        ).all()
+        if activity_refs:
+            session.execute(
+                select(WellnessEvent.id)
+                .where(
+                    WellnessEvent.event_type
+                    == DELETION_TOMBSTONE_EVENT,
+                    WellnessEvent.source_provider
+                    == DELETION_PROVIDER,
+                )
+                .order_by(WellnessEvent.id)
+                .with_for_update(read=True)
+            ).all()
+        return canonical
+
     def _preflight(
         self,
         session: Session,
@@ -1365,6 +1767,7 @@ class ContextAccessTurn:
                 ),
                 now=now,
                 allow_external=self.policy.allow_external_provenance,
+                require_content_digest=False,
             )
             if validated[0] is None:
                 limitations.update(validated[1])
@@ -1851,6 +2254,7 @@ def _validate_source_ref(
     related_nutrition_interactions: frozenset[str],
     now: datetime,
     allow_external: bool,
+    require_content_digest: bool,
 ) -> tuple[SourceRef | None, tuple[str, ...]]:
     expected_reference_id = source_ref_id(
         domain=source_ref.domain,
@@ -1870,7 +2274,7 @@ def _validate_source_ref(
         else None
     )
     if event is not None:
-        return _validate_wellness_event_ref(
+        validated, limitations = _validate_wellness_event_ref(
             session,
             source_ref,
             event,
@@ -1882,6 +2286,19 @@ def _validate_source_ref(
                 related_nutrition_interactions
             ),
             now=now,
+        )
+        if validated is None:
+            return None, limitations
+        attested, digest_limitations = _attest_source_content(
+            validated,
+            content_digest=_wellness_event_content_digest(
+                session,
+                event,
+            ),
+            require_content_digest=require_content_digest,
+        )
+        return attested, tuple(
+            sorted({*limitations, *digest_limitations})
         )
 
     if privacy_level is PrivacyLevel.SCOPED_RAW:
@@ -1927,7 +2344,12 @@ def _validate_source_ref(
             return None, ("source_ref_observation_mismatch",)
         if not _overlaps_query(source_ref, query_bounds):
             return None, ("source_ref_outside_query",)
-        return source_ref, ()
+        attested, digest_limitations = _attest_source_content(
+            source_ref,
+            content_digest=_calendar_event_content_digest(row),
+            require_content_digest=require_content_digest,
+        )
+        return attested, digest_limitations
 
     if (
         source_ref.domain == "wearable"
@@ -1968,9 +2390,24 @@ def _validate_source_ref(
             timezone=query_timezone,
         ):
             return None, ("source_ref_outside_query",)
-        return source_ref, ("external_source_retention_unverified",)
+        return (
+            source_ref.model_copy(
+                update={"content_digest": None},
+                deep=True,
+            ),
+            ("external_source_retention_unverified",),
+        )
 
     return None, ("source_ref_record_missing",)
+
+
+def _source_ref_record_uuid(
+    source_ref: SourceRef,
+) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(source_ref.record_id)
+    except ValueError:
+        return None
 
 
 def _validate_wellness_event_ref(

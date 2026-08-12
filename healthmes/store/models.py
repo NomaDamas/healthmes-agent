@@ -15,6 +15,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     ForeignKey,
     Index,
     UniqueConstraint,
@@ -324,6 +325,32 @@ class DecisionRecord(Base):
             "trigger_event_id",
             unique=True,
         ),
+        Index(
+            "ux_decision_record_decision_request_id",
+            "decision_request_id",
+            unique=True,
+        ),
+        Index(
+            "ux_decision_record_decision_turn_id",
+            "decision_turn_id",
+            unique=True,
+        ),
+        CheckConstraint(
+            "("
+            "decision_request_id IS NULL "
+            "AND decision_turn_id IS NULL "
+            "AND decision_request_fingerprint IS NULL "
+            "AND decision_payload IS NULL "
+            "AND decision_payload_digest IS NULL"
+            ") OR ("
+            "decision_request_id IS NOT NULL "
+            "AND decision_turn_id IS NOT NULL "
+            "AND decision_request_fingerprint IS NOT NULL "
+            "AND decision_payload IS NOT NULL "
+            "AND decision_payload_digest IS NOT NULL"
+            ")",
+            name="decision_agent_correlation_complete",
+        ),
     )
 
     kind: Mapped[DecisionKind] = mapped_column(index=True)
@@ -333,6 +360,19 @@ class DecisionRecord(Base):
     tokens: Mapped[int | None]
     trigger_event_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("trigger_event.id", ondelete="SET NULL"),
+        default=None,
+    )
+    decision_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        default=None,
+    )
+    decision_turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        default=None,
+    )
+    decision_request_fingerprint: Mapped[str_64 | None] = mapped_column(
+        default=None,
+    )
+    decision_payload: Mapped[JSONDict | None] = mapped_column(default=None)
+    decision_payload_digest: Mapped[str_64 | None] = mapped_column(
         default=None,
     )
 
