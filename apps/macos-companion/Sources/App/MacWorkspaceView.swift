@@ -75,6 +75,24 @@ struct MacWorkspaceView: View {
                 inspectorState = nil
             }
         }
+        .alert(
+            "Local workspace",
+            isPresented: Binding(
+                get: { workspaceStore.notice != nil },
+                set: { if !$0 { workspaceStore.dismissNotice() } }
+            )
+        ) {
+            if !workspaceStore.storageMode.isWritable {
+                Button("Reset local data", role: .destructive) {
+                    workspaceStore.resetLocalWorkspace()
+                }
+            }
+            Button("OK", role: .cancel) {
+                workspaceStore.dismissNotice()
+            }
+        } message: {
+            Text(workspaceStore.notice ?? "")
+        }
     }
 
     @ViewBuilder
@@ -262,6 +280,10 @@ private struct MacWorkspaceSidebar: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(Text(category.isSystem ? "Core" : category.title))
+                .accessibilityValue(
+                    Text(category.isCollapsed ? "Collapsed" : "Expanded")
+                )
 
                 Spacer()
 
@@ -380,6 +402,8 @@ private struct MacWorkspaceSidebar: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityValue(Text(channel.isFavorite ? "Favorite" : "Channel"))
         .contextMenu {
             Button {
                 store.toggleFavorite(channel.id)

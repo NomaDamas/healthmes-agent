@@ -78,7 +78,7 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
             !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return }
         Task { @MainActor in
-            AppRouter.shared.focusCommandDock(prefill: command)
+            AppRouter.shared.openAgentCommandDock(prefill: command)
         }
     }
 

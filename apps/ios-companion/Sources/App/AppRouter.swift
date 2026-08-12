@@ -33,6 +33,7 @@ final class AppRouter: ObservableObject {
     @Published var decisionSheet: DecisionSheetTarget?
     @Published var proposalSheetID: UUID?
     @Published private(set) var commandFocusRequest = 0
+    @Published private(set) var agentChannelRequest = 0
     @Published private(set) var pendingCommand: String?
     @Published private(set) var homeRequest = 0
     @Published private(set) var pairingImportMessage: String?
@@ -49,6 +50,14 @@ final class AppRouter: ObservableObject {
         }
         pendingCommand = clean
         commandFocusRequest += 1
+    }
+
+    func openAgentCommandDock(prefill: String? = nil) {
+        if let prefill {
+            let clean = prefill.trimmingCharacters(in: .whitespacesAndNewlines)
+            pendingCommand = clean.isEmpty ? nil : clean
+        }
+        agentChannelRequest += 1
     }
 
     func consumePendingCommand() -> String? {
@@ -117,7 +126,7 @@ final class AppRouter: ObservableObject {
         case "report":
             modal = .report
         case "speak":
-            focusCommandDock()
+            openAgentCommandDock()
         case "pair":
             Task { await importPairing(url) }
         default:

@@ -4,13 +4,20 @@ import Foundation
 @MainActor
 public final class WorkspaceViewModel: ObservableObject {
     @Published public private(set) var state: WorkspaceState
+    @Published public private(set) var storageMode: WorkspaceLocalStoreMode
+    @Published public private(set) var notice: String?
 
     private let store: WorkspaceLocalStore
 
     public init(store: WorkspaceLocalStore = .shared) {
         self.store = store
-        state = store.load()
+        let snapshot = store.loadSnapshot()
+        state = snapshot.state
+        storageMode = snapshot.mode
+        notice = snapshot.mode.userMessage
     }
+
+    public var canEdit: Bool { storageMode.isWritable }
 
     public var selectedChannel: WorkspaceChannel? {
         guard let selectedID = state.selectedChannelID else { return nil }
@@ -28,6 +35,12 @@ public final class WorkspaceViewModel: ObservableObject {
         state.selectedChannelID = id
         state.selectedThreadID = nil
         persist()
+    }
+
+    public func routeToChannel(_ id: UUID) {
+        guard selectedChannel(with: id) != nil else { return }
+        state.selectedChannelID = id
+        state.selectedThreadID = nil
     }
 
     public func selectThread(_ id: UUID?) {
@@ -217,11 +230,12 @@ public final class WorkspaceViewModel: ObservableObject {
         let body = state.threads[index].draft
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return }
+        guard state.threads[index].messages.count < WorkspaceState.maximumMessagesPerThread else {
+            notice = "이 스레드는 메시지 \(WorkspaceState.maximumMessagesPerThread)개 한도에 도달했습니다. 기존 대화는 삭제되지 않았습니다."
+            return
+        }
         state.threads[index].messages.append(
             WorkspaceThreadMessage(author: author, body: body)
-        )
-        state.threads[index].messages = Array(
-            state.threads[index].messages.suffix(500)
         )
         state.threads[index].draft = ""
         state.threads[index].updatedAt = Date()
@@ -229,11 +243,18 @@ public final class WorkspaceViewModel: ObservableObject {
     }
 
     public func reset() {
-        state = store.reset()
+        let snapshot = store.reset()
+        state = snapshot.state
+        storageMode = snapshot.mode
+        notice = nil
     }
 
     public func reloadForPairingChange() {
-        state = store.load()
+        apply(store.loadSnapshot())
+    }
+
+    public func dismissNotice() {
+        notice = nil
     }
 
     private func selectedChannel(with id: UUID) -> WorkspaceChannel? {
@@ -255,7 +276,18 @@ public final class WorkspaceViewModel: ObservableObject {
     }
 
     private func persist() {
-        state = store.save(state)
+        guard storageMode.isWritable else {
+            state = store.loadSnapshot().state
+            notice = storageMode.userMessage
+            return
+        }
+        apply(store.save(state))
+    }
+
+    private func apply(_ snapshot: WorkspaceLocalSnapshot) {
+        state = snapshot.state
+        storageMode = snapshot.mode
+        notice = snapshot.mode.userMessage
     }
 
     private func defaultCards(for canvas: WorkspaceCanvasKind) -> [WorkspaceCard] {

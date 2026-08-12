@@ -31,6 +31,11 @@ struct WellnessControlView: View {
     @FocusState private var commandFocused: Bool
 
     private let moss = Color(red: 0.08, green: 0.38, blue: 0.28)
+    private let receivesAgentCommands: Bool
+
+    init(receivesAgentCommands: Bool = false) {
+        self.receivesAgentCommands = receivesAgentCommands
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -76,6 +81,7 @@ struct WellnessControlView: View {
         }
         .task { await refreshAll() }
         .onReceive(router.$commandFocusRequest) { request in
+            guard receivesAgentCommands else { return }
             guard request > lastFocusRequest else { return }
             lastFocusRequest = request
             if let prefill = router.consumePendingCommand() {

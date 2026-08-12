@@ -139,7 +139,7 @@ final class WorkspaceContractTests: XCTestCase {
             )
         ]
 
-        store.save(state)
+        _ = store.save(state)
         let loaded = store.load()
         XCTAssertEqual(loaded.threads.count, 1)
         XCTAssertEqual(loaded.threads[0].messages[0].body, "오늘 일정을 가볍게 조정해줘")
@@ -157,7 +157,7 @@ final class WorkspaceContractTests: XCTestCase {
         )
         var first = WorkspaceState.defaults()
         first.categories.append(WorkspaceCategory(title: "Private workspace"))
-        store.save(first)
+        _ = store.save(first)
 
         activeNamespace = "pairing-b"
         XCTAssertEqual(store.load().categories.count, 1)
@@ -190,5 +190,68 @@ final class WorkspaceContractTests: XCTestCase {
             WorkspaceState.systemChannelID(.overview)
         )
         XCTAssertEqual(future.categories[0].channels.count, 5)
+    }
+
+    func testFutureSchemaBytesArePreservedUntilExplicitReset() throws {
+        let suite = "WorkspaceContractTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = WorkspaceLocalStore(defaults: defaults, namespace: { "future" })
+        let key = "\(WorkspaceLocalStore.defaultsKey).future"
+        let raw = Data(
+            """
+            {"schemaVersion":99,"categories":[],"threads":[],"futureField":"keep-me"}
+            """.utf8
+        )
+        defaults.set(raw, forKey: key)
+
+        let loaded = store.loadSnapshot()
+        XCTAssertEqual(loaded.mode, .incompatibleFutureSchema(version: 99))
+        XCTAssertFalse(loaded.mode.isWritable)
+
+        var attempted = loaded.state
+        attempted.categories.append(WorkspaceCategory(title: "Must not save"))
+        let result = store.save(attempted)
+
+        XCTAssertEqual(result.mode, .incompatibleFutureSchema(version: 99))
+        XCTAssertEqual(defaults.data(forKey: key), raw)
+    }
+
+    func testCorruptedWorkspaceBytesArePreservedUntilExplicitReset() {
+        let suite = "WorkspaceContractTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = WorkspaceLocalStore(defaults: defaults, namespace: { "corrupt" })
+        let key = "\(WorkspaceLocalStore.defaultsKey).corrupt"
+        let raw = Data("not-json".utf8)
+        defaults.set(raw, forKey: key)
+
+        let result = store.save(WorkspaceState.defaults())
+
+        XCTAssertEqual(result.mode, .corrupted)
+        XCTAssertEqual(defaults.data(forKey: key), raw)
+    }
+
+    func testNormalizationDoesNotSilentlyTrimThreadMessages() {
+        let channelID = WorkspaceState.systemChannelID(.agent)
+        let messages = (0...WorkspaceState.maximumMessagesPerThread).map { index in
+            WorkspaceThreadMessage(author: .user, body: "message-\(index)")
+        }
+        let state = WorkspaceState(
+            categories: WorkspaceState.defaults().categories,
+            threads: [
+                WorkspaceThread(
+                    channelID: channelID,
+                    anchor: WorkspaceThreadAnchor(
+                        kind: .post,
+                        localID: "large-thread",
+                        title: "Large thread"
+                    ),
+                    messages: messages
+                )
+            ]
+        ).normalized()
+
+        XCTAssertEqual(state.threads[0].messages.count, messages.count)
     }
 }

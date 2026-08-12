@@ -245,7 +245,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                 ] as? String
             )
             Task { @MainActor in
-                AppRouter.shared.focusCommandDock(prefill: command)
+                AppRouter.shared.openAgentCommandDock(prefill: command)
                 completionHandler()
             }
         case UNNotificationDefaultActionIdentifier:

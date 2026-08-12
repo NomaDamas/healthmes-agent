@@ -117,6 +117,16 @@ main {
 }
 .workspace-status .storage-status::before { background: var(--danger); }
 
+.storage-reset {
+  margin-inline-start: 0.45rem;
+  border: 1px solid color-mix(in srgb, var(--danger) 48%, transparent);
+  border-radius: 999px;
+  padding: 0.2rem 0.5rem;
+  color: var(--danger);
+  background: transparent;
+  font: inherit;
+}
+
 .workspace-layout {
   display: grid;
   grid-template-columns: 15.5rem minmax(0, 1fr);
@@ -210,6 +220,19 @@ main {
   gap: 0.1rem;
   align-items: center;
   border-radius: 10px;
+}
+
+.channel-transfer {
+  grid-column: 1 / -1;
+  width: 100%;
+  margin-top: 0.25rem;
+  border: 1px solid var(--line-soft);
+  border-radius: 0.55rem;
+  padding: 0.32rem 0.45rem;
+  color: var(--ink-2);
+  background: color-mix(in srgb, var(--workspace-rail) 88%, transparent);
+  font: inherit;
+  font-size: 0.68rem;
 }
 
 .channel-row-wrap.is-dragging,

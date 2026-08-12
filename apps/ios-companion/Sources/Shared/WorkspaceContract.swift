@@ -245,6 +245,7 @@ public struct WorkspaceState: Codable, Equatable {
     public static let currentSchemaVersion = 1
     public static let maximumUserCategories = 40
     public static let maximumChannelsPerCategory = 80
+    public static let maximumMessagesPerThread = 500
 
     public var schemaVersion: Int
     public var categories: [WorkspaceCategory]
@@ -363,11 +364,9 @@ public struct WorkspaceState: Codable, Equatable {
             else { return nil }
             var normalizedThread = thread
             normalizedThread.channelID = channelID
-            normalizedThread.messages = Array(
-                thread.messages
-                    .filter { !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                    .suffix(500)
-            )
+            normalizedThread.messages = thread.messages.filter {
+                !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
             normalizedThread.draft = String(thread.draft.prefix(4_000))
             return normalizedThread
         }
@@ -498,6 +497,37 @@ public struct WorkspaceState: Codable, Equatable {
     }
 }
 
+public enum WorkspaceLocalStoreMode: Equatable {
+    case writable
+    case incompatibleFutureSchema(version: Int)
+    case corrupted
+
+    public var isWritable: Bool {
+        self == .writable
+    }
+
+    public var userMessage: String? {
+        switch self {
+        case .writable:
+            return nil
+        case .incompatibleFutureSchema:
+            return "이 기기의 워크스페이스는 더 최신 버전에서 만들어졌습니다. 현재 버전에서는 표시하거나 편집하지 않고 원본을 그대로 보존합니다."
+        case .corrupted:
+            return "로컬 워크스페이스를 읽을 수 없습니다. 원본을 보호하기 위해 편집을 중지했습니다."
+        }
+    }
+}
+
+public struct WorkspaceLocalSnapshot {
+    public let state: WorkspaceState
+    public let mode: WorkspaceLocalStoreMode
+
+    public init(state: WorkspaceState, mode: WorkspaceLocalStoreMode) {
+        self.state = state
+        self.mode = mode
+    }
+}
+
 public final class WorkspaceLocalStore {
     public static let shared = WorkspaceLocalStore()
     public static let defaultsKey = "healthmes.workspace.state.v1"
@@ -521,32 +551,69 @@ public final class WorkspaceLocalStore {
         decoder.dateDecodingStrategy = .iso8601
     }
 
-    public func load() -> WorkspaceState {
-        guard
-            let data = defaults.data(forKey: scopedDefaultsKey),
-            let decoded = try? decoder.decode(WorkspaceState.self, from: data)
-        else {
-            return WorkspaceState.defaults()
+    public func loadSnapshot() -> WorkspaceLocalSnapshot {
+        guard let data = defaults.data(forKey: scopedDefaultsKey) else {
+            return WorkspaceLocalSnapshot(
+                state: WorkspaceState.defaults(),
+                mode: .writable
+            )
         }
-        return decoded.normalized()
+        if let version = Self.schemaVersion(in: data),
+            version > WorkspaceState.currentSchemaVersion
+        {
+            return WorkspaceLocalSnapshot(
+                state: WorkspaceState.defaults(),
+                mode: .incompatibleFutureSchema(version: version)
+            )
+        }
+        guard let decoded = try? decoder.decode(WorkspaceState.self, from: data) else {
+            return WorkspaceLocalSnapshot(
+                state: WorkspaceState.defaults(),
+                mode: .corrupted
+            )
+        }
+        return WorkspaceLocalSnapshot(
+            state: decoded.normalized(),
+            mode: .writable
+        )
+    }
+
+    public func load() -> WorkspaceState {
+        loadSnapshot().state
     }
 
     @discardableResult
-    public func save(_ state: WorkspaceState) -> WorkspaceState {
+    public func save(_ state: WorkspaceState) -> WorkspaceLocalSnapshot {
+        let current = loadSnapshot()
+        guard current.mode.isWritable else {
+            return current
+        }
         let normalized = state.normalized()
         guard let data = try? encoder.encode(normalized) else {
-            return load()
+            return current
         }
         defaults.set(data, forKey: scopedDefaultsKey)
-        return normalized
+        return WorkspaceLocalSnapshot(state: normalized, mode: .writable)
     }
 
-    public func reset() -> WorkspaceState {
+    public func reset() -> WorkspaceLocalSnapshot {
         defaults.removeObject(forKey: scopedDefaultsKey)
-        return WorkspaceState.defaults()
+        return WorkspaceLocalSnapshot(
+            state: WorkspaceState.defaults(),
+            mode: .writable
+        )
     }
 
     private var scopedDefaultsKey: String {
         "\(Self.defaultsKey).\(namespace())"
+    }
+
+    private static func schemaVersion(in data: Data) -> Int? {
+        guard
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let dictionary = object as? [String: Any],
+            let number = dictionary["schemaVersion"] as? NSNumber
+        else { return nil }
+        return number.intValue
     }
 }

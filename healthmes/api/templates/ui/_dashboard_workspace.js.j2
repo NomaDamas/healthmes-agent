@@ -4,11 +4,11 @@
   var shell = document.querySelector("[data-workspace-shell]");
   if (!shell) { return; }
 
-  var STORAGE_KEY = "healthmes.workspace.web.v1";
   var SCHEMA_VERSION = 1;
   var MAX_CATEGORIES = 40;
   var MAX_CHANNELS_PER_CATEGORY = 80;
   var MAX_THREADS = 500;
+  var MAX_MESSAGES_PER_FEED = 500;
   var SYSTEM_CHANNELS = {
     overview: {
       title: "overview",
@@ -60,8 +60,26 @@
   var channelCategorySelect = shell.querySelector("[data-channel-category]");
   var channelKindSelect = shell.querySelector("[data-channel-kind]");
   var storageStatus = shell.querySelector("[data-storage-status]");
+  var mobileToggle = shell.querySelector('[data-action="toggle-sidebar"]');
+  var workspaceMain = shell.querySelector(".workspace-main");
   var activeThreadId = null;
   var dragPayload = null;
+  var previousThreadFocus = null;
+  var storageMode = "writable";
+  var dashboardRoot = window.location.pathname.split("/dashboard")[0] + "/dashboard";
+  var LEGACY_STORAGE_KEY = "healthmes.workspace.web.v1";
+  var STORAGE_KEY = LEGACY_STORAGE_KEY + ".instance."
+    + stableHash(window.location.origin + dashboardRoot);
+  var MIGRATION_KEY = STORAGE_KEY + ".legacy-migration-complete";
+
+  function stableHash(value) {
+    var hash = 2166136261;
+    String(value).split("").forEach(function (character) {
+      hash ^= character.charCodeAt(0);
+      hash = Math.imul(hash, 16777619);
+    });
+    return (hash >>> 0).toString(36);
+  }
 
   function createId(prefix) {
     if (window.crypto && typeof window.crypto.randomUUID === "function") {
@@ -103,7 +121,7 @@
 
   function normalizeMessages(value) {
     if (!Array.isArray(value)) { return []; }
-    return value.slice(-500).map(function (message) {
+    return value.map(function (message) {
       if (!message || typeof message !== "object") { return null; }
       var body = String(message.body || "").trim().slice(0, 4000);
       if (!body) { return null; }
@@ -119,7 +137,7 @@
 
   function normalizeState(value) {
     var base = defaultState();
-    if (!value || typeof value !== "object" || value.version !== SCHEMA_VERSION) {
+    if (!value || typeof value !== "object") {
       return base;
     }
 
@@ -189,7 +207,7 @@
       Object.keys(value.threads).forEach(function (id) {
         var thread = value.threads[id];
         if (!thread || typeof thread !== "object") { return; }
-        threads[id.slice(0, 180)] = {
+        threads[id] = {
           title: cleanText(thread.title, 160) || "Thread",
           kind: cleanText(thread.kind, 60) || "workspace",
           messages: normalizeMessages(thread.messages)
@@ -201,7 +219,7 @@
     if (value.threadDrafts && typeof value.threadDrafts === "object") {
       Object.keys(value.threadDrafts).forEach(function (id) {
         if (typeof value.threadDrafts[id] === "string") {
-          threadDrafts[id.slice(0, 180)] = value.threadDrafts[id].slice(0, 4000);
+          threadDrafts[id] = value.threadDrafts[id].slice(0, 4000);
         }
       });
     }
@@ -225,18 +243,80 @@
   }
 
   function loadState() {
+    var raw;
     try {
-      return normalizeState(JSON.parse(window.localStorage.getItem(STORAGE_KEY)));
+      raw = window.localStorage.getItem(STORAGE_KEY);
+      if (raw === null && window.localStorage.getItem(MIGRATION_KEY) !== "done") {
+        var candidate = window.localStorage.getItem(LEGACY_STORAGE_KEY);
+        if (candidate !== null) {
+          window.localStorage.setItem(STORAGE_KEY, candidate);
+          raw = candidate;
+        }
+        window.localStorage.setItem(MIGRATION_KEY, "done");
+      }
+      if (raw === null) {
+        return { state: defaultState(), mode: "writable" };
+      }
+      var decoded = JSON.parse(raw);
+      if (!decoded || typeof decoded !== "object") {
+        return { state: defaultState(), mode: "corrupted" };
+      }
+      if (typeof decoded.version !== "number") {
+        return { state: defaultState(), mode: "corrupted" };
+      }
+      if (decoded.version > SCHEMA_VERSION) {
+        return { state: defaultState(), mode: "future_schema" };
+      }
+      if (decoded.version !== SCHEMA_VERSION) {
+        return { state: defaultState(), mode: "corrupted" };
+      }
+      return { state: normalizeState(decoded), mode: "writable" };
     } catch (error) {
-      return defaultState();
+      return { state: defaultState(), mode: "corrupted" };
     }
   }
 
-  var state = loadState();
+  var loaded = loadState();
+  var state = loaded.state;
+  storageMode = loaded.mode;
+  var persistedSnapshot = JSON.stringify(state);
+
+  function showStorageStatus(message, allowReset) {
+    if (!storageStatus) { return; }
+    storageStatus.hidden = false;
+    storageStatus.textContent = message;
+    if (allowReset) {
+      var reset = createButton(
+        "로컬 데이터 초기화",
+        "storage-reset",
+        "reset-local-workspace"
+      );
+      storageStatus.appendChild(document.createTextNode(" "));
+      storageStatus.appendChild(reset);
+    }
+  }
+
+  function storageModeMessage() {
+    if (storageMode === "future_schema") {
+      return "이 브라우저의 워크스페이스는 더 최신 버전입니다. 현재 버전에서는 표시하거나 편집하지 않고 원본을 그대로 보존합니다.";
+    }
+    if (storageMode === "corrupted") {
+      return "로컬 워크스페이스를 읽을 수 없습니다. 원본 보호를 위해 편집을 중지했습니다.";
+    }
+    return "";
+  }
+
+  function ensureWritable() {
+    if (storageMode === "writable") { return true; }
+    showStorageStatus(storageModeMessage(), true);
+    return false;
+  }
 
   function saveState() {
+    if (!ensureWritable()) { return false; }
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      persistedSnapshot = JSON.stringify(state);
       shell.setAttribute("data-local-storage", "available");
       if (storageStatus) {
         storageStatus.hidden = true;
@@ -244,11 +324,12 @@
       }
       return true;
     } catch (error) {
+      state = normalizeState(JSON.parse(persistedSnapshot));
       shell.setAttribute("data-local-storage", "unavailable");
-      if (storageStatus) {
-        storageStatus.hidden = false;
-        storageStatus.textContent = "로컬 저장에 실패했습니다. 입력은 유지되지만 새로고침하면 사라질 수 있습니다.";
-      }
+      showStorageStatus(
+        "로컬 저장에 실패해 변경을 취소했습니다. 작성 중인 입력은 화면에 남아 있습니다.",
+        false
+      );
       return false;
     }
   }
@@ -262,8 +343,14 @@
   }
 
   function channelFromLocation() {
-    var hash = window.location.hash.replace(/^#channel-/, "");
-    if (Object.prototype.hasOwnProperty.call(SYSTEM_CHANNELS, hash)) { return hash; }
+    var hash = window.location.hash;
+    if (hash.indexOf("#channel-") === 0) {
+      try {
+        return decodeURIComponent(hash.slice("#channel-".length));
+      } catch (error) {
+        return hash.slice("#channel-".length);
+      }
+    }
     var path = window.location.pathname.replace(/\/+$/, "");
     if (path.endsWith("/decisions")) { return "decisions"; }
     if (path.endsWith("/history")) { return "insights"; }
@@ -388,6 +475,25 @@
       secondary.setAttribute("data-category-id", options.categoryId);
     }
     wrapper.appendChild(secondary);
+    if (!options.system && state.categories.length > 1) {
+      var transfer = document.createElement("select");
+      transfer.className = "channel-transfer";
+      transfer.setAttribute("data-transfer-channel", channel.id);
+      transfer.setAttribute("data-category-id", options.categoryId);
+      transfer.setAttribute("aria-label", channel.title + " 채널을 다른 카테고리로 이동");
+      var current = document.createElement("option");
+      current.value = "";
+      current.textContent = "이동…";
+      transfer.appendChild(current);
+      state.categories.forEach(function (category) {
+        if (category.id === options.categoryId) { return; }
+        var option = document.createElement("option");
+        option.value = category.id;
+        option.textContent = category.title;
+        transfer.appendChild(option);
+      });
+      wrapper.appendChild(transfer);
+    }
     return wrapper;
   }
 
@@ -575,9 +681,7 @@
         if (source) {
           Array.prototype.forEach.call(source.children, function (child) {
             var clone = child.cloneNode(true);
-            Array.prototype.forEach.call(clone.querySelectorAll("[id]"), function (node) {
-              node.removeAttribute("id");
-            });
+            rewriteCloneIdentifiers(clone, "clone-" + stableHash(channel.id) + "-");
             panel.appendChild(clone);
           });
         } else {
@@ -589,6 +693,35 @@
         customPanelsMount.appendChild(panel);
       });
     });
+  }
+
+  function rewriteCloneIdentifiers(root, prefix) {
+    var idMap = {};
+    var nodes = [];
+    if (root.id) { nodes.push(root); }
+    Array.prototype.push.apply(nodes, root.querySelectorAll("[id]"));
+    nodes.forEach(function (node) {
+      var previous = node.id;
+      var next = prefix + previous;
+      idMap[previous] = next;
+      node.id = next;
+    });
+    ["for", "aria-controls", "aria-describedby", "aria-labelledby", "aria-owns"].forEach(
+      function (attribute) {
+        var candidates = [];
+        if (root.hasAttribute && root.hasAttribute(attribute)) { candidates.push(root); }
+        Array.prototype.push.apply(
+          candidates,
+          root.querySelectorAll("[" + attribute + "]")
+        );
+        candidates.forEach(function (node) {
+          var rewritten = node.getAttribute(attribute).split(/\s+/).map(function (id) {
+            return idMap[id] || id;
+          }).join(" ");
+          node.setAttribute(attribute, rewritten);
+        });
+      }
+    );
   }
 
   function renderAgentFeed() {
@@ -606,6 +739,9 @@
     renderCustomPanels();
     renderAgentFeed();
     selectChannel(state.selectedChannel, false);
+    if (storageMode !== "writable") {
+      showStorageStatus(storageModeMessage(), true);
+    }
   }
 
   function selectChannel(channelId, updateLocation) {
@@ -617,7 +753,10 @@
       panel = shell.querySelector('[data-channel-panel="overview"]');
     }
     state.selectedChannel = channelId;
-    saveState();
+    if (storageMode === "writable" && !saveState()) {
+      channelId = state.selectedChannel;
+      meta = channelMeta(channelId);
+    }
     Array.prototype.forEach.call(
       shell.querySelectorAll(".channel-row[data-channel-id]"),
       function (button) {
@@ -632,41 +771,49 @@
       var active = item.getAttribute("data-channel-panel") === channelId;
       item.setAttribute("data-active", String(active));
       item.setAttribute("aria-hidden", String(!active));
+      if ("inert" in item) { item.inert = !active; }
     });
     channelTitle.textContent = "# " + meta.title;
     channelDescription.textContent = meta.description;
     shell.setAttribute("data-enhanced", "true");
-    shell.setAttribute("data-sidebar-open", "false");
+    setSidebarOpen(false, false);
     if (updateLocation && window.history && window.history.pushState) {
-      var next = window.location.pathname + window.location.search + "#channel-" + channelId;
+      var next = window.location.pathname + window.location.search
+        + "#channel-" + encodeURIComponent(channelId);
       window.history.pushState({ channel: channelId }, "", next);
     }
   }
 
   function toggleFavorite(channelId) {
+    if (!ensureWritable()) { return; }
+    var previous = snapshotState();
     var index = state.favorites.indexOf(channelId);
     if (index >= 0) {
       state.favorites.splice(index, 1);
     } else {
       state.favorites.push(channelId);
     }
-    saveState();
+    if (!saveState()) { restoreSnapshot(previous); }
     renderAll();
   }
 
   function hideSystemChannel(channelId) {
+    if (!ensureWritable()) { return; }
     if (!SYSTEM_CHANNELS[channelId]) { return; }
+    var previous = snapshotState();
     if (state.hiddenSystem.indexOf(channelId) === -1) {
       state.hiddenSystem.push(channelId);
     }
     if (state.selectedChannel === channelId) { state.selectedChannel = "overview"; }
-    saveState();
+    if (!saveState()) { restoreSnapshot(previous); }
     renderAll();
   }
 
   function restoreSystemChannels() {
+    if (!ensureWritable()) { return; }
+    var previous = snapshotState();
     state.hiddenSystem = [];
-    saveState();
+    if (!saveState()) { restoreSnapshot(previous); }
     renderAll();
   }
 
@@ -702,6 +849,7 @@
   }
 
   function addCategory() {
+    if (!ensureWritable()) { return; }
     var title = cleanText(categoryInput.value, 48);
     if (!title) {
       categoryInput.focus();
@@ -731,6 +879,7 @@
   }
 
   function addChannel() {
+    if (!ensureWritable()) { return; }
     var title = cleanText(channelInput.value, 48);
     var category = state.categories.find(function (item) {
       return item.id === channelCategorySelect.value;
@@ -769,10 +918,12 @@
   }
 
   function editCategory(categoryId) {
+    if (!ensureWritable()) { return; }
     var category = state.categories.find(function (item) { return item.id === categoryId; });
     if (!category) { return; }
     var next = window.prompt("카테고리 이름", category.title);
     if (next === null) { return; }
+    var previous = snapshotState();
     next = cleanText(next, 48);
     if (!next) {
       if (!window.confirm("이 카테고리와 안의 로컬 채널을 삭제할까요?")) { return; }
@@ -783,7 +934,7 @@
     } else {
       category.title = next;
     }
-    saveState();
+    if (!saveState()) { restoreSnapshot(previous); }
     renderAll();
   }
 
@@ -800,12 +951,14 @@
   }
 
   function editChannel(categoryId, channelId) {
+    if (!ensureWritable()) { return; }
     var category = state.categories.find(function (item) { return item.id === categoryId; });
     if (!category) { return; }
     var channel = category.channels.find(function (item) { return item.id === channelId; });
     if (!channel) { return; }
     var next = window.prompt("채널 이름", channel.title);
     if (next === null) { return; }
+    var previous = snapshotState();
     next = cleanText(next, 48);
     if (!next) {
       if (!window.confirm("이 로컬 채널과 글·스레드를 삭제할까요?")) { return; }
@@ -815,23 +968,32 @@
     } else {
       channel.title = next;
     }
-    saveState();
+    if (!saveState()) { restoreSnapshot(previous); }
     renderAll();
   }
 
   function submitLocalPost(channelId) {
+    if (!ensureWritable()) { return; }
     var draft = shell.querySelector('[data-local-draft="' + CSS.escape(channelId) + '"]');
     if (!draft) { return; }
     var body = String(draft.value || "").trim().slice(0, 4000);
     if (!body) { draft.focus(); return; }
     var previous = snapshotState();
     if (!state.posts[channelId]) { state.posts[channelId] = []; }
+    if (state.posts[channelId].length >= MAX_MESSAGES_PER_FEED) {
+      showStorageStatus(
+        "이 채널은 로컬 글 " + MAX_MESSAGES_PER_FEED
+          + "개 한도에 도달했습니다. 기존 글은 삭제되지 않았습니다.",
+        false
+      );
+      draft.focus();
+      return;
+    }
     state.posts[channelId].push({
       id: createId("post"),
       body: body,
       createdAt: new Date().toISOString()
     });
-    state.posts[channelId] = state.posts[channelId].slice(-500);
     state.drafts[channelId] = "";
     if (!saveState()) {
       restoreSnapshot(previous);
@@ -849,9 +1011,13 @@
   }
 
   function openThread(anchorId, title, kind) {
-    activeThreadId = String(anchorId || "").slice(0, 180);
+    activeThreadId = String(anchorId || "");
     if (!activeThreadId) { return; }
     if (!state.threads[activeThreadId]) {
+      if (!ensureWritable()) {
+        activeThreadId = null;
+        return;
+      }
       if (Object.keys(state.threads).length >= MAX_THREADS) {
         if (storageStatus) {
           storageStatus.hidden = false;
@@ -864,16 +1030,22 @@
         kind: cleanText(kind, 60) || "workspace",
         messages: []
       };
+      if (!saveState()) {
+        activeThreadId = null;
+        return;
+      }
     }
     var thread = state.threads[activeThreadId];
     threadTitle.textContent = thread.title;
     threadKind.textContent = thread.kind + " · 이 브라우저에만 저장";
     threadDraft.value = state.threadDrafts[activeThreadId] || "";
     renderThreadMessages(thread);
+    previousThreadFocus = document.activeElement;
     threadPanel.hidden = false;
     shell.setAttribute("data-thread-open", "true");
-    saveState();
-    window.setTimeout(function () { threadDraft.focus(); }, 0);
+    if ("inert" in workspaceMain) { workspaceMain.inert = true; }
+    syncSidebarAccessibility();
+    window.setTimeout(function () { threadPanel.focus(); }, 0);
   }
 
   function renderThreadMessages(thread) {
@@ -909,21 +1081,35 @@
   function closeThread() {
     threadPanel.hidden = true;
     shell.setAttribute("data-thread-open", "false");
+    if ("inert" in workspaceMain) { workspaceMain.inert = false; }
+    syncSidebarAccessibility();
     activeThreadId = null;
+    if (previousThreadFocus && document.contains(previousThreadFocus)) {
+      previousThreadFocus.focus();
+    }
+    previousThreadFocus = null;
   }
 
   function submitThreadMessage() {
+    if (!ensureWritable()) { return; }
     if (!activeThreadId || !state.threads[activeThreadId]) { return; }
     var body = String(threadDraft.value || "").trim().slice(0, 4000);
     if (!body) { threadDraft.focus(); return; }
     var previous = snapshotState();
+    if (state.threads[activeThreadId].messages.length >= MAX_MESSAGES_PER_FEED) {
+      showStorageStatus(
+        "이 스레드는 답글 " + MAX_MESSAGES_PER_FEED
+          + "개 한도에 도달했습니다. 기존 답글은 삭제되지 않았습니다.",
+        false
+      );
+      threadDraft.focus();
+      return;
+    }
     state.threads[activeThreadId].messages.push({
       id: createId("reply"),
       body: body,
       createdAt: new Date().toISOString()
     });
-    state.threads[activeThreadId].messages =
-      state.threads[activeThreadId].messages.slice(-500);
     state.threadDrafts[activeThreadId] = "";
     if (!saveState()) {
       restoreSnapshot(previous);
@@ -1000,6 +1186,83 @@
     if (category) { moveItemByOffset(category.channels, channelId, offset); }
   }
 
+  function moveChannelToCategory(channelId, sourceCategoryId, targetCategoryId) {
+    var source = state.categories.find(function (item) {
+      return item.id === sourceCategoryId;
+    });
+    var target = state.categories.find(function (item) {
+      return item.id === targetCategoryId;
+    });
+    if (!source || !target || source === target) { return false; }
+    var index = source.channels.findIndex(function (item) { return item.id === channelId; });
+    if (index < 0 || target.channels.length >= MAX_CHANNELS_PER_CATEGORY) {
+      showStorageStatus(
+        "대상 카테고리가 채널 " + MAX_CHANNELS_PER_CATEGORY + "개 한도에 도달했습니다.",
+        false
+      );
+      return false;
+    }
+    target.channels.push(source.channels.splice(index, 1)[0]);
+    target.collapsed = false;
+    return true;
+  }
+
+  function isMobileSidebar() {
+    return window.matchMedia && window.matchMedia("(max-width: 760px)").matches;
+  }
+
+  function syncSidebarAccessibility() {
+    var closedOnMobile = isMobileSidebar()
+      && shell.getAttribute("data-sidebar-open") !== "true";
+    sidebar.setAttribute("aria-hidden", String(closedOnMobile));
+    if ("inert" in sidebar) {
+      sidebar.inert = closedOnMobile
+        || shell.getAttribute("data-thread-open") === "true";
+    }
+  }
+
+  function setSidebarOpen(open, restoreFocus) {
+    shell.setAttribute("data-sidebar-open", String(open));
+    if (mobileToggle) {
+      mobileToggle.setAttribute("aria-expanded", String(open));
+    }
+    syncSidebarAccessibility();
+    if (!open && restoreFocus && mobileToggle) {
+      mobileToggle.focus();
+    }
+  }
+
+  function openAdvanced() {
+    selectChannel("overview", true);
+    var details = shell.querySelector("#advanced");
+    if (!details) { return; }
+    details.open = true;
+    window.setTimeout(function () {
+      details.scrollIntoView({ block: "start", behavior: "smooth" });
+      var summary = details.querySelector("summary");
+      if (summary) { summary.focus(); }
+    }, 0);
+  }
+
+  function resetLocalWorkspace() {
+    try {
+      window.localStorage.removeItem(STORAGE_KEY);
+      window.localStorage.setItem(MIGRATION_KEY, "done");
+    } catch (error) {
+      showStorageStatus("로컬 데이터를 초기화하지 못했습니다.", false);
+      return;
+    }
+    storageMode = "writable";
+    state = defaultState();
+    persistedSnapshot = JSON.stringify(state);
+    shell.setAttribute("data-local-storage", "available");
+    if (storageStatus) {
+      storageStatus.hidden = true;
+      storageStatus.textContent = "";
+    }
+    renderAll();
+  }
+
   shell.addEventListener("click", function (event) {
     var channelButton = event.target.closest("[data-channel-id]");
     if (channelButton && channelButton.classList.contains("channel-row")) {
@@ -1014,18 +1277,21 @@
     var categoryId = action.getAttribute("data-category-id");
 
     if (actionName === "toggle-sidebar") {
-      shell.setAttribute(
-        "data-sidebar-open",
-        String(shell.getAttribute("data-sidebar-open") !== "true")
-      );
+      var sidebarOpen = shell.getAttribute("data-sidebar-open") !== "true";
+      setSidebarOpen(sidebarOpen, !sidebarOpen);
     } else if (actionName === "close-sidebar") {
-      shell.setAttribute("data-sidebar-open", "false");
+      setSidebarOpen(false, true);
     } else if (actionName === "toggle-favorite") {
       toggleFavorite(channelId);
     } else if (actionName === "hide-system-channel") {
       hideSystemChannel(channelId);
     } else if (actionName === "restore-system-channels") {
       restoreSystemChannels();
+    } else if (actionName === "open-advanced") {
+      event.preventDefault();
+      openAdvanced();
+    } else if (actionName === "reset-local-workspace") {
+      resetLocalWorkspace();
     } else if (actionName === "open-category-dialog") {
       categoryInput.value = "";
       showDialog(categoryDialog);
@@ -1048,32 +1314,38 @@
     } else if (actionName === "close-dialog") {
       closeDialog(action.closest("dialog"));
     } else if (actionName === "toggle-category") {
+      if (!ensureWritable()) { return; }
       var category = state.categories.find(function (item) { return item.id === categoryId; });
       if (category) {
+        var categorySnapshot = snapshotState();
         category.collapsed = !category.collapsed;
-        saveState();
+        if (!saveState()) { restoreSnapshot(categorySnapshot); }
         renderCategories();
       }
     } else if (actionName === "edit-category") {
       editCategory(categoryId);
     } else if (actionName === "move-category-up" || actionName === "move-category-down") {
+      if (!ensureWritable()) { return; }
+      var categoryMoveSnapshot = snapshotState();
       moveItemByOffset(
         state.categories,
         categoryId,
         actionName === "move-category-up" ? -1 : 1
       );
-      saveState();
+      if (!saveState()) { restoreSnapshot(categoryMoveSnapshot); }
       renderAll();
     } else if (actionName === "edit-channel") {
       editChannel(categoryId, channelId);
     } else if (actionName === "move-channel-up" || actionName === "move-channel-down") {
+      if (!ensureWritable()) { return; }
+      var channelMoveSnapshot = snapshotState();
       moveChannelByOffset(
         channelId,
         categoryId,
         action.getAttribute("data-channel-scope"),
         actionName === "move-channel-up" ? -1 : 1
       );
-      saveState();
+      if (!saveState()) { restoreSnapshot(channelMoveSnapshot); }
       renderAll();
     } else if (actionName === "submit-local-post") {
       submitLocalPost(channelId);
@@ -1093,14 +1365,49 @@
   shell.addEventListener("input", function (event) {
     var draftChannel = event.target.getAttribute("data-local-draft");
     if (draftChannel) {
+      if (!ensureWritable()) {
+        event.target.value = state.drafts[draftChannel] || "";
+        return;
+      }
+      var previous = snapshotState();
       state.drafts[draftChannel] = event.target.value.slice(0, 4000);
-      saveState();
+      if (!saveState()) {
+        restoreSnapshot(previous);
+      }
       return;
     }
     if (event.target === threadDraft && activeThreadId) {
+      if (!ensureWritable()) {
+        threadDraft.value = state.threadDrafts[activeThreadId] || "";
+        return;
+      }
+      var threadDraftSnapshot = snapshotState();
       state.threadDrafts[activeThreadId] = event.target.value.slice(0, 4000);
-      saveState();
+      if (!saveState()) { restoreSnapshot(threadDraftSnapshot); }
     }
+  });
+
+  shell.addEventListener("change", function (event) {
+    var channelId = event.target.getAttribute("data-transfer-channel");
+    var targetCategoryId = event.target.value;
+    if (!channelId || !targetCategoryId || !ensureWritable()) { return; }
+    var previous = snapshotState();
+    var moved = moveChannelToCategory(
+      channelId,
+      event.target.getAttribute("data-category-id"),
+      targetCategoryId
+    );
+    if (!moved) {
+      event.target.value = "";
+      return;
+    }
+    if (!saveState()) {
+      restoreSnapshot(previous);
+      renderAll();
+      return;
+    }
+    renderAll();
+    showStorageStatus("채널을 선택한 카테고리로 이동했습니다.", false);
   });
 
   shell.addEventListener("keydown", function (event) {
@@ -1118,7 +1425,25 @@
       if (shell.getAttribute("data-thread-open") === "true") {
         closeThread();
       } else {
-        shell.setAttribute("data-sidebar-open", "false");
+        setSidebarOpen(false, true);
+      }
+    }
+    if (event.key === "Tab" && shell.getAttribute("data-thread-open") === "true") {
+      var focusable = Array.prototype.filter.call(
+        threadPanel.querySelectorAll(
+          'button:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
+        ),
+        function (item) { return !item.hidden; }
+      );
+      if (!focusable.length) { return; }
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
       }
     }
   });
@@ -1164,12 +1489,14 @@
   });
 
   shell.addEventListener("drop", function (event) {
+    if (!ensureWritable()) { return; }
     if (!dragPayload) { return; }
     var target = dragPayload.type === "category"
       ? event.target.closest(".workspace-category")
       : event.target.closest("[data-channel-wrapper]");
     if (!target) { return; }
     event.preventDefault();
+    var previous = snapshotState();
     if (dragPayload.type === "system-channel"
         && target.getAttribute("data-channel-scope") === "system") {
       moveSystemChannel(dragPayload.id, target.getAttribute("data-channel-wrapper"));
@@ -1184,7 +1511,7 @@
         target.getAttribute("data-category-id")
       );
     }
-    saveState();
+    if (!saveState()) { restoreSnapshot(previous); }
     renderAll();
   });
 
@@ -1199,12 +1526,17 @@
     dragPayload = null;
   });
 
-  window.addEventListener("popstate", function () {
+  function restoreChannelFromLocation() {
     var next = channelFromLocation();
     if (findUserChannel(next) || SYSTEM_CHANNELS[next]) {
       selectChannel(next, false);
     }
-  });
+  }
+
+  window.addEventListener("popstate", restoreChannelFromLocation);
+  window.addEventListener("hashchange", restoreChannelFromLocation);
+  window.addEventListener("resize", syncSidebarAccessibility);
 
   renderAll();
+  syncSidebarAccessibility();
 })();

@@ -21,6 +21,7 @@ struct WorkspaceRootView: View {
     @StateObject private var workspace = WorkspaceViewModel()
     @State private var creationSheet: WorkspaceCreationSheet?
     @State private var columnVisibility: NavigationSplitViewVisibility = .detailOnly
+    @State private var lastAgentChannelRequest = 0
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -74,6 +75,34 @@ struct WorkspaceRootView: View {
             NotificationCenter.default.publisher(for: .healthmesPairingChanged)
         ) { _ in
             workspace.reloadForPairingChange()
+        }
+        .onReceive(router.$agentChannelRequest) { request in
+            guard request > lastAgentChannelRequest else { return }
+            lastAgentChannelRequest = request
+            workspace.routeToChannel(WorkspaceState.systemChannelID(.agent))
+            columnVisibility = .detailOnly
+            Task { @MainActor in
+                await Task.yield()
+                router.focusCommandDock()
+            }
+        }
+        .alert(
+            "로컬 워크스페이스",
+            isPresented: Binding(
+                get: { workspace.notice != nil },
+                set: { if !$0 { workspace.dismissNotice() } }
+            )
+        ) {
+            if !workspace.canEdit {
+                Button("로컬 데이터 초기화", role: .destructive) {
+                    workspace.reset()
+                }
+            }
+            Button("확인", role: .cancel) {
+                workspace.dismissNotice()
+            }
+        } message: {
+            Text(workspace.notice ?? "")
         }
     }
 }
@@ -164,6 +193,12 @@ private struct WorkspaceSidebar: View {
     private func channelRow(_ channel: WorkspaceChannel) -> some View {
         Label(channel.title, systemImage: channel.symbolName)
             .tag(channel.id)
+            .accessibilityAddTraits(
+                workspace.state.selectedChannelID == channel.id ? .isSelected : []
+            )
+            .accessibilityValue(
+                channel.isFavorite ? "즐겨찾기, 선택 가능" : "선택 가능"
+            )
             .contextMenu {
                 Button {
                     workspace.setChannelFavorite(
@@ -244,6 +279,9 @@ private struct WorkspaceSidebar: View {
                 .font(.caption2.bold())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(
+                "\(category.title), \(category.isCollapsed ? "접힘" : "펼쳐짐")"
+            )
             Text(verbatim: category.title)
             Spacer()
             if !category.isSystem {
@@ -327,7 +365,7 @@ private struct WorkspaceChannelView: View {
         case .decisions:
             DecisionsView()
         case .agent:
-            WellnessControlView()
+            WellnessControlView(receivesAgentCommands: true)
         case nil:
             customChannelCanvas(channel)
         }
@@ -432,22 +470,21 @@ private struct WorkspaceInsightCanvas: View {
     let onOpenThread: () -> Void
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 14) {
-                ProductCard(kicker: "Wellness insight", systemImage: "chart.xyaxis.line") {
-                    Text("질문에 맞는 시각화는 HealthMes의 분석 결과가 있을 때만 생성됩니다.")
-                        .font(.title3.weight(.semibold))
-                    Text("에너지 추이, 개인 기준선, 영향 요인과 실제 캘린더를 함께 비교합니다.")
-                        .foregroundStyle(.secondary)
-                    Button(action: onOpenThread) {
-                        Label("이 인사이트로 대화", systemImage: "bubble.left")
-                    }
-                    .buttonStyle(.bordered)
+        VStack(spacing: 0) {
+            HStack {
+                Text("HealthMes가 검증한 데이터가 있을 때 질문에 맞는 시각화를 생성합니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(action: onOpenThread) {
+                    Label("스레드", systemImage: "bubble.left")
                 }
-                WellnessControlView()
-                    .frame(minHeight: 640)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
-            .padding(16)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            WellnessControlView()
         }
         .background(Color(uiColor: .systemGroupedBackground))
     }

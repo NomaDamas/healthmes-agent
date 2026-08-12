@@ -3,12 +3,17 @@ import Foundation
 @MainActor
 final class MacWorkspaceViewModel: ObservableObject {
     @Published private(set) var state: WorkspaceState
+    @Published private(set) var storageMode: WorkspaceLocalStoreMode
+    @Published private(set) var notice: String?
 
     private let store: WorkspaceLocalStore
 
     init(store: WorkspaceLocalStore = .shared) {
         self.store = store
-        state = store.load()
+        let snapshot = store.loadSnapshot()
+        state = snapshot.state
+        storageMode = snapshot.mode
+        notice = snapshot.mode.userMessage
     }
 
     var categories: [WorkspaceCategory] {
@@ -262,14 +267,20 @@ final class MacWorkspaceViewModel: ObservableObject {
     }
 
     func sendSelectedThreadMessage() {
+        guard
+            let id = state.selectedThreadID,
+            let current = state.threads.first(where: { $0.id == id })
+        else { return }
+        let body = current.draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return }
+        guard current.messages.count < WorkspaceState.maximumMessagesPerThread else {
+            notice = "This thread reached the \(WorkspaceState.maximumMessagesPerThread)-message local limit. Existing messages were preserved."
+            return
+        }
         mutate { state in
-            guard
-                let id = state.selectedThreadID,
-                let index = state.threads.firstIndex(where: { $0.id == id })
-            else { return }
-            let body = state.threads[index].draft
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !body.isEmpty else { return }
+            guard let index = state.threads.firstIndex(where: { $0.id == id }) else {
+                return
+            }
             state.threads[index].messages.append(
                 WorkspaceThreadMessage(author: .user, body: body)
             )
@@ -285,6 +296,13 @@ final class MacWorkspaceViewModel: ObservableObject {
     ) {
         let clean = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
+        guard
+            let thread = state.threads.first(where: { $0.id == threadID }),
+            thread.messages.count < WorkspaceState.maximumMessagesPerThread
+        else {
+            notice = "This thread reached the \(WorkspaceState.maximumMessagesPerThread)-message local limit. Existing messages were preserved."
+            return
+        }
         mutate { state in
             guard let index = state.threads.firstIndex(where: { $0.id == threadID }) else {
                 return
@@ -297,13 +315,33 @@ final class MacWorkspaceViewModel: ObservableObject {
     }
 
     func reloadForPairingChange() {
-        state = store.load()
+        apply(store.loadSnapshot())
+    }
+
+    func resetLocalWorkspace() {
+        apply(store.reset())
+        notice = nil
+    }
+
+    func dismissNotice() {
+        notice = nil
     }
 
     private func mutate(_ mutation: (inout WorkspaceState) -> Void) {
+        guard storageMode.isWritable else {
+            state = store.loadSnapshot().state
+            notice = storageMode.userMessage
+            return
+        }
         var next = state
         mutation(&next)
-        state = store.save(next)
+        apply(store.save(next))
+    }
+
+    private func apply(_ snapshot: WorkspaceLocalSnapshot) {
+        state = snapshot.state
+        storageMode = snapshot.mode
+        notice = snapshot.mode.userMessage
     }
 
     private func cleanTitle(_ title: String, fallback: String) -> String {
