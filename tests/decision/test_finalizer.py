@@ -940,6 +940,86 @@ async def test_aclose_drains_timed_out_worker_before_static_pool_dispose(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_aclose_defers_teardown_until_worker_cleanup(
+    persistence,
+):
+    engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    flush_started = threading.Event()
+    release_flush = threading.Event()
+    session_closed = threading.Event()
+    teardown_started = threading.Event()
+    teardown_before_cleanup = threading.Event()
+
+    class BlockingFlushSession(Session):
+        def flush(self, objects=None) -> None:
+            if any(
+                isinstance(item, DecisionRecord)
+                for item in self.new
+            ):
+                flush_started.set()
+                if not release_flush.wait(timeout=5):
+                    raise TimeoutError("test flush was not released")
+            super().flush(objects)
+
+        def close(self) -> None:
+            try:
+                super().close()
+            finally:
+                session_closed.set()
+
+    slow_factory = sessionmaker(
+        bind=engine,
+        class_=BlockingFlushSession,
+        expire_on_commit=False,
+    )
+    finalizer = _finalizer(
+        slow_factory,
+        timeout_seconds=0.05,
+    )
+
+    result = await finalizer.afinalize(
+        request,
+        _run(request, [ref]),
+    )
+    assert flush_started.is_set()
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+
+    async def close_then_teardown() -> None:
+        try:
+            await finalizer.aclose()
+        finally:
+            if not session_closed.is_set():
+                teardown_before_cleanup.set()
+            else:
+                engine.dispose()
+            teardown_started.set()
+
+    closing = asyncio.create_task(close_then_teardown())
+    await asyncio.sleep(0.02)
+    closing.cancel()
+    await asyncio.sleep(0.02)
+    try:
+        assert closing.done() is False
+        assert teardown_started.is_set() is False
+        closing.cancel()
+        await asyncio.sleep(0.02)
+        assert closing.done() is False
+        assert teardown_started.is_set() is False
+    finally:
+        release_flush.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, timeout=1)
+    assert session_closed.is_set()
+    assert teardown_started.is_set()
+    assert teardown_before_cleanup.is_set() is False
+
+
+@pytest.mark.asyncio
 async def test_finalizer_sync_close_is_rejected_inside_event_loop(
     persistence,
 ):
@@ -1154,6 +1234,131 @@ def test_finalizer_capacity_is_bounded_and_auditable(persistence):
         first_result[0].persistence_status
         is PersistenceStatus.PERSISTED
     )
+
+
+def test_completed_result_releases_capacity_before_becoming_visible(
+    persistence,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    first_request = _request()
+    second_request = _request()
+    finalizer = _finalizer(
+        factory,
+        timeout_seconds=2,
+        max_workers=1,
+    )
+    semaphore = finalizer._worker_slots
+    done_state_at_release: list[bool] = []
+    lock_state_at_release: list[bool] = []
+
+    class ReleaseGate:
+        def acquire(self, *args, **kwargs):
+            return semaphore.acquire(*args, **kwargs)
+
+        def release(self) -> None:
+            lock_state_at_release.append(
+                finalizer._workers_lock.locked()
+            )
+            controls = tuple(finalizer._active_controls)
+            assert len(controls) == 1
+            done_state_at_release.append(controls[0].done.is_set())
+            semaphore.release()
+
+    finalizer._worker_slots = ReleaseGate()
+    first_result: list[DecisionResult] = []
+    first = threading.Thread(
+        target=lambda: first_result.append(
+            finalizer.finalize(
+                first_request,
+                _run(first_request, [ref]),
+            )
+        )
+    )
+    first.start()
+    first.join(timeout=5)
+
+    assert not first.is_alive()
+    assert len(first_result) == 1
+    assert lock_state_at_release == [True]
+    assert done_state_at_release == [False]
+    assert (
+        first_result[0].persistence_status
+        is PersistenceStatus.PERSISTED
+    )
+
+    second = finalizer.finalize(
+        second_request,
+        _run(second_request, [ref]),
+    )
+    finalizer.close()
+    assert second.persistence_status is PersistenceStatus.PERSISTED
+
+
+def test_shutdown_cannot_expire_prepared_worker_completion(
+    persistence,
+):
+    _engine, factory = persistence
+    request = _request()
+    finalizer = _finalizer(
+        factory,
+        timeout_seconds=2,
+        max_workers=1,
+    )
+    lock = finalizer._workers_lock
+    completion_waiting = threading.Event()
+    allow_completion = threading.Event()
+
+    class CompletionGate:
+        def __enter__(self):
+            if threading.current_thread().name.startswith(
+                "healthmes-finalizer-"
+            ):
+                completion_waiting.set()
+                if not allow_completion.wait(timeout=5):
+                    raise TimeoutError(
+                        "test completion was not allowed"
+                    )
+            lock.acquire()
+            return self
+
+        def __exit__(self, *_exc_info) -> None:
+            lock.release()
+
+    finalizer._workers_lock = CompletionGate()
+    results: list[DecisionResult] = []
+    worker = threading.Thread(
+        target=lambda: results.append(
+            finalizer.finalize(
+                request,
+                _run(
+                    request,
+                    [],
+                    status=DecisionStatus.NEEDS_CLARIFICATION,
+                ),
+            )
+        )
+    )
+    worker.start()
+    assert completion_waiting.wait(timeout=1)
+
+    shutdown = threading.Thread(target=finalizer.begin_shutdown)
+    shutdown.start()
+    try:
+        shutdown.join(timeout=1)
+        assert not shutdown.is_alive()
+        assert results == []
+    finally:
+        allow_completion.set()
+        worker.join(timeout=5)
+        shutdown.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert not shutdown.is_alive()
+    assert len(results) == 1
+    assert results[0].status is DecisionStatus.NEEDS_CLARIFICATION
+    assert results[0].persistence_status is PersistenceStatus.NOT_REQUIRED
 
 
 def test_finalizer_shutdown_seals_admission_and_fences_precommit(

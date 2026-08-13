@@ -211,6 +211,8 @@ timeout으로 아직 agent 단계에 있는 요청을 취소할 때는 finalizer
 `DecisionFinalizer`를 엔진 밖에서 직접 소유하는 adapter나 테스트도 같은 규칙을
 지켜야 한다. 동기 owner는 `finalizer.close()`, async owner는
 `await finalizer.aclose()`를 호출한 뒤 session factory의 engine을 dispose한다.
+`aclose()`는 호출 task가 취소되더라도 이미 승인된 worker의 drain을 끝낸 뒤
+취소를 다시 전달하므로, async cleanup stack이 DB dispose로 먼저 넘어가지 않는다.
 deadline 결과를 받았다는 사실만으로 background worker의 connection cleanup까지
 끝났다고 가정하면 안 된다.
 

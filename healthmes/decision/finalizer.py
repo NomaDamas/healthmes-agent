@@ -271,6 +271,12 @@ class _FinalizationControl:
             return self._phase
 
     def publish(self, result: DecisionResult) -> None:
+        self.prepare_result(result)
+        self.signal_done()
+
+    def prepare_result(self, result: DecisionResult) -> None:
+        """Freeze the worker outcome without waking a waiting caller."""
+
         with self._lock:
             if self._phase is not _FinalizationPhase.COMMITTED:
                 self._result = result
@@ -280,6 +286,10 @@ class _FinalizationControl:
                 _FinalizationPhase.OUTCOME_UNKNOWN,
             }:
                 self._phase = _FinalizationPhase.FINISHED
+
+    def signal_done(self) -> None:
+        """Expose a prepared outcome after worker resources are reusable."""
+
         self.done.set()
 
     def snapshot(
@@ -416,10 +426,11 @@ class DecisionFinalizer:
                     code=_PERSISTENCE_FAILURE,
                     persistence_required=_run_requires_persistence(run),
                 )
-            control.publish(result)
-            self._worker_slots.release()
+            control.prepare_result(result)
             with self._workers_lock:
+                self._worker_slots.release()
                 self._active_controls.discard(control)
+                control.signal_done()
 
         thread = threading.Thread(
             target=worker,
@@ -429,16 +440,16 @@ class DecisionFinalizer:
         try:
             thread.start()
         except BaseException:
-            control.publish(
-                _failure_result(
-                    run,
-                    code=_PERSISTENCE_FAILURE,
-                    persistence_required=_run_requires_persistence(run),
-                )
+            result = _failure_result(
+                run,
+                code=_PERSISTENCE_FAILURE,
+                persistence_required=_run_requires_persistence(run),
             )
-            self._worker_slots.release()
+            control.prepare_result(result)
             with self._workers_lock:
+                self._worker_slots.release()
                 self._active_controls.discard(control)
+                control.signal_done()
         return control
 
     def begin_shutdown(self) -> None:
@@ -466,10 +477,27 @@ class DecisionFinalizer:
             await asyncio.sleep(0.01)
 
     async def aclose(self) -> None:
-        """Seal admission and drain workers before the database is disposed."""
+        """Seal admission and durably drain before the database is disposed."""
 
         self.begin_shutdown()
-        await self.adrain()
+        cancelled: asyncio.CancelledError | None = None
+        current = asyncio.current_task()
+        while True:
+            cancelling_before = (
+                current.cancelling() if current is not None else 0
+            )
+            try:
+                await self.adrain()
+                break
+            except asyncio.CancelledError as exc:
+                cancelling_after = (
+                    current.cancelling() if current is not None else 0
+                )
+                if current is None or cancelling_after <= cancelling_before:
+                    raise
+                cancelled = exc
+        if cancelled is not None:
+            raise cancelled
 
     def close(self) -> None:
         """Synchronously close when no event loop is running."""
