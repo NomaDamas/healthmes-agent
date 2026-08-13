@@ -15,4 +15,3 @@ def session() -> Iterator[Session]:
         yield value
         value.rollback()
     engine.dispose()
-
