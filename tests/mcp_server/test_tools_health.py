@@ -154,7 +154,13 @@ class TestWhoopRecoveryContext:
         self, mcp_client, mcp_env, call_tool
     ):
         mcp_env.add_score("recovery", "whoop", "2026-07-08T07:00:00+09:00", 50)
-        mcp_env.add_score("day_strain", "whoop", "2026-07-08T17:00:00+09:00", 14)
+        mcp_env.add_score(
+            "day_strain",
+            "whoop",
+            "2026-07-08T17:00:00+09:00",
+            14,
+            components={"cycle_updated_at": {"qualifier": "2026-07-09T01:00:00+00:00"}},
+        )
         mcp_env.add_score("strain", "whoop", "2026-07-08T09:00:00+09:00", 5)
 
         result = await call_tool(mcp_client, "get_whoop_recovery_context", {"date": AS_OF})
@@ -167,6 +173,8 @@ class TestWhoopRecoveryContext:
         assert result["strain"]["source_category"] == "day_strain"
         assert result["strain"]["label"] == "high"
         assert result["strain"]["raw_value"] == 14.0
+        assert result["strain"]["observed_on"] == AS_OF
+        assert result["strain"]["updated_at"] == "2026-07-09T01:00:00+00:00"
         assert all(
             request.url.params.get("category") != "strain" for request in mcp_env.requests[-2:]
         )

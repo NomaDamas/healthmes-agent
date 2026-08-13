@@ -40,9 +40,10 @@ class TestWhoopDayStrain:
         assert score is not None
         assert score.category == HealthScoreCategory.DAY_STRAIN
         assert score.value == 14.2
-        assert score.recorded_at == datetime(2026, 8, 13, 6, 20, tzinfo=timezone.utc)
+        assert score.recorded_at == datetime(2026, 8, 13, 1, 30, tzinfo=timezone.utc)
         assert score.components is not None
         assert score.components["cycle_id"].qualifier == "93845"
+        assert score.components["cycle_updated_at"].qualifier == "2026-08-13T06:20:00+00:00"
 
     def test_rejects_unscored_or_unparseable_cycles(self, data_247: Whoop247Data, scored_cycle: dict) -> None:
         user_id = uuid4()
@@ -54,7 +55,7 @@ class TestWhoopDayStrain:
         assert data_247.normalize_day_strain_health_score(scored_cycle, user_id) is None
 
     @patch("app.services.providers.whoop.data_247.health_score_service")
-    def test_persists_cycle_scores_with_their_source_update_time(
+    def test_persists_cycle_scores_with_their_cycle_start_time(
         self, health_score_service: MagicMock, data_247: Whoop247Data, scored_cycle: dict
     ) -> None:
         db = MagicMock()
@@ -70,5 +71,7 @@ class TestWhoopDayStrain:
         health_score_service.bulk_create.assert_called_once()
         persisted = health_score_service.bulk_create.call_args.args[1][0]
         assert persisted.category == HealthScoreCategory.DAY_STRAIN
-        assert persisted.recorded_at == datetime(2026, 8, 13, 6, 20, tzinfo=timezone.utc)
+        assert persisted.recorded_at == datetime(2026, 8, 13, 1, 30, tzinfo=timezone.utc)
+        assert persisted.components is not None
+        assert persisted.components["cycle_updated_at"].qualifier == "2026-08-13T06:20:00+00:00"
         db.commit.assert_called_once()
