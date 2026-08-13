@@ -218,12 +218,30 @@ HEALTHMES_DECISION_FINALIZATION_TIMEOUT_SECONDS=5
 SQLite는 HealthMes process/file lock뿐 아니라 protocol 밖의 외부 writer가 잡은
 `BEGIN IMMEDIATE`도 임시 `busy_timeout`으로 제한하고, 끝난 뒤 기존 30초 설정을
 복원한다. PostgreSQL은 advisory lock polling과 transaction-local `lock_timeout`,
-`statement_timeout`을 같은 남은 deadline으로 제한한다. 어느 단계든 시간을
-초과하면 `decision_finalization_timeout`이라는 감사 가능한 실패가 되고 REST에서는
-`503 decision_service_unavailable`로 반환된다. 이 제한 덕분에 저장소가 잠겨 있어도
-`aclose()`가 수락된 작업을 무기한 기다리지 않는다. Python payload 생성이나
-SQLAlchemy `flush()`가 deadline을 넘긴 경우에도 `commit()`을 호출하지 않고
-rollback한다.
+`statement_timeout`을 같은 남은 deadline으로 제한한다. Deadline 결과는 commit
+경계에 따라 다르게 처리한다.
+
+```text
+PRE_COMMIT에서 deadline 초과
+  -> commit 진입을 영구 차단
+  -> rollback
+  -> decision_finalization_timeout
+  -> HTTP 503 decision_service_unavailable
+
+COMMITTING에서 deadline 초과
+  -> 저장 성공/실패를 추측하지 않음
+  -> persistence_status=unknown
+  -> HTTP 202 + Location: /v1/wellness-decisions/{request_id}
+  -> 같은 request_id로 저장 결과 재조회
+```
+
+이 제한 덕분에 저장소가 잠겨 있어도 `aclose()`가 수락된 작업을 무기한 기다리지
+않는다. Python payload 생성이나 SQLAlchemy `flush()`가 deadline을 넘긴 경우에는
+`commit()`을 호출하지 않고 rollback한다. 반대로 DB driver가 이미 commit을 시작한
+뒤 응답만 늦는 상황에서는 실패나 성공으로 단정하지 않는다. commit이 실제 완료되면
+복구 endpoint가 저장된 private payload와 digest를 다시 검증한
+`PersistenceStatus.PERSISTED` 결과를 반환하고, 아직 행이 없으면 `404`이므로 호출자는
+같은 request ID로 다시 조회할 수 있다.
 
 ### 2.2 운영 설정, 실행 위치와 domain 동의
 
@@ -912,3 +930,5 @@ Hermes가 이미 provider, tool loop, session과 channel을 제공하므로 MVP�
 13. finalization의 payload 생성 또는 flush가 deadline을 넘기면 commit하지 않는다.
 14. Calendar sync, sleep scheduler와 sleep web 경로는 disconnect 뒤 stale backend를
     호출하지 않고 reconnect 뒤 새 credential generation으로 backend를 재생성한다.
+15. commit 시작 전 timeout은 늦은 `DecisionRecord` 생성을 영구 차단하고, commit
+    시작 후 timeout은 `UNKNOWN`으로 반환한 뒤 request ID 조회로만 결과를 복구한다.

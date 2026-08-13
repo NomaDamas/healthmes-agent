@@ -128,8 +128,11 @@ Telegram (phone + watch)          decision viewer (web)
   MCP or database teardown. Finalization has a configurable total deadline
   (`HEALTHMES_DECISION_FINALIZATION_TIMEOUT_SECONDS`, default 5 seconds)
   across policy lookup, process/SQLite/PostgreSQL locks, source revalidation,
-  payload construction, flush, and the final pre-commit boundary; a timeout
-  fails closed as an auditable HTTP 503 instead of hanging shutdown. Every
+  payload construction, flush, and the final pre-commit boundary. A timeout
+  before commit begins fails closed as an auditable HTTP 503 and permanently
+  fences late writes. If the deadline expires after commit begins, HealthMes
+  returns HTTP 202 with `persistence_status=unknown` and a request-ID recovery
+  location rather than guessing whether the database committed. Every
   context tool call re-reads domain consent before and after provider work,
   including revision changes that briefly disable and re-enable a domain.
   Calendar poll, sleep scheduler, and sleep web paths cache backends only for
