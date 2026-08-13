@@ -145,8 +145,13 @@ async def test_mcp_automatically_analyzes_text_capture(
 
 
 async def test_mcp_transcribes_local_voice_before_nutrition_analysis(
-    mcp_client, call_tool, monkeypatch, store_factory
+    mcp_client, call_tool, monkeypatch, store_factory, freeze_retention_clock
 ):
+    freeze_retention_clock(
+        datetime(2026, 8, 7, 12, tzinfo=UTC),
+        "nutrition_repository",
+        "nutrition_intake",
+    )
     provider = FakeAnalysis()
     monkeypatch.setattr(
         server_module,
