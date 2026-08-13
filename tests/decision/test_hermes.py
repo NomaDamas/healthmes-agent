@@ -735,7 +735,20 @@ async def test_adapter_rejects_unknown_or_forged_tool_calls(
 
 
 @pytest.mark.asyncio
-async def test_skill_discovery_flag_does_not_change_runtime_policy_request():
+async def test_skill_discovery_flag_does_not_change_runtime_policy_request(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fixed_monotonic() -> float:
+        return 1_000.0
+
+    monkeypatch.setattr(
+        "healthmes.decision.hermes.monotonic",
+        fixed_monotonic,
+    )
+    monkeypatch.setattr(
+        "healthmes.decision.validation.monotonic",
+        fixed_monotonic,
+    )
     transports = [
         FakeTransport(capabilities=_capabilities(skills_api=value))
         for value in (False, True)
