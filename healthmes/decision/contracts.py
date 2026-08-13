@@ -148,6 +148,7 @@ class PersistenceStatus(StrEnum):
     NOT_REQUIRED = "not_required"
     PERSISTED = "persisted"
     FAILED = "failed"
+    UNKNOWN = "unknown"
 
 
 class CompatibilityPreset(StrEnum):

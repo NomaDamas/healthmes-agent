@@ -53,7 +53,12 @@ from healthmes.calendars.sleep_mirror import (
     SLEEP_CREATE_PENDING_STATUS,
     SLEEP_UPDATE_PENDING_STATUS,
 )
-from healthmes.calendars.state import PendingDiffStore, SyncStateStore
+from healthmes.calendars.state import (
+    PendingDiffStore,
+    SyncStateStore,
+    sync_state_account_generation,
+    with_sync_state_account_generation,
+)
 from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror, Task
 
@@ -187,6 +192,8 @@ class CalendarMirrorService:
         backends: Iterable[CalendarBackend],
         state_store: SyncStateStore,
         pending_store: PendingDiffStore | None = None,
+        *,
+        account_generation: str | None = None,
     ) -> None:
         self._session = session
         self._backends: dict[CalendarSource, CalendarBackend] = {}
@@ -196,6 +203,11 @@ class CalendarMirrorService:
             self._backends[backend.source] = backend
         self._state_store = state_store
         self._pending_store = pending_store
+        self._account_generation = account_generation
+
+    @property
+    def account_generation(self) -> str | None:
+        return self._account_generation
 
     # -- pull / diff -------------------------------------------------------
 
@@ -210,6 +222,12 @@ class CalendarMirrorService:
         """Pull one backend's changes, upsert the mirror, persist sync state."""
         source = backend.source
         previous_state = self._state_store.load(source)
+        if (
+            self._account_generation is not None
+            and sync_state_account_generation(previous_state)
+            != self._account_generation
+        ):
+            previous_state = None
         bootstrap = previous_state is None
         # Carry forward any diff a previous run journaled but never delivered
         # (its cursor save failed after the idempotent mirror commit landed).
@@ -247,6 +265,11 @@ class CalendarMirrorService:
         if diff.has_changes:
             self._save_pending(source, diff)
         self._session.commit()
+        if self._account_generation is not None:
+            new_state = with_sync_state_account_generation(
+                new_state,
+                self._account_generation,
+            )
         self._state_store.save(source, new_state)
         self._clear_pending(source)
         if diff.has_changes:
@@ -264,11 +287,24 @@ class CalendarMirrorService:
         if self._pending_store is None:
             return None
         payload = self._pending_store.load(source)
+        if (
+            payload
+            and self._account_generation is not None
+            and payload.get("_healthmes_account_generation")
+            != self._account_generation
+        ):
+            self._pending_store.clear(source)
+            return None
         return SyncDiff.from_payload(payload) if payload else None
 
     def _save_pending(self, source: CalendarSource, diff: SyncDiff) -> None:
         if self._pending_store is not None:
-            self._pending_store.save(source, diff.to_payload())
+            payload = diff.to_payload()
+            if self._account_generation is not None:
+                payload["_healthmes_account_generation"] = (
+                    self._account_generation
+                )
+            self._pending_store.save(source, payload)
 
     def _clear_pending(self, source: CalendarSource) -> None:
         if self._pending_store is not None:
@@ -334,6 +370,7 @@ class CalendarMirrorService:
                 CalendarEventMirror(
                     external_id=event.external_id,
                     calendar_source=source,
+                    connection_generation=self._account_generation,
                     summary=event.summary,
                     start_at=event.start_at,
                     end_at=event.end_at,
@@ -378,6 +415,12 @@ class CalendarMirrorService:
         # external, and what would have been an agent-move is reclassified into
         # the external ``diff.moved`` bucket below.
         ownership_changed = row.is_agent_created != trusted_agent
+        generation_changed = (
+            self._account_generation is not None
+            and row.connection_generation != self._account_generation
+        )
+        if generation_changed:
+            self._retire_intake_task(row)
 
         if (
             not moved
@@ -385,6 +428,7 @@ class CalendarMirrorService:
             and not ownership_changed
             and not metadata_changed
             and not healthmes_changed
+            and not generation_changed
         ):
             # Byte-identical, same-tag re-delivery (410 full resync, lost
             # sync-state file, crash between commit and cursor save): write
@@ -406,6 +450,21 @@ class CalendarMirrorService:
                 "etag": event.etag,
                 "is_agent_created": trusted_agent,
                 "agent_task_id": resolved_task_id if trusted_agent else None,
+                "connection_generation": (
+                    self._account_generation
+                    if self._account_generation is not None
+                    else row.connection_generation
+                ),
+                "intake_task_id": (
+                    None
+                    if generation_changed
+                    else row.intake_task_id
+                ),
+                "intake_opted_out": (
+                    False
+                    if generation_changed
+                    else row.intake_opted_out
+                ),
                 **_mirror_healthmes_kwargs(
                     event,
                     trusted_agent=trusted_agent,
@@ -442,6 +501,7 @@ class CalendarMirrorService:
         if row is None or _pending_sleep_intent(row):
             return
         snapshot = _mirror_snapshot(row)
+        self._retire_intake_task(row)
         change = EventChange(
             calendar_source=source,
             external_id=event.external_id,
@@ -471,7 +531,8 @@ class CalendarMirrorService:
         sync has an empty mirror, so this reconcile is a silent no-op then.
         """
         statement = select(CalendarEventMirror).where(
-            CalendarEventMirror.calendar_source == source
+            CalendarEventMirror.calendar_source == source,
+            self._generation_predicate(),
         ).order_by(CalendarEventMirror.external_id)
         for row in self._session.execute(statement).scalars().all():
             if row.external_id in seen_ids:
@@ -484,6 +545,7 @@ class CalendarMirrorService:
             ):
                 continue
             snapshot = _mirror_snapshot(row)
+            self._retire_intake_task(row)
             change = EventChange(
                 calendar_source=source,
                 external_id=row.external_id,
@@ -533,6 +595,7 @@ class CalendarMirrorService:
         row = existing or CalendarEventMirror(
             external_id=created.external_id,
             calendar_source=source,
+            connection_generation=self._account_generation,
             start_at=created.start_at,
             end_at=created.end_at,
         )
@@ -542,6 +605,8 @@ class CalendarMirrorService:
         row.is_agent_created = True
         row.agent_task_id = self._resolve_task_id(draft.agent_task_id)
         row.etag = created.etag
+        if self._account_generation is not None:
+            row.connection_generation = self._account_generation
         row.healthmes_kind = identity.kind.value if identity is not None else None
         row.healthmes_source = identity.source if identity is not None else None
         row.healthmes_source_key = (
@@ -694,6 +759,13 @@ class CalendarMirrorService:
             return None
         return task_id if self._session.get(Task, task_id) is not None else None
 
+    def _retire_intake_task(self, row: CalendarEventMirror) -> None:
+        if row.intake_task_id is None:
+            return
+        task = self._session.get(Task, row.intake_task_id)
+        if task is not None:
+            task.status = "cancelled"
+
     def _quarantine_identity_conflicts(
         self,
         source: CalendarSource,
@@ -704,6 +776,7 @@ class CalendarMirrorService:
             self._session.scalars(
                 select(CalendarEventMirror).where(
                     CalendarEventMirror.calendar_source == source,
+                    self._generation_predicate(),
                     CalendarEventMirror.healthmes_source_key == identity.source_key,
                     CalendarEventMirror.external_id != expected_external_id,
                 )
@@ -775,6 +848,7 @@ class CalendarMirrorService:
     def _get_row(self, source: CalendarSource, external_id: str) -> CalendarEventMirror | None:
         statement = select(CalendarEventMirror).where(
             CalendarEventMirror.calendar_source == source,
+            self._generation_predicate(),
             CalendarEventMirror.external_id == external_id,
         )
         return self._session.execute(statement).scalar_one_or_none()
@@ -788,6 +862,7 @@ class CalendarMirrorService:
             select(CalendarEventMirror)
             .where(
                 CalendarEventMirror.calendar_source == source,
+                self._generation_predicate(),
                 CalendarEventMirror.external_id == external_id,
             )
             .with_for_update()
@@ -795,6 +870,14 @@ class CalendarMirrorService:
         )
         with self._session.no_autoflush:
             return self._session.execute(statement).scalar_one_or_none()
+
+    def _generation_predicate(self) -> sa.ColumnElement[bool]:
+        if self._account_generation is None:
+            return CalendarEventMirror.connection_generation.is_(None)
+        return (
+            CalendarEventMirror.connection_generation
+            == self._account_generation
+        )
 
     def _cas_update_row(
         self,

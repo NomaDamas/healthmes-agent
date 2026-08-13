@@ -21,11 +21,15 @@ The Phase-2 focus template is fed from the local store; its hand-computed
 seed lives in the ``seeded_focus_data`` fixture (see its docstring).
 """
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 
+from healthmes.api import insights as insights_api
+from healthmes.calendars.state import FileSyncHealthStore
+from healthmes.calendars.visibility import CalendarVisibilityChanged
 from healthmes.storage import update_retention_policy
 from healthmes.store import (
     AppUsageSample,
@@ -38,6 +42,8 @@ from healthmes.store import (
 USER_ID = "u-1"
 PERIOD_BODY = {"period_start": "2026-07-06", "period_end": "2026-07-07"}
 PERIOD = "2026-07-06..2026-07-07"
+GOOGLE_ACCOUNT_GENERATION = "a" * 32
+RECONNECTED_GOOGLE_ACCOUNT_GENERATION = "c" * 32
 
 STRESS_POINTS = [
     ("2026-07-06T09:00:00Z", 60),
@@ -81,6 +87,34 @@ WORKOUTS = [
 def historical_activity_usage_retention(session):
     update_retention_policy(session, "activity_raw", "forever")
     session.commit()
+
+
+def _connect_google(app, generation: str = GOOGLE_ACCOUNT_GENERATION) -> None:
+    path = app.state.settings.data_dir / "google" / "calendar_token.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "refresh_token": "fake-refresh",
+                "client_id": "test.apps.googleusercontent.com",
+                "client_secret": "fake-secret",
+                "_healthmes_account_generation": generation,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture(autouse=True)
+def visible_google_calendar(app):
+    _connect_google(app)
+    FileSyncHealthStore.for_data_dir(app.state.settings.data_dir).record_success(
+        CalendarSource.GOOGLE,
+        datetime(2026, 7, 6, 8, tzinfo=UTC),
+        event_count=0,
+        account_generation=GOOGLE_ACCOUNT_GENERATION,
+    )
 
 
 def _stress_page(points):
@@ -137,6 +171,7 @@ def seeded_calendar(session):
             CalendarEventMirror(
                 external_id="ev-1",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=GOOGLE_ACCOUNT_GENERATION,
                 summary="Team standup meeting",
                 start_at=_dt("2026-07-06T09:00:00"),
                 end_at=_dt("2026-07-06T10:00:00"),
@@ -144,6 +179,7 @@ def seeded_calendar(session):
             CalendarEventMirror(
                 external_id="ev-2",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=GOOGLE_ACCOUNT_GENERATION,
                 summary="Planning meeting",
                 start_at=_dt("2026-07-07T09:00:00"),
                 end_at=_dt("2026-07-07T10:00:00"),
@@ -151,6 +187,7 @@ def seeded_calendar(session):
             CalendarEventMirror(
                 external_id="ev-3",
                 calendar_source=CalendarSource.CALDAV,
+                connection_generation="b" * 32,
                 summary="Focus block",
                 start_at=_dt("2026-07-06T14:00:00"),
                 end_at=_dt("2026-07-06T15:00:00"),
@@ -459,6 +496,7 @@ def seeded_focus_data(session):
             CalendarEventMirror(
                 external_id=external_id,
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=GOOGLE_ACCOUNT_GENERATION,
                 summary=summary,
                 start_at=_utc(start),
                 end_at=_utc(end),
@@ -593,6 +631,7 @@ def test_recompute_focus_sparse_data_produces_no_insight(app, client, session, o
             CalendarEventMirror(
                 external_id=f"m-{index}",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=GOOGLE_ACCOUNT_GENERATION,
                 summary="Morning meeting",
                 start_at=_utc(f"2026-07-06T{6 + index:02d}:00:00"),
                 end_at=_utc(f"2026-07-06T{6 + index:02d}:30:00"),
@@ -649,6 +688,112 @@ def test_recompute_focus_flat_profile_reports_no_dip(app, client, session, ow_cl
     assert skipped[FOCUS_KIND] == "no_dip_detected"
 
 
+def test_recompute_marks_calendar_templates_unavailable_after_unsynced_reconnect(
+    app,
+    client,
+    seeded_calendar,
+    ow_client_factory,
+):
+    app.state.ow_client = ow_client_factory(make_handler([]))
+    _connect_google(app, RECONNECTED_GOOGLE_ACCOUNT_GENERATION)
+
+    response = client.post("/v1/insights/recompute", json=PERIOD_BODY)
+
+    assert response.status_code == 200
+    by_kind = {item["kind"] for item in response.json()["insights"]}
+    assert by_kind == {
+        "stress_by_hour",
+        "stress_by_weekday",
+        "activity_type_vs_stress",
+    }
+    skipped = {item["kind"]: item["reason"] for item in response.json()["skipped"]}
+    assert skipped["stress_by_calendar_keyword"] == "calendar_unavailable"
+    assert skipped[FOCUS_KIND] == "insufficient_data"
+    stored = client.get(
+        "/v1/insights",
+        params={"period": PERIOD},
+    ).json()
+    assert stored["pagination"]["total_count"] == 3
+
+
+def test_recompute_rolls_back_when_calendar_reconnects_before_commit(
+    app,
+    client,
+    session,
+    seeded_calendar,
+    ow_client_factory,
+    monkeypatch,
+):
+    app.state.ow_client = ow_client_factory(make_handler([]))
+    existing = Insight(
+        period=PERIOD,
+        kind="stress_by_hour",
+        statement="existing insight must survive rollback",
+    )
+    session.add(existing)
+    session.commit()
+    original_compute_all = insights_api.compute_all
+
+    def reconnect_during_compute(*args, **kwargs):
+        result = original_compute_all(*args, **kwargs)
+        _connect_google(app, RECONNECTED_GOOGLE_ACCOUNT_GENERATION)
+        return result
+
+    monkeypatch.setattr(
+        insights_api,
+        "compute_all",
+        reconnect_during_compute,
+    )
+
+    response = client.post("/v1/insights/recompute", json=PERIOD_BODY)
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "calendar_unavailable",
+        "message": (
+            "Calendar data changed before the recomputed insights could be "
+            "saved. No insight changes were committed."
+        ),
+        "detail": {"reason_codes": ["calendar_visibility_changed"]},
+    }
+    session.expire_all()
+    stored = client.get(
+        "/v1/insights",
+        params={"period": PERIOD},
+    ).json()
+    assert stored["pagination"]["total_count"] == 1
+    assert stored["data"][0]["statement"] == ("existing insight must survive rollback")
+
+
+def test_recompute_fails_closed_when_calendar_read_never_stabilizes(
+    app,
+    client,
+    ow_client_factory,
+    monkeypatch,
+):
+    app.state.ow_client = ow_client_factory(make_handler([]))
+
+    def unstable_snapshot(*_args, **_kwargs):
+        raise CalendarVisibilityChanged("unstable")
+
+    monkeypatch.setattr(
+        insights_api,
+        "read_visible_calendar",
+        unstable_snapshot,
+    )
+
+    response = client.post("/v1/insights/recompute", json=PERIOD_BODY)
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "calendar_unavailable",
+        "message": (
+            "Calendar data changed while insights were being recomputed. Retry the request."
+        ),
+        "detail": {"reason_codes": ["calendar_visibility_changed"]},
+    }
+
+
 # ---------------------------------------------------------------------------
 # User-timezone bucketing (Settings.timezone) + truncation honesty
 # ---------------------------------------------------------------------------
@@ -681,9 +826,7 @@ def test_recompute_buckets_hours_and_weekdays_in_user_timezone(
     by_kind = {insight["kind"]: insight for insight in response.json()["insights"]}
 
     hour = by_kind["stress_by_hour"]
-    assert hour["statement"] == (
-        "Stress peaks around 22:00 Asia/Seoul (avg 80 vs overall 48)."
-    )
+    assert hour["statement"] == ("Stress peaks around 22:00 Asia/Seoul (avg 80 vs overall 48).")
     assert set(hour["evidence"]["by_hour"]) == {"7", "14", "22"}
     assert hour["evidence"]["by_hour"]["22"] == {"mean": 80.0, "n": 6}
     assert hour["evidence"]["timezone"] == "Asia/Seoul"

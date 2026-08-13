@@ -6,8 +6,10 @@ exactly ``/mcp`` — the URL Hermes registers per vendor/hermes-agent/tools/
 mcp_tool.py), and the in-process APScheduler loops.
 """
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import asyncio
+from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI
 from sqlalchemy.orm import Session
@@ -36,6 +38,12 @@ from healthmes.backup.local import build_backup_job
 from healthmes.calendars.jobs import build_calendar_jobs
 from healthmes.calendars.sleep_job import build_sleep_reconciliation_job
 from healthmes.config import Settings, get_settings, resolve_timezone
+from healthmes.decision import (
+    build_configured_decision_engine,
+    ensure_decision_domain_policies,
+)
+from healthmes.decision.domain_providers import WearableReader
+from healthmes.decision.hermes import HermesIterationTransport
 from healthmes.engine.cognitive_energy import build_energy_job
 from healthmes.engine.scheduler import (
     create_scheduler,
@@ -51,15 +59,45 @@ from healthmes.engine.scheduler import (
 )
 from healthmes.mcp_server import server as mcp_server
 from healthmes.storage import build_storage_maintenance_job
-from healthmes.store import Base, dispose_engine, init_engine, session_scope
+from healthmes.store import (
+    Base,
+    dispose_engine,
+    get_session_factory,
+    init_engine,
+    session_scope,
+)
+
+
+async def _close_decision_engine_durably(decision_engine) -> None:
+    """Drain accepted decisions before propagating external cancellation."""
+
+    cancelled: asyncio.CancelledError | None = None
+    current = asyncio.current_task()
+    while True:
+        cancelling_before = (
+            current.cancelling() if current is not None else 0
+        )
+        try:
+            await decision_engine.aclose()
+            break
+        except asyncio.CancelledError as exc:
+            cancelling_after = (
+                current.cancelling() if current is not None else 0
+            )
+            if current is None or cancelling_after <= cancelling_before:
+                raise
+            cancelled = exc
+    if cancelled is not None:
+        raise cancelled
 
 
 def _initialize_activity_storage(
     session: Session,
     *,
     timezone: str,
+    decision_owner_principal_id: str,
 ) -> None:
-    """Bootstrap activity policies and derivations under the global write lock."""
+    """Bootstrap local data policies under the global write-plane lock."""
     with activity_write_lock():
         lock_activity_write_plane(session)
         backfill_android_canonical_events(
@@ -67,9 +105,19 @@ def _initialize_activity_storage(
             timezone=timezone,
         )
         migrate_activity_summary_derivations(session)
+        ensure_decision_domain_policies(
+            session,
+            decision_owner_principal_id,
+        )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    decision_transport: HermesIterationTransport | None = None,
+    decision_wearable_reader: WearableReader | None = None,
+    decision_clock: Callable[[], datetime] | None = None,
+) -> FastAPI:
     """Build the HealthMes FastAPI application.
 
     Feature layers (store, engine, calendars, mcp_server, api) are wired here;
@@ -86,63 +134,104 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Bind the process-wide store engine to *this* app's settings so
-        # SessionDep / session_scope() hit the configured database instead of
-        # lazily reading the environment at first use.
-        engine = init_engine(settings)
-        if engine.dialect.name == "sqlite":
-            Base.metadata.create_all(engine)
-        with session_scope() as session:
-            _initialize_activity_storage(
-                session,
-                timezone=str(resolve_timezone(settings)),
+        app.state.scheduler = None
+        app.state.decision_engine = None
+        async with AsyncExitStack() as cleanup:
+            # Register each cleanup immediately after ownership is acquired.
+            # LIFO then guarantees scheduler -> decisions -> MCP -> DB even
+            # when a later startup step fails.
+            engine = init_engine(settings)
+            cleanup.callback(dispose_engine)
+            if engine.dialect.name == "sqlite":
+                Base.metadata.create_all(engine)
+            with session_scope() as session:
+                _initialize_activity_storage(
+                    session,
+                    timezone=str(resolve_timezone(settings)),
+                    decision_owner_principal_id=(
+                        settings.decision_owner_principal_id
+                    ),
+                )
+
+            mcp_server.set_settings(settings)
+            cleanup.callback(mcp_server.set_settings, None)
+            await cleanup.enter_async_context(mcp_app.lifespan(mcp_app))
+
+            wearable_reader = (
+                decision_wearable_reader
+                if decision_wearable_reader is not None
+                else lambda day: mcp_server.get_daily_readiness_context(
+                    day.isoformat()
+                )
             )
-        # MCP tools resolve settings through the same override hook the tests
-        # use, so tools always agree with the app about endpoints/keys.
-        mcp_server.set_settings(settings)
-        # Background loops: the 10-minute trigger sweep (created with the
-        # scheduler), the hourly cognitive-energy persist (PLAN §3), the
-        # weekly encrypted backup (PLAN §9), and one calendar mirror poll per
-        # enabled backend (PLAN §6 — Google 5 min / CalDAV 10 min; the write
-        # backend also pushes accepted proposals to the external calendar).
-        # All of them only ever run when settings.scheduler_enabled is True —
-        # start_scheduler returns None otherwise (the gate lives inside it).
-        scheduler = create_scheduler(settings)
-        register_energy_job(scheduler, build_energy_job(settings))
-        register_backup_job(scheduler, build_backup_job(settings))
-        register_storage_maintenance_job(scheduler, build_storage_maintenance_job(settings))
-        register_activity_maintenance_job(
-            scheduler,
-            build_activity_maintenance_job(),
-        )
-        activitywatch_job = build_activitywatch_job(settings)
-        if activitywatch_job is not None:
-            register_activitywatch_job(
+            decision_engine = build_configured_decision_engine(
+                settings=settings,
+                session_factory=get_session_factory(),
+                transport=decision_transport,
+                wearable_reader=wearable_reader,
+                clock=decision_clock,
+            )
+            app.state.decision_engine = decision_engine
+            if decision_engine is not None:
+
+                async def close_decision_engine() -> None:
+                    try:
+                        await _close_decision_engine_durably(
+                            decision_engine
+                        )
+                    finally:
+                        app.state.decision_engine = None
+
+                cleanup.push_async_callback(close_decision_engine)
+
+            # Background loops are prepared even when globally disabled so
+            # their configuration remains testable. Register shutdown before
+            # job setup so a partial scheduler startup cannot leak a thread.
+            scheduler = create_scheduler(settings)
+
+            def stop_scheduler() -> None:
+                try:
+                    shutdown_scheduler(scheduler)
+                finally:
+                    app.state.scheduler = None
+
+            cleanup.callback(stop_scheduler)
+            register_energy_job(scheduler, build_energy_job(settings))
+            register_backup_job(scheduler, build_backup_job(settings))
+            register_storage_maintenance_job(
                 scheduler,
-                activitywatch_job,
-                minutes=settings.activitywatch_interval_minutes,
+                build_storage_maintenance_job(settings),
             )
-        register_calendar_adjustment_maintenance_job(
-            scheduler, mcp_server.expire_and_reconcile_calendar_adjustments
-        )
-        for spec in build_calendar_jobs(settings):
-            register_calendar_job(
-                scheduler, spec.job, job_id=spec.job_id, minutes=spec.interval_minutes
+            register_activity_maintenance_job(
+                scheduler,
+                build_activity_maintenance_job(),
             )
-        sleep_job = build_sleep_reconciliation_job(settings)
-        if sleep_job is not None:
-            register_sleep_reconciliation_job(scheduler, sleep_job)
-        app.state.scheduler = start_scheduler(settings, scheduler=scheduler)
-        try:
-            # Chain the MCP app's lifespan: it starts the StreamableHTTP
-            # session manager serving POST /mcp.
-            async with mcp_app.lifespan(mcp_app):
-                yield
-        finally:
-            shutdown_scheduler(app.state.scheduler)
-            app.state.scheduler = None
-            mcp_server.set_settings(None)
-            dispose_engine()
+            activitywatch_job = build_activitywatch_job(settings)
+            if activitywatch_job is not None:
+                register_activitywatch_job(
+                    scheduler,
+                    activitywatch_job,
+                    minutes=settings.activitywatch_interval_minutes,
+                )
+            register_calendar_adjustment_maintenance_job(
+                scheduler,
+                mcp_server.expire_and_reconcile_calendar_adjustments,
+            )
+            for spec in build_calendar_jobs(settings):
+                register_calendar_job(
+                    scheduler,
+                    spec.job,
+                    job_id=spec.job_id,
+                    minutes=spec.interval_minutes,
+                )
+            sleep_job = build_sleep_reconciliation_job(settings)
+            if sleep_job is not None:
+                register_sleep_reconciliation_job(scheduler, sleep_job)
+            app.state.scheduler = start_scheduler(
+                settings,
+                scheduler=scheduler,
+            )
+            yield
 
     app = FastAPI(
         title="HealthMes Agent",
@@ -152,6 +241,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.decision_clock = decision_clock
+    app.state.decision_engine = None
+    app.state.scheduler = None
     install_local_sessions(app)
     install_google_oauth(app)
 

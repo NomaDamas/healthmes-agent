@@ -416,6 +416,89 @@ def test_loopback_google_oauth_connect_and_disconnect_without_secret_render(
         assert creds.google_connection_state(settings.data_dir) == "not_connected"
 
 
+def test_google_oauth_late_callbacks_cannot_overwrite_newer_changes(
+    app,
+    settings,
+) -> None:
+    client_secret = settings.data_dir / "google" / "client_secret.json"
+    client_secret.parent.mkdir(parents=True, exist_ok=True)
+    client_secret.write_text('{"installed":{}}', encoding="utf-8")
+    app.state.google_oauth_flow_factory = lambda *_args: FakeWebFlow()
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as local:
+        page = local.get("/connect")
+        csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+        assert csrf is not None
+
+        older = local.post(
+            "/connect/google/start",
+            data={"csrf": csrf.group(1)},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        newer = local.post(
+            "/connect/google/reconnect",
+            data={"csrf": csrf.group(1)},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        older_state = parse_qs(
+            urlsplit(older.headers["location"]).query
+        )["state"][0]
+        newer_state = parse_qs(
+            urlsplit(newer.headers["location"]).query
+        )["state"][0]
+
+        stale = local.get(
+            f"/connect/google/callback?state={older_state}"
+            "&code=one-time-code",
+            follow_redirects=False,
+        )
+        assert stale.status_code == 409
+        assert creds.google_connection_state(
+            settings.data_dir
+        ) == "not_connected"
+
+        current = local.get(
+            f"/connect/google/callback?state={newer_state}"
+            "&code=one-time-code",
+            follow_redirects=False,
+        )
+        assert current.status_code == 303
+        assert creds.google_connection_state(settings.data_dir) == "connected"
+
+        pending_disconnect = local.post(
+            "/connect/google/reconnect",
+            data={"csrf": csrf.group(1)},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        pending_state = parse_qs(
+            urlsplit(pending_disconnect.headers["location"]).query
+        )["state"][0]
+        disconnected = local.post(
+            "/connect/google/disconnect",
+            data={"csrf": csrf.group(1)},
+            headers={"Origin": "http://127.0.0.1:8100"},
+            follow_redirects=False,
+        )
+        assert disconnected.status_code == 303
+
+        stale_after_disconnect = local.get(
+            f"/connect/google/callback?state={pending_state}"
+            "&code=one-time-code",
+            follow_redirects=False,
+        )
+        assert stale_after_disconnect.status_code == 409
+        assert creds.google_connection_state(
+            settings.data_dir
+        ) == "not_connected"
+
+
 @pytest.mark.asyncio
 async def test_oura_card_reports_missing_api_key(settings) -> None:
     unconfigured = settings.model_copy(update={"ow_api_key": SecretStr("")})

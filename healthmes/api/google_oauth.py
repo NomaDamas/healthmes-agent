@@ -19,6 +19,8 @@ from healthmes.calendars import creds
 from healthmes.calendars.google import GOOGLE_SCOPES, google_token_path, save_credentials
 from healthmes.calendars.google_client import resolve_google_client_secret
 from healthmes.config import Settings
+from healthmes.store.enums import CalendarSource
+from healthmes.store.session import SessionDep
 
 router = APIRouter(tags=["connect"])
 OAUTH_TTL = dt.timedelta(minutes=10)
@@ -39,6 +41,7 @@ class WebOAuthFlow(Protocol):
 class GoogleOAuthAttempt:
     local_session_id: str
     flow: WebOAuthFlow
+    operation_id: str
     expires_at: dt.datetime
 
 
@@ -91,11 +94,16 @@ def _start_redirect(
         include_granted_scopes="true",
         state=secrets.token_urlsafe(24),
     )
+    operation_id = creds.begin_calendar_connection_operation(
+        settings.data_dir,
+        CalendarSource.GOOGLE,
+    )
     request.app.state.google_oauth.put(
         state,
         GoogleOAuthAttempt(
             local.session_id,
             flow,
+            operation_id,
             dt.datetime.now(dt.UTC) + OAUTH_TTL,
         ),
     )
@@ -103,7 +111,11 @@ def _start_redirect(
 
 
 @router.get("/connect/google/callback", name="google_oauth_callback")
-async def google_oauth_callback(request: Request, state: str = "") -> RedirectResponse:
+async def google_oauth_callback(
+    request: Request,
+    session: SessionDep,
+    state: str = "",
+) -> RedirectResponse:
     store = request.app.state.local_sessions
     local = authenticated_local_session(request.scope, store)
     if local is None:
@@ -114,7 +126,25 @@ async def google_oauth_callback(request: Request, state: str = "") -> RedirectRe
     flow = attempt.flow
     flow.fetch_token(authorization_response=str(request.url))
     settings: Settings = request.app.state.settings
-    save_credentials(flow.credentials, google_token_path(settings.data_dir))
+    try:
+        with creds.calendar_connection_write(
+            session,
+            CalendarSource.GOOGLE,
+        ):
+            creds.complete_calendar_connection_operation(
+                settings.data_dir,
+                CalendarSource.GOOGLE,
+                attempt.operation_id,
+                lambda: save_credentials(
+                    flow.credentials,
+                    google_token_path(settings.data_dir),
+                ),
+            )
+    except creds.StaleCalendarConnectionOperation as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Google OAuth attempt was superseded by a newer connection change",
+        ) from exc
     return RedirectResponse("/connect?google=connected", status_code=303)
 
 
@@ -125,10 +155,21 @@ async def reconnect_google(request: Request) -> RedirectResponse:
 
 
 @router.post("/connect/google/disconnect")
-async def disconnect_google(request: Request) -> RedirectResponse:
+async def disconnect_google(
+    request: Request,
+    session: SessionDep,
+) -> RedirectResponse:
     await _authorized_local(request)
     settings: Settings = request.app.state.settings
-    creds.delete_google_token(settings.data_dir)
+    with creds.calendar_connection_write(
+        session,
+        CalendarSource.GOOGLE,
+    ):
+        creds.invalidate_calendar_connection_operation(
+            settings.data_dir,
+            CalendarSource.GOOGLE,
+            lambda: creds.delete_google_token(settings.data_dir),
+        )
     return RedirectResponse("/connect?google=disconnected", status_code=303)
 
 

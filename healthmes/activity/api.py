@@ -980,6 +980,7 @@ async def post_wellness_context(
             body,
             default_timezone=zone,
             wearable_reader=wearable_reader,
+            calendar_settings=request.app.state.settings,
         )
     except WellnessContextRangeError as exc:
         raise APIError(422, "invalid_context_range", str(exc)) from exc

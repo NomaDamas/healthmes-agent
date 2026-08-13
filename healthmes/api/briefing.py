@@ -77,9 +77,16 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
 
 from healthmes.api.auth import viewer_url
 from healthmes.api.common import ensure_utc, utc_now
+from healthmes.api.errors import APIError
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    CalendarVisibilityChanged,
+    read_visible_calendar,
+)
 from healthmes.config import Settings, resolve_timezone
 from healthmes.store import (
     CalendarEventMirror,
@@ -218,8 +225,7 @@ def _energy_block(session: Session, tz: tzinfo, now: datetime) -> GlanceEnergyOu
     local_day = now.astimezone(tz).date()
     local_midnight = datetime.combine(local_day, time.min, tzinfo=tz)
     hour_keys = [
-        _floor_hour((local_midnight + timedelta(hours=hour)).astimezone(UTC))
-        for hour in range(24)
+        _floor_hour((local_midnight + timedelta(hours=hour)).astimezone(UTC)) for hour in range(24)
     ]
 
     rows = session.scalars(
@@ -228,13 +234,10 @@ def _energy_block(session: Session, tz: tzinfo, now: datetime) -> GlanceEnergyOu
             CognitiveEnergyEstimate.window_start < hour_keys[-1] + timedelta(hours=1),
         )
     ).all()
-    scores: dict[datetime, int] = {
-        ensure_utc(row.window_start): row.score for row in rows
-    }
+    scores: dict[datetime, int] = {ensure_utc(row.window_start): row.score for row in rows}
 
     curve = [
-        EnergyCurvePointOut(hour=hour, score=scores.get(hour_keys[hour]))
-        for hour in range(24)
+        EnergyCurvePointOut(hour=hour, score=scores.get(hour_keys[hour])) for hour in range(24)
     ]
 
     current_score: int | None = None
@@ -260,7 +263,11 @@ def _energy_block(session: Session, tz: tzinfo, now: datetime) -> GlanceEnergyOu
     return GlanceEnergyOut(score=current_score, confidence=confidence, curve_24h=curve)
 
 
-def _next_blocks(session: Session, now: datetime) -> list[GlanceBlockOut]:
+def _next_blocks(
+    session: Session,
+    now: datetime,
+    visibility: CalendarVisibility,
+) -> list[GlanceBlockOut]:
     """Up to 3 ongoing/upcoming blocks: mirror events + accepted proposals.
 
     Accepted proposals are the ones *not yet written* to the external calendar
@@ -269,7 +276,10 @@ def _next_blocks(session: Session, now: datetime) -> list[GlanceBlockOut]:
     """
     events = session.scalars(
         select(CalendarEventMirror)
-        .where(CalendarEventMirror.end_at > now)
+        .where(
+            visibility.predicate(),
+            CalendarEventMirror.end_at > now,
+        )
         .order_by(CalendarEventMirror.start_at, CalendarEventMirror.end_at)
         .limit(MAX_NEXT_BLOCKS)
     ).all()
@@ -341,9 +351,7 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
     payload: dict[str, Any] = top.payload or {}
     summary = payload.get("summary")
     decision = session.scalar(
-        select(DecisionRecord)
-        .where(DecisionRecord.trigger_event_id == top.id)
-        .limit(1)
+        select(DecisionRecord).where(DecisionRecord.trigger_event_id == top.id).limit(1)
     )
     return GlanceAlertsOut(
         unresolved_count=len(events),
@@ -377,7 +385,11 @@ def _latest_decision(session: Session, settings: Settings) -> GlanceDecisionOut 
 # ---------------------------------------------------------------------------
 
 
-def _compute_etag(payload: dict[str, Any]) -> str:
+def _compute_etag(
+    payload: dict[str, Any],
+    *,
+    calendar_status: str = "available",
+) -> str:
     """Strong ETag over the payload *content* (``generated_at`` excluded).
 
     The timestamp changes on every request; hashing it would make
@@ -385,6 +397,7 @@ def _compute_etag(payload: dict[str, Any]) -> str:
     ETag identifies the underlying data instead.
     """
     basis = {key: value for key, value in payload.items() if key != "generated_at"}
+    basis["_calendar_status"] = calendar_status
     digest = hashlib.sha256(
         json.dumps(basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -418,17 +431,45 @@ def get_glance_briefing(request: Request, session: SessionDep) -> Response:
     tz = resolve_timezone(settings)
     now = utc_now()
 
-    glance = GlanceOut(
-        generated_at=now,
-        timezone=str(tz),
-        energy=_energy_block(session, tz, now),
-        next_blocks=_next_blocks(session, now),
-        alerts=_alerts_block(session, settings, now),
-        latest_decision=_latest_decision(session, settings),
+    def read_glance(visibility: CalendarVisibility) -> GlanceOut:
+        return GlanceOut(
+            generated_at=now,
+            timezone=str(tz),
+            energy=_energy_block(session, tz, now),
+            next_blocks=_next_blocks(session, now, visibility),
+            alerts=_alerts_block(session, settings, now),
+            latest_decision=_latest_decision(session, settings),
+        )
+
+    try:
+        glance, visibility = read_visible_calendar(
+            session,
+            settings,
+            read_glance,
+        )
+    except CalendarVisibilityChanged as exc:
+        session.rollback()
+        raise APIError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "calendar_unavailable",
+            "The briefing could not obtain a stable Calendar snapshot. Retry the request.",
+            detail={"reason_codes": ["calendar_visibility_changed"]},
+        ) from exc
+
+    calendar_status = (
+        ",".join(visibility.limitations)
+        if visibility.limitations
+        else "available"
+        if visibility.available
+        else "calendar_not_connected"
     )
     payload = glance.model_dump(mode="json")
-    etag = _compute_etag(payload)
-    headers = {"Cache-Control": CACHE_CONTROL_VALUE, "ETag": etag}
+    etag = _compute_etag(payload, calendar_status=calendar_status)
+    headers = {
+        "Cache-Control": CACHE_CONTROL_VALUE,
+        "ETag": etag,
+        "X-HealthMes-Calendar-Status": calendar_status,
+    }
 
     if _if_none_match_hit(request.headers.get("if-none-match"), etag):
         return Response(status_code=304, headers=headers)

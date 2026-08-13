@@ -6,13 +6,17 @@ write backend advances accepted proposals to ``pushed`` by writing tagged
 agent blocks — the contract promised by healthmes/api/schedule.py.
 """
 
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 
+from healthmes.calendars import creds
 from healthmes.calendars.base import (
     CalendarAuthError,
     CalendarConflictError,
@@ -40,13 +44,16 @@ from healthmes.calendars.state import (
 )
 from healthmes.calendars.sync import CalendarMirrorService
 from healthmes.store import (
+    Base,
     CalendarEventMirror,
     CalendarSource,
     ProposalStatus,
     ScheduleProposal,
     Task,
     TaskSource,
+    create_db_engine,
 )
+from tests.calendars.conftest import FakeCalendarBackend
 
 
 def utc(*args: int) -> datetime:
@@ -90,6 +97,115 @@ class TestEnablement:
 
 
 class TestJobRun:
+    def test_disconnect_waits_for_sync_and_reconnect_rebuilds_backend(
+        self,
+        settings,
+        tmp_path,
+    ) -> None:
+        database_url = (
+            f"sqlite+pysqlite:///{tmp_path / 'calendar-fence.db'}"
+        )
+        engine = create_db_engine(database_url)
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+        generation = {"value": "generation-1"}
+        sync_started = threading.Event()
+        release_sync = threading.Event()
+        disconnect_attempted = threading.Event()
+        disconnect_completed = threading.Event()
+        failures: list[BaseException] = []
+
+        class BlockingBackend(FakeCalendarBackend):
+            def list_changes(self, sync_state):
+                sync_started.set()
+                assert release_sync.wait(timeout=5)
+                return super().list_changes(sync_state)
+
+        backends = [
+            BlockingBackend(CalendarSource.GOOGLE),
+            FakeCalendarBackend(CalendarSource.GOOGLE),
+        ]
+        factory_calls = 0
+
+        def build_backend():
+            nonlocal factory_calls
+            backend = backends[factory_calls]
+            factory_calls += 1
+            return backend
+
+        job = build_calendar_job(
+            settings.model_copy(update={"database_url": database_url}),
+            CalendarSource.GOOGLE,
+            is_write_backend=False,
+            backend_factory=build_backend,
+            session_factory=factory,
+            state_store=InMemorySyncStateStore(),
+            pending_store=InMemoryPendingDiffStore(),
+            health_store=InMemorySyncHealthStore(),
+            connection_generation_resolver=lambda: generation["value"],
+        )
+
+        def run_sync() -> None:
+            try:
+                job()
+            except BaseException as exc:
+                failures.append(exc)
+
+        def disconnect() -> None:
+            try:
+                disconnect_attempted.set()
+                with factory() as session:
+                    with creds.calendar_connection_write(
+                        session,
+                        CalendarSource.GOOGLE,
+                    ):
+                        generation["value"] = None
+                disconnect_completed.set()
+            except BaseException as exc:
+                failures.append(exc)
+
+        sync_thread = threading.Thread(target=run_sync)
+        disconnect_thread = threading.Thread(target=disconnect)
+        try:
+            sync_thread.start()
+            assert sync_started.wait(timeout=5)
+            disconnect_thread.start()
+            assert disconnect_attempted.wait(timeout=5)
+            time.sleep(0.1)
+            assert not disconnect_completed.is_set()
+
+            release_sync.set()
+            sync_thread.join(timeout=10)
+            disconnect_thread.join(timeout=10)
+
+            assert not sync_thread.is_alive()
+            assert not disconnect_thread.is_alive()
+            assert disconnect_completed.is_set()
+            assert failures == []
+            assert factory_calls == 1
+            assert len(backends[0].received_sync_states) == 1
+
+            assert job() is None
+            assert factory_calls == 1
+            assert len(backends[0].received_sync_states) == 1
+
+            with factory() as session:
+                with creds.calendar_connection_write(
+                    session,
+                    CalendarSource.GOOGLE,
+                ):
+                    generation["value"] = "generation-2"
+
+            assert job() is not None
+            assert factory_calls == 2
+            assert len(backends[0].received_sync_states) == 1
+            assert len(backends[1].received_sync_states) == 1
+        finally:
+            release_sync.set()
+            sync_thread.join(timeout=5)
+            disconnect_thread.join(timeout=5)
+            engine.dispose()
+
     def test_health_attempt_precedes_backend_construction_and_empty_success(
         self,
         settings,
@@ -119,6 +235,7 @@ class TestJobRun:
                 coverage_kind=SyncCoverageKind.UNKNOWN,
                 coverage_start=None,
                 coverage_end=None,
+                account_generation=None,
             ) -> None:
                 timeline.append("success")
                 super().record_success(
@@ -128,6 +245,7 @@ class TestJobRun:
                     coverage_kind=coverage_kind,
                     coverage_start=coverage_start,
                     coverage_end=coverage_end,
+                    account_generation=account_generation,
                 )
 
         health_store = OrderedHealthStore()
@@ -178,6 +296,7 @@ class TestJobRun:
                 coverage_kind=SyncCoverageKind.UNKNOWN,
                 coverage_start=None,
                 coverage_end=None,
+                account_generation=None,
             ) -> None:
                 with session_factory() as observer:
                     rows = observer.scalars(
@@ -194,6 +313,7 @@ class TestJobRun:
                     coverage_kind=coverage_kind,
                     coverage_start=coverage_start,
                     coverage_end=coverage_end,
+                    account_generation=account_generation,
                 )
 
         health_store = CommitObservingHealthStore()
@@ -332,6 +452,7 @@ class TestJobRun:
                 coverage_kind=SyncCoverageKind.UNKNOWN,
                 coverage_start=None,
                 coverage_end=None,
+                account_generation=None,
             ) -> None:
                 if failing_method == "record_success":
                     raise OSError("health store unavailable")
@@ -342,6 +463,7 @@ class TestJobRun:
                     coverage_kind=coverage_kind,
                     coverage_start=coverage_start,
                     coverage_end=coverage_end,
+                    account_generation=account_generation,
                 )
 
         job = build_calendar_job(
@@ -611,6 +733,7 @@ class TestJobRun:
             proposed_end=mirror.end_at,
             status=ProposalStatus.ACCEPTED,
             intake_calendar_source=mirror.calendar_source,
+            intake_account_generation=mirror.connection_generation,
             intake_external_id=mirror.external_id,
             intake_revision=intake_revision(mirror),
         )
@@ -661,6 +784,7 @@ class TestJobRun:
             proposed_end=mirror.end_at,
             status=ProposalStatus.ACCEPTED,
             intake_calendar_source=mirror.calendar_source,
+            intake_account_generation=mirror.connection_generation,
             intake_external_id=mirror.external_id,
             intake_revision=intake_revision(mirror),
         )
@@ -684,6 +808,128 @@ class TestJobRun:
         assert fake_backend.created_drafts == []
         assert session.get(ScheduleProposal, proposal.id).status is (
             ProposalStatus.INVALIDATED
+        )
+        assert session.get(
+            ScheduleProposal,
+            proposal.id,
+        ).invalidation_reason == "calendar_intake_event_changed"
+
+    def test_cross_provider_timed_intake_uses_original_account_generation(
+        self,
+        session,
+        fake_backend_factory,
+    ) -> None:
+        google_generation = "google-account-a"
+        caldav_generation = "caldav-account-b"
+        task = Task(title="Use existing Google block", source=TaskSource.USER)
+        session.add(task)
+        session.flush()
+        mirror = CalendarEventMirror(
+            external_id="google-timed-intake",
+            calendar_source=CalendarSource.GOOGLE,
+            connection_generation=google_generation,
+            summary="[HM] Use existing Google block",
+            start_at=utc(2026, 8, 4, 9),
+            end_at=utc(2026, 8, 4, 10),
+            organizer_self=True,
+            event_type="default",
+            etag="etag-1",
+            intake_task_id=task.id,
+        )
+        session.add(mirror)
+        session.flush()
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=mirror.start_at,
+            proposed_end=mirror.end_at,
+            status=ProposalStatus.ACCEPTED,
+            intake_calendar_source=mirror.calendar_source,
+            intake_account_generation=google_generation,
+            intake_external_id=mirror.external_id,
+            intake_revision=intake_revision(mirror),
+        )
+        session.add(proposal)
+        session.commit()
+        caldav_backend = fake_backend_factory(CalendarSource.CALDAV)
+        service = CalendarMirrorService(
+            session,
+            [caldav_backend],
+            InMemorySyncStateStore(),
+            account_generation=caldav_generation,
+        )
+
+        assert push_accepted_proposals(
+            service,
+            session,
+            CalendarSource.CALDAV,
+            current_account_generations={
+                CalendarSource.GOOGLE: google_generation,
+                CalendarSource.CALDAV: caldav_generation,
+            },
+        ) == 1
+
+        assert caldav_backend.created_drafts == []
+        stored = session.get(ScheduleProposal, proposal.id)
+        assert stored.status is ProposalStatus.PUSHED
+        assert stored.invalidation_reason is None
+
+    def test_timed_intake_from_reconnected_account_is_explicitly_stale(
+        self,
+        session,
+        fake_backend,
+    ) -> None:
+        original_generation = "google-account-a"
+        task = Task(title="Stale account block", source=TaskSource.USER)
+        session.add(task)
+        session.flush()
+        mirror = CalendarEventMirror(
+            external_id="stale-google-intake",
+            calendar_source=CalendarSource.GOOGLE,
+            connection_generation=original_generation,
+            summary="[HM] Stale account block",
+            start_at=utc(2026, 8, 4, 9),
+            end_at=utc(2026, 8, 4, 10),
+            organizer_self=True,
+            event_type="default",
+            etag="etag-1",
+            intake_task_id=task.id,
+        )
+        session.add(mirror)
+        session.flush()
+        proposal = ScheduleProposal(
+            task_id=task.id,
+            proposed_start=mirror.start_at,
+            proposed_end=mirror.end_at,
+            status=ProposalStatus.ACCEPTED,
+            intake_calendar_source=mirror.calendar_source,
+            intake_account_generation=original_generation,
+            intake_external_id=mirror.external_id,
+            intake_revision=intake_revision(mirror),
+        )
+        session.add(proposal)
+        session.commit()
+        service = CalendarMirrorService(
+            session,
+            [fake_backend],
+            InMemorySyncStateStore(),
+            account_generation="google-account-b",
+        )
+
+        assert push_accepted_proposals(
+            service,
+            session,
+            CalendarSource.GOOGLE,
+            current_account_generations={
+                CalendarSource.GOOGLE: "google-account-b"
+            },
+        ) == 0
+
+        assert fake_backend.created_drafts == []
+        stored = session.get(ScheduleProposal, proposal.id)
+        assert stored.status is ProposalStatus.INVALIDATED
+        assert (
+            stored.invalidation_reason
+            == "calendar_intake_account_changed"
         )
 
     def test_all_day_intake_still_creates_provider_agnostic_output_block(

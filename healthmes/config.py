@@ -15,10 +15,10 @@ import logging
 import zoneinfo
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 from urllib.parse import urlparse
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from healthmes.timezones import parse_timezone
@@ -68,6 +68,82 @@ class Settings(BaseSettings):
     hermes_webhook_secret: SecretStr = Field(
         default=SecretStr(""),
         description="HMAC secret shared with the Hermes webhook route.",
+    )
+    decision_hermes_base_url: str | None = Field(
+        default=None,
+        max_length=2_048,
+        description="Hermes origin exposing the HealthMes-required "
+        "single-model-iteration contract. None keeps the decision REST "
+        "entrypoint fail-closed; the generic Hermes chat endpoint is never "
+        "used as a fallback.",
+    )
+    decision_hermes_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="Optional bearer credential for the dedicated Hermes "
+        "decision runtime. Remote origins require a credential.",
+    )
+    decision_hermes_model: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Exact model identity expected from Hermes decision "
+        "iterations. Required together with decision_hermes_provider and "
+        "decision_hermes_base_url.",
+    )
+    decision_hermes_provider: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Exact provider identity expected from Hermes decision "
+        "iterations. Required together with decision_hermes_model and "
+        "decision_hermes_base_url.",
+    )
+    decision_hermes_discovery_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=60,
+        description="Timeout for probing the Hermes single-iteration "
+        "capability contract.",
+    )
+    decision_hermes_max_iteration_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        le=300,
+        description="Upper bound for one Hermes model iteration.",
+    )
+    decision_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=300,
+        description="Wall-clock deadline for one complete HealthMes decision "
+        "turn, including all model iterations and context calls.",
+    )
+    decision_finalization_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=60,
+        description="Maximum time allowed for atomic source revalidation "
+        "and DecisionRecord persistence after model reasoning completes. "
+        "Bounds process, SQLite file, and PostgreSQL transaction waits so "
+        "accepted requests can drain during shutdown.",
+    )
+    decision_execution_scope: Literal["local", "hosted"] = Field(
+        default="local",
+        description="Where decision prompts and aggregate context are "
+        "processed. Local requires a loopback Hermes origin. Operators must "
+        "explicitly select hosted when loopback Hermes proxies a cloud model.",
+    )
+    decision_max_pending_requests: int = Field(
+        default=8,
+        ge=1,
+        le=128,
+        description="Maximum accepted Decision Agent requests, including the "
+        "one currently executing. Additional requests fail fast with 429.",
+    )
+    decision_owner_principal_id: str = Field(
+        default="owner",
+        min_length=1,
+        max_length=255,
+        description="Server-owned identity of the single local HealthMes "
+        "owner. Decision clients cannot supply or override this value.",
     )
     public_base_url: str = Field(
         default="http://localhost:8100",
@@ -464,6 +540,9 @@ class Settings(BaseSettings):
         "activitywatch_timezone",
         "activitywatch_window_bucket_id",
         "activitywatch_afk_bucket_id",
+        "decision_hermes_base_url",
+        "decision_hermes_model",
+        "decision_hermes_provider",
         "backup_dir",
         "ow_database_url",
         "hermes_home",
@@ -487,6 +566,62 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator(
+        "decision_hermes_model",
+        "decision_hermes_provider",
+    )
+    @classmethod
+    def _strip_decision_runtime_identity(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("decision runtime identity must not be blank")
+        return cleaned
+
+    @field_validator("decision_owner_principal_id")
+    @classmethod
+    def _strip_decision_owner_principal_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError(
+                "decision owner principal ID must not be blank"
+            )
+        return cleaned
+
+    @model_validator(mode="after")
+    def _validate_decision_runtime_bundle(self) -> Self:
+        configured = (
+            self.decision_hermes_base_url,
+            self.decision_hermes_model,
+            self.decision_hermes_provider,
+        )
+        if any(value is not None for value in configured) and not all(
+            value is not None for value in configured
+        ):
+            raise ValueError(
+                "decision_hermes_base_url, decision_hermes_model, and "
+                "decision_hermes_provider must be configured together"
+            )
+        if (
+            self.decision_execution_scope == "local"
+            and self.decision_hermes_base_url is not None
+        ):
+            parsed = urlparse(self.decision_hermes_base_url)
+            if (
+                parsed.hostname is not None
+                and not is_loopback_host(parsed.hostname)
+            ):
+                raise ValueError(
+                    "local decision execution requires a loopback Hermes "
+                    "origin; set decision_execution_scope='hosted' for "
+                    "remote or cloud processing"
+                )
+        return self
 
     @field_validator("activitywatch_device_id")
     @classmethod

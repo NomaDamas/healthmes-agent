@@ -8,6 +8,7 @@ from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from healthmes.calendars.adjustments_types import (
     APPLYING_RECONCILE_DELAY,
@@ -146,6 +147,7 @@ class SqlAlchemyAdjustmentRepository:
         proposal = CalendarMutationProposal(
             id=proposal_id,
             calendar_source=snapshot.calendar_source,
+            account_generation=snapshot.account_generation,
             mirror_event_id=snapshot.mirror_event_id,
             external_event_id=snapshot.external_event_id,
             operation=AdjustmentOperation.SHORTEN,
@@ -226,13 +228,47 @@ class SqlAlchemyAdjustmentRepository:
 
     def update_mirror_after_apply(
         self, proposal: StoredAdjustmentProposal, event: ExternalEvent
-    ) -> None:
-        mirror = self._session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
-        if mirror is None:
-            return
-        mirror.end_at = event.end_at
-        mirror.etag = event.etag
+    ) -> bool:
+        snapshot = proposal.snapshot
+        if snapshot.mirror_event_id is None:
+            return False
+        result = self._session.execute(
+            sa.update(CalendarEventMirror)
+            .where(
+                CalendarEventMirror.id == snapshot.mirror_event_id,
+                CalendarEventMirror.calendar_source
+                == snapshot.calendar_source,
+                (
+                    CalendarEventMirror.connection_generation.is_(None)
+                    if snapshot.account_generation is None
+                    else CalendarEventMirror.connection_generation
+                    == snapshot.account_generation
+                ),
+                CalendarEventMirror.external_id
+                == snapshot.external_event_id,
+                CalendarEventMirror.start_at
+                == snapshot.original_start_at,
+                CalendarEventMirror.end_at == snapshot.original_end_at,
+                CalendarEventMirror.etag == snapshot.expected_etag,
+            )
+            .values(
+                end_at=event.end_at,
+                etag=event.etag,
+                updated_at=sa.func.now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
         self._session.flush()
+        if result.rowcount != 1:
+            return False
+        identity = self._session.get(
+            CalendarEventMirror,
+            snapshot.mirror_event_id,
+        )
+        if identity is not None:
+            set_committed_value(identity, "end_at", event.end_at)
+            set_committed_value(identity, "etag", event.etag)
+        return True
 
     def compare_and_mark_terminal(
         self,
@@ -300,6 +336,7 @@ class SqlAlchemyAdjustmentRepository:
     def _from_model(row: CalendarMutationProposal) -> StoredAdjustmentProposal:
         snapshot = ProposalSnapshot(
             calendar_source=row.calendar_source,
+            account_generation=row.account_generation,
             mirror_event_id=row.mirror_event_id,
             external_event_id=row.external_event_id,
             operation=row.operation,

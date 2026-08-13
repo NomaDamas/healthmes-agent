@@ -18,8 +18,11 @@ from sqlalchemy import (
     CheckConstraint,
     ForeignKey,
     Index,
+    String,
+    TypeDecorator,
     UniqueConstraint,
     false,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -35,6 +38,27 @@ from healthmes.store.enums import (
     TaskSource,
 )
 
+LEGACY_CALENDAR_ACCOUNT_GENERATION = "__legacy_unbound__"
+
+
+class _CalendarAccountGeneration(TypeDecorator[str]):
+    """Keep legacy unscoped lookups compatible with non-null identities."""
+
+    impl = String
+    cache_ok = True
+
+    class Comparator(TypeDecorator.Comparator[str]):
+        def is_(self, other):
+            if other is None:
+                return self.expr == LEGACY_CALENDAR_ACCOUNT_GENERATION
+            return super().is_(other)
+
+    comparator_factory = Comparator
+
+    def __init__(self) -> None:
+        super().__init__(length=64)
+
+
 __all__ = [
     "WeeklyGoal",
     "Task",
@@ -45,6 +69,7 @@ __all__ = [
     "AppUsageSample",
     "CognitiveEnergyEstimate",
     "DecisionRecord",
+    "DecisionDomainPolicy",
     "Insight",
     "MedicalRecord",
     "TriggerEvent",
@@ -116,12 +141,14 @@ class CalendarEventMirror(Base):
     __table_args__ = (
         UniqueConstraint(
             "calendar_source",
+            "connection_generation",
             "external_id",
-            name="uq_calendar_event_mirror_source_external_id",
+            name="uq_calendar_event_mirror_source_generation_external_id",
         ),
         Index(
             "ux_calendar_event_mirror_calendar_identity",
             "calendar_source",
+            "connection_generation",
             "healthmes_kind",
             "healthmes_source",
             "healthmes_source_key",
@@ -133,10 +160,20 @@ class CalendarEventMirror(Base):
             "healthmes_kind",
             "sleep_local_date",
         ),
+        Index(
+            "ix_calendar_event_mirror_source_connection_generation",
+            "calendar_source",
+            "connection_generation",
+        ),
     )
 
     external_id: Mapped[str_255]
     calendar_source: Mapped[CalendarSource]
+    connection_generation: Mapped[str] = mapped_column(
+        _CalendarAccountGeneration(),
+        default=LEGACY_CALENDAR_ACCOUNT_GENERATION,
+        server_default=LEGACY_CALENDAR_ACCOUNT_GENERATION,
+    )
     summary: Mapped[str | None]
     start_at: Mapped[datetime] = mapped_column(index=True)
     end_at: Mapped[datetime]
@@ -192,8 +229,10 @@ class ScheduleProposal(Base):
     decided_at: Mapped[datetime | None] = mapped_column(index=True)
     decision_surface: Mapped[str_32 | None]
     intake_calendar_source: Mapped[CalendarSource | None]
+    intake_account_generation: Mapped[str_64 | None]
     intake_external_id: Mapped[str_255 | None]
     intake_revision: Mapped[str_255 | None]
+    invalidation_reason: Mapped[str_64 | None]
 
 
 class CalendarMutationProposal(Base):
@@ -207,10 +246,24 @@ class CalendarMutationProposal(Base):
             "attempt_id",
             name="uq_calendar_mutation_proposal_attempt_id",
         ),
+        Index(
+            "ix_calendar_mutation_proposal_source_account_generation",
+            "calendar_source",
+            "account_generation",
+        ),
+        CheckConstraint(
+            "status NOT IN ('pending', 'applying') "
+            "OR (account_generation IS NOT NULL "
+            f"AND account_generation <> '{LEGACY_CALENDAR_ACCOUNT_GENERATION}')",
+            name="active_generation",
+        ),
     )
 
     calendar_source: Mapped[CalendarSource] = mapped_column(
         default=CalendarSource.GOOGLE, index=True
+    )
+    account_generation: Mapped[str_64 | None] = mapped_column(
+        server_default=LEGACY_CALENDAR_ACCOUNT_GENERATION,
     )
     mirror_event_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("calendar_event_mirror.id", ondelete="SET NULL"), index=True
@@ -374,6 +427,34 @@ class DecisionRecord(Base):
     decision_payload: Mapped[JSONDict | None] = mapped_column(default=None)
     decision_payload_digest: Mapped[str_64 | None] = mapped_column(
         default=None,
+    )
+
+
+class DecisionDomainPolicy(Base):
+    """Owner-controlled consent switch for one Decision Agent domain."""
+
+    __tablename__ = "decision_domain_policy"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_principal_id",
+            "domain",
+            name="uq_decision_domain_policy_owner_domain",
+        ),
+        CheckConstraint(
+            "revision >= 1",
+            name="revision_positive",
+        ),
+    )
+
+    owner_principal_id: Mapped[str_255] = mapped_column(index=True)
+    domain: Mapped[str_64] = mapped_column(index=True)
+    enabled: Mapped[bool] = mapped_column(
+        default=True,
+        server_default=true(),
+    )
+    revision: Mapped[int] = mapped_column(
+        default=1,
+        server_default="1",
     )
 
 

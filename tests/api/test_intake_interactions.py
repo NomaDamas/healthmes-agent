@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from threading import Event
 from time import sleep
 from types import SimpleNamespace
@@ -40,6 +40,10 @@ from healthmes.storage import run_storage_maintenance
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
 
 JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
+
+
+def _recent_utc() -> str:
+    return (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
 
 
 class FakeVision:
@@ -211,8 +215,8 @@ def _photo_observation(client) -> str:
         "/v1/nutrition-observations/analyze",
         json={
             "media_path": media_path,
-            "captured_at": "2026-08-06T08:30:00+09:00",
-            "timezone": "Asia/Seoul",
+            "captured_at": _recent_utc(),
+            "timezone": "UTC",
             "source": "ios-photo",
             "location": None,
             "metadata_provenance": {
@@ -777,6 +781,7 @@ def test_voice_capture_requires_local_transcript_and_indexes_audio(
 
 def test_uploaded_media_cannot_be_reused_by_another_capture(client):
     media_path = _upload(client, b"fake-m4a", "audio/m4a", "meal.m4a")
+    observed_at = _recent_utc()
     first = client.post(
         "/v1/intake-interactions",
         json=_text_interaction(
@@ -784,6 +789,8 @@ def test_uploaded_media_cannot_be_reused_by_another_capture(client):
             source_text="아침에 바나나와 우유를 먹었어",
             media_path=media_path,
             items=[],
+            observed_at=observed_at,
+            timezone="UTC",
         ),
     )
     assert first.status_code == 201
@@ -795,6 +802,8 @@ def test_uploaded_media_cannot_be_reused_by_another_capture(client):
             source_text="같은 음성을 다시 연결",
             media_path=media_path,
             items=[],
+            observed_at=observed_at,
+            timezone="UTC",
         ),
     )
 
@@ -1519,8 +1528,8 @@ def test_voice_is_transcribed_locally_then_automatically_analyzed(
             "operation_id": str(uuid.uuid4()),
             "intent": "log_consumed",
             "modality": "voice",
-            "observed_at": "2026-08-06T08:30:00+09:00",
-            "timezone": "Asia/Seoul",
+            "observed_at": _recent_utc(),
+            "timezone": "UTC",
             "source": "android-device",
             "media_path": media_path,
             "allow_remote_analysis": False,
@@ -1768,11 +1777,15 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
         reviewed.json()["review_id"]
     )
 
+    observation_day = observation_event.observed_at
+    if observation_day.tzinfo is None:
+        observation_day = observation_day.replace(tzinfo=UTC)
+    local_date = observation_day.astimezone(UTC).date()
     daily = client.post(
         "/v1/nutrition-observations/daily-confirmations",
         json={
-            "local_date": "2026-08-06",
-            "timezone": "Asia/Seoul",
+            "local_date": local_date.isoformat(),
+            "timezone": "UTC",
             "observation_ids": [observation_id],
             "total_intake_complete": True,
             "source": "desktop-web",
@@ -1782,8 +1795,8 @@ def test_photo_review_correction_flows_into_interaction_search_and_context(
     session.expire_all()
     caffeine = known_caffeine_for_day(
         session,
-        local_date=date(2026, 8, 6),
-        timezone="Asia/Seoul",
+        local_date=local_date,
+        timezone="UTC",
     )
     assert caffeine["status"] == "known"
     assert caffeine["confirmed_caffeine_mg"] == 95

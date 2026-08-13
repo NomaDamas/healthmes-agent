@@ -59,7 +59,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from healthmes import schedule_proposals
 from healthmes.activity.mcp import register_activity_tools
 from healthmes.activity.repository import legacy_app_usage_cutoff
+from healthmes.calendars import creds
 from healthmes.calendars.adjustments import (
+    CalendarAccountGenerationChanged,
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
     SqlAlchemyAdjustmentRepository,
@@ -67,6 +69,7 @@ from healthmes.calendars.adjustments import (
     issue_reply_handle,
 )
 from healthmes.calendars.base import HealthmesEventKind
+from healthmes.calendars.connection import CalendarBackendFence
 from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.calendars.intake import intake_revision
 from healthmes.calendars.sleep_context import (
@@ -77,6 +80,12 @@ from healthmes.calendars.sleep_context import (
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.calendars.sleep_source import (
     select_actual_sleep_rows_with_source,
+)
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    CalendarVisibilityChanged,
+    read_visible_calendar,
+    require_calendar_visibility_current,
 )
 from healthmes.config import Settings, get_settings, system_timezone
 from healthmes.mcp_server import (
@@ -152,6 +161,7 @@ from healthmes.nutrition.vision import (
 from healthmes.store import (
     AppUsageSample,
     CalendarEventMirror,
+    CalendarSource,
     DecisionKind,
     DecisionRecord,
     EnergyDemand,
@@ -253,6 +263,7 @@ _discovered_user_id: str | None = None
 _timezone_override: dt.tzinfo | None = None
 _energy_engine_override: Any | None = None
 _calendar_adjustment_writer_override: CalendarAdjustmentWriter | None = None
+_ACCOUNT_GENERATION_UNCHECKED = object()
 
 
 def set_settings(settings: Settings | None) -> None:
@@ -319,6 +330,65 @@ def reset_runtime_state() -> None:
 
 def _active_settings() -> Settings:
     return _settings_override if _settings_override is not None else get_settings()
+
+
+def _calendar_account_generations() -> dict[CalendarSource, str]:
+    return creds.calendar_account_generations(_active_settings())
+
+
+def _read_visible_calendar_rows(
+    session: Session,
+    statement: Any,
+) -> tuple[list[CalendarEventMirror], CalendarVisibility]:
+    """Read mirror rows from one stable, successfully synced account set."""
+
+    try:
+        return read_visible_calendar(
+            session,
+            _active_settings(),
+            lambda visibility: list(
+                session.scalars(
+                    statement.where(visibility.predicate())
+                ).all()
+            ),
+        )
+    except CalendarVisibilityChanged as exc:
+        raise ToolError(
+            "calendar visibility changed during the request; retry"
+        ) from exc
+
+
+def _read_visible_calendar_event(
+    session: Session,
+    event_id: uuid.UUID,
+) -> tuple[CalendarEventMirror | None, CalendarVisibility]:
+    rows, visibility = _read_visible_calendar_rows(
+        session,
+        select(CalendarEventMirror).where(
+            CalendarEventMirror.id == event_id
+        ),
+    )
+    return (rows[0] if rows else None), visibility
+
+
+def _calendar_limitations(
+    visibility: CalendarVisibility,
+) -> list[str]:
+    return list(visibility.limitations)
+
+
+def _require_calendar_visibility_snapshot(
+    visibility: CalendarVisibility,
+) -> None:
+    try:
+        require_calendar_visibility_current(
+            _active_settings(),
+            visibility,
+        )
+    except CalendarVisibilityChanged as exc:
+        raise ToolError(
+            "calendar visibility changed during the request; retry"
+        ) from exc
 
 
 def get_ow_client() -> OWClient:
@@ -402,30 +472,73 @@ def _build_energy_engine() -> Any:
 
 
 class _LazyGoogleAdjustmentWriter:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        expected_account_generation: str | None | object = (
+            _ACCOUNT_GENERATION_UNCHECKED
+        ),
+    ) -> None:
         self._settings = settings
-        self._backend: GoogleCalendarBackend | None = None
-
-    def _writer(self) -> GoogleCalendarBackend:
-        if self._backend is None:
-            self._backend = GoogleCalendarBackend.from_data_dir(
+        self._expected_account_generation = expected_account_generation
+        self._backend_fence = CalendarBackendFence(
+            source=CalendarSource.GOOGLE,
+            backend_factory=lambda: GoogleCalendarBackend.from_data_dir(
                 self._settings.data_dir,
                 calendar_id=self._settings.google_calendar_id,
                 interactive=False,
+            ),
+            generation_resolver=lambda: (
+                creds.calendar_connection_generation(
+                    self._settings,
+                    CalendarSource.GOOGLE,
+                )
+            ),
+        )
+
+    def _assert_expected_account_generation(self) -> None:
+        if (
+            self._expected_account_generation
+            is _ACCOUNT_GENERATION_UNCHECKED
+        ):
+            return
+        current = creds.calendar_account_generation(
+            self._settings,
+            CalendarSource.GOOGLE,
+        )
+        if current != self._expected_account_generation:
+            raise CalendarAccountGenerationChanged(
+                "calendar account changed after proposal creation"
             )
-        return self._backend
 
     def apply_confirmed_external_time_change(self, change):
-        return self._writer().apply_confirmed_external_time_change(change)
+        with _store_session() as session:
+            with self._backend_fence.use(session) as backend:
+                self._assert_expected_account_generation()
+                writer: CalendarAdjustmentWriter = backend
+                return writer.apply_confirmed_external_time_change(change)
 
     def read_event(self, external_id: str):
-        return self._writer().read_event(external_id)
+        with _store_session() as session:
+            with self._backend_fence.use(session) as backend:
+                self._assert_expected_account_generation()
+                writer: CalendarAdjustmentWriter = backend
+                return writer.read_event(external_id)
 
 
-def _calendar_adjustment_writer() -> CalendarAdjustmentWriter:
+def _calendar_adjustment_writer(
+    source: CalendarSource,
+    account_generation: str | None,
+) -> CalendarAdjustmentWriter | None:
+    if source is not CalendarSource.GOOGLE:
+        return None
     if _calendar_adjustment_writer_override is not None:
         return _calendar_adjustment_writer_override
-    return _LazyGoogleAdjustmentWriter(_active_settings())
+    return _LazyGoogleAdjustmentWriter(
+        _active_settings(),
+        expected_account_generation=account_generation,
+    )
 
 
 def _adjustment_handle_secret(settings: Settings | None = None) -> str:
@@ -990,7 +1103,12 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
         (
             actual_sleep_block,
             actual_sleep_source_ref,
-        ) = actual_sleep_context_with_source_ref(session, as_of, tz)
+        ) = actual_sleep_context_with_source_ref(
+            session,
+            as_of,
+            tz,
+            account_generations=_calendar_account_generations(),
+        )
     fresh_sleep: ActualSleepObservation | None = None
     fresh_sleep_source_row: Mapping[str, Any] | None = None
     if actual_sleep_block["status"] != interpret.STATUS_OK:
@@ -2665,12 +2783,14 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
     end = start + dt.timedelta(days=days)
 
     with _store_session() as session:
-        events = list(
-            session.scalars(
-                select(CalendarEventMirror)
-                .where(CalendarEventMirror.start_at < end, CalendarEventMirror.end_at > start)
-                .order_by(CalendarEventMirror.start_at)
+        events, visibility = _read_visible_calendar_rows(
+            session,
+            select(CalendarEventMirror)
+            .where(
+                CalendarEventMirror.start_at < end,
+                CalendarEventMirror.end_at > start,
             )
+            .order_by(CalendarEventMirror.start_at),
         )
         proposals = list(
             session.scalars(
@@ -2715,11 +2835,13 @@ def get_schedule(range: str = "7d") -> dict[str, Any]:
             }
             for proposal in proposals
         ]
+        _require_calendar_visibility_snapshot(visibility)
     return {
         "status": "ok",
         "window": {"start": _iso_utc(start), "end": _iso_utc(end), "days": days},
         "events": event_payload,
         "proposals": proposal_payload,
+        "calendar_limitations": _calendar_limitations(visibility),
     }
 
 
@@ -2739,12 +2861,14 @@ async def evaluate_morning_calendar_nudge(date: str | None = None) -> dict[str, 
     with _store_session() as write_session:
         repository = SqlAlchemyAdjustmentRepository(write_session)
         repository.begin_evaluation_boundary()
-        candidates = list(
-            write_session.scalars(
-                select(CalendarEventMirror)
-                .where(CalendarEventMirror.start_at < end, CalendarEventMirror.end_at > start)
-                .order_by(CalendarEventMirror.start_at)
+        candidates, visibility = _read_visible_calendar_rows(
+            write_session,
+            select(CalendarEventMirror)
+            .where(
+                CalendarEventMirror.start_at < end,
+                CalendarEventMirror.end_at > start,
             )
+            .order_by(CalendarEventMirror.start_at),
         )
         afternoon_busy = _afternoon_busy_minutes(candidates, local_date, tz)
         candidate_payload = [_mirror_to_adjustment_candidate(event) for event in candidates]
@@ -2777,6 +2901,7 @@ async def evaluate_morning_calendar_nudge(date: str | None = None) -> dict[str, 
             if proposal is not None
             else None
         )
+        _require_calendar_visibility_snapshot(visibility)
         decision_url = (
             display["viewer_url"]
             if display is not None
@@ -2842,7 +2967,14 @@ def resolve_calendar_adjustment(
         if proposal is None:
             raise ToolError("reply_handle is invalid, expired, or already consumed")
 
-        writer = _calendar_adjustment_writer()
+        current_account_generation = creds.calendar_account_generation(
+            _active_settings(),
+            proposal.snapshot.calendar_source,
+        )
+        writer = _calendar_adjustment_writer(
+            proposal.snapshot.calendar_source,
+            proposal.snapshot.account_generation,
+        )
         service = CalendarAdjustmentService(
             repository,
             handle_secret=_adjustment_handle_secret(),
@@ -2859,6 +2991,7 @@ def resolve_calendar_adjustment(
             writer=writer,
             response_channel="telegram",
             mirror_snapshot=mirror_snapshot,
+            current_account_generation=current_account_generation,
         )
         current = repository.get_proposal(proposal.id)
         outcome_url = (
@@ -2874,14 +3007,21 @@ def resolve_calendar_adjustment(
 
 
 def expire_and_reconcile_calendar_adjustments() -> list[dict[str, Any]]:
-    writer = _calendar_adjustment_writer()
     with _store_session() as session:
         repository = SqlAlchemyAdjustmentRepository(session)
         service = CalendarAdjustmentService(
             repository,
             handle_secret=_adjustment_handle_secret(),
         )
-        results = service.expire_and_reconcile_adjustments(writer)
+        results = service.expire_and_reconcile_adjustments(
+            writer_resolver=_calendar_adjustment_writer,
+            account_generation_resolver=lambda source: (
+                creds.calendar_account_generation(
+                    _active_settings(),
+                    source,
+                )
+            ),
+        )
         return [
             {"status": _enum_value(result.status), "receipt": result.receipt} for result in results
         ]
@@ -3080,10 +3220,17 @@ def propose_schedule_blocks(
     with _store_session() as session:
         handle_secret = _adjustment_handle_secret()
         now = dt.datetime.now(dt.UTC)
+        calendar_visibility_snapshots: list[CalendarVisibility] = []
         if decision_uuid is not None and session.get(DecisionRecord, decision_uuid) is None:
             raise ToolError(f"decision_record {decision_record_id} not found")
         for index, (_, start, end) in enumerate(parsed):
-            violation = actual_sleep_violation(session, start, end, _local_timezone())
+            violation = actual_sleep_violation(
+                session,
+                start,
+                end,
+                _local_timezone(),
+                account_generations=_calendar_account_generations(),
+            )
             if violation is not None:
                 raise ToolError(f"blocks[{index}]: {violation}")
         created: list[dict[str, Any]] = []
@@ -3102,6 +3249,26 @@ def propose_schedule_blocks(
                 )
                 session.add(task)
                 session.flush()
+            visible_events, visibility = _read_visible_calendar_rows(
+                session,
+                select(CalendarEventMirror).where(
+                    or_(
+                        (
+                            CalendarEventMirror.start_at < end
+                        )
+                        & (
+                            CalendarEventMirror.end_at > start
+                        ),
+                        (
+                            CalendarEventMirror.intake_task_id
+                            == task.id
+                        )
+                        & CalendarEventMirror.is_agent_created.is_(False)
+                        & CalendarEventMirror.is_all_day.is_(False),
+                    )
+                ),
+            )
+            calendar_visibility_snapshots.append(visibility)
             conflicts = [
                 {
                     "summary": event.summary,
@@ -3109,18 +3276,13 @@ def propose_schedule_blocks(
                     "end": _iso_utc(event.end_at),
                     "is_agent_created": event.is_agent_created,
                 }
-                for event in session.scalars(
-                    select(CalendarEventMirror)
-                    .where(
-                        CalendarEventMirror.start_at < end,
-                        CalendarEventMirror.end_at > start,
-                        or_(
-                            CalendarEventMirror.intake_task_id.is_(None),
-                            CalendarEventMirror.intake_task_id != task.id,
-                        ),
-                    )
-                    .order_by(CalendarEventMirror.start_at)
+                for event in sorted(
+                    visible_events,
+                    key=lambda item: item.start_at,
                 )
+                if _ensure_utc_dt(event.start_at) < end
+                and _ensure_utc_dt(event.end_at) > start
+                and event.intake_task_id != task.id
             ]
             proposal = ScheduleProposal(
                 task_id=task.id,
@@ -3132,13 +3294,10 @@ def propose_schedule_blocks(
             )
             intake_matches = [
                 event
-                for event in session.scalars(
-                    select(CalendarEventMirror).where(
-                        CalendarEventMirror.intake_task_id == task.id,
-                        CalendarEventMirror.is_agent_created.is_(False),
-                        CalendarEventMirror.is_all_day.is_(False),
-                    )
-                )
+                for event in visible_events
+                if event.intake_task_id == task.id
+                and not event.is_agent_created
+                and not event.is_all_day
                 if _ensure_utc_dt(event.start_at) == start
                 and _ensure_utc_dt(event.end_at) == end
             ]
@@ -3149,6 +3308,9 @@ def propose_schedule_blocks(
             if intake_matches:
                 intake_event = intake_matches[0]
                 proposal.intake_calendar_source = intake_event.calendar_source
+                proposal.intake_account_generation = (
+                    intake_event.connection_generation
+                )
                 proposal.intake_external_id = intake_event.external_id
                 proposal.intake_revision = intake_revision(intake_event)
             handle = issue_reply_handle(handle_secret)
@@ -3170,6 +3332,8 @@ def propose_schedule_blocks(
                     "conflicts": conflicts,
                 }
             )
+        for visibility in calendar_visibility_snapshots:
+            _require_calendar_visibility_snapshot(visibility)
     return {"status": "ok", "proposals": created}
 
 
@@ -3221,6 +3385,7 @@ def resolve_schedule_proposal(
                 proposal.proposed_start,
                 proposal.proposed_end,
                 _local_timezone(),
+                account_generations=_calendar_account_generations(),
             )
             if violation is not None:
                 try:
@@ -4430,6 +4595,7 @@ register_activity_tools(
     store_session_factory=_store_session,
     timezone_resolver=_local_timezone,
     readiness_reader=get_daily_readiness_context,
+    settings_resolver=_active_settings,
 )
 
 

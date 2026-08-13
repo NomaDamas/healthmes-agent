@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+import time
 from datetime import UTC, date, datetime
 
 import httpx
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 
+from healthmes.calendars import creds
 from healthmes.calendars.base import (
+    CalendarAuthError,
     CalendarConflictError,
     CalendarEventIdentity,
     EventNotFoundError,
@@ -18,15 +24,19 @@ from healthmes.calendars.base import (
 )
 from healthmes.calendars.sleep_job import (
     build_sleep_reconciliation_job,
+    preview_recent_sleep,
     reconcile_recent_sleep,
 )
 from healthmes.store import (
+    Base,
     CalendarEventMirror,
     CalendarSource,
     ProposalStatus,
     ScheduleProposal,
     Task,
+    create_db_engine,
 )
+from tests.calendars.conftest import FakeCalendarBackend
 
 
 class SleepReader:
@@ -866,6 +876,217 @@ def test_runtime_job_only_proposes_the_recent_local_date_window(
         ("redacted-user", "2026-07-25", "2026-07-26"),
         ("redacted-user", "2026-07-26", "2026-07-27"),
     ]
+
+
+def test_runtime_job_rebuilds_backend_after_connection_generation_change(
+    settings,
+    session_factory,
+) -> None:
+    reader = SleepReader([_summary()])
+    enabled = settings.model_copy(
+        update={
+            "google_calendar_enabled": True,
+            "ow_user_id": "redacted-user",
+            "timezone": "Asia/Seoul",
+        }
+    )
+    generation = {"value": "generation-1"}
+    backends = [
+        FakeCalendarBackend(CalendarSource.GOOGLE),
+        FakeCalendarBackend(CalendarSource.GOOGLE),
+    ]
+    factory_calls = 0
+
+    def build_backend():
+        nonlocal factory_calls
+        backend = backends[factory_calls]
+        factory_calls += 1
+        return backend
+
+    job = build_sleep_reconciliation_job(
+        enabled,
+        client=reader,
+        backend_factory=build_backend,
+        session_factory=session_factory,
+        date_provider=lambda _timezone: date(2026, 7, 26),
+        connection_generation_resolver=lambda: generation["value"],
+    )
+    assert job is not None
+
+    assert job() is not None
+    assert factory_calls == 1
+
+    generation["value"] = None
+    assert job() is None
+    assert factory_calls == 1
+
+    generation["value"] = "generation-2"
+    assert job() is not None
+    assert factory_calls == 2
+
+
+def test_sleep_cli_preview_fences_calendar_disconnect_and_reconnect(
+    settings,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'sleep-preview-fence.db'}"
+    engine = create_db_engine(database_url)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    enabled = settings.model_copy(
+        update={
+            "database_url": database_url,
+            "google_calendar_enabled": True,
+            "ow_user_id": "redacted-user",
+            "timezone": "Asia/Seoul",
+        }
+    )
+    reader = SleepReader([_summary()])
+    generation = {"value": "generation-1"}
+    preview_started = threading.Event()
+    release_preview = threading.Event()
+    disconnect_attempted = threading.Event()
+    disconnect_completed = threading.Event()
+    failures: list[BaseException] = []
+    backends = [
+        FakeCalendarBackend(CalendarSource.GOOGLE),
+        FakeCalendarBackend(CalendarSource.GOOGLE),
+    ]
+    factory_calls = 0
+    preview_backends = []
+
+    def build_backend():
+        nonlocal factory_calls
+        backend = backends[factory_calls]
+        factory_calls += 1
+        return backend
+
+    def blocking_preview(
+        _session,
+        _calendar_source,
+        observation,
+        backend,
+        *,
+        account_generation=None,
+    ):
+        assert account_generation is None
+        preview_backends.append(backend)
+        if len(preview_backends) == 1:
+            preview_started.set()
+            assert release_preview.wait(timeout=5)
+        return {
+            "status": "preview",
+            "action": "would_create",
+            "calendar": "google",
+            "local_date": observation.local_date.isoformat(),
+            "summary": "Sleep (actual)",
+            "start": observation.start_at.isoformat(),
+            "wake_time": observation.end_at.isoformat(),
+            "duration_minutes": observation.duration_minutes,
+            "time_in_bed_minutes": observation.time_in_bed_minutes,
+            "non_sleep_minutes": 30,
+            "source": observation.provider,
+            "planned_sleep_replacements": 0,
+        }
+
+    monkeypatch.setattr(
+        "healthmes.calendars.sleep_job.preview_sleep_reconciliation",
+        blocking_preview,
+    )
+
+    def run_preview() -> None:
+        try:
+            asyncio.run(
+                preview_recent_sleep(
+                    enabled,
+                    date(2026, 7, 26),
+                    client=reader,
+                    backend_factory=build_backend,
+                    session_factory=factory,
+                    connection_generation_resolver=lambda: generation["value"],
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    def disconnect() -> None:
+        try:
+            disconnect_attempted.set()
+            with factory() as session:
+                with creds.calendar_connection_write(
+                    session,
+                    CalendarSource.GOOGLE,
+                ):
+                    generation["value"] = None
+            disconnect_completed.set()
+        except BaseException as exc:
+            failures.append(exc)
+
+    preview_thread = threading.Thread(target=run_preview)
+    disconnect_thread = threading.Thread(target=disconnect)
+    try:
+        preview_thread.start()
+        assert preview_started.wait(timeout=5)
+        disconnect_thread.start()
+        assert disconnect_attempted.wait(timeout=5)
+        time.sleep(0.1)
+        assert not disconnect_completed.is_set()
+
+        release_preview.set()
+        preview_thread.join(timeout=10)
+        disconnect_thread.join(timeout=10)
+
+        assert not preview_thread.is_alive()
+        assert not disconnect_thread.is_alive()
+        assert failures == []
+        assert disconnect_completed.is_set()
+        assert factory_calls == 1
+        assert preview_backends == [backends[0]]
+
+        with pytest.raises(CalendarAuthError):
+            asyncio.run(
+                preview_recent_sleep(
+                    enabled,
+                    date(2026, 7, 26),
+                    client=reader,
+                    backend_factory=build_backend,
+                    session_factory=factory,
+                    connection_generation_resolver=lambda: generation["value"],
+                )
+            )
+        assert factory_calls == 1
+        assert preview_backends == [backends[0]]
+
+        with factory() as session:
+            with creds.calendar_connection_write(
+                session,
+                CalendarSource.GOOGLE,
+            ):
+                generation["value"] = "generation-2"
+        reconnected = asyncio.run(
+            preview_recent_sleep(
+                enabled,
+                date(2026, 7, 26),
+                client=reader,
+                backend_factory=build_backend,
+                session_factory=factory,
+                connection_generation_resolver=lambda: generation["value"],
+            )
+        )
+        assert reconnected["status"] == "preview"
+        assert factory_calls == 2
+        assert preview_backends == [backends[0], backends[1]]
+        assert reader.requests[0] == (
+            "redacted-user",
+            "2026-07-26",
+            "2026-07-27",
+        )
+    finally:
+        release_preview.set()
+        preview_thread.join(timeout=5)
+        disconnect_thread.join(timeout=5)
+        engine.dispose()
 
 
 def test_runtime_job_redacts_provider_user_id_from_failures(

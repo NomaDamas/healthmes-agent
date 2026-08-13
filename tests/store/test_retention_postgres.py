@@ -120,7 +120,13 @@ def test_activity_bootstrap_takes_write_plane_before_policy_inserts(
             worker_started.set()
             try:
                 if bootstrap_path == "startup":
-                    _initialize_activity_storage(session, timezone="UTC")
+                    _initialize_activity_storage(
+                        session,
+                        timezone="UTC",
+                        decision_owner_principal_id=(
+                            settings.decision_owner_principal_id
+                        ),
+                    )
                 else:
                     run_storage_maintenance(
                         session,

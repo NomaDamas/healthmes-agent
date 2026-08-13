@@ -28,6 +28,12 @@ from healthmes.calendars.state import (
     SyncHealthStatus,
     SyncHealthStore,
 )
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    CalendarVisibilityChanged,
+    read_visible_calendar,
+)
+from healthmes.config import Settings
 from healthmes.decision.contracts import (
     ContextCoverage,
     ContextFreshness,
@@ -81,6 +87,11 @@ from healthmes.wearables.provenance import (
 )
 
 WearableReader = Callable[[date], Awaitable[dict[str, Any]]]
+CalendarSourceResolver = Callable[[], Sequence[CalendarSource]]
+CalendarAccountGenerationResolver = Callable[
+    [CalendarSource],
+    str | None,
+]
 
 _DATE_PARAMETER = ContextParameterSpec(
     name="date",
@@ -449,7 +460,10 @@ _WEARABLE_LIMITATION_CODES = (
     "wearable_source_refs_are_readiness_level",
 )
 _CALENDAR_LIMITATION_CODES = (
+    "calendar_account_not_synced",
+    "calendar_connection_state_unavailable",
     "calendar_never_synced",
+    "calendar_not_connected",
     "calendar_mirror_completeness_unknown",
     "calendar_query_outside_sync_coverage",
     "calendar_recent_sync_failure",
@@ -2046,6 +2060,7 @@ def _calendar_rows(
     start: datetime,
     end: datetime,
     sources: Sequence[CalendarSource] | None = None,
+    account_generations: Mapping[CalendarSource, str] | None = None,
 ) -> list[CalendarEventMirror]:
     statement = select(CalendarEventMirror).where(
         CalendarEventMirror.start_at < end,
@@ -2057,7 +2072,20 @@ def _calendar_rows(
             != HealthmesEventKind.ACTUAL_SLEEP.value,
         )
     )
-    if sources is not None:
+    if account_generations is not None:
+        account_filters = tuple(
+            (
+                CalendarEventMirror.calendar_source == source
+            )
+            & (
+                CalendarEventMirror.connection_generation == generation
+            )
+            for source, generation in account_generations.items()
+        )
+        if not account_filters:
+            return []
+        statement = statement.where(or_(*account_filters))
+    elif sources is not None:
         statement = statement.where(
             CalendarEventMirror.calendar_source.in_(sources)
         )
@@ -2109,6 +2137,8 @@ def _calendar_completeness(
     sources: Sequence[CalendarSource],
     start: datetime,
     end: datetime,
+    states: tuple[CalendarSyncHealth | None, ...] | None = None,
+    account_generations: Mapping[CalendarSource, str] | None = None,
 ) -> tuple[
     str,
     datetime | None,
@@ -2126,7 +2156,11 @@ def _calendar_completeness(
             {"status": "unknown", "ratio": None},
             {"calendar_mirror_completeness_unknown"},
         )
-    states = _calendar_sync_states(store, sources)
+    states = (
+        states
+        if states is not None
+        else _calendar_sync_states(store, sources)
+    )
     if states is None:
         return (
             "partial" if rows else "insufficient_data",
@@ -2137,9 +2171,22 @@ def _calendar_completeness(
             {"status": "sync_health_unavailable", "ratio": None},
             {"calendar_sync_health_unavailable"},
         )
+    current_states = tuple(
+        state
+        if (
+            account_generations is None
+            or (
+                state is not None
+                and state.account_generation
+                == account_generations.get(source)
+            )
+        )
+        else None
+        for source, state in zip(sources, states, strict=True)
+    )
     successful = tuple(
         state
-        for state in states
+        for state in current_states
         if state is not None
         and state.status
         in {SyncHealthStatus.SUCCESS, SyncHealthStatus.EMPTY_SUCCESS}
@@ -2147,14 +2194,14 @@ def _calendar_completeness(
     )
     failures = tuple(
         state
-        for state in states
+        for state in current_states
         if state is not None
         and state.status is SyncHealthStatus.RECENT_FAILURE
     )
     oldest_success = min(
         (
             state.last_success_at
-            for state in states
+            for state in current_states
             if state is not None
             and state.last_success_at is not None
         ),
@@ -2164,9 +2211,14 @@ def _calendar_completeness(
     limitations: set[str] = set()
     if failures:
         limitations.add("calendar_recent_sync_failure")
+    if account_generations is not None and any(
+        state is None
+        for state in current_states
+    ):
+        limitations.add("calendar_account_not_synced")
     if any(
         state is None or state.status is SyncHealthStatus.NEVER_SYNCED
-        for state in states
+        for state in current_states
     ):
         limitations.add("calendar_never_synced")
     if any(
@@ -2174,13 +2226,13 @@ def _calendar_completeness(
         and state.status
         in {SyncHealthStatus.SUCCESS, SyncHealthStatus.EMPTY_SUCCESS}
         and not state.covers(start, end)
-        for state in states
+        for state in current_states
     ):
         limitations.add("calendar_query_outside_sync_coverage")
     all_currently_successful = len(successful) == len(sources)
     any_prior_success = any(
         state is not None and state.last_success_at is not None
-        for state in states
+        for state in current_states
     )
     if rows:
         status = "ok" if all_currently_successful else "partial"
@@ -2309,11 +2361,102 @@ class CalendarContextProvider:
     def __init__(
         self,
         *,
+        settings: Settings | None = None,
         sync_health_store: SyncHealthStore | None = None,
         sources: Sequence[CalendarSource] = (),
+        source_resolver: CalendarSourceResolver | None = None,
+        account_generation_resolver: (
+            CalendarAccountGenerationResolver | None
+        ) = None,
     ) -> None:
+        if source_resolver is not None and not callable(source_resolver):
+            raise TypeError("source_resolver must be callable")
+        if source_resolver is not None and sources:
+            raise ValueError(
+                "sources and source_resolver are mutually exclusive"
+            )
         self._sync_health_store = sync_health_store
+        self._settings = settings
         self._sources = tuple(dict.fromkeys(sources))
+        self._source_resolver = source_resolver
+        if (
+            account_generation_resolver is not None
+            and not callable(account_generation_resolver)
+        ):
+            raise TypeError(
+                "account_generation_resolver must be callable"
+            )
+        self._account_generation_resolver = (
+            account_generation_resolver
+        )
+
+    def _read_visible_rows(
+        self,
+        session: Session,
+        visibility: CalendarVisibility,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> tuple[
+        list[CalendarEventMirror],
+        tuple[CalendarSource, ...],
+        tuple[CalendarSyncHealth | None, ...] | None,
+    ]:
+        sources = tuple(visibility.account_generations)
+        states = (
+            _calendar_sync_states(self._sync_health_store, sources)
+            if self._sync_health_store is not None
+            else None
+        )
+        return (
+            _calendar_rows(
+                session,
+                start=start,
+                end=end,
+                account_generations=visibility.account_generations,
+            ),
+            sources,
+            states,
+        )
+
+    def _current_sources(
+        self,
+    ) -> tuple[tuple[CalendarSource, ...], str | None]:
+        if self._source_resolver is None:
+            return self._sources, None
+        try:
+            resolved = tuple(
+                dict.fromkeys(
+                    CalendarSource(source)
+                    for source in self._source_resolver()
+                )
+            )
+        except Exception:
+            return (), "calendar_connection_state_unavailable"
+        return resolved, None
+
+    def _current_account_generations(
+        self,
+        sources: Sequence[CalendarSource],
+    ) -> tuple[dict[CalendarSource, str] | None, str | None]:
+        if self._account_generation_resolver is None:
+            return None, None
+        try:
+            generations = {
+                source: generation
+                for source in sources
+                if (
+                    generation := self._account_generation_resolver(
+                        source
+                    )
+                )
+                is not None
+            }
+        except Exception:
+            return None, "calendar_connection_state_unavailable"
+        if len(generations) != len(sources):
+            return None, "calendar_connection_state_unavailable"
+        return generations, None
 
     async def query(
         self,
@@ -2327,22 +2470,154 @@ class CalendarContextProvider:
         day_start, day_end = local_day_bounds(day, query.timezone)
         start = query.start or day_start
         end = query.end or day_end
-        rows = _calendar_rows(
-            session,
-            start=start,
-            end=end,
-            sources=self._sources or None,
-        )
+        visibility_limitations: tuple[str, ...] = ()
+        if self._settings is not None:
+            try:
+                (
+                    (rows, sources, sync_states),
+                    visibility,
+                ) = read_visible_calendar(
+                    session,
+                    self._settings,
+                    lambda snapshot: self._read_visible_rows(
+                        session,
+                        snapshot,
+                        start=start,
+                        end=end,
+                    ),
+                    sync_health_store=self._sync_health_store,
+                )
+            except CalendarVisibilityChanged:
+                return _result(
+                    query,
+                    {
+                        "status": "unavailable",
+                        "limitations": [
+                            "calendar_connection_state_unavailable"
+                        ],
+                    },
+                    refs=(),
+                    refs_complete=True,
+                    now=now,
+                )
+            account_generations = dict(
+                visibility.account_generations
+            )
+            visibility_limitations = visibility.limitations
+            if not visibility.available:
+                return _result(
+                    query,
+                    {
+                        "status": "unavailable",
+                        "limitations": list(
+                            visibility.limitations
+                            or ("calendar_not_connected",)
+                        ),
+                    },
+                    refs=(),
+                    refs_complete=True,
+                    now=now,
+                )
+        else:
+            sources, connection_error = self._current_sources()
+            if connection_error is not None or not sources:
+                return _result(
+                    query,
+                    {
+                        "status": "unavailable",
+                        "limitations": [
+                            connection_error or "calendar_not_connected"
+                        ],
+                    },
+                    refs=(),
+                    refs_complete=True,
+                    now=now,
+                )
+            account_generations, generation_error = (
+                self._current_account_generations(sources)
+            )
+            if generation_error is not None:
+                return _result(
+                    query,
+                    {
+                        "status": "unavailable",
+                        "limitations": [generation_error],
+                    },
+                    refs=(),
+                    refs_complete=True,
+                    now=now,
+                )
+            sync_states = (
+                _calendar_sync_states(
+                    self._sync_health_store,
+                    sources,
+                )
+                if self._sync_health_store is not None
+                else None
+            )
+            ready_generations = account_generations
+            if account_generations is not None:
+                if sync_states is None:
+                    return _result(
+                        query,
+                        {
+                            "status": "unavailable",
+                            "limitations": [
+                                "calendar_sync_health_unavailable"
+                            ],
+                        },
+                        refs=(),
+                        refs_complete=True,
+                        now=now,
+                    )
+                ready_generations = {
+                    source: account_generations[source]
+                    for source, state in zip(
+                        sources,
+                        sync_states,
+                        strict=True,
+                    )
+                    if (
+                        state is not None
+                        and state.account_generation
+                        == account_generations[source]
+                        and state.last_success_at is not None
+                    )
+                }
+                if not ready_generations:
+                    return _result(
+                        query,
+                        {
+                            "status": "unavailable",
+                            "limitations": [
+                                "calendar_account_not_synced"
+                            ],
+                        },
+                        refs=(),
+                        refs_complete=True,
+                        now=now,
+                    )
+            rows = _calendar_rows(
+                session,
+                start=start,
+                end=end,
+                sources=sources,
+                account_generations=ready_generations,
+            )
         refs = _calendar_source_refs(rows)
         status, freshness, coverage, completeness_limitations = (
             _calendar_completeness(
                 rows=rows,
                 store=self._sync_health_store,
-                sources=self._sources,
+                sources=sources,
                 start=start,
                 end=end,
+                states=sync_states,
+                account_generations=account_generations,
             )
         )
+        if visibility_limitations:
+            status = "partial" if rows else "insufficient_data"
         spans = _merged_spans(rows, start=start, end=end)
         if query.capability == "calendar.day-summary":
             busy_minutes = round(
@@ -2457,6 +2732,7 @@ class CalendarContextProvider:
                 *list(raw.get("limitations") or []),
                 "calendar_titles_omitted",
                 *completeness_limitations,
+                *visibility_limitations,
             }
         )
         return _result(

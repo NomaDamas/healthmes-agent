@@ -15,6 +15,7 @@ from freezegun import freeze_time
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
+from healthmes.calendars import creds
 from healthmes.calendars.adjustments import provider_revision_fingerprint
 from healthmes.config import Settings
 from healthmes.engine.rules import (
@@ -614,10 +615,17 @@ def test_is_in_quiet_hours_plain_and_disabled_windows() -> None:
 
 
 def test_calendar_task_intake_invokes_planner_once(
-    settings, session_factory, alert_sender
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
 ) -> None:
     with freeze_time("2026-07-29 14:00:00") as frozen:
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             task = Task(title="백오피스 작업", est_minutes=45)
             session.add(task)
@@ -627,6 +635,9 @@ def test_calendar_task_intake_invokes_planner_once(
                 CalendarEventMirror(
                     external_id="hm-backoffice",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=generations[
+                        CalendarSource.GOOGLE
+                    ],
                     summary="[HM] 백오피스 작업",
                     start_at=utc(now + timedelta(hours=1)),
                     end_at=utc(now + timedelta(hours=1, minutes=45)),
@@ -684,10 +695,18 @@ def test_calendar_task_intake_invokes_planner_once(
 
 
 def test_schedule_changed_fires_from_calendar_mirror_diff(
-    settings, session_factory, alert_sender
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
 ) -> None:
     with freeze_time("2026-07-09 14:00:00") as frozen:
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            CalendarSource.CALDAV,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             task = Task(title="Write report", est_minutes=120)
             session.add(task)
@@ -705,6 +724,9 @@ def test_schedule_changed_fires_from_calendar_mirror_diff(
                 CalendarEventMirror(
                     external_id="agent-1",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=generations[
+                        CalendarSource.GOOGLE
+                    ],
                     summary="Deep work",
                     start_at=utc(now + timedelta(hours=2)),
                     end_at=utc(now + timedelta(hours=3)),
@@ -719,6 +741,9 @@ def test_schedule_changed_fires_from_calendar_mirror_diff(
                 CalendarEventMirror(
                     external_id="ext-9",
                     calendar_source=CalendarSource.CALDAV,
+                    connection_generation=generations[
+                        CalendarSource.CALDAV
+                    ],
                     summary="Dentist",
                     start_at=utc(now + timedelta(hours=4)),
                     end_at=utc(now + timedelta(hours=4, minutes=30)),
@@ -755,9 +780,18 @@ def test_schedule_changed_fires_from_calendar_mirror_diff(
     assert len(all_events(session_factory)) == 1
 
 
-def test_untouched_external_events_do_not_fire(settings, session_factory, alert_sender) -> None:
+def test_untouched_external_events_do_not_fire(
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
+) -> None:
     with freeze_time("2026-07-09 14:00:00"):
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             # Fresh external event that conflicts with nothing (e.g. initial
             # sync import) must not alert.
@@ -765,6 +799,9 @@ def test_untouched_external_events_do_not_fire(settings, session_factory, alert_
                 CalendarEventMirror(
                     external_id="ext-1",
                     calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=generations[
+                        CalendarSource.GOOGLE
+                    ],
                     summary="Lunch",
                     start_at=utc(now + timedelta(hours=1)),
                     end_at=utc(now + timedelta(hours=2)),
@@ -782,10 +819,17 @@ def test_untouched_external_events_do_not_fire(settings, session_factory, alert_
 
 
 def test_confirmed_internal_adjustment_does_not_fire_schedule_changed(
-    settings, session_factory, alert_sender
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
 ) -> None:
     with freeze_time("2026-07-09 14:00:00"):
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             task = Task(title="Write report", est_minutes=60)
             session.add(task)
@@ -804,6 +848,9 @@ def test_confirmed_internal_adjustment_does_not_fire_schedule_changed(
             mirror = CalendarEventMirror(
                 external_id="ext-adjusted",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=generations[
+                    CalendarSource.GOOGLE
+                ],
                 summary="Confirmed shortening",
                 start_at=start,
                 end_at=proposed_end,
@@ -817,6 +864,9 @@ def test_confirmed_internal_adjustment_does_not_fire_schedule_changed(
             session.add(
                 CalendarMutationProposal(
                     calendar_source=CalendarSource.GOOGLE,
+                    account_generation=generations[
+                        CalendarSource.GOOGLE
+                    ],
                     mirror_event_id=mirror.id,
                     external_event_id=mirror.external_id,
                     operation=CalendarMutationOperation.SHORTEN,
@@ -852,10 +902,17 @@ def test_confirmed_internal_adjustment_does_not_fire_schedule_changed(
 
 
 def test_external_change_after_internal_adjustment_still_fires(
-    settings, session_factory, alert_sender
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
 ) -> None:
     with freeze_time("2026-07-09 14:00:00"):
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             task = Task(title="Write report", est_minutes=60)
             session.add(task)
@@ -874,6 +931,9 @@ def test_external_change_after_internal_adjustment_still_fires(
             mirror = CalendarEventMirror(
                 external_id="ext-adjusted",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=generations[
+                    CalendarSource.GOOGLE
+                ],
                 summary="Externally changed after apply",
                 start_at=start,
                 end_at=externally_moved_end,
@@ -887,6 +947,9 @@ def test_external_change_after_internal_adjustment_still_fires(
             session.add(
                 CalendarMutationProposal(
                     calendar_source=CalendarSource.GOOGLE,
+                    account_generation=generations[
+                        CalendarSource.GOOGLE
+                    ],
                     mirror_event_id=mirror.id,
                     external_event_id=mirror.external_id,
                     operation=CalendarMutationOperation.SHORTEN,
@@ -1000,10 +1063,17 @@ def test_deadline_blocks_after_deadline_do_not_count(
 
 
 def test_low_recovery_heavy_afternoon_uses_remaining_afternoon_load(
-    settings, session_factory, alert_sender
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
 ) -> None:
     with freeze_time("2026-07-09 12:30:00"):
         now = local_now()
+        generations = connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
         with session_factory() as session:
             half_hour = timedelta(minutes=30)
             events = [
@@ -1017,6 +1087,9 @@ def test_low_recovery_heavy_afternoon_uses_remaining_afternoon_load(
                     CalendarEventMirror(
                         external_id=f"evt-{index}",
                         calendar_source=CalendarSource.GOOGLE,
+                        connection_generation=generations[
+                            CalendarSource.GOOGLE
+                        ],
                         summary=summary,
                         start_at=utc(start),
                         end_at=utc(end),
@@ -1044,6 +1117,90 @@ def test_low_recovery_heavy_afternoon_uses_remaining_afternoon_load(
     fire = report.outcomes[0].fire
     assert fire.evidence["afternoon_busy_minutes"] == 30 + 120 + 90
     assert fire.evidence["afternoon_event_count"] == 3
+
+
+def test_stale_calendar_generation_is_not_used_for_trigger(
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
+) -> None:
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        old_generation = "c" * 32
+        new_generation = "d" * 32
+        connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            generations={CalendarSource.GOOGLE: old_generation},
+            synced_at=utc(now - timedelta(minutes=2)),
+        )
+        with session_factory() as session:
+            session.add(
+                CalendarEventMirror(
+                    external_id="stale-agent-block",
+                    calendar_source=CalendarSource.GOOGLE,
+                    connection_generation=old_generation,
+                    summary="Old account block",
+                    start_at=utc(now + timedelta(hours=1)),
+                    end_at=utc(now + timedelta(hours=2)),
+                    is_agent_created=True,
+                    etag="old-etag",
+                    created_at=utc(now - timedelta(days=2)),
+                    updated_at=utc(now - timedelta(minutes=1)),
+                )
+            )
+            session.commit()
+
+        connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            generations={CalendarSource.GOOGLE: new_generation},
+            synced_at=utc(now),
+        )
+        report = make_evaluator(
+            settings,
+            session_factory,
+            alert_sender,
+            rules=(schedule_changed,),
+        ).evaluate_once()
+
+    assert report.outcomes == ()
+    assert alert_sender.sent == []
+    assert all_events(session_factory) == []
+
+
+def test_calendar_trigger_is_not_persisted_after_disconnect(
+    settings,
+    session_factory,
+    alert_sender,
+    connect_calendar_sources,
+) -> None:
+    with freeze_time("2026-07-09 14:00:00"):
+        now = local_now()
+        connect_calendar_sources(
+            CalendarSource.GOOGLE,
+            synced_at=utc(now - timedelta(minutes=1)),
+        )
+
+        def disconnect_before_fire(_context: TriggerContext) -> TriggerFire:
+            assert creds.delete_google_token(settings.data_dir) is True
+            return TriggerFire(
+                rule_id="schedule_changed",
+                dedup_key="schedule_changed:disconnect-race",
+                summary="Calendar changed.",
+                proposal="Review the schedule.",
+                evidence={},
+            )
+
+        report = make_evaluator(
+            settings,
+            session_factory,
+            alert_sender,
+            rules=(disconnect_before_fire,),
+        ).evaluate_once()
+
+    assert report.outcomes == ()
+    assert alert_sender.sent == []
+    assert all_events(session_factory) == []
 
 
 # ---------------------------------------------------------------------------

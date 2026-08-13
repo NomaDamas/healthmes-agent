@@ -56,13 +56,16 @@ __all__ = [
     "SyncHealthStatus",
     "SyncHealthStore",
     "SyncStateStore",
+    "sync_state_account_generation",
     "sync_state_coverage",
+    "with_sync_state_account_generation",
     "with_sync_state_coverage",
 ]
 
 logger = logging.getLogger(__name__)
 _ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _SYNC_COVERAGE_KEY = "_healthmes_sync_coverage"
+_ACCOUNT_GENERATION_KEY = "_healthmes_account_generation"
 
 #: JSON-serializable ``SyncDiff.to_payload()`` document (journal contents).
 DiffPayload = dict[str, Any]
@@ -207,6 +210,40 @@ def sync_state_coverage(
     return kind, start, end
 
 
+def with_sync_state_account_generation(
+    state: SyncState,
+    account_generation: str,
+) -> SyncState:
+    """Return a cursor bound to one explicit calendar account connection."""
+
+    generation = account_generation.strip().lower()
+    if (
+        len(generation) not in {32, 64}
+        or any(character not in "0123456789abcdef" for character in generation)
+    ):
+        raise ValueError("calendar account generation is invalid")
+    return {**state, _ACCOUNT_GENERATION_KEY: generation}
+
+
+def sync_state_account_generation(
+    state: SyncState | None,
+) -> str | None:
+    """Decode the account generation carried by a sync cursor."""
+
+    if not state:
+        return None
+    value = state.get(_ACCOUNT_GENERATION_KEY)
+    if not isinstance(value, str):
+        return None
+    generation = value.strip().lower()
+    if (
+        len(generation) not in {32, 64}
+        or any(character not in "0123456789abcdef" for character in generation)
+    ):
+        return None
+    return generation
+
+
 def _utc_timestamp(value: datetime, *, field: str) -> datetime:
     if value.tzinfo is None:
         raise ValueError(f"{field} must be timezone-aware")
@@ -225,6 +262,7 @@ class CalendarSyncHealth:
     """
 
     source: CalendarSource
+    account_generation: str | None = None
     last_attempt_at: datetime | None = None
     last_success_at: datetime | None = None
     last_failure_at: datetime | None = None
@@ -243,6 +281,23 @@ class CalendarSyncHealth:
     writeback_failed_count: int | None = None
 
     def __post_init__(self) -> None:
+        if self.account_generation is not None:
+            generation = self.account_generation.strip().lower()
+            if (
+                len(generation) not in {32, 64}
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in generation
+                )
+            ):
+                raise ValueError(
+                    "calendar sync-health account generation is invalid"
+                )
+            object.__setattr__(
+                self,
+                "account_generation",
+                generation,
+            )
         for field in (
             "last_attempt_at",
             "last_success_at",
@@ -374,8 +429,9 @@ class CalendarSyncHealth:
             return value.isoformat() if value is not None else None
 
         return {
-            "version": 2,
+            "version": 3,
             "source": self.source.value,
+            "account_generation": self.account_generation,
             "last_attempt_at": encoded(self.last_attempt_at),
             "last_success_at": encoded(self.last_success_at),
             "last_failure_at": encoded(self.last_failure_at),
@@ -412,7 +468,7 @@ class CalendarSyncHealth:
         expected_source: CalendarSource,
     ) -> "CalendarSyncHealth":
         version = payload.get("version")
-        if version not in {1, 2}:
+        if version not in {1, 2, 3}:
             raise ValueError("unsupported calendar sync-health version")
         if payload.get("source") != expected_source.value:
             raise ValueError("calendar sync-health source mismatch")
@@ -443,7 +499,7 @@ class CalendarSyncHealth:
             raise ValueError("latest_outcome must be a known outcome")
         raw_coverage_kind = (
             payload.get("coverage_kind")
-            if version == 2
+            if version >= 2
             else SyncCoverageKind.UNKNOWN.value
         )
         if not isinstance(raw_coverage_kind, str):
@@ -468,6 +524,12 @@ class CalendarSyncHealth:
             )
         return cls(
             source=expected_source,
+            account_generation=(
+                str(payload["account_generation"])
+                if version == 3
+                and isinstance(payload.get("account_generation"), str)
+                else None
+            ),
             last_attempt_at=decoded("last_attempt_at"),
             last_success_at=decoded("last_success_at"),
             last_failure_at=decoded("last_failure_at"),
@@ -476,24 +538,24 @@ class CalendarSyncHealth:
             latest_outcome=outcome,
             coverage_kind=coverage_kind,
             coverage_start=(
-                decoded("coverage_start") if version == 2 else None
+                decoded("coverage_start") if version >= 2 else None
             ),
             coverage_end=(
-                decoded("coverage_end") if version == 2 else None
+                decoded("coverage_end") if version >= 2 else None
             ),
             writeback_last_attempt_at=(
                 decoded("writeback_last_attempt_at")
-                if version == 2
+                if version >= 2
                 else None
             ),
             writeback_last_success_at=(
                 decoded("writeback_last_success_at")
-                if version == 2
+                if version >= 2
                 else None
             ),
             writeback_last_failure_at=(
                 decoded("writeback_last_failure_at")
-                if version == 2
+                if version >= 2
                 else None
             ),
             writeback_last_error_code=raw_writeback_error,
@@ -530,10 +592,12 @@ def _record_success(
     coverage_kind: SyncCoverageKind,
     coverage_start: datetime | None,
     coverage_end: datetime | None,
+    account_generation: str | None,
 ) -> CalendarSyncHealth:
     current = state or _initial_sync_health(source)
     return replace(
         current,
+        account_generation=account_generation,
         last_success_at=at,
         last_success_event_count=event_count,
         latest_outcome=SyncHealthOutcome.SUCCESS,
@@ -637,6 +701,7 @@ class SyncHealthStore(Protocol):
         coverage_kind: SyncCoverageKind = SyncCoverageKind.UNKNOWN,
         coverage_start: datetime | None = None,
         coverage_end: datetime | None = None,
+        account_generation: str | None = None,
     ) -> None:
         """Record a completed sync after its database commit."""
         ...
@@ -701,6 +766,7 @@ class InMemorySyncHealthStore:
         coverage_kind: SyncCoverageKind = SyncCoverageKind.UNKNOWN,
         coverage_start: datetime | None = None,
         coverage_end: datetime | None = None,
+        account_generation: str | None = None,
     ) -> None:
         with self._locks[source]:
             self._states[source.value] = _record_success(
@@ -711,6 +777,7 @@ class InMemorySyncHealthStore:
                 coverage_kind,
                 coverage_start,
                 coverage_end,
+                account_generation,
             )
 
     def record_writeback_attempt(
@@ -817,6 +884,7 @@ class FileSyncHealthStore:
         coverage_kind: SyncCoverageKind = SyncCoverageKind.UNKNOWN,
         coverage_start: datetime | None = None,
         coverage_end: datetime | None = None,
+        account_generation: str | None = None,
     ) -> None:
         with self._locks[source]:
             state = _record_success(
@@ -827,6 +895,7 @@ class FileSyncHealthStore:
                 coverage_kind,
                 coverage_start,
                 coverage_end,
+                account_generation,
             )
             _atomic_write_json(self.path_for(source), state.to_payload())
 

@@ -21,10 +21,12 @@ from healthmes.activity.resolver import WellnessContextRangeError
 from healthmes.activity.resolver import (
     resolve_wellness_context as resolve_context,
 )
+from healthmes.config import Settings
 
 StoreSessionFactory = Callable[[], AbstractContextManager[Session]]
 TimezoneResolver = Callable[[], tzinfo]
 ReadinessReader = Callable[[str | None], Any]
+SettingsResolver = Callable[[], Settings]
 
 _registered_mcp_ids: set[int] = set()
 
@@ -54,6 +56,7 @@ def register_activity_tools(
     store_session_factory: StoreSessionFactory,
     timezone_resolver: TimezoneResolver,
     readiness_reader: ReadinessReader,
+    settings_resolver: SettingsResolver | None = None,
 ) -> None:
     """Register once on the process-global HealthMes MCP server."""
     identity = id(mcp)
@@ -148,6 +151,11 @@ def register_activity_tools(
                     request,
                     default_timezone=timezone,
                     wearable_reader=wearable,
+                    calendar_settings=(
+                        settings_resolver()
+                        if settings_resolver is not None
+                        else None
+                    ),
                 )
             except WellnessContextRangeError as exc:
                 raise ToolError(str(exc)) from exc

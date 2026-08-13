@@ -37,7 +37,7 @@ import statistics
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Protocol
 
@@ -45,6 +45,11 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars.adjustments_proposals import provider_revision_fingerprint
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    read_visible_calendar,
+    require_calendar_visibility_current,
+)
 from healthmes.config import Settings, resolve_timezone
 from healthmes.engine.rules import (
     ALL_RULES,
@@ -103,6 +108,45 @@ _SUPPRESS_QUIET_HOURS = "quiet_hours"
 _SUPPRESS_COOLDOWN = "cooldown"
 _SUPPRESS_DAILY_BUDGET = "daily_budget"
 _SUPPRESS_PUSH_FAILED = "push_failed"
+_CALENDAR_DERIVED_RULE_IDS = frozenset(
+    {
+        "calendar_task_intake",
+        "low_recovery_heavy_afternoon",
+        "schedule_changed",
+    }
+)
+
+
+def _calendar_generation_fingerprint(
+    visibility: CalendarVisibility,
+) -> str:
+    """Return a secret-safe identity for the visible Calendar snapshot."""
+
+    payload = "\x1f".join(
+        f"{source.value}:{generation}"
+        for source, generation in sorted(
+            visibility.account_generations.items(),
+            key=lambda item: item[0].value,
+        )
+    )
+    return hashlib.sha256(
+        f"healthmes-calendar-visibility-v1\x1f{payload}".encode()
+    ).hexdigest()[:16]
+
+
+def _scope_calendar_fire(
+    fire: TriggerFire,
+    visibility: CalendarVisibility,
+) -> TriggerFire:
+    if fire.rule_id not in _CALENDAR_DERIVED_RULE_IDS:
+        return fire
+    return replace(
+        fire,
+        dedup_key=(
+            f"{fire.dedup_key}:calendar-generation:"
+            f"{_calendar_generation_fingerprint(visibility)}"
+        ),
+    )
 
 
 def _ensure_utc(value: datetime) -> datetime:
@@ -364,9 +408,14 @@ def _overlap_minutes(
 
 
 def _load_afternoon(
-    session: Session, now: datetime, thresholds: RuleThresholds
+    session: Session,
+    now: datetime,
+    thresholds: RuleThresholds,
+    visibility: CalendarVisibility,
 ) -> AfternoonLoad | None:
     """Booked load for the remaining afternoon (local wall-clock window)."""
+    if not visibility.available:
+        return None
     day = now.date()
     afternoon_start = datetime.combine(day, time(thresholds.afternoon_start_hour), now.tzinfo)
     afternoon_end = datetime.combine(day, time(thresholds.afternoon_end_hour), now.tzinfo)
@@ -379,6 +428,7 @@ def _load_afternoon(
     events = session.scalars(
         select(CalendarEventMirror)
         .where(
+            visibility.predicate(),
             CalendarEventMirror.start_at < window_end_utc,
             CalendarEventMirror.end_at > window_start_utc,
         )
@@ -399,12 +449,17 @@ def _load_afternoon(
 
 
 def _conflict_labels(
-    session: Session, changed: CalendarEventMirror, start_utc: datetime, end_utc: datetime
+    session: Session,
+    changed: CalendarEventMirror,
+    start_utc: datetime,
+    end_utc: datetime,
+    visibility: CalendarVisibility,
 ) -> tuple[str, ...]:
     """Labels of agent blocks / accepted proposals the changed event overlaps."""
     labels: list[str] = []
     agent_blocks = session.scalars(
         select(CalendarEventMirror).where(
+            visibility.predicate(),
             CalendarEventMirror.is_agent_created.is_(True),
             CalendarEventMirror.id != changed.id,
             CalendarEventMirror.start_at < end_utc,
@@ -427,7 +482,10 @@ def _conflict_labels(
 
 
 def _load_schedule_changes(
-    session: Session, now: datetime, lookback: timedelta
+    session: Session,
+    now: datetime,
+    lookback: timedelta,
+    visibility: CalendarVisibility,
 ) -> tuple[ScheduleChange, ...]:
     """Diff of the calendar mirror since the last sweeps (docs/PLAN.md §6).
 
@@ -439,7 +497,10 @@ def _load_schedule_changes(
     """
     cutoff = _ensure_utc(now - lookback)
     rows = session.scalars(
-        select(CalendarEventMirror).where(CalendarEventMirror.updated_at >= cutoff)
+        select(CalendarEventMirror).where(
+            visibility.predicate(),
+            CalendarEventMirror.updated_at >= cutoff,
+        )
     ).all()
     internal_revisions = _confirmed_internal_adjustment_revisions(
         session, rows=rows, cutoff=cutoff
@@ -469,7 +530,19 @@ def _load_schedule_changes(
                 continue
             conflicts: tuple[str, ...] = ()
         else:
-            conflicts = _conflict_labels(session, row, start_utc, end_utc)
+            conflicts = _conflict_labels(
+                session,
+                row,
+                start_utc,
+                end_utc,
+                visibility,
+            )
+        generation_fingerprint = hashlib.sha256(
+            (
+                f"{row.calendar_source.value}:"
+                f"{visibility.account_generations[row.calendar_source]}"
+            ).encode()
+        ).hexdigest()[:16]
         changes.append(
             ScheduleChange(
                 external_id=row.external_id,
@@ -481,6 +554,7 @@ def _load_schedule_changes(
                 is_agent_created=row.is_agent_created,
                 conflicts=conflicts,
                 fingerprint=(
+                    f"{generation_fingerprint}:"
                     f"{row.calendar_source.value}:{row.external_id}:"
                     f"{row.etag or updated_at.isoformat()}"
                 ),
@@ -575,7 +649,10 @@ def _load_deadline_tasks(
     return tuple(result)
 
 
-def _load_calendar_task_inputs(session: Session) -> tuple[CalendarTaskInput, ...]:
+def _load_calendar_task_inputs(
+    session: Session,
+    visibility: CalendarVisibility,
+) -> tuple[CalendarTaskInput, ...]:
     processed_revisions: set[str] = set()
     events = session.scalars(
         select(TriggerEvent).where(TriggerEvent.rule_id == "calendar_task_intake")
@@ -594,13 +671,17 @@ def _load_calendar_task_inputs(session: Session) -> tuple[CalendarTaskInput, ...
     rows = session.execute(
         select(CalendarEventMirror, Task)
         .join(Task, CalendarEventMirror.intake_task_id == Task.id)
-        .where(Task.status.not_in(_TERMINAL_TASK_STATUSES))
+        .where(
+            visibility.predicate(),
+            Task.status.not_in(_TERMINAL_TASK_STATUSES),
+        )
         .order_by(Task.created_at, Task.id)
     ).all()
     inputs: list[CalendarTaskInput] = []
     for mirror, task in rows:
         raw_revision = (
-            f"{mirror.calendar_source.value}:{mirror.external_id}:"
+            f"{mirror.calendar_source.value}:{mirror.connection_generation}:"
+            f"{mirror.external_id}:"
             f"{mirror.etag or _ensure_utc(mirror.updated_at).isoformat()}"
         )
         input_revision = hashlib.sha256(raw_revision.encode("utf-8")).hexdigest()[:16]
@@ -711,15 +792,30 @@ class TriggerEvaluator:
             retried, pending_keys = self._retry_pending_dispatches(session)
             outcomes.extend(retried)
             signals = self._health_reader.read(now)
-            context = self._build_context(session, now, signals)
+            context, calendar_visibility = self._build_context(
+                session,
+                now,
+                signals,
+            )
             for rule in self._rules:
                 try:
                     fire = rule(context)
                     if fire is None:
                         continue
+                    fire = _scope_calendar_fire(
+                        fire,
+                        calendar_visibility,
+                    )
                     if fire.dedup_key in pending_keys:
                         continue
-                    outcomes.append(self._process_fire(session, now, fire))
+                    outcomes.append(
+                        self._process_fire(
+                            session,
+                            now,
+                            fire,
+                            calendar_visibility=calendar_visibility,
+                        )
+                    )
                 except Exception:
                     logger.exception(
                         "Trigger rule %s failed; remaining rules continue.",
@@ -809,21 +905,52 @@ class TriggerEvaluator:
 
     def _build_context(
         self, session: Session, now: datetime, signals: HealthSignals
-    ) -> TriggerContext:
-        return TriggerContext(
-            now=now,
-            stress=signals.stress,
-            recovery=signals.recovery,
-            afternoon=_load_afternoon(session, now, self._thresholds),
-            schedule_changes=_load_schedule_changes(
-                session, now, timedelta(minutes=SCHEDULE_DIFF_LOOKBACK_MINUTES)
-            ),
-            calendar_task_inputs=_load_calendar_task_inputs(session),
-            deadline_tasks=_load_deadline_tasks(session, now, self._thresholds),
-            thresholds=self._thresholds,
+    ) -> tuple[TriggerContext, CalendarVisibility]:
+        def read_context(
+            visibility: CalendarVisibility,
+        ) -> TriggerContext:
+            return TriggerContext(
+                now=now,
+                stress=signals.stress,
+                recovery=signals.recovery,
+                afternoon=_load_afternoon(
+                    session,
+                    now,
+                    self._thresholds,
+                    visibility,
+                ),
+                schedule_changes=_load_schedule_changes(
+                    session,
+                    now,
+                    timedelta(minutes=SCHEDULE_DIFF_LOOKBACK_MINUTES),
+                    visibility,
+                ),
+                calendar_task_inputs=_load_calendar_task_inputs(
+                    session,
+                    visibility,
+                ),
+                deadline_tasks=_load_deadline_tasks(
+                    session,
+                    now,
+                    self._thresholds,
+                ),
+                thresholds=self._thresholds,
+            )
+
+        return read_visible_calendar(
+            session,
+            self._settings,
+            read_context,
         )
 
-    def _process_fire(self, session: Session, now: datetime, fire: TriggerFire) -> FireOutcome:
+    def _process_fire(
+        self,
+        session: Session,
+        now: datetime,
+        fire: TriggerFire,
+        *,
+        calendar_visibility: CalendarVisibility,
+    ) -> FireOutcome:
         # Dedup-key uniqueness, application-level: a key that was ever
         # recorded is never persisted or pushed again. Keys embed their
         # temporal scope (date / diff fingerprint), so "again later" is a new
@@ -841,6 +968,11 @@ class TriggerEvaluator:
         if existing_event is not None:
             return FireOutcome(fire=fire, status="deduplicated")
 
+        if fire.rule_id in _CALENDAR_DERIVED_RULE_IDS:
+            require_calendar_visibility_current(
+                self._settings,
+                calendar_visibility,
+            )
         payload = {
             "summary": fire.summary,
             "proposal": fire.proposal,

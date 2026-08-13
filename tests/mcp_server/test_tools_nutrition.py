@@ -5,6 +5,7 @@ import pytest
 from fastmcp.exceptions import ToolError
 
 from healthmes.mcp_server import server as server_module
+from healthmes.nutrition import repository as nutrition_repository
 from healthmes.nutrition.contracts import (
     CaffeineConfirmation,
     CaptureContext,
@@ -29,6 +30,24 @@ from healthmes.nutrition.repository import (
 from healthmes.storage import register_storage_object
 from healthmes.store import WellnessEvent
 from healthmes.trusted_session import issue_trusted_session_proof
+
+
+class _FixedNutritionDateTime(dt.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        fixed = dt.datetime(2026, 8, 10, tzinfo=dt.UTC)
+        if tz is None:
+            return fixed.replace(tzinfo=None)
+        return fixed.astimezone(tz)
+
+
+@pytest.fixture(autouse=True)
+def _pin_nutrition_repository_clock(monkeypatch):
+    monkeypatch.setattr(
+        nutrition_repository,
+        "datetime",
+        _FixedNutritionDateTime,
+    )
 
 
 def _observation(observed_at: dt.datetime, media_path: str) -> NutritionObservation:

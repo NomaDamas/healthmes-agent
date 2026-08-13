@@ -67,6 +67,7 @@ def mirror_to_adjustment_candidate(event: CalendarEventMirror) -> dict[str, Any]
         "id": event.id,
         "external_id": event.external_id,
         "calendar_source": event.calendar_source,
+        "connection_generation": event.connection_generation,
         "summary": event.summary,
         "start_at": coerce_utc(event.start_at),
         "end_at": coerce_utc(event.end_at),

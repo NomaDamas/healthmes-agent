@@ -7,6 +7,11 @@ lifespan running), the MCP settings override, and the APScheduler lifecycle
 gated on ``Settings.scheduler_enabled``.
 """
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -91,6 +96,349 @@ class TestStoreWiring:
             assert [goal["title"] for goal in listed.json()["data"]] == ["Integration"]
 
         # Shutdown disposes the process-wide engine singleton.
+        assert store_session._engine is None
+        assert store_session._session_factory is None
+
+    def test_startup_failure_releases_mcp_settings_and_database(
+        self,
+        settings,
+        monkeypatch,
+    ) -> None:
+        """A later composition failure must not leak process-global state."""
+        import healthmes.app as app_module
+
+        lifecycle = {"entered": False, "exited": False}
+
+        class StubMcpApp:
+            @asynccontextmanager
+            async def lifespan(
+                self,
+                _app,
+            ) -> AsyncIterator[None]:
+                lifecycle["entered"] = True
+                try:
+                    yield
+                finally:
+                    lifecycle["exited"] = True
+
+            async def __call__(self, _scope, _receive, _send) -> None:
+                raise AssertionError("MCP request dispatch was not expected")
+
+        def fail_decision_engine(**_kwargs):
+            raise RuntimeError("decision composition failed")
+
+        monkeypatch.setattr(
+            app_module.mcp_server,
+            "build_mcp_http_app",
+            lambda: StubMcpApp(),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "build_configured_decision_engine",
+            fail_decision_engine,
+        )
+
+        app = create_app(settings)
+        with pytest.raises(
+            RuntimeError,
+            match="decision composition failed",
+        ):
+            with TestClient(app):
+                pass
+
+        assert lifecycle == {"entered": True, "exited": True}
+        assert app.state.decision_engine is None
+        assert app.state.scheduler is None
+        assert mcp_server._settings_override is None
+        assert store_session._engine is None
+        assert store_session._session_factory is None
+
+    def test_shutdown_closes_decisions_before_mcp_and_database(
+        self,
+        settings,
+        monkeypatch,
+    ) -> None:
+        """Accepted decisions retain their dependencies during shutdown."""
+        import healthmes.app as app_module
+
+        observed: dict[str, object] = {}
+
+        class StubDecisionEngine:
+            async def aclose(self) -> None:
+                observed["engine_open"] = store_session._engine is not None
+                observed["mcp_settings"] = mcp_server._settings_override
+
+        engine = StubDecisionEngine()
+        monkeypatch.setattr(
+            app_module,
+            "build_configured_decision_engine",
+            lambda **_kwargs: engine,
+        )
+
+        app = create_app(settings)
+        with TestClient(app):
+            assert app.state.decision_engine is engine
+
+        assert observed == {
+            "engine_open": True,
+            "mcp_settings": settings,
+        }
+        assert app.state.decision_engine is None
+        assert mcp_server._settings_override is None
+        assert store_session._engine is None
+
+    def test_scheduler_setup_failure_closes_decisions_mcp_and_database(
+        self,
+        settings,
+        monkeypatch,
+    ) -> None:
+        """A failure after Decision Engine creation releases every dependency."""
+        import healthmes.app as app_module
+
+        observed: list[str] = []
+
+        class StubMcpApp:
+            @asynccontextmanager
+            async def lifespan(
+                self,
+                _app,
+            ) -> AsyncIterator[None]:
+                observed.append("mcp_enter")
+                try:
+                    yield
+                finally:
+                    observed.append("mcp_exit")
+
+            async def __call__(self, _scope, _receive, _send) -> None:
+                raise AssertionError("MCP request dispatch was not expected")
+
+        class StubDecisionEngine:
+            async def aclose(self) -> None:
+                observed.append("decision")
+
+        monkeypatch.setattr(
+            app_module.mcp_server,
+            "build_mcp_http_app",
+            lambda: StubMcpApp(),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "build_configured_decision_engine",
+            lambda **_kwargs: StubDecisionEngine(),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "register_energy_job",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("scheduler setup failed")
+            ),
+        )
+
+        app = create_app(settings)
+        with pytest.raises(RuntimeError, match="scheduler setup failed"):
+            with TestClient(app):
+                pass
+
+        assert observed == ["mcp_enter", "decision", "mcp_exit"]
+        assert app.state.decision_engine is None
+        assert app.state.scheduler is None
+        assert mcp_server._settings_override is None
+        assert store_session._engine is None
+        assert store_session._session_factory is None
+
+    def test_scheduler_shutdown_failure_does_not_skip_other_cleanup(
+        self,
+        settings,
+        monkeypatch,
+    ) -> None:
+        """AsyncExitStack continues after one registered cleanup fails."""
+        import healthmes.app as app_module
+
+        observed: list[str] = []
+
+        class StubMcpApp:
+            @asynccontextmanager
+            async def lifespan(
+                self,
+                _app,
+            ) -> AsyncIterator[None]:
+                observed.append("mcp_enter")
+                try:
+                    yield
+                finally:
+                    observed.append("mcp_exit")
+
+            async def __call__(self, _scope, _receive, _send) -> None:
+                raise AssertionError("MCP request dispatch was not expected")
+
+        class StubDecisionEngine:
+            async def aclose(self) -> None:
+                observed.append("decision")
+
+        monkeypatch.setattr(
+            app_module.mcp_server,
+            "build_mcp_http_app",
+            lambda: StubMcpApp(),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "build_configured_decision_engine",
+            lambda **_kwargs: StubDecisionEngine(),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "shutdown_scheduler",
+            lambda _scheduler: (_ for _ in ()).throw(
+                RuntimeError("scheduler shutdown failed")
+            ),
+        )
+
+        app = create_app(settings)
+        with pytest.raises(
+            RuntimeError,
+            match="scheduler shutdown failed",
+        ):
+            with TestClient(app):
+                pass
+
+        assert observed == ["mcp_enter", "decision", "mcp_exit"]
+        assert app.state.decision_engine is None
+        assert app.state.scheduler is None
+        assert mcp_server._settings_override is None
+        assert store_session._engine is None
+        assert store_session._session_factory is None
+
+    def test_mcp_lifespan_entry_failure_releases_settings_and_database(
+        self,
+        settings,
+        monkeypatch,
+    ) -> None:
+        """MCP startup failure cannot leave process-global state installed."""
+        import healthmes.app as app_module
+
+        class FailingMcpApp:
+            @asynccontextmanager
+            async def lifespan(
+                self,
+                _app,
+            ) -> AsyncIterator[None]:
+                raise RuntimeError("MCP lifespan entry failed")
+                yield
+
+            async def __call__(self, _scope, _receive, _send) -> None:
+                raise AssertionError("MCP request dispatch was not expected")
+
+        monkeypatch.setattr(
+            app_module.mcp_server,
+            "build_mcp_http_app",
+            lambda: FailingMcpApp(),
+        )
+
+        app = create_app(settings)
+        with pytest.raises(
+            RuntimeError,
+            match="MCP lifespan entry failed",
+        ):
+            with TestClient(app):
+                pass
+
+        assert app.state.decision_engine is None
+        assert app.state.scheduler is None
+        assert mcp_server._settings_override is None
+        assert store_session._engine is None
+        assert store_session._session_factory is None
+
+    async def test_repeated_lifespan_cancellation_drains_decisions_before_db(
+        self,
+        settings,
+        monkeypatch,
+    ) -> None:
+        """Cancellation cannot let MCP or DB outrun accepted finalization."""
+        import healthmes.app as app_module
+
+        entered = asyncio.Event()
+        hold_lifespan = asyncio.Event()
+        observed: list[str] = []
+
+        class StubMcpApp:
+            @asynccontextmanager
+            async def lifespan(
+                self,
+                _app,
+            ) -> AsyncIterator[None]:
+                observed.append("mcp_enter")
+                try:
+                    yield
+                finally:
+                    assert decision_engine.finished.is_set()
+                    assert store_session._engine is not None
+                    observed.append("mcp_exit")
+
+            async def __call__(self, _scope, _receive, _send) -> None:
+                raise AssertionError("MCP request dispatch was not expected")
+
+        class StubDecisionEngine:
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+                self.finished = asyncio.Event()
+                self._shutdown_task: asyncio.Task[None] | None = None
+
+            async def _shutdown(self) -> None:
+                self.started.set()
+                await self.release.wait()
+                self.finished.set()
+                observed.append("decision")
+
+            async def aclose(self) -> None:
+                if self._shutdown_task is None:
+                    self._shutdown_task = asyncio.create_task(
+                        self._shutdown()
+                    )
+                await asyncio.shield(self._shutdown_task)
+
+        decision_engine = StubDecisionEngine()
+        monkeypatch.setattr(
+            app_module.mcp_server,
+            "build_mcp_http_app",
+            lambda: StubMcpApp(),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "build_configured_decision_engine",
+            lambda **_kwargs: decision_engine,
+        )
+
+        app = create_app(settings)
+
+        async def run_lifespan() -> None:
+            async with app.router.lifespan_context(app):
+                entered.set()
+                await hold_lifespan.wait()
+
+        lifespan_task = asyncio.create_task(run_lifespan())
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        lifespan_task.cancel()
+        await asyncio.wait_for(decision_engine.started.wait(), timeout=1)
+
+        assert lifespan_task.done() is False
+        assert store_session._engine is not None
+        assert mcp_server._settings_override is settings
+
+        lifespan_task.cancel()
+        await asyncio.sleep(0)
+        assert lifespan_task.done() is False
+        assert store_session._engine is not None
+        assert mcp_server._settings_override is settings
+
+        decision_engine.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await lifespan_task
+
+        assert observed == ["mcp_enter", "decision", "mcp_exit"]
+        assert app.state.decision_engine is None
+        assert app.state.scheduler is None
+        assert mcp_server._settings_override is None
         assert store_session._engine is None
         assert store_session._session_factory is None
 

@@ -33,6 +33,7 @@ from healthmes.calendars.adjustments_types import (
     AdjustmentRepository,
     AdjustmentStatus,
     AmbiguousProviderResult,
+    CalendarAccountGenerationChanged,
     CalendarAdjustmentWriter,
     EvaluationResult,
     ResolveResult,
@@ -47,8 +48,10 @@ from healthmes.calendars.base import (
     coerce_utc,
     ensure_utc,
 )
+from healthmes.store.enums import CalendarSource
 
 _MIRROR_SNAPSHOT_UNSET = object()
+_ACCOUNT_GENERATION_UNCHECKED = object()
 
 
 class CalendarAdjustmentService:
@@ -151,9 +154,12 @@ class CalendarAdjustmentService:
         *,
         response: str,
         reply_handle: str | None,
-        writer: CalendarAdjustmentWriter,
+        writer: CalendarAdjustmentWriter | None,
         response_channel: str | None = None,
         mirror_snapshot: Any = _MIRROR_SNAPSHOT_UNSET,
+        current_account_generation: str | None | object = (
+            _ACCOUNT_GENERATION_UNCHECKED
+        ),
     ) -> ResolveResult:
         now = ensure_utc(self._clock())
         proposal = self._repository.get_proposal(proposal_id)
@@ -196,6 +202,27 @@ class CalendarAdjustmentService:
                 proposal.status,
                 redacted_receipt(status=proposal.status, provider_code="unsupported_response"),
             )
+        if (
+            current_account_generation
+            is not _ACCOUNT_GENERATION_UNCHECKED
+            and current_account_generation
+            != proposal.snapshot.account_generation
+        ):
+            return self._terminal(
+                proposal,
+                AdjustmentStatus.CONFLICTED,
+                "calendar_account_generation_changed",
+                now,
+                expected_status=AdjustmentStatus.PENDING,
+            )
+        if writer is None:
+            return self._terminal(
+                proposal,
+                AdjustmentStatus.FAILED_NO_CHANGE,
+                "unsupported_calendar_source",
+                now,
+                expected_status=AdjustmentStatus.PENDING,
+            )
 
         attempt_id = uuid.uuid4()
         applying = self._repository.compare_and_mark_applying(
@@ -236,6 +263,14 @@ class CalendarAdjustmentService:
         try:
             event = writer.apply_confirmed_external_time_change(
                 applying.snapshot.confirmed_change()
+            )
+        except CalendarAccountGenerationChanged:
+            return self._terminal(
+                applying,
+                AdjustmentStatus.CONFLICTED,
+                "calendar_account_generation_changed",
+                now,
+                expected_status=AdjustmentStatus.APPLYING,
             )
         except CalendarConflictError:
             return self._terminal(
@@ -303,14 +338,69 @@ class CalendarAdjustmentService:
         )
 
     def expire_and_reconcile_adjustments(
-        self, writer: CalendarAdjustmentWriter
+        self,
+        writer: CalendarAdjustmentWriter | None = None,
+        *,
+        writer_resolver: (
+            Callable[
+                [CalendarSource, str | None],
+                CalendarAdjustmentWriter | None,
+            ]
+            | None
+        ) = None,
+        account_generation_resolver: (
+            Callable[[CalendarSource], str | None] | None
+        ) = None,
     ) -> list[ResolveResult]:
         now = ensure_utc(self._clock())
         results: list[ResolveResult] = []
         for proposal in self._repository.pending_expired(now):
             results.append(self._expire(proposal, now))
         for proposal in self._repository.stale_applying(now):
-            results.append(self._reconcile(proposal, writer, "restart_recovery", now))
+            if (
+                account_generation_resolver is not None
+                and account_generation_resolver(
+                    proposal.snapshot.calendar_source
+                )
+                != proposal.snapshot.account_generation
+            ):
+                results.append(
+                    self._terminal(
+                        proposal,
+                        AdjustmentStatus.UNKNOWN,
+                        "calendar_account_generation_changed",
+                        now,
+                        expected_status=AdjustmentStatus.APPLYING,
+                    )
+                )
+                continue
+            selected_writer = (
+                writer_resolver(
+                    proposal.snapshot.calendar_source,
+                    proposal.snapshot.account_generation,
+                )
+                if writer_resolver is not None
+                else writer
+            )
+            if selected_writer is None:
+                results.append(
+                    self._terminal(
+                        proposal,
+                        AdjustmentStatus.UNKNOWN,
+                        "unsupported_calendar_source",
+                        now,
+                        expected_status=AdjustmentStatus.APPLYING,
+                    )
+                )
+                continue
+            results.append(
+                self._reconcile(
+                    proposal,
+                    selected_writer,
+                    "restart_recovery",
+                    now,
+                )
+            )
         return results
 
     def _expire(self, proposal: StoredAdjustmentProposal, now: datetime) -> ResolveResult:
@@ -369,7 +459,19 @@ class CalendarAdjustmentService:
         provider_code: str,
         now: datetime,
     ) -> ResolveResult:
-        event = read_remote_event(writer, proposal.snapshot.external_event_id)
+        try:
+            event = read_remote_event(
+                writer,
+                proposal.snapshot.external_event_id,
+            )
+        except CalendarAccountGenerationChanged:
+            return self._terminal(
+                proposal,
+                AdjustmentStatus.UNKNOWN,
+                "calendar_account_generation_changed",
+                now,
+                expected_status=AdjustmentStatus.APPLYING,
+            )
         if event is not None and remote_matches_snapshot(proposal.snapshot, event):
             return self._terminal(
                 proposal,

@@ -22,8 +22,10 @@ from the mirror the same way, which keeps the mirror bounded to the active
 scheduling horizon.
 """
 
+import hashlib
 import json
 import logging
+import uuid
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -51,6 +53,11 @@ from healthmes.calendars.base import (
     parse_calendar_identity,
     parse_event_kind,
     parse_task_id,
+)
+from healthmes.calendars.creds import (
+    GOOGLE_ACCOUNT_GENERATION_KEY,
+    calendar_credential_file_lock,
+    write_owner_only_json,
 )
 from healthmes.calendars.state import (
     SyncCoverageKind,
@@ -91,14 +98,75 @@ def google_client_secret_path(data_dir: Path) -> Path:
     return Path(data_dir) / "google" / "client_secret.json"
 
 
-def save_credentials(credentials: Any, token_file: Path) -> None:
+def save_credentials(
+    credentials: Any,
+    token_file: Path,
+    *,
+    account_generation: str | None = None,
+) -> None:
     """Persist authorized-user credentials as JSON, owner-readable only."""
     token_file = Path(token_file)
-    token_file.parent.mkdir(parents=True, exist_ok=True)
     payload = json.loads(credentials.to_json())
+    if not isinstance(payload, dict):
+        raise ValueError("Google credentials must serialize to an object")
     payload.setdefault("type", "authorized_user")
-    token_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    token_file.chmod(0o600)
+    payload[GOOGLE_ACCOUNT_GENERATION_KEY] = (
+        account_generation or uuid.uuid4().hex
+    )
+    with calendar_credential_file_lock(token_file):
+        write_owner_only_json(token_file, payload)
+
+
+def _token_digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _save_refreshed_credentials(
+    credentials: Any,
+    token_file: Path,
+    *,
+    expected_digest: str,
+) -> bool:
+    """Persist a refresh only when the authorization file is unchanged."""
+
+    with calendar_credential_file_lock(token_file):
+        try:
+            current = token_file.read_bytes()
+        except FileNotFoundError:
+            return False
+        if _token_digest(current) != expected_digest:
+            return False
+        payload = json.loads(credentials.to_json())
+        if not isinstance(payload, dict):
+            raise ValueError("Google credentials must serialize to an object")
+        payload.setdefault("type", "authorized_user")
+        try:
+            current_payload = json.loads(current.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(current_payload, dict):
+            return False
+        account_generation = current_payload.get(
+            GOOGLE_ACCOUNT_GENERATION_KEY
+        )
+        if not isinstance(account_generation, str) or not account_generation:
+            refresh_token = str(
+                current_payload.get("refresh_token") or ""
+            )
+            client_id = str(current_payload.get("client_id") or "")
+            account_generation = hashlib.sha256(
+                "\x1f".join(
+                    (
+                        "healthmes-calendar-account-v1",
+                        CalendarSource.GOOGLE.value,
+                        refresh_token,
+                        client_id,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+        payload[GOOGLE_ACCOUNT_GENERATION_KEY] = account_generation
+        write_owner_only_json(token_file, payload)
+        return True
 
 
 def load_credentials(token_file: Path, scopes: Sequence[str] = GOOGLE_SCOPES) -> Any | None:
@@ -108,22 +176,50 @@ def load_credentials(token_file: Path, scopes: Sequence[str] = GOOGLE_SCOPES) ->
     file, or invalid without a refresh token). Never interactive.
     """
     token_file = Path(token_file)
-    if not token_file.exists():
-        return None
-
     from google.oauth2.credentials import Credentials
 
-    try:
-        credentials = Credentials.from_authorized_user_file(str(token_file), list(scopes))
-    except ValueError:
-        logger.warning("unreadable google token file %s; re-auth required", token_file)
-        return None
+    with calendar_credential_file_lock(token_file):
+        try:
+            raw = token_file.read_bytes()
+        except FileNotFoundError:
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError
+            authorized_user_info = dict(payload)
+            authorized_user_info.pop(
+                GOOGLE_ACCOUNT_GENERATION_KEY,
+                None,
+            )
+            credentials = Credentials.from_authorized_user_info(
+                authorized_user_info,
+                list(scopes),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            logger.warning(
+                "unreadable google token file %s; re-auth required",
+                token_file,
+            )
+            return None
 
     if credentials.expired and credentials.refresh_token:
         from google.auth.transport.requests import Request
 
+        expected_digest = _token_digest(raw)
+        # Refresh is remote I/O. Disconnect and reconnect must not wait for it;
+        # the compare-and-swap below rejects a result from stale credentials.
         credentials.refresh(Request())
-        save_credentials(credentials, token_file)
+        if not _save_refreshed_credentials(
+            credentials,
+            token_file,
+            expected_digest=expected_digest,
+        ):
+            logger.info(
+                "google token changed during refresh; discarding stale "
+                "authorization"
+            )
+            return None
 
     return credentials if credentials.valid else None
 
@@ -134,6 +230,7 @@ def run_installed_app_flow(
     scopes: Sequence[str] = GOOGLE_SCOPES,
     *,
     port: int = 0,
+    persist: bool = True,
 ) -> Any:
     """Run the interactive installed-app OAuth flow and persist the token.
 
@@ -144,7 +241,8 @@ def run_installed_app_flow(
 
     flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_file), list(scopes))
     credentials = flow.run_local_server(port=port)
-    save_credentials(credentials, token_file)
+    if persist:
+        save_credentials(credentials, token_file)
     return credentials
 
 

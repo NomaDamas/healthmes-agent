@@ -21,6 +21,13 @@ from healthmes.activity.context import (
 )
 from healthmes.activity.contracts import ActivityContextResolveRequest
 from healthmes.calendars.base import HealthmesEventKind
+from healthmes.calendars.state import SyncHealthStore
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    CalendarVisibilityChanged,
+    read_visible_calendar,
+)
+from healthmes.config import Settings
 from healthmes.nutrition.intake_query import decision_context as nutrition_decision_context
 from healthmes.nutrition.query import known_caffeine_for_day
 from healthmes.store import CalendarEventMirror
@@ -76,9 +83,35 @@ def calendar_context(
     *,
     day: date,
     timezone: str | tzinfo,
+    visibility: CalendarVisibility | None = None,
 ) -> dict[str, Any]:
     name = _timezone_name(timezone)
     start, end = local_day_bounds(day, timezone)
+    if visibility is None:
+        return {
+            "status": "unavailable",
+            "reason": "calendar_visibility_not_configured",
+            "date": day.isoformat(),
+            "timezone": name,
+            "event_count": 0,
+            "busy_minutes": 0.0,
+            "first_event_at": None,
+            "last_event_at": None,
+            "evidence_ids": [],
+            "freshness": {
+                "recorded_at": None,
+                "status": "unavailable",
+            },
+            "coverage": {
+                "status": "unavailable",
+                "ratio": None,
+            },
+            "limitations": [
+                "calendar_visibility_not_configured",
+                "calendar_titles_omitted",
+                "calendar_presence_is_not_work_intensity",
+            ],
+        }
     rows = list(
         session.scalars(
             select(CalendarEventMirror)
@@ -91,6 +124,7 @@ def calendar_context(
                     CalendarEventMirror.healthmes_kind
                     != HealthmesEventKind.ACTUAL_SLEEP.value,
                 ),
+                visibility.predicate(),
             )
             .order_by(CalendarEventMirror.start_at)
         )
@@ -131,8 +165,22 @@ def calendar_context(
         if rows
         else None
     )
+    status = (
+        "ok"
+        if rows
+        else ("insufficient_data" if visibility.available else "unavailable")
+    )
     return {
-        "status": "ok" if rows else "insufficient_data",
+        "status": status,
+        "reason": (
+            None
+            if rows
+            else (
+                "no_visible_calendar_events"
+                if visibility.available
+                else "calendar_unavailable"
+            )
+        ),
         "date": day.isoformat(),
         "timezone": name,
         "event_count": len(rows),
@@ -150,16 +198,31 @@ def calendar_context(
         "evidence_ids": [str(row.id) for row in rows],
         "freshness": {
             "recorded_at": freshness.isoformat() if freshness is not None else None,
-            "status": "calendar_mirror" if rows else "unavailable",
+            "status": (
+                "calendar_mirror"
+                if rows
+                else (
+                    "no_visible_rows"
+                    if visibility.available
+                    else "unavailable"
+                )
+            ),
         },
         "coverage": {
-            "status": "calendar_mirror_rows" if rows else "no_data",
+            "status": (
+                "calendar_mirror_rows"
+                if rows
+                else ("no_data" if visibility.available else "unavailable")
+            ),
             "ratio": None,
         },
-        "limitations": [
-            "calendar_titles_omitted",
-            "calendar_presence_is_not_work_intensity",
-        ],
+        "limitations": sorted(
+            {
+                *visibility.limitations,
+                "calendar_titles_omitted",
+                "calendar_presence_is_not_work_intensity",
+            }
+        ),
     }
 
 
@@ -1157,6 +1220,8 @@ async def resolve_wellness_context(
     *,
     default_timezone: str | tzinfo,
     wearable_reader: WearableReader | None = None,
+    calendar_settings: Settings | None = None,
+    calendar_sync_health_store: SyncHealthStore | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     timezone_value: str | tzinfo = request.timezone or default_timezone
@@ -1284,11 +1349,41 @@ async def resolve_wellness_context(
                 }
 
     if "calendar" in selected:
-        contexts["calendar"] = calendar_context(
-            session,
-            day=day,
-            timezone=timezone_value,
-        )
+        if calendar_settings is None:
+            contexts["calendar"] = calendar_context(
+                session,
+                day=day,
+                timezone=timezone_value,
+            )
+        else:
+            try:
+                contexts["calendar"], _visibility = (
+                    read_visible_calendar(
+                        session,
+                        calendar_settings,
+                        lambda visibility: calendar_context(
+                            session,
+                            day=day,
+                            timezone=timezone_value,
+                            visibility=visibility,
+                        ),
+                        sync_health_store=calendar_sync_health_store,
+                    )
+                )
+            except CalendarVisibilityChanged:
+                contexts["calendar"] = {
+                    **calendar_context(
+                        session,
+                        day=day,
+                        timezone=timezone_value,
+                    ),
+                    "reason": "calendar_visibility_changed",
+                    "limitations": [
+                        "calendar_visibility_changed",
+                        "calendar_titles_omitted",
+                        "calendar_presence_is_not_work_intensity",
+                    ],
+                }
 
     if "nutrition" in selected:
         contexts["nutrition"] = nutrition_context(

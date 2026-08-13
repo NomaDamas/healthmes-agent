@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
+import threading
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from typing import Any, Literal
 
 from pydantic import (
@@ -19,7 +23,8 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
-from sqlalchemy import or_, select, text
+from sqlalchemy import event, or_, select, text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
@@ -27,6 +32,10 @@ from healthmes.activity.locking import (
     activity_write_lock,
     lock_activity_write_plane,
     postgres_activity_write_plane_guard,
+)
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    CalendarVisibilityChanged,
 )
 from healthmes.decision.access import (
     AccessAuditEntry,
@@ -52,6 +61,7 @@ from healthmes.decision.validation import (
     strict_model_validate,
 )
 from healthmes.store import DecisionKind, DecisionRecord
+from healthmes.timing import steady_time
 
 DECISION_RECORD_SCHEMA = "healthmes.decision-record.v1"
 DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v1"
@@ -59,6 +69,31 @@ _PERSISTENCE_FAILURE = "decision_record_persistence_failed"
 _MAX_STORED_JSON_BYTES = 2_000_000
 _MAX_POSTGRES_ATTEMPTS = 3
 _RETRYABLE_POSTGRES_STATES = frozenset({"40001", "40P01"})
+_POSTGRES_TIMEOUT_STATES = frozenset({"55P03", "57014"})
+_DEFAULT_FINALIZATION_TIMEOUT_SECONDS = 5.0
+_FINALIZATION_TIMEOUT = "decision_finalization_timeout"
+_FINALIZATION_OUTCOME_UNKNOWN = "decision_finalization_outcome_unknown"
+_FINALIZATION_CAPACITY_EXHAUSTED = (
+    "decision_finalization_capacity_exhausted"
+)
+_SQLITE_BUSY_TIMEOUT_INFO_KEY = (
+    "healthmes_decision_finalization_sqlite_busy_timeout"
+)
+_SAFE_TOOL_ERROR_CODES = frozenset(
+    {
+        "decision_tool_call_budget_exhausted",
+        "duplicate_tool_call",
+        "invalid_provider_query",
+        "malformed_tool_arguments",
+        "provider_contract_violation",
+        "provider_execution_failed",
+        "tool_execution_failed",
+        "turn_context_byte_budget_exhausted",
+        "turn_source_ref_budget_exhausted",
+        "turn_tool_call_budget_exhausted",
+        "unknown_tool",
+    }
+)
 _SOURCE_REF_TOKEN = re.compile(
     r"(?<![A-Za-z0-9_])sr_[0-9a-f]{32}(?![A-Za-z0-9_])",
     re.IGNORECASE,
@@ -161,6 +196,99 @@ class _FinalizationRejected(RuntimeError):
         self.limitations = limitations
 
 
+class _FinalizationPhase(Enum):
+    PRE_COMMIT = "pre_commit"
+    COMMITTING = "committing"
+    COMMITTED = "committed"
+    ABORTED = "aborted"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+    FINISHED = "finished"
+
+
+class _FinalizationControl:
+    """Cross-thread commit fence for one supervised finalization."""
+
+    def __init__(self, deadline: float) -> None:
+        self.deadline = deadline
+        self.done = threading.Event()
+        self._lock = threading.Lock()
+        self._phase = _FinalizationPhase.PRE_COMMIT
+        self._result: DecisionResult | None = None
+
+    def enter_commit(self) -> None:
+        """Enter the irreversible phase only at SQLAlchemy before_commit."""
+
+        with self._lock:
+            if self._phase is _FinalizationPhase.ABORTED:
+                raise TimeoutError(
+                    "decision finalization was aborted before commit"
+                )
+            if self._phase in {
+                _FinalizationPhase.COMMITTING,
+                _FinalizationPhase.OUTCOME_UNKNOWN,
+            }:
+                return
+            if self._phase is not _FinalizationPhase.PRE_COMMIT:
+                raise RuntimeError(
+                    "decision finalization commit phase is invalid"
+                )
+            if steady_time() >= self.deadline:
+                self._phase = _FinalizationPhase.ABORTED
+                raise TimeoutError(
+                    "decision finalization deadline expired before commit"
+                )
+            self._phase = _FinalizationPhase.COMMITTING
+
+    def mark_committed(self, result: DecisionResult) -> None:
+        with self._lock:
+            if self._phase is _FinalizationPhase.ABORTED:
+                raise RuntimeError(
+                    "aborted decision finalization reached commit"
+                )
+            self._result = result
+            self._phase = _FinalizationPhase.COMMITTED
+
+    def reset_retryable_commit(self) -> bool:
+        """Return a known-rolled-back PostgreSQL retry to PRE_COMMIT."""
+
+        with self._lock:
+            if self._phase is _FinalizationPhase.COMMITTING:
+                if steady_time() >= self.deadline:
+                    self._phase = _FinalizationPhase.ABORTED
+                    return False
+                self._phase = _FinalizationPhase.PRE_COMMIT
+                return True
+            return self._phase is _FinalizationPhase.PRE_COMMIT
+
+    def expire(self) -> _FinalizationPhase:
+        """Fence future commits and classify an in-flight commit safely."""
+
+        with self._lock:
+            if self._phase is _FinalizationPhase.PRE_COMMIT:
+                self._phase = _FinalizationPhase.ABORTED
+            elif self._phase is _FinalizationPhase.COMMITTING:
+                self._phase = _FinalizationPhase.OUTCOME_UNKNOWN
+            return self._phase
+
+    def publish(self, result: DecisionResult) -> None:
+        with self._lock:
+            if self._phase is not _FinalizationPhase.COMMITTED:
+                self._result = result
+            if self._phase not in {
+                _FinalizationPhase.ABORTED,
+                _FinalizationPhase.COMMITTED,
+                _FinalizationPhase.OUTCOME_UNKNOWN,
+            }:
+                self._phase = _FinalizationPhase.FINISHED
+        self.done.set()
+
+    def snapshot(
+        self,
+    ) -> tuple[_FinalizationPhase, DecisionResult | None]:
+        with self._lock:
+            return self._phase, self._result
+
+
 def decision_request_fingerprint(request: DecisionRequest) -> str:
     """Hash semantic request contents while excluding retry correlation IDs."""
 
@@ -180,6 +308,18 @@ def decision_request_fingerprint(request: DecisionRequest) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def decision_result_from_record(row: DecisionRecord) -> DecisionResult:
+    """Recover one verified result after an outcome-unknown response."""
+
+    fingerprint = row.decision_request_fingerprint
+    if fingerprint is None:
+        raise ValueError("decision record is not Decision Agent correlated")
+    stored = _stored_decision(row, fingerprint=fingerprint)
+    if isinstance(stored, str):
+        raise ValueError(stored)
+    return stored.result.model_copy(deep=True)
+
+
 class DecisionFinalizer:
     """Promote a runtime draft only after current-source and storage checks."""
 
@@ -189,17 +329,160 @@ class DecisionFinalizer:
         access_layer: ContextAccessLayer,
         session_factory: SessionFactory,
         policy_resolver: AccessPolicyResolver,
+        timeout_seconds: float = _DEFAULT_FINALIZATION_TIMEOUT_SECONDS,
+        max_workers: int = 8,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("finalization timeout must be positive")
+        if max_workers < 1:
+            raise ValueError("finalization max_workers must be positive")
         self._access_layer = access_layer
         self._session_factory = session_factory
         self._policy_resolver = policy_resolver
+        self._timeout_seconds = timeout_seconds
+        self._worker_slots = threading.BoundedSemaphore(max_workers)
+        self._workers_lock = threading.Lock()
+        self._active_controls: set[_FinalizationControl] = set()
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def finalize(
         self,
         request: DecisionRequest,
         run: DecisionAgentRun,
+    ) -> DecisionResult:
+        control = self._start_supervised_finalization(request, run)
+        control.done.wait(
+            timeout=max(0.0, control.deadline - steady_time())
+        )
+        return self._supervised_result(request, run, control)
+
+    async def afinalize(
+        self,
+        request: DecisionRequest,
+        run: DecisionAgentRun,
+    ) -> DecisionResult:
+        """Finalize without occupying asyncio's non-daemon thread pool."""
+
+        control = self._start_supervised_finalization(request, run)
+        while not control.done.is_set():
+            remaining = control.deadline - steady_time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.01, remaining))
+        return self._supervised_result(request, run, control)
+
+    def _start_supervised_finalization(
+        self,
+        request: DecisionRequest,
+        run: DecisionAgentRun,
+    ) -> _FinalizationControl:
+        control = _FinalizationControl(
+            steady_time() + self._timeout_seconds
+        )
+        if not self._worker_slots.acquire(blocking=False):
+            control.publish(
+                _failure_result(
+                    run,
+                    code=_FINALIZATION_CAPACITY_EXHAUSTED,
+                    persistence_required=_run_requires_persistence(run),
+                )
+            )
+            return control
+        with self._workers_lock:
+            self._active_controls.add(control)
+
+        def worker() -> None:
+            try:
+                result = self._finalize_inline(
+                    request,
+                    run,
+                    control=control,
+                )
+            except BaseException:
+                result = _failure_result(
+                    run,
+                    code=_PERSISTENCE_FAILURE,
+                    persistence_required=_run_requires_persistence(run),
+                )
+            with self._workers_lock:
+                self._active_controls.discard(control)
+            self._worker_slots.release()
+            control.publish(result)
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"healthmes-finalizer-{getattr(run, 'request_id', 'invalid')}",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except BaseException:
+            with self._workers_lock:
+                self._active_controls.discard(control)
+            self._worker_slots.release()
+            control.publish(
+                _failure_result(
+                    run,
+                    code=_PERSISTENCE_FAILURE,
+                    persistence_required=_run_requires_persistence(run),
+                )
+            )
+        return control
+
+    def abort_active(self) -> None:
+        """Fence every in-flight pre-commit worker during bounded shutdown."""
+
+        with self._workers_lock:
+            controls = tuple(self._active_controls)
+        for control in controls:
+            control.expire()
+
+    def _supervised_result(
+        self,
+        request: DecisionRequest,
+        run: DecisionAgentRun,
+        control: _FinalizationControl,
+    ) -> DecisionResult:
+        del request
+        phase, result = control.snapshot()
+        if control.done.is_set():
+            if phase is _FinalizationPhase.COMMITTED and result is not None:
+                return result
+            if phase is _FinalizationPhase.OUTCOME_UNKNOWN:
+                return _unknown_result(run)
+            if phase is _FinalizationPhase.ABORTED:
+                return _failure_result(
+                    run,
+                    code=_FINALIZATION_TIMEOUT,
+                    persistence_required=_run_requires_persistence(run),
+                )
+            if result is not None:
+                return result
+
+        phase = control.expire()
+        final_phase, final_result = control.snapshot()
+        if final_phase is _FinalizationPhase.COMMITTED:
+            if final_result is None:
+                return _unknown_result(run)
+            return final_result
+        if final_phase is _FinalizationPhase.OUTCOME_UNKNOWN or phase in {
+            _FinalizationPhase.COMMITTING,
+            _FinalizationPhase.OUTCOME_UNKNOWN,
+        }:
+            return _unknown_result(run)
+        return _failure_result(
+            run,
+            code=_FINALIZATION_TIMEOUT,
+            persistence_required=_run_requires_persistence(run),
+        )
+
+    def _finalize_inline(
+        self,
+        request: DecisionRequest,
+        run: DecisionAgentRun,
+        *,
+        control: _FinalizationControl,
     ) -> DecisionResult:
         try:
             canonical_request = strict_model_validate(
@@ -272,31 +555,30 @@ class DecisionFinalizer:
             and bool(used_ids)
         )
         fingerprint = decision_request_fingerprint(canonical_request)
+        finalization_deadline = control.deadline
 
         try:
-            policy = strict_model_validate(
-                ContextAccessPolicy,
-                self._policy_resolver(canonical_request),
-            )
-        except Exception:
-            if used_ids:
-                return _failure_result(
-                    canonical_run,
-                    code="access_policy_resolution_failed",
-                    persistence_required=persistence_required,
+            with self._session_factory() as session:
+                _configure_finalization_database_timeouts(
+                    session,
+                    timeout_seconds=_remaining_seconds(
+                        finalization_deadline
+                    ),
                 )
-            return _result_without_persistence(canonical_run, ())
-        policy_error = _request_policy_error(canonical_request, policy)
-        if policy_error is not None:
-            return _failure_result(
-                canonical_run,
-                code=policy_error,
-                persistence_required=persistence_required,
-            )
-
-        try:
-            if not persistence_required:
-                with self._session_factory() as session:
+                policy = self._resolve_policy(
+                    canonical_request,
+                    session=session,
+                    lock=False,
+                )
+                _ensure_finalization_deadline(finalization_deadline)
+                if not persistence_required:
+                    calendar_snapshot = (
+                        self._calendar_visibility_for_candidates(
+                            session,
+                            used_ids=used_ids,
+                            candidates=source_candidates,
+                        )
+                    )
                     validated_refs, source_limitations = (
                         self._revalidate_used_refs(
                             session,
@@ -306,9 +588,19 @@ class DecisionFinalizer:
                             candidates=source_candidates,
                             access_trace=canonical_run.access_trace,
                             lock_sources=False,
+                            calendar_visibility_snapshot=(
+                                calendar_snapshot
+                            ),
                         )
                     )
-                    session.rollback()
+                    self._require_calendar_visibility_current(
+                        calendar_snapshot
+                    )
+                    _ensure_finalization_deadline(
+                        finalization_deadline
+                    )
+                session.rollback()
+            if not persistence_required:
                 return _result_without_persistence(
                     canonical_run,
                     validated_refs,
@@ -321,6 +613,8 @@ class DecisionFinalizer:
                 used_ids=used_ids,
                 candidates=source_candidates,
                 fingerprint=fingerprint,
+                deadline=finalization_deadline,
+                control=control,
             )
         except _FinalizationRejected as exc:
             return _failure_result(
@@ -338,6 +632,8 @@ class DecisionFinalizer:
                     candidates=source_candidates,
                     fingerprint=fingerprint,
                     insert_if_missing=False,
+                    deadline=finalization_deadline,
+                    control=control,
                 )
             except _FinalizationRejected as exc:
                 return _failure_result(
@@ -346,12 +642,44 @@ class DecisionFinalizer:
                     extra_limitations=exc.limitations,
                     persistence_required=persistence_required,
                 )
+            except TimeoutError:
+                return _failure_result(
+                    canonical_run,
+                    code=_FINALIZATION_TIMEOUT,
+                    persistence_required=persistence_required,
+                )
+            except DBAPIError as exc:
+                return _failure_result(
+                    canonical_run,
+                    code=(
+                        _FINALIZATION_TIMEOUT
+                        if _database_timeout_error(exc)
+                        else _PERSISTENCE_FAILURE
+                    ),
+                    persistence_required=persistence_required,
+                )
             except Exception:
                 return _failure_result(
                     canonical_run,
                     code=_PERSISTENCE_FAILURE,
                     persistence_required=persistence_required,
                 )
+        except TimeoutError:
+            return _failure_result(
+                canonical_run,
+                code=_FINALIZATION_TIMEOUT,
+                persistence_required=persistence_required,
+            )
+        except DBAPIError as exc:
+            return _failure_result(
+                canonical_run,
+                code=(
+                    _FINALIZATION_TIMEOUT
+                    if _database_timeout_error(exc)
+                    else _PERSISTENCE_FAILURE
+                ),
+                persistence_required=persistence_required,
+            )
         except Exception:
             return _failure_result(
                 canonical_run,
@@ -368,49 +696,86 @@ class DecisionFinalizer:
         candidates: SourceCandidates,
         fingerprint: str,
         insert_if_missing: bool = True,
+        deadline: float | None = None,
+        control: _FinalizationControl | None = None,
     ) -> DecisionResult:
-        with activity_write_lock():
+        deadline = (
+            deadline
+            if deadline is not None
+            else steady_time() + self._timeout_seconds
+        )
+        control = control or _FinalizationControl(deadline)
+        with activity_write_lock(
+            timeout_seconds=_remaining_seconds(deadline)
+        ):
             for attempt in range(_MAX_POSTGRES_ATTEMPTS):
                 try:
                     with self._session_factory() as session:
                         original_bind = session.bind
-                        with postgres_activity_write_plane_guard(
-                            session.get_bind()
+                        with _finalization_connection_guard(
+                            session.get_bind(),
+                            timeout_seconds=_remaining_seconds(deadline),
                         ) as guarded_connection:
                             if guarded_connection is not None:
                                 session.bind = guarded_connection
                             try:
-                                _begin_finalization_transaction(session)
+                                _begin_finalization_transaction(
+                                    session,
+                                    timeout_seconds=_remaining_seconds(
+                                        deadline
+                                    ),
+                                )
                                 final_policy = self._resolve_policy(
                                     request,
+                                    session=session,
+                                    lock=True,
                                 )
+                                _ensure_finalization_deadline(deadline)
                                 existing = _existing_stored_decision(
                                     session,
                                     request,
                                     fingerprint=fingerprint,
                                     lock=True,
                                 )
+                                _ensure_finalization_deadline(deadline)
                                 if existing is not None:
                                     if isinstance(existing, str):
                                         raise _FinalizationRejected(existing)
-                                    return self._revalidate_stored_decision(
-                                        session,
-                                        request,
-                                        policy=final_policy,
-                                        stored=existing,
+                                    stored_result = (
+                                        self._revalidate_stored_decision(
+                                            session,
+                                            request,
+                                            policy=final_policy,
+                                            stored=existing,
+                                        )
                                     )
+                                    _ensure_finalization_deadline(
+                                        deadline
+                                    )
+                                    return stored_result
                                 if not insert_if_missing:
                                     raise _FinalizationRejected(
                                         _PERSISTENCE_FAILURE
                                     )
 
+                                calendar_snapshot = (
+                                    self._calendar_visibility_for_candidates(
+                                        session,
+                                        used_ids=used_ids,
+                                        candidates=candidates,
+                                    )
+                                )
                                 self._lock_used_ref_sources(
                                     session,
                                     request,
                                     policy=final_policy,
                                     used_ids=used_ids,
                                     candidates=candidates,
+                                    calendar_visibility_snapshot=(
+                                        calendar_snapshot
+                                    ),
                                 )
+                                _ensure_finalization_deadline(deadline)
 
                                 validated_refs, source_limitations = (
                                     self._revalidate_used_refs(
@@ -421,8 +786,12 @@ class DecisionFinalizer:
                                         candidates=candidates,
                                         access_trace=run.access_trace,
                                         lock_sources=False,
+                                        calendar_visibility_snapshot=(
+                                            calendar_snapshot
+                                        ),
                                     )
                                 )
+                                _ensure_finalization_deadline(deadline)
                                 if (
                                     run.draft.proposed_action
                                     and (
@@ -442,12 +811,14 @@ class DecisionFinalizer:
                                     record_id=record_id,
                                     extra_limitations=source_limitations,
                                 )
+                                _ensure_finalization_deadline(deadline)
                                 payload = _decision_payload(
                                     request,
                                     run,
                                     result,
                                     request_fingerprint=fingerprint,
                                 )
+                                _ensure_finalization_deadline(deadline)
                                 row = DecisionRecord(
                                     id=record_id,
                                     kind=DecisionKind.INSIGHT,
@@ -468,8 +839,46 @@ class DecisionFinalizer:
                                     ),
                                 )
                                 session.add(row)
+                                _ensure_finalization_deadline(deadline)
                                 session.flush()
-                                session.commit()
+                                _ensure_finalization_deadline(deadline)
+                                self._require_calendar_visibility_current(
+                                    calendar_snapshot
+                                )
+                                _ensure_finalization_deadline(deadline)
+                                def before_commit(
+                                    _session: Session,
+                                ) -> None:
+                                    control.enter_commit()
+
+                                def after_commit(
+                                    _session: Session,
+                                ) -> None:
+                                    control.mark_committed(result)
+
+                                event.listen(
+                                    session,
+                                    "before_commit",
+                                    before_commit,
+                                )
+                                event.listen(
+                                    session,
+                                    "after_commit",
+                                    after_commit,
+                                )
+                                try:
+                                    session.commit()
+                                finally:
+                                    event.remove(
+                                        session,
+                                        "before_commit",
+                                        before_commit,
+                                    )
+                                    event.remove(
+                                        session,
+                                        "after_commit",
+                                        after_commit,
+                                    )
                                 return result
                             except BaseException:
                                 session.rollback()
@@ -477,11 +886,13 @@ class DecisionFinalizer:
                             finally:
                                 if session.in_transaction():
                                     session.rollback()
+                                _restore_sqlite_busy_timeout(session)
                                 session.bind = original_bind
                 except DBAPIError as exc:
                     if (
                         attempt + 1 < _MAX_POSTGRES_ATTEMPTS
                         and _retryable_postgres_error(exc)
+                        and control.reset_retryable_commit()
                     ):
                         continue
                     raise
@@ -499,12 +910,18 @@ class DecisionFinalizer:
             source_ref.reference_id
             for source_ref in stored.source_refs
         )
+        calendar_snapshot = self._calendar_visibility_for_candidates(
+            session,
+            used_ids=used_ids,
+            candidates=stored.candidates,
+        )
         self._lock_used_ref_sources(
             session,
             request,
             policy=policy,
             used_ids=used_ids,
             candidates=stored.candidates,
+            calendar_visibility_snapshot=calendar_snapshot,
         )
         validated_refs, source_limitations = self._revalidate_used_refs(
             session,
@@ -514,7 +931,9 @@ class DecisionFinalizer:
             candidates=stored.candidates,
             access_trace=stored.access_trace,
             lock_sources=False,
+            calendar_visibility_snapshot=calendar_snapshot,
         )
+        self._require_calendar_visibility_current(calendar_snapshot)
         if tuple(validated_refs) != stored.source_refs:
             raise _FinalizationRejected(
                 "decision_stored_source_contract_changed"
@@ -548,12 +967,37 @@ class DecisionFinalizer:
     def _resolve_policy(
         self,
         request: DecisionRequest,
+        *,
+        session: Session | None = None,
+        lock: bool = False,
     ) -> ContextAccessPolicy:
         try:
+            in_session = getattr(
+                self._policy_resolver,
+                "resolve_in_session",
+                None,
+            )
+            raw_policy = (
+                in_session(
+                    request,
+                    session,
+                    lock=lock,
+                )
+                if session is not None and callable(in_session)
+                else self._policy_resolver(request)
+            )
             policy = strict_model_validate(
                 ContextAccessPolicy,
-                self._policy_resolver(request),
+                raw_policy,
             )
+        except DBAPIError as exc:
+            if _database_timeout_error(exc):
+                raise TimeoutError(
+                    "decision finalization database deadline expired"
+                ) from exc
+            raise _FinalizationRejected(
+                "access_policy_resolution_failed"
+            ) from exc
         except Exception as exc:
             raise _FinalizationRejected(
                 "access_policy_resolution_failed"
@@ -571,6 +1015,7 @@ class DecisionFinalizer:
         policy: ContextAccessPolicy,
         used_ids: Sequence[str],
         candidates: SourceCandidates,
+        calendar_visibility_snapshot: CalendarVisibility | None,
     ) -> None:
         lock_refs: dict[str, SourceRef] = {}
         for reference_id in used_ids:
@@ -586,6 +1031,7 @@ class DecisionFinalizer:
         ).lock_source_refs_for_finalization(
             session,
             tuple(lock_refs.values()),
+            calendar_visibility_snapshot=calendar_visibility_snapshot,
         )
 
     def _revalidate_used_refs(
@@ -598,6 +1044,7 @@ class DecisionFinalizer:
         candidates: SourceCandidates,
         access_trace: Sequence[AccessAuditEntry],
         lock_sources: bool,
+        calendar_visibility_snapshot: CalendarVisibility | None,
     ) -> tuple[tuple[SourceRef, ...], tuple[str, ...]]:
         if not used_ids:
             return (), ()
@@ -615,6 +1062,9 @@ class DecisionFinalizer:
             turn.lock_source_refs_for_finalization(
                 session,
                 tuple(lock_refs.values()),
+                calendar_visibility_snapshot=(
+                    calendar_visibility_snapshot
+                ),
             )
         now = _as_utc(self._clock())
         validated: list[SourceRef] = []
@@ -647,6 +1097,9 @@ class DecisionFinalizer:
                     candidate,
                     context_source_refs=attempt.supporting_refs,
                     now=now,
+                    calendar_visibility_snapshot=(
+                        calendar_visibility_snapshot
+                    ),
                 )
                 rejected_reasons.update(reasons)
                 if checked is not None:
@@ -660,6 +1113,49 @@ class DecisionFinalizer:
                 )
             validated.append(accepted)
         return tuple(validated), tuple(sorted(limitations))
+
+    def _calendar_visibility_for_candidates(
+        self,
+        session: Session,
+        *,
+        used_ids: Sequence[str],
+        candidates: SourceCandidates,
+    ) -> CalendarVisibility | None:
+        refs = _supporting_refs_for_ids(
+            used_ids=used_ids,
+            candidates=candidates,
+        )
+        return self._access_layer.calendar_visibility_for_source_refs(
+            session,
+            refs,
+        )
+
+    def _require_calendar_visibility_current(
+        self,
+        visibility: CalendarVisibility | None,
+    ) -> None:
+        try:
+            self._access_layer.require_calendar_visibility_current(
+                visibility
+            )
+        except CalendarVisibilityChanged as exc:
+            raise _FinalizationRejected(
+                "decision_source_ref_revalidation_failed",
+                "calendar_visibility_changed",
+            ) from exc
+
+
+def _supporting_refs_for_ids(
+    *,
+    used_ids: Sequence[str],
+    candidates: SourceCandidates,
+) -> tuple[SourceRef, ...]:
+    refs: dict[str, SourceRef] = {}
+    for reference_id in used_ids:
+        for attempt in candidates.get(reference_id, ()):
+            for source_ref in attempt.supporting_refs:
+                refs[source_ref.reference_id] = source_ref
+    return tuple(refs.values())
 
 
 def _trace_source_candidates(
@@ -905,6 +1401,7 @@ def _persisted_result(
         source_refs=list(source_refs),
         limitations=_merge_limitations(
             draft.limitations,
+            _tool_trace_limitations(run.tool_trace),
             extra_limitations,
         ),
         clarification_question=draft.clarification_question,
@@ -934,6 +1431,7 @@ def _result_without_persistence(
         source_refs=list(source_refs),
         limitations=_merge_limitations(
             draft.limitations,
+            _tool_trace_limitations(run.tool_trace),
             extra_limitations,
         ),
         clarification_question=draft.clarification_question,
@@ -955,12 +1453,18 @@ def _failure_result(
 ) -> DecisionResult:
     request_id = getattr(run, "request_id", uuid.uuid4())
     turn_id = getattr(run, "turn_id", uuid.uuid4())
+    run_limitations = (
+        _tool_trace_limitations(run.tool_trace)
+        if isinstance(run, DecisionAgentRun)
+        else ()
+    )
     return DecisionResult(
         request_id=request_id,
         turn_id=turn_id,
         status=DecisionStatus.FAILED,
         proposed_action=False,
         limitations=_merge_limitations(
+            run_limitations,
             (*extra_limitations, code),
         ),
         persistence_status=(
@@ -970,6 +1474,29 @@ def _failure_result(
         ),
         runtime=RuntimeMetadata(runtime="healthmes-finalizer"),
         tool_trace=[],
+    )
+
+
+def _unknown_result(run: DecisionAgentRun | Any) -> DecisionResult:
+    request_id = getattr(run, "request_id", uuid.uuid4())
+    turn_id = getattr(run, "turn_id", uuid.uuid4())
+    return DecisionResult(
+        request_id=request_id,
+        turn_id=turn_id,
+        status=DecisionStatus.FAILED,
+        proposed_action=False,
+        limitations=[_FINALIZATION_OUTCOME_UNKNOWN],
+        persistence_status=PersistenceStatus.UNKNOWN,
+        runtime=RuntimeMetadata(runtime="healthmes-finalizer"),
+        tool_trace=[],
+    )
+
+
+def _run_requires_persistence(run: DecisionAgentRun | Any) -> bool:
+    return bool(
+        isinstance(run, DecisionAgentRun)
+        and run.draft.status is DecisionStatus.COMPLETED
+        and run.draft.used_source_ref_ids
     )
 
 
@@ -984,6 +1511,30 @@ def _merge_limitations(
     if len(merged) <= 100:
         return merged
     return merged[:99] + [merged[-1]]
+
+
+def _tool_trace_limitations(
+    trace: Sequence[ToolCallRecord],
+) -> tuple[str, ...]:
+    """Preserve gateway-safe context limits even when the model omits them."""
+
+    limitations: list[str] = []
+    for record in trace:
+        result_codes = (
+            tuple(record.result.limitations)
+            if record.result is not None
+            else ()
+        )
+        limitations.extend(result_codes)
+        if (
+            record.error_code is not None
+            and (
+                record.error_code in result_codes
+                or record.error_code in _SAFE_TOOL_ERROR_CODES
+            )
+        ):
+            limitations.append(record.error_code)
+    return tuple(_merge_limitations(limitations))
 
 
 def _decision_tree(result: DecisionResult) -> dict[str, Any]:
@@ -1202,18 +1753,138 @@ def _request_policy_error(
     return None
 
 
-def _begin_finalization_transaction(session: Session) -> None:
+def _begin_finalization_transaction(
+    session: Session,
+    *,
+    timeout_seconds: float,
+) -> None:
+    if timeout_seconds <= 0:
+        raise TimeoutError("decision finalization deadline expired")
     dialect = session.get_bind().dialect.name
     if dialect == "sqlite":
         # The file lock is acquired before SQLite's reserved write lock to
         # preserve the same order used by activity ingest/deletion.
-        lock_activity_write_plane(session)
-        session.execute(text("BEGIN IMMEDIATE"))
+        lock_activity_write_plane(
+            session,
+            timeout_seconds=timeout_seconds,
+        )
+        _begin_sqlite_immediate(
+            session,
+            timeout_seconds=timeout_seconds,
+        )
         return
     if dialect == "postgresql":
         # ``postgres_activity_write_plane_guard`` already configured the
         # guarded connection before binding it to this session.
         session.connection()
+        _configure_finalization_database_timeouts(
+            session,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+@contextmanager
+def _finalization_connection_guard(
+    bind: Engine | Connection,
+    *,
+    timeout_seconds: float,
+) -> Iterator[Connection | None]:
+    """Keep SQLite checkouts alive through connection-local timeout cleanup."""
+
+    if bind.dialect.name == "sqlite":
+        if isinstance(bind, Connection):
+            yield bind
+            return
+        with bind.connect() as connection:
+            yield connection
+        return
+    with postgres_activity_write_plane_guard(
+        bind,
+        timeout_seconds=timeout_seconds,
+    ) as connection:
+        yield connection
+
+
+def _begin_sqlite_immediate(
+    session: Session,
+    *,
+    timeout_seconds: float,
+) -> None:
+    """Bound SQLite writers that bypass the HealthMes file-lock protocol."""
+
+    connection = session.connection()
+    if _SQLITE_BUSY_TIMEOUT_INFO_KEY not in session.info:
+        original_timeout_ms = int(
+            connection.exec_driver_sql(
+                "PRAGMA busy_timeout"
+            ).scalar_one()
+        )
+        session.info[_SQLITE_BUSY_TIMEOUT_INFO_KEY] = (
+            connection,
+            original_timeout_ms,
+        )
+    timeout_ms = max(1, int(timeout_seconds * 1_000))
+    connection.exec_driver_sql(
+        f"PRAGMA busy_timeout={timeout_ms}"
+    )
+    try:
+        session.execute(text("BEGIN IMMEDIATE"))
+    except BaseException:
+        _restore_sqlite_busy_timeout(session)
+        raise
+
+
+def _restore_sqlite_busy_timeout(session: Session) -> None:
+    state = session.info.pop(_SQLITE_BUSY_TIMEOUT_INFO_KEY, None)
+    if state is None:
+        return
+    connection, original_timeout_ms = state
+    try:
+        connection.exec_driver_sql(
+            f"PRAGMA busy_timeout={original_timeout_ms}"
+        )
+    except Exception as exc:
+        try:
+            connection.invalidate(exc)
+        except Exception:
+            pass
+
+
+def _configure_finalization_database_timeouts(
+    session: Session,
+    *,
+    timeout_seconds: float,
+) -> None:
+    if timeout_seconds <= 0:
+        raise TimeoutError("decision finalization deadline expired")
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    session.connection()
+    timeout_ms = max(1, int(timeout_seconds * 1_000))
+    timeout_value = f"{timeout_ms}ms"
+    session.execute(
+        text(
+            "SELECT set_config('lock_timeout', :timeout, true)"
+        ),
+        {"timeout": timeout_value},
+    )
+    session.execute(
+        text(
+            "SELECT set_config('statement_timeout', :timeout, true)"
+        ),
+        {"timeout": timeout_value},
+    )
+
+
+def _remaining_seconds(deadline: float) -> float:
+    remaining = deadline - steady_time()
+    if remaining <= 0:
+        raise TimeoutError("decision finalization deadline expired")
+    return remaining
+
+
+def _ensure_finalization_deadline(deadline: float) -> None:
+    _remaining_seconds(deadline)
 
 
 def _retryable_postgres_error(exc: DBAPIError) -> bool:
@@ -1224,6 +1895,18 @@ def _retryable_postgres_error(exc: DBAPIError) -> bool:
         None,
     )
     return state in _RETRYABLE_POSTGRES_STATES
+
+
+def _database_timeout_error(exc: DBAPIError) -> bool:
+    original = exc.orig
+    state = getattr(original, "sqlstate", None) or getattr(
+        original,
+        "pgcode",
+        None,
+    )
+    if state in _POSTGRES_TIMEOUT_STATES:
+        return True
+    return "database is locked" in str(original).casefold()
 
 
 def _as_utc(value: datetime) -> datetime:

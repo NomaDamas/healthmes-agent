@@ -14,6 +14,17 @@ ALL_ENV_VARS = [
     "HEALTHMES_OW_USER_ID",
     "HEALTHMES_HERMES_WEBHOOK_URL",
     "HEALTHMES_HERMES_WEBHOOK_SECRET",
+    "HEALTHMES_DECISION_HERMES_BASE_URL",
+    "HEALTHMES_DECISION_HERMES_API_KEY",
+    "HEALTHMES_DECISION_HERMES_MODEL",
+    "HEALTHMES_DECISION_HERMES_PROVIDER",
+    "HEALTHMES_DECISION_HERMES_DISCOVERY_TIMEOUT_SECONDS",
+    "HEALTHMES_DECISION_HERMES_MAX_ITERATION_TIMEOUT_SECONDS",
+    "HEALTHMES_DECISION_TIMEOUT_SECONDS",
+    "HEALTHMES_DECISION_FINALIZATION_TIMEOUT_SECONDS",
+    "HEALTHMES_DECISION_EXECUTION_SCOPE",
+    "HEALTHMES_DECISION_MAX_PENDING_REQUESTS",
+    "HEALTHMES_DECISION_OWNER_PRINCIPAL_ID",
     "HEALTHMES_PUBLIC_BASE_URL",
     "HEALTHMES_DATA_DIR",
     "HEALTHMES_PORT",
@@ -64,6 +75,17 @@ def test_defaults(monkeypatch) -> None:
     # 'healthmes-alerts' is the route name in config/hermes-config.yaml.tmpl.
     assert settings.hermes_webhook_url == "http://localhost:8644/webhooks/healthmes-alerts"
     assert settings.hermes_webhook_secret.get_secret_value() == ""
+    assert settings.decision_hermes_base_url is None
+    assert settings.decision_hermes_api_key.get_secret_value() == ""
+    assert settings.decision_hermes_model is None
+    assert settings.decision_hermes_provider is None
+    assert settings.decision_hermes_discovery_timeout_seconds == 5
+    assert settings.decision_hermes_max_iteration_timeout_seconds == 120
+    assert settings.decision_timeout_seconds == 60
+    assert settings.decision_finalization_timeout_seconds == 5
+    assert settings.decision_execution_scope == "local"
+    assert settings.decision_max_pending_requests == 8
+    assert settings.decision_owner_principal_id == "owner"
     assert settings.public_base_url == "http://localhost:8100"
     assert settings.data_dir == Path("data")
     assert settings.port == 8100
@@ -217,6 +239,10 @@ def test_secrets_are_not_leaked_in_repr(monkeypatch) -> None:
     monkeypatch.setenv("HEALTHMES_HERMES_WEBHOOK_SECRET", "hmac-secret")
     monkeypatch.setenv("HEALTHMES_API_TOKEN", "bearer-secret")
     monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_API_KEY",
+        "decision-runtime-secret",
+    )
+    monkeypatch.setenv(
         "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
         "calendar-adjustment-secret-that-is-long-enough",
     )
@@ -226,10 +252,15 @@ def test_secrets_are_not_leaked_in_repr(monkeypatch) -> None:
     assert "super-secret-key" not in repr(settings)
     assert "hmac-secret" not in repr(settings)
     assert "bearer-secret" not in repr(settings)
+    assert "decision-runtime-secret" not in repr(settings)
     assert "calendar-adjustment-secret-that-is-long-enough" not in repr(settings)
     assert settings.ow_api_key.get_secret_value() == "super-secret-key"
     assert settings.hermes_webhook_secret.get_secret_value() == "hmac-secret"
     assert settings.api_token.get_secret_value() == "bearer-secret"
+    assert (
+        settings.decision_hermes_api_key.get_secret_value()
+        == "decision-runtime-secret"
+    )
     assert (
         settings.calendar_adjustment_secret.get_secret_value()
         == "calendar-adjustment-secret-that-is-long-enough"
@@ -244,6 +275,86 @@ def test_host_and_api_token_from_env(monkeypatch) -> None:
 
     assert settings.host == "0.0.0.0"
     assert settings.api_token.get_secret_value() == "tok"
+
+
+def test_decision_runtime_bundle_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_BASE_URL",
+        "http://127.0.0.1:8644",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_MODEL",
+        "gpt-5.6-sol",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_PROVIDER",
+        "openai",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_OWNER_PRINCIPAL_ID",
+        " local-owner ",
+    )
+
+    settings = _clean_settings()
+
+    assert settings.decision_hermes_base_url == "http://127.0.0.1:8644"
+    assert settings.decision_hermes_model == "gpt-5.6-sol"
+    assert settings.decision_hermes_provider == "openai"
+    assert settings.decision_owner_principal_id == "local-owner"
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        {"decision_hermes_base_url": "http://127.0.0.1:8644"},
+        {"decision_hermes_model": "gpt-5.6-sol"},
+        {"decision_hermes_provider": "openai"},
+        {
+            "decision_hermes_base_url": "http://127.0.0.1:8644",
+            "decision_hermes_model": "gpt-5.6-sol",
+        },
+    ],
+)
+def test_decision_runtime_bundle_is_all_or_none(configured) -> None:
+    with pytest.raises(
+        ValueError,
+        match="must be configured together",
+    ):
+        _clean_settings(**configured)
+
+
+def test_decision_owner_has_a_distinct_validation_error() -> None:
+    with pytest.raises(
+        ValueError,
+        match="decision owner principal ID must not be blank",
+    ):
+        _clean_settings(decision_owner_principal_id=" ")
+
+
+def test_local_decision_scope_rejects_remote_hermes_origin() -> None:
+    configured = {
+        "decision_hermes_base_url": "https://hermes.example.com",
+        "decision_hermes_model": "gpt-5.6-sol",
+        "decision_hermes_provider": "openai",
+    }
+    with pytest.raises(
+        ValueError,
+        match="local decision execution requires a loopback",
+    ):
+        _clean_settings(**configured)
+
+    hosted = _clean_settings(
+        **configured,
+        decision_execution_scope="hosted",
+    )
+    assert hosted.decision_execution_scope == "hosted"
+
+
+def test_decision_capacity_bounds() -> None:
+    with pytest.raises(ValueError):
+        _clean_settings(decision_max_pending_requests=0)
+    with pytest.raises(ValueError):
+        _clean_settings(decision_max_pending_requests=129)
 
 
 def test_is_loopback_host() -> None:

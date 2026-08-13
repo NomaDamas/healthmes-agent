@@ -52,6 +52,8 @@ def find_actual_sleep_mirrors(
     session: Session,
     calendar_source: CalendarSource,
     observation: ActualSleepObservation,
+    *,
+    account_generation: str | None = None,
 ) -> list[CalendarEventMirror]:
     canonical = actual_sleep_identity(observation)
     canonical_external_id = calendar_identity_external_id(
@@ -67,31 +69,36 @@ def find_actual_sleep_mirrors(
             CalendarEventMirror.healthmes_source == observation.provider,
         ),
     )
-    return list(
-        session.scalars(
-            sa.select(CalendarEventMirror)
-            .where(
-                CalendarEventMirror.calendar_source == calendar_source,
+    statement = sa.select(CalendarEventMirror).where(
+        CalendarEventMirror.calendar_source == calendar_source,
+        sa.or_(
+            CalendarEventMirror.external_id == canonical_external_id,
+            CalendarEventMirror.healthmes_source_key
+            == canonical.source_key,
+            sa.and_(
+                is_base_observation,
+                CalendarEventMirror.is_agent_created.is_(True),
+                CalendarEventMirror.healthmes_kind
+                == HealthmesEventKind.ACTUAL_SLEEP.value,
+                CalendarEventMirror.sleep_local_date
+                == observation.local_date,
                 sa.or_(
-                    CalendarEventMirror.external_id == canonical_external_id,
-                    CalendarEventMirror.healthmes_source_key
-                    == canonical.source_key,
-                    sa.and_(
-                        is_base_observation,
-                        CalendarEventMirror.is_agent_created.is_(True),
-                        CalendarEventMirror.healthmes_kind
-                        == HealthmesEventKind.ACTUAL_SLEEP.value,
-                        CalendarEventMirror.sleep_local_date
-                        == observation.local_date,
-                        sa.or_(
-                            CalendarEventMirror.healthmes_source_key.is_(None),
-                            CalendarEventMirror.healthmes_source_key.not_like(
-                                f"{base_source_key}:segment:%"
-                            ),
-                        ),
+                    CalendarEventMirror.healthmes_source_key.is_(None),
+                    CalendarEventMirror.healthmes_source_key.not_like(
+                        f"{base_source_key}:segment:%"
                     ),
                 ),
-            )
+            ),
+        ),
+    )
+    if account_generation is not None:
+        statement = statement.where(
+            CalendarEventMirror.connection_generation
+            == account_generation
+        )
+    return list(
+        session.scalars(
+            statement
             .order_by(
                 sa.case(
                     (
@@ -125,11 +132,14 @@ def find_actual_sleep_mirror(
     session: Session,
     calendar_source: CalendarSource,
     observation: ActualSleepObservation,
+    *,
+    account_generation: str | None = None,
 ) -> CalendarEventMirror | None:
     rows = find_actual_sleep_mirrors(
         session,
         calendar_source,
         observation,
+        account_generation=account_generation,
     )
     canonical = canonical_actual_sleep_mirror(
         rows,
@@ -211,10 +221,14 @@ def adopt_remote_actual_sleep(
     row: CalendarEventMirror,
     remote: ExternalEvent,
     identity: CalendarEventIdentity,
+    *,
+    account_generation: str | None = None,
 ) -> None:
     if remote.start_at is None or remote.end_at is None:
         raise RuntimeError("live actual_sleep event is missing its time range")
     row.external_id = remote.external_id
+    if account_generation is not None:
+        row.connection_generation = account_generation
     row.summary = remote.summary or "수면 (실제)"
     row.start_at = remote.start_at
     row.end_at = remote.end_at
@@ -251,10 +265,13 @@ def pending_sleep_mirror(
     observation: ActualSleepObservation,
     identity: CalendarEventIdentity,
     fingerprint: str,
+    *,
+    account_generation: str | None = None,
 ) -> CalendarEventMirror:
     return CalendarEventMirror(
         external_id=calendar_identity_external_id(calendar_source, identity),
         calendar_source=calendar_source,
+        connection_generation=account_generation,
         summary=ACTUAL_SLEEP_SUMMARY,
         start_at=ensure_utc(observation.start_at),
         end_at=ensure_utc(observation.end_at),
@@ -276,13 +293,19 @@ def find_sleep_source_key(
     session: Session,
     calendar_source: CalendarSource,
     source_key: str,
+    *,
+    account_generation: str | None = None,
 ) -> CalendarEventMirror | None:
-    return session.scalar(
-        sa.select(CalendarEventMirror).where(
-            CalendarEventMirror.calendar_source == calendar_source,
-            CalendarEventMirror.healthmes_source_key == source_key,
-        )
+    statement = sa.select(CalendarEventMirror).where(
+        CalendarEventMirror.calendar_source == calendar_source,
+        CalendarEventMirror.healthmes_source_key == source_key,
     )
+    if account_generation is not None:
+        statement = statement.where(
+            CalendarEventMirror.connection_generation
+            == account_generation
+        )
+    return session.scalar(statement)
 
 
 def finalize_sleep_mirror(
@@ -291,8 +314,12 @@ def finalize_sleep_mirror(
     created: ExternalEvent,
     observation: ActualSleepObservation,
     fingerprint: str,
+    *,
+    account_generation: str | None = None,
 ) -> None:
     row.external_id = created.external_id
+    if account_generation is not None:
+        row.connection_generation = account_generation
     row.summary = created.summary or ACTUAL_SLEEP_SUMMARY
     row.start_at = created.start_at or ensure_utc(observation.start_at)
     row.end_at = created.end_at or ensure_utc(observation.end_at)
@@ -318,7 +345,11 @@ def mark_sleep_update_pending(
     observation: ActualSleepObservation,
     fingerprint: str,
     expected_etag: str | None,
+    *,
+    account_generation: str | None = None,
 ) -> None:
+    if account_generation is not None:
+        row.connection_generation = account_generation
     row.summary = ACTUAL_SLEEP_SUMMARY
     row.start_at = ensure_utc(observation.start_at)
     row.end_at = ensure_utc(observation.end_at)

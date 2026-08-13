@@ -40,8 +40,11 @@ import datetime as dt
 import getpass
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from sqlalchemy.orm import Session
 
 from healthmes.backup.local import LocalDirectoryProvider
 from healthmes.backup.provider import BackupError
@@ -59,7 +62,12 @@ from healthmes.calendars.sleep_job import (
     preview_recent_sleep,
 )
 from healthmes.config import Settings, get_settings, is_loopback_host
-from healthmes.store import dispose_engine, init_engine
+from healthmes.store import (
+    CalendarSource,
+    create_db_engine,
+    dispose_engine,
+    init_engine,
+)
 
 if TYPE_CHECKING:  # pragma: no cover — typing only; runtime import stays lazy
     from healthmes.backup.remote_vault import RemoteVaultProvider
@@ -332,12 +340,39 @@ def _google_identity(google_calendar, credentials, calendar_id: str) -> str | No
         return None
 
 
+@contextmanager
+def _calendar_connection_write(
+    settings: Settings,
+    source: CalendarSource,
+):
+    """Use the shared calendar/Decision write fence without global DB state."""
+
+    engine = create_db_engine(settings.database_url)
+    try:
+        with Session(engine) as session:
+            with calendar_creds.calendar_connection_write(
+                session,
+                source,
+            ):
+                yield
+    finally:
+        engine.dispose()
+
+
 def _cmd_connect_google(args: argparse.Namespace) -> int:
     settings = _cli_settings()
     from healthmes.calendars import google as google_calendar
 
     token_path = google_calendar.google_token_path(settings.data_dir)
-    if calendar_creds.google_connection_state(settings.data_dir) == "connected":
+    with _calendar_connection_write(
+        settings,
+        CalendarSource.GOOGLE,
+    ):
+        already_connected = (
+            calendar_creds.google_connection_state(settings.data_dir)
+            == "connected"
+        )
+    if already_connected:
         print(f"Google Calendar is already connected (token at {token_path}).")
         print("To re-authorize, run `healthmes connect disconnect google` first.")
         return 0
@@ -353,9 +388,29 @@ def _cmd_connect_google(args: argparse.Namespace) -> int:
         return 1
 
     print("Opening your browser for Google login + consent ...")
-    credentials = google_calendar.run_installed_app_flow(
-        client_secret, token_path, port=args.port
+    operation_id = calendar_creds.begin_calendar_connection_operation(
+        settings.data_dir,
+        CalendarSource.GOOGLE,
     )
+    credentials = google_calendar.run_installed_app_flow(
+        client_secret,
+        token_path,
+        port=args.port,
+        persist=False,
+    )
+    with _calendar_connection_write(
+        settings,
+        CalendarSource.GOOGLE,
+    ):
+        calendar_creds.complete_calendar_connection_operation(
+            settings.data_dir,
+            CalendarSource.GOOGLE,
+            operation_id,
+            lambda: google_calendar.save_credentials(
+                credentials,
+                token_path,
+            ),
+        )
     identity = _google_identity(google_calendar, credentials, settings.google_calendar_id)
     if identity:
         print(f"connected as {identity}")
@@ -373,6 +428,14 @@ def _cmd_connect_google(args: argparse.Namespace) -> int:
 
 def _cmd_connect_icloud(args: argparse.Namespace) -> int:
     settings = _cli_settings()
+    if calendar_creds.caldav_environment_managed(settings):
+        print(
+            "error: iCloud/CalDAV is managed by "
+            "HEALTHMES_CALDAV_USERNAME and HEALTHMES_CALDAV_APP_PASSWORD; "
+            "clear those settings before using CLI-managed credentials",
+            file=sys.stderr,
+        )
+        return 1
     username = args.username.strip()
     if not username:
         print("error: --username must be a non-empty Apple ID email", file=sys.stderr)
@@ -386,12 +449,28 @@ def _cmd_connect_icloud(args: argparse.Namespace) -> int:
         return 1
 
     print(f"validating CalDAV connection to {url} as {username} ...")
+    operation_id = calendar_creds.begin_calendar_connection_operation(
+        settings.data_dir,
+        CalendarSource.CALDAV,
+    )
     summary = calendar_creds.validate_caldav_connection(
         username=username, app_password=app_password, url=url
     )
-    path = calendar_creds.save_caldav_credentials(
-        settings.data_dir, username=username, app_password=app_password, url=url
-    )
+    with _calendar_connection_write(
+        settings,
+        CalendarSource.CALDAV,
+    ):
+        path = calendar_creds.complete_calendar_connection_operation(
+            settings.data_dir,
+            CalendarSource.CALDAV,
+            operation_id,
+            lambda: calendar_creds.save_caldav_credentials(
+                settings.data_dir,
+                username=username,
+                app_password=app_password,
+                url=url,
+            ),
+        )
     print(f"connected as {username} — {summary}")
     print(f"credentials saved to {path} (owner-only, mode 600)")
     print(
@@ -452,7 +531,17 @@ def _cmd_connect_disconnect(args: argparse.Namespace) -> int:
     if args.target == "google":
         from healthmes.calendars import google as google_calendar
 
-        removed = calendar_creds.delete_google_token(settings.data_dir)
+        with _calendar_connection_write(
+            settings,
+            CalendarSource.GOOGLE,
+        ):
+            removed = calendar_creds.invalidate_calendar_connection_operation(
+                settings.data_dir,
+                CalendarSource.GOOGLE,
+                lambda: calendar_creds.delete_google_token(
+                    settings.data_dir
+                ),
+            )
         token_path = google_calendar.google_token_path(settings.data_dir)
         print(f"removed {token_path}" if removed else "nothing to remove (no stored token)")
         if settings.google_calendar_enabled:
@@ -461,15 +550,27 @@ def _cmd_connect_disconnect(args: argparse.Namespace) -> int:
                 "poll job on; unset it to fully disable"
             )
         return 0
-    removed = calendar_creds.delete_caldav_credentials(settings.data_dir)
+    if calendar_creds.caldav_environment_managed(settings):
+        print(
+            "error: iCloud/CalDAV is managed by "
+            "HEALTHMES_CALDAV_USERNAME and HEALTHMES_CALDAV_APP_PASSWORD; "
+            "clear those settings to disconnect it",
+            file=sys.stderr,
+        )
+        return 1
+    with _calendar_connection_write(
+        settings,
+        CalendarSource.CALDAV,
+    ):
+        removed = calendar_creds.invalidate_calendar_connection_operation(
+            settings.data_dir,
+            CalendarSource.CALDAV,
+            lambda: calendar_creds.delete_caldav_credentials(
+                settings.data_dir
+            ),
+        )
     creds_path = calendar_creds.caldav_credentials_path(settings.data_dir)
     print(f"removed {creds_path}" if removed else "nothing to remove (no stored credentials)")
-    if settings.caldav_username.strip() and settings.caldav_app_password.get_secret_value():
-        print(
-            "note: HEALTHMES_CALDAV_USERNAME/HEALTHMES_CALDAV_APP_PASSWORD are "
-            "still set in the environment/.env and keep the connection alive; "
-            "clear them to fully disconnect"
-        )
     return 0
 
 

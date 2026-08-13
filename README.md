@@ -112,14 +112,30 @@ Telegram (phone + watch)          decision viewer (web)
   reads `UsageStatsManager`, uploads ordered provisional/final hourly
   snapshots, and stores them in the same `WellnessEvent` data plane used by
   other wellness inputs. Desktop ActivityWatch data can be imported through
-  the bounded localhost adapter; automatic periodic import is not implemented.
-  iOS currently exposes only an honest aggregate/unavailable capability
-  contract, not a production Screen Time timeline collector. Retention,
-  deletion, hourly/daily aggregation, focus/overwork/recovery context, REST
-  and MCP surfaces are implemented. The compatibility resolver assembles
-  bounded context only; natural-language LLM planning, final wellness
-  judgment, automatic DecisionRecord finalization and Hermes adaptation are
-  separate Decision Agent work.
+  the bounded localhost adapter and scheduled through the HealthMes engine.
+  iOS exposes an honest aggregate/unavailable server contract, not a
+  production Screen Time timeline collector. Retention, deletion,
+  cross-device-aware hourly/daily aggregation, focus/overwork/recovery
+  context, REST and MCP surfaces are implemented. The fixed `question_kind`
+  resolver remains compatibility-only. The HealthMes Decision Agent owns
+  natural-language adaptive tool planning, source validation and automatic
+  `DecisionRecord` finalization; Hermes is connected through a strict
+  replaceable adapter whose upstream single-iteration hook is tracked
+  separately in issue #139. Its authenticated REST boundary exposes
+  per-domain `activity` / `nutrition` / `wearable` / `calendar` consent,
+  explicit local-versus-hosted execution scope, bounded request admission,
+  and cancellation-safe shutdown that drains accepted finalization before
+  MCP or database teardown. Finalization has a configurable total deadline
+  (`HEALTHMES_DECISION_FINALIZATION_TIMEOUT_SECONDS`, default 5 seconds)
+  across policy lookup, process/SQLite/PostgreSQL locks, source revalidation,
+  payload construction, flush, and the final pre-commit boundary; a timeout
+  fails closed as an auditable HTTP 503 instead of hanging shutdown. Every
+  context tool call re-reads domain consent before and after provider work,
+  including revision changes that briefly disable and re-enable a domain.
+  Calendar poll, sleep scheduler, and sleep web paths cache backends only for
+  the current credential generation under the shared connection fence, so a
+  completed disconnect cannot leave a stale client doing remote work.
+  Migrations refuse to discard disabled domain-consent choices.
 
 **Medical-lite & backups (Phase 3)**
 - Capture via Telegram (no new app): the `healthmes-capture` skill routes

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -25,10 +26,12 @@ from healthmes.activity.repository import (
     update_collection_config,
     update_collection_status,
 )
+from healthmes.calendars import creds
 from healthmes.calendars.state import (
     InMemorySyncHealthStore,
     SyncCoverageKind,
 )
+from healthmes.config import Settings
 from healthmes.decision import (
     AccessOutcome,
     ActivityContextProvider,
@@ -1124,7 +1127,9 @@ async def test_postflight_rejects_cross_session_calendar_all_day_change(
                 external.commit()
             return result
 
-    provider = AllDayChangingProvider()
+    provider = AllDayChangingProvider(
+        sources=(CalendarSource.GOOGLE,),
+    )
     layer = ContextAccessLayer(
         ContextProviderRegistry((provider,)),
         clock=lambda: NOW,
@@ -3196,10 +3201,36 @@ async def test_unknown_local_source_freshness_is_not_upgraded(session):
 
 async def test_real_wearable_provider_preserves_actual_sleep_interval(
     session,
+    tmp_path,
 ):
+    settings = Settings(
+        database_url="sqlite+pysqlite:///:memory:",
+        data_dir=tmp_path / "data",
+        timezone="UTC",
+        _env_file=None,
+    )
+    token_path = settings.data_dir / "google" / "calendar_token.json"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "refresh_token": "actual-sleep-refresh-token",
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+            }
+        ),
+        encoding="utf-8",
+    )
+    account_generation = creds.calendar_account_generation(
+        settings,
+        CalendarSource.GOOGLE,
+    )
+    assert account_generation is not None
     row = CalendarEventMirror(
         external_id="actual-sleep-access-1",
         calendar_source=CalendarSource.GOOGLE,
+        connection_generation=account_generation,
         summary="Private sleep title",
         start_at=datetime(2026, 8, 10, 0, tzinfo=UTC),
         end_at=datetime(2026, 8, 10, 7, tzinfo=UTC),
@@ -3254,9 +3285,35 @@ async def test_real_wearable_provider_preserves_actual_sleep_interval(
             expire_on_commit=False,
         ),
     )
+    health = InMemorySyncHealthStore()
     layer = ContextAccessLayer(
         ContextProviderRegistry((provider,)),
         clock=lambda: NOW,
+        calendar_settings=settings,
+        calendar_sync_health_store=health,
+    )
+    blocked_turn = layer.start_turn(
+        _request(),
+        policy=_policy(domain="wearable"),
+    )
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.sleep",
+        parameters={"date": "2026-08-10"},
+    )
+
+    blocked = await blocked_turn.query(session, query)
+
+    assert blocked.status is ContextStatus.DENIED
+    assert blocked.source_refs == []
+    assert "calendar_account_not_synced" in blocked.limitations
+
+    health.record_success(
+        CalendarSource.GOOGLE,
+        NOW,
+        event_count=1,
+        coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+        account_generation=account_generation,
     )
     turn = layer.start_turn(
         _request(),
@@ -3264,11 +3321,7 @@ async def test_real_wearable_provider_preserves_actual_sleep_interval(
     )
     result = await turn.query(
         session,
-        ContextQuery(
-            provider_id="wearable",
-            capability="wearable.sleep",
-            parameters={"date": "2026-08-10"},
-        ),
+        query,
     )
 
     assert result.status is ContextStatus.PARTIAL
@@ -3706,7 +3759,13 @@ async def test_calendar_day_summary_uses_requested_partial_window(session):
     session.add_all((morning, afternoon))
     session.flush()
     layer = ContextAccessLayer(
-        ContextProviderRegistry((CalendarContextProvider(),)),
+        ContextProviderRegistry(
+            (
+                CalendarContextProvider(
+                    sources=(CalendarSource.GOOGLE,),
+                ),
+            )
+        ),
         clock=lambda: NOW,
     )
     turn = layer.start_turn(

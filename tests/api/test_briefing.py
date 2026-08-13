@@ -5,6 +5,7 @@ shared app fixture already mounts it. Time is controlled with freezegun;
 every expected value below is hand-computed from the seeds.
 """
 
+import json
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -14,8 +15,12 @@ from fastapi.testclient import TestClient
 from freezegun import freeze_time
 from pydantic import SecretStr
 
+from healthmes.api import briefing as briefing_api
 from healthmes.api.auth import viewer_token
 from healthmes.app import create_app
+from healthmes.calendars import creds
+from healthmes.calendars.state import FileSyncHealthStore
+from healthmes.calendars.visibility import CalendarVisibilityChanged
 from healthmes.store import (
     Base,
     CalendarEventMirror,
@@ -43,6 +48,9 @@ DECISION_ALERT_TOP_ID = uuid.UUID("00000000-0000-0000-0000-00000000d002")
 DECISION_SCHEDULE_ID = uuid.UUID("00000000-0000-0000-0000-00000000d003")
 TRIGGER_ALERT_OLD_ID = uuid.UUID("00000000-0000-0000-0000-00000000f001")
 TRIGGER_ALERT_TOP_ID = uuid.UUID("00000000-0000-0000-0000-00000000f002")
+GOOGLE_ACCOUNT_GENERATION = "a" * 32
+CALDAV_ACCOUNT_GENERATION = "b" * 32
+RECONNECTED_GOOGLE_ACCOUNT_GENERATION = "c" * 32
 
 
 def _utc(day: int, hour: int, minute: int = 0, month: int = 7) -> datetime:
@@ -55,6 +63,64 @@ def _estimate(start: datetime, score: int) -> CognitiveEnergyEstimate:
         window_end=start + timedelta(hours=1),
         score=score,
         components={"version": 1, "items": [], "score_exact": float(score)},
+    )
+
+
+def _connect_google(
+    client: TestClient,
+    *,
+    generation: str = GOOGLE_ACCOUNT_GENERATION,
+) -> None:
+    path = client.app.state.settings.data_dir / "google" / "calendar_token.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "refresh_token": "fake-refresh",
+                "client_id": "test.apps.googleusercontent.com",
+                "client_secret": "fake-secret",
+                "_healthmes_account_generation": generation,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _mark_calendar_synced(
+    client: TestClient,
+    source: CalendarSource,
+    generation: str,
+    *,
+    event_count: int = 1,
+) -> None:
+    FileSyncHealthStore.for_data_dir(client.app.state.settings.data_dir).record_success(
+        source,
+        _utc(9, 8),
+        event_count=event_count,
+        account_generation=generation,
+    )
+
+
+def _make_calendars_visible(client: TestClient) -> None:
+    _connect_google(client)
+    creds.save_caldav_credentials(
+        client.app.state.settings.data_dir,
+        username="calendar@example.test",
+        app_password="test-app-password",
+        url="https://caldav.test",
+        account_generation=CALDAV_ACCOUNT_GENERATION,
+    )
+    _mark_calendar_synced(
+        client,
+        CalendarSource.GOOGLE,
+        GOOGLE_ACCOUNT_GENERATION,
+        event_count=3,
+    )
+    _mark_calendar_synced(
+        client,
+        CalendarSource.CALDAV,
+        CALDAV_ACCOUNT_GENERATION,
     )
 
 
@@ -87,7 +153,7 @@ def client(app):
 
 
 @pytest.fixture
-def seeded(session):
+def seeded(client, session):
     """Seed all four data sources around the frozen now 2026-07-09 14:23 UTC.
 
     Energy   : persisted windows 08:00->71, 13:00->64, 14:00->58 (current);
@@ -101,6 +167,7 @@ def seeded(session):
     Decisions: alert-kind rows are linked directly to their trigger events;
                schedule_change 14:10 = latest overall.
     """
+    _make_calendars_visible(client)
     task_deep = Task(id=TASK_DEEP_ID, title="Ship revenue model", energy_demand=EnergyDemand.HIGH)
     task_report = Task(
         id=TASK_REPORT_ID, title="Write weekly report", energy_demand=EnergyDemand.MED
@@ -123,6 +190,7 @@ def seeded(session):
             CalendarEventMirror(
                 external_id="standup",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=GOOGLE_ACCOUNT_GENERATION,
                 summary="Standup",
                 start_at=_utc(9, 9),
                 end_at=_utc(9, 10),  # already over
@@ -130,6 +198,7 @@ def seeded(session):
             CalendarEventMirror(
                 external_id="deep-work",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=GOOGLE_ACCOUNT_GENERATION,
                 summary="Deep work block",
                 start_at=_utc(9, 14),
                 end_at=_utc(9, 15),  # ongoing
@@ -139,6 +208,7 @@ def seeded(session):
             CalendarEventMirror(
                 external_id="untitled",
                 calendar_source=CalendarSource.CALDAV,
+                connection_generation=CALDAV_ACCOUNT_GENERATION,
                 summary=None,
                 start_at=_utc(9, 16),
                 end_at=_utc(9, 16, 30),
@@ -146,6 +216,7 @@ def seeded(session):
             CalendarEventMirror(
                 external_id="clinic-tomorrow",
                 calendar_source=CalendarSource.GOOGLE,
+                connection_generation=GOOGLE_ACCOUNT_GENERATION,
                 summary="Clinic",
                 start_at=_utc(10, 9),
                 end_at=_utc(10, 10),  # 4th upcoming block -> beyond the top 3
@@ -247,6 +318,7 @@ def test_seeded_glance_returns_exact_payload(client, seeded):
     response = client.get(GLANCE)
 
     assert response.status_code == 200
+    assert response.headers["X-HealthMes-Calendar-Status"] == "available"
     hour_scores = {8: 71, 13: 64, 14: 58}
     assert response.json() == {
         "generated_at": "2026-07-09T14:23:00Z",
@@ -254,9 +326,7 @@ def test_seeded_glance_returns_exact_payload(client, seeded):
         "energy": {
             "score": 58,  # the persisted 14:00 window (covers now)
             "confidence": "high",
-            "curve_24h": [
-                {"hour": hour, "score": hour_scores.get(hour)} for hour in range(24)
-            ],
+            "curve_24h": [{"hour": hour, "score": hour_scores.get(hour)} for hour in range(24)],
         },
         "next_blocks": [
             {
@@ -302,6 +372,7 @@ def test_empty_database_yields_valid_all_null_shape(client):
     response = client.get(GLANCE)
 
     assert response.status_code == 200
+    assert response.headers["X-HealthMes-Calendar-Status"] == "calendar_not_connected"
     assert response.json() == {
         "generated_at": "2026-07-09T14:23:00Z",
         "timezone": "UTC",
@@ -313,6 +384,142 @@ def test_empty_database_yields_valid_all_null_shape(client):
         "next_blocks": [],
         "alerts": {"unresolved_count": 0, "top": None},
         "latest_decision": None,
+    }
+
+
+@freeze_time(FROZEN_NOW)
+def test_disconnected_briefing_hides_retained_calendar_rows_but_keeps_proposals(
+    client,
+    session,
+):
+    task = Task(title="Local proposal", energy_demand=EnergyDemand.MED)
+    session.add(task)
+    session.flush()
+    session.add_all(
+        [
+            CalendarEventMirror(
+                external_id="retained-private-event",
+                calendar_source=CalendarSource.GOOGLE,
+                connection_generation=GOOGLE_ACCOUNT_GENERATION,
+                summary="Retained private title",
+                start_at=_utc(9, 14),
+                end_at=_utc(9, 15),
+            ),
+            ScheduleProposal(
+                task_id=task.id,
+                proposed_start=_utc(9, 15),
+                proposed_end=_utc(9, 16),
+                status=ProposalStatus.ACCEPTED,
+            ),
+        ]
+    )
+    session.commit()
+
+    response = client.get(GLANCE)
+
+    assert response.status_code == 200
+    assert response.headers["X-HealthMes-Calendar-Status"] == ("calendar_not_connected")
+    assert response.json()["next_blocks"] == [
+        {
+            "start": "2026-07-09T15:00:00Z",
+            "end": "2026-07-09T16:00:00Z",
+            "title": "Local proposal",
+            "energy_demand": "med",
+            "source": "proposal",
+        }
+    ]
+
+
+@freeze_time(FROZEN_NOW)
+def test_briefing_discards_old_generation_when_reconnect_races_read(
+    client,
+    session,
+    monkeypatch,
+):
+    _connect_google(client)
+    _mark_calendar_synced(
+        client,
+        CalendarSource.GOOGLE,
+        GOOGLE_ACCOUNT_GENERATION,
+    )
+    task = Task(title="Still safe", energy_demand=EnergyDemand.LOW)
+    session.add(task)
+    session.flush()
+    session.add_all(
+        [
+            CalendarEventMirror(
+                external_id="old-generation-event",
+                calendar_source=CalendarSource.GOOGLE,
+                connection_generation=GOOGLE_ACCOUNT_GENERATION,
+                summary="Must not leak",
+                start_at=_utc(9, 14),
+                end_at=_utc(9, 15),
+            ),
+            ScheduleProposal(
+                task_id=task.id,
+                proposed_start=_utc(9, 15),
+                proposed_end=_utc(9, 16),
+                status=ProposalStatus.ACCEPTED,
+            ),
+        ]
+    )
+    session.commit()
+    original_next_blocks = briefing_api._next_blocks
+    calls = 0
+
+    def reconnect_after_first_read(*args, **kwargs):
+        nonlocal calls
+        blocks = original_next_blocks(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            _connect_google(
+                client,
+                generation=RECONNECTED_GOOGLE_ACCOUNT_GENERATION,
+            )
+        return blocks
+
+    monkeypatch.setattr(
+        briefing_api,
+        "_next_blocks",
+        reconnect_after_first_read,
+    )
+
+    response = client.get(GLANCE)
+
+    assert response.status_code == 200
+    assert calls == 2
+    assert response.headers["X-HealthMes-Calendar-Status"] == ("calendar_account_not_synced")
+    assert response.json()["next_blocks"] == [
+        {
+            "start": "2026-07-09T15:00:00Z",
+            "end": "2026-07-09T16:00:00Z",
+            "title": "Still safe",
+            "energy_demand": "low",
+            "source": "proposal",
+        }
+    ]
+
+
+def test_briefing_fails_closed_when_calendar_snapshot_never_stabilizes(
+    client,
+    monkeypatch,
+):
+    def unstable_snapshot(*_args, **_kwargs):
+        raise CalendarVisibilityChanged("unstable")
+
+    monkeypatch.setattr(
+        briefing_api,
+        "read_visible_calendar",
+        unstable_snapshot,
+    )
+
+    response = client.get(GLANCE)
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "calendar_unavailable",
+        "message": ("The briefing could not obtain a stable Calendar snapshot. Retry the request."),
+        "detail": {"reason_codes": ["calendar_visibility_changed"]},
     }
 
 
@@ -541,8 +748,6 @@ class TestAuth:
                 session.commit()
             body = client.get(GLANCE, headers={"Authorization": f"Bearer {TOKEN}"}).json()
 
-        expected = (
-            f"{BASE_URL}/decisions/{DECISION_SCHEDULE_ID}?token={viewer_token(TOKEN)}"
-        )
+        expected = f"{BASE_URL}/decisions/{DECISION_SCHEDULE_ID}?token={viewer_token(TOKEN)}"
         assert body["latest_decision"]["url"] == expected
         assert TOKEN not in body["latest_decision"]["url"]

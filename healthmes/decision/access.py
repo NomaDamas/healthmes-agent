@@ -12,6 +12,7 @@ from enum import StrEnum
 from threading import Lock
 from typing import Any
 
+import sqlalchemy as sa
 from pydantic import (
     AwareDatetime,
     BaseModel,
@@ -32,6 +33,14 @@ from healthmes.activity.repository import (
     get_control_payload,
 )
 from healthmes.calendars.base import HealthmesEventKind
+from healthmes.calendars.state import SyncHealthStore
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    CalendarVisibilityChanged,
+    calendar_visibility,
+    require_calendar_visibility_current,
+)
+from healthmes.config import Settings
 from healthmes.decision.contracts import (
     ContextCoverage,
     ContextFreshness,
@@ -70,6 +79,7 @@ from healthmes.store import (
     StorageObject,
     WellnessEvent,
 )
+from healthmes.store.enums import CalendarSource
 from healthmes.timezones import parse_timezone
 from healthmes.wearables.provenance import (
     OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
@@ -145,12 +155,21 @@ _AUDIT_REASON_CODES = frozenset(
         "activity_permission_denied",
         "activity_permission_revoked",
         "activity_permission_unavailable",
+        "access_policy_resolution_failed",
         "caller_not_authenticated",
+        "calendar_connection_state_unavailable",
+        "calendar_account_generation_changed",
+        "calendar_account_not_synced",
+        "calendar_not_connected",
+        "calendar_source_disconnected",
+        "calendar_sync_health_unavailable",
+        "calendar_visibility_changed",
         "caller_not_policy_owner",
         "capability_privacy_level_unsupported",
         "context_stale",
         "coverage_unknown",
         "domain_consent_denied",
+        "domain_consent_changed",
         "duplicate_tool_call",
         "domain_privacy_consent_denied",
         "execution_scope_denied",
@@ -283,6 +302,7 @@ class _StorageObjectSnapshot:
 class _CalendarEventSnapshot:
     id: uuid.UUID
     calendar_source: str
+    connection_generation: str | None
     external_id: str
     start_at: datetime
     end_at: datetime
@@ -421,25 +441,30 @@ def _fresh_storage_object(
 def _fresh_calendar_event(
     session: Session,
     event_id: uuid.UUID,
+    *,
+    visibility: CalendarVisibility | None = None,
 ) -> _CalendarEventSnapshot | None:
-    row = session.execute(
-        select(
-            CalendarEventMirror.id,
-            CalendarEventMirror.calendar_source,
-            CalendarEventMirror.external_id,
-            CalendarEventMirror.start_at,
-            CalendarEventMirror.end_at,
-            CalendarEventMirror.healthmes_kind,
-            CalendarEventMirror.is_all_day,
-            CalendarEventMirror.status,
-            CalendarEventMirror.updated_at,
-        ).where(CalendarEventMirror.id == event_id)
-    ).mappings().one_or_none()
+    statement = select(
+        CalendarEventMirror.id,
+        CalendarEventMirror.calendar_source,
+        CalendarEventMirror.connection_generation,
+        CalendarEventMirror.external_id,
+        CalendarEventMirror.start_at,
+        CalendarEventMirror.end_at,
+        CalendarEventMirror.healthmes_kind,
+        CalendarEventMirror.is_all_day,
+        CalendarEventMirror.status,
+        CalendarEventMirror.updated_at,
+    ).where(CalendarEventMirror.id == event_id)
+    if visibility is not None:
+        statement = statement.where(visibility.predicate())
+    row = session.execute(statement).mappings().one_or_none()
     if row is None:
         return None
     return _CalendarEventSnapshot(
         id=row["id"],
         calendar_source=str(row["calendar_source"]),
+        connection_generation=row["connection_generation"],
         external_id=row["external_id"],
         start_at=row["start_at"],
         end_at=row["end_at"],
@@ -548,6 +573,7 @@ def _calendar_event_content_digest(
             "schema": "healthmes.source-content.calendar-event.v1",
             "id": str(event.id),
             "calendar_source": event.calendar_source,
+            "connection_generation": event.connection_generation,
             "external_id": event.external_id,
             "start_at": _as_utc(event.start_at).isoformat(),
             "end_at": _as_utc(event.end_at).isoformat(),
@@ -619,6 +645,7 @@ class DomainAccessGrant(BaseModel):
     )
     consent_scopes: tuple[str, ...] = ("personal",)
     allow_hosted_raw: bool = False
+    revision: int = Field(default=0, ge=0)
 
     @field_validator("domain")
     @classmethod
@@ -741,9 +768,137 @@ class ContextAccessLayer:
         registry: ContextProviderRegistry,
         *,
         clock: Callable[[], datetime] | None = None,
+        calendar_source_resolver: (
+            Callable[[], Sequence[CalendarSource]] | None
+        ) = None,
+        calendar_account_generation_resolver: (
+            Callable[[CalendarSource], str | None] | None
+        ) = None,
+        calendar_settings: Settings | None = None,
+        calendar_sync_health_store: SyncHealthStore | None = None,
     ) -> None:
+        if (
+            calendar_source_resolver is not None
+            and not callable(calendar_source_resolver)
+        ):
+            raise TypeError("calendar_source_resolver must be callable")
         self.registry = registry
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._calendar_source_resolver = calendar_source_resolver
+        if (
+            calendar_account_generation_resolver is not None
+            and not callable(calendar_account_generation_resolver)
+        ):
+            raise TypeError(
+                "calendar_account_generation_resolver must be callable"
+            )
+        self._calendar_account_generation_resolver = (
+            calendar_account_generation_resolver
+        )
+        self._calendar_settings = calendar_settings
+        self._calendar_sync_health_store = calendar_sync_health_store
+
+    def calendar_visibility_snapshot(
+        self,
+    ) -> CalendarVisibility | None:
+        """Resolve one production Calendar visibility snapshot."""
+
+        if self._calendar_settings is None:
+            return None
+        return calendar_visibility(
+            self._calendar_settings,
+            sync_health_store=self._calendar_sync_health_store,
+        )
+
+    def require_calendar_visibility_current(
+        self,
+        visibility: CalendarVisibility | None,
+    ) -> None:
+        """Reject work that outlived its Calendar account/sync snapshot."""
+
+        if visibility is None or self._calendar_settings is None:
+            return
+        require_calendar_visibility_current(
+            self._calendar_settings,
+            visibility,
+            sync_health_store=self._calendar_sync_health_store,
+        )
+
+    def calendar_visibility_for_source_refs(
+        self,
+        session: Session,
+        source_refs: Sequence[SourceRef],
+    ) -> CalendarVisibility | None:
+        """Snapshot visibility only when refs actually depend on Calendar."""
+
+        if (
+            self._calendar_settings is None
+            or not _source_refs_depend_on_calendar(session, source_refs)
+        ):
+            return None
+        return self.calendar_visibility_snapshot()
+
+    def current_calendar_connections(
+        self,
+    ) -> tuple[
+        Mapping[CalendarSource, str] | frozenset[CalendarSource] | None,
+        tuple[str, ...],
+    ]:
+        """Resolve connected sources and, when configured, account generations."""
+
+        visibility = self.calendar_visibility_snapshot()
+        if visibility is not None:
+            return (
+                visibility.account_generations,
+                visibility.limitations,
+            )
+        if self._calendar_source_resolver is None:
+            return None, ()
+        try:
+            sources = frozenset(
+                CalendarSource(source)
+                for source in self._calendar_source_resolver()
+            )
+        except Exception:
+            return (
+                frozenset(),
+                ("calendar_connection_state_unavailable",),
+            )
+        if self._calendar_account_generation_resolver is None:
+            return sources, ()
+        try:
+            generations = {
+                source: generation
+                for source in sources
+                if (
+                    generation
+                    := self._calendar_account_generation_resolver(
+                        source
+                    )
+                )
+                is not None
+            }
+        except Exception:
+            return (
+                {},
+                ("calendar_connection_state_unavailable",),
+            )
+        if len(generations) != len(sources):
+            return (
+                {},
+                ("calendar_connection_state_unavailable",),
+            )
+        return generations, ()
+
+    def current_calendar_sources(
+        self,
+    ) -> tuple[frozenset[CalendarSource] | None, tuple[str, ...]]:
+        """Compatibility view of currently connected calendar sources."""
+
+        connections, limitations = self.current_calendar_connections()
+        if connections is None or isinstance(connections, frozenset):
+            return connections, limitations
+        return frozenset(connections), limitations
 
     def start_turn(
         self,
@@ -807,6 +962,31 @@ class ContextAccessTurn:
         with self._budget_lock:
             return self._source_refs
 
+    def update_policy(
+        self,
+        policy: ContextAccessPolicy,
+    ) -> ContextAccessPolicy:
+        """Replace the turn snapshot with a freshly resolved owner policy."""
+
+        canonical = strict_model_validate(ContextAccessPolicy, policy)
+        self.policy = canonical
+        return canonical
+
+    def deny(
+        self,
+        query: ContextQuery,
+        *,
+        reason_codes: Sequence[str],
+    ) -> ContextResult:
+        """Record a fail-closed denial without invoking a provider."""
+
+        canonical = strict_model_validate(ContextQuery, query)
+        return self._deny(
+            canonical,
+            now=_as_utc(self._layer._clock()),
+            reason_codes=tuple(reason_codes),
+        )
+
     async def query(
         self,
         session: Session,
@@ -846,6 +1026,14 @@ class ContextAccessTurn:
         if isinstance(preflight, ContextResult):
             return preflight
         effective_query, capability, grant, pre_limitations = preflight
+        calendar_snapshot = (
+            self._layer.calendar_visibility_snapshot()
+            if (
+                self._layer._calendar_settings is not None
+                and grant.domain in {"calendar", "wearable"}
+            )
+            else None
+        )
         if self._reject_duplicate_effective_queries:
             fingerprint = _effective_query_fingerprint(effective_query)
             with self._budget_lock:
@@ -1019,6 +1207,7 @@ class ContextAccessTurn:
             capability=capability,
             grant=grant,
             now=now,
+            calendar_visibility_snapshot=calendar_snapshot,
         )
         if ensure_active is not None:
             ensure_active()
@@ -1135,6 +1324,25 @@ class ContextAccessTurn:
             truncated=result.truncated,
             next_cursor=result.next_cursor,
         )
+        calendar_dependent = (
+            grant.domain == "calendar"
+            or _source_refs_depend_on_calendar(
+                session,
+                result.source_refs,
+            )
+        )
+        if calendar_dependent and calendar_snapshot is not None:
+            try:
+                self._layer.require_calendar_visibility_current(
+                    calendar_snapshot
+                )
+            except CalendarVisibilityChanged:
+                return self._deny(
+                    query,
+                    effective_query=effective_query,
+                    now=now,
+                    reason_codes=("calendar_visibility_changed",),
+                )
         serialized = normalized.model_dump(mode="json")
         for key in ("observed_start", "observed_end", "collected_at"):
             if serialized.get(key) is None:
@@ -1234,6 +1442,7 @@ class ContextAccessTurn:
         *,
         context_source_refs: Sequence[SourceRef] = (),
         now: datetime | None = None,
+        calendar_visibility_snapshot: CalendarVisibility | None = None,
     ) -> tuple[SourceRef | None, tuple[str, ...]]:
         """Recheck one returned reference without invoking its provider again."""
 
@@ -1278,6 +1487,24 @@ class ContextAccessTurn:
                 query_bounds=bounds,
             )
         )
+        if calendar_visibility_snapshot is None:
+            calendar_visibility_snapshot = (
+                self._layer.calendar_visibility_for_source_refs(
+                    session,
+                    supporting_refs or (canonical_ref,),
+                )
+            )
+        if calendar_visibility_snapshot is not None:
+            allowed_calendar_connections = (
+                calendar_visibility_snapshot.account_generations
+            )
+            calendar_limitations = (
+                calendar_visibility_snapshot.limitations
+            )
+        else:
+            allowed_calendar_connections, calendar_limitations = (
+                self._layer.current_calendar_connections()
+            )
         validated, source_limitations = _validate_source_ref(
             session,
             canonical_ref,
@@ -1294,6 +1521,11 @@ class ContextAccessTurn:
             now=checked_at,
             allow_external=self.policy.allow_external_provenance,
             require_content_digest=True,
+            allowed_calendar_connections=(
+                allowed_calendar_connections
+            ),
+            calendar_connection_limitations=calendar_limitations,
+            calendar_visibility_snapshot=calendar_visibility_snapshot,
         )
         return validated, tuple(
             sorted({*limitations, *source_limitations})
@@ -1303,6 +1535,8 @@ class ContextAccessTurn:
         self,
         session: Session,
         source_refs: Sequence[SourceRef],
+        *,
+        calendar_visibility_snapshot: CalendarVisibility | None = None,
     ) -> tuple[SourceRef, ...]:
         """Lock current policy rows before final source validation and storage.
 
@@ -1362,8 +1596,34 @@ class ContextAccessTurn:
                 key=str,
             )
         )
+        upstream_calendar_ids = tuple(
+            sorted(
+                {
+                    calendar_id
+                    for content_id in wearable_content_ids
+                    if (
+                        content := _fresh_wellness_event(
+                            session,
+                            content_id,
+                        )
+                    )
+                    is not None
+                    for calendar_id in _upstream_calendar_source_ids(
+                        content
+                    )[0]
+                },
+                key=str,
+            )
+        )
         record_ids = tuple(
-            sorted({*record_ids, *wearable_content_ids}, key=str)
+            sorted(
+                {
+                    *record_ids,
+                    *wearable_content_ids,
+                    *upstream_calendar_ids,
+                },
+                key=str,
+            )
         )
         if activity_refs:
             device_ids = tuple(
@@ -1435,7 +1695,14 @@ class ContextAccessTurn:
         ).all()
         session.execute(
             select(CalendarEventMirror.id)
-            .where(CalendarEventMirror.id.in_(record_ids))
+            .where(
+                CalendarEventMirror.id.in_(record_ids),
+                (
+                    calendar_visibility_snapshot.predicate()
+                    if calendar_visibility_snapshot is not None
+                    else sa.true()
+                ),
+            )
             .order_by(CalendarEventMirror.id)
             .with_for_update(read=True)
         ).all()
@@ -1789,6 +2056,7 @@ class ContextAccessTurn:
         capability: ContextCapability,
         grant: DomainAccessGrant,
         now: datetime,
+        calendar_visibility_snapshot: CalendarVisibility | None = None,
     ) -> tuple[list[SourceRef], list[str], bool]:
         refs: list[SourceRef] = []
         limitations: set[str] = set()
@@ -1806,6 +2074,17 @@ class ContextAccessTurn:
                 query_bounds=bounds,
             )
         )
+        if calendar_visibility_snapshot is not None:
+            allowed_calendar_connections = (
+                calendar_visibility_snapshot.account_generations
+            )
+            calendar_limitations = (
+                calendar_visibility_snapshot.limitations
+            )
+        else:
+            allowed_calendar_connections, calendar_limitations = (
+                self._layer.current_calendar_connections()
+            )
         for source_ref in result.source_refs:
             if source_ref.domain != grant.domain:
                 limitations.add("source_ref_domain_mismatch")
@@ -1827,6 +2106,15 @@ class ContextAccessTurn:
                 now=now,
                 allow_external=self.policy.allow_external_provenance,
                 require_content_digest=False,
+                allowed_calendar_connections=(
+                    allowed_calendar_connections
+                ),
+                calendar_connection_limitations=(
+                    calendar_limitations
+                ),
+                calendar_visibility_snapshot=(
+                    calendar_visibility_snapshot
+                ),
             )
             if validated[0] is None:
                 limitations.update(validated[1])
@@ -2339,6 +2627,13 @@ def _validate_source_ref(
     now: datetime,
     allow_external: bool,
     require_content_digest: bool,
+    allowed_calendar_connections: (
+        Mapping[CalendarSource, str]
+        | frozenset[CalendarSource]
+        | None
+    ) = None,
+    calendar_connection_limitations: tuple[str, ...] = (),
+    calendar_visibility_snapshot: CalendarVisibility | None = None,
 ) -> tuple[SourceRef | None, tuple[str, ...]]:
     expected_reference_id = source_ref_id(
         domain=source_ref.domain,
@@ -2363,6 +2658,13 @@ def _validate_source_ref(
             source_ref,
             event,
             now=now,
+            allowed_calendar_connections=allowed_calendar_connections,
+            calendar_connection_limitations=(
+                calendar_connection_limitations
+            ),
+            calendar_visibility_snapshot=(
+                calendar_visibility_snapshot
+            ),
         )
         if wearable_limitations:
             return None, wearable_limitations
@@ -2397,13 +2699,38 @@ def _validate_source_ref(
         return None, ("raw_source_unavailable",)
 
     if source_ref.source_provider == "healthmes-calendar-mirror":
+        if (
+            calendar_visibility_snapshot is None
+            and calendar_connection_limitations
+        ):
+            return None, calendar_connection_limitations
         row = (
-            _fresh_calendar_event(session, record_uuid)
+            _fresh_calendar_event(
+                session,
+                record_uuid,
+                visibility=calendar_visibility_snapshot,
+            )
             if record_uuid is not None
             else None
         )
         if row is None:
+            if (
+                calendar_visibility_snapshot is not None
+                and record_uuid is not None
+            ):
+                hidden = _fresh_calendar_event(session, record_uuid)
+                if hidden is not None:
+                    return None, _calendar_visibility_row_limitations(
+                        hidden,
+                        calendar_visibility_snapshot,
+                    )
             return None, ("source_ref_record_missing",)
+        connection_limitations = _calendar_row_connection_limitations(
+            row,
+            allowed_calendar_connections,
+        )
+        if connection_limitations:
+            return None, connection_limitations
         if source_ref.resource_type not in {
             "calendar.event",
             "actual_sleep",
@@ -2520,6 +2847,13 @@ def _validate_wearable_observation_source(
     event: _WellnessEventSnapshot,
     *,
     now: datetime,
+    allowed_calendar_connections: (
+        Mapping[CalendarSource, str]
+        | frozenset[CalendarSource]
+        | None
+    ),
+    calendar_connection_limitations: tuple[str, ...],
+    calendar_visibility_snapshot: CalendarVisibility | None,
 ) -> tuple[str, ...]:
     if event.event_type != OPEN_WEARABLES_OBSERVATION_EVENT_TYPE:
         return ()
@@ -2554,7 +2888,144 @@ def _validate_wearable_observation_source(
         != (content.quality_flags or {}).get("content_digest")
     ):
         return ("source_ref_record_missing",)
+    upstream_calendar_ids, upstream_limitations = (
+        _upstream_calendar_source_ids(content)
+    )
+    if upstream_limitations:
+        return upstream_limitations
+    if (
+        upstream_calendar_ids
+        and calendar_visibility_snapshot is None
+        and calendar_connection_limitations
+    ):
+        return calendar_connection_limitations
+    for calendar_id in upstream_calendar_ids:
+        row = _fresh_calendar_event(
+            session,
+            calendar_id,
+            visibility=calendar_visibility_snapshot,
+        )
+        if row is None:
+            if calendar_visibility_snapshot is not None:
+                hidden = _fresh_calendar_event(session, calendar_id)
+                if hidden is not None:
+                    return _calendar_visibility_row_limitations(
+                        hidden,
+                        calendar_visibility_snapshot,
+                    )
+            return ("source_ref_record_missing",)
+        connection_limitations = _calendar_row_connection_limitations(
+            row,
+            allowed_calendar_connections,
+        )
+        if connection_limitations:
+            return connection_limitations
     return ()
+
+
+def _upstream_calendar_source_ids(
+    content: _WellnessEventSnapshot,
+) -> tuple[tuple[uuid.UUID, ...], tuple[str, ...]]:
+    provenance = content.payload.get("upstream_provenance")
+    if not isinstance(provenance, Mapping):
+        return (), ()
+    values = provenance.get("source_refs")
+    if not isinstance(values, Sequence) or isinstance(values, str | bytes):
+        return (), ()
+    ids: list[uuid.UUID] = []
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        if value.get("source_provider") != "healthmes-calendar-mirror":
+            continue
+        if (
+            value.get("domain") != "wearable"
+            or value.get("resource_type") != "actual_sleep"
+            or value.get("derived_by")
+            != "healthmes.actual-sleep-mirror.v1"
+        ):
+            return (), ("source_ref_identity_mismatch",)
+        try:
+            ids.append(uuid.UUID(str(value["record_id"])))
+        except (KeyError, TypeError, ValueError):
+            return (), ("source_ref_identity_mismatch",)
+    return tuple(dict.fromkeys(ids)), ()
+
+
+def _calendar_row_connection_limitations(
+    row: _CalendarEventSnapshot,
+    allowed_calendar_connections: (
+        Mapping[CalendarSource, str]
+        | frozenset[CalendarSource]
+        | None
+    ),
+) -> tuple[str, ...]:
+    if allowed_calendar_connections is None:
+        return ()
+    try:
+        source = CalendarSource(row.calendar_source)
+    except ValueError:
+        return ("source_ref_identity_mismatch",)
+    if source not in allowed_calendar_connections:
+        return ("calendar_source_disconnected",)
+    if (
+        isinstance(allowed_calendar_connections, Mapping)
+        and row.connection_generation
+        != allowed_calendar_connections.get(source)
+    ):
+        return ("calendar_account_generation_changed",)
+    return ()
+
+
+def _calendar_visibility_row_limitations(
+    row: _CalendarEventSnapshot,
+    visibility: CalendarVisibility,
+) -> tuple[str, ...]:
+    try:
+        source = CalendarSource(row.calendar_source)
+    except ValueError:
+        return ("source_ref_identity_mismatch",)
+    generation = visibility.account_generations.get(source)
+    if generation is None:
+        if "calendar_account_not_synced" in visibility.limitations:
+            return ("calendar_account_not_synced",)
+        if "calendar_sync_health_unavailable" in visibility.limitations:
+            return ("calendar_sync_health_unavailable",)
+        if "calendar_connection_state_unavailable" in visibility.limitations:
+            return ("calendar_connection_state_unavailable",)
+        return ("calendar_source_disconnected",)
+    if row.connection_generation != generation:
+        return ("calendar_account_generation_changed",)
+    return ("calendar_visibility_changed",)
+
+
+def _source_refs_depend_on_calendar(
+    session: Session,
+    source_refs: Sequence[SourceRef],
+) -> bool:
+    for source_ref in source_refs:
+        if source_ref.source_provider == "healthmes-calendar-mirror":
+            return True
+        record_id = _source_ref_record_uuid(source_ref)
+        if record_id is None:
+            continue
+        event = _fresh_wellness_event(session, record_id)
+        if event is None:
+            continue
+        content_id = _wearable_observation_content_id(
+            event.event_type,
+            event.source_provider,
+            event.payload,
+        )
+        if content_id is None:
+            continue
+        content = _fresh_wellness_event(session, content_id)
+        if (
+            content is not None
+            and _upstream_calendar_source_ids(content)[0]
+        ):
+            return True
+    return False
 
 
 def _source_ref_record_uuid(

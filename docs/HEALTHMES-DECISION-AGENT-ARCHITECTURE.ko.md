@@ -2,9 +2,10 @@
 
 > **결정일:** 2026-08-10
 >
-> **상태:** 승인된 목표 아키텍처. `DEC-01`부터 `DEC-04`까지의 core 계약,
-> provider registry, Context Access Layer와 HealthMes-owned decision loop가
-> 구현되었고, 고정 `question_kind` resolver는 호환용 구현으로 남는다.
+> **상태:** 승인된 아키텍처의 `DEC-01`부터 `DEC-07`까지 구현되었다.
+> `DEC-08`의 공개 엔진 경계와 실제 4-domain E2E도 구현되었으며, 전체 회귀와
+> 독립 리뷰를 거쳐 merge-ready 상태를 검증한다. 고정 `question_kind` resolver는
+> 새 core 경로가 아니라 기존 호출자를 위한 호환 구현으로만 남는다.
 >
 > **범위:** 엔진, 데이터 조회, LLM 판단, Hermes adaptation과 의사결정 기록.
 > 실제 iOS, Android, 데스크톱 UI는 포함하지 않는다.
@@ -44,7 +45,7 @@ Hermes는 위 흐름의 모델 iteration을 실행하는 첫 번째 runtime adap
 
 ## 1. 왜 바꾸는가
 
-현재 구현에는 다음 문제가 있다.
+이 작업을 시작하기 전 구현에는 다음 문제가 있었다.
 
 1. 호출자가 `activity_summary`, `focus`, `overwork`, `recovery`,
    `caffeine_for_focus` 중 하나를 먼저 골라야 한다.
@@ -151,6 +152,199 @@ Domain provider
 Decision Finalizer
   실제 사용한 자료와 최종 답변을 검증하고 저장한다.
 ```
+
+### 2.1 공개 엔진 경계와 수명주기
+
+UI, API와 MCP adapter가 공통으로 호출할 canonical Python 경계는 다음과 같다.
+
+```text
+build_healthmes_decision_engine(...)
+  같은 ContextAccessLayer와 policy_resolver를
+  HealthMesDecisionAgent와 DecisionFinalizer에 주입
+        |
+        v
+await engine.ask_wellness(DecisionRequest)
+        |
+        +-- agent.ask(): 질문 해석과 반복 context tool loop
+        |
+        +-- finalizer.finalize(): source_refs 재검증과 DecisionRecord 저장
+        |
+        v
+DecisionResult
+```
+
+`ask()`는 기존 내부 호출자를 위한 호환 wrapper이고, 새 UI와 service adapter는
+`ask_wellness()`를 사용한다. production composition root에는 broad-consent
+기본값이 없다. 인증된 사용자의 현재 정책을 반환하는 `policy_resolver`를 명시하지
+않으면 엔진을 구성할 수 없다.
+
+종료 경계도 제품 계약의 일부다.
+
+```text
+수락된 요청 ──> LLM/provider 실행 ──> finalization ──> record 저장
+                         |
+caller 취소 -------------+  내부 작업은 취소하지 않음
+
+await engine.aclose()
+  1. 새 요청 거부
+  2. 이미 수락한 요청의 finalization 대기
+  3. agent runtime 종료
+```
+
+따라서 HTTP 연결이나 UI task가 먼저 취소돼도 이미 생성된 행동 제안의 감사 기록이
+중간에 유실되지 않는다. async application은 `await aclose()`를 사용하며, 실행 중인
+event loop 안에서 동기 `close()`를 호출하면 명시적으로 거부한다. 애플리케이션
+lifespan 자체가 반복 취소되더라도 Decision Engine 종료를 끝낸 뒤 MCP와 DB를
+닫으므로 finalization이 이미 dispose된 저장소를 참조하지 않는다. composition이
+agent worker 생성 뒤 실패하면 worker도 즉시 회수한다.
+
+finalization 자체도 무기한 기다리지 않는다.
+
+```text
+HEALTHMES_DECISION_FINALIZATION_TIMEOUT_SECONDS=5
+
+하나의 총 deadline
+  -> preflight 정책 조회
+  -> process write lock
+  -> SQLite file lock 또는 PostgreSQL advisory lock
+  -> transaction 안의 정책 재검사
+  -> source row lock과 재검증
+  -> result와 private payload 생성
+  -> DecisionRecord flush
+  -> commit 직전 마지막 deadline 검사
+  -> 제한된 retry
+```
+
+SQLite는 HealthMes process/file lock뿐 아니라 protocol 밖의 외부 writer가 잡은
+`BEGIN IMMEDIATE`도 임시 `busy_timeout`으로 제한하고, 끝난 뒤 기존 30초 설정을
+복원한다. PostgreSQL은 advisory lock polling과 transaction-local `lock_timeout`,
+`statement_timeout`을 같은 남은 deadline으로 제한한다. 어느 단계든 시간을
+초과하면 `decision_finalization_timeout`이라는 감사 가능한 실패가 되고 REST에서는
+`503 decision_service_unavailable`로 반환된다. 이 제한 덕분에 저장소가 잠겨 있어도
+`aclose()`가 수락된 작업을 무기한 기다리지 않는다. Python payload 생성이나
+SQLAlchemy `flush()`가 deadline을 넘긴 경우에도 `commit()`을 호출하지 않고
+rollback한다.
+
+### 2.2 운영 설정, 실행 위치와 domain 동의
+
+Decision runtime은 세 설정이 모두 있을 때만 활성화된다.
+
+```text
+HEALTHMES_DECISION_HERMES_BASE_URL
+HEALTHMES_DECISION_HERMES_MODEL
+HEALTHMES_DECISION_HERMES_PROVIDER
+```
+
+일부만 설정하면 startup validation이 실패한다. Hermes가 전용 single-iteration
+계약을 광고하지 않으면 일반 chat endpoint로 fallback하지 않고 Decision REST
+호출을 `503 decision_runtime_unavailable`로 종료한다.
+
+실행 위치는 서버가 소유하는 명시적 설정이다.
+
+```text
+HEALTHMES_DECISION_EXECUTION_SCOPE=local
+  -> Hermes origin은 loopback이어야 함
+
+HEALTHMES_DECISION_EXECUTION_SCOPE=hosted
+  -> 질문과 허용된 aggregate context가 외부 모델로 갈 수 있음
+```
+
+loopback Hermes가 cloud model을 대신 호출하는 경우에도 운영자는 `hosted`를
+명시해야 한다. 클라이언트는 request body에서 실행 위치, principal, privacy level,
+budget 또는 허용 domain을 바꿀 수 없다.
+
+domain 동의는 `decision_domain_policy`에 저장하며 서버 시작 시 누락된 네 domain만
+로컬 기본값인 enabled로 만든다. 이미 사용자가 바꾼 값은 재시작 뒤에도 보존한다.
+`hosted`로 바꾸는 행위는 현재 enabled인 domain의 aggregate context를 외부 runtime에
+보내도록 운영자가 명시적으로 승인하는 설정 변경이다.
+
+```text
+GET /v1/wellness-decisions/settings
+PUT /v1/wellness-decisions/settings/{domain}
+
+domain = activity | nutrition | wearable | calendar
+```
+
+두 endpoint는 전체 REST/MCP와 같은 bearer 또는 loopback-only 인증 경계 안에 있다.
+Decision Agent는 planning 때만 정책 snapshot을 믿지 않는다. 각 context tool 호출
+직전과 provider 실행 직후에 현재 정책을 다시 읽는다. domain의 `enabled` 상태,
+revision, 실행 범위, privacy 또는 query limit이 실행 중 바뀌면 provider 결과를
+버리고 `domain_consent_changed`로 turn을 중단한다. 따라서 사용자가 실행 중
+`off -> on`으로 빠르게 되돌려도 revision 변화가 감지된다. Finalization
+transaction 안에서도 정책을 다시 읽고 row lock을 건다. 이미 철회된 consent는
+`domain_consent_denied`로 기록 저장을 거부한다. Calendar는 별도로 현재 연결된
+credential source만 읽으며, 연결 해제된 source의 오래된 mirror row를 판단에
+재사용하지 않는다.
+
+Google과 iCloud/CalDAV credential 저장·삭제도 finalization과 같은 process 및
+database write fence를 사용한다. OAuth나 CalDAV 네트워크 통신은 잠금 밖에서 하고,
+owner-only 임시 파일을 atomic replace하는 짧은 credential 변경만 fence 안에서
+수행한다.
+
+```text
+finalization이 먼저 fence 획득
+  -> 검증된 Calendar source로 DecisionRecord commit
+  -> 그 뒤 disconnect
+
+disconnect가 먼저 fence 획득
+  -> credential 삭제
+  -> 그 뒤 finalization은 calendar_source_disconnected로 실패
+```
+
+따라서 두 작업이 동시에 실행돼도 "연결 해제된 캘린더를 사용했지만 판단 기록은
+나중에 저장된" 중간 상태가 생기지 않는다.
+
+Calendar 원격 실행 경로는 credential 파일의 secret-safe digest를 connection
+generation으로 사용한다.
+
+```text
+Calendar poll / sleep scheduler / sleep web preview·apply
+  -> source별 calendar connection lock
+  -> 현재 credential generation 확인
+  -> generation이 바뀌면 cached backend 폐기
+  -> 연결이 없으면 원격 호출 없이 실패
+  -> 현재 generation으로 새 backend 생성
+  -> lock을 유지한 동안에만 원격 read/write
+```
+
+sync 도중 disconnect가 시작되면 disconnect는 현재 원격 작업이 끝날 때까지
+기다린다. disconnect가 완료된 다음 실행은 이전 cached backend를 호출하지 않는다.
+재연결 뒤에는 새 generation으로 새 backend를 만든다. Open Wearables 수면 조회는
+이 lock 밖에서 먼저 수행하고, 캘린더 preview/apply에 필요한 원격 작업만 lock
+안에서 수행하므로 async event loop를 wearable 네트워크 I/O 동안 막지 않는다.
+Google token refresh는 credential 파일 digest compare-and-swap도 사용하므로
+refresh 도중 파일이 삭제되거나 교체되면 오래된 refresh 결과를 저장하지 않는다.
+
+`decision_domain_policy` migration의 downgrade도 동의 상태를 조용히 잃지 않는다.
+offline downgrade는 현재 행을 확인할 수 없어 항상 거부하고, 하나라도
+`enabled=false`인 행이 있으면 online downgrade도 거부한다. PostgreSQL은 검사와
+table drop 사이에 사용자가 동의를 철회하는 race까지 막도록 table을
+`ACCESS EXCLUSIVE`로 잠근다. 모든 행이 enabled일 때만 명시적 downgrade를 허용한다.
+
+요청 admission도 무제한 queue가 아니다.
+
+```text
+HEALTHMES_DECISION_MAX_PENDING_REQUESTS=8
+```
+
+실행 중인 요청과 수락된 대기 요청을 합쳐 이 수를 넘으면 새 요청은 runtime에
+도달하지 않고 `429 decision_engine_busy`로 즉시 거부된다. runtime contract,
+identity 또는 실행 실패는 성공 응답으로 위장하지 않고
+`503 decision_runtime_unavailable`로 변환한다. 정책 resolver, provider catalog,
+tool 실행, source contract 또는 DecisionRecord 저장과 같은 HealthMes 내부 실패도
+`503 decision_service_unavailable`로 변환한다.
+
+반대로 다음은 서비스 장애가 아니라 안전하게 중단한 정상 제품 결과이므로
+구조화된 `DecisionResult`와 HTTP `200`을 유지한다.
+
+- 사용자가 허용한 step, tool, source 또는 context byte 예산 소진
+- domain consent, privacy 또는 retention 정책에 따른 차단
+- 조회 뒤 원본 삭제, 만료, 연결 해제로 source ref 재검증이 실패한 경우
+- 자료 부족으로 추가 질문이 필요한 경우
+
+즉 HTTP 상태는 `FAILED` 문자열만 보고 결정하지 않는다. 호출자가 설정이나 질문을
+바꿔 해결할 수 있는 안전한 중단과, 운영자가 runtime/provider/storage를 복구해야
+하는 내부 장애를 reason code로 분류한다.
 
 ## 3. 각 부품의 책임
 
@@ -385,9 +579,11 @@ deadline과 gateway 소유권이 다시 Hermes로 넘어가므로 사용하지 �
 `HermesRuntimeAdapter.next_step()`은 HealthMes가 준 turn snapshot으로 정확히 한 번의
 모델 iteration만 실행하고, `tool_calls` 또는 final draft 중 하나를 반환해야 한다.
 
-새 provider SDK, 세션과 채널을 처음부터 다시 만들지는 않는다. Hermes에 이
-single-iteration generic hook이 없다면 HealthMes vendored tree를 직접 수정하지 않고
-별도 Hermes 저장소와 PR에서 다음 범용 확장만 제안한다.
+HealthMes 쪽 `HermesRuntimeAdapter`와 fail-closed 계약은 구현되어 있다. 다만 현재
+vendored Hermes에는 이 single-iteration generic hook이 없다. 따라서 기존 chat
+endpoint를 안전한 것처럼 fallback하지 않고 `unavailable`을 반환한다. 실제 Hermes
+모델 실행을 활성화하려면 HealthMes vendored tree를 직접 수정하지 않고 별도 Hermes
+저장소와 PR에서 다음 범용 확장을 구현해야 한다.
 
 - 필수 system policy 주입 hook
 - structured tool-call/final response 한 번 생성
@@ -430,7 +626,9 @@ ContextToolGateway
   +-- FakeToolGateway      테스트용
 ```
 
-MVP는 기존 Hermes 연동을 위해 MCP 구현체만 제공해도 된다.
+현재 core E2E는 in-process Context Access Layer로 실행한다. MCP는 외부 agent나
+channel이 HealthMes 기능을 호출하는 integration surface로 유지하되, 권한 검사와
+finalization을 우회하는 별도 core 경로로 만들지 않는다.
 
 ## 9. 중앙 데이터 조회
 
@@ -473,19 +671,23 @@ MVP는 기존 Hermes 연동을 위해 MCP 구현체만 제공해도 된다.
 질문 종류에 따라 조회 영역을 고정하는 것은 폐기하지만, 계산과 보안까지 LLM에게
 넘기지는 않는다.
 
-## 11. 현재와 목표
+## 11. 현재 구현과 남은 경계
 
-| 항목 | 현재 코드 | 목표 |
+| 항목 | 현재 구현 | 남은 경계 |
 |---|---|---|
-| 질문 입력 | 자연어 `DecisionRequest`; 기존 호출자는 `question_kind` 사용 가능 | 자연어를 기본값으로 정착 |
-| 자료 선택 | HealthMes-owned `next_step` loop와 호환 resolver 병존 | LLM의 반복 tool planning |
-| resolver | 호환 wrapper | 호환 기간 뒤 core 경로에서 제거 |
-| Context layer | 권한, retention, privacy, query cap과 source ref 강제 | provider completeness 지속 보강 |
-| Skill | 일부 제품 workflow와 필수 절차 포함 | 얇은 runtime adapter |
-| Hermes | MCP 연결 가능, HealthMes 전용 adapter 없음 | `HermesRuntimeAdapter` |
-| 최종 판단 | runtime-neutral structured draft loop 구현 | Hermes adapter 연결 |
-| 판단 저장 | LLM이 `record_decision`을 기억해야 함 | finalizer가 자동 저장 |
-| wearable provenance | 안정적인 evidence ID 부족 | normalized source reference 또는 mirror |
+| 질문 입력 | 공개 `ask_wellness(DecisionRequest)`와 호환 `ask()` | API/MCP/UI별 얇은 호출 adapter |
+| 자료 선택 | HealthMes-owned 반복 `next_step` loop | 실제 runtime의 모델 품질 평가는 운영 단계 |
+| resolver | 고정 `question_kind`를 compatibility preset으로만 유지 | 기존 호출자 migration 뒤 축소 가능 |
+| Context layer | 권한, retention, timezone, privacy, query cap과 source ref 강제 | 새 provider 추가 시 동일 계약 준수 |
+| Domain provider | Activity, Nutrition, Wearable, Calendar 공통 registry | 새로운 wellness 입력 provider 확장 |
+| Skill | 필수 정책을 소유하지 않는 설명 계층 | channel별 표현 지침만 유지 |
+| Hermes | `HermesRuntimeAdapter`와 strict/fail-closed 계약 구현 | Hermes upstream single-iteration hook `#139` |
+| 최종 판단 | runtime-neutral structured draft loop 구현 | 상용 LLM eval은 이 PR 비범위 |
+| 판단 저장 | finalizer가 source ref를 재검증하고 자동 저장 | 저장 backend 운영·관측성 보강 |
+| wearable provenance | normalized local snapshot과 stable source ref 구현 | vendor별 장기 호환성 모니터링 |
+| activity completeness | ActivityWatch scheduler, iOS aggregate 경계, cross-device dedup 구현 | 실제 device UI와 dogfood |
+| production 조립 | FastAPI lifespan singleton, DB policy resolver, REST adapter와 cancellation-safe cleanup 구현 | 다른 channel/UI의 얇은 호출 adapter |
+| E2E | 실제 네 domain 저장소에서 자연어 질문부터 DecisionRecord 재조회까지 검증 | 실제 상용 LLM 네트워크 평가는 별도 |
 
 ## 12. 마이그레이션
 
@@ -634,6 +836,39 @@ cancellation 억제, 동기 event-loop blocking, step 우회와 source ref 위�
   -> DecisionRecord 저장
 ```
 
+현재 E2E는 다음 실제 저장 경로를 사용한다.
+
+```text
+"오늘 집중이 흐트러지고 피곤한데,
+ 100mg 카페인 커피를 더 마시면서 계속 일해도 될까?"
+        |
+        v
+Activity 저장 이벤트와 focus 집계
+        |
+        v
+Open Wearables local sleep snapshot
+        |
+        v
+Calendar local mirror
+        |
+        v
+Nutrition confirmed caffeine ledger
+        |
+        v
+네 domain의 content digest가 있는 SourceRef 재검증
+        |
+        v
+DecisionRecord 저장
+        |
+        v
+DB dispose/reopen 뒤 같은 record 재조회
+```
+
+Activity 자료가 없으면 첫 결과 뒤 즉시 `needs_clarification`으로 끝내며 Wearable,
+Calendar와 Nutrition을 관성적으로 조회하지 않고 record도 저장하지 않는다.
+privacy 거부, missing/partial data, source ref 위조와 저장 실패는 같은 production
+component를 사용하는 focused failure tests에서 별도로 검증한다.
+
 ## 14. 채택하지 않는 대안
 
 ### 고성능 LLM에 DB 직접 개방
@@ -672,3 +907,8 @@ Hermes가 이미 provider, tool loop, session과 channel을 제공하므로 MVP�
     deadline 안에 실패로 반환된다.
 11. timeout으로 worker가 종료되지 않아도 같은 agent가 새 thread를 계속 만들지 않고
     이후 요청을 fail-fast 한다.
+12. 각 tool 호출 전후 consent revision이 달라지면 결과를 버리며,
+    `off -> on` 경합도 허용된 것으로 오인하지 않는다.
+13. finalization의 payload 생성 또는 flush가 deadline을 넘기면 commit하지 않는다.
+14. Calendar sync, sleep scheduler와 sleep web 경로는 disconnect 뒤 stale backend를
+    호출하지 않고 reconnect 뒤 새 credential generation으로 backend를 재생성한다.

@@ -28,7 +28,13 @@ from starlette.status import (
 from healthmes.api.common import UTCDateTime
 from healthmes.api.errors import APIError, invalid_transition, not_found
 from healthmes.api.pagination import Page, PageParamsDep, paginate
+from healthmes.calendars import creds
 from healthmes.calendars.sleep_context import actual_sleep_violation
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    CalendarVisibilityChanged,
+    read_visible_calendar,
+)
 from healthmes.config import resolve_timezone
 from healthmes.schedule_proposals import (
     ScheduleProposalResolutionError,
@@ -72,6 +78,7 @@ class ProposalOut(BaseModel):
     healthmes_kind: str | None
     decided_at: datetime | None
     decision_surface: str | None
+    invalidation_reason: str | None
     accept_resolution_token: str | None = None
     decline_resolution_token: str | None = None
 
@@ -97,14 +104,10 @@ def _proposal_out(proposal: ScheduleProposal, request: Request) -> ProposalOut:
         and len(handle_secret) >= 32
     )
     accept_token = (
-        resolution_token(proposal, handle_secret, ProposalStatus.ACCEPTED)
-        if actionable
-        else None
+        resolution_token(proposal, handle_secret, ProposalStatus.ACCEPTED) if actionable else None
     )
     decline_token = (
-        resolution_token(proposal, handle_secret, ProposalStatus.DECLINED)
-        if actionable
-        else None
+        resolution_token(proposal, handle_secret, ProposalStatus.DECLINED) if actionable else None
     )
     return ProposalOut.model_validate(proposal).model_copy(
         update={
@@ -114,10 +117,35 @@ def _proposal_out(proposal: ScheduleProposal, request: Request) -> ProposalOut:
     )
 
 
+def _require_calendar_available(
+    visibility: CalendarVisibility,
+    *,
+    calendar_source: CalendarSource | None,
+) -> None:
+    reason_codes: list[str]
+    if calendar_source is not None:
+        if calendar_source in visibility.account_generations:
+            return
+        reason_codes = list(visibility.limitations)
+    else:
+        if visibility.available and not visibility.limitations:
+            return
+        reason_codes = list(visibility.limitations)
+    if not reason_codes:
+        reason_codes.append("calendar_source_unavailable")
+    raise APIError(
+        HTTP_503_SERVICE_UNAVAILABLE,
+        "calendar_unavailable",
+        "Calendar events are unavailable until the connected account completes a successful sync.",
+        detail={"reason_codes": reason_codes},
+    )
+
+
 @router.get("/events")
 def list_events(
     session: SessionDep,
     page: PageParamsDep,
+    request: Request,
     start: UTCDateTime,
     end: UTCDateTime,
     calendar_source: CalendarSource | None = None,
@@ -129,14 +157,44 @@ def list_events(
             "invalid_range",
             "'end' must be after 'start'",
         )
-    stmt = (
-        select(CalendarEventMirror)
-        .where(CalendarEventMirror.end_at > start, CalendarEventMirror.start_at < end)
-        .order_by(CalendarEventMirror.start_at, CalendarEventMirror.end_at)
-    )
-    if calendar_source is not None:
-        stmt = stmt.where(CalendarEventMirror.calendar_source == calendar_source)
-    rows, meta = paginate(session, stmt, page)
+
+    def read_page(
+        visibility: CalendarVisibility,
+    ):
+        _require_calendar_available(
+            visibility,
+            calendar_source=calendar_source,
+        )
+        stmt = (
+            select(CalendarEventMirror)
+            .where(
+                visibility.predicate(),
+                CalendarEventMirror.end_at > start,
+                CalendarEventMirror.start_at < end,
+            )
+            .order_by(
+                CalendarEventMirror.start_at,
+                CalendarEventMirror.end_at,
+            )
+        )
+        if calendar_source is not None:
+            stmt = stmt.where(CalendarEventMirror.calendar_source == calendar_source)
+        return paginate(session, stmt, page)
+
+    try:
+        (rows, meta), _visibility = read_visible_calendar(
+            session,
+            request.app.state.settings,
+            read_page,
+        )
+    except CalendarVisibilityChanged as exc:
+        session.rollback()
+        raise APIError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "calendar_unavailable",
+            "Calendar events changed while they were being read. Retry the request.",
+            detail={"reason_codes": ["calendar_visibility_changed"]},
+        ) from exc
     return Page(data=[CalendarEventOut.model_validate(row) for row in rows], pagination=meta)
 
 
@@ -224,15 +282,14 @@ def _resolve_proposal(
             "The schedule proposal has expired",
         )
     if proposal.status is not ProposalStatus.PROPOSED:
-        raise invalid_transition(
-            "schedule_proposal", proposal.status.value, target.value
-        )
+        raise invalid_transition("schedule_proposal", proposal.status.value, target.value)
     if target is ProposalStatus.ACCEPTED:
         violation = actual_sleep_violation(
             session,
             proposal.proposed_start,
             proposal.proposed_end,
             resolve_timezone(request.app.state.settings),
+            account_generations=creds.calendar_account_generations(request.app.state.settings),
         )
         if violation is not None:
             try:
@@ -298,6 +355,7 @@ def _resolve_proposal(
     session.commit()
     session.refresh(proposal)
     return _proposal_out(proposal, request)
+
 
 @router.post("/proposals/{proposal_id}/accept")
 def accept_proposal(

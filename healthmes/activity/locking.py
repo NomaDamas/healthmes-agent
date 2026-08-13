@@ -6,20 +6,24 @@ import logging
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from errno import EACCES, EAGAIN, EDEADLK
 from pathlib import Path
 from threading import RLock
-from time import monotonic, sleep
+from time import sleep
 from typing import BinaryIO
 
 from sqlalchemy import event, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
 
+from healthmes.timing import steady_time
+
 _ACTIVITY_WRITE_LOCK = RLock()
 _ACTIVITY_WRITE_PLANE_KEY = "healthmes:activity:write-plane:v1"
 _SQLITE_FILE_LOCK_INFO_KEY = "healthmes_activity_sqlite_file_lock"
 _POSTGRES_GUARD_TIMEOUT_SECONDS = 5.0
 _POSTGRES_GUARD_POLL_SECONDS = 0.05
+_SQLITE_FILE_LOCK_POLL_SECONDS = 0.05
 _LOGGER = logging.getLogger(__name__)
 
 if os.name == "nt":  # pragma: no cover - exercised on Windows runners
@@ -29,10 +33,25 @@ else:
 
 
 @contextmanager
-def activity_write_lock():
+def activity_write_lock(
+    *,
+    timeout_seconds: float | None = None,
+) -> Iterator[None]:
     """Serialize activity ingest, retention, deletion, and summary writes."""
-    with _ACTIVITY_WRITE_LOCK:
+    if timeout_seconds is None:
+        acquired = _ACTIVITY_WRITE_LOCK.acquire()
+    else:
+        if timeout_seconds <= 0:
+            raise ValueError("activity write lock timeout must be positive")
+        acquired = _ACTIVITY_WRITE_LOCK.acquire(timeout=timeout_seconds)
+    if not acquired:
+        raise TimeoutError(
+            "timed out waiting for the process activity write lock"
+        )
+    try:
         yield
+    finally:
+        _ACTIVITY_WRITE_LOCK.release()
 
 
 def _sqlite_database_path(session: Session) -> Path | None:
@@ -45,7 +64,12 @@ def _sqlite_database_path(session: Session) -> Path | None:
     return Path(database).expanduser().resolve()
 
 
-def _lock_file(handle: BinaryIO) -> None:
+def _lock_file(
+    handle: BinaryIO,
+    *,
+    timeout_seconds: float | None,
+    poll_seconds: float,
+) -> None:
     if os.name == "nt":  # pragma: no cover - exercised on Windows runners
         handle.seek(0)
         if handle.read(1) == b"":
@@ -53,9 +77,39 @@ def _lock_file(handle: BinaryIO) -> None:
             handle.write(b"\0")
             handle.flush()
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        blocking_mode = msvcrt.LK_LOCK
+        nonblocking_mode = msvcrt.LK_NBLCK
+    else:
+        blocking_mode = fcntl.LOCK_EX
+        nonblocking_mode = fcntl.LOCK_EX | fcntl.LOCK_NB
+
+    if timeout_seconds is None:
+        if os.name == "nt":  # pragma: no cover - Windows runners
+            msvcrt.locking(handle.fileno(), blocking_mode, 1)
+        else:
+            fcntl.flock(handle.fileno(), blocking_mode)
         return
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    if timeout_seconds <= 0 or poll_seconds <= 0:
+        raise ValueError("SQLite file-lock bounds must be positive")
+
+    deadline = steady_time() + timeout_seconds
+    while True:
+        try:
+            if os.name == "nt":  # pragma: no cover - Windows runners
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), nonblocking_mode, 1)
+            else:
+                fcntl.flock(handle.fileno(), nonblocking_mode)
+            return
+        except OSError as exc:
+            if exc.errno not in {EACCES, EAGAIN, EDEADLK}:
+                raise
+            remaining = deadline - steady_time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "timed out waiting for the SQLite activity file lock"
+                ) from exc
+            sleep(min(poll_seconds, remaining))
 
 
 def _unlock_file(handle: BinaryIO) -> None:
@@ -79,7 +133,12 @@ def _release_sqlite_activity_lock(session: Session, transaction) -> None:
         handle.close()
 
 
-def _lock_sqlite_write_plane(session: Session) -> None:
+def _lock_sqlite_write_plane(
+    session: Session,
+    *,
+    timeout_seconds: float | None,
+    poll_seconds: float,
+) -> None:
     if _SQLITE_FILE_LOCK_INFO_KEY in session.info:
         return
     database = _sqlite_database_path(session)
@@ -89,24 +148,70 @@ def _lock_sqlite_write_plane(session: Session) -> None:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
     try:
-        _lock_file(handle)
+        _lock_file(
+            handle,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
     except BaseException:
         handle.close()
         raise
     session.info[_SQLITE_FILE_LOCK_INFO_KEY] = handle
     # Ensure transaction cleanup, session.close(), and rollback all trigger the
     # after_transaction_end release hook even if the caller fails before DML.
-    session.connection()
+    try:
+        session.connection()
+    except BaseException:
+        session.info.pop(_SQLITE_FILE_LOCK_INFO_KEY, None)
+        try:
+            _unlock_file(handle)
+        finally:
+            handle.close()
+        raise
 
 
-def lock_activity_write_plane(session: Session) -> None:
+def lock_activity_write_plane(
+    session: Session,
+    *,
+    timeout_seconds: float | None = None,
+    poll_seconds: float = _SQLITE_FILE_LOCK_POLL_SECONDS,
+) -> None:
     """Serialize PostgreSQL activity writes across processes and devices."""
     dialect = session.get_bind().dialect.name
     if dialect == "sqlite":
-        _lock_sqlite_write_plane(session)
+        _lock_sqlite_write_plane(
+            session,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
         return
     if dialect != "postgresql":
         return
+    if timeout_seconds is not None:
+        if timeout_seconds <= 0 or poll_seconds <= 0:
+            raise ValueError(
+                "PostgreSQL activity lock bounds must be positive"
+            )
+        deadline = steady_time() + timeout_seconds
+        while True:
+            acquired = bool(
+                session.scalar(
+                    text(
+                        "SELECT pg_try_advisory_xact_lock("
+                        "hashtextextended(:write_plane_key, 0)"
+                        ")"
+                    ),
+                    {"write_plane_key": _ACTIVITY_WRITE_PLANE_KEY},
+                )
+            )
+            if acquired:
+                return
+            remaining = deadline - steady_time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "timed out waiting for the activity write plane"
+                )
+            sleep(min(poll_seconds, remaining))
     session.execute(
         text(
             "SELECT pg_advisory_xact_lock("
@@ -146,9 +251,9 @@ def postgres_activity_write_plane_guard(
             raise ValueError("PostgreSQL lock bounds must be positive")
         lock_attempted = False
         try:
-            deadline = monotonic() + timeout_seconds
+            deadline = steady_time() + timeout_seconds
             acquired = False
-            while monotonic() < deadline:
+            while steady_time() < deadline:
                 # Cleanup starts before PostgreSQL can grant the lock. A driver
                 # or result-processing failure after server-side acquisition
                 # must not return a lock-holding connection to the pool.
@@ -168,7 +273,7 @@ def postgres_activity_write_plane_guard(
                 sleep(
                     min(
                         poll_seconds,
-                        max(0.0, deadline - monotonic()),
+                        max(0.0, deadline - steady_time()),
                     )
                 )
             if not acquired:

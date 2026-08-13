@@ -29,7 +29,11 @@ import httpx
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import delete, select
-from starlette.status import HTTP_422_UNPROCESSABLE_CONTENT, HTTP_502_BAD_GATEWAY
+from starlette.status import (
+    HTTP_422_UNPROCESSABLE_CONTENT,
+    HTTP_502_BAD_GATEWAY,
+    HTTP_503_SERVICE_UNAVAILABLE,
+)
 
 from healthmes.activity.repository import legacy_app_usage_cutoff
 from healthmes.api.common import ensure_utc, utc_now
@@ -37,12 +41,19 @@ from healthmes.api.errors import APIError
 from healthmes.api.insight_focus import KIND_FOCUS_DROP_BY_HOUR, compute_focus_drop
 from healthmes.api.insight_templates import (
     ALL_KINDS,
+    KIND_STRESS_BY_CALENDAR_KEYWORD,
     SkippedTemplate,
     StressSample,
     WorkoutEvent,
     compute_all,
 )
 from healthmes.api.pagination import Page, PageParamsDep, paginate
+from healthmes.calendars.visibility import (
+    CalendarVisibility,
+    CalendarVisibilityChanged,
+    read_visible_calendar,
+    require_calendar_visibility_current,
+)
 from healthmes.config import Settings, resolve_timezone
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.store import (
@@ -250,11 +261,39 @@ def recompute_insights(
     days = (period_end - period_start).days + 1
     period = f"{period_start.isoformat()}..{period_end.isoformat()}"
     window_start = datetime.combine(period_start, datetime.min.time(), tzinfo=UTC)
-    window_end = datetime.combine(
-        period_end + timedelta(days=1), datetime.min.time(), tzinfo=UTC
-    )
+    window_end = datetime.combine(period_end + timedelta(days=1), datetime.min.time(), tzinfo=UTC)
     settings: Settings = request.app.state.settings
     tz = _user_timezone(settings)
+
+    def read_events(
+        visibility: CalendarVisibility,
+    ) -> list[CalendarEventMirror]:
+        return list(
+            session.scalars(
+                select(CalendarEventMirror)
+                .where(
+                    visibility.predicate(),
+                    CalendarEventMirror.end_at > window_start,
+                    CalendarEventMirror.start_at < window_end,
+                )
+                .order_by(CalendarEventMirror.start_at)
+            ).all()
+        )
+
+    try:
+        events, visibility = read_visible_calendar(
+            session,
+            settings,
+            read_events,
+        )
+    except CalendarVisibilityChanged as exc:
+        session.rollback()
+        raise APIError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "calendar_unavailable",
+            "Calendar data changed while insights were being recomputed. Retry the request.",
+            detail={"reason_codes": ["calendar_visibility_changed"]},
+        ) from exc
 
     ow = get_ow_client(request)
     try:
@@ -264,13 +303,9 @@ def recompute_insights(
             _fetch_ow_inputs(ow, settings, body.ow_user_id, window_start, window_end, days)
         )
     except LookupError as exc:
-        raise APIError(
-            HTTP_422_UNPROCESSABLE_CONTENT, "ow_user_unresolved", str(exc)
-        ) from exc
+        raise APIError(HTTP_422_UNPROCESSABLE_CONTENT, "ow_user_unresolved", str(exc)) from exc
     except (OWClientError, httpx.HTTPError) as exc:
-        raise APIError(
-            HTTP_502_BAD_GATEWAY, "upstream_error", f"open-wearables: {exc}"
-        ) from exc
+        raise APIError(HTTP_502_BAD_GATEWAY, "upstream_error", f"open-wearables: {exc}") from exc
     if truncated:
         raise APIError(
             HTTP_502_BAD_GATEWAY,
@@ -282,16 +317,6 @@ def recompute_insights(
     samples = _parse_stress_samples(series_rows)
     workouts = _parse_workouts(workout_rows)
 
-    events = list(
-        session.scalars(
-            select(CalendarEventMirror)
-            .where(
-                CalendarEventMirror.end_at > window_start,
-                CalendarEventMirror.start_at < window_end,
-            )
-            .order_by(CalendarEventMirror.start_at)
-        ).all()
-    )
     estimates = list(
         session.scalars(
             select(CognitiveEnergyEstimate)
@@ -308,17 +333,31 @@ def recompute_insights(
     )
     usage_cutoff = legacy_app_usage_cutoff(session)
     if usage_cutoff is not None:
-        usage_statement = usage_statement.where(
-            AppUsageSample.bucket_start > usage_cutoff
-        )
-    usage = list(
-        session.scalars(
-            usage_statement.order_by(AppUsageSample.bucket_start)
-        ).all()
-    )
+        usage_statement = usage_statement.where(AppUsageSample.bucket_start > usage_cutoff)
+    usage = list(session.scalars(usage_statement.order_by(AppUsageSample.bucket_start)).all())
 
-    results, skipped = compute_all(samples, events, workouts, tz)
-    focus = compute_focus_drop(estimates, usage, events, tz)
+    calendar_complete = visibility.available and not visibility.limitations
+    derived_calendar_events = events if calendar_complete else []
+    results, skipped = compute_all(
+        samples,
+        derived_calendar_events,
+        workouts,
+        tz,
+    )
+    if not calendar_complete:
+        skipped = [item for item in skipped if item.kind != KIND_STRESS_BY_CALENDAR_KEYWORD]
+        skipped.append(
+            SkippedTemplate(
+                KIND_STRESS_BY_CALENDAR_KEYWORD,
+                "calendar_unavailable",
+            )
+        )
+    focus = compute_focus_drop(
+        estimates,
+        usage,
+        derived_calendar_events,
+        tz,
+    )
     if isinstance(focus, SkippedTemplate):
         skipped.append(focus)
     else:
@@ -339,6 +378,17 @@ def recompute_insights(
         for result in results
     ]
     session.add_all(rows)
+    try:
+        require_calendar_visibility_current(settings, visibility)
+    except CalendarVisibilityChanged as exc:
+        session.rollback()
+        raise APIError(
+            HTTP_503_SERVICE_UNAVAILABLE,
+            "calendar_unavailable",
+            "Calendar data changed before the recomputed insights could be "
+            "saved. No insight changes were committed.",
+            detail={"reason_codes": ["calendar_visibility_changed"]},
+        ) from exc
     session.commit()
     for row in rows:
         session.refresh(row)

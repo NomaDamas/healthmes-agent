@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 import time
@@ -20,7 +21,14 @@ from healthmes.activity.locking import (
     lock_activity_write_plane,
     postgres_activity_write_plane_guard,
 )
+from healthmes.calendars import creds
+from healthmes.calendars.state import (
+    InMemorySyncHealthStore,
+    SyncCoverageKind,
+)
+from healthmes.config import Settings
 from healthmes.decision import (
+    CalendarContextProvider,
     ContextAccessLayer,
     ContextAccessPolicy,
     ContextCapability,
@@ -46,9 +54,12 @@ from healthmes.decision import (
     SourceRef,
     ToolCallRecord,
     ToolCallStatus,
+    decision_result_from_record,
 )
 from healthmes.store import (
     Base,
+    CalendarEventMirror,
+    CalendarSource,
     DecisionRecord,
     WellnessEvent,
     create_db_engine,
@@ -325,6 +336,9 @@ def _run(
 def _finalizer(
     factory: sessionmaker[Session],
     source_ref: SourceRef,
+    *,
+    policy_resolver=None,
+    timeout_seconds: float = 5,
 ) -> DecisionFinalizer:
     registry = ContextProviderRegistry(
         (_StoredNutritionProvider(source_ref),)
@@ -335,7 +349,10 @@ def _finalizer(
             clock=lambda: NOW,
         ),
         session_factory=factory,
-        policy_resolver=lambda _request: _policy(),
+        policy_resolver=(
+            policy_resolver or (lambda _request: _policy())
+        ),
+        timeout_seconds=timeout_seconds,
         clock=lambda: NOW,
     )
 
@@ -374,7 +391,7 @@ def test_concurrent_same_request_finalization_returns_one_record_id(
         start = threading.Barrier(2, timeout=5)
         monkeypatch.setattr(
             "healthmes.decision.finalizer.activity_write_lock",
-            nullcontext,
+            lambda **_kwargs: nullcontext(),
         )
 
         def finalize_once():
@@ -474,6 +491,243 @@ def test_postgres_activity_write_plane_guard_timeout_is_bounded() -> None:
             poll_seconds=0.02,
         ) as connection:
             assert connection is not None
+
+
+def test_postgres_finalizer_advisory_lock_timeout_is_auditable() -> None:
+    with _postgres_store(pool_size=2) as store:
+        request, run, _finalizer_instance, _event_id = (
+            _decision_fixture(store)
+        )
+        finalizer = _finalizer(
+            store.factory,
+            run.source_refs[0],
+            timeout_seconds=0.2,
+        )
+        with store.factory() as blocker:
+            lock_activity_write_plane(blocker)
+            started = time.monotonic()
+            result = finalizer.finalize(request, run)
+            elapsed = time.monotonic() - started
+            assert 0.15 <= elapsed < 2
+            assert result.status is DecisionStatus.FAILED
+            assert result.persistence_status is PersistenceStatus.FAILED
+            assert result.limitations == [
+                "decision_finalization_timeout"
+            ]
+            blocker.rollback()
+
+        retry = _finalizer(
+            store.factory,
+            run.source_refs[0],
+        ).finalize(request, run)
+        assert retry.persistence_status is PersistenceStatus.PERSISTED
+
+
+def test_postgres_finalizer_row_lock_timeout_is_auditable() -> None:
+    with _postgres_store(pool_size=2) as store:
+        request, run, _finalizer_instance, event_id = (
+            _decision_fixture(store)
+        )
+        finalizer = _finalizer(
+            store.factory,
+            run.source_refs[0],
+            timeout_seconds=0.2,
+        )
+        with store.factory() as blocker:
+            blocker.scalar(
+                sa.select(WellnessEvent)
+                .where(WellnessEvent.id == event_id)
+                .with_for_update()
+            )
+            started = time.monotonic()
+            result = finalizer.finalize(request, run)
+            elapsed = time.monotonic() - started
+            assert 0.15 <= elapsed < 2
+            assert result.status is DecisionStatus.FAILED
+            assert result.persistence_status is PersistenceStatus.FAILED
+            assert result.limitations == [
+                "decision_finalization_timeout"
+            ]
+            blocker.rollback()
+
+        retry = _finalizer(
+            store.factory,
+            run.source_refs[0],
+        ).finalize(request, run)
+        assert retry.persistence_status is PersistenceStatus.PERSISTED
+
+
+def test_postgres_finalizer_statement_timeout_is_auditable() -> None:
+    class SlowPolicyResolver:
+        def __call__(self, _request):
+            return _policy()
+
+        def resolve_in_session(
+            self,
+            _request,
+            session,
+            *,
+            lock,
+        ):
+            if lock:
+                session.execute(sa.text("SELECT pg_sleep(1)"))
+            return _policy()
+
+    with _postgres_store(pool_size=2) as store:
+        request, run, _finalizer_instance, _event_id = (
+            _decision_fixture(store)
+        )
+        result = _finalizer(
+            store.factory,
+            run.source_refs[0],
+            policy_resolver=SlowPolicyResolver(),
+            timeout_seconds=0.2,
+        ).finalize(request, run)
+
+        assert result.status is DecisionStatus.FAILED
+        assert result.persistence_status is PersistenceStatus.FAILED
+        assert result.limitations == ["decision_finalization_timeout"]
+        retry = _finalizer(
+            store.factory,
+            run.source_refs[0],
+        ).finalize(request, run)
+        assert retry.persistence_status is PersistenceStatus.PERSISTED
+
+
+def test_postgres_calendar_visibility_change_after_flush_rolls_back(
+    tmp_path,
+) -> None:
+    with _postgres_store(pool_size=2) as store:
+        settings = Settings(
+            database_url=str(_POSTGRES_URL),
+            data_dir=tmp_path / "data",
+            timezone="UTC",
+            _env_file=None,
+        )
+        token_path = (
+            settings.data_dir / "google" / "calendar_token.json"
+        )
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(
+            json.dumps(
+                {
+                    "type": "authorized_user",
+                    "refresh_token": "postgres-calendar-refresh-token",
+                    "client_id": "client-id",
+                    "client_secret": "client-secret",
+                }
+            ),
+            encoding="utf-8",
+        )
+        account_generation = creds.calendar_account_generation(
+            settings,
+            CalendarSource.GOOGLE,
+        )
+        assert account_generation is not None
+        health = InMemorySyncHealthStore()
+        health.record_success(
+            CalendarSource.GOOGLE,
+            NOW,
+            event_count=1,
+            coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+            account_generation=account_generation,
+        )
+        with store.factory() as session:
+            row = CalendarEventMirror(
+                external_id="postgres-calendar-finalizer",
+                calendar_source=CalendarSource.GOOGLE,
+                connection_generation=account_generation,
+                summary="Private PostgreSQL meeting",
+                start_at=NOW + timedelta(hours=1),
+                end_at=NOW + timedelta(hours=2),
+                is_all_day=False,
+                created_at=NOW - timedelta(minutes=2),
+                updated_at=NOW - timedelta(minutes=1),
+            )
+            session.add(row)
+            session.commit()
+            row_id = row.id
+
+        policy = ContextAccessPolicy(
+            owner_principal_id="owner",
+            grants=(DomainAccessGrant(domain="calendar"),),
+        )
+        request = _request()
+        query = ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            parameters={"date": NOW.date().isoformat()},
+            timezone="UTC",
+        )
+        provider = CalendarContextProvider(
+            settings=settings,
+            sync_health_store=health,
+        )
+        access_layer = ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: NOW,
+            calendar_settings=settings,
+            calendar_sync_health_store=health,
+        )
+        turn = access_layer.start_turn(request, policy=policy)
+        with store.factory() as session:
+            context = asyncio.run(turn.query(session, query))
+            session.rollback()
+        assert context.status in {
+            ContextStatus.OK,
+            ContextStatus.PARTIAL,
+        }
+        assert [ref.record_id for ref in context.source_refs] == [
+            str(row_id)
+        ]
+        run = _run(request, query, context, turn.trace)
+
+        class SyncChangingSession(Session):
+            changed = False
+
+            def flush(self, objects=None) -> None:
+                super().flush(objects)
+                if (
+                    not type(self).changed
+                    and any(
+                        isinstance(item, DecisionRecord)
+                        for item in self.identity_map.values()
+                    )
+                ):
+                    type(self).changed = True
+                    health.record_success(
+                        CalendarSource.GOOGLE,
+                        NOW + timedelta(minutes=1),
+                        event_count=0,
+                        coverage_kind=(
+                            SyncCoverageKind.FULL_COLLECTION
+                        ),
+                        account_generation="f" * 64,
+                    )
+
+        changing_factory = sessionmaker(
+            bind=store.engine,
+            class_=SyncChangingSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        finalizer = DecisionFinalizer(
+            access_layer=access_layer,
+            session_factory=changing_factory,
+            policy_resolver=lambda _request: policy,
+            clock=lambda: NOW,
+        )
+
+        result = finalizer.finalize(request, run)
+
+        assert result.status is DecisionStatus.FAILED
+        assert result.persistence_status is PersistenceStatus.FAILED
+        assert "calendar_visibility_changed" in result.limitations
+        with store.factory() as session:
+            assert session.scalar(
+                sa.select(sa.func.count()).select_from(DecisionRecord)
+            ) == 0
 
 
 def test_initial_guard_commit_failure_releases_advisory_lock(
@@ -628,6 +882,79 @@ def test_success_releases_advisory_lock_and_restores_isolation() -> None:
                 ),
                 {"write_plane_key": _ACTIVITY_WRITE_PLANE_KEY},
             ) is True
+
+
+def test_slow_postgres_commit_returns_unknown_then_recovers(
+    monkeypatch,
+) -> None:
+    with _postgres_store(pool_size=2) as store:
+        request, run, _finalizer_instance, _event_id = (
+            _decision_fixture(store)
+        )
+        commit_started = threading.Event()
+        release_commit = threading.Event()
+        commit_finished = threading.Event()
+        session_closed = threading.Event()
+        original_do_commit = store.engine.dialect.do_commit
+
+        class CommitCompletionSession(Session):
+            def close(self) -> None:
+                try:
+                    super().close()
+                finally:
+                    session_closed.set()
+
+        finalization_factory = sessionmaker(
+            bind=store.engine,
+            class_=CommitCompletionSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+
+        def slow_transaction_commit(dbapi_connection) -> None:
+            if not dbapi_connection.autocommit:
+                commit_started.set()
+                if not release_commit.wait(timeout=5):
+                    raise TimeoutError(
+                        "test PostgreSQL commit was not released"
+                    )
+            original_do_commit(dbapi_connection)
+            if commit_started.is_set():
+                commit_finished.set()
+
+        monkeypatch.setattr(
+            store.engine.dialect,
+            "do_commit",
+            slow_transaction_commit,
+        )
+        finalizer = _finalizer(
+            finalization_factory,
+            run.source_refs[0],
+            timeout_seconds=0.2,
+        )
+        try:
+            result = finalizer.finalize(request, run)
+
+            assert commit_started.is_set()
+            assert result.status is DecisionStatus.FAILED
+            assert result.persistence_status is PersistenceStatus.UNKNOWN
+            assert result.decision_record_id is None
+            assert result.limitations == [
+                "decision_finalization_outcome_unknown"
+            ]
+        finally:
+            release_commit.set()
+            assert commit_finished.wait(timeout=5)
+            assert session_closed.wait(timeout=5)
+
+        with store.factory() as session:
+            row = session.scalars(sa.select(DecisionRecord)).one()
+            recovered = decision_result_from_record(row)
+        assert recovered.status is DecisionStatus.COMPLETED
+        assert recovered.persistence_status is PersistenceStatus.PERSISTED
+        assert recovered.request_id == request.request_id
+        assert recovered.decision_record_id == row.id
 
 
 def test_cleanup_failure_does_not_reverse_committed_success(

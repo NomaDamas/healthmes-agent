@@ -4,10 +4,14 @@ import multiprocessing
 import threading
 import time
 
+import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from healthmes.activity.locking import lock_activity_write_plane
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.store.session import create_db_engine
 
 
@@ -74,6 +78,68 @@ def test_file_sqlite_activity_lock_lasts_until_transaction_end(tmp_path) -> None
     first.close()
     second.close()
     engine.dispose()
+
+
+def test_process_activity_write_lock_timeout_is_bounded() -> None:
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with activity_write_lock():
+            acquired.set()
+            assert release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert acquired.wait(timeout=5)
+        started = time.monotonic()
+        with pytest.raises(
+            TimeoutError,
+            match="process activity write lock",
+        ):
+            with activity_write_lock(timeout_seconds=0.1):
+                pytest.fail("process write lock unexpectedly acquired")
+        assert 0.05 <= time.monotonic() - started < 1
+    finally:
+        release.set()
+        holder.join(timeout=5)
+
+    assert not holder.is_alive()
+
+
+def test_file_sqlite_activity_lock_timeout_is_bounded(tmp_path) -> None:
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'bounded.db'}")
+    first = Session(engine)
+    second = Session(engine)
+    try:
+        lock_activity_write_plane(first)
+        first.execute(text("SELECT 1"))
+
+        started = time.monotonic()
+        with pytest.raises(
+            TimeoutError,
+            match="SQLite activity file lock",
+        ):
+            lock_activity_write_plane(
+                second,
+                timeout_seconds=0.1,
+                poll_seconds=0.01,
+            )
+        assert 0.05 <= time.monotonic() - started < 1
+        assert "healthmes_activity_sqlite_file_lock" not in second.info
+
+        first.rollback()
+        lock_activity_write_plane(
+            second,
+            timeout_seconds=1,
+            poll_seconds=0.01,
+        )
+        second.rollback()
+    finally:
+        first.close()
+        second.close()
+        engine.dispose()
 
 
 def test_file_sqlite_activity_lock_serializes_independent_processes(

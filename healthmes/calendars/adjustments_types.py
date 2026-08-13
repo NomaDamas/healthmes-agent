@@ -55,6 +55,10 @@ class AmbiguousProviderResult(CalendarError):
         self.provider_code = provider_code
 
 
+class CalendarAccountGenerationChanged(CalendarError):
+    """The proposal's connected account is no longer current."""
+
+
 class AdjustmentError(ValueError):
     pass
 
@@ -81,6 +85,7 @@ class HandlePair:
 @dataclass(frozen=True, slots=True)
 class ProposalSnapshot:
     calendar_source: CalendarSource
+    account_generation: str | None
     mirror_event_id: uuid.UUID | str | None
     external_event_id: str
     operation: AdjustmentOperation
@@ -194,7 +199,7 @@ class AdjustmentRepository(Protocol):
 
     def update_mirror_after_apply(
         self, proposal: StoredAdjustmentProposal, event: ExternalEvent
-    ) -> None: ...
+    ) -> bool: ...
 
     def compare_and_mark_terminal(
         self,

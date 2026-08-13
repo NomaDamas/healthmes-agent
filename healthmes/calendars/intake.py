@@ -46,15 +46,28 @@ def intake_revision(mirror: CalendarEventMirror) -> str:
 
 
 def intake_calendar_tasks(
-    session: Session, source: CalendarSource, local_timezone: tzinfo
+    session: Session,
+    source: CalendarSource,
+    local_timezone: tzinfo,
+    *,
+    account_generation: str | None = None,
 ) -> tuple[Task, ...]:
     if source is not CalendarSource.GOOGLE:
         return ()
 
+    statement = select(CalendarEventMirror).where(
+        CalendarEventMirror.calendar_source == source
+    )
+    if account_generation is not None:
+        statement = statement.where(
+            CalendarEventMirror.connection_generation
+            == account_generation
+        )
     mirrors = session.scalars(
-        select(CalendarEventMirror)
-        .where(CalendarEventMirror.calendar_source == source)
-        .order_by(CalendarEventMirror.created_at, CalendarEventMirror.id)
+        statement.order_by(
+            CalendarEventMirror.created_at,
+            CalendarEventMirror.id,
+        )
     ).all()
     affected: list[Task] = []
     for mirror in mirrors:

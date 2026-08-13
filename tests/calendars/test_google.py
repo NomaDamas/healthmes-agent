@@ -1,11 +1,13 @@
 """Google backend tests against a fake ``calendar v3`` service (no network)."""
 
 import json
+import threading
 import uuid
 from datetime import UTC, datetime
 
 import pytest
 
+from healthmes.calendars import creds
 from healthmes.calendars.base import (
     CalendarAuthError,
     CalendarConflictError,
@@ -708,6 +710,65 @@ class TestOAuthHelpers:
         token_file.parent.mkdir(parents=True, exist_ok=True)
         token_file.write_text(json.dumps({"token": "x"}), encoding="utf-8")  # missing keys
         assert load_credentials(token_file) is None
+
+    def test_disconnect_during_refresh_cannot_restore_deleted_token(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        token_file = google_token_path(tmp_path)
+        self._write_token(token_file, expiry="2000-01-01T00:00:00Z")
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+
+        class RefreshingCredentials:
+            expired = True
+            refresh_token = "refresh-token"
+            valid = False
+
+            def refresh(self, _request) -> None:
+                refresh_started.set()
+                assert release_refresh.wait(timeout=5)
+                self.expired = False
+                self.valid = True
+
+            def to_json(self) -> str:
+                return json.dumps(
+                    {
+                        "token": "refreshed-access-token",
+                        "refresh_token": self.refresh_token,
+                        "client_id": "client-id",
+                        "client_secret": "client-secret",
+                    }
+                )
+
+        monkeypatch.setattr(
+            "google.oauth2.credentials.Credentials.from_authorized_user_info",
+            lambda *_args, **_kwargs: RefreshingCredentials(),
+        )
+        loaded: list[object | None] = []
+        failures: list[BaseException] = []
+
+        def refresh() -> None:
+            try:
+                loaded.append(load_credentials(token_file))
+            except BaseException as exc:
+                failures.append(exc)
+
+        worker = threading.Thread(target=refresh)
+        worker.start()
+        try:
+            assert refresh_started.wait(timeout=5)
+            assert creds.delete_google_token(tmp_path) is True
+            assert token_file.exists() is False
+        finally:
+            release_refresh.set()
+            worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert failures == []
+        assert loaded == [None]
+        assert token_file.exists() is False
 
     def test_ensure_credentials_non_interactive_raises(self, tmp_path) -> None:
         with pytest.raises(CalendarAuthError, match="run the interactive setup"):

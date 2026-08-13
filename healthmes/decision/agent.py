@@ -112,6 +112,22 @@ _BUDGET_FAILURES = {
     "turn_source_ref_budget_exhausted",
     "turn_tool_call_budget_exhausted",
 }
+_INTERNAL_TOOL_FAILURES = {
+    "access_policy_resolution_failed",
+    "invalid_provider_query",
+    "provider_contract_violation",
+    "provider_execution_failed",
+    "tool_execution_failed",
+}
+_ACTIVE_CONSENT_FAILURES = frozenset(
+    {
+        "caller_not_authenticated",
+        "caller_not_policy_owner",
+        "domain_consent_changed",
+        "domain_consent_denied",
+        "execution_scope_denied",
+    }
+)
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
 AccessPolicyResolver = Callable[[DecisionRequest], ContextAccessPolicy]
@@ -670,6 +686,7 @@ class _ToolExecutor:
             tuple[ContextParameterSpec, ...],
         ],
         session_factory: SessionFactory,
+        policy_resolver: AccessPolicyResolver,
         clock: Callable[[], datetime],
         deadline: float,
     ) -> None:
@@ -688,6 +705,7 @@ class _ToolExecutor:
             in provider_parameter_specs.items()
         }
         self._session_factory = session_factory
+        self._policy_resolver = policy_resolver
         self._clock = clock
         self._deadline = deadline
         self._fingerprints: set[str] = set()
@@ -838,6 +856,35 @@ class _ToolExecutor:
                 status=DecisionStatus.FAILED,
             )
 
+        try:
+            policy_before = self._resolve_current_policy()
+        except DecisionToolCallError as exc:
+            return self._failed_execution(
+                call,
+                query,
+                started_at=started_at,
+                code=exc.code,
+                status=DecisionStatus.FAILED,
+            )
+        denial = _tool_policy_denial(
+            self.request,
+            policy_before,
+            domain=spec.domain,
+        )
+        if denial is not None:
+            return self._denied_execution(
+                call,
+                query,
+                started_at=started_at,
+                code=denial,
+            )
+        self._access_turn.update_policy(policy_before)
+        policy_fingerprint = _tool_policy_fingerprint(
+            policy_before,
+            domain=spec.domain,
+        )
+        self._ensure_active()
+
         fingerprint_payload = call.model_dump(
             mode="json",
             exclude={"purpose"},
@@ -877,6 +924,36 @@ class _ToolExecutor:
                         raw_result,
                     )
                     self._ensure_active()
+                    try:
+                        policy_after = self._resolve_current_policy()
+                    except DecisionToolCallError as exc:
+                        result = self._access_turn.deny(
+                            query,
+                            reason_codes=(exc.code,),
+                        )
+                        self._set_fatal(
+                            exc.code,
+                            DecisionStatus.FAILED,
+                        )
+                    else:
+                        self._access_turn.update_policy(policy_after)
+                        if (
+                            _tool_policy_fingerprint(
+                                policy_after,
+                                domain=spec.domain,
+                            )
+                            != policy_fingerprint
+                        ):
+                            result = self._access_turn.deny(
+                                query,
+                                reason_codes=(
+                                    "domain_consent_changed",
+                                ),
+                            )
+                            self._set_fatal(
+                                "domain_consent_changed",
+                                DecisionStatus.BLOCKED,
+                            )
                     if result.status in {
                         ContextStatus.OK,
                         ContextStatus.PARTIAL,
@@ -942,11 +1019,76 @@ class _ToolExecutor:
                 budget_code,
                 DecisionStatus.BLOCKED,
             )
-        if "duplicate_tool_call" in result.limitations:
+        elif (
+            consent_code := next(
+                (
+                    code
+                    for code in result.limitations
+                    if code in _ACTIVE_CONSENT_FAILURES
+                ),
+                None,
+            )
+        ) is not None:
+            self._set_fatal(
+                consent_code,
+                DecisionStatus.BLOCKED,
+            )
+        elif result.status is ContextStatus.FAILED:
+            fatal_code = (
+                error_code
+                if error_code in _INTERNAL_TOOL_FAILURES
+                else "tool_execution_failed"
+            )
+            self._set_fatal(
+                fatal_code,
+                DecisionStatus.FAILED,
+            )
+        elif "duplicate_tool_call" in result.limitations:
             self._set_fatal(
                 "duplicate_tool_call",
                 DecisionStatus.FAILED,
             )
+        return _ExecutedTool(call=call, result=result)
+
+    def _resolve_current_policy(self) -> ContextAccessPolicy:
+        self._ensure_active()
+        try:
+            policy = strict_model_validate(
+                ContextAccessPolicy,
+                self._policy_resolver(self.request),
+            )
+        except Exception as exc:
+            raise DecisionToolCallError(
+                "access_policy_resolution_failed"
+            ) from exc
+        self._ensure_active()
+        policy_error = _request_policy_error(self.request, policy)
+        if policy_error is not None:
+            raise DecisionToolCallError(policy_error)
+        return policy
+
+    def _denied_execution(
+        self,
+        call: ContextToolCall,
+        query: ContextQuery,
+        *,
+        started_at: datetime,
+        code: str,
+    ) -> _ExecutedTool:
+        self._set_fatal(code, DecisionStatus.BLOCKED)
+        result = self._access_turn.deny(
+            query,
+            reason_codes=(code,),
+        )
+        record = ToolCallRecord(
+            query=query,
+            status=ToolCallStatus.DENIED,
+            started_at=started_at,
+            finished_at=_as_utc(self._clock()),
+            result=result,
+        )
+        with self._state_lock:
+            self._trace.append(record)
         return _ExecutedTool(call=call, result=result)
 
     def _failed_execution(
@@ -1223,6 +1365,7 @@ class HealthMesDecisionAgent:
             related_records=related_records,
             provider_parameter_specs=provider_parameter_specs,
             session_factory=self._session_factory,
+            policy_resolver=self._policy_resolver,
             clock=self._clock,
             deadline=deadline,
         )
@@ -1702,6 +1845,57 @@ def _request_policy_error(
     if request.caller.principal_id != policy.owner_principal_id:
         return "caller_not_policy_owner"
     return None
+
+
+def _tool_policy_denial(
+    request: DecisionRequest,
+    policy: ContextAccessPolicy,
+    *,
+    domain: str,
+) -> str | None:
+    policy_error = _request_policy_error(request, policy)
+    if policy_error is not None:
+        return policy_error
+    grant = policy.grant(domain)
+    if grant is None or not grant.enabled:
+        return "domain_consent_denied"
+    if request.caller.execution_scope not in grant.execution_scopes:
+        return "execution_scope_denied"
+    return None
+
+
+def _tool_policy_fingerprint(
+    policy: ContextAccessPolicy,
+    *,
+    domain: str,
+) -> str:
+    grant = policy.grant(domain)
+    payload = {
+        "owner_principal_id": policy.owner_principal_id,
+        "grant": (
+            grant.model_dump(mode="json", round_trip=True)
+            if grant is not None
+            else None
+        ),
+        "max_query_days": policy.max_query_days,
+        "max_rows_per_query": policy.max_rows_per_query,
+        "max_payload_bytes_per_query": (
+            policy.max_payload_bytes_per_query
+        ),
+        "max_source_refs_per_query": (
+            policy.max_source_refs_per_query
+        ),
+        "trim_overlong_queries": policy.trim_overlong_queries,
+        "allow_external_provenance": (
+            policy.allow_external_provenance
+        ),
+    }
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
 
 
 def _tool_catalog(

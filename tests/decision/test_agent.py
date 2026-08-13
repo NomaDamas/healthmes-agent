@@ -218,6 +218,43 @@ def _policy(
     )
 
 
+class MutablePolicyResolver:
+    def __init__(self, *domains: str) -> None:
+        self._lock = threading.Lock()
+        self._state = {
+            domain: {"enabled": True, "revision": 1}
+            for domain in domains
+        }
+
+    def __call__(
+        self,
+        _request: DecisionRequest,
+    ) -> ContextAccessPolicy:
+        with self._lock:
+            state = {
+                domain: values.copy()
+                for domain, values in self._state.items()
+            }
+        return ContextAccessPolicy(
+            owner_principal_id="owner",
+            grants=tuple(
+                DomainAccessGrant(
+                    domain=domain,
+                    enabled=bool(values["enabled"]),
+                    revision=int(values["revision"]),
+                )
+                for domain, values in state.items()
+            ),
+        )
+
+    def set_enabled(self, domain: str, enabled: bool) -> None:
+        with self._lock:
+            values = self._state[domain]
+            if values["enabled"] != enabled:
+                values["enabled"] = enabled
+                values["revision"] = int(values["revision"]) + 1
+
+
 def _agent(
     session_factory,
     *,
@@ -348,6 +385,123 @@ async def test_agent_maps_runtime_boundary_errors_without_fallback(
     assert result.draft.limitations == [limitation]
     assert result.steps_used == 1
     assert result.tool_trace == ()
+
+
+async def test_consent_revoked_between_tool_calls_blocks_next_provider(
+    session_factory,
+):
+    resolver = MutablePolicyResolver("activity", "wearable")
+
+    class RevokingActivityProvider(StubProvider):
+        async def query(self, session, query, *, now):
+            result = await super().query(session, query, now=now)
+            resolver.set_enabled("wearable", False)
+            return result
+
+    class TwoToolRuntime:
+        metadata = RuntimeMetadata(runtime="scripted")
+
+        async def next_step(self, turn):
+            if not turn.history:
+                return RuntimeStepOutput(
+                    tool_calls=(
+                        {"capability": "activity.summary"},
+                        {"capability": "wearable.summary"},
+                    ),
+                    metadata=self.metadata,
+                )
+            raise AssertionError(
+                "consent revocation must terminate before another model step"
+            )
+
+    activity = RevokingActivityProvider(domain="activity")
+    wearable = StubProvider(domain="wearable")
+    registry = ContextProviderRegistry((activity, wearable))
+    agent = HealthMesDecisionAgent(
+        access_layer=ContextAccessLayer(
+            registry,
+            clock=lambda: NOW,
+        ),
+        runtime=TwoToolRuntime(),
+        session_factory=session_factory,
+        policy_resolver=resolver,
+        timeout_seconds=1,
+        clock=lambda: NOW,
+    )
+
+    result = await agent.ask(_request())
+    agent.close()
+
+    assert result.draft.status is DecisionStatus.BLOCKED
+    assert result.draft.limitations == ["domain_consent_denied"]
+    assert len(activity.calls) == 1
+    assert wearable.calls == []
+    assert [record.status for record in result.tool_trace] == [
+        ToolCallStatus.COMPLETED,
+        ToolCallStatus.DENIED,
+    ]
+
+
+@pytest.mark.parametrize("reenable_before_release", (False, True))
+async def test_consent_revision_change_during_provider_discards_result(
+    session_factory,
+    reenable_before_release,
+):
+    resolver = MutablePolicyResolver("activity")
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingProvider(StubProvider):
+        async def query(self, session, query, *, now):
+            started.set()
+            assert release.wait(timeout=5)
+            return await super().query(session, query, now=now)
+
+    class ToolRuntime:
+        metadata = RuntimeMetadata(runtime="scripted")
+
+        async def next_step(self, turn):
+            if not turn.history:
+                return RuntimeStepOutput(
+                    tool_calls=({"capability": "activity.summary"},),
+                    metadata=self.metadata,
+                )
+            raise AssertionError(
+                "a changed consent revision must terminate the turn"
+            )
+
+    provider = BlockingProvider(domain="activity")
+    registry = ContextProviderRegistry((provider,))
+    agent = HealthMesDecisionAgent(
+        access_layer=ContextAccessLayer(
+            registry,
+            clock=lambda: NOW,
+        ),
+        runtime=ToolRuntime(),
+        session_factory=session_factory,
+        policy_resolver=resolver,
+        timeout_seconds=1,
+        clock=lambda: NOW,
+    )
+    task = asyncio.create_task(agent.ask(_request()))
+    assert await asyncio.to_thread(started.wait, 1)
+    resolver.set_enabled("activity", False)
+    if reenable_before_release:
+        resolver.set_enabled("activity", True)
+    release.set()
+    result = await task
+    agent.close()
+
+    assert result.draft.status is DecisionStatus.BLOCKED
+    assert result.draft.limitations == ["domain_consent_changed"]
+    assert len(provider.calls) == 1
+    assert len(result.tool_trace) == 1
+    record = result.tool_trace[0]
+    assert record.status is ToolCallStatus.DENIED
+    assert record.result is not None
+    assert record.result.status is ContextStatus.DENIED
+    assert record.result.source_refs == []
+    assert record.result.limitations == ["domain_consent_changed"]
 
 
 async def test_runtime_request_omits_caller_and_record_identifiers(
@@ -2225,19 +2379,8 @@ async def test_provider_cannot_smuggle_model_copy_forged_source_ref(
                     tool_calls=({"capability": "nutrition.summary"},),
                     metadata=self.metadata,
                 )
-            context = turn.history[0].results[0]
-            assert context.status is ContextStatus.FAILED
-            assert context.limitations == (
-                "provider_contract_violation",
-            )
-            return RuntimeStepOutput(
-                draft=DecisionDraft(
-                    status=DecisionStatus.NEEDS_CLARIFICATION,
-                    clarification_question=(
-                        "The source identity was invalid. Can I retry?"
-                    ),
-                ),
-                metadata=self.metadata,
+            raise AssertionError(
+                "a provider contract failure must terminate the turn"
             )
 
     result = await _agent(
@@ -2252,7 +2395,10 @@ async def test_provider_cannot_smuggle_model_copy_forged_source_ref(
         policy=_policy("nutrition"),
     ).ask(_request())
 
-    assert result.draft.status is DecisionStatus.NEEDS_CLARIFICATION
+    assert result.draft.status is DecisionStatus.FAILED
+    assert result.draft.limitations == [
+        "provider_contract_violation"
+    ]
     assert result.source_refs == ()
 
 

@@ -48,6 +48,7 @@ EXPECTED_TABLES = {
     "app_usage_sample",
     "cognitive_energy_estimate",
     "decision_record",
+    "decision_domain_policy",
     "insight",
     "medical_record",
     "trigger_event",
@@ -112,6 +113,30 @@ def _render_offline_decision_agent_downgrade(
     command.downgrade(
         _config(database_url, buffer=buffer),
         "f4a5b6c7d8e9:e3f4a5b6c7d8",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_decision_policy_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "a5b6c7d8e9f0:f4a5b6c7d8e9",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_calendar_generation_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "b6c7d8e9f0a1:a5b6c7d8e9f0",
         sql=True,
     )
     return buffer.getvalue()
@@ -189,6 +214,74 @@ class TestOfflineRender:
             match="offline downgrade cannot verify Decision Agent records",
         ):
             _render_offline_decision_agent_downgrade(database_url)
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_decision_policy_offline_downgrade_is_refused(
+        self,
+        database_url,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "offline downgrade cannot verify Decision Agent "
+                "domain consent"
+            ),
+        ):
+            _render_offline_decision_policy_downgrade(database_url)
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_calendar_generation_offline_downgrade_is_refused_before_ddl(
+        self,
+        database_url,
+    ):
+        buffer = io.StringIO()
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "offline downgrade cannot verify Calendar "
+                "account-generation safety"
+            ),
+        ):
+            command.downgrade(
+                _config(database_url, buffer=buffer),
+                "b6c7d8e9f0a1:a5b6c7d8e9f0",
+                sql=True,
+            )
+        rendered = buffer.getvalue()
+        assert "DROP COLUMN" not in rendered
+        assert "DROP TABLE" not in rendered
+        assert "ALTER TABLE calendar_" not in rendered
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_calendar_generation_offline_upgrade_renders_safety_contract(
+        self,
+        database_url,
+    ):
+        rendered = _render_offline_upgrade(database_url)
+
+        assert "connection_generation" in rendered
+        assert "__legacy_unbound__" in rendered
+        assert "ck_calendar_mutation_proposal_active_generation" in rendered
+        if database_url.startswith("sqlite"):
+            assert "_alembic_tmp_calendar_event_mirror" in rendered
 
     def test_render_marks_head_revision(self):
         rendered = _render_offline_upgrade("sqlite:///offline-render.db")
@@ -277,6 +370,500 @@ class TestSqliteUpgrade:
                 context = MigrationContext.configure(connection)
                 diff = compare_metadata(context, Base.metadata)
             assert diff == []
+        finally:
+            engine.dispose()
+
+    def test_calendar_generation_upgrade_quarantines_legacy_rows(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'calendar-generation.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "a5b6c7d8e9f0")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        mirror = sa.Table(
+            "calendar_event_mirror",
+            metadata,
+            autoload_with=engine,
+        )
+        proposal = sa.Table(
+            "calendar_mutation_proposal",
+            metadata,
+            autoload_with=engine,
+        )
+        mirror_id = uuid.uuid4().hex
+        start_at = datetime(2026, 8, 12, 9, tzinfo=UTC)
+        end_at = start_at + timedelta(hours=1)
+        base_proposal = {
+            "calendar_source": "google",
+            "mirror_event_id": mirror_id,
+            "external_event_id": "legacy-event",
+            "operation": "shorten",
+            "original_start_at": start_at,
+            "original_end_at": end_at,
+            "proposed_start_at": start_at,
+            "proposed_end_at": end_at - timedelta(minutes=15),
+            "expected_etag": '"legacy-etag"',
+            "protected_fingerprint": "legacy-fingerprint",
+            "reply_handle_digest": "legacy-reply",
+            "expires_at": end_at,
+        }
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    mirror.insert().values(
+                        id=mirror_id,
+                        external_id="legacy-event",
+                        calendar_source="google",
+                        summary="Legacy event",
+                        start_at=start_at,
+                        end_at=end_at,
+                        is_agent_created=False,
+                    )
+                )
+                connection.execute(
+                    proposal.insert(),
+                    [
+                        {
+                            **base_proposal,
+                            "id": uuid.uuid4().hex,
+                            "status": "pending",
+                            "dedup_key": "legacy-pending",
+                        },
+                        {
+                            **base_proposal,
+                            "id": uuid.uuid4().hex,
+                            "status": "applying",
+                            "dedup_key": "legacy-applying",
+                        },
+                        {
+                            **base_proposal,
+                            "id": uuid.uuid4().hex,
+                            "status": "applied",
+                            "dedup_key": "legacy-applied",
+                        },
+                    ],
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            mirror_columns = {
+                item["name"]: item
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            checks = {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "calendar_mutation_proposal"
+                )
+            }
+            assert mirror_columns["connection_generation"]["nullable"] is False
+            assert "ck_calendar_mutation_proposal_active_generation" in checks
+
+            migrated_mirror = sa.Table(
+                "calendar_event_mirror",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            migrated_proposal = sa.Table(
+                "calendar_mutation_proposal",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.select(migrated_mirror.c.connection_generation)
+                    .where(migrated_mirror.c.id == mirror_id)
+                ) == "__legacy_unbound__"
+                statuses = {
+                    row.dedup_key: row.status
+                    for row in connection.execute(
+                        sa.select(
+                            migrated_proposal.c.dedup_key,
+                            migrated_proposal.c.status,
+                        )
+                    )
+                }
+                assert statuses == {
+                    "legacy-pending": "conflicted",
+                    "legacy-applying": "unknown",
+                    "legacy-applied": "applied",
+                }
+                with connection.begin_nested():
+                    with pytest.raises(sa.exc.IntegrityError):
+                        connection.execute(
+                            migrated_mirror.insert().values(
+                                id=uuid.uuid4().hex,
+                                external_id="legacy-event",
+                                calendar_source="google",
+                                start_at=start_at,
+                                end_at=end_at,
+                                is_agent_created=False,
+                            )
+                        )
+
+            with engine.begin() as connection:
+                connection.execute(
+                    migrated_mirror.insert().values(
+                        id=uuid.uuid4().hex,
+                        external_id="legacy-event",
+                        calendar_source="google",
+                        connection_generation="reconnected-account",
+                        start_at=start_at,
+                        end_at=end_at,
+                        is_agent_created=False,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+    def test_schedule_intake_generation_upgrade_binds_or_invalidates_legacy_rows(
+        self,
+        tmp_path,
+    ):
+        database_url = (
+            f"sqlite:///{tmp_path / 'schedule-intake-generation.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "b6c7d8e9f0a1")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        task = sa.Table("task", metadata, autoload_with=engine)
+        mirror = sa.Table(
+            "calendar_event_mirror",
+            metadata,
+            autoload_with=engine,
+        )
+        proposal = sa.Table(
+            "schedule_proposal",
+            metadata,
+            autoload_with=engine,
+        )
+        start_at = datetime(2026, 8, 13, 9, tzinfo=UTC)
+        end_at = start_at + timedelta(hours=1)
+        task_ids = {
+            name: uuid.uuid4().hex
+            for name in ("bound", "ambiguous", "incomplete")
+        }
+        proposal_ids = {
+            name: uuid.uuid4().hex
+            for name in task_ids
+        }
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    task.insert(),
+                    [
+                        {
+                            "id": task_id,
+                            "title": name,
+                            "status": "todo",
+                            "source": "user",
+                            "energy_demand": "med",
+                        }
+                        for name, task_id in task_ids.items()
+                    ],
+                )
+                connection.execute(
+                    mirror.insert(),
+                    [
+                        {
+                            "id": uuid.uuid4().hex,
+                            "external_id": "bound-event",
+                            "calendar_source": "google",
+                            "connection_generation": "google-account-a",
+                            "start_at": start_at,
+                            "end_at": end_at,
+                            "is_agent_created": False,
+                        },
+                        *[
+                            {
+                                "id": uuid.uuid4().hex,
+                                "external_id": "ambiguous-event",
+                                "calendar_source": "google",
+                                "connection_generation": generation,
+                                "start_at": start_at,
+                                "end_at": end_at,
+                                "is_agent_created": False,
+                            }
+                            for generation in (
+                                "google-account-a",
+                                "google-account-b",
+                            )
+                        ],
+                    ],
+                )
+                connection.execute(
+                    proposal.insert(),
+                    [
+                        {
+                            "id": proposal_ids["bound"],
+                            "task_id": task_ids["bound"],
+                            "proposed_start": start_at,
+                            "proposed_end": end_at,
+                            "status": "proposed",
+                            "intake_calendar_source": "google",
+                            "intake_external_id": "bound-event",
+                            "intake_revision": "revision-bound",
+                        },
+                        {
+                            "id": proposal_ids["ambiguous"],
+                            "task_id": task_ids["ambiguous"],
+                            "proposed_start": start_at,
+                            "proposed_end": end_at,
+                            "status": "accepted",
+                            "intake_calendar_source": "google",
+                            "intake_external_id": "ambiguous-event",
+                            "intake_revision": "revision-ambiguous",
+                        },
+                        {
+                            "id": proposal_ids["incomplete"],
+                            "task_id": task_ids["incomplete"],
+                            "proposed_start": start_at,
+                            "proposed_end": end_at,
+                            "status": "proposed",
+                            "intake_calendar_source": None,
+                            "intake_external_id": "missing-source",
+                            "intake_revision": None,
+                        },
+                    ],
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            migrated = sa.Table(
+                "schedule_proposal",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                rows = {
+                    row.id: row
+                    for row in connection.execute(
+                        sa.select(migrated).where(
+                            migrated.c.id.in_(proposal_ids.values())
+                        )
+                    )
+                }
+                bound = rows[proposal_ids["bound"]]
+                assert bound.intake_account_generation == "google-account-a"
+                assert bound.status == "proposed"
+                assert bound.invalidation_reason is None
+                for name in ("ambiguous", "incomplete"):
+                    unresolved = rows[proposal_ids[name]]
+                    assert unresolved.intake_account_generation is None
+                    assert unresolved.status == "invalidated"
+                    assert (
+                        unresolved.invalidation_reason
+                        == "calendar_intake_generation_unresolved"
+                    )
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "b6c7d8e9f0a1")
+        engine = sa.create_engine(database_url)
+        try:
+            columns = {
+                item["name"]
+                for item in sa.inspect(engine).get_columns(
+                    "schedule_proposal"
+                )
+            }
+            assert "intake_account_generation" not in columns
+            assert "invalidation_reason" not in columns
+        finally:
+            engine.dispose()
+
+    def test_calendar_generation_downgrade_failure_preserves_state(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'calendar-downgrade.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        proposal = sa.Table(
+            "calendar_mutation_proposal",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        proposal_id = uuid.uuid4().hex
+        start_at = datetime(2026, 8, 12, 9, tzinfo=UTC)
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    proposal.insert().values(
+                        id=proposal_id,
+                        calendar_source="google",
+                        account_generation="connected-account",
+                        external_event_id="active-event",
+                        operation="shorten",
+                        original_start_at=start_at,
+                        original_end_at=start_at + timedelta(hours=1),
+                        proposed_start_at=start_at,
+                        proposed_end_at=start_at + timedelta(minutes=45),
+                        expected_etag='"etag"',
+                        protected_fingerprint="fingerprint",
+                        reply_handle_digest="reply",
+                        expires_at=start_at + timedelta(hours=1),
+                        status="pending",
+                        dedup_key="active-proposal",
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="calendar mutation proposals are still active",
+        ):
+            command.downgrade(config, "a5b6c7d8e9f0")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert "account_generation" in {
+                item["name"]
+                for item in inspector.get_columns(
+                    "calendar_mutation_proposal"
+                )
+            }
+            assert "connection_generation" in {
+                item["name"]
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b6c7d8e9f0a1"
+                assert connection.scalar(
+                    sa.select(proposal.c.status).where(
+                        proposal.c.id == proposal_id
+                    )
+                ) == "pending"
+                connection.execute(
+                    proposal.update()
+                    .where(proposal.c.id == proposal_id)
+                    .values(status="conflicted")
+                )
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "a5b6c7d8e9f0")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert "account_generation" not in {
+                item["name"]
+                for item in inspector.get_columns(
+                    "calendar_mutation_proposal"
+                )
+            }
+            assert "connection_generation" not in {
+                item["name"]
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a5b6c7d8e9f0"
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT status FROM calendar_mutation_proposal "
+                        "WHERE id = :id"
+                    ),
+                    {"id": proposal_id},
+                ) == "conflicted"
+        finally:
+            engine.dispose()
+
+    def test_calendar_generation_downgrade_waits_for_sqlite_writer(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'calendar-race.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(
+            database_url,
+            connect_args={"timeout": 5},
+        )
+        proposal = sa.Table(
+            "calendar_mutation_proposal",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        proposal_id = uuid.uuid4().hex
+        start_at = datetime(2026, 8, 12, 9, tzinfo=UTC)
+        try:
+            with engine.connect() as writer:
+                transaction = writer.begin()
+                writer.execute(
+                    proposal.insert().values(
+                        id=proposal_id,
+                        calendar_source="google",
+                        account_generation="connected-account",
+                        external_event_id="racing-event",
+                        operation="shorten",
+                        original_start_at=start_at,
+                        original_end_at=start_at + timedelta(hours=1),
+                        proposed_start_at=start_at,
+                        proposed_end_at=start_at + timedelta(minutes=45),
+                        expected_etag='"etag"',
+                        protected_fingerprint="fingerprint",
+                        reply_handle_digest="reply-race",
+                        expires_at=start_at + timedelta(hours=1),
+                        status="pending",
+                        dedup_key="racing-proposal",
+                    )
+                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    downgrade = pool.submit(
+                        command.downgrade,
+                        _config(database_url),
+                        "a5b6c7d8e9f0",
+                    )
+                    time.sleep(0.2)
+                    assert downgrade.done() is False
+                    transaction.commit()
+                    with pytest.raises(
+                        RuntimeError,
+                        match="calendar mutation proposals are still active",
+                    ):
+                        downgrade.result(timeout=5)
+        finally:
+            engine.dispose()
+
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b6c7d8e9f0a1"
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT status FROM calendar_mutation_proposal "
+                        "WHERE id = :id"
+                    ),
+                    {"id": proposal_id},
+                ) == "pending"
         finally:
             engine.dispose()
 
@@ -473,6 +1060,78 @@ class TestSqliteUpgrade:
         try:
             tables = set(sa.inspect(engine).get_table_names())
             assert tables & EXPECTED_TABLES == set()
+        finally:
+            engine.dispose()
+
+    def test_decision_policy_downgrade_preserves_disabled_consent(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'decision-policy.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        table = sa.Table(
+            "decision_domain_policy",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        policy_id = uuid.uuid4().hex
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    table.insert().values(
+                        id=policy_id,
+                        owner_principal_id="owner",
+                        domain="calendar",
+                        enabled=False,
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing disabled Decision Agent domain consent",
+        ):
+            command.downgrade(config, "f4a5b6c7d8e9")
+
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a5b6c7d8e9f0"
+                assert connection.scalar(
+                    sa.select(table.c.enabled).where(
+                        table.c.id == policy_id
+                    )
+                ) is False
+                connection.execute(
+                    table.update()
+                    .where(table.c.id == policy_id)
+                    .values(enabled=True)
+                )
+        finally:
+            engine.dispose()
+
+        command.downgrade(config, "f4a5b6c7d8e9")
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert "decision_domain_policy" in inspector.get_table_names()
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(sa.func.count()).select_from(
+                        sa.Table(
+                            "decision_domain_policy",
+                            sa.MetaData(),
+                            autoload_with=connection,
+                        )
+                    )
+                ) == 0
         finally:
             engine.dispose()
 
@@ -889,7 +1548,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "f4a5b6c7d8e9"
+                ) == "c7d8e9f0a1b2"
         finally:
             engine.dispose()
 
@@ -1130,6 +1789,319 @@ class TestSqliteUpgrade:
         "HEALTHMES_TEST_POSTGRES_URL"
     ),
 )
+def test_postgres_calendar_generation_migration_is_lossless() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_calendar_generation_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    mirror_id = uuid.uuid4()
+    start_at = datetime(2026, 8, 12, 9, tzinfo=UTC)
+    end_at = start_at + timedelta(hours=1)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "a5b6c7d8e9f0")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            legacy_mirror = sa.Table(
+                "calendar_event_mirror",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            legacy_proposal = sa.Table(
+                "calendar_mutation_proposal",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            base_proposal = {
+                "calendar_source": "google",
+                "mirror_event_id": mirror_id,
+                "external_event_id": "legacy-event",
+                "operation": "shorten",
+                "original_start_at": start_at,
+                "original_end_at": end_at,
+                "proposed_start_at": start_at,
+                "proposed_end_at": end_at - timedelta(minutes=15),
+                "expected_etag": '"legacy-etag"',
+                "protected_fingerprint": "legacy-fingerprint",
+                "reply_handle_digest": "legacy-reply",
+                "expires_at": end_at,
+            }
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    legacy_mirror.insert().values(
+                        id=mirror_id,
+                        external_id="legacy-event",
+                        calendar_source="google",
+                        summary="Legacy event",
+                        start_at=start_at,
+                        end_at=end_at,
+                        is_agent_created=False,
+                    )
+                )
+                connection.execute(
+                    legacy_proposal.insert(),
+                    [
+                        {
+                            **base_proposal,
+                            "id": uuid.uuid4(),
+                            "status": "pending",
+                            "dedup_key": "legacy-pending",
+                        },
+                        {
+                            **base_proposal,
+                            "id": uuid.uuid4(),
+                            "status": "applying",
+                            "dedup_key": "legacy-applying",
+                        },
+                    ],
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        active_id = uuid.uuid4()
+        raced_id = uuid.uuid4()
+        reconnected_id = uuid.uuid4()
+        try:
+            inspector = sa.inspect(scoped_engine)
+            mirror_columns = {
+                item["name"]: item
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            checks = {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "calendar_mutation_proposal"
+                )
+            }
+            assert mirror_columns["connection_generation"]["nullable"] is False
+            assert "ck_calendar_mutation_proposal_active_generation" in checks
+
+            mirror = sa.Table(
+                "calendar_event_mirror",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            proposal = sa.Table(
+                "calendar_mutation_proposal",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                statuses = {
+                    row.dedup_key: row.status
+                    for row in connection.execute(
+                        sa.select(
+                            proposal.c.dedup_key,
+                            proposal.c.status,
+                        )
+                    )
+                }
+                assert statuses == {
+                    "legacy-pending": "conflicted",
+                    "legacy-applying": "unknown",
+                }
+                assert connection.scalar(
+                    sa.select(mirror.c.connection_generation)
+                    .where(mirror.c.id == mirror_id)
+                ) == "__legacy_unbound__"
+                connection.execute(
+                    mirror.insert().values(
+                        id=reconnected_id,
+                        external_id="legacy-event",
+                        calendar_source="google",
+                        connection_generation="reconnected-account",
+                        start_at=start_at,
+                        end_at=end_at,
+                        is_agent_created=False,
+                    )
+                )
+                connection.execute(
+                    proposal.insert().values(
+                        id=active_id,
+                        calendar_source="google",
+                        account_generation="connected-account",
+                        external_event_id="active-event",
+                        operation="shorten",
+                        original_start_at=start_at,
+                        original_end_at=end_at,
+                        proposed_start_at=start_at,
+                        proposed_end_at=end_at - timedelta(minutes=15),
+                        expected_etag='"active-etag"',
+                        protected_fingerprint="active-fingerprint",
+                        reply_handle_digest="active-reply",
+                        expires_at=end_at,
+                        status="pending",
+                        dedup_key="active-proposal",
+                    )
+                )
+
+            with pytest.raises(sa.exc.IntegrityError):
+                with scoped_engine.begin() as connection:
+                    connection.execute(
+                        mirror.insert().values(
+                            id=uuid.uuid4(),
+                            external_id="null-generation",
+                            calendar_source="google",
+                            connection_generation=None,
+                            start_at=start_at,
+                            end_at=end_at,
+                            is_agent_created=False,
+                        )
+                    )
+
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    "multiple account generations share one "
+                    "provider event id"
+                ),
+            ):
+                command.downgrade(config, "a5b6c7d8e9f0")
+
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+                assert connection.scalar(
+                    sa.select(proposal.c.status).where(
+                        proposal.c.id == active_id
+                    )
+                ) == "pending"
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(mirror)
+                    .where(mirror.c.id == reconnected_id)
+                ) == 1
+                connection.execute(
+                    mirror.delete().where(mirror.c.id == reconnected_id)
+                )
+
+            with pytest.raises(
+                RuntimeError,
+                match="calendar mutation proposals are still active",
+            ):
+                command.downgrade(config, "a5b6c7d8e9f0")
+
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+                connection.execute(
+                    proposal.update()
+                    .where(proposal.c.id == active_id)
+                    .values(status="conflicted")
+                )
+
+            with scoped_engine.connect() as writer:
+                transaction = writer.begin()
+                writer.execute(
+                    proposal.insert().values(
+                        id=raced_id,
+                        calendar_source="google",
+                        account_generation="connected-account",
+                        external_event_id="racing-event",
+                        operation="shorten",
+                        original_start_at=start_at,
+                        original_end_at=end_at,
+                        proposed_start_at=start_at,
+                        proposed_end_at=end_at - timedelta(minutes=15),
+                        expected_etag='"racing-etag"',
+                        protected_fingerprint="racing-fingerprint",
+                        reply_handle_digest="racing-reply",
+                        expires_at=end_at,
+                        status="pending",
+                        dedup_key="racing-proposal",
+                    )
+                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    downgrade = pool.submit(
+                        command.downgrade,
+                        _config(schema_url),
+                        "a5b6c7d8e9f0",
+                    )
+                    time.sleep(0.2)
+                    assert downgrade.done() is False
+                    transaction.commit()
+                    with pytest.raises(
+                        RuntimeError,
+                        match="calendar mutation proposals are still active",
+                    ):
+                        downgrade.result(timeout=5)
+
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+                assert connection.scalar(
+                    sa.select(proposal.c.status).where(
+                        proposal.c.id == raced_id
+                    )
+                ) == "pending"
+                connection.execute(
+                    proposal.update()
+                    .where(proposal.c.id == raced_id)
+                    .values(status="conflicted")
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "a5b6c7d8e9f0")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert "account_generation" not in {
+                item["name"]
+                for item in inspector.get_columns(
+                    "calendar_mutation_proposal"
+                )
+            }
+            assert "connection_generation" not in {
+                item["name"]
+                for item in inspector.get_columns("calendar_event_mirror")
+            }
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "a5b6c7d8e9f0"
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT COUNT(*) FROM calendar_event_mirror "
+                        "WHERE id = :id"
+                    ),
+                    {"id": mirror_id},
+                ) == 1
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
 def test_postgres_decision_agent_migration_round_trip() -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = sa.create_engine(database_url)
@@ -1280,7 +2252,7 @@ def test_postgres_decision_agent_migration_round_trip() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "f4a5b6c7d8e9"
+                ) == "c7d8e9f0a1b2"
                 assert connection.scalar(
                     sa.select(sa.func.count())
                     .select_from(preserved)
@@ -1345,7 +2317,7 @@ def test_postgres_decision_agent_migration_round_trip() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "f4a5b6c7d8e9"
+                ) == "c7d8e9f0a1b2"
                 assert connection.scalar(
                     sa.select(sa.func.count())
                     .select_from(migrated)
@@ -1377,6 +2349,160 @@ def test_postgres_decision_agent_migration_round_trip() -> None:
                     .select_from(legacy)
                     .where(legacy.c.id == legacy_id)
                 ) == 1
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_decision_policy_downgrade_is_lossless() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_policy_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        policy_id = uuid.uuid4()
+        try:
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    policy.insert().values(
+                        id=policy_id,
+                        owner_principal_id="owner",
+                        domain="calendar",
+                        enabled=False,
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing disabled Decision Agent domain consent",
+        ):
+            command.downgrade(config, "f4a5b6c7d8e9")
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+                assert connection.scalar(
+                    sa.select(policy.c.enabled).where(
+                        policy.c.id == policy_id
+                    )
+                ) is False
+                connection.execute(
+                    policy.update()
+                    .where(policy.c.id == policy_id)
+                    .values(enabled=True)
+                )
+
+            with scoped_engine.connect() as writer:
+                transaction = writer.begin()
+                writer.execute(
+                    policy.update()
+                    .where(policy.c.id == policy_id)
+                    .values(enabled=False)
+                )
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    downgrade = pool.submit(
+                        command.downgrade,
+                        _config(schema_url),
+                        "f4a5b6c7d8e9",
+                    )
+                    time.sleep(0.2)
+                    assert downgrade.done() is False
+                    transaction.commit()
+                    with pytest.raises(
+                        RuntimeError,
+                        match=(
+                            "without losing disabled Decision Agent "
+                            "domain consent"
+                        ),
+                    ):
+                        downgrade.result(timeout=5)
+
+            with scoped_engine.begin() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+                assert connection.scalar(
+                    sa.select(policy.c.enabled).where(
+                        policy.c.id == policy_id
+                    )
+                ) is False
+                connection.execute(
+                    policy.update()
+                    .where(policy.c.id == policy_id)
+                    .values(enabled=True)
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "f4a5b6c7d8e9")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            assert (
+                "decision_domain_policy"
+                not in sa.inspect(scoped_engine).get_table_names()
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "f4a5b6c7d8e9"
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            policy = sa.Table(
+                "decision_domain_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(sa.func.count()).select_from(policy)
+                ) == 0
         finally:
             scoped_engine.dispose()
     finally:

@@ -273,6 +273,7 @@ class TestFileSyncHealthStore:
             store.path_for(CalendarSource.GOOGLE).read_text(encoding="utf-8")
         )
         assert set(payload) == {
+            "account_generation",
             "coverage_end",
             "coverage_kind",
             "coverage_start",

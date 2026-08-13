@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import parse_qs
 
@@ -18,16 +20,23 @@ from healthmes.api.local_session import (
     local_browser_url,
     require_local_session,
 )
+from healthmes.calendars import creds
 from healthmes.calendars.approval import ApprovalCalendar, calendar_approval_target
 from healthmes.calendars.base import CalendarError
+from healthmes.calendars.connection import CalendarBackendFence
 from healthmes.calendars.jobs import _build_backend, write_source
 from healthmes.calendars.sleep_apply import (
-    apply_sleep_proposal,
+    apply_sleep_proposal_from_observation,
     approval_token,
     decline_sleep_proposal,
 )
-from healthmes.calendars.sleep_proposals import prepare_sleep_proposal
-from healthmes.calendars.sleep_source import SleepSummaryReader
+from healthmes.calendars.sleep_proposals import (
+    prepare_sleep_proposal_from_observation,
+)
+from healthmes.calendars.sleep_source import (
+    SleepSummaryReader,
+    read_actual_sleep,
+)
 from healthmes.config import Settings, resolve_timezone
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.store import SessionDep, SleepProposalStatus, SleepReconciliationProposal
@@ -43,7 +52,12 @@ class SleepReviewUnavailable(RuntimeError):
 class SleepReviewRuntime:
     reader: SleepSummaryReader
     user_id: str
-    calendar: ApprovalCalendar
+    calendar: ApprovalCalendar | None
+    backend_fence: CalendarBackendFence | None = None
+    account_generation_resolver: Callable[[], str | None] | None = None
+    calendar_target: str | None = None
+    review_base_url: str | None = None
+    review_url_builder: Callable[[dt.date], str] | None = None
 
 
 @router.get("/sleep/unlock", response_class=HTMLResponse)
@@ -105,14 +119,21 @@ async def sleep_review_page(
             record = session.get(SleepReconciliationProposal, proposal)
         elif local is not None:
             runtime = await _runtime(request, settings)
-            record = await prepare_sleep_proposal(
-                target_date=target_date,
-                calendar_source=runtime.calendar.backend.source,
-                reader=runtime.reader,
-                user_id=runtime.user_id,
-                session=session,
-                calendar=runtime.calendar,
+            selected = await read_actual_sleep(
+                runtime.reader,
+                runtime.user_id,
+                target_date,
+                review_base_url=_review_base_url(runtime),
+                review_url_builder=_review_url_builder(runtime),
             )
+            with _calendar_runtime(runtime, session) as calendar:
+                record = prepare_sleep_proposal_from_observation(
+                    target_date=target_date,
+                    calendar_source=calendar.backend.source,
+                    selected=selected,
+                    session=session,
+                    calendar=calendar,
+                )
     except (CalendarError, LookupError, OWClientError, SleepReviewUnavailable) as exc:
         error = _safe_error(exc)
     html = _render(
@@ -135,16 +156,25 @@ async def apply_sleep(request: Request, session: SessionDep) -> RedirectResponse
     settings: Settings = request.app.state.settings
     runtime = await _runtime(request, settings)
     store = request.app.state.local_sessions
-    await apply_sleep_proposal(
-        proposal_id=proposal_id,
-        submitted_token=form.get("approval", ""),
-        local_session_id=local.session_id,
-        secret=store.signing_secret,
-        reader=runtime.reader,
-        user_id=runtime.user_id,
-        session=session,
-        calendar=runtime.calendar,
-    )
+    proposal = session.get(SleepReconciliationProposal, proposal_id)
+    if proposal is not None:
+        selected = await read_actual_sleep(
+            runtime.reader,
+            runtime.user_id,
+            proposal.local_date,
+            review_base_url=_review_base_url(runtime),
+            review_url_builder=_review_url_builder(runtime),
+        )
+        with _calendar_runtime(runtime, session) as calendar:
+            apply_sleep_proposal_from_observation(
+                proposal_id=proposal_id,
+                submitted_token=form.get("approval", ""),
+                local_session_id=local.session_id,
+                secret=store.signing_secret,
+                selected=selected,
+                session=session,
+                calendar=calendar,
+            )
     return RedirectResponse(f"/sleep?proposal={proposal_id}", status_code=303)
 
 
@@ -169,16 +199,81 @@ async def _runtime(request: Request, settings: Settings) -> SleepReviewRuntime:
     return SleepReviewRuntime(
         reader,
         user_id,
-        ApprovalCalendar(
-            _build_backend(settings, source),
-            calendar_approval_target(settings, source),
-            settings.public_base_url,
-            lambda target_date: viewer_url(
-                settings,
-                f"/sleep?date={target_date.isoformat()}",
+        None,
+        backend_fence=CalendarBackendFence(
+            source=source,
+            backend_factory=lambda: _build_backend(settings, source),
+            generation_resolver=lambda: (
+                creds.calendar_connection_generation(settings, source)
             ),
         ),
+        account_generation_resolver=lambda: (
+            creds.calendar_account_generation(settings, source)
+        ),
+        calendar_target=calendar_approval_target(settings, source),
+        review_base_url=settings.public_base_url,
+        review_url_builder=lambda target_date: viewer_url(
+            settings,
+            f"/sleep?date={target_date.isoformat()}",
+        ),
     )
+
+
+@contextmanager
+def _calendar_runtime(
+    runtime: SleepReviewRuntime,
+    session: SessionDep,
+) -> Iterator[ApprovalCalendar]:
+    if runtime.backend_fence is not None:
+        if runtime.calendar_target is None:
+            raise SleepReviewUnavailable(
+                "Calendar runtime target is unavailable."
+            )
+        with runtime.backend_fence.use(session) as backend:
+            account_generation = (
+                runtime.account_generation_resolver()
+                if runtime.account_generation_resolver is not None
+                else None
+            )
+            if (
+                runtime.account_generation_resolver is not None
+                and account_generation is None
+            ):
+                raise SleepReviewUnavailable(
+                    "Calendar account identity is unavailable."
+                )
+            yield ApprovalCalendar(
+                backend,
+                runtime.calendar_target,
+                runtime.review_base_url,
+                runtime.review_url_builder,
+                account_generation,
+            )
+        return
+    if runtime.calendar is not None:
+        yield runtime.calendar
+        return
+    raise SleepReviewUnavailable(
+        "Calendar runtime is unavailable."
+    )
+
+
+def _review_base_url(runtime: SleepReviewRuntime) -> str | None:
+    if runtime.review_base_url is not None:
+        return runtime.review_base_url
+    if runtime.calendar is not None:
+        return runtime.calendar.review_base_url
+    return None
+
+
+def _review_url_builder(
+    runtime: SleepReviewRuntime,
+) -> Callable[[dt.date], str] | None:
+    if runtime.review_url_builder is not None:
+        return runtime.review_url_builder
+    if runtime.calendar is not None:
+        return runtime.calendar.review_url_builder
+    return None
 
 
 def _local_unlock_url(

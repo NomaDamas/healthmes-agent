@@ -12,6 +12,8 @@ import pytest
 from freezegun import freeze_time
 from sqlalchemy import select
 
+from healthmes.calendars import creds
+from healthmes.calendars.visibility import CalendarVisibilityChanged
 from healthmes.config import Settings
 from healthmes.engine.cognitive_energy import (
     STATUS_INSUFFICIENT,
@@ -151,6 +153,28 @@ class TestPersistCurrentWindow:
             "body_battery": "ow_unavailable",
         }
         assert estimate.inputs_snapshot["ow"]["detail"] == "boom"
+
+    @freeze_time("2026-07-09 14:23:00")
+    def test_disconnect_between_compute_and_persist_is_rejected(
+        self,
+        energy_engine_factory,
+        session_factory,
+        full_signal_ow_rows,
+        seed_vector_store,
+        monkeypatch,
+    ) -> None:
+        seed_vector_store()
+        engine = energy_engine_factory(full_signal_ow_rows)
+        estimate = engine.compute_window()
+        assert creds.delete_google_token(
+            engine._settings.data_dir
+        ) is True
+        monkeypatch.setattr(engine, "compute_window", lambda: estimate)
+
+        with pytest.raises(CalendarVisibilityChanged):
+            engine.persist_current_window()
+
+        assert _stored_estimates(session_factory) == []
 
 
 # ---------------------------------------------------------------------------

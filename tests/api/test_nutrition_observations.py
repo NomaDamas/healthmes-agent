@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
@@ -24,6 +24,10 @@ from healthmes.storage import run_storage_maintenance
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
 
 JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
+
+
+def _recent_capture_at() -> str:
+    return (datetime.now(UTC) - timedelta(hours=1)).isoformat()
 
 
 class FakeVision:
@@ -144,7 +148,11 @@ def test_analyze_persists_sake_payload_and_reclassifies_media(
 
     response = client.post(
         "/v1/nutrition-observations/analyze",
-        json=_request(media_path),
+        json=_request(
+            media_path,
+            captured_at=_recent_capture_at(),
+            timezone="UTC",
+        ),
     )
 
     assert response.status_code == 201
@@ -234,7 +242,11 @@ def test_analysis_is_idempotent_per_uploaded_media(client, session):
     provider = FakeVision()
     client.app.state.nutrition_vision_provider = provider
     media_path = _upload(client)
-    payload = _request(media_path)
+    payload = _request(
+        media_path,
+        captured_at=_recent_capture_at(),
+        timezone="UTC",
+    )
 
     first = client.post("/v1/nutrition-observations/analyze", json=payload)
     second = client.post("/v1/nutrition-observations/analyze", json=payload)
@@ -539,7 +551,11 @@ def test_photo_raw_evidence_expires_with_media(client, session, settings):
     media_path = _upload(client)
     created = client.post(
         "/v1/nutrition-observations/analyze",
-        json=_request(media_path),
+        json=_request(
+            media_path,
+            captured_at=_recent_capture_at(),
+            timezone="UTC",
+        ),
     )
     assert created.status_code == 201
     observation_id = created.json()["observation_id"]
@@ -548,7 +564,7 @@ def test_photo_raw_evidence_expires_with_media(client, session, settings):
     run_storage_maintenance(
         session,
         settings,
-        now=datetime(2026, 8, 14, 8, 30, tzinfo=UTC),
+        now=datetime.now(UTC) + timedelta(days=8),
     )
     session.commit()
 

@@ -1,13 +1,16 @@
+import json
 import uuid
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy.orm import sessionmaker
 
+from healthmes.calendars import creds
 from healthmes.calendars.state import (
     InMemorySyncHealthStore,
     SyncCoverageKind,
 )
+from healthmes.config import Settings
 from healthmes.decision import (
     ActivityContextProvider,
     CalendarContextProvider,
@@ -36,6 +39,41 @@ from healthmes.store.enums import CalendarSource
 NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 DAY_START = datetime(2026, 8, 10, tzinfo=UTC)
 DAY_END = DAY_START + timedelta(days=1)
+
+
+def _calendar_settings(tmp_path) -> Settings:
+    return Settings(
+        database_url="sqlite+pysqlite:///:memory:",
+        data_dir=tmp_path / "data",
+        timezone="UTC",
+        _env_file=None,
+    )
+
+
+def _connect_google(
+    settings: Settings,
+    *,
+    refresh_token: str,
+) -> str:
+    path = settings.data_dir / "google" / "calendar_token.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "refresh_token": refresh_token,
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+            }
+        ),
+        encoding="utf-8",
+    )
+    generation = creds.calendar_account_generation(
+        settings,
+        CalendarSource.GOOGLE,
+    )
+    assert generation is not None
+    return generation
 
 
 def _wellness_event(
@@ -631,7 +669,13 @@ async def test_calendar_adapter_returns_merged_aggregate_without_titles(
     )
     session.add(row)
     session.flush()
-    registry = ContextProviderRegistry((CalendarContextProvider(),))
+    registry = ContextProviderRegistry(
+        (
+            CalendarContextProvider(
+                sources=(CalendarSource.GOOGLE,),
+            ),
+        )
+    )
     query = ContextQuery(
         provider_id="calendar",
         capability="calendar.busy-intervals",
@@ -652,6 +696,172 @@ async def test_calendar_adapter_returns_merged_aggregate_without_titles(
     ]
     assert "Private meeting title" not in result.model_dump_json()
     assert result.source_refs[0].record_id == str(row.id)
+
+
+async def test_calendar_dynamic_connection_filters_and_revokes_mirror_rows(
+    session,
+):
+    google = CalendarEventMirror(
+        external_id="connected-google",
+        calendar_source=CalendarSource.GOOGLE,
+        summary="Connected calendar title",
+        start_at=datetime(2026, 8, 10, 9, tzinfo=UTC),
+        end_at=datetime(2026, 8, 10, 10, tzinfo=UTC),
+        is_all_day=False,
+    )
+    caldav = CalendarEventMirror(
+        external_id="disconnected-caldav",
+        calendar_source=CalendarSource.CALDAV,
+        summary="Disconnected calendar title",
+        start_at=datetime(2026, 8, 10, 10, tzinfo=UTC),
+        end_at=datetime(2026, 8, 10, 11, tzinfo=UTC),
+        is_all_day=False,
+    )
+    session.add_all((google, caldav))
+    session.flush()
+    connected = {CalendarSource.GOOGLE}
+    provider = CalendarContextProvider(
+        source_resolver=lambda: tuple(connected),
+    )
+    registry = ContextProviderRegistry((provider,))
+    query = ContextQuery(
+        provider_id="calendar",
+        capability="calendar.day-summary",
+        parameters={"date": "2026-08-10"},
+    )
+
+    result = await registry.execute(session, query, now=NOW)
+
+    assert result.status is ContextStatus.OK
+    assert result.payload["event_count"] == 1
+    assert [ref.record_id for ref in result.source_refs] == [
+        str(google.id)
+    ]
+    assert str(caldav.id) not in result.model_dump_json()
+
+    connected.clear()
+    revoked = await registry.execute(session, query, now=NOW)
+
+    assert revoked.status is ContextStatus.UNAVAILABLE
+    assert revoked.payload == {}
+    assert revoked.source_refs == []
+    assert revoked.limitations == ["calendar_not_connected"]
+
+
+async def test_calendar_connection_resolver_failure_is_unavailable(session):
+    def fail() -> tuple[CalendarSource, ...]:
+        raise OSError("credential state unavailable")
+
+    provider = CalendarContextProvider(source_resolver=fail)
+
+    result = await ContextProviderRegistry((provider,)).execute(
+        session,
+        ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            parameters={"date": "2026-08-10"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.UNAVAILABLE
+    assert result.payload == {}
+    assert result.source_refs == []
+    assert result.limitations == [
+        "calendar_connection_state_unavailable"
+    ]
+
+
+async def test_calendar_provider_requires_first_sync_and_current_generation(
+    session,
+    tmp_path,
+):
+    settings = _calendar_settings(tmp_path)
+    first_generation = _connect_google(
+        settings,
+        refresh_token="first-refresh-token",
+    )
+    first = CalendarEventMirror(
+        external_id="first-account-event",
+        calendar_source=CalendarSource.GOOGLE,
+        connection_generation=first_generation,
+        summary="First account private title",
+        start_at=datetime(2026, 8, 10, 9, tzinfo=UTC),
+        end_at=datetime(2026, 8, 10, 10, tzinfo=UTC),
+        is_all_day=False,
+    )
+    session.add(first)
+    session.flush()
+    health = InMemorySyncHealthStore()
+    provider = CalendarContextProvider(
+        settings=settings,
+        sync_health_store=health,
+    )
+    registry = ContextProviderRegistry((provider,))
+    query = ContextQuery(
+        provider_id="calendar",
+        capability="calendar.day-summary",
+        parameters={"date": "2026-08-10"},
+    )
+
+    before_sync = await registry.execute(session, query, now=NOW)
+
+    assert before_sync.status is ContextStatus.UNAVAILABLE
+    assert before_sync.source_refs == []
+    assert before_sync.limitations == ["calendar_account_not_synced"]
+
+    health.record_success(
+        CalendarSource.GOOGLE,
+        NOW,
+        event_count=1,
+        coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+        account_generation=first_generation,
+    )
+    visible = await registry.execute(session, query, now=NOW)
+
+    assert visible.payload["event_count"] == 1
+    assert [ref.record_id for ref in visible.source_refs] == [
+        str(first.id)
+    ]
+
+    second_generation = _connect_google(
+        settings,
+        refresh_token="second-refresh-token",
+    )
+    assert second_generation != first_generation
+    after_reconnect = await registry.execute(session, query, now=NOW)
+
+    assert after_reconnect.status is ContextStatus.UNAVAILABLE
+    assert after_reconnect.source_refs == []
+    assert after_reconnect.limitations == [
+        "calendar_account_not_synced"
+    ]
+
+    second = CalendarEventMirror(
+        external_id="second-account-event",
+        calendar_source=CalendarSource.GOOGLE,
+        connection_generation=second_generation,
+        summary="Second account private title",
+        start_at=datetime(2026, 8, 10, 11, tzinfo=UTC),
+        end_at=datetime(2026, 8, 10, 12, tzinfo=UTC),
+        is_all_day=False,
+    )
+    session.add(second)
+    session.flush()
+    health.record_success(
+        CalendarSource.GOOGLE,
+        NOW + timedelta(minutes=1),
+        event_count=1,
+        coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+        account_generation=second_generation,
+    )
+    reconnected = await registry.execute(session, query, now=NOW)
+
+    assert reconnected.payload["event_count"] == 1
+    assert [ref.record_id for ref in reconnected.source_refs] == [
+        str(second.id)
+    ]
+    assert str(first.id) not in reconnected.model_dump_json()
 
 
 async def test_calendar_empty_success_is_distinct_from_never_synced(

@@ -17,7 +17,13 @@ from healthmes.decision.agent import (
 from healthmes.decision.compatibility import (
     decision_request_from_activity_context,
 )
-from healthmes.decision.composition import build_context_provider_registry
+from healthmes.decision.composition import (
+    build_configured_decision_engine,
+    build_context_provider_registry,
+    build_healthmes_decision_engine,
+    local_owner_access_policy,
+    resolve_decision_execution_scope,
+)
 from healthmes.decision.contracts import (
     CompatibilityPreset,
     ContextCoverage,
@@ -50,12 +56,17 @@ from healthmes.decision.domain_providers import (
     NutritionContextProvider,
     WearableContextProvider,
 )
-from healthmes.decision.engine import HealthMesDecisionEngine
+from healthmes.decision.engine import (
+    DecisionEngineBusyError,
+    DecisionEngineClosedError,
+    HealthMesDecisionEngine,
+)
 from healthmes.decision.finalizer import (
     DECISION_PAYLOAD_SCHEMA,
     DECISION_RECORD_SCHEMA,
     DecisionFinalizer,
     decision_request_fingerprint,
+    decision_result_from_record,
 )
 from healthmes.decision.hermes import (
     HERMES_CAPABILITIES_PATH,
@@ -72,6 +83,14 @@ from healthmes.decision.hermes import (
     HermesRuntimeAdapter,
     HermesRuntimeCapability,
     HermesTransportError,
+)
+from healthmes.decision.policy import (
+    DECISION_DOMAINS,
+    DatabaseDecisionPolicyResolver,
+    decision_access_policy,
+    ensure_decision_domain_policies,
+    list_decision_domain_policies,
+    update_decision_domain_policy,
 )
 from healthmes.decision.providers import (
     ContextCapability,
@@ -139,6 +158,8 @@ __all__ = [
     "DecisionCaller",
     "DecisionContextHints",
     "DecisionDraft",
+    "DecisionEngineBusyError",
+    "DecisionEngineClosedError",
     "DecisionFinalizer",
     "DecisionRequest",
     "DECISION_PAYLOAD_SCHEMA",
@@ -152,6 +173,8 @@ __all__ = [
     "DecisionStatus",
     "DecisionToolCallError",
     "DecisionToolSpec",
+    "DatabaseDecisionPolicyResolver",
+    "DECISION_DOMAINS",
     "DisabledProviderError",
     "DomainAccessGrant",
     "DuplicateCapabilityError",
@@ -196,8 +219,17 @@ __all__ = [
     "UnknownProviderError",
     "WearableContextProvider",
     "build_context_provider_registry",
+    "build_configured_decision_engine",
+    "build_healthmes_decision_engine",
     "decision_request_from_activity_context",
     "decision_request_fingerprint",
+    "decision_result_from_record",
+    "decision_access_policy",
+    "ensure_decision_domain_policies",
+    "list_decision_domain_policies",
+    "resolve_decision_execution_scope",
     "source_ref_id",
+    "local_owner_access_policy",
+    "update_decision_domain_policy",
     "validate_context_parameters",
 ]

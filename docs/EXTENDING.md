@@ -51,9 +51,11 @@ Ground rules for skill authors:
   `mcp__open_wearables__<tool>` (double underscores).
 - **Never instruct raw REST calls** — data access must go through MCP tools so
   every decision stays reconstructable in the decision tree.
-- Legacy Hermes workflows still instruct `record_decision`; the target
-  Decision Agent finalizer enforces persistence in code rather than trusting
-  this instruction alone.
+- Legacy Hermes workflows still instruct `record_decision`; the
+  `HealthMesDecisionEngine` finalizer enforces persistence in code rather than
+  trusting this instruction alone. New service adapters should construct the
+  engine with `build_healthmes_decision_engine(...)` and call
+  `await engine.ask_wellness(request)`.
 - **Respect confidence**: the tools return `confidence` / `coverage` /
   `insufficient_data` honestly; skills must gate advice on them.
 - Multiple skills are welcome — one file per clinical question keeps them

@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, object_session, sessionmaker
 
+import healthmes.decision.finalizer as finalizer_module
 from healthmes.activity.locking import activity_write_lock
 from healthmes.decision import (
     DECISION_PAYLOAD_SCHEMA,
@@ -34,6 +36,7 @@ from healthmes.decision import (
     DecisionDraft,
     DecisionFinalizer,
     DecisionRequest,
+    DecisionResult,
     DecisionStatus,
     DomainAccessGrant,
     ExecutionScope,
@@ -44,6 +47,7 @@ from healthmes.decision import (
     SourceRef,
     ToolCallRecord,
     ToolCallStatus,
+    decision_result_from_record,
 )
 from healthmes.decision.access import _current_source_content_digest
 from healthmes.store import (
@@ -232,13 +236,15 @@ def _run(
     payload: dict[str, int] | None = None,
     runtime: RuntimeMetadata | None = None,
     answer: str | None = None,
+    context_status: ContextStatus = ContextStatus.OK,
+    result_limitations: list[str] | None = None,
 ) -> DecisionAgentRun:
     query = query or _query()
     result = ContextResult(
         query_id=query.query_id,
         provider_id=query.provider_id,
         capability=query.capability,
-        status=ContextStatus.OK,
+        status=context_status,
         payload=payload or {"caffeine_mg": 80},
         source_refs=refs,
         freshness=ContextFreshness(
@@ -250,6 +256,7 @@ def _run(
             status=CoverageStatus.COMPLETE,
             ratio=1,
         ),
+        limitations=result_limitations or [],
     )
     record = ToolCallRecord(
         query=query,
@@ -308,6 +315,8 @@ def _finalizer(
         Callable[[DecisionRequest], ContextAccessPolicy] | None
     ) = None,
     registry: ContextProviderRegistry | None = None,
+    timeout_seconds: float = 5,
+    max_workers: int = 8,
 ) -> DecisionFinalizer:
     registry = registry or ContextProviderRegistry(
         (StoredNutritionProvider(),)
@@ -322,6 +331,8 @@ def _finalizer(
             policy_resolver
             or (lambda _request: policy or _policy())
         ),
+        timeout_seconds=timeout_seconds,
+        max_workers=max_workers,
         clock=lambda: NOW,
     )
 
@@ -403,6 +414,72 @@ def test_source_backed_information_is_persisted_without_action(persistence):
         assert session.scalar(
             sa.select(sa.func.count()).select_from(DecisionRecord)
         ) == 1
+
+
+def test_tool_result_limitations_are_preserved_when_model_omits_them(
+    persistence,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+
+    result = _finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            context_status=ContextStatus.PARTIAL,
+            result_limitations=["context_stale"],
+        ),
+    )
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert result.limitations == ["context_stale"]
+    with factory() as session:
+        row = session.scalars(sa.select(DecisionRecord)).one()
+        assert row.decision_payload is not None
+        assert row.decision_payload["result"]["limitations"] == [
+            "context_stale"
+        ]
+
+
+def test_safe_tool_error_is_preserved_without_exposing_unknown_error(
+    persistence,
+):
+    _engine, factory = persistence
+    request = _request()
+    base_run = _run(
+        request,
+        [],
+        used_ids=[],
+        proposed_action=False,
+        status=DecisionStatus.NEEDS_CLARIFICATION,
+    )
+    safe_error = ToolCallRecord(
+        query=_query(),
+        status=ToolCallStatus.FAILED,
+        started_at=NOW,
+        finished_at=NOW,
+        error_code="tool_execution_failed",
+    )
+    unknown_error = ToolCallRecord(
+        query=_query(),
+        status=ToolCallStatus.FAILED,
+        started_at=NOW,
+        finished_at=NOW,
+        error_code="calendar_timeout",
+    )
+    run = base_run.model_copy(
+        update={"tool_trace": (safe_error, unknown_error)},
+        deep=True,
+    )
+
+    result = _finalizer(factory).finalize(request, run)
+
+    assert result.status is DecisionStatus.NEEDS_CLARIFICATION
+    assert "tool_execution_failed" in result.limitations
+    assert "calendar_timeout" not in result.limitations
 
 
 def test_public_record_redacts_internal_source_reference_ids(
@@ -645,9 +722,59 @@ def test_policy_is_resolved_again_inside_finalization_transaction(
         ) == 0
 
 
+def test_policy_resolution_failure_without_used_refs_fails_closed(
+    persistence,
+):
+    _engine, factory = persistence
+    request = _request()
+
+    def fail_policy(_request: DecisionRequest) -> ContextAccessPolicy:
+        raise RuntimeError("policy store unavailable")
+
+    result = _finalizer(
+        factory,
+        policy_resolver=fail_policy,
+    ).finalize(
+        request,
+        _run(
+            request,
+            [],
+            used_ids=[],
+            proposed_action=False,
+            status=DecisionStatus.NEEDS_CLARIFICATION,
+        ),
+    )
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
+    assert result.limitations == ["access_policy_resolution_failed"]
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
+
+
 class FailingCommitSession(Session):
     def commit(self) -> None:
         raise RuntimeError("injected commit failure")
+
+
+class CommitTrackingSession(Session):
+    commit_calls = 0
+
+    def commit(self) -> None:
+        type(self).commit_calls += 1
+        super().commit()
+
+
+class SlowDecisionFlushSession(CommitTrackingSession):
+    def flush(self, objects=None) -> None:
+        if any(
+            isinstance(item, DecisionRecord)
+            for item in self.new
+        ):
+            time.sleep(0.1)
+        super().flush(objects)
 
 
 def test_storage_failure_rolls_back_and_never_returns_action(persistence):
@@ -674,6 +801,263 @@ def test_storage_failure_rolls_back_and_never_returns_action(persistence):
         assert session.scalar(
             sa.select(sa.func.count()).select_from(DecisionRecord)
         ) == 0
+
+
+def test_payload_work_past_deadline_never_reaches_commit(
+    persistence,
+    monkeypatch,
+):
+    engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    original_payload = finalizer_module._decision_payload
+
+    def slow_payload(*args, **kwargs):
+        time.sleep(0.1)
+        return original_payload(*args, **kwargs)
+
+    CommitTrackingSession.commit_calls = 0
+    tracked_factory = sessionmaker(
+        bind=engine,
+        class_=CommitTrackingSession,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(
+        finalizer_module,
+        "_decision_payload",
+        slow_payload,
+    )
+
+    result = _finalizer(
+        tracked_factory,
+        timeout_seconds=0.05,
+    ).finalize(request, _run(request, [ref]))
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+    assert result.limitations == ["decision_finalization_timeout"]
+    assert CommitTrackingSession.commit_calls == 0
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
+
+
+def test_flush_work_past_deadline_is_rolled_back_before_commit(
+    persistence,
+):
+    engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    SlowDecisionFlushSession.commit_calls = 0
+    slow_factory = sessionmaker(
+        bind=engine,
+        class_=SlowDecisionFlushSession,
+        expire_on_commit=False,
+    )
+
+    result = _finalizer(
+        slow_factory,
+        timeout_seconds=0.05,
+    ).finalize(request, _run(request, [ref]))
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+    assert result.limitations == ["decision_finalization_timeout"]
+    assert SlowDecisionFlushSession.commit_calls == 0
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
+
+
+def test_slow_session_commit_after_timeout_cannot_create_late_record(
+    tmp_path,
+):
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'slow-pre-commit.db'}"
+    )
+    Base.metadata.create_all(engine)
+    normal_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with normal_factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    commit_started = threading.Event()
+    release_commit = threading.Event()
+    session_closed = threading.Event()
+
+    class SlowCommitSession(Session):
+        def commit(self) -> None:
+            commit_started.set()
+            if not release_commit.wait(timeout=5):
+                raise TimeoutError("test commit was not released")
+            super().commit()
+
+        def close(self) -> None:
+            try:
+                super().close()
+            finally:
+                session_closed.set()
+
+    slow_factory = sessionmaker(
+        bind=engine,
+        class_=SlowCommitSession,
+        expire_on_commit=False,
+    )
+    try:
+        started = time.monotonic()
+        result = _finalizer(
+            slow_factory,
+            timeout_seconds=0.2,
+        ).finalize(request, _run(request, [ref]))
+        elapsed = time.monotonic() - started
+
+        assert 0.15 <= elapsed < 1
+        assert commit_started.is_set()
+        assert result.status is DecisionStatus.FAILED
+        assert result.persistence_status is PersistenceStatus.FAILED
+        assert result.limitations == ["decision_finalization_timeout"]
+        with normal_factory() as session:
+            assert session.scalar(
+                sa.select(sa.func.count()).select_from(DecisionRecord)
+            ) == 0
+    finally:
+        release_commit.set()
+        assert session_closed.wait(timeout=5)
+
+    with normal_factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
+    engine.dispose()
+
+
+def test_slow_database_commit_returns_unknown_then_can_be_recovered(
+    tmp_path,
+    monkeypatch,
+):
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'slow-dbapi-commit.db'}"
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    commit_started = threading.Event()
+    release_commit = threading.Event()
+    commit_finished = threading.Event()
+    session_closed = threading.Event()
+    original_do_commit = engine.dialect.do_commit
+
+    class CommitCompletionSession(Session):
+        def close(self) -> None:
+            try:
+                super().close()
+            finally:
+                session_closed.set()
+
+    finalization_factory = sessionmaker(
+        bind=engine,
+        class_=CommitCompletionSession,
+        expire_on_commit=False,
+    )
+
+    def slow_do_commit(dbapi_connection) -> None:
+        commit_started.set()
+        if not release_commit.wait(timeout=5):
+            raise TimeoutError("test DBAPI commit was not released")
+        original_do_commit(dbapi_connection)
+        commit_finished.set()
+
+    monkeypatch.setattr(engine.dialect, "do_commit", slow_do_commit)
+    try:
+        result = _finalizer(
+            finalization_factory,
+            timeout_seconds=0.2,
+        ).finalize(request, _run(request, [ref]))
+
+        assert commit_started.is_set()
+        assert result.status is DecisionStatus.FAILED
+        assert result.persistence_status is PersistenceStatus.UNKNOWN
+        assert result.decision_record_id is None
+        assert result.limitations == [
+            "decision_finalization_outcome_unknown"
+        ]
+        with factory() as session:
+            assert session.scalar(
+                sa.select(sa.func.count()).select_from(DecisionRecord)
+            ) == 0
+    finally:
+        release_commit.set()
+        assert commit_finished.wait(timeout=5)
+        assert session_closed.wait(timeout=5)
+
+    with factory() as session:
+        row = session.scalars(sa.select(DecisionRecord)).one()
+        recovered = decision_result_from_record(row)
+    assert recovered.status is DecisionStatus.COMPLETED
+    assert recovered.persistence_status is PersistenceStatus.PERSISTED
+    assert recovered.request_id == request.request_id
+    assert recovered.decision_record_id == row.id
+    engine.dispose()
+
+
+def test_finalizer_capacity_is_bounded_and_auditable(persistence):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    first_request = _request()
+    second_request = _request()
+    entered = threading.Event()
+    release = threading.Event()
+    first_result: list[DecisionResult] = []
+
+    def blocking_policy(_request: DecisionRequest) -> ContextAccessPolicy:
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test policy was not released")
+        return _policy()
+
+    finalizer = _finalizer(
+        factory,
+        policy_resolver=blocking_policy,
+        timeout_seconds=2,
+        max_workers=1,
+    )
+
+    worker = threading.Thread(
+        target=lambda: first_result.append(
+            finalizer.finalize(
+                first_request,
+                _run(first_request, [ref]),
+            )
+        )
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=1)
+        rejected = finalizer.finalize(
+            second_request,
+            _run(second_request, [ref]),
+        )
+        assert rejected.status is DecisionStatus.FAILED
+        assert rejected.persistence_status is PersistenceStatus.FAILED
+        assert rejected.limitations == [
+            "decision_finalization_capacity_exhausted"
+        ]
+    finally:
+        release.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert len(first_result) == 1
+    assert (
+        first_result[0].persistence_status
+        is PersistenceStatus.PERSISTED
+    )
 
 
 def test_retry_returns_one_logical_record_and_conflicting_request_fails(
@@ -1124,6 +1508,88 @@ def test_concurrent_sqlite_finalization_keeps_one_record(tmp_path):
         engine.dispose()
 
 
+def test_finalization_process_lock_timeout_is_auditable(tmp_path):
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'process-timeout.db'}"
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with activity_write_lock():
+            acquired.set()
+            assert release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert acquired.wait(timeout=5)
+        started = time.monotonic()
+        result = _finalizer(
+            factory,
+            timeout_seconds=0.1,
+        ).finalize(request, run)
+        assert 0.05 <= time.monotonic() - started < 1
+        assert result.status is DecisionStatus.FAILED
+        assert result.persistence_status is PersistenceStatus.FAILED
+        assert result.limitations == ["decision_finalization_timeout"]
+        with factory() as session:
+            assert session.scalar(
+                sa.select(sa.func.count()).select_from(DecisionRecord)
+            ) == 0
+    finally:
+        release.set()
+        holder.join(timeout=5)
+
+    assert not holder.is_alive()
+    retry = _finalizer(factory).finalize(request, run)
+    assert retry.persistence_status is PersistenceStatus.PERSISTED
+    engine.dispose()
+
+
+def test_finalization_sqlite_database_lock_timeout_is_auditable(
+    tmp_path,
+):
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'database-timeout.db'}"
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+
+    with factory() as blocker:
+        # Simulate an external SQLite writer that does not participate in the
+        # HealthMes process/file-lock protocol.
+        blocker.execute(sa.text("BEGIN IMMEDIATE"))
+        started = time.monotonic()
+        result = _finalizer(
+            factory,
+            timeout_seconds=0.1,
+        ).finalize(request, run)
+        assert 0.05 <= time.monotonic() - started < 1
+        assert result.status is DecisionStatus.FAILED
+        assert result.persistence_status is PersistenceStatus.FAILED
+        assert result.limitations == ["decision_finalization_timeout"]
+        blocker.rollback()
+
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql(
+            "PRAGMA busy_timeout"
+        ).scalar_one() == 30_000
+    retry = _finalizer(factory).finalize(request, run)
+    assert retry.persistence_status is PersistenceStatus.PERSISTED
+    engine.dispose()
+
+
 def test_sqlite_source_delete_before_finalization_fails_closed(tmp_path):
     engine = create_db_engine(
         f"sqlite+pysqlite:///{tmp_path / 'delete-first.db'}"
@@ -1343,7 +1809,7 @@ async def test_engine_runs_agent_then_finalizer(persistence):
     )
 
     result = await engine.ask(request)
-    engine.close()
+    await engine.aclose()
 
     assert result.persistence_status is PersistenceStatus.PERSISTED
     assert agent.closed is True
