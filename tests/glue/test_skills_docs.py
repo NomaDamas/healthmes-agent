@@ -71,7 +71,23 @@ def test_skill_dirs_all_checked() -> None:
         "healthmes-planner",
         "healthmes-sleep",
         "healthmes-stress",
+        "healthmes-whoop-recovery",
     ]
+
+
+def test_whoop_recovery_skill_keeps_its_data_and_recording_boundaries() -> None:
+    text = (REPO_ROOT / "skills" / "healthmes-whoop-recovery" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "mcp__healthmes__get_whoop_recovery_context" in text
+    assert "Never recreate numeric WHOOP\n   thresholds" in text
+    assert "workout-specific" in text
+    assert "Never offer 20 or 30 minutes" in text
+    assert "separate immutable" in text
+    assert "do **not** create a\ncompletion record" in text
+    assert "v0 leaves completion unrecorded" in text
+    assert "Never put raw scores, timestamps" in text
 
 
 @pytest.mark.parametrize("skill_name", ("healthmes-sleep", "healthmes-stress"))

@@ -20,6 +20,7 @@ EXPECTED_SKILLS = (
     "healthmes-planner",
     "healthmes-sleep",
     "healthmes-stress",
+    "healthmes-whoop-recovery",
 )
 EXPECTED_PLUGINS = ("healthmes-routing",)
 

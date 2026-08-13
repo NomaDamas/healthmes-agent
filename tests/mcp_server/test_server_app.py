@@ -7,6 +7,7 @@ from healthmes.mcp_server.server import build_mcp_http_app
 
 TRANCHE_1_TOOLS = {
     "get_health_scores",
+    "get_whoop_recovery_context",
     "get_daily_readiness_context",
     "get_personal_baselines",
     "list_goals",

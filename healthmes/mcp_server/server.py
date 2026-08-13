@@ -45,6 +45,7 @@ import asyncio
 import datetime as dt
 import functools
 import logging
+import math
 import os
 import re
 import uuid
@@ -109,7 +110,17 @@ from healthmes.trusted_session import verify_trusted_session_proof
 
 # backend/app/schemas/enums/health_score_category.py
 SCORE_CATEGORIES = frozenset(
-    {"sleep", "recovery", "readiness", "activity", "stress", "resilience", "body_battery", "strain"}
+    {
+        "sleep",
+        "recovery",
+        "readiness",
+        "activity",
+        "stress",
+        "resilience",
+        "body_battery",
+        "strain",
+        "day_strain",
+    }
 )
 # The categories the vendor MCP server cannot see (docs/PLAN.md 1.5 gap table).
 DEFAULT_SCORE_CATEGORIES = (
@@ -576,19 +587,128 @@ _summary_daily_values = interpret.summary_daily_values
 
 
 async def _fetch_health_scores(
-    user_id: str, start: dt.date, end_exclusive: dt.date
+    user_id: str,
+    start: dt.date,
+    end_exclusive: dt.date,
+    *,
+    category: str | None = None,
+    provider: str | None = None,
 ) -> list[dict[str, Any]]:
-    rows, _truncated = await _fetch_health_scores_tracked(user_id, start, end_exclusive)
+    rows, _truncated = await _fetch_health_scores_tracked(
+        user_id, start, end_exclusive, category=category, provider=provider
+    )
     return rows
 
 
 async def _fetch_health_scores_tracked(
-    user_id: str, start: dt.date, end_exclusive: dt.date
+    user_id: str,
+    start: dt.date,
+    end_exclusive: dt.date,
+    *,
+    category: str | None = None,
+    provider: str | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     client = get_ow_client()
     return await client.collect_health_scores_tracked(
-        user_id, start_date=start.isoformat(), end_date=end_exclusive.isoformat()
+        user_id,
+        start_date=start.isoformat(),
+        end_date=end_exclusive.isoformat(),
+        category=category,
+        provider=provider,
     )
+
+
+def _whoop_label(category: str, value: float) -> str | None:
+    if category == "recovery":
+        if 0 <= value <= 33:
+            return "red"
+        if 34 <= value <= 66:
+            return "yellow"
+        if 67 <= value <= 100:
+            return "green"
+    if category == "day_strain":
+        if 0 <= value <= 9:
+            return "light"
+        if 10 <= value <= 13:
+            return "moderate"
+        if 14 <= value <= 17:
+            return "high"
+        if 18 <= value <= 21:
+            return "all_out"
+    return None
+
+
+def _whoop_primary_signal(
+    rows: list[dict[str, Any]],
+    *,
+    category: str,
+    as_of: dt.date,
+    tz: dt.tzinfo,
+    truncated: bool,
+) -> dict[str, Any]:
+    name = "recovery" if category == "recovery" else "day_strain"
+    result: dict[str, Any] = {
+        "provider": "whoop",
+        "source_category": category,
+        "raw_value": None,
+        "label": None,
+        "observed_on": None,
+        "updated_at": None,
+        "freshness": "unknown",
+        "stale_days": None,
+        "confidence": "low",
+    }
+    if truncated:
+        return {**result, "status": interpret.STATUS_INSUFFICIENT, "reason": "truncated_source"}
+
+    matching = [
+        row for row in rows if row.get("provider") == "whoop" and row.get("category") == category
+    ]
+    if not matching:
+        return {**result, "status": interpret.STATUS_INSUFFICIENT, "reason": f"no_whoop_{name}"}
+
+    parsed: list[tuple[dt.datetime, dict[str, Any]]] = []
+    for row in matching:
+        recorded_at = _parse_recorded_at(row.get("recorded_at"))
+        if recorded_at is None:
+            return {
+                **result,
+                "status": interpret.STATUS_INSUFFICIENT,
+                "reason": "unparseable_recorded_at",
+            }
+        parsed.append((recorded_at, row))
+
+    latest_at = max(recorded_at for recorded_at, _row in parsed)
+    latest = [row for recorded_at, row in parsed if recorded_at == latest_at]
+    if len(latest) != 1:
+        return {**result, "status": interpret.STATUS_INSUFFICIENT, "reason": "ambiguous_latest_row"}
+
+    row = latest[0]
+    value = _as_float(row.get("value"))
+    local_recorded_at = latest_at.astimezone(tz)
+    observed_on = local_recorded_at.date()
+    stale_days = (as_of - observed_on).days
+    base = {
+        **result,
+        "raw_value": value,
+        "observed_on": observed_on.isoformat(),
+        "updated_at": latest_at.isoformat(),
+        "freshness": "current_day" if observed_on == as_of else "stale",
+        "stale_days": stale_days,
+    }
+    if value is None or not math.isfinite(value):
+        return {**base, "status": interpret.STATUS_INSUFFICIENT, "reason": "unparseable_raw_value"}
+    label = _whoop_label(category, value)
+    if label is None:
+        return {**base, "status": interpret.STATUS_INSUFFICIENT, "reason": "raw_value_out_of_range"}
+    if observed_on != as_of:
+        return {
+            **base,
+            "label": label,
+            "status": interpret.STATUS_INSUFFICIENT,
+            "reason": "not_current_local_day",
+        }
+    return {**base, "label": label, "status": interpret.STATUS_OK, "confidence": "high"}
 
 
 def _ow_error(exc: Exception) -> ToolError:
@@ -727,6 +847,58 @@ async def get_health_scores(
         "categories_requested": list(requested),
         "scores": scores,
         "truncated": truncated,
+    }
+
+
+@mcp.tool
+@_with_ow_errors
+async def get_whoop_recovery_context(date: str | None = None) -> dict[str, Any]:
+    """Deterministic WHOOP recovery-package inputs for one local day.
+
+    Returns the WHOOP Recovery health score and separately persisted WHOOP Cycle
+    day-strain score with raw values, official labels, local-day freshness, and
+    binary confidence. Missing, stale, ambiguous, truncated, unparsable, or
+    out-of-range primary data fails closed as ``insufficient_data``.
+    """
+    tz = _local_timezone()
+    as_of = _parse_date_local(date, "date", tz)
+    user_id = await _resolve_user_id()
+    fetch_start = as_of - dt.timedelta(days=2)
+    fetch_end = as_of + dt.timedelta(days=1)
+    (recovery_rows, recovery_truncated), (strain_rows, strain_truncated) = await asyncio.gather(
+        _fetch_health_scores_tracked(
+            user_id, fetch_start, fetch_end, category="recovery", provider="whoop"
+        ),
+        _fetch_health_scores_tracked(
+            user_id, fetch_start, fetch_end, category="day_strain", provider="whoop"
+        ),
+    )
+    recovery = _whoop_primary_signal(
+        recovery_rows,
+        category="recovery",
+        as_of=as_of,
+        tz=tz,
+        truncated=recovery_truncated,
+    )
+    strain = _whoop_primary_signal(
+        strain_rows,
+        category="day_strain",
+        as_of=as_of,
+        tz=tz,
+        truncated=strain_truncated,
+    )
+    status = (
+        interpret.STATUS_OK
+        if recovery["status"] == interpret.STATUS_OK and strain["status"] == interpret.STATUS_OK
+        else interpret.STATUS_INSUFFICIENT
+    )
+    return {
+        "status": status,
+        "date": as_of.isoformat(),
+        "timezone": str(tz),
+        "confidence": "high" if status == interpret.STATUS_OK else "low",
+        "recovery": recovery,
+        "strain": strain,
     }
 
 

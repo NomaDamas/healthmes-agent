@@ -461,6 +461,7 @@ class Whoop247Data(Base247DataTemplate):
         results = {
             "sleep_sessions_synced": 0,
             "recovery_samples_synced": 0,
+            "day_strain_scores_synced": 0,
             "activity_samples_synced": 0,
             "body_measurement_samples_synced": 0,
         }
@@ -486,6 +487,19 @@ class Whoop247Data(Base247DataTemplate):
                 self.logger,
                 "error",
                 f"Failed to sync recovery data: {e}",
+                provider="whoop",
+                task="load_and_save_all",
+                user_id=str(user_id),
+            )
+
+        try:
+            results["day_strain_scores_synced"] = self.load_and_save_day_strain(db, user_id, start_time, end_time)
+        except Exception as e:
+            db.rollback()
+            log_structured(
+                self.logger,
+                "error",
+                f"Failed to sync Whoop day strain: {e}",
                 provider="whoop",
                 task="load_and_save_all",
                 user_id=str(user_id),
@@ -934,6 +948,85 @@ class Whoop247Data(Base247DataTemplate):
             db.commit()
 
         return total_count
+
+    def get_cycle_data(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        all_cycle_data: list[dict[str, Any]] = []
+        next_token = None
+        start_iso = start_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        while True:
+            params: dict[str, Any] = {"start": start_iso, "end": end_iso, "limit": 25}
+            if next_token:
+                params["nextToken"] = next_token
+
+            response = self._make_api_request(db, user_id, "/v2/cycle", params=params)
+            store_raw_payload(
+                source="api_response",
+                provider="whoop",
+                payload=response,
+                user_id=str(user_id),
+                trace_id="/v2/cycle",
+            )
+            records = response.get("records", []) if isinstance(response, dict) else []
+            all_cycle_data.extend(record for record in records if isinstance(record, dict))
+            next_token = response.get("next_token") if isinstance(response, dict) else None
+            if not records or not next_token:
+                return all_cycle_data
+
+    def normalize_day_strain_health_score(
+        self,
+        raw_cycle: dict[str, Any],
+        user_id: UUID,
+    ) -> HealthScoreCreate | None:
+        if raw_cycle.get("score_state") != "SCORED":
+            return None
+
+        score = raw_cycle.get("score") or {}
+        value = score.get("strain") if isinstance(score, dict) else None
+        updated_at = raw_cycle.get("updated_at")
+        cycle_id = raw_cycle.get("id")
+        if value is None or updated_at is None or cycle_id is None:
+            return None
+        try:
+            recorded_at = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+
+        return HealthScoreCreate(
+            id=uuid4(),
+            user_id=user_id,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.DAY_STRAIN,
+            value=value,
+            recorded_at=recorded_at,
+            components={"cycle_id": ScoreComponent(qualifier=str(cycle_id))},
+        )
+
+    def load_and_save_day_strain(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> int:
+        health_scores = [
+            score
+            for raw_cycle in self.get_cycle_data(db, user_id, start_time, end_time)
+            if (score := self.normalize_day_strain_health_score(raw_cycle, user_id)) is not None
+        ]
+        if not health_scores:
+            return 0
+        health_score_service.bulk_create(db, health_scores)
+        db.commit()
+        return len(health_scores)
 
     # -------------------------------------------------------------------------
     # Activity Samples

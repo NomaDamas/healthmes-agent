@@ -38,4 +38,7 @@ HEALTH_SCORE_RANGES: dict[HealthScoreCategory, dict[ProviderName, ScoreRange]] =
         ProviderName.WHOOP: ScoreRange(0, 21),
         ProviderName.POLAR: ScoreRange(0, float("inf")),
     },
+    HealthScoreCategory.DAY_STRAIN: {
+        ProviderName.WHOOP: ScoreRange(0, 21),
+    },
 }
