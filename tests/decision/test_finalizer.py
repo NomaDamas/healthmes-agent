@@ -1181,6 +1181,80 @@ def test_slow_database_commit_returns_unknown_then_can_be_recovered(
     engine.dispose()
 
 
+def test_committed_record_with_late_cleanup_returns_unknown_then_recovers(
+    tmp_path,
+):
+    engine = create_db_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'late-cleanup.db'}"
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    close_started = threading.Event()
+    release_close = threading.Event()
+    session_closed = threading.Event()
+
+    class SlowCleanupSession(Session):
+        def flush(self, objects=None) -> None:
+            if any(
+                isinstance(item, DecisionRecord)
+                for item in self.new
+            ):
+                self.info["committed_decision"] = True
+            super().flush(objects)
+
+        def close(self) -> None:
+            try:
+                if self.info.get("committed_decision"):
+                    close_started.set()
+                    if not release_close.wait(timeout=5):
+                        raise TimeoutError(
+                            "test session cleanup was not released"
+                        )
+                super().close()
+            finally:
+                if self.info.get("committed_decision"):
+                    session_closed.set()
+
+    finalization_factory = sessionmaker(
+        bind=engine,
+        class_=SlowCleanupSession,
+        expire_on_commit=False,
+    )
+    finalizer = _finalizer(
+        finalization_factory,
+        timeout_seconds=0.2,
+    )
+    try:
+        result = finalizer.finalize(
+            request,
+            _run(request, [ref]),
+        )
+
+        assert close_started.is_set()
+        assert result.status is DecisionStatus.FAILED
+        assert result.persistence_status is PersistenceStatus.UNKNOWN
+        assert result.decision_record_id is None
+        assert result.limitations == [
+            "decision_finalization_outcome_unknown"
+        ]
+    finally:
+        release_close.set()
+        assert session_closed.wait(timeout=5)
+        finalizer.close()
+
+    with factory() as session:
+        row = session.scalars(sa.select(DecisionRecord)).one()
+        recovered = decision_result_from_record(row)
+    assert recovered.status is DecisionStatus.COMPLETED
+    assert recovered.persistence_status is PersistenceStatus.PERSISTED
+    assert recovered.request_id == request.request_id
+    assert recovered.decision_record_id == row.id
+    engine.dispose()
+
+
 def test_commit_completion_cannot_reverse_unknown_response_contract(
     persistence,
 ):
@@ -1221,6 +1295,154 @@ def test_commit_completion_cannot_reverse_unknown_response_contract(
         run,
         control,
     )
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.UNKNOWN
+    assert result.decision_record_id is None
+    assert result.limitations == [
+        "decision_finalization_outcome_unknown"
+    ]
+
+
+def test_unpublished_commit_success_becomes_unknown_at_deadline(
+    persistence,
+    monkeypatch,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+    persisted = DecisionResult(
+        request_id=request.request_id,
+        turn_id=request.turn_id,
+        status=DecisionStatus.COMPLETED,
+        answer="Take a short break.",
+        proposed_action=True,
+        source_refs=[ref],
+        persistence_status=PersistenceStatus.PERSISTED,
+        decision_record_id=uuid.uuid4(),
+        runtime=run.runtime,
+    )
+    current_time = [10.0]
+    monkeypatch.setattr(
+        finalizer_module,
+        "steady_time",
+        lambda: current_time[0],
+    )
+    control = finalizer_module._FinalizationControl(11.0)
+    control.enter_commit()
+    control.mark_committed(persisted)
+    current_time[0] = 12.0
+    control.signal_done()
+
+    phase, stored_result = control.snapshot()
+    assert phase is finalizer_module._FinalizationPhase.COMMITTED
+    assert stored_result == persisted
+    assert control.done.is_set()
+
+    result = _finalizer(factory)._supervised_result(
+        request,
+        run,
+        control,
+    )
+    phase, stored_result = control.snapshot()
+    assert phase is finalizer_module._FinalizationPhase.OUTCOME_UNKNOWN
+    assert stored_result == persisted
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.UNKNOWN
+    assert result.decision_record_id is None
+    assert result.limitations == [
+        "decision_finalization_outcome_unknown"
+    ]
+
+
+def test_timely_published_commit_remains_success_after_caller_delay(
+    persistence,
+    monkeypatch,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+    persisted = DecisionResult(
+        request_id=request.request_id,
+        turn_id=request.turn_id,
+        status=DecisionStatus.COMPLETED,
+        answer="Take a short break.",
+        proposed_action=True,
+        source_refs=[ref],
+        persistence_status=PersistenceStatus.PERSISTED,
+        decision_record_id=uuid.uuid4(),
+        runtime=run.runtime,
+    )
+    current_time = [10.0]
+    monkeypatch.setattr(
+        finalizer_module,
+        "steady_time",
+        lambda: current_time[0],
+    )
+    control = finalizer_module._FinalizationControl(11.0)
+    control.enter_commit()
+    control.mark_committed(persisted)
+    assert (
+        control.expire()
+        is finalizer_module._FinalizationPhase.COMMITTED
+    )
+    control.signal_done()
+    current_time[0] = 12.0
+
+    result = _finalizer(factory)._supervised_result(
+        request,
+        run,
+        control,
+    )
+    phase, stored_result = control.snapshot()
+    assert phase is finalizer_module._FinalizationPhase.COMMITTED
+    assert stored_result == persisted
+    assert result == persisted
+
+
+def test_publication_at_deadline_uses_unknown_recovery_contract(
+    persistence,
+    monkeypatch,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+    persisted = DecisionResult(
+        request_id=request.request_id,
+        turn_id=request.turn_id,
+        status=DecisionStatus.COMPLETED,
+        answer="Take a short break.",
+        proposed_action=True,
+        source_refs=[ref],
+        persistence_status=PersistenceStatus.PERSISTED,
+        decision_record_id=uuid.uuid4(),
+        runtime=run.runtime,
+    )
+    current_time = [10.0]
+    monkeypatch.setattr(
+        finalizer_module,
+        "steady_time",
+        lambda: current_time[0],
+    )
+    control = finalizer_module._FinalizationControl(11.0)
+    control.enter_commit()
+    control.mark_committed(persisted)
+    current_time[0] = 11.0
+    control.signal_done()
+
+    result = _finalizer(factory)._supervised_result(
+        request,
+        run,
+        control,
+    )
+    phase, stored_result = control.snapshot()
+    assert phase is finalizer_module._FinalizationPhase.OUTCOME_UNKNOWN
+    assert stored_result == persisted
     assert result.status is DecisionStatus.FAILED
     assert result.persistence_status is PersistenceStatus.UNKNOWN
     assert result.decision_record_id is None

@@ -208,6 +208,10 @@ agent worker 생성 뒤 실패하면 worker도 즉시 회수한다.
 driver는 HTTP 응답 deadline보다 프로세스 종료를 더 오래 지연시킬 수 있다. 종료
 timeout으로 아직 agent 단계에 있는 요청을 취소할 때는 finalizer admission을 먼저
 봉쇄하므로, 취소를 늦게 관찰한 요청이 DB teardown 직전에 새 worker를 만들 수 없다.
+commit 성공만으로 최초 성공 응답을 공개하지 않는다. session/connection cleanup,
+worker capacity 반환, active-worker 제거까지 모두 deadline 전에 끝난 시각을
+publication 시각으로 기록한다. publication이 deadline 뒤라면 최초 응답은 계속
+`UNKNOWN`이며, 실제 저장 성공 여부는 request ID 복구 endpoint에서만 확인한다.
 `DecisionFinalizer`를 엔진 밖에서 직접 소유하는 adapter나 테스트도 같은 규칙을
 지켜야 한다. 동기 owner는 `finalizer.close()`, async owner는
 `await finalizer.aclose()`를 호출한 뒤 session factory의 engine을 dispose한다.

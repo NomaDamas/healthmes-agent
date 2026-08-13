@@ -214,6 +214,7 @@ class _FinalizationControl:
         self._lock = threading.Lock()
         self._phase = _FinalizationPhase.PRE_COMMIT
         self._result: DecisionResult | None = None
+        self._published_at: float | None = None
 
     def enter_commit(self) -> None:
         """Enter the irreversible phase only at SQLAlchemy before_commit."""
@@ -263,13 +264,32 @@ class _FinalizationControl:
                 return True
             return self._phase is _FinalizationPhase.PRE_COMMIT
 
-    def expire(self) -> _FinalizationPhase:
-        """Fence future commits and classify an in-flight commit safely."""
+    def expire(
+        self,
+        *,
+        response_deadline: bool = False,
+    ) -> _FinalizationPhase:
+        """Fence future commits and classify unfinished work safely."""
 
         with self._lock:
+            published_in_time = (
+                self._published_at is not None
+                and self._published_at < self.deadline
+            )
+            if published_in_time:
+                return self._phase
             if self._phase is _FinalizationPhase.PRE_COMMIT:
                 self._phase = _FinalizationPhase.ABORTED
-            elif self._phase is _FinalizationPhase.COMMITTING:
+            elif (
+                self._phase is _FinalizationPhase.COMMITTING
+                or (
+                    response_deadline
+                    and self._phase is _FinalizationPhase.COMMITTED
+                )
+            ):
+                # after_commit can run before session cleanup and capacity
+                # release. A deadline at that point still uses request-ID
+                # recovery rather than exposing success prematurely.
                 self._phase = _FinalizationPhase.OUTCOME_UNKNOWN
             return self._phase
 
@@ -293,13 +313,29 @@ class _FinalizationControl:
     def signal_done(self) -> None:
         """Expose a prepared outcome after worker resources are reusable."""
 
-        self.done.set()
+        with self._lock:
+            if self._published_at is None:
+                self._published_at = steady_time()
+                self.done.set()
 
     def snapshot(
         self,
     ) -> tuple[_FinalizationPhase, DecisionResult | None]:
         with self._lock:
             return self._phase, self._result
+
+    def response_snapshot(
+        self,
+    ) -> tuple[_FinalizationPhase, DecisionResult | None, bool]:
+        """Return outcome plus whether it became visible within deadline."""
+
+        with self._lock:
+            return (
+                self._phase,
+                self._result,
+                self._published_at is not None
+                and self._published_at < self.deadline,
+            )
 
 
 def decision_request_fingerprint(request: DecisionRequest) -> str:
@@ -530,8 +566,8 @@ class DecisionFinalizer:
         control: _FinalizationControl,
     ) -> DecisionResult:
         del request
-        phase, result = control.snapshot()
-        if control.done.is_set():
+        phase, result, published_in_time = control.response_snapshot()
+        if published_in_time:
             if phase is _FinalizationPhase.COMMITTED and result is not None:
                 return result
             if phase is _FinalizationPhase.OUTCOME_UNKNOWN:
@@ -545,12 +581,26 @@ class DecisionFinalizer:
             if result is not None:
                 return result
 
-        phase = control.expire()
-        final_phase, final_result = control.snapshot()
-        if final_phase is _FinalizationPhase.COMMITTED:
-            if final_result is None:
+        phase = control.expire(response_deadline=True)
+        final_phase, final_result, published_in_time = (
+            control.response_snapshot()
+        )
+        if published_in_time:
+            if (
+                final_phase is _FinalizationPhase.COMMITTED
+                and final_result is not None
+            ):
+                return final_result
+            if final_phase is _FinalizationPhase.OUTCOME_UNKNOWN:
                 return _unknown_result(run)
-            return final_result
+            if final_phase is _FinalizationPhase.ABORTED:
+                return _failure_result(
+                    run,
+                    code=_FINALIZATION_TIMEOUT,
+                    persistence_required=_run_requires_persistence(run),
+                )
+            if final_result is not None:
+                return final_result
         if final_phase is _FinalizationPhase.OUTCOME_UNKNOWN or phase in {
             _FinalizationPhase.COMMITTING,
             _FinalizationPhase.OUTCOME_UNKNOWN,

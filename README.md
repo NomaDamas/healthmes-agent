@@ -135,11 +135,14 @@ Telegram (phone + watch)          decision viewer (web)
   location rather than guessing whether the database committed. The finalizer
   keeps tracking that irreversible commit worker, and application shutdown
   drains its session/connection cleanup before database disposal. Code that
-  owns a `DecisionFinalizer` directly must likewise call `close()` or await
-  `aclose()` before disposing its session-factory engine. `aclose()` defers
-  caller cancellation until accepted workers have released those resources.
-  Every
-  context tool call re-reads domain consent before and after provider work,
+  owns the response only publishes committed success when session cleanup,
+  worker-capacity release, and active-worker removal all finish before the
+  deadline; a later completion remains HTTP 202 and is recovered by request ID.
+  Code that owns a `DecisionFinalizer` directly must likewise call `close()` or
+  await `aclose()` before disposing its session-factory engine. `aclose()`
+  defers caller cancellation until accepted workers have released those
+  resources. Every context tool call re-reads domain consent before and after
+  provider work,
   including revision changes that briefly disable and re-enable a domain.
   Calendar poll, sleep scheduler, and sleep web paths cache backends only for
   the current credential generation under the shared connection fence, so a
