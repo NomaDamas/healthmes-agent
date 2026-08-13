@@ -829,10 +829,12 @@ def test_payload_work_past_deadline_never_reaches_commit(
         slow_payload,
     )
 
-    result = _finalizer(
+    finalizer = _finalizer(
         tracked_factory,
         timeout_seconds=0.05,
-    ).finalize(request, _run(request, [ref]))
+    )
+    result = finalizer.finalize(request, _run(request, [ref]))
+    finalizer.close()
 
     assert result.status is DecisionStatus.FAILED
     assert result.persistence_status is PersistenceStatus.FAILED
@@ -858,10 +860,12 @@ def test_flush_work_past_deadline_is_rolled_back_before_commit(
         expire_on_commit=False,
     )
 
-    result = _finalizer(
+    finalizer = _finalizer(
         slow_factory,
         timeout_seconds=0.05,
-    ).finalize(request, _run(request, [ref]))
+    )
+    result = finalizer.finalize(request, _run(request, [ref]))
+    finalizer.close()
 
     assert result.status is DecisionStatus.FAILED
     assert result.persistence_status is PersistenceStatus.FAILED
@@ -871,6 +875,84 @@ def test_flush_work_past_deadline_is_rolled_back_before_commit(
         assert session.scalar(
             sa.select(sa.func.count()).select_from(DecisionRecord)
         ) == 0
+
+
+@pytest.mark.asyncio
+async def test_aclose_drains_timed_out_worker_before_static_pool_dispose(
+    persistence,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    flush_started = threading.Event()
+    release_flush = threading.Event()
+    session_closed = threading.Event()
+
+    class BlockingFlushSession(Session):
+        def flush(self, objects=None) -> None:
+            if any(
+                isinstance(item, DecisionRecord)
+                for item in self.new
+            ):
+                flush_started.set()
+                if not release_flush.wait(timeout=5):
+                    raise TimeoutError("test flush was not released")
+            super().flush(objects)
+
+        def close(self) -> None:
+            try:
+                super().close()
+            finally:
+                session_closed.set()
+
+    slow_factory = sessionmaker(
+        bind=_engine,
+        class_=BlockingFlushSession,
+        expire_on_commit=False,
+    )
+    finalizer = _finalizer(
+        slow_factory,
+        timeout_seconds=0.05,
+    )
+
+    result = await finalizer.afinalize(
+        request,
+        _run(request, [ref]),
+    )
+    assert flush_started.is_set()
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+    assert result.limitations == ["decision_finalization_timeout"]
+
+    closing = asyncio.create_task(finalizer.aclose())
+    await asyncio.sleep(0.02)
+    assert closing.done() is False
+
+    release_flush.set()
+    await asyncio.wait_for(closing, timeout=1)
+    assert session_closed.is_set()
+
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_finalizer_sync_close_is_rejected_inside_event_loop(
+    persistence,
+):
+    _engine, factory = persistence
+    finalizer = _finalizer(factory)
+
+    with pytest.raises(
+        RuntimeError,
+        match="await aclose",
+    ):
+        finalizer.close()
+
+    await finalizer.aclose()
 
 
 def test_slow_session_commit_after_timeout_cannot_create_late_record(
@@ -1604,17 +1686,19 @@ def test_finalization_process_lock_timeout_is_auditable(tmp_path):
 
     holder = threading.Thread(target=hold_lock)
     holder.start()
+    finalizer = _finalizer(
+        factory,
+        timeout_seconds=0.1,
+    )
     try:
         assert acquired.wait(timeout=5)
         started = time.monotonic()
-        result = _finalizer(
-            factory,
-            timeout_seconds=0.1,
-        ).finalize(request, run)
+        result = finalizer.finalize(request, run)
         assert 0.05 <= time.monotonic() - started < 1
         assert result.status is DecisionStatus.FAILED
         assert result.persistence_status is PersistenceStatus.FAILED
         assert result.limitations == ["decision_finalization_timeout"]
+        finalizer.close()
         with factory() as session:
             assert session.scalar(
                 sa.select(sa.func.count()).select_from(DecisionRecord)
@@ -1641,22 +1725,24 @@ def test_finalization_sqlite_database_lock_timeout_is_auditable(
         ref = _source_ref(_event(session))
     request = _request()
     run = _run(request, [ref])
+    finalizer = _finalizer(
+        factory,
+        timeout_seconds=0.1,
+    )
 
     with factory() as blocker:
         # Simulate an external SQLite writer that does not participate in the
         # HealthMes process/file-lock protocol.
         blocker.execute(sa.text("BEGIN IMMEDIATE"))
         started = time.monotonic()
-        result = _finalizer(
-            factory,
-            timeout_seconds=0.1,
-        ).finalize(request, run)
+        result = finalizer.finalize(request, run)
         assert 0.05 <= time.monotonic() - started < 1
         assert result.status is DecisionStatus.FAILED
         assert result.persistence_status is PersistenceStatus.FAILED
         assert result.limitations == ["decision_finalization_timeout"]
         blocker.rollback()
 
+    finalizer.close()
     with engine.connect() as connection:
         assert connection.exec_driver_sql(
             "PRAGMA busy_timeout"

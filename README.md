@@ -134,7 +134,9 @@ Telegram (phone + watch)          decision viewer (web)
   returns HTTP 202 with `persistence_status=unknown` and a request-ID recovery
   location rather than guessing whether the database committed. The finalizer
   keeps tracking that irreversible commit worker, and application shutdown
-  drains its session/connection cleanup before database disposal. Every
+  drains its session/connection cleanup before database disposal. Code that
+  owns a `DecisionFinalizer` directly must likewise call `close()` or await
+  `aclose()` before disposing its session-factory engine. Every
   context tool call re-reads domain consent before and after provider work,
   including revision changes that briefly disable and re-enable a domain.
   Calendar poll, sleep scheduler, and sleep web paths cache backends only for

@@ -416,10 +416,10 @@ class DecisionFinalizer:
                     code=_PERSISTENCE_FAILURE,
                     persistence_required=_run_requires_persistence(run),
                 )
+            control.publish(result)
+            self._worker_slots.release()
             with self._workers_lock:
                 self._active_controls.discard(control)
-            self._worker_slots.release()
-            control.publish(result)
 
         thread = threading.Thread(
             target=worker,
@@ -429,9 +429,6 @@ class DecisionFinalizer:
         try:
             thread.start()
         except BaseException:
-            with self._workers_lock:
-                self._active_controls.discard(control)
-            self._worker_slots.release()
             control.publish(
                 _failure_result(
                     run,
@@ -439,6 +436,9 @@ class DecisionFinalizer:
                     persistence_required=_run_requires_persistence(run),
                 )
             )
+            self._worker_slots.release()
+            with self._workers_lock:
+                self._active_controls.discard(control)
         return control
 
     def begin_shutdown(self) -> None:
@@ -464,6 +464,25 @@ class DecisionFinalizer:
                 if not self._active_controls:
                     return
             await asyncio.sleep(0.01)
+
+    async def aclose(self) -> None:
+        """Seal admission and drain workers before the database is disposed."""
+
+        self.begin_shutdown()
+        await self.adrain()
+
+    def close(self) -> None:
+        """Synchronously close when no event loop is running."""
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self.aclose())
+            return
+        raise RuntimeError(
+            "DecisionFinalizer.close() cannot run inside an active "
+            "event loop; await aclose() instead"
+        )
 
     def abort_active(self) -> None:
         """Fence every in-flight pre-commit worker during bounded shutdown."""

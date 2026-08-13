@@ -232,16 +232,24 @@ class HealthMesDecisionEngine:
                             "task(s) pending after the bounded grace period",
                             len(still_pending),
                         )
-            begin_finalizer_shutdown = getattr(
-                self._finalizer,
-                "begin_shutdown",
-                None,
-            )
-            if callable(begin_finalizer_shutdown):
-                begin_finalizer_shutdown()
-            drain_finalizer = getattr(self._finalizer, "adrain", None)
-            if callable(drain_finalizer):
-                await drain_finalizer()
+            close_finalizer = getattr(self._finalizer, "aclose", None)
+            if callable(close_finalizer):
+                await close_finalizer()
+            else:
+                begin_finalizer_shutdown = getattr(
+                    self._finalizer,
+                    "begin_shutdown",
+                    None,
+                )
+                if callable(begin_finalizer_shutdown):
+                    begin_finalizer_shutdown()
+                drain_finalizer = getattr(
+                    self._finalizer,
+                    "adrain",
+                    None,
+                )
+                if callable(drain_finalizer):
+                    await drain_finalizer()
         finally:
             try:
                 self._agent.close()

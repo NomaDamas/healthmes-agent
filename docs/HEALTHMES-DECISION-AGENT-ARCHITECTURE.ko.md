@@ -208,6 +208,11 @@ agent worker 생성 뒤 실패하면 worker도 즉시 회수한다.
 driver는 HTTP 응답 deadline보다 프로세스 종료를 더 오래 지연시킬 수 있다. 종료
 timeout으로 아직 agent 단계에 있는 요청을 취소할 때는 finalizer admission을 먼저
 봉쇄하므로, 취소를 늦게 관찰한 요청이 DB teardown 직전에 새 worker를 만들 수 없다.
+`DecisionFinalizer`를 엔진 밖에서 직접 소유하는 adapter나 테스트도 같은 규칙을
+지켜야 한다. 동기 owner는 `finalizer.close()`, async owner는
+`await finalizer.aclose()`를 호출한 뒤 session factory의 engine을 dispose한다.
+deadline 결과를 받았다는 사실만으로 background worker의 connection cleanup까지
+끝났다고 가정하면 안 된다.
 
 finalization 자체도 무기한 기다리지 않는다.
 
@@ -946,3 +951,5 @@ Hermes가 이미 provider, tool loop, session과 channel을 제공하므로 MVP�
     시작 후 timeout은 `UNKNOWN`으로 반환한 뒤 request ID 조회로만 결과를 복구한다.
 16. `UNKNOWN` 응답 뒤에도 commit worker를 추적하며, app shutdown은 worker와 DB
     connection cleanup을 drain한 뒤에만 저장소를 dispose한다.
+17. 엔진 밖에서 `DecisionFinalizer`를 직접 소유하는 호출자도 `close()` 또는
+    `aclose()`로 worker를 drain한 뒤 저장소를 dispose한다.
