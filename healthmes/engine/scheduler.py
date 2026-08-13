@@ -45,7 +45,6 @@ __all__ = [
     "STORAGE_MAINTENANCE_JOB_ID",
     "CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID",
     "SLEEP_RECONCILIATION_JOB_ID",
-    "PLANNER_JOB_ID",
     "create_scheduler",
     "register_energy_job",
     "register_backup_job",
@@ -53,7 +52,6 @@ __all__ = [
     "register_calendar_job",
     "register_calendar_adjustment_maintenance_job",
     "register_sleep_reconciliation_job",
-    "register_planner_job",
     "start_scheduler",
     "shutdown_scheduler",
 ]
@@ -66,7 +64,6 @@ BACKUP_JOB_ID = "healthmes-weekly-backup"
 STORAGE_MAINTENANCE_JOB_ID = "healthmes-storage-maintenance"
 CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID = "healthmes-calendar-adjustment-maintenance"
 SLEEP_RECONCILIATION_JOB_ID = "healthmes-sleep-reconciliation"
-PLANNER_JOB_ID = "healthmes-deterministic-planner"
 
 # One misfired run is coalesced and allowed to start this late (seconds);
 # with max_instances=1 a slow sweep can never pile up behind itself.
@@ -236,25 +233,6 @@ def register_sleep_reconciliation_job(
         trigger=IntervalTrigger(minutes=minutes),
         id=SLEEP_RECONCILIATION_JOB_ID,
         name="HealthMes actual sleep reconciliation",
-        replace_existing=True,
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=_MISFIRE_GRACE_SECONDS,
-    )
-
-
-def register_planner_job(
-    scheduler: BackgroundScheduler,
-    job: Callable[[], None],
-    *,
-    minutes: int = 10,
-) -> Job:
-    _remove_job_if_present(scheduler, PLANNER_JOB_ID)
-    return scheduler.add_job(
-        job,
-        trigger=IntervalTrigger(minutes=minutes),
-        id=PLANNER_JOB_ID,
-        name="HealthMes deterministic schedule planner",
         replace_existing=True,
         coalesce=True,
         max_instances=1,

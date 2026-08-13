@@ -38,16 +38,31 @@ class TestLocalTimezoneResolution:
         server_module.set_timezone("Asia/Seoul")
         assert str(server_module._local_timezone()) == "Asia/Seoul"
 
+    def test_set_timezone_accepts_a_fixed_offset_name(self):
+        server_module.set_timezone("UTC+09:00")
+        assert str(server_module._local_timezone()) == "UTC+09:00"
+
     def test_settings_field_is_consulted(self):
         server_module.set_settings(_StubSettings("Asia/Seoul"))  # type: ignore[arg-type]
         resolved = server_module._local_timezone()
         assert isinstance(resolved, zoneinfo.ZoneInfo)
         assert str(resolved) == "Asia/Seoul"
 
+    def test_fixed_offset_settings_field_is_consulted(self):
+        server_module.set_settings(_StubSettings("UTC+09:00"))  # type: ignore[arg-type]
+        resolved = server_module._local_timezone()
+        assert str(resolved) == "UTC+09:00"
+        assert resolved.utcoffset(None) == dt.timedelta(hours=9)
+
     def test_env_var_fallback(self, monkeypatch):
         server_module.set_settings(_StubSettings(None))  # type: ignore[arg-type]
         monkeypatch.setenv("HEALTHMES_TIMEZONE", "Asia/Seoul")
         assert str(server_module._local_timezone()) == "Asia/Seoul"
+
+    def test_fixed_offset_env_var_fallback(self, monkeypatch):
+        server_module.set_settings(_StubSettings(None))  # type: ignore[arg-type]
+        monkeypatch.setenv("HEALTHMES_TIMEZONE", "UTC+09:00")
+        assert str(server_module._local_timezone()) == "UTC+09:00"
 
     def test_invalid_name_fails_loudly_never_silent_utc(self):
         server_module.set_settings(_StubSettings("Mars/Olympus_Mons"))  # type: ignore[arg-type]
@@ -108,4 +123,3 @@ class TestSystemTimezone:
 
         monkeypatch.setattr(config, "Path", _BoomPath)
         assert system_timezone() == dt.UTC
-

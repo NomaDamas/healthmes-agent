@@ -7,7 +7,6 @@ docker-mode defaults. Everything runs against tmp paths — the developer's
 real ~/.hermes is never touched.
 """
 
-import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -23,7 +22,6 @@ EXPECTED_SKILLS = (
     "healthmes-planner",
     "healthmes-sleep",
     "healthmes-stress",
-    "healthmes-wellness-visualizer",
 )
 
 pytestmark = pytest.mark.usefixtures("clean_env")
@@ -48,7 +46,9 @@ def hermes_home(tmp_path: Path) -> Path:
 
 
 def run_bootstrap(bootstrap, hermes_home: Path, env_file: Path, *extra: str) -> int:
-    return bootstrap.main(["--hermes-home", str(hermes_home), "--env-file", str(env_file), *extra])
+    return bootstrap.main(
+        ["--hermes-home", str(hermes_home), "--env-file", str(env_file), *extra]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -97,19 +97,15 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     # scheduler's only allowed script location ($HERMES_HOME/scripts/).
     installed_script = hermes_home / "scripts" / "healthmes_briefing_snapshot.py"
     assert installed_script.is_file()
-    assert (
-        installed_script.read_text()
-        == (REPO_ROOT / "scripts" / "healthmes_briefing_snapshot.py").read_text()
-    )
+    assert installed_script.read_text() == (
+        REPO_ROOT / "scripts" / "healthmes_briefing_snapshot.py"
+    ).read_text()
     sidecar = yaml.safe_load((hermes_home / "scripts" / "healthmes_snapshot.json").read_text())
-    assert sidecar == {
-        "base_url": "http://localhost:8100",
-        "api_token": env_values["HEALTHMES_API_TOKEN"],
-    }
+    assert sidecar == {"base_url": "http://localhost:8100"}  # native default
 
-    assert servers["healthmes"]["headers"] == {
-        "Authorization": f"Bearer {env_values['HEALTHMES_API_TOKEN']}"
-    }
+    # No api token configured: the MCP registration carries no auth header
+    # and the sidecar carries no token key.
+    assert "headers" not in servers["healthmes"]
 
     # 4. Cron briefings registered in the vendor jobs.json envelope.
     jobs_doc = yaml.safe_load((hermes_home / "cron" / "jobs.json").read_text())
@@ -148,7 +144,9 @@ def test_second_run_is_idempotent(bootstrap, hermes_home, env_file):
     assert (hermes_home / "config.yaml").read_text() == config_before
     jobs_after = yaml.safe_load((hermes_home / "cron" / "jobs.json").read_text())
     assert len(jobs_after["jobs"]) == 3
-    assert [j["id"] for j in jobs_after["jobs"]] == [j["id"] for j in jobs_before["jobs"]]
+    assert [j["id"] for j in jobs_after["jobs"]] == [
+        j["id"] for j in jobs_before["jobs"]
+    ]
     assert env_file.read_text() == env_before
 
 
@@ -317,53 +315,11 @@ def test_missing_env_file_is_created_for_secret(bootstrap, hermes_home, tmp_path
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
     assert env_file.is_file()
     assert bootstrap.load_env_file(env_file)["HEALTHMES_HERMES_WEBHOOK_SECRET"]
-    assert os.stat(env_file).st_mode & 0o777 == 0o600
 
 
-def test_env_replace_failure_cleans_private_temporary(
-    bootstrap,
-    tmp_path,
-    monkeypatch,
-) -> None:
-    env_file = tmp_path / ".env"
-    env_file.write_text("EXISTING=value\n", encoding="utf-8")
-
-    def failing_replace(source, destination):
-        assert os.stat(source).st_mode & 0o777 == 0o600
-        assert destination == env_file
-        raise OSError("replace failed")
-
-    monkeypatch.setattr(bootstrap.os, "replace", failing_replace)
-
-    with pytest.raises(OSError, match="replace failed"):
-        bootstrap.upsert_env_var(env_file, "SECRET", "private")
-
-    assert env_file.read_text(encoding="utf-8") == "EXISTING=value\n"
-    assert list(tmp_path.glob(".*.tmp")) == []
-
-
-def test_env_fsync_failure_cleans_private_temporary(
-    bootstrap,
-    tmp_path,
-    monkeypatch,
-) -> None:
-    env_file = tmp_path / ".env"
-    env_file.write_text("EXISTING=value\n", encoding="utf-8")
-
-    def failing_fsync(fd):
-        assert os.fstat(fd).st_mode & 0o777 == 0o600
-        raise OSError("fsync failed")
-
-    monkeypatch.setattr(bootstrap.os, "fsync", failing_fsync)
-
-    with pytest.raises(OSError, match="fsync failed"):
-        bootstrap.upsert_env_var(env_file, "SECRET", "private")
-
-    assert env_file.read_text(encoding="utf-8") == "EXISTING=value\n"
-    assert list(tmp_path.glob(".*.tmp")) == []
-
-
-def test_adjustment_secret_is_generated_separately_and_preserved(bootstrap, hermes_home, env_file):
+def test_adjustment_secret_is_generated_separately_and_preserved(
+    bootstrap, hermes_home, env_file
+):
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
     first = bootstrap.load_env_file(env_file)
     adjustment_secret = first["HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"]
@@ -442,11 +398,7 @@ def test_docker_mode_defaults(bootstrap, hermes_home, env_file):
     # script itself stays byte-identical to the repo copy (URL via sidecar,
     # never hardcoded — the hard localhost-default rule).
     sidecar = yaml.safe_load((hermes_home / "scripts" / "healthmes_snapshot.json").read_text())
-    env_values = bootstrap.load_env_file(env_file)
-    assert sidecar == {
-        "base_url": "http://healthmes:8100",
-        "api_token": env_values["HEALTHMES_API_TOKEN"],
-    }
+    assert sidecar == {"base_url": "http://healthmes:8100"}
 
 
 def test_env_overrides_beat_mode_defaults(bootstrap, hermes_home, env_file, monkeypatch):
@@ -466,18 +418,19 @@ def test_api_token_flows_into_mcp_headers_and_sidecar(
     rendered MCP registration carries the bearer header (mcp_tool.py url
     transports support `headers:`) and the briefing snapshot sidecar carries
     the token for its REST fetches."""
-    token = "g" * 32
-    monkeypatch.setenv("HEALTHMES_API_TOKEN", token)
+    monkeypatch.setenv("HEALTHMES_API_TOKEN", "glue-token")
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
 
     config = yaml.safe_load((hermes_home / "config.yaml").read_text())
     healthmes = config["mcp_servers"]["healthmes"]
-    assert healthmes["headers"] == {"Authorization": f"Bearer {token}"}
+    assert healthmes["headers"] == {"Authorization": "Bearer glue-token"}
 
-    sidecar = yaml.safe_load((hermes_home / "scripts" / "healthmes_snapshot.json").read_text())
+    sidecar = yaml.safe_load(
+        (hermes_home / "scripts" / "healthmes_snapshot.json").read_text()
+    )
     assert sidecar == {
         "base_url": "http://localhost:8100",
-        "api_token": token,
+        "api_token": "glue-token",
     }
 
 
@@ -492,14 +445,19 @@ def test_repo_skills_are_discovered(bootstrap):
 
 
 def test_planner_skill_documents_morning_nudge_trust_boundary():
-    skill = (REPO_ROOT / "skills" / "healthmes-planner" / "SKILL.md").read_text(encoding="utf-8")
+    skill = (REPO_ROOT / "skills" / "healthmes-planner" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
     normalized = " ".join(skill.split())
 
     assert "External (user-created) events never move" in normalized
     assert "user-confirmed Google `SHORTEN`" in normalized
     assert "eligible external event through `resolve_calendar_adjustment`" in normalized
     assert "one eligible Google event may be shortened" in normalized
-    assert "mcp__healthmes__evaluate_morning_calendar_nudge` exactly once" in normalized
+    assert (
+        "mcp__healthmes__evaluate_morning_calendar_nudge` exactly once"
+        in normalized
+    )
     assert "`적용 <handle>` / `그대로 <handle>`" in normalized
     assert "do not call `clarify`, and do not wait for a reply" in normalized
     assert "Only live Telegram replies may call" in normalized
@@ -507,11 +465,16 @@ def test_planner_skill_documents_morning_nudge_trust_boundary():
     assert "exact combined reply as `response`" in normalized
     assert "unchanged `<handle>` as `reply_handle`" in normalized
     assert "Do not pass a proposal id or response channel" in normalized
-    assert "Do not rewrite, shorten, translate, log, or expose the handle" in normalized
+    assert (
+        "Do not rewrite, shorten, translate, log, or expose the handle"
+        in normalized
+    )
 
 
 def test_sleep_skill_documents_open_wearables_exclusive_end_date():
-    skill = (REPO_ROOT / "skills" / "healthmes-sleep" / "SKILL.md").read_text(encoding="utf-8")
+    skill = (REPO_ROOT / "skills" / "healthmes-sleep" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
     normalized = " ".join(skill.split())
 
     assert "The Open Wearables `end_date` is exclusive" in normalized
@@ -606,7 +569,9 @@ def test_hermes_now_honors_config_timezone_key(bootstrap, tmp_path, monkeypatch)
     assert now.utcoffset() == timedelta(hours=5, minutes=30)  # fixed +05:30
 
 
-def test_hermes_now_env_beats_config_and_bad_values_fall_back(bootstrap, tmp_path, monkeypatch):
+def test_hermes_now_env_beats_config_and_bad_values_fall_back(
+    bootstrap, tmp_path, monkeypatch
+):
     (tmp_path / "config.yaml").write_text("timezone: Asia/Kolkata\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_TIMEZONE", "Asia/Seoul")
     assert bootstrap._hermes_now(tmp_path).utcoffset() == timedelta(hours=9)
@@ -652,10 +617,16 @@ def test_payload_fallback_jobs_use_hermes_timezone(
 def test_next_cron_run_daily_and_weekly(bootstrap):
     # 2026-07-08 is a Wednesday.
     now = datetime(2026, 7, 8, 8, 0, tzinfo=UTC)
-    assert bootstrap._next_cron_run("0 7 * * *", now) == datetime(2026, 7, 9, 7, 0, tzinfo=UTC)
-    assert bootstrap._next_cron_run("30 21 * * *", now) == datetime(2026, 7, 8, 21, 30, tzinfo=UTC)
+    assert bootstrap._next_cron_run("0 7 * * *", now) == datetime(
+        2026, 7, 9, 7, 0, tzinfo=UTC
+    )
+    assert bootstrap._next_cron_run("30 21 * * *", now) == datetime(
+        2026, 7, 8, 21, 30, tzinfo=UTC
+    )
     # cron weekday 0 = Sunday -> 2026-07-12.
-    assert bootstrap._next_cron_run("0 18 * * 0", now) == datetime(2026, 7, 12, 18, 0, tzinfo=UTC)
+    assert bootstrap._next_cron_run("0 18 * * 0", now) == datetime(
+        2026, 7, 12, 18, 0, tzinfo=UTC
+    )
     # A weekly schedule whose slot already passed today rolls a full week.
     sunday_evening = datetime(2026, 7, 12, 19, 0, tzinfo=UTC)
     assert bootstrap._next_cron_run("0 18 * * 0", sunday_evening) == datetime(

@@ -13,7 +13,13 @@ only relative paths are stored here (``media_path`` columns).
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import ForeignKey, Index, UniqueConstraint, false
+from sqlalchemy import (
+    BigInteger,
+    ForeignKey,
+    Index,
+    UniqueConstraint,
+    false,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from healthmes.store.base import Base, JSONDict, str_32, str_64, str_255, string_enum
@@ -34,6 +40,7 @@ __all__ = [
     "CalendarEventMirror",
     "ScheduleProposal",
     "CalendarMutationProposal",
+    "FoodLog",
     "AppUsageSample",
     "CognitiveEnergyEstimate",
     "DecisionRecord",
@@ -237,6 +244,18 @@ class CalendarMutationProposal(Base):
     receipt: Mapped[JSONDict | None]
 
 
+class FoodLog(Base):
+    """A captured meal/snack with an LLM-generated description (docs/PLAN.md §8)."""
+
+    __tablename__ = "food_log"
+
+    logged_at: Mapped[datetime] = mapped_column(index=True)
+    description: Mapped[str]
+    media_path: Mapped[str | None]
+    meal_type: Mapped[str_32 | None]
+    source: Mapped[str_32 | None]
+
+
 class AppUsageSample(Base):
     """One app's foreground usage within a time bucket, from a companion device."""
 
@@ -244,18 +263,33 @@ class AppUsageSample(Base):
     __table_args__ = (
         UniqueConstraint(
             "device_id",
+            "collection_generation",
             "bucket_start",
             "app_package",
-            name="uq_app_usage_sample_device_bucket_app",
+            name="uq_app_usage_sample_device_generation_bucket_app",
         ),
     )
 
     device_id: Mapped[str_64]
+    collection_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        server_default="0",
+    )
     bucket_start: Mapped[datetime] = mapped_column(index=True)
     app_package: Mapped[str_255]
     foreground_seconds: Mapped[int] = mapped_column(default=0)
     launches: Mapped[int] = mapped_column(default=0)
     category: Mapped[str_64 | None]
+    bucket_complete: Mapped[bool] = mapped_column(
+        default=False,
+        server_default=false(),
+    )
+    snapshot_sequence: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        server_default="0",
+    )
 
 
 class CognitiveEnergyEstimate(Base):

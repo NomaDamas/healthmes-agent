@@ -202,7 +202,7 @@ def resolve_data_locations(settings: Settings) -> DataLocations:
     - open-wearables database: optional — ``Settings.ow_database_url`` or
       the ``HEALTHMES_OW_DATABASE_URL`` env var (direct postgres URL; the
       REST ``ow_base_url`` cannot produce a dump);
-    - media: always ``{data_dir}/media`` (shared intake-media convention);
+    - media: always ``{data_dir}/media`` (healthmes/api/food.py convention);
     - Hermes state: optional — ``Settings.hermes_home`` or the vendor's own
       ``HERMES_HOME`` env var; only included "when configured" (PLAN §9).
     """

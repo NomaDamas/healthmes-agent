@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.provider.Settings
+import com.healthmes.usagecollector.work.UploadScheduling
 
 /**
  * PACKAGE_USAGE_STATS is "special access": it cannot be requested at runtime,
@@ -41,15 +42,45 @@ object UsageAccess {
         }
     }
 
-    /** Opens the system "Usage access" screen; false if the device has none. */
-    fun openSettings(context: Context): Boolean =
-        try {
+    /**
+     * Opens the system "Usage access" screen after synchronously closing the
+     * current readable window. Returning from settings starts the foreground
+     * guard in a second boundary under the observed grant state.
+     */
+    fun openSettings(context: Context): Boolean {
+        val prefs = CollectorPrefs(context)
+        val nowMs = System.currentTimeMillis()
+        val marked = UsageAccessGuardRegistry.withBoundaryFence {
+            prefs.markUsageSettingsOpened(
+                nowMs = nowMs,
+                currentlyGranted = isGranted(context),
+            )
+        }
+        if (!marked) {
+            UsageAccessGuardService.stop(context)
+            prefs.lastResult =
+                "Usage access settings blocked: privacy boundary could not be saved."
+            UploadScheduling.disable(context)
+            return false
+        }
+        UsageAccessGuardService.stop(context)
+        return try {
             context.startActivity(
                 Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
             true
         } catch (_: ActivityNotFoundException) {
+            val observation = prefs.observeUsageAccess(
+                granted = isGranted(context),
+                nowMs = System.currentTimeMillis(),
+            )
+            if (!observation.persisted) {
+                UploadScheduling.disable(context)
+            } else if (prefs.collectionEnabled) {
+                UsageAccessGuardService.start(context)
+            }
             false
         }
+    }
 }

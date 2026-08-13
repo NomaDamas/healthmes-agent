@@ -14,9 +14,9 @@ dockerized postgres):
 
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import event, pool
 
+from alembic import context
 from healthmes.config import get_settings
 from healthmes.store import models  # noqa: F401  (register all tables on Base.metadata)
 from healthmes.store.base import Base

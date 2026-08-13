@@ -1,9 +1,7 @@
-import anyio.to_thread
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from healthmes.api.auth import viewer_token
-from healthmes.api.calendar_runtime import refresh_calendar_jobs
 from healthmes.api.connection_status import (
     ConnectionCard,
     build_connection_cards,
@@ -15,11 +13,7 @@ from healthmes.api.local_session import (
     is_loopback_scope,
     issue_local_session,
     local_browser_url,
-    require_local_session,
 )
-from healthmes.api.sleep import _form
-from healthmes.calendars import creds
-from healthmes.calendars.base import CalendarError
 from healthmes.config import Settings
 
 __all__ = ["router", "build_connection_cards", "build_oura_card", "ConnectionCard"]
@@ -75,50 +69,7 @@ async def connect_status_page(request: Request, response: Response) -> HTMLRespo
             else ""
         ),
         google_result=request.query_params.get("google", ""),
-        icloud_result=request.query_params.get("icloud", ""),
         active_nav="connect",
         **shell_context(settings),
     )
     return HTMLResponse(html, headers=response.headers)
-
-
-@router.post("/connect/icloud")
-async def connect_icloud(request: Request) -> RedirectResponse:
-    form = await _form(request)
-    require_local_session(request, csrf_token=form.get("csrf", ""))
-    username = form.get("username", "").strip()
-    app_password = form.get("app_password", "")
-    settings: Settings = request.app.state.settings
-    if not username or not app_password:
-        return RedirectResponse("/connect?icloud=missing", status_code=303)
-    try:
-        await anyio.to_thread.run_sync(
-            lambda: creds.validate_caldav_connection(
-                username=username,
-                app_password=app_password,
-                url=settings.caldav_url,
-            )
-        )
-        creds.save_caldav_credentials(
-            settings.data_dir,
-            username=username,
-            app_password=app_password,
-            url=settings.caldav_url,
-        )
-        refresh_calendar_jobs(request.app)
-    except CalendarError:
-        return RedirectResponse("/connect?icloud=failed", status_code=303)
-    return RedirectResponse("/connect?icloud=connected", status_code=303)
-
-
-@router.post("/connect/icloud/disconnect")
-async def disconnect_icloud(request: Request) -> RedirectResponse:
-    form = await _form(request)
-    require_local_session(request, csrf_token=form.get("csrf", ""))
-    settings: Settings = request.app.state.settings
-    resolved = creds.resolve_caldav_credentials(settings)
-    if resolved is not None and resolved.source == "env":
-        return RedirectResponse("/connect?icloud=managed_by_env", status_code=303)
-    creds.delete_caldav_credentials(settings.data_dir)
-    refresh_calendar_jobs(request.app)
-    return RedirectResponse("/connect?icloud=disconnected", status_code=303)

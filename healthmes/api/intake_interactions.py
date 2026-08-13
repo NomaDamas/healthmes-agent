@@ -5,7 +5,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Self
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Request, status
 from pydantic import AwareDatetime, BaseModel, Field, model_validator
@@ -60,6 +59,7 @@ from healthmes.nutrition.vision import (
     create_vision_provider,
 )
 from healthmes.store.session import SessionDep
+from healthmes.timezones import parse_timezone
 
 router = APIRouter(prefix="/v1/intake-interactions", tags=["nutrition"])
 MAX_CAPTURE_CLOCK_SKEW = timedelta(minutes=5)
@@ -162,9 +162,11 @@ class CreateInteractionInput(BaseModel):
         if self.observed_at is None or self.timezone is None:
             raise ValueError("text and voice require observed_at and timezone")
         try:
-            timezone = ZoneInfo(self.timezone)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError("timezone must be a valid IANA timezone") from exc
+            timezone = parse_timezone(self.timezone)
+        except ValueError as exc:
+            raise ValueError(
+                "timezone must be a valid IANA or UTC fixed-offset timezone"
+            ) from exc
         if self.observed_at.utcoffset() != self.observed_at.astimezone(timezone).utcoffset():
             raise ValueError("observed_at offset conflicts with timezone")
         if self.observed_at.astimezone(UTC) > datetime.now(UTC) + MAX_CAPTURE_CLOCK_SKEW:
@@ -193,9 +195,11 @@ class AnalyzeInteractionInput(BaseModel):
                 "automatic interaction analysis supports text or voice"
             )
         try:
-            timezone = ZoneInfo(self.timezone)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError("timezone must be a valid IANA timezone") from exc
+            timezone = parse_timezone(self.timezone)
+        except ValueError as exc:
+            raise ValueError(
+                "timezone must be a valid IANA or UTC fixed-offset timezone"
+            ) from exc
         if (
             self.observed_at.utcoffset()
             != self.observed_at.astimezone(timezone).utcoffset()
@@ -223,10 +227,7 @@ class OutcomeInput(BaseModel):
     status: IntakeOutcomeStatus
     source: str = Field(min_length=1, max_length=64)
     consumed_at: AwareDatetime | None = None
-    corrected_items: list[IntakeItemInput] | None = Field(
-        default=None,
-        max_length=50,
-    )
+    corrected_items: list[IntakeItemInput] = Field(default_factory=list, max_length=50)
     note: str | None = Field(default=None, max_length=2000)
 
 
@@ -460,10 +461,7 @@ def confirm_intake_outcome(
             if body.consumed_at is not None
             else None
         ),
-        corrected_items=tuple(
-            item.to_domain() for item in (body.corrected_items or ())
-        ),
-        items_corrected=body.corrected_items is not None,
+        corrected_items=tuple(item.to_domain() for item in body.corrected_items),
         note=body.note,
     )
     try:

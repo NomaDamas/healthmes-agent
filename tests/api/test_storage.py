@@ -1,13 +1,23 @@
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import SecretStr
 from sqlalchemy import select
 
-from healthmes.api.auth import viewer_token
-from healthmes.app import create_app
-from healthmes.storage import register_storage_object, run_storage_maintenance
+from healthmes.activity.contracts import (
+    ActivityBatchIn,
+    ActivityCapability,
+    ActivityPlatform,
+    AppIntervalRecord,
+)
+from healthmes.activity.repository import DAY_SUMMARY_EVENT
+from healthmes.activity.service import ingest_activity_batch
+from healthmes.storage import (
+    register_storage_object,
+    run_storage_maintenance,
+    update_retention_policy,
+)
 from healthmes.store import (
     PurgeJob,
     RetentionPolicy,
@@ -33,6 +43,9 @@ def test_storage_settings_bootstraps_defaults_and_measures_files(
     assert policies["raw_payload"] == "14d"
     assert policies["media"] == "7d"
     assert policies["aggregate"] == "forever"
+    assert policies["activity_raw"] == "14d"
+    assert policies["activity_hourly"] == "90d"
+    assert policies["activity_daily"] == "forever"
     assert body["backup"]["provider"] == "local"
     assert body["backup"]["snapshot_count"] == 0
 
@@ -50,6 +63,80 @@ def test_retention_update_is_persisted(client: TestClient, session) -> None:
     )
     assert policy is not None
     assert policy.retention_days == 1
+
+
+def test_daily_retention_update_immediately_refreshes_rest_baseline(
+    client: TestClient,
+    session,
+    monkeypatch,
+) -> None:
+    current = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    for day in range(1, 5):
+        start = datetime(2026, 8, day, 0, tzinfo=UTC)
+        ingest_activity_batch(
+            session,
+            ActivityBatchIn(
+                source_provider="retention-rest-test",
+                source_device="desktop-retention-rest",
+                platform=ActivityPlatform.MACOS,
+                capability=ActivityCapability.DETAILED,
+                timezone="UTC",
+                records=[
+                    AppIntervalRecord(
+                        source_record_id=f"retention-rest-{day}",
+                        start_at=start,
+                        end_at=start + timedelta(hours=12),
+                        state="active",
+                        app_id="editor",
+                    )
+                ],
+            ),
+            now=start + timedelta(hours=13),
+        )
+    session.commit()
+
+    target = next(
+        row
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT
+            )
+        )
+        if row.payload.get("date") == "2026-08-04"
+    )
+    assert target.payload["seven_day_baseline_delta"]["status"] == "ok"
+    monkeypatch.setattr(
+        "healthmes.storage.service._now",
+        lambda: current,
+    )
+
+    updated = client.put(
+        "/v1/storage/settings/activity_daily",
+        json={"preset": "7d"},
+    )
+    summary = client.get(
+        "/v1/activity/summary",
+        params={"date": "2026-08-04", "timezone": "UTC"},
+    )
+
+    assert updated.status_code == 200
+    assert summary.status_code == 200
+    assert summary.json()["seven_day_baseline_delta"] == {
+        "status": "insufficient_data",
+        "days_with_data": 0,
+        "required_days": 3,
+        "lookback_days": 7,
+    }
+    session.expire_all()
+    remaining_days = {
+        row.payload.get("date")
+        for row in session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == DAY_SUMMARY_EVENT
+            )
+        )
+    }
+    assert remaining_days == {"2026-08-04"}
 
 
 def test_retention_update_uses_the_original_object_observation_time(
@@ -112,9 +199,15 @@ def test_wellness_event_contract_sets_expiry_and_is_idempotent(
         ("subjective_energy", "nutrition-outcome-raw"),
         ("subjective_energy", "nutrition-future-internal"),
         ("nutrition.interaction.v1", "manual"),
+        ("activity.app-hour.v1", "manual"),
+        ("subjective_energy", "activitywatch"),
+        ("subjective_energy", "healthmes-activity-aggregator"),
+        ("subjective_energy", "ActivityWatch"),
+        ("subjective_energy", "HEALTHMES-ACTIVITY-AGGREGATOR"),
+        ("subjective_energy", "healthmes-activity-deletion"),
     ),
 )
-def test_generic_wellness_api_rejects_internal_nutrition_namespaces(
+def test_generic_wellness_api_rejects_internal_domain_namespaces(
     client: TestClient,
     session,
     event_type: str,
@@ -177,55 +270,30 @@ def test_maintenance_dry_run_then_deletes_expired_object(
     assert len(list(session.scalars(select(PurgeJob)))) == 2
 
 
-def test_legacy_nutrition_migration_handles_shared_media(
-    session, settings
+def test_retention_and_maintenance_enter_the_activity_write_lock(
+    session,
+    settings,
+    monkeypatch,
 ) -> None:
-    observed = datetime(2026, 8, 7, 9, tzinfo=UTC)
-    media = register_storage_object(
-        session,
-        settings,
-        relative_path="media/shared.jpg",
-        data_class="nutrition_media",
-        content_type="image/jpeg",
-        size_bytes=12,
-        observed_at=observed,
-    )
-    session.add_all(
-        [
-            WellnessEvent(
-                event_type="nutrition.interaction.v1",
-                observed_at=observed,
-                recorded_at=observed,
-                source_provider="nutrition-interaction",
-                source_record_id=f"legacy-{index}",
-                capture_method="photo",
-                payload={
-                    "media_path": media.relative_path,
-                    "source_text": f"shared meal {index}",
-                },
-            )
-            for index in range(2)
-        ]
-    )
-    session.commit()
+    transitions: list[str] = []
 
-    report = run_storage_maintenance(
-        session,
-        settings,
-        now=datetime(2026, 8, 8, 9, tzinfo=UTC),
-    )
-    session.commit()
+    @contextmanager
+    def tracked_lock():
+        transitions.append("enter")
+        try:
+            yield
+        finally:
+            transitions.append("exit")
 
-    assert report.errors == ()
-    migrated = list(
-        session.scalars(
-            select(WellnessEvent).where(
-                WellnessEvent.event_type == "nutrition.raw-capture.v1"
-            )
-        )
+    monkeypatch.setattr(
+        "healthmes.storage.service.activity_write_lock",
+        tracked_lock,
     )
-    assert len(migrated) == 2
-    assert sum(event.raw_object_id == media.id for event in migrated) == 1
+
+    update_retention_policy(session, "activity_raw", "14d")
+    run_storage_maintenance(session, settings, dry_run=True)
+
+    assert transitions == ["enter", "exit", "enter", "exit"]
 
 
 def test_storage_web_page_renders(client: TestClient) -> None:
@@ -233,61 +301,3 @@ def test_storage_web_page_renders(client: TestClient) -> None:
     assert response.status_code == 200
     assert "저장 관리" in response.text
     assert "데이터별 보존기간" in response.text
-
-
-def test_storage_nav_preserves_reverse_proxy_base_path(settings) -> None:
-    proxied = settings.model_copy(
-        update={"public_base_url": "https://example.test/healthmes"}
-    )
-    with TestClient(create_app(proxied)) as client:
-        response = client.get("/storage")
-
-    assert response.status_code == 200
-    assert 'href="https://example.test/healthmes/storage"' in response.text
-    assert 'action="/storage/policy"' not in response.text
-
-
-def test_storage_supports_viewer_reads_and_local_session_writes(settings) -> None:
-    token = "storage-api-token"
-    secured = settings.model_copy(update={"api_token": SecretStr(token)})
-    application = create_app(secured)
-
-    with TestClient(application) as remote:
-        assert remote.get("/storage").status_code == 401
-        viewer = remote.get(
-            "/storage",
-            params={"token": viewer_token(token)},
-        )
-        assert viewer.status_code == 200
-        assert 'action="/storage/policy"' not in viewer.text
-
-    with TestClient(
-        application,
-        base_url="http://127.0.0.1:8100",
-    ) as local:
-        unlocked = local.post(
-            "/connect/unlock",
-            data={"api_token": token},
-            headers={"Origin": "http://127.0.0.1:8100"},
-            follow_redirects=False,
-        )
-        assert unlocked.status_code == 303
-        session_id = local.cookies.get("healthmes_local_session")
-        assert session_id is not None
-
-        page = local.get("/storage")
-        assert page.status_code == 200
-        assert 'action="/storage/policy"' in page.text
-        csrf = application.state.local_sessions.get(session_id).csrf_token
-        updated = local.post(
-            "/storage/policy",
-            data={
-                "csrf": csrf,
-                "data_class": "raw_payload",
-                "preset": "7d",
-            },
-            headers={"Origin": "http://127.0.0.1:8100"},
-            follow_redirects=False,
-        )
-        assert updated.status_code == 303
-        assert updated.headers["location"] == "/storage"

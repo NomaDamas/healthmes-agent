@@ -87,8 +87,3 @@ select = [
     "I",  # isort
     "UP", # pyupgrade
 ]
-
-[tool.ruff.lint.isort]
-# Keep Alembic classified as a dependency even though this repository also
-# contains an alembic/ migration directory.
-known-third-party = ["alembic"]

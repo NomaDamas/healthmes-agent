@@ -15,7 +15,6 @@ from healthmes.schedule_proposals import (
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
-    DecisionRecord,
     ProposalStatus,
     ScheduleProposal,
     Task,
@@ -69,8 +68,6 @@ def test_list_events_returns_overlapping_range_ordered(client, session):
     assert [e["external_id"] for e in body["data"]] == ["overlaps-start", "inside"]
     assert body["pagination"]["total_count"] == 2
     assert body["data"][0]["calendar_source"] == "caldav"
-    assert body["data"][0]["is_all_day"] is False
-    assert body["data"][0]["is_locked"] is False
 
 
 def test_list_events_filters_by_calendar_source(client, session):
@@ -174,10 +171,6 @@ def test_accept_proposal_then_second_accept_conflicts(client, session):
     assert stored.status == ProposalStatus.ACCEPTED
     assert stored.decided_at is not None
     assert stored.decision_surface == "ios_notification"
-    outcome = session.query(DecisionRecord).one()
-    assert outcome.tree["detail"]["proposal_id"] == str(proposal.id)
-    assert outcome.tree["detail"]["status"] == "accepted"
-    assert outcome.tree["detail"]["surface"] == "ios_notification"
 
     again = client.post(
         f"/v1/schedule/proposals/{proposal.id}/accept",

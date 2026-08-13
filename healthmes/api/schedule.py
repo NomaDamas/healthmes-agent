@@ -56,8 +56,6 @@ class CalendarEventOut(BaseModel):
     end_at: datetime
     is_agent_created: bool
     agent_task_id: uuid.UUID | None
-    is_all_day: bool
-    is_locked: bool
 
 
 class ProposalOut(BaseModel):

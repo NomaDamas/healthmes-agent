@@ -8,8 +8,7 @@ agent blocks — the contract promised by healthmes/api/schedule.py.
 
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -36,7 +35,6 @@ from healthmes.calendars.sync import CalendarMirrorService
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
-    DecisionRecord,
     ProposalStatus,
     ScheduleProposal,
     Task,
@@ -76,32 +74,6 @@ class TestEnablement:
             enabled.caldav_poll_minutes,
         ]
         assert write_source(enabled) is CalendarSource.GOOGLE
-
-    def test_both_enabled_can_select_caldav_as_writer(self, settings) -> None:
-        enabled = settings.model_copy(
-            update={
-                "google_calendar_enabled": True,
-                "caldav_enabled": True,
-                "calendar_write_provider": "caldav",
-            }
-        )
-        specs = build_calendar_jobs(enabled)
-        assert write_source(enabled) is CalendarSource.CALDAV
-        assert [spec.source for spec in specs] == [
-            CalendarSource.GOOGLE,
-            CalendarSource.CALDAV,
-        ]
-
-    def test_explicit_disconnected_writer_fails_closed(self, settings) -> None:
-        enabled = settings.model_copy(
-            update={
-                "google_calendar_enabled": True,
-                "calendar_write_provider": "caldav",
-            }
-        )
-        specs = build_calendar_jobs(enabled)
-        assert write_source(enabled) is None
-        assert [spec.source for spec in specs] == [CalendarSource.GOOGLE]
 
     def test_caldav_only_is_the_writer(self, settings) -> None:
         enabled = settings.model_copy(update={"caldav_enabled": True})
@@ -167,77 +139,6 @@ class TestJobRun:
         assert mirror.intake_task_id == readded.id
         assert mirror.intake_opted_out is False
 
-    @pytest.mark.parametrize(
-        "source",
-        [CalendarSource.GOOGLE, CalendarSource.CALDAV],
-    )
-    def test_intake_is_provider_neutral(self, session, source) -> None:
-        mirror = CalendarEventMirror(
-            external_id=f"hm-{source.value}",
-            calendar_source=source,
-            summary="[HM] Prepare launch",
-            start_at=utc(2026, 8, 4, 9),
-            end_at=utc(2026, 8, 4, 10),
-            organizer_self=True,
-            event_type="default",
-            etag="etag-1",
-        )
-        session.add(mirror)
-        session.commit()
-
-        [task] = intake_calendar_tasks(session, source, UTC)
-        session.commit()
-
-        assert task.title == "Prepare launch"
-        assert task.est_minutes == 60
-        assert mirror.intake_task_id == task.id
-
-    @pytest.mark.parametrize(
-        ("source", "local_timezone", "start_at", "end_at", "deadline"),
-        [
-            (
-                CalendarSource.CALDAV,
-                timezone(timedelta(hours=9)),
-                utc(2026, 7, 9, 15),
-                utc(2026, 7, 10, 15),
-                utc(2026, 7, 10, 14, 59, 59, 999999),
-            ),
-            (
-                CalendarSource.GOOGLE,
-                ZoneInfo("America/Los_Angeles"),
-                utc(2026, 7, 10),
-                utc(2026, 7, 11),
-                utc(2026, 7, 11, 6, 59, 59, 999999),
-            ),
-        ],
-    )
-    def test_all_day_intake_deadline_uses_configured_local_exclusive_end(
-        self,
-        session,
-        source,
-        local_timezone,
-        start_at,
-        end_at,
-        deadline,
-    ) -> None:
-        mirror = CalendarEventMirror(
-            external_id=f"hm-all-day-{source.value}",
-            calendar_source=source,
-            summary="[HM] Submit launch brief",
-            start_at=start_at,
-            end_at=end_at,
-            organizer_self=True,
-            event_type="default",
-            is_all_day=True,
-            etag="etag-1",
-        )
-        session.add(mirror)
-        session.commit()
-
-        [task] = intake_calendar_tasks(session, source, local_timezone)
-
-        assert task.deadline == deadline
-
     def test_timed_intake_event_is_adopted_without_provider_create(
         self,
         session,
@@ -287,10 +188,6 @@ class TestJobRun:
         )
         assert session.get(Task, task.id).status == "scheduled"
         assert mirror.is_agent_created is False
-        outcome = session.query(DecisionRecord).one()
-        assert outcome.tree["detail"]["proposal_id"] == str(proposal.id)
-        assert outcome.tree["detail"]["calendar_source"] == "google"
-        assert outcome.tree["detail"]["calendar_write"] is True
 
     def test_changed_timed_intake_invalidates_instead_of_creating_duplicate(
         self,
@@ -475,60 +372,6 @@ class TestJobRun:
         assert deletion_diff is not None
         assert [change.external_id for change in deletion_diff.deleted] == ["meet-1"]
 
-    def test_write_failure_replays_already_consumed_sync_diff(
-        self,
-        settings,
-        session_factory,
-        session,
-        fake_backend,
-        make_event,
-        monkeypatch,
-    ) -> None:
-        pending = InMemoryPendingDiffStore()
-        state = InMemorySyncStateStore()
-        job = build_calendar_job(
-            settings,
-            fake_backend.source,
-            is_write_backend=True,
-            backend_factory=lambda: fake_backend,
-            session_factory=session_factory,
-            state_store=state,
-            pending_store=pending,
-        )
-        fake_backend.queue_changes([make_event("meet-1")], {"sync_token": "tok-1"})
-        fake_backend.queue_changes(
-            [make_event("meet-1", deleted=True, summary=None, etag=None)],
-            {"sync_token": "tok-2"},
-        )
-        assert job() is not None
-
-        task = Task(title="Write failure")
-        session.add(task)
-        session.flush()
-        session.add(
-            ScheduleProposal(
-                task_id=task.id,
-                proposed_start=utc(2026, 7, 10, 9),
-                proposed_end=utc(2026, 7, 10, 10),
-                status=ProposalStatus.ACCEPTED,
-            )
-        )
-        session.commit()
-
-        def fail_create(_draft):
-            raise RuntimeError("provider write failed")
-
-        monkeypatch.setattr(fake_backend, "create_event", fail_create)
-        assert job() is None
-        assert pending.load(fake_backend.source) is not None
-
-        session.query(ScheduleProposal).delete()
-        session.commit()
-        replayed = job()
-        assert replayed is not None
-        assert [change.external_id for change in replayed.deleted] == ["meet-1"]
-        assert pending.load(fake_backend.source) is None
-
     def test_write_backend_pushes_accepted_proposals(
         self, settings, session_factory, session, fake_backend
     ) -> None:
@@ -578,140 +421,6 @@ class TestJobRun:
             for proposal in session.scalars(select(ScheduleProposal)).all()
         }
         assert statuses == {ProposalStatus.PUSHED, ProposalStatus.PROPOSED}
-
-    def test_owning_provider_retries_cleanup_even_when_not_writer(
-        self,
-        settings,
-        session_factory,
-        session,
-        fake_backend,
-        monkeypatch,
-    ) -> None:
-        task = Task(title="Imported task", status="cancelled")
-        session.add(task)
-        session.flush()
-        proposal = ScheduleProposal(
-            task_id=task.id,
-            proposed_start=utc(2026, 7, 10, 9),
-            proposed_end=utc(2026, 7, 10, 10),
-            status=ProposalStatus.PUSHED,
-        )
-        session.add(proposal)
-        session.commit()
-        state = InMemorySyncStateStore()
-        state.save(fake_backend.source, {"sync_token": "tok-1"})
-        service = CalendarMirrorService(session, [fake_backend], state)
-        block = service.create_agent_event(
-            fake_backend.source,
-            EventDraft(
-                summary=task.title,
-                start_at=utc(2026, 7, 10, 9),
-                end_at=utc(2026, 7, 10, 10),
-                agent_task_id=task.id,
-                identity=_proposal_identity(proposal),
-            ),
-        )
-        block_id = block.id
-        block_external_id = block.external_id
-        original_delete = fake_backend.delete_event
-        attempts = 0
-
-        def fail_once(
-            external_id,
-            *,
-            expected_kind=None,
-            expected_etag=None,
-        ):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                raise RuntimeError("provider delete failed")
-            original_delete(
-                external_id,
-                expected_kind=expected_kind,
-                expected_etag=expected_etag,
-            )
-
-        monkeypatch.setattr(fake_backend, "delete_event", fail_once)
-        job = build_calendar_job(
-            settings,
-            fake_backend.source,
-            is_write_backend=False,
-            backend_factory=lambda: fake_backend,
-            session_factory=session_factory,
-            state_store=state,
-        )
-
-        assert job() is None
-        session.expire_all()
-        assert session.get(ScheduleProposal, proposal.id).status is (
-            ProposalStatus.PUSHED
-        )
-        assert session.get(CalendarEventMirror, block_id) is not None
-
-        assert job() is not None
-        session.expire_all()
-        assert session.get(ScheduleProposal, proposal.id).status is (
-            ProposalStatus.INVALIDATED
-        )
-        assert session.get(CalendarEventMirror, block_id) is None
-        assert block_external_id not in fake_backend.events
-        assert attempts == 2
-
-    def test_non_owning_provider_defers_cancelled_proposal_cleanup(
-        self,
-        settings,
-        session_factory,
-        session,
-        fake_backend_factory,
-    ) -> None:
-        google = fake_backend_factory(CalendarSource.GOOGLE)
-        caldav = fake_backend_factory(CalendarSource.CALDAV)
-        task = Task(title="Old writer block", status="cancelled")
-        session.add(task)
-        session.flush()
-        proposal = ScheduleProposal(
-            task_id=task.id,
-            proposed_start=utc(2026, 7, 10, 9),
-            proposed_end=utc(2026, 7, 10, 10),
-            status=ProposalStatus.PUSHED,
-        )
-        session.add(proposal)
-        session.commit()
-        google_service = CalendarMirrorService(
-            session,
-            [google],
-            InMemorySyncStateStore(),
-        )
-        block = google_service.create_agent_event(
-            google.source,
-            EventDraft(
-                summary=task.title,
-                start_at=utc(2026, 7, 10, 9),
-                end_at=utc(2026, 7, 10, 10),
-                agent_task_id=task.id,
-                identity=_proposal_identity(proposal),
-            ),
-        )
-        state = InMemorySyncStateStore()
-        state.save(caldav.source, {"ctag": "ctag-1"})
-        job = build_calendar_job(
-            settings,
-            caldav.source,
-            is_write_backend=True,
-            backend_factory=lambda: caldav,
-            session_factory=session_factory,
-            state_store=state,
-        )
-
-        assert job() is not None
-        session.expire_all()
-        assert session.get(ScheduleProposal, proposal.id).status is (
-            ProposalStatus.PUSHED
-        )
-        assert session.get(CalendarEventMirror, block.id) is not None
-        assert block.external_id in google.events
-        assert caldav.delete_calls == []
 
     def test_read_backend_never_pushes(
         self, settings, session_factory, session, fake_backend
@@ -787,40 +496,6 @@ class TestJobRun:
         )
         job()  # must not raise — next interval retries
 
-    def test_job_rebuilds_backend_after_runtime_failure(
-        self,
-        settings,
-        session_factory,
-        fake_backend_factory,
-    ) -> None:
-        class FailingBackend:
-            source = CalendarSource.GOOGLE
-
-            def list_changes(self, _sync_state):
-                raise RuntimeError("expired authenticated session")
-
-        healthy = fake_backend_factory(CalendarSource.GOOGLE)
-        backends = iter([FailingBackend(), healthy])
-        factory_calls = 0
-
-        def factory():
-            nonlocal factory_calls
-            factory_calls += 1
-            return next(backends)
-
-        job = build_calendar_job(
-            settings,
-            CalendarSource.GOOGLE,
-            is_write_backend=False,
-            backend_factory=factory,
-            session_factory=session_factory,
-            state_store=InMemorySyncStateStore(),
-        )
-
-        assert job() is None
-        assert job() is not None
-        assert factory_calls == 2
-
     def test_failed_push_leaves_proposal_accepted_for_retry(
         self, settings, session_factory, session, fake_backend, monkeypatch
     ) -> None:
@@ -849,204 +524,6 @@ class TestJobRun:
         session.expire_all()
         proposal = session.scalars(select(ScheduleProposal)).one()
         assert proposal.status is ProposalStatus.ACCEPTED
-
-    def test_job_rebuilds_backend_after_proposal_write_failure(
-        self,
-        settings,
-        session_factory,
-        session,
-        fake_backend_factory,
-    ) -> None:
-        task = Task(title="Refresh stale writer")
-        session.add(task)
-        session.flush()
-        session.add(
-            ScheduleProposal(
-                task_id=task.id,
-                proposed_start=utc(2026, 7, 10, 9, 0),
-                proposed_end=utc(2026, 7, 10, 10, 0),
-                status=ProposalStatus.ACCEPTED,
-            )
-        )
-        session.commit()
-
-        stale = fake_backend_factory(CalendarSource.GOOGLE)
-        healthy = fake_backend_factory(CalendarSource.GOOGLE)
-
-        def failing_create(_draft):
-            raise RuntimeError("expired authenticated write session")
-
-        stale.create_event = failing_create
-        backends = iter([stale, healthy])
-        factory_calls = 0
-
-        def factory():
-            nonlocal factory_calls
-            factory_calls += 1
-            return next(backends)
-
-        job = build_calendar_job(
-            settings,
-            CalendarSource.GOOGLE,
-            is_write_backend=True,
-            backend_factory=factory,
-            session_factory=session_factory,
-            state_store=InMemorySyncStateStore(),
-        )
-
-        assert job() is None
-        session.expire_all()
-        proposal = session.scalars(select(ScheduleProposal)).one()
-        assert proposal.status is ProposalStatus.ACCEPTED
-
-        assert job() is not None
-        assert factory_calls == 2
-        session.expire_all()
-        proposal = session.scalars(select(ScheduleProposal)).one()
-        assert proposal.status is ProposalStatus.PUSHED
-        assert len(healthy.created_drafts) == 1
-
-    def test_job_rebuilds_backend_after_pre_create_delete_failure(
-        self,
-        settings,
-        session_factory,
-        session,
-        fake_backend_factory,
-    ) -> None:
-        task = Task(title="Invalidate stale block")
-        session.add(task)
-        session.flush()
-        proposal = ScheduleProposal(
-            task_id=task.id,
-            proposed_start=utc(2026, 7, 10, 6),
-            proposed_end=utc(2026, 7, 10, 7),
-            status=ProposalStatus.ACCEPTED,
-        )
-        session.add(proposal)
-        session.commit()
-
-        stale = fake_backend_factory(CalendarSource.GOOGLE)
-        service = CalendarMirrorService(
-            session,
-            [stale],
-            InMemorySyncStateStore(),
-        )
-        service.create_agent_event(
-            stale.source,
-            EventDraft(
-                summary=task.title,
-                start_at=utc(2026, 7, 10, 6),
-                end_at=utc(2026, 7, 10, 7),
-                agent_task_id=task.id,
-                identity=_proposal_identity(proposal),
-            ),
-        )
-        session.add(
-            CalendarEventMirror(
-                external_id="actual-sleep-pre-create",
-                calendar_source=CalendarSource.GOOGLE,
-                summary="Actual sleep",
-                start_at=utc(2026, 7, 9, 23),
-                end_at=utc(2026, 7, 10, 7, 30),
-                is_agent_created=True,
-                healthmes_kind=HealthmesEventKind.ACTUAL_SLEEP.value,
-                sleep_local_date=utc(2026, 7, 10).date(),
-            )
-        )
-        session.commit()
-
-        def failing_delete(*_args, **_kwargs):
-            raise RuntimeError("expired delete session")
-
-        stale.delete_event = failing_delete
-        healthy = fake_backend_factory(CalendarSource.GOOGLE)
-        backends = iter([stale, healthy])
-        factory_calls = 0
-
-        def factory():
-            nonlocal factory_calls
-            factory_calls += 1
-            return next(backends)
-
-        state_store = InMemorySyncStateStore()
-        state_store.save(CalendarSource.GOOGLE, {"sync_token": "existing"})
-        job = build_calendar_job(
-            settings,
-            CalendarSource.GOOGLE,
-            is_write_backend=True,
-            backend_factory=factory,
-            session_factory=session_factory,
-            state_store=state_store,
-        )
-
-        assert job() is None
-        assert job() is not None
-        assert factory_calls == 2
-        with session_factory() as persisted:
-            assert (
-                persisted.get(ScheduleProposal, proposal.id).status
-                is ProposalStatus.INVALIDATED
-            )
-
-    def test_job_rebuilds_backend_after_post_create_rollback_failure(
-        self,
-        settings,
-        session_factory,
-        session,
-        fake_backend_factory,
-        monkeypatch,
-    ) -> None:
-        task = Task(title="Concurrent sleep rollback")
-        session.add(task)
-        session.flush()
-        proposal = ScheduleProposal(
-            task_id=task.id,
-            proposed_start=utc(2026, 7, 10, 8),
-            proposed_end=utc(2026, 7, 10, 9),
-            status=ProposalStatus.ACCEPTED,
-        )
-        session.add(proposal)
-        session.commit()
-
-        stale = fake_backend_factory(CalendarSource.GOOGLE)
-
-        def failing_delete(*_args, **_kwargs):
-            raise RuntimeError("expired rollback session")
-
-        stale.delete_event = failing_delete
-        healthy = fake_backend_factory(CalendarSource.GOOGLE)
-        backends = iter([stale, healthy])
-        factory_calls = 0
-
-        def factory():
-            nonlocal factory_calls
-            factory_calls += 1
-            return next(backends)
-
-        checks = iter((None, "concurrent overlap", "concurrent overlap"))
-        monkeypatch.setattr(
-            "healthmes.calendars.jobs.actual_sleep_violation",
-            lambda *_args, **_kwargs: next(checks),
-        )
-        state_store = InMemorySyncStateStore()
-        state_store.save(CalendarSource.GOOGLE, {"sync_token": "existing"})
-        job = build_calendar_job(
-            settings,
-            CalendarSource.GOOGLE,
-            is_write_backend=True,
-            backend_factory=factory,
-            session_factory=session_factory,
-            state_store=state_store,
-        )
-
-        assert job() is None
-        assert job() is not None
-        assert factory_calls == 2
-        with session_factory() as persisted:
-            assert (
-                persisted.get(ScheduleProposal, proposal.id).status
-                is ProposalStatus.INVALIDATED
-            )
 
     def test_sleep_change_invalidates_accepted_proposal_before_push(
         self,

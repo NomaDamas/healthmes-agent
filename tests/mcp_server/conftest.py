@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from healthmes.config import Settings
 from healthmes.mcp_server import server as server_module
 from healthmes.mcp_server.ow_client import OWClient
+from healthmes.storage import update_retention_policy
 from healthmes.store import Base, create_db_engine
 
 USER_ID = "7a6b1a1e-2f6d-4a5b-9c3e-1f2a3b4c5d6e"
@@ -294,7 +295,11 @@ def store_factory() -> Iterator[sessionmaker[Session]]:
     """Session factory over an in-memory sqlite store with the full schema."""
     engine = create_db_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
-    yield sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    with factory() as session:
+        update_retention_policy(session, "activity_raw", "forever")
+        session.commit()
+    yield factory
     engine.dispose()
 
 

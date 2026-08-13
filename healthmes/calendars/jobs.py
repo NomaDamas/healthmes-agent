@@ -65,10 +65,6 @@ from healthmes.calendars.state import (
 from healthmes.calendars.sync import CalendarMirrorService, SyncDiff
 from healthmes.calendars.write_lock import calendar_write_lock
 from healthmes.config import Settings, resolve_timezone
-from healthmes.schedule_outcomes import (
-    record_calendar_push_outcome,
-    record_invalidation_outcome,
-)
 from healthmes.store.enums import CalendarSource, ProposalStatus
 from healthmes.store.models import CalendarEventMirror, ScheduleProposal, Task
 from healthmes.store.session import session_scope
@@ -118,22 +114,9 @@ def enabled_sources(settings: Settings) -> tuple[CalendarSource, ...]:
 
 
 def write_source(settings: Settings) -> CalendarSource | None:
-    """Return the explicitly selected writer, or the legacy auto fallback."""
+    """The single backend agent blocks are written to (None: nothing enabled)."""
     sources = enabled_sources(settings)
-    if not sources:
-        return None
-    configured = settings.calendar_write_provider
-    if configured == "auto":
-        return sources[0]
-    selected = CalendarSource(configured)
-    if selected not in sources:
-        logger.warning(
-            "Configured calendar writer %s is not connected; calendar writes "
-            "are disabled until that provider is available.",
-            configured,
-        )
-        return None
-    return selected
+    return sources[0] if sources else None
 
 
 def _build_backend(settings: Settings, source: CalendarSource) -> CalendarBackend:
@@ -159,7 +142,6 @@ def _build_backend(settings: Settings, source: CalendarSource) -> CalendarBacken
         app_password=resolved.app_password,
         url=resolved.url,
         calendar_name=settings.caldav_calendar_name,
-        local_timezone=resolve_timezone(settings),
     )
 
 
@@ -190,28 +172,6 @@ def _existing_agent_block(
     Times are compared in Python via ``coerce_utc`` because sqlite round-trips
     ``DateTime`` columns as naive UTC.
     """
-    row = _owned_proposal_block(session, source, proposal)
-    if row is None:
-        return None
-    start = coerce_utc(proposal.proposed_start)
-    end = coerce_utc(proposal.proposed_end)
-    if (
-        row.agent_task_id != proposal.task_id
-        or coerce_utc(row.start_at) != start
-        or coerce_utc(row.end_at) != end
-    ):
-        raise CalendarConflictError(
-            f"proposal {proposal.id} owns a calendar block with different content"
-        )
-    return row
-
-
-def _owned_proposal_block(
-    session: Session,
-    source: CalendarSource,
-    proposal: ScheduleProposal,
-) -> CalendarEventMirror | None:
-    """Return the canonical agent-owned block for a proposal, regardless of time."""
     identity = _proposal_identity(proposal)
     row = session.scalar(
         select(CalendarEventMirror).where(
@@ -226,6 +186,16 @@ def _owned_proposal_block(
         return None
     if row.external_id != calendar_identity_external_id(source, identity):
         return None
+    start = coerce_utc(proposal.proposed_start)
+    end = coerce_utc(proposal.proposed_end)
+    if (
+        row.agent_task_id != proposal.task_id
+        or coerce_utc(row.start_at) != start
+        or coerce_utc(row.end_at) != end
+    ):
+        raise CalendarConflictError(
+            f"proposal {proposal.id} owns a calendar block with different content"
+        )
     return row
 
 
@@ -345,8 +315,6 @@ def push_accepted_proposals(
     session: Session,
     source: CalendarSource,
     timezone: tzinfo = UTC,
-    *,
-    raise_on_write_failure: bool = False,
 ) -> int:
     """Write every ``accepted`` proposal to the calendar; advance to ``pushed``.
 
@@ -386,11 +354,6 @@ def push_accepted_proposals(
                 intake_row = _timed_intake_block(session, proposal)
             except CalendarConflictError as exc:
                 proposal.status = ProposalStatus.INVALIDATED
-                record_invalidation_outcome(
-                    session,
-                    proposal,
-                    reason=f"timed_intake_conflict:{exc}",
-                )
                 session.commit()
                 logger.warning(
                     "Proposal %s invalidated because its timed intake event "
@@ -459,15 +422,8 @@ def push_accepted_proposals(
                             owned_row.external_id,
                             source.value,
                         )
-                        if raise_on_write_failure:
-                            raise
                         continue
                 proposal.status = ProposalStatus.INVALIDATED
-                record_invalidation_outcome(
-                    session,
-                    proposal,
-                    reason=f"sleep_conflict_before_push:{violation}",
-                )
                 session.commit()
                 logger.warning(
                     "Proposal %s invalidated before calendar push: %s",
@@ -478,13 +434,6 @@ def push_accepted_proposals(
             if intake_row is not None:
                 proposal.status = ProposalStatus.PUSHED
                 task.status = "scheduled"
-                record_calendar_push_outcome(
-                    session,
-                    proposal,
-                    source,
-                    provider_event_id=intake_row.external_id,
-                    reused_existing=True,
-                )
                 session.commit()
                 pushed += 1
                 logger.info(
@@ -498,13 +447,6 @@ def push_accepted_proposals(
             if legacy_row is not None:
                 proposal.status = ProposalStatus.PUSHED
                 task.status = "scheduled"
-                record_calendar_push_outcome(
-                    session,
-                    proposal,
-                    source,
-                    provider_event_id=legacy_row.external_id,
-                    reused_existing=True,
-                )
                 session.commit()
                 pushed += 1
                 logger.info(
@@ -526,8 +468,6 @@ def push_accepted_proposals(
                     task.title,
                     source.value,
                 )
-                if raise_on_write_failure:
-                    raise
                 continue
             if reused_existing:
                 logger.info(
@@ -560,15 +500,8 @@ def push_accepted_proposals(
                         proposal.id,
                         row.external_id,
                     )
-                    if raise_on_write_failure:
-                        raise
                     continue
                 proposal.status = ProposalStatus.INVALIDATED
-                record_invalidation_outcome(
-                    session,
-                    proposal,
-                    reason=f"sleep_conflict_after_create:{post_create_violation}",
-                )
                 session.commit()
                 logger.warning(
                     "Proposal %s invalidated after calendar create: %s",
@@ -578,13 +511,6 @@ def push_accepted_proposals(
                 continue
             proposal.status = ProposalStatus.PUSHED
             task.status = "scheduled"
-            record_calendar_push_outcome(
-                session,
-                proposal,
-                source,
-                provider_event_id=row.external_id,
-                reused_existing=reused_existing,
-            )
             session.commit()
             pushed += 1
             logger.info(
@@ -595,64 +521,6 @@ def push_accepted_proposals(
                 task.title,
             )
     return pushed
-
-
-def _cleanup_cancelled_pushed_proposals(
-    service: CalendarMirrorService,
-    session: Session,
-    source: CalendarSource,
-) -> int:
-    """Remove provider-owned blocks whose imported source task was cancelled."""
-    proposal_ids = list(
-        session.scalars(
-            select(ScheduleProposal.id)
-            .join(Task, ScheduleProposal.task_id == Task.id)
-            .where(
-                ScheduleProposal.status == ProposalStatus.PUSHED,
-                Task.status == "cancelled",
-            )
-            .order_by(ScheduleProposal.proposed_start)
-        ).all()
-    )
-    cleaned = 0
-    for proposal_id in proposal_ids:
-        with calendar_write_lock(session, source):
-            session.expire_all()
-            proposal = session.get(ScheduleProposal, proposal_id)
-            if proposal is None or proposal.status is not ProposalStatus.PUSHED:
-                continue
-            task = session.get(Task, proposal.task_id)
-            if task is None or task.status != "cancelled":
-                continue
-            identity = _proposal_identity(proposal)
-            row = _owned_proposal_block(session, source, proposal)
-            if row is not None:
-                service.delete_agent_event(
-                    source,
-                    row.external_id,
-                    expected_identity=identity,
-                )
-            else:
-                block_on_another_source = session.scalar(
-                    select(CalendarEventMirror.id).where(
-                        CalendarEventMirror.is_agent_created.is_(True),
-                        CalendarEventMirror.healthmes_kind == identity.kind.value,
-                        CalendarEventMirror.healthmes_source == identity.source,
-                        CalendarEventMirror.healthmes_source_key
-                        == identity.source_key,
-                    )
-                )
-                if block_on_another_source is not None:
-                    continue
-            proposal.status = ProposalStatus.INVALIDATED
-            record_invalidation_outcome(
-                session,
-                proposal,
-                reason="source_task_cancelled",
-            )
-            session.commit()
-            cleaned += 1
-    return cleaned
 
 
 def build_calendar_job(
@@ -678,8 +546,6 @@ def build_calendar_job(
 
     def run_calendar_sync() -> SyncDiff | None:
         nonlocal backend
-        diff: SyncDiff | None = None
-        service: CalendarMirrorService | None = None
         try:
             if backend is None:
                 backend = (
@@ -707,34 +573,15 @@ def build_calendar_job(
                         resolve_timezone(settings),
                     )
                     session.commit()
-                _cleanup_cancelled_pushed_proposals(
-                    service,
-                    session,
-                    source,
-                )
                 if is_write_backend:
                     push_accepted_proposals(
                         service,
                         session,
                         source,
                         resolve_timezone(settings),
-                        raise_on_write_failure=True,
                     )
                 return diff
         except Exception:
-            if service is not None and diff is not None:
-                try:
-                    service.preserve_diff_for_retry(source, diff)
-                except Exception:
-                    logger.exception(
-                        "Calendar diff journal restore for %s failed after "
-                        "downstream processing error.",
-                        source.value,
-                    )
-            # Authorized service/session objects can become permanently stale
-            # after credential rotation or server-side session invalidation.
-            # Rebuild on the next interval instead of caching a poisoned client.
-            backend = None
             logger.exception(
                 "Calendar sync for %s failed; next interval will retry.", source.value
             )

@@ -23,7 +23,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -51,47 +50,34 @@ import com.healthmes.api.ApiError
 import com.healthmes.api.CaptureRequests
 import com.healthmes.api.HealthmesApi
 import com.healthmes.api.MediaUploadResult
-import com.healthmes.api.NutritionCaptureSession
-import com.healthmes.api.NutritionCaptureState
-import com.healthmes.api.NutritionCaptureTransitions
-import com.healthmes.api.NutritionInteractionResult
-import com.healthmes.api.NutritionModality
-import com.healthmes.api.NutritionObservationResult
-import com.healthmes.api.NutritionOutcomeStatus
-import com.healthmes.api.NutritionReviewStatus
 import com.healthmes.companion.R
 import java.io.File
-import java.time.OffsetDateTime
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Owner-reviewed capture surface.
+ * Capture shortcuts (issue #10): photo (camera or picker) / voice memo →
+ * `POST /v1/media` → food-log or medical-record create with an EDITABLE
+ * description — the same contracts the Telegram capture skill uses. The
+ * health-context snapshot on medical records is attached server-side; the
+ * app sends capture metadata only (local-first, no health data uploaded from
+ * the client beyond the capture itself).
  *
- * Nutrition follows observation/interaction/outcome contracts and cannot
- * become consumed from analysis alone. Medication and symptom capture keep
- * the existing `/v1/medical-records` contract, including server-attached
- * health context.
+ * No CameraX dependency on purpose: ACTION_IMAGE_CAPTURE + the photo picker
+ * cover the "camera/photo" capture path without a camera permission, keeping
+ * the app lean. Voice memos record on-device via MediaRecorder into
+ * audio/mp4 (.m4a on the server's allowlist).
  */
 private enum class CaptureKind { FOOD, MEDICATION, SYMPTOM }
 
-/** A local attachment that has not necessarily been uploaded yet. */
+/** A staged attachment (not yet uploaded). */
 private data class Staged(
     val uri: Uri?,
     val file: File?,
     val contentType: String,
     val label: String,
     val sizeBytes: Long,
-)
-
-private data class NutritionDraft(
-    val description: String,
-    val staged: Staged?,
-    val uploadedMediaPath: String? = null,
 )
 
 @Composable
@@ -106,23 +92,7 @@ fun CaptureScreen(services: AppServices, modifier: Modifier = Modifier) {
     var busy by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     var isRecording by remember { mutableStateOf(false) }
-    var nutritionState by remember {
-        mutableStateOf<NutritionCaptureState>(NutritionCaptureState.Editing)
-    }
-    var nutritionDraft by remember { mutableStateOf<NutritionDraft?>(null) }
-    var correctionMode by remember { mutableStateOf(false) }
-    var correctedNames by remember { mutableStateOf(emptyList<String>()) }
     val recorderHolder = remember { RecorderHolder() }
-
-    fun resetNutrition() {
-        nutritionState = NutritionCaptureState.Editing
-        nutritionDraft = null
-        correctionMode = false
-        correctedNames = emptyList()
-        description = ""
-        staged = null
-        message = null
-    }
 
     // -- capture launchers ---------------------------------------------------
     var cameraTarget by remember { mutableStateOf<Pair<Uri, File>?>(null) }
@@ -161,14 +131,10 @@ fun CaptureScreen(services: AppServices, modifier: Modifier = Modifier) {
         }
     }
 
+    // Stop a dangling recorder when leaving the screen.
     DisposableEffect(Unit) {
         onDispose { recorderHolder.cancel() }
     }
-
-    val foodFlowActive =
-        kind == CaptureKind.FOOD.name && nutritionState !is NutritionCaptureState.Editing
-    val voiceFoodDraft =
-        kind == CaptureKind.FOOD.name && staged?.contentType?.startsWith("audio/") == true
 
     Column(
         modifier = modifier
@@ -188,71 +154,53 @@ fun CaptureScreen(services: AppServices, modifier: Modifier = Modifier) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
+        // Kind selector
         Text(
             stringResource(R.string.capture_kind_label),
             style = MaterialTheme.typography.titleSmall,
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            KindChip(
-                CaptureKind.FOOD,
-                kind,
-                R.string.capture_kind_food,
-                enabled = !busy && !foodFlowActive,
-            ) { kind = it }
-            KindChip(
-                CaptureKind.MEDICATION,
-                kind,
-                R.string.capture_kind_medication,
-                enabled = !busy && !foodFlowActive,
-            ) { kind = it }
-            KindChip(
-                CaptureKind.SYMPTOM,
-                kind,
-                R.string.capture_kind_symptom,
-                enabled = !busy && !foodFlowActive,
-            ) { kind = it }
+            KindChip(CaptureKind.FOOD, kind, R.string.capture_kind_food) { kind = it }
+            KindChip(CaptureKind.MEDICATION, kind, R.string.capture_kind_medication) { kind = it }
+            KindChip(CaptureKind.SYMPTOM, kind, R.string.capture_kind_symptom) { kind = it }
         }
 
-        if (!foodFlowActive) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    enabled = !busy && !isRecording,
-                    onClick = {
-                        val result = runCatching {
-                            val dir = File(context.cacheDir, "captures").apply { mkdirs() }
-                            val file = File(dir, "photo-${System.currentTimeMillis()}.jpg")
-                            val uri = FileProvider.getUriForFile(
-                                context,
-                                "${context.packageName}.fileprovider",
-                                file,
-                            )
-                            Pair(uri, file)
-                        }
-                        result.fold(
-                            onSuccess = { target ->
-                                cameraTarget = target
-                                takePicture.launch(target.first)
-                            },
-                            onFailure = {
-                                message = context.getString(
-                                    R.string.capture_photo_failed,
-                                    it.message ?: "?",
-                                )
-                            },
+        // Capture sources
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                enabled = !busy && !isRecording,
+                onClick = {
+                    val result = runCatching {
+                        val dir = File(context.cacheDir, "captures").apply { mkdirs() }
+                        val file = File(dir, "photo-${System.currentTimeMillis()}.jpg")
+                        val uri = FileProvider.getUriForFile(
+                            context, "${context.packageName}.fileprovider", file
                         )
-                    },
-                ) { Text(stringResource(R.string.capture_take_photo)) }
-                OutlinedButton(
-                    enabled = !busy && !isRecording,
-                    onClick = {
-                        pickMedia.launch(
-                            PickVisualMediaRequest(
-                                ActivityResultContracts.PickVisualMedia.ImageOnly
+                        Pair(uri, file)
+                    }
+                    result.fold(
+                        onSuccess = { target ->
+                            cameraTarget = target
+                            takePicture.launch(target.first)
+                        },
+                        onFailure = {
+                            message = context.getString(
+                                R.string.capture_photo_failed, it.message ?: "?"
                             )
-                        )
-                    },
-                ) { Text(stringResource(R.string.capture_pick_photo)) }
-            }
+                        },
+                    )
+                },
+            ) { Text(stringResource(R.string.capture_take_photo)) }
+            OutlinedButton(
+                enabled = !busy && !isRecording,
+                onClick = {
+                    pickMedia.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                    )
+                },
+            ) { Text(stringResource(R.string.capture_pick_photo)) }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(
                 enabled = !busy,
                 onClick = {
@@ -270,8 +218,7 @@ fun CaptureScreen(services: AppServices, modifier: Modifier = Modifier) {
                         }
                     } else if (
                         ContextCompat.checkSelfPermission(
-                            context,
-                            Manifest.permission.RECORD_AUDIO,
+                            context, Manifest.permission.RECORD_AUDIO
                         ) == PackageManager.PERMISSION_GRANTED
                     ) {
                         isRecording = recorderHolder.start(context)
@@ -287,545 +234,95 @@ fun CaptureScreen(services: AppServices, modifier: Modifier = Modifier) {
                     )
                 )
             }
-            if (isRecording) {
-                Text(
-                    stringResource(R.string.capture_recording),
-                    color = MaterialTheme.colorScheme.primary,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
+        }
+        if (isRecording) {
+            Text(
+                stringResource(R.string.capture_recording),
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
 
-            staged?.let { attachment ->
-                Card {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Text(
-                            stringResource(
-                                R.string.capture_attached,
-                                "${attachment.label} (${attachment.contentType})",
-                                attachment.sizeBytes / 1024,
-                            ),
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.weight(1f),
+        // Staged attachment
+        staged?.let { attachment ->
+            Card {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        stringResource(
+                            R.string.capture_attached,
+                            "${attachment.label} (${attachment.contentType})",
+                            attachment.sizeBytes / 1024,
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(onClick = { staged = null }) {
+                        Icon(
+                            Icons.Filled.Clear,
+                            contentDescription = stringResource(R.string.capture_remove_attachment),
                         )
-                        IconButton(onClick = { staged = null }) {
-                            Icon(
-                                Icons.Filled.Clear,
-                                contentDescription = stringResource(
-                                    R.string.capture_remove_attachment
-                                ),
-                            )
-                        }
                     }
                 }
-            }
-
-            if (voiceFoodDraft) {
-                Text(
-                    stringResource(R.string.capture_voice_analysis_note),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            } else {
-                OutlinedTextField(
-                    value = description,
-                    onValueChange = { description = it },
-                    label = {
-                        Text(
-                            stringResource(
-                                if (kind == CaptureKind.FOOD.name) {
-                                    R.string.capture_food_text_hint
-                                } else {
-                                    R.string.capture_description_hint
-                                }
-                            )
-                        )
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    minLines = 2,
-                )
-            }
-            if (kind != CaptureKind.FOOD.name) {
-                OutlinedTextField(
-                    value = transcript,
-                    onValueChange = { transcript = it },
-                    label = { Text(stringResource(R.string.capture_transcript_hint)) },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-
-            Button(
-                enabled = !busy && !isRecording,
-                onClick = {
-                    val api = services.api()
-                    when {
-                        api == null -> {
-                            message = context.getString(R.string.capture_error_not_paired)
-                        }
-
-                        kind == CaptureKind.FOOD.name -> {
-                            val modality = nutritionModality(staged)
-                            if (
-                                modality == NutritionModality.TEXT &&
-                                description.isBlank()
-                            ) {
-                                message = context.getString(
-                                    R.string.capture_error_description_required
-                                )
-                            } else {
-                                val session = NutritionCaptureSession.create(
-                                    modality = modality,
-                                    observedAt = currentTimestamp(),
-                                    timezone = ZoneId.systemDefault().id,
-                                    sourceText = when (modality) {
-                                        NutritionModality.TEXT -> description.trim()
-                                        NutritionModality.PHOTO ->
-                                            description.trim().takeIf { it.isNotBlank() }
-
-                                        NutritionModality.VOICE -> null
-                                    },
-                                )
-                                val analyzing = NutritionCaptureState.Analyzing(session)
-                                val draft = NutritionDraft(
-                                    description = description.trim(),
-                                    staged = staged,
-                                )
-                                nutritionDraft = draft
-                                correctionMode = false
-                                correctedNames = emptyList()
-                                launchNutritionAnalysis(
-                                    scope = scope,
-                                    context = context,
-                                    api = api,
-                                    state = analyzing,
-                                    draft = draft,
-                                    onDraft = { nutritionDraft = it },
-                                    onState = { nutritionState = it },
-                                    onBusy = { busy = it },
-                                    onMessage = { message = it },
-                                )
-                            }
-                        }
-
-                        description.isBlank() -> {
-                            message = context.getString(
-                                R.string.capture_error_description_required
-                            )
-                        }
-
-                        else -> {
-                            val request = MedicalSaveRequest(
-                                kind = kind,
-                                description = description.trim(),
-                                transcript = transcript.trim(),
-                                staged = staged,
-                            )
-                            busy = true
-                            message = context.getString(R.string.capture_saving)
-                            scope.launch {
-                                val outcome = withContext(Dispatchers.IO) {
-                                    saveMedical(context, api, request)
-                                }
-                                message = outcome.message
-                                if (outcome.success) {
-                                    description = ""
-                                    transcript = ""
-                                    staged = null
-                                }
-                                busy = false
-                            }
-                        }
-                    }
-                },
-            ) {
-                Text(
-                    stringResource(
-                        when {
-                            busy && kind == CaptureKind.FOOD.name ->
-                                R.string.capture_analyzing
-
-                            busy -> R.string.capture_saving
-                            kind == CaptureKind.FOOD.name -> R.string.capture_analyze
-                            else -> R.string.capture_save
-                        }
-                    )
-                )
             }
         }
 
-        if (kind == CaptureKind.FOOD.name) {
-            when (val state = nutritionState) {
-                NutritionCaptureState.Editing -> Unit
+        // Editable description (+ transcript for medical voice notes)
+        OutlinedTextField(
+            value = description,
+            onValueChange = { description = it },
+            label = { Text(stringResource(R.string.capture_description_hint)) },
+            modifier = Modifier.fillMaxWidth(),
+            minLines = 2,
+        )
+        if (kind != CaptureKind.FOOD.name) {
+            OutlinedTextField(
+                value = transcript,
+                onValueChange = { transcript = it },
+                label = { Text(stringResource(R.string.capture_transcript_hint)) },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
 
-                is NutritionCaptureState.Analyzing -> {
-                    CaptureProgressCard(R.string.capture_analyzing)
-                }
+        Button(
+            enabled = !busy && !isRecording,
+            onClick = {
+                val api = services.api()
+                when {
+                    api == null -> message = context.getString(R.string.capture_error_not_paired)
+                    description.isBlank() ->
+                        message = context.getString(R.string.capture_error_description_required)
 
-                is NutritionCaptureState.PhotoReview -> {
-                    NutritionResultCard(
-                        title = stringResource(R.string.capture_review_title),
-                        status = state.observation.status,
-                        confidence = state.observation.confidence,
-                        warnings = state.observation.warnings,
-                        items = state.observation.items,
-                    )
-                    if (correctionMode) {
-                        correctedNames.forEachIndexed { index, value ->
-                            OutlinedTextField(
-                                value = value,
-                                onValueChange = { updated ->
-                                    correctedNames = correctedNames.mapIndexed {
-                                            itemIndex, current ->
-                                            if (itemIndex == index) updated else current
-                                        }
-                                },
-                                label = {
-                                    Text(
-                                        stringResource(
-                                            R.string.capture_correct_item,
-                                            index + 1,
-                                        )
-                                    )
-                                },
-                                modifier = Modifier.fillMaxWidth(),
-                                singleLine = true,
-                            )
-                        }
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Button(
-                                enabled = correctedNames.isNotEmpty() &&
-                                    correctedNames.all { it.isNotBlank() },
-                                modifier = Modifier.weight(1f),
-                                onClick = {
-                                    val submitting =
-                                        NutritionCaptureTransitions.beginPhotoReview(
-                                            state,
-                                            NutritionReviewStatus.CORRECTED,
-                                            correctedNames,
-                                        )
-                                    correctionMode = false
-                                    services.api()?.let { api ->
-                                        launchPhotoReview(
-                                            scope = scope,
-                                            context = context,
-                                            api = api,
-                                            state = submitting,
-                                            onState = { nutritionState = it },
-                                            onBusy = { busy = it },
-                                            onMessage = { message = it },
-                                        )
-                                    }
-                                },
-                            ) {
-                                Text(stringResource(R.string.capture_save_correction))
+                    else -> {
+                        busy = true
+                        message = context.getString(R.string.capture_saving)
+                        val request = SaveRequest(
+                            kind = kind,
+                            description = description.trim(),
+                            transcript = transcript.trim(),
+                            staged = staged,
+                        )
+                        scope.launch {
+                            val outcome = withContext(Dispatchers.IO) {
+                                save(context, api, request)
                             }
-                            OutlinedButton(
-                                modifier = Modifier.weight(1f),
-                                onClick = { correctionMode = false },
-                            ) {
-                                Text(stringResource(R.string.capture_back))
+                            message = outcome.message
+                            if (outcome.success) {
+                                description = ""
+                                transcript = ""
+                                staged = null
                             }
-                        }
-                    } else {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Button(
-                                enabled = state.observation.canConfirm,
-                                modifier = Modifier.weight(1f),
-                                onClick = {
-                                    val submitting =
-                                        NutritionCaptureTransitions.beginPhotoReview(
-                                            state,
-                                            NutritionReviewStatus.CONFIRMED,
-                                        )
-                                    services.api()?.let { api ->
-                                        launchPhotoReview(
-                                            scope = scope,
-                                            context = context,
-                                            api = api,
-                                            state = submitting,
-                                            onState = { nutritionState = it },
-                                            onBusy = { busy = it },
-                                            onMessage = { message = it },
-                                        )
-                                    }
-                                },
-                            ) {
-                                Text(stringResource(R.string.capture_looks_right))
-                            }
-                            OutlinedButton(
-                                enabled = state.observation.canCorrect,
-                                modifier = Modifier.weight(1f),
-                                onClick = {
-                                    correctedNames =
-                                        state.observation.items.map { it.name }
-                                    correctionMode = true
-                                },
-                            ) {
-                                Text(stringResource(R.string.capture_correct))
-                            }
-                        }
-                        OutlinedButton(
-                            modifier = Modifier.fillMaxWidth(),
-                            onClick = {
-                                val submitting =
-                                    NutritionCaptureTransitions.beginPhotoReview(
-                                        state,
-                                        NutritionReviewStatus.REJECTED,
-                                    )
-                                services.api()?.let { api ->
-                                    launchPhotoReview(
-                                        scope = scope,
-                                        context = context,
-                                        api = api,
-                                        state = submitting,
-                                        onState = { nutritionState = it },
-                                        onBusy = { busy = it },
-                                        onMessage = { message = it },
-                                    )
-                                }
-                            },
-                        ) {
-                            Text(stringResource(R.string.capture_reject))
+                            busy = false
                         }
                     }
                 }
-
-                is NutritionCaptureState.SubmittingPhotoReview -> {
-                    CaptureProgressCard(R.string.capture_review_saving)
-                }
-
-                is NutritionCaptureState.CreatingInteraction -> {
-                    CaptureProgressCard(R.string.capture_creating_interaction)
-                }
-
-                is NutritionCaptureState.AwaitingOutcome -> {
-                    NutritionResultCard(
-                        title = stringResource(R.string.capture_outcome_title),
-                        status = null,
-                        confidence = null,
-                        warnings = state.interaction.warnings,
-                        items = state.interaction.items,
-                    )
-                    Text(
-                        stringResource(R.string.capture_outcome_note),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Button(
-                            enabled = state.interaction.items.isNotEmpty(),
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                val submitting = NutritionCaptureTransitions.beginOutcome(
-                                    state,
-                                    NutritionOutcomeStatus.CONSUMED,
-                                    consumedAt = currentTimestamp(),
-                                )
-                                services.api()?.let { api ->
-                                    launchNutritionOutcome(
-                                        scope = scope,
-                                        context = context,
-                                        api = api,
-                                        state = submitting,
-                                        onState = { nutritionState = it },
-                                        onBusy = { busy = it },
-                                        onMessage = { message = it },
-                                    )
-                                }
-                            },
-                        ) {
-                            Text(stringResource(R.string.capture_consumed))
-                        }
-                        OutlinedButton(
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                val submitting = NutritionCaptureTransitions.beginOutcome(
-                                    state,
-                                    NutritionOutcomeStatus.NOT_CONSUMED,
-                                )
-                                services.api()?.let { api ->
-                                    launchNutritionOutcome(
-                                        scope = scope,
-                                        context = context,
-                                        api = api,
-                                        state = submitting,
-                                        onState = { nutritionState = it },
-                                        onBusy = { busy = it },
-                                        onMessage = { message = it },
-                                    )
-                                }
-                            },
-                        ) {
-                            Text(stringResource(R.string.capture_not_consumed))
-                        }
-                    }
-                    OutlinedButton(
-                        modifier = Modifier.fillMaxWidth(),
-                        onClick = {
-                            val submitting = NutritionCaptureTransitions.beginOutcome(
-                                state,
-                                NutritionOutcomeStatus.CANCELLED,
-                            )
-                            services.api()?.let { api ->
-                                launchNutritionOutcome(
-                                    scope = scope,
-                                    context = context,
-                                    api = api,
-                                    state = submitting,
-                                    onState = { nutritionState = it },
-                                    onBusy = { busy = it },
-                                    onMessage = { message = it },
-                                )
-                            }
-                        },
-                    ) {
-                        Text(stringResource(R.string.capture_cancel))
-                    }
-                }
-
-                is NutritionCaptureState.SubmittingOutcome -> {
-                    CaptureProgressCard(R.string.capture_submitting_outcome)
-                }
-
-                is NutritionCaptureState.Completed -> {
-                    CaptureTerminalCard(
-                        messageRes = when (state.status) {
-                            NutritionOutcomeStatus.CONSUMED ->
-                                R.string.capture_completed_consumed
-
-                            NutritionOutcomeStatus.NOT_CONSUMED ->
-                                R.string.capture_completed_not_consumed
-
-                            NutritionOutcomeStatus.CANCELLED ->
-                                R.string.capture_completed_cancelled
-                        },
-                        onReset = ::resetNutrition,
-                    )
-                }
-
-                is NutritionCaptureState.Rejected -> {
-                    CaptureTerminalCard(
-                        messageRes = R.string.capture_photo_rejected,
-                        onReset = ::resetNutrition,
-                    )
-                }
-
-                is NutritionCaptureState.Failed -> {
-                    Card {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Text(
-                                stringResource(
-                                    R.string.capture_nutrition_failed,
-                                    state.detail,
-                                ),
-                                color = MaterialTheme.colorScheme.error,
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                Button(
-                                    modifier = Modifier.weight(1f),
-                                    onClick = {
-                                        val api = services.api() ?: return@Button
-                                        when (val retry = state.retryState) {
-                                            is NutritionCaptureState.Analyzing -> {
-                                                nutritionDraft?.let { draft ->
-                                                    launchNutritionAnalysis(
-                                                        scope = scope,
-                                                        context = context,
-                                                        api = api,
-                                                        state = retry,
-                                                        draft = draft,
-                                                        onDraft = {
-                                                            nutritionDraft = it
-                                                        },
-                                                        onState = {
-                                                            nutritionState = it
-                                                        },
-                                                        onBusy = { busy = it },
-                                                        onMessage = {
-                                                            message = it
-                                                        },
-                                                    )
-                                                }
-                                            }
-
-                                            is NutritionCaptureState.SubmittingPhotoReview -> {
-                                                launchPhotoReview(
-                                                    scope = scope,
-                                                    context = context,
-                                                    api = api,
-                                                    state = retry,
-                                                    onState = {
-                                                        nutritionState = it
-                                                    },
-                                                    onBusy = { busy = it },
-                                                    onMessage = { message = it },
-                                                )
-                                            }
-
-                                            is NutritionCaptureState.CreatingInteraction -> {
-                                                launchPhotoInteraction(
-                                                    scope = scope,
-                                                    context = context,
-                                                    api = api,
-                                                    state = retry,
-                                                    onState = {
-                                                        nutritionState = it
-                                                    },
-                                                    onBusy = { busy = it },
-                                                    onMessage = { message = it },
-                                                )
-                                            }
-
-                                            is NutritionCaptureState.SubmittingOutcome -> {
-                                                launchNutritionOutcome(
-                                                    scope = scope,
-                                                    context = context,
-                                                    api = api,
-                                                    state = retry,
-                                                    onState = {
-                                                        nutritionState = it
-                                                    },
-                                                    onBusy = { busy = it },
-                                                    onMessage = { message = it },
-                                                )
-                                            }
-
-                                            else -> resetNutrition()
-                                        }
-                                    },
-                                ) {
-                                    Text(stringResource(R.string.capture_retry))
-                                }
-                                OutlinedButton(
-                                    modifier = Modifier.weight(1f),
-                                    onClick = ::resetNutrition,
-                                ) {
-                                    Text(stringResource(R.string.capture_start_over))
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            },
+        ) {
+            Text(stringResource(if (busy) R.string.capture_saving else R.string.capture_save))
         }
 
         message?.let {
@@ -840,518 +337,13 @@ private fun KindChip(
     value: CaptureKind,
     selected: String,
     labelRes: Int,
-    enabled: Boolean,
     onSelect: (String) -> Unit,
 ) {
     FilterChip(
         selected = selected == value.name,
-        enabled = enabled,
         onClick = { onSelect(value.name) },
         label = { Text(stringResource(labelRes)) },
     )
-}
-
-@Composable
-private fun CaptureProgressCard(messageRes: Int) {
-    Card {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            CircularProgressIndicator()
-            Text(
-                stringResource(messageRes),
-                style = MaterialTheme.typography.bodyMedium,
-            )
-        }
-    }
-}
-
-@Composable
-private fun NutritionResultCard(
-    title: String,
-    status: String?,
-    confidence: String?,
-    warnings: List<String>,
-    items: List<com.healthmes.api.NutritionItemView>,
-) {
-    Card {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text(title, style = MaterialTheme.typography.titleMedium)
-            if (status != null && confidence != null) {
-                Text(
-                    stringResource(
-                        R.string.capture_review_meta,
-                        status.replace('_', ' '),
-                        confidence,
-                    ),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (items.isEmpty()) {
-                Text(
-                    stringResource(R.string.capture_no_items),
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-            items.forEach { item ->
-                Text(item.name, style = MaterialTheme.typography.titleSmall)
-                Text(
-                    stringResource(
-                        R.string.capture_serving_line,
-                        item.serving.summary(),
-                    ),
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                item.nutrientSummary().takeIf { it.isNotBlank() }?.let {
-                    Text(
-                        stringResource(R.string.capture_nutrients_line, it),
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                item.warnings.forEach {
-                    Text(
-                        stringResource(R.string.capture_warning_line, it),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-            }
-            warnings.forEach {
-                Text(
-                    stringResource(R.string.capture_warning_line, it),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun CaptureTerminalCard(messageRes: Int, onReset: () -> Unit) {
-    Card {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Text(stringResource(messageRes), style = MaterialTheme.typography.bodyMedium)
-            Button(onClick = onReset) {
-                Text(stringResource(R.string.capture_another))
-            }
-        }
-    }
-}
-
-private fun nutritionModality(staged: Staged?): NutritionModality =
-    when {
-        staged?.contentType?.startsWith("image/") == true -> NutritionModality.PHOTO
-        staged?.contentType?.startsWith("audio/") == true -> NutritionModality.VOICE
-        else -> NutritionModality.TEXT
-    }
-
-private fun currentTimestamp(): String =
-    OffsetDateTime.now(ZoneId.systemDefault()).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
-
-private fun launchNutritionAnalysis(
-    scope: CoroutineScope,
-    context: Context,
-    api: HealthmesApi,
-    state: NutritionCaptureState.Analyzing,
-    draft: NutritionDraft,
-    onDraft: (NutritionDraft) -> Unit,
-    onState: (NutritionCaptureState) -> Unit,
-    onBusy: (Boolean) -> Unit,
-    onMessage: (String?) -> Unit,
-) {
-    onState(state)
-    onBusy(true)
-    onMessage(null)
-    scope.launch {
-        when (
-            val attempt = withContext(Dispatchers.IO) {
-                analyzeNutrition(context, api, state, draft)
-            }
-        ) {
-            is NutritionAnalysisAttempt.Success -> {
-                onDraft(attempt.draft)
-                onState(attempt.state)
-            }
-
-            is NutritionAnalysisAttempt.Failure -> {
-                onDraft(attempt.draft)
-                onState(NutritionCaptureTransitions.failed(state, attempt.detail))
-            }
-        }
-        onBusy(false)
-    }
-}
-
-private fun launchPhotoReview(
-    scope: CoroutineScope,
-    context: Context,
-    api: HealthmesApi,
-    state: NutritionCaptureState.SubmittingPhotoReview,
-    onState: (NutritionCaptureState) -> Unit,
-    onBusy: (Boolean) -> Unit,
-    onMessage: (String?) -> Unit,
-) {
-    onState(state)
-    onBusy(true)
-    onMessage(null)
-    scope.launch {
-        when (
-            val review = withContext(Dispatchers.IO) {
-                submitPhotoReview(api, state)
-            }
-        ) {
-            is CaptureCall.Failure -> {
-                onState(NutritionCaptureTransitions.failed(state, review.detail))
-                onBusy(false)
-            }
-
-            is CaptureCall.Success -> {
-                when (val next = NutritionCaptureTransitions.photoReviewStored(state)) {
-                    is NutritionCaptureState.Rejected -> {
-                        onState(next)
-                        onBusy(false)
-                    }
-
-                    is NutritionCaptureState.CreatingInteraction -> {
-                        onState(next)
-                        when (
-                            val created = withContext(Dispatchers.IO) {
-                                createPhotoInteraction(api, next)
-                            }
-                        ) {
-                            is CaptureCall.Success -> onState(created.value)
-                            is CaptureCall.Failure -> onState(
-                                NutritionCaptureTransitions.failed(next, created.detail)
-                            )
-                        }
-                        onBusy(false)
-                    }
-
-                    else -> {
-                        onState(
-                            NutritionCaptureTransitions.failed(
-                                state,
-                                context.getString(R.string.capture_invalid_state),
-                            )
-                        )
-                        onBusy(false)
-                    }
-                }
-            }
-        }
-    }
-}
-
-private fun launchPhotoInteraction(
-    scope: CoroutineScope,
-    context: Context,
-    api: HealthmesApi,
-    state: NutritionCaptureState.CreatingInteraction,
-    onState: (NutritionCaptureState) -> Unit,
-    onBusy: (Boolean) -> Unit,
-    onMessage: (String?) -> Unit,
-) {
-    onState(state)
-    onBusy(true)
-    onMessage(null)
-    scope.launch {
-        when (
-            val created = withContext(Dispatchers.IO) {
-                createPhotoInteraction(api, state)
-            }
-        ) {
-            is CaptureCall.Success -> onState(created.value)
-            is CaptureCall.Failure -> onState(
-                NutritionCaptureTransitions.failed(state, created.detail)
-            )
-        }
-        onBusy(false)
-    }
-}
-
-private fun launchNutritionOutcome(
-    scope: CoroutineScope,
-    context: Context,
-    api: HealthmesApi,
-    state: NutritionCaptureState.SubmittingOutcome,
-    onState: (NutritionCaptureState) -> Unit,
-    onBusy: (Boolean) -> Unit,
-    onMessage: (String?) -> Unit,
-) {
-    onState(state)
-    onBusy(true)
-    onMessage(null)
-    scope.launch {
-        when (
-            val outcome = withContext(Dispatchers.IO) {
-                submitNutritionOutcome(api, state)
-            }
-        ) {
-            is CaptureCall.Success -> onState(outcome.value)
-            is CaptureCall.Failure -> onState(
-                NutritionCaptureTransitions.failed(state, outcome.detail)
-            )
-        }
-        onBusy(false)
-    }
-}
-
-private sealed interface NutritionAnalysisAttempt {
-    data class Success(
-        val draft: NutritionDraft,
-        val state: NutritionCaptureState,
-    ) : NutritionAnalysisAttempt
-
-    data class Failure(
-        val draft: NutritionDraft,
-        val detail: String,
-    ) : NutritionAnalysisAttempt
-}
-
-private fun analyzeNutrition(
-    context: Context,
-    api: HealthmesApi,
-    state: NutritionCaptureState.Analyzing,
-    draft: NutritionDraft,
-): NutritionAnalysisAttempt {
-    var updatedDraft = draft
-    val mediaPath = if (state.session.modality == NutritionModality.TEXT) {
-        null
-    } else {
-        draft.uploadedMediaPath ?: when (
-            val uploaded = draft.staged?.let { uploadAttachment(context, api, it) }
-                ?: CaptureCall.Failure("missing photo or voice attachment")
-        ) {
-            is CaptureCall.Success -> {
-                updatedDraft = draft.copy(uploadedMediaPath = uploaded.value)
-                uploaded.value
-            }
-
-            is CaptureCall.Failure -> {
-                return NutritionAnalysisAttempt.Failure(updatedDraft, uploaded.detail)
-            }
-        }
-    }
-    val body = when (state.session.modality) {
-        NutritionModality.PHOTO -> CaptureRequests.photoAnalyzeBody(
-            mediaPath = requireNotNull(mediaPath),
-            capturedAt = state.session.observedAt,
-            timezone = state.session.timezone,
-            source = CAPTURE_SOURCE,
-        )
-
-        NutritionModality.TEXT -> CaptureRequests.textAnalyzeBody(
-            operationId = state.session.analyzeOperationId,
-            intent = CaptureRequests.INTENT_LOG_CONSUMED,
-            observedAt = state.session.observedAt,
-            timezone = state.session.timezone,
-            source = CAPTURE_SOURCE,
-            sourceText = requireNotNull(state.session.sourceText),
-        )
-
-        NutritionModality.VOICE -> CaptureRequests.voiceAnalyzeBody(
-            operationId = state.session.analyzeOperationId,
-            intent = CaptureRequests.INTENT_LOG_CONSUMED,
-            observedAt = state.session.observedAt,
-            timezone = state.session.timezone,
-            source = CAPTURE_SOURCE,
-            mediaPath = requireNotNull(mediaPath),
-        )
-    }
-    val path = if (state.session.modality == NutritionModality.PHOTO) {
-        CaptureRequests.NUTRITION_OBSERVATIONS_ANALYZE_PATH
-    } else {
-        CaptureRequests.INTAKE_INTERACTIONS_ANALYZE_PATH
-    }
-    return when (val response = postJson(api, path, body)) {
-        is CaptureCall.Failure ->
-            NutritionAnalysisAttempt.Failure(updatedDraft, response.detail)
-
-        is CaptureCall.Success -> {
-            val parsed = runCatching {
-                if (state.session.modality == NutritionModality.PHOTO) {
-                    NutritionCaptureTransitions.photoAnalyzed(
-                        state,
-                        NutritionObservationResult.parse(response.value),
-                    )
-                } else {
-                    NutritionCaptureTransitions.interactionAnalyzed(
-                        state,
-                        NutritionInteractionResult.parse(response.value),
-                    )
-                }
-            }
-            parsed.fold(
-                onSuccess = { NutritionAnalysisAttempt.Success(updatedDraft, it) },
-                onFailure = {
-                    NutritionAnalysisAttempt.Failure(
-                        updatedDraft,
-                        "invalid analysis response: ${it.message ?: it.javaClass.simpleName}",
-                    )
-                },
-            )
-        }
-    }
-}
-
-private fun submitPhotoReview(
-    api: HealthmesApi,
-    state: NutritionCaptureState.SubmittingPhotoReview,
-): CaptureCall<Unit> {
-    val correctedItems =
-        if (state.status == NutritionReviewStatus.CORRECTED) {
-            state.observation.correctedItems(state.correctedNames)
-        } else {
-            emptyList()
-        }
-    val body = CaptureRequests.photoReviewBody(
-        operationId = state.session.reviewOperationId(state.status),
-        status = state.status.wireValue,
-        source = CAPTURE_SOURCE,
-        correctedItems = correctedItems,
-    )
-    return when (
-        val response = postJson(
-            api,
-            CaptureRequests.nutritionObservationReviewPath(
-                state.observation.observationId
-            ),
-            body,
-        )
-    ) {
-        is CaptureCall.Success -> CaptureCall.Success(Unit)
-        is CaptureCall.Failure -> response
-    }
-}
-
-private fun createPhotoInteraction(
-    api: HealthmesApi,
-    state: NutritionCaptureState.CreatingInteraction,
-): CaptureCall<NutritionCaptureState.AwaitingOutcome> {
-    val body = CaptureRequests.photoInteractionBody(
-        operationId = state.session.interactionOperationId,
-        intent = CaptureRequests.INTENT_LOG_CONSUMED,
-        nutritionObservationId = state.observation.observationId,
-        source = CAPTURE_SOURCE,
-        sourceText = state.session.sourceText,
-    )
-    return when (
-        val response = postJson(api, CaptureRequests.INTAKE_INTERACTIONS_PATH, body)
-    ) {
-        is CaptureCall.Failure -> response
-        is CaptureCall.Success -> runCatching {
-            NutritionCaptureTransitions.interactionCreated(
-                state,
-                NutritionInteractionResult.parse(response.value),
-            )
-        }.fold(
-            onSuccess = { CaptureCall.Success(it) },
-            onFailure = {
-                CaptureCall.Failure(
-                    "invalid interaction response: ${it.message ?: it.javaClass.simpleName}"
-                )
-            },
-        )
-    }
-}
-
-private fun submitNutritionOutcome(
-    api: HealthmesApi,
-    state: NutritionCaptureState.SubmittingOutcome,
-): CaptureCall<NutritionCaptureState.Completed> {
-    val body = CaptureRequests.intakeOutcomeBody(
-        operationId = state.session.outcomeOperationId(state.status),
-        status = state.status.wireValue,
-        source = CAPTURE_SOURCE,
-        consumedAt = state.consumedAt,
-    )
-    return when (
-        val response = postJson(
-            api,
-            CaptureRequests.intakeOutcomePath(state.interaction.interactionId),
-            body,
-        )
-    ) {
-        is CaptureCall.Failure -> response
-        is CaptureCall.Success -> runCatching {
-            NutritionCaptureTransitions.outcomeStored(
-                state,
-                NutritionInteractionResult.parse(response.value),
-            )
-        }.fold(
-            onSuccess = { CaptureCall.Success(it) },
-            onFailure = {
-                CaptureCall.Failure(
-                    "invalid outcome response: ${it.message ?: it.javaClass.simpleName}"
-                )
-            },
-        )
-    }
-}
-
-private sealed interface CaptureCall<out T> {
-    data class Success<T>(val value: T) : CaptureCall<T>
-    data class Failure(val detail: String) : CaptureCall<Nothing>
-}
-
-private fun postJson(api: HealthmesApi, path: String, body: String): CaptureCall<String> =
-    when (val response = api.postJson(path, body)) {
-        is HealthmesApi.Response.NetworkError -> CaptureCall.Failure(response.reason)
-        is HealthmesApi.Response.Http -> if (response.isSuccess) {
-            CaptureCall.Success(response.body)
-        } else {
-            val detail = ApiError.parseOrNull(response.body)?.message
-                ?: "HTTP ${response.code}"
-            CaptureCall.Failure(detail)
-        }
-    }
-
-private fun uploadAttachment(
-    context: Context,
-    api: HealthmesApi,
-    attachment: Staged,
-): CaptureCall<String> {
-    val bytes = try {
-        when {
-            attachment.file != null -> attachment.file.readBytes()
-            attachment.uri != null ->
-                context.contentResolver.openInputStream(attachment.uri)?.use { it.readBytes() }
-
-            else -> null
-        }
-    } catch (e: Exception) {
-        return CaptureCall.Failure(e.message ?: e.javaClass.simpleName)
-    } ?: return CaptureCall.Failure(attachment.label)
-
-    return when (
-        val response = api.postMultipart("/v1/media", attachment.contentType, bytes)
-    ) {
-        is HealthmesApi.Response.NetworkError -> CaptureCall.Failure(response.reason)
-        is HealthmesApi.Response.Http -> {
-            if (!response.isSuccess) {
-                val detail = ApiError.parseOrNull(response.body)?.message
-                    ?: "HTTP ${response.code}"
-                CaptureCall.Failure(detail)
-            } else {
-                runCatching { MediaUploadResult.parse(response.body).mediaPath }
-                    .fold(
-                        onSuccess = { CaptureCall.Success(it) },
-                        onFailure = { CaptureCall.Failure("unparseable upload response") },
-                    )
-            }
-        }
-    }
 }
 
 /** MediaRecorder lifecycle kept out of composition. */
@@ -1359,6 +351,7 @@ private class RecorderHolder {
     private var recorder: MediaRecorder? = null
     private var output: File? = null
 
+    /** True when recording started. */
     fun start(context: Context): Boolean {
         cancel()
         return try {
@@ -1382,6 +375,7 @@ private class RecorderHolder {
         }
     }
 
+    /** The recorded file, or null when stop failed / nothing was recording. */
     fun stop(): File? {
         val mediaRecorder = recorder ?: return null
         val file = output
@@ -1402,7 +396,7 @@ private class RecorderHolder {
         try {
             recorder?.release()
         } catch (_: Exception) {
-            // Already released.
+            // already released
         }
         recorder = null
         output?.delete()
@@ -1410,7 +404,7 @@ private class RecorderHolder {
     }
 }
 
-private data class MedicalSaveRequest(
+private data class SaveRequest(
     val kind: String,
     val description: String,
     val transcript: String,
@@ -1419,45 +413,87 @@ private data class MedicalSaveRequest(
 
 private data class SaveOutcome(val success: Boolean, val message: String)
 
-/** Existing medical upload/create behavior, kept separate from nutrition. */
-private fun saveMedical(
-    context: Context,
-    api: HealthmesApi,
-    request: MedicalSaveRequest,
-): SaveOutcome {
-    val mediaPath = request.staged?.let { attachment ->
-        when (val uploaded = uploadAttachment(context, api, attachment)) {
-            is CaptureCall.Success -> uploaded.value
-            is CaptureCall.Failure -> return SaveOutcome(
-                false,
-                context.getString(R.string.capture_upload_failed, uploaded.detail),
+/** Upload (optional) then create — blocking; call on Dispatchers.IO. */
+private fun save(context: Context, api: HealthmesApi, request: SaveRequest): SaveOutcome {
+    // 1) media upload (skipped for text-only captures)
+    var mediaPath: String? = null
+    val attachment = request.staged
+    if (attachment != null) {
+        val bytes = try {
+            when {
+                attachment.file != null -> attachment.file.readBytes()
+                attachment.uri != null ->
+                    context.contentResolver.openInputStream(attachment.uri)?.use { it.readBytes() }
+                else -> null
+            }
+        } catch (e: Exception) {
+            return SaveOutcome(
+                false, context.getString(R.string.capture_upload_failed, e.message ?: "?")
             )
-        }
-    }
-    val body = CaptureRequests.medicalRecordBody(
-        kind = if (request.kind == CaptureKind.MEDICATION.name) {
-            CaptureRequests.KIND_MEDICATION
-        } else {
-            CaptureRequests.KIND_SYMPTOM
-        },
-        description = request.description,
-        mediaPath = mediaPath,
-        transcript = request.transcript.takeIf { it.isNotBlank() },
-        captureSource = CAPTURE_SOURCE,
-    )
-    return when (
-        val response = postJson(api, CaptureRequests.MEDICAL_RECORDS_PATH, body)
-    ) {
-        is CaptureCall.Success -> SaveOutcome(
-            true,
-            context.getString(R.string.capture_saved_medical),
+        } ?: return SaveOutcome(
+            false, context.getString(R.string.capture_upload_failed, attachment.label)
         )
 
-        is CaptureCall.Failure -> SaveOutcome(
-            false,
-            context.getString(R.string.capture_create_failed, response.detail),
+        when (val response = api.postMultipart("/v1/media", attachment.contentType, bytes)) {
+            is HealthmesApi.Response.NetworkError -> return SaveOutcome(
+                false, context.getString(R.string.capture_upload_failed, response.reason)
+            )
+
+            is HealthmesApi.Response.Http -> {
+                if (!response.isSuccess) {
+                    val detail = ApiError.parseOrNull(response.body)?.message
+                        ?: "HTTP ${response.code}"
+                    return SaveOutcome(
+                        false, context.getString(R.string.capture_upload_failed, detail)
+                    )
+                }
+                mediaPath = runCatching { MediaUploadResult.parse(response.body).mediaPath }
+                    .getOrNull()
+                    ?: return SaveOutcome(
+                        false,
+                        context.getString(R.string.capture_upload_failed, "unparseable response"),
+                    )
+            }
+        }
+    }
+
+    // 2) create the row (food vs medical — the Telegram-skill contracts)
+    val isFood = request.kind == CaptureKind.FOOD.name
+    val path = if (isFood) CaptureRequests.FOOD_LOGS_PATH else CaptureRequests.MEDICAL_RECORDS_PATH
+    val body = if (isFood) {
+        CaptureRequests.foodLogBody(request.description, mediaPath, source = CAPTURE_SOURCE)
+    } else {
+        CaptureRequests.medicalRecordBody(
+            kind = if (request.kind == CaptureKind.MEDICATION.name) {
+                CaptureRequests.KIND_MEDICATION
+            } else {
+                CaptureRequests.KIND_SYMPTOM
+            },
+            description = request.description,
+            mediaPath = mediaPath,
+            transcript = request.transcript.takeIf { it.isNotBlank() },
+            captureSource = CAPTURE_SOURCE,
         )
+    }
+    return when (val response = api.postJson(path, body)) {
+        is HealthmesApi.Response.NetworkError ->
+            SaveOutcome(false, context.getString(R.string.capture_create_failed, response.reason))
+
+        is HealthmesApi.Response.Http ->
+            if (response.isSuccess) {
+                SaveOutcome(
+                    true,
+                    context.getString(
+                        if (isFood) R.string.capture_saved_food else R.string.capture_saved_medical
+                    ),
+                )
+            } else {
+                val detail = ApiError.parseOrNull(response.body)?.message
+                    ?: "HTTP ${response.code}"
+                SaveOutcome(false, context.getString(R.string.capture_create_failed, detail))
+            }
     }
 }
 
+/** context.capture.source value — identifies this surface in stored records. */
 private const val CAPTURE_SOURCE = "android-companion"

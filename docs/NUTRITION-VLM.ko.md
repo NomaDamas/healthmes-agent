@@ -27,14 +27,8 @@
 사진은 `POST /v1/nutrition-observations/analyze`, 자유 텍스트와 음성은
 `POST /v1/intake-interactions/analyze`를 사용한다. 음성 파일은 먼저
 `POST /v1/media`로 저장하며 HealthMes는 등록된 audio object만 로컬
-whisper.cpp에 전달한다. 구형 단일 음식 기록 계약으로 평탄화하지 않고,
-모든 신규 쓰기는 관찰·검토·interaction·outcome을 분리한다.
-
-사진 분석 후에는 반드시 사용자가 `confirmed`, 전체 `corrected`, 또는
-`rejected`로 검토한다. 검토된 사진만 `IntakeInteraction`으로 만들 수 있으며,
-텍스트·음성 분석 결과도 먼저 사용자에게 구조화 항목을 보여준다.
-`intent=log_consumed`는 기록 목적일 뿐이다. 실제 섭취는 사용자가 별도로
-승인해 `IntakeOutcome(status=consumed)`이 생성된 뒤에만 확정된다.
+whisper.cpp에 전달한다. 기존 `FoodLog`도 별도 계약이며, sake 관찰을
+`FoodLog`로 평탄화하지 않는다.
 
 상위 `IntakeInteraction` 엔진은 텍스트 원문을 자동 분석하고, 음성은 로컬
 전사 후 같은 분석 경로를 사용한다. 섭취 확인과 판단 요청에는

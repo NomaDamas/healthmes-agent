@@ -37,7 +37,6 @@ def test_landing_returns_200_with_surface_links(client) -> None:
     assert response.status_code == 200
     hrefs = _hrefs(response.text)
     # Real-page sanity: the surface cards are present to assert against.
-    assert "/dashboard" in hrefs
     assert "/decisions" in hrefs
     assert "/v1/briefing/glance" in hrefs
 

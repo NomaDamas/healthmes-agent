@@ -12,7 +12,7 @@ HEALTHMES_LOG="$RUNTIME_DIR/healthmes.log"
 OW_LOG="$RUNTIME_DIR/open-wearables.log"
 WORKER_LOG="$RUNTIME_DIR/open-wearables-worker.log"
 BEAT_LOG="$RUNTIME_DIR/open-wearables-beat.log"
-DASHBOARD_URL="${HEALTHMES_DASHBOARD_URL:-http://127.0.0.1:${HEALTHMES_PORT:-8100}/dashboard}"
+DASHBOARD_URL="${HEALTHMES_DASHBOARD_URL:-http://127.0.0.1:${HEALTHMES_PORT:-8100}/sleep}"
 DEV_MAC_SCRIPT="${HEALTHMES_DEV_MAC_SCRIPT:-$REPO_ROOT/scripts/dev_mac.sh}"
 LAUNCH_AGENT_LABEL="com.healthmes.local"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
@@ -360,20 +360,10 @@ cmd_install() {
 }
 
 cmd_update() {
-    if [ "${HEALTHMES_MANAGED_RUNTIME:-0}" != "1" ]; then
-        git -C "$REPO_ROOT" diff --quiet \
-            || die "working tree has changes; commit or stash first"
-        git -C "$REPO_ROOT" diff --cached --quiet \
-            || die "index has changes; commit or stash first"
-        git -C "$REPO_ROOT" pull --ff-only
-    fi
+    git -C "$REPO_ROOT" diff --quiet || die "working tree has changes; commit or stash first"
+    git -C "$REPO_ROOT" diff --cached --quiet || die "index has changes; commit or stash first"
+    git -C "$REPO_ROOT" pull --ff-only
     bash "$DEV_MAC_SCRIPT" setup
-    if [ -f "$LAUNCH_AGENT_PLIST" ]; then
-        start_launch_agent
-    else
-        stop_apps
-        start_apps
-    fi
     info "updated"
 }
 

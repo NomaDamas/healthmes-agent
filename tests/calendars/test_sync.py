@@ -9,7 +9,6 @@ import pytest
 from sqlalchemy import select
 
 from healthmes.calendars.base import (
-    CalendarConflictError,
     CalendarError,
     CalendarEventIdentity,
     EventDraft,
@@ -36,13 +35,7 @@ from healthmes.calendars.state import (
     InMemorySyncStateStore,
 )
 from healthmes.calendars.sync import CalendarMirrorService, ChangeKind, SyncDiff
-from healthmes.store import (
-    CalendarEventMirror,
-    CalendarSource,
-    ProposalStatus,
-    ScheduleProposal,
-    Task,
-)
+from healthmes.store import CalendarEventMirror, CalendarSource, Task
 
 
 def utc(*args: int) -> datetime:
@@ -260,208 +253,6 @@ class TestNonAgentDiff:
         assert change.kind is ChangeKind.DELETED
         assert change.old_start_at == utc(2026, 7, 9, 9, 0)
         assert rows(session) == {}
-
-    @pytest.mark.parametrize("proposal_status", [ProposalStatus.ACCEPTED, ProposalStatus.PUSHED])
-    def test_deleted_intake_invalidates_active_proposal(
-        self,
-        service,
-        fake_backend,
-        session,
-        make_event,
-        proposal_status,
-    ) -> None:
-        task = Task(title="Imported task")
-        session.add(task)
-        session.flush()
-        session.add(
-            ScheduleProposal(
-                task_id=task.id,
-                proposed_start=utc(2026, 7, 10, 9),
-                proposed_end=utc(2026, 7, 10, 10),
-                status=proposal_status,
-            )
-        )
-        session.commit()
-        fake_backend.queue_changes(
-            [
-                make_event(
-                    "hm-intake-delete",
-                    summary="[HM] Imported task",
-                    organizer_self=True,
-                    event_type="default",
-                )
-            ],
-            {"sync_token": "tok-1"},
-        )
-        service.sync_backend(fake_backend)
-        mirror = rows(session)["hm-intake-delete"]
-        mirror.intake_task_id = task.id
-        session.commit()
-
-        fake_backend.queue_changes(
-            [
-                make_event(
-                    "hm-intake-delete",
-                    deleted=True,
-                    summary=None,
-                    etag=None,
-                )
-            ],
-            {"sync_token": "tok-2"},
-        )
-        service.sync_backend(fake_backend)
-
-        session.expire_all()
-        assert session.get(Task, task.id).status == "cancelled"
-        assert session.scalars(select(ScheduleProposal)).one().status is (
-            ProposalStatus.INVALIDATED
-        )
-
-    def test_deleted_intake_removes_pushed_proposal_block(
-        self,
-        service,
-        fake_backend,
-        session,
-        make_event,
-    ) -> None:
-        task = Task(title="Imported task", status="scheduled")
-        session.add(task)
-        session.flush()
-        proposal = ScheduleProposal(
-            task_id=task.id,
-            proposed_start=utc(2026, 7, 10, 9),
-            proposed_end=utc(2026, 7, 10, 10),
-            status=ProposalStatus.PUSHED,
-        )
-        session.add(proposal)
-        session.commit()
-        identity = CalendarEventIdentity(
-            kind=HealthmesEventKind.SCHEDULE_BLOCK,
-            source="planner",
-            source_key=f"proposal:{proposal.id}",
-        )
-        fake_backend.queue_changes(
-            [
-                make_event(
-                    "hm-intake-delete",
-                    summary="[HM] Imported task",
-                    organizer_self=True,
-                    event_type="default",
-                )
-            ],
-            {"sync_token": "tok-1"},
-        )
-        service.sync_backend(fake_backend)
-        intake_row = rows(session)["hm-intake-delete"]
-        intake_row.intake_task_id = task.id
-        session.commit()
-        block = service.create_agent_event(
-            fake_backend.source,
-            EventDraft(
-                summary=task.title,
-                start_at=utc(2026, 7, 10, 9),
-                end_at=utc(2026, 7, 10, 10),
-                agent_task_id=task.id,
-                identity=identity,
-            ),
-        )
-
-        fake_backend.queue_changes(
-            [
-                make_event(
-                    "hm-intake-delete",
-                    deleted=True,
-                    summary=None,
-                    etag=None,
-                )
-            ],
-            {"sync_token": "tok-2"},
-        )
-        service.sync_backend(fake_backend)
-
-        session.expire_all()
-        assert block.external_id not in fake_backend.events
-        assert block.external_id not in rows(session)
-        assert fake_backend.delete_calls == [block.external_id]
-        assert session.get(Task, task.id).status == "cancelled"
-        assert session.get(ScheduleProposal, proposal.id).status is (
-            ProposalStatus.INVALIDATED
-        )
-
-    def test_deleted_intake_defers_block_owned_by_another_provider(
-        self,
-        session,
-        state_store,
-        fake_backend_factory,
-        make_event,
-    ) -> None:
-        google = fake_backend_factory(CalendarSource.GOOGLE)
-        caldav = fake_backend_factory(CalendarSource.CALDAV)
-        google_service = CalendarMirrorService(session, [google], state_store)
-        caldav_service = CalendarMirrorService(session, [caldav], state_store)
-        task = Task(title="Cross-provider task", status="scheduled")
-        session.add(task)
-        session.flush()
-        proposal = ScheduleProposal(
-            task_id=task.id,
-            proposed_start=utc(2026, 7, 10, 9),
-            proposed_end=utc(2026, 7, 10, 10),
-            status=ProposalStatus.PUSHED,
-        )
-        session.add(proposal)
-        session.commit()
-        identity = CalendarEventIdentity(
-            kind=HealthmesEventKind.SCHEDULE_BLOCK,
-            source="planner",
-            source_key=f"proposal:{proposal.id}",
-        )
-        block = google_service.create_agent_event(
-            google.source,
-            EventDraft(
-                summary=task.title,
-                start_at=utc(2026, 7, 10, 9),
-                end_at=utc(2026, 7, 10, 10),
-                agent_task_id=task.id,
-                identity=identity,
-            ),
-        )
-        caldav.queue_changes(
-            [
-                make_event(
-                    "icloud-intake",
-                    summary="[HM] Cross-provider task",
-                    organizer_self=True,
-                    event_type="default",
-                )
-            ],
-            {"ctag": "ctag-1"},
-        )
-        caldav_service.sync_backend(caldav)
-        intake_row = rows(session)["icloud-intake"]
-        intake_row.intake_task_id = task.id
-        session.commit()
-
-        caldav.queue_changes(
-            [
-                make_event(
-                    "icloud-intake",
-                    deleted=True,
-                    summary=None,
-                    etag=None,
-                )
-            ],
-            {"ctag": "ctag-2"},
-        )
-        caldav_service.sync_backend(caldav)
-
-        session.expire_all()
-        assert session.get(Task, task.id).status == "cancelled"
-        assert session.get(ScheduleProposal, proposal.id).status is (
-            ProposalStatus.PUSHED
-        )
-        assert session.get(CalendarEventMirror, block.id) is not None
-        assert block.external_id in google.events
-        assert caldav.delete_calls == []
 
     def test_deletion_of_unknown_event_is_ignored(
         self, service, fake_backend, make_event
@@ -819,73 +610,6 @@ class TestOwnershipGuard:
             fake_backend.source, draft(agent_task_id=uuid.uuid4())
         )
         assert rows(session)[row.external_id].agent_task_id is None
-
-    def test_nonrecoverable_create_error_is_not_treated_as_identity_collision(
-        self, service, fake_backend, session, monkeypatch
-    ) -> None:
-        identity = CalendarEventIdentity(
-            kind=HealthmesEventKind.ACTUAL_SLEEP,
-            source="oura",
-            source_key="oura:2026-07-26",
-        )
-        read_calls = 0
-
-        def missing_etag(_draft):
-            raise CalendarError("caldav create read-back returned no server ETag")
-
-        def read_event(_external_id):
-            nonlocal read_calls
-            read_calls += 1
-            raise AssertionError("non-conflict errors must not enter recovery")
-
-        monkeypatch.setattr(fake_backend, "create_event", missing_etag)
-        monkeypatch.setattr(fake_backend, "read_event", read_event)
-
-        with pytest.raises(CalendarError, match="server ETag"):
-            service.create_agent_event(
-                fake_backend.source,
-                draft(identity=identity),
-            )
-
-        assert read_calls == 0
-        assert rows(session) == {}
-
-    def test_identity_recovery_never_adopts_an_event_without_etag(
-        self, service, fake_backend, session, monkeypatch
-    ) -> None:
-        identity = CalendarEventIdentity(
-            kind=HealthmesEventKind.ACTUAL_SLEEP,
-            source="oura",
-            source_key="oura:2026-07-26",
-        )
-        event_draft = draft(identity=identity)
-        external_id = calendar_identity_external_id(
-            fake_backend.source,
-            identity,
-        )
-        remote = ExternalEvent(
-            external_id=external_id,
-            summary=event_draft.summary,
-            description=event_draft.description,
-            start_at=event_draft.start_at,
-            end_at=event_draft.end_at,
-            is_agent_created=True,
-            agent_task_id=event_draft.agent_task_id,
-            identity=identity,
-            etag=None,
-        )
-
-        def create_conflict(_draft):
-            fake_backend.events[external_id] = remote
-            raise CalendarConflictError("remote create raced")
-
-        monkeypatch.setattr(fake_backend, "create_event", create_conflict)
-
-        for _ in range(2):
-            with pytest.raises(CalendarConflictError, match="missing an ETag"):
-                service.create_agent_event(fake_backend.source, event_draft)
-
-        assert rows(session) == {}
 
     def test_owned_identity_without_task_survives_provider_round_trip(
         self, service, fake_backend, session, make_event
@@ -1430,51 +1154,6 @@ class TestFullResyncReconcile:
         assert [change.external_id for change in diff.deleted] == ["gone-1"]
         assert diff.created == diff.moved == diff.agent_modified == []
         assert set(rows(session)) == {"keep-1"}
-
-    def test_full_resync_tombstone_invalidates_intake_proposal(
-        self,
-        service,
-        fake_backend,
-        session,
-        state_store,
-        make_event,
-    ) -> None:
-        task = Task(title="Imported tombstone task")
-        session.add(task)
-        session.flush()
-        proposal = ScheduleProposal(
-            task_id=task.id,
-            proposed_start=utc(2026, 7, 10, 9),
-            proposed_end=utc(2026, 7, 10, 10),
-            status=ProposalStatus.ACCEPTED,
-        )
-        session.add(proposal)
-        session.commit()
-        fake_backend.queue_changes(
-            [
-                make_event(
-                    "hm-intake-tombstone",
-                    summary="[HM] Imported tombstone task",
-                    organizer_self=True,
-                    event_type="default",
-                )
-            ],
-            {"sync_token": "tok-1"},
-        )
-        service.sync_backend(fake_backend)
-        mirror = rows(session)["hm-intake-tombstone"]
-        mirror.intake_task_id = task.id
-        session.commit()
-
-        state_store.clear(fake_backend.source)
-        fake_backend.queue_changes([], {"sync_token": "tok-2"})
-        service.sync_backend(fake_backend)
-
-        session.expire_all()
-        assert session.get(Task, task.id).status == "cancelled"
-        assert session.get(ScheduleProposal, proposal.id).status is (
-            ProposalStatus.INVALIDATED
-        )
 
     def test_true_first_sync_emits_no_tombstones(
         self, service, fake_backend, session, make_event

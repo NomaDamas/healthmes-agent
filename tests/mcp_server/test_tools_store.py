@@ -25,11 +25,11 @@ from healthmes.store import (
     CalendarSource,
     DecisionRecord,
     EnergyDemand,
+    FoodLog,
     ProposalStatus,
     ScheduleProposal,
     Task,
     TriggerEvent,
-    WellnessEvent,
 )
 from healthmes.trusted_session import issue_trusted_session_proof
 
@@ -1098,87 +1098,27 @@ class TestCaptureTools:
             "log_food",
             {
                 "description": "Bibimbap with extra vegetables",
-                "operation_id": "11111111-1111-4111-8111-111111111111",
                 "logged_at": "2026-07-08T12:30:00Z",
                 "meal_type": "lunch",
+                "media_path": "media/2026-07-08/lunch.jpg",
                 "source": "telegram",
             },
         )
         assert result["status"] == "ok"
-        assert "food_log_id" not in result
         assert result["logged_at"] == "2026-07-08T12:30:00+00:00"
         with store_factory() as session:
-            interaction = session.scalar(
-                select(WellnessEvent).where(
-                    WellnessEvent.source_provider == "nutrition-interaction",
-                    WellnessEvent.source_record_id == result["interaction_id"],
-                )
-            )
-            outcome = session.scalar(
-                select(WellnessEvent).where(
-                    WellnessEvent.source_provider == "nutrition-intake-outcome",
-                    WellnessEvent.source_record_id == result["outcome_id"],
-                )
-            )
-            assert interaction is not None
-            assert interaction.payload["items"][0]["name"] == (
-                "Bibimbap with extra vegetables"
-            )
-            assert interaction.payload["items"][0]["meal_type"] == "lunch"
-            assert outcome is not None
-            assert outcome.payload["status"] == "consumed"
-            assert outcome.payload["intake_snapshot"]["items"][0]["meal_type"] == "lunch"
-
-    async def test_log_food_retry_is_idempotent(
-        self, mcp_client, call_tool, store_factory
-    ):
-        arguments = {
-            "description": "Toast",
-            "operation_id": "22222222-2222-4222-8222-222222222222",
-            "logged_at": "2026-07-08T08:00:00Z",
-            "meal_type": "breakfast",
-        }
-
-        first = await call_tool(mcp_client, "log_food", arguments)
-        second = await call_tool(mcp_client, "log_food", arguments)
-
-        assert second["interaction_id"] == first["interaction_id"]
-        assert second["outcome_id"] == first["outcome_id"]
-        with store_factory() as session:
-            rows = list(
-                session.scalars(
-                    select(WellnessEvent).where(
-                        WellnessEvent.source_provider.in_(
-                            [
-                                "nutrition-interaction",
-                                "nutrition-intake-outcome",
-                            ]
-                        ),
-                        WellnessEvent.source_record_id.in_(
-                            [first["interaction_id"], first["outcome_id"]]
-                        )
-                    )
-                )
-            )
-            assert len(rows) == 2
+            row = session.get(FoodLog, uuid.UUID(result["food_log_id"]))
+            assert row is not None
+            assert row.description == "Bibimbap with extra vegetables"
+            assert row.meal_type == "lunch"
+            assert row.media_path == "media/2026-07-08/lunch.jpg"
 
     async def test_log_food_validation(self, mcp_client):
         with pytest.raises(ToolError, match="description"):
-            await mcp_client.call_tool(
-                "log_food",
-                {
-                    "description": "   ",
-                    "operation_id": "33333333-3333-4333-8333-333333333333",
-                },
-            )
+            await mcp_client.call_tool("log_food", {"description": "   "})
         with pytest.raises(ToolError, match="meal_type"):
             await mcp_client.call_tool(
-                "log_food",
-                {
-                    "description": "toast",
-                    "operation_id": "44444444-4444-4444-8444-444444444444",
-                    "meal_type": "brunch",
-                },
+                "log_food", {"description": "toast", "meal_type": "brunch"}
             )
 
     async def test_record_decision_returns_viewer_url(

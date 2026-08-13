@@ -92,7 +92,7 @@ def redacted_provider_guard(provider_state: dict[str, Any]) -> dict[str, Any]:
     actual = provider_state["actual"]
     planned = provider_state["planned"]
     actual_digest = None
-    if isinstance(actual, dict | list):
+    if isinstance(actual, (dict, list)):
         actual_digest = redacted_digest(json.dumps(actual, sort_keys=True))
     planned_digests = [
         redacted_digest(json.dumps(item, sort_keys=True))

@@ -11,7 +11,7 @@ import httpx
 import pytest
 from sqlalchemy import select
 
-from healthmes.ingest import transform_hae, transform_healthkit
+from healthmes.ingest import transform_hae
 from healthmes.store import RawIngestEvent
 
 OW_USER = "0b6f3a52-8c1d-4e2a-9f10-2a5b7c9d1e3f"
@@ -41,46 +41,6 @@ HAE_PAYLOAD = {
     }
 }
 
-NATIVE_PAYLOAD = {
-    "schema": "healthmes.healthkit.v1",
-    "sdkVersion": "healthmes-ios/1",
-    "syncTimestamp": "2026-08-10T01:00:00Z",
-    "data": {
-        "records": [
-            {
-                "id": "metric-1",
-                "type": "HKQuantityTypeIdentifierHeartRate",
-                "startDate": "2026-08-10T00:00:00Z",
-                "endDate": "2026-08-10T00:01:00Z",
-                "value": 61,
-                "unit": "count/min",
-            }
-        ],
-        "sleep": [
-            {
-                "id": "sleep-1",
-                "stage": "deep",
-                "startDate": "2026-08-09T15:00:00Z",
-                "endDate": "2026-08-09T16:00:00Z",
-            }
-        ],
-        "workouts": [
-            {
-                "id": "workout-1",
-                "type": "WALKING",
-                "startDate": "2026-08-10T00:10:00Z",
-                "endDate": "2026-08-10T00:30:00Z",
-            }
-        ],
-        "deletions": [
-            {
-                "id": "deleted-metric-1",
-                "type": "HKQuantityTypeIdentifierHeartRate",
-            }
-        ],
-    },
-}
-
 
 def _stored_file(settings, event: RawIngestEvent):
     return settings.data_dir / event.path
@@ -107,14 +67,6 @@ def test_transform_tolerates_garbage(junk):
     assert transform_hae(junk) == []
 
 
-def test_transform_native_healthkit_preserves_all_sdk_arrays():
-    records, sleep, workouts, sdk_version = transform_healthkit(NATIVE_PAYLOAD)
-    assert records == NATIVE_PAYLOAD["data"]["records"]
-    assert sleep == NATIVE_PAYLOAD["data"]["sleep"]
-    assert workouts == NATIVE_PAYLOAD["data"]["workouts"]
-    assert sdk_version == "healthmes-ios/1"
-
-
 # --- POST /v1/ingest/healthkit ----------------------------------------------
 
 
@@ -136,7 +88,6 @@ def test_healthkit_ingest_stores_raw_and_forwards(client, session, settings):
     assert response.status_code == 202
     ack = response.json()
     assert ack["parse_status"] == "parsed"
-    assert ack["durable"] is True
     assert ack["forward_status"] == "queued"
     assert ack["records_forwarded"] == 3
 
@@ -163,33 +114,6 @@ def test_healthkit_ingest_without_user_still_stores(client, session):
     assert ack["forward_status"] == "skipped_no_user"  # conftest ow_user_id=None
     event = session.scalars(select(RawIngestEvent)).one()
     assert event.forward_status == "skipped_no_user"
-
-
-def test_native_healthkit_ingest_forwards_records_sleep_and_workouts(
-    client, settings
-):
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.read())
-        return httpx.Response(202, json={"status": "queued"})
-
-    client.app.state.ingest_transport = httpx.MockTransport(handler)
-    client.app.state.settings = settings.model_copy(update={"ow_user_id": OW_USER})
-
-    response = client.post("/v1/ingest/healthkit", json=NATIVE_PAYLOAD)
-
-    assert response.status_code == 202
-    assert response.json()["records_forwarded"] == 1
-    assert response.json()["sleep_forwarded"] == 1
-    assert response.json()["workouts_forwarded"] == 1
-    assert response.json()["deletions_received"] == 1
-    assert captured["body"]["sdkVersion"] == "healthmes-ios/1"
-    assert captured["body"]["data"] == {
-        key: value
-        for key, value in NATIVE_PAYLOAD["data"].items()
-        if key != "deletions"
-    }
 
 
 def test_healthkit_ingest_forward_failure_keeps_raw(client, session, settings):
@@ -249,7 +173,6 @@ def test_raw_ingest_stores_anything(client, session, settings):
     assert response.status_code == 202
     ack = response.json()
     assert ack["forward_status"] == "not_applicable"
-    assert ack["durable"] is True
     event = session.scalars(select(RawIngestEvent)).one()
     assert event.source == "sleep-diary"
     assert _stored_file(settings, event).read_text() == "오늘 새벽 3시에 깼다"

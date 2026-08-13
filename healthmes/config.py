@@ -12,7 +12,6 @@ Never hardcode docker service hostnames here.
 import datetime
 import ipaddress
 import logging
-import socket
 import zoneinfo
 from functools import lru_cache
 from pathlib import Path
@@ -20,6 +19,8 @@ from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from healthmes.timezones import parse_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -120,10 +121,11 @@ class Settings(BaseSettings):
     )
     timezone: str | None = Field(
         default=None,
-        description="IANA timezone of the user (e.g. 'Asia/Seoul'); local-day "
-        "boundaries and the calendar/app-usage joins of the tranche-2 MCP tools "
-        "use it. None = the machine's local timezone (right on mac-native; "
-        "docker containers run UTC clocks, so compose forwards HEALTHMES_TIMEZONE).",
+        description="IANA timezone or UTC fixed offset of the user "
+        "(e.g. 'Asia/Seoul' or 'UTC+09:00'); local-day boundaries and the "
+        "calendar/app-usage joins of the tranche-2 MCP tools use it. "
+        "None = the machine's local timezone (right on mac-native; docker "
+        "containers run UTC clocks, so compose forwards HEALTHMES_TIMEZONE).",
     )
 
     # Delivery: proactive alerts reach the user through the Hermes webhook
@@ -302,12 +304,6 @@ class Settings(BaseSettings):
         description="Polling interval for Google Calendar incremental sync "
         "(syncToken; docs/PLAN.md §6 says 5 minutes).",
     )
-    calendar_write_provider: Literal["auto", "google", "caldav"] = Field(
-        default="auto",
-        description="Calendar provider that receives approved HealthMes blocks. "
-        "'auto' preserves the historical Google-first fallback; choose "
-        "'google' or 'caldav' when both providers are connected.",
-    )
     caldav_enabled: bool = Field(
         default=False,
         description="Enable the iCloud CalDAV mirror backend "
@@ -328,8 +324,8 @@ class Settings(BaseSettings):
     )
     caldav_calendar_name: str | None = Field(
         default=None,
-        description="Display name of the CalDAV calendar to mirror. May be omitted "
-        "only when the principal exposes exactly one calendar.",
+        description="Display name of the CalDAV calendar to mirror; None picks "
+        "the principal's default calendar.",
     )
     caldav_poll_minutes: int = Field(
         default=10,
@@ -469,18 +465,19 @@ def system_timezone() -> datetime.tzinfo:
 
 
 def resolve_timezone(settings: Settings) -> datetime.tzinfo:
-    """The user's local timezone: ``Settings.timezone`` (IANA) or the machine's.
+    """The user's configured timezone or the machine's local IANA timezone.
 
-    A configured-but-invalid name raises ``ZoneInfoNotFoundError`` — loud,
-    never a silent UTC fallback (silent guessing corrupts every local-day
-    join, quiet-hours window and dedup key). ``None`` (unset) means the
-    machine's local timezone: right on mac-native, where machine tz == user
-    tz; docker deployments forward ``HEALTHMES_TIMEZONE`` because container
-    clocks run UTC.
+    IANA names and stable ``UTC+09:00`` fixed offsets are accepted. A
+    configured-but-invalid value raises ``ZoneInfoNotFoundError`` for backward
+    compatibility, never a silent UTC fallback. ``None`` means the machine's
+    local timezone.
     """
     name = getattr(settings, "timezone", None)
     if name:
-        return zoneinfo.ZoneInfo(str(name))
+        try:
+            return parse_timezone(str(name))
+        except ValueError as exc:
+            raise zoneinfo.ZoneInfoNotFoundError(str(name)) from exc
     return system_timezone()
 
 
@@ -490,19 +487,9 @@ def is_loopback_host(host: str) -> bool:
     Non-IP hostnames other than ``localhost`` count as non-loopback — the
     safe direction for the serve-time auth interlock.
     """
-    normalized = host.strip().lower().removesuffix(".")
-    if normalized == "localhost":
+    if host == "localhost":
         return True
     try:
-        return ipaddress.ip_address(normalized).is_loopback
+        return ipaddress.ip_address(host).is_loopback
     except ValueError:
-        pass
-    # URL stacks still accept historical IPv4 spellings such as 127.1 and
-    # 2130706433. Normalize them before applying the remote-pairing boundary.
-    if not normalized or any(character not in "0123456789." for character in normalized):
         return False
-    try:
-        packed = socket.inet_aton(normalized)
-    except OSError:
-        return False
-    return ipaddress.IPv4Address(packed).is_loopback

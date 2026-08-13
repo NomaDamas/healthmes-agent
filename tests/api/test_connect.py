@@ -53,7 +53,11 @@ class FakeOpenWearables:
 @pytest.fixture
 def client(app):
     """Status page served by the shared api-test app (tokenless settings)."""
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as test_client:
         yield test_client
 
 
@@ -115,75 +119,6 @@ def test_connected_states_render_without_secrets(client, settings) -> None:
     assert str(settings.data_dir) not in text
 
 
-def test_local_session_can_connect_and_disconnect_icloud_without_rendering_secrets(
-    settings, monkeypatch
-) -> None:
-    secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
-    validated = []
-    monkeypatch.setattr(
-        creds,
-        "validate_caldav_connection",
-        lambda **kwargs: validated.append(kwargs) or "1 calendar",
-    )
-    with TestClient(
-        create_app(secured),
-        base_url="http://127.0.0.1:8100",
-    ) as local:
-        unlock = local.post(
-            "/connect/unlock",
-            data={"api_token": TOKEN},
-            headers={"Origin": "http://127.0.0.1:8100"},
-            follow_redirects=False,
-        )
-        assert unlock.status_code == 303
-        page = local.get("/connect")
-        csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
-        assert csrf is not None
-
-        connected = local.post(
-            "/connect/icloud",
-            data={
-                "csrf": csrf.group(1),
-                "username": "me@icloud.com",
-                "app_password": APP_PASSWORD,
-            },
-            headers={"Origin": "http://127.0.0.1:8100"},
-            follow_redirects=False,
-        )
-        assert connected.status_code == 303
-        assert connected.headers["location"] == "/connect?icloud=connected"
-        assert validated[0]["username"] == "me@icloud.com"
-        saved = creds.load_caldav_credentials(settings.data_dir)
-        assert saved is not None and saved.app_password == APP_PASSWORD
-
-        rendered = local.get("/connect").text
-        assert "me@icloud.com" not in rendered
-        assert APP_PASSWORD not in rendered
-        csrf = re.search(
-            r'action="/connect/icloud/disconnect".*?name="csrf" value="([^"]+)"',
-            rendered,
-            re.S,
-        )
-        assert csrf is not None
-        disconnected = local.post(
-            "/connect/icloud/disconnect",
-            data={"csrf": csrf.group(1)},
-            headers={"Origin": "http://127.0.0.1:8100"},
-            follow_redirects=False,
-        )
-        assert disconnected.status_code == 303
-        assert creds.load_caldav_credentials(settings.data_dir) is None
-
-
-def test_remote_viewer_never_gets_icloud_secret_form(settings) -> None:
-    secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
-    with TestClient(create_app(secured)) as remote:
-        page = remote.get("/connect", params={"token": viewer_token(TOKEN)})
-        assert page.status_code == 200
-        assert 'name="app_password"' not in page.text
-        assert 'action="/connect/icloud"' not in page.text
-
-
 def test_mixed_state_renders_per_calendar(client, settings) -> None:
     connect_icloud(settings.data_dir)
     text = client.get("/connect").text
@@ -217,6 +152,7 @@ def test_gating_matches_viewer_pages(settings) -> None:
     with TestClient(
         create_app(secured),
         base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
     ) as loopback:
         assert loopback.get("/connect").status_code == 401
         raw_query = loopback.get(
@@ -280,6 +216,8 @@ def test_loopback_proxy_cannot_bootstrap_local_session_from_host_header(settings
     with TestClient(
         create_app(secured),
         base_url="http://proxy.test:8100",
+        client=("127.0.0.1", 43123),
+        headers={"X-Forwarded-For": "203.0.113.10"},
     ) as proxied:
         bare = proxied.get("/connect", headers={"Host": "localhost:8100"})
         assert bare.status_code == 401
@@ -311,12 +249,7 @@ def test_loopback_proxy_cannot_bootstrap_local_session_from_host_header(settings
             params={"token": viewer_token(TOKEN)},
             headers={"Host": "localhost:8100"},
         )
-        assert proxied_unlock_page.status_code == 200
-        assert (
-            'action="http://127.0.0.1:8100/connect/unlock"'
-            in proxied_unlock_page.text
-        )
-        assert TOKEN not in proxied_unlock_page.text
+        assert proxied_unlock_page.status_code == 403
         assert "healthmes_local_session" not in proxied_unlock_page.headers.get(
             "set-cookie", ""
         )
@@ -354,6 +287,7 @@ def test_local_session_cookie_is_bound_to_direct_loopback_origin(settings) -> No
     with TestClient(
         application,
         base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
     ) as direct:
         unlocked = direct.post(
             "/connect/unlock",
@@ -431,7 +365,11 @@ def test_loopback_google_oauth_connect_and_disconnect_without_secret_render(
     client_secret.write_text('{"installed":{}}', encoding="utf-8")
     app.state.google_oauth_flow_factory = lambda *_args: FakeWebFlow()
 
-    with TestClient(app, base_url="http://127.0.0.1:8100") as local:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as local:
         page = local.get("/connect")
         csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
         assert csrf is not None

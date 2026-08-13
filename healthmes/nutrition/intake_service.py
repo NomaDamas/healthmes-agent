@@ -708,12 +708,6 @@ def _validate_items(items: tuple[NormalizedIntakeItem, ...]) -> None:
             raise IntakeInteractionError(
                 "intake_type must contain between 1 and 32 characters"
             )
-        if item.meal_type is not None and (
-            not item.meal_type.strip() or len(item.meal_type) > 32
-        ):
-            raise IntakeInteractionError(
-                "meal_type must contain between 1 and 32 characters"
-            )
         if len(item.nutrients) > 100:
             raise IntakeInteractionError(
                 "at most 100 nutrient facts are accepted per item"
@@ -1566,15 +1560,9 @@ def persist_outcome(session: Session, outcome: IntakeOutcome) -> WellnessEvent:
         raise IntakeInteractionError(
             "non-consumed outcomes cannot include consumed_at"
         )
-    if outcome.items_corrected:
-        _validate_items(outcome.corrected_items)
+    _validate_items(outcome.corrected_items)
 
     confirmed_at = _as_utc(outcome.confirmed_at)
-    snapshot_items = (
-        outcome.corrected_items
-        if outcome.items_corrected
-        else interaction.items
-    )
     durable_outcome = replace(
         outcome,
         corrected_items=structured_snapshot(
@@ -1584,7 +1572,11 @@ def persist_outcome(session: Session, outcome: IntakeOutcome) -> WellnessEvent:
         note=None,
         intake_snapshot=structured_snapshot(
             interaction,
-            items=snapshot_items,
+            items=(
+                outcome.corrected_items
+                if outcome.corrected_items
+                else interaction.items
+            ),
         ),
     )
     policy = _policy(session, "nutrition_confirmation")
@@ -2065,6 +2057,6 @@ def persisted_decision_for_operation(
 def resolved_items(
     interaction: IntakeInteraction, outcome: IntakeOutcome | None
 ) -> tuple[NormalizedIntakeItem, ...]:
-    if outcome is not None and outcome.items_corrected:
+    if outcome is not None and outcome.corrected_items:
         return outcome.corrected_items
     return interaction.items

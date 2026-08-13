@@ -12,7 +12,6 @@ from healthmes.engine.scheduler import (
     BACKUP_JOB_ID,
     CALENDAR_ADJUSTMENT_MAINTENANCE_JOB_ID,
     ENERGY_JOB_ID,
-    PLANNER_JOB_ID,
     SLEEP_RECONCILIATION_JOB_ID,
     STORAGE_MAINTENANCE_JOB_ID,
     TRIGGER_JOB_ID,
@@ -20,7 +19,6 @@ from healthmes.engine.scheduler import (
     register_backup_job,
     register_calendar_adjustment_maintenance_job,
     register_energy_job,
-    register_planner_job,
     register_sleep_reconciliation_job,
     register_storage_maintenance_job,
     shutdown_scheduler,
@@ -100,15 +98,6 @@ def test_sleep_reconciliation_hook_registers_interval_job(scheduler) -> None:
     assert scheduler.get_job(SLEEP_RECONCILIATION_JOB_ID) is job
     assert isinstance(job.trigger, IntervalTrigger)
     assert job.trigger.interval == timedelta(minutes=15)
-    assert job.func is noop
-
-
-def test_planner_hook_registers_ten_minute_interval_job(scheduler) -> None:
-    assert scheduler.get_job(PLANNER_JOB_ID) is None
-    job = register_planner_job(scheduler, noop)
-    assert scheduler.get_job(PLANNER_JOB_ID) is job
-    assert isinstance(job.trigger, IntervalTrigger)
-    assert job.trigger.interval == timedelta(minutes=10)
     assert job.func is noop
 
 

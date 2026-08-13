@@ -323,7 +323,7 @@ def _next_blocks(session: Session, now: datetime) -> list[GlanceBlockOut]:
 
 
 def _alerts_block(session: Session, settings: Settings, now: datetime) -> GlanceAlertsOut:
-    """Actionable pushed alerts whose linked schedule proposal is unresolved."""
+    """Recent pushed alerts, newest first (recency stands in for resolution)."""
     cutoff = now - timedelta(hours=ALERT_RECENT_HOURS)
     events = [
         event
@@ -337,36 +337,7 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
     if not events:
         return GlanceAlertsOut(unresolved_count=0, top=None)
 
-    event_ids = {event.id for event in events}
-    decisions = {
-        trigger_event_id: decision_id
-        for trigger_event_id, decision_id in session.execute(
-            select(DecisionRecord.trigger_event_id, DecisionRecord.id).where(
-                DecisionRecord.trigger_event_id.in_(event_ids)
-            )
-        )
-        if trigger_event_id is not None
-    }
-    if not decisions:
-        return GlanceAlertsOut(unresolved_count=0, top=None)
-    actionable_decision_ids = set(
-        session.scalars(
-            select(ScheduleProposal.decision_record_id).where(
-                ScheduleProposal.decision_record_id.in_(set(decisions.values())),
-                ScheduleProposal.status == ProposalStatus.PROPOSED,
-                ScheduleProposal.expires_at > now,
-            )
-        ).all()
-    )
-    unresolved = [
-        event
-        for event in events
-        if decisions.get(event.id) in actionable_decision_ids
-    ]
-    if not unresolved:
-        return GlanceAlertsOut(unresolved_count=0, top=None)
-
-    top = unresolved[0]
+    top = events[0]
     payload: dict[str, Any] = top.payload or {}
     summary = payload.get("summary")
     decision = session.scalar(
@@ -375,7 +346,7 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
         .limit(1)
     )
     return GlanceAlertsOut(
-        unresolved_count=len(unresolved),
+        unresolved_count=len(events),
         top=GlanceAlertOut(
             id=top.id,
             rule_id=top.rule_id,

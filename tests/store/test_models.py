@@ -22,6 +22,7 @@ from healthmes.store import (
     DecisionKind,
     DecisionRecord,
     EnergyDemand,
+    FoodLog,
     Insight,
     MedicalRecord,
     MedicalRecordKind,
@@ -514,12 +515,32 @@ class TestCalendarMutationProposal:
         assert loaded.outcome_decision_record_id is None
 
 
+class TestFoodLog:
+    def test_roundtrip(self, session):
+        log = _roundtrip(
+            session,
+            FoodLog(
+                logged_at=T0,
+                description="Bibimbap with extra vegetables, ~650 kcal",
+                media_path="media/food/2026-07-06-lunch.jpg",
+                meal_type="lunch",
+                source="telegram",
+            ),
+        )
+        assert log.logged_at == T0
+        assert log.description.startswith("Bibimbap")
+        assert log.media_path == "media/food/2026-07-06-lunch.jpg"
+        assert log.meal_type == "lunch"
+        assert log.source == "telegram"
+
+
 class TestAppUsageSample:
     def test_roundtrip(self, session):
         sample = _roundtrip(
             session,
             AppUsageSample(
                 device_id="pixel-8",
+                collection_generation=3,
                 bucket_start=T0,
                 app_package="com.slack",
                 foreground_seconds=540,
@@ -528,6 +549,7 @@ class TestAppUsageSample:
             ),
         )
         assert sample.device_id == "pixel-8"
+        assert sample.collection_generation == 3
         assert sample.bucket_start == T0
         assert sample.app_package == "com.slack"
         assert sample.foreground_seconds == 540
@@ -541,6 +563,28 @@ class TestAppUsageSample:
         with pytest.raises(IntegrityError):
             session.commit()
         session.rollback()
+
+    def test_same_bucket_is_distinct_across_collection_generations(self, session):
+        session.add(
+            AppUsageSample(
+                device_id="d",
+                collection_generation=1,
+                bucket_start=T0,
+                app_package="a",
+            )
+        )
+        session.add(
+            AppUsageSample(
+                device_id="d",
+                collection_generation=2,
+                bucket_start=T0,
+                app_package="a",
+            )
+        )
+
+        session.commit()
+
+        assert len(session.scalars(select(AppUsageSample)).all()) == 2
 
 
 class TestCognitiveEnergyEstimate:

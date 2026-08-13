@@ -9,8 +9,7 @@ import java.util.UUID
 /**
  * Minimal bearer-token HTTP client for the non-glance app surface of the
  * paired HealthMes instance (issue #10): alert history, weekly report,
- * schedule-proposal actions, media upload, staged nutrition capture, and
- * medical capture.
+ * schedule-proposal actions, media upload, and food/medical capture.
  *
  * Same plain-HttpURLConnection, no-HTTP-library approach as
  * [com.healthmes.briefing.GlanceApiClient] — local-first, the paired base URL

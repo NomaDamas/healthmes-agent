@@ -33,7 +33,6 @@ class ConnectionCard:
     link_url: str = ""
     notes: tuple[str, ...] = ()
     badge_label: str = ""
-    disconnect_allowed: bool = True
 
 
 class OpenWearablesStatusReader(Protocol):
@@ -177,13 +176,7 @@ def _icloud_card(settings: Settings) -> ConnectionCard:
             if resolved.source == "env"
             else "CLI로 저장된 CalDAV credential 사용 중"
         )
-        return ConnectionCard(
-            "icloud",
-            "iCloud 캘린더 (CalDAV)",
-            True,
-            detail,
-            disconnect_allowed=resolved.source != "env",
-        )
+        return ConnectionCard("icloud", "iCloud 캘린더 (CalDAV)", True, detail)
     return ConnectionCard(
         "icloud",
         "iCloud 캘린더 (CalDAV)",
@@ -219,7 +212,7 @@ def _oura_payload_error(stage: str) -> ConnectionCard:
 
 def _mapping_rows(value: object) -> tuple[Mapping[str, Any], ...]:
     if not isinstance(value, Sequence) or isinstance(
-        value, str | bytes | bytearray
+        value, (str, bytes, bytearray)
     ):
         raise ProviderPayloadError("provider response must be a row sequence")
     if any(not isinstance(row, Mapping) for row in value):

@@ -13,17 +13,18 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from alembic import command
 from alembic.config import Config as AlembicConfig
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from alembic import command
 from healthmes.store import (
     Base,
     CalendarEventMirror,
     CalendarSource,
     DecisionKind,
     DecisionRecord,
+    FoodLog,
     Task,
     TriggerEvent,
     WeeklyGoal,
@@ -89,6 +90,13 @@ def _seed(database_url: str) -> dict[str, int]:
                         deadline=now + timedelta(days=2),
                     ),
                     Task(title="Flood the trigger engine", est_minutes=45),
+                    FoodLog(
+                        logged_at=now,
+                        description="Bibimbap with extra vegetables",
+                        media_path="food/lunch.jpg",
+                        meal_type="lunch",
+                        source="telegram",
+                    ),
                     DecisionRecord(
                         kind=DecisionKind.ALERT,
                         tree={"id": "root", "type": "rule", "label": "stress_spike"},
@@ -122,7 +130,7 @@ def _seed(database_url: str) -> dict[str, int]:
     return {
         "weekly_goal": 1,
         "task": 2,
-        "retention_policy": 5,
+        "food_log": 1,
         "decision_record": 1,
         "trigger_event": 2,
         "calendar_event_mirror": 1,

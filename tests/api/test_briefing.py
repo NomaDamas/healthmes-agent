@@ -72,7 +72,11 @@ def _prime_routes(test_client: TestClient) -> None:
 @pytest.fixture
 def client(app):
     """The shared api-test app (briefing router included), lifespan running."""
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as test_client:
         _prime_routes(test_client)
         yield test_client
 
@@ -92,8 +96,8 @@ def seeded(session):
                to a HIGH task, accepted proposal 15:00-15:45 (MED task),
                titleless event 16:00-16:30, tomorrow event (4th -> dropped);
                a pending and a past-accepted proposal never appear.
-    Alerts   : pushed fires remain in history, but neither has a live linked
-               schedule proposal -> unresolved_count 0.
+    Alerts   : pushed fires 13:50 (top) + 09:00; a suppressed 14:00 fire and a
+               pushed fire 2 days ago are excluded -> unresolved_count 2.
     Decisions: alert-kind rows are linked directly to their trigger events;
                schedule_change 14:10 = latest overall.
     """
@@ -277,7 +281,15 @@ def test_seeded_glance_returns_exact_payload(client, seeded):
                 "source": "calendar",
             },
         ],
-        "alerts": {"unresolved_count": 0, "top": None},
+        "alerts": {
+            "unresolved_count": 2,
+            "top": {
+                "id": str(TRIGGER_ALERT_TOP_ID),
+                "rule_id": "stress_spike_vs_baseline",
+                "summary": "Stress 82 vs baseline 55",
+                "decision_url": f"{BASE_URL}/decisions/{DECISION_ALERT_TOP_ID}",
+            },
+        },
         "latest_decision": {
             "id": str(DECISION_SCHEDULE_ID),
             "url": f"{BASE_URL}/decisions/{DECISION_SCHEDULE_ID}",
@@ -329,7 +341,11 @@ def test_alert_without_payload_or_decision_degrades_honestly(client, session):
 
     body = client.get(GLANCE).json()
 
-    assert body["alerts"] == {"unresolved_count": 0, "top": None}
+    assert body["alerts"]["unresolved_count"] == 1
+    assert body["alerts"]["top"]["id"] == str(event.id)
+    assert body["alerts"]["top"]["rule_id"] == "schedule_changed"
+    assert body["alerts"]["top"]["summary"] == "schedule_changed"
+    assert body["alerts"]["top"]["decision_url"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +390,11 @@ def seoul_client(settings, session_factory):
             db.close()
 
     application.dependency_overrides[get_session] = _override_get_session
-    with TestClient(application) as test_client:
+    with TestClient(
+        application,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as test_client:
         _prime_routes(test_client)
         yield test_client
 

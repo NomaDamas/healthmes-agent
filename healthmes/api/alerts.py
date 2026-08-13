@@ -1,8 +1,9 @@
 """Alert history for the companion apps (issues #10/#11).
 
-``GET /v1/alerts`` lists recent *pushed* trigger events as history. The glance
-``unresolved_count`` is narrower: it counts only events linked to a currently
-actionable schedule proposal. Each history item carries the §8.5
+``GET /v1/alerts`` lists recent *pushed* trigger events with the same
+"unresolved == recent" placeholder semantics as the glance ``alerts`` block
+(healthmes/api/briefing.py — the store has no resolution tracking yet; the
+domain expert owns refining that policy). Each item carries the §8.5
 notification-grammar lines the trigger recorded at fire time (observation
 ``summary``, ``evidence`` facts, ``proposal``) plus the "why this?"
 decision-viewer deep link, resolved through the same persisted trigger

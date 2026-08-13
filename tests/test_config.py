@@ -35,7 +35,6 @@ ALL_ENV_VARS = [
     "HEALTHMES_GOOGLE_CALENDAR_ENABLED",
     "HEALTHMES_GOOGLE_CALENDAR_ID",
     "HEALTHMES_GOOGLE_POLL_MINUTES",
-    "HEALTHMES_CALENDAR_WRITE_PROVIDER",
     "HEALTHMES_CALDAV_ENABLED",
     "HEALTHMES_CALDAV_URL",
     "HEALTHMES_CALDAV_USERNAME",
@@ -90,7 +89,6 @@ def test_defaults(monkeypatch) -> None:
     assert settings.google_calendar_enabled is False
     assert settings.google_calendar_id == "primary"
     assert settings.google_poll_minutes == 5
-    assert settings.calendar_write_provider == "auto"
     assert settings.caldav_enabled is False
     assert settings.caldav_url == "https://caldav.icloud.com"
     assert settings.caldav_username == ""
@@ -143,7 +141,6 @@ def test_calendar_and_ow_user_settings_from_env(monkeypatch) -> None:
     monkeypatch.setenv("HEALTHMES_GOOGLE_CALENDAR_ENABLED", "true")
     monkeypatch.setenv("HEALTHMES_GOOGLE_CALENDAR_ID", "work@example.com")
     monkeypatch.setenv("HEALTHMES_GOOGLE_POLL_MINUTES", "3")
-    monkeypatch.setenv("HEALTHMES_CALENDAR_WRITE_PROVIDER", "caldav")
     monkeypatch.setenv("HEALTHMES_CALDAV_ENABLED", "true")
     monkeypatch.setenv("HEALTHMES_CALDAV_URL", "https://dav.example.com")
     monkeypatch.setenv("HEALTHMES_CALDAV_USERNAME", "me@example.com")
@@ -157,7 +154,6 @@ def test_calendar_and_ow_user_settings_from_env(monkeypatch) -> None:
     assert settings.google_calendar_enabled is True
     assert settings.google_calendar_id == "work@example.com"
     assert settings.google_poll_minutes == 3
-    assert settings.calendar_write_provider == "caldav"
     assert settings.caldav_enabled is True
     assert settings.caldav_url == "https://dav.example.com"
     assert settings.caldav_username == "me@example.com"
@@ -255,12 +251,8 @@ def test_is_loopback_host() -> None:
 
     assert is_loopback_host("127.0.0.1")
     assert is_loopback_host("127.0.0.2")
-    assert is_loopback_host("127.1")
-    assert is_loopback_host("127.0.1")
-    assert is_loopback_host("2130706433")
     assert is_loopback_host("::1")
     assert is_loopback_host("localhost")
-    assert is_loopback_host("LOCALHOST.")
     assert not is_loopback_host("0.0.0.0")
     assert not is_loopback_host("192.168.0.12")
     assert not is_loopback_host("my-laptop.local")
@@ -274,9 +266,23 @@ def test_resolve_timezone(monkeypatch) -> None:
     seoul = _clean_settings(timezone="Asia/Seoul")
     assert resolve_timezone(seoul) == zoneinfo.ZoneInfo("Asia/Seoul")
 
+    fixed = _clean_settings(timezone="UTC+09:00")
+    assert str(resolve_timezone(fixed)) == "UTC+09:00"
+    assert resolve_timezone(fixed).utcoffset(None) == datetime.timedelta(hours=9)
+
     machine = _clean_settings(timezone=None)
     assert resolve_timezone(machine) is not None  # machine-local tz
 
     broken = _clean_settings(timezone="Not/AZone")
     with pytest.raises(zoneinfo.ZoneInfoNotFoundError):
         resolve_timezone(broken)
+
+
+def test_fixed_offset_timezone_from_environment(monkeypatch) -> None:
+    from healthmes.config import resolve_timezone
+
+    monkeypatch.setenv("HEALTHMES_TIMEZONE", "UTC+09:00")
+    settings = _clean_settings()
+
+    assert settings.timezone == "UTC+09:00"
+    assert str(resolve_timezone(settings)) == "UTC+09:00"

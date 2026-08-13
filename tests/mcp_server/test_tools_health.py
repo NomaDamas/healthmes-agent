@@ -141,7 +141,15 @@ class TestDailyReadinessContext:
             "score": 70.0,
             "recorded_at": "2026-07-08T16:10:00+09:00",
         }
+        assert sleep["freshness"] == {
+            "recorded_at": "2026-07-08T07:10:00+00:00",
+            "status": "derived_from_readiness_block",
+        }
         assert sleep["source"] == "internal_sleep_score"
+        assert result["freshness"] == {
+            "recorded_at": "2026-07-08T07:10:00+00:00",
+            "status": "derived_from_readiness_blocks",
+        }
 
         hrv = result["hrv"]
         assert hrv["status"] == "ok"
@@ -151,6 +159,10 @@ class TestDailyReadinessContext:
         assert hrv["z_score"] == -1.41  # hand-computed
         assert hrv["delta_pct"] == -20.0
         assert hrv["n_days"] == 5
+        assert hrv["freshness"] == {
+            "observed_on": AS_OF,
+            "status": "derived_from_readiness_block",
+        }
 
         stress = result["stress"]
         assert stress["source"] == "internal_resilience_proxy"  # no Garmin stress
@@ -171,6 +183,10 @@ class TestDailyReadinessContext:
             }
         ]
         assert charge["freshest_at"] == "2026-07-08T15:30:00+09:00"
+        assert charge["freshness"] == {
+            "recorded_at": "2026-07-08T06:30:00+00:00",
+            "status": "derived_from_readiness_block",
+        }
 
         load = result["yesterday_load"]
         assert load["date"] == "2026-07-07"
@@ -182,6 +198,53 @@ class TestDailyReadinessContext:
 
         # Weakest confirmed block (sleep debt / hrv are low-coverage) wins.
         assert result["confidence"] == "low"
+
+    async def test_source_refs_are_stable_and_only_cover_used_rows(
+        self,
+        mcp_client,
+        mcp_env,
+        call_tool,
+    ):
+        _seed_readiness_fixture(mcp_env)
+        mcp_env.add_score(
+            "sleep",
+            "oura",
+            "2026-07-08T08:00:00Z",
+            99,
+        )
+        unrelated_id = mcp_env.health_scores[-1]["id"]
+
+        first = await call_tool(
+            mcp_client,
+            "get_daily_readiness_context",
+            {"date": AS_OF},
+        )
+        second = await call_tool(
+            mcp_client,
+            "get_daily_readiness_context",
+            {"date": AS_OF},
+        )
+
+        assert first["source_refs"] == second["source_refs"]
+        assert first["evidence_ids"] == [
+            source_ref["record_id"]
+            for source_ref in first["source_refs"]
+        ]
+        assert unrelated_id not in first["evidence_ids"]
+        assert {
+            source_ref["resource_type"]
+            for source_ref in first["source_refs"]
+        } == {"health_score", "sleep_summary", "workout"}
+        sleep_refs = [
+            source_ref
+            for source_ref in first["source_refs"]
+            if source_ref["resource_type"] == "sleep_summary"
+        ]
+        assert sleep_refs
+        assert all(
+            source_ref["record_id"].startswith("synthetic:sleep_summary:")
+            for source_ref in sleep_refs
+        )
 
     async def test_native_garmin_stress_wins_over_proxy(self, mcp_client, mcp_env, call_tool):
         _seed_readiness_fixture(mcp_env)
@@ -198,6 +261,8 @@ class TestDailyReadinessContext:
         assert result["confidence"] == "low"
         # A day with no workouts is still a valid (rest-day) observation.
         assert result["yesterday_load"]["workouts"] == 0
+        assert result["source_refs"] == []
+        assert result["evidence_ids"] == []
 
     async def test_actual_readiness_fixture_is_fresh_with_nested_sleep_date(
         self, mcp_env

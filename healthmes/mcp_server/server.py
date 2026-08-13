@@ -46,7 +46,6 @@ import logging
 import os
 import re
 import uuid
-import zoneinfo
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
@@ -58,6 +57,8 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes import schedule_proposals
+from healthmes.activity.mcp import register_activity_tools
+from healthmes.activity.repository import legacy_app_usage_cutoff
 from healthmes.calendars.adjustments import (
     CalendarAdjustmentService,
     CalendarAdjustmentWriter,
@@ -69,12 +70,14 @@ from healthmes.calendars.base import HealthmesEventKind
 from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.calendars.intake import intake_revision
 from healthmes.calendars.sleep_context import (
-    actual_sleep_context,
+    actual_sleep_context_with_source_ref,
     actual_sleep_observation_context,
     actual_sleep_violation,
 )
 from healthmes.calendars.sleep_observation import ActualSleepObservation
-from healthmes.calendars.sleep_source import select_actual_sleep_rows
+from healthmes.calendars.sleep_source import (
+    select_actual_sleep_rows_with_source,
+)
 from healthmes.config import Settings, get_settings, system_timezone
 from healthmes.mcp_server import (
     adjustment_tools,
@@ -92,21 +95,11 @@ from healthmes.mcp_server.caffeine_contract import (
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.nutrition.contracts import (
     CaffeineConfirmation,
-    CaptureContext,
-    Confidence,
     ConfirmationStatus,
     ConfirmedCaffeineItem,
     DailyIntakeConfirmation,
-    Estimate,
-    EstimateKind,
-    IntakeItem,
-    IntakeType,
-    MetadataSource,
-    NutritionObservation,
     NutritionReview,
-    ObservationStatus,
     ReviewedNutritionItem,
-    VisionProvenance,
 )
 from healthmes.nutrition.intake_contracts import (
     CaptureModality,
@@ -147,8 +140,6 @@ from healthmes.nutrition.repository import (
     persist_caffeine_confirmation,
     persist_daily_confirmation,
     persist_nutrition_review,
-    persist_observation,
-    storage_object_for_media,
 )
 from healthmes.nutrition.transcription import (
     TranscriptionError,
@@ -164,6 +155,7 @@ from healthmes.store import (
     DecisionKind,
     DecisionRecord,
     EnergyDemand,
+    FoodLog,
     MedicalRecord,
     MedicalRecordKind,
     MonthlyGoal,
@@ -176,6 +168,7 @@ from healthmes.store import (
     session_scope,
 )
 from healthmes.store import enums as store_enums
+from healthmes.timezones import parse_timezone
 from healthmes.trusted_session import verify_trusted_session_proof
 
 _NORMALIZED_INTAKE_ITEMS = TypeAdapter(tuple[NormalizedIntakeItem, ...])
@@ -296,7 +289,7 @@ def set_timezone(tz: dt.tzinfo | str | None) -> None:
     """Pin the user-local timezone (tests / wiring); None restores resolution."""
     global _timezone_override
     if isinstance(tz, str):
-        tz = zoneinfo.ZoneInfo(tz)
+        tz = parse_timezone(tz)
     _timezone_override = tz
 
 
@@ -366,22 +359,21 @@ async def _resolve_user_id() -> str:
 def _local_timezone() -> dt.tzinfo:
     """The user's local timezone (all tranche-2 joins happen in it).
 
-    Order: explicit override -> ``Settings.timezone`` (IANA name; field
-    pending in the shared config, see needs) -> ``HEALTHMES_TIMEZONE`` env
-    var -> the machine's local timezone. A configured-but-invalid name is a
-    loud error, never a silent UTC fallback (silent guessing corrupts every
-    date join).
+    Order: explicit override -> ``Settings.timezone`` -> ``HEALTHMES_TIMEZONE``
+    -> the machine's local timezone. IANA names and stable ``UTC+09:00``
+    offsets are accepted. Invalid values fail loudly instead of silently
+    corrupting local-day joins.
     """
     if _timezone_override is not None:
         return _timezone_override
     name = getattr(_active_settings(), "timezone", None) or os.environ.get("HEALTHMES_TIMEZONE")
     if name:
         try:
-            return zoneinfo.ZoneInfo(str(name))
-        except (zoneinfo.ZoneInfoNotFoundError, ValueError) as exc:
+            return parse_timezone(str(name))
+        except ValueError as exc:
             raise ToolError(
-                f"Configured timezone {name!r} is not a valid IANA name "
-                "(HEALTHMES_TIMEZONE, e.g. 'Asia/Seoul')."
+                f"Configured timezone {name!r} is not a valid IANA name or "
+                "UTC fixed offset (e.g. 'Asia/Seoul' or 'UTC+09:00')."
             ) from exc
     return system_timezone()
 
@@ -723,6 +715,74 @@ def _with_ow_errors(
     return wrapper
 
 
+def _open_wearables_provider(row: Mapping[str, Any]) -> str:
+    direct = row.get("provider")
+    if isinstance(direct, str) and direct:
+        return direct
+    source = row.get("source")
+    if isinstance(source, Mapping):
+        provider = source.get("provider")
+        if isinstance(provider, str) and provider:
+            return provider
+    return "unknown"
+
+
+def _open_wearables_source_ref(
+    row: Mapping[str, Any],
+    *,
+    resource_type: str,
+    observed_at: str,
+) -> dict[str, Any]:
+    raw_id = row.get("id")
+    if isinstance(raw_id, str) and raw_id:
+        record_id = raw_id
+    else:
+        provider = _open_wearables_provider(row)
+        synthetic = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            (
+                "healthmes:open-wearables:"
+                f"{resource_type}:{provider}:{observed_at}"
+            ),
+        )
+        record_id = f"synthetic:{resource_type}:{synthetic}"
+    return {
+        "domain": "wearable",
+        "record_id": record_id,
+        "source_provider": "open-wearables",
+        "upstream_provider": _open_wearables_provider(row),
+        "resource_type": resource_type,
+        "observed_at": observed_at,
+        "schema_version": 1,
+        "derived_by": "open-wearables.daily-readiness.v1",
+    }
+
+
+def _score_row_point(
+    row: Mapping[str, Any],
+    *,
+    category: str,
+    provider: str | None = None,
+    resilience: bool = False,
+) -> tuple[dt.datetime, float] | None:
+    points = (
+        _resilience_score_points([row])
+        if resilience
+        else _score_points([row], category, provider=provider)
+    )
+    return points[0] if points else None
+
+
+def _sleep_summary_day(row: Mapping[str, Any]) -> dt.date | None:
+    raw = row.get("date")
+    if raw is None:
+        return None
+    try:
+        return dt.date.fromisoformat(str(raw))
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Health tools (open-wearables + deterministic interpretation)
 # ---------------------------------------------------------------------------
@@ -843,6 +903,61 @@ async def get_health_scores(
     }
 
 
+def _readiness_block_freshness(block: dict[str, Any]) -> dict[str, Any]:
+    timestamps: list[dt.datetime] = []
+    observed_days: list[dt.date] = []
+
+    def collect(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, raw in node.items():
+                if (
+                    key
+                    in {
+                        "recorded_at",
+                        "freshest_at",
+                        "observed_at",
+                        "wake_time",
+                        "start",
+                    }
+                    and isinstance(raw, str)
+                ):
+                    try:
+                        parsed = dt.datetime.fromisoformat(raw)
+                    except ValueError:
+                        continue
+                    if parsed.tzinfo is not None:
+                        timestamps.append(parsed.astimezone(dt.UTC))
+                elif (
+                    key in {"date", "local_date", "observed_on"}
+                    and isinstance(raw, str)
+                ):
+                    try:
+                        observed_days.append(dt.date.fromisoformat(raw))
+                    except ValueError:
+                        continue
+                elif key != "freshness":
+                    collect(raw)
+        elif isinstance(node, list):
+            for raw in node:
+                collect(raw)
+
+    collect(block)
+    if timestamps:
+        return {
+            "recorded_at": max(timestamps).isoformat(),
+            "status": "derived_from_readiness_block",
+        }
+    if observed_days:
+        return {
+            "observed_on": max(observed_days).isoformat(),
+            "status": "derived_from_readiness_block",
+        }
+    return {
+        "recorded_at": None,
+        "status": "unavailable",
+    }
+
+
 @mcp.tool
 @_with_ow_errors
 async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]:
@@ -872,11 +987,24 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
         user_id, (as_of - dt.timedelta(days=1)).isoformat(), as_of.isoformat()
     )
     with _store_session() as session:
-        actual_sleep_block = actual_sleep_context(session, as_of, tz)
+        (
+            actual_sleep_block,
+            actual_sleep_source_ref,
+        ) = actual_sleep_context_with_source_ref(session, as_of, tz)
+    fresh_sleep: ActualSleepObservation | None = None
+    fresh_sleep_source_row: Mapping[str, Any] | None = None
     if actual_sleep_block["status"] != interpret.STATUS_OK:
-        fresh_sleep = select_actual_sleep_rows(sleep_rows, as_of)
-        if isinstance(fresh_sleep, ActualSleepObservation):
-            actual_sleep_block = actual_sleep_observation_context(fresh_sleep, tz)
+        (
+            selected_sleep,
+            selected_sleep_source_row,
+        ) = select_actual_sleep_rows_with_source(sleep_rows, as_of)
+        if isinstance(selected_sleep, ActualSleepObservation):
+            fresh_sleep = selected_sleep
+            fresh_sleep_source_row = selected_sleep_source_row
+            actual_sleep_block = actual_sleep_observation_context(
+                selected_sleep,
+                tz,
+            )
 
     # --- sleep debt (internal sleep score; algorithms/sleep.py, never reinvented)
     internal_sleep_points = _localized(
@@ -940,6 +1068,7 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
     # --- charge scores (freshest body_battery / readiness / recovery)
     charge_entries: list[dict[str, Any]] = []
     charge_recorded_times: list[dt.datetime] = []
+    charge_source_rows: list[dict[str, Any]] = []
     for category in CHARGE_CATEGORIES:
         candidates = [
             (recorded_at, value, row)
@@ -954,6 +1083,7 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
         if not candidates:
             continue
         recorded_at, value, row = max(candidates, key=lambda item: item[0])
+        charge_source_rows.append(row)
         charge_recorded_times.append(recorded_at)
         charge_entries.append(
             {
@@ -1000,17 +1130,244 @@ async def get_daily_readiness_context(date: str | None = None) -> dict[str, Any]
 
     core_blocks = (sleep_block, hrv_block, stress_block, charge_block)
     any_ok = any(block.get("status") == interpret.STATUS_OK for block in core_blocks)
-    return {
-        "status": interpret.STATUS_OK if any_ok else interpret.STATUS_INSUFFICIENT,
-        "date": as_of.isoformat(),
-        "baseline_window_days": interpret.BASELINE_WINDOW_DAYS,
-        "confidence": interpret.overall_confidence(core_blocks),
+    readiness_blocks = {
         "sleep_debt": sleep_block,
         "actual_sleep": actual_sleep_block,
         "hrv": hrv_block,
         "stress": stress_block,
         "charge": charge_block,
         "yesterday_load": load_block,
+    }
+    for block in readiness_blocks.values():
+        # Some public block contracts already expose a domain-specific
+        # ``freshness`` value (for example actual_sleep uses "current").
+        # Preserve that API; the resolver derives its normalized freshness
+        # metadata from the block's observed timestamps when this value is not
+        # the structured readiness freshness object.
+        block.setdefault("freshness", _readiness_block_freshness(block))
+    usable_blocks = sum(
+        block.get("status") == interpret.STATUS_OK
+        for block in readiness_blocks.values()
+    )
+    freshness_candidates: list[dt.datetime] = []
+
+    def collect_freshness(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, raw in node.items():
+                if key in {
+                    "recorded_at",
+                    "freshest_at",
+                    "observed_at",
+                } and isinstance(raw, str):
+                    try:
+                        parsed = dt.datetime.fromisoformat(raw)
+                    except ValueError:
+                        continue
+                    if parsed.tzinfo is not None:
+                        freshness_candidates.append(parsed.astimezone(dt.UTC))
+                else:
+                    collect_freshness(raw)
+        elif isinstance(node, list):
+            for raw in node:
+                collect_freshness(raw)
+
+    collect_freshness(readiness_blocks)
+    used_score_rows: list[dict[str, Any]] = []
+    sleep_debt_start = as_of - dt.timedelta(
+        days=interpret.SLEEP_DEBT_WINDOW_DAYS
+    )
+    for local_day, selected_value in internal_scores.items():
+        if not sleep_debt_start < local_day <= as_of:
+            continue
+        candidates: list[tuple[dt.datetime, dict[str, Any]]] = []
+        for row in score_rows:
+            if not isinstance(row, dict):
+                continue
+            point = _score_row_point(
+                row,
+                category="sleep",
+                provider="internal",
+            )
+            if point is None:
+                continue
+            recorded_at, value = point
+            if (
+                recorded_at.astimezone(tz).date() == local_day
+                and value == selected_value
+            ):
+                candidates.append((recorded_at, row))
+        if candidates:
+            used_score_rows.append(max(candidates, key=lambda item: item[0])[1])
+
+    hrv_current = hrv_block.get("current")
+    hrv_current_day = (
+        dt.date.fromisoformat(str(hrv_current.get("date")))
+        if isinstance(hrv_current, dict) and hrv_current.get("date")
+        else None
+    )
+    used_sleep_rows: list[Mapping[str, Any]] = []
+    if hrv_current_day is not None:
+        hrv_field = (
+            "avg_hrv_rmssd_ms"
+            if hrv_block.get("variant") == "rmssd"
+            else "avg_hrv_sdnn_ms"
+        )
+        hrv_start = hrv_current_day - dt.timedelta(
+            days=interpret.BASELINE_WINDOW_DAYS
+        )
+        selected_hrv_rows: dict[dt.date, dict[str, Any]] = {}
+        for row in sleep_rows:
+            if not isinstance(row, dict):
+                continue
+            row_day = _sleep_summary_day(row)
+            if (
+                row_day is not None
+                and hrv_start <= row_day <= hrv_current_day
+                and _as_float(row.get(hrv_field)) is not None
+            ):
+                # summary_daily_values uses the final valid row for a day.
+                selected_hrv_rows[row_day] = row
+        used_sleep_rows.extend(selected_hrv_rows.values())
+
+    stress_source = stress_block.get("source")
+    if stress_source in {
+        "garmin_stress",
+        "internal_resilience_proxy",
+    }:
+        try:
+            selected_stress_day = dt.date.fromisoformat(
+                str(stress_block["observed_on"])
+            )
+        except (KeyError, ValueError):
+            selected_stress_day = None
+        candidates: list[tuple[dt.datetime, dict[str, Any]]] = []
+        if selected_stress_day is not None:
+            for row in score_rows:
+                if not isinstance(row, dict):
+                    continue
+                point = _score_row_point(
+                    row,
+                    category=(
+                        "stress"
+                        if stress_source == "garmin_stress"
+                        else "resilience"
+                    ),
+                    provider=(
+                        "garmin"
+                        if stress_source == "garmin_stress"
+                        else None
+                    ),
+                    resilience=(
+                        stress_source == "internal_resilience_proxy"
+                    ),
+                )
+                if point is None:
+                    continue
+                recorded_at, _ = point
+                if recorded_at.astimezone(tz).date() == selected_stress_day:
+                    candidates.append((recorded_at, row))
+        if stress_source == "garmin_stress":
+            # The native stress block uses the mean of every selected-day row.
+            used_score_rows.extend(row for _, row in candidates)
+        elif candidates:
+            # The resilience proxy uses the latest selected-day row.
+            used_score_rows.append(
+                max(candidates, key=lambda item: item[0])[1]
+            )
+    used_score_rows.extend(charge_source_rows)
+
+    if fresh_sleep is not None and fresh_sleep_source_row is not None:
+        used_sleep_rows.append(fresh_sleep_source_row)
+
+    source_refs_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    if actual_sleep_source_ref is not None:
+        source_refs_by_key[
+            (
+                str(actual_sleep_source_ref["resource_type"]),
+                str(actual_sleep_source_ref["record_id"]),
+            )
+        ] = actual_sleep_source_ref
+    for row in used_score_rows:
+        observed_at = row.get("recorded_at")
+        if not isinstance(observed_at, str):
+            continue
+        source_ref = _open_wearables_source_ref(
+            row,
+            resource_type="health_score",
+            observed_at=observed_at,
+        )
+        source_refs_by_key[
+            (
+                str(source_ref["resource_type"]),
+                str(source_ref["record_id"]),
+            )
+        ] = source_ref
+    for row in used_sleep_rows:
+        observed_at = row.get("date")
+        if not isinstance(observed_at, str):
+            continue
+        source_ref = _open_wearables_source_ref(
+            row,
+            resource_type="sleep_summary",
+            observed_at=observed_at,
+        )
+        source_refs_by_key[
+            (
+                str(source_ref["resource_type"]),
+                str(source_ref["record_id"]),
+            )
+        ] = source_ref
+    for row in workout_rows:
+        if not isinstance(row, dict):
+            continue
+        observed_at = row.get("start_time")
+        if not isinstance(observed_at, str):
+            continue
+        source_ref = _open_wearables_source_ref(
+            row,
+            resource_type="workout",
+            observed_at=observed_at,
+        )
+        source_refs_by_key[
+            (
+                str(source_ref["resource_type"]),
+                str(source_ref["record_id"]),
+            )
+        ] = source_ref
+    source_refs = [
+        source_refs_by_key[key]
+        for key in sorted(source_refs_by_key)
+    ]
+    return {
+        "status": interpret.STATUS_OK if any_ok else interpret.STATUS_INSUFFICIENT,
+        "date": as_of.isoformat(),
+        "baseline_window_days": interpret.BASELINE_WINDOW_DAYS,
+        "confidence": interpret.overall_confidence(core_blocks),
+        **readiness_blocks,
+        "source_refs": source_refs,
+        "evidence_ids": [
+            str(source_ref["record_id"])
+            for source_ref in source_refs
+        ],
+        "freshness": {
+            "recorded_at": (
+                max(freshness_candidates).isoformat()
+                if freshness_candidates
+                else None
+            ),
+            "status": (
+                "derived_from_readiness_blocks"
+                if freshness_candidates
+                else "unavailable"
+            ),
+        },
+        "coverage": {
+            "status": "readiness_blocks",
+            "ratio": round(usable_blocks / len(readiness_blocks), 4),
+            "usable_blocks": usable_blocks,
+            "total_blocks": len(readiness_blocks),
+        },
+        "limitations": [],
     }
 
 
@@ -1391,6 +1748,7 @@ async def _arousal_hints_for(
         }
 
     with _store_session() as session:
+        usage_cutoff = legacy_app_usage_cutoff(session)
         event_rows = session.scalars(
             select(CalendarEventMirror)
             .where(
@@ -1399,21 +1757,23 @@ async def _arousal_hints_for(
             )
             .order_by(CalendarEventMirror.start_at)
         ).all()
-        usage_rows = session.scalars(
-            select(AppUsageSample)
-            .where(
-                AppUsageSample.bucket_start >= start_utc - dt.timedelta(minutes=60),
-                AppUsageSample.bucket_start < end_utc,
-            )
-            .order_by(AppUsageSample.bucket_start)
-        ).all()
-        meal_history = search_intake_history(
-            session,
-            start=start_utc,
-            end=end_utc,
-            confirmed_only=True,
-            limit=None,
+        usage_statement = select(AppUsageSample).where(
+            AppUsageSample.bucket_start
+            >= start_utc - dt.timedelta(minutes=60),
+            AppUsageSample.bucket_start < end_utc,
         )
+        if usage_cutoff is not None:
+            usage_statement = usage_statement.where(
+                AppUsageSample.bucket_start > usage_cutoff
+            )
+        usage_rows = session.scalars(
+            usage_statement.order_by(AppUsageSample.bucket_start)
+        ).all()
+        meal_rows = session.scalars(
+            select(FoodLog)
+            .where(FoodLog.logged_at >= start_utc, FoodLog.logged_at < end_utc)
+            .order_by(FoodLog.logged_at)
+        ).all()
         events = [
             (
                 _ensure_utc_dt(row.start_at).astimezone(tz),
@@ -1432,17 +1792,10 @@ async def _arousal_hints_for(
         ]
         meals = [
             (
-                _ensure_utc_dt(
-                    dt.datetime.fromisoformat(
-                        record["latest_outcome"]["consumed_at"]
-                    )
-                ).astimezone(tz),
-                " · ".join(
-                    item["name"] for item in record["resolved_items"]
-                )[:60]
-                or "meal",
+                _ensure_utc_dt(row.logged_at).astimezone(tz),
+                str(row.description or "meal")[:60],
             )
-            for record in meal_history["records"]
+            for row in meal_rows
         ]
 
     return arousal.build_arousal_hints(
@@ -1576,6 +1929,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
         }
 
     with _store_session() as session:
+        usage_cutoff = legacy_app_usage_cutoff(session)
         event_rows = session.scalars(
             select(CalendarEventMirror)
             .where(
@@ -1584,13 +1938,17 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
             )
             .order_by(CalendarEventMirror.start_at)
         ).all()
-        usage_rows = session.scalars(
-            select(AppUsageSample)
-            .where(
-                AppUsageSample.bucket_start >= start_utc - dt.timedelta(minutes=60),
-                AppUsageSample.bucket_start < end_utc,
+        usage_statement = select(AppUsageSample).where(
+            AppUsageSample.bucket_start
+            >= start_utc - dt.timedelta(minutes=60),
+            AppUsageSample.bucket_start < end_utc,
+        )
+        if usage_cutoff is not None:
+            usage_statement = usage_statement.where(
+                AppUsageSample.bucket_start > usage_cutoff
             )
-            .order_by(AppUsageSample.bucket_start)
+        usage_rows = session.scalars(
+            usage_statement.order_by(AppUsageSample.bucket_start)
         ).all()
         events = [
             (
@@ -1689,36 +2047,17 @@ IMPACT_MAX_EXAMPLES = 3
 def _collect_store_occurrences(
     factor: str, start_utc: dt.datetime, end_utc: dt.datetime
 ) -> tuple[list[impact.Occurrence], dict[str, int]]:
-    """Factor occurrences from confirmed intake, calendar, and done tasks."""
+    """Factor occurrences from the healthmes store (food / calendar / done tasks)."""
     occurrences: list[impact.Occurrence] = []
-    counts = {"nutrition_intake": 0, "calendar": 0, "task": 0}
+    counts = {"food_log": 0, "calendar": 0, "task": 0}
     with _store_session() as session:
-        intake_history = search_intake_history(
-            session,
-            start=start_utc,
-            end=end_utc,
-            confirmed_only=True,
-            query=factor,
-            limit=None,
-        )
-        for record in intake_history["records"]:
-            label = " · ".join(
-                item["name"] for item in record["resolved_items"]
-            )
-            at = _ensure_utc_dt(
-                dt.datetime.fromisoformat(
-                    record["latest_outcome"]["consumed_at"]
-                )
-            )
-            occurrences.append(
-                impact.Occurrence(
-                    "nutrition_intake",
-                    label[:80],
-                    at,
-                    at,
-                )
-            )
-            counts["nutrition_intake"] += 1
+        for row in session.scalars(
+            select(FoodLog).where(FoodLog.logged_at >= start_utc, FoodLog.logged_at < end_utc)
+        ):
+            if impact.matches(factor, row.description):
+                at = _ensure_utc_dt(row.logged_at)
+                occurrences.append(impact.Occurrence("food_log", row.description[:80], at, at))
+                counts["food_log"] += 1
         for row in session.scalars(
             select(CalendarEventMirror).where(
                 CalendarEventMirror.start_at >= start_utc,
@@ -2937,13 +3276,18 @@ def resolve_schedule_proposal(
 @mcp.tool
 def log_food(
     description: str,
-    operation_id: str,
     logged_at: str | None = None,
     meal_type: str | None = None,
     media_path: str | None = None,
     source: str | None = None,
 ) -> dict[str, Any]:
-    """Record a confirmed intake in the canonical nutrition ledger."""
+    """Log a meal/snack with its (vision/transcription-derived) description.
+
+    `meal_type` is breakfast / lunch / dinner / snack when known; `logged_at`
+    is ISO-8601 (default: now, UTC); `media_path` is the stored media file path
+    relative to the HealthMes data dir (never raw bytes); `source` names the
+    capture channel (e.g. 'telegram').
+    """
     if not description.strip():
         raise ToolError("description must not be empty")
     if meal_type is not None and meal_type not in MEAL_TYPES:
@@ -2953,172 +3297,23 @@ def log_food(
         if logged_at is not None
         else dt.datetime.now(dt.UTC)
     )
-    recorded_at = dt.datetime.now(dt.UTC)
-    interaction_id = _parse_uuid(operation_id, "operation_id")
-    outcome_id = uuid.uuid5(interaction_id, "confirmed-consumption")
-    timezone = _local_timezone()
-    timezone_name = getattr(timezone, "key", None) or str(timezone)
-    intake_source = (source or "mcp")[:64]
-    operation_arguments = {
-        "operation_id": str(interaction_id),
-        "intent": IntakeIntent.LOG_CONSUMED.value,
-        "description": description.strip(),
-        "observed_at": _iso_utc(logged_dt),
-        "media_path": media_path,
-        "meal_type": meal_type,
-        "source": intake_source,
-    }
-    fingerprint = operation_fingerprint(operation_arguments)
-    unknown = Estimate(kind=EstimateKind.UNKNOWN, unit="serving")
-    normalized_item = NormalizedIntakeItem(
-        name=description.strip(),
-        intake_type="food",
-        serving=unknown,
-        confidence=Confidence.LOW,
-        warnings=(
-            "Captured from a user-provided description without model estimates.",
-        ),
-        meal_type=meal_type,
-    )
-    settings = _active_settings()
-    try:
-        with _store_session() as session:
-            if media_path is None:
-                interaction = IntakeInteraction(
-                    interaction_id=interaction_id,
-                    operation_fingerprint=fingerprint,
-                    intent=IntakeIntent.LOG_CONSUMED,
-                    modality=CaptureModality.TEXT,
-                    observed_at=logged_dt,
-                    recorded_at=recorded_at,
-                    timezone=timezone_name,
-                    source=intake_source,
-                    source_text=description.strip(),
-                    media_path=None,
-                    nutrition_observation_id=None,
-                    items=(normalized_item,),
-                )
-                create_interaction(session, settings, interaction)
-            else:
-                storage_object = storage_object_for_media(session, media_path)
-                if storage_object is None:
-                    raise ToolError("media storage object not found")
-                content_type = storage_object.content_type or ""
-                if content_type.startswith("image/"):
-                    observation_id = uuid.uuid5(
-                        interaction_id,
-                        "compatibility-photo-observation",
-                    )
-                    observation = NutritionObservation(
-                        observation_id=observation_id,
-                        capture=CaptureContext(
-                            media_path=media_path,
-                            captured_at=logged_dt,
-                            timezone=timezone_name,
-                            source=intake_source,
-                            location=None,
-                            metadata_provenance={
-                                "captured_at": MetadataSource.USER,
-                                "timezone": MetadataSource.USER,
-                            },
-                        ),
-                        status=ObservationStatus.USABLE,
-                        confidence=Confidence.LOW,
-                        warnings=(
-                            "Structured from the compatibility capture description.",
-                        ),
-                        items=(
-                            IntakeItem(
-                                intake_type=IntakeType.FOOD,
-                                name_candidates=(description.strip(),),
-                                category=meal_type,
-                                serving=unknown,
-                                caffeine=Estimate(
-                                    kind=EstimateKind.UNKNOWN,
-                                    unit="mg",
-                                ),
-                                confidence=Confidence.LOW,
-                            ),
-                        ),
-                        vision=VisionProvenance(
-                            provider="healthmes-description",
-                            model="provided-description",
-                            model_digest=None,
-                            prompt_version="provided-description-v1",
-                            schema_version="nutrition-observation-v2",
-                            analyzed_at=recorded_at,
-                        ),
-                    )
-                    persist_observation(
-                        session,
-                        settings,
-                        observation,
-                        request_fingerprint=fingerprint,
-                    )
-                    interaction = create_photo_interaction(
-                        session,
-                        settings,
-                        observation_id=observation_id,
-                        operation_id=interaction_id,
-                        operation_fingerprint=fingerprint,
-                        intent=IntakeIntent.LOG_CONSUMED,
-                        source=intake_source,
-                        recorded_at=recorded_at,
-                        source_text=description.strip(),
-                    )
-                elif content_type.startswith("audio/"):
-                    interaction = IntakeInteraction(
-                        interaction_id=interaction_id,
-                        operation_fingerprint=fingerprint,
-                        intent=IntakeIntent.LOG_CONSUMED,
-                        modality=CaptureModality.VOICE,
-                        observed_at=logged_dt,
-                        recorded_at=recorded_at,
-                        timezone=timezone_name,
-                        source=intake_source,
-                        source_text=description.strip(),
-                        media_path=media_path,
-                        nutrition_observation_id=None,
-                        items=(normalized_item,),
-                    )
-                    create_interaction(session, settings, interaction)
-                else:
-                    raise ToolError(
-                        "food media must be an image or audio storage object"
-                    )
-
-            outcome_arguments = {
-                "operation_id": str(outcome_id),
-                "interaction_id": str(interaction_id),
-                "status": IntakeOutcomeStatus.CONSUMED.value,
-                "consumed_at": _iso_utc(logged_dt),
-                "meal_type": meal_type,
-            }
-            outcome = IntakeOutcome(
-                outcome_id=outcome_id,
-                operation_fingerprint=operation_fingerprint(
-                    outcome_arguments
-                ),
-                interaction_id=interaction_id,
-                status=IntakeOutcomeStatus.CONSUMED,
-                confirmed_at=recorded_at,
-                source=intake_source,
-                consumed_at=logged_dt,
-                note=None,
-            )
-            persist_outcome(session, outcome)
-            view = interaction_view(session, interaction_id)
-    except (IntakeInteractionError, NutritionRepositoryError) as exc:
-        raise ToolError(str(exc)) from exc
-    assert view is not None
+    with _store_session() as session:
+        row = FoodLog(
+            logged_at=logged_dt,
+            description=description,
+            media_path=media_path,
+            meal_type=meal_type,
+            source=source,
+        )
+        session.add(row)
+        session.flush()
+        food_log_id = str(row.id)
+        logged_iso = _iso_utc(row.logged_at)
     return {
         "status": "ok",
-        "interaction_id": str(interaction_id),
-        "outcome_id": str(outcome_id),
-        "logged_at": _iso_utc(logged_dt),
+        "food_log_id": food_log_id,
+        "logged_at": logged_iso,
         "meal_type": meal_type,
-        "media_path": media_path,
-        "interaction": view,
     }
 
 
@@ -3632,10 +3827,9 @@ def confirm_intake_outcome(
         "interaction_id": interaction_id,
         "status": status,
         "consumed_at": consumed_at,
+        "corrected_items": raw_items,
         "note": note,
     }
-    if corrected_items is not None:
-        proof_arguments["corrected_items"] = raw_items
     _require_trusted_telegram_owner_proof(
         trusted_session_proof,
         tool_name="confirm_intake_outcome",
@@ -3657,7 +3851,6 @@ def confirm_intake_outcome(
             else None
         ),
         corrected_items=parsed_items,
-        items_corrected=corrected_items is not None,
         note=note,
     )
     try:
@@ -4230,6 +4423,14 @@ def record_decision(
         "schedule_proposal_ids": [str(value) for value in proposal_uuids],
         "viewer_url": viewer_url(_active_settings(), f"/decisions/{decision_id}"),
     }
+
+
+register_activity_tools(
+    mcp,
+    store_session_factory=_store_session,
+    timezone_resolver=_local_timezone,
+    readiness_reader=get_daily_readiness_context,
+)
 
 
 # ---------------------------------------------------------------------------

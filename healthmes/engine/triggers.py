@@ -708,7 +708,7 @@ class TriggerEvaluator:
 
         outcomes: list[FireOutcome] = []
         with session_scope(self._session_factory) as session:
-            retried, pending_keys = self._retry_pending_dispatches(session, now)
+            retried, pending_keys = self._retry_pending_dispatches(session)
             outcomes.extend(retried)
             signals = self._health_reader.read(now)
             context = self._build_context(session, now, signals)
@@ -744,9 +744,8 @@ class TriggerEvaluator:
     def _retry_pending_dispatches(
         self,
         session: Session,
-        now: datetime,
     ) -> tuple[list[FireOutcome], set[str]]:
-        """Gate new outbox rows, then retry already-approved dispatches."""
+        """Deliver committed outbox rows independently of rule conditions."""
         events = session.scalars(
             select(TriggerEvent)
             .where(TriggerEvent.alert_sent.is_(False))
@@ -755,7 +754,7 @@ class TriggerEvaluator:
         outcomes: list[FireOutcome] = []
         pending_keys: set[str] = set()
         for event in events:
-            if not (self._is_pending_hygiene(event) or self._is_dispatching(event)):
+            if not self._is_dispatching(event):
                 continue
             locked_event = session.scalar(
                 select(TriggerEvent)
@@ -763,10 +762,7 @@ class TriggerEvaluator:
                 .with_for_update(skip_locked=True)
                 .execution_options(populate_existing=True)
             )
-            if locked_event is None or not (
-                self._is_pending_hygiene(locked_event)
-                or self._is_dispatching(locked_event)
-            ):
+            if locked_event is None or not self._is_dispatching(locked_event):
                 continue
             event = locked_event
             if event.dedup_key is not None:
@@ -796,35 +792,6 @@ class TriggerEvaluator:
                 proposal=proposal,
                 evidence=evidence,
             )
-            if self._is_pending_hygiene(event):
-                reason = self._push_suppression_reason(session, now, fire)
-                if reason is not None:
-                    event.payload = {
-                        "summary": summary,
-                        "proposal": proposal,
-                        "evidence": evidence,
-                        "push": {"suppressed_reason": reason},
-                    }
-                    session.commit()
-                    outcomes.append(
-                        FireOutcome(fire=fire, status="suppressed", reason=reason)
-                    )
-                    continue
-                event.payload = {
-                    "summary": summary,
-                    "proposal": proposal,
-                    "evidence": evidence,
-                    "push": {"state": "dispatching", "channel": "webhook"},
-                }
-                session.commit()
-                event = session.scalar(
-                    select(TriggerEvent)
-                    .where(TriggerEvent.id == event.id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-                if event is None or not self._is_dispatching(event):
-                    continue
             outcomes.append(
                 self._deliver_event(
                     session,
@@ -839,15 +806,6 @@ class TriggerEvaluator:
                 )
             )
         return outcomes, pending_keys
-
-    @staticmethod
-    def _is_pending_hygiene(event: TriggerEvent) -> bool:
-        push = (event.payload or {}).get("push")
-        return (
-            not event.alert_sent
-            and isinstance(push, dict)
-            and push.get("state") == "pending_hygiene"
-        )
 
     def _build_context(
         self, session: Session, now: datetime, signals: HealthSignals

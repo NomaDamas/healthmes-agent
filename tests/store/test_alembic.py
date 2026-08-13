@@ -14,16 +14,14 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy.orm import sessionmaker
 
-from healthmes.config import Settings
+from alembic import command
 from healthmes.schedule_proposals import resolution_token, verify_resolution_token
-from healthmes.storage import run_storage_maintenance
 from healthmes.store import (
     Base,
     DecisionKind,
@@ -43,6 +41,7 @@ EXPECTED_TABLES = {
     "calendar_mutation_proposal",
     "sleep_reconciliation_proposal",
     "schedule_proposal",
+    "food_log",
     "app_usage_sample",
     "cognitive_energy_estimate",
     "decision_record",
@@ -78,6 +77,26 @@ def _render_offline_legacy_cleanup_downgrade(database_url: str) -> str:
     command.downgrade(
         _config(database_url, buffer=buffer),
         "f2a3b4c5d6e7:e1f2a3b4c5d6",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_app_usage_generation_downgrade(database_url: str) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "d2e3f4a5b6c7:c1d2e3f4a5b6",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_app_usage_snapshot_downgrade(database_url: str) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "e3f4a5b6c7d8:d2e3f4a5b6c7",
         sql=True,
     )
     return buffer.getvalue()
@@ -121,8 +140,6 @@ class TestOfflineRender:
     def test_render_marks_head_revision(self):
         rendered = _render_offline_upgrade("sqlite:///offline-render.db")
         assert "INSERT INTO alembic_version" in rendered
-        assert "healthmes_food_log_offline_guard" in rendered
-        assert "SELECT COUNT(*) FROM food_log" in rendered
 
     def test_legacy_cleanup_downgrade_renders_for_both_dialects(self):
         urls = (
@@ -133,6 +150,35 @@ class TestOfflineRender:
             rendered = _render_offline_legacy_cleanup_downgrade(url)
             assert "ROW_NUMBER() OVER" in rendered
             assert "ux_calendar_event_mirror_source_healthmes_source_key" in rendered
+
+    def test_app_usage_generation_downgrade_renders_for_both_dialects(self):
+        sqlite_sql = _render_offline_app_usage_generation_downgrade(
+            "sqlite:///offline-render.db"
+        )
+        postgres_sql = _render_offline_app_usage_generation_downgrade(
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes"
+        )
+
+        assert "_alembic_tmp_app_usage_sample" in sqlite_sql
+        assert "DROP TABLE app_usage_sample" in sqlite_sql
+        assert "DROP COLUMN collection_generation" in postgres_sql
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_app_usage_snapshot_downgrade_requires_online_check(
+        self,
+        database_url,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="offline downgrade cannot verify Android snapshot state",
+        ):
+            _render_offline_app_usage_snapshot_downgrade(database_url)
 
 
 class TestSqliteUpgrade:
@@ -199,6 +245,234 @@ class TestSqliteUpgrade:
         config = _config(database_url)
         command.upgrade(config, "head")
         command.upgrade(config, "head")  # no-op, must not raise
+
+    def test_app_usage_generation_migration_preserves_rows_and_refuses_loss(
+        self,
+        tmp_path,
+    ):
+        database_url = f"sqlite:///{tmp_path / 'app-usage-generation.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c1d2e3f4a5b6")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        legacy = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        bucket = datetime(2026, 8, 9, 12, tzinfo=UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                legacy.insert().values(
+                    id=uuid.uuid4().hex,
+                    device_id="android-migration",
+                    bucket_start=bucket,
+                    app_package="com.example.editor",
+                    foreground_seconds=900,
+                    launches=2,
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        migrated = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        assert "collection_generation" in migrated.c
+        assert "bucket_complete" in migrated.c
+        assert "snapshot_sequence" in migrated.c
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.select(migrated.c.collection_generation)
+            ) == 0
+            assert connection.scalar(
+                sa.select(migrated.c.bucket_complete)
+            ) is False
+            assert connection.scalar(
+                sa.select(migrated.c.snapshot_sequence)
+            ) == 0
+            connection.execute(
+                migrated.insert().values(
+                    id=uuid.uuid4().hex,
+                    device_id="android-migration",
+                    collection_generation=1,
+                    bucket_start=bucket,
+                    app_package="com.example.editor",
+                    foreground_seconds=300,
+                    launches=1,
+                )
+            )
+        engine.dispose()
+
+        # e3 -> d2 removes only snapshot fields, so cross-generation rows are
+        # still lossless at this boundary.
+        command.downgrade(config, "d2e3f4a5b6c7")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        generation_rows = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        assert "collection_generation" in generation_rows.c
+        assert "bucket_complete" not in generation_rows.c
+        assert "snapshot_sequence" not in generation_rows.c
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            ) == "d2e3f4a5b6c7"
+            assert connection.scalar(
+                sa.select(sa.func.count()).select_from(generation_rows)
+            ) == 2
+        engine.dispose()
+
+        # d2 -> c1 is the boundary that would collapse generations.
+        with pytest.raises(RuntimeError, match="without losing collection generations"):
+            command.downgrade(config, "c1d2e3f4a5b6")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        preserved = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        assert "collection_generation" in preserved.c
+        assert "bucket_complete" not in preserved.c
+        assert "snapshot_sequence" not in preserved.c
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            ) == "d2e3f4a5b6c7"
+            assert connection.scalar(
+                sa.select(sa.func.count()).select_from(preserved)
+            ) == 2
+            connection.execute(
+                preserved.delete().where(
+                    preserved.c.collection_generation == 1
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        snapshot_rows = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                snapshot_rows.update().values(
+                    bucket_complete=True,
+                    snapshot_sequence=42,
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing Android snapshot state",
+        ):
+            command.downgrade(config, "d2e3f4a5b6c7")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        snapshot_preserved = sa.Table(
+            "app_usage_sample",
+            metadata,
+            autoload_with=engine,
+        )
+        assert "bucket_complete" in snapshot_preserved.c
+        assert "snapshot_sequence" in snapshot_preserved.c
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            ) == "e3f4a5b6c7d8"
+            assert connection.execute(
+                sa.select(
+                    snapshot_preserved.c.bucket_complete,
+                    snapshot_preserved.c.snapshot_sequence,
+                )
+            ).one() == (True, 42)
+            connection.execute(
+                snapshot_preserved.update().values(
+                    bucket_complete=False,
+                    snapshot_sequence=0,
+                )
+            )
+            wellness_event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            now = datetime(2026, 8, 10, tzinfo=UTC)
+            connection.execute(
+                wellness_event.insert().values(
+                    id=uuid.uuid4().hex,
+                    event_type="activity.android-bucket-snapshot.v1",
+                    schema_version=1,
+                    observed_at=now,
+                    recorded_at=now,
+                    timezone="UTC",
+                    source_provider="android-usage",
+                    source_device="android-empty-manifest",
+                    source_record_id="snapshot:empty-manifest",
+                    capture_method="derived",
+                    sensitivity="activity-control",
+                    consent_scope="personal",
+                    payload={
+                        "bucket_complete": True,
+                        "snapshot_sequence": 1,
+                        "app_count": 0,
+                    },
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="without losing Android snapshot state",
+        ):
+            command.downgrade(config, "d2e3f4a5b6c7")
+
+        engine = sa.create_engine(database_url)
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            ) == "e3f4a5b6c7d8"
+            connection.execute(
+                sa.text(
+                    "DELETE FROM wellness_event "
+                    "WHERE event_type = 'activity.android-bucket-snapshot.v1'"
+                )
+            )
+        engine.dispose()
+
+        command.downgrade(config, "c1d2e3f4a5b6")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert "collection_generation" not in {
+                column["name"]
+                for column in inspector.get_columns("app_usage_sample")
+            }
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT COUNT(*) FROM app_usage_sample")
+                ) == 1
+        finally:
+            engine.dispose()
 
     def test_legacy_pending_schedule_proposal_is_backfilled_and_resolvable(
         self,
@@ -380,380 +654,6 @@ class TestSqliteUpgrade:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
                 ) == "e3f4a5b6c7d8"
-        finally:
-            engine.dispose()
-
-    def test_food_log_backfill_preserves_originals_and_retention(self, tmp_path):
-        database_url = f"sqlite:///{tmp_path / 'food-log-backfill.db'}"
-        config = _config(database_url)
-        command.upgrade(config, "c1d2e3f4a5b6")
-        engine = sa.create_engine(database_url)
-        metadata = sa.MetaData()
-        food_log = sa.Table("food_log", metadata, autoload_with=engine)
-        storage_object = sa.Table("storage_object", metadata, autoload_with=engine)
-        first_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
-        second_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
-        media_id = uuid.UUID("33333333-3333-3333-3333-333333333333")
-        logged_at = datetime(2024, 2, 29, 23, 59, 58, tzinfo=UTC)
-        created_at = datetime(2024, 3, 1, 0, 0, 1, tzinfo=UTC)
-        updated_at = datetime(2024, 3, 2, 1, 2, 3, tzinfo=UTC)
-        original_rows = [
-            {
-                "id": first_id,
-                "logged_at": logged_at,
-                "description": "  김치찌개 🍲  ",
-                "media_path": "media/shared.jpg",
-                "meal_type": None,
-                "source": None,
-                "created_at": created_at,
-                "updated_at": updated_at,
-            },
-            {
-                "id": second_id,
-                "logged_at": logged_at + timedelta(minutes=1),
-                "description": "\tLatte\n",
-                "media_path": "media/shared.jpg",
-                "meal_type": "snack",
-                "source": "ios",
-                "created_at": created_at + timedelta(seconds=1),
-                "updated_at": updated_at + timedelta(seconds=1),
-            },
-        ]
-        with engine.begin() as connection:
-            connection.execute(
-                storage_object.insert(),
-                {
-                    "id": media_id.hex,
-                    "data_class": "media",
-                    "relative_path": "media/shared.jpg",
-                    "content_type": "image/jpeg",
-                    "size_bytes": 123,
-                    "sha256": "a" * 64,
-                    "retention_basis_at": created_at,
-                    "expires_at": created_at + timedelta(days=1),
-                    "safe_to_purge": True,
-                    "purged_at": None,
-                    "created_at": created_at,
-                    "updated_at": updated_at,
-                },
-            )
-            connection.execute(
-                food_log.insert(),
-                [
-                    {**row, "id": row["id"].hex}
-                    for row in original_rows
-                ],
-            )
-        engine.dispose()
-
-        command.upgrade(config, "d2e3f4a5b6c7")
-
-        engine = sa.create_engine(database_url)
-        try:
-            metadata = sa.MetaData()
-            food_log = sa.Table("food_log", metadata, autoload_with=engine)
-            wellness_event = sa.Table("wellness_event", metadata, autoload_with=engine)
-            storage_object = sa.Table("storage_object", metadata, autoload_with=engine)
-            retention_policy = sa.Table(
-                "retention_policy", metadata, autoload_with=engine
-            )
-            with engine.connect() as connection:
-                archives = connection.execute(
-                    sa.select(wellness_event).where(
-                        wellness_event.c.event_type == "legacy.food-log.v1"
-                    )
-                ).mappings().all()
-                events = connection.execute(sa.select(wellness_event)).mappings().all()
-                media = connection.execute(
-                    sa.select(storage_object).where(
-                        storage_object.c.id == media_id.hex
-                    )
-                ).mappings().one()
-                raw_events = [
-                    row
-                    for row in events
-                    if row["event_type"] == "nutrition.raw-capture.v1"
-                ]
-                policies = {
-                    row["id"]: row
-                    for row in connection.execute(
-                        sa.select(retention_policy)
-                    ).mappings()
-                }
-                assert len(archives) == 2
-                assert len(events) == 10
-                assert all(row["payload"]["sha256"] for row in archives)
-                assert all(row["expires_at"] is None for row in archives)
-                assert all(
-                    policies[row["retention_policy_id"]]["data_class"]
-                    == "legacy_food_log_archive"
-                    for row in archives
-                )
-                archived_originals = {
-                    row["source_record_id"]: row["payload"]["original"]
-                    for row in archives
-                }
-                assert archived_originals[str(first_id)]["description"] == "  김치찌개 🍲  "
-                assert archived_originals[str(first_id)]["meal_type"] is None
-                assert archived_originals[str(first_id)]["source"] is None
-                assert archived_originals[str(second_id)]["description"] == "\tLatte\n"
-                assert media["expires_at"] == (
-                    created_at + timedelta(days=1)
-                ).replace(tzinfo=None)
-                assert media["retention_basis_at"] == created_at.replace(
-                    tzinfo=None
-                )
-                assert media["safe_to_purge"] is True
-                assert all(row["raw_object_id"] is None for row in raw_events)
-                assert all(row["retention_policy_id"] is not None for row in events)
-                assert all(
-                    policies[row["retention_policy_id"]]["data_class"]
-                    == "nutrition_raw_capture"
-                    for row in raw_events
-                )
-                assert all(row["expires_at"] is not None for row in raw_events)
-                interactions = [
-                    row
-                    for row in events
-                    if row["event_type"] == "nutrition.interaction.v1"
-                ]
-                assert all(
-                    row["payload"]["modality"] == "text"
-                    and row["payload"]["nutrition_observation_id"] is None
-                    for row in interactions
-                )
-                second_interaction = next(
-                    row
-                    for row in interactions
-                    if row["source_record_id"] == str(second_id)
-                )
-                assert (
-                    second_interaction["payload"]["items"][0]["meal_type"]
-                    == "snack"
-                )
-                assert connection.scalar(sa.select(sa.func.count()).select_from(food_log)) == 2
-        finally:
-            engine.dispose()
-
-        command.upgrade(config, "head")
-        engine = sa.create_engine(database_url)
-        try:
-            assert not sa.inspect(engine).has_table("food_log")
-            maintenance_session = sessionmaker(bind=engine)()
-            try:
-                run_storage_maintenance(
-                    maintenance_session,
-                    Settings(
-                        database_url=database_url,
-                        data_dir=tmp_path / "storage",
-                    ),
-                    now=datetime(2030, 1, 1, tzinfo=UTC),
-                )
-                maintenance_session.commit()
-            finally:
-                maintenance_session.close()
-            metadata = sa.MetaData()
-            wellness_event = sa.Table(
-                "wellness_event",
-                metadata,
-                autoload_with=engine,
-            )
-            with engine.connect() as connection:
-                surviving_archives = connection.execute(
-                    sa.select(wellness_event).where(
-                        wellness_event.c.source_provider
-                        == "legacy-food-log-archive"
-                    )
-                ).mappings().all()
-                assert len(surviving_archives) == 2
-                assert all(row["expires_at"] is None for row in surviving_archives)
-        finally:
-            engine.dispose()
-
-        command.downgrade(config, "d2e3f4a5b6c7")
-        engine = sa.create_engine(database_url)
-        try:
-            metadata = sa.MetaData()
-            food_log = sa.Table("food_log", metadata, autoload_with=engine)
-            with engine.connect() as connection:
-                restored = connection.execute(
-                    sa.select(food_log).order_by(food_log.c.id)
-                ).mappings().all()
-            assert [
-                {
-                    "id": str(uuid.UUID(str(row["id"]))),
-                    "logged_at": row["logged_at"],
-                    "description": row["description"],
-                    "media_path": row["media_path"],
-                    "meal_type": row["meal_type"],
-                    "source": row["source"],
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"],
-                }
-                for row in restored
-            ] == [
-                {
-                    "id": str(row["id"]),
-                    "logged_at": row["logged_at"].replace(tzinfo=None),
-                    "description": row["description"],
-                    "media_path": row["media_path"],
-                    "meal_type": row["meal_type"],
-                    "source": row["source"],
-                    "created_at": row["created_at"].replace(tzinfo=None),
-                    "updated_at": row["updated_at"].replace(tzinfo=None),
-                }
-                for row in original_rows
-            ]
-        finally:
-            engine.dispose()
-
-        command.downgrade(config, "c1d2e3f4a5b6")
-        engine = sa.create_engine(database_url)
-        try:
-            metadata = sa.MetaData()
-            food_log = sa.Table("food_log", metadata, autoload_with=engine)
-            wellness_event = sa.Table("wellness_event", metadata, autoload_with=engine)
-            storage_object = sa.Table("storage_object", metadata, autoload_with=engine)
-            with engine.connect() as connection:
-                restored = connection.execute(
-                    sa.select(food_log).order_by(food_log.c.id)
-                ).mappings().all()
-                restored_media = connection.execute(
-                    sa.select(storage_object).where(
-                        storage_object.c.id == media_id.hex
-                    )
-                ).mappings().one()
-                assert [row["description"] for row in restored] == [
-                    "  김치찌개 🍲  ",
-                    "\tLatte\n",
-                ]
-                assert restored_media["expires_at"] == (
-                    created_at + timedelta(days=1)
-                ).replace(tzinfo=None)
-                assert restored_media["retention_basis_at"] == created_at.replace(
-                    tzinfo=None
-                )
-                assert restored_media["safe_to_purge"] is True
-                assert connection.scalar(
-                    sa.select(sa.func.count()).select_from(wellness_event)
-                ) == 0
-        finally:
-            engine.dispose()
-
-    def test_food_log_downgrade_refuses_missing_archive(self, tmp_path):
-        database_url = f"sqlite:///{tmp_path / 'food-log-missing-archive.db'}"
-        config = _config(database_url)
-        command.upgrade(config, "c1d2e3f4a5b6")
-        engine = sa.create_engine(database_url)
-        food_log = sa.Table(
-            "food_log",
-            sa.MetaData(),
-            autoload_with=engine,
-        )
-        legacy_id = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
-        now = datetime(2026, 8, 8, 12, tzinfo=UTC)
-        with engine.begin() as connection:
-            connection.execute(
-                food_log.insert(),
-                {
-                    "id": legacy_id.hex,
-                    "logged_at": now,
-                    "description": "Dinner",
-                    "media_path": None,
-                    "meal_type": "dinner",
-                    "source": "ios",
-                    "created_at": now,
-                    "updated_at": now,
-                },
-            )
-        engine.dispose()
-        command.upgrade(config, "head")
-
-        engine = sa.create_engine(database_url)
-        wellness_event = sa.Table(
-            "wellness_event",
-            sa.MetaData(),
-            autoload_with=engine,
-        )
-        with engine.begin() as connection:
-            connection.execute(
-                sa.delete(wellness_event).where(
-                    wellness_event.c.source_provider
-                    == "legacy-food-log-archive"
-                )
-            )
-        engine.dispose()
-
-        with pytest.raises(RuntimeError, match="missing archive"):
-            command.downgrade(config, "d2e3f4a5b6c7")
-
-        engine = sa.create_engine(database_url)
-        try:
-            assert not sa.inspect(engine).has_table("food_log")
-            with engine.connect() as connection:
-                assert connection.scalar(
-                    sa.text("SELECT version_num FROM alembic_version")
-                ) == "e3f4a5b6c7d8"
-        finally:
-            engine.dispose()
-
-    def test_food_log_removal_refuses_a_corrupt_archive(self, tmp_path):
-        database_url = f"sqlite:///{tmp_path / 'food-log-corrupt.db'}"
-        config = _config(database_url)
-        command.upgrade(config, "c1d2e3f4a5b6")
-        engine = sa.create_engine(database_url)
-        metadata = sa.MetaData()
-        food_log = sa.Table("food_log", metadata, autoload_with=engine)
-        now = datetime(2026, 8, 8, 12, tzinfo=UTC)
-        with engine.begin() as connection:
-            connection.execute(
-                food_log.insert(),
-                {
-                    "id": uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").hex,
-                    "logged_at": now,
-                    "description": "Lunch",
-                    "media_path": None,
-                    "meal_type": "lunch",
-                    "source": "ios",
-                    "created_at": now,
-                    "updated_at": now,
-                },
-            )
-        engine.dispose()
-        command.upgrade(config, "d2e3f4a5b6c7")
-
-        engine = sa.create_engine(database_url)
-        wellness_event = sa.Table(
-            "wellness_event",
-            sa.MetaData(),
-            autoload_with=engine,
-        )
-        with engine.begin() as connection:
-            archive = connection.execute(
-                sa.select(wellness_event).where(
-                    wellness_event.c.source_provider
-                    == "legacy-food-log-archive"
-                )
-            ).mappings().one()
-            corrupted = dict(archive["payload"])
-            corrupted["sha256"] = "0" * 64
-            connection.execute(
-                sa.update(wellness_event)
-                .where(wellness_event.c.id == archive["id"])
-                .values(payload=corrupted)
-            )
-        engine.dispose()
-
-        with pytest.raises(RuntimeError, match="checksum mismatch"):
-            command.upgrade(config, "head")
-
-        engine = sa.create_engine(database_url)
-        try:
-            assert sa.inspect(engine).has_table("food_log")
-            with engine.connect() as connection:
-                assert connection.scalar(
-                    sa.text("SELECT version_num FROM alembic_version")
-                ) == "d2e3f4a5b6c7"
         finally:
             engine.dispose()
 

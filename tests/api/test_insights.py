@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
+from healthmes.storage import update_retention_policy
 from healthmes.store import (
     AppUsageSample,
     CalendarEventMirror,
@@ -74,6 +75,12 @@ WORKOUTS = [
         "end_time": "2026-07-07T07:00:00Z",
     },
 ]
+
+
+@pytest.fixture(autouse=True)
+def historical_activity_usage_retention(session):
+    update_retention_policy(session, "activity_raw", "forever")
+    session.commit()
 
 
 def _stress_page(points):

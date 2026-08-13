@@ -6,8 +6,6 @@ serialization exercise the same code paths as against caldav.icloud.com.
 
 import uuid
 from datetime import UTC, date, datetime, timedelta, timezone
-from types import SimpleNamespace
-from zoneinfo import ZoneInfo
 
 import icalendar
 import pytest
@@ -16,7 +14,6 @@ from caldav.lib.url import URL
 
 from healthmes.calendars.base import (
     CalendarConflictError,
-    CalendarError,
     CalendarEventIdentity,
     EventDraft,
     EventNotFoundError,
@@ -50,25 +47,9 @@ class FakeDavClient:
     def request(
         self,
         url: str,
-        method: str = "GET",
-        body: str = "",
-        headers: dict[str, str] | None = None,
+        method: str,
+        headers: dict[str, str],
     ) -> FakeDavResponse:
-        headers = headers or {}
-        if method == "PUT" and headers.get("If-None-Match") == "*":
-            self.calendar.conditional_create_calls.append(
-                (url, body, dict(headers))
-            )
-            parsed = icalendar.Calendar.from_ical(body)
-            (component,) = [
-                item for item in parsed.subcomponents if item.name == "VEVENT"
-            ]
-            uid = str(component.get("UID"))
-            if uid in self.calendar.objects:
-                return FakeDavResponse(412)
-            self.calendar.added_icals.append(body)
-            self.calendar.put(component, etag='"fresh"')
-            return FakeDavResponse(201, {"Etag": '"fresh"'})
         uid = url.rsplit("/", 1)[-1]
         self.calendar.conditional_delete_calls.append((uid, method, headers))
         obj = self.calendar.objects.get(uid)
@@ -96,10 +77,6 @@ def make_component(
     agent: bool = False,
     task_id: uuid.UUID | None = None,
     healthmes_kind: str | None = None,
-    organizer: str | None = None,
-    attendee: str | None = None,
-    recurring: bool = False,
-    status: str | None = None,
 ) -> icalendar.Event:
     component = icalendar.Event()
     component.add("uid", uid)
@@ -116,14 +93,6 @@ def make_component(
         component["X-HEALTHMES-TASK-ID"] = str(task_id)
     if healthmes_kind is not None:
         component["X-HEALTHMES-KIND"] = healthmes_kind
-    if organizer is not None:
-        component.add("organizer", organizer)
-    if attendee is not None:
-        component.add("attendee", attendee)
-    if recurring:
-        component.add("rrule", {"freq": "daily"})
-    if status is not None:
-        component.add("status", status)
     return component
 
 
@@ -161,14 +130,10 @@ class FakeCalDavCalendar:
         self.ctag = ctag
         self.objects: dict[str, FakeCalDavObject] = {}
         self.events_calls = 0
-        self.event_by_uid_calls = 0
         self.ctag_requests: list[object] = []
         self.added_icals: list[str] = []
         self.saved_objects: list[str] = []
         self.deleted_uids: list[str] = []
-        self.conditional_create_calls: list[
-            tuple[str, str, dict[str, str]]
-        ] = []
         self.conditional_delete_calls: list[tuple[str, str, dict[str, str]]] = []
         self.conditional_update_calls: list[tuple[str, str, dict[str, str]]] = []
 
@@ -189,13 +154,9 @@ class FakeCalDavCalendar:
         return list(self.objects.values())
 
     def event_by_uid(self, uid: str) -> FakeCalDavObject:
-        self.event_by_uid_calls += 1
         if uid not in self.objects:
             raise NotFoundError(uid)
         return self.objects[uid]
-
-    def conditional_create(self, external_id: str, ical: str) -> None:
-        self.add_event(ical=ical, no_overwrite=True)
 
     def add_event(
         self,
@@ -278,55 +239,6 @@ class TestListChanges:
         assert gone.external_id == "b" and gone.deleted
         assert next_state["fingerprints"] == {"a": '"a1"'}
 
-    def test_cancelled_event_is_reported_deleted(self, backend, calendar) -> None:
-        calendar.put(make_component("a"), etag='"a1"')
-        _, state = backend.list_changes(None)
-
-        calendar.ctag = "ctag-2"
-        calendar.objects["a"] = FakeCalDavObject(
-            make_component("a", status="CANCELLED"), '"a2"', calendar
-        )
-        events, next_state = backend.list_changes(state)
-
-        (cancelled,) = events
-        assert cancelled.external_id == "a"
-        assert cancelled.deleted
-        assert next_state["fingerprints"] == {"a": '"a2"'}
-
-    def test_cancelled_event_removal_remains_a_deletion_notice(
-        self, backend, calendar
-    ) -> None:
-        calendar.put(make_component("a", status="CANCELLED"), etag='"a1"')
-        events, state = backend.list_changes(None)
-        assert len(events) == 1 and events[0].deleted
-
-        calendar.ctag = "ctag-2"
-        del calendar.objects["a"]
-        events, next_state = backend.list_changes(state)
-
-        (removed,) = events
-        assert removed.external_id == "a"
-        assert removed.deleted
-        assert next_state["fingerprints"] == {}
-
-    def test_cancelled_event_reactivation_is_reported_live(
-        self, backend, calendar
-    ) -> None:
-        calendar.put(make_component("a", status="CANCELLED"), etag='"a1"')
-        _, state = backend.list_changes(None)
-
-        calendar.ctag = "ctag-2"
-        calendar.objects["a"] = FakeCalDavObject(
-            make_component("a", status="CONFIRMED"), '"a2"', calendar
-        )
-        events, next_state = backend.list_changes(state)
-
-        (reactivated,) = events
-        assert reactivated.external_id == "a"
-        assert not reactivated.deleted
-        assert reactivated.status == "confirmed"
-        assert next_state["fingerprints"] == {"a": '"a2"'}
-
     def test_missing_etag_falls_back_to_content_hash(self, backend, calendar) -> None:
         calendar.put(make_component("a"), etag=None)
         _, state = backend.list_changes(None)
@@ -336,94 +248,6 @@ class TestListChanges:
         calendar.ctag = "ctag-2"
         events, _ = backend.list_changes(state)
         assert events == []
-
-    def test_detached_recurrence_exception_has_independent_identity(
-        self, backend, calendar
-    ) -> None:
-        master = make_component("series", recurring=True)
-        exception = make_component(
-            "series",
-            summary="Standup (moved)",
-            start=datetime(2026, 7, 10, 11, tzinfo=UTC),
-            end=datetime(2026, 7, 10, 11, 30, tzinfo=UTC),
-        )
-        exception.add(
-            "recurrence-id",
-            datetime(2026, 7, 10, 9, tzinfo=UTC),
-        )
-        payload = icalendar.Calendar()
-        payload.add("prodid", "-//HealthMes Test//EN")
-        payload.add("version", "2.0")
-        payload.add_component(master)
-        payload.add_component(exception)
-        calendar.objects["series"] = CalDavEvent(
-            client=FakeDavClient(calendar),
-            url="https://caldav.invalid/series.ics",
-            data=payload.to_ical().decode(),
-            parent=calendar,
-            props={ETAG_PROPERTY_TAG: '"series-v1"'},
-        )
-
-        events, state = backend.list_changes(None)
-
-        assert {event.external_id for event in events} == {
-            "series",
-            "series::recurrence::2026-07-10T09:00:00+00:00",
-        }
-        detached = next(
-            event for event in events if "::recurrence::" in event.external_id
-        )
-        assert detached.summary == "Standup (moved)"
-        assert detached.start_at == datetime(2026, 7, 10, 11, tzinfo=UTC)
-        assert len(state["fingerprints"]) == 2
-
-    def test_detached_exception_content_has_its_own_fingerprint(
-        self, backend, calendar
-    ) -> None:
-        master = make_component("series", recurring=True)
-        exception = make_component(
-            "series",
-            summary="Standup (moved)",
-            start=datetime(2026, 7, 10, 11, tzinfo=UTC),
-            end=datetime(2026, 7, 10, 11, 30, tzinfo=UTC),
-        )
-        exception.add(
-            "recurrence-id",
-            datetime(2026, 7, 10, 9, tzinfo=UTC),
-        )
-
-        def put_series() -> None:
-            payload = icalendar.Calendar()
-            payload.add("prodid", "-//HealthMes Test//EN")
-            payload.add("version", "2.0")
-            payload.add_component(master)
-            payload.add_component(exception)
-            calendar.objects["series"] = CalDavEvent(
-                client=FakeDavClient(calendar),
-                url="https://caldav.invalid/series.ics",
-                data=payload.to_ical().decode(),
-                parent=calendar,
-                # Some REPORT responses omit ETags; content hashing must still
-                # distinguish the master from a detached override.
-                props={},
-            )
-
-        put_series()
-        _, state = backend.list_changes(None)
-        master_fingerprint = state["fingerprints"]["series"]
-        exception_id = "series::recurrence::2026-07-10T09:00:00+00:00"
-        exception_fingerprint = state["fingerprints"][exception_id]
-        assert master_fingerprint != exception_fingerprint
-
-        exception["SUMMARY"] = "Standup (moved again)"
-        calendar.ctag = "ctag-2"
-        put_series()
-
-        events, next_state = backend.list_changes(state)
-
-        assert [event.external_id for event in events] == [exception_id]
-        assert next_state["fingerprints"]["series"] == master_fingerprint
-        assert next_state["fingerprints"][exception_id] != exception_fingerprint
 
 
 class TestComponentParsing:
@@ -461,7 +285,6 @@ class TestComponentParsing:
         (event,), _ = backend.list_changes(None)
         assert event.start_at == datetime(2026, 7, 10, tzinfo=UTC)
         assert event.end_at == datetime(2026, 7, 11, tzinfo=UTC)
-        assert event.is_all_day
 
     def test_all_day_without_dtend_defaults_to_one_day(self, backend, calendar) -> None:
         component = icalendar.Event()
@@ -472,113 +295,6 @@ class TestComponentParsing:
         calendar.put(component)
         (event,), _ = backend.list_changes(None)
         assert event.end_at == datetime(2026, 7, 11, tzinfo=UTC)
-        assert event.is_all_day
-
-    @pytest.mark.parametrize(
-        ("local_date", "expected_start", "expected_end"),
-        [
-            (
-                date(2026, 3, 8),
-                datetime(2026, 3, 8, 5, tzinfo=UTC),
-                datetime(2026, 3, 9, 4, tzinfo=UTC),
-            ),
-            (
-                date(2026, 11, 1),
-                datetime(2026, 11, 1, 4, tzinfo=UTC),
-                datetime(2026, 11, 2, 5, tzinfo=UTC),
-            ),
-        ],
-    )
-    def test_all_day_without_dtend_uses_next_local_midnight_across_dst(
-        self,
-        calendar,
-        local_date,
-        expected_start,
-        expected_end,
-    ) -> None:
-        backend = CalDavCalendarBackend(
-            calendar,
-            local_timezone=ZoneInfo("America/New_York"),
-        )
-        component = icalendar.Event()
-        component.add("uid", f"dst-{local_date.isoformat()}")
-        component.add("dtstamp", datetime(2026, 7, 1, tzinfo=UTC))
-        component.add("summary", "DST-safe holiday")
-        component.add("dtstart", local_date)
-        calendar.put(component)
-
-        (event,), _ = backend.list_changes(None)
-
-        assert event.start_at == expected_start
-        assert event.end_at == expected_end
-        assert event.is_all_day
-
-    def test_all_day_uses_configured_local_midnight(self, calendar) -> None:
-        backend = CalDavCalendarBackend(calendar, local_timezone=KST)
-        calendar.put(
-            make_component(
-                "kst-allday",
-                start=date(2026, 7, 10),
-                end=date(2026, 7, 11),
-            )
-        )
-
-        (event,), _ = backend.list_changes(None)
-
-        assert event.start_at == datetime(2026, 7, 9, 15, tzinfo=UTC)
-        assert event.end_at == datetime(2026, 7, 10, 15, tzinfo=UTC)
-
-    def test_intake_safety_metadata_is_parsed(self, calendar) -> None:
-        backend = CalDavCalendarBackend(
-            calendar,
-            owner_email="owner@example.com",
-        )
-        calendar.put(
-            make_component(
-                "owned",
-                organizer="mailto:owner@example.com",
-                attendee="mailto:guest@example.com",
-                recurring=True,
-            )
-        )
-
-        (event,), _ = backend.list_changes(None)
-
-        assert event.organizer_self
-        assert event.has_attendees
-        assert event.is_recurring
-        assert event.event_type == "default"
-
-    @pytest.mark.parametrize("property_name", ["rdate", "recurrence-id"])
-    def test_recurrence_variants_are_marked_recurring(
-        self, backend, calendar, property_name
-    ) -> None:
-        component = make_component("recurrence-variant")
-        if property_name == "rdate":
-            component.add("rdate", datetime(2026, 7, 10, 9, tzinfo=UTC))
-        else:
-            component.add("recurrence-id", datetime(2026, 7, 9, 9, tzinfo=UTC))
-        calendar.put(component)
-
-        (event,), _ = backend.list_changes(None)
-
-        assert event.is_recurring
-
-    def test_foreign_organizer_is_not_self(self, calendar) -> None:
-        backend = CalDavCalendarBackend(
-            calendar,
-            owner_email="owner@example.com",
-        )
-        calendar.put(
-            make_component(
-                "foreign",
-                organizer="mailto:other@example.com",
-            )
-        )
-
-        (event,), _ = backend.list_changes(None)
-
-        assert not event.organizer_self
 
     def test_component_without_uid_is_skipped(self, backend, calendar) -> None:
         component = icalendar.Event()
@@ -611,85 +327,13 @@ class TestCreateEvent:
 
         assert created.external_id.endswith("@healthmes")
         assert created.is_agent_created
-        assert created.etag == '"fresh"'
         assert created.start_at == datetime(2026, 7, 10, 9, 0, tzinfo=UTC)
-        assert calendar.event_by_uid_calls == 1
 
         # Round-trip through parsing keeps the tag readable.
         stored = calendar.objects[created.external_id]
         events, _ = backend.list_changes(None)
         assert events[0].is_agent_created
         assert stored.uid == created.external_id
-
-    def test_create_requires_server_read_back_etag(
-        self, backend, calendar, monkeypatch
-    ) -> None:
-        original_add = calendar.add_event
-
-        def add_without_server_etag(*args, **kwargs):
-            created = original_add(*args, **kwargs)
-            created.props.clear()
-            return created
-
-        monkeypatch.setattr(calendar, "add_event", add_without_server_etag)
-
-        with pytest.raises(CalendarError, match="server ETag"):
-            backend.create_event(
-                EventDraft(
-                    summary="No ETag",
-                    start_at=datetime(2026, 7, 10, 9, tzinfo=UTC),
-                    end_at=datetime(2026, 7, 10, 10, tzinfo=UTC),
-                )
-            )
-
-    def test_identity_create_uses_atomic_if_none_match(
-        self, calendar
-    ) -> None:
-        calendar.conditional_create = None
-        calendar.client = FakeDavClient(calendar)
-        backend = CalDavCalendarBackend(calendar)
-        identity = CalendarEventIdentity(
-            kind=HealthmesEventKind.ACTUAL_SLEEP,
-            source="oura",
-            source_key="oura:2026-07-26",
-        )
-        draft = EventDraft(
-            summary="Sleep",
-            start_at=datetime(2026, 7, 25, 23, tzinfo=UTC),
-            end_at=datetime(2026, 7, 26, 7, tzinfo=UTC),
-            identity=identity,
-        )
-
-        created = backend.create_event(draft)
-
-        assert created.identity == identity
-        assert len(calendar.conditional_create_calls) == 1
-        url, _, headers = calendar.conditional_create_calls[0]
-        assert url.endswith(".ics")
-        assert headers["If-None-Match"] == "*"
-        assert headers["Content-Type"] == "text/calendar; charset=utf-8"
-
-        with pytest.raises(CalendarConflictError):
-            backend.create_event(draft)
-
-
-class TestConnect:
-    def test_unnamed_calendar_requires_unambiguous_collection(
-        self, monkeypatch
-    ) -> None:
-        principal = SimpleNamespace(
-            calendars=lambda: [object(), object()],
-        )
-        monkeypatch.setattr(
-            "caldav.DAVClient",
-            lambda **_: SimpleNamespace(principal=lambda: principal),
-        )
-
-        with pytest.raises(CalendarError, match="multiple caldav calendars"):
-            CalDavCalendarBackend.connect(
-                username="owner@example.com",
-                app_password="app-password",
-            )
 
     def test_actual_sleep_identity_round_trips_x_properties(
         self, backend, calendar

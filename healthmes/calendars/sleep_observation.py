@@ -96,22 +96,48 @@ def actual_sleep_source_key(local_date: date) -> str:
 class _SleepCandidate:
     observation: ActualSleepObservation
     main_session_minutes: int
+    summary_index: int
 
 
 def select_actual_sleep(
     summaries: tuple[SleepSummaryPayload, ...],
     target_date: date,
 ) -> SleepObservationResult:
-    if not summaries:
-        return SleepObservationNoOp(reason=SleepObservationNoOpReason.MISSING)
+    selected, _ = select_actual_sleep_with_source_index(
+        summaries,
+        target_date,
+    )
+    return selected
 
-    current = tuple(summary for summary in summaries if summary.date == target_date)
+
+def select_actual_sleep_with_source_index(
+    summaries: tuple[SleepSummaryPayload, ...],
+    target_date: date,
+) -> tuple[SleepObservationResult, int | None]:
+    if not summaries:
+        return (
+            SleepObservationNoOp(
+                reason=SleepObservationNoOpReason.MISSING
+            ),
+            None,
+        )
+
+    current = tuple(
+        (index, summary)
+        for index, summary in enumerate(summaries)
+        if summary.date == target_date
+    )
     if not current:
-        return SleepObservationNoOp(reason=SleepObservationNoOpReason.STALE)
+        return (
+            SleepObservationNoOp(
+                reason=SleepObservationNoOpReason.STALE
+            ),
+            None,
+        )
 
     candidates: list[_SleepCandidate] = []
     all_sessions_are_naps = True
-    for summary in current:
+    for summary_index, summary in current:
         provider = summary.source.provider.strip()
         if not provider or summary.duration_minutes is None or summary.duration_minutes <= 0:
             all_sessions_are_naps = False
@@ -140,6 +166,7 @@ def select_actual_sleep(
                     start_at=start_at,
                     end_at=end_at,
                     main_session_minutes=main_session_minutes,
+                    summary_index=summary_index,
                 )
             )
             continue
@@ -163,6 +190,7 @@ def select_actual_sleep(
                         item.start_time,
                         item.end_time,
                     ),
+                    summary_index=summary_index,
                 )
             )
 
@@ -172,7 +200,7 @@ def select_actual_sleep(
             if all_sessions_are_naps
             else SleepObservationNoOpReason.INCOMPLETE
         )
-        return SleepObservationNoOp(reason=reason)
+        return SleepObservationNoOp(reason=reason), None
 
     longest_minutes = max(candidate.main_session_minutes for candidate in candidates)
     longest = tuple(
@@ -180,8 +208,19 @@ def select_actual_sleep(
     )
     observations = {candidate.observation for candidate in longest}
     if len(observations) != 1:
-        return SleepObservationNoOp(reason=SleepObservationNoOpReason.AMBIGUOUS)
-    return observations.pop()
+        return (
+            SleepObservationNoOp(
+                reason=SleepObservationNoOpReason.AMBIGUOUS
+            ),
+            None,
+        )
+    observation = observations.pop()
+    source_index = min(
+        candidate.summary_index
+        for candidate in longest
+        if candidate.observation == observation
+    )
+    return observation, source_index
 
 
 def _valid_span(start_at: datetime | None, end_at: datetime | None) -> bool:
@@ -210,6 +249,7 @@ def _candidate(
     start_at: datetime,
     end_at: datetime,
     main_session_minutes: int,
+    summary_index: int,
 ) -> _SleepCandidate:
     assert summary.duration_minutes is not None
     return _SleepCandidate(
@@ -223,6 +263,7 @@ def _candidate(
             time_in_bed_minutes=summary.time_in_bed_minutes,
         ),
         main_session_minutes=main_session_minutes,
+        summary_index=summary_index,
     )
 
 
