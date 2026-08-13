@@ -184,8 +184,8 @@ private struct MacWorkspaceSidebar: View {
         .background(
             LinearGradient(
                 colors: [
-                    Color(red: 0.105, green: 0.135, blue: 0.118),
-                    Color(red: 0.145, green: 0.195, blue: 0.158),
+                    MacHealthMesStyle.sidebarTop,
+                    MacHealthMesStyle.sidebarBottom,
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -201,7 +201,7 @@ private struct MacWorkspaceSidebar: View {
                     .fill(Color.white.opacity(0.13))
                     .frame(width: 36, height: 36)
                 Image(systemName: "bolt.heart.fill")
-                    .foregroundStyle(Color(red: 0.77, green: 0.88, blue: 0.69))
+                    .foregroundStyle(Color(red: 0.44, green: 0.91, blue: 0.79))
             }
             VStack(alignment: .leading, spacing: 1) {
                 Text("HealthMes")
@@ -395,7 +395,7 @@ private struct MacWorkspaceSidebar: View {
             .foregroundStyle(selected ? MacHealthMesStyle.graphite : .white.opacity(0.88))
             .background(
                 selected
-                    ? Color(red: 0.78, green: 0.86, blue: 0.71)
+                    ? Color(red: 0.74, green: 0.91, blue: 0.84)
                     : Color.clear,
                 in: RoundedRectangle(cornerRadius: 8)
             )

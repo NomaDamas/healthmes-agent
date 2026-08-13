@@ -275,17 +275,14 @@ struct ProductCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 12) {
             Label(kicker, systemImage: systemImage)
                 .font(.caption.weight(.bold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HealthMesVisualStyle.capacityDeep)
                 .textCase(.uppercase)
+                .tracking(0.7)
             content
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(.background, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(Color.primary.opacity(0.07), lineWidth: 1)
-        }
+        .padding(17)
+        .healthMesSurface()
     }
 }
 

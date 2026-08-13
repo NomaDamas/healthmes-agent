@@ -53,6 +53,13 @@ UI 테스트의 skip은 성공으로 위장하지 않는다. 실제 nutrition pr
 
 ## 시각 검수 메모
 
+- Visual Design Refinement는 Capacity 청록, Calendar 파랑, Proposal 호박색,
+  Recovery 녹색의 의미 색상을 iPhone, Mac, Watch, Web에 공통 적용한다.
+- iPhone의 Canvas와 Surface는 Light/Dark appearance에 대응하는 동적
+  색상을 사용한다. Mac은 기존 제품 계약대로 Light appearance를 유지한다.
+- Watch 알림 액션은 `No → Yes → Alternative` 순서다. 첫 액션은 계속
+  비파괴적인 No이므로 Double Tap 우발 승인을 막고, 42 mm에서는 No/Yes를
+  대안 입력보다 우선한다.
 - iPhone은 `2026-08-10` America/Los_Angeles fixture를 사용하며 실제
   Google 일정 `Team sync`를 시간 블록으로 표시한다.
 - iPhone의 마지막 분석 시각은 기기 시간대가 아니라 WellnessScene의
@@ -69,3 +76,17 @@ UI 테스트의 skip은 성공으로 위장하지 않는다. 실제 nutrition pr
 - macOS 이미지는 동일한 결정적 demo contract를 보여주는 기존 캡처다.
   최신 바이너리의 57개 unit test는 다시 통과했지만 현재 GUI 캡처
   세션은 사용할 수 없어 새 이미지로 교체하지 않았다.
+
+## Visual Design Refinement 재검증
+
+- iPhone 13 mini + embedded Watch targets: build 성공
+- Apple Watch Series 10 42 mm target: build 성공
+- macOS target: build 성공
+- 42 mm 공식 decision notification payload 전달: 성공
+- iPhone Light/Dark appearance 수동 렌더 확인: 성공
+- `git diff --check`: 성공
+- UI automation 전체 재실행: 로컬 디스크 공간 부족으로 중단
+
+마지막 항목을 통과로 기록하지 않는다. 빌드와 수동 simulator 렌더는
+성공했지만, 실제 iPhone·Watch에서 알림을 확장했을 때의 버튼 배치와
+VoiceOver 순서는 owner Live QA가 최종 증거다.

@@ -18,11 +18,11 @@ main {
 }
 
 .workspace-shell {
-  --google: #4285f4;
-  --apple: #14947d;
-  --healthmes: #d8822a;
-  --workspace-rail: color-mix(in srgb, var(--glass-solid) 92%, #e9f2ed);
-  --workspace-canvas: color-mix(in srgb, var(--glass-solid) 84%, transparent);
+  --google: #296bd6;
+  --apple: #08796c;
+  --healthmes: #cf761f;
+  --workspace-rail: color-mix(in srgb, var(--glass-solid) 96%, #e8f0ec);
+  --workspace-canvas: color-mix(in srgb, var(--glass-solid) 94%, transparent);
   min-height: calc(100vh - 3.65rem);
 }
 
@@ -33,7 +33,7 @@ main {
   gap: 0.7rem;
   padding: 0.55rem clamp(0.7rem, 2vw, 1.15rem);
   border-bottom: 1px solid var(--glass-line);
-  background: var(--glass-solid);
+  background: color-mix(in srgb, var(--glass-solid) 96%, transparent);
   -webkit-backdrop-filter: blur(18px) saturate(150%);
   backdrop-filter: blur(18px) saturate(150%);
 }
@@ -129,12 +129,12 @@ main {
 
 .workspace-layout {
   display: grid;
-  grid-template-columns: 15.5rem minmax(0, 1fr);
+  grid-template-columns: 16.25rem minmax(0, 1fr);
   min-height: calc(100vh - 7.25rem);
 }
 
 .workspace-shell[data-thread-open="true"] .workspace-layout {
-  grid-template-columns: 15.5rem minmax(0, 1fr) minmax(19rem, 22rem);
+  grid-template-columns: 16.25rem minmax(0, 1fr) minmax(19rem, 22rem);
 }
 
 .workspace-sidebar {
@@ -144,7 +144,8 @@ main {
   height: calc(100vh - 3.65rem);
   overflow: auto;
   border-right: 1px solid var(--glass-line);
-  background: var(--workspace-rail);
+  background:
+    linear-gradient(180deg, rgba(7, 34, 31, 0.97), rgba(9, 55, 48, 0.95));
   -webkit-backdrop-filter: blur(18px) saturate(145%);
   backdrop-filter: blur(18px) saturate(145%);
 }
@@ -155,12 +156,41 @@ main {
   padding: 1rem 0.9rem 0.75rem;
 }
 
+.workspace-identity strong { color: #f3faf7; }
+.workspace-identity span { color: rgba(231, 246, 240, 0.58); }
+.workspace-sidebar .sidebar-section-head,
+.workspace-sidebar .category-heading { color: rgba(231, 246, 240, 0.58); }
+.workspace-sidebar .channel-row { color: rgba(243, 250, 247, 0.76); }
+.workspace-sidebar .channel-row:hover {
+  background: rgba(255, 255, 255, 0.07);
+  color: #fff;
+}
+.workspace-sidebar .channel-row[aria-current="page"],
+.workspace-sidebar .channel-row[aria-selected="true"] {
+  background: rgba(111, 224, 194, 0.16);
+  box-shadow: inset 3px 0 0 #6fe0c2;
+  color: #fff;
+}
+.workspace-sidebar .channel-glyph {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.07);
+  color: #9ce9d5;
+}
+.workspace-sidebar .channel-action,
+.workspace-sidebar .category-add,
+.workspace-sidebar .channel-create,
+.workspace-sidebar .sidebar-footer a,
+.workspace-sidebar .sidebar-footer button { color: rgba(243, 250, 247, 0.64); }
+.workspace-sidebar .sidebar-footer {
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
 .workspace-identity strong {
   font-size: 0.9rem;
 }
 
 .workspace-identity span {
-  color: var(--ink-3);
+  color: rgba(231, 246, 240, 0.58);
   font-size: 0.68rem;
 }
 
@@ -177,7 +207,7 @@ main {
   gap: 0.35rem;
   min-height: 1.9rem;
   padding: 0 0.35rem;
-  color: var(--ink-2);
+  color: rgba(231, 246, 240, 0.58);
   font-size: 0.68rem;
   font-weight: 820;
   letter-spacing: 0.075em;
@@ -201,7 +231,7 @@ main {
   border: 0;
   border-radius: 8px;
   background: transparent;
-  color: var(--ink-2);
+  color: rgba(243, 250, 247, 0.64);
   cursor: pointer;
 }
 
@@ -371,7 +401,7 @@ main {
   border: 0;
   border-radius: 7px;
   background: transparent;
-  color: var(--ink-3);
+  color: rgba(243, 250, 247, 0.64);
   cursor: pointer;
 }
 
@@ -380,7 +410,7 @@ main {
   gap: 0.35rem;
   margin: 0.5rem 0.75rem 1rem;
   padding-top: 0.7rem;
-  border-top: 1px solid var(--line-soft);
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .sidebar-footer button,
@@ -389,7 +419,7 @@ main {
   border: 0;
   border-radius: 9px;
   background: transparent;
-  color: var(--ink-2);
+  color: rgba(243, 250, 247, 0.64);
   font: inherit;
   font-size: 0.72rem;
   font-weight: 720;
@@ -399,14 +429,17 @@ main {
 
 .sidebar-footer button:hover,
 .sidebar-footer a:hover {
-  background: var(--surface-2);
-  color: var(--ink);
+  background: rgba(255, 255, 255, 0.07);
+  color: #fff;
   text-decoration: none;
 }
 
 .workspace-main {
   min-width: 0;
-  padding: clamp(0.7rem, 2vw, 1.25rem);
+  padding: clamp(0.9rem, 2.4vw, 1.6rem);
+  background:
+    radial-gradient(circle at 12% 0%, rgba(22, 128, 108, 0.08), transparent 30rem),
+    radial-gradient(circle at 94% 12%, rgba(207, 118, 31, 0.07), transparent 28rem);
 }
 
 .channel-header {
@@ -469,11 +502,12 @@ main {
   min-width: 0;
   margin: 0;
   border: 1px solid var(--glass-line);
-  border-radius: 18px;
+  border-color: color-mix(in srgb, var(--line) 82%, transparent);
+  border-radius: 20px;
   background: var(--workspace-canvas);
   -webkit-backdrop-filter: blur(16px) saturate(140%);
   backdrop-filter: blur(16px) saturate(140%);
-  box-shadow: 0 8px 28px rgba(17, 38, 30, 0.065);
+  box-shadow: 0 1px 2px rgba(17, 38, 30, 0.04), 0 16px 42px rgba(17, 38, 30, 0.07);
 }
 
 .primitive-body {
@@ -533,7 +567,7 @@ main {
 .capacity-score {
   display: grid;
   place-items: center;
-  width: 4.7rem;
+  width: 5.1rem;
   aspect-ratio: 1;
   border-radius: 50%;
   background:
@@ -543,7 +577,7 @@ main {
       var(--surface-2) 0
     );
   color: var(--brand-deep);
-  font-size: 1.22rem;
+  font-size: 1.35rem;
   font-weight: 850;
   font-variant-numeric: tabular-nums;
 }
@@ -562,7 +596,8 @@ main {
 
 .capacity-copy h3 {
   margin: 0 0 0.2rem;
-  font-size: clamp(1.05rem, 2.2vw, 1.35rem);
+  font-size: clamp(1.08rem, 2.2vw, 1.42rem);
+  letter-spacing: -0.015em;
   line-height: 1.42;
 }
 
@@ -693,7 +728,8 @@ main {
   padding: 0.72rem 0.75rem 0.45rem;
   border: 1px solid var(--line-soft);
   border-radius: 13px;
-  background: var(--brand-wash);
+  background:
+    linear-gradient(180deg, var(--brand-wash), color-mix(in srgb, var(--brand-wash) 42%, transparent));
 }
 
 .energy-chart figcaption {
@@ -753,8 +789,8 @@ main {
   padding: 0.72rem 0.78rem;
   border: 1px solid var(--line-soft);
   border-left: 4px solid var(--provider-color);
-  border-radius: 12px;
-  background: var(--surface-2);
+  border-radius: 13px;
+  background: color-mix(in srgb, var(--surface) 70%, var(--surface-2));
 }
 
 .calendar-event[data-duration-minutes] {

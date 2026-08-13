@@ -475,13 +475,13 @@ struct WatchDecisionRemoteView: View {
     }
 
     private func pending(_ decision: PendingDecision) -> some View {
-        VStack(spacing: 5) {
+        VStack(spacing: 7) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("SCHEDULE CHANGE")
+                        Label("CHANGE", systemImage: "calendar.badge.clock")
                             .font(.caption2.weight(.bold))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Color(red: 0.42, green: 0.88, blue: 0.76))
                         Spacer()
                         if let score = model.energyScore {
                             Text(verbatim: "\(score)%")
@@ -493,7 +493,7 @@ struct WatchDecisionRemoteView: View {
                     }
 
                     Text(verbatim: decision.watchActionTitle)
-                        .font(.headline.weight(.semibold))
+                        .font(.headline.weight(.bold))
                         .lineLimit(2)
                         .minimumScaleFactor(0.82)
                         .fixedSize(horizontal: false, vertical: true)
@@ -503,6 +503,7 @@ struct WatchDecisionRemoteView: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
 
                     if !model.isDecisionContextReady {
@@ -520,6 +521,9 @@ struct WatchDecisionRemoteView: View {
                                 .foregroundStyle(.primary)
                         }
                         .font(.system(.caption, design: .rounded).weight(.bold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
                         .accessibilityElement(children: .combine)
                         .accessibilityLabel(Text("Schedule moves"))
                     } else {
@@ -570,7 +574,6 @@ struct WatchDecisionRemoteView: View {
                 )
             }
             .padding(.top, 2)
-            .background(.ultraThinMaterial)
         }
     }
 
@@ -590,7 +593,7 @@ struct WatchDecisionRemoteView: View {
                     accessibilityLabel: accessibilityLabel
                 )
                     .buttonStyle(.borderedProminent)
-                    .tint(.green)
+                    .tint(Color(red: 0.03, green: 0.55, blue: 0.46))
             } else {
                 decisionButtonContent(
                     title: title,
@@ -685,7 +688,7 @@ struct WatchDecisionRemoteView: View {
                         ZStack(alignment: .leading) {
                             Capsule().fill(Color.primary.opacity(0.12))
                             Capsule()
-                                .fill(energyScore < 45 ? Color.orange : Color.green)
+                                .fill(energyTint(energyScore))
                                 .frame(
                                     width: proxy.size.width
                                         * CGFloat(min(max(energyScore, 0), 100)) / 100

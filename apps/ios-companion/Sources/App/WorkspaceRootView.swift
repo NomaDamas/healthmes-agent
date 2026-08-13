@@ -212,13 +212,13 @@ private struct WorkspaceDrawer: View {
             HStack(spacing: 12) {
                 Image(systemName: "waveform.path.ecg.rectangle.fill")
                     .font(.title2)
-                    .foregroundStyle(Color(red: 0.08, green: 0.38, blue: 0.28))
+                    .foregroundStyle(Color(red: 0.44, green: 0.91, blue: 0.79))
                 VStack(alignment: .leading, spacing: 1) {
                     Text("HealthMes")
                         .font(.headline)
                     Text("Local wellness workspace")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.white.opacity(0.62))
                 }
                 Spacer()
                 Button(action: onCreateCategory) {
@@ -232,7 +232,7 @@ private struct WorkspaceDrawer: View {
             }
             .padding(.horizontal, 16)
             .frame(height: 58)
-            .background(.regularMaterial)
+            .background(Color.white.opacity(0.045))
 
             Divider()
 
@@ -247,7 +247,8 @@ private struct WorkspaceDrawer: View {
         }
         .frame(width: width)
         .frame(maxHeight: .infinity)
-        .background(Color(uiColor: .secondarySystemBackground))
+        .background(HealthMesVisualStyle.drawer)
+        .foregroundStyle(.white)
         .clipShape(
             UnevenRoundedRectangle(
                 bottomTrailingRadius: 24,
@@ -313,6 +314,7 @@ private struct WorkspaceSidebar: View {
             }
         }
         .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
     }
 
     private var favoriteChannels: [WorkspaceChannel] {
@@ -713,17 +715,19 @@ private struct WorkspaceOverviewCanvas: View {
     @StateObject private var plan = PlanModel()
     let onOpenDecisionThread: () -> Void
 
-    private let moss = Color(red: 0.08, green: 0.38, blue: 0.28)
+    private let moss = HealthMesVisualStyle.capacity
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 14) {
+            LazyVStack(alignment: .leading, spacing: 16) {
                 overviewHeader
                 capacityCard
                 todayBlocksCard
                 decisionCard
             }
-            .padding(16)
+            .padding(.horizontal, 16)
+            .padding(.top, 18)
+            .padding(.bottom, 28)
         }
         .background(workspaceBackground)
         .refreshable { await refresh() }
@@ -741,10 +745,13 @@ private struct WorkspaceOverviewCanvas: View {
     private var overviewHeader: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(Date(), format: .dateTime.weekday(.wide).month(.wide).day())
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(HealthMesVisualStyle.capacityDeep)
+                .textCase(.uppercase)
+                .tracking(0.8)
             Text(conclusion)
-                .font(.system(.title2, design: .rounded).weight(.bold))
+                .font(.title2.weight(.bold))
+                .tracking(-0.35)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -756,8 +763,9 @@ private struct WorkspaceOverviewCanvas: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text(verbatim: GlanceFormat.scoreText(payload.energy.score))
-                            .font(.system(size: 38, weight: .bold, design: .rounded))
-                        Text("available energy")
+                            .font(.system(size: 42, weight: .bold, design: .default))
+                            .foregroundStyle(HealthMesVisualStyle.capacityDeep)
+                        Text("available")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                         Spacer()
@@ -791,10 +799,10 @@ private struct WorkspaceOverviewCanvas: View {
                 unavailable(plan.message ?? "오늘 동기화된 Apple·Google 일정이 없습니다.")
             } else {
                 ForEach(blocks) { event in
-                    HStack(alignment: .top, spacing: 11) {
+                    HStack(alignment: .top, spacing: 12) {
                         RoundedRectangle(cornerRadius: 3)
                             .fill(eventColor(event))
-                            .frame(width: 4, height: 42)
+                            .frame(width: 4, height: 46)
                         Text(event.startAt, format: .dateTime.hour().minute())
                             .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
@@ -810,6 +818,7 @@ private struct WorkspaceOverviewCanvas: View {
                         }
                         Spacer()
                     }
+                    .padding(.vertical, 2)
                     if event.id != blocks.last?.id {
                         Divider()
                     }
@@ -992,20 +1001,14 @@ private struct WorkspaceOverviewCanvas: View {
     }
 
     private func eventColor(_ event: CalendarEventItem) -> Color {
-        if event.isAgentCreated { return moss }
-        return event.calendarSource.lowercased().contains("google") ? .orange : .blue
+        if event.isAgentCreated { return HealthMesVisualStyle.proposal }
+        return event.calendarSource.lowercased().contains("google")
+            ? HealthMesVisualStyle.calendar
+            : HealthMesVisualStyle.capacity
     }
 
     private var workspaceBackground: some View {
-        LinearGradient(
-            colors: [
-                Color(red: 0.94, green: 0.96, blue: 0.92),
-                Color(uiColor: .systemGroupedBackground),
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-        .ignoresSafeArea()
+        HealthMesVisualStyle.canvas.ignoresSafeArea()
     }
 }
 
@@ -1030,12 +1033,7 @@ private struct WorkspaceCapacityBar: View {
     }
 
     private var barColor: Color {
-        switch score {
-        case .some(70...): return Color(red: 0.08, green: 0.38, blue: 0.28)
-        case .some(45..<70): return Color(red: 0.55, green: 0.62, blue: 0.30)
-        case .some: return .orange
-        case .none: return .secondary.opacity(0.3)
-        }
+        HealthMesVisualStyle.capacityColor(score)
     }
 }
 
@@ -1158,7 +1156,7 @@ private struct WorkspaceAgentCanvas: View {
     @State private var lastFocusRequest = 0
     @FocusState private var commandFocused: Bool
 
-    private let moss = Color(red: 0.08, green: 0.38, blue: 0.28)
+    private let moss = HealthMesVisualStyle.capacity
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1379,9 +1377,13 @@ private struct WorkspaceAgentCanvas: View {
                 .padding(.horizontal, 13)
                 .padding(.vertical, 11)
                 .background(
-                    Color.primary.opacity(0.06),
+                    Color.primary.opacity(0.055),
                     in: RoundedRectangle(cornerRadius: 17, style: .continuous)
                 )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 17, style: .continuous)
+                        .stroke(HealthMesVisualStyle.line)
+                }
                 .submitLabel(.send)
                 .onSubmit(submit)
                 .accessibilityIdentifier("healthmes-command-input")
@@ -1413,7 +1415,7 @@ private struct WorkspaceAgentCanvas: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(.bar)
+        .background(.ultraThinMaterial)
         .overlay(alignment: .top) { Divider() }
     }
 
@@ -1732,15 +1734,7 @@ private struct WorkspaceAgentCanvas: View {
     }
 
     private var workspaceBackground: some View {
-        LinearGradient(
-            colors: [
-                Color(red: 0.93, green: 0.96, blue: 0.91),
-                Color(uiColor: .systemGroupedBackground),
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-        .ignoresSafeArea()
+        HealthMesVisualStyle.canvas.ignoresSafeArea()
     }
 }
 
@@ -1774,7 +1768,7 @@ private struct WorkspaceCustomDashboardCanvas: View {
             }
             .padding(16)
         }
-        .background(Color(uiColor: .systemGroupedBackground))
+        .background(HealthMesVisualStyle.canvas)
         .task { await refresh() }
         .refreshable { await refresh() }
         .onReceive(NotificationCenter.default.publisher(for: .healthmesPairingChanged)) { _ in
@@ -1853,16 +1847,7 @@ private struct WorkspaceMixedCanvas: View {
             }
             .padding(16)
         }
-        .background(
-            LinearGradient(
-                colors: [
-                    Color(red: 0.95, green: 0.96, blue: 0.92),
-                    Color(uiColor: .systemGroupedBackground),
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        )
+        .background(HealthMesVisualStyle.canvas)
         .task { await refresh() }
         .refreshable { await refresh() }
         .onReceive(NotificationCenter.default.publisher(for: .healthmesPairingChanged)) { _ in
@@ -2161,7 +2146,7 @@ private struct WorkspaceThreadSheet: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .healthMesSurface(radius: 16)
     }
 
     private func messageRow(_ message: WorkspaceThreadMessage) -> some View {
@@ -2178,7 +2163,7 @@ private struct WorkspaceThreadSheet: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             message.author == .user
-                ? Color.accentColor.opacity(0.09)
+                ? HealthMesVisualStyle.calendar.opacity(0.11)
                 : Color.primary.opacity(0.05),
             in: RoundedRectangle(cornerRadius: 14)
         )
@@ -2203,7 +2188,7 @@ private struct WorkspaceThreadSheet: View {
                     .font(.body.bold())
                     .foregroundStyle(.white)
                     .frame(width: 36, height: 36)
-                    .background(Color.accentColor, in: Circle())
+                    .background(HealthMesVisualStyle.capacity, in: Circle())
             }
             .buttonStyle(.plain)
             .disabled(thread.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)

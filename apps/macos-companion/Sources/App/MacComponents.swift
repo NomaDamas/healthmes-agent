@@ -1,11 +1,15 @@
 import SwiftUI
 
 enum MacHealthMesStyle {
-    static let canvas = Color(red: 0.96, green: 0.95, blue: 0.91)
-    static let graphite = Color(red: 0.12, green: 0.14, blue: 0.13)
-    static let moss = Color(red: 0.24, green: 0.39, blue: 0.28)
-    static let amber = Color(red: 0.72, green: 0.49, blue: 0.18)
-    static let line = Color.black.opacity(0.08)
+    static let canvas = Color(red: 0.955, green: 0.955, blue: 0.935)
+    static let graphite = Color(red: 0.10, green: 0.13, blue: 0.13)
+    static let moss = Color(red: 0.02, green: 0.45, blue: 0.39)
+    static let mossDeep = Color(red: 0.02, green: 0.27, blue: 0.25)
+    static let calendar = Color(red: 0.16, green: 0.42, blue: 0.78)
+    static let amber = Color(red: 0.59, green: 0.31, blue: 0.04)
+    static let line = Color.black.opacity(0.09)
+    static let sidebarTop = Color(red: 0.045, green: 0.105, blue: 0.10)
+    static let sidebarBottom = Color(red: 0.07, green: 0.17, blue: 0.15)
 }
 
 struct MacPageHeader: View {
@@ -58,12 +62,12 @@ struct MacSurfaceCard<Content: View>: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, minHeight: 188, alignment: .topLeading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(MacHealthMesStyle.line)
         }
-        .shadow(color: .black.opacity(0.04), radius: 18, y: 8)
+        .shadow(color: MacHealthMesStyle.mossDeep.opacity(0.055), radius: 18, y: 8)
     }
 }
 

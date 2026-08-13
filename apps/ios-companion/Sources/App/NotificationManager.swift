@@ -52,8 +52,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             identifier: AlertNotificationContent.actionableCategoryID,
             // Apple Watch Double Tap can invoke the first non-destructive
             // action. Default to the non-mutating choice so an accidental
-            // gesture can never approve a calendar change.
-            actions: [no, alternative, yes],
+            // gesture can never approve a calendar change. Keep Yes second
+            // so both primary decisions remain visible on the 42 mm screen.
+            actions: [no, yes, alternative],
             intentIdentifiers: []
         )
         let info = UNNotificationCategory(

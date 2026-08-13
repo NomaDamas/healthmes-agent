@@ -33,7 +33,7 @@ struct MacWorkspaceChannelView: View {
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(MacHealthMesStyle.moss)
                     .frame(width: 32, height: 32)
-                    .background(MacHealthMesStyle.moss.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
+                    .background(MacHealthMesStyle.moss.opacity(0.11), in: RoundedRectangle(cornerRadius: 9))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(channel.title)
                         .font(.headline)
@@ -139,7 +139,8 @@ struct MacWorkspaceChannelView: View {
         LinearGradient(
             colors: [
                 MacHealthMesStyle.canvas,
-                Color(red: 0.925, green: 0.945, blue: 0.91),
+                Color(red: 0.90, green: 0.945, blue: 0.925),
+                Color(red: 0.965, green: 0.95, blue: 0.91),
             ],
             startPoint: .topLeading,
             endPoint: .bottomTrailing
@@ -181,7 +182,7 @@ private struct MacWorkspaceOverviewCanvas: View {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Today")
-                            .font(.system(size: 30, weight: .bold, design: .rounded))
+                            .font(.system(size: 30, weight: .bold, design: .default))
                         Text(todayConclusion)
                             .font(.title3)
                             .foregroundStyle(.secondary)
@@ -1276,12 +1277,12 @@ struct MacWorkspaceCard<Content: View>: View {
         }
         .padding(17)
         .frame(maxWidth: .infinity, minHeight: 190, alignment: .topLeading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 18)
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(MacHealthMesStyle.line)
         }
-        .shadow(color: .black.opacity(0.035), radius: 12, y: 6)
+        .shadow(color: MacHealthMesStyle.mossDeep.opacity(0.05), radius: 16, y: 8)
     }
 }
 
@@ -1320,9 +1321,9 @@ struct MacWorkspacePanel<Content: View>: View {
             content
         }
         .padding(18)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 18)
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(MacHealthMesStyle.line)
         }
     }
@@ -1378,13 +1379,13 @@ struct MacWorkspaceEventRow: View {
 
     private var sourceColor: Color {
         if event.isAgentCreated {
-            return MacHealthMesStyle.moss
+            return MacHealthMesStyle.amber
         }
         switch event.calendarSource.lowercased() {
         case let source where source.contains("google"):
-            return Color(red: 0.80, green: 0.36, blue: 0.23)
+            return MacHealthMesStyle.calendar
         case let source where source.contains("apple"), let source where source.contains("icloud"):
-            return Color(red: 0.25, green: 0.49, blue: 0.82)
+            return MacHealthMesStyle.moss
         default:
             return .secondary
         }

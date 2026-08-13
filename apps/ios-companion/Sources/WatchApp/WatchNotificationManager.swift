@@ -31,7 +31,7 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
         center.setNotificationCategories([
             UNNotificationCategory(
                 identifier: AlertNotificationContent.actionableCategoryID,
-                actions: [no, alternative, yes],
+                actions: [no, yes, alternative],
                 intentIdentifiers: []
             )
         ])
