@@ -69,6 +69,7 @@ struct WellnessSceneRenderer: View {
                     Label("근거 자세히 보기", systemImage: "safari")
                 }
                 .font(.caption.weight(.semibold))
+                .accessibilityIdentifier(actionIdentifier(detail.kind))
             }
         }
         .padding(16)
@@ -736,6 +737,7 @@ struct WellnessSceneRenderer: View {
                         .disabled(
                             action.proposalID.map(busyProposalIDs.contains) ?? false
                         )
+                        .accessibilityIdentifier(actionIdentifier(action.kind))
                     } else {
                         Button {
                             onAction(action)
@@ -747,6 +749,7 @@ struct WellnessSceneRenderer: View {
                         .disabled(
                             action.proposalID.map(busyProposalIDs.contains) ?? false
                         )
+                        .accessibilityIdentifier(actionIdentifier(action.kind))
                     }
                 }
                 if let detail = scene.actions.first(where: { $0.kind == .openWebDetail }) {
@@ -757,8 +760,22 @@ struct WellnessSceneRenderer: View {
                     }
                     .buttonStyle(.bordered)
                     .accessibilityLabel(Text(verbatim: detail.label))
+                    .accessibilityIdentifier(actionIdentifier(detail.kind))
                 }
             }
+        }
+    }
+
+    private func actionIdentifier(_ kind: WellnessActionKind) -> String {
+        switch kind {
+        case .acceptProposal: return "healthmes-scene-action-accept"
+        case .declineProposal: return "healthmes-scene-action-decline"
+        case .modifyProposal: return "healthmes-scene-action-modify"
+        case .createTask: return "healthmes-scene-action-create-task"
+        case .createGoal: return "healthmes-scene-action-create-goal"
+        case .openWebDetail: return "healthmes-scene-action-open-detail"
+        case .refresh: return "healthmes-scene-action-refresh"
+        case .switchLens: return "healthmes-scene-action-switch-lens"
         }
     }
 

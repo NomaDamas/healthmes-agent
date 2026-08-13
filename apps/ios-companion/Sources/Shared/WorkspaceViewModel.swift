@@ -193,6 +193,74 @@ public final class WorkspaceViewModel: ObservableObject {
         persist()
     }
 
+    public func addCard(_ kind: WorkspaceCardKind, to channelID: UUID) {
+        mutateChannel(channelID) { channel in
+            guard !channel.isSystem, channel.cards.count < 30 else { return }
+            channel.cards.append(WorkspaceCard(kind: kind))
+        }
+    }
+
+    public func removeCard(_ cardID: UUID, from channelID: UUID) {
+        mutateChannel(channelID) { channel in
+            guard !channel.isSystem else { return }
+            channel.cards.removeAll { $0.id == cardID }
+        }
+    }
+
+    public func moveCard(_ cardID: UUID, in channelID: UUID, offset: Int) {
+        mutateChannel(channelID) { channel in
+            guard !channel.isSystem,
+                let source = channel.cards.firstIndex(where: { $0.id == cardID })
+            else { return }
+            let destination = min(max(source + offset, 0), channel.cards.count - 1)
+            guard source != destination else { return }
+            let card = channel.cards.remove(at: source)
+            channel.cards.insert(card, at: destination)
+        }
+    }
+
+    public func setCardSize(
+        _ cardID: UUID,
+        in channelID: UUID,
+        size: WorkspaceCardSize
+    ) {
+        mutateChannel(channelID) { channel in
+            guard !channel.isSystem,
+                let index = channel.cards.firstIndex(where: { $0.id == cardID })
+            else { return }
+            channel.cards[index].size = size
+        }
+    }
+
+    @discardableResult
+    public func createPostThread(channelID: UUID, title: String) -> UUID? {
+        guard selectedChannel(with: channelID) != nil else {
+            notice = "삭제되었거나 존재하지 않는 채널에는 게시글을 만들 수 없습니다."
+            return nil
+        }
+        guard threads(in: channelID).count < WorkspaceState.maximumPostThreadsPerChannel else {
+            notice = "이 채널은 게시글 \(WorkspaceState.maximumPostThreadsPerChannel)개 한도에 도달했습니다."
+            return nil
+        }
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let anchor = WorkspaceThreadAnchor(
+            kind: .post,
+            localID: UUID().uuidString,
+            title: clean.isEmpty ? "새 게시글" : String(clean.prefix(120))
+        )
+        let thread = WorkspaceThread(channelID: channelID, anchor: anchor)
+        state.threads.append(thread)
+        state.selectedThreadID = thread.id
+        persist()
+        return thread.id
+    }
+
+    public func threads(in channelID: UUID) -> [WorkspaceThread] {
+        state.threads
+            .filter { $0.channelID == channelID && $0.anchor.kind == .post }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
     @discardableResult
     public func openThread(
         channelID: UUID,

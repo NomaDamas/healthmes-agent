@@ -254,4 +254,66 @@ final class WorkspaceContractTests: XCTestCase {
 
         XCTAssertEqual(state.threads[0].messages.count, messages.count)
     }
+
+    @MainActor
+    func testChannelPostsCreateIndependentThreads() {
+        let suite = "WorkspaceContractTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = WorkspaceLocalStore(defaults: defaults, namespace: { "posts" })
+        let model = WorkspaceViewModel(store: store)
+        let channelID = WorkspaceState.systemChannelID(.agent)
+
+        let first = try! XCTUnwrap(
+            model.createPostThread(channelID: channelID, title: "오전 일정")
+        )
+        let second = try! XCTUnwrap(
+            model.createPostThread(channelID: channelID, title: "식사 분석")
+        )
+
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(model.threads(in: channelID).count, 2)
+        XCTAssertEqual(Set(model.threads(in: channelID).map(\.anchor.localID)).count, 2)
+    }
+
+    @MainActor
+    func testPostThreadRejectsMissingChannel() {
+        let suite = "WorkspaceContractTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = WorkspaceViewModel(
+            store: WorkspaceLocalStore(defaults: defaults, namespace: { "missing" })
+        )
+
+        XCTAssertNil(model.createPostThread(channelID: UUID(), title: "고아 게시글"))
+        XCTAssertTrue(model.state.threads.isEmpty)
+    }
+
+    @MainActor
+    func testCustomDashboardCardEditingPersists() {
+        let suite = "WorkspaceContractTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = WorkspaceLocalStore(defaults: defaults, namespace: { "cards" })
+        let model = WorkspaceViewModel(store: store)
+        let categoryID = model.createCategory(title: "내 보드")
+        let channelID = try! XCTUnwrap(
+            model.createChannel(in: categoryID, title: "회복", canvas: .dashboard)
+        )
+
+        model.addCard(.energyCurve, to: channelID)
+        let channel = try! XCTUnwrap(
+            model.state.categories.flatMap(\.channels).first { $0.id == channelID }
+        )
+        let card = try! XCTUnwrap(channel.cards.first { $0.kind == .energyCurve })
+        model.setCardSize(card.id, in: channelID, size: .expanded)
+        model.moveCard(card.id, in: channelID, offset: -1)
+
+        let reloaded = WorkspaceViewModel(store: store)
+        let saved = try! XCTUnwrap(
+            reloaded.state.categories.flatMap(\.channels).first { $0.id == channelID }
+        )
+        XCTAssertEqual(saved.cards.first(where: { $0.id == card.id })?.size, .expanded)
+        XCTAssertTrue(saved.cards.contains(where: { $0.kind == .energyCurve }))
+    }
 }

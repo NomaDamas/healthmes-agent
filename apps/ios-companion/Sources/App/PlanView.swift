@@ -10,6 +10,8 @@ final class PlanModel: ObservableObject {
     @Published var busyProposalIDs: Set<UUID> = []
     @Published var message: String?
     @Published var isLoading = false
+    @Published private(set) var calendarLastSyncedAt: Date?
+    @Published private(set) var calendarError: String?
 
     private let api = HealthMesAPI()
     private var refreshGate = LatestRefreshGate()
@@ -95,8 +97,12 @@ final class PlanModel: ObservableObject {
         switch results.2 {
         case .success(let page):
             events = page.data
+            calendarLastSyncedAt = Date()
+            calendarError = nil
         case .failure(let error):
-            errors.append("Calendar: \(BriefingHomeModel.describe(error))")
+            let detail = BriefingHomeModel.describe(error)
+            calendarError = detail
+            errors.append("Calendar: \(detail)")
         }
         switch results.3 {
         case .success(let page):
@@ -186,6 +192,8 @@ final class PlanModel: ObservableObject {
         busyProposalIDs = []
         message = nil
         isLoading = false
+        calendarLastSyncedAt = nil
+        calendarError = nil
     }
 
     private func resolutionIsCurrent(

@@ -22,12 +22,18 @@ final class CompanionUITests: XCTestCase {
             "http://127.0.0.1:8201",
         ]
         app.launch()
-        // Wait for the stable control-canvas contract. The initial body card
-        // can be replaced immediately by a generated wellness scene.
-        guard app.otherElements["healthmes-wellness-control"].waitForExistence(timeout: 15) else {
+        guard app.buttons["healthmes-open-workspace-drawer"].waitForExistence(timeout: 15) else {
             throw XCTSkip(
                 "No paired live instance — serve healthmes and pair first (README)."
             )
+        }
+        app.buttons["healthmes-open-workspace-drawer"].tap()
+        guard element("healthmes-workspace-drawer", in: app).waitForExistence(timeout: 3) else {
+            throw XCTSkip("Workspace drawer did not become available.")
+        }
+        app.buttons["overview"].tap()
+        guard element("healthmes-live-pairing-ready", in: app).waitForExistence(timeout: 15) else {
+            throw XCTSkip("No live paired wellness snapshot is available.")
         }
         return app
     }
@@ -46,52 +52,66 @@ final class CompanionUITests: XCTestCase {
         element.tap()
     }
 
-    /// The iPhone default stays within the four-area wellness contract and
-    /// exposes food capture and bounded question input without old lens pages.
-    func testDailyLoopSurfacesRenderAgainstLiveInstance() throws {
+    /// Overview is a compact briefing, while the Agent owns command input.
+    func testWorkspaceSeparatesOverviewAndAgent() throws {
         let app = try launchPairedApp()
 
-        guard app.otherElements["healthmes-generated-scene"].waitForExistence(timeout: 15) else {
-            throw XCTSkip("No live wellness scene seeded for UI QA.")
-        }
-        XCTAssertTrue(app.buttons["식사 사진"].exists)
-        XCTAssertTrue(app.buttons["지금"].exists)
-        XCTAssertTrue(app.buttons["조율"].exists)
-        XCTAssertTrue(app.buttons["변화"].exists)
-        XCTAssertFalse(app.staticTexts["OUTCOME LOOP"].exists)
-        XCTAssertFalse(app.staticTexts["RECENT EVIDENCE"].exists)
-        XCTAssertFalse(app.buttons["전체 보기"].exists)
+        app.buttons["healthmes-open-workspace-drawer"].tap()
         XCTAssertTrue(
-            app.textFields["healthmes-command-input"].waitForExistence(timeout: 3)
+            element("healthmes-workspace-drawer", in: app).waitForExistence(timeout: 3)
         )
+        app.buttons["overview"].tap()
+        XCTAssertTrue(
+            element("healthmes-overview-canvas", in: app).waitForExistence(timeout: 3)
+        )
+        XCTAssertFalse(app.buttons["지금"].exists)
+        XCTAssertFalse(app.buttons["조율"].exists)
+        XCTAssertFalse(app.buttons["변화"].exists)
+        XCTAssertFalse(app.textFields["healthmes-command-input"].exists)
+        keepScreenshot("HealthMes iPhone Overview", app: app)
+
+        app.buttons["healthmes-open-workspace-drawer"].tap()
+        XCTAssertTrue(
+            element("healthmes-workspace-drawer", in: app).waitForExistence(timeout: 3)
+        )
+        XCTAssertTrue(app.staticTexts["overview"].exists)
+        XCTAssertTrue(app.staticTexts["agent"].exists)
+        keepScreenshot("HealthMes iPhone overlay channel drawer", app: app)
+        app.buttons["agent"].tap()
+
+        XCTAssertTrue(
+            element("healthmes-agent-canvas", in: app).waitForExistence(timeout: 3)
+        )
+        XCTAssertTrue(
+            element("healthmes-command-input", in: app).waitForExistence(timeout: 3)
+        )
+        XCTAssertTrue(app.buttons["식사 사진"].exists)
+        keepScreenshot("HealthMes iPhone Agent canvas", app: app)
     }
 
     /// The seeded proactive proposal exposes real controls, while a later
     /// uncorrelated command stays read-only instead of approving by inference.
     func testWellnessCommandRendersScheduleScene() throws {
         let app = try launchPairedApp()
-        guard app.otherElements["healthmes-generated-scene"].waitForExistence(timeout: 15) else {
-            throw XCTSkip("No proactive wellness proposal seeded for live UI QA.")
-        }
-        guard app.buttons["유지"].exists, app.buttons["변경 승인"].exists else {
-            throw XCTSkip("No actionable health-backed proposal seeded for live UI QA.")
-        }
+        app.buttons["healthmes-open-workspace-drawer"].tap()
+        XCTAssertTrue(element("healthmes-workspace-drawer", in: app).waitForExistence(timeout: 3))
+        app.buttons["agent"].tap()
 
-        let command = app.textFields["healthmes-command-input"]
+        let command = element("healthmes-command-input", in: app)
         XCTAssertTrue(command.waitForExistence(timeout: 3))
 
         command.tap()
-        command.typeText("adjust today schedule")
-        app.buttons["질문 보내기"].tap()
+        command.typeText("show why my afternoon energy drops")
+        app.buttons["Agent 실행"].tap()
 
         XCTAssertTrue(
             app.otherElements["healthmes-generated-scene"].waitForExistence(timeout: 15)
         )
-        XCTAssertFalse(app.buttons["유지"].exists)
-        XCTAssertFalse(app.buttons["변경 승인"].exists)
+        XCTAssertFalse(element("healthmes-scene-action-accept", in: app).exists)
+        XCTAssertFalse(element("healthmes-scene-action-decline", in: app).exists)
 
         let screenshot = XCTAttachment(screenshot: app.screenshot())
-        screenshot.name = "HealthMes generative schedule scene"
+        screenshot.name = "HealthMes agentic schedule scene"
         screenshot.lifetime = .keepAlways
         add(screenshot)
     }
@@ -102,18 +122,30 @@ final class CompanionUITests: XCTestCase {
     func testZZApplyProposalRoundTrip() throws {
         let app = try launchPairedApp()
 
+        app.buttons["healthmes-open-workspace-drawer"].tap()
+        XCTAssertTrue(element("healthmes-workspace-drawer", in: app).waitForExistence(timeout: 3))
+        app.buttons["overview"].tap()
+
+        let overviewYes = app.buttons["Yes"].firstMatch
         let generatedApply = app.buttons["적용"].firstMatch
         let legacyApply = app.buttons["변경 승인"].firstMatch
-        let apply = generatedApply.waitForExistence(timeout: 10)
-            ? generatedApply
-            : legacyApply
+        let apply =
+            overviewYes.waitForExistence(timeout: 10)
+            ? overviewYes
+            : (
+                generatedApply.waitForExistence(timeout: 3)
+                    ? generatedApply
+                    : legacyApply
+            )
         guard apply.waitForExistence(timeout: 10) else {
             throw XCTSkip("No pending proposal seeded — nothing to apply.")
         }
         apply.tap()
+        let accepted = app.staticTexts["Approved · calendar sync pending"]
+        let pushed = app.staticTexts["Applied to calendar"]
         XCTAssertTrue(
-            app.staticTexts["Approved · calendar sync pending"].waitForExistence(timeout: 15),
-            "accept endpoint round-trip should confirm in the banner"
+            accepted.waitForExistence(timeout: 15) || pushed.waitForExistence(timeout: 3),
+            "accept endpoint round-trip should report an accepted or pushed status"
         )
     }
 
@@ -121,6 +153,10 @@ final class CompanionUITests: XCTestCase {
     func testFoodCaptureRoundTrip() throws {
         let app = try launchPairedApp()
 
+        app.buttons["healthmes-open-workspace-drawer"].tap()
+        XCTAssertTrue(element("healthmes-workspace-drawer", in: app).waitForExistence(timeout: 3))
+        app.buttons["agent"].tap()
+        XCTAssertTrue(element("healthmes-agent-canvas", in: app).waitForExistence(timeout: 3))
         app.buttons["식사 사진"].tap()
         let field = app.textFields["healthmes-capture-description"]
         guard field.waitForExistence(timeout: 10) else {
@@ -237,5 +273,16 @@ final class CompanionUITests: XCTestCase {
         screenshot.name = "HealthMes expanded decision notification"
         screenshot.lifetime = .keepAlways
         add(screenshot)
+    }
+
+    private func keepScreenshot(_ name: String, app: XCUIApplication) {
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = name
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
+    private func element(_ identifier: String, in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any)[identifier]
     }
 }

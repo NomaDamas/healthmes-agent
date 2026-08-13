@@ -245,6 +245,7 @@ public struct WorkspaceState: Codable, Equatable {
     public static let currentSchemaVersion = 1
     public static let maximumUserCategories = 40
     public static let maximumChannelsPerCategory = 80
+    public static let maximumPostThreadsPerChannel = 200
     public static let maximumMessagesPerThread = 500
 
     public var schemaVersion: Int
