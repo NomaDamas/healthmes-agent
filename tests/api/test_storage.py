@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+import healthmes.activity.aggregation as activity_aggregation
 from healthmes.activity.contracts import (
     ActivityBatchIn,
     ActivityCapability,
@@ -71,6 +72,14 @@ def test_daily_retention_update_immediately_refreshes_rest_baseline(
     monkeypatch,
 ) -> None:
     current = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    original_event_is_expired = activity_aggregation.event_is_expired
+    monkeypatch.setattr(
+        activity_aggregation,
+        "event_is_expired",
+        lambda event, *, now=None: original_event_is_expired(
+            event, now=current if now is None else now
+        ),
+    )
     for day in range(1, 5):
         start = datetime(2026, 8, day, 0, tzinfo=UTC)
         ingest_activity_batch(

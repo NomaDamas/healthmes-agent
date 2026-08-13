@@ -5,12 +5,35 @@ fixture points at in-memory sqlite and dummy endpoints, and disables both
 ``.env`` loading and the scheduler.
 """
 
+from datetime import UTC, datetime
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from healthmes.app import create_app
 from healthmes.config import Settings
+
+
+@pytest.fixture
+def freeze_retention_clock(monkeypatch):
+    def freeze(current: datetime, *module_names: str) -> None:
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None) -> datetime:
+                value = current.astimezone(UTC)
+                return value if tz is not None else value.replace(tzinfo=None)
+
+        modules = {
+            "nutrition_repository": "healthmes.nutrition.repository",
+            "nutrition_intake": "healthmes.nutrition.intake_service",
+            "activity_aggregation": "healthmes.activity.aggregation",
+        }
+        for name in module_names:
+            module = __import__(modules[name], fromlist=["datetime"])
+            monkeypatch.setattr(module, "datetime", FrozenDateTime)
+
+    return freeze
 
 
 @pytest.fixture
