@@ -123,6 +123,81 @@ class TestGetHealthScores:
             await mcp_client.call_tool("get_health_scores", {"range": "7 days"})
 
 
+class TestWhoopRecoveryContext:
+    @pytest.mark.parametrize(
+        ("category", "value", "expected"),
+        [
+            ("recovery", 0, "red"),
+            ("recovery", 33, "red"),
+            ("recovery", 34, "yellow"),
+            ("recovery", 66, "yellow"),
+            ("recovery", 67, "green"),
+            ("recovery", 100, "green"),
+            ("day_strain", 0, "light"),
+            ("day_strain", 9, "light"),
+            ("day_strain", 10, "moderate"),
+            ("day_strain", 13, "moderate"),
+            ("day_strain", 14, "high"),
+            ("day_strain", 17, "high"),
+            ("day_strain", 18, "all_out"),
+            ("day_strain", 21, "all_out"),
+            ("recovery", -1, None),
+            ("recovery", 101, None),
+            ("day_strain", -1, None),
+            ("day_strain", 22, None),
+        ],
+    )
+    def test_uses_exact_whoop_label_boundaries(self, category, value, expected):
+        assert server_module._whoop_label(category, value) == expected
+
+    async def test_uses_cycle_day_strain_and_returns_official_labels(
+        self, mcp_client, mcp_env, call_tool
+    ):
+        mcp_env.add_score("recovery", "whoop", "2026-07-08T07:00:00+09:00", 50)
+        mcp_env.add_score("day_strain", "whoop", "2026-07-08T17:00:00+09:00", 14)
+        mcp_env.add_score("strain", "whoop", "2026-07-08T09:00:00+09:00", 5)
+
+        result = await call_tool(mcp_client, "get_whoop_recovery_context", {"date": AS_OF})
+
+        assert result["status"] == "ok"
+        assert result["timezone"] == str(server_module._local_timezone())
+        assert result["confidence"] == "high"
+        assert result["recovery"]["label"] == "yellow"
+        assert result["recovery"]["confidence"] == "high"
+        assert result["strain"]["source_category"] == "day_strain"
+        assert result["strain"]["label"] == "high"
+        assert result["strain"]["raw_value"] == 14.0
+        assert all(
+            request.url.params.get("category") != "strain" for request in mcp_env.requests[-2:]
+        )
+
+    async def test_fails_closed_for_stale_or_missing_day_strain(
+        self, mcp_client, mcp_env, call_tool
+    ):
+        mcp_env.add_score("recovery", "whoop", "2026-07-07T07:00:00+09:00", 80)
+        mcp_env.add_score("strain", "whoop", "2026-07-08T12:00:00+09:00", 18)
+
+        result = await call_tool(mcp_client, "get_whoop_recovery_context", {"date": AS_OF})
+
+        assert result["status"] == "insufficient_data"
+        assert result["confidence"] == "low"
+        assert result["recovery"]["reason"] == "not_current_local_day"
+        assert result["strain"]["reason"] == "no_whoop_day_strain"
+
+    async def test_fails_closed_when_a_primary_fetch_is_truncated(
+        self, mcp_client, mcp_env, call_tool
+    ):
+        for minute in range(11):
+            mcp_env.add_score("recovery", "whoop", f"2026-07-08T00:{minute:02d}:00Z", 70)
+        mcp_env.add_score("day_strain", "whoop", "2026-07-08T12:00:00Z", 5)
+        mcp_env.max_page_size = 1
+
+        result = await call_tool(mcp_client, "get_whoop_recovery_context", {"date": AS_OF})
+
+        assert result["status"] == "insufficient_data"
+        assert result["recovery"]["reason"] == "truncated_source"
+
+
 class TestDailyReadinessContext:
     async def test_full_context_hand_computed(self, mcp_client, mcp_env, call_tool):
         _seed_readiness_fixture(mcp_env)
