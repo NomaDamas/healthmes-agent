@@ -246,7 +246,10 @@ class _FinalizationControl:
                     "aborted decision finalization reached commit"
                 )
             self._result = result
-            self._phase = _FinalizationPhase.COMMITTED
+            # Once the caller has classified an in-flight commit as unknown,
+            # only request-ID recovery may reveal its eventual outcome.
+            if self._phase is not _FinalizationPhase.OUTCOME_UNKNOWN:
+                self._phase = _FinalizationPhase.COMMITTED
 
     def reset_retryable_commit(self) -> bool:
         """Return a known-rolled-back PostgreSQL retry to PRE_COMMIT."""

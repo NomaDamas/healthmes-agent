@@ -1181,6 +1181,54 @@ def test_slow_database_commit_returns_unknown_then_can_be_recovered(
     engine.dispose()
 
 
+def test_commit_completion_cannot_reverse_unknown_response_contract(
+    persistence,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+    persisted = DecisionResult(
+        request_id=request.request_id,
+        turn_id=request.turn_id,
+        status=DecisionStatus.COMPLETED,
+        answer="Take a short break.",
+        proposed_action=True,
+        source_refs=[ref],
+        persistence_status=PersistenceStatus.PERSISTED,
+        decision_record_id=uuid.uuid4(),
+        runtime=run.runtime,
+    )
+    control = finalizer_module._FinalizationControl(
+        finalizer_module.steady_time() + 1
+    )
+    control.enter_commit()
+
+    assert (
+        control.expire()
+        is finalizer_module._FinalizationPhase.OUTCOME_UNKNOWN
+    )
+    control.mark_committed(persisted)
+    control.signal_done()
+
+    phase, stored_result = control.snapshot()
+    assert phase is finalizer_module._FinalizationPhase.OUTCOME_UNKNOWN
+    assert stored_result == persisted
+
+    result = _finalizer(factory)._supervised_result(
+        request,
+        run,
+        control,
+    )
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.UNKNOWN
+    assert result.decision_record_id is None
+    assert result.limitations == [
+        "decision_finalization_outcome_unknown"
+    ]
+
+
 def test_finalizer_capacity_is_bounded_and_auditable(persistence):
     _engine, factory = persistence
     with factory() as session:
