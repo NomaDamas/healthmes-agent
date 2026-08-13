@@ -102,6 +102,35 @@ class _BlockingAsyncFinalizer:
         self.abort_calls += 1
 
 
+class _UnknownCommitFinalizer:
+    def __init__(self) -> None:
+        self.shutdown_started = False
+        self.drain_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def afinalize(
+        self,
+        request: DecisionRequest,
+        _run: object,
+    ) -> DecisionResult:
+        return DecisionResult(
+            request_id=request.request_id,
+            turn_id=request.turn_id,
+            status=DecisionStatus.FAILED,
+            limitations=["decision_finalization_outcome_unknown"],
+            persistence_status=PersistenceStatus.UNKNOWN,
+            runtime=RuntimeMetadata(runtime="test-finalizer"),
+        )
+
+    def begin_shutdown(self) -> None:
+        self.shutdown_started = True
+
+    async def adrain(self) -> None:
+        assert self.shutdown_started is True
+        self.drain_started.set()
+        await self.release.wait()
+
+
 async def test_aclose_rejects_new_requests_and_drains_accepted_work() -> None:
     agent = _StubAgent()
     finalizer = _BlockingFinalizer()
@@ -125,6 +154,30 @@ async def test_aclose_rejects_new_requests_and_drains_accepted_work() -> None:
     await closing
 
     assert result.status is DecisionStatus.COMPLETED
+    assert agent.closed is True
+    await engine.aclose()
+
+
+async def test_aclose_drains_commit_worker_after_unknown_response() -> None:
+    agent = _StubAgent()
+    finalizer = _UnknownCommitFinalizer()
+    engine = HealthMesDecisionEngine(
+        agent=agent,  # type: ignore[arg-type]
+        finalizer=finalizer,  # type: ignore[arg-type]
+    )
+
+    result = await engine.ask_wellness(_request())
+    assert result.persistence_status is PersistenceStatus.UNKNOWN
+
+    closing = asyncio.create_task(engine.aclose())
+    await asyncio.wait_for(finalizer.drain_started.wait(), timeout=1)
+
+    assert closing.done() is False
+    assert agent.closed is False
+
+    finalizer.release.set()
+    await closing
+
     assert agent.closed is True
     await engine.aclose()
 

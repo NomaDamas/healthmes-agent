@@ -188,7 +188,8 @@ caller 취소 -------------+  내부 작업은 취소하지 않음
 await engine.aclose()
   1. 새 요청 거부
   2. 이미 수락한 요청의 finalization 대기
-  3. agent runtime 종료
+  3. HTTP에 UNKNOWN을 반환한 commit worker까지 DB connection 정리 대기
+  4. agent runtime 종료
 ```
 
 따라서 HTTP 연결이나 UI task가 먼저 취소돼도 이미 생성된 행동 제안의 감사 기록이
@@ -197,6 +198,16 @@ event loop 안에서 동기 `close()`를 호출하면 명시적으로 거부한�
 lifespan 자체가 반복 취소되더라도 Decision Engine 종료를 끝낸 뒤 MCP와 DB를
 닫으므로 finalization이 이미 dispose된 저장소를 참조하지 않는다. composition이
 agent worker 생성 뒤 실패하면 worker도 즉시 회수한다.
+
+응답 deadline과 저장소 수명은 서로 다른 계약이다. `COMMITTING`에서 deadline이
+지나면 호출자에게는 즉시 `UNKNOWN`을 반환하지만, finalizer는 해당 worker를 계속
+추적한다. 정상 종료 시 `aclose()`는 그 commit 시도와 session/connection cleanup이
+끝날 때까지 기다린 뒤에만 DB teardown을 허용한다. 따라서 특히 in-memory SQLite의
+`StaticPool` connection을 commit 도중 `dispose()`하는 경쟁이 없다. 반대로 이미
+시작된 DB commit은 안전하게 취소할 수 없으므로, 비정상적으로 응답하지 않는 DB
+driver는 HTTP 응답 deadline보다 프로세스 종료를 더 오래 지연시킬 수 있다. 종료
+timeout으로 아직 agent 단계에 있는 요청을 취소할 때는 finalizer admission을 먼저
+봉쇄하므로, 취소를 늦게 관찰한 요청이 DB teardown 직전에 새 worker를 만들 수 없다.
 
 finalization 자체도 무기한 기다리지 않는다.
 
@@ -235,11 +246,12 @@ COMMITTING에서 deadline 초과
   -> 같은 request_id로 저장 결과 재조회
 ```
 
-이 제한 덕분에 저장소가 잠겨 있어도 `aclose()`가 수락된 작업을 무기한 기다리지
-않는다. Python payload 생성이나 SQLAlchemy `flush()`가 deadline을 넘긴 경우에는
+이 제한 덕분에 commit 시작 전 저장소 잠금과 계산은 deadline 뒤 영구 차단된다.
+Python payload 생성이나 SQLAlchemy `flush()`가 deadline을 넘긴 경우에는
 `commit()`을 호출하지 않고 rollback한다. 반대로 DB driver가 이미 commit을 시작한
-뒤 응답만 늦는 상황에서는 실패나 성공으로 단정하지 않는다. commit이 실제 완료되면
-복구 endpoint가 저장된 private payload와 digest를 다시 검증한
+뒤 응답만 늦는 상황에서는 실패나 성공으로 단정하지 않으며, 안전한 DB teardown을
+위해 shutdown은 해당 worker를 drain한다. commit이 실제 완료되면 복구 endpoint가
+저장된 private payload와 digest를 다시 검증한
 `PersistenceStatus.PERSISTED` 결과를 반환하고, 아직 행이 없으면 `404`이므로 호출자는
 같은 request ID로 다시 조회할 수 있다.
 
@@ -932,3 +944,5 @@ Hermes가 이미 provider, tool loop, session과 channel을 제공하므로 MVP�
     호출하지 않고 reconnect 뒤 새 credential generation으로 backend를 재생성한다.
 15. commit 시작 전 timeout은 늦은 `DecisionRecord` 생성을 영구 차단하고, commit
     시작 후 timeout은 `UNKNOWN`으로 반환한 뒤 request ID 조회로만 결과를 복구한다.
+16. `UNKNOWN` 응답 뒤에도 commit worker를 추적하며, app shutdown은 worker와 DB
+    connection cleanup을 drain한 뒤에만 저장소를 dispose한다.

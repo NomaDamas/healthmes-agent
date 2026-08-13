@@ -933,6 +933,7 @@ def test_slow_postgres_commit_returns_unknown_then_recovers(
             run.source_refs[0],
             timeout_seconds=0.2,
         )
+        drain_thread: threading.Thread | None = None
         try:
             result = finalizer.finalize(request, run)
 
@@ -943,10 +944,19 @@ def test_slow_postgres_commit_returns_unknown_then_recovers(
             assert result.limitations == [
                 "decision_finalization_outcome_unknown"
             ]
+            drain_thread = threading.Thread(
+                target=lambda: asyncio.run(finalizer.adrain())
+            )
+            drain_thread.start()
+            time.sleep(0.02)
+            assert drain_thread.is_alive()
         finally:
             release_commit.set()
             assert commit_finished.wait(timeout=5)
             assert session_closed.wait(timeout=5)
+            if drain_thread is not None:
+                drain_thread.join(timeout=5)
+                assert not drain_thread.is_alive()
 
         with store.factory() as session:
             row = session.scalars(sa.select(DecisionRecord)).one()

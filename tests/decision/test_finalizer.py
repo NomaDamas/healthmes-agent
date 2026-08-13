@@ -973,11 +973,16 @@ def test_slow_database_commit_returns_unknown_then_can_be_recovered(
         commit_finished.set()
 
     monkeypatch.setattr(engine.dialect, "do_commit", slow_do_commit)
+    finalizer = _finalizer(
+        finalization_factory,
+        timeout_seconds=0.2,
+    )
+    drain_thread: threading.Thread | None = None
     try:
-        result = _finalizer(
-            finalization_factory,
-            timeout_seconds=0.2,
-        ).finalize(request, _run(request, [ref]))
+        result = finalizer.finalize(
+            request,
+            _run(request, [ref]),
+        )
 
         assert commit_started.is_set()
         assert result.status is DecisionStatus.FAILED
@@ -990,10 +995,19 @@ def test_slow_database_commit_returns_unknown_then_can_be_recovered(
             assert session.scalar(
                 sa.select(sa.func.count()).select_from(DecisionRecord)
             ) == 0
+        drain_thread = threading.Thread(
+            target=lambda: asyncio.run(finalizer.adrain())
+        )
+        drain_thread.start()
+        time.sleep(0.02)
+        assert drain_thread.is_alive()
     finally:
         release_commit.set()
         assert commit_finished.wait(timeout=5)
         assert session_closed.wait(timeout=5)
+        if drain_thread is not None:
+            drain_thread.join(timeout=5)
+            assert not drain_thread.is_alive()
 
     with factory() as session:
         row = session.scalars(sa.select(DecisionRecord)).one()
@@ -1058,6 +1072,68 @@ def test_finalizer_capacity_is_bounded_and_auditable(persistence):
         first_result[0].persistence_status
         is PersistenceStatus.PERSISTED
     )
+
+
+def test_finalizer_shutdown_seals_admission_and_fences_precommit(
+    persistence,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    first_request = _request()
+    second_request = _request()
+    entered = threading.Event()
+    release = threading.Event()
+    first_result: list[DecisionResult] = []
+
+    def blocking_policy(_request: DecisionRequest) -> ContextAccessPolicy:
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test policy was not released")
+        return _policy()
+
+    finalizer = _finalizer(
+        factory,
+        policy_resolver=blocking_policy,
+        timeout_seconds=2,
+        max_workers=2,
+    )
+    worker = threading.Thread(
+        target=lambda: first_result.append(
+            finalizer.finalize(
+                first_request,
+                _run(first_request, [ref]),
+            )
+        )
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=1)
+        finalizer.begin_shutdown()
+        rejected = finalizer.finalize(
+            second_request,
+            _run(second_request, [ref]),
+        )
+        assert rejected.status is DecisionStatus.FAILED
+        assert rejected.persistence_status is PersistenceStatus.FAILED
+        assert rejected.limitations == [
+            "decision_finalization_timeout"
+        ]
+    finally:
+        release.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert len(first_result) == 1
+    assert first_result[0].status is DecisionStatus.FAILED
+    assert first_result[0].persistence_status is PersistenceStatus.FAILED
+    assert first_result[0].limitations == [
+        "decision_finalization_timeout"
+    ]
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
 
 
 def test_retry_returns_one_logical_record_and_conflicting_request_fails(

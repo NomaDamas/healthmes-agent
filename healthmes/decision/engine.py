@@ -205,13 +205,21 @@ class HealthMesDecisionEngine:
                     timeout=drain_timeout,
                 )
                 if pending:
-                    abort_active = getattr(
+                    begin_finalizer_shutdown = getattr(
                         self._finalizer,
-                        "abort_active",
+                        "begin_shutdown",
                         None,
                     )
-                    if callable(abort_active):
-                        abort_active()
+                    if callable(begin_finalizer_shutdown):
+                        begin_finalizer_shutdown()
+                    else:
+                        abort_active = getattr(
+                            self._finalizer,
+                            "abort_active",
+                            None,
+                        )
+                        if callable(abort_active):
+                            abort_active()
                     for task in pending:
                         task.cancel()
                     _cancelled, still_pending = await asyncio.wait(
@@ -224,10 +232,22 @@ class HealthMesDecisionEngine:
                             "task(s) pending after the bounded grace period",
                             len(still_pending),
                         )
-            self._agent.close()
+            begin_finalizer_shutdown = getattr(
+                self._finalizer,
+                "begin_shutdown",
+                None,
+            )
+            if callable(begin_finalizer_shutdown):
+                begin_finalizer_shutdown()
+            drain_finalizer = getattr(self._finalizer, "adrain", None)
+            if callable(drain_finalizer):
+                await drain_finalizer()
         finally:
-            with self._state_lock:
-                self._closed = True
+            try:
+                self._agent.close()
+            finally:
+                with self._state_lock:
+                    self._closed = True
 
     def close(self) -> None:
         """Synchronously close only when no event loop is running.

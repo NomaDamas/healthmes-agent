@@ -132,7 +132,9 @@ Telegram (phone + watch)          decision viewer (web)
   before commit begins fails closed as an auditable HTTP 503 and permanently
   fences late writes. If the deadline expires after commit begins, HealthMes
   returns HTTP 202 with `persistence_status=unknown` and a request-ID recovery
-  location rather than guessing whether the database committed. Every
+  location rather than guessing whether the database committed. The finalizer
+  keeps tracking that irreversible commit worker, and application shutdown
+  drains its session/connection cleanup before database disposal. Every
   context tool call re-reads domain consent before and after provider work,
   including revision changes that briefly disable and re-enable a domain.
   Calendar poll, sleep scheduler, and sleep web paths cache backends only for

@@ -344,6 +344,7 @@ class DecisionFinalizer:
         self._worker_slots = threading.BoundedSemaphore(max_workers)
         self._workers_lock = threading.Lock()
         self._active_controls: set[_FinalizationControl] = set()
+        self._shutdown_started = False
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def finalize(
@@ -390,6 +391,16 @@ class DecisionFinalizer:
             )
             return control
         with self._workers_lock:
+            if self._shutdown_started:
+                self._worker_slots.release()
+                control.publish(
+                    _failure_result(
+                        run,
+                        code=_FINALIZATION_TIMEOUT,
+                        persistence_required=_run_requires_persistence(run),
+                    )
+                )
+                return control
             self._active_controls.add(control)
 
         def worker() -> None:
@@ -429,6 +440,30 @@ class DecisionFinalizer:
                 )
             )
         return control
+
+    def begin_shutdown(self) -> None:
+        """Seal worker admission and fence every pre-commit finalization."""
+
+        with self._workers_lock:
+            self._shutdown_started = True
+            controls = tuple(self._active_controls)
+        for control in controls:
+            control.expire()
+
+    async def adrain(self) -> None:
+        """Wait until every accepted worker has released its DB resources.
+
+        A COMMITTING worker can outlive the response deadline and return
+        ``UNKNOWN`` to the caller. Graceful shutdown must still retain the
+        database engine until that irreversible commit attempt and its
+        connection cleanup have finished.
+        """
+
+        while True:
+            with self._workers_lock:
+                if not self._active_controls:
+                    return
+            await asyncio.sleep(0.01)
 
     def abort_active(self) -> None:
         """Fence every in-flight pre-commit worker during bounded shutdown."""
