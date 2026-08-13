@@ -10,3 +10,4 @@ class HealthScoreCategory(StrEnum):
     RESILIENCE = "resilience"
     BODY_BATTERY = "body_battery"
     STRAIN = "strain"
+    DAY_STRAIN = "day_strain"
