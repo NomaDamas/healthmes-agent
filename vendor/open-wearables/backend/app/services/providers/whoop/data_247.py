@@ -990,12 +990,14 @@ class Whoop247Data(Base247DataTemplate):
 
         score = raw_cycle.get("score") or {}
         value = score.get("strain") if isinstance(score, dict) else None
+        cycle_start = raw_cycle.get("start")
         updated_at = raw_cycle.get("updated_at")
         cycle_id = raw_cycle.get("id")
-        if value is None or updated_at is None or cycle_id is None:
+        if value is None or cycle_start is None or updated_at is None or cycle_id is None:
             return None
         try:
-            recorded_at = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+            recorded_at = datetime.fromisoformat(str(cycle_start).replace("Z", "+00:00"))
+            source_updated_at = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
             value = float(value)
         except (TypeError, ValueError):
             return None
@@ -1007,7 +1009,10 @@ class Whoop247Data(Base247DataTemplate):
             category=HealthScoreCategory.DAY_STRAIN,
             value=value,
             recorded_at=recorded_at,
-            components={"cycle_id": ScoreComponent(qualifier=str(cycle_id))},
+            components={
+                "cycle_id": ScoreComponent(qualifier=str(cycle_id)),
+                "cycle_updated_at": ScoreComponent(qualifier=source_updated_at.isoformat()),
+            },
         )
 
     def load_and_save_day_strain(

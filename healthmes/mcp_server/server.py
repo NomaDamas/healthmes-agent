@@ -743,6 +743,16 @@ def _whoop_label(category: str, value: float) -> str | None:
     return None
 
 
+def _whoop_cycle_updated_at(row: dict[str, Any]) -> dt.datetime | None:
+    components = row.get("components")
+    if not isinstance(components, dict):
+        return None
+    source = components.get("cycle_updated_at")
+    if not isinstance(source, dict):
+        return None
+    return _parse_recorded_at(source.get("qualifier"))
+
+
 def _whoop_primary_signal(
     rows: list[dict[str, Any]],
     *,
@@ -772,7 +782,7 @@ def _whoop_primary_signal(
     if not matching:
         return {**result, "status": interpret.STATUS_INSUFFICIENT, "reason": f"no_whoop_{name}"}
 
-    parsed: list[tuple[dt.datetime, dict[str, Any]]] = []
+    parsed: list[tuple[dt.datetime, dt.datetime, dict[str, Any]]] = []
     for row in matching:
         recorded_at = _parse_recorded_at(row.get("recorded_at"))
         if recorded_at is None:
@@ -781,23 +791,36 @@ def _whoop_primary_signal(
                 "status": interpret.STATUS_INSUFFICIENT,
                 "reason": "unparseable_recorded_at",
             }
-        parsed.append((recorded_at, row))
+        updated_at = recorded_at
+        if category == "day_strain":
+            updated_at = _whoop_cycle_updated_at(row)
+            if updated_at is None:
+                return {
+                    **result,
+                    "status": interpret.STATUS_INSUFFICIENT,
+                    "reason": "unparseable_cycle_updated_at",
+                }
+        parsed.append((recorded_at, updated_at, row))
 
-    latest_at = max(recorded_at for recorded_at, _row in parsed)
-    latest = [row for recorded_at, row in parsed if recorded_at == latest_at]
+    latest_at = max(updated_at for _recorded_at, updated_at, _row in parsed)
+    latest = [
+        (recorded_at, updated_at, row)
+        for recorded_at, updated_at, row in parsed
+        if updated_at == latest_at
+    ]
     if len(latest) != 1:
         return {**result, "status": interpret.STATUS_INSUFFICIENT, "reason": "ambiguous_latest_row"}
 
-    row = latest[0]
+    recorded_at, updated_at, row = latest[0]
     value = _as_float(row.get("value"))
-    local_recorded_at = latest_at.astimezone(tz)
+    local_recorded_at = recorded_at.astimezone(tz)
     observed_on = local_recorded_at.date()
     stale_days = (as_of - observed_on).days
     base = {
         **result,
         "raw_value": value,
         "observed_on": observed_on.isoformat(),
-        "updated_at": latest_at.isoformat(),
+        "updated_at": updated_at.isoformat(),
         "freshness": "current_day" if observed_on == as_of else "stale",
         "stale_days": stale_days,
     }
