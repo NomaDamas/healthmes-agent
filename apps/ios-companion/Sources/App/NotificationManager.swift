@@ -83,12 +83,12 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     /// Post one local notification for an alert-history item.
     func post(content: AlertNotificationContent) async {
         let notification = UNMutableNotificationContent()
-        notification.title = content.title
+        notification.title = content.systemTitle
         if !content.subtitle.isEmpty {
             notification.subtitle = content.subtitle
         }
-        if !content.body.isEmpty {
-            notification.body = content.body
+        if !content.systemBody.isEmpty {
+            notification.body = content.systemBody
         }
         notification.categoryIdentifier = content.categoryID
         notification.threadIdentifier = content.threadID
@@ -177,6 +177,8 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                             localized:
                                 "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
                         ),
+                    AlertNotificationContent.userInfoDecisionCompactPrompt:
+                        String(localized: "Move Deep Work?"),
                     AlertNotificationContent.userInfoDecisionBefore:
                         formatter.string(from: currentStart),
                     AlertNotificationContent.userInfoDecisionAfter:

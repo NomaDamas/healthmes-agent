@@ -235,9 +235,7 @@ final class CompanionUITests: XCTestCase {
         XCUIDevice.shared.press(.home)
 
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let notificationTitle = springboard.staticTexts[
-            "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
-        ]
+        let notificationTitle = springboard.staticTexts["Move Deep Work?"]
         XCTAssertTrue(
             notificationTitle.waitForExistence(timeout: 20),
             "The deterministic HealthMes decision notification should appear."
@@ -247,6 +245,13 @@ final class CompanionUITests: XCTestCase {
                 "Recovery is below your baseline after short sleep and a high-stress morning"
             ].waitForExistence(timeout: 5),
             "The notification must retain the complete health reason."
+        )
+        let expansionHint = springboard.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS %@", "Hold to decide")
+        ).firstMatch
+        XCTAssertTrue(
+            expansionHint.waitForExistence(timeout: 5),
+            "The compact card must explain how to reveal No / Yes / Speak."
         )
         XCTAssertFalse(
             springboard.buttons["healthmes-decision-yes"].exists,
@@ -262,6 +267,12 @@ final class CompanionUITests: XCTestCase {
         XCTAssertTrue(
             springboard.staticTexts["HEALTHMES · DECISION"].waitForExistence(timeout: 5),
             "The HealthMes content extension must render instead of a blank card."
+        )
+        XCTAssertTrue(
+            springboard.staticTexts[
+                "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
+            ].waitForExistence(timeout: 5),
+            "Expansion must restore the complete, untruncated action."
         )
         XCTAssertTrue(
             springboard.staticTexts["healthmes-decision-details"].exists,

@@ -22,6 +22,10 @@ struct HealthMesWatchApp: App {
         WindowGroup {
             WatchHomeView()
         }
+        WKNotificationScene(
+            controller: WatchDecisionNotificationController.self,
+            category: AlertNotificationContent.actionableCategoryID
+        )
     }
 }
 

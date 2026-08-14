@@ -75,6 +75,7 @@ public struct AlertNotificationContent: Equatable {
     public static let userInfoDecisionObservation = "healthmes_decision_observation"
     public static let userInfoDecisionEvidence = "healthmes_decision_evidence"
     public static let userInfoDecisionAction = "healthmes_decision_action"
+    public static let userInfoDecisionCompactPrompt = "healthmes_decision_compact_prompt"
     public static let userInfoDecisionBefore = "healthmes_decision_before"
     public static let userInfoDecisionAfter = "healthmes_decision_after"
     public static let userInfoDecisionEndsAt = "healthmes_decision_ends_at"
@@ -93,6 +94,19 @@ public struct AlertNotificationContent: Equatable {
     /// Routing payload: alert id, optional decision link, optional pending
     /// proposal id (string values only — plist-safe).
     public let userInfo: [String: String]
+
+    /// The system-owned compact notification cannot render category buttons.
+    /// Keep its copy short enough that the explicit expansion affordance is
+    /// visible; the complete action remains in `title` and `userInfo`.
+    public var systemTitle: String {
+        userInfo[Self.userInfoDecisionCompactPrompt] ?? title
+    }
+
+    public var systemBody: String {
+        guard categoryID == Self.actionableCategoryID else { return body }
+        let hint = String(localized: "Hold to decide · No / Yes / Speak")
+        return body.isEmpty ? hint : "\(body)\n\(hint)"
+    }
 
     /// Deterministic placeholder rendering of the evidence facts: keys
     /// sorted, "key value" pairs joined with " · ". Never invents data.
@@ -234,6 +248,7 @@ public struct AlertNotificationContent: Equatable {
                 userInfo[userInfoDecisionEvidence] = evidence
             }
             userInfo[userInfoDecisionAction] = card.proposedAction
+            userInfo[userInfoDecisionCompactPrompt] = decisionPrompt(for: card)
             if let before = card.before {
                 userInfo[userInfoDecisionBefore] = formatter.string(from: before)
             }

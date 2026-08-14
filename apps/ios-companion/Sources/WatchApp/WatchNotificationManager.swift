@@ -62,10 +62,7 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
                 ?? proposedStart.addingTimeInterval(90 * 60)
 
             let content = UNMutableNotificationContent()
-            content.title = String(
-                localized:
-                    "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
-            )
+            content.title = String(localized: "Move Deep Work?")
             content.subtitle = String(
                 localized:
                     "Recovery is below your baseline after short sleep and a high-stress morning"
@@ -84,6 +81,8 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
                     String(localized: "HRV is 18% below your baseline"),
                 AlertNotificationContent.userInfoDecisionAction:
                     String(localized: "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"),
+                AlertNotificationContent.userInfoDecisionCompactPrompt:
+                    String(localized: "Move Deep Work?"),
                 AlertNotificationContent.userInfoDecisionBefore:
                     formatter.string(from: todayFocus),
                 AlertNotificationContent.userInfoDecisionAfter:

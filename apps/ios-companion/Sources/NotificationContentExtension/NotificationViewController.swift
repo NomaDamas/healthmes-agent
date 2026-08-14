@@ -188,10 +188,15 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
             )
         ]
         proposalID = (info["healthmes_proposal_id"] as? String).flatMap(UUID.init(uuidString:))
-        actionLabel.text = content.title
+        actionLabel.text =
+            (info[NotificationUserInfoKey.action] as? String)
+            ?? content.title
         reasonLabel.text = content.subtitle
         reasonLabel.isHidden = content.subtitle.isEmpty
-        timeLabel.text = content.body
+        // The compact system card appends an expansion affordance. The
+        // expanded custom card already exposes the controls, so retain only
+        // the schedule result here.
+        timeLabel.text = content.body.split(separator: "\n").first.map(String.init) ?? ""
         detailLabel.attributedText = detailText(info: info)
         contentScrollView.setContentOffset(.zero, animated: false)
         detailScrollView.setContentOffset(.zero, animated: false)

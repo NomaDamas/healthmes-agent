@@ -113,6 +113,9 @@ final class NotificationContentTests: XCTestCase {
         XCTAssertEqual(content.subtitle, "Sleep debt is high")
         XCTAssertTrue(content.body.hasPrefix("→ "))
         XCTAssertFalse(content.body.contains("\n"))
+        XCTAssertLessThanOrEqual(content.systemTitle.count, 34)
+        XCTAssertTrue(content.systemTitle.hasSuffix("…"))
+        XCTAssertTrue(content.systemBody.contains("Hold to decide · No / Yes / Speak"))
         XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(
             content.userInfo[AlertNotificationContent.userInfoDecisionObservation],

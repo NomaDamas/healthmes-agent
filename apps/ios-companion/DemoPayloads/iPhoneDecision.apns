@@ -1,35 +1,22 @@
 {
-  "Simulator Target Bundle": "com.healthmes.companion.watchkitapp",
-  "WatchKit Simulator Actions": [
-    {
-      "title": "No",
-      "identifier": "HEALTHMES_NO"
-    },
-    {
-      "title": "Yes",
-      "identifier": "HEALTHMES_YES"
-    },
-    {
-      "title": "Speak",
-      "identifier": "HEALTHMES_SPEAK"
-    }
-  ],
+  "Simulator Target Bundle": "com.healthmes.companion",
   "aps": {
     "alert": {
       "title": "Move Deep Work?",
-      "subtitle": "Low recovery · sleep debt",
-      "body": "→ Thu · 9:30 AM"
+      "subtitle": "Recovery is below your baseline",
+      "body": "→ Sat · 9:30 AM\nHold to decide · No / Yes / Speak"
     },
     "category": "HEALTHMES_ALERT_ACTIONABLE",
     "sound": "default"
   },
   "healthmes_proposal_id": "00000000-0000-0000-0000-000000000091",
   "healthmes_decision_title": "Deep Work",
-  "healthmes_decision_observation": "Low recovery · sleep debt",
+  "healthmes_decision_observation": "Recovery is below your baseline after short sleep and a high-stress morning",
   "healthmes_decision_evidence": "HRV is 18% below your baseline",
   "healthmes_decision_action": "Move the 2:00 PM focus block to tomorrow at 9:30 AM?",
   "healthmes_decision_compact_prompt": "Move Deep Work?",
   "healthmes_decision_before": "2026-08-14T14:00:00+09:00",
   "healthmes_decision_after": "2026-08-15T09:30:00+09:00",
-  "healthmes_decision_ends_at": "2026-08-15T11:00:00+09:00"
+  "healthmes_decision_ends_at": "2026-08-15T11:00:00+09:00",
+  "healthmes_decision_expires_at": "2026-08-14T23:59:00+09:00"
 }
