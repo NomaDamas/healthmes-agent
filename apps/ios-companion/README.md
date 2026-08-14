@@ -223,13 +223,16 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
 
 - `xcodegen generate`; **both schemes build** (`generic/platform=iOS
   Simulator`, `generic/platform=watchOS Simulator`, `CODE_SIGNING_ALLOWED=NO`).
-- **33/33 unit tests green** on an iPhone 17 Pro (iOS 26.2) simulator:
+- **The host-less unit-test suite passed** on an iPhone simulator (iOS 26.2):
   glance/alerts/weekly-report contract decoding (incl. empty shapes and the
   naive-datetime variant), multipart/JSON request builders byte-for-byte,
   §8.5 notification-content mapping, error-envelope → "already resolved"
   mapping, seen-store exactly-once semantics, focus-block selection, ETag
-  200→304 flow.
-- **UI acceptance tests against a LIVE instance** (`python -m healthmes
+  200→304 flow, and Screen Time report serialization, retention-window
+  planning, pseudonymization/key-rotation fencing, privacy-aware coverage,
+  state-store, and injected sync-service contracts. The compile-gated Apple
+  collector path was not compiled or exercised.
+- **4 UI acceptance tests passed against a LIVE instance** (`python -m healthmes
   serve` on :8199, seeded alert/proposal/energy rows): briefing home
   rendered live data; Report tab rendered live `weekly.json`; Capture form
   saved a real food log (`source: "ios-app"` row verified server-side);
@@ -248,6 +251,59 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
   scheme registered (system open-confirmation appears).
 - Fixtures validated against the server's own pydantic models
   (`WeeklyReportOut`, `Page[AlertOut]`) via `uv run python`.
+
+## Screen Time activity engine seam
+
+`ScreenTimeActivitySyncService` is intentionally UI-neutral. A future
+device-team screen/lifecycle integration calls:
+
+```text
+requestAuthorization()
+sync(pairing:now:timezone:)
+```
+
+In a gate-enabled, entitled build, each successfully lifecycle-wired sync
+would fetch the paired HealthMes node's current device collection settings,
+remove excluded apps on-device, replace bundle identifiers with device-keyed
+HMAC pseudonyms, and upload one authoritative snapshot to
+`POST /v1/activity/ios/report`. The first authorized sync and the first sync
+after a timezone change are deliberately limited to the latest completed
+local hour. Later syncs in the same timezone reconcile from that consent
+boundary, bounded to the last 48 completed hours and the server retention
+cutoff. Denied or unavailable collection does not persist that boundary, so a
+later first grant cannot backfill from the earlier denial date.
+
+The collector ID is derived from the same device-only Keychain key as the app
+pseudonym namespace rather than `identifierForVendor`. A new
+`ios-collector-v1-*` identity is disabled server-side until the unified input
+settings endpoint explicitly enables it. Losing the Keychain key therefore
+cannot silently create an enabled collector with an empty private-app
+exclusion list.
+
+The sync core fingerprints the device-only HMAC key locally and binds approval
+to the SHA-256 digest of the exact sorted exclusion-token set. If the key or
+set changes, it advances `collection_generation` when appropriate and stops
+before reading Screen Time with
+`ios_screen_time_exclusions_require_reapproval_after_key_change`. A future UI
+must save `ios-app-v2-<key fingerprint>-<app HMAC>` tokens generated under the
+current key and then call the UI-neutral `approveExcludedApps(_:)` seam. The
+service rejects legacy or stale-key tokens, and clearing the list does not
+silently approve a later set. Hours containing excluded or identity-missing
+activity never become false zero-usage hours; if allowed activity shares that
+hour, its duration remains usable but `coverage_seconds` is omitted.
+Successful authoritative snapshot fences also retain the first server
+response. An identical retry returns that response before evaluating later
+mutable collection settings; sequence reuse with different content remains a
+conflict.
+
+The current normal build uses an explicit unavailable adapter. The actual
+Apple export implementation is compiled only with
+`HEALTHMES_IOS_26_4_SCREENTIME_EXPORT` and additionally requires a supporting
+SDK/OS, Apple's App & Website Usage entitlement, data-access authorization,
+and eligible Apple customer/region access. This repository does not yet add
+that entitlement, compile condition, Screen Time-specific background task,
+settings UI, app-lifecycle call site, signing, or real-device validation.
+See `docs/INPUT-CONTROL-PLANE.ko.md`.
 
 **Not yet verified (honest list):**
 

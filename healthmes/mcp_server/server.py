@@ -72,6 +72,10 @@ from healthmes.calendars.base import HealthmesEventKind
 from healthmes.calendars.connection import CalendarBackendFence
 from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.calendars.intake import intake_revision
+from healthmes.calendars.repository import (
+    retained_calendar_event,
+    retained_calendar_statement,
+)
 from healthmes.calendars.sleep_context import (
     actual_sleep_context_with_source_ref,
     actual_sleep_observation_context,
@@ -342,13 +346,14 @@ def _read_visible_calendar_rows(
 ) -> tuple[list[CalendarEventMirror], CalendarVisibility]:
     """Read mirror rows from one stable, successfully synced account set."""
 
+    retained_statement = retained_calendar_statement(session, statement)
     try:
         return read_visible_calendar(
             session,
             _active_settings(),
             lambda visibility: list(
                 session.scalars(
-                    statement.where(visibility.predicate())
+                    retained_statement.where(visibility.predicate())
                 ).all()
             ),
         )
@@ -1867,14 +1872,15 @@ async def _arousal_hints_for(
 
     with _store_session() as session:
         usage_cutoff = legacy_app_usage_cutoff(session)
-        event_rows = session.scalars(
+        event_rows, calendar_visibility = _read_visible_calendar_rows(
+            session,
             select(CalendarEventMirror)
             .where(
                 CalendarEventMirror.start_at < end_utc,
                 CalendarEventMirror.end_at > start_utc,
             )
-            .order_by(CalendarEventMirror.start_at)
-        ).all()
+            .order_by(CalendarEventMirror.start_at),
+        )
         usage_statement = select(AppUsageSample).where(
             AppUsageSample.bucket_start
             >= start_utc - dt.timedelta(minutes=60),
@@ -1916,7 +1922,7 @@ async def _arousal_hints_for(
             for row in meal_rows
         ]
 
-    return arousal.build_arousal_hints(
+    result = arousal.build_arousal_hints(
         day=day,
         tz=tz,
         hr_samples=[(at.astimezone(tz), value) for at, value in hr_utc],
@@ -1927,6 +1933,8 @@ async def _arousal_hints_for(
         context_for=lambda start, end: timeline.attach_context(start, end, events, usage),
         meals=meals,
     )
+    _require_calendar_visibility_snapshot(calendar_visibility)
+    return result
 
 
 @mcp.tool
@@ -2048,14 +2056,15 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
 
     with _store_session() as session:
         usage_cutoff = legacy_app_usage_cutoff(session)
-        event_rows = session.scalars(
+        event_rows, calendar_visibility = _read_visible_calendar_rows(
+            session,
             select(CalendarEventMirror)
             .where(
                 CalendarEventMirror.start_at < end_utc,
                 CalendarEventMirror.end_at > start_utc,
             )
-            .order_by(CalendarEventMirror.start_at)
-        ).all()
+            .order_by(CalendarEventMirror.start_at),
+        )
         usage_statement = select(AppUsageSample).where(
             AppUsageSample.bucket_start
             >= start_utc - dt.timedelta(minutes=60),
@@ -2115,6 +2124,7 @@ async def get_stress_timeline(date: str | None = None) -> dict[str, Any]:
         response["arousal_hints"] = await _arousal_hints_for(
             client, user_id, day, tz, start_utc, end_utc
         )
+    _require_calendar_visibility_snapshot(calendar_visibility)
     return response
 
 
@@ -2164,7 +2174,11 @@ IMPACT_MAX_EXAMPLES = 3
 
 def _collect_store_occurrences(
     factor: str, start_utc: dt.datetime, end_utc: dt.datetime
-) -> tuple[list[impact.Occurrence], dict[str, int]]:
+) -> tuple[
+    list[impact.Occurrence],
+    dict[str, int],
+    CalendarVisibility,
+]:
     """Factor occurrences from the healthmes store (food / calendar / done tasks)."""
     occurrences: list[impact.Occurrence] = []
     counts = {"food_log": 0, "calendar": 0, "task": 0}
@@ -2176,12 +2190,14 @@ def _collect_store_occurrences(
                 at = _ensure_utc_dt(row.logged_at)
                 occurrences.append(impact.Occurrence("food_log", row.description[:80], at, at))
                 counts["food_log"] += 1
-        for row in session.scalars(
+        calendar_rows, calendar_visibility = _read_visible_calendar_rows(
+            session,
             select(CalendarEventMirror).where(
                 CalendarEventMirror.start_at >= start_utc,
                 CalendarEventMirror.start_at < end_utc,
-            )
-        ):
+            ),
+        )
+        for row in calendar_rows:
             if impact.matches(factor, row.summary):
                 occurrences.append(
                     impact.Occurrence(
@@ -2203,7 +2219,7 @@ def _collect_store_occurrences(
                 at = _ensure_utc_dt(row.updated_at)
                 occurrences.append(impact.Occurrence("task", row.title[:80], at, at))
                 counts["task"] += 1
-    return occurrences, counts
+    return occurrences, counts, calendar_visibility
 
 
 async def _collect_workout_occurrences(
@@ -2359,7 +2375,11 @@ async def compare_impact(
     user_id = await _resolve_user_id()
     client = get_ow_client()
 
-    occurrences, counts = _collect_store_occurrences(factor, start_utc, end_utc)
+    occurrences, counts, calendar_visibility = _collect_store_occurrences(
+        factor,
+        start_utc,
+        end_utc,
+    )
     workout_occurrences = await _collect_workout_occurrences(
         client, user_id, factor, start_utc, end_utc
     )
@@ -2412,6 +2432,7 @@ async def compare_impact(
             "truncated": truncated,
         },
     }
+    _require_calendar_visibility_snapshot(calendar_visibility)
     if stats["n"] < impact.MIN_PAIRED_OBSERVATIONS:
         return {
             "status": interpret.STATUS_INSUFFICIENT,
@@ -2886,7 +2907,10 @@ async def evaluate_morning_calendar_nudge(date: str | None = None) -> dict[str, 
         )
         proposal = repository.get_proposal(result.proposal_id) if result.proposal_id else None
         mirror = (
-            write_session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
+            retained_calendar_event(
+                write_session,
+                proposal.snapshot.mirror_event_id,
+            )
             if proposal is not None
             else None
         )
@@ -2980,7 +3004,10 @@ def resolve_calendar_adjustment(
             handle_secret=_adjustment_handle_secret(),
         )
         mirror_snapshot = (
-            session.get(CalendarEventMirror, proposal.snapshot.mirror_event_id)
+            retained_calendar_event(
+                session,
+                proposal.snapshot.mirror_event_id,
+            )
             if proposal.snapshot.mirror_event_id is not None
             else None
         )
@@ -3076,7 +3103,10 @@ async def get_caffeine_proposal(
     )
     event_uuid = _parse_uuid(event_id, "event_id")
     with _store_session() as session:
-        event = session.get(CalendarEventMirror, event_uuid)
+        event, calendar_visibility = _read_visible_calendar_event(
+            session,
+            event_uuid,
+        )
         event_snapshot = (
             {
                 "id": str(event.id),
@@ -3139,12 +3169,14 @@ async def get_caffeine_proposal(
         contraindications=contraindications,
         product_form=product_form,
     )
-    return caffeine_adapter.serialize_proposal(
+    result = caffeine_adapter.serialize_proposal(
         request,
         target_event=target_event,
         sleep_adapter_reason=sleep_adapter_reason,
         caffeine_intake=caffeine_intake,
     )
+    _require_calendar_visibility_snapshot(calendar_visibility)
+    return result
 
 
 class ScheduleBlockIn(BaseModel):

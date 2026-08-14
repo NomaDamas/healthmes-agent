@@ -82,6 +82,7 @@ from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
 from healthmes.api.auth import viewer_url
 from healthmes.api.common import ensure_utc, utc_now
 from healthmes.api.errors import APIError
+from healthmes.calendars.repository import retained_calendar_statement
 from healthmes.calendars.visibility import (
     CalendarVisibility,
     CalendarVisibilityChanged,
@@ -274,15 +275,18 @@ def _next_blocks(
     (once pushed they surface through the mirror), so the merge never shows
     the same block twice.
     """
-    events = session.scalars(
+    event_statement = retained_calendar_statement(
+        session,
         select(CalendarEventMirror)
         .where(
             visibility.predicate(),
             CalendarEventMirror.end_at > now,
         )
         .order_by(CalendarEventMirror.start_at, CalendarEventMirror.end_at)
-        .limit(MAX_NEXT_BLOCKS)
-    ).all()
+        .limit(MAX_NEXT_BLOCKS),
+        now=now,
+    )
+    events = session.scalars(event_statement).all()
 
     task_ids = {event.agent_task_id for event in events if event.agent_task_id is not None}
     tasks_by_id: dict[uuid.UUID, Task] = {}

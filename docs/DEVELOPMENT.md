@@ -338,7 +338,16 @@ the service must listen on the LAN: set `HEALTHMES_HOST=0.0.0.0` **and**
 `HEALTHMES_API_TOKEN=<token>` (serve refuses a non-loopback bind without a
 token — the surface carries medical data), then enter the same token in the
 app. The fragmentation term of the energy engine activates automatically
-once samples arrive; iOS is deliberately not collected.
+once samples arrive. iOS Screen Time has a separate aggregate-only server
+contract and injectable `ScreenTimeActivitySyncService` core. A future
+gate-enabled, entitled build can fetch collection policy, source-filter
+excluded apps, and submit completed local-hour snapshots to
+`POST /v1/activity/ios/report`. The normal repository build always selects
+the unavailable adapter and collects no Apple activity. Compile configuration,
+authorization UI, app lifecycle, Screen Time-specific background scheduling,
+signing, and real-device verification remain device-team work; that work must
+use `docs/INPUT-CONTROL-PLANE.ko.md` rather than inventing a second settings
+model.
 
 ## Companion & desktop apps (issues #7 · #10 · #11)
 

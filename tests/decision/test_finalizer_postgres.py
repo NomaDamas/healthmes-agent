@@ -56,6 +56,7 @@ from healthmes.decision import (
     ToolCallStatus,
     decision_result_from_record,
 )
+from healthmes.storage import update_retention_policy
 from healthmes.store import (
     Base,
     CalendarEventMirror,
@@ -725,6 +726,79 @@ def test_postgres_calendar_visibility_change_after_flush_rolls_back(
         assert result.persistence_status is PersistenceStatus.FAILED
         assert "calendar_visibility_changed" in result.limitations
         with store.factory() as session:
+            assert session.scalar(
+                sa.select(sa.func.count()).select_from(DecisionRecord)
+            ) == 0
+
+
+def test_postgres_finalizer_rejects_calendar_row_expired_before_maintenance(
+    ) -> None:
+    with _postgres_store(pool_size=2) as store:
+        with store.factory() as session:
+            update_retention_policy(
+                session,
+                "calendar_mirror",
+                "1d",
+                now=NOW,
+            )
+            row = CalendarEventMirror(
+                external_id="postgres-calendar-expired-before-maintenance",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="Retained during context query",
+                start_at=NOW - timedelta(hours=2),
+                end_at=NOW - timedelta(hours=1),
+                is_all_day=False,
+                created_at=NOW - timedelta(hours=3),
+                updated_at=NOW - timedelta(hours=1),
+            )
+            session.add(row)
+            session.commit()
+            row_id = row.id
+
+        policy = ContextAccessPolicy(
+            owner_principal_id="owner",
+            grants=(DomainAccessGrant(domain="calendar"),),
+        )
+        request = _request()
+        query = ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            parameters={"date": NOW.date().isoformat()},
+            timezone="UTC",
+        )
+        provider = CalendarContextProvider(
+            sources=(CalendarSource.GOOGLE,),
+        )
+        access_layer = ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: NOW,
+        )
+        turn = access_layer.start_turn(request, policy=policy)
+        with store.factory() as session:
+            context = asyncio.run(turn.query(session, query))
+            session.rollback()
+        assert context.status in {
+            ContextStatus.OK,
+            ContextStatus.PARTIAL,
+        }
+        assert [ref.record_id for ref in context.source_refs] == [
+            str(row_id)
+        ]
+        run = _run(request, query, context, turn.trace)
+        finalizer = DecisionFinalizer(
+            access_layer=access_layer,
+            session_factory=store.factory,
+            policy_resolver=lambda _request: policy,
+            clock=lambda: NOW + timedelta(days=2),
+        )
+
+        result = finalizer.finalize(request, run)
+
+        assert result.status is DecisionStatus.FAILED
+        assert result.persistence_status is PersistenceStatus.FAILED
+        assert "source_ref_record_missing" in result.limitations
+        with store.factory() as session:
+            assert session.get(CalendarEventMirror, row_id) is not None
             assert session.scalar(
                 sa.select(sa.func.count()).select_from(DecisionRecord)
             ) == 0

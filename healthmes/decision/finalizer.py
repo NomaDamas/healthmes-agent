@@ -900,12 +900,16 @@ class DecisionFinalizer:
                                         candidates=candidates,
                                     )
                                 )
+                                source_validation_now = _as_utc(
+                                    self._clock()
+                                )
                                 self._lock_used_ref_sources(
                                     session,
                                     request,
                                     policy=final_policy,
                                     used_ids=used_ids,
                                     candidates=candidates,
+                                    now=source_validation_now,
                                     calendar_visibility_snapshot=(
                                         calendar_snapshot
                                     ),
@@ -921,6 +925,7 @@ class DecisionFinalizer:
                                         candidates=candidates,
                                         access_trace=run.access_trace,
                                         lock_sources=False,
+                                        now=source_validation_now,
                                         calendar_visibility_snapshot=(
                                             calendar_snapshot
                                         ),
@@ -1050,12 +1055,14 @@ class DecisionFinalizer:
             used_ids=used_ids,
             candidates=stored.candidates,
         )
+        source_validation_now = _as_utc(self._clock())
         self._lock_used_ref_sources(
             session,
             request,
             policy=policy,
             used_ids=used_ids,
             candidates=stored.candidates,
+            now=source_validation_now,
             calendar_visibility_snapshot=calendar_snapshot,
         )
         validated_refs, source_limitations = self._revalidate_used_refs(
@@ -1066,6 +1073,7 @@ class DecisionFinalizer:
             candidates=stored.candidates,
             access_trace=stored.access_trace,
             lock_sources=False,
+            now=source_validation_now,
             calendar_visibility_snapshot=calendar_snapshot,
         )
         self._require_calendar_visibility_current(calendar_snapshot)
@@ -1150,6 +1158,7 @@ class DecisionFinalizer:
         policy: ContextAccessPolicy,
         used_ids: Sequence[str],
         candidates: SourceCandidates,
+        now: datetime,
         calendar_visibility_snapshot: CalendarVisibility | None,
     ) -> None:
         lock_refs: dict[str, SourceRef] = {}
@@ -1166,6 +1175,7 @@ class DecisionFinalizer:
         ).lock_source_refs_for_finalization(
             session,
             tuple(lock_refs.values()),
+            now=now,
             calendar_visibility_snapshot=calendar_visibility_snapshot,
         )
 
@@ -1179,11 +1189,13 @@ class DecisionFinalizer:
         candidates: SourceCandidates,
         access_trace: Sequence[AccessAuditEntry],
         lock_sources: bool,
+        now: datetime | None = None,
         calendar_visibility_snapshot: CalendarVisibility | None,
     ) -> tuple[tuple[SourceRef, ...], tuple[str, ...]]:
         if not used_ids:
             return (), ()
 
+        validation_now = _as_utc(now or self._clock())
         turn = self._access_layer.start_turn(request, policy=policy)
         if lock_sources:
             lock_refs: dict[str, SourceRef] = {}
@@ -1197,11 +1209,11 @@ class DecisionFinalizer:
             turn.lock_source_refs_for_finalization(
                 session,
                 tuple(lock_refs.values()),
+                now=validation_now,
                 calendar_visibility_snapshot=(
                     calendar_visibility_snapshot
                 ),
             )
-        now = _as_utc(self._clock())
         validated: list[SourceRef] = []
         limitations: set[str] = set()
         audit_by_query_id = {
@@ -1231,7 +1243,7 @@ class DecisionFinalizer:
                     query,
                     candidate,
                     context_source_refs=attempt.supporting_refs,
-                    now=now,
+                    now=validation_now,
                     calendar_visibility_snapshot=(
                         calendar_visibility_snapshot
                     ),

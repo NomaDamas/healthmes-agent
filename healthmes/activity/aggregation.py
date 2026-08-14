@@ -21,6 +21,7 @@ from healthmes.activity.repository import (
     APP_INTERVAL_EVENT,
     DAY_SUMMARY_EVENT,
     HOUR_SUMMARY_EVENT,
+    IOS_PROVIDER,
     RAW_EVENT_TYPES,
     SUMMARY_PROVIDER,
     as_utc,
@@ -39,7 +40,7 @@ LATE_END_HOUR = 6
 BASELINE_DAYS = 7
 MIN_BASELINE_DAYS = 3
 MIN_BASELINE_COVERAGE = 0.25
-SUMMARY_DERIVATION_VERSION = 4
+SUMMARY_DERIVATION_VERSION = 5
 LEGACY_SUMMARY_REASON = "legacy_activity_summary_incompatible"
 
 
@@ -164,6 +165,7 @@ class DeviceHour:
     ] = field(default_factory=lambda: defaultdict(list))
     launches: int = 0
     launches_upper: int = 0
+    has_unknown_launches: bool = False
     first_activity_at: datetime | None = None
     last_activity_at: datetime | None = None
     active_spans: list[tuple[datetime, datetime]] = field(default_factory=list)
@@ -180,6 +182,10 @@ class DeviceHour:
         tuple[datetime, datetime],
         int,
     ] = field(default_factory=lambda: defaultdict(int))
+    coarse_coverage_buckets: dict[
+        tuple[datetime, datetime],
+        float,
+    ] = field(default_factory=dict)
     coverage_spans: list[tuple[datetime, datetime]] = field(default_factory=list)
     known_coverage_seconds: float | None = None
     has_interval_data: bool = False
@@ -344,14 +350,25 @@ def _apply_hour_events(
         capability = payload.get("capability")
         if isinstance(capability, str):
             target.capabilities.add(capability)
+        coverage_only = payload.get("coverage_only") is True
         source_active = float(payload.get("foreground_seconds") or 0)
         if source_active > 3600:
             target.source_overflow = True
         bucket = (bucket_start, bucket_end)
-        target.coarse_active_buckets[bucket] += source_active
-        category = str(payload.get("category") or "uncategorized")
-        target.coarse_category_buckets[bucket][category] += source_active
-        target.coarse_launch_buckets[bucket] += int(payload.get("launches") or 0)
+        if not coverage_only:
+            target.coarse_active_buckets[bucket] += source_active
+            category = str(payload.get("category") or "uncategorized")
+            target.coarse_category_buckets[bucket][category] += source_active
+        launches_observed = payload.get("launches_observed")
+        if launches_observed is False or (
+            launches_observed is None
+            and event.source_provider == IOS_PROVIDER
+        ):
+            target.has_unknown_launches = True
+        else:
+            target.coarse_launch_buckets[bucket] += int(
+                payload.get("launches") or 0
+            )
         if overlap_start > bucket_start or overlap_end < bucket_end:
             target.has_partial_coarse_data = True
         if source_active > 0:
@@ -366,12 +383,18 @@ def _apply_hour_events(
             bucket_seconds = (bucket_end - bucket_start).total_seconds()
             fraction = overlap_seconds / bucket_seconds
             known = min(window_seconds, max(0.0, float(coverage) * fraction))
-            target.known_coverage_seconds = max(
-                target.known_coverage_seconds or 0.0,
+            target.coarse_coverage_buckets[bucket] = max(
+                target.coarse_coverage_buckets.get(bucket, 0.0),
                 known,
             )
         else:
             target.has_unknown_coverage = True
+
+    if target.coarse_coverage_buckets:
+        target.known_coverage_seconds = min(
+            window_seconds,
+            sum(target.coarse_coverage_buckets.values()),
+        )
 
     for bucket, seconds in tuple(target.coarse_active_buckets.items()):
         bucket_seconds = (bucket[1] - bucket[0]).total_seconds()
@@ -937,9 +960,14 @@ def summarize_window(
         ),
     }
     launches = sum(row.launches for row in devices)
-    launches_upper = max(
-        launches,
-        sum(row.launches_upper for row in devices),
+    launches_unknown = any(row.has_unknown_launches for row in devices)
+    launches_upper = (
+        None
+        if launches_unknown
+        else max(
+            launches,
+            sum(row.launches_upper for row in devices),
+        )
     )
     first = min(
         (row.first_activity_at for row in devices if row.first_activity_at is not None),
@@ -991,6 +1019,8 @@ def summarize_window(
                 "partial_hourly_launches_bounded",
             ]
         )
+    if launches_unknown:
+        limitations.append("launches_unavailable_for_some_sources")
     if (
         len(devices) > 1
         and any(row.coarse_active_buckets for row in devices)
@@ -1065,7 +1095,11 @@ def summarize_window(
             "lower_bound": launches,
             "upper_bound": launches_upper,
             "precision": (
-                "bounded" if launches_upper != launches else "exact"
+                "unknown"
+                if launches_upper is None
+                else "bounded"
+                if launches_upper != launches
+                else "exact"
             ),
         },
         "longest_active_block_minutes": _longest_span_minutes(precise_spans),
@@ -1405,20 +1439,33 @@ def rebuild_day_summaries(
         int(value["app_launches_or_switches"])
         for value in hour_payloads
     )
-    launches_upper = sum(
-        max(
-            int(value["app_launches_or_switches"]),
-            int(
-                value.get(
-                    "app_launches_or_switches_range",
-                    {},
-                ).get(
-                    "upper_bound",
-                    value["app_launches_or_switches"],
-                )
-            ),
-        )
+    launch_ranges = [
+        value.get("app_launches_or_switches_range", {})
         for value in hour_payloads
+    ]
+    launches_unknown = any(
+        "upper_bound" in value and value.get("upper_bound") is None
+        for value in launch_ranges
+    )
+    launches_upper = (
+        None
+        if launches_unknown
+        else sum(
+            max(
+                int(value["app_launches_or_switches"]),
+                int(
+                    launch_range.get(
+                        "upper_bound",
+                        value["app_launches_or_switches"],
+                    )
+                ),
+            )
+            for value, launch_range in zip(
+                hour_payloads,
+                launch_ranges,
+                strict=True,
+            )
+        )
     )
     idle_values = [
         float(payload["idle_and_break_minutes"])
@@ -1520,7 +1567,9 @@ def rebuild_day_summaries(
             "lower_bound": launches,
             "upper_bound": launches_upper,
             "precision": (
-                "exact"
+                "unknown"
+                if launches_upper is None
+                else "exact"
                 if launches_upper == launches
                 else "bounded"
             ),

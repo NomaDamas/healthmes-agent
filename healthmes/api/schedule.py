@@ -29,6 +29,7 @@ from healthmes.api.common import UTCDateTime
 from healthmes.api.errors import APIError, invalid_transition, not_found
 from healthmes.api.pagination import Page, PageParamsDep, paginate
 from healthmes.calendars import creds
+from healthmes.calendars.repository import retained_calendar_statement
 from healthmes.calendars.sleep_context import actual_sleep_violation
 from healthmes.calendars.visibility import (
     CalendarVisibility,
@@ -165,7 +166,8 @@ def list_events(
             visibility,
             calendar_source=calendar_source,
         )
-        stmt = (
+        stmt = retained_calendar_statement(
+            session,
             select(CalendarEventMirror)
             .where(
                 visibility.predicate(),
@@ -175,7 +177,7 @@ def list_events(
             .order_by(
                 CalendarEventMirror.start_at,
                 CalendarEventMirror.end_at,
-            )
+            ),
         )
         if calendar_source is not None:
             stmt = stmt.where(CalendarEventMirror.calendar_source == calendar_source)

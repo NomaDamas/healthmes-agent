@@ -9,6 +9,7 @@ from healthmes.store import WellnessEvent
 from healthmes.wearables.provenance import (
     OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
     OPEN_WEARABLES_SNAPSHOT_EVENT_TYPE,
+    OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
     OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
     commit_open_wearables_snapshot,
     latest_retained_open_wearables_snapshot,
@@ -306,7 +307,12 @@ def test_late_arriving_old_observation_does_not_replace_latest(session) -> None:
 
 
 def test_expired_snapshot_is_not_returned(session) -> None:
-    update_retention_policy(session, "normalized", "1d", now=NOW)
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "1d",
+        now=NOW,
+    )
     event = persist_open_wearables_snapshot(
         session,
         normalized_context=_context(),
@@ -329,7 +335,12 @@ def test_expired_snapshot_is_not_returned(session) -> None:
 
 
 def test_expired_duplicate_is_not_revived_by_a_new_collection_time(session) -> None:
-    update_retention_policy(session, "normalized", "1d", now=NOW)
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "1d",
+        now=NOW,
+    )
     persist_open_wearables_snapshot(
         session,
         normalized_context=_context(),
@@ -364,7 +375,12 @@ def test_observed_window_respects_dst(
     local_day: date,
     expected_hours: int,
 ) -> None:
-    update_retention_policy(session, "normalized", "forever", now=NOW)
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "forever",
+        now=NOW,
+    )
     event = persist_open_wearables_snapshot(
         session,
         normalized_context={"date": local_day.isoformat(), "status": "ok"},

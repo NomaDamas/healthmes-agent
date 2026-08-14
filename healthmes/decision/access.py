@@ -33,6 +33,7 @@ from healthmes.activity.repository import (
     get_control_payload,
 )
 from healthmes.calendars.base import HealthmesEventKind
+from healthmes.calendars.repository import retained_calendar_statement
 from healthmes.calendars.state import SyncHealthStore
 from healthmes.calendars.visibility import (
     CalendarVisibility,
@@ -442,20 +443,25 @@ def _fresh_calendar_event(
     session: Session,
     event_id: uuid.UUID,
     *,
+    now: datetime | None = None,
     visibility: CalendarVisibility | None = None,
 ) -> _CalendarEventSnapshot | None:
-    statement = select(
-        CalendarEventMirror.id,
-        CalendarEventMirror.calendar_source,
-        CalendarEventMirror.connection_generation,
-        CalendarEventMirror.external_id,
-        CalendarEventMirror.start_at,
-        CalendarEventMirror.end_at,
-        CalendarEventMirror.healthmes_kind,
-        CalendarEventMirror.is_all_day,
-        CalendarEventMirror.status,
-        CalendarEventMirror.updated_at,
-    ).where(CalendarEventMirror.id == event_id)
+    statement = retained_calendar_statement(
+        session,
+        select(
+            CalendarEventMirror.id,
+            CalendarEventMirror.calendar_source,
+            CalendarEventMirror.connection_generation,
+            CalendarEventMirror.external_id,
+            CalendarEventMirror.start_at,
+            CalendarEventMirror.end_at,
+            CalendarEventMirror.healthmes_kind,
+            CalendarEventMirror.is_all_day,
+            CalendarEventMirror.status,
+            CalendarEventMirror.updated_at,
+        ).where(CalendarEventMirror.id == event_id),
+        now=now,
+    )
     if visibility is not None:
         statement = statement.where(visibility.predicate())
     row = session.execute(statement).mappings().one_or_none()
@@ -587,6 +593,8 @@ def _calendar_event_content_digest(
 def _current_source_content_digest(
     session: Session,
     source_ref: SourceRef,
+    *,
+    now: datetime | None = None,
 ) -> str | None:
     """Return the Gateway-owned digest for a retained local source."""
 
@@ -597,7 +605,11 @@ def _current_source_content_digest(
     if event is not None:
         return _wellness_event_content_digest(session, event)
     if source_ref.source_provider == "healthmes-calendar-mirror":
-        calendar_event = _fresh_calendar_event(session, record_uuid)
+        calendar_event = _fresh_calendar_event(
+            session,
+            record_uuid,
+            now=now,
+        )
         if calendar_event is not None:
             return _calendar_event_content_digest(calendar_event)
     return None
@@ -1302,6 +1314,7 @@ class ContextAccessTurn:
         observed_start, observed_end, collected_at = _source_ref_times(
             session,
             refs,
+            now=now,
         )
         if not refs and verified_empty_metadata:
             observed_start = result.observed_start
@@ -1536,6 +1549,7 @@ class ContextAccessTurn:
         session: Session,
         source_refs: Sequence[SourceRef],
         *,
+        now: datetime | None = None,
         calendar_visibility_snapshot: CalendarVisibility | None = None,
     ) -> tuple[SourceRef, ...]:
         """Lock current policy rows before final source validation and storage.
@@ -1551,6 +1565,7 @@ class ContextAccessTurn:
             strict_model_validate(SourceRef, source_ref)
             for source_ref in source_refs
         )
+        locked_at = _as_utc(now or self._layer._clock())
         activity_refs = tuple(
             source_ref
             for source_ref in canonical
@@ -1693,16 +1708,20 @@ class ContextAccessTurn:
             .order_by(WellnessEvent.id)
             .with_for_update(read=True)
         ).all()
-        session.execute(
-            select(CalendarEventMirror.id)
-            .where(
+        calendar_lock_statement = retained_calendar_statement(
+            session,
+            select(CalendarEventMirror.id).where(
                 CalendarEventMirror.id.in_(record_ids),
                 (
                     calendar_visibility_snapshot.predicate()
                     if calendar_visibility_snapshot is not None
                     else sa.true()
                 ),
-            )
+            ),
+            now=locked_at,
+        )
+        session.execute(
+            calendar_lock_statement
             .order_by(CalendarEventMirror.id)
             .with_for_update(read=True)
         ).all()
@@ -2708,6 +2727,7 @@ def _validate_source_ref(
             _fresh_calendar_event(
                 session,
                 record_uuid,
+                now=now,
                 visibility=calendar_visibility_snapshot,
             )
             if record_uuid is not None
@@ -2718,7 +2738,11 @@ def _validate_source_ref(
                 calendar_visibility_snapshot is not None
                 and record_uuid is not None
             ):
-                hidden = _fresh_calendar_event(session, record_uuid)
+                hidden = _fresh_calendar_event(
+                    session,
+                    record_uuid,
+                    now=now,
+                )
                 if hidden is not None:
                     return None, _calendar_visibility_row_limitations(
                         hidden,
@@ -2903,11 +2927,16 @@ def _validate_wearable_observation_source(
         row = _fresh_calendar_event(
             session,
             calendar_id,
+            now=now,
             visibility=calendar_visibility_snapshot,
         )
         if row is None:
             if calendar_visibility_snapshot is not None:
-                hidden = _fresh_calendar_event(session, calendar_id)
+                hidden = _fresh_calendar_event(
+                    session,
+                    calendar_id,
+                    now=now,
+                )
                 if hidden is not None:
                     return _calendar_visibility_row_limitations(
                         hidden,
@@ -3133,6 +3162,8 @@ def _overlaps_query(
 def _source_ref_times(
     session: Session,
     refs: Sequence[SourceRef],
+    *,
+    now: datetime,
 ) -> tuple[datetime | None, datetime | None, datetime | None]:
     if not refs:
         return None, None, None
@@ -3155,7 +3186,11 @@ def _source_ref_times(
             ref.source_provider == "healthmes-calendar-mirror"
             and record_uuid is not None
         ):
-            calendar = _fresh_calendar_event(session, record_uuid)
+            calendar = _fresh_calendar_event(
+                session,
+                record_uuid,
+                now=now,
+            )
             if calendar is not None:
                 collected.append(_as_utc(calendar.updated_at))
     return (

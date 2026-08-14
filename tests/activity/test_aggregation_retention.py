@@ -1297,6 +1297,56 @@ def test_partial_hourly_deletion_requires_bucket_alignment(session) -> None:
         )
 
 
+def test_fractional_timezone_hour_deletes_at_stored_bucket_bounds(
+    session,
+) -> None:
+    bucket_start = datetime(
+        2026,
+        8,
+        1,
+        4,
+        15,
+        tzinfo=UTC,
+    )
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="aggregate-test",
+            source_device="kathmandu-phone",
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="Asia/Kathmandu",
+            records=[
+                AppHourRecord(
+                    source_record_id="kathmandu-hour",
+                    bucket_start=bucket_start,
+                    app_id="browser",
+                    foreground_seconds=600,
+                    coverage_seconds=3600,
+                )
+            ],
+        ),
+    )
+
+    report = delete_activity_data(
+        session,
+        device_id="kathmandu-phone",
+        start=bucket_start,
+        end=bucket_start + timedelta(hours=1),
+        include_summaries=True,
+        include_control=False,
+        now=bucket_start + timedelta(hours=2),
+    )
+
+    assert report.raw_events_deleted == 1
+    assert session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == APP_HOUR_EVENT,
+            WellnessEvent.source_device == "kathmandu-phone",
+        )
+    ) is None
+
+
 def test_empty_known_aggregate_device_rejects_partial_hour_deletion(
     session,
 ) -> None:
@@ -2049,6 +2099,56 @@ def test_focus_coverage_uses_the_entire_requested_window(session) -> None:
     assert focus["status"] == "insufficient_data"
     assert focus["reason"] == "low_source_coverage"
     assert focus["coverage"] == 0.2
+
+
+def test_hourly_aggregate_coverage_sums_distinct_hours(session) -> None:
+    start = datetime(2026, 8, 1, 9, tzinfo=UTC)
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="aggregate-coverage-test",
+            source_device="phone-six-hours",
+            platform=ActivityPlatform.ANDROID,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            records=[
+                AppHourRecord(
+                    source_record_id=f"coverage-hour-{offset}",
+                    bucket_start=start + timedelta(hours=offset),
+                    app_id="reader",
+                    foreground_seconds=600,
+                    category="reading",
+                    coverage_seconds=3600,
+                )
+                for offset in range(6)
+            ],
+        ),
+        now=start + timedelta(hours=7),
+        rebuild_summaries=False,
+    )
+    events = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT,
+                WellnessEvent.source_device == "phone-six-hours",
+            )
+        )
+    )
+
+    summary = summarize_window(
+        events,
+        start=start,
+        end=start + timedelta(hours=6),
+        timezone="UTC",
+    )
+
+    assert summary["source_coverage"] == {
+        "status": "complete",
+        "ratio": 1.0,
+        "known_seconds": 21_600,
+        "expected_seconds": 21_600,
+        "unknown_device_count": 0,
+    }
 
 
 def test_partial_hour_focus_metrics_use_exact_retained_raw_window(session) -> None:

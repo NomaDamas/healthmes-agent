@@ -3,8 +3,18 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
+from healthmes.activity.aggregation import rebuild_day_summaries
+from healthmes.activity.contracts import (
+    ActivityBatchIn,
+    ActivityCapability,
+    ActivityPlatform,
+    AppHourRecord,
+)
+from healthmes.activity.repository import APP_HOUR_EVENT
+from healthmes.activity.service import ingest_activity_batch
 from healthmes.calendars import creds
 from healthmes.calendars.state import (
     InMemorySyncHealthStore,
@@ -33,6 +43,7 @@ from healthmes.decision import (
     WearableContextProvider,
     build_context_provider_registry,
 )
+from healthmes.storage import update_retention_policy
 from healthmes.store import CalendarEventMirror, WellnessEvent
 from healthmes.store.enums import CalendarSource
 
@@ -374,6 +385,124 @@ async def test_activity_event_id_never_falls_back_to_source_record_id(
     assert result.limitations == ["provenance_incomplete"]
 
 
+async def test_activity_provider_preserves_unknown_ios_launch_range(
+    session,
+) -> None:
+    bucket = DAY_START + timedelta(hours=10)
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="ios-device-activity",
+            source_device="iphone-provider-launch-range",
+            platform=ActivityPlatform.IOS,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            collected_at=bucket + timedelta(hours=1),
+            records=[
+                AppHourRecord(
+                    source_record_id="ios-provider-hour",
+                    bucket_start=bucket,
+                    app_id="category:productivity",
+                    foreground_seconds=1800,
+                    launches=0,
+                    launches_observed=False,
+                    category="productivity",
+                    coverage_seconds=3600,
+                )
+            ],
+        ),
+        now=NOW,
+    )
+    registry = ContextProviderRegistry((ActivityContextProvider(),))
+
+    result = await registry.execute(
+        session,
+        ContextQuery(
+            provider_id="activity",
+            capability="activity.summary",
+            parameters={"date": "2026-08-10"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.OK
+    assert result.payload["app_launches_or_switches"] == 0
+    assert result.payload["app_launches_or_switches_range"] == {
+        "lower_bound": 0,
+        "upper_bound": None,
+        "precision": "unknown",
+    }
+    assert "launches_unavailable_for_some_sources" in result.limitations
+
+
+async def test_activity_provider_treats_legacy_ios_launches_as_unknown(
+    session,
+) -> None:
+    bucket = DAY_START + timedelta(hours=10)
+    ingest_activity_batch(
+        session,
+        ActivityBatchIn(
+            source_provider="ios-device-activity",
+            source_device="legacy-iphone-provider-launch-range",
+            platform=ActivityPlatform.IOS,
+            capability=ActivityCapability.AGGREGATE,
+            timezone="UTC",
+            collected_at=bucket + timedelta(hours=1),
+            records=[
+                AppHourRecord(
+                    source_record_id="legacy-ios-provider-hour",
+                    bucket_start=bucket,
+                    app_id="category:productivity",
+                    foreground_seconds=1800,
+                    launches=0,
+                    launches_observed=False,
+                    category="productivity",
+                    coverage_seconds=3600,
+                )
+            ],
+        ),
+        now=NOW,
+    )
+    legacy_event = session.scalar(
+        select(WellnessEvent).where(
+            WellnessEvent.event_type == APP_HOUR_EVENT,
+            WellnessEvent.source_record_id == "legacy-ios-provider-hour",
+        )
+    )
+    assert legacy_event is not None
+    legacy_payload = dict(legacy_event.payload)
+    legacy_payload.pop("launches_observed")
+    legacy_event.payload = legacy_payload
+    session.flush()
+    rebuild_day_summaries(
+        session,
+        day=DAY_START.date(),
+        timezone="UTC",
+        force_rebuild=True,
+        now=NOW,
+    )
+    registry = ContextProviderRegistry((ActivityContextProvider(),))
+
+    result = await registry.execute(
+        session,
+        ContextQuery(
+            provider_id="activity",
+            capability="activity.summary",
+            parameters={"date": "2026-08-10"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.OK
+    assert result.payload["app_launches_or_switches"] == 0
+    assert result.payload["app_launches_or_switches_range"] == {
+        "lower_bound": 0,
+        "upper_bound": None,
+        "precision": "unknown",
+    }
+    assert "launches_unavailable_for_some_sources" in result.limitations
+
+
 async def test_nutrition_adapter_returns_only_structured_capture_context(
     session,
     monkeypatch,
@@ -696,6 +825,44 @@ async def test_calendar_adapter_returns_merged_aggregate_without_titles(
     ]
     assert "Private meeting title" not in result.model_dump_json()
     assert result.source_refs[0].record_id == str(row.id)
+
+
+async def test_calendar_adapter_hides_expired_rows_before_maintenance(
+    session,
+):
+    update_retention_policy(
+        session,
+        "calendar_mirror",
+        "1d",
+        now=NOW,
+    )
+    expired = CalendarEventMirror(
+        external_id="expired-before-maintenance",
+        calendar_source=CalendarSource.GOOGLE,
+        summary="Must not reach the Decision Agent",
+        start_at=datetime(2026, 8, 8, 9, tzinfo=UTC),
+        end_at=datetime(2026, 8, 8, 10, tzinfo=UTC),
+        is_all_day=False,
+    )
+    session.add(expired)
+    session.flush()
+    registry = ContextProviderRegistry(
+        (
+            CalendarContextProvider(
+                sources=(CalendarSource.GOOGLE,),
+            ),
+        )
+    )
+    query = ContextQuery(
+        provider_id="calendar",
+        capability="calendar.day-summary",
+        parameters={"date": "2026-08-08"},
+    )
+
+    result = await registry.execute(session, query, now=NOW)
+
+    assert result.payload["event_count"] == 0
+    assert result.source_refs == []
 
 
 async def test_calendar_dynamic_connection_filters_and_revokes_mirror_rows(

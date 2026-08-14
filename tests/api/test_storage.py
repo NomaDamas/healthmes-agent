@@ -19,9 +19,12 @@ from healthmes.storage import (
     update_retention_policy,
 )
 from healthmes.store import (
+    CalendarEventMirror,
+    CalendarSource,
     PurgeJob,
     RetentionPolicy,
     StorageObject,
+    Task,
     WellnessEvent,
 )
 
@@ -46,6 +49,7 @@ def test_storage_settings_bootstraps_defaults_and_measures_files(
     assert policies["activity_raw"] == "14d"
     assert policies["activity_hourly"] == "90d"
     assert policies["activity_daily"] == "forever"
+    assert policies["wearable_normalized"] == "30d"
     assert body["backup"]["provider"] == "local"
     assert body["backup"]["snapshot_count"] == 0
 
@@ -63,6 +67,105 @@ def test_retention_update_is_persisted(client: TestClient, session) -> None:
     )
     assert policy is not None
     assert policy.retention_days == 1
+
+
+def test_calendar_retention_update_immediately_removes_expired_mirror_rows(
+    session,
+) -> None:
+    current = datetime(2026, 8, 14, 12, tzinfo=UTC)
+    intake_task = Task(title="Expired calendar intake")
+    session.add(intake_task)
+    session.flush()
+    expired = CalendarEventMirror(
+        external_id="expired-calendar-retention",
+        calendar_source=CalendarSource.GOOGLE,
+        start_at=current - timedelta(days=10, hours=1),
+        end_at=current - timedelta(days=10),
+        intake_task_id=intake_task.id,
+    )
+    retained = CalendarEventMirror(
+        external_id="retained-calendar-retention",
+        calendar_source=CalendarSource.GOOGLE,
+        start_at=current - timedelta(hours=2),
+        end_at=current - timedelta(hours=1),
+    )
+    session.add_all((expired, retained))
+    session.commit()
+    expired_id = expired.id
+    retained_id = retained.id
+
+    update_retention_policy(
+        session,
+        "calendar_mirror",
+        "1d",
+        now=current,
+    )
+    session.commit()
+
+    assert session.get(CalendarEventMirror, expired_id) is None
+    assert session.get(CalendarEventMirror, retained_id) is retained
+    assert session.get(Task, intake_task.id).status == "cancelled"
+
+
+def test_calendar_maintenance_retires_expired_intake_task(
+    session,
+    settings,
+) -> None:
+    current = datetime(2026, 8, 14, 12, tzinfo=UTC)
+    intake_task = Task(title="Maintenance-expired calendar intake")
+    session.add(intake_task)
+    session.flush()
+    expired = CalendarEventMirror(
+        external_id="maintenance-expired-calendar-retention",
+        calendar_source=CalendarSource.GOOGLE,
+        start_at=current - timedelta(days=100, hours=1),
+        end_at=current - timedelta(days=100),
+        intake_task_id=intake_task.id,
+    )
+    session.add(expired)
+    session.commit()
+    expired_id = expired.id
+    task_id = intake_task.id
+
+    run_storage_maintenance(session, settings, now=current)
+    session.commit()
+
+    assert session.get(CalendarEventMirror, expired_id) is None
+    assert session.get(Task, task_id).status == "cancelled"
+
+
+def test_disabled_calendar_retention_does_not_delete_mirror_rows(
+    session,
+    settings,
+) -> None:
+    current = datetime(2026, 8, 14, 12, tzinfo=UTC)
+    update_retention_policy(
+        session,
+        "calendar_mirror",
+        "1d",
+        now=current,
+    )
+    expired = CalendarEventMirror(
+        external_id="disabled-calendar-retention",
+        calendar_source=CalendarSource.CALDAV,
+        start_at=current - timedelta(days=100, hours=1),
+        end_at=current - timedelta(days=100),
+    )
+    session.add(expired)
+    policy = session.scalar(
+        select(RetentionPolicy).where(
+            RetentionPolicy.data_class == "calendar_mirror"
+        )
+    )
+    assert policy is not None
+    policy.enabled = False
+    session.add(expired)
+    session.commit()
+
+    run_storage_maintenance(session, settings, now=current)
+    session.commit()
+
+    assert session.get(CalendarEventMirror, expired.id) is expired
 
 
 def test_daily_retention_update_immediately_refreshes_rest_baseline(

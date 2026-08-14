@@ -113,8 +113,16 @@ Telegram (phone + watch)          decision viewer (web)
   snapshots, and stores them in the same `WellnessEvent` data plane used by
   other wellness inputs. Desktop ActivityWatch data can be imported through
   the bounded localhost adapter and scheduled through the HealthMes engine.
-  iOS exposes an honest aggregate/unavailable server contract, not a
-  production Screen Time timeline collector. Retention, deletion,
+  The iOS companion now has Screen Time report contracts and a UI-neutral
+  sync-service seam, a Keychain-derived stable collector identity, and an
+  explicit-registration fail-closed boundary for new iPhone collectors. The
+  repository's normal build does not enable
+  `HEALTHMES_IOS_26_4_SCREENTIME_EXPORT`, so it selects the unavailable
+  adapter and collects no Apple activity instead of inventing zero usage.
+  A production collector still requires a supporting SDK/OS, approved
+  entitlement, authorization UI, lifecycle and Screen Time-specific
+  background-task wiring, signing, and real-device validation. Retention,
+  deletion,
   cross-device-aware hourly/daily aggregation, focus/overwork/recovery
   context, REST and MCP surfaces are implemented. The fixed `question_kind`
   resolver remains compatibility-only. The HealthMes Decision Agent owns
@@ -148,6 +156,19 @@ Telegram (phone + watch)          decision viewer (web)
   the current credential generation under the shared connection fence, so a
   completed disconnect cannot leave a stale client doing remote work.
   Migrations refuse to discard disabled domain-consent choices.
+- Unified input control plane (`healthmes/inputs/`): desktop and future mobile
+  settings UIs can enumerate Android, ActivityWatch, iPhone Screen Time,
+  nutrition capture, the raw-first HealthKit bridge, Open Wearables, Google
+  Calendar, and iCloud Calendar through `GET /v1/inputs`.
+  `PUT /v1/inputs/{source_id}/settings` composes the existing per-device
+  collection controls for activity collectors, per-domain Decision Agent
+  consent, and per-data-class `1d/7d/14d/30d/90d/forever` retention policies
+  without creating a second settings store. New multi-platform desktop
+  instances persist the caller-supplied platform and reject later platform
+  conflicts instead of discarding the field. Other inputs expose only the
+  connection and sync actions their real adapters enforce; the API does not
+  invent a generic enable switch. The UI contract and scope rules are in
+  `docs/INPUT-CONTROL-PLANE.ko.md`.
 
 **Medical-lite & backups (Phase 3)**
 - Capture via Telegram (no new app): the `healthmes-capture` skill routes

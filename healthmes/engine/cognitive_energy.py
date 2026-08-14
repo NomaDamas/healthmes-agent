@@ -87,6 +87,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.activity.repository import legacy_app_usage_cutoff
+from healthmes.calendars.repository import retained_calendar_statement
 from healthmes.calendars.visibility import (
     CalendarVisibility,
     read_visible_calendar,
@@ -1392,15 +1393,17 @@ def load_store_day_context(
         tuple[tuple[datetime, datetime], ...],
         tuple[tuple[datetime, datetime], ...],
     ]:
-        event_rows = session.scalars(
+        event_statement = retained_calendar_statement(
+            session,
             select(CalendarEventMirror)
             .where(
                 visibility.predicate(),
                 CalendarEventMirror.start_at < day_end,
                 CalendarEventMirror.end_at > prev_start,
             )
-            .order_by(CalendarEventMirror.start_at)
-        ).all()
+            .order_by(CalendarEventMirror.start_at),
+        )
+        event_rows = session.scalars(event_statement).all()
         events = tuple(
             (_ensure_utc(row.start_at), _ensure_utc(row.end_at))
             for row in event_rows

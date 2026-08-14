@@ -16,6 +16,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
 from healthmes.storage.service import ensure_default_policies
 from healthmes.store import RetentionPolicy, WellnessEvent
 from healthmes.store.session import session_scope
@@ -26,7 +30,7 @@ OPEN_WEARABLES_OBSERVATION_EVENT_TYPE = (
     "wearable.open-wearables-observation.v1"
 )
 OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER = "healthmes-open-wearables-mirror"
-OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS = "normalized"
+OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS = "wearable_normalized"
 
 _SNAPSHOT_SCHEMA = "healthmes.open-wearables-snapshot.v1"
 _OBSERVATION_SCHEMA = "healthmes.open-wearables-observation.v1"
@@ -380,6 +384,28 @@ def _validate_existing_snapshot(
 
 
 def persist_open_wearables_observation(
+    session: Session,
+    *,
+    normalized_context: dict[str, Any],
+    local_day: date,
+    timezone: str,
+    collected_at: datetime,
+    now: datetime,
+) -> WearableSnapshot:
+    """Persist one observation under the shared wellness write fence."""
+    with activity_write_lock():
+        lock_activity_write_plane(session)
+        return _persist_open_wearables_observation(
+            session,
+            normalized_context=normalized_context,
+            local_day=local_day,
+            timezone=timezone,
+            collected_at=collected_at,
+            now=now,
+        )
+
+
+def _persist_open_wearables_observation(
     session: Session,
     *,
     normalized_context: dict[str, Any],

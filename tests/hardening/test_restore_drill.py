@@ -28,7 +28,14 @@ from healthmes.backup import (
     LocalDirectoryProvider,
     WrongPassphraseError,
 )
-from healthmes.store import Base, Task, TriggerEvent, create_db_engine, session_scope
+from healthmes.store import (
+    Base,
+    RetentionPolicy,
+    Task,
+    TriggerEvent,
+    create_db_engine,
+    session_scope,
+)
 
 # Test modules cannot import from conftest under --import-mode=importlib;
 # the seeded_store fixture (a SeededStore dataclass) comes from conftest.py.
@@ -94,13 +101,16 @@ def test_snapshot_restore_reopen_counts_rows(seeded_store, tmp_path: Path) -> No
     provider.restore(info.path)
 
     # Reopen through the production engine machinery and verify every seeded
-    # table has exactly its expected rows (unseeded domain tables are empty).
+    # table has exactly its expected rows. The wearable-retention migration
+    # intentionally owns one policy row even when the fixture seeds no policy.
     counts = count_rows(seeded_store.database_url)
+    migration_owned_counts = {"retention_policy": 1}
     for table, expected in seeded_store.expected_counts.items():
         assert counts[table] == expected, f"{table}: {counts[table]} != {expected}"
     for table, count in counts.items():
         if table not in seeded_store.expected_counts:
-            assert count == 0, f"unexpected rows in {table}"
+            expected = migration_owned_counts.get(table, 0)
+            assert count == expected, f"{table}: {count} != {expected}"
 
     # The restored database is a *migrated* store stamped at the current head,
     # so future `alembic upgrade head` runs keep working after a restore.
@@ -110,7 +120,19 @@ def test_snapshot_restore_reopen_counts_rows(seeded_store, tmp_path: Path) -> No
             stamped = connection.execute(
                 sa.text("SELECT version_num FROM alembic_version")
             ).scalar_one()
+            wearable_policy = connection.execute(
+                sa.select(
+                    RetentionPolicy.data_class,
+                    RetentionPolicy.retention_days,
+                    RetentionPolicy.enabled,
+                )
+            ).one()
         assert stamped == alembic_head_revision()
+        assert wearable_policy._mapping == {
+            "data_class": "wearable_normalized",
+            "retention_days": 30,
+            "enabled": True,
+        }
     finally:
         engine.dispose()
 

@@ -7,6 +7,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from healthmes.calendars.base import HealthmesEventKind, coerce_utc
+from healthmes.calendars.repository import retained_calendar_statement
 from healthmes.calendars.sleep_observation import ActualSleepObservation
 from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror
@@ -125,7 +126,7 @@ def actual_sleep_violation(
             return None
         statement = statement.where(sa.or_(*filters))
     row = session.scalar(
-        statement
+        retained_calendar_statement(session, statement)
         .order_by(CalendarEventMirror.end_at.desc())
         .limit(1)
     )
@@ -161,7 +162,7 @@ def _actual_sleep_for_date(
             return None
         statement = statement.where(sa.or_(*filters))
     return session.scalar(
-        statement
+        retained_calendar_statement(session, statement)
         .order_by(
             CalendarEventMirror.sleep_duration_minutes.desc(),
             CalendarEventMirror.end_at.desc(),

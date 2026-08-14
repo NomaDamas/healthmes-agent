@@ -9,10 +9,11 @@ rendering, which never connects.
 import io
 import logging
 import os
+import sqlite3
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -30,9 +31,13 @@ from healthmes.store import (
     DecisionKind,
     DecisionRecord,
     ProposalStatus,
+    RetentionPolicy,
     ScheduleProposal,
     Task,
     session_scope,
+)
+from healthmes.wearables.provenance import (
+    persist_open_wearables_observation,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -137,6 +142,30 @@ def _render_offline_calendar_generation_downgrade(
     command.downgrade(
         _config(database_url, buffer=buffer),
         "b6c7d8e9f0a1:a5b6c7d8e9f0",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_wearable_retention_upgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.upgrade(
+        _config(database_url, buffer=buffer),
+        "c7d8e9f0a1b2:d8e9f0a1b2c3",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_wearable_retention_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "d8e9f0a1b2c3:c7d8e9f0a1b2",
         sql=True,
     )
     return buffer.getvalue()
@@ -283,6 +312,40 @@ class TestOfflineRender:
         if database_url.startswith("sqlite"):
             assert "_alembic_tmp_calendar_event_mirror" in rendered
 
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_wearable_retention_offline_downgrade_requires_online_check(
+        self,
+        database_url,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "offline downgrade cannot verify wearable "
+                "retention policy"
+            ),
+        ):
+            _render_offline_wearable_retention_downgrade(
+                database_url
+            )
+
+    def test_wearable_retention_offline_uuid_matches_each_dialect(self):
+        sqlite_sql = _render_offline_wearable_retention_upgrade(
+            "sqlite:///offline-render.db"
+        )
+        postgres_sql = _render_offline_wearable_retention_upgrade(
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes"
+        )
+
+        assert "d8e9f0a1b2c34d5e8f90a1b2c3d4e5f6" in sqlite_sql
+        assert "d8e9f0a1-b2c3-4d5e-8f90-a1b2c3d4e5f6" not in sqlite_sql
+        assert "d8e9f0a1-b2c3-4d5e-8f90-a1b2c3d4e5f6" in postgres_sql
+
     def test_render_marks_head_revision(self):
         rendered = _render_offline_upgrade("sqlite:///offline-render.db")
         assert "INSERT INTO alembic_version" in rendered
@@ -370,6 +433,505 @@ class TestSqliteUpgrade:
                 context = MigrationContext.configure(connection)
                 diff = compare_metadata(context, Base.metadata)
             assert diff == []
+        finally:
+            engine.dispose()
+
+    def test_wearable_retention_offline_sql_supports_orm_writes(
+        self,
+        tmp_path,
+    ):
+        database_path = tmp_path / "wearable-retention-offline.db"
+        database_url = f"sqlite:///{database_path}"
+        command.upgrade(_config(database_url), "c7d8e9f0a1b2")
+        rendered = _render_offline_wearable_retention_upgrade(
+            database_url
+        )
+
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.executescript(rendered)
+            assert connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall() == []
+        finally:
+            connection.close()
+
+        engine = sa.create_engine(database_url)
+        factory = sessionmaker(
+            bind=engine,
+            autocommit=False,
+            autoflush=False,
+        )
+        try:
+            with factory() as session:
+                snapshot = persist_open_wearables_observation(
+                    session,
+                    normalized_context={
+                        "date": "2026-08-14",
+                        "status": "ok",
+                    },
+                    local_day=date(2026, 8, 14),
+                    timezone="UTC",
+                    collected_at=datetime(
+                        2026,
+                        8,
+                        14,
+                        12,
+                        tzinfo=UTC,
+                    ),
+                    now=datetime(
+                        2026,
+                        8,
+                        14,
+                        12,
+                        tzinfo=UTC,
+                    ),
+                )
+                session.commit()
+                policy = session.scalar(
+                    sa.select(RetentionPolicy).where(
+                        RetentionPolicy.data_class
+                        == "wearable_normalized"
+                    )
+                )
+                assert policy is not None
+                assert snapshot.content_event_id is not None
+                assert policy.id.hex == (
+                    "d8e9f0a1b2c34d5e8f90a1b2c3d4e5f6"
+                )
+            with engine.connect() as connection:
+                assert connection.exec_driver_sql(
+                    "PRAGMA foreign_key_check"
+                ).all() == []
+        finally:
+            engine.dispose()
+
+    def test_wearable_retention_migration_round_trip(self, tmp_path):
+        database_url = f"sqlite:///{tmp_path / 'wearable-retention.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        retention_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        wellness_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        generic_policy_id = uuid.uuid4().hex
+        wearable_event_id = uuid.uuid4().hex
+        generic_event_id = uuid.uuid4().hex
+        observed_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+        # The migration must never resurrect data by extending an existing
+        # shorter expiry to the new policy duration.
+        original_expiry = observed_at + timedelta(days=3)
+        with engine.begin() as connection:
+            connection.execute(
+                retention_policy.insert().values(
+                    id=generic_policy_id,
+                    data_class="normalized",
+                    retention_days=14,
+                    enabled=True,
+                )
+            )
+            base_event = {
+                "schema_version": 1,
+                "observed_at": observed_at,
+                "recorded_at": observed_at,
+                "timezone": "UTC",
+                "source_device": None,
+                "capture_method": "import",
+                "sensitivity": "wellness",
+                "consent_scope": "personal",
+                "retention_policy_id": generic_policy_id,
+                "expires_at": original_expiry,
+                "payload": {},
+            }
+            connection.execute(
+                wellness_event.insert(),
+                [
+                    {
+                        **base_event,
+                        "id": wearable_event_id,
+                        "event_type": "wearable.sleep.v1",
+                        "source_provider": (
+                            "healthmes-open-wearables-mirror"
+                        ),
+                        "source_record_id": "wearable:sleep:1",
+                    },
+                    {
+                        **base_event,
+                        "id": generic_event_id,
+                        "event_type": "nutrition.meal.v1",
+                        "source_provider": "healthmes-nutrition",
+                        "source_record_id": "nutrition:meal:1",
+                    },
+                ],
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        migrated_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        migrated_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        with engine.connect() as connection:
+            policies = {
+                row.data_class: row
+                for row in connection.execute(sa.select(migrated_policy))
+            }
+            wearable_policy = policies["wearable_normalized"]
+            assert wearable_policy.retention_days == 14
+            assert wearable_policy.enabled is True
+
+            events = {
+                row.id: row
+                for row in connection.execute(sa.select(migrated_event))
+            }
+            wearable = events[wearable_event_id]
+            generic = events[generic_event_id]
+            assert wearable.retention_policy_id == wearable_policy.id
+            assert wearable.expires_at == original_expiry.replace(tzinfo=None)
+            assert generic.retention_policy_id == generic_policy_id
+            assert generic.expires_at == original_expiry.replace(tzinfo=None)
+        engine.dispose()
+
+        command.downgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        restored_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        restored_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        try:
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(restored_policy)
+                    .where(
+                        restored_policy.c.data_class
+                        == "wearable_normalized"
+                    )
+                ) == 0
+                restored = connection.execute(
+                    sa.select(restored_event).where(
+                        restored_event.c.id == wearable_event_id
+                    )
+                ).one()
+                assert restored.retention_policy_id == generic_policy_id
+                assert restored.expires_at == original_expiry.replace(
+                    tzinfo=None
+                )
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+        finally:
+            engine.dispose()
+
+    def test_wearable_retention_downgrade_recreates_missing_generic_policy(
+        self,
+        tmp_path,
+    ):
+        database_url = (
+            f"sqlite:///{tmp_path / 'wearable-retention-no-generic.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        retention_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        wellness_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        legacy_policy_id = uuid.uuid4().hex
+        wearable_event_id = uuid.uuid4().hex
+        observed_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                retention_policy.insert().values(
+                    id=legacy_policy_id,
+                    data_class="legacy_wearable",
+                    retention_days=3,
+                    enabled=True,
+                )
+            )
+            connection.execute(
+                wellness_event.insert().values(
+                    id=wearable_event_id,
+                    event_type="wearable.sleep.v1",
+                    schema_version=1,
+                    observed_at=observed_at,
+                    recorded_at=observed_at,
+                    timezone="UTC",
+                    source_provider="healthmes-open-wearables-mirror",
+                    source_device=None,
+                    source_record_id="wearable:sleep:no-generic",
+                    capture_method="import",
+                    sensitivity="wellness",
+                    consent_scope="personal",
+                    retention_policy_id=legacy_policy_id,
+                    expires_at=observed_at + timedelta(days=3),
+                    payload={},
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+        command.downgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        restored_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        restored_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        try:
+            with engine.connect() as connection:
+                policies = {
+                    row.data_class: row
+                    for row in connection.execute(
+                        sa.select(restored_policy)
+                    )
+                }
+                assert "wearable_normalized" not in policies
+                generic = policies["normalized"]
+                assert generic.retention_days == 30
+                assert generic.enabled is True
+                event = connection.execute(
+                    sa.select(restored_event).where(
+                        restored_event.c.id == wearable_event_id
+                    )
+                ).one()
+                assert event.retention_policy_id == generic.id
+                assert event.expires_at == (
+                    observed_at + timedelta(days=3)
+                ).replace(tzinfo=None)
+        finally:
+            engine.dispose()
+
+    def test_wearable_retention_downgrade_refuses_preexisting_policy_loss(
+        self,
+        tmp_path,
+    ):
+        database_url = (
+            f"sqlite:///{tmp_path / 'wearable-retention-existing.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        retention_policy = sa.Table(
+            "retention_policy",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        generic_policy_id = uuid.uuid4().hex
+        wearable_policy_id = uuid.uuid4().hex
+        with engine.begin() as connection:
+            connection.execute(
+                retention_policy.insert(),
+                [
+                    {
+                        "id": generic_policy_id,
+                        "data_class": "normalized",
+                        "retention_days": 30,
+                        "enabled": True,
+                    },
+                    {
+                        "id": wearable_policy_id,
+                        "data_class": "wearable_normalized",
+                        "retention_days": 1,
+                        "enabled": True,
+                    },
+                ],
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "cannot downgrade wearable retention without losing "
+                "its dedicated retention policy"
+            ),
+        ):
+            command.downgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        restored_policy = sa.Table(
+            "retention_policy",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        try:
+            with engine.connect() as connection:
+                wearable = connection.execute(
+                    sa.select(restored_policy).where(
+                        restored_policy.c.data_class
+                        == "wearable_normalized"
+                    )
+                ).one()
+                assert wearable.id == wearable_policy_id
+                assert wearable.retention_days == 1
+                assert wearable.enabled is True
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d8e9f0a1b2c3"
+        finally:
+            engine.dispose()
+
+    def test_wearable_retention_downgrade_refuses_changed_owned_policy(
+        self,
+        tmp_path,
+    ):
+        database_url = (
+            f"sqlite:///{tmp_path / 'wearable-retention-no-extension.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        retention_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        wellness_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        generic_policy_id = uuid.uuid4().hex
+        wearable_event_id = uuid.uuid4().hex
+        observed_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                retention_policy.insert().values(
+                    id=generic_policy_id,
+                    data_class="normalized",
+                    retention_days=30,
+                    enabled=True,
+                )
+            )
+            connection.execute(
+                wellness_event.insert().values(
+                    id=wearable_event_id,
+                    event_type="wearable.sleep.v1",
+                    schema_version=1,
+                    observed_at=observed_at,
+                    recorded_at=observed_at,
+                    timezone="UTC",
+                    source_provider="healthmes-open-wearables-mirror",
+                    source_device=None,
+                    source_record_id="wearable:sleep:short-expiry",
+                    capture_method="import",
+                    sensitivity="wellness",
+                    consent_scope="personal",
+                    retention_policy_id=generic_policy_id,
+                    expires_at=observed_at + timedelta(days=30),
+                    payload={},
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        retention_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        wellness_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        short_expiry = observed_at + timedelta(days=1)
+        with engine.begin() as connection:
+            wearable_policy_id = connection.scalar(
+                sa.select(retention_policy.c.id).where(
+                    retention_policy.c.data_class
+                    == "wearable_normalized"
+                )
+            )
+            connection.execute(
+                retention_policy.update()
+                .where(retention_policy.c.id == wearable_policy_id)
+                .values(retention_days=1)
+            )
+            connection.execute(
+                wellness_event.update()
+                .where(wellness_event.c.id == wearable_event_id)
+                .values(expires_at=short_expiry)
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "cannot downgrade wearable retention without losing "
+                "its dedicated retention policy"
+            ),
+        ):
+            command.downgrade(config, "c7d8e9f0a1b2")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        restored_event = sa.Table(
+            "wellness_event",
+            metadata,
+            autoload_with=engine,
+        )
+        try:
+            with engine.connect() as connection:
+                event = connection.execute(
+                    sa.select(restored_event).where(
+                        restored_event.c.id == wearable_event_id
+                    )
+                ).one()
+                assert event.retention_policy_id == wearable_policy_id
+                assert event.expires_at == short_expiry.replace(tzinfo=None)
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d8e9f0a1b2c3"
         finally:
             engine.dispose()
 
@@ -671,7 +1233,7 @@ class TestSqliteUpgrade:
                     )
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c7d8e9f0a1b2"
+                ) == "d8e9f0a1b2c3"
         finally:
             engine.dispose()
 
@@ -1548,7 +2110,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c7d8e9f0a1b2"
+                ) == "d8e9f0a1b2c3"
         finally:
             engine.dispose()
 
@@ -1789,6 +2351,165 @@ class TestSqliteUpgrade:
         "HEALTHMES_TEST_POSTGRES_URL"
     ),
 )
+def test_postgres_wearable_retention_migration_round_trip() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_wearable_retention_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    generic_policy_id = uuid.uuid4()
+    wearable_event_id = uuid.uuid4()
+    observed_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+    original_expiry = observed_at + timedelta(days=3)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "c7d8e9f0a1b2")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            policy = sa.Table(
+                "retention_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    policy.insert().values(
+                        id=generic_policy_id,
+                        data_class="normalized",
+                        retention_days=14,
+                        enabled=True,
+                    )
+                )
+                connection.execute(
+                    event.insert().values(
+                        id=wearable_event_id,
+                        event_type="wearable.sleep.v1",
+                        schema_version=1,
+                        observed_at=observed_at,
+                        recorded_at=observed_at,
+                        timezone="UTC",
+                        source_provider=(
+                            "healthmes-open-wearables-mirror"
+                        ),
+                        source_device=None,
+                        source_record_id="wearable:postgres:1",
+                        capture_method="import",
+                        sensitivity="wellness",
+                        consent_scope="personal",
+                        retention_policy_id=generic_policy_id,
+                        expires_at=original_expiry,
+                        payload={},
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            policy = sa.Table(
+                "retention_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                wearable_policy = connection.execute(
+                    sa.select(policy).where(
+                        policy.c.data_class == "wearable_normalized"
+                    )
+                ).one()
+                migrated = connection.execute(
+                    sa.select(event).where(
+                        event.c.id == wearable_event_id
+                    )
+                ).one()
+                assert wearable_policy.retention_days == 14
+                assert wearable_policy.enabled is True
+                assert (
+                    migrated.retention_policy_id
+                    == wearable_policy.id
+                )
+                assert migrated.expires_at == original_expiry
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "d8e9f0a1b2c3"
+        finally:
+            scoped_engine.dispose()
+
+        command.downgrade(config, "c7d8e9f0a1b2")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            policy = sa.Table(
+                "retention_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            event = sa.Table(
+                "wellness_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                restored = connection.execute(
+                    sa.select(event).where(
+                        event.c.id == wearable_event_id
+                    )
+                ).one()
+                assert (
+                    restored.retention_policy_id
+                    == generic_policy_id
+                )
+                assert restored.expires_at == original_expiry
+                assert connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(policy)
+                    .where(
+                        policy.c.data_class
+                        == "wearable_normalized"
+                    )
+                ) == 0
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c7d8e9f0a1b2"
+        finally:
+            scoped_engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
 def test_postgres_calendar_generation_migration_is_lossless() -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = sa.create_engine(database_url)
@@ -1974,7 +2695,7 @@ def test_postgres_calendar_generation_migration_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c7d8e9f0a1b2"
+                ) == "d8e9f0a1b2c3"
                 assert connection.scalar(
                     sa.select(proposal.c.status).where(
                         proposal.c.id == active_id
@@ -1998,7 +2719,7 @@ def test_postgres_calendar_generation_migration_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c7d8e9f0a1b2"
+                ) == "d8e9f0a1b2c3"
                 connection.execute(
                     proposal.update()
                     .where(proposal.c.id == active_id)
@@ -2044,7 +2765,7 @@ def test_postgres_calendar_generation_migration_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c7d8e9f0a1b2"
+                ) == "d8e9f0a1b2c3"
                 assert connection.scalar(
                     sa.select(proposal.c.status).where(
                         proposal.c.id == raced_id
@@ -2252,7 +2973,7 @@ def test_postgres_decision_agent_migration_round_trip() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c7d8e9f0a1b2"
+                ) == "d8e9f0a1b2c3"
                 assert connection.scalar(
                     sa.select(sa.func.count())
                     .select_from(preserved)
@@ -2317,7 +3038,7 @@ def test_postgres_decision_agent_migration_round_trip() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c7d8e9f0a1b2"
+                ) == "d8e9f0a1b2c3"
                 assert connection.scalar(
                     sa.select(sa.func.count())
                     .select_from(migrated)
@@ -2423,7 +3144,7 @@ def test_postgres_decision_policy_downgrade_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c7d8e9f0a1b2"
+                ) == "d8e9f0a1b2c3"
                 assert connection.scalar(
                     sa.select(policy.c.enabled).where(
                         policy.c.id == policy_id
@@ -2463,7 +3184,7 @@ def test_postgres_decision_policy_downgrade_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "c7d8e9f0a1b2"
+                ) == "d8e9f0a1b2c3"
                 assert connection.scalar(
                     sa.select(policy.c.enabled).where(
                         policy.c.id == policy_id

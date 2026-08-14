@@ -25,13 +25,19 @@ import logging
 import uuid
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 
 import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from healthmes.activity.locking import (
+    activity_write_lock,
+    lock_activity_write_plane,
+)
+from healthmes.calendar_intake_tasks import retire_calendar_intake_task
+from healthmes.calendar_retention import purge_expired_calendar_mirrors
 from healthmes.calendars.base import (
     CalendarBackend,
     CalendarConflictError,
@@ -41,6 +47,7 @@ from healthmes.calendars.base import (
     EventNotFoundError,
     ExternalEvent,
     OwnershipError,
+    SyncState,
     calendar_identity_external_id,
     coerce_utc,
     ensure_utc,
@@ -59,6 +66,7 @@ from healthmes.calendars.state import (
     sync_state_account_generation,
     with_sync_state_account_generation,
 )
+from healthmes.storage import retention_cutoff
 from healthmes.store.enums import CalendarSource
 from healthmes.store.models import CalendarEventMirror, Task
 
@@ -152,6 +160,22 @@ class SyncDiff:
         self.deleted.extend(other.deleted)
         self.agent_modified.extend(other.agent_modified)
 
+    def retained_after(self, cutoff: datetime) -> "SyncDiff":
+        """Drop journal entries whose referenced event is already expired."""
+
+        def retained(change: EventChange) -> bool:
+            end_at = change.new_end_at or change.old_end_at
+            return end_at is not None and coerce_utc(end_at) > cutoff
+
+        return SyncDiff(
+            created=[change for change in self.created if retained(change)],
+            moved=[change for change in self.moved if retained(change)],
+            deleted=[change for change in self.deleted if retained(change)],
+            agent_modified=[
+                change for change in self.agent_modified if retained(change)
+            ],
+        )
+
     def to_payload(self) -> dict[str, object]:
         """JSON-safe dict for trigger payloads / webhook bodies / the journal."""
         return {
@@ -218,8 +242,14 @@ class CalendarMirrorService:
             diff.extend(self.sync_backend(backend))
         return diff
 
-    def sync_backend(self, backend: CalendarBackend) -> SyncDiff:
+    def sync_backend(
+        self,
+        backend: CalendarBackend,
+        *,
+        now: datetime | None = None,
+    ) -> SyncDiff:
         """Pull one backend's changes, upsert the mirror, persist sync state."""
+        current = ensure_utc(now or datetime.now(UTC))
         source = backend.source
         previous_state = self._state_store.load(source)
         if (
@@ -234,12 +264,52 @@ class CalendarMirrorService:
         replayed = self._load_pending(source)
         events, new_state = backend.list_changes(previous_state)
 
+        with activity_write_lock():
+            lock_activity_write_plane(self._session)
+            purge_expired_calendar_mirrors(
+                self._session,
+                cutoff=retention_cutoff(
+                    self._session,
+                    "calendar_mirror",
+                    now=current,
+                ),
+            )
+            return self._apply_sync_result(
+                source=source,
+                events=events,
+                new_state=new_state,
+                bootstrap=bootstrap,
+                replayed=replayed,
+                now=current,
+            )
+
+    def _apply_sync_result(
+        self,
+        *,
+        source: CalendarSource,
+        events: list[ExternalEvent],
+        new_state: SyncState,
+        bootstrap: bool,
+        replayed: SyncDiff | None,
+        now: datetime,
+    ) -> SyncDiff:
+        cutoff = retention_cutoff(
+            self._session,
+            "calendar_mirror",
+            now=now,
+        )
         diff = SyncDiff()
         seen_ids: set[str] = set()
         for event in events:
             seen_ids.add(event.external_id)
             if event.deleted:
                 self._apply_deletion(source, event, diff)
+            elif (
+                cutoff is not None
+                and event.end_at is not None
+                and ensure_utc(event.end_at) <= cutoff
+            ):
+                self._discard_expired(source, event.external_id)
             else:
                 self._apply_upsert(source, event, diff, bootstrap=bootstrap)
 
@@ -249,6 +319,11 @@ class CalendarMirrorService:
             # scheduling window) while we had no cursor — emit tombstones so the
             # deletion is not lost forever (docs/PLAN.md §6).
             self._reconcile_tombstones(source, seen_ids, diff)
+
+        if cutoff is not None:
+            diff = diff.retained_after(cutoff)
+            if replayed is not None:
+                replayed = replayed.retained_after(cutoff)
 
         if replayed is not None:
             merged = SyncDiff()
@@ -282,6 +357,16 @@ class CalendarMirrorService:
                 len(diff.agent_modified),
             )
         return diff
+
+    def _discard_expired(
+        self,
+        source: CalendarSource,
+        external_id: str,
+    ) -> None:
+        row = self._lock_current_row(source, external_id)
+        if row is not None:
+            retire_calendar_intake_task(self._session, row)
+            self._session.delete(row)
 
     def _load_pending(self, source: CalendarSource) -> SyncDiff | None:
         if self._pending_store is None:
@@ -760,11 +845,7 @@ class CalendarMirrorService:
         return task_id if self._session.get(Task, task_id) is not None else None
 
     def _retire_intake_task(self, row: CalendarEventMirror) -> None:
-        if row.intake_task_id is None:
-            return
-        task = self._session.get(Task, row.intake_task_id)
-        if task is not None:
-            task.status = "cancelled"
+        retire_calendar_intake_task(self._session, row)
 
     def _quarantine_identity_conflicts(
         self,

@@ -18,6 +18,9 @@ from healthmes.activity.locking import (
     activity_write_lock,
     lock_activity_write_plane,
 )
+from healthmes.calendar_retention import (
+    purge_expired_calendar_mirrors,
+)
 from healthmes.config import Settings
 from healthmes.store import (
     AppUsageSample,
@@ -46,6 +49,7 @@ DEFAULT_RETENTION: dict[str, str] = {
     "nutrition_media": "7d",
     "nutrition_raw_capture": "14d",
     "normalized": "30d",
+    "wearable_normalized": "30d",
     "nutrition_observation": "90d",
     "nutrition_confirmation": "forever",
     "aggregate": "forever",
@@ -54,6 +58,7 @@ DEFAULT_RETENTION: dict[str, str] = {
     "activity_raw": "14d",
     "activity_hourly": "90d",
     "activity_daily": "forever",
+    "calendar_mirror": "90d",
 }
 
 
@@ -150,7 +155,11 @@ def _update_retention_policy(
     if preset not in RETENTION_PRESETS:
         raise ValueError(f"unsupported retention preset: {preset}")
     current = _as_utc(now or _now())
-    if data_class.startswith("activity_"):
+    if (
+        data_class.startswith("activity_")
+        or data_class
+        in {"calendar_mirror", "wearable_normalized"}
+    ):
         lock_activity_write_plane(session)
     ensure_default_policies(session)
     policy = session.scalar(
@@ -160,6 +169,7 @@ def _update_retention_policy(
         policy = RetentionPolicy(data_class=data_class, enabled=True)
         session.add(policy)
     previous_retention_days = policy.retention_days
+    policy.enabled = True
     policy.retention_days = RETENTION_PRESETS[preset]
     session.flush()
     _recalculate_expiry(
@@ -168,12 +178,51 @@ def _update_retention_policy(
         previous_retention_days=previous_retention_days,
         now=current,
     )
+    if data_class == "calendar_mirror":
+        purge_expired_calendar_mirrors(
+            session,
+            cutoff=retention_cutoff(
+                session,
+                "calendar_mirror",
+                now=current,
+            ),
+        )
     if data_class.startswith("activity_"):
         session.flush()
         from healthmes.activity.maintenance import run_activity_maintenance
 
         run_activity_maintenance(session, now=current)
     return policy
+
+
+def retention_cutoff(
+    session: Session,
+    data_class: str,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Return the enforced UTC cutoff for a retained database data class."""
+    policy = session.scalar(
+        select(RetentionPolicy).where(
+            RetentionPolicy.data_class == data_class
+        )
+    )
+    if policy is None:
+        preset = DEFAULT_RETENTION.get(data_class)
+        retention_days = (
+            RETENTION_PRESETS[preset]
+            if preset is not None
+            else None
+        )
+        enabled = preset is not None
+    else:
+        retention_days = policy.retention_days
+        enabled = policy.enabled
+    if not enabled or retention_days is None:
+        return None
+    return _as_utc(now or _now()) - timedelta(
+        days=retention_days
+    )
 
 
 def _expiry(policy: RetentionPolicy, observed_at: datetime) -> datetime | None:
@@ -716,6 +765,20 @@ def _run_storage_maintenance(
         from healthmes.activity.maintenance import run_activity_maintenance
 
         run_activity_maintenance(session, now=current)
+        calendar_policy = session.scalar(
+            select(RetentionPolicy).where(
+                RetentionPolicy.data_class == "calendar_mirror"
+            )
+        )
+        if calendar_policy is not None:
+            purge_expired_calendar_mirrors(
+                session,
+                cutoff=retention_cutoff(
+                    session,
+                    "calendar_mirror",
+                    now=current,
+                ),
+            )
     candidates = list(
         session.scalars(
             select(StorageObject).where(

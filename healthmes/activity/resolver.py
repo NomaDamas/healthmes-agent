@@ -21,6 +21,7 @@ from healthmes.activity.context import (
 )
 from healthmes.activity.contracts import ActivityContextResolveRequest
 from healthmes.calendars.base import HealthmesEventKind
+from healthmes.calendars.repository import retained_calendar_statement
 from healthmes.calendars.state import SyncHealthStore
 from healthmes.calendars.visibility import (
     CalendarVisibility,
@@ -112,23 +113,23 @@ def calendar_context(
                 "calendar_presence_is_not_work_intensity",
             ],
         }
-    rows = list(
-        session.scalars(
-            select(CalendarEventMirror)
-            .where(
-                CalendarEventMirror.start_at < end,
-                CalendarEventMirror.end_at > start,
-                CalendarEventMirror.is_all_day.is_(False),
-                or_(
-                    CalendarEventMirror.healthmes_kind.is_(None),
-                    CalendarEventMirror.healthmes_kind
-                    != HealthmesEventKind.ACTUAL_SLEEP.value,
-                ),
-                visibility.predicate(),
-            )
-            .order_by(CalendarEventMirror.start_at)
+    statement = retained_calendar_statement(
+        session,
+        select(CalendarEventMirror)
+        .where(
+            CalendarEventMirror.start_at < end,
+            CalendarEventMirror.end_at > start,
+            CalendarEventMirror.is_all_day.is_(False),
+            or_(
+                CalendarEventMirror.healthmes_kind.is_(None),
+                CalendarEventMirror.healthmes_kind
+                != HealthmesEventKind.ACTUAL_SLEEP.value,
+            ),
+            visibility.predicate(),
         )
+        .order_by(CalendarEventMirror.start_at),
     )
+    rows = list(session.scalars(statement))
     spans: list[tuple[datetime, datetime]] = []
     for row in rows:
         row_start = (

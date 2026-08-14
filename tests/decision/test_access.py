@@ -63,6 +63,7 @@ from healthmes.decision import (
     SourceRef,
     WearableContextProvider,
 )
+from healthmes.storage import update_retention_policy
 from healthmes.store import (
     Base,
     CalendarEventMirror,
@@ -1801,6 +1802,95 @@ async def test_wearable_provider_returns_attested_local_snapshot(
     assert limitations == ("future_range_trimmed",)
 
 
+async def test_wearable_source_ref_rejects_expired_upstream_calendar_row(
+    session,
+):
+    update_retention_policy(
+        session,
+        "calendar_mirror",
+        "1d",
+        now=NOW,
+    )
+    row = CalendarEventMirror(
+        external_id="expired-upstream-actual-sleep",
+        calendar_source=CalendarSource.GOOGLE,
+        summary="Expired private sleep title",
+        start_at=datetime(2026, 8, 8, 0, tzinfo=UTC),
+        end_at=datetime(2026, 8, 8, 7, tzinfo=UTC),
+        is_agent_created=True,
+        healthmes_kind="actual_sleep",
+        healthmes_source="oura",
+        healthmes_source_key="oura:2026-08-08",
+        sleep_local_date=datetime(2026, 8, 8, tzinfo=UTC).date(),
+        sleep_duration_minutes=420,
+        sleep_time_in_bed_minutes=450,
+    )
+    session.add(row)
+    session.flush()
+
+    async def reader(day):
+        return {
+            "status": "ok",
+            "date": day.isoformat(),
+            "actual_sleep": {
+                "status": "ok",
+                "local_date": day.isoformat(),
+                "start": row.start_at.isoformat(),
+                "wake_time": row.end_at.isoformat(),
+                "duration_minutes": 420,
+                "source": "oura",
+            },
+            "source_refs": [
+                {
+                    "domain": "wearable",
+                    "record_id": str(row.id),
+                    "source_provider": "healthmes-calendar-mirror",
+                    "upstream_provider": "oura",
+                    "resource_type": "actual_sleep",
+                    "observed_at": row.end_at.isoformat(),
+                    "schema_version": 1,
+                    "derived_by": "healthmes.actual-sleep-mirror.v1",
+                }
+            ],
+            "freshness": {
+                "recorded_at": row.end_at.isoformat(),
+                "status": "current",
+            },
+            "coverage": {"ratio": 1.0},
+            "limitations": [],
+        }
+
+    provider = WearableContextProvider(
+        reader,
+        snapshot_session_factory=sessionmaker(
+            bind=session.get_bind(),
+            expire_on_commit=False,
+        ),
+    )
+    layer = ContextAccessLayer(
+        ContextProviderRegistry((provider,)),
+        clock=lambda: NOW,
+    )
+    turn = layer.start_turn(
+        _request(),
+        policy=_policy(domain="wearable"),
+    )
+
+    result = await turn.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.sleep",
+            timezone="UTC",
+            parameters={"date": "2026-08-08"},
+        ),
+    )
+
+    assert session.get(CalendarEventMirror, row.id) is row
+    assert result.status is ContextStatus.DENIED
+    assert result.limitations == ["source_ref_record_missing"]
+
+
 @pytest.mark.parametrize(
     ("date_value", "timezone", "expected_hours"),
     (
@@ -3117,6 +3207,67 @@ async def test_calendar_mirror_ref_requires_exact_end_and_identity(session):
 
     assert result.status is ContextStatus.DENIED
     assert result.limitations == ["source_ref_observation_mismatch"]
+
+
+async def test_calendar_source_ref_rejects_expired_row_before_maintenance(
+    session,
+):
+    update_retention_policy(
+        session,
+        "calendar_mirror",
+        "1d",
+        now=NOW,
+    )
+    row = CalendarEventMirror(
+        external_id="calendar-expired-source-ref",
+        calendar_source=CalendarSource.GOOGLE,
+        summary="Expired but not yet maintained",
+        start_at=datetime(2026, 8, 8, 9, tzinfo=UTC),
+        end_at=datetime(2026, 8, 8, 10, tzinfo=UTC),
+        is_all_day=False,
+    )
+    session.add(row)
+    session.flush()
+    ref = SourceRef(
+        domain="calendar",
+        resource_type="calendar.event",
+        record_id=str(row.id),
+        source_provider="healthmes-calendar-mirror",
+        observed_start=row.start_at,
+        observed_end=row.end_at,
+        schema_version=1,
+        derived_by="calendar.context.v1",
+        freshness=FreshnessStatus.UNKNOWN,
+        sensitivity="calendar-metadata",
+    )
+    provider = StaticProvider(
+        provider_id="calendar",
+        domain="calendar",
+        result_factory=lambda query, now: _result(
+            query,
+            now=now,
+            payload={"value": 1},
+            source_refs=[ref],
+        ),
+    )
+    _, turn = _turn(
+        provider,
+        policy=_policy(domain="calendar"),
+    )
+
+    result = await turn.query(
+        session,
+        _query(
+            provider_id="calendar",
+            domain="calendar",
+            start=datetime(2026, 8, 8, tzinfo=UTC),
+            end=NOW,
+        ),
+    )
+
+    assert session.get(CalendarEventMirror, row.id) is row
+    assert result.status is ContextStatus.DENIED
+    assert result.limitations == ["source_ref_record_missing"]
 
 
 async def test_naive_stored_observation_window_is_rejected(session):

@@ -726,7 +726,7 @@ finalization을 우회하는 별도 core 경로로 만들지 않는다.
 | 최종 판단 | runtime-neutral structured draft loop 구현 | 상용 LLM eval은 이 PR 비범위 |
 | 판단 저장 | finalizer가 source ref를 재검증하고 자동 저장 | 저장 backend 운영·관측성 보강 |
 | wearable provenance | normalized local snapshot과 stable source ref 구현 | vendor별 장기 호환성 모니터링 |
-| activity completeness | ActivityWatch scheduler, iOS aggregate 경계, cross-device dedup 구현 | 실제 device UI와 dogfood |
+| activity server/data plane | ActivityWatch scheduler, iOS ingest/storage 계약, cross-device overlap-aware bounded aggregation, 조건부 Screen Time sync-service seam | 정확한 cross-device dedup, compile flag, entitlement, lifecycle/background task, 실제 device UI와 dogfood |
 | production 조립 | FastAPI lifespan singleton, DB policy resolver, REST adapter와 cancellation-safe cleanup 구현 | 다른 channel/UI의 얇은 호출 adapter |
 | E2E | 실제 네 domain 저장소에서 자연어 질문부터 DecisionRecord 재조회까지 검증 | 실제 상용 LLM 네트워크 평가는 별도 |
 
@@ -852,7 +852,7 @@ cancellation 억제, 동기 event-loop blocking, step 우회와 source ref 위�
 
 - Open Wearables normalized summary의 안정적 source reference 또는 local mirror
 - ActivityWatch 자동 주기 import
-- iOS capability 범위 안의 실제 activity 제출 경로
+- iOS capability 범위 안의 Screen Time aggregate collection/sync seam
 - 여러 기기의 겹친 활동시간 처리 정책
 
 **종료 조건:** 선택 가능한 각 provider가 freshness, coverage와 provenance를 반환한다.

@@ -9,7 +9,7 @@
 > 음식 분석·음식 사진 인식은 sake가 담당한다. HealthMes는 그 결과를 공통
 > `WellnessEvent`로 받아 저장·맥락 연결만 한다.
 
-## 구현 상태 — 2026-08-06
+## 구현 상태 — 2026-08-14
 
 컴퓨터 Personal Data Node의 저장 제어 계층은 구현되었다.
 
@@ -24,6 +24,15 @@
 - 기존 LocalDirectory/RemoteVault 암호화 백업 상태 표시
 - sake `NutritionObservation`을 원형 그대로 `WellnessEvent.payload`에 저장
 - 음식/음료 사진, 구조화 관측값, 사용자 확인을 서로 다른 보존 클래스로 분리
+- Android와 ActivityWatch를 같은 `activity.*` `WellnessEvent` 파티션에
+  저장하며, 서버가 조건부 iPhone Screen Time aggregate도 같은 파티션에
+  수용할 수 있음
+- `/v1/inputs` 통합 입력 제어 평면에서 수집기 capability, 연결 상태,
+  activity 기기별 수집 제어, domain별 Decision Agent 동의와 데이터별 보존
+  정책을 제공. 비활동 입력은 실제 adapter의 연결·동기화 action만 노출
+- 기존 `POST /v1/ingest/healthkit` raw-first 경로를
+  `wearable.healthkit-bridge` 입력으로 노출하고, 원문은 `raw_payload`,
+  정규화된 Open Wearables mirror는 `wearable_normalized`로 분리
 
 | 데이터 클래스 | 기본 보존 | 저장 내용 |
 |---|---:|---|
@@ -37,9 +46,25 @@
 `/v1/storage/settings/{data_class}` API에서 네 클래스를 각각
 `1/7/14/30/90일/무기한`으로 바꿀 수 있다.
 
-iOS/Android의 저장 설정 UI와 durable upload queue는 별도 후속 작업이다.
-이번 구현의 설정 정본은 컴퓨터 Personal Data Node이며, 모바일은 향후 동일 API를
-사용한다.
+iOS/Android의 실제 설정 UI는 별도 후속 작업이다. 설정 정본은 컴퓨터
+Personal Data Node이며 데스크톱 웹과 모바일 UI는 동일한
+`/v1/inputs/{source_id}/settings` 계약을 사용한다. Android는 기존 durable
+upload queue를 유지하고, iPhone Screen Time은 최근 완료 48시간을 반복 가능한
+authoritative snapshot으로 전송하도록 계약돼 있다. 단 최초 승인 직후와 timezone
+변경 직후에는 최신 완료 local-hour 1개에서 시작하고, 이후 같은 timezone에서만
+최대 48시간을 재조정한다. 현재 앱 lifecycle은
+Screen Time sync seam을 호출하지 않는다. 향후 lifecycle이 seam을 호출하면
+일반 iOS 빌드의 factory는 unavailable adapter를 반환하고 unavailable report를
+전송한다. 실제 snapshot에 필요한 compile flag, entitlement, 권한 UI,
+lifecycle/Screen Time background task, 서명과 실기기 검증은 device-team
+범위다.
+
+iPhone collector ID는 Screen Time 가명화 Keychain key에서 안정적으로 파생되며
+새 `ios-collector-v1-*` instance는 중앙 input 설정에서 명시적으로 활성화하기
+전까지 fail closed한다. denied/unavailable 결과는 최초 동의 경계를 저장하지
+않는다. Calendar mirror도 retention 변경과 sync를 같은 저장 write fence로
+직렬화하고, ingest와 Decision Agent 조회 모두 `calendar_mirror` cutoff를
+강제하므로 다음 provider full sync가 삭제된 과거 일정을 되살리지 못한다.
 
 ## TLDR
 

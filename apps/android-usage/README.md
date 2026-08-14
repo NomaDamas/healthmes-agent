@@ -195,8 +195,10 @@ seconds, launch counts, app category) and uploads them to your own HealthMes
 instance every ~30 minutes via WorkManager. The cognitive-energy engine uses
 these samples for its fragmentation term (docs/PLAN.md §3).
 
-There is intentionally no iOS counterpart: Screen Time / DeviceActivity data
-cannot leave the device sandbox (docs/PLAN.md §7).
+The separate iOS companion now contains a capability-gated Screen Time
+aggregate collection/sync seam. It is not an Android-equivalent detailed
+timeline collector and still requires Apple entitlement, lifecycle wiring,
+and real-device verification (docs/PLAN.md §7).
 
 ## Privacy
 

@@ -45,6 +45,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.calendars.adjustments_proposals import provider_revision_fingerprint
+from healthmes.calendars.repository import retained_calendar_statement
 from healthmes.calendars.visibility import (
     CalendarVisibility,
     read_visible_calendar,
@@ -425,15 +426,18 @@ def _load_afternoon(
 
     window_start_utc = _ensure_utc(window_start)
     window_end_utc = _ensure_utc(afternoon_end)
-    events = session.scalars(
+    event_statement = retained_calendar_statement(
+        session,
         select(CalendarEventMirror)
         .where(
             visibility.predicate(),
             CalendarEventMirror.start_at < window_end_utc,
             CalendarEventMirror.end_at > window_start_utc,
         )
-        .order_by(CalendarEventMirror.start_at)
-    ).all()
+        .order_by(CalendarEventMirror.start_at),
+        now=now,
+    )
+    events = session.scalars(event_statement).all()
 
     busy = 0
     summaries: list[str] = []
@@ -457,15 +461,17 @@ def _conflict_labels(
 ) -> tuple[str, ...]:
     """Labels of agent blocks / accepted proposals the changed event overlaps."""
     labels: list[str] = []
-    agent_blocks = session.scalars(
+    agent_statement = retained_calendar_statement(
+        session,
         select(CalendarEventMirror).where(
             visibility.predicate(),
             CalendarEventMirror.is_agent_created.is_(True),
             CalendarEventMirror.id != changed.id,
             CalendarEventMirror.start_at < end_utc,
             CalendarEventMirror.end_at > start_utc,
-        )
-    ).all()
+        ),
+    )
+    agent_blocks = session.scalars(agent_statement).all()
     labels.extend(f"agent block: {block.summary or block.external_id}" for block in agent_blocks)
 
     proposals = session.execute(
@@ -496,12 +502,15 @@ def _load_schedule_changes(
     cancelled) — tracked as a known Phase-1 gap.
     """
     cutoff = _ensure_utc(now - lookback)
-    rows = session.scalars(
+    change_statement = retained_calendar_statement(
+        session,
         select(CalendarEventMirror).where(
             visibility.predicate(),
             CalendarEventMirror.updated_at >= cutoff,
-        )
-    ).all()
+        ),
+        now=now,
+    )
+    rows = session.scalars(change_statement).all()
     internal_revisions = _confirmed_internal_adjustment_revisions(
         session, rows=rows, cutoff=cutoff
     )

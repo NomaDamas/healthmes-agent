@@ -23,6 +23,7 @@ from healthmes.activity.resolver import (
     _normalize_wearable_context,
 )
 from healthmes.calendars.base import HealthmesEventKind
+from healthmes.calendars.repository import retained_calendar_event
 from healthmes.calendars.state import (
     CalendarSyncHealth,
     SyncHealthStatus,
@@ -75,6 +76,7 @@ from healthmes.nutrition.repository import (
 from healthmes.nutrition.repository import (
     SOURCE_PROVIDER as NUTRITION_OBSERVATION_PROVIDER,
 )
+from healthmes.storage import retention_cutoff
 from healthmes.store import CalendarEventMirror, WellnessEvent
 from healthmes.store.enums import CalendarSource
 from healthmes.timezones import parse_timezone
@@ -171,6 +173,7 @@ _ACTIVITY_NESTED_FIELDS = (
     "active_minutes_upper",
     "active_time_range",
     "app_launches_or_switches",
+    "app_launches_or_switches_range",
     "baseline_minutes",
     "capabilities",
     "category_attribution",
@@ -191,9 +194,11 @@ _ACTIVITY_NESTED_FIELDS = (
     "late_activity_minutes",
     "late_activity_time_range",
     "launches",
+    "launches_observed",
     "longest_active_block_minutes",
     "longest_block",
     "lookback_baseline_delta",
+    "lower_bound",
     "lower_bound_minutes",
     "metrics",
     "method",
@@ -207,6 +212,7 @@ _ACTIVITY_NESTED_FIELDS = (
     "threshold_uncertainties",
     "total_active_minutes",
     "timezone",
+    "upper_bound",
     "upper_bound_minutes",
     "value_minutes",
     "window",
@@ -422,6 +428,7 @@ _ACTIVITY_LIMITATION_CODES = (
     "hourly_aggregate_cannot_reconstruct_exact_focus_blocks",
     "interval_source_takes_precedence_over_hourly_for_device",
     "legacy_activity_summary_incompatible",
+    "launches_unavailable_for_some_sources",
     "low_source_coverage",
     "missing_is_not_zero",
     "overwork_thresholds_blocked_by_cross_device_overlap",
@@ -892,7 +899,7 @@ def _wearable_source_refs(
                 row_id = uuid.UUID(str(value.get("record_id") or ""))
             except ValueError:
                 continue
-            row = session.get(CalendarEventMirror, row_id)
+            row = retained_calendar_event(session, row_id)
             supplied_observed = _timestamp(
                 raw_observed,
                 timezone=timezone,
@@ -1188,6 +1195,7 @@ class ActivityContextProvider:
                     "late_activity_time_range",
                     "longest_active_block_minutes",
                     "app_launches_or_switches",
+                    "app_launches_or_switches_range",
                     "deduplication",
                     "category_attribution",
                     "source_coverage",
@@ -2059,6 +2067,7 @@ def _calendar_rows(
     *,
     start: datetime,
     end: datetime,
+    retained_after: datetime | None,
     sources: Sequence[CalendarSource] | None = None,
     account_generations: Mapping[CalendarSource, str] | None = None,
 ) -> list[CalendarEventMirror]:
@@ -2072,6 +2081,10 @@ def _calendar_rows(
             != HealthmesEventKind.ACTUAL_SLEEP.value,
         )
     )
+    if retained_after is not None:
+        statement = statement.where(
+            CalendarEventMirror.end_at > retained_after
+        )
     if account_generations is not None:
         account_filters = tuple(
             (
@@ -2397,6 +2410,7 @@ class CalendarContextProvider:
         *,
         start: datetime,
         end: datetime,
+        now: datetime,
     ) -> tuple[
         list[CalendarEventMirror],
         tuple[CalendarSource, ...],
@@ -2413,6 +2427,11 @@ class CalendarContextProvider:
                 session,
                 start=start,
                 end=end,
+                retained_after=retention_cutoff(
+                    session,
+                    "calendar_mirror",
+                    now=now,
+                ),
                 account_generations=visibility.account_generations,
             ),
             sources,
@@ -2484,6 +2503,7 @@ class CalendarContextProvider:
                         snapshot,
                         start=start,
                         end=end,
+                        now=now,
                     ),
                     sync_health_store=self._sync_health_store,
                 )
@@ -2601,6 +2621,11 @@ class CalendarContextProvider:
                 session,
                 start=start,
                 end=end,
+                retained_after=retention_cutoff(
+                    session,
+                    "calendar_mirror",
+                    now=now,
+                ),
                 sources=sources,
                 account_generations=ready_generations,
             )

@@ -48,6 +48,7 @@ from healthmes.api.insight_templates import (
     compute_all,
 )
 from healthmes.api.pagination import Page, PageParamsDep, paginate
+from healthmes.calendars.repository import retained_calendar_statement
 from healthmes.calendars.visibility import (
     CalendarVisibility,
     CalendarVisibilityChanged,
@@ -268,17 +269,17 @@ def recompute_insights(
     def read_events(
         visibility: CalendarVisibility,
     ) -> list[CalendarEventMirror]:
-        return list(
-            session.scalars(
-                select(CalendarEventMirror)
-                .where(
-                    visibility.predicate(),
-                    CalendarEventMirror.end_at > window_start,
-                    CalendarEventMirror.start_at < window_end,
-                )
-                .order_by(CalendarEventMirror.start_at)
-            ).all()
+        statement = retained_calendar_statement(
+            session,
+            select(CalendarEventMirror)
+            .where(
+                visibility.predicate(),
+                CalendarEventMirror.end_at > window_start,
+                CalendarEventMirror.start_at < window_end,
+            )
+            .order_by(CalendarEventMirror.start_at),
         )
+        return list(session.scalars(statement).all())
 
     try:
         events, visibility = read_visible_calendar(

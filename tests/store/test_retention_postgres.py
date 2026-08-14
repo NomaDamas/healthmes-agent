@@ -4,7 +4,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 import sqlalchemy as sa
@@ -16,9 +16,22 @@ from healthmes.app import _initialize_activity_storage
 from healthmes.storage import (
     ensure_default_policies,
     run_storage_maintenance,
+    update_retention_policy,
 )
+from healthmes.storage import service as storage_service
 from healthmes.storage.service import DEFAULT_RETENTION
-from healthmes.store import Base, RetentionPolicy, create_db_engine
+from healthmes.store import (
+    Base,
+    RetentionPolicy,
+    WellnessEvent,
+    create_db_engine,
+)
+from healthmes.wearables import provenance as wearable_provenance
+from healthmes.wearables.provenance import (
+    OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+    OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+    persist_open_wearables_observation,
+)
 
 
 @pytest.mark.skipif(
@@ -187,4 +200,172 @@ def test_activity_bootstrap_takes_write_plane_before_policy_inserts(
         engine.dispose()
         with admin_engine.begin() as connection:
             connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_wearable_writer_and_retention_shrink_share_write_fence(
+    monkeypatch,
+) -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_test_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    now = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    with factory() as session:
+        update_retention_policy(
+            session,
+            OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+            "30d",
+            now=now,
+        )
+        session.commit()
+
+    policy_read = threading.Event()
+    release_writer = threading.Event()
+    original_policy = wearable_provenance._retention_policy
+
+    def paused_policy(session):
+        policy = original_policy(session)
+        if not policy_read.is_set():
+            policy_read.set()
+            assert release_writer.wait(timeout=10)
+        return policy
+
+    monkeypatch.setattr(
+        wearable_provenance,
+        "_retention_policy",
+        paused_policy,
+    )
+    failures: list[BaseException] = []
+    updater_pid: list[int] = []
+    updater_started = threading.Event()
+
+    def write_snapshot() -> None:
+        with factory() as session:
+            try:
+                persist_open_wearables_observation(
+                    session,
+                    normalized_context={
+                        "date": "2026-08-10",
+                        "status": "ok",
+                    },
+                    local_day=date(2026, 8, 10),
+                    timezone="UTC",
+                    collected_at=now,
+                    now=now,
+                )
+                session.commit()
+            except BaseException as exc:
+                session.rollback()
+                failures.append(exc)
+
+    def shrink_retention() -> None:
+        with factory() as session:
+            updater_pid.append(
+                int(
+                    session.scalar(
+                        sa.text("SELECT pg_backend_pid()")
+                    )
+                )
+            )
+            updater_started.set()
+            try:
+                storage_service._update_retention_policy(
+                    session,
+                    OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+                    "1d",
+                    now=now,
+                )
+                session.commit()
+            except BaseException as exc:
+                session.rollback()
+                failures.append(exc)
+
+    writer = threading.Thread(target=write_snapshot)
+    updater: threading.Thread | None = None
+    try:
+        writer.start()
+        assert policy_read.wait(timeout=5)
+        updater = threading.Thread(target=shrink_retention)
+        updater.start()
+        assert updater_started.wait(timeout=5)
+
+        deadline = time.monotonic() + 5
+        waiting_for_advisory_lock = False
+        while (
+            time.monotonic() < deadline
+            and updater.is_alive()
+        ):
+            with factory() as observer:
+                wait_event = observer.execute(
+                    sa.text(
+                        "SELECT wait_event_type, wait_event "
+                        "FROM pg_stat_activity WHERE pid = :pid"
+                    ),
+                    {"pid": updater_pid[0]},
+                ).one_or_none()
+            if wait_event is not None and tuple(wait_event) == (
+                "Lock",
+                "advisory",
+            ):
+                waiting_for_advisory_lock = True
+                break
+            time.sleep(0.05)
+
+        assert waiting_for_advisory_lock
+        release_writer.set()
+        writer.join(timeout=10)
+        updater.join(timeout=10)
+
+        assert not writer.is_alive()
+        assert not updater.is_alive()
+        assert failures == []
+        with factory() as session:
+            policy = session.scalar(
+                sa.select(RetentionPolicy).where(
+                    RetentionPolicy.data_class
+                    == OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS
+                )
+            )
+            assert policy is not None
+            assert policy.retention_days == 1
+            rows = session.scalars(
+                sa.select(WellnessEvent).where(
+                    WellnessEvent.source_provider
+                    == OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+                )
+            ).all()
+            assert len(rows) == 2
+            assert {
+                row.expires_at
+                for row in rows
+            } == {
+                datetime(2026, 8, 11, tzinfo=UTC)
+            }
+    finally:
+        release_writer.set()
+        writer.join(timeout=5)
+        if updater is not None:
+            updater.join(timeout=5)
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
         admin_engine.dispose()

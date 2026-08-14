@@ -165,7 +165,9 @@ score = 100
   − fragmentation_penalty   (app_usage_sample: 방해성 앱 실행 빈도 — 데이터 있을 때만)
 ```
 
-- **누락 신호는 항 자체가 빠지고 가중치 재정규화** (iOS 사용자는 앱사용 데이터 없음, Fitbit/Strava는 수면조차 없음 — 필수 설계).
+- **누락 신호는 항 자체가 빠지고 가중치 재정규화** (일반 iOS 빌드는
+  앱사용 데이터가 없고, 조건부 Screen Time aggregate도 coverage가 없으면
+  결측으로 처리; Fitbit/Strava는 수면조차 없음 — 필수 설계).
 - 개인 baseline = 14일 트레일링 중앙값, 매일 밤 재계산. HRV는 야간(수면 구간) 측정만 사용 — 주간 스팟 측정은 노이즈.
 - **실행 위치: HealthMes 서비스 내 APScheduler** (매시간 persist + 온디맨드 엔드포인트). Celery beat(벤더 수정 필요)와 Hermes cron(결정론적 산수에 LLM 호출 낭비) 기각.
 
@@ -210,7 +212,25 @@ receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한
 ## 7. 앱사용 추적 — 현실 점검
 
 - **Android (MVP 경로):** 최소 컴패니언 앱 `apps/android-usage/` (Kotlin, 페어링+토글 한 화면). `UsageStatsManager.queryEvents` + WorkManager 30분 주기 → 시간별 버킷을 `POST /v1/app-usage/batch`로 전송. ~1주 작업량.
-- **iOS: DeviceActivity/Screen Time API는 데이터 오프디바이스 반출 불가** (샌드박스 확장 안에서만 렌더). **권장: MVP에서 스킵** — 엔진이 신호 없이 재정규화. 옵션으로 주간 Screen Time 스크린샷을 Telegram 봇에 보내면 비전 모델이 대략적 버킷으로 추출하는 습관을 문서화 (capture 스킬 덕에 거의 공짜). 네이티브 iOS 추적은 만들지 않음.
+- **iOS (조건부 aggregate 경로):** 최신 Apple App & Website Usage data-access
+  capability가 허용되는 환경에서는 완료된 local-hour별 앱 사용시간과 category를
+  수집해 `POST /v1/activity/ios/report`로 보낸다. 앱 ID는 기기 Keychain key로
+  HMAC 가명화하고 pickup을 launch로 가장하지 않는다. capability, entitlement,
+  사용자·지역 조건이 맞지 않으면 사용시간 `0` 대신 명시적 unavailable 상태를
+  보고한다. 수집·sync service seam과 서버 계약은 구현됐고, entitlement,
+  lifecycle/background refresh, 실제 UI와 실기기 dogfood는 device-team
+  후속이다.
+- **통합 설정:** 데스크톱 웹과 미래 iPhone UI는
+  `GET /v1/inputs`, `GET /v1/inputs/{source_id}`,
+  `PUT /v1/inputs/{source_id}/settings`를 사용한다. 이 API는 별도 설정 DB를
+  만들지 않고 activity collector의 기기별 수집 제어, domain별 Decision Agent
+  동의와 데이터 클래스별 보존 정책을 합성한다. Nutrition, Wearable, Calendar는
+  실제 adapter가 강제하는 connect/disconnect/sync action만 노출하며 구현되지
+  않은 범용 enable/pause를 만들지 않는다. 기존 HealthKit raw-first receiver도
+  `wearable.healthkit-bridge` source로 같은 목록에 포함한다.
+- **GPS/location 후속:** iOS와 Android의 opt-in, coarse-first 수집,
+  source-side private zone, 짧은 raw 좌표 보존, 파생 이동 context와 Decision
+  Agent provider는 Issue #158에서 구현한다.
 
 ## 8. 음식 + 의료 라이트 캡처
 
@@ -285,10 +305,11 @@ worktree 격리의 상세 계약은
 ## 11. 리스크 & 단순화
 
 - **최대 리스크 — 알림 소음.** 잘못 울리는 비서는 일주일 안에 음소거된다. 완화: 결정론적 트리거가 모든 push를 게이트(LLM 자체 발화 금지), 룰별 쿨다운, 일일 alert 예산, 방해금지 시간.
-- **iOS 사용량은 하드월** — 싸우지 않고 우회 설계 (§7).
+- **iOS 상세 foreground timeline은 하드월** — 조건부 Screen Time aggregate
+  export seam만 사용하고 private API로 우회하지 않는다 (§7).
 - **캘린더 쓰기 신뢰:** propose-then-confirm으로 시작.
 - **벤더 드리프트:** 커플링 표면은 open-wearables REST v1 + MCP 도구명, Hermes config/skill/cron/웹훅 계약뿐. compose 부팅 + Phase-0 데모 쿼리를 CI 스모크 테스트로.
-- **MVP에서 잘라낸 것:** Telegram 외 모든 채널, 네이티브 워치/폰 앱(Android 사용량 수집기 제외), ML 전부, 자유형 인사이트 마이닝, React 의사결정 UI(Mermaid 먼저), 멀티유저, 클라우드 백업 서비스, iOS 사용량 캡처, Hermes MoA 루프.
+- **MVP에서 잘라낸 것:** Telegram 외 모든 채널, 네이티브 워치/폰 앱(Android 사용량 수집기 제외), ML 전부, 자유형 인사이트 마이닝, React 의사결정 UI(Mermaid 먼저), 멀티유저, 클라우드 백업 서비스, production iOS Screen Time device integration, Hermes MoA 루프.
 - **이미 확보한 단순화:** Telegram=캡처앱(모바일 앱 하나 제거), MCP=글루(커스텀 통합 API 제거), 소유권 분할 캘린더 동기화(충돌 해결 제거), 룰 기반 에너지 엔진(ML 파이프라인 제거).
 
 ## 검증 방법
@@ -495,6 +516,11 @@ issue #10(풀 네이티브 폰 앱)·#11(macOS/Windows 데스크톱 글랜스)�
 - ✅ 이번에 추가: **월 목표**(monthly_goal + 주 목표 연결, list_goals/upsert_goal),
   **전날 과부하 이월**(carryover_load, 어제 예약시간 4h→9h 램프, 어제 데이터
   없으면 결측 처리로 기존 흐름 바이트 동일).
-- ⏸ 보류: **노트북 스크린타임** — 맥 컴패니언 앱 코드 필요 = 네이티브 보류
-  원칙과 충돌. 앱 작업 재개 시 함께 (이슈로 기록).
-- ❌ 불가(구조적): 아이폰 스크린타임(애플 미개방), 피부전기활동(애플워치 센서 없음).
+- ✅ 구현: **ActivityWatch 기반 데스크톱 활동 수집** — macOS, Windows, Linux의
+  localhost 데이터를 bounded import와 scheduler로 중앙 activity 저장소에 적재.
+- ⏸ 보류: **macOS companion 자체의 네이티브 활동 수집기** — 네이티브 앱 작업
+  재개 시 별도 구현.
+- ⚠️ 조건부: 아이폰 상세 foreground timeline은 제공하지 않는다. Screen Time
+  aggregate export용 server/sync seam은 있으나 일반 빌드에서는 비활성이고
+  entitlement·lifecycle·실기기 통합은 후속이다.
+- ❌ 불가(구조적): 피부전기활동(애플워치 센서 없음).

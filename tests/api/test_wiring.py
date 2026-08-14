@@ -34,6 +34,9 @@ EXPECTED_PATHS = [
     "/connect",
     "/v1/storage/settings",
     "/v1/storage/maintenance",
+    "/v1/inputs",
+    "/v1/inputs/{source_id}",
+    "/v1/inputs/{source_id}/settings",
     "/v1/wellness-events",
     "/v1/wellness-decisions",
     "/v1/wellness-decisions/settings",
@@ -42,7 +45,7 @@ EXPECTED_PATHS = [
 
 
 def test_routers_list_covers_all_modules():
-    assert len(routers) == 21
+    assert len(routers) == 22
 
 
 def test_openapi_schema_generates_with_all_paths(client):
