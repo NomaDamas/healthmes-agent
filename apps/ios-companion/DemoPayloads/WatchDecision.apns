@@ -11,7 +11,8 @@
     },
     {
       "title": "Speak",
-      "identifier": "HEALTHMES_SPEAK"
+      "identifier": "HEALTHMES_SPEAK",
+      "behavior": "textInput"
     }
   ],
   "aps": {
