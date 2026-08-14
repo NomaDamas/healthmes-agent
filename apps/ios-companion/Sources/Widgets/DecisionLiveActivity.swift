@@ -9,10 +9,10 @@
 
         var body: some WidgetConfiguration {
             ActivityConfiguration(for: DecisionActivityAttributes.self) { context in
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
                         Image(systemName: "waveform.path.ecg")
-                        Text(verbatim: "HEALTHMES · DECISION")
+                        Text(verbatim: "HEALTHMES")
                         Spacer()
                         if isActionable(context) {
                             Text(
@@ -27,23 +27,25 @@
 
                     Text(verbatim: context.state.title)
                         .font(.headline)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    Text(verbatim: statusReason(context.state, isStale: context.isStale))
-                        .font(.subheadline)
-                        .foregroundStyle(
-                            context.state.status == .failed ? Color.red : healthGreen
-                        )
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.88)
 
                     if isActionable(context) {
-                        Text(verbatim: context.state.target)
-                            .font(.subheadline)
+                        Label {
+                            Text(verbatim: context.state.target)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.85)
+                        } icon: {
+                            Image(systemName: "calendar.badge.clock")
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(healthGreen)
+
+                        Text(verbatim: context.state.reason)
+                            .font(.caption)
                             .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
 
                         HStack(spacing: 8) {
                             Button(
@@ -51,7 +53,7 @@
                                     proposalID: context.attributes.proposalID
                                 )
                             ) {
-                                Label("No", systemImage: "xmark")
+                                Text("No")
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.bordered)
@@ -62,7 +64,7 @@
                                     proposalID: context.attributes.proposalID
                                 )
                             ) {
-                                Label("Yes", systemImage: "checkmark")
+                                Text("Yes")
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.borderedProminent)
@@ -70,15 +72,25 @@
 
                             Link(destination: speakURL(context.attributes.proposalID)) {
                                 Label("Speak", systemImage: "microphone.fill")
+                                    .labelStyle(.titleAndIcon)
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.bordered)
                             .tint(healthGreen)
                         }
-                        .font(.subheadline.weight(.semibold))
+                        .font(.caption.weight(.semibold))
+                        .controlSize(.small)
+                    } else {
+                        Text(verbatim: statusReason(context.state, isStale: context.isStale))
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(
+                                context.state.status == .failed ? Color.red : healthGreen
+                            )
+                            .lineLimit(2)
                     }
                 }
-                .padding(14)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
                 .activityBackgroundTint(nil)
                 .widgetURL(URL(string: "healthmes://proposal?id=\(context.attributes.proposalID)"))
                 .accessibilityElement(children: .contain)
