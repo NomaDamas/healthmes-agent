@@ -80,9 +80,8 @@ public struct AlertNotificationContent: Equatable {
     public static let userInfoDecisionEndsAt = "healthmes_decision_ends_at"
     public static let userInfoDecisionExpiresAt = "healthmes_decision_expires_at"
 
-    /// A glanceable decision question. Actionable content is kept to one
-    /// short line so watchOS can surface the actions without scrolling past
-    /// health evidence first.
+    /// The complete decision question. Compact system banners may truncate it,
+    /// but expanded iPhone and Watch surfaces must retain the original text.
     public let title: String
     /// One short health reason shown directly below the decision.
     public let subtitle: String
@@ -149,6 +148,21 @@ public struct AlertNotificationContent: Equatable {
         )
         guard !stem.isEmpty else { return "" }
         return compactLine(stem, limit: max(1, limit - 1)) + "?"
+    }
+
+    public static func fullQuestionLine(_ text: String) -> String {
+        let singleLine = text
+            .split(whereSeparator: \.isNewline)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !singleLine.isEmpty else { return "" }
+        if singleLine.hasSuffix("?") {
+            return singleLine
+        }
+        let stem = singleLine.trimmingCharacters(
+            in: CharacterSet(charactersIn: ".!。！？? ")
+        )
+        return stem.isEmpty ? "" : stem + "?"
     }
 
     public init(
@@ -228,7 +242,13 @@ public struct AlertNotificationContent: Equatable {
             userInfo[userInfoDecisionExpiresAt] = formatter.string(from: card.expiresAt)
         }
 
-        let actionPrompt = ProposalActionPresentation.exactPrompt(alert: alert)
+        let actionText =
+            correlatedCard?.proposedAction
+            ?? alert.proposal
+        let actionPrompt = actionText.flatMap {
+            let prompt = fullQuestionLine($0)
+            return prompt.isEmpty ? nil : prompt
+        }
         // A proposal id is not enough for safe Yes/No controls. The user must
         // also see the concrete mutation those controls will resolve.
         let isActionable = exactProposalID != nil && actionPrompt != nil
@@ -237,16 +257,16 @@ public struct AlertNotificationContent: Equatable {
         let body: String
         if let card = correlatedCard, let actionPrompt, isActionable {
             title = actionPrompt
-            subtitle = compactLine(card.observationShort, limit: 28)
+            subtitle = card.observationShort
             body = targetLine(after: card.after)
         } else if let actionPrompt, isActionable {
             title = actionPrompt
-            subtitle = compactLine(alert.summary, limit: 28)
-            body = compactLine(evidenceLine(alert.evidence) ?? "", limit: 32)
+            subtitle = alert.summary
+            body = evidenceLine(alert.evidence) ?? ""
         } else {
-            title = compactLine(alert.summary, limit: 26)
+            title = alert.summary
             subtitle = ""
-            body = compactLine(bodyLines.joined(separator: " "), limit: 32)
+            body = bodyLines.joined(separator: " ")
         }
 
         return AlertNotificationContent(

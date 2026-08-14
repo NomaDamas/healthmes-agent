@@ -458,6 +458,8 @@ struct WatchDecisionRemoteView: View {
     @ObservedObject var model: WatchDecisionRemoteModel
     @State private var detail: WatchDecisionDetail?
     @State private var isSpeaking = false
+    @State private var spokenDraft: String?
+    @State private var speakStatus: String?
 
     var body: some View {
         Group {
@@ -478,133 +480,199 @@ struct WatchDecisionRemoteView: View {
     }
 
     private func pending(_ decision: PendingDecision) -> some View {
-        VStack(spacing: 7) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Label("CHANGE", systemImage: "calendar.badge.clock")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(Color(red: 0.42, green: 0.88, blue: 0.76))
-                        Spacer()
-                        if let score = model.energyScore {
-                            Text(verbatim: "\(score)%")
-                                .font(.caption2.bold().monospacedDigit())
-                                .foregroundStyle(energyTint(score))
-                                .accessibilityLabel(Text("Cognitive energy"))
-                                .accessibilityValue(Text(verbatim: "\(score) percent"))
-                        }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Label("CHANGE", systemImage: "calendar.badge.clock")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Color(red: 0.42, green: 0.88, blue: 0.76))
+                    Spacer()
+                    if let score = model.energyScore {
+                        Text(verbatim: "\(score)%")
+                            .font(.caption2.bold().monospacedDigit())
+                            .foregroundStyle(energyTint(score))
+                            .accessibilityLabel(Text("Cognitive energy"))
+                            .accessibilityValue(Text(verbatim: "\(score) percent"))
                     }
-
-                    Text(verbatim: decision.watchActionTitle)
-                        .font(.headline.weight(.bold))
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.82)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    if let reason = decision.watchReason {
-                        Text(verbatim: reason)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    if !model.isDecisionContextReady {
-                        Label("Confirming calendar time", systemImage: "clock")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    } else if let before = decision.card?.before {
-                        HStack(spacing: 5) {
-                            watchTime(before)
-                                .foregroundStyle(.secondary)
-                            Image(systemName: "arrow.right")
-                                .font(.caption2.bold())
-                                .foregroundStyle(.orange)
-                            watchTime(decision.card?.after ?? decision.proposal.proposedStart)
-                                .foregroundStyle(.primary)
-                        }
-                        .font(.system(.caption, design: .rounded).weight(.bold))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
-                        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel(Text("Schedule moves"))
-                    } else {
-                        Text(
-                            verbatim: ProposalFormat.watchWindowLine(
-                                decision.proposal,
-                                timeZone: TimeZone(identifier: model.timezone)
-                                    ?? .autoupdatingCurrent
-                            )
-                        )
-                            .font(.caption.weight(.semibold))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.72)
-                    }
-
-                    Button {
-                        detail = WatchDecisionDetail(
-                            decision: decision,
-                            timezone: model.timezone
-                        )
-                    } label: {
-                        Label("Why?", systemImage: "info.circle")
-                            .font(.caption2.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .accessibilityHint(Text("Shows the reason and supporting evidence"))
                 }
-            }
-            .scrollIndicators(.hidden)
-            .frame(maxHeight: .infinity, alignment: .top)
 
-            VStack(spacing: 5) {
-                HStack(spacing: 7) {
-                    decisionButton(
-                        title: "No",
-                        image: "xmark",
-                        action: .decline,
-                        prominent: false,
-                        accessibilityLabel: "Reject: \(decision.primaryActionText)"
+                Text(verbatim: decision.watchActionTitle)
+                    .font(.headline.weight(.bold))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let reason = decision.watchReason {
+                    Text(verbatim: reason)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if !model.isDecisionContextReady {
+                    Label("Confirming calendar time", systemImage: "clock")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                } else if let before = decision.card?.before {
+                    HStack(spacing: 5) {
+                        watchTime(before)
+                            .foregroundStyle(.secondary)
+                        Image(systemName: "arrow.right")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.orange)
+                        watchTime(decision.card?.after ?? decision.proposal.proposedStart)
+                            .foregroundStyle(.primary)
+                    }
+                    .font(.system(.caption, design: .rounded).weight(.bold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(Text("Schedule moves"))
+                } else {
+                    Text(
+                        verbatim: ProposalFormat.watchWindowLine(
+                            decision.proposal,
+                            timeZone: TimeZone(identifier: model.timezone)
+                                ?? .autoupdatingCurrent
+                        )
                     )
-                    decisionButton(
-                        title: "Yes",
-                        image: "checkmark",
-                        action: .accept,
-                        prominent: true,
-                        accessibilityLabel: "Approve: \(decision.primaryActionText)"
-                    )
+                        .font(.caption.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Button {
-                    presentSpeakInput(for: decision)
+                    detail = WatchDecisionDetail(
+                        decision: decision,
+                        timezone: model.timezone
+                    )
                 } label: {
-                    Group {
-                        if isSpeaking {
-                            ProgressView()
-                        } else {
-                            Label("Speak", systemImage: "microphone.fill")
-                                .font(.caption.weight(.bold))
-                        }
-                    }
-                    .frame(maxWidth: .infinity, minHeight: 28)
+                    Label("Why?", systemImage: "info.circle")
+                        .font(.caption2.weight(.semibold))
+                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.bordered)
-                .tint(Color(red: 0.42, green: 0.88, blue: 0.76))
-                .disabled(model.applyingAction != nil || isSpeaking)
-                .accessibilityHint(
-                    Text("Dictate a different instruction to HealthMes")
-                )
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityHint(Text("Shows the reason and supporting evidence"))
+
+                if let speakStatus {
+                    Label(speakStatus, systemImage: "checkmark.circle.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Color(red: 0.42, green: 0.88, blue: 0.76))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if let spokenDraft {
+                    spokenConfirmation(spokenDraft, decision: decision)
+                } else {
+                    VStack(spacing: 5) {
+                        HStack(spacing: 7) {
+                            decisionButton(
+                                title: "No",
+                                image: "xmark",
+                                action: .decline,
+                                prominent: false,
+                                accessibilityLabel: "Reject: \(decision.primaryActionText)"
+                            )
+                            decisionButton(
+                                title: "Yes",
+                                image: "checkmark",
+                                action: .accept,
+                                prominent: true,
+                                accessibilityLabel: "Approve: \(decision.primaryActionText)"
+                            )
+                        }
+
+                        Button {
+                            presentSpeakInput(for: decision)
+                        } label: {
+                            Group {
+                                if isSpeaking {
+                                    ProgressView()
+                                } else {
+                                    Label("Speak", systemImage: "microphone.fill")
+                                        .font(.caption.weight(.bold))
+                                }
+                            }
+                            .frame(maxWidth: .infinity, minHeight: 28)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(Color(red: 0.42, green: 0.88, blue: 0.76))
+                        .disabled(model.applyingAction != nil || isSpeaking)
+                        .accessibilityHint(
+                            Text("Dictate a different instruction to HealthMes")
+                        )
+                    }
+                    .padding(.top, 2)
+                }
             }
-            .padding(.top, 2)
+            .padding(.bottom, 6)
         }
+        .scrollIndicators(.visible)
+    }
+
+    private func spokenConfirmation(
+        _ transcript: String,
+        decision: PendingDecision
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Recognized")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            Text(verbatim: transcript)
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    Color.white.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 9)
+                )
+
+            Button {
+                applySpokenDraft(transcript, decision: decision)
+            } label: {
+                Label("Apply", systemImage: "checkmark")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(Color(red: 0.03, green: 0.55, blue: 0.46))
+
+            Button {
+                presentSpeakInput(for: decision)
+            } label: {
+                Label("Record Again", systemImage: "arrow.counterclockwise")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(isSpeaking)
+        }
+    }
+
+    private func applySpokenDraft(
+        _ transcript: String,
+        decision: PendingDecision
+    ) {
+        let command = SpeakCommand.compose(
+            userText: transcript,
+            proposalID: decision.id,
+            title: decision.card?.title,
+            proposedAction: decision.primaryActionText
+        )
+        guard WCSession.isSupported() else {
+            speakStatus = String(localized: "iPhone connection is unavailable.")
+            return
+        }
+        WCSession.default.transferUserInfo([
+            SpeakCommandSyncKeys.command: command
+        ])
+        spokenDraft = nil
+        speakStatus = String(localized: "Instruction queued for HealthMes.")
     }
 
     private func presentSpeakInput(for decision: PendingDecision) {
         guard !isSpeaking else { return }
         isSpeaking = true
+        speakStatus = nil
         WKExtension.shared().visibleInterfaceController?.presentTextInputController(
             withSuggestions: nil,
             allowedInputMode: .plain
@@ -612,19 +680,11 @@ struct WatchDecisionRemoteView: View {
             Task { @MainActor in
                 defer { isSpeaking = false }
                 guard
-                    let spoken = results?.first as? String,
-                    !spoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    let spoken = results?.first as? String
                 else { return }
-                let command = SpeakCommand.compose(
-                    userText: spoken,
-                    proposalID: decision.id,
-                    title: decision.card?.title,
-                    proposedAction: decision.primaryActionText
-                )
-                guard WCSession.isSupported() else { return }
-                WCSession.default.transferUserInfo([
-                    SpeakCommandSyncKeys.command: command
-                ])
+                let clean = spoken.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !clean.isEmpty else { return }
+                spokenDraft = clean
             }
         }
     }

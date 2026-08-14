@@ -31,7 +31,7 @@ final class NotificationContentTests: XCTestCase {
         XCTAssertTrue(content.title.hasPrefix("Move the 14:00 block"))
         XCTAssertTrue(content.title.hasSuffix("?"))
         XCTAssertEqual(content.subtitle, "Recovery 38 today.")
-        XCTAssertLessThanOrEqual(content.body.count, 32)
+        XCTAssertEqual(content.body, "baseline_days 14 · hrv_delta_pct -18")
         XCTAssertFalse(content.body.contains("\n"))
         XCTAssertTrue(content.body.hasPrefix("baseline_days 14"))
         // Buttons only exist because a real pending proposal is attached.
@@ -73,7 +73,7 @@ final class NotificationContentTests: XCTestCase {
         XCTAssertNil(content.userInfo[AlertNotificationContent.userInfoDecisionURL])
     }
 
-    func testDecisionCardUsesCompactActionableBannerAndExtensionPayload() {
+    func testDecisionCardUsesCompleteActionableCopyAndExtensionPayload() {
         let after = Date(timeIntervalSince1970: 1_783_674_600)
         let endsAt = after.addingTimeInterval(5_400)
         let expiresAt = Date(timeIntervalSince1970: 1_783_610_400)
@@ -108,7 +108,7 @@ final class NotificationContentTests: XCTestCase {
 
         XCTAssertEqual(
             content.title,
-            AlertNotificationContent.questionLine(card.proposedAction)
+            AlertNotificationContent.fullQuestionLine(card.proposedAction)
         )
         XCTAssertEqual(content.subtitle, "Sleep debt is high")
         XCTAssertTrue(content.body.hasPrefix("→ "))
@@ -129,6 +129,46 @@ final class NotificationContentTests: XCTestCase {
         XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionAfter])
         XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionEndsAt])
         XCTAssertNotNil(content.userInfo[AlertNotificationContent.userInfoDecisionExpiresAt])
+    }
+
+    func testActionableNotificationPreservesCompleteDecisionCopy() {
+        let longAction =
+            "Move the afternoon deep-work block to tomorrow morning after the recovery window"
+        let longObservation =
+            "Recovery is below your personal baseline after a short night and a high-stress morning"
+        let card = DecisionCard(
+            decisionId: alertID,
+            proposalId: proposalID,
+            kind: "schedule_change",
+            severity: "coaching",
+            title: "Deep Work",
+            observationShort: longObservation,
+            evidenceShort: "HRV is 18% below baseline",
+            proposedAction: longAction,
+            before: nil,
+            after: Date(timeIntervalSince1970: 1_783_674_600),
+            endsAt: Date(timeIntervalSince1970: 1_783_680_000),
+            expiresAt: Date(timeIntervalSince1970: 1_783_610_400),
+            decisionUrl: nil
+        )
+        let alert = AlertItem(
+            id: alertID,
+            ruleId: "full-copy",
+            firedAt: Date(),
+            summary: "Fallback",
+            proposal: nil,
+            evidence: nil,
+            decisionUrl: nil,
+            proposalId: proposalID,
+            decisionCard: card
+        )
+
+        let content = AlertNotificationContent.from(alert: alert)
+
+        XCTAssertEqual(content.title, longAction + "?")
+        XCTAssertEqual(content.subtitle, longObservation)
+        XCTAssertFalse(content.title.contains("…"))
+        XCTAssertFalse(content.subtitle.contains("…"))
     }
 
     func testDecisionPromptMapsRealServerKindsHonestly() {
@@ -295,7 +335,10 @@ final class NotificationContentTests: XCTestCase {
         let content = AlertNotificationContent.from(alert: page.data[0])
         XCTAssertTrue(content.title.hasPrefix("Move the 14:00 block"))
         XCTAssertTrue(content.title.hasSuffix("?"))
-        XCTAssertLessThanOrEqual(content.body.count, 32)
+        XCTAssertEqual(
+            content.body,
+            "baseline_days 14 · hrv_delta_pct -18"
+        )
         XCTAssertFalse(content.body.contains("\n"))
         XCTAssertEqual(content.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(

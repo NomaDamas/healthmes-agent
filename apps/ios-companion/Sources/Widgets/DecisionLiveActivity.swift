@@ -27,21 +27,23 @@
 
                     Text(verbatim: context.state.title)
                         .font(.headline)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
 
                     Text(verbatim: statusReason(context.state, isStale: context.isStale))
                         .font(.subheadline)
                         .foregroundStyle(
                             context.state.status == .failed ? Color.red : healthGreen
                         )
-                        .lineLimit(1)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
 
                     if isActionable(context) {
                         Text(verbatim: context.state.target)
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
 
                         HStack(spacing: 10) {
                             Button(
@@ -65,19 +67,8 @@
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(healthGreen)
-
-                            Link(
-                                destination: speakURL(
-                                    proposalID: context.attributes.proposalID
-                                )
-                            ) {
-                                Label("Speak", systemImage: "microphone.fill")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(healthGreen)
                         }
-                        .font(.subheadline.weight(.semibold))
+                        .font(.headline)
                     }
                 }
                 .padding(14)
@@ -103,7 +94,7 @@
                         VStack(alignment: .leading, spacing: 6) {
                             Text(verbatim: context.state.title)
                                 .font(.headline)
-                                .lineLimit(1)
+                                .lineLimit(2)
                             Text(
                                 verbatim: statusReason(
                                     context.state,
@@ -127,13 +118,6 @@
                                         )
                                     ) {
                                         Label("Yes", systemImage: "checkmark")
-                                    }
-                                    Link(
-                                        destination: speakURL(
-                                            proposalID: context.attributes.proposalID
-                                        )
-                                    ) {
-                                        Label("Speak", systemImage: "microphone.fill")
                                     }
                                 }
                                 .buttonStyle(.bordered)
@@ -197,8 +181,5 @@
             min(Date(), end)...end
         }
 
-        private func speakURL(proposalID: String) -> URL {
-            URL(string: "healthmes://speak?proposal=\(proposalID)")!
-        }
     }
 #endif

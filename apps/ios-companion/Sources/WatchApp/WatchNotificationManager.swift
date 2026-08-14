@@ -24,10 +24,10 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
         let speak = UNTextInputNotificationAction(
             identifier: AlertNotificationActionID.speak,
             title: String(localized: "Speak"),
-            options: [.foreground],
+            options: [.authenticationRequired],
             icon: UNNotificationActionIcon(systemImageName: "microphone.fill"),
-            textInputButtonTitle: String(localized: "Send"),
-            textInputPlaceholder: String(localized: "Speak to HealthMes")
+            textInputButtonTitle: String(localized: "Apply"),
+            textInputPlaceholder: String(localized: "Speak, review, then apply")
         )
         center.setNotificationCategories([
             UNNotificationCategory(
@@ -63,10 +63,13 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
 
             let content = UNMutableNotificationContent()
             content.title = String(
-                format: String(localized: "Move %@?"),
-                String(localized: "Deep Work")
+                localized:
+                    "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
             )
-            content.subtitle = String(localized: "Low recovery · sleep debt")
+            content.subtitle = String(
+                localized:
+                    "Recovery is below your baseline after short sleep and a high-stress morning"
+            )
             content.body = AlertNotificationContent.targetLine(after: proposedStart)
             content.categoryIdentifier = AlertNotificationContent.actionableCategoryID
             content.sound = .default
@@ -76,7 +79,7 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
                 AlertNotificationContent.userInfoDecisionTitle:
                     String(localized: "Deep Work"),
                 AlertNotificationContent.userInfoDecisionObservation:
-                    String(localized: "Low recovery · sleep debt"),
+                    content.subtitle,
                 AlertNotificationContent.userInfoDecisionEvidence:
                     String(localized: "HRV is 18% below your baseline"),
                 AlertNotificationContent.userInfoDecisionAction:

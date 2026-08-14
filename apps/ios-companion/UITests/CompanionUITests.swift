@@ -218,7 +218,7 @@ final class CompanionUITests: XCTestCase {
     /// Visual contract for #91: the ordinary compact banner arrives first,
     /// then expanding it reveals the glass decision remote without opening
     /// the HealthMes app.
-    func testExpandedDecisionNotificationShowsNoAndYes() throws {
+    func testExpandedDecisionNotificationShowsNoYesAndInlineSpeak() throws {
         let app = XCUIApplication()
         app.launchArguments += ["-healthmes-notification-demo"]
 
@@ -235,14 +235,18 @@ final class CompanionUITests: XCTestCase {
         XCUIDevice.shared.press(.home)
 
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let notificationTitle = springboard.staticTexts["Move Deep Work?"]
+        let notificationTitle = springboard.staticTexts[
+            "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
+        ]
         XCTAssertTrue(
             notificationTitle.waitForExistence(timeout: 20),
             "The deterministic HealthMes decision notification should appear."
         )
         XCTAssertTrue(
-            springboard.staticTexts["Low recovery · sleep debt"].waitForExistence(timeout: 5),
-            "The compact notification must explain the health reason immediately."
+            springboard.staticTexts[
+                "Recovery is below your baseline after short sleep and a high-stress morning"
+            ].waitForExistence(timeout: 5),
+            "The notification must retain the complete health reason."
         )
         XCTAssertFalse(
             springboard.buttons["healthmes-decision-yes"].exists,
@@ -268,11 +272,42 @@ final class CompanionUITests: XCTestCase {
         let yes = springboard.buttons["healthmes-decision-yes"]
         XCTAssertTrue(no.waitForExistence(timeout: 5), "Expanded notification must show No.")
         XCTAssertTrue(yes.waitForExistence(timeout: 5), "Expanded notification must show Yes.")
+        let speak = springboard.buttons["Speak"]
+        XCTAssertTrue(
+            speak.waitForExistence(timeout: 5),
+            "Expanded notification must expose native inline Speak."
+        )
 
         let screenshot = XCTAttachment(screenshot: springboard.screenshot())
         screenshot.name = "HealthMes expanded decision notification"
         screenshot.lifetime = .keepAlways
         add(screenshot)
+
+        speak.tap()
+        let transcriptField = springboard.textFields.firstMatch
+        let transcriptTextView = springboard.textViews.firstMatch
+        XCTAssertTrue(
+            transcriptField.waitForExistence(timeout: 5)
+                || transcriptTextView.waitForExistence(timeout: 2),
+            "Speak must show transcript review inside the notification."
+        )
+        let transcript = transcriptField.exists
+            ? transcriptField
+            : transcriptTextView
+        transcript.tap()
+        transcript.typeText("Move it to 10 AM instead")
+        let apply = springboard.buttons["Apply"]
+        let systemSend = springboard.buttons["Send"]
+        XCTAssertTrue(
+            apply.waitForExistence(timeout: 2)
+                || systemSend.waitForExistence(timeout: 2),
+            "The notification must require explicit submission after transcript review."
+        )
+
+        let speakScreenshot = XCTAttachment(screenshot: springboard.screenshot())
+        speakScreenshot.name = "HealthMes inline Speak transcript review"
+        speakScreenshot.lifetime = .keepAlways
+        add(speakScreenshot)
     }
 
     private func keepScreenshot(_ name: String, app: XCUIApplication) {

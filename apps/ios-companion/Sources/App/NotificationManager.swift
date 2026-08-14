@@ -44,10 +44,10 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         let speak = UNTextInputNotificationAction(
             identifier: AlertNotificationActionID.speak,
             title: String(localized: "Speak"),
-            options: [.foreground],
+            options: protectedActionOptions,
             icon: UNNotificationActionIcon(systemImageName: "microphone.fill"),
-            textInputButtonTitle: String(localized: "Send"),
-            textInputPlaceholder: String(localized: "Speak to HealthMes")
+            textInputButtonTitle: String(localized: "Apply"),
+            textInputPlaceholder: String(localized: "Speak, review the text, then apply")
         )
         let actionable = UNNotificationCategory(
             identifier: AlertNotificationContent.actionableCategoryID,
@@ -133,10 +133,13 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             let proposalID =
                 UUID(uuidString: DecisionActivityAttributes.demoProposalID)!
             let prompt = String(
-                format: String(localized: "Move %@?"),
-                String(localized: "Deep Work")
+                localized:
+                    "Move the 2:00 PM focus block to tomorrow at 9:30 AM?"
             )
-            let reason = String(localized: "Low recovery · sleep debt")
+            let reason = String(
+                localized:
+                    "Recovery is below your baseline after short sleep and a high-stress morning"
+            )
             let target = AlertNotificationContent.targetLine(after: proposedStart)
             let expiresAt = now.addingTimeInterval(30 * 60)
 
@@ -164,7 +167,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                     AlertNotificationContent.userInfoProposalID:
                         proposalID.uuidString.lowercased(),
                     AlertNotificationContent.userInfoDecisionObservation:
-                        String(localized: "Low recovery · sleep debt"),
+                        reason,
                     AlertNotificationContent.userInfoDecisionTitle:
                         String(localized: "Deep Work"),
                     AlertNotificationContent.userInfoDecisionEvidence:

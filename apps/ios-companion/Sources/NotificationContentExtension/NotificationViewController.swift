@@ -10,11 +10,11 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
     private let reasonLabel = UILabel()
     private let timeLabel = UILabel()
     private let hintLabel = UILabel()
+    private let contentScrollView = UIScrollView()
     private let detailScrollView = UIScrollView()
     private let detailLabel = UILabel()
     private let noButton = UIButton(type: .system)
     private let yesButton = UIButton(type: .system)
-    private let speakButton = UIButton(type: .system)
     private var proposalID: UUID?
     private var expiresAt: Date?
     private let healthGreen = UIColor(red: 0.02, green: 0.34, blue: 0.25, alpha: 1)
@@ -42,21 +42,17 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         actionLabel.font = .preferredFont(forTextStyle: .title3)
         actionLabel.adjustsFontForContentSizeCategory = true
         actionLabel.textColor = .label
-        actionLabel.numberOfLines = 1
-        actionLabel.adjustsFontSizeToFitWidth = true
-        actionLabel.minimumScaleFactor = 0.78
+        actionLabel.numberOfLines = 0
 
         reasonLabel.font = .preferredFont(forTextStyle: .subheadline)
         reasonLabel.adjustsFontForContentSizeCategory = true
         reasonLabel.textColor = healthGreen
-        reasonLabel.numberOfLines = 1
-        reasonLabel.adjustsFontSizeToFitWidth = true
-        reasonLabel.minimumScaleFactor = 0.8
+        reasonLabel.numberOfLines = 0
 
         timeLabel.font = .preferredFont(forTextStyle: .subheadline)
         timeLabel.adjustsFontForContentSizeCategory = true
         timeLabel.textColor = .secondaryLabel
-        timeLabel.numberOfLines = 1
+        timeLabel.numberOfLines = 0
 
         hintLabel.text = String(localized: "Details")
         hintLabel.font = .preferredFont(forTextStyle: .footnote)
@@ -80,15 +76,12 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
 
         var noConfiguration: UIButton.Configuration
         var yesConfiguration: UIButton.Configuration
-        var speakConfiguration: UIButton.Configuration
         if #available(iOS 26.0, *) {
             noConfiguration = .glass()
             yesConfiguration = .prominentGlass()
-            speakConfiguration = .glass()
         } else {
             noConfiguration = .tinted()
             yesConfiguration = .filled()
-            speakConfiguration = .tinted()
         }
         noConfiguration.title = String(localized: "No")
         noConfiguration.image = UIImage(systemName: "xmark")
@@ -109,15 +102,6 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         yesButton.accessibilityIdentifier = "healthmes-decision-yes"
         yesButton.addTarget(self, action: #selector(acceptProposal), for: .touchUpInside)
 
-        speakConfiguration.title = String(localized: "Speak")
-        speakConfiguration.image = UIImage(systemName: "microphone.fill")
-        speakConfiguration.imagePadding = 6
-        speakConfiguration.cornerStyle = .large
-        speakConfiguration.baseForegroundColor = healthGreen
-        speakButton.configuration = speakConfiguration
-        speakButton.accessibilityIdentifier = "healthmes-decision-speak"
-        speakButton.addTarget(self, action: #selector(openSpeak), for: .touchUpInside)
-
         let signalRow = UIStackView(arrangedSubviews: [signalIconView, signalLabel])
         signalRow.axis = .horizontal
         signalRow.alignment = .center
@@ -134,7 +118,6 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
             reasonLabel,
             timeLabel,
             buttonRow,
-            speakButton,
             hintLabel,
             detailScrollView,
         ])
@@ -144,39 +127,73 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         stack.setCustomSpacing(4, after: actionLabel)
         stack.setCustomSpacing(4, after: reasonLabel)
         stack.setCustomSpacing(12, after: timeLabel)
-        stack.setCustomSpacing(8, after: buttonRow)
-        stack.setCustomSpacing(12, after: speakButton)
+        stack.setCustomSpacing(12, after: buttonRow)
         stack.setCustomSpacing(4, after: hintLabel)
         stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+        contentScrollView.alwaysBounceVertical = true
+        contentScrollView.showsVerticalScrollIndicator = true
+        contentScrollView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(contentScrollView)
+        contentScrollView.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
-            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 14),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -14),
+            contentScrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            contentScrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            contentScrollView.topAnchor.constraint(equalTo: view.topAnchor),
+            contentScrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            stack.leadingAnchor.constraint(
+                equalTo: contentScrollView.contentLayoutGuide.leadingAnchor,
+                constant: 18
+            ),
+            stack.trailingAnchor.constraint(
+                equalTo: contentScrollView.contentLayoutGuide.trailingAnchor,
+                constant: -18
+            ),
+            stack.topAnchor.constraint(
+                equalTo: contentScrollView.contentLayoutGuide.topAnchor,
+                constant: 14
+            ),
+            stack.bottomAnchor.constraint(
+                equalTo: contentScrollView.contentLayoutGuide.bottomAnchor,
+                constant: -14
+            ),
+            stack.widthAnchor.constraint(
+                equalTo: contentScrollView.frameLayoutGuide.widthAnchor,
+                constant: -36
+            ),
             signalIconView.widthAnchor.constraint(equalToConstant: 18),
             signalIconView.heightAnchor.constraint(equalToConstant: 18),
             noButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
             yesButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
-            speakButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
             detailScrollView.heightAnchor.constraint(equalToConstant: 104),
         ])
-        preferredContentSize = CGSize(width: 0, height: 380)
+        preferredContentSize = CGSize(width: 0, height: 480)
     }
 
     func didReceive(_ notification: UNNotification) {
         let content = notification.request.content
         let info = content.userInfo
-        // This custom card owns all visible actions. Speak opens the app's
-        // microphone surface because notification extensions cannot begin
-        // recording directly from the lock screen.
-        extensionContext?.notificationActions = []
+        // Keep No / Yes in the custom card. Speak stays a native text-input
+        // action so dictation and transcript review happen inside the
+        // notification instead of opening the application.
+        extensionContext?.notificationActions = [
+            UNTextInputNotificationAction(
+                identifier: "HEALTHMES_SPEAK",
+                title: String(localized: "Speak"),
+                options: [],
+                icon: UNNotificationActionIcon(systemImageName: "microphone.fill"),
+                textInputButtonTitle: String(localized: "Apply"),
+                textInputPlaceholder: String(
+                    localized: "Speak, review the text, then apply"
+                )
+            )
+        ]
         proposalID = (info["healthmes_proposal_id"] as? String).flatMap(UUID.init(uuidString:))
         actionLabel.text = content.title
         reasonLabel.text = content.subtitle
         reasonLabel.isHidden = content.subtitle.isEmpty
         timeLabel.text = content.body
         detailLabel.attributedText = detailText(info: info)
+        contentScrollView.setContentOffset(.zero, animated: false)
         detailScrollView.setContentOffset(.zero, animated: false)
 
         let formatter = ISO8601DateFormatter()
@@ -285,24 +302,6 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         resolve(.accept)
     }
 
-    @objc private func openSpeak() {
-        guard
-            let proposalID,
-            let url = URL(
-                string: "healthmes://speak?proposal=\(proposalID.uuidString.lowercased())"
-            )
-        else {
-            showFailure(String(localized: "Open HealthMes to speak."))
-            return
-        }
-        extensionContext?.open(url) { [weak self] opened in
-            guard !opened else { return }
-            Task { @MainActor [weak self] in
-                self?.showFailure(String(localized: "Open HealthMes to speak."))
-            }
-        }
-    }
-
     private func resolve(_ action: DecisionAction) {
         if let expiresAt, expiresAt <= Date() {
             showTerminal(String(localized: "Decision expired"), color: .secondaryLabel)
@@ -360,7 +359,6 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
                         : healthGreen
                     noButton.isHidden = true
                     yesButton.isHidden = true
-                    speakButton.isHidden = true
                 }
             } catch {
                 await MainActor.run {
@@ -379,7 +377,6 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
     private func setResolving(_ resolving: Bool, action: DecisionAction) {
         noButton.isEnabled = !resolving
         yesButton.isEnabled = !resolving
-        speakButton.isEnabled = !resolving
         hintLabel.text =
             action == .accept
             ? String(localized: "Recording Yes…")
@@ -391,7 +388,6 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         hintLabel.textColor = .systemRed
         noButton.isEnabled = true
         yesButton.isEnabled = true
-        speakButton.isEnabled = true
     }
 
     private func showTerminal(_ message: String, color: UIColor) {
@@ -399,7 +395,6 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         hintLabel.textColor = color
         noButton.isHidden = true
         yesButton.isHidden = true
-        speakButton.isHidden = true
     }
 
     private func showResolutionError(_ error: NotificationResolutionError) {
@@ -426,7 +421,6 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         guard let proposalID else {
             noButton.isHidden = true
             yesButton.isHidden = true
-            speakButton.isHidden = true
             return
         }
         Task {
