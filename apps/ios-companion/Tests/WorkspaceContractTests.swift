@@ -166,9 +166,9 @@ final class WorkspaceContractTests: XCTestCase {
         XCTAssertEqual(store.load().categories.last?.title, "Private workspace")
     }
 
-    func testAlternativeCommandKeepsProposalContext() {
+    func testSpeakCommandKeepsProposalContext() {
         let proposalID = UUID()
-        let command = AlternativeCommand.compose(
+        let command = SpeakCommand.compose(
             userText: "내일 오전으로 옮겨줘",
             proposalID: proposalID,
             title: "집중 블록 이동",
@@ -178,6 +178,7 @@ final class WorkspaceContractTests: XCTestCase {
         XCTAssertTrue(command.contains(proposalID.uuidString.lowercased()))
         XCTAssertTrue(command.contains("집중 블록 이동"))
         XCTAssertTrue(command.contains("내일 오전으로 옮겨줘"))
+        XCTAssertTrue(command.hasPrefix("Spoken instruction"))
     }
 
     func testFutureSchemaFailsClosedToDefaults() {

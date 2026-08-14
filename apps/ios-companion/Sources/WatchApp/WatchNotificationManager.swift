@@ -21,17 +21,18 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             options: [.authenticationRequired],
             icon: UNNotificationActionIcon(systemImageName: "checkmark")
         )
-        let alternative = UNTextInputNotificationAction(
-            identifier: AlertNotificationActionID.alternative,
-            title: String(localized: "Alternative"),
+        let speak = UNTextInputNotificationAction(
+            identifier: AlertNotificationActionID.speak,
+            title: String(localized: "Speak"),
             options: [.foreground],
+            icon: UNNotificationActionIcon(systemImageName: "microphone.fill"),
             textInputButtonTitle: String(localized: "Send"),
-            textInputPlaceholder: String(localized: "Tell HealthMes another option")
+            textInputPlaceholder: String(localized: "Speak to HealthMes")
         )
         center.setNotificationCategories([
             UNNotificationCategory(
                 identifier: AlertNotificationContent.actionableCategoryID,
-                actions: [no, yes, alternative],
+                actions: [no, yes, speak],
                 intentIdentifiers: []
             )
         ])
@@ -128,10 +129,11 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             action = .accept
         case AlertNotificationActionID.no:
             action = .decline
-        case AlertNotificationActionID.alternative:
+        case AlertNotificationActionID.speak,
+            AlertNotificationActionID.legacyAlternative:
             let userInfo = response.notification.request.content.userInfo
             let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
-            let command = AlternativeCommand.compose(
+            let command = SpeakCommand.compose(
                 userText: text,
                 proposalID: proposalID,
                 title: userInfo[AlertNotificationContent.userInfoDecisionTitle] as? String,
@@ -141,7 +143,7 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             )
             if WCSession.isSupported() {
                 WCSession.default.transferUserInfo([
-                    AlternativeCommandSyncKeys.command: command
+                    SpeakCommandSyncKeys.command: command
                 ])
             }
             Task { @MainActor in

@@ -3,14 +3,18 @@ import Foundation
 public enum AlertNotificationActionID {
     public static let yes = "HEALTHMES_YES"
     public static let no = "HEALTHMES_NO"
-    public static let alternative = "HEALTHMES_ALTERNATIVE"
+    public static let speak = "HEALTHMES_SPEAK"
+    // Keep handling already-delivered notifications from older builds.
+    public static let legacyAlternative = "HEALTHMES_ALTERNATIVE"
 }
 
-public enum AlternativeCommandSyncKeys {
+public enum SpeakCommandSyncKeys {
+    // Keep the wire key stable so phones and watches on adjacent builds
+    // continue to exchange dictated instructions.
     public static let command = "healthmes_alternative_command"
 }
 
-public enum AlternativeCommand {
+public enum SpeakCommand {
     public static func compose(
         userText: String,
         proposalID: UUID?,
@@ -32,8 +36,8 @@ public enum AlternativeCommand {
         }
 
         let header = context.isEmpty
-            ? "Alternative request"
-            : "Alternative request [\(context.joined(separator: " | "))]"
+            ? "Spoken instruction"
+            : "Spoken instruction [\(context.joined(separator: " | "))]"
         return cleanText.isEmpty ? header : "\(header)\n\(cleanText)"
     }
 }
@@ -43,7 +47,7 @@ public enum AlternativeCommand {
 //
 //   [decision, 1 line]      -> notification title
 //   [result, 1 line]        -> notification body
-//   [buttons]  No / Yes   -> UNNotificationActions
+//   [buttons]  No / Yes / Speak -> UNNotificationActions
 //   [details]  Why / change -> userInfo for expanded or tapped surfaces
 //
 // Pure Foundation so the mapping from a `GET /v1/alerts` item is unit-
@@ -57,7 +61,7 @@ public enum AlternativeCommand {
 // silent — is the healthcare domain expert's deliverable
 // (docs/design/WATCH-NOTIFICATIONS.ko.md Q2/Q3/Q5).
 public struct AlertNotificationContent: Equatable {
-    /// Category with No / Yes actions — used only when
+    /// Category with No / Yes / Speak actions — used only when
     /// a pending schedule proposal is attached, so every button maps to a
     /// REAL endpoint call instead of a stub.
     public static let actionableCategoryID = "HEALTHMES_ALERT_ACTIONABLE"

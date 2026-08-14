@@ -41,12 +41,13 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             options: protectedActionOptions,
             icon: UNNotificationActionIcon(systemImageName: "xmark.circle")
         )
-        let alternative = UNTextInputNotificationAction(
-            identifier: AlertNotificationActionID.alternative,
-            title: String(localized: "Alternative"),
+        let speak = UNTextInputNotificationAction(
+            identifier: AlertNotificationActionID.speak,
+            title: String(localized: "Speak"),
             options: [.foreground],
+            icon: UNNotificationActionIcon(systemImageName: "microphone.fill"),
             textInputButtonTitle: String(localized: "Send"),
-            textInputPlaceholder: String(localized: "Tell HealthMes another option")
+            textInputPlaceholder: String(localized: "Speak to HealthMes")
         )
         let actionable = UNNotificationCategory(
             identifier: AlertNotificationContent.actionableCategoryID,
@@ -54,7 +55,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             // action. Default to the non-mutating choice so an accidental
             // gesture can never approve a calendar change. Keep Yes second
             // so both primary decisions remain visible on the 42 mm screen.
-            actions: [no, yes, alternative],
+            actions: [no, yes, speak],
             intentIdentifiers: []
         )
         let info = UNNotificationCategory(
@@ -235,9 +236,10 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             resolve(proposalID, action: .accept, completionHandler: completionHandler)
         case AlertNotificationActionID.no:
             resolve(proposalID, action: .decline, completionHandler: completionHandler)
-        case AlertNotificationActionID.alternative:
+        case AlertNotificationActionID.speak,
+            AlertNotificationActionID.legacyAlternative:
             let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
-            let command = AlternativeCommand.compose(
+            let command = SpeakCommand.compose(
                 userText: text,
                 proposalID: proposalID,
                 title: userInfo[AlertNotificationContent.userInfoDecisionTitle] as? String,

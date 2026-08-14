@@ -74,7 +74,7 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
 
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         guard
-            let command = userInfo[AlternativeCommandSyncKeys.command] as? String,
+            let command = userInfo[SpeakCommandSyncKeys.command] as? String,
             !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return }
         Task { @MainActor in

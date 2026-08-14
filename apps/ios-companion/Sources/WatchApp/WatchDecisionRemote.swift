@@ -1,4 +1,6 @@
 import SwiftUI
+import WatchConnectivity
+import WatchKit
 
 enum WatchDecisionResult: Equatable {
     case approved
@@ -455,6 +457,7 @@ final class WatchDecisionRemoteModel: ObservableObject {
 struct WatchDecisionRemoteView: View {
     @ObservedObject var model: WatchDecisionRemoteModel
     @State private var detail: WatchDecisionDetail?
+    @State private var isSpeaking = false
 
     var body: some View {
         Group {
@@ -557,23 +560,72 @@ struct WatchDecisionRemoteView: View {
             .scrollIndicators(.hidden)
             .frame(maxHeight: .infinity, alignment: .top)
 
-            HStack(spacing: 7) {
-                decisionButton(
-                    title: "No",
-                    image: "xmark",
-                    action: .decline,
-                    prominent: false,
-                    accessibilityLabel: "Reject: \(decision.primaryActionText)"
-                )
-                decisionButton(
-                    title: "Yes",
-                    image: "checkmark",
-                    action: .accept,
-                    prominent: true,
-                    accessibilityLabel: "Approve: \(decision.primaryActionText)"
+            VStack(spacing: 5) {
+                HStack(spacing: 7) {
+                    decisionButton(
+                        title: "No",
+                        image: "xmark",
+                        action: .decline,
+                        prominent: false,
+                        accessibilityLabel: "Reject: \(decision.primaryActionText)"
+                    )
+                    decisionButton(
+                        title: "Yes",
+                        image: "checkmark",
+                        action: .accept,
+                        prominent: true,
+                        accessibilityLabel: "Approve: \(decision.primaryActionText)"
+                    )
+                }
+
+                Button {
+                    presentSpeakInput(for: decision)
+                } label: {
+                    Group {
+                        if isSpeaking {
+                            ProgressView()
+                        } else {
+                            Label("Speak", systemImage: "microphone.fill")
+                                .font(.caption.weight(.bold))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 28)
+                }
+                .buttonStyle(.bordered)
+                .tint(Color(red: 0.42, green: 0.88, blue: 0.76))
+                .disabled(model.applyingAction != nil || isSpeaking)
+                .accessibilityHint(
+                    Text("Dictate a different instruction to HealthMes")
                 )
             }
             .padding(.top, 2)
+        }
+    }
+
+    private func presentSpeakInput(for decision: PendingDecision) {
+        guard !isSpeaking else { return }
+        isSpeaking = true
+        WKExtension.shared().visibleInterfaceController?.presentTextInputController(
+            withSuggestions: nil,
+            allowedInputMode: .plain
+        ) { results in
+            Task { @MainActor in
+                defer { isSpeaking = false }
+                guard
+                    let spoken = results?.first as? String,
+                    !spoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else { return }
+                let command = SpeakCommand.compose(
+                    userText: spoken,
+                    proposalID: decision.id,
+                    title: decision.card?.title,
+                    proposedAction: decision.primaryActionText
+                )
+                guard WCSession.isSupported() else { return }
+                WCSession.default.transferUserInfo([
+                    SpeakCommandSyncKeys.command: command
+                ])
+            }
         }
     }
 

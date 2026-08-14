@@ -8,6 +8,10 @@
     {
       "title": "Yes",
       "identifier": "HEALTHMES_YES"
+    },
+    {
+      "title": "Speak",
+      "identifier": "HEALTHMES_SPEAK"
     }
   ],
   "aps": {
