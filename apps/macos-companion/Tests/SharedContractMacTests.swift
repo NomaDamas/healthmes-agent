@@ -60,7 +60,7 @@ final class SharedContractMacTests: XCTestCase {
         let plain = AlertNotificationContent.from(alert: alert)
         XCTAssertEqual(plain.title, "Move the 14:00 block to tomorrow?")
         XCTAssertEqual(plain.subtitle, "Recovery 38 today.")
-        XCTAssertEqual(plain.body, "baseline_days 14 · hrv_delta_pc…")
+        XCTAssertEqual(plain.body, "baseline_days 14 · hrv_delta_pct -18")
         XCTAssertEqual(plain.categoryID, AlertNotificationContent.actionableCategoryID)
         XCTAssertEqual(plain.threadID, "deep_sleep_drop")
         XCTAssertNotNil(plain.userInfo[AlertNotificationContent.userInfoDecisionURL])

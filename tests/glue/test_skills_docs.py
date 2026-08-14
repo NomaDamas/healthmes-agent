@@ -73,4 +73,5 @@ def test_skill_dirs_all_checked() -> None:
         "healthmes-planner",
         "healthmes-sleep",
         "healthmes-stress",
+        "healthmes-wellness-visualizer",
     ]

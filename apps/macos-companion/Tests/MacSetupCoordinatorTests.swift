@@ -15,12 +15,16 @@ final class MacSetupSupportTests: XCTestCase {
         XCTAssertFalse(events[0].isFailure)
     }
 
-    func testFindsRepositoryFromExplicitEnvironment() {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
+    func testFindsRepositoryFromExplicitEnvironment() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let scripts = root.appendingPathComponent("scripts", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: scripts,
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: scripts.appendingPathComponent("healthmes_setup.py"))
+        defer { try? FileManager.default.removeItem(at: root) }
 
         XCTAssertEqual(
             MacSetupSupport.repositoryRoot(

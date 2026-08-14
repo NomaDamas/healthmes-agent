@@ -22,6 +22,7 @@ EXPECTED_SKILLS = (
     "healthmes-planner",
     "healthmes-sleep",
     "healthmes-stress",
+    "healthmes-wellness-visualizer",
 )
 
 pytestmark = pytest.mark.usefixtures("clean_env")
