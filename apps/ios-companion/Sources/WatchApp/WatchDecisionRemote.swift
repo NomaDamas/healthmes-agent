@@ -784,72 +784,94 @@ struct WatchDecisionRemoteView: View {
     private var glance: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("CAPACITY")
+                if model.availability == .unpaired {
+                    Label("CONNECT", systemImage: "iphone.gen2")
                         .font(.caption2.weight(.bold))
+                        .foregroundStyle(Color(red: 0.42, green: 0.88, blue: 0.76))
+                    Text("Open HealthMes on iPhone")
+                        .font(.headline)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Pair iPhone once. This Watch connects automatically.")
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
-                    Spacer()
-                    if let energyScore = model.energyScore {
-                        Text(verbatim: "\(energyScore)")
-                            .font(.system(.title2, design: .rounded).bold())
-                            .accessibilityLabel(Text("Cognitive energy"))
-                            .accessibilityValue(Text(verbatim: "\(energyScore)"))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Label("No URL or token on Watch", systemImage: "lock.shield")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Button("Check again") {
+                        Task { await model.refresh() }
                     }
-                }
-
-                if let energyScore = model.energyScore {
-                    GeometryReader { proxy in
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(Color.primary.opacity(0.12))
-                            Capsule()
-                                .fill(energyTint(energyScore))
-                                .frame(
-                                    width: proxy.size.width
-                                        * CGFloat(min(max(energyScore, 0), 100)) / 100
-                                )
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color(red: 0.03, green: 0.55, blue: 0.46))
+                    .frame(maxWidth: .infinity)
+                } else {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("CAPACITY")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if let energyScore = model.energyScore {
+                            Text(verbatim: "\(energyScore)")
+                                .font(.system(.title2, design: .rounded).bold())
+                                .accessibilityLabel(Text("Cognitive energy"))
+                                .accessibilityValue(Text(verbatim: "\(energyScore)"))
                         }
                     }
-                    .frame(height: 7)
-                    .accessibilityHidden(true)
-                }
 
-                Text(verbatim: model.wellnessImpact ?? String(localized: "Checking body-to-plan impact…"))
-                    .font(.headline)
-                    .lineLimit(3)
-                    .minimumScaleFactor(0.78)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if !model.upcomingEvents.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(model.upcomingEvents.prefix(3)) { event in
-                            HStack(spacing: 5) {
-                                Text(event.startAt, format: .dateTime.hour().minute())
-                                    .font(.caption2.bold().monospacedDigit())
-                                    .frame(width: 38, alignment: .leading)
-                                Text(verbatim: event.summary ?? String(localized: "Scheduled block"))
-                                    .font(.caption)
-                                    .lineLimit(1)
+                    if let energyScore = model.energyScore {
+                        GeometryReader { proxy in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.primary.opacity(0.12))
+                                Capsule()
+                                    .fill(energyTint(energyScore))
+                                    .frame(
+                                        width: proxy.size.width
+                                            * CGFloat(min(max(energyScore, 0), 100)) / 100
+                                    )
                             }
                         }
+                        .frame(height: 7)
+                        .accessibilityHidden(true)
                     }
-                } else if let glanceLine = model.glanceLine {
-                    Label(glanceLine, systemImage: "calendar")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
 
-                Label(
-                    model.availability.label,
-                    systemImage: model.availability.systemImage
-                )
-                .font(.caption2)
-                .foregroundStyle(model.availability == .current ? .green : .orange)
+                    Text(verbatim: model.wellnessImpact ?? String(localized: "Checking body-to-plan impact…"))
+                        .font(.headline)
+                        .lineLimit(3)
+                        .minimumScaleFactor(0.78)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                Button("Refresh") {
-                    Task { await model.refresh() }
+                    if !model.upcomingEvents.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(model.upcomingEvents.prefix(3)) { event in
+                                HStack(spacing: 5) {
+                                    Text(event.startAt, format: .dateTime.hour().minute())
+                                        .font(.caption2.bold().monospacedDigit())
+                                        .frame(width: 38, alignment: .leading)
+                                    Text(verbatim: event.summary ?? String(localized: "Scheduled block"))
+                                        .font(.caption)
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    } else if let glanceLine = model.glanceLine {
+                        Label(glanceLine, systemImage: "calendar")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Label(
+                        model.availability.label,
+                        systemImage: model.availability.systemImage
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(model.availability == .current ? .green : .orange)
+
+                    Button("Refresh") {
+                        Task { await model.refresh() }
+                    }
+                    .buttonStyle(.bordered)
+                    .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.bordered)
-                .frame(maxWidth: .infinity)
             }
         }
     }

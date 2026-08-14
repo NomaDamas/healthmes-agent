@@ -92,6 +92,23 @@ final class MacSetupSupportTests: XCTestCase {
         )
     }
 
+    func testTailscaleSetupContractIsSharedWithAppleClients() {
+        XCTAssertEqual(TailscalePairingPresentation.steps.count, 5)
+        XCTAssertEqual(
+            TailscalePairingPresentation.steps.last?.title,
+            "Done"
+        )
+        XCTAssertEqual(
+            TailscalePairingPresentation.transport(
+                for: Pairing(
+                    baseURL: URL(string: "https://healthmes.example.ts.net")!,
+                    token: "token"
+                )
+            ),
+            .tailscaleDNS
+        )
+    }
+
     func testReadinessMapsEveryComponentWithoutCollapsingFailures() {
         let readiness = SetupReadiness(
             overall: .actionRequired,

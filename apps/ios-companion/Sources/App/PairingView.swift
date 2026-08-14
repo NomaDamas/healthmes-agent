@@ -28,10 +28,10 @@ struct PairingView: View {
                 }
                 .accessibilityLabel(Text("API token"))
             } header: {
-                Text("Your HealthMes instance")
+                Text("Manual connection")
             } footer: {
                 Text(
-                    "Use your HTTPS HealthMes URL. Plain HTTP is accepted only for same-device localhost development."
+                    "Advanced fallback only. The normal setup uses Tailscale and a one-time QR, so no URL or API token is typed."
                 )
             }
 

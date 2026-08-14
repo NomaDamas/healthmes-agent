@@ -166,6 +166,45 @@ final class ProductContractTests: XCTestCase {
         )
     }
 
+    func testTailscalePairingPresentationUsesFiveBoundedSteps() {
+        XCTAssertEqual(
+            TailscalePairingPresentation.steps.map(\.number),
+            [1, 2, 3, 4, 5]
+        )
+        XCTAssertEqual(
+            TailscalePairingPresentation.steps[2].title,
+            "Select Connect iPhone"
+        )
+    }
+
+    func testConnectionTransportRecognizesTailnetDNSAndCGNAT() throws {
+        let dns = Pairing(
+            baseURL: try XCTUnwrap(URL(string: "https://healthmes.tail123.ts.net")),
+            token: "token"
+        )
+        let ip = Pairing(
+            baseURL: try XCTUnwrap(URL(string: "https://100.100.20.30")),
+            token: "token"
+        )
+        let publicHTTPS = Pairing(
+            baseURL: try XCTUnwrap(URL(string: "https://healthmes.example")),
+            token: "token"
+        )
+
+        XCTAssertEqual(
+            TailscalePairingPresentation.transport(for: dns),
+            .tailscaleDNS
+        )
+        XCTAssertEqual(
+            TailscalePairingPresentation.transport(for: ip),
+            .tailscaleIP
+        )
+        XCTAssertEqual(
+            TailscalePairingPresentation.transport(for: publicHTTPS),
+            .remoteHTTPS
+        )
+    }
+
     func testViewerURLUsesDerivedReadOnlyTokenAndStrictOrigin() {
         let url = ViewerURL.make(
             pairing: pairing,

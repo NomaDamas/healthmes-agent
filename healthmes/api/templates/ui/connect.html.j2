@@ -38,6 +38,22 @@
     padding: 0.62rem 0.75rem; background: var(--surface); color: var(--ink);
     font: inherit;
   }
+  .pairing-flow {
+    display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 0.55rem; margin-top: 0.8rem;
+  }
+  .pairing-step {
+    padding: 0.75rem; border: 1px solid var(--line-soft);
+    border-radius: var(--radius-sm); background: var(--surface-2);
+  }
+  .pairing-step strong {
+    display: block; color: var(--brand-deep); font-size: 0.78rem;
+    margin-bottom: 0.2rem;
+  }
+  .pairing-step span { display: block; font-size: 0.82rem; color: var(--ink-2); }
+  @media (max-width: 700px) {
+    .pairing-flow { grid-template-columns: 1fr; }
+  }
 </style>
 {% endblock %}
 
@@ -57,6 +73,22 @@
 <p class="conn-note">Apple Calendar: {{ icloud_result }}</p>
 {% endif %}
 {% if local_unlock_url %}
+<section class="card">
+  <p class="eyebrow">Apple 연결</p>
+  <h2>iPhone 연결</h2>
+  <div class="pairing-flow" aria-label="Tailscale 기반 iPhone 연결 5단계">
+    <div class="pairing-step"><strong>1 · 설치</strong><span>Mac/Linux와 iPhone에 Tailscale 설치</span></div>
+    <div class="pairing-step"><strong>2 · 로그인</strong><span>두 기기에서 같은 Tailnet 로그인</span></div>
+    <div class="pairing-step"><strong>3 · 연결</strong><span>HealthMes에서 iPhone 연결 선택</span></div>
+    <div class="pairing-step"><strong>4 · 스캔</strong><span>iPhone 카메라로 일회용 QR 스캔</span></div>
+    <div class="pairing-step"><strong>5 · 완료</strong><span>Watch는 iPhone을 통해 자동 연결</span></div>
+  </div>
+  <p class="conn-note">일반 사용자는 IP 주소, 포트, 도메인, API token 또는 인증서를 직접 입력하지 않습니다.</p>
+  <div class="conn-actions">
+    <a href="https://tailscale.com/download" rel="noopener noreferrer">Tailscale 설치</a>
+    <a href="{{ local_unlock_url }}" rel="noreferrer">이 Mac에서 iPhone 연결</a>
+  </div>
+</section>
 <section class="card">
   <h2>이 Mac에서 연결 관리 잠금 해제</h2>
   <p class="muted">전체 API 토큰 입력은 이 Mac의 직접 loopback 화면에서만 받습니다.</p>

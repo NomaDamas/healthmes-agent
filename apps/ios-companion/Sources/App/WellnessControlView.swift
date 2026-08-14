@@ -1337,24 +1337,29 @@ struct HealthMesOnboardingView: View {
                         .foregroundStyle(Color(red: 0.08, green: 0.38, blue: 0.28))
                     Text("HealthMes 시작하기")
                         .font(.system(.largeTitle, design: .rounded).bold())
-                    Text("한 번의 연결로 건강 상태, 캘린더 조율, 알림, Apple Watch를 같은 리모컨에서 사용합니다.")
+                    Text("내 Mac 또는 Linux의 HealthMes를 iPhone과 Apple Watch에 5단계로 연결합니다.")
                         .foregroundStyle(.secondary)
 
-                    setupRow("계정과 안전한 인스턴스", detail: "관리형 HTTPS 연결은 아직 배포 준비가 필요합니다.", image: "person.crop.circle")
-                    setupRow("건강 데이터", detail: "HealthKit 권한과 데이터 신선도를 확인합니다.", image: "heart.text.square")
-                    setupRow("Google Calendar", detail: "Google 계정으로 HealthMes 서버에 연결합니다.", image: "g.circle")
-                    setupRow("Apple Calendar", detail: "iPhone 권한과 iCloud 서버 동기화를 함께 확인합니다.", image: "calendar")
-                    setupRow("알림과 Apple Watch", detail: "손목과 잠금화면에서 제안을 승인합니다.", image: "applewatch")
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(TailscalePairingPresentation.steps) { step in
+                            pairingStep(step)
+                        }
+                    }
+                    .padding(16)
+                    .healthMesSurface(radius: 18)
 
-                    Button("관리형 HealthMes로 계속") {}
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
-                        .disabled(true)
-                    Text("이 오픈소스 빌드에는 계정 provisioning과 App Store 배포가 아직 포함되지 않았습니다.")
+                    Link(destination: TailscalePairingPresentation.downloadURL) {
+                        Label("1. Tailscale 설치", systemImage: "arrow.down.circle.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+
+                    Text("Mac 또는 Linux의 HealthMes에서 ‘iPhone 연결’을 누른 뒤, iPhone 카메라로 표시된 QR을 스캔하세요. URL, 포트, API token은 입력하지 않습니다.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                    DisclosureGroup("Advanced · self-host 연결", isExpanded: $showSelfHost) {
+                    DisclosureGroup("Advanced · 수동 연결", isExpanded: $showSelfHost) {
                         PairingView()
                             .padding(.top, 10)
                     }
@@ -1365,14 +1370,16 @@ struct HealthMesOnboardingView: View {
         }
     }
 
-    private func setupRow(_ title: String, detail: String, image: String) -> some View {
+    private func pairingStep(_ step: TailscalePairingStep) -> some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: image)
-                .font(.title3)
-                .frame(width: 28)
+            Text(verbatim: "\(step.number)")
+                .font(.caption.bold().monospacedDigit())
+                .foregroundStyle(.white)
+                .frame(width: 24, height: 24)
+                .background(HealthMesVisualStyle.capacity, in: Circle())
             VStack(alignment: .leading, spacing: 3) {
-                Text(verbatim: title).font(.headline)
-                Text(verbatim: detail)
+                Text(verbatim: step.title).font(.headline)
+                Text(verbatim: step.detail)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

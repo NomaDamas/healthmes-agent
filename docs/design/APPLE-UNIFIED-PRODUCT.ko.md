@@ -604,3 +604,23 @@ raw data, Advanced를 제공하지 않는다.
 
 이 질문에 답하는 장기 `상태 → 판단 → 행동 → 결과` 연결이 HealthMes의 핵심
 제품 해자다.
+
+# Tailscale 기반 Apple 연결 UX
+
+PR #111의 연결 화면은 클라이언트 UI만 담당하며 다음 5단계를 모든 Apple surface에서 같은
+용어로 보여준다.
+
+1. Mac/Linux와 iPhone에 Tailscale 설치
+2. 두 기기에서 같은 Tailnet 로그인
+3. Mac/Linux HealthMes에서 `iPhone 연결` 선택
+4. iPhone 카메라로 일회용 QR 스캔
+5. iPhone 연결 완료 후 Apple Watch 자동 연결
+
+기본 흐름에는 IP 주소, 포트, 도메인, API token, 인증서 입력이 없다. 수동 URL/token
+pairing은 문제 해결을 위한 `Advanced`에만 유지한다.
+
+이 PR이 구현하는 것은 설치 단계, 연결 상태, QR 대기/만료, 온라인/오프라인과 복구 동작의
+UI다. Tailscale 설치 감지, Tailnet 주소 자동 선택, pairing grant 발급 및 Agent command
+bridge는 #159가 담당한다. background/terminated 상태의 선제 알림과 APNs/Live Activity
+remote start는 #160이 담당한다. PR #111은 Agent 서버 API, APNs Provider, Worker, Cloud
+Gateway 또는 데이터베이스를 추가하지 않는다.

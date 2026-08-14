@@ -16,9 +16,9 @@ struct SettingsView: View {
             Section {
                 if let pairing = PairingStore.shared.load() {
                     readinessRow(
-                        "HealthMes instance",
-                        value: instanceMode(pairing),
-                        systemImage: "network"
+                        "Connection",
+                        value: connectionLabel(pairing),
+                        systemImage: connectionSymbol(pairing)
                     )
                     readinessRow(
                         "Apple Health",
@@ -47,7 +47,7 @@ struct SettingsView: View {
                     )
                     readinessRow(
                         "Apple Watch",
-                        value: "Pairing follows iPhone",
+                        value: "Connected through iPhone",
                         systemImage: "applewatch"
                     )
                     LabeledContent("Instance host") {
@@ -63,9 +63,35 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             } header: {
-                Text("Ready check")
+                Text("Connection")
             } footer: {
-                Text("Device calendar permission and HealthMes server synchronization are separate. A proposal is on the external calendar only after it reaches Applied.")
+                Text("iPhone reaches your Mac or Linux HealthMes through Tailscale. Apple Watch uses iPhone as its secure connection hub.")
+            }
+
+            Section {
+                ForEach(TailscalePairingPresentation.steps) { step in
+                    HStack(alignment: .top, spacing: 10) {
+                        Text(verbatim: "\(step.number)")
+                            .font(.caption.bold().monospacedDigit())
+                            .foregroundStyle(.white)
+                            .frame(width: 22, height: 22)
+                            .background(HealthMesVisualStyle.capacity, in: Circle())
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(verbatim: step.title)
+                                .font(.subheadline.weight(.semibold))
+                            Text(verbatim: step.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Link(destination: TailscalePairingPresentation.downloadURL) {
+                    Label("Open Tailscale setup", systemImage: "network.badge.shield.half.filled")
+                }
+            } header: {
+                Text("Connect another iPhone")
+            } footer: {
+                Text("Generate the QR on the Mac or Linux host. The QR uses a one-time pairing code, not the long-lived API token.")
             }
 
             Section {
@@ -252,16 +278,22 @@ struct SettingsView: View {
         }
     }
 
-    private func instanceMode(_ pairing: Pairing) -> String {
-        guard let host = pairing.baseURL.host?.lowercased() else {
-            return String(localized: "Self-host")
-        }
-        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+    private func connectionLabel(_ pairing: Pairing) -> String {
+        switch TailscalePairingPresentation.transport(for: pairing) {
+        case .disconnected:
+            return String(localized: "Not connected")
+        case .sameDevice:
             return String(localized: "Local demo")
+        case .tailscaleDNS, .tailscaleIP:
+            return String(localized: "Connected · Tailscale")
+        case .remoteHTTPS:
+            return String(localized: "Connected · HTTPS")
         }
-        if pairing.baseURL.scheme?.lowercased() == "https" {
-            return String(localized: "HTTPS instance")
-        }
-        return String(localized: "LAN self-host")
+    }
+
+    private func connectionSymbol(_ pairing: Pairing) -> String {
+        TailscalePairingPresentation.transport(for: pairing).isTailscale
+            ? "network.badge.shield.half.filled"
+            : "network"
     }
 }

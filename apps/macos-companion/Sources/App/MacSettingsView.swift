@@ -87,8 +87,8 @@ struct MacSettingsView: View {
                     .font(.title2.weight(.semibold))
                 Text(
                     glanceStore.isPaired
-                        ? "Today, Plan and Decisions use your paired HealthMes instance."
-                        : "Open Advanced once to connect a self-hosted or managed instance."
+                        ? connectionDescription
+                        : "Set up this Mac, then connect iPhone with the Tailscale QR."
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -113,13 +113,27 @@ struct MacSettingsView: View {
                     }
                     .buttonStyle(.bordered)
                 } else {
-                    Button("Connect HealthMes") {
-                        showAdvanced = true
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(MacHealthMesStyle.moss)
+                    Text("The Setup card keeps URL, port and API token out of the normal flow.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
+        }
+    }
+
+    private var connectionDescription: String {
+        guard let pairing = dashboardStore.pairing else {
+            return "Not connected"
+        }
+        switch TailscalePairingPresentation.transport(for: pairing) {
+        case .tailscaleDNS, .tailscaleIP:
+            return "Connected through Tailscale. iPhone and Watch can reach this Mac outside the local network."
+        case .sameDevice:
+            return "This Mac is connected locally. Use Connect iPhone to prepare the Tailscale QR."
+        case .remoteHTTPS:
+            return "Connected through HTTPS. iPhone and Watch follow the same paired instance."
+        case .disconnected:
+            return "Not connected"
         }
     }
 

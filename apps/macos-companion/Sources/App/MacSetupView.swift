@@ -14,7 +14,7 @@ struct MacSetupView: View {
                     .font(.title2.weight(.semibold))
                 Text(
                     glanceStore.isPaired
-                        ? "HealthMes is paired and available to the Mac app."
+                        ? "HealthMes is ready on this Mac. Connect iPhone through Tailscale next."
                         : "Installs the local runtime, protects it with a token, and pairs this app."
                 )
                 .font(.callout)
@@ -134,9 +134,9 @@ struct MacSetupView: View {
                                     .frame(width: 132, height: 132)
                                     .accessibilityLabel("iPhone pairing QR code")
                                 VStack(alignment: .leading, spacing: 6) {
-                                    Text("Pair iPhone")
+                                    Text("4. Scan the QR")
                                         .font(.headline)
-                                    Text("Scan with the iPhone Camera within five minutes. HealthMes opens and pairs automatically.")
+                                    Text("Scan with the iPhone Camera within five minutes. HealthMes opens, verifies the Tailnet path, and pairs automatically.")
                                         .font(.callout)
                                         .foregroundStyle(.secondary)
                                     if let expiresAt = coordinator.phonePairingExpiresAt {
@@ -157,14 +157,49 @@ struct MacSetupView: View {
                     }
                 } else if glanceStore.isPaired {
                     Divider()
-                    Label(
-                        "iPhone pairing needs an HTTPS public URL. Localhost remains Mac-only.",
-                        systemImage: "lock.shield"
-                    )
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                    tailscalePairingGuide
                 }
             }
+        }
+    }
+
+    private var tailscalePairingGuide: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text("Connect iPhone")
+                .font(.headline)
+            ForEach(TailscalePairingPresentation.steps.prefix(3)) { step in
+                HStack(alignment: .top, spacing: 9) {
+                    Text(verbatim: "\(step.number)")
+                        .font(.caption.bold().monospacedDigit())
+                        .foregroundStyle(.white)
+                        .frame(width: 22, height: 22)
+                        .background(MacHealthMesStyle.moss, in: Circle())
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(verbatim: step.title)
+                            .font(.subheadline.weight(.semibold))
+                        Text(verbatim: step.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            HStack {
+                Link(destination: TailscalePairingPresentation.downloadURL) {
+                    Label("Install Tailscale", systemImage: "arrow.down.circle")
+                }
+                .buttonStyle(.bordered)
+                Button {
+                    Task { await coordinator.refreshPhonePairing() }
+                } label: {
+                    Label("3. Connect iPhone", systemImage: "qrcode")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(MacHealthMesStyle.moss)
+                .disabled(coordinator.isRunning)
+            }
+            Text("HealthMes selects the Tailnet address and generates a short-lived QR. Do not enter an IP, port, domain, or API token on iPhone.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
