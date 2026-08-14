@@ -126,7 +126,19 @@ final class AppRouter: ObservableObject {
         case "report":
             modal = .report
         case "speak":
-            openAgentCommandDock()
+            if
+                let rawProposalID = Self.queryValue(of: url, name: "proposal"),
+                let proposalID = UUID(uuidString: rawProposalID)
+            {
+                openAgentCommandDock(
+                    prefill: String(
+                        localized:
+                            "I want to change proposal \(proposalID.uuidString.lowercased()). "
+                    )
+                )
+            } else {
+                openAgentCommandDock()
+            }
         case "pair":
             Task { await importPairing(url) }
         default:
