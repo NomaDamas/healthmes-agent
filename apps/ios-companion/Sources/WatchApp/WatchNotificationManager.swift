@@ -135,6 +135,7 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
             AlertNotificationActionID.legacyAlternative:
             let userInfo = response.notification.request.content.userInfo
             let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
+            let requestID = UUID().uuidString.lowercased()
             let command = SpeakCommand.compose(
                 userText: text,
                 proposalID: proposalID,
@@ -143,14 +144,29 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
                     AlertNotificationContent.userInfoDecisionAction
                 ] as? String
             )
-            if WCSession.isSupported() {
-                WCSession.default.transferUserInfo([
-                    SpeakCommandSyncKeys.command: command
-                ])
-            }
-            Task { @MainActor in
-                WatchDecisionInbox.shared.present(
-                    content: response.notification.request.content
+            let queued = WatchPairingReceiver.shared.sendSpokenCommand(
+                command,
+                requestID: requestID,
+                proposalID: proposalID
+            )
+            Task {
+                let title =
+                    queued
+                    ? String(localized: "Queued for iPhone")
+                    : String(localized: "iPhone connection unavailable")
+                let detail =
+                    queued
+                    ? String(
+                        localized:
+                            "HealthMes will process the instruction when the iPhone receives it."
+                    )
+                    : String(
+                        localized:
+                            "Open HealthMes on the paired iPhone and try again."
+                    )
+                await postSpokenCommandOutcome(
+                    title: title,
+                    detail: detail
                 )
                 completionHandler()
             }
@@ -232,6 +248,19 @@ final class WatchNotificationManager: NSObject, UNUserNotificationCenterDelegate
         content.threadIdentifier = "healthmes-watch-outcome"
         let request = UNNotificationRequest(
             identifier: "healthmes-watch-outcome-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    func postSpokenCommandOutcome(title: String, detail: String) async {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = detail
+        content.threadIdentifier = "healthmes-watch-spoken-command"
+        let request = UNNotificationRequest(
+            identifier: "healthmes-watch-spoken-\(UUID().uuidString)",
             content: content,
             trigger: nil
         )

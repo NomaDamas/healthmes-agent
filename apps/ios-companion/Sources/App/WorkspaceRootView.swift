@@ -1154,6 +1154,7 @@ private struct WorkspaceAgentCanvas: View {
     @State private var resolutionGate = PairingOperationGate()
     @State private var writePreview: AgentWritePreview?
     @State private var lastFocusRequest = 0
+    @State private var lastVoiceStartRequest = 0
     @FocusState private var commandFocused: Bool
 
     private let moss = HealthMesVisualStyle.capacity
@@ -1203,6 +1204,16 @@ private struct WorkspaceAgentCanvas: View {
                 command.transcript = prefill
             }
             commandFocused = true
+        }
+        .onReceive(router.$voiceStartRequest) { request in
+            guard request > lastVoiceStartRequest else { return }
+            lastVoiceStartRequest = request
+            let launch = router.consumePendingVoiceStart(request: request)
+            guard launch.shouldStart else { return }
+            commandFocused = false
+            Task {
+                await command.startListening(prefill: launch.prefill)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .healthmesPairingChanged)) { _ in
             sceneGate.invalidate()

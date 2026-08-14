@@ -31,6 +31,7 @@ final class VoiceCommandModel: NSObject, ObservableObject {
     private let audioEngine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
+    private var listeningPrefix = ""
     private let recognizer = SFSpeechRecognizer(locale: .autoupdatingCurrent)
     private let api = HealthMesAPI()
 
@@ -48,9 +49,12 @@ final class VoiceCommandModel: NSObject, ObservableObject {
         }
     }
 
-    func startListening() async {
+    func startListening(prefill: String? = nil) async {
         message = nil
-        transcript = ""
+        listeningPrefix =
+            prefill?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        transcript = listeningPrefix
         guard await speechPermission() else {
             message = String(localized: "Speech recognition permission is off.")
             return
@@ -99,7 +103,10 @@ final class VoiceCommandModel: NSObject, ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let result {
-                    transcript = result.bestTranscription.formattedString
+                    let spoken = result.bestTranscription.formattedString
+                    transcript = [listeningPrefix, spoken]
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " ")
                     if result.isFinal {
                         stopListening()
                     }
@@ -151,6 +158,7 @@ final class VoiceCommandModel: NSObject, ObservableObject {
         stopListening()
         task?.cancel()
         task = nil
+        listeningPrefix = ""
     }
 
     private func speechPermission() async -> Bool {

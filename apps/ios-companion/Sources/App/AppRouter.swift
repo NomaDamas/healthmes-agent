@@ -34,7 +34,10 @@ final class AppRouter: ObservableObject {
     @Published var proposalSheetID: UUID?
     @Published private(set) var commandFocusRequest = 0
     @Published private(set) var agentChannelRequest = 0
+    @Published private(set) var voiceStartRequest = 0
     @Published private(set) var pendingCommand: String?
+    @Published private(set) var pendingVoicePrefill: String?
+    private var pendingVoiceStartRequest: Int?
     @Published private(set) var homeRequest = 0
     @Published private(set) var pairingImportMessage: String?
 
@@ -60,9 +63,33 @@ final class AppRouter: ObservableObject {
         agentChannelRequest += 1
     }
 
+    func openAgentVoice(prefill: String? = nil) {
+        if let prefill {
+            let clean = prefill.trimmingCharacters(in: .whitespacesAndNewlines)
+            pendingVoicePrefill = clean.isEmpty ? nil : clean
+        } else {
+            pendingVoicePrefill = nil
+        }
+        agentChannelRequest += 1
+        let nextRequest = voiceStartRequest + 1
+        pendingVoiceStartRequest = nextRequest
+        voiceStartRequest = nextRequest
+    }
+
     func consumePendingCommand() -> String? {
         defer { pendingCommand = nil }
         return pendingCommand
+    }
+
+    func consumePendingVoiceStart(
+        request: Int
+    ) -> (shouldStart: Bool, prefill: String?) {
+        guard pendingVoiceStartRequest == request else {
+            return (false, nil)
+        }
+        pendingVoiceStartRequest = nil
+        defer { pendingVoicePrefill = nil }
+        return (true, pendingVoicePrefill)
     }
 
     func showHome() {
@@ -130,14 +157,14 @@ final class AppRouter: ObservableObject {
                 let rawProposalID = Self.queryValue(of: url, name: "proposal"),
                 let proposalID = UUID(uuidString: rawProposalID)
             {
-                openAgentCommandDock(
+                openAgentVoice(
                     prefill: String(
                         localized:
                             "I want to change proposal \(proposalID.uuidString.lowercased()). "
                     )
                 )
             } else {
-                openAgentCommandDock()
+                openAgentVoice()
             }
         case "pair":
             Task { await importPairing(url) }

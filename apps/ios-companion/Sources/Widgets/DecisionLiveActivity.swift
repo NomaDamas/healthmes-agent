@@ -45,7 +45,7 @@
                             .lineLimit(2)
                             .fixedSize(horizontal: false, vertical: true)
 
-                        HStack(spacing: 10) {
+                        HStack(spacing: 8) {
                             Button(
                                 intent: DeclineDecisionIntent(
                                     proposalID: context.attributes.proposalID
@@ -67,8 +67,15 @@
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(healthGreen)
+
+                            Link(destination: speakURL(context.attributes.proposalID)) {
+                                Label("Speak", systemImage: "microphone.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(healthGreen)
                         }
-                        .font(.headline)
+                        .font(.subheadline.weight(.semibold))
                     }
                 }
                 .padding(14)
@@ -118,6 +125,13 @@
                                         )
                                     ) {
                                         Label("Yes", systemImage: "checkmark")
+                                    }
+                                    Link(
+                                        destination: speakURL(
+                                            context.attributes.proposalID
+                                        )
+                                    ) {
+                                        Label("Speak", systemImage: "microphone.fill")
                                     }
                                 }
                                 .buttonStyle(.bordered)
@@ -179,6 +193,13 @@
 
         private func countdownInterval(to end: Date) -> ClosedRange<Date> {
             min(Date(), end)...end
+        }
+
+        private func speakURL(_ proposalID: String) -> URL {
+            URL(
+                string:
+                    "healthmes://speak?proposal=\(proposalID)&autostart=1"
+            )!
         }
 
     }

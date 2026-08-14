@@ -8,6 +8,8 @@ import WatchConnectivity
 final class PhoneWatchSync: NSObject, WCSessionDelegate {
     static let shared = PhoneWatchSync()
     private var pendingContext: [String: Any]?
+    private var pendingUserInfo: [[String: Any]] = []
+    private let pendingUserInfoLock = NSLock()
 
     func activate() {
         guard WCSession.isSupported() else { return }
@@ -64,6 +66,7 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
         if activationState == .activated, error == nil {
             queuePersistedPairing()
             deliverPendingContext()
+            deliverPendingUserInfo()
         }
     }
 
@@ -77,8 +80,20 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
             let command = userInfo[SpeakCommandSyncKeys.command] as? String,
             !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return }
-        Task { @MainActor in
-            AppRouter.shared.openAgentCommandDock(prefill: command)
+
+        let requestID =
+            userInfo[SpeakCommandSyncKeys.requestID] as? String
+            ?? UUID().uuidString.lowercased()
+        let proposalID =
+            (userInfo[SpeakCommandSyncKeys.proposalID] as? String)
+            .flatMap(UUID.init(uuidString:))
+
+        Task {
+            await relayToHealthMes(
+                command: command,
+                requestID: requestID,
+                proposalID: proposalID
+            )
         }
     }
 
@@ -86,5 +101,91 @@ final class PhoneWatchSync: NSObject, WCSessionDelegate {
 
     func sessionDidDeactivate(_ session: WCSession) {
         session.activate()
+    }
+
+    private func relayToHealthMes(
+        command: String,
+        requestID: String,
+        proposalID: UUID?
+    ) async {
+        do {
+            let scene = try await HealthMesAPI().createWellnessScene(
+                query: command,
+                source: .user,
+                proposalID: proposalID
+            )
+            let detail = AlertNotificationContent.compactLine(
+                scene.summary,
+                limit: 120
+            )
+            sendSpeakResult(
+                requestID: requestID,
+                status: "completed",
+                title: scene.title,
+                detail: detail
+            )
+            await NotificationManager.shared.postOutcome(
+                title: String(localized: "HealthMes processed your instruction"),
+                body: detail
+            )
+        } catch {
+            let detail = String(
+                localized:
+                    "Check the connection to your paired HealthMes instance and try again."
+            )
+            sendSpeakResult(
+                requestID: requestID,
+                status: "failed",
+                title: String(localized: "HealthMes could not process the instruction"),
+                detail: detail
+            )
+            await NotificationManager.shared.postOutcome(
+                title: String(localized: "HealthMes command failed"),
+                body: detail
+            )
+        }
+    }
+
+    private func sendSpeakResult(
+        requestID: String,
+        status: String,
+        title: String,
+        detail: String
+    ) {
+        guard WCSession.isSupported() else { return }
+        enqueueUserInfo([
+            SpeakCommandSyncKeys.requestID: requestID,
+            SpeakCommandSyncKeys.resultStatus: status,
+            SpeakCommandSyncKeys.resultTitle: title,
+            SpeakCommandSyncKeys.resultDetail: detail,
+        ])
+        deliverPendingUserInfo()
+    }
+
+    private func deliverPendingUserInfo() {
+        guard
+            WCSession.isSupported(),
+            WCSession.default.activationState == .activated
+        else {
+            WCSession.default.activate()
+            return
+        }
+        for userInfo in takePendingUserInfo() {
+            WCSession.default.transferUserInfo(userInfo)
+        }
+    }
+
+    private func enqueueUserInfo(_ userInfo: [String: Any]) {
+        pendingUserInfoLock.lock()
+        defer { pendingUserInfoLock.unlock() }
+        pendingUserInfo.append(userInfo)
+    }
+
+    private func takePendingUserInfo() -> [[String: Any]] {
+        pendingUserInfoLock.lock()
+        defer { pendingUserInfoLock.unlock() }
+        let queued = pendingUserInfo
+        pendingUserInfo.removeAll()
+        return queued
     }
 }

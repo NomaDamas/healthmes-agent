@@ -658,15 +658,17 @@ struct WatchDecisionRemoteView: View {
             title: decision.card?.title,
             proposedAction: decision.primaryActionText
         )
-        guard WCSession.isSupported() else {
+        let queued = WatchPairingReceiver.shared.sendSpokenCommand(
+            command,
+            requestID: UUID().uuidString.lowercased(),
+            proposalID: decision.id
+        )
+        guard queued else {
             speakStatus = String(localized: "iPhone connection is unavailable.")
             return
         }
-        WCSession.default.transferUserInfo([
-            SpeakCommandSyncKeys.command: command
-        ])
         spokenDraft = nil
-        speakStatus = String(localized: "Instruction queued for HealthMes.")
+        speakStatus = String(localized: "Instruction queued for iPhone HealthMes.")
     }
 
     private func presentSpeakInput(for decision: PendingDecision) {

@@ -12,6 +12,11 @@ public enum SpeakCommandSyncKeys {
     // Keep the wire key stable so phones and watches on adjacent builds
     // continue to exchange dictated instructions.
     public static let command = "healthmes_alternative_command"
+    public static let requestID = "healthmes_speak_request_id"
+    public static let proposalID = "healthmes_speak_proposal_id"
+    public static let resultTitle = "healthmes_speak_result_title"
+    public static let resultDetail = "healthmes_speak_result_detail"
+    public static let resultStatus = "healthmes_speak_result_status"
 }
 
 public enum SpeakCommand {

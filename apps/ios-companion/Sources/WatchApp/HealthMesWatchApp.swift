@@ -34,6 +34,8 @@ struct HealthMesWatchApp: App {
 /// talks to anything but the paired healthmes instance.
 final class WatchPairingReceiver: NSObject, WCSessionDelegate {
     static let shared = WatchPairingReceiver()
+    private var pendingUserInfo: [[String: Any]] = []
+    private let pendingUserInfoLock = NSLock()
 
     func activate() {
         guard WCSession.isSupported() else { return }
@@ -49,10 +51,43 @@ final class WatchPairingReceiver: NSObject, WCSessionDelegate {
     ) {
         // A context may have arrived while this app was not running.
         applyContext(session.receivedApplicationContext)
+        if activationState == .activated, error == nil {
+            deliverPendingUserInfo()
+        }
     }
 
     func session(_ session: WCSession, didReceiveApplicationContext context: [String: Any]) {
         applyContext(context)
+    }
+
+    func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        guard
+            let title = userInfo[SpeakCommandSyncKeys.resultTitle] as? String,
+            let detail = userInfo[SpeakCommandSyncKeys.resultDetail] as? String,
+            userInfo[SpeakCommandSyncKeys.resultStatus] as? String != nil
+        else { return }
+
+        Task {
+            await WatchNotificationManager.shared.postSpokenCommandOutcome(
+                title: title,
+                detail: detail
+            )
+        }
+    }
+
+    func sendSpokenCommand(
+        _ command: String,
+        requestID: String,
+        proposalID: UUID
+    ) -> Bool {
+        guard WCSession.isSupported() else { return false }
+        enqueueUserInfo([
+            SpeakCommandSyncKeys.command: command,
+            SpeakCommandSyncKeys.requestID: requestID,
+            SpeakCommandSyncKeys.proposalID: proposalID.uuidString.lowercased(),
+        ])
+        deliverPendingUserInfo()
+        return true
     }
 
     #if os(iOS)
@@ -77,5 +112,32 @@ final class WatchPairingReceiver: NSObject, WCSessionDelegate {
             NotificationCenter.default.post(name: .healthmesPairingChanged, object: nil)
             WidgetCenter.shared.reloadAllTimelines()
         }
+    }
+
+    private func deliverPendingUserInfo() {
+        guard
+            WCSession.isSupported(),
+            WCSession.default.activationState == .activated
+        else {
+            WCSession.default.activate()
+            return
+        }
+        for userInfo in takePendingUserInfo() {
+            WCSession.default.transferUserInfo(userInfo)
+        }
+    }
+
+    private func enqueueUserInfo(_ userInfo: [String: Any]) {
+        pendingUserInfoLock.lock()
+        defer { pendingUserInfoLock.unlock() }
+        pendingUserInfo.append(userInfo)
+    }
+
+    private func takePendingUserInfo() -> [[String: Any]] {
+        pendingUserInfoLock.lock()
+        defer { pendingUserInfoLock.unlock() }
+        let queued = pendingUserInfo
+        pendingUserInfo.removeAll()
+        return queued
     }
 }
