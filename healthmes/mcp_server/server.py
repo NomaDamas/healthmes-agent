@@ -70,6 +70,7 @@ from healthmes.calendars.adjustments import (
 from healthmes.calendars.base import HealthmesEventKind
 from healthmes.calendars.google import GoogleCalendarBackend
 from healthmes.calendars.intake import intake_revision
+from healthmes.calendars.jobs import _build_backend, build_calendar_job, write_source
 from healthmes.calendars.sleep_context import (
     actual_sleep_context_with_source_ref,
     actual_sleep_observation_context,
@@ -153,6 +154,7 @@ from healthmes.nutrition.vision import (
 from healthmes.store import (
     AppUsageSample,
     CalendarEventMirror,
+    CalendarSource,
     DecisionKind,
     DecisionRecord,
     EnergyDemand,
@@ -3449,8 +3451,9 @@ def resolve_schedule_proposal(
             if exc.code == "expired":
                 raise ToolError("schedule proposal has expired") from exc
             raise
+        proposal_id = proposal.id
         task = session.get(Task, proposal.task_id)
-        return {
+        result = {
             "status": "ok",
             "proposal": {
                 "id": str(proposal.id),
@@ -3466,6 +3469,58 @@ def resolve_schedule_proposal(
                 ),
             },
         }
+    if target is ProposalStatus.ACCEPTED:
+        result["proposal"].update(_flush_accepted_schedule_proposal(proposal_id))
+    return result
+
+
+def _flush_accepted_schedule_proposal(proposal_id: uuid.UUID) -> dict[str, str | bool]:
+    settings = _active_settings()
+    source = write_source(settings)
+    if source is None:
+        return {"calendar_write": "queued", "provider_read_back": False}
+    build_calendar_job(settings, source, is_write_backend=True)()
+    with _store_session() as session:
+        proposal = session.get(ScheduleProposal, proposal_id)
+        if proposal is None or proposal.status is not ProposalStatus.PUSHED:
+            return {
+                "calendar_write": "queued",
+                "calendar_provider": source.value,
+                "provider_read_back": False,
+            }
+        row = session.scalars(
+            select(CalendarEventMirror).where(
+                CalendarEventMirror.calendar_source == source,
+                CalendarEventMirror.agent_task_id == proposal.task_id,
+                CalendarEventMirror.is_agent_created.is_(True),
+            )
+        ).first()
+        external_id = row.external_id if row is not None else None
+    if source is not CalendarSource.CALDAV or external_id is None:
+        return {
+            "calendar_write": "queued",
+            "calendar_provider": source.value,
+            "provider_read_back": False,
+        }
+    try:
+        events, _ = _build_backend(settings, source).list_changes(None)
+    except Exception:  # noqa: BLE001 - provider clients expose broad network errors
+        return {
+            "calendar_write": "queued",
+            "calendar_provider": source.value,
+            "provider_read_back": False,
+        }
+    if any(event.external_id == external_id for event in events):
+        return {
+            "calendar_write": "confirmed",
+            "calendar_provider": source.value,
+            "provider_read_back": True,
+        }
+    return {
+        "calendar_write": "queued",
+        "calendar_provider": source.value,
+        "provider_read_back": False,
+    }
 
 
 @mcp.tool

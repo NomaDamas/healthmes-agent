@@ -98,7 +98,7 @@ def calendar_job_id(source: CalendarSource) -> str:
 def enabled_sources(settings: Settings) -> tuple[CalendarSource, ...]:
     """Backends enabled by settings OR connected via ``healthmes connect``.
 
-    Write-preference order (Google first). "Connected" means the runtime
+    Write-preference order (CalDAV/iCloud first). "Connected" means the runtime
     token/creds file under ``Settings.data_dir`` exists and is usable
     (healthmes/calendars/creds.py) — establishing a connection with the CLI
     is enough, no ``.env`` edit required. The settings flags keep working
@@ -106,10 +106,10 @@ def enabled_sources(settings: Settings) -> tuple[CalendarSource, ...]:
     per-run until credentials appear, exactly as before).
     """
     sources: list[CalendarSource] = []
-    if settings.google_calendar_enabled or creds.google_connected(settings.data_dir):
-        sources.append(CalendarSource.GOOGLE)
     if settings.caldav_enabled or creds.load_caldav_credentials(settings.data_dir) is not None:
         sources.append(CalendarSource.CALDAV)
+    if settings.google_calendar_enabled or creds.google_connected(settings.data_dir):
+        sources.append(CalendarSource.GOOGLE)
     return tuple(sources)
 
 

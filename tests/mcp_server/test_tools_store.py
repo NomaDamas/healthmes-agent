@@ -441,6 +441,53 @@ class TestScheduleTools:
             proposal = session.scalars(select(ScheduleProposal)).one()
             assert proposal.status is ProposalStatus.ACCEPTED
 
+    async def test_schedule_resolution_returns_immediate_provider_evidence(
+        self,
+        mcp_client,
+        call_tool,
+        monkeypatch,
+    ):
+        start = dt.datetime.now(dt.UTC).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        ) + dt.timedelta(days=1)
+        proposed = await call_tool(
+            mcp_client,
+            "propose_schedule_blocks",
+            {
+                "blocks": [
+                    {
+                        "title": "Provider-confirmed block",
+                        "start": start.isoformat(),
+                        "end": (start + dt.timedelta(hours=1)).isoformat(),
+                    }
+                ]
+            },
+        )
+        handle = proposed["proposals"][0]["reply_handle"]
+        evidence = {
+            "calendar_write": "confirmed",
+            "calendar_provider": "caldav",
+            "provider_read_back": True,
+        }
+        flushed: list[uuid.UUID] = []
+
+        def flush(proposal_id: uuid.UUID) -> dict[str, str | bool]:
+            flushed.append(proposal_id)
+            return evidence
+
+        monkeypatch.setattr(server_module, "_flush_accepted_schedule_proposal", flush)
+
+        resolved = await call_tool(
+            mcp_client,
+            "resolve_schedule_proposal",
+            calendar_reply_arguments(handle, tool_name="resolve_schedule_proposal"),
+        )
+
+        assert resolved["proposal"]["calendar_write"] == "confirmed"
+        assert resolved["proposal"]["calendar_provider"] == "caldav"
+        assert resolved["proposal"]["provider_read_back"] is True
+        assert len(flushed) == 1
+
     async def test_upsert_task_tolerates_non_uuid_goal_ref(self, mcp_client, call_tool):
         """An LLM often passes a human label for goal_id; the task is still
         created (not an error) and a note is returned (docs: live-E2E fix)."""

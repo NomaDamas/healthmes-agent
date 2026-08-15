@@ -60,20 +60,20 @@ class TestEnablement:
         assert specs[0].interval_minutes == enabled.google_poll_minutes
         assert write_source(enabled) is CalendarSource.GOOGLE
 
-    def test_both_enabled_builds_both_with_google_as_writer(self, settings) -> None:
+    def test_both_enabled_builds_both_with_icloud_as_writer(self, settings) -> None:
         enabled = settings.model_copy(
             update={"google_calendar_enabled": True, "caldav_enabled": True}
         )
         specs = build_calendar_jobs(enabled)
         assert [spec.source for spec in specs] == [
-            CalendarSource.GOOGLE,
             CalendarSource.CALDAV,
+            CalendarSource.GOOGLE,
         ]
         assert [spec.interval_minutes for spec in specs] == [
-            enabled.google_poll_minutes,
             enabled.caldav_poll_minutes,
+            enabled.google_poll_minutes,
         ]
-        assert write_source(enabled) is CalendarSource.GOOGLE
+        assert write_source(enabled) is CalendarSource.CALDAV
 
     def test_caldav_only_is_the_writer(self, settings) -> None:
         enabled = settings.model_copy(update={"caldav_enabled": True})
