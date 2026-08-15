@@ -246,6 +246,38 @@ class TestSqliteUpgrade:
         command.upgrade(config, "head")
         command.upgrade(config, "head")  # no-op, must not raise
 
+    def test_head_repairs_stamped_sqlite_schema_missing_sleep_provider(self, tmp_path):
+        database_url = f"sqlite:///{tmp_path / 'stamped-schema-drift.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    sa.text(
+                        "ALTER TABLE calendar_event_mirror DROP COLUMN sleep_provider"
+                    )
+                )
+                connection.execute(
+                    sa.text(
+                        "UPDATE alembic_version SET version_num = 'e3f4a5b6c7d8'"
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            columns = {
+                column["name"]
+                for column in sa.inspect(engine).get_columns("calendar_event_mirror")
+            }
+            assert "sleep_provider" in columns
+        finally:
+            engine.dispose()
+
     def test_app_usage_generation_migration_preserves_rows_and_refuses_loss(
         self,
         tmp_path,
@@ -653,7 +685,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "e3f4a5b6c7d8"
+                ) == "f4a5b6c7d8e"
         finally:
             engine.dispose()
 
