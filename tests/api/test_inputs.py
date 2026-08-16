@@ -1,9 +1,29 @@
+import os
+import threading
+import uuid
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 
+import pytest
+import sqlalchemy as sa
 from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 
+from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.repository import COLLECTION_CONFIG_EVENT
-from healthmes.store import RawIngestEvent, RetentionPolicy, WellnessEvent
+from healthmes.inputs import (
+    InputSettingsUpdate,
+    InputSourceRegistry,
+    InputSourceRegistryError,
+)
+from healthmes.storage import update_retention_policy
+from healthmes.store import (
+    Base,
+    RawIngestEvent,
+    RetentionPolicy,
+    WellnessEvent,
+    create_db_engine,
+)
 
 IOS_KEY_FINGERPRINT = "1" * 40
 IOS_APP_A = f"ios-app-v2-{IOS_KEY_FINGERPRINT}-" + ("a" * 40)
@@ -24,6 +44,26 @@ EXPECTED_SOURCE_IDS = [
 def _source(payload: dict, source_id: str) -> dict:
     return next(
         item for item in payload["sources"] if item["source_id"] == source_id
+    )
+
+
+def _put_settings(
+    client,
+    source_id: str,
+    body: dict,
+    *,
+    revision: str | None = None,
+    quoted: bool = True,
+):
+    if revision is None:
+        current = client.get(f"/v1/inputs/{source_id}")
+        assert current.status_code == 200
+        revision = current.json()["revision"]
+    if_match = f'"{revision}"' if quoted else revision
+    return client.put(
+        f"/v1/inputs/{source_id}/settings",
+        headers={"If-Match": if_match},
+        json=body,
     )
 
 
@@ -111,6 +151,7 @@ def test_unified_inputs_returns_one_source_and_404s_unknown(client) -> None:
     response = client.get("/v1/inputs/nutrition.capture")
 
     assert response.status_code == 200
+    assert response.headers["ETag"] == f'"{response.json()["revision"]}"'
     assert response.json()["capabilities"] == [
         "photo_vlm",
         "free_text",
@@ -124,12 +165,94 @@ def test_unified_inputs_returns_one_source_and_404s_unknown(client) -> None:
     assert missing.json()["error"]["code"] == "input_source_not_found"
 
 
+def test_input_settings_requires_a_well_formed_if_match(client) -> None:
+    missing = client.put(
+        "/v1/inputs/activity.android/settings",
+        json={"retention": {"activity_raw": "1d"}},
+    )
+
+    assert missing.status_code == 428
+    assert (
+        missing.json()["error"]["code"]
+        == "input_settings_revision_required"
+    )
+
+    malformed_values = (
+        "",
+        "*",
+        "W/\"" + "sha256:" + ("0" * 64) + "\"",
+        "sha256:" + ("A" * 64),
+        "sha256:" + ("0" * 63),
+        "sha256:" + ("0" * 64) + ", " + "sha256:" + ("1" * 64),
+        "\"sha256:" + ("0" * 64),
+        "sha256:" + ("0" * 64) + "\"",
+    )
+    for value in malformed_values:
+        response = client.put(
+            "/v1/inputs/activity.android/settings",
+            headers={"If-Match": value},
+            json={"retention": {"activity_raw": "1d"}},
+        )
+
+        assert response.status_code == 400
+        assert (
+            response.json()["error"]["code"]
+            == "input_settings_revision_invalid"
+        )
+
+    duplicate = client.put(
+        "/v1/inputs/activity.android/settings",
+        headers=[
+            ("If-Match", "sha256:" + ("0" * 64)),
+            ("If-Match", "sha256:" + ("1" * 64)),
+        ],
+        json={"retention": {"activity_raw": "1d"}},
+    )
+    assert duplicate.status_code == 400
+    assert (
+        duplicate.json()["error"]["code"]
+        == "input_settings_revision_invalid"
+    )
+
+
+def test_input_settings_accepts_unquoted_revision_and_noop_keeps_revision(
+    client,
+) -> None:
+    before = client.get("/v1/inputs/activity.android").json()
+    raw_preset = next(
+        row["preset"]
+        for row in before["retention"]
+        if row["data_class"] == "activity_raw"
+    )
+
+    first = _put_settings(
+        client,
+        "activity.android",
+        {"retention": {"activity_raw": raw_preset}},
+        revision=before["revision"],
+        quoted=False,
+    )
+    repeated = _put_settings(
+        client,
+        "activity.android",
+        {"retention": {"activity_raw": raw_preset}},
+        revision=before["revision"],
+    )
+
+    assert first.status_code == 200
+    assert repeated.status_code == 200
+    assert first.json()["revision"] == before["revision"]
+    assert repeated.json()["revision"] == before["revision"]
+    assert first.headers["ETag"] == f'"{before["revision"]}"'
+
+
 def test_unified_inputs_updates_ios_device_collection_settings(client) -> None:
     paused_until = datetime.now(UTC) + timedelta(hours=2)
 
-    response = client.put(
-        "/v1/inputs/activity.ios-screentime/settings",
-        json={
+    response = _put_settings(
+        client,
+        "activity.ios-screentime",
+        {
             "instance_id": "iphone-input-settings",
             "enabled": True,
             "excluded_apps": [
@@ -161,9 +284,10 @@ def test_unified_inputs_updates_ios_device_collection_settings(client) -> None:
 def test_unified_inputs_does_not_claim_config_only_device_is_collecting(
     client,
 ) -> None:
-    response = client.put(
-        "/v1/inputs/activity.ios-screentime/settings",
-        json={
+    response = _put_settings(
+        client,
+        "activity.ios-screentime",
+        {
             "instance_id": "configured-only-iphone",
             "enabled": True,
         },
@@ -178,9 +302,10 @@ def test_unified_inputs_does_not_claim_config_only_device_is_collecting(
 
 
 def test_unified_inputs_uses_and_persists_desktop_platform(client) -> None:
-    response = client.put(
-        "/v1/inputs/activity.activitywatch/settings",
-        json={
+    response = _put_settings(
+        client,
+        "activity.activitywatch",
+        {
             "instance_id": "desktop-platform-input",
             "platform": "macOS",
             "enabled": True,
@@ -192,9 +317,10 @@ def test_unified_inputs_uses_and_persists_desktop_platform(client) -> None:
     assert instance["instance_id"] == "desktop-platform-input"
     assert instance["platform"] == "macos"
 
-    conflict = client.put(
-        "/v1/inputs/activity.activitywatch/settings",
-        json={
+    conflict = _put_settings(
+        client,
+        "activity.activitywatch",
+        {
             "instance_id": "desktop-platform-input",
             "platform": "linux",
             "enabled": False,
@@ -205,9 +331,10 @@ def test_unified_inputs_uses_and_persists_desktop_platform(client) -> None:
 
 
 def test_unified_inputs_rejects_platform_outside_source(client) -> None:
-    response = client.put(
-        "/v1/inputs/activity.ios-screentime/settings",
-        json={
+    response = _put_settings(
+        client,
+        "activity.ios-screentime",
+        {
             "instance_id": "iphone-invalid-platform",
             "platform": "android",
         },
@@ -218,9 +345,10 @@ def test_unified_inputs_rejects_platform_outside_source(client) -> None:
 
 
 def test_unified_inputs_shares_domain_consent_and_activity_retention(client, session) -> None:
-    response = client.put(
-        "/v1/inputs/activity.ios-screentime/settings",
-        json={
+    response = _put_settings(
+        client,
+        "activity.ios-screentime",
+        {
             "decision_access_enabled": False,
             "retention": {
                 "activity_raw": "1d",
@@ -276,9 +404,10 @@ def test_unified_inputs_shares_domain_consent_and_activity_retention(client, ses
 def test_unified_inputs_rejects_unenforced_non_activity_collection_controls(
     client,
 ) -> None:
-    nutrition = client.put(
-        "/v1/inputs/nutrition.capture/settings",
-        json={
+    nutrition = _put_settings(
+        client,
+        "nutrition.capture",
+        {
             "instance_id": "phone",
             "platform": "ios",
             "enabled": False,
@@ -290,18 +419,20 @@ def test_unified_inputs_rejects_unenforced_non_activity_collection_controls(
         == "input_collection_settings_unsupported"
     )
 
-    configured = client.put(
-        "/v1/inputs/activity.android/settings",
-        json={
+    configured = _put_settings(
+        client,
+        "activity.android",
+        {
             "instance_id": "shared-device-id",
             "enabled": True,
         },
     )
     assert configured.status_code == 200
 
-    mismatch = client.put(
-        "/v1/inputs/activity.ios-screentime/settings",
-        json={
+    mismatch = _put_settings(
+        client,
+        "activity.ios-screentime",
+        {
             "instance_id": "shared-device-id",
             "enabled": False,
         },
@@ -313,9 +444,10 @@ def test_unified_inputs_rejects_unenforced_non_activity_collection_controls(
 def test_unified_inputs_rejects_exclusions_for_non_activity_sources(
     client,
 ) -> None:
-    response = client.put(
-        "/v1/inputs/nutrition.capture/settings",
-        json={
+    response = _put_settings(
+        client,
+        "nutrition.capture",
+        {
             "instance_id": "phone",
             "platform": "ios",
             "excluded_apps": ["com.example.private"],
@@ -340,9 +472,10 @@ def test_unified_inputs_rejects_invalid_ios_exclusion_namespaces(client) -> None
     )
 
     for index, excluded_apps in enumerate(invalid_sets):
-        response = client.put(
-            "/v1/inputs/activity.ios-screentime/settings",
-            json={
+        response = _put_settings(
+            client,
+            "activity.ios-screentime",
+            {
                 "instance_id": f"iphone-invalid-exclusion-{index}",
                 "excluded_apps": excluded_apps,
             },
@@ -359,16 +492,18 @@ def test_unified_inputs_translates_legacy_ios_reenable_failure(
     device_id = "iphone-input-legacy-exclusion"
     _seed_legacy_ios_exclusion(client, session, device_id)
 
-    disabled = client.put(
-        "/v1/inputs/activity.ios-screentime/settings",
-        json={
+    disabled = _put_settings(
+        client,
+        "activity.ios-screentime",
+        {
             "instance_id": device_id,
             "enabled": False,
         },
     )
-    rejected = client.put(
-        "/v1/inputs/activity.ios-screentime/settings",
-        json={
+    rejected = _put_settings(
+        client,
+        "activity.ios-screentime",
+        {
             "instance_id": device_id,
             "enabled": True,
         },
@@ -381,9 +516,10 @@ def test_unified_inputs_translates_legacy_ios_reenable_failure(
 
 
 def test_unified_inputs_rejects_unknown_retention_class(client) -> None:
-    response = client.put(
-        "/v1/inputs/activity.android/settings",
-        json={"retention": {"nutrition_media": "7d"}},
+    response = _put_settings(
+        client,
+        "activity.android",
+        {"retention": {"nutrition_media": "7d"}},
     )
 
     assert response.status_code == 422
@@ -398,9 +534,10 @@ def test_unified_inputs_rejects_empty_or_null_only_updates(client) -> None:
         {"enabled": None},
         {"decision_access_enabled": None},
     ):
-        response = client.put(
-            "/v1/inputs/activity.ios-screentime/settings",
-            json=body,
+        response = _put_settings(
+            client,
+            "activity.ios-screentime",
+            body,
         )
 
         assert response.status_code == 422
@@ -423,13 +560,584 @@ def test_unified_inputs_documents_source_specific_exclusion_ids(client) -> None:
 def test_unified_inputs_revision_changes_for_retention_updates(client) -> None:
     before = client.get("/v1/inputs/activity.ios-screentime").json()
 
-    updated = client.put(
-        "/v1/inputs/activity.ios-screentime/settings",
-        json={"retention": {"activity_raw": "1d"}},
+    updated = _put_settings(
+        client,
+        "activity.ios-screentime",
+        {"retention": {"activity_raw": "1d"}},
+        revision=before["revision"],
     )
 
     assert updated.status_code == 200
     assert updated.json()["revision"] != before["revision"]
+    after = client.get("/v1/inputs/activity.ios-screentime")
+    assert after.json()["revision"] == updated.json()["revision"]
+    assert updated.headers["ETag"] == f'"{updated.json()["revision"]}"'
+    assert after.headers["ETag"] == updated.headers["ETag"]
+
+
+def test_stale_input_settings_update_changes_no_setting_group(client) -> None:
+    paused_until = datetime.now(UTC) + timedelta(hours=4)
+    before = client.get("/v1/inputs/activity.ios-screentime").json()
+    accepted = _put_settings(
+        client,
+        "activity.ios-screentime",
+        {
+            "instance_id": "iphone-stale-settings",
+            "enabled": True,
+            "excluded_apps": [IOS_APP_A],
+            "paused_until": paused_until.isoformat(),
+            "decision_access_enabled": False,
+            "retention": {
+                "activity_raw": "1d",
+                "activity_hourly": "30d",
+                "activity_daily": "90d",
+            },
+        },
+        revision=before["revision"],
+    )
+    assert accepted.status_code == 200
+
+    stale = _put_settings(
+        client,
+        "activity.ios-screentime",
+        {
+            "instance_id": "iphone-stale-settings",
+            "enabled": False,
+            "excluded_apps": [IOS_APP_B],
+            "paused_until": None,
+            "decision_access_enabled": True,
+            "retention": {
+                "activity_raw": "7d",
+                "activity_hourly": "7d",
+                "activity_daily": "7d",
+            },
+        },
+        revision=before["revision"],
+    )
+
+    assert stale.status_code == 409
+    error = stale.json()["error"]
+    assert error["code"] == "input_settings_revision_conflict"
+    assert error["detail"] == {
+        "expected_revision": before["revision"],
+        "current_revision": accepted.json()["revision"],
+    }
+    current = client.get("/v1/inputs/activity.ios-screentime").json()
+    assert current == accepted.json()
+
+
+def test_input_settings_roll_back_every_group_after_partial_failure(
+    client,
+    monkeypatch,
+) -> None:
+    before = client.get("/v1/inputs/activity.ios-screentime").json()
+    original_get = InputSourceRegistry._get_in_transaction
+    calls = 0
+
+    def fail_after_updates(self, session, source):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected post-update descriptor failure")
+        return original_get(self, session, source)
+
+    monkeypatch.setattr(
+        InputSourceRegistry,
+        "_get_in_transaction",
+        fail_after_updates,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="injected post-update descriptor failure",
+    ):
+        _put_settings(
+            client,
+            "activity.ios-screentime",
+            {
+                "instance_id": "iphone-atomic-settings",
+                "enabled": True,
+                "excluded_apps": [IOS_APP_A],
+                "decision_access_enabled": False,
+                "retention": {
+                    "activity_raw": "1d",
+                    "activity_hourly": "30d",
+                    "activity_daily": "90d",
+                },
+            },
+            revision=before["revision"],
+        )
+
+    assert client.get(
+        "/v1/inputs/activity.ios-screentime"
+    ).json() == before
+
+
+def test_concurrent_same_revision_updates_allow_one_sqlite_winner(
+    settings,
+    session_factory,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "healthmes.inputs.registry.activity_write_lock",
+        nullcontext,
+    )
+    monkeypatch.setattr(
+        "healthmes.storage.service.activity_write_lock",
+        nullcontext,
+    )
+    registry = InputSourceRegistry(settings=settings)
+    with session_factory() as session:
+        revision = registry.get(
+            session,
+            "nutrition.capture",
+        ).revision
+
+    start = threading.Barrier(2)
+    successes = []
+    conflicts: list[InputSourceRegistryError] = []
+    failures: list[BaseException] = []
+
+    def update(preset: str) -> None:
+        with session_factory() as session:
+            try:
+                start.wait(timeout=5)
+                descriptor = InputSourceRegistry(
+                    settings=settings
+                ).update(
+                    session,
+                    "nutrition.capture",
+                    InputSettingsUpdate(
+                        retention={"nutrition_observation": preset}
+                    ),
+                    expected_revision=revision,
+                )
+            except InputSourceRegistryError as exc:
+                session.rollback()
+                conflicts.append(exc)
+            except BaseException as exc:
+                session.rollback()
+                failures.append(exc)
+            else:
+                successes.append(descriptor)
+
+    workers = [
+        threading.Thread(target=update, args=(preset,))
+        for preset in ("1d", "7d")
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert failures == []
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    assert conflicts[0].code == "input_settings_revision_conflict"
+    assert conflicts[0].detail["current_revision"] == successes[0].revision
+
+    with session_factory() as session:
+        current = registry.get(session, "nutrition.capture")
+    assert current.revision == successes[0].revision
+    raw_policy = next(
+        row
+        for row in current.retention
+        if row.data_class == "nutrition_observation"
+    )
+    assert raw_policy.preset in {"1d", "7d"}
+
+
+def test_sqlite_legacy_retention_writer_invalidates_input_revision(
+    settings,
+    session_factory,
+    monkeypatch,
+) -> None:
+    legacy_has_fence = threading.Event()
+    release_legacy = threading.Event()
+    input_attempted_fence = threading.Event()
+
+    def controlled_legacy_fence(session) -> None:
+        lock_activity_write_plane(session)
+        if session.info.get("legacy_retention_writer"):
+            legacy_has_fence.set()
+            if not release_legacy.wait(timeout=10):
+                raise TimeoutError("test did not release legacy writer")
+
+    def observed_input_fence(session) -> None:
+        input_attempted_fence.set()
+        lock_activity_write_plane(session)
+
+    monkeypatch.setattr(
+        "healthmes.inputs.registry.activity_write_lock",
+        nullcontext,
+    )
+    monkeypatch.setattr(
+        "healthmes.storage.service.activity_write_lock",
+        nullcontext,
+    )
+    monkeypatch.setattr(
+        "healthmes.storage.service.lock_activity_write_plane",
+        controlled_legacy_fence,
+    )
+    monkeypatch.setattr(
+        "healthmes.inputs.registry.lock_activity_write_plane",
+        observed_input_fence,
+    )
+
+    registry = InputSourceRegistry(settings=settings)
+    with session_factory() as session:
+        revision = registry.get(
+            session,
+            "nutrition.capture",
+        ).revision
+
+    failures: list[BaseException] = []
+    conflicts: list[InputSourceRegistryError] = []
+
+    def legacy_update() -> None:
+        with session_factory() as session:
+            session.info["legacy_retention_writer"] = True
+            try:
+                update_retention_policy(
+                    session,
+                    "nutrition_observation",
+                    "1d",
+                )
+                session.commit()
+            except BaseException as exc:
+                session.rollback()
+                failures.append(exc)
+
+    def input_update() -> None:
+        with session_factory() as session:
+            try:
+                registry.update(
+                    session,
+                    "nutrition.capture",
+                    InputSettingsUpdate(
+                        retention={"nutrition_observation": "7d"}
+                    ),
+                    expected_revision=revision,
+                )
+            except InputSourceRegistryError as exc:
+                session.rollback()
+                conflicts.append(exc)
+            except BaseException as exc:
+                session.rollback()
+                failures.append(exc)
+
+    legacy_worker = threading.Thread(target=legacy_update)
+    input_worker = threading.Thread(target=input_update)
+    try:
+        legacy_worker.start()
+        assert legacy_has_fence.wait(timeout=10)
+        input_worker.start()
+        assert input_attempted_fence.wait(timeout=10)
+        release_legacy.set()
+        legacy_worker.join(timeout=10)
+        input_worker.join(timeout=10)
+
+        assert not legacy_worker.is_alive()
+        assert not input_worker.is_alive()
+        assert failures == []
+        assert len(conflicts) == 1
+        assert conflicts[0].code == "input_settings_revision_conflict"
+
+        with session_factory() as session:
+            current = registry.get(session, "nutrition.capture")
+        policy = next(
+            row
+            for row in current.retention
+            if row.data_class == "nutrition_observation"
+        )
+        assert policy.preset == "1d"
+        assert conflicts[0].detail["current_revision"] == current.revision
+    finally:
+        release_legacy.set()
+        if legacy_worker.ident is not None:
+            legacy_worker.join(timeout=5)
+        if input_worker.ident is not None:
+            input_worker.join(timeout=5)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_concurrent_same_revision_updates_use_postgres_write_fence(
+    settings,
+    monkeypatch,
+) -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_test_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    monkeypatch.setattr(
+        "healthmes.inputs.registry.activity_write_lock",
+        nullcontext,
+    )
+    registry = InputSourceRegistry(settings=settings)
+    with factory() as session:
+        revision = registry.get(
+            session,
+            "activity.android",
+        ).revision
+
+    start = threading.Barrier(2)
+    successes = []
+    conflicts: list[InputSourceRegistryError] = []
+    failures: list[BaseException] = []
+
+    def update(preset: str) -> None:
+        with factory() as session:
+            try:
+                start.wait(timeout=5)
+                descriptor = InputSourceRegistry(
+                    settings=settings
+                ).update(
+                    session,
+                    "activity.android",
+                    InputSettingsUpdate(
+                        retention={"activity_raw": preset}
+                    ),
+                    expected_revision=revision,
+                )
+            except InputSourceRegistryError as exc:
+                session.rollback()
+                conflicts.append(exc)
+            except BaseException as exc:
+                session.rollback()
+                failures.append(exc)
+            else:
+                successes.append(descriptor)
+
+    workers = [
+        threading.Thread(target=update, args=(preset,))
+        for preset in ("1d", "7d")
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        assert all(not worker.is_alive() for worker in workers)
+        assert failures == []
+        assert len(successes) == 1
+        assert len(conflicts) == 1
+        assert conflicts[0].code == "input_settings_revision_conflict"
+        assert (
+            conflicts[0].detail["current_revision"]
+            == successes[0].revision
+        )
+    finally:
+        for worker in workers:
+            worker.join(timeout=5)
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_legacy_retention_writer_invalidates_input_revision(
+    settings,
+    monkeypatch,
+) -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_test_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+
+    legacy_has_fence = threading.Event()
+    release_legacy = threading.Event()
+    input_attempted_fence = threading.Event()
+
+    def controlled_legacy_fence(session) -> None:
+        lock_activity_write_plane(session)
+        if session.info.get("legacy_retention_writer"):
+            legacy_has_fence.set()
+            if not release_legacy.wait(timeout=10):
+                raise TimeoutError("test did not release legacy writer")
+
+    def observed_input_fence(session) -> None:
+        input_attempted_fence.set()
+        lock_activity_write_plane(session)
+
+    monkeypatch.setattr(
+        "healthmes.inputs.registry.activity_write_lock",
+        nullcontext,
+    )
+    monkeypatch.setattr(
+        "healthmes.storage.service.activity_write_lock",
+        nullcontext,
+    )
+    monkeypatch.setattr(
+        "healthmes.storage.service.lock_activity_write_plane",
+        controlled_legacy_fence,
+    )
+    monkeypatch.setattr(
+        "healthmes.inputs.registry.lock_activity_write_plane",
+        observed_input_fence,
+    )
+
+    registry = InputSourceRegistry(settings=settings)
+    with factory() as session:
+        revision = registry.get(
+            session,
+            "nutrition.capture",
+        ).revision
+
+    failures: list[BaseException] = []
+    conflicts: list[InputSourceRegistryError] = []
+
+    def legacy_update() -> None:
+        with factory() as session:
+            session.info["legacy_retention_writer"] = True
+            try:
+                update_retention_policy(
+                    session,
+                    "nutrition_observation",
+                    "1d",
+                )
+                session.commit()
+            except BaseException as exc:
+                session.rollback()
+                failures.append(exc)
+
+    def input_update() -> None:
+        with factory() as session:
+            try:
+                registry.update(
+                    session,
+                    "nutrition.capture",
+                    InputSettingsUpdate(
+                        retention={"nutrition_observation": "7d"}
+                    ),
+                    expected_revision=revision,
+                )
+            except InputSourceRegistryError as exc:
+                session.rollback()
+                conflicts.append(exc)
+            except BaseException as exc:
+                session.rollback()
+                failures.append(exc)
+
+    legacy_worker = threading.Thread(target=legacy_update)
+    input_worker = threading.Thread(target=input_update)
+    try:
+        legacy_worker.start()
+        assert legacy_has_fence.wait(timeout=10)
+        input_worker.start()
+        assert input_attempted_fence.wait(timeout=10)
+        release_legacy.set()
+        legacy_worker.join(timeout=10)
+        input_worker.join(timeout=10)
+
+        assert not legacy_worker.is_alive()
+        assert not input_worker.is_alive()
+        assert failures == []
+        assert len(conflicts) == 1
+        assert conflicts[0].code == "input_settings_revision_conflict"
+
+        with factory() as session:
+            current = registry.get(session, "nutrition.capture")
+        policy = next(
+            row
+            for row in current.retention
+            if row.data_class == "nutrition_observation"
+        )
+        assert policy.preset == "1d"
+        assert conflicts[0].detail["current_revision"] == current.revision
+    finally:
+        release_legacy.set()
+        if legacy_worker.ident is not None:
+            legacy_worker.join(timeout=5)
+        if input_worker.ident is not None:
+            input_worker.join(timeout=5)
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
+        admin_engine.dispose()
+
+
+def test_input_settings_openapi_requires_if_match(client) -> None:
+    operation = client.get("/openapi.json").json()["paths"][
+        "/v1/inputs/{source_id}/settings"
+    ]["put"]
+    parameters = [
+        parameter
+        for parameter in operation["parameters"]
+        if parameter["in"] == "header"
+    ]
+
+    assert parameters == [
+        {
+            "name": "If-Match",
+            "in": "header",
+            "required": True,
+            "description": (
+                "Current input descriptor revision from GET "
+                "/v1/inputs/{source_id}. Accepts an exact sha256 tag in "
+                "quoted or unquoted form."
+            ),
+            "schema": {
+                "type": "string",
+                "pattern": (
+                    '^(?:"sha256:[0-9a-f]{64}"|'
+                    "sha256:[0-9a-f]{64})$"
+                ),
+                "examples": [
+                    "sha256:" + ("0" * 64),
+                    '"sha256:' + ("0" * 64) + '"',
+                ],
+            },
+        }
+    ]
+    assert operation["description"] == (
+        "Atomically update input settings when If-Match equals the current "
+        "descriptor revision. A semantically identical update returns 200 "
+        "and preserves the revision, so that revision remains reusable."
+    )
+    assert {"400", "409", "428"} <= set(operation["responses"])
 
 
 def test_retention_preset_reenables_a_disabled_policy(
@@ -447,9 +1155,10 @@ def test_retention_preset_reenables_a_disabled_policy(
     policy.retention_days = 1
     session.commit()
 
-    response = client.put(
-        "/v1/inputs/activity.android/settings",
-        json={"retention": {"activity_raw": "1d"}},
+    response = _put_settings(
+        client,
+        "activity.android",
+        {"retention": {"activity_raw": "1d"}},
     )
 
     assert response.status_code == 200
@@ -462,9 +1171,10 @@ def test_open_wearables_retention_isolated_from_generic_wellness(
     client,
     session,
 ) -> None:
-    updated = client.put(
-        "/v1/inputs/wearable.open-wearables/settings",
-        json={"retention": {"wearable_normalized": "1d"}},
+    updated = _put_settings(
+        client,
+        "wearable.open-wearables",
+        {"retention": {"wearable_normalized": "1d"}},
     )
 
     assert updated.status_code == 200

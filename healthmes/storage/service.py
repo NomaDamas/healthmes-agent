@@ -155,12 +155,9 @@ def _update_retention_policy(
     if preset not in RETENTION_PRESETS:
         raise ValueError(f"unsupported retention preset: {preset}")
     current = _as_utc(now or _now())
-    if (
-        data_class.startswith("activity_")
-        or data_class
-        in {"calendar_mirror", "wearable_normalized"}
-    ):
-        lock_activity_write_plane(session)
+    # Input descriptor revisions include every retention class. All retention
+    # writers must therefore share the same cross-process fence as input CAS.
+    lock_activity_write_plane(session)
     ensure_default_policies(session)
     policy = session.scalar(
         select(RetentionPolicy).where(RetentionPolicy.data_class == data_class)

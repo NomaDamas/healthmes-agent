@@ -551,8 +551,12 @@ def test_versioned_ios_collector_requires_explicit_input_registration(
         params={"platform": "ios"},
     )
     blocked = client.post("/v1/activity/ios/report", json=payload)
+    revision = client.get(
+        "/v1/inputs/activity.ios-screentime"
+    ).json()["revision"]
     registered = client.put(
         "/v1/inputs/activity.ios-screentime/settings",
+        headers={"If-Match": f'"{revision}"'},
         json={
             "instance_id": device_id,
             "platform": "ios",

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from healthmes.activity.contracts import (
@@ -469,11 +469,30 @@ _SOURCES = (
 _SOURCE_BY_ID = {source.source_id: source for source in _SOURCES}
 
 
+def _begin_input_settings_transaction(session: Session) -> None:
+    """Make SQLite's outer transaction real before nested control writes."""
+
+    lock_activity_write_plane(session)
+    if session.get_bind().dialect.name != "sqlite":
+        return
+    connection = session.connection()
+    driver_connection = connection.connection.driver_connection
+    if not driver_connection.in_transaction:
+        session.execute(text("BEGIN IMMEDIATE"))
+
+
 class InputSourceRegistryError(ValueError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        detail: Any = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.detail = detail
 
 
 class InputSourceRegistry:
@@ -483,6 +502,14 @@ class InputSourceRegistry:
         self._settings = settings
 
     def list(self, session: Session) -> tuple[InputSourceDescriptor, ...]:
+        descriptors = self._list_in_transaction(session)
+        session.commit()
+        return descriptors
+
+    def _list_in_transaction(
+        self,
+        session: Session,
+    ) -> tuple[InputSourceDescriptor, ...]:
         policies = {
             row.data_class: row
             for row in ensure_default_policies(session)
@@ -498,7 +525,6 @@ class InputSourceRegistry:
         raw_ingest_sources = set(
             session.scalars(select(RawIngestEvent.source).distinct())
         )
-        session.commit()
         return tuple(
             self._descriptor(
                 source,
@@ -516,9 +542,18 @@ class InputSourceRegistry:
         source_id: str,
     ) -> InputSourceDescriptor:
         source = self._source(source_id)
+        descriptor = self._get_in_transaction(session, source)
+        session.commit()
+        return descriptor
+
+    def _get_in_transaction(
+        self,
+        session: Session,
+        source: _SourceSpec,
+    ) -> InputSourceDescriptor:
         return next(
             descriptor
-            for descriptor in self.list(session)
+            for descriptor in self._list_in_transaction(session)
             if descriptor.source_id == source.source_id
         )
 
@@ -527,7 +562,16 @@ class InputSourceRegistry:
         session: Session,
         source_id: str,
         update: InputSettingsUpdate,
+        *,
+        expected_revision: str,
     ) -> InputSourceDescriptor:
+        """Conditionally update one source under the shared write fence.
+
+        Revisions are content hashes. A semantically identical PUT therefore
+        succeeds without changing the revision, while every state-changing
+        PUT invalidates clients holding the previous revision.
+        """
+
         source = self._source(source_id)
         collection_values = update.collection_values()
         collection_requested = bool(collection_values) or update.platform is not None
@@ -565,63 +609,78 @@ class InputSourceRegistry:
             )
 
         with activity_write_lock():
-            lock_activity_write_plane(session)
-            if collection_requested:
-                assert update.instance_id is not None
-                if source.activity_platforms:
-                    platform = self._activity_platform_for_update(
-                        session,
-                        source,
-                        update.instance_id,
-                        requested_platform=update.platform,
+            try:
+                _begin_input_settings_transaction(session)
+                current = self._get_in_transaction(session, source)
+                if current.revision != expected_revision:
+                    raise InputSourceRegistryError(
+                        "input_settings_revision_conflict",
+                        "The input settings changed after the caller read them.",
+                        detail={
+                            "expected_revision": expected_revision,
+                            "current_revision": current.revision,
+                        },
                     )
-                    if (
-                        platform is ActivityPlatform.IOS
-                        and update.excluded_apps is not None
-                        and (
-                            any(
-                                not is_ios_app_token(value)
-                                for value in update.excluded_apps
-                            )
-                            or len(
-                                {
-                                    ios_app_token_key_id(value)
-                                    for value in update.excluded_apps
-                                }
-                            )
-                            > 1
-                        )
-                    ):
-                        raise InputSourceRegistryError(
-                            "invalid_ios_app_token",
-                            "iOS excluded apps must be v2 tokens from one "
-                            "device pseudonym key namespace",
-                        )
-                    try:
-                        update_collection_config(
+                if collection_requested:
+                    assert update.instance_id is not None
+                    if source.activity_platforms:
+                        platform = self._activity_platform_for_update(
                             session,
+                            source,
                             update.instance_id,
-                            ActivityCollectionUpdate(
-                                platform=platform,
-                                **collection_values,
-                            ),
+                            requested_platform=update.platform,
                         )
-                    except InvalidIOSAppTokenError as exc:
-                        raise InputSourceRegistryError(
-                            "invalid_ios_app_token",
-                            str(exc),
-                        ) from exc
-            for data_class, preset in sorted(update.retention.items()):
-                update_retention_policy(session, data_class, preset)
-            if update.decision_access_enabled is not None:
-                update_decision_domain_policy(
-                    session,
-                    self._settings.decision_owner_principal_id,
-                    source.domain,
-                    enabled=update.decision_access_enabled,
-                )
-            session.commit()
-        return self.get(session, source.source_id)
+                        if (
+                            platform is ActivityPlatform.IOS
+                            and update.excluded_apps is not None
+                            and (
+                                any(
+                                    not is_ios_app_token(value)
+                                    for value in update.excluded_apps
+                                )
+                                or len(
+                                    {
+                                        ios_app_token_key_id(value)
+                                        for value in update.excluded_apps
+                                    }
+                                )
+                                > 1
+                            )
+                        ):
+                            raise InputSourceRegistryError(
+                                "invalid_ios_app_token",
+                                "iOS excluded apps must be v2 tokens from one "
+                                "device pseudonym key namespace",
+                            )
+                        try:
+                            update_collection_config(
+                                session,
+                                update.instance_id,
+                                ActivityCollectionUpdate(
+                                    platform=platform,
+                                    **collection_values,
+                                ),
+                            )
+                        except InvalidIOSAppTokenError as exc:
+                            raise InputSourceRegistryError(
+                                "invalid_ios_app_token",
+                                str(exc),
+                            ) from exc
+                for data_class, preset in sorted(update.retention.items()):
+                    update_retention_policy(session, data_class, preset)
+                if update.decision_access_enabled is not None:
+                    update_decision_domain_policy(
+                        session,
+                        self._settings.decision_owner_principal_id,
+                        source.domain,
+                        enabled=update.decision_access_enabled,
+                    )
+                updated = self._get_in_transaction(session, source)
+                session.commit()
+            except BaseException:
+                session.rollback()
+                raise
+        return updated
 
     def _source(self, source_id: str) -> _SourceSpec:
         normalized = source_id.strip().casefold()
