@@ -3261,6 +3261,12 @@ class WearableContextProvider:
                     }
                 ),
             }
+            if query.capability == "wearable.timeseries":
+                stored_result["stream_attribution_status"] = (
+                    "unavailable"
+                    if fetched.stream_attribution_unavailable
+                    else "verified"
+                )
             if not fetched.limitations:
                 stored_result["coverage"] = {"ratio": 1.0}
             snapshot, store_limitation = self._store_detail_snapshot(
@@ -3433,6 +3439,10 @@ class WearableContextProvider:
                 resolution=str(query.parameters["resolution"]),
                 start=snapshot.start,
                 end=snapshot.end,
+                stream_attribution_verified=(
+                    stored.get("stream_attribution_status")
+                    == "verified"
+                ),
             )
             public_records = list(normalized_fetch.records)
             retained_limitations.update(normalized_fetch.limitations)

@@ -1139,6 +1139,173 @@ async def test_retained_timeseries_reapplies_resolution_without_merging(
         engine.dispose()
 
 
+async def test_retained_timeseries_exact_boundary_is_partial_without_streams(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(
+        tmp_path,
+        "detail-retained-timeseries-exact-boundary.db",
+    )
+    with factory() as session:
+        persist_open_wearables_query_snapshot(
+            session,
+            capability="wearable.timeseries",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            timezone="UTC",
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+            result={
+                "status": "ok",
+                "records": [
+                    {
+                        "timestamp": "2026-08-16T08:00:00+00:00",
+                        "series_type": "steps",
+                        "value": 10,
+                        "unit": "count",
+                        "provider": "apple_health",
+                        "provider_attribution": "source_exact_alias",
+                    },
+                    {
+                        "timestamp": "2026-08-16T08:00:00+00:00",
+                        "series_type": "steps",
+                        "value": 20,
+                        "unit": "count",
+                        "provider": "apple_health",
+                        "provider_attribution": "source_exact_alias",
+                    },
+                ],
+                "coverage": {"ratio": 1.0},
+                "limitations": [],
+            },
+            collected_at=NOW,
+            now=NOW,
+        )
+        session.commit()
+
+    async def unavailable_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        raise RuntimeError("upstream unavailable")
+
+    service = _service(
+        factory,
+        WearableContextProvider(
+            search_reader=unavailable_reader,
+            snapshot_session_factory=factory,
+        ),
+    )
+    try:
+        handle = service.begin(_request())
+        result = await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.timeseries",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="series",
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+        )
+
+        assert [record["value"] for record in result.payload["records"]] == [
+            10,
+            20,
+        ]
+        assert [
+            record["timestamp"] for record in result.payload["records"]
+        ] == [
+            "2026-08-16T08:00:00+00:00",
+            "2026-08-16T08:00:00+00:00",
+        ]
+        assert result.status is ContextStatus.PARTIAL
+        assert result.coverage.status is CoverageStatus.UNKNOWN
+        assert result.coverage.ratio is None
+        assert (
+            "wearable_stream_attribution_unavailable"
+            in result.limitations
+        )
+    finally:
+        service.close()
+        engine.dispose()
+
+
+async def test_live_exact_boundary_with_verified_streams_stays_complete(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(
+        tmp_path,
+        "detail-live-timeseries-exact-boundary.db",
+    )
+
+    async def verified_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(
+                {
+                    "timestamp": "2026-08-16T08:00:00+00:00",
+                    "series_type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "provider": "apple_health",
+                    "provider_attribution": "source_exact_alias",
+                },
+            ),
+            stream_attribution_unavailable=False,
+        )
+
+    service = _service(
+        factory,
+        WearableContextProvider(
+            search_reader=verified_reader,
+            snapshot_session_factory=factory,
+        ),
+    )
+    try:
+        handle = service.begin(_request())
+        result = await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.timeseries",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="series",
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+        )
+
+        assert result.status is ContextStatus.OK
+        assert result.coverage.status is CoverageStatus.COMPLETE
+        assert result.coverage.ratio == 1
+        assert (
+            "wearable_stream_attribution_unavailable"
+            not in result.limitations
+        )
+        assert result.payload["provenance_mode"] == (
+            "live_upstream_mirrored"
+        )
+        with factory() as observer:
+            event = observer.get(
+                WellnessEvent,
+                UUID(result.source_refs[0].record_id),
+            )
+            assert event is not None
+            assert (
+                event.payload["result"]["stream_attribution_status"]
+                == "verified"
+            )
+    finally:
+        service.close()
+        engine.dispose()
+
+
 async def test_detail_search_timeout_uses_exact_retained_query(
     tmp_path,
 ) -> None:

@@ -11,11 +11,78 @@ from healthmes.wearables.search import (
     MAX_WEARABLE_SEARCH_ROWS,
     BoundedOpenWearablesSearch,
     WearableSearchRequest,
+    normalize_retained_wearable_timeseries,
     validate_wearable_search_request,
 )
 
 START = datetime(2026, 8, 10, tzinfo=UTC)
 END = START + timedelta(days=1)
+
+
+def test_retained_timeseries_exact_boundary_remains_unattributed() -> None:
+    fetched = normalize_retained_wearable_timeseries(
+        (
+            {
+                "timestamp": "2026-08-10T08:00:00+00:00",
+                "series_type": "steps",
+                "value": 10,
+                "unit": "count",
+                "provider": "apple_health",
+                "provider_attribution": "source_exact_alias",
+                "device": "Private Watch A",
+            },
+            {
+                "timestamp": "2026-08-10T08:00:00+00:00",
+                "series_type": "steps",
+                "value": 20,
+                "unit": "count",
+                "provider": "apple_health",
+                "provider_attribution": "source_exact_alias",
+                "device": "Private Watch B",
+            },
+        ),
+        series_type="steps",
+        resolution="1hour",
+        start=START,
+        end=END,
+    )
+
+    assert [record["value"] for record in fetched.records] == [10, 20]
+    assert [record["timestamp"] for record in fetched.records] == [
+        "2026-08-10T08:00:00+00:00",
+        "2026-08-10T08:00:00+00:00",
+    ]
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "Private Watch" not in encoded
+    assert "_healthmes_stream_key" not in encoded
+    assert fetched.limitations == (
+        "wearable_stream_attribution_unavailable",
+    )
+
+
+def test_retained_timeseries_preserves_verified_attribution_status() -> None:
+    fetched = normalize_retained_wearable_timeseries(
+        (
+            {
+                "timestamp": "2026-08-10T08:00:00+00:00",
+                "series_type": "steps",
+                "value": 10,
+                "unit": "count",
+                "provider": "apple_health",
+                "provider_attribution": "source_exact_alias",
+            },
+        ),
+        series_type="steps",
+        resolution="1hour",
+        start=START,
+        end=END,
+        stream_attribution_verified=True,
+    )
+
+    assert fetched.records[0]["timestamp"] == (
+        "2026-08-10T08:00:00+00:00"
+    )
+    assert fetched.limitations == ()
 
 
 def _request(

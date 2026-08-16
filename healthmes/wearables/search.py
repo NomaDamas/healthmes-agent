@@ -190,6 +190,7 @@ def normalize_retained_wearable_timeseries(
     resolution: str,
     start: datetime,
     end: datetime,
+    stream_attribution_verified: bool = False,
 ) -> WearableSearchFetch:
     """Reapply current privacy rules to previously stored public records."""
 
@@ -200,7 +201,6 @@ def normalize_retained_wearable_timeseries(
 
     normalized: list[dict[str, Any]] = []
     discarded = 0
-    rebucketed = False
     for record in records:
         timestamp = _timestamp(record.get("timestamp"))
         retained_type = _safe_text(
@@ -224,7 +224,6 @@ def normalize_retained_wearable_timeseries(
             timestamp,
             resolution=resolution,
         )
-        rebucketed = rebucketed or bucket_start != timestamp
         result: dict[str, Any] = {
             "timestamp": bucket_start.isoformat(),
             "series_type": series_type,
@@ -251,7 +250,9 @@ def normalize_retained_wearable_timeseries(
     return WearableSearchFetch(
         records=tuple(normalized),
         discarded_rows=discarded,
-        stream_attribution_unavailable=rebucketed,
+        stream_attribution_unavailable=(
+            bool(normalized) and not stream_attribution_verified
+        ),
     )
 
 
