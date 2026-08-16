@@ -455,10 +455,12 @@ class DecisionContextSearchSessionService:
             if record is None:
                 self._raise_lookup_error_locked(decision_session_id)
             assert record is not None
-            self._transition_locked(
-                record,
-                DecisionSearchSessionState.ABORTED,
-            )
+            record.terminal_error_code = "decision_search_session_aborted"
+            if not record.in_flight:
+                self._transition_locked(
+                    record,
+                    DecisionSearchSessionState.ABORTED,
+                )
         return self._snapshot(record)
 
     def close(self) -> None:
@@ -642,6 +644,39 @@ class DecisionContextSearchSessionService:
             )
             self._expire(record)
             raise ExpiredDecisionSearchSessionError() from exc
+        except AbortedDecisionSearchSessionError:
+            error_code = (
+                record.terminal_error_code
+                or "decision_search_session_aborted"
+            )
+            finished_at = _utc(self._clock())
+            effective_query = (
+                record.access_turn.effective_query_for(query.query_id)
+                or query
+            )
+            audit = next(
+                (
+                    entry
+                    for entry in reversed(record.access_turn.trace)
+                    if entry.query_id == query.query_id
+                ),
+                None,
+            ) or _failed_access_audit(
+                query,
+                effective_query=effective_query,
+                occurred_at=finished_at,
+                error_code=error_code,
+            )
+            self._store_failed_call(
+                record,
+                query=query,
+                effective_query=effective_query,
+                started_at=started_at,
+                finished_at=finished_at,
+                error_code=error_code,
+                access_audit=audit,
+            )
+            raise
         except DecisionSearchSessionError:
             raise
         except Exception:
@@ -717,16 +752,40 @@ class DecisionContextSearchSessionService:
                 effective_query=effective_query,
                 started_at=started_at,
                 finished_at=finished_at,
+                access_audit=audit,
             )
             raise DecisionSearchBudgetError(
                 "decision_search_context_byte_budget_exhausted"
             )
         wire_result, wire_bytes, context_bytes = projected
-        with record.result_lock:
-            record.tool_trace.append(tool_record.model_copy(deep=True))
-            record.access_trace.append(audit.model_copy(deep=True))
-            record.wire_bytes = wire_bytes
-            record.context_bytes = context_bytes
+        with self._lock:
+            aborted = (
+                record.terminal_error_code is not None
+                or record.state is DecisionSearchSessionState.ABORTED
+            )
+            if not aborted:
+                with record.result_lock:
+                    record.tool_trace.append(
+                        tool_record.model_copy(deep=True)
+                    )
+                    record.access_trace.append(audit.model_copy(deep=True))
+                    record.wire_bytes = wire_bytes
+                    record.context_bytes = context_bytes
+        if aborted:
+            error_code = (
+                record.terminal_error_code
+                or "decision_search_session_aborted"
+            )
+            self._store_failed_call(
+                record,
+                query=query,
+                effective_query=effective_query,
+                started_at=started_at,
+                finished_at=finished_at,
+                error_code=error_code,
+                access_audit=audit,
+            )
+            raise AbortedDecisionSearchSessionError()
         return wire_result
 
     def _resolve_policy(
@@ -927,6 +986,7 @@ class DecisionContextSearchSessionService:
         effective_query: ContextQuery,
         started_at: datetime,
         finished_at: datetime,
+        access_audit: AccessAuditEntry,
     ) -> None:
         self._store_failed_call(
             record,
@@ -935,6 +995,7 @@ class DecisionContextSearchSessionService:
             started_at=started_at,
             finished_at=finished_at,
             error_code="turn_context_byte_budget_exhausted",
+            access_audit=access_audit,
         )
 
     def _store_failed_call(
@@ -1149,7 +1210,11 @@ class DecisionContextSearchSessionService:
             if current_monotonic >= record.deadline:
                 self._transition_locked(
                     record,
-                    DecisionSearchSessionState.EXPIRED,
+                    (
+                        DecisionSearchSessionState.ABORTED
+                        if record.terminal_error_code is not None
+                        else DecisionSearchSessionState.EXPIRED
+                    ),
                     ended_monotonic=current_monotonic,
                 )
         terminal_cutoff = (

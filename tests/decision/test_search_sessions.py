@@ -183,6 +183,18 @@ class CancellationProvider(SearchProvider):
         raise AssertionError("cancelled provider call resumed unexpectedly")
 
 
+class BlockingProvider(SearchProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def query(self, session, query, *, now):
+        self.started.set()
+        await self.release.wait()
+        return await super().query(session, query, now=now)
+
+
 @pytest.fixture
 def store_factory() -> sessionmaker[Session]:
     engine = create_db_engine("sqlite+pysqlite:///:memory:")
@@ -544,6 +556,12 @@ async def test_range_limit_and_encoded_byte_bounds_use_access_layer(
         byte_snapshot.tool_trace[-1].error_code
         == "turn_context_byte_budget_exhausted"
     )
+    assert len(byte_snapshot.access_trace) == 1
+    assert (
+        byte_snapshot.access_trace[0].query_id
+        == byte_snapshot.tool_trace[-1].query.query_id
+    )
+    assert byte_snapshot.access_trace[0].payload_bytes > 0
     assert len(
         json.dumps(
             byte_snapshot.model_dump(mode="json", round_trip=True),
@@ -801,3 +819,100 @@ async def test_cancelled_tool_call_is_audited_and_cannot_finish_normally(
     assert finished.access_trace == snapshot.access_trace
     with pytest.raises(AbortedDecisionSearchSessionError):
         service.inspect(handle.session_id)
+
+
+async def test_explicit_abort_preserves_in_flight_tool_and_access_trace(
+    store_factory,
+) -> None:
+    clock = MutableClock()
+    provider = BlockingProvider()
+    service = _service(
+        store_factory,
+        provider,
+        [_policy()],
+        clock,
+    )
+    handle = service.begin(_request())
+    task = asyncio.create_task(
+        _search(service, handle.session_id)
+    )
+    await provider.started.wait()
+
+    aborted = service.abort(handle.session_id)
+    assert aborted.state is DecisionSearchSessionState.ABORTED
+    provider.release.set()
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        await task
+
+    snapshot = service.inspect(handle.session_id)
+    assert snapshot.state is DecisionSearchSessionState.ABORTED
+    assert snapshot.budget.tool_calls_used == 1
+    assert len(snapshot.tool_trace) == 1
+    assert snapshot.tool_trace[0].status is ToolCallStatus.FAILED
+    assert (
+        snapshot.tool_trace[0].error_code
+        == "decision_search_session_aborted"
+    )
+    assert len(snapshot.access_trace) == 1
+    assert snapshot.access_trace[0].reason_codes == (
+        "decision_search_session_aborted",
+    )
+    assert (
+        snapshot.access_trace[0].query_id
+        == snapshot.tool_trace[0].query.query_id
+    )
+
+    finished = service.finish(handle.session_id)
+    assert finished.state is DecisionSearchSessionState.ABORTED
+    assert finished.tool_trace == snapshot.tool_trace
+    assert finished.access_trace == snapshot.access_trace
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        service.inspect(handle.session_id)
+
+
+async def test_abort_wins_race_with_result_snapshot_commit(
+    store_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = MutableClock()
+    service = _service(
+        store_factory,
+        SearchProvider(),
+        [_policy()],
+        clock,
+    )
+    handle = service.begin(_request())
+    original_project = service._project_accepted_result
+
+    def abort_after_projection(record, *, audit, tool_record):
+        projected = original_project(
+            record,
+            audit=audit,
+            tool_record=tool_record,
+        )
+        service.abort(record.session_id)
+        return projected
+
+    monkeypatch.setattr(
+        service,
+        "_project_accepted_result",
+        abort_after_projection,
+    )
+
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        await _search(service, handle.session_id)
+
+    snapshot = service.inspect(handle.session_id)
+    assert snapshot.state is DecisionSearchSessionState.ABORTED
+    assert len(snapshot.tool_trace) == 1
+    assert snapshot.tool_trace[0].status is ToolCallStatus.FAILED
+    assert snapshot.tool_trace[0].result is None
+    assert (
+        snapshot.tool_trace[0].error_code
+        == "decision_search_session_aborted"
+    )
+    assert len(snapshot.access_trace) == 1
+    assert (
+        snapshot.access_trace[0].query_id
+        == snapshot.tool_trace[0].query.query_id
+    )
