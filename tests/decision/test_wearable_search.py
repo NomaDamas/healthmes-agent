@@ -413,9 +413,21 @@ async def test_detail_query_clamps_to_shorter_retention_policy(
         now=NOW,
     )
 
-    assert result.status is not ContextStatus.FAILED
+    assert result.status is ContextStatus.PARTIAL
     assert calls[0].start == NOW - timedelta(days=7)
     assert "wearable_retention_window_trimmed" in result.limitations
+    assert result.coverage.status is CoverageStatus.UNKNOWN
+    assert result.coverage.ratio is None
+    assert result.source_refs[0].observed_start == NOW - timedelta(days=7)
+    assert result.source_refs[0].coverage is None
+    event = session.get(
+        WellnessEvent,
+        UUID(result.source_refs[0].record_id),
+    )
+    assert event is not None
+    assert event.coverage is None
+    assert event.payload["result"]["status"] == "partial"
+    assert "coverage" not in event.payload["result"]
 
 
 async def test_detail_query_fully_before_retention_skips_upstream(
@@ -1336,7 +1348,10 @@ class UnalignedWindowTimeseriesClient:
                     "data_source_id": "trusted-sensor",
                 },
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {
+                "next_cursor": None,
+                "has_more": False,
+            },
         }
 
 

@@ -687,6 +687,7 @@ _WEARABLE_INCOMPLETE_RESULT_LIMITATIONS = frozenset(
     {
         "wearable_payload_limit_reached",
         "wearable_provider_attribution_unavailable",
+        "wearable_retention_window_trimmed",
         "wearable_rows_discarded",
         "wearable_stream_attribution_unavailable",
         "wearable_upstream_page_limit_reached",
@@ -3227,6 +3228,7 @@ class WearableContextProvider:
                     retained,
                     provenance_mode="retained_local_mirror",
                     now=now,
+                    extra_limitations=tuple(limitations),
                 )
 
         fetched: WearableSearchFetch | None = None
@@ -3245,21 +3247,24 @@ class WearableContextProvider:
 
         if fetched is not None:
             fetched = _wearable_fetch_with_required_provider(fetched)
+            stored_limitations = {
+                *fetched.limitations,
+                *limitations,
+            }
+            incomplete_result = bool(
+                _WEARABLE_INCOMPLETE_RESULT_LIMITATIONS
+                & stored_limitations
+            )
             stored_result: dict[str, Any] = {
                 "status": (
                     "partial"
-                    if fetched.limitations
+                    if incomplete_result
                     else "empty_success"
                     if not fetched.records
                     else "ok"
                 ),
                 "records": list(fetched.records),
-                "limitations": sorted(
-                    {
-                        *fetched.limitations,
-                        *limitations,
-                    }
-                ),
+                "limitations": sorted(stored_limitations),
             }
             if query.capability == "wearable.timeseries":
                 stored_result["stream_attribution_status"] = (
@@ -3267,7 +3272,7 @@ class WearableContextProvider:
                     if fetched.stream_attribution_unavailable
                     else "verified"
                 )
-            if not fetched.limitations:
+            if not incomplete_result:
                 stored_result["coverage"] = {"ratio": 1.0}
             snapshot, store_limitation = self._store_detail_snapshot(
                 session,
@@ -3540,7 +3545,11 @@ class WearableContextProvider:
             schema_version=1,
             derived_by=f"{query.capability}.mirror.v1",
             freshness=freshness.status,
-            coverage=snapshot.coverage,
+            coverage=(
+                None
+                if "wearable_retention_window_trimmed" in limitations
+                else snapshot.coverage
+            ),
             sensitivity="wearable",
         )
         raw["records"] = [

@@ -151,7 +151,7 @@ class SanitizingClient:
                     "distance_meters": 5000,
                 }
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
     async def get_timeseries(self, user_id, *_args, **_kwargs):
@@ -173,7 +173,7 @@ class SanitizingClient:
                     "longitude": 127.0,
                 }
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
 
@@ -290,7 +290,7 @@ class RawResolutionClient:
                     "source": {"provider": "apple_health"},
                 },
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
 
@@ -371,7 +371,7 @@ class SummableResolutionClient:
                     "is_daily_total": True,
                 },
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
 
@@ -435,7 +435,7 @@ class SummaryClient:
                     },
                 }
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
     async def get_sleep_summaries(self, *_args, **_kwargs):
@@ -454,7 +454,7 @@ class SummaryClient:
                     },
                 }
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
     async def get_recovery_summaries(self, *_args, **_kwargs):
@@ -468,7 +468,7 @@ class SummaryClient:
                     "connection_id": "private-connection",
                 }
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
 
@@ -835,6 +835,49 @@ async def test_cursor_pagination_rejects_non_mapping_metadata() -> None:
         await search(_request("wearable.workouts"))
 
 
+class InvalidCursorPaginationClient:
+    def __init__(self, pagination: object) -> None:
+        self.pagination = pagination
+
+    async def get_workouts(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                    "provider": "garmin",
+                }
+            ],
+            "pagination": self.pagination,
+        }
+
+
+@pytest.mark.parametrize(
+    "pagination",
+    (
+        {"next_cursor": None},
+        {"has_more": False},
+        {"next_cursor": None, "has_more": True},
+        {"next_cursor": "page-2", "has_more": False},
+        {"next_cursor": "", "has_more": True},
+        {"next_cursor": None, "has_more": "false"},
+    ),
+)
+async def test_cursor_pagination_rejects_incomplete_or_contradictory_contract(
+    pagination: object,
+) -> None:
+    search = BoundedOpenWearablesSearch(
+        InvalidCursorPaginationClient(  # type: ignore[arg-type]
+            pagination
+        ),
+        lambda: "private-user-id",
+    )
+
+    with pytest.raises(ValueError, match="cursor pagination"):
+        await search(_request("wearable.workouts"))
+
+
 class OversizedPageClient:
     async def get_health_scores(self, _user_id, *, limit, **_kwargs):
         return {
@@ -851,7 +894,7 @@ class OversizedPageClient:
     ):
         return {
             "data": [{} for _ in range(limit + 1)],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
 
@@ -1044,7 +1087,7 @@ class SourceProviderPrivacyClient:
                     "source": {"provider": "unknown"},
                 },
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
 
@@ -1118,7 +1161,7 @@ class ProviderPrecedenceClient:
                     "source": {"provider": "samsung"},
                 },
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
 
@@ -1177,7 +1220,7 @@ class DistinctSensorStreamsClient:
                     },
                 },
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
 
@@ -1241,7 +1284,7 @@ class AmbiguousSensorStreamClient:
                     },
                 },
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
 
@@ -1295,7 +1338,7 @@ class MissingProviderClient:
     ):
         return {
             "data": [{"date": "2026-08-10", "steps": 8000}],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
     async def get_workouts(self, _user_id, *_args, **_kwargs):
@@ -1307,7 +1350,7 @@ class MissingProviderClient:
                     "end_time": "2026-08-10T09:30:00Z",
                 }
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
     async def get_timeseries(self, _user_id, *_args, **_kwargs):
@@ -1320,7 +1363,7 @@ class MissingProviderClient:
                     "unit": "bpm",
                 }
             ],
-            "pagination": {"next_cursor": None},
+            "pagination": {"next_cursor": None, "has_more": False},
         }
 
 

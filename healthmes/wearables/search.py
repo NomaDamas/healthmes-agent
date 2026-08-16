@@ -581,17 +581,17 @@ async def _collect_cursor_pages(
         pagination = _response_pagination(payload)
         if (
             "next_cursor" not in pagination
-            and "has_more" not in pagination
+            or "has_more" not in pagination
         ):
             raise ValueError(
                 "open-wearables returned invalid cursor pagination"
             )
-        raw_has_more = pagination.get("has_more", False)
+        raw_has_more = pagination["has_more"]
         if type(raw_has_more) is not bool:
             raise ValueError(
                 "open-wearables returned invalid cursor pagination"
             )
-        raw_cursor = pagination.get("next_cursor")
+        raw_cursor = pagination["next_cursor"]
         if raw_cursor is not None and (
             not isinstance(raw_cursor, str) or not raw_cursor
         ):
@@ -599,7 +599,13 @@ async def _collect_cursor_pages(
                 "open-wearables returned invalid cursor pagination"
             )
         next_cursor = raw_cursor
-        has_more = bool(next_cursor or raw_has_more)
+        if (raw_has_more and next_cursor is None) or (
+            not raw_has_more and next_cursor is not None
+        ):
+            raise ValueError(
+                "open-wearables returned contradictory cursor pagination"
+            )
+        has_more = raw_has_more
         if has_more and (
             next_cursor is None
             or next_cursor == cursor
