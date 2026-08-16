@@ -46,18 +46,22 @@ def _legacy_payload_predicate() -> str:
     dialect = context.get_context().dialect.name
     if dialect == "postgresql":
         schema_value = "decision_payload ->> 'schema'"
+        valid_guard = ""
     elif dialect == "sqlite":
         schema_value = "json_extract(decision_payload, '$.schema')"
+        valid_guard = "json_valid(decision_payload) AND "
     else:
         raise RuntimeError(
             "decision retention migration supports only sqlite and postgresql"
         )
-    return f"{schema_value} IN ('{_V1_SCHEMA}', '{_V2_SCHEMA}')"
+    return (
+        f"{valid_guard}{schema_value} "
+        f"IN ('{_V1_SCHEMA}', '{_V2_SCHEMA}')"
+    )
 
 
-def _delete_legacy_private_payloads() -> None:
-    predicate = _legacy_payload_predicate()
-    legacy_ids = (
+def _delete_correlated_records(predicate: str) -> None:
+    correlated_ids = (
         "SELECT id FROM decision_record "
         "WHERE decision_request_id IS NOT NULL "
         f"AND {predicate}"
@@ -66,7 +70,7 @@ def _delete_legacy_private_payloads() -> None:
         sa.text(
             "UPDATE schedule_proposal "
             "SET decision_record_id = NULL "
-            f"WHERE decision_record_id IN ({legacy_ids})"
+            f"WHERE decision_record_id IN ({correlated_ids})"
         )
     )
     for column in (
@@ -77,7 +81,7 @@ def _delete_legacy_private_payloads() -> None:
             sa.text(
                 "UPDATE calendar_mutation_proposal "
                 f"SET {column} = NULL "
-                f"WHERE {column} IN ({legacy_ids})"
+                f"WHERE {column} IN ({correlated_ids})"
             )
         )
     op.execute(
@@ -87,6 +91,18 @@ def _delete_legacy_private_payloads() -> None:
             f"AND {predicate}"
         )
     )
+
+
+def _delete_malformed_sqlite_payloads() -> None:
+    if context.get_context().dialect.name != "sqlite":
+        return
+    _delete_correlated_records(
+        "decision_payload IS NULL OR NOT json_valid(decision_payload)"
+    )
+
+
+def _delete_legacy_private_payloads() -> None:
+    _delete_correlated_records(_legacy_payload_predicate())
 
 
 def _assert_downgrade_is_safe() -> None:
@@ -137,6 +153,10 @@ def _assert_downgrade_is_safe() -> None:
 
 
 def upgrade() -> None:
+    # SQLite DDL is not fully transactional. Remove unreadable correlated
+    # payloads before adding columns so json_extract cannot strand a database
+    # at the old Alembic revision with partially-applied schema changes.
+    _delete_malformed_sqlite_payloads()
     op.add_column(
         "decision_record",
         sa.Column(

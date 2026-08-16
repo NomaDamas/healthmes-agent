@@ -510,6 +510,81 @@ class TestSqliteUpgrade:
         finally:
             engine.dispose()
 
+    def test_decision_retention_removes_malformed_payload_before_sqlite_ddl(
+        self,
+        tmp_path,
+    ):
+        database_url = (
+            f"sqlite:///{tmp_path / 'decision-retention-malformed.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "d8e9f0a1b2c3")
+
+        engine = sa.create_engine(database_url)
+        record_id = uuid.uuid4().hex
+        try:
+            decision_record = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            created_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+            with engine.begin() as connection:
+                connection.execute(
+                    decision_record.insert().values(
+                        id=record_id,
+                        kind="insight",
+                        tree={"id": "malformed", "children": []},
+                        summary="Unreadable historical decision",
+                        decision_request_id=uuid.uuid4().hex,
+                        decision_turn_id=uuid.uuid4().hex,
+                        decision_request_fingerprint="a" * 64,
+                        decision_payload={
+                            "schema": "healthmes.decision-private.v3"
+                        },
+                        decision_payload_digest="b" * 64,
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+                connection.execute(
+                    sa.text(
+                        "UPDATE decision_record "
+                        "SET decision_payload = '{bad' "
+                        "WHERE id = :record_id"
+                    ),
+                    {"record_id": record_id},
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        # A second invocation proves the first run did not leave SQLite at the
+        # prior Alembic revision with only part of the DDL applied.
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            columns = {
+                item["name"]
+                for item in inspector.get_columns("decision_record")
+            }
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "e9f0a1b2c3d4"
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT COUNT(*) FROM decision_record "
+                        "WHERE id = :record_id"
+                    ),
+                    {"record_id": record_id},
+                ) == 0
+            assert {"retention_basis_at", "expires_at"} <= columns
+        finally:
+            engine.dispose()
+
     def test_decision_retention_migration_round_trip(self, tmp_path):
         database_url = (
             f"sqlite:///{tmp_path / 'decision-retention.db'}"
