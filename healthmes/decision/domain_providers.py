@@ -3237,10 +3237,10 @@ class WearableContextProvider:
             fetched = _wearable_fetch_with_required_provider(fetched)
             stored_result: dict[str, Any] = {
                 "status": (
-                    "empty_success"
-                    if not fetched.records
-                    else "partial"
+                    "partial"
                     if fetched.limitations
+                    else "empty_success"
+                    if not fetched.records
                     else "ok"
                 ),
                 "records": list(fetched.records),

@@ -142,6 +142,13 @@ class WearableSearchRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProviderPage:
+    rows: tuple[dict[str, Any], ...]
+    raw_count: int
+    discarded_rows: int
+
+
+@dataclass(frozen=True, slots=True)
 class WearableSearchFetch:
     records: tuple[dict[str, Any], ...]
     upstream_truncated: bool = False
@@ -252,14 +259,20 @@ class BoundedOpenWearablesSearch:
             raise LookupError("open-wearables user is unavailable")
 
         if request.capability == "wearable.health-scores":
-            rows, truncated = await self._health_scores(user_id, request)
+            rows, truncated, discarded = await self._health_scores(
+                user_id,
+                request,
+            )
             sanitizer = partial(
                 _sanitize_health_score,
                 start=request.start,
                 end=request.end,
             )
         elif request.capability == "wearable.summaries":
-            rows, truncated = await self._summaries(user_id, request)
+            rows, truncated, discarded = await self._summaries(
+                user_id,
+                request,
+            )
             kind = str(request.parameters["summary_kind"])
             sanitizer = partial(
                 _sanitize_summary,
@@ -269,14 +282,20 @@ class BoundedOpenWearablesSearch:
                 timezone=request.timezone,
             )
         elif request.capability == "wearable.workouts":
-            rows, truncated = await self._workouts(user_id, request)
+            rows, truncated, discarded = await self._workouts(
+                user_id,
+                request,
+            )
             sanitizer = partial(
                 _sanitize_workout,
                 start=request.start,
                 end=request.end,
             )
         else:
-            rows, truncated = await self._timeseries(user_id, request)
+            rows, truncated, discarded = await self._timeseries(
+                user_id,
+                request,
+            )
             series_type = str(request.parameters["series_type"])
             sanitizer = partial(
                 _sanitize_timeseries,
@@ -286,9 +305,8 @@ class BoundedOpenWearablesSearch:
             )
 
         sanitized: list[dict[str, Any]] = []
-        discarded = 0
         for row in rows:
-            clean = sanitizer(row) if isinstance(row, Mapping) else None
+            clean = sanitizer(row)
             if clean is None or _contains_private_value(clean, user_id):
                 discarded += 1
                 continue
@@ -328,7 +346,7 @@ class BoundedOpenWearablesSearch:
         self,
         user_id: str,
         request: WearableSearchRequest,
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, int]:
         category = request.parameters.get("category")
 
         async def fetch(limit: int, offset: int) -> Mapping[str, Any]:
@@ -347,7 +365,7 @@ class BoundedOpenWearablesSearch:
         self,
         user_id: str,
         request: WearableSearchRequest,
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, int]:
         kind = request.parameters.get("summary_kind")
         if kind not in WEARABLE_SUMMARY_KINDS:
             raise ValueError("wearable summary kind is not allowlisted")
@@ -386,7 +404,7 @@ class BoundedOpenWearablesSearch:
         self,
         user_id: str,
         request: WearableSearchRequest,
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, int]:
         async def fetch(
             limit: int,
             cursor: str | None,
@@ -405,7 +423,7 @@ class BoundedOpenWearablesSearch:
         self,
         user_id: str,
         request: WearableSearchRequest,
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, int]:
         series_type = str(request.parameters["series_type"])
         resolution = str(request.parameters["resolution"])
 
@@ -428,30 +446,36 @@ class BoundedOpenWearablesSearch:
 
 async def _collect_offset_pages(
     fetch: Callable[[int, int], Awaitable[Mapping[str, Any]]],
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], bool, int]:
     rows: list[dict[str, Any]] = []
+    raw_rows = 0
+    discarded_rows = 0
     offset = 0
     has_more = False
     for _ in range(MAX_WEARABLE_SEARCH_PAGES):
-        remaining = MAX_WEARABLE_SEARCH_ROWS + 1 - len(rows)
+        remaining = MAX_WEARABLE_SEARCH_ROWS + 1 - raw_rows
         if remaining <= 0:
-            return rows, True
+            return rows, True, discarded_rows
         page_limit = min(_PAGE_SIZE, remaining)
         payload = await fetch(page_limit, offset)
-        page = _response_rows(payload, max_rows=page_limit)
-        rows.extend(page)
+        page = _response_page(payload, max_rows=page_limit)
+        rows.extend(page.rows)
+        raw_rows += page.raw_count
+        discarded_rows += page.discarded_rows
         pagination = payload.get("pagination")
         has_more = bool(
             pagination.get("has_more")
             if isinstance(pagination, Mapping)
             else False
         )
-        if len(rows) > MAX_WEARABLE_SEARCH_ROWS:
-            return rows, True
-        if not has_more or not page:
-            return rows, False
-        offset += len(page)
-    return rows, has_more
+        if raw_rows > MAX_WEARABLE_SEARCH_ROWS:
+            return rows, True, discarded_rows
+        if not has_more:
+            return rows, False, discarded_rows
+        if page.raw_count == 0:
+            return rows, True, discarded_rows
+        offset += page.raw_count
+    return rows, has_more, discarded_rows
 
 
 async def _collect_cursor_pages(
@@ -459,40 +483,51 @@ async def _collect_cursor_pages(
         [int, str | None],
         Awaitable[Mapping[str, Any]],
     ],
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], bool, int]:
     rows: list[dict[str, Any]] = []
+    raw_rows = 0
+    discarded_rows = 0
     cursor: str | None = None
+    seen_cursors: set[str] = set()
     has_more = False
     for _ in range(MAX_WEARABLE_SEARCH_PAGES):
-        remaining = MAX_WEARABLE_SEARCH_ROWS + 1 - len(rows)
+        remaining = MAX_WEARABLE_SEARCH_ROWS + 1 - raw_rows
         if remaining <= 0:
-            return rows, True
+            return rows, True, discarded_rows
         page_limit = min(_PAGE_SIZE, remaining)
         payload = await fetch(page_limit, cursor)
-        page = _response_rows(payload, max_rows=page_limit)
-        rows.extend(page)
+        page = _response_page(payload, max_rows=page_limit)
+        rows.extend(page.rows)
+        raw_rows += page.raw_count
+        discarded_rows += page.discarded_rows
         pagination = payload.get("pagination")
         if isinstance(pagination, Mapping):
             raw_cursor = pagination.get("next_cursor")
-            cursor = str(raw_cursor) if raw_cursor else None
-            has_more = bool(cursor or pagination.get("has_more"))
+            next_cursor = str(raw_cursor) if raw_cursor else None
+            has_more = bool(next_cursor or pagination.get("has_more"))
         else:
-            cursor = None
+            next_cursor = None
             has_more = False
-        if len(rows) > MAX_WEARABLE_SEARCH_ROWS:
-            return rows, True
-        if not has_more or not page:
-            return rows, False
-        if cursor is None:
-            return rows, True
-    return rows, has_more
+        if raw_rows > MAX_WEARABLE_SEARCH_ROWS:
+            return rows, True, discarded_rows
+        if not has_more:
+            return rows, False, discarded_rows
+        if (
+            next_cursor is None
+            or next_cursor == cursor
+            or next_cursor in seen_cursors
+        ):
+            return rows, True, discarded_rows
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    return rows, has_more, discarded_rows
 
 
-def _response_rows(
+def _response_page(
     payload: Mapping[str, Any],
     *,
     max_rows: int,
-) -> list[dict[str, Any]]:
+) -> _ProviderPage:
     values = payload.get("data")
     if not isinstance(values, list):
         raise ValueError("open-wearables returned an invalid page")
@@ -500,7 +535,14 @@ def _response_rows(
         raise ValueError(
             "open-wearables page exceeded the requested row limit"
         )
-    return [dict(value) for value in values if isinstance(value, Mapping)]
+    rows = tuple(
+        dict(value) for value in values if isinstance(value, Mapping)
+    )
+    return _ProviderPage(
+        rows=rows,
+        raw_count=len(values),
+        discarded_rows=len(values) - len(rows),
+    )
 
 
 def _normalized_key(value: str) -> str:
@@ -914,23 +956,23 @@ def _aggregate_timeseries(
         )
         if timestamp is None or unit is None or provider is None:
             continue
-        if stream_key is None:
-            # Matching provider or device labels do not prove that samples
-            # belong to one sensor. Preserve the original observation instead
-            # of inventing an aggregate or replacing its timestamp.
-            unattributed.append(
-                {
-                    key: value
-                    for key, value in record.items()
-                    if key != _INTERNAL_STREAM_KEY
-                }
-            )
-            continue
         epoch_seconds = int(timestamp.timestamp())
         bucket_start = datetime.fromtimestamp(
             epoch_seconds - (epoch_seconds % interval_seconds),
             tz=UTC,
         )
+        if stream_key is None:
+            # Matching provider or device labels do not prove that samples
+            # belong to one sensor. Keep observations separate while still
+            # enforcing the requested timestamp resolution.
+            coarsened = {
+                key: value
+                for key, value in record.items()
+                if key != _INTERNAL_STREAM_KEY
+            }
+            coarsened["timestamp"] = bucket_start.isoformat()
+            unattributed.append(coarsened)
+            continue
         buckets.setdefault(
             (bucket_start, unit, provider, stream_key),
             [],

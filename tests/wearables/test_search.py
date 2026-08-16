@@ -158,7 +158,7 @@ async def test_search_sanitizes_identity_secrets_raw_ids_and_gps() -> None:
     )
     assert timeseries.records == (
         {
-            "timestamp": "2026-08-10T10:00:05+00:00",
+            "timestamp": "2026-08-10T10:00:00+00:00",
             "series_type": "heart_rate",
             "value": 72,
             "unit": "bpm",
@@ -533,6 +533,121 @@ async def test_search_stops_at_three_pages_and_250_rows() -> None:
     )
 
 
+class MalformedOffsetPaginationClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int]] = []
+        self.rows: list[object] = [
+            {
+                "category": "stress",
+                "provider": "garmin",
+                "recorded_at": (START + timedelta(minutes=0)).isoformat(),
+                "value": 0,
+            },
+            "malformed-row-1",
+            {
+                "category": "stress",
+                "provider": "garmin",
+                "recorded_at": (START + timedelta(minutes=2)).isoformat(),
+                "value": 2,
+            },
+            17,
+            {
+                "category": "stress",
+                "provider": "garmin",
+                "recorded_at": (START + timedelta(minutes=4)).isoformat(),
+                "value": 4,
+            },
+        ]
+
+    async def get_health_scores(
+        self,
+        _user_id,
+        *,
+        limit: int,
+        offset: int,
+        **_kwargs,
+    ):
+        self.calls.append((limit, offset))
+        page = self.rows[offset : offset + min(limit, 2)]
+        return {
+            "data": page,
+            "pagination": {
+                "has_more": offset + len(page) < len(self.rows),
+            },
+        }
+
+
+async def test_offset_pagination_advances_by_raw_page_cardinality() -> None:
+    client = MalformedOffsetPaginationClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(_request("wearable.health-scores"))
+
+    assert client.calls == [(100, 0), (100, 2), (100, 4)]
+    assert [record["value"] for record in fetched.records] == [0, 2, 4]
+    assert fetched.upstream_truncated is False
+    assert fetched.discarded_rows == 2
+    assert fetched.limitations == ("wearable_rows_discarded",)
+
+
+class FullyMalformedCursorPageClient:
+    def __init__(self) -> None:
+        self.calls: list[str | None] = []
+
+    async def get_workouts(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        self.calls.append(cursor)
+        if cursor is None:
+            return {
+                "data": ["malformed-row", 17],
+                "pagination": {
+                    "next_cursor": "page-2",
+                    "has_more": True,
+                },
+            }
+        assert cursor == "page-2"
+        return {
+            "data": [
+                {
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                    "provider": "garmin",
+                }
+            ],
+            "pagination": {
+                "next_cursor": None,
+                "has_more": False,
+            },
+        }
+
+
+async def test_cursor_pagination_continues_after_fully_malformed_page() -> None:
+    client = FullyMalformedCursorPageClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(_request("wearable.workouts"))
+
+    assert client.calls == [None, "page-2"]
+    assert [record["workout_type"] for record in fetched.records] == [
+        "running"
+    ]
+    assert fetched.upstream_truncated is False
+    assert fetched.discarded_rows == 2
+    assert fetched.limitations == ("wearable_rows_discarded",)
+
+
 class OversizedPageClient:
     async def get_health_scores(self, _user_id, *, limit, **_kwargs):
         return {
@@ -891,14 +1006,14 @@ async def test_timeseries_never_sums_distinct_sensor_streams() -> None:
             start=START + timedelta(hours=9),
             end=START + timedelta(hours=11),
             series_type="steps",
-            resolution="1min",
+            resolution="1hour",
         )
     )
 
     assert [record["value"] for record in fetched.records] == [10, 20]
     assert [record["timestamp"] for record in fetched.records] == [
-        "2026-08-10T10:00:05+00:00",
-        "2026-08-10T10:00:25+00:00",
+        "2026-08-10T10:00:00+00:00",
+        "2026-08-10T10:00:00+00:00",
     ]
     assert all(
         record["provider"] == "apple_health"
@@ -961,8 +1076,8 @@ async def test_timeseries_does_not_sum_ambiguous_matching_sources() -> None:
 
     assert [record["value"] for record in fetched.records] == [10, 20]
     assert [record["timestamp"] for record in fetched.records] == [
-        "2026-08-10T10:00:05+00:00",
-        "2026-08-10T10:00:25+00:00",
+        "2026-08-10T10:00:00+00:00",
+        "2026-08-10T10:00:00+00:00",
     ]
     assert fetched.limitations == (
         "wearable_stream_attribution_unavailable",

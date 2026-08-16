@@ -18,6 +18,7 @@ from healthmes.decision.access import (
 from healthmes.decision.contracts import (
     ContextQuery,
     ContextStatus,
+    CoverageStatus,
     DecisionCaller,
     DecisionRequest,
     ExecutionScope,
@@ -1147,6 +1148,38 @@ async def test_detail_search_retains_unknown_provider_as_partial(
         "wearable_provider_attribution_unavailable"
         in result.limitations
     )
+
+
+async def test_detail_search_degrades_fully_discarded_page_to_partial(
+    session,
+) -> None:
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(),
+            discarded_rows=2,
+        )
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.health-scores",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="record",
+            parameters={"category": "stress"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["status"] == "partial"
+    assert result.coverage.status is CoverageStatus.UNKNOWN
+    assert result.coverage.ratio is None
+    assert "wearable_rows_discarded" in result.limitations
 
 
 async def test_wearable_consent_denial_happens_before_upstream_access(
