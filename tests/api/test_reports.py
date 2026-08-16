@@ -18,7 +18,7 @@ Covers, over one seeded week (frozen at 2026-07-10, UTC settings):
 import importlib.util
 import sys
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -305,6 +305,37 @@ def test_weekly_report_json_computes_numbers(client, session):
     alert_id = str(seeded["decision_alert"].id)
     assert items[0]["id"] == alert_id
     assert items[0]["url"] == f"http://healthmes.test:8100/decisions/{alert_id}"
+
+
+def test_weekly_report_excludes_decision_at_exact_expiry(
+    client,
+    session,
+):
+    current = datetime(2026, 7, 10, 12, tzinfo=UTC)
+    expired = DecisionRecord(
+        kind=DecisionKind.INSIGHT,
+        tree=TREE,
+        summary="exact-cutoff report decision",
+        created_at=_utc(2026, 7, 10, 10),
+        expires_at=current,
+    )
+    available = DecisionRecord(
+        kind=DecisionKind.INSIGHT,
+        tree=TREE,
+        summary="available report decision",
+        created_at=_utc(2026, 7, 10, 9),
+        expires_at=current + timedelta(microseconds=1),
+    )
+    session.add_all((expired, available))
+    session.commit()
+
+    with freeze_time(FROZEN_NOW):
+        body = client.get("/reports/weekly.json").json()
+
+    assert body["decisions"]["count"] == 1
+    assert [item["summary"] for item in body["decisions"]["items"]] == [
+        "available report decision"
+    ]
 
 
 # --- HTML: same numbers, rendered --------------------------------------------

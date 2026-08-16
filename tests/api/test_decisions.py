@@ -1,6 +1,9 @@
 """Tests for the decision viewer routes (JSON + placeholder HTML page)."""
 
 import uuid
+from datetime import UTC, datetime, timedelta
+
+from freezegun import freeze_time
 
 from healthmes.store import DecisionKind, DecisionRecord
 
@@ -143,3 +146,41 @@ def test_decision_html_invalid_uuid_is_validation_error(client):
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_decision_read_surfaces_hide_exact_cutoff(
+    client,
+    session,
+):
+    assert client.get("/v1/decisions").status_code == 200
+    with freeze_time("2026-08-16 12:00:00"):
+        current = datetime.now(UTC)
+        expired = _seed_decision(session, "exact-cutoff decision")
+        available = _seed_decision(session, "available decision")
+        expired.expires_at = current
+        available.expires_at = current + timedelta(microseconds=1)
+        session.commit()
+
+        api_list = client.get("/v1/decisions")
+        html_list = client.get("/decisions")
+        api_detail = client.get(f"/v1/decisions/{expired.id}")
+        adjacent_detail = client.get(
+            f"/decisions/{expired.id}.json"
+        )
+        html_detail = client.get(f"/decisions/{expired.id}")
+        available_detail = client.get(
+            f"/v1/decisions/{available.id}"
+        )
+
+    assert api_list.status_code == 200
+    assert [item["summary"] for item in api_list.json()["data"]] == [
+        "available decision"
+    ]
+    assert "available decision" in html_list.text
+    assert "exact-cutoff decision" not in html_list.text
+    for response in (api_detail, adjacent_detail):
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "not_found"
+    assert html_detail.status_code == 404
+    assert html_detail.headers["content-type"].startswith("text/html")
+    assert available_detail.status_code == 200

@@ -541,12 +541,17 @@ def decision_request_fingerprint(request: DecisionRequest) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def decision_result_from_record(row: DecisionRecord) -> DecisionResult:
+def decision_result_from_record(
+    row: DecisionRecord,
+    *,
+    now: datetime | None = None,
+) -> DecisionResult:
     """Recover one verified result after an outcome-unknown response."""
 
+    current = _as_utc(now or datetime.now(UTC))
     if (
         row.expires_at is not None
-        and _as_utc(row.expires_at) <= datetime.now(UTC)
+        and _as_utc(row.expires_at) <= current
     ):
         raise ValueError("decision record has expired")
     fingerprint = row.decision_request_fingerprint

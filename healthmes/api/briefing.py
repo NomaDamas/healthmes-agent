@@ -99,6 +99,9 @@ from healthmes.store import (
     Task,
     TriggerEvent,
 )
+from healthmes.store.decision_records import (
+    decision_record_is_available_at,
+)
 from healthmes.store.session import SessionDep
 
 __all__ = ["router", "ALERT_RECENT_HOURS", "CACHE_MAX_AGE_SECONDS", "decision_viewer_url"]
@@ -355,7 +358,12 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
     payload: dict[str, Any] = top.payload or {}
     summary = payload.get("summary")
     decision = session.scalar(
-        select(DecisionRecord).where(DecisionRecord.trigger_event_id == top.id).limit(1)
+        select(DecisionRecord)
+        .where(
+            DecisionRecord.trigger_event_id == top.id,
+            decision_record_is_available_at(now),
+        )
+        .limit(1)
     )
     return GlanceAlertsOut(
         unresolved_count=len(events),
@@ -372,10 +380,15 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
     )
 
 
-def _latest_decision(session: Session, settings: Settings) -> GlanceDecisionOut | None:
+def _latest_decision(
+    session: Session,
+    settings: Settings,
+    now: datetime,
+) -> GlanceDecisionOut | None:
     """Newest decision record (same ordering as the /v1/decisions list)."""
     record = session.scalars(
         select(DecisionRecord)
+        .where(decision_record_is_available_at(now))
         .order_by(DecisionRecord.created_at.desc(), DecisionRecord.id.desc())
         .limit(1)
     ).first()
@@ -442,7 +455,7 @@ def get_glance_briefing(request: Request, session: SessionDep) -> Response:
             energy=_energy_block(session, tz, now),
             next_blocks=_next_blocks(session, now, visibility),
             alerts=_alerts_block(session, settings, now),
-            latest_decision=_latest_decision(session, settings),
+            latest_decision=_latest_decision(session, settings, now),
         )
 
     try:

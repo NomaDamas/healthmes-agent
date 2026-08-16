@@ -170,6 +170,26 @@ def test_decision_links_use_exact_trigger_correlation(client, seeded):
     assert glance_alerts["top"]["decision_url"] == alerts[0]["decision_url"]
 
 
+def test_alert_link_hides_decision_at_exact_expiry(
+    client,
+    session,
+    seeded,
+):
+    top = session.get(DecisionRecord, DECISION_TOP_ID)
+    assert top is not None
+    top.expires_at = datetime(2026, 7, 9, 14, 23, tzinfo=UTC)
+    session.commit()
+
+    with frozen():
+        alerts = client.get(ALERTS).json()["data"]
+
+    by_id = {item["id"]: item for item in alerts}
+    assert by_id[str(EVENT_TOP_ID)]["decision_url"] is None
+    assert by_id[str(EVENT_EARLY_ID)]["decision_url"].endswith(
+        f"/decisions/{DECISION_EARLY_ID}"
+    )
+
+
 def test_proposal_alert_resolves_its_direct_target_beyond_first_page(
     client,
     session,

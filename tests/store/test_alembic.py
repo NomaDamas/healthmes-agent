@@ -237,14 +237,11 @@ class TestOfflineRender:
             "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
         ),
     )
-    def test_decision_retention_upgrade_and_downgrade_render(
+    def test_decision_retention_upgrade_renders_legacy_cleanup(
         self,
         database_url,
     ):
         upgrade = _render_offline_decision_retention_upgrade(
-            database_url
-        )
-        downgrade = _render_offline_decision_retention_downgrade(
             database_url
         )
 
@@ -254,9 +251,34 @@ class TestOfflineRender:
         assert "decision_request_id IS NOT NULL" in upgrade
         assert "ix_decision_record_retention_basis_at" in upgrade
         assert "ix_decision_record_expires_at" in upgrade
-        assert "DROP" in downgrade
-        assert "retention_basis_at" in downgrade
-        assert "expires_at" in downgrade
+        assert "healthmes.decision-private.v1" in upgrade
+        assert "healthmes.decision-private.v2" in upgrade
+        assert "UPDATE schedule_proposal" in upgrade
+        assert "UPDATE calendar_mutation_proposal" in upgrade
+        assert "DELETE FROM decision_record" in upgrade
+        if database_url.startswith("postgresql"):
+            assert "decision_payload ->> 'schema'" in upgrade
+        else:
+            assert "json_extract(decision_payload, '$.schema')" in upgrade
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_decision_retention_offline_downgrade_is_refused(
+        self,
+        database_url,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="offline downgrade cannot verify decision retention",
+        ):
+            _render_offline_decision_retention_downgrade(
+                database_url
+            )
 
     @pytest.mark.parametrize(
         "database_url",
@@ -507,14 +529,55 @@ class TestSqliteUpgrade:
             metadata,
             autoload_with=engine,
         )
+        task = sa.Table(
+            "task",
+            metadata,
+            autoload_with=engine,
+        )
+        schedule_proposal = sa.Table(
+            "schedule_proposal",
+            metadata,
+            autoload_with=engine,
+        )
         policy_id = uuid.uuid4().hex
-        wellness_id = uuid.uuid4().hex
+        v1_id = uuid.uuid4().hex
+        v2_id = uuid.uuid4().hex
+        v3_id = uuid.uuid4().hex
         legacy_id = uuid.uuid4().hex
-        request_id = uuid.uuid4().hex
-        turn_id = uuid.uuid4().hex
+        task_id = uuid.uuid4().hex
+        proposal_id = uuid.uuid4().hex
         created_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
-        private_payload = {
-            "schema": "healthmes.decision-private.v2"
+        private_marker = (
+            "legacy-private-question-caller-transcript-tool"
+        )
+        v1_payload = {
+            "schema": "healthmes.decision-private.v1",
+            "request": {
+                "question": private_marker,
+                "caller": private_marker,
+            },
+            "tool_trace": [{"payload": private_marker}],
+        }
+        v2_payload = {
+            "schema": "healthmes.decision-private.v2",
+            "result": {"answer": private_marker},
+            "source_attestations": [
+                {
+                    "query": {
+                        "parameters": {
+                            "transcript": private_marker,
+                        }
+                    }
+                }
+            ],
+        }
+        v3_payload = {
+            "schema": "healthmes.decision-private.v3",
+            "outcome": {
+                "summary": (
+                    "A wellness decision was explicitly tracked."
+                )
+            },
         }
         with engine.begin() as connection:
             connection.execute(
@@ -525,30 +588,64 @@ class TestSqliteUpgrade:
                     enabled=True,
                 )
             )
-            connection.execute(
-                decision_record.insert().values(
-                    id=wellness_id,
-                    kind="insight",
-                    tree={
-                        "id": "healthmes-decision",
-                        "children": [],
-                    },
-                    summary="Historical wellness decision",
-                    decision_request_id=request_id,
-                    decision_turn_id=turn_id,
-                    decision_request_fingerprint="f" * 64,
-                    decision_payload=private_payload,
-                    decision_payload_digest="d" * 64,
-                    created_at=created_at,
-                    updated_at=created_at,
+            for index, (record_id, payload) in enumerate(
+                (
+                    (v1_id, v1_payload),
+                    (v2_id, v2_payload),
+                    (v3_id, v3_payload),
                 )
-            )
+            ):
+                connection.execute(
+                    decision_record.insert().values(
+                        id=record_id,
+                        kind="insight",
+                        tree={
+                            "id": f"healthmes-decision-{index}",
+                            "children": [],
+                        },
+                        summary=(
+                            f"Historical wellness decision {index}"
+                        ),
+                        decision_request_id=uuid.uuid4().hex,
+                        decision_turn_id=uuid.uuid4().hex,
+                        decision_request_fingerprint=(
+                            f"{index + 1:064x}"
+                        ),
+                        decision_payload=payload,
+                        decision_payload_digest=f"{index + 4:064x}",
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
             connection.execute(
                 decision_record.insert().values(
                     id=legacy_id,
                     kind="schedule_change",
                     tree={"id": "legacy", "children": []},
                     summary="Historical non-wellness decision",
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+            connection.execute(
+                task.insert().values(
+                    id=task_id,
+                    title="Legacy decision proposal",
+                    energy_demand="med",
+                    status="todo",
+                    source="user",
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+            connection.execute(
+                schedule_proposal.insert().values(
+                    id=proposal_id,
+                    task_id=task_id,
+                    proposed_start=created_at + timedelta(hours=1),
+                    proposed_end=created_at + timedelta(hours=2),
+                    status="proposed",
+                    decision_record_id=v1_id,
                     created_at=created_at,
                     updated_at=created_at,
                 )
@@ -563,13 +660,19 @@ class TestSqliteUpgrade:
             sa.MetaData(),
             autoload_with=engine,
         )
+        migrated_proposal = sa.Table(
+            "schedule_proposal",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
         with engine.connect() as connection:
             rows = {
                 row.id: row
                 for row in connection.execute(sa.select(migrated))
             }
-            wellness = rows[wellness_id]
+            wellness = rows[v3_id]
             legacy = rows[legacy_id]
+            assert set(rows) == {v3_id, legacy_id}
             assert wellness.retention_basis_at == (
                 created_at.replace(tzinfo=None)
             )
@@ -578,7 +681,52 @@ class TestSqliteUpgrade:
             ).replace(tzinfo=None)
             assert legacy.retention_basis_at is None
             assert legacy.expires_at is None
-            assert wellness.decision_payload == private_payload
+            assert wellness.decision_payload == v3_payload
+            assert private_marker not in str(
+                [row.decision_payload for row in rows.values()]
+            )
+            proposal = connection.execute(
+                sa.select(migrated_proposal).where(
+                    migrated_proposal.c.id == proposal_id
+                )
+            ).one()
+            assert proposal.decision_record_id is None
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "cannot downgrade decision retention while a finite "
+                "decision policy or finite-retention DecisionRecord exists"
+            ),
+        ):
+            command.downgrade(config, "d8e9f0a1b2c3")
+
+        engine = sa.create_engine(database_url)
+        with engine.begin() as connection:
+            assert connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            ) == "e9f0a1b2c3d4"
+            current_policy = sa.Table(
+                "retention_policy",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            current_decisions = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            connection.execute(
+                current_policy.update()
+                .where(current_policy.c.data_class == "decision")
+                .values(retention_days=None)
+            )
+            connection.execute(
+                current_decisions.update()
+                .where(current_decisions.c.id == v3_id)
+                .values(expires_at=None)
+            )
         engine.dispose()
 
         command.downgrade(config, "d8e9f0a1b2c3")
@@ -602,10 +750,10 @@ class TestSqliteUpgrade:
                     row.id: row
                     for row in connection.execute(sa.select(restored))
                 }
-                assert set(rows) == {wellness_id, legacy_id}
+                assert set(rows) == {v3_id, legacy_id}
                 assert (
-                    rows[wellness_id].decision_payload
-                    == private_payload
+                    rows[v3_id].decision_payload
+                    == v3_payload
                 )
                 assert connection.scalar(
                     sa.text(

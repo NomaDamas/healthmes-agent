@@ -24,6 +24,7 @@ from healthmes.activity.locking import (
     activity_write_lock,
     lock_activity_write_plane,
 )
+from healthmes.api.common import utc_now
 from healthmes.api.errors import APIError
 from healthmes.decision import (
     DECISION_DOMAINS,
@@ -45,6 +46,9 @@ from healthmes.decision import (
     update_decision_domain_policy,
 )
 from healthmes.store import DecisionRecord
+from healthmes.store.decision_records import (
+    decision_record_is_available_at,
+)
 from healthmes.store.session import SessionDep
 
 router = APIRouter(prefix="/v1/wellness-decisions", tags=["decisions"])
@@ -321,19 +325,21 @@ def get_wellness_decision_result(
 ) -> WellnessDecisionOutput:
     """Recover a committed result after a 202 outcome-unknown response."""
 
+    now = utc_now()
     record = session.scalar(
         select(DecisionRecord).where(
-            DecisionRecord.decision_request_id == request_id
+            DecisionRecord.decision_request_id == request_id,
+            decision_record_is_available_at(now),
         )
     )
     if record is None:
         raise APIError(
             status.HTTP_404_NOT_FOUND,
             "wellness_decision_not_found",
-            f"Wellness decision {request_id} is not available.",
+            "Wellness decision is not available.",
         )
     try:
-        result = decision_result_from_record(record)
+        result = decision_result_from_record(record, now=now)
     except ValueError as exc:
         raise APIError(
             status.HTTP_503_SERVICE_UNAVAILABLE,

@@ -66,6 +66,9 @@ from healthmes.store import (
     ScheduleProposal,
     TriggerEvent,
 )
+from healthmes.store.decision_records import (
+    decision_record_is_available_at,
+)
 from healthmes.store.session import SessionDep
 
 __all__ = [
@@ -373,7 +376,11 @@ def _alerts_section(
 
 
 def _decisions_section(
-    session: Session, settings: Settings, window_start: datetime, window_end: datetime
+    session: Session,
+    settings: Settings,
+    window_start: datetime,
+    window_end: datetime,
+    now: datetime,
 ) -> WeeklyDecisionsOut:
     """Decision records of the week, newest first, each with its viewer link."""
     rows = [
@@ -383,6 +390,7 @@ def _decisions_section(
             .where(
                 DecisionRecord.created_at >= window_start,
                 DecisionRecord.created_at < window_end,
+                decision_record_is_available_at(now),
             )
             .order_by(DecisionRecord.created_at.desc(), DecisionRecord.id.desc())
         ).all()
@@ -430,7 +438,13 @@ def build_weekly_report(session: Session, settings: Settings, now: datetime) -> 
         insights=_insights_section(session, window_start, window_end),
         schedule=_schedule_section(session, window_start, window_end),
         alerts=_alerts_section(session, settings, window_start, window_end),
-        decisions=_decisions_section(session, settings, window_start, window_end),
+        decisions=_decisions_section(
+            session,
+            settings,
+            window_start,
+            window_end,
+            now,
+        ),
     )
 
 

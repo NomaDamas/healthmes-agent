@@ -31,6 +31,9 @@ from healthmes.api.common import ensure_utc, utc_now
 from healthmes.api.pagination import Page, PageMeta, PageParamsDep
 from healthmes.config import Settings
 from healthmes.store import DecisionRecord, ProposalStatus, ScheduleProposal, Task, TriggerEvent
+from healthmes.store.decision_records import (
+    decision_record_is_available_at,
+)
 from healthmes.store.session import SessionDep
 
 __all__ = ["router", "MAX_WINDOW_HOURS"]
@@ -74,7 +77,10 @@ class AlertOut(BaseModel):
 
 
 def _decision_ids(
-    session: Session, events: list[TriggerEvent]
+    session: Session,
+    events: list[TriggerEvent],
+    *,
+    now: datetime,
 ) -> dict[uuid.UUID, uuid.UUID]:
     """Return the exact persisted decision correlation for each alert."""
     if not events:
@@ -84,7 +90,8 @@ def _decision_ids(
         trigger_event_id: decision_id
         for trigger_event_id, decision_id in session.execute(
             select(DecisionRecord.trigger_event_id, DecisionRecord.id).where(
-                DecisionRecord.trigger_event_id.in_(event_ids)
+                DecisionRecord.trigger_event_id.in_(event_ids),
+                decision_record_is_available_at(now),
             )
         )
         if trigger_event_id is not None
@@ -184,7 +191,8 @@ def list_alerts(
 ) -> Page[AlertOut]:
     """Recent pushed alerts, newest first (glance ``alerts`` block semantics)."""
     settings: Settings = request.app.state.settings
-    cutoff = utc_now() - timedelta(hours=hours)
+    now = utc_now()
+    cutoff = now - timedelta(hours=hours)
     events = [
         event
         for event in session.scalars(
@@ -196,7 +204,7 @@ def list_alerts(
     ]
 
     window = events[page.offset : page.offset + page.limit]
-    decision_ids = _decision_ids(session, window)
+    decision_ids = _decision_ids(session, window, now=now)
     links = {
         event_id: decision_viewer_url(settings, decision_id)
         for event_id, decision_id in decision_ids.items()

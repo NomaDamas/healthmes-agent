@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from freezegun import freeze_time
 from pydantic import SecretStr
 from sqlalchemy.orm import sessionmaker
 
@@ -946,6 +947,47 @@ def test_decision_recovery_returns_404_for_unknown_request(
     assert response.json()["error"]["code"] == (
         "wellness_decision_not_found"
     )
+
+
+def test_decision_recovery_maps_exact_cutoff_to_unknown_404(
+    settings,
+) -> None:
+    request_id = uuid.uuid4()
+    app = create_app(settings)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        assert client.get(
+            f"/v1/wellness-decisions/{uuid.uuid4()}"
+        ).status_code == 404
+        with freeze_time("2026-08-16 12:00:00"):
+            with session_scope() as session:
+                session.add(
+                    DecisionRecord(
+                        kind=DecisionKind.INSIGHT,
+                        tree={},
+                        summary="Expired decision fixture",
+                        decision_request_id=request_id,
+                        decision_turn_id=uuid.uuid4(),
+                        decision_request_fingerprint="0" * 64,
+                        decision_payload={"schema": "invalid"},
+                        decision_payload_digest="0" * 64,
+                        retention_basis_at=datetime.now(UTC),
+                        expires_at=datetime.now(UTC),
+                    )
+                )
+
+            expired = client.get(
+                f"/v1/wellness-decisions/{request_id}"
+            )
+            unknown = client.get(
+                f"/v1/wellness-decisions/{uuid.uuid4()}"
+            )
+
+    assert expired.status_code == 404
+    assert expired.json() == unknown.json()
 
 
 def test_decision_recovery_rejects_corrupt_persisted_payload(

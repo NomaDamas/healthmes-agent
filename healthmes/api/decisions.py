@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Select, select
 from starlette import status
 
+from healthmes.api.common import utc_now
 from healthmes.api.decision_html import (
     render_decision_html,
     render_decision_list_html,
@@ -42,6 +43,9 @@ from healthmes.api.decision_html import (
 from healthmes.api.errors import not_found
 from healthmes.api.pagination import Page, PageParamsDep, paginate
 from healthmes.store import DecisionKind, DecisionRecord
+from healthmes.store.decision_records import (
+    decision_record_is_available_at,
+)
 from healthmes.store.session import SessionDep
 
 router = APIRouter(tags=["decisions"])
@@ -77,18 +81,42 @@ class DecisionSummaryOut(BaseModel):
     created_at: datetime
 
 
-def _list_stmt(kind: DecisionKind | None) -> Select:
+def _list_stmt(kind: DecisionKind | None, *, now: datetime) -> Select:
     """Newest-first decision select (id tiebreak keeps pagination stable)."""
-    stmt = select(DecisionRecord).order_by(
-        DecisionRecord.created_at.desc(), DecisionRecord.id.desc()
+    stmt = (
+        select(DecisionRecord)
+        .where(decision_record_is_available_at(now))
+        .order_by(
+            DecisionRecord.created_at.desc(),
+            DecisionRecord.id.desc(),
+        )
     )
     if kind is not None:
         stmt = stmt.where(DecisionRecord.kind == kind)
     return stmt
 
 
-def _load_decision(session: SessionDep, decision_id: uuid.UUID) -> DecisionRecord:
-    record = session.get(DecisionRecord, decision_id)
+def _find_decision(
+    session: SessionDep,
+    decision_id: uuid.UUID,
+    *,
+    now: datetime,
+) -> DecisionRecord | None:
+    return session.scalar(
+        select(DecisionRecord).where(
+            DecisionRecord.id == decision_id,
+            decision_record_is_available_at(now),
+        )
+    )
+
+
+def _load_decision(
+    session: SessionDep,
+    decision_id: uuid.UUID,
+    *,
+    now: datetime,
+) -> DecisionRecord:
+    record = _find_decision(session, decision_id, now=now)
     if record is None:
         raise not_found("decision_record", decision_id)
     return record
@@ -101,14 +129,20 @@ def list_decisions(
     kind: DecisionKind | None = None,
 ) -> Page[DecisionSummaryOut]:
     """List decision records, newest first (optional ``kind`` filter)."""
-    rows, meta = paginate(session, _list_stmt(kind), page)
+    rows, meta = paginate(
+        session,
+        _list_stmt(kind, now=utc_now()),
+        page,
+    )
     return Page(data=[DecisionSummaryOut.model_validate(row) for row in rows], pagination=meta)
 
 
 @router.get("/v1/decisions/{decision_id}")
 def get_decision(decision_id: uuid.UUID, session: SessionDep) -> DecisionOut:
     """JSON view of one decision record's tree."""
-    return DecisionOut.model_validate(_load_decision(session, decision_id))
+    return DecisionOut.model_validate(
+        _load_decision(session, decision_id, now=utc_now())
+    )
 
 
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -130,7 +164,11 @@ def list_decisions_page(
     kind: DecisionKind | None = None,
 ) -> HTMLResponse:
     """Human-facing decision index, newest first (weekly-report entry point)."""
-    rows, meta = paginate(session, _list_stmt(kind), page)
+    rows, meta = paginate(
+        session,
+        _list_stmt(kind, now=utc_now()),
+        page,
+    )
     html = render_decision_list_html(
         rows,
         meta,
@@ -146,7 +184,9 @@ def list_decisions_page(
 @router.get("/decisions/{decision_id}.json")
 def get_decision_json_view(decision_id: uuid.UUID, session: SessionDep) -> DecisionOut:
     """Same payload as ``GET /v1/decisions/{id}``, reachable from any viewer link."""
-    return DecisionOut.model_validate(_load_decision(session, decision_id))
+    return DecisionOut.model_validate(
+        _load_decision(session, decision_id, now=utc_now())
+    )
 
 
 @router.get("/decisions/{decision_id}", response_class=HTMLResponse)
@@ -155,7 +195,11 @@ def view_decision(
 ) -> HTMLResponse:
     """Human-facing decision page: interactive tree + Mermaid view + detail panel."""
     settings = request.app.state.settings
-    record = session.get(DecisionRecord, decision_id)
+    record = _find_decision(
+        session,
+        decision_id,
+        now=utc_now(),
+    )
     if record is None:
         return HTMLResponse(
             render_not_found_html(str(decision_id), settings=settings),

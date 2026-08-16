@@ -368,6 +368,46 @@ def test_seeded_glance_returns_exact_payload(client, seeded):
 
 
 @freeze_time(FROZEN_NOW)
+def test_glance_hides_exact_cutoff_decision_links(
+    client,
+    session,
+):
+    current = datetime.now(UTC)
+    event = TriggerEvent(
+        fired_at=_utc(9, 13, 50),
+        rule_id="exact_cutoff_alert",
+        payload={"summary": "Exact cutoff alert"},
+        alert_sent=True,
+        dedup_key="exact-cutoff-alert",
+    )
+    session.add(event)
+    session.flush()
+    expired = DecisionRecord(
+        kind=DecisionKind.ALERT,
+        tree={"type": "input", "label": "expired"},
+        summary="newest but expired",
+        trigger_event_id=event.id,
+        created_at=_utc(9, 14, 20),
+        expires_at=current,
+    )
+    available = DecisionRecord(
+        kind=DecisionKind.INSIGHT,
+        tree={"type": "input", "label": "available"},
+        summary="older and available",
+        created_at=_utc(9, 14, 10),
+        expires_at=current + timedelta(microseconds=1),
+    )
+    session.add_all((expired, available))
+    session.commit()
+
+    body = client.get(GLANCE).json()
+
+    assert body["alerts"]["top"]["id"] == str(event.id)
+    assert body["alerts"]["top"]["decision_url"] is None
+    assert body["latest_decision"]["id"] == str(available.id)
+
+
+@freeze_time(FROZEN_NOW)
 def test_empty_database_yields_valid_all_null_shape(client):
     response = client.get(GLANCE)
 
