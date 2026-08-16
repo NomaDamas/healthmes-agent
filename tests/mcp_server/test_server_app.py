@@ -54,6 +54,12 @@ ACTIVITY_TOOLS = {
     "get_overwork_context",
     "resolve_wellness_context",
 }
+DOMAIN_SEARCH_TOOLS = {
+    "search_activity",
+    "search_nutrition",
+    "search_calendar",
+    "search_wearable",
+}
 EXPECTED_TOOLS = (
     TRANCHE_1_TOOLS
     | TRANCHE_2_TOOLS
@@ -61,6 +67,7 @@ EXPECTED_TOOLS = (
     | NUTRITION_TOOLS
     | CALENDAR_ADJUSTMENT_TOOLS
     | ACTIVITY_TOOLS
+    | DOMAIN_SEARCH_TOOLS
 )
 
 _INITIALIZE = {

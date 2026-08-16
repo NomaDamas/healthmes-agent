@@ -122,7 +122,7 @@ def register_activity_tools(
         lookback_days: int = 7,
         nutrition_request_id: str | None = None,
     ) -> dict[str, Any]:
-        """Select only the domains needed for one bounded cross-domain wellness question."""
+        """Compatibility-only fixed-preset context resolver for legacy callers."""
         timezone = timezone_resolver()
         parsed_start = _aware(start, "start") if start is not None else None
         parsed_end = _aware(end, "end") if end is not None else None

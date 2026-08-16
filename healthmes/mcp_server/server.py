@@ -45,6 +45,7 @@ import functools
 import logging
 import os
 import re
+import threading
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
@@ -92,6 +93,12 @@ from healthmes.calendars.visibility import (
     require_calendar_visibility_current,
 )
 from healthmes.config import Settings, get_settings, system_timezone
+from healthmes.decision.composition import (
+    build_decision_context_search_session_service,
+)
+from healthmes.decision.search import (
+    DecisionContextSearchSessionService,
+)
 from healthmes.mcp_server import (
     adjustment_tools,
     arousal,
@@ -104,6 +111,9 @@ from healthmes.mcp_server.caffeine_contract import (
     CaffeineContraindication,
     CaffeineProductForm,
     SupportedPopulationStatus,
+)
+from healthmes.mcp_server.domain_search import (
+    register_domain_search_tools,
 )
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
 from healthmes.nutrition.contracts import (
@@ -179,6 +189,7 @@ from healthmes.store import (
     TaskSource,
     TriggerEvent,
     WeeklyGoal,
+    get_session_factory,
     session_scope,
 )
 from healthmes.store import enums as store_enums
@@ -267,6 +278,13 @@ _discovered_user_id: str | None = None
 _timezone_override: dt.tzinfo | None = None
 _energy_engine_override: Any | None = None
 _calendar_adjustment_writer_override: CalendarAdjustmentWriter | None = None
+_decision_search_service_override: (
+    DecisionContextSearchSessionService | None
+) = None
+_decision_search_service_cached: (
+    DecisionContextSearchSessionService | None
+) = None
+_decision_search_service_lock = threading.Lock()
 _ACCOUNT_GENERATION_UNCHECKED = object()
 
 
@@ -277,6 +295,7 @@ def set_settings(settings: Settings | None) -> None:
     different ``ow_user_id``.
     """
     global _settings_override, _discovered_user_id
+    _clear_decision_search_session_service()
     _settings_override = settings
     _discovered_user_id = None
 
@@ -290,6 +309,7 @@ def set_ow_client(client: OWClient | None) -> None:
 def set_session_factory(factory: sessionmaker[Session] | None) -> None:
     """Override the store session factory (None restores the process-wide one)."""
     global _session_factory_override
+    _clear_decision_search_session_service()
     _session_factory_override = factory
 
 
@@ -317,6 +337,56 @@ def set_energy_engine(engine: Any | None) -> None:
 def set_calendar_adjustment_writer(writer: CalendarAdjustmentWriter | None) -> None:
     global _calendar_adjustment_writer_override
     _calendar_adjustment_writer_override = writer
+
+
+def set_decision_search_session_service(
+    service: DecisionContextSearchSessionService | None,
+) -> None:
+    """Override the request-scoped decision search service."""
+
+    global _decision_search_service_override
+    _clear_decision_search_session_service()
+    _decision_search_service_override = service
+
+
+def _clear_decision_search_session_service() -> None:
+    global _decision_search_service_cached, _decision_search_service_override
+    with _decision_search_service_lock:
+        services = {
+            service
+            for service in (
+                _decision_search_service_cached,
+                _decision_search_service_override,
+            )
+            if service is not None
+        }
+        _decision_search_service_cached = None
+        _decision_search_service_override = None
+    for service in services:
+        service.close()
+
+
+def get_decision_search_session_service(
+) -> DecisionContextSearchSessionService:
+    """Return the process service shared by #169 and all four MCP tools."""
+
+    global _decision_search_service_cached
+    with _decision_search_service_lock:
+        if _decision_search_service_override is not None:
+            return _decision_search_service_override
+        if _decision_search_service_cached is None:
+            factory = (
+                _session_factory_override
+                if _session_factory_override is not None
+                else get_session_factory()
+            )
+            _decision_search_service_cached = (
+                build_decision_context_search_session_service(
+                    settings=_active_settings(),
+                    session_factory=factory,
+                )
+            )
+        return _decision_search_service_cached
 
 
 def reset_runtime_state() -> None:
@@ -4621,6 +4691,11 @@ def record_decision(
         "viewer_url": viewer_url(_active_settings(), f"/decisions/{decision_id}"),
     }
 
+
+register_domain_search_tools(
+    mcp,
+    service_resolver=get_decision_search_session_service,
+)
 
 register_activity_tools(
     mcp,

@@ -46,6 +46,9 @@ from healthmes.decision.policy import (
 )
 from healthmes.decision.providers import ContextProviderRegistry
 from healthmes.decision.runtime import DecisionRuntime
+from healthmes.decision.search import (
+    DecisionContextSearchSessionService,
+)
 from healthmes.store.enums import CalendarSource
 
 _LOGGER = logging.getLogger(__name__)
@@ -213,6 +216,62 @@ def resolve_decision_execution_scope(
                 "remote or cloud processing"
             )
     return scope
+
+
+def build_decision_context_search_session_service(
+    *,
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+    clock: Callable[[], datetime] | None = None,
+    monotonic_clock: Callable[[], float] | None = None,
+) -> DecisionContextSearchSessionService:
+    """Compose the read-only MCP search boundary independently of Hermes."""
+
+    execution_scope = resolve_decision_execution_scope(settings)
+
+    def source_resolver() -> tuple[CalendarSource, ...]:
+        return connected_sources(settings)
+
+    def account_generation_resolver(
+        source: CalendarSource,
+    ) -> str | None:
+        return creds.calendar_account_generation(settings, source)
+
+    sync_health_store = FileSyncHealthStore.for_data_dir(settings.data_dir)
+    registry = build_context_provider_registry(
+        calendar_settings=settings,
+        wearable_reader=None,
+        session_factory=session_factory,
+        calendar_sync_health_store=sync_health_store,
+        calendar_source_resolver=source_resolver,
+        calendar_account_generation_resolver=(
+            account_generation_resolver
+        ),
+    )
+    access_layer = ContextAccessLayer(
+        registry,
+        clock=clock,
+        calendar_settings=settings,
+        calendar_sync_health_store=sync_health_store,
+        calendar_source_resolver=source_resolver,
+        calendar_account_generation_resolver=(
+            account_generation_resolver
+        ),
+    )
+    policy_resolver = DatabaseDecisionPolicyResolver(
+        session_factory=session_factory,
+        owner_principal_id=settings.decision_owner_principal_id,
+        execution_scope=execution_scope,
+    )
+    return DecisionContextSearchSessionService(
+        access_layer=access_layer,
+        session_factory=session_factory,
+        policy_resolver=policy_resolver,
+        ttl_seconds=settings.decision_timeout_seconds,
+        max_active_sessions=settings.decision_max_pending_requests,
+        clock=clock,
+        monotonic_clock=monotonic_clock,
+    )
 
 
 def build_configured_decision_engine(
