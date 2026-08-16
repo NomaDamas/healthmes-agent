@@ -59,6 +59,7 @@ def test_template_is_a_dedicated_filtered_decision_profile(
         "default": "decision-model",
         "provider": "openai",
     }
+    assert config["compression"] == {"in_place": True}
     assert config["platforms"]["api_server"]["extra"]["model_routes"] == {
         "decision-model": {
             "model": "decision-model",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from pathlib import Path
@@ -109,6 +110,7 @@ def test_full_run_builds_only_attested_decision_runtime(
     profile = _load_profile(hermes_home)
     assert set(profile["platforms"]) == {"api_server"}
     assert profile["platform_toolsets"] == {"api_server": ["healthmes"]}
+    assert profile["compression"] == {"in_place": True}
     assert set(profile["mcp_servers"]) == {"healthmes"}
     assert (
         profile["mcp_servers"]["healthmes"]["tools"]["resources"] is False
@@ -200,8 +202,177 @@ def test_full_run_builds_only_attested_decision_runtime(
 
     output = capsys.readouterr().out
     assert "content-bound runtime manifest" in output
-    assert "do not install HealthMes Telegram, webhook" in output
+    assert "preserve all 1 general cron job" in output
+    assert "do not install new HealthMes reasoning" in output
     assert "cron registration method" not in output
+
+
+def test_bootstrap_removes_only_owned_legacy_cron_reasoning_jobs(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    capsys,
+) -> None:
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    jobs_file.parent.mkdir(parents=True)
+    exact_legacy = {
+        **bootstrap.LEGACY_HEALTHMES_CRON_REASONING_FINGERPRINTS[1],
+        "id": "legacy-exact",
+        "origin": None,
+    }
+    same_name_user_job = {
+        **bootstrap.LEGACY_HEALTHMES_CRON_REASONING_FINGERPRINTS[0],
+        "id": "same-name-user",
+        "prompt": "User-owned replacement prompt.",
+    }
+    foreign_origin_job = {
+        "id": "foreign-origin",
+        "name": "healthmes-evening-review",
+        "origin": {"source": "user-bootstrap", "version": 1},
+        "prompt": "User-owned scheduled message.",
+    }
+    user_job = {
+        "id": "user-job",
+        "name": "my-reminder",
+        "prompt": "Remember this.",
+    }
+    jobs_file.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "legacy-origin",
+                        "name": "renamed-healthmes-job",
+                        "origin": {
+                            "source": bootstrap.HEALTHMES_CRON_ORIGIN_SOURCE,
+                            "version": 1,
+                        },
+                    },
+                    exact_legacy,
+                    same_name_user_job,
+                    foreign_origin_job,
+                    user_job,
+                ],
+                "custom_metadata": {"preserve": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    migrated = json.loads(jobs_file.read_text(encoding="utf-8"))
+    assert migrated["custom_metadata"] == {"preserve": True}
+    assert migrated["jobs"] == [
+        same_name_user_job,
+        foreign_origin_job,
+        user_job,
+    ]
+    assert "updated_at" in migrated
+    output = capsys.readouterr().out
+    assert "legacy-origin" in output
+    assert "legacy-exact" in output
+    assert "preserve 3 unowned job(s)" in output
+
+
+def test_cron_migration_dry_run_reports_without_writing(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    capsys,
+) -> None:
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    jobs_file.parent.mkdir(parents=True)
+    jobs_file.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "legacy-origin",
+                        "name": "healthmes-weekly-plan",
+                        "origin": {
+                            "source": bootstrap.HEALTHMES_CRON_ORIGIN_SOURCE,
+                            "version": 1,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = jobs_file.read_bytes()
+
+    assert run_bootstrap(
+        bootstrap,
+        hermes_home,
+        env_file,
+        "--dry-run",
+    ) == 0
+
+    assert jobs_file.read_bytes() == before
+    assert "would remove legacy HealthMes-owned" in capsys.readouterr().out
+
+
+def test_malformed_cron_database_fails_before_bootstrap_writes(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    jobs_file.parent.mkdir(parents=True)
+    jobs_file.write_text('{"jobs": [', encoding="utf-8")
+    before_env = env_file.read_bytes()
+
+    with pytest.raises(ValueError, match="malformed"):
+        run_bootstrap(bootstrap, hermes_home, env_file)
+
+    assert jobs_file.read_text(encoding="utf-8") == '{"jobs": ['
+    assert env_file.read_bytes() == before_env
+    assert not _decision_home(hermes_home).exists()
+
+
+def test_unsafe_cron_database_path_fails_before_bootstrap_writes(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    jobs_file.parent.mkdir(parents=True)
+    target = hermes_home / "user-owned-jobs.json"
+    target.write_text('{"jobs":[{"id":"user-job"}]}\n', encoding="utf-8")
+    jobs_file.symlink_to(target)
+    before_env = env_file.read_bytes()
+
+    with pytest.raises(ValueError, match="unsafe"):
+        run_bootstrap(bootstrap, hermes_home, env_file)
+
+    assert target.read_text(encoding="utf-8") == (
+        '{"jobs":[{"id":"user-job"}]}\n'
+    )
+    assert env_file.read_bytes() == before_env
+    assert not _decision_home(hermes_home).exists()
+
+
+def test_cron_migration_refuses_a_concurrent_rewrite(
+    bootstrap,
+    hermes_home: Path,
+) -> None:
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    jobs_file.parent.mkdir(parents=True)
+    jobs_file.write_text('{"jobs":[]}\n', encoding="utf-8")
+    original = jobs_file.read_bytes()
+    jobs_file.write_text('{"jobs":[{"id":"concurrent"}]}\n', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="changed during migration"):
+        bootstrap._write_cron_document_if_unchanged(
+            jobs_file,
+            original=original,
+            document={"jobs": []},
+        )
+
+    assert json.loads(jobs_file.read_text(encoding="utf-8")) == {
+        "jobs": [{"id": "concurrent"}]
+    }
 
 
 def test_second_run_is_byte_idempotent(

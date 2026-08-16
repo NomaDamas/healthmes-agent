@@ -21,6 +21,11 @@ model:
   {%- endif %}
 {%- endif %}
 
+compression:
+  # Keep request-scoped Responses sessions on one stable ID so HealthMes can
+  # delete the exact transcript identified by X-Hermes-Session-Id.
+  in_place: true
+
 platforms:
   api_server:
     enabled: true

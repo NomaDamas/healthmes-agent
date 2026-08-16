@@ -85,6 +85,7 @@ def runtime_bundle(tmp_path: Path) -> RuntimeBundle:
     profile_path.write_text(
         yaml.safe_dump(
             {
+                "compression": {"in_place": True},
                 "model": {
                     "default": MODEL,
                     "provider": PROVIDER,

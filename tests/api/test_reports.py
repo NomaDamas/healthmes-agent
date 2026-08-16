@@ -11,12 +11,9 @@ Covers, over one seeded week (frozen at 2026-07-10, UTC settings):
 - viewer auth: bearer plus the derived read-only ``?token=`` credential
   (the same construction as decision links);
 - pure helpers: :func:`weekly_report_url`, :func:`build_energy_sparkline`,
-  :func:`confidence_level`;
-- the bootstrap Sunday briefing prompt mentions the report link.
+  :func:`confidence_level`.
 """
 
-import importlib.util
-import sys
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -557,33 +554,3 @@ def test_confidence_level_ladder():
     assert confidence_level(0.74) == "medium"
     assert confidence_level(0.75) == "high"
     assert confidence_level(1.0) == "high"
-
-
-# --- bootstrap: the Sunday briefing links the report ---------------------------
-
-
-def test_bootstrap_weekly_prompt_mentions_the_report_link():
-    """Only the Sunday weekly-planning prompt carries the report link — and it
-    instructs verbatim use of the snapshot's server-built ``weekly_report.url``
-    (token embedded by :func:`weekly_report_url` server-side). The agent must
-    never hand-construct viewer links: a bare public-base-URL + /reports/weekly
-    401s on every token-gated (i.e. phone-tappable) deployment.
-    """
-    spec = importlib.util.spec_from_file_location(
-        "healthmes_bootstrap_reports_test", REPO_ROOT / "scripts" / "bootstrap.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    # Register before exec: the @dataclass decorator resolves the module via
-    # sys.modules (same recipe as tests/glue/conftest.py).
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-
-    jobs = {job["name"]: job for job in module.BRIEFING_JOBS}
-    weekly = jobs["healthmes-weekly-plan"]["prompt"]
-    assert "weekly_report.url" in weekly  # the snapshot field, used verbatim
-    assert "verbatim" in weekly
-    assert "Never construct" in weekly  # hand-built URLs are forbidden
-    for other in ("healthmes-morning-plan", "healthmes-evening-review"):
-        assert "/reports/weekly" not in jobs[other]["prompt"]
-        assert "weekly_report.url" not in jobs[other]["prompt"]

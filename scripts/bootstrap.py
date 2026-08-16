@@ -4,8 +4,9 @@
 The canonical deployment has one reasoning ingress:
 ``POST /v1/wellness-decisions``. This command writes only the isolated
 ``$HERMES_HOME/decision`` profile and its content-bound manifest and
-attestation key. It deliberately leaves the legacy general Hermes home,
-Telegram, webhooks, cron jobs, and installed Hermes skills untouched.
+attestation key. It also removes only legacy HealthMes-owned cron reasoning
+jobs from the general Hermes home. User and otherwise unowned cron jobs,
+Telegram, webhooks, configuration, and installed Hermes skills are preserved.
 
 Run targets (HERMES_HOME resolution, highest precedence first):
   --hermes-home flag > HERMES_HOME env var > mode default
@@ -22,19 +23,16 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import secrets
 import shutil
 import stat
 import sys
 import tempfile
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import yaml
 from jinja2 import Environment, StrictUndefined
@@ -98,38 +96,24 @@ DECISION_HOME_ARTIFACT_CONTENT = {
     ".no-bundled-skills": "",
 }
 
-# Briefing state-snapshot script (docs/PLAN.md section 4 `script:` context
-# injection). The vendor scheduler resolves relative script paths under
-# $HERMES_HOME/scripts/ and rejects anything outside it, so bootstrap copies
-# the repo script there; the sidecar JSON feeds it the healthmes base URL
-# (env HEALTHMES_BASE_URL still wins at run time).
+# Legacy briefing jobs referenced this relative script name. It remains only
+# as part of the exact pre-ownership-marker fingerprints below; bootstrap no
+# longer installs or runs the script in the general Hermes home.
 SNAPSHOT_SCRIPT_NAME = "healthmes_briefing_snapshot.py"
-SNAPSHOT_SCRIPT_SOURCE = REPO_ROOT / "scripts" / SNAPSHOT_SCRIPT_NAME
-SNAPSHOT_SIDECAR_NAME = "healthmes_snapshot.json"
-HEALTHMES_CRON_ORIGIN = {
-    "source": "healthmes-bootstrap",
-    "version": 1,
-}
-HEALTHMES_MORNING_CRON_NAME = "healthmes-morning-plan"
-HEALTHMES_MANAGED_CRON_FIELDS = (
-    "prompt",
-    "schedule",
-    "skills",
-    "deliver",
-    "script",
-)
+HEALTHMES_CRON_ORIGIN_SOURCE = "healthmes-bootstrap"
 
 # ---------------------------------------------------------------------------
-# Cron briefings (docs/PLAN.md section 4 "time-driven briefings").
-# Keys are keyword arguments of vendor cron/jobs.py::create_job — the glue
-# test suite asserts this against inspect.signature(create_job).
+# Legacy cron reasoning fingerprints
 # ---------------------------------------------------------------------------
 
-# Each job pre-injects the state snapshot (script stdout) as prompt context;
-# the prompts therefore say "the snapshot above" and keep MCP for verification.
-BRIEFING_JOBS: tuple[dict[str, Any], ...] = (
+# Jobs written by bootstrap versions before the ownership marker are removed
+# only when their complete managed declaration is an exact match. A user job
+# that merely reuses one of these names is not HealthMes-owned.
+LEGACY_HEALTHMES_CRON_REASONING_FINGERPRINTS: tuple[
+    dict[str, Any], ...
+] = (
     {
-        "name": HEALTHMES_MORNING_CRON_NAME,
+        "name": "healthmes-morning-plan",
         "schedule": "0 7 * * *",
         "prompt": (
             "Morning briefing. A HealthMes state snapshot (open tasks, "
@@ -182,10 +166,8 @@ BRIEFING_JOBS: tuple[dict[str, Any], ...] = (
         "deliver": "telegram",
         "script": SNAPSHOT_SCRIPT_NAME,
     },
-)
-
-LEGACY_HEALTHMES_MORNING_CRON_FINGERPRINTS: tuple[dict[str, Any], ...] = (
     {
+        "name": "healthmes-morning-plan",
         "prompt": (
             "Morning briefing. A HealthMes state snapshot (open tasks, "
             "today's events, pending proposals, energy forecast) is injected "
@@ -200,8 +182,6 @@ LEGACY_HEALTHMES_MORNING_CRON_FINGERPRINTS: tuple[dict[str, Any], ...] = (
         "script": SNAPSHOT_SCRIPT_NAME,
     },
 )
-
-_CRON_FIELD_RE = re.compile(r"^[\d\*\-,/]+$")  # same shape check as parse_schedule
 
 
 @dataclass
@@ -821,281 +801,8 @@ def install_skills(repo_root: Path, hermes_home: Path, plan: Plan) -> list[Path]
 
 
 # ---------------------------------------------------------------------------
-# Briefing snapshot script (docs/PLAN.md section 4 `script:` context injection)
+# Legacy general-Hermes cron migration
 # ---------------------------------------------------------------------------
-
-
-def snapshot_base_url(context: dict[str, Any]) -> str:
-    """HealthMes base URL for the snapshot sidecar, derived from the MCP URL.
-
-    The template context already carries the mode-correct healthmes endpoint
-    (http://localhost:8100/mcp native, http://healthmes:8100/mcp docker);
-    the REST base is the same origin without the /mcp path.
-    """
-    mcp_url = str(context.get("healthmes_mcp_url", "")).strip()
-    base = mcp_url[: -len("/mcp")] if mcp_url.endswith("/mcp") else mcp_url
-    return (base or "http://localhost:8100").rstrip("/")
-
-
-def install_snapshot_script(hermes_home: Path, context: dict[str, Any], plan: Plan) -> None:
-    """Copy the snapshot script + base-URL sidecar into $HERMES_HOME/scripts/.
-
-    A copy (not a symlink): the vendor path guard resolves symlinks and
-    rejects scripts outside $HERMES_HOME/scripts/, and in docker mode the
-    repo path is not mounted into the hermes container while ./data/hermes
-    is. Idempotent by content comparison. Must run BEFORE cron registration
-    so create_job's lifecycle guard scans the file that will actually run.
-    """
-    if not SNAPSHOT_SCRIPT_SOURCE.is_file():
-        plan.warn(f"{SNAPSHOT_SCRIPT_SOURCE} is missing; briefing snapshot not installed")
-        return
-    scripts_dir = hermes_home / "scripts"
-    script_target = scripts_dir / SNAPSHOT_SCRIPT_NAME
-    source_text = SNAPSHOT_SCRIPT_SOURCE.read_text(encoding="utf-8")
-    sidecar_target = scripts_dir / SNAPSHOT_SIDECAR_NAME
-    sidecar: dict[str, str] = {"base_url": snapshot_base_url(context)}
-    # The snapshot script must authenticate when the healthmes surface is
-    # token-protected; the sidecar is chmod 600 inside $HERMES_HOME.
-    api_token = str(context.get("healthmes_api_token", "")).strip()
-    if api_token:
-        sidecar["api_token"] = api_token
-    sidecar_text = json.dumps(sidecar, indent=2, sort_keys=True) + "\n"
-
-    for target, content, label in (
-        (script_target, source_text, "briefing snapshot script"),
-        (sidecar_target, sidecar_text, "snapshot base-url sidecar"),
-    ):
-        if target.is_file() and target.read_text(encoding="utf-8") == content:
-            plan.act(f"keep {target} ({label} already up to date)")
-            continue
-        plan.act(f"write {target} ({label})")
-        if not plan.dry_run:
-            scripts_dir.mkdir(parents=True, exist_ok=True)
-            _chmod_quiet(scripts_dir, 0o700)
-            target.write_text(content, encoding="utf-8")
-            _chmod_quiet(target, 0o600)
-
-
-# ---------------------------------------------------------------------------
-# Cron briefings
-# ---------------------------------------------------------------------------
-
-
-def _restore_env(key: str, previous: str | None) -> None:
-    if previous is None:
-        os.environ.pop(key, None)
-    else:
-        os.environ[key] = previous
-
-
-def _resolve_hermes_timezone(hermes_home: Path) -> ZoneInfo | None:
-    """The configured Hermes IANA timezone, or None for server-local time.
-
-    Mirror of vendor/hermes-agent/hermes_time.py (_resolve_timezone_name +
-    _get_zoneinfo): 1. HERMES_TIMEZONE env var, 2. ``timezone`` key of
-    ``$HERMES_HOME/config.yaml``, 3. None. Invalid names fall back to None
-    exactly like the vendor (which logs and never crashes on a bad string).
-    """
-    name = os.environ.get("HERMES_TIMEZONE", "").strip()
-    if not name:
-        config_path = hermes_home / "config.yaml"
-        try:
-            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            raw = config.get("timezone", "") if isinstance(config, dict) else ""
-            name = raw.strip() if isinstance(raw, str) else ""
-        except (OSError, yaml.YAMLError):
-            name = ""
-    if not name:
-        return None
-    try:
-        return ZoneInfo(name)
-    except Exception:
-        return None
-
-
-def _hermes_now(hermes_home: Path) -> datetime:
-    """Timezone-aware "now" as the vendor scheduler would compute it.
-
-    The vendor's create_job stamps created_at/next_run_at with
-    hermes_time.now(), which honors the configured Hermes timezone; the
-    payload fallback must match, or the first briefing fires on the wrong
-    wall clock whenever the Hermes timezone differs from the system one
-    (the vendor scheduler recomputes subsequent runs correctly).
-    """
-    tz = _resolve_hermes_timezone(hermes_home)
-    if tz is not None:
-        return datetime.now(tz)
-    return datetime.now().astimezone()
-
-
-def _import_vendor_cron_jobs(hermes_home: Path) -> Any | None:
-    """Import vendor cron.jobs bound to *hermes_home*, or None.
-
-    The module resolves HERMES_DIR from the HERMES_HOME env var at import
-    time, so the env var is set first (and restored when the import is
-    unusable). Returns None when the import fails, when croniter is
-    unavailable (cron-expression schedules require it), or when an
-    already-imported copy is bound to a different home. On success the
-    HERMES_HOME env var stays pointed at *hermes_home* — vendor helpers
-    (e.g. the timezone lookup in hermes_time.now) re-read it at call time.
-    """
-    if not (VENDOR_HERMES / "cron" / "jobs.py").is_file():
-        return None
-    previous_home = os.environ.get("HERMES_HOME")
-    os.environ["HERMES_HOME"] = str(hermes_home)
-    vendor_path = str(VENDOR_HERMES)
-    inserted = vendor_path not in sys.path
-    if inserted:
-        sys.path.insert(0, vendor_path)
-    try:
-        from cron import jobs as vendor_jobs  # type: ignore[import-not-found]
-    except Exception:
-        _restore_env("HERMES_HOME", previous_home)
-        return None
-    finally:
-        if inserted:
-            try:
-                sys.path.remove(vendor_path)
-            except ValueError:
-                pass
-    jobs_file = Path(getattr(vendor_jobs, "JOBS_FILE", ""))
-    usable = getattr(vendor_jobs, "HAS_CRONITER", False)
-    try:
-        usable = usable and jobs_file.parent.parent.resolve() == hermes_home.resolve()
-    except OSError:
-        usable = False
-    if not usable:
-        # Either croniter is missing or a previously-imported copy is bound
-        # to a different home; the payload fallback takes over.
-        _restore_env("HERMES_HOME", previous_home)
-        return None
-    return vendor_jobs
-
-
-def _next_cron_run(expr: str, now: datetime) -> datetime:
-    """Next fire time for the restricted cron shapes bootstrap registers.
-
-    Supports ``M H * * *`` (daily) and ``M H * * D`` (weekly, D: 0=Sunday,
-    croniter convention). Only used by the payload fallback; the gateway's
-    scheduler recomputes subsequent runs with croniter.
-    """
-    fields = expr.split()
-    if len(fields) != 5 or not all(_CRON_FIELD_RE.match(f) for f in fields):
-        raise ValueError(f"unsupported cron expression: {expr!r}")
-    minute, hour, dom, month, dow = fields
-    if dom != "*" or month != "*":
-        raise ValueError(f"unsupported cron expression (day/month field): {expr!r}")
-    candidate = now.replace(
-        hour=int(hour), minute=int(minute), second=0, microsecond=0
-    )
-    if dow == "*":
-        if candidate <= now:
-            candidate += timedelta(days=1)
-        return candidate
-    python_weekday = (int(dow) - 1) % 7  # cron 0=Sunday -> python 6
-    days_ahead = (python_weekday - candidate.weekday()) % 7
-    candidate += timedelta(days=days_ahead)
-    if candidate <= now:
-        candidate += timedelta(days=7)
-    return candidate
-
-
-def build_fallback_job(
-    *,
-    prompt: str,
-    schedule: str,
-    name: str,
-    deliver: str,
-    skills: list[str],
-    script: str | None = None,
-    origin: Mapping[str, Any] | None = None,
-    now: datetime | None = None,
-) -> dict[str, Any]:
-    """The exact job dict vendor create_job() persists for these arguments.
-
-    Mirrors vendor/hermes-agent/cron/jobs.py::create_job for the subset
-    bootstrap uses (agent job, cron-expression schedule, context script, no
-    overrides). ``attach_to_session`` is omitted, matching create_job's
-    behavior when the argument is not explicitly set. Key parity with the
-    real function is asserted by tests/glue/test_cron_payload.py.
-
-    Callers should pass ``now=_hermes_now(hermes_home)`` so timestamps honor
-    the configured Hermes timezone like the vendor's hermes_time.now(); the
-    default only covers the unconfigured (server-local) case.
-    """
-    now = now or datetime.now().astimezone()
-    normalized_skills = [s.strip() for s in skills if s and s.strip()]
-    normalized_script = (script.strip() if isinstance(script, str) else None) or None
-    return {
-        "id": uuid.uuid4().hex[:12],
-        "name": name or prompt[:50].strip(),
-        "prompt": prompt,
-        "skills": normalized_skills,
-        "skill": normalized_skills[0] if normalized_skills else None,
-        "model": None,
-        "provider": None,
-        "provider_snapshot": None,
-        "model_snapshot": None,
-        "base_url": None,
-        "script": normalized_script,
-        "no_agent": False,
-        "context_from": None,
-        "schedule": {"kind": "cron", "expr": schedule, "display": schedule},
-        "schedule_display": schedule,
-        "repeat": {"times": None, "completed": 0},
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
-        "paused_reason": None,
-        "created_at": now.isoformat(),
-        "next_run_at": _next_cron_run(schedule, now).isoformat(),
-        "last_run_at": None,
-        "last_status": None,
-        "last_error": None,
-        "last_delivery_error": None,
-        "deliver": deliver,
-        "origin": dict(origin) if origin is not None else None,
-        "enabled_toolsets": None,
-        "workdir": None,
-    }
-
-
-def _load_jobs_envelope(jobs_file: Path) -> list[dict[str, Any]]:
-    """Existing jobs from jobs.json ({"jobs": [...]} or legacy bare list)."""
-    if not jobs_file.is_file():
-        return []
-    try:
-        data = json.loads(jobs_file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return []
-    if isinstance(data, dict):
-        jobs = data.get("jobs", [])
-        return jobs if isinstance(jobs, list) else []
-    if isinstance(data, list):
-        return data
-    return []
-
-
-def _write_jobs_envelope(
-    jobs_file: Path, jobs: list[dict[str, Any]], now: datetime | None = None
-) -> None:
-    """Atomically write the vendor jobs.json envelope (save_jobs shape)."""
-    jobs_file.parent.mkdir(parents=True, exist_ok=True)
-    _chmod_quiet(jobs_file.parent, 0o700)
-    now = now or datetime.now().astimezone()
-    payload = {"jobs": jobs, "updated_at": now.isoformat()}
-    fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-        os.replace(tmp_path, jobs_file)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    _chmod_quiet(jobs_file, 0o600)
 
 
 def _cron_schedule_expr(job: Mapping[str, Any]) -> str:
@@ -1118,6 +825,7 @@ def _cron_skills(job: Mapping[str, Any]) -> list[str]:
 
 def _cron_managed_declaration(job: Mapping[str, Any]) -> dict[str, Any]:
     return {
+        "name": str(job.get("name") or ""),
         "prompt": str(job.get("prompt") or ""),
         "schedule": _cron_schedule_expr(job),
         "skills": _cron_skills(job),
@@ -1126,193 +834,165 @@ def _cron_managed_declaration(job: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _is_healthmes_managed_cron(
-    existing: Mapping[str, Any], desired: Mapping[str, Any]
-) -> bool:
-    if str(existing.get("name") or "") != desired["name"]:
-        return False
-    origin = existing.get("origin")
+def _is_legacy_healthmes_owned_cron(job: Mapping[str, Any]) -> bool:
+    origin = job.get("origin")
     if origin is not None:
         return (
             isinstance(origin, Mapping)
-            and origin.get("source") == HEALTHMES_CRON_ORIGIN["source"]
+            and origin.get("source") == HEALTHMES_CRON_ORIGIN_SOURCE
         )
-    declaration = _cron_managed_declaration(existing)
-    return any(
-        declaration == fingerprint
-        for fingerprint in LEGACY_HEALTHMES_MORNING_CRON_FINGERPRINTS
-    )
+    declaration = _cron_managed_declaration(job)
+    return declaration in LEGACY_HEALTHMES_CRON_REASONING_FINGERPRINTS
 
 
-def _managed_cron_updates(
-    existing: Mapping[str, Any], desired: Mapping[str, Any]
-) -> dict[str, Any]:
-    updates: dict[str, Any] = {}
-    if str(existing.get("prompt") or "") != desired["prompt"]:
-        updates["prompt"] = desired["prompt"]
-    if _cron_schedule_expr(existing) != desired["schedule"]:
-        updates["schedule"] = desired["schedule"]
-    if _cron_skills(existing) != desired["skills"]:
-        updates["skills"] = list(desired["skills"])
-    if existing.get("deliver") != desired["deliver"]:
-        updates["deliver"] = desired["deliver"]
-    if existing.get("script") != desired.get("script"):
-        updates["script"] = desired.get("script")
-    if existing.get("origin") != HEALTHMES_CRON_ORIGIN:
-        updates["origin"] = dict(HEALTHMES_CRON_ORIGIN)
-    return updates
+def _read_regular_cron_database(jobs_file: Path) -> bytes:
+    if jobs_file.is_symlink() or jobs_file.parent.is_symlink():
+        raise ValueError(
+            "legacy Hermes cron database path is unsafe; refusing migration"
+        )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(jobs_file, flags)
+    except OSError as exc:
+        raise RuntimeError(
+            "legacy Hermes cron database is unreadable"
+        ) from exc
+    with os.fdopen(descriptor, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError(
+                "legacy Hermes cron database path is unsafe; "
+                "refusing migration"
+            )
+        return handle.read()
 
 
-def _apply_fallback_cron_updates(
-    existing: Mapping[str, Any],
-    updates: Mapping[str, Any],
+def _load_cron_document(
+    jobs_file: Path,
+) -> tuple[dict[str, Any] | list[Any], list[Any], bytes]:
+    raw = _read_regular_cron_database(jobs_file)
+    try:
+        document = json.loads(raw.decode("utf-8"), strict=False)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "legacy Hermes cron database is malformed; refusing migration"
+        ) from exc
+    if isinstance(document, dict):
+        jobs = document.get("jobs")
+    elif isinstance(document, list):
+        jobs = document
+    else:
+        jobs = None
+    if not isinstance(jobs, list):
+        raise ValueError(
+            "legacy Hermes cron database has an invalid jobs envelope; "
+            "refusing migration"
+        )
+    return document, jobs, raw
+
+
+def _write_cron_document_if_unchanged(
+    jobs_file: Path,
     *,
-    now: datetime,
-) -> dict[str, Any]:
-    updated = {**existing, **updates}
-    if "skills" in updates:
-        skills = list(updates["skills"])
-        updated["skills"] = skills
-        updated["skill"] = skills[0] if skills else None
-    if "schedule" in updates:
-        schedule = str(updates["schedule"])
-        updated["schedule"] = {
-            "kind": "cron",
-            "expr": schedule,
-            "display": schedule,
-        }
-        updated["schedule_display"] = schedule
-        if updated.get("state") != "paused":
-            updated["next_run_at"] = _next_cron_run(schedule, now).isoformat()
-    return updated
+    original: bytes,
+    document: dict[str, Any] | list[Any],
+) -> None:
+    encoded = (
+        json.dumps(
+            document,
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(jobs_file.parent),
+        prefix=".healthmes-cron-migration-",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            current = _read_regular_cron_database(jobs_file)
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(
+                "legacy Hermes cron database changed during migration"
+            ) from exc
+        if current != original:
+            raise RuntimeError(
+                "legacy Hermes cron database changed during migration"
+            )
+        os.replace(tmp_path, jobs_file)
+        _chmod_quiet(jobs_file, 0o600)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
-def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
-    """Create BRIEFING_JOBS and reconcile the HealthMes-owned morning job.
+def remove_legacy_healthmes_cron_reasoning(
+    hermes_home: Path,
+    plan: Plan,
+) -> int:
+    """Remove only cron jobs proven to be owned by legacy HealthMes bootstrap."""
 
-    The morning job is updated only when a HealthMes ownership marker or a
-    legacy HealthMes-specific fingerprint is present. Runtime state and job
-    identity remain untouched; only the managed declaration fields drift.
-    """
     jobs_file = hermes_home / "cron" / "jobs.json"
-    existing_jobs = _load_jobs_envelope(jobs_file)
-    jobs_by_name: dict[str, list[dict[str, Any]]] = {}
-    for existing in existing_jobs:
-        jobs_by_name.setdefault(str(existing.get("name") or ""), []).append(existing)
+    try:
+        jobs_file.lstat()
+    except FileNotFoundError:
+        plan.act(
+            "legacy HealthMes cron reasoning migration: no general cron "
+            "database found"
+        )
+        return 0
+    except OSError as exc:
+        raise RuntimeError(
+            "legacy Hermes cron database is unreadable"
+        ) from exc
 
-    missing: list[dict[str, Any]] = []
-    drifted: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
-    for desired in BRIEFING_JOBS:
-        matches = jobs_by_name.get(desired["name"], [])
-        if not matches:
-            missing.append(desired)
-            continue
-        if len(matches) > 1:
-            plan.warn(
-                f"cron job name '{desired['name']}' is ambiguous; "
-                "leaving all matching jobs unchanged"
-            )
-            continue
-        existing = matches[0]
-        if desired["name"] != HEALTHMES_MORNING_CRON_NAME:
-            plan.act(f"keep cron job '{desired['name']}' (already registered)")
-            continue
-        job_id = str(existing.get("id") or "").strip()
-        id_matches = [
-            job
-            for job in existing_jobs
-            if str(job.get("id") or "").strip() == job_id
-        ]
-        if not job_id or len(id_matches) != 1:
-            plan.warn(
-                f"cron job '{desired['name']}' has a missing or ambiguous id; "
-                "leaving it unchanged"
-            )
-            continue
-        if not _is_healthmes_managed_cron(existing, desired):
-            plan.warn(
-                f"cron job '{desired['name']}' is not HealthMes-managed; "
-                "leaving it unchanged"
-            )
-            continue
-        updates = _managed_cron_updates(existing, desired)
-        if updates:
-            drifted.append((existing, desired, updates))
+    document, jobs, original = _load_cron_document(jobs_file)
+    retained: list[Any] = []
+    removed: list[str] = []
+    for index, job in enumerate(jobs):
+        if isinstance(job, Mapping) and _is_legacy_healthmes_owned_cron(job):
+            name = str(job.get("name") or "<unnamed>")
+            job_id = str(job.get("id") or f"index-{index}")
+            removed.append(f"{name}:{job_id}")
         else:
-            plan.act(f"keep cron job '{desired['name']}' (already current)")
+            retained.append(job)
 
-    if not missing and not drifted:
-        return "no-op"
-
-    vendor_jobs = _import_vendor_cron_jobs(hermes_home)
-    method = "vendor-create_job" if vendor_jobs is not None else "payload-fallback"
-
-    for existing, desired, updates in drifted:
-        managed_fields = sorted(set(updates) & set(HEALTHMES_MANAGED_CRON_FIELDS))
+    if not removed:
         plan.act(
-            f"update cron job '{desired['name']}' "
-            f"(id={existing.get('id')}, fields={managed_fields}) via {method}"
+            "legacy HealthMes cron reasoning migration: preserve all "
+            f"{len(jobs)} general cron job(s); no owned job found"
         )
-    for job in missing:
-        plan.act(
-            f"register cron job '{job['name']}' ({job['schedule']}, "
-            f"skills={job['skills']}, deliver={job['deliver']}) via {method}"
-        )
+        return 0
+
+    plan.act(
+        "remove legacy HealthMes-owned Hermes cron reasoning job(s) "
+        f"{', '.join(removed)}; preserve {len(retained)} unowned job(s)"
+    )
     if plan.dry_run:
-        return method
+        return len(removed)
 
-    if vendor_jobs is not None:
-        for existing, _desired, updates in drifted:
-            if vendor_jobs.update_job(str(existing.get("id") or ""), updates) is None:
-                raise RuntimeError(
-                    f"cron job disappeared during update: {existing.get('id')}"
-                )
-        for job in missing:
-            vendor_jobs.create_job(
-                prompt=job["prompt"],
-                schedule=job["schedule"],
-                name=job["name"],
-                deliver=job["deliver"],
-                skills=list(job["skills"]),
-                script=job.get("script"),
-                origin=dict(HEALTHMES_CRON_ORIGIN),
-            )
-        return method
-
-    # Same clock the vendor's create_job would use (hermes_time.now()):
-    # honors HERMES_TIMEZONE / the config.yaml `timezone` key so the first
-    # next_run_at lands on the configured wall clock, not the system one.
-    now = _hermes_now(hermes_home)
-    all_jobs = _load_jobs_envelope(jobs_file)
-    updates_by_id = {
-        str(existing.get("id") or ""): updates
-        for existing, _desired, updates in drifted
-    }
-    all_jobs = [
-        _apply_fallback_cron_updates(
-            existing,
-            updates_by_id[str(existing.get("id") or "")],
-            now=now,
-        )
-        if str(existing.get("id") or "") in updates_by_id
-        else existing
-        for existing in all_jobs
-    ]
-    for job in missing:
-        all_jobs.append(
-            build_fallback_job(
-                prompt=job["prompt"],
-                schedule=job["schedule"],
-                name=job["name"],
-                deliver=job["deliver"],
-                skills=list(job["skills"]),
-                script=job.get("script"),
-                origin=HEALTHMES_CRON_ORIGIN,
-                now=now,
-            )
-        )
-    _write_jobs_envelope(jobs_file, all_jobs, now=now)
-    return method
+    if isinstance(document, dict):
+        migrated: dict[str, Any] | list[Any] = dict(document)
+        migrated["jobs"] = retained
+        migrated["updated_at"] = datetime.now().astimezone().isoformat()
+    else:
+        migrated = retained
+    _write_cron_document_if_unchanged(
+        jobs_file,
+        original=original,
+        document=migrated,
+    )
+    return len(removed)
 
 
 # ---------------------------------------------------------------------------
@@ -1412,6 +1092,8 @@ def run(args: argparse.Namespace) -> int:
             "HEALTHMES_DECISION_HERMES_MODEL and "
             "HEALTHMES_DECISION_HERMES_PROVIDER are required"
         )
+    remove_legacy_healthmes_cron_reasoning(hermes_home, plan)
+
     profile_path = decision_home / "config.yaml"
     manifest_path = decision_home / "runtime-manifest.json"
     key_path = decision_home / "runtime-attestation.key"
@@ -1562,8 +1244,8 @@ def run(args: argparse.Namespace) -> int:
         write_runtime_manifest(manifest_path, manifest)
 
     plan.act(
-        "leave the legacy general Hermes home untouched and do not install "
-        "HealthMes Telegram, webhook, skill, MCP, or cron reasoning there"
+        "leave general Hermes config, Telegram, webhook, skills, and unowned "
+        "cron jobs untouched; do not install new HealthMes reasoning there"
     )
 
     plan.report()

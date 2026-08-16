@@ -76,11 +76,13 @@ criteria are tracked in
   interactive questions; Telegram remains an outbound delivery adapter.
   Alert hygiene is already built in: per-rule cooldown, daily budget, quiet
   hours, dedup keys, and per-rule crash isolation.
-- Hermes bootstrap (`scripts/bootstrap.py`): renders the gateway config,
-  copy-installs `skills/`, registers morning/evening/weekly cron briefings.
-  The 07:00 prompt calls the server-owned morning evaluator once, sends its
-  display packet and plain-text reply handle to Telegram, then exits without
-  waiting; live replies are resolved by the normal Hermes gateway session.
+- Hermes decision bootstrap (`scripts/bootstrap.py`): renders and attests an
+  isolated `$HERMES_HOME/decision` profile for the single Responses-based
+  wellness reasoning path. The profile requires in-place compression so one
+  request keeps a stable session ID for exact cleanup. Bootstrap no longer
+  installs HealthMes reasoning into the general Hermes home; during migration
+  it removes only legacy HealthMes-owned cron reasoning jobs and preserves all
+  user or otherwise unowned cron jobs.
 
 **Cognitive energy & explainability (Phase 2)**
 - Rule-based, fully explainable energy engine (`healthmes/engine/

@@ -219,8 +219,10 @@ score = 100
    스케줄은 입력 시점만 결정한다. 실제 wellness reasoning은 cron 안에서 별도
    Hermes 대화를 시작하지 않고 같은 internal DecisionRequest service를 호출한다.
 
-2026-08-16 현재 webhook과 Hermes cron은 이 목표 경로로 완전히 이관되지 않았다.
-Issue #169와 #165가 runtime 연결과 E2E를 소유한다.
+2026-08-16 현재 legacy Hermes cron reasoning job은 bootstrap migration이
+HealthMes 소유권을 증명할 수 있는 항목만 제거한다. 사용자 또는 소유권 불명 cron은
+보존한다. 시간 구동 입력 자체를 internal DecisionRequest에 연결하는 작업과 기존
+webhook 이관은 Issue #169와 #165의 runtime/E2E 범위다.
 
 ## 5. 의사결정 트리 설명가능성
 
@@ -336,7 +338,8 @@ worktree 격리의 상세 계약은
 - `config/hermes-config.yaml.tmpl`: API server에는 filtered HealthMes MCP만
   등록하고 direct Open Wearables MCP와 mutation tool을 제외, Telegram은
   outbound delivery로 구성
-- `scripts/bootstrap.py`: config 렌더 → `HERMES_HOME`, 스킬 심링크, API 키 생성, cron 등록
+- `scripts/bootstrap.py`: 격리된 decision profile 렌더·attestation, API 키 생성,
+  legacy HealthMes 소유 cron reasoning만 제거
 - **종료 데모:** `POST /v1/wellness-decisions`에 "이번 주 수면 어땠어?" →
   Hermes가 HealthMes MCP의 wearable search를 선택 → source_refs가 검증된 답변
   → 같은 결과를 Telegram outbound adapter로 전달

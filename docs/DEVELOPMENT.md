@@ -193,36 +193,19 @@ Without `HEALTHMES_API_TOKEN`, the app factory accepts only actual loopback
 socket peers even if Uvicorn is accidentally bound to `0.0.0.0`. LAN, proxy,
 container, phone, and other remote clients require a token.
 
-## Agent plane: Hermes bootstrap
+## Agent plane: Hermes decision bootstrap
 
-The Hermes gateway is configured entirely from outside `vendor/`:
-`scripts/bootstrap.py` renders `config/hermes-config.yaml.tmpl` into
-`$HERMES_HOME/config.yaml`, copies `skills/` into `$HERMES_HOME/skills/`
-(copies, not symlinks — the vendor skill trust check resolves symlinks and
-would log a security warning on every skill load; re-runs resync content),
-generates independent `HEALTHMES_HERMES_WEBHOOK_SECRET` and
-`HEALTHMES_CALENDAR_ADJUSTMENT_SECRET` values into `.env` when missing,
-installs the briefing state-snapshot script
-(`scripts/healthmes_briefing_snapshot.py` + a base-URL sidecar) into
-`$HERMES_HOME/scripts/`, and registers the three cron briefings (morning
-07:00, evening 21:30, weekly Sunday 18:00) in `$HERMES_HOME/cron/jobs.json`
-— each with `script:` set so the vendor scheduler pre-injects a compact
-state snapshot into the briefing prompt (docs/PLAN.md §4), saving MCP
-round-trips at run time. The snapshot also carries the server-built weekly
-report link (`weekly_report.url`, token-embedded via
-`healthmes.api.reports.weekly_report_url`); the Sunday prompt instructs the
-agent to include it verbatim — the agent never constructs viewer URLs.
-The 07:00 prompt is also the Telegram glue for morning recovery nudges: it
-calls `mcp__healthmes__evaluate_morning_calendar_nudge` exactly once, sends
-the returned display packet and `적용 <handle>` / `그대로 <handle>` choices,
-then exits without waiting. The later allowed-user reply enters the normal
-Hermes live gateway session, which calls
-`mcp__healthmes__resolve_calendar_adjustment` with the exact combined live
-Telegram reply as `response` and its unchanged `reply_handle`. Hermes attaches
-an owner-bound signed proof, and HealthMes resolves the proposal server-side.
-Planner-created schedule proposals use the same exact-reply proof boundary via
-`mcp__healthmes__resolve_schedule_proposal`; REST/native clients use a separate
-proposal-bound resolution token and can never mint a Telegram proof.
+The HealthMes decision runtime is configured entirely from outside `vendor/`.
+`scripts/bootstrap.py` renders
+`config/hermes-decision-config.yaml.tmpl` into the isolated
+`$HERMES_HOME/decision/config.yaml` and creates the profile manifest and
+attestation key. It does not install HealthMes skills, scripts, webhooks,
+Telegram configuration, or new reasoning jobs into the general Hermes home.
+
+The dedicated profile requires `compression.in_place: true`. Hermes may
+compress a long request-scoped transcript, but it must keep the same session
+ID so HealthMes can delete the exact session returned by `/v1/responses`
+instead of losing track of a rotated session.
 
 ```bash
 uv run python scripts/bootstrap.py --dry-run     # show what would change
@@ -230,10 +213,18 @@ uv run python scripts/bootstrap.py               # native run (HERMES_HOME=~/.he
 uv run python scripts/bootstrap.py --mode docker # compose paths (HERMES_HOME=./data/hermes)
 ```
 
-It is idempotent: re-runs deep-merge the config (your manual keys win, one
-backup is kept), resync skill copies, and skip already-registered jobs.
-`HERMES_HOME`, `TELEGRAM_HOME_CHAT_ID`, and the other inputs come from the
-environment or `.env` (see the bootstrap section of `.env.example`).
+Re-runs are byte-idempotent when the desired decision artifacts are current.
+Bootstrap also performs a one-way migration of the general
+`$HERMES_HOME/cron/jobs.json`: jobs carrying the legacy
+`origin.source=healthmes-bootstrap` marker are removed, while unmarked jobs
+are removed only if their complete managed declaration exactly matches a
+known old HealthMes briefing. Same-name customized jobs, foreign-origin jobs,
+unknown records, and all other user jobs are preserved. Malformed or unsafe
+cron storage fails closed, dry-run never writes, and a concurrent content
+change aborts replacement.
+
+The legacy Hermes scheduler does not share a cross-process lock with
+bootstrap. Stop or pause that scheduler while performing the migration.
 
 The wellness decision runtime uses a separate rendered profile at
 `config/hermes-decision-config.yaml.tmpl`. It exposes one product MCP server,
@@ -258,7 +249,8 @@ Running the gateway natively (verified live on macOS with dummy creds):
 
 ```bash
 cd vendor/hermes-agent && \
-  HERMES_HOME=... UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
+  HERMES_HOME=~/.hermes/decision \
+  UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
   uv run --frozen --no-dev --extra messaging hermes gateway run
 ```
 
@@ -272,12 +264,13 @@ you want the vendor tree pristine; the venv itself stays outside via
 
 ### Hermes CLI diagnostics (not the HealthMes product ingress)
 
-The vendor CLI reads the same `$HERMES_HOME` config bootstrap renders. Use it
-only to diagnose Hermes model/provider or MCP registration behavior:
+The vendor CLI can read the isolated decision profile. Use it only to diagnose
+Hermes model/provider or MCP registration behavior:
 
 ```bash
 cd vendor/hermes-agent && \
-  HERMES_HOME=~/.hermes UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
+  HERMES_HOME=~/.hermes/decision \
+  UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
   uv run --frozen --no-dev --extra messaging hermes            # interactive
 # one-shot:
 #   ... hermes chat -q "List the tools visible to this runtime."
@@ -293,13 +286,13 @@ HealthMes product path works.
 The vendor ships ~29 model-provider plugins
 (`vendor/hermes-agent/plugins/model-providers/`: anthropic, openai-codex,
 gemini, openrouter, ollama-cloud, bedrock, vertex, deepseek, xai, …).
-Selection is config, not code: set `HERMES_MODEL` / `HERMES_PROVIDER`
-(optionally `HERMES_MODEL_BASE_URL` for OpenAI-compatible self-hosted
+Selection is config, not code: set
+`HEALTHMES_DECISION_HERMES_MODEL` /
+`HEALTHMES_DECISION_HERMES_PROVIDER` (optionally
+`HEALTHMES_DECISION_HERMES_MODEL_BASE_URL` for OpenAI-compatible self-hosted
 endpoints) in `.env`, re-run bootstrap, and export the matching provider API
-key. Omitting both keeps the vendor default (Anthropic Claude). The same
-selection drives the gateway, cron briefings, and `hermes chat`; per-run
-override: `hermes chat --model … --provider …`. All HealthMes glue
-(webhook prompts, skills, MCP tools) is provider-agnostic.
+key. These values configure only the isolated HealthMes decision runtime; the
+general Hermes gateway and `hermes chat` retain their own configuration.
 
 ## Backups (local-first, encrypted)
 

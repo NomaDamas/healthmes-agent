@@ -85,7 +85,7 @@ HERMES_DECISION_NATIVE_TOOLSET_DENYLIST = frozenset(
 )
 
 _MAX_PROFILE_BYTES = 256_000
-_PROFILE_DIGEST_SCHEMA = "healthmes.hermes-decision-profile.v1"
+_PROFILE_DIGEST_SCHEMA = "healthmes.hermes-decision-profile.v2"
 
 
 class HermesDecisionProfileError(ValueError):
@@ -251,6 +251,15 @@ def _asserted_profile(
             "hermes_decision_profile_model_route_invalid"
         )
 
+    compression = _mapping(
+        profile.get("compression"),
+        code="hermes_decision_profile_compression_invalid",
+    )
+    if compression.get("in_place") is not True:
+        raise HermesDecisionProfileError(
+            "hermes_decision_profile_compression_invalid"
+        )
+
     platform_toolsets = _mapping(
         profile.get("platform_toolsets"),
         code="hermes_decision_profile_toolsets_invalid",
@@ -346,6 +355,7 @@ def _asserted_profile(
             "model": expected_model,
             "provider": expected_provider,
         },
+        "compression": {"in_place": True},
         "platform_toolsets": [HERMES_DECISION_MCP_SERVER],
         "native_disabled": sorted(
             HERMES_DECISION_NATIVE_TOOLSET_DENYLIST

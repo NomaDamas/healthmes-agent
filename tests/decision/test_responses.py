@@ -140,6 +140,7 @@ def _decision_profile(
     prompts: bool | None = False,
     profile_api_key: str = "k" * 64,
     expected_api_key: str | None = None,
+    compression_in_place: object = True,
 ) -> HermesDecisionProfileAssertion:
     tool_settings: dict[str, object] = {"include": list(tools)}
     if resources is not None:
@@ -161,6 +162,9 @@ def _decision_profile(
     path.write_text(
         yaml.safe_dump(
             {
+                "compression": {
+                    "in_place": compression_in_place,
+                },
                 "platforms": {
                     "api_server": {
                         "enabled": True,
@@ -1048,7 +1052,7 @@ def test_dedicated_profile_digest_binds_disabled_mcp_utilities(
         tmp_path / "decision-config.yaml"
     ).verify_details()
     asserted = {
-        "schema": "healthmes.hermes-decision-profile.v1",
+        "schema": "healthmes.hermes-decision-profile.v2",
         "platform": "api_server",
         "runtime_model_name": "healthmes-decision-runtime",
         "model_route": {
@@ -1056,6 +1060,7 @@ def test_dedicated_profile_digest_binds_disabled_mcp_utilities(
             "model": MODEL,
             "provider": PROVIDER,
         },
+        "compression": {"in_place": True},
         "platform_toolsets": ["healthmes"],
         "native_disabled": sorted(
             HERMES_DECISION_NATIVE_TOOLSET_DENYLIST
@@ -1078,6 +1083,42 @@ def test_dedicated_profile_digest_binds_disabled_mcp_utilities(
     ).hexdigest()
 
     assert details.semantic_digest == expected
+
+
+@pytest.mark.parametrize("in_place", (False, None, "true", 1))
+def test_dedicated_profile_requires_in_place_compression(
+    tmp_path: Path,
+    in_place: object,
+) -> None:
+    assertion = _decision_profile(
+        tmp_path / "unsafe-compression.yaml",
+        compression_in_place=in_place,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="hermes_decision_profile_compression_invalid",
+    ):
+        assertion.verify()
+
+
+def test_dedicated_profile_rejects_missing_compression(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "missing-compression.yaml"
+    assertion = _decision_profile(path)
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile.pop("compression")
+    path.write_text(
+        yaml.safe_dump(profile, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="hermes_decision_profile_compression_invalid",
+    ):
+        assertion.verify()
 
 
 @pytest.mark.asyncio

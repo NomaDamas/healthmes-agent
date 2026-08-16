@@ -178,6 +178,96 @@ LLM은 `question_kind -> 고정 domain 표`를 따르지 않는다. 첫 결과�
 `coverage`, `freshness`, `limitations`를 보고 다른 domain이나 기간을 추가로
 조회할 수 있다.
 
+hosted multi-user 제품에서는 이 단일-owner 계약을 재사용하면 안 된다. 그때는
+HealthMes가 서명한 request-scoped principal envelope 또는 사용자별 MCP session이
+별도 설계돼야 한다.
+
+### Hermes API server tool surface
+
+`/v1/responses`는 Hermes의 `platform_toolsets.api_server` 설정을 사용한다.
+server 이름만 허용하면 그 server의 mutation tool까지 노출되므로 두 단계 필터를
+모두 사용한다. 또한 `platform_toolsets.api_server: [healthmes]` 하나만으로
+native tool이 절대 노출되지 않는다고 가정하지 않는다. credential과 설정 상태에
+따른 toolset 복구를 막기 위해 bootstrap은 API server용 deny-by-default profile을
+함께 생성한다.
+
+```yaml
+platform_toolsets:
+  api_server:
+    - healthmes
+
+agent:
+  # 실제 목록은 bootstrap이 Hermes native toolset catalog에서 생성한다.
+  # healthmes MCP는 native toolset이 아니므로 이 목록에 넣지 않는다.
+  disabled_toolsets:
+    - web
+    - search
+    - x_search
+    - terminal
+    - file
+    - browser
+    - delegation
+    - memory
+    - skills
+
+mcp_servers:
+  healthmes:
+    tools:
+      include:
+        - search_activity
+        - search_nutrition
+        - search_calendar
+        - search_wearable
+        - list_wellness_skills
+        - read_wellness_skill
+```
+
+실제 include 목록은 코드의 decision-read profile이 정본이며 위 목록은 최소
+형태다. `healthmes`는 유일한 제품 MCP server 이름이다. Hermes 내장
+`skills_list`, `skill_view`, `skill_manage`, HealthMes mutation tools, terminal,
+file write, browser, delegation과 direct `open_wearables` MCP는 wellness decision
+turn에 노출하지 않는다. HealthMes response adapter도 설정만 신뢰하지 않고 실제
+transcript의 tool name allowlist를 다시 검사한다. 사후 검증은 이미 실행된
+mutation을 되돌릴 수 없으므로 **등록 전 include filter가 1차 경계**다.
+
+배포 시작 검사는 다음 두 검증을 모두 통과해야 한다.
+
+1. 렌더된 Hermes config에는 `healthmes` MCP 하나와 정확한
+   `mcp_servers.healthmes.tools.include` 목록만 존재한다.
+2. 인증된 `GET /v1/toolsets` 결과에서 API server용 native toolset이 하나라도
+   `enabled=true`면 HealthMes decision runtime은 fail closed한다.
+
+`GET /v1/toolsets`는 native toolset 검사용이며 MCP 도구 allowlist의 정본은
+렌더된 config와 HealthMes의 decision-read profile이다. transcript 검사는
+잘못된 배포를 탐지하는 2차 방어이지 실행 전 경계를 대신하지 않는다.
+
+전용 profile은 `compression.in_place: true`도 필수로 선언한다. Hermes가 긴
+request-scoped transcript를 압축하더라도 session ID를 회전시키지 않아야
+HealthMes가 `/v1/responses`에서 받은 정확한 session을 turn 종료 후 삭제할 수
+있다. 이 값이 없거나 boolean `true`가 아니면 profile validation과 runtime
+attestation이 시작 전에 실패한다.
+
+### Legacy cron migration
+
+`scripts/bootstrap.py`는 더 이상 일반 Hermes home에 wellness reasoning job,
+Skill, snapshot script 또는 채널 설정을 설치하지 않는다. 대신 기존 배포를
+단일 reasoning ingress로 옮길 때
+`$HERMES_HOME/cron/jobs.json`에서 다음 항목만 제거한다.
+
+1. 과거 bootstrap의 `origin.source=healthmes-bootstrap` 소유권 marker가 있는 job
+2. marker 도입 전의 알려진 briefing declaration과 모든 관리 필드가 정확히 같은 job
+
+이름만 같은 사용자 job, 수정된 job, 외부 origin job과 알 수 없는 record는 모두
+보존한다. no-op과 dry-run은 파일 bytes를 바꾸지 않으며, malformed/symlinked
+storage 또는 compare-before-replace 중 감지된 변경은 fail closed한다. 다만
+legacy Hermes scheduler와 공유하는 cross-process lock은 vendor 계약에 없으므로
+migration 실행 중에는 해당 scheduler를 중지하거나 일시 정지해야 한다.
+
+### Open Wearables
+
+Open Wearables의 상세 DB는 별도 물리 저장소로 유지한다. 그러나 Hermes에 별도
+`open_wearables` MCP 서버를 노출하지 않는다.
+
 예:
 
 ```text
