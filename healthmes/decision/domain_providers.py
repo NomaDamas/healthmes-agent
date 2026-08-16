@@ -2587,7 +2587,7 @@ class WearableContextProvider:
             raw = {
                 "status": "ok" if metrics else "insufficient_data",
                 "date": day.isoformat(),
-                "count": len(metrics),
+                "count": len(selected),
                 "records": [
                     {
                         "kind": kind,

@@ -521,18 +521,25 @@ def test_decision_draft_preserves_uncertainty_and_follow_up():
 def test_persistence_intent_contract_rejects_inconsistent_drafts():
     reference_id = _source_ref().reference_id
 
-    with pytest.raises(ValidationError, match="action persistence"):
+    with pytest.raises(ValidationError, match="action and risk persistence"):
         DecisionDraft(
             status=DecisionStatus.COMPLETED,
             answer="No action was proposed.",
             persistence_intent=DecisionPersistenceIntent.ACTION,
             used_source_ref_ids=[reference_id],
         )
-    with pytest.raises(ValidationError, match="require at least one"):
+    with pytest.raises(ValidationError, match="action and risk persistence"):
         DecisionDraft(
             status=DecisionStatus.COMPLETED,
             answer="This is an important warning.",
             persistence_intent=DecisionPersistenceIntent.RISK,
+            used_source_ref_ids=[reference_id],
+        )
+    with pytest.raises(ValidationError, match="require at least one"):
+        DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="A mutation was reported.",
+            persistence_intent=DecisionPersistenceIntent.MUTATION,
         )
     with pytest.raises(ValidationError, match="only completed"):
         DecisionDraft(

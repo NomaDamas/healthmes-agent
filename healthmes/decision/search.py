@@ -585,7 +585,11 @@ class DecisionContextSearchSessionService:
 
         remaining = record.deadline - self._monotonic()
         if remaining <= 0:
-            self._expire(record)
+            self._store_expired_call(
+                record,
+                query=query,
+                started_at=started_at,
+            )
             raise ExpiredDecisionSearchSessionError()
 
         try:
@@ -689,20 +693,19 @@ class DecisionContextSearchSessionService:
                     access_audit=audit,
                 )
                 raise AbortedDecisionSearchSessionError() from exc
-            self._store_failed_call(
+            self._store_expired_call(
                 record,
                 query=query,
-                effective_query=(
-                    record.access_turn.effective_query_for(
-                        query.query_id
-                    )
-                ),
                 started_at=started_at,
-                finished_at=_utc(self._clock()),
-                error_code="decision_search_session_expired",
             )
-            self._expire(record)
             raise ExpiredDecisionSearchSessionError() from exc
+        except ExpiredDecisionSearchSessionError:
+            self._store_expired_call(
+                record,
+                query=query,
+                started_at=started_at,
+            )
+            raise
         except AbortedDecisionSearchSessionError:
             error_code = (
                 record.terminal_error_code
@@ -1057,6 +1060,35 @@ class DecisionContextSearchSessionService:
             access_audit=access_audit,
         )
 
+    def _store_expired_call(
+        self,
+        record: _DecisionSearchSession,
+        *,
+        query: ContextQuery,
+        started_at: datetime,
+    ) -> None:
+        error_code = "decision_search_session_expired"
+        finished_at = _utc(self._clock())
+        effective_query = (
+            record.access_turn.effective_query_for(query.query_id)
+            or query
+        )
+        self._store_failed_call(
+            record,
+            query=query,
+            effective_query=effective_query,
+            started_at=started_at,
+            finished_at=finished_at,
+            error_code=error_code,
+            access_audit=_failed_access_audit(
+                query,
+                effective_query=effective_query,
+                occurred_at=finished_at,
+                error_code=error_code,
+            ),
+        )
+        self._expire(record, preserve_snapshot=True)
+
     def _store_failed_call(
         self,
         record: _DecisionSearchSession,
@@ -1256,7 +1288,12 @@ class DecisionContextSearchSessionService:
         if self._active.get(record.session_id) is not record:
             self._raise_lookup_error_locked(record.session_id)
 
-    def _expire(self, record: _DecisionSearchSession) -> None:
+    def _expire(
+        self,
+        record: _DecisionSearchSession,
+        *,
+        preserve_snapshot: bool = False,
+    ) -> None:
         with self._lock:
             if record.state is DecisionSearchSessionState.ACTIVE:
                 if record.terminal_error_code is not None:
@@ -1270,7 +1307,20 @@ class DecisionContextSearchSessionService:
                 self._transition_locked(
                     record,
                     DecisionSearchSessionState.EXPIRED,
+                    preserve_snapshot=preserve_snapshot,
                 )
+            elif (
+                preserve_snapshot
+                and record.state is DecisionSearchSessionState.EXPIRED
+            ):
+                terminal = self._terminal.get(record.session_id)
+                if terminal is not None:
+                    self._terminal[record.session_id] = _TerminalSession(
+                        state=terminal.state,
+                        ended_monotonic=terminal.ended_monotonic,
+                        snapshot=self._snapshot(record),
+                    )
+                    self._terminal.move_to_end(record.session_id)
 
     def _prune_locked(self, current_monotonic: float) -> None:
         for record in tuple(self._active.values()):

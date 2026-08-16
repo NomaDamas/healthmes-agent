@@ -988,12 +988,12 @@ class DecisionDraft(BaseModel):
             DecisionStatus.FAILED,
         } and self.proposed_action:
             raise ValueError("blocked or failed decisions cannot propose actions")
-        if (
-            self.persistence_intent is DecisionPersistenceIntent.ACTION
-            and not self.proposed_action
-        ):
+        if self.persistence_intent in {
+            DecisionPersistenceIntent.ACTION,
+            DecisionPersistenceIntent.RISK,
+        } and not self.proposed_action:
             raise ValueError(
-                "action persistence requires a proposed action"
+                "action and risk persistence require a proposed action"
             )
         if self.proposed_action and self.persistence_intent not in {
             DecisionPersistenceIntent.ACTION,

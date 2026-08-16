@@ -497,7 +497,6 @@ def test_source_backed_information_is_not_persisted_without_intent(
 @pytest.mark.parametrize(
     "persistence_intent",
     (
-        DecisionPersistenceIntent.RISK,
         DecisionPersistenceIntent.MUTATION,
         DecisionPersistenceIntent.EXPLICIT_TRACKING,
     ),

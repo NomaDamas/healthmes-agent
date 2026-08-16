@@ -944,6 +944,7 @@ async def test_wearable_metric_cursor_is_stable_and_filter_bound(session):
     assert repeated.payload == first.payload
     assert repeated.next_cursor == first.next_cursor
     assert first.next_cursor is not None
+    assert first.payload["count"] == len(first.payload["records"]) == 1
 
     second = await registry.execute(
         session,
@@ -955,6 +956,7 @@ async def test_wearable_metric_cursor_is_stable_and_filter_bound(session):
         second.payload["records"][0]["metric"]
         != first.payload["records"][0]["metric"]
     )
+    assert second.payload["count"] == len(second.payload["records"]) == 1
 
     changed_filter = await registry.execute(
         session,

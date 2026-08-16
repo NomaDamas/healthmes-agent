@@ -400,6 +400,49 @@ def test_unknown_and_expired_sessions_are_distinct(
         service.inspect(handle.session_id)
 
 
+async def test_in_flight_expiry_preserves_failure_audit_snapshot(
+    store_factory,
+) -> None:
+    provider = BlockingProvider()
+    service = DecisionContextSearchSessionService(
+        access_layer=ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: datetime.now(UTC),
+        ),
+        session_factory=store_factory,
+        policy_resolver=lambda _request: _policy(),
+        ttl_seconds=0.02,
+    )
+    handle = service.begin(_request())
+
+    with pytest.raises(ExpiredDecisionSearchSessionError):
+        await _search(service, handle.session_id)
+
+    snapshot = service.inspect(handle.session_id)
+    assert snapshot.state is DecisionSearchSessionState.EXPIRED
+    assert snapshot.budget.tool_calls_used == 1
+    assert len(snapshot.tool_trace) == 1
+    assert snapshot.tool_trace[0].status is ToolCallStatus.FAILED
+    assert (
+        snapshot.tool_trace[0].error_code
+        == "decision_search_session_expired"
+    )
+    assert len(snapshot.access_trace) == 1
+    assert snapshot.access_trace[0].reason_codes == (
+        "decision_search_session_expired",
+    )
+    assert (
+        snapshot.access_trace[0].query_id
+        == snapshot.tool_trace[0].query.query_id
+    )
+
+    finished = service.finish(handle.session_id)
+    assert finished.tool_trace == snapshot.tool_trace
+    assert finished.access_trace == snapshot.access_trace
+    with pytest.raises(ExpiredDecisionSearchSessionError):
+        service.inspect(handle.session_id)
+
+
 def test_finished_aborted_and_closed_sessions_fail_closed(
     store_factory,
 ) -> None:
