@@ -292,6 +292,30 @@ HealthMes가 `/v1/responses`에서 받은 정확한 session을 turn 종료 후 �
 있다. 이 값이 없거나 boolean `true`가 아니면 profile validation과 runtime
 attestation이 시작 전에 실패한다.
 
+Runtime seal은 시작 전후와 실행 중 manifest·profile·provider 환경·명시적으로
+등록된 launch-control artifact·MCP schema drift를 탐지한다. 모든 transitive
+Python package와 native library를 전부 봉인하는 것은 아니며, 같은 OS 사용자
+권한으로 venv, manifest와 key를 동시에 바꿀 수 있는 악성 프로세스까지 막는
+sandbox도 아니다. 따라서 repository, runtime venv, decision home과
+attestation key의 OS 소유권과 파일 권한이 신뢰 경계다.
+
+macOS의 Python은 동적 라이브러리를 `@executable_path` 기준으로 찾을 수 있으므로
+검증된 실행 파일을 임시 위치에 복사해 실행하지 않는다. 모든 플랫폼에서
+manifest에 기록된 원래 venv Python 경로를 실행하고, launch 직전과 startup 완료
+후에 전체 manifest를 다시 검증한다. 각 `/v1/responses` 요청은 attestation부터
+stream 종료까지 하나의 child generation lease를 보유한다. 그동안 watchdog
+restart와 shutdown은 같은 child lock을 기다리므로 판단 도중 다른 child로
+바뀌지 않는다.
+
+Docker 이미지를 다시 빌드하거나 교체하면 기존 container artifact seal을
+명시적으로 폐기한 뒤 새 컨테이너가 다시 seal하게 한다.
+
+```bash
+docker compose stop hermes-decision
+uv run python scripts/bootstrap.py --mode docker --refresh-runtime-seal
+docker compose up -d --build --force-recreate hermes-decision
+```
+
 ### Legacy cron migration
 
 `scripts/bootstrap.py`는 더 이상 일반 Hermes home에 wellness reasoning job,

@@ -1069,6 +1069,37 @@ def test_docker_rerun_preserves_equivalent_container_seal(
     assert load_runtime_manifest(manifest_path) == sealed
 
 
+def test_docker_runtime_seal_can_be_explicitly_refreshed(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    assert run_bootstrap(
+        bootstrap,
+        hermes_home,
+        env_file,
+        "--mode",
+        "docker",
+    ) == 0
+    manifest_path = _decision_home(hermes_home) / "runtime-manifest.json"
+    sealed = _fake_container_seal(load_runtime_manifest(manifest_path))
+    write_runtime_manifest(manifest_path, sealed)
+
+    assert run_bootstrap(
+        bootstrap,
+        hermes_home,
+        env_file,
+        "--mode",
+        "docker",
+        "--refresh-runtime-seal",
+    ) == 0
+
+    refreshed = load_runtime_manifest(manifest_path)
+    assert refreshed.sealed is False
+    assert refreshed.execution_artifacts == ()
+    assert refreshed.runtime_id != sealed.runtime_id
+
+
 @pytest.mark.parametrize(
     ("first_mode", "second_mode", "expected_origin"),
     (

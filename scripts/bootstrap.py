@@ -14,7 +14,7 @@ Run targets (HERMES_HOME resolution, highest precedence first):
 
 Usage:
   uv run python scripts/bootstrap.py [--dry-run] [--mode native|docker]
-      [--hermes-home PATH] [--env-file PATH]
+      [--refresh-runtime-seal] [--hermes-home PATH] [--env-file PATH]
 """
 
 from __future__ import annotations
@@ -654,6 +654,7 @@ def write_prepared_runtime_manifest(
     plan: Plan,
     *,
     verify_execution_artifacts: bool,
+    refresh_runtime_seal: bool = False,
 ) -> None:
     """Preserve an equivalent seal; publish changed intent as unsealed."""
 
@@ -664,7 +665,8 @@ def write_prepared_runtime_manifest(
         except HermesRuntimeIdentityError:
             pass
     if (
-        existing is not None
+        not refresh_runtime_seal
+        and existing is not None
         and runtime_manifest_matches_preseal_identity(
             existing,
             manifest,
@@ -1133,6 +1135,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=str(REPO_ROOT / ".env"),
         help="dotenv file to read and to receive generated secrets (default: <repo>/.env).",
     )
+    parser.add_argument(
+        "--refresh-runtime-seal",
+        action="store_true",
+        help=(
+            "Publish an unsealed runtime manifest even when the current seal "
+            "matches the configured intent. Stop the old supervisor, run "
+            "this after rebuilding or replacing the Docker image, then start "
+            "the new supervisor so it seals the new container execution "
+            "artifacts."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1321,6 +1334,7 @@ def run(args: argparse.Namespace) -> int:
         manifest,
         plan,
         verify_execution_artifacts=args.mode == "native",
+        refresh_runtime_seal=args.refresh_runtime_seal,
     )
 
     plan.act(

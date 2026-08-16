@@ -10,17 +10,13 @@ import json
 import math
 import os
 import signal
-import stat
-import sys
-import tempfile
 from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
-    Iterator,
     Mapping,
 )
-from contextlib import asynccontextmanager, contextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -48,7 +44,6 @@ from healthmes.hermes_runtime_identity import (
     HermesRuntimeIdentityError,
     HermesRuntimeMcpConnection,
     load_runtime_mcp_connection,
-    open_verified_runtime_launcher,
     seal_supervised_runtime,
     sign_runtime_attestation,
     validate_supervised_runtime,
@@ -139,10 +134,22 @@ class HermesRuntimeState:
     mcp_inventory: HermesMcpToolInventory
 
 
-@dataclass(frozen=True, slots=True)
-class _PinnedLauncher:
-    executable: str
-    pass_fds: tuple[int, ...] = ()
+@dataclass(slots=True)
+class HermesRuntimeResponseLease:
+    """Hold one verified child generation for a complete Responses stream."""
+
+    state: HermesRuntimeState
+    generation: int
+    _release_callback: Callable[[], None]
+    _released: bool = False
+
+    def release(self) -> None:
+        """Release the child generation exactly once."""
+
+        if self._released:
+            return
+        self._released = True
+        self._release_callback()
 
 
 class RuntimeController(Protocol):
@@ -157,6 +164,11 @@ class RuntimeController(Protocol):
 
     async def attest(self) -> HermesRuntimeState:
         """Revalidate the child and its live model-visible MCP inventory."""
+
+    async def acquire_response_lease(
+        self,
+    ) -> HermesRuntimeResponseLease:
+        """Hold one attested child generation through an entire response."""
 
     async def start(self) -> None:
         """Start and verify the dedicated child."""
@@ -183,6 +195,7 @@ class HermesRuntimeProcess:
         self._state: HermesRuntimeState | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._launch_argv: tuple[str, ...] | None = None
+        self._child_generation = 0
         self._healthy = False
         self._lifecycle_state: _LifecycleState = "new"
         self._lifecycle_lock = asyncio.Lock()
@@ -251,7 +264,7 @@ class HermesRuntimeProcess:
             )
         return state
 
-    async def attest(self) -> HermesRuntimeState:
+    async def _attest_locked(self) -> HermesRuntimeState:
         state = self.revalidate()
         inventory = await self._probe_runtime_inventory()
         verified = self.revalidate()
@@ -263,6 +276,32 @@ class HermesRuntimeProcess:
                 "hermes_runtime_mcp_inventory_changed"
             )
         return state
+
+    async def attest(self) -> HermesRuntimeState:
+        async with self._child_lock:
+            return await self._attest_locked()
+
+    async def acquire_response_lease(
+        self,
+    ) -> HermesRuntimeResponseLease:
+        """Attest and pin the current child until the caller releases it."""
+
+        await self._child_lock.acquire()
+        try:
+            state = await self._attest_locked()
+            process = self._process
+            if process is None or process.returncode is not None:
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_child_not_running"
+                )
+            return HermesRuntimeResponseLease(
+                state=state,
+                generation=self._child_generation,
+                _release_callback=self._child_lock.release,
+            )
+        except BaseException:
+            self._child_lock.release()
+            raise
 
     async def start(self) -> None:
         """Strictly launch and verify one child for direct callers."""
@@ -341,15 +380,12 @@ class HermesRuntimeProcess:
             raise HermesRuntimeIdentityError(
                 "hermes_runtime_identity_changed"
             )
-        with _pinned_runtime_launcher(launch_manifest) as launcher:
-            process = await asyncio.create_subprocess_exec(
-                *launch_manifest.launch_argv,
-                executable=launcher.executable,
-                pass_fds=launcher.pass_fds,
-                cwd=str(config.vendor_root),
-                env=child_env,
-                start_new_session=True,
-            )
+        process = await asyncio.create_subprocess_exec(
+            *launch_manifest.launch_argv,
+            cwd=str(config.vendor_root),
+            env=child_env,
+            start_new_session=True,
+        )
         self._process = process
         self._launch_argv = launch_manifest.launch_argv
         try:
@@ -388,6 +424,7 @@ class HermesRuntimeProcess:
             api_key=api_key,
             mcp_inventory=inventory,
         )
+        self._child_generation += 1
         self._healthy = True
 
     async def _monitor_runtime(self) -> None:
@@ -692,129 +729,6 @@ async def _await_teardown_task(
                 return caller_cancelled, task.result()
 
 
-@contextmanager
-def _pinned_runtime_launcher(
-    manifest: HermesDecisionRuntimeManifest,
-) -> Iterator[_PinnedLauncher]:
-    """Execute the verified launcher without reopening its mutable path."""
-
-    descriptor: int | None = open_verified_runtime_launcher(manifest)
-    snapshot: Path | None = None
-    try:
-        if sys.platform.startswith("linux"):
-            descriptor_path = Path(f"/proc/self/fd/{descriptor}")
-            if not descriptor_path.exists():
-                raise HermesRuntimeIdentityError(
-                    "hermes_runtime_launcher_fd_unavailable"
-                )
-            yield _PinnedLauncher(
-                executable=str(descriptor_path),
-                pass_fds=(descriptor,),
-            )
-            return
-
-        snapshot = _copy_verified_launcher(
-            descriptor,
-            manifest=manifest,
-        )
-        os.close(descriptor)
-        descriptor = None
-        yield _PinnedLauncher(executable=str(snapshot))
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if snapshot is not None:
-            with suppress(FileNotFoundError):
-                snapshot.unlink()
-
-
-def _copy_verified_launcher(
-    source_descriptor: int,
-    *,
-    manifest: HermesDecisionRuntimeManifest,
-) -> Path:
-    """Create an owner-only executable snapshot beside the original venv."""
-
-    artifact = next(
-        item
-        for item in manifest.execution_artifacts
-        if item.name == "child_launcher"
-    )
-    launcher_parent = Path(manifest.launch_argv[0]).expanduser().parent
-    destination_descriptor: int | None = None
-    destination_path: Path | None = None
-    completed = False
-    try:
-        destination_descriptor, raw_path = tempfile.mkstemp(
-            prefix=f".healthmes-{manifest.runtime_id[:16]}-",
-            suffix=".python",
-            dir=launcher_parent,
-        )
-        destination_path = Path(raw_path)
-        before = os.fstat(source_descriptor)
-        os.lseek(source_descriptor, 0, os.SEEK_SET)
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(source_descriptor, 65_536)
-            if not chunk:
-                break
-            digest.update(chunk)
-            view = memoryview(chunk)
-            while view:
-                written = os.write(destination_descriptor, view)
-                if written <= 0:
-                    raise OSError("short runtime launcher write")
-                view = view[written:]
-        after = os.fstat(source_descriptor)
-        if (
-            _descriptor_identity(before) != _descriptor_identity(after)
-            or not hmac.compare_digest(
-                digest.hexdigest(),
-                artifact.sha256,
-            )
-        ):
-            raise HermesRuntimeIdentityError(
-                "hermes_runtime_execution_artifact_unsafe"
-            )
-        os.fchmod(destination_descriptor, 0o500)
-        os.fsync(destination_descriptor)
-        copied = os.fstat(destination_descriptor)
-        if (
-            not stat.S_ISREG(copied.st_mode)
-            or copied.st_size != before.st_size
-        ):
-            raise HermesRuntimeIdentityError(
-                "hermes_runtime_execution_artifact_unsafe"
-            )
-        completed = True
-        return destination_path
-    except HermesRuntimeIdentityError:
-        raise
-    except OSError as exc:
-        raise HermesRuntimeIdentityError(
-            "hermes_runtime_execution_artifact_unreadable"
-        ) from exc
-    finally:
-        if destination_descriptor is not None:
-            os.close(destination_descriptor)
-        if destination_path is not None and not completed:
-            with suppress(FileNotFoundError):
-                destination_path.unlink()
-
-
-def _descriptor_identity(
-    metadata: os.stat_result,
-) -> tuple[int, int, int, int, int, int]:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_mode,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
-    )
-
-
 def _next_restart_backoff(
     current: float,
     *,
@@ -994,20 +908,27 @@ def create_supervisor_app(
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
+        lease: HermesRuntimeResponseLease | None = None
         try:
-            state = await controller.attest()
+            lease = await controller.acquire_response_lease()
+            _require_api_key(request, lease.state.api_key)
         except HermesRuntimeIdentityError as exc:
             raise HTTPException(
                 status_code=503,
                 detail="runtime identity unavailable",
             ) from exc
-        return await _proxy(
-            request,
-            "/v1/responses",
-            body=encoded,
-            accept="text/event-stream",
-            state=state,
-        )
+        try:
+            return await _proxy(
+                request,
+                "/v1/responses",
+                body=encoded,
+                accept="text/event-stream",
+                state=lease.state,
+                response_lease=lease,
+            )
+        except BaseException:
+            lease.release()
+            raise
 
     @app.get("/api/sessions")
     async def proxy_sessions(request: Request) -> StreamingResponse:
@@ -1032,6 +953,7 @@ def create_supervisor_app(
         body: bytes | None = None,
         accept: str = "application/json",
         state: HermesRuntimeState | None = None,
+        response_lease: HermesRuntimeResponseLease | None = None,
     ) -> StreamingResponse:
         if state is None:
             try:
@@ -1053,27 +975,34 @@ def create_supervisor_app(
         }
         if body is not None:
             headers["Content-Type"] = "application/json"
-        client = httpx.AsyncClient(
-            base_url=state.manifest.internal_origin,
-            follow_redirects=False,
-            transport=proxy_transport,
-        )
-        upstream_request = client.build_request(
-            request.method,
-            target,
-            content=body,
-            headers=headers,
-        )
+        client: httpx.AsyncClient | None = None
         try:
+            client = httpx.AsyncClient(
+                base_url=state.manifest.internal_origin,
+                follow_redirects=False,
+                transport=proxy_transport,
+            )
+            upstream_request = client.build_request(
+                request.method,
+                target,
+                content=body,
+                headers=headers,
+            )
             upstream = await client.send(upstream_request, stream=True)
         except httpx.HTTPError as exc:
-            await client.aclose()
+            if client is not None:
+                await client.aclose()
+            if response_lease is not None:
+                response_lease.release()
             raise HTTPException(
                 status_code=503,
                 detail="runtime upstream unavailable",
             ) from exc
         except BaseException:
-            await client.aclose()
+            if client is not None:
+                await client.aclose()
+            if response_lease is not None:
+                response_lease.release()
             raise
         response_headers = {
             key: value
@@ -1087,6 +1016,7 @@ def create_supervisor_app(
                 request=request,
                 upstream=upstream,
                 client=client,
+                response_lease=response_lease,
             ),
             status_code=upstream.status_code,
             headers=response_headers,
@@ -1100,6 +1030,7 @@ async def _stream_upstream_response(
     request: Request,
     upstream: httpx.Response,
     client: httpx.AsyncClient,
+    response_lease: HermesRuntimeResponseLease | None = None,
 ) -> AsyncIterator[bytes]:
     """Close Hermes immediately when the HealthMes caller goes away."""
 
@@ -1110,8 +1041,14 @@ async def _stream_upstream_response(
             yield chunk
     finally:
         # Hermes maps this upstream disconnect to agent.interrupt().
-        await upstream.aclose()
-        await client.aclose()
+        try:
+            await upstream.aclose()
+        finally:
+            try:
+                await client.aclose()
+            finally:
+                if response_lease is not None:
+                    response_lease.release()
 
 
 async def _bounded_body(request: Request) -> bytes:

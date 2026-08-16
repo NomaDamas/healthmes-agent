@@ -213,6 +213,21 @@ uv run python scripts/bootstrap.py               # native run (HERMES_HOME=~/.he
 uv run python scripts/bootstrap.py --mode docker # compose paths (HERMES_HOME=./data/hermes)
 ```
 
+After rebuilding or replacing the `hermes-decision` Docker image, revoke the
+old container execution seal before starting the replacement:
+
+```bash
+docker compose stop hermes-decision
+uv run python scripts/bootstrap.py --mode docker --refresh-runtime-seal
+docker compose up -d --build --force-recreate hermes-decision
+```
+
+Stop the old supervisor first so it cannot reseal the old image between
+refresh and replacement. The new supervisor seals the new container artifacts
+on startup. A normal bootstrap rerun deliberately preserves an equivalent
+seal, so image replacement without the explicit refresh fails closed instead
+of silently trusting different runtime files.
+
 Re-runs are byte-idempotent when the desired decision artifacts are current.
 Bootstrap also performs a one-way migration of the general
 `$HERMES_HOME/cron/jobs.json`: jobs carrying the legacy
@@ -244,6 +259,20 @@ memory, browser, terminal, or writable Skill tools to this profile. Product
 wellness requests enter through `POST /v1/wellness-decisions`; the server
 calls Hermes `/v1/responses` once and validates the live tool profile,
 transcript, strict result envelope, and source references.
+
+The runtime manifest detects drift in its declared launch-control artifacts
+at startup and during operation. It does not hash every transitive Python
+package or native library, and it is not a sandbox against a process that
+already has the same OS user and can rewrite the runtime, venv, and manifest
+concurrently. Protect the repository, runtime venv, decision home, and
+attestation key with OS ownership and filesystem permissions. The supervisor
+executes the original
+manifest-bound venv Python path on every platform (required for macOS
+`@executable_path` library resolution), revalidates the manifest immediately
+around startup, and holds one child-generation lease from response
+attestation until the complete `/v1/responses` stream closes. Watchdog restart
+and shutdown wait for that lease rather than switching the child midway
+through a decision.
 
 Running the gateway natively (verified live on macOS with dummy creds):
 

@@ -188,6 +188,49 @@ async def test_watchdog_restarts_immediately_on_runtime_identity_drift(
 
 
 @pytest.mark.asyncio
+async def test_response_lease_blocks_child_generation_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = HermesRuntimeProcess(_supervisor_config(tmp_path))
+    child = SimpleNamespace(returncode=None)
+    state = object()
+    process._process = child
+    process._state = state  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._child_generation = 7
+    process._healthy = True
+
+    async def attest_locked():
+        return state
+
+    monkeypatch.setattr(process, "_attest_locked", attest_locked)
+    lease = await process.acquire_response_lease()
+    replacement_waiting = asyncio.Event()
+    replaced = asyncio.Event()
+
+    async def replace_child() -> None:
+        replacement_waiting.set()
+        async with process._child_lock:
+            process._child_generation += 1
+            replaced.set()
+
+    replacement = asyncio.create_task(replace_child())
+    await asyncio.wait_for(replacement_waiting.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert lease.generation == 7
+    assert not replaced.is_set()
+
+    lease.release()
+    lease.release()
+    await asyncio.wait_for(replacement, timeout=1)
+
+    assert replaced.is_set()
+    assert process._child_generation == 8
+
+
+@pytest.mark.asyncio
 async def test_concurrent_close_prevents_watchdog_resurrection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

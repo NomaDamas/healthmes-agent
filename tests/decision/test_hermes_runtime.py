@@ -49,6 +49,7 @@ from healthmes.hermes_runtime_identity import (
 )
 from healthmes.hermes_runtime_supervisor import (
     HermesRuntimeProcess,
+    HermesRuntimeResponseLease,
     HermesRuntimeState,
     HermesRuntimeSupervisorConfig,
     _stream_upstream_response,
@@ -389,7 +390,7 @@ def test_supervised_runtime_rejects_launcher_content_drift(
         )
 
 
-def test_verified_launcher_rejects_one_byte_over_limit(
+def test_execution_artifact_rejects_one_byte_over_limit(
     runtime_bundle: RuntimeBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -408,8 +409,9 @@ def test_verified_launcher_rejects_one_byte_over_limit(
         HermesRuntimeIdentityError,
         match="hermes_runtime_execution_artifact_too_large",
     ):
-        hermes_runtime_identity.open_verified_runtime_launcher(
-            runtime_bundle.manifest
+        runtime_execution_artifacts(
+            manifest=runtime_bundle.manifest,
+            vendor_root=runtime_bundle.vendor_root,
         )
 
 
@@ -652,7 +654,7 @@ async def test_runtime_process_seals_manifest_before_child_launch(
 
 
 @pytest.mark.asyncio
-async def test_runtime_process_executes_verified_launcher_snapshot(
+async def test_runtime_process_uses_the_manifest_venv_launcher_path(
     runtime_bundle: RuntimeBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -660,12 +662,7 @@ async def test_runtime_process_executes_verified_launcher_snapshot(
         runtime_bundle.manifest_path,
         runtime_bundle.prepared_manifest,
     )
-    launcher = Path(runtime_bundle.prepared_manifest.launch_argv[0])
-    sealed_bytes = launcher.read_bytes()
-    replacement = launcher.with_name("replacement-python")
-    replacement.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
-    replacement.chmod(0o755)
-    observed_executable: list[str] = []
+    observed_argv: list[tuple[str, ...]] = []
 
     class FakeProcess:
         returncode = None
@@ -675,17 +672,9 @@ async def test_runtime_process_executes_verified_launcher_snapshot(
         *argv: str,
         **kwargs: Any,
     ) -> FakeProcess:
-        replacement.replace(launcher)
-        assert launcher.read_text(encoding="utf-8") == (
-            "#!/bin/sh\nexit 99\n"
-        )
-        executable = str(kwargs["executable"])
-        observed_executable.append(executable)
-        assert executable != str(launcher)
-        assert Path(executable).read_bytes() == sealed_bytes
-        assert argv == runtime_bundle.prepared_manifest.launch_argv
-        launcher.write_bytes(sealed_bytes)
-        launcher.chmod(0o755)
+        observed_argv.append(argv)
+        assert "executable" not in kwargs
+        assert "pass_fds" not in kwargs
         return FakeProcess()
 
     async def fake_wait_until_ready(**_kwargs: Any) -> None:
@@ -717,9 +706,77 @@ async def test_runtime_process_executes_verified_launcher_snapshot(
 
     await process.start()
 
-    assert observed_executable
-    assert launcher.read_bytes() == sealed_bytes
+    assert observed_argv == [
+        runtime_bundle.prepared_manifest.launch_argv
+    ]
     assert process.state.manifest.sealed is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_process_rejects_launcher_drift_during_startup(
+    runtime_bundle: RuntimeBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_runtime_manifest(
+        runtime_bundle.manifest_path,
+        runtime_bundle.prepared_manifest,
+    )
+    launcher = Path(runtime_bundle.prepared_manifest.launch_argv[0])
+
+    class FakeProcess:
+        returncode = None
+        pid = 424242
+
+    async def fake_create_subprocess_exec(
+        *_argv: str,
+        **_kwargs: Any,
+    ) -> FakeProcess:
+        launcher.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        return FakeProcess()
+
+    async def fake_wait_until_ready(**_kwargs: Any) -> None:
+        return None
+
+    async def fake_stop_child() -> None:
+        process._process = None
+        process._state = None
+        process._launch_argv = None
+        process._healthy = False
+
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    process = HermesRuntimeProcess(
+        HermesRuntimeSupervisorConfig(
+            hermes_home=runtime_bundle.home,
+            manifest_path=runtime_bundle.manifest_path,
+            attestation_key_path=runtime_bundle.key_path,
+            vendor_root=runtime_bundle.vendor_root,
+        ),
+        environ=PROVIDER_ENV,
+        mcp_inventory_probe=lambda _connection, _timeout: asyncio.sleep(
+            0,
+            result=HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256,
+        ),
+    )
+    monkeypatch.setattr(
+        process,
+        "_wait_until_ready",
+        fake_wait_until_ready,
+    )
+    monkeypatch.setattr(process, "_stop_child", fake_stop_child)
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_execution_artifact_mismatch",
+    ):
+        await process.start()
+
+    assert process._process is None
+    assert process._state is None
 
 
 @pytest.mark.asyncio
@@ -974,6 +1031,7 @@ async def test_runtime_attestation_fails_closed_after_live_inventory_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = object.__new__(HermesRuntimeProcess)
+    process._child_lock = asyncio.Lock()
     state = HermesRuntimeState(
         manifest=runtime_bundle.manifest,
         attestation_key=runtime_bundle.key,
@@ -1022,6 +1080,7 @@ class _FakeController:
         self.failure = failure
         self.revalidations = 0
         self.attestations = 0
+        self.releases = 0
 
     @property
     def state(self) -> HermesRuntimeState:
@@ -1036,6 +1095,19 @@ class _FakeController:
     async def attest(self) -> HermesRuntimeState:
         self.attestations += 1
         return self.revalidate()
+
+    async def acquire_response_lease(
+        self,
+    ) -> HermesRuntimeResponseLease:
+        self.attestations += 1
+        return HermesRuntimeResponseLease(
+            state=self.revalidate(),
+            generation=1,
+            _release_callback=self._release,
+        )
+
+    def _release(self) -> None:
+        self.releases += 1
 
     async def start(self) -> None:
         return None
@@ -1111,6 +1183,7 @@ def test_supervisor_revalidates_live_inventory_before_each_response(
 
     assert response.status_code == 200
     assert controller.attestations == 1
+    assert controller.releases == 1
 
 
 def test_supervisor_authenticates_before_parsing_responses_body(
@@ -1184,10 +1257,17 @@ async def test_proxy_stream_cancel_closes_upstream_connection() -> None:
 
     upstream = httpx.Response(200, stream=BlockingStream())
     client = ClosingClient()
+    released = asyncio.Event()
+    lease = HermesRuntimeResponseLease(
+        state=SimpleNamespace(),  # type: ignore[arg-type]
+        generation=1,
+        _release_callback=released.set,
+    )
     stream = _stream_upstream_response(
         request=ConnectedRequest(),  # type: ignore[arg-type]
         upstream=upstream,
         client=client,  # type: ignore[arg-type]
+        response_lease=lease,
     )
     assert await anext(stream) == b"first"
     next_chunk = asyncio.create_task(anext(stream))
@@ -1199,3 +1279,4 @@ async def test_proxy_stream_cancel_closes_upstream_connection() -> None:
 
     await asyncio.wait_for(stream_closed.wait(), timeout=1)
     await asyncio.wait_for(client.closed.wait(), timeout=1)
+    await asyncio.wait_for(released.wait(), timeout=1)
