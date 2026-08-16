@@ -94,7 +94,7 @@ class SanitizingClient:
                 {
                     "id": "raw-series-id",
                     "user_id": user_id,
-                    "timestamp": "2026-08-10T10:00:00Z",
+                    "timestamp": "2026-08-10T10:00:05Z",
                     "type": "heart_rate",
                     "value": 72,
                     "unit": "bpm",
@@ -133,6 +133,7 @@ async def test_search_sanitizes_identity_secrets_raw_ids_and_gps() -> None:
             "category": "stress",
             "recorded_at": "2026-08-10T08:00:00+00:00",
             "provider": "garmin",
+            "provider_attribution": "declared",
             "value": 42,
             "qualifier": "balanced",
             "components": [
@@ -150,18 +151,23 @@ async def test_search_sanitizes_identity_secrets_raw_ids_and_gps() -> None:
             "start_time": "2026-08-10T09:00:00+00:00",
             "end_time": "2026-08-10T09:30:00+00:00",
             "provider": "garmin",
+            "provider_attribution": "source_exact_alias",
             "duration_seconds": 1800,
             "distance_meters": 5000,
         },
     )
     assert timeseries.records == (
         {
-            "timestamp": "2026-08-10T10:00:00+00:00",
+            "timestamp": "2026-08-10T10:00:05+00:00",
             "series_type": "heart_rate",
             "value": 72,
             "unit": "bpm",
             "provider": "apple_health",
+            "provider_attribution": "source_exact_alias",
         },
+    )
+    assert timeseries.limitations == (
+        "wearable_stream_attribution_unavailable",
     )
     encoded = json.dumps(
         {
@@ -197,6 +203,7 @@ class RawResolutionClient:
                     "type": "heart_rate",
                     "value": 70,
                     "unit": "bpm",
+                    "data_source_id": "apple-heart-rate-stream",
                     "source": {"provider": "apple_health"},
                 },
                 {
@@ -204,6 +211,7 @@ class RawResolutionClient:
                     "type": "heart_rate",
                     "value": 80,
                     "unit": "bpm",
+                    "data_source_id": "apple-heart-rate-stream",
                     "source": {"provider": "apple_health"},
                 },
                 {
@@ -211,6 +219,7 @@ class RawResolutionClient:
                     "type": "heart_rate",
                     "value": 76,
                     "unit": "bpm",
+                    "data_source_id": "apple-heart-rate-stream",
                     "source": {"provider": "apple_health"},
                 },
             ],
@@ -241,6 +250,7 @@ async def test_timeseries_enforces_requested_resolution_locally() -> None:
             "value": 75,
             "unit": "bpm",
             "provider": "apple_health",
+            "provider_attribution": "source_exact_alias",
         },
         {
             "timestamp": "2026-08-10T10:01:00+00:00",
@@ -248,6 +258,7 @@ async def test_timeseries_enforces_requested_resolution_locally() -> None:
             "value": 76,
             "unit": "bpm",
             "provider": "apple_health",
+            "provider_attribution": "source_exact_alias",
         },
     )
 
@@ -261,6 +272,7 @@ class SummableResolutionClient:
                     "type": "steps",
                     "value": 10,
                     "unit": "count",
+                    "data_source_id": "apple-steps-stream",
                     "source": {"provider": "apple_health"},
                     "is_daily_total": False,
                 },
@@ -269,6 +281,7 @@ class SummableResolutionClient:
                     "type": "steps",
                     "value": 20,
                     "unit": "count",
+                    "data_source_id": "apple-steps-stream",
                     "source": {"provider": "apple_health"},
                     "is_daily_total": False,
                 },
@@ -277,6 +290,7 @@ class SummableResolutionClient:
                     "type": "steps",
                     "value": 1000,
                     "unit": "count",
+                    "data_source_id": "garmin-steps-stream",
                     "source": {"provider": "garmin"},
                     "is_daily_total": True,
                 },
@@ -285,6 +299,7 @@ class SummableResolutionClient:
                     "type": "steps",
                     "value": 900,
                     "unit": "count",
+                    "data_source_id": "garmin-steps-stream",
                     "source": {"provider": "garmin"},
                     "is_daily_total": True,
                 },
@@ -320,6 +335,7 @@ async def test_timeseries_uses_sum_and_prefers_daily_totals_per_provider() -> No
             "value": 30,
             "unit": "count",
             "provider": "apple_health",
+            "provider_attribution": "source_exact_alias",
         },
         "garmin": {
             "timestamp": "2026-08-10T10:00:00+00:00",
@@ -327,6 +343,7 @@ async def test_timeseries_uses_sum_and_prefers_daily_totals_per_provider() -> No
             "value": 1000,
             "unit": "count",
             "provider": "garmin",
+            "provider_attribution": "source_exact_alias",
             "is_daily_total": True,
         },
     }
@@ -397,6 +414,7 @@ class SummaryClient:
                 "summary_kind": "activity",
                 "date": "2026-08-10",
                 "provider": "apple_health",
+                "provider_attribution": "source_exact_alias",
                 "steps": 8000,
                 "active_minutes": 60,
                 "heart_rate": {
@@ -411,6 +429,7 @@ class SummaryClient:
                 "summary_kind": "sleep",
                 "date": "2026-08-10",
                 "provider": "oura",
+                "provider_attribution": "source_exact_alias",
                 "start_time": "2026-08-09T23:00:00+00:00",
                 "end_time": "2026-08-10T07:00:00+00:00",
                 "duration_minutes": 420,
@@ -426,6 +445,7 @@ class SummaryClient:
                 "summary_kind": "recovery",
                 "date": "2026-08-10",
                 "provider": "whoop",
+                "provider_attribution": "source_exact_alias",
                 "resting_heart_rate_bpm": 54,
                 "recovery_score": 83,
             },
@@ -658,7 +678,7 @@ class UserIdEchoClient:
         }
 
 
-async def test_search_discards_user_id_echoed_in_allowlisted_text() -> None:
+async def test_search_redacts_user_id_echoed_in_provider_text() -> None:
     search = BoundedOpenWearablesSearch(
         UserIdEchoClient(),  # type: ignore[arg-type]
         lambda: "private-user-id",
@@ -666,9 +686,290 @@ async def test_search_discards_user_id_echoed_in_allowlisted_text() -> None:
 
     fetched = await search(_request("wearable.health-scores"))
 
-    assert fetched.records == ()
-    assert fetched.discarded_rows == 1
-    assert fetched.limitations == ("wearable_rows_discarded",)
+    assert len(fetched.records) == 1
+    assert fetched.records[0]["provider"] == "unknown"
+    assert fetched.records[0]["provider_attribution"] == (
+        "declared_unclassified"
+    )
+    assert "private-user-id" not in json.dumps(fetched.records)
+    assert fetched.discarded_rows == 0
+    assert fetched.limitations == (
+        "wearable_provider_attribution_unavailable",
+    )
+
+
+class SourceProviderPrivacyClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                    "source": {
+                        "provider":
+                            "com.apple.health."
+                            "ED447642-08FD-4E45-AF20-633C02C83170"
+                    },
+                },
+                {
+                    "timestamp": "2026-08-10T10:01:00Z",
+                    "type": "heart_rate",
+                    "value": 74,
+                    "unit": "bpm",
+                    "source": {"provider": "com.pineapple.health"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:02:00Z",
+                    "type": "heart_rate",
+                    "value": 76,
+                    "unit": "bpm",
+                    "source": {"provider": "notgarmin-device"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:03:00Z",
+                    "type": "heart_rate",
+                    "value": 78,
+                    "unit": "bpm",
+                    "source": {"provider": "org.googleless.fit"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:04:00Z",
+                    "type": "heart_rate",
+                    "value": 80,
+                    "unit": "bpm",
+                    "source": {"provider": "unknown"},
+                },
+            ],
+            "pagination": {"next_cursor": None},
+        }
+
+
+async def test_search_does_not_guess_provider_from_source_identifiers() -> None:
+    search = BoundedOpenWearablesSearch(
+        SourceProviderPrivacyClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+        )
+    )
+
+    assert [record["provider"] for record in fetched.records] == [
+        "unknown",
+        "unknown",
+        "unknown",
+        "unknown",
+        "unknown",
+    ]
+    assert {
+        record["provider_attribution"]
+        for record in fetched.records
+    } == {"source_unclassified"}
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "com.apple.health" not in encoded
+    assert "ED447642" not in encoded
+    assert "pineapple" not in encoded
+    assert "notgarmin" not in encoded
+    assert "googleless" not in encoded
+    assert fetched.discarded_rows == 0
+
+
+class ProviderPrecedenceClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                    "provider": "garmin",
+                    "source": {"provider": "apple"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:01:00Z",
+                    "type": "heart_rate",
+                    "value": 73,
+                    "unit": "bpm",
+                    "source": {"provider": "apple"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:02:00Z",
+                    "type": "heart_rate",
+                    "value": 74,
+                    "unit": "bpm",
+                    "source": {"provider": "google"},
+                },
+                {
+                    "timestamp": "2026-08-10T10:03:00Z",
+                    "type": "heart_rate",
+                    "value": 75,
+                    "unit": "bpm",
+                    "source": {"provider": "samsung"},
+                },
+            ],
+            "pagination": {"next_cursor": None},
+        }
+
+
+async def test_search_uses_declared_provider_and_exact_legacy_aliases() -> None:
+    search = BoundedOpenWearablesSearch(
+        ProviderPrecedenceClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+        )
+    )
+
+    assert [
+        (
+            record["provider"],
+            record["provider_attribution"],
+        )
+        for record in fetched.records
+    ] == [
+        ("garmin", "declared"),
+        ("apple_health", "source_exact_alias"),
+        ("google_health_connect", "source_exact_alias"),
+        ("samsung_health", "source_exact_alias"),
+    ]
+
+
+class DistinctSensorStreamsClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:05Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple",
+                        "device": "device-A",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-10T10:00:25Z",
+                    "type": "steps",
+                    "value": 20,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple",
+                        "device": "device-B",
+                    },
+                },
+            ],
+            "pagination": {"next_cursor": None},
+        }
+
+
+async def test_timeseries_never_sums_distinct_sensor_streams() -> None:
+    search = BoundedOpenWearablesSearch(
+        DistinctSensorStreamsClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1min",
+        )
+    )
+
+    assert [record["value"] for record in fetched.records] == [10, 20]
+    assert [record["timestamp"] for record in fetched.records] == [
+        "2026-08-10T10:00:05+00:00",
+        "2026-08-10T10:00:25+00:00",
+    ]
+    assert all(
+        record["provider"] == "apple_health"
+        and record["provider_attribution"] == "source_exact_alias"
+        for record in fetched.records
+    )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "device-A" not in encoded
+    assert "device-B" not in encoded
+    assert "_healthmes_stream_key" not in encoded
+    assert fetched.limitations == (
+        "wearable_stream_attribution_unavailable",
+    )
+
+
+class AmbiguousSensorStreamClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:05Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple",
+                        "device": "same-public-label",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-10T10:00:25Z",
+                    "type": "steps",
+                    "value": 20,
+                    "unit": "count",
+                    "source": {
+                        "provider": "apple",
+                        "device": "same-public-label",
+                    },
+                },
+            ],
+            "pagination": {"next_cursor": None},
+        }
+
+
+async def test_timeseries_does_not_sum_ambiguous_matching_sources() -> None:
+    search = BoundedOpenWearablesSearch(
+        AmbiguousSensorStreamClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1min",
+        )
+    )
+
+    assert [record["value"] for record in fetched.records] == [10, 20]
+    assert [record["timestamp"] for record in fetched.records] == [
+        "2026-08-10T10:00:05+00:00",
+        "2026-08-10T10:00:25+00:00",
+    ]
+    assert fetched.limitations == (
+        "wearable_stream_attribution_unavailable",
+    )
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "same-public-label" not in encoded
+    assert "_healthmes_stream_key" not in encoded
 
 
 class MissingProviderClient:
@@ -739,7 +1040,7 @@ class MissingProviderClient:
         ),
     ),
 )
-async def test_search_discards_rows_without_provider(
+async def test_search_retains_rows_without_provider_as_unknown(
     wearable_request: WearableSearchRequest,
 ) -> None:
     search = BoundedOpenWearablesSearch(
@@ -749,6 +1050,15 @@ async def test_search_discards_rows_without_provider(
 
     fetched = await search(wearable_request)
 
-    assert fetched.records == ()
-    assert fetched.discarded_rows == 1
-    assert fetched.limitations == ("wearable_rows_discarded",)
+    assert len(fetched.records) == 1
+    assert fetched.records[0]["provider"] == "unknown"
+    assert fetched.records[0]["provider_attribution"] == "missing"
+    assert fetched.discarded_rows == 0
+    expected_limitations = {
+        "wearable_provider_attribution_unavailable",
+    }
+    if wearable_request.capability == "wearable.timeseries":
+        expected_limitations.add(
+            "wearable_stream_attribution_unavailable"
+        )
+    assert set(fetched.limitations) == expected_limitations

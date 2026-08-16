@@ -536,6 +536,7 @@ _WEARABLE_NESTED_FIELDS = (
     "observed_on",
     "mode",
     "provider",
+    "provider_attribution",
     "provenance",
     "qualifier",
     "ratio",
@@ -576,6 +577,7 @@ _WEARABLE_NESTED_FIELDS = (
     "variant",
     "vigorous",
     "wake_time",
+    "wearable_provider",
     "window_days",
     "workout_type",
     "workouts",
@@ -585,6 +587,14 @@ _WEARABLE_NESTED_FIELDS = (
     "row_digest",
 )
 _WEARABLE_IDENTITY_FIELDS = ("source",)
+_WEARABLE_PUBLIC_RECORD_FIELDS = frozenset(_WEARABLE_NESTED_FIELDS) - {
+    "provenance",
+    "row_digest",
+    "source",
+    "source_ref_id",
+    "upstream_provider",
+    "wearable_provider",
+}
 _WEARABLE_METRIC_KIND = {
     "actual_sleep": "sleep",
     "charge": "recovery",
@@ -662,13 +672,44 @@ _WEARABLE_LIMITATION_CODES = (
     "wearable_readiness_evidence_ids_unavailable",
     "wearable_query_snapshot_fallback_used",
     "wearable_query_outside_retention_window",
+    "wearable_provider_attribution_unavailable",
     "wearable_retention_window_trimmed",
     "wearable_rows_discarded",
     "wearable_snapshot_fallback_used",
     "wearable_snapshot_persistence_failed",
     "wearable_snapshot_writer_unavailable",
     "wearable_source_refs_are_readiness_level",
+    "wearable_stream_attribution_unavailable",
     "wearable_upstream_page_limit_reached",
+)
+_WEARABLE_PROVIDER_FAMILIES = frozenset(
+    {
+        "apple_health",
+        "fitbit",
+        "garmin",
+        "google_health_connect",
+        "internal",
+        "oura",
+        "polar",
+        "samsung_health",
+        "strava",
+        "suunto",
+        "ultrahuman",
+        "unknown",
+        "whoop",
+    }
+)
+_WEARABLE_PROVIDER_ATTRIBUTIONS = frozenset(
+    {
+        "declared",
+        "declared_unclassified",
+        "legacy_missing",
+        "legacy_unclassified",
+        "missing",
+        "mixed",
+        "source_exact_alias",
+        "source_unclassified",
+    }
 )
 _WEARABLE_DETAIL_OUTPUT_FIELDS = (
     "status",
@@ -709,23 +750,68 @@ def _canonical_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _public_wearable_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _public_wearable_value(item)
+            for key, item in value.items()
+            if str(key) in _WEARABLE_PUBLIC_RECORD_FIELDS
+        }
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return [_public_wearable_value(item) for item in value]
+    return _json_value(value)
+
+
+def _public_wearable_record(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    cleaned = _public_wearable_value(record)
+    return cleaned if isinstance(cleaned, dict) else {}
+
+
+def _normalized_public_wearable_record(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = _public_wearable_record(record)
+    declared_provider = normalized.get("provider")
+    provider = (
+        declared_provider
+        if declared_provider in _WEARABLE_PROVIDER_FAMILIES
+        else "unknown"
+    )
+    attribution = normalized.get("provider_attribution")
+    if attribution not in _WEARABLE_PROVIDER_ATTRIBUTIONS:
+        if provider == "unknown":
+            attribution = (
+                "legacy_missing"
+                if declared_provider is None
+                else "legacy_unclassified"
+            )
+        else:
+            attribution = "declared"
+    normalized["provider"] = provider
+    normalized["provider_attribution"] = attribution
+    return normalized
+
+
 def _wearable_fetch_with_required_provider(
     fetched: WearableSearchFetch,
 ) -> WearableSearchFetch:
-    records = tuple(
-        dict(record)
+    records = [
+        _normalized_public_wearable_record(record)
         for record in fetched.records
-        if isinstance(record.get("provider"), str)
-        and bool(str(record["provider"]).strip())
-    )
+    ]
     return WearableSearchFetch(
-        records=records,
+        records=tuple(records),
         upstream_truncated=fetched.upstream_truncated,
         payload_trimmed=fetched.payload_trimmed,
         discarded_rows=(
             fetched.discarded_rows
             + len(fetched.records)
             - len(records)
+        ),
+        stream_attribution_unavailable=(
+            fetched.stream_attribution_unavailable
         ),
     )
 
@@ -763,16 +849,18 @@ def _wearable_record_with_provenance(
     provenance_mode: str,
     timezone: str,
 ) -> dict[str, Any]:
-    provider = record.get("provider")
-    if not isinstance(provider, str) or not provider.strip():
-        raise ValueError("wearable record provider is missing")
-    normalized = dict(record)
+    normalized = _normalized_public_wearable_record(record)
+    provider = normalized["provider"]
+    attribution = normalized["provider_attribution"]
+    row_digest = _canonical_digest(normalized)
     normalized["provenance"] = {
         "source_ref_id": source_ref.reference_id,
-        "row_digest": _canonical_digest(record),
-        "upstream_provider": provider,
+        "row_digest": row_digest,
+        "upstream_provider": "open_wearables",
+        "wearable_provider": provider,
+        "provider_attribution": attribution,
         "observed_at": _wearable_record_observed_at(
-            record,
+            normalized,
             timezone=timezone,
         ),
         "mode": provenance_mode,
@@ -3318,19 +3406,37 @@ class WearableContextProvider:
     ) -> ContextResult:
         stored = dict(snapshot.result)
         raw_records = stored.get("records")
-        records = (
-            list(raw_records)
-            if isinstance(raw_records, list)
-            else []
-        )
-        selected, next_cursor = _page_items(
-            records,
+        public_records = [
+            _normalized_public_wearable_record(record)
+            for record in (
+                raw_records
+                if isinstance(raw_records, list)
+                else []
+            )
+            if isinstance(record, Mapping)
+        ]
+        occurrence_by_digest: dict[str, int] = {}
+        page_entries: list[dict[str, Any]] = []
+        for record in public_records:
+            digest = _canonical_digest(record)
+            occurrence = occurrence_by_digest.get(digest, 0)
+            occurrence_by_digest[digest] = occurrence + 1
+            page_entries.append(
+                {
+                    "record": record,
+                    "cursor_identity": {
+                        "record_digest": digest,
+                        "occurrence": occurrence,
+                    },
+                }
+            )
+        selected_entries, next_cursor = _page_items(
+            page_entries,
             query=query,
             namespace=query.capability,
-            identity=lambda item: {
-                "record_digest": _canonical_digest(item),
-            },
+            identity=lambda item: item["cursor_identity"],
         )
+        selected = [entry["record"] for entry in selected_entries]
         limitations = {
             *_limitations(stored),
             *(value for value in extra_limitations if value),
@@ -3342,6 +3448,18 @@ class WearableContextProvider:
             }
             & limitations
         )
+        if any(
+            record.get("provider") in (None, "unknown")
+            or record.get("provider_attribution") in (
+                None,
+                "legacy_missing",
+                "legacy_unclassified",
+            )
+            for record in selected
+        ):
+            limitations.add(
+                "wearable_provider_attribution_unavailable"
+            )
         raw = {
             "status": stored.get("status", "partial"),
             "count": len(selected),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
@@ -37,6 +38,7 @@ from healthmes.wearables.provenance import (
     OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
     OPEN_WEARABLES_QUERY_EVENT_TYPE,
     OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+    persist_open_wearables_query_snapshot,
 )
 from healthmes.wearables.search import (
     WearableSearchFetch,
@@ -542,7 +544,9 @@ async def test_file_backed_detail_search_uses_stable_mirror_ref_and_cursor(
         assert first_provenance == {
             "source_ref_id": source_ref.reference_id,
             "row_digest": first_provenance["row_digest"],
-            "upstream_provider": "apple_health",
+            "upstream_provider": "open_wearables",
+            "wearable_provider": "apple_health",
+            "provider_attribution": "declared",
             "observed_at": "2026-08-16T08:05:00+00:00",
             "mode": "live_upstream_mirrored",
         }
@@ -550,7 +554,9 @@ async def test_file_backed_detail_search_uses_stable_mirror_ref_and_cursor(
         assert second_provenance == {
             "source_ref_id": source_ref.reference_id,
             "row_digest": second_provenance["row_digest"],
-            "upstream_provider": "apple_health",
+            "upstream_provider": "open_wearables",
+            "wearable_provider": "apple_health",
+            "provider_attribution": "declared",
             "observed_at": "2026-08-16T08:10:00+00:00",
             "mode": "retained_local_mirror",
         }
@@ -574,6 +580,252 @@ async def test_file_backed_detail_search_uses_stable_mirror_ref_and_cursor(
                     == OPEN_WEARABLES_QUERY_EVENT_TYPE
                 )
             ) == 1
+    finally:
+        service.close()
+        engine.dispose()
+
+
+async def test_detail_digest_ignores_private_source_identifiers(
+    tmp_path,
+) -> None:
+    async def fetch_digest(
+        database_name: str,
+        private_source: str,
+    ) -> str:
+        engine, factory = _file_store(tmp_path, database_name)
+
+        async def search_reader(
+            _request: WearableSearchRequest,
+        ) -> WearableSearchFetch:
+            return WearableSearchFetch(
+                records=(
+                    {
+                        "timestamp": "2026-08-16T08:05:00+00:00",
+                        "series_type": "heart_rate",
+                        "value": 72,
+                        "unit": "bpm",
+                        "provider": "apple_health",
+                        "source": {
+                            "provider": private_source,
+                            "device": "private-device",
+                        },
+                    },
+                )
+            )
+
+        service = _service(
+            factory,
+            WearableContextProvider(
+                search_reader=search_reader,
+                snapshot_session_factory=factory,
+            ),
+        )
+        try:
+            handle = service.begin(_request())
+            result = await service.search(
+                handle.session_id,
+                domain="wearable",
+                capability="wearable.timeseries",
+                start=DETAIL_START,
+                end=DETAIL_END,
+                granularity="series",
+                parameters={
+                    "series_type": "heart_rate",
+                    "resolution": "1min",
+                },
+            )
+            record = result.payload["records"][0]
+            encoded_record = json.dumps(record, sort_keys=True)
+            assert private_source not in encoded_record
+            assert "private-device" not in encoded_record
+
+            with factory() as observer:
+                event = observer.get(
+                    WellnessEvent,
+                    UUID(result.source_refs[0].record_id),
+                )
+                assert event is not None
+                encoded_snapshot = json.dumps(
+                    event.payload,
+                    sort_keys=True,
+                )
+                assert private_source not in encoded_snapshot
+                assert "private-device" not in encoded_snapshot
+            return str(record["provenance"]["row_digest"])
+        finally:
+            service.close()
+            engine.dispose()
+
+    first = await fetch_digest(
+        "detail-private-source-a.db",
+        "com.apple.health.bundle-A",
+    )
+    second = await fetch_digest(
+        "detail-private-source-b.db",
+        "com.apple.health.bundle-B",
+    )
+
+    assert first == second
+
+
+async def test_legacy_private_source_does_not_change_public_cursor(
+    tmp_path,
+) -> None:
+    async def fetch_cursor(
+        database_name: str,
+        private_source: str,
+    ) -> str:
+        engine, factory = _file_store(tmp_path, database_name)
+        with factory() as session:
+            persist_open_wearables_query_snapshot(
+                session,
+                capability="wearable.timeseries",
+                start=DETAIL_START,
+                end=DETAIL_END,
+                timezone="UTC",
+                parameters={
+                    "series_type": "heart_rate",
+                    "resolution": "1min",
+                },
+                result={
+                    "status": "ok",
+                    "records": [
+                        {
+                            "timestamp":
+                                "2026-08-16T08:05:00+00:00",
+                            "series_type": "heart_rate",
+                            "value": 72,
+                            "unit": "bpm",
+                            "source": {
+                                "provider": private_source,
+                                "device": "private-device",
+                            },
+                        },
+                        {
+                            "timestamp":
+                                "2026-08-16T08:10:00+00:00",
+                            "series_type": "heart_rate",
+                            "value": 76,
+                            "unit": "bpm",
+                            "provider": "apple_health",
+                        },
+                    ],
+                    "coverage": {"ratio": 1.0},
+                    "limitations": [],
+                },
+                collected_at=NOW,
+                now=NOW,
+            )
+            session.commit()
+
+        async def unavailable_reader(
+            _request: WearableSearchRequest,
+        ) -> WearableSearchFetch:
+            raise RuntimeError("upstream unavailable")
+
+        service = _service(
+            factory,
+            WearableContextProvider(
+                search_reader=unavailable_reader,
+                snapshot_session_factory=factory,
+            ),
+        )
+        try:
+            handle = service.begin(_request())
+            result = await service.search(
+                handle.session_id,
+                domain="wearable",
+                capability="wearable.timeseries",
+                start=DETAIL_START,
+                end=DETAIL_END,
+                granularity="series",
+                limit=1,
+                parameters={
+                    "series_type": "heart_rate",
+                    "resolution": "1min",
+                },
+            )
+            assert result.next_cursor is not None
+            encoded = json.dumps(result.payload["records"], sort_keys=True)
+            assert private_source not in encoded
+            assert "private-device" not in encoded
+            assert result.payload["records"][0]["provider"] == "unknown"
+            return result.next_cursor
+        finally:
+            service.close()
+            engine.dispose()
+
+    first = await fetch_cursor(
+        "legacy-private-cursor-a.db",
+        "com.apple.health.bundle-A",
+    )
+    second = await fetch_cursor(
+        "legacy-private-cursor-b.db",
+        "com.apple.health.bundle-B",
+    )
+
+    assert first == second
+
+
+async def test_identical_public_wearable_records_paginate_to_completion(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(tmp_path, "identical-pagination.db")
+
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        record = {
+            "timestamp": "2026-08-16T08:05:00+00:00",
+            "series_type": "heart_rate",
+            "value": 72,
+            "unit": "bpm",
+            "provider": "apple_health",
+        }
+        return WearableSearchFetch(
+            records=(dict(record), dict(record), dict(record))
+        )
+
+    service = _service(
+        factory,
+        WearableContextProvider(
+            search_reader=search_reader,
+            snapshot_session_factory=factory,
+        ),
+    )
+    try:
+        handle = service.begin(_request())
+        cursor: str | None = None
+        pages = []
+        for _ in range(3):
+            parameters = {
+                "series_type": "heart_rate",
+                "resolution": "1min",
+            }
+            if cursor is not None:
+                parameters["cursor"] = cursor
+            page = await service.search(
+                handle.session_id,
+                domain="wearable",
+                capability="wearable.timeseries",
+                start=DETAIL_START,
+                end=DETAIL_END,
+                granularity="series",
+                limit=1,
+                parameters=parameters,
+            )
+            pages.append(page)
+            cursor = page.next_cursor
+
+        assert [page.payload["count"] for page in pages] == [1, 1, 1]
+        assert pages[0].next_cursor is not None
+        assert pages[1].next_cursor is not None
+        assert pages[0].next_cursor != pages[1].next_cursor
+        assert pages[2].next_cursor is None
+        assert [
+            page.payload["records"][0]["value"]
+            for page in pages
+        ] == [72, 72, 72]
     finally:
         service.close()
         engine.dispose()
@@ -692,6 +944,82 @@ async def test_detail_search_falls_back_to_exact_retained_query(
         engine.dispose()
 
 
+async def test_detail_search_reads_legacy_snapshot_without_provider(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(tmp_path, "detail-legacy-provider.db")
+    with factory() as session:
+        snapshot = persist_open_wearables_query_snapshot(
+            session,
+            capability="wearable.health-scores",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            timezone="UTC",
+            parameters={"category": "recovery"},
+            result={
+                "status": "ok",
+                "records": [
+                    {
+                        "category": "recovery",
+                        "recorded_at":
+                            "2026-08-16T08:00:00+00:00",
+                        "value": 82,
+                    }
+                ],
+                "coverage": {"ratio": 1.0},
+                "limitations": [],
+            },
+            collected_at=NOW,
+            now=NOW,
+        )
+        session.commit()
+
+    async def unavailable_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        raise RuntimeError("upstream unavailable")
+
+    service = _service(
+        factory,
+        WearableContextProvider(
+            search_reader=unavailable_reader,
+            snapshot_session_factory=factory,
+        ),
+    )
+    try:
+        handle = service.begin(_request())
+        fallback = await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.health-scores",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="record",
+            parameters={"category": "recovery"},
+        )
+
+        record = fallback.payload["records"][0]
+        assert record["provider"] == "unknown"
+        assert record["provider_attribution"] == "legacy_missing"
+        assert record["provenance"]["upstream_provider"] == (
+            "open_wearables"
+        )
+        assert record["provenance"]["wearable_provider"] == "unknown"
+        assert record["provenance"]["provider_attribution"] == (
+            "legacy_missing"
+        )
+        assert fallback.source_refs[0].record_id == str(
+            snapshot.event_id
+        )
+        assert (
+            "wearable_provider_attribution_unavailable"
+            in fallback.limitations
+        )
+    finally:
+        service.close()
+        engine.dispose()
+
+
 async def test_detail_search_timeout_uses_exact_retained_query(
     tmp_path,
 ) -> None:
@@ -773,7 +1101,7 @@ async def test_detail_search_timeout_uses_exact_retained_query(
         engine.dispose()
 
 
-async def test_detail_search_discards_rows_without_provider(
+async def test_detail_search_retains_unknown_provider_as_partial(
     session,
 ) -> None:
     async def search_reader(
@@ -810,9 +1138,15 @@ async def test_detail_search_discards_rows_without_provider(
     )
 
     assert result.status is ContextStatus.PARTIAL
-    assert result.payload["count"] == 1
-    assert result.payload["records"][0]["value"] == 42
-    assert "wearable_rows_discarded" in result.limitations
+    assert result.payload["count"] == 2
+    assert [
+        record["value"] for record in result.payload["records"]
+    ] == [99, 42]
+    assert result.payload["records"][0]["provider"] == "unknown"
+    assert (
+        "wearable_provider_attribution_unavailable"
+        in result.limitations
+    )
 
 
 async def test_wearable_consent_denial_happens_before_upstream_access(

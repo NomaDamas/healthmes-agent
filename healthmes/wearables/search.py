@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import math
@@ -106,6 +107,27 @@ _PRIVATE_KEYS = frozenset(
         "userid",
     }
 )
+_PROVIDER_FAMILY_ALIASES = {
+    "apple": "apple_health",
+    "apple_health": "apple_health",
+    "fitbit": "fitbit",
+    "garmin": "garmin",
+    "google": "google_health_connect",
+    "google_health_connect": "google_health_connect",
+    "internal": "internal",
+    "oura": "oura",
+    "polar": "polar",
+    "samsung": "samsung_health",
+    "samsung_health": "samsung_health",
+    "strava": "strava",
+    "suunto": "suunto",
+    "ultrahuman": "ultrahuman",
+    "whoop": "whoop",
+}
+_INTERNAL_STREAM_KEY = "_healthmes_stream_key"
+_TRUSTED_PROVIDER_ATTRIBUTIONS = frozenset(
+    {"declared", "source_exact_alias"}
+)
 
 WearableUserIdResolver = Callable[[], str | Awaitable[str]]
 
@@ -125,6 +147,7 @@ class WearableSearchFetch:
     upstream_truncated: bool = False
     payload_trimmed: bool = False
     discarded_rows: int = 0
+    stream_attribution_unavailable: bool = False
 
     @property
     def limitations(self) -> tuple[str, ...]:
@@ -135,6 +158,15 @@ class WearableSearchFetch:
             values.append("wearable_payload_limit_reached")
         if self.discarded_rows:
             values.append("wearable_rows_discarded")
+        if self.stream_attribution_unavailable:
+            values.append("wearable_stream_attribution_unavailable")
+        if any(
+            record.get("provider") == "unknown"
+            or record.get("provider_attribution")
+            not in _TRUSTED_PROVIDER_ATTRIBUTIONS
+            for record in self.records
+        ):
+            values.append("wearable_provider_attribution_unavailable")
         return tuple(values)
 
 
@@ -261,11 +293,14 @@ class BoundedOpenWearablesSearch:
                 discarded += 1
                 continue
             sanitized.append(clean)
+        stream_attribution_unavailable = False
         if request.capability == "wearable.timeseries":
-            sanitized = _aggregate_timeseries(
+            sanitized, stream_attribution_unavailable = (
+                _aggregate_timeseries(
                 sanitized,
                 series_type=str(request.parameters["series_type"]),
                 resolution=str(request.parameters["resolution"]),
+                )
             )
         sanitized.sort(key=_row_sort_key)
 
@@ -284,6 +319,9 @@ class BoundedOpenWearablesSearch:
             upstream_truncated=truncated or row_trimmed,
             payload_trimmed=payload_trimmed,
             discarded_rows=discarded,
+            stream_attribution_unavailable=(
+                stream_attribution_unavailable
+            ),
         )
 
     async def _health_scores(
@@ -532,12 +570,49 @@ def _day(value: Any) -> date | None:
         return None
 
 
-def _provider(row: Mapping[str, Any]) -> str | None:
+def _provider_family(value: Any) -> str | None:
+    cleaned = _safe_text(value, max_length=64)
+    if cleaned is None:
+        return None
+    return _PROVIDER_FAMILY_ALIASES.get(cleaned.casefold())
+
+
+def _provider(row: Mapping[str, Any]) -> tuple[str, str]:
+    declared = row.get("provider")
+    if declared is not None:
+        family = _provider_family(declared)
+        return (
+            (family, "declared")
+            if family is not None
+            else ("unknown", "declared_unclassified")
+        )
+
     source = row.get("source")
     value = source.get("provider") if isinstance(source, Mapping) else None
     if value is None:
-        value = row.get("provider")
-    return _safe_text(value, max_length=64)
+        return "unknown", "missing"
+    family = _provider_family(value)
+    return (
+        (family, "source_exact_alias")
+        if family is not None
+        else ("unknown", "source_unclassified")
+    )
+
+
+def _trusted_stream_key(row: Mapping[str, Any]) -> str | None:
+    data_source_id = _safe_text(
+        row.get("data_source_id"),
+        max_length=512,
+    )
+    if data_source_id is None:
+        return None
+    encoded = json.dumps(
+        {"data_source_id": data_source_id},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _put_number(
@@ -560,18 +635,18 @@ def _sanitize_health_score(
 ) -> dict[str, Any] | None:
     recorded_at = _timestamp(row.get("recorded_at"))
     category = _safe_text(row.get("category"), max_length=32)
-    provider = _provider(row)
+    provider, attribution = _provider(row)
     if (
         recorded_at is None
         or not start.astimezone(UTC) <= recorded_at < end.astimezone(UTC)
         or category not in WEARABLE_HEALTH_SCORE_CATEGORIES
-        or provider is None
     ):
         return None
     result: dict[str, Any] = {
         "category": category,
         "recorded_at": recorded_at.isoformat(),
         "provider": provider,
+        "provider_attribution": attribution,
     }
     _put_number(result, row, "value")
     qualifier = _safe_text(row.get("qualifier"), max_length=64)
@@ -614,20 +689,20 @@ def _sanitize_summary(
     timezone: str,
 ) -> dict[str, Any] | None:
     observed_day = _day(row.get("date"))
-    provider = _provider(row)
+    provider, attribution = _provider(row)
     zone = parse_timezone(timezone)
     first_day = start.astimezone(zone).date()
     last_day = (end - timedelta(microseconds=1)).astimezone(zone).date()
     if (
         observed_day is None
         or not first_day <= observed_day <= last_day
-        or provider is None
     ):
         return None
     result: dict[str, Any] = {
         "summary_kind": kind,
         "date": observed_day.isoformat(),
         "provider": provider,
+        "provider_attribution": attribution,
     }
     if kind == "activity":
         for field in (
@@ -740,14 +815,13 @@ def _sanitize_workout(
     start_time = _timestamp(row.get("start_time"))
     end_time = _timestamp(row.get("end_time"))
     workout_type = _safe_text(row.get("type"), max_length=64)
-    provider = _provider(row)
+    provider, attribution = _provider(row)
     if (
         start_time is None
         or end_time is None
         or end_time <= start_time
         or not start.astimezone(UTC) <= start_time < end.astimezone(UTC)
         or workout_type is None
-        or provider is None
     ):
         return None
     result: dict[str, Any] = {
@@ -755,6 +829,7 @@ def _sanitize_workout(
         "start_time": start_time.isoformat(),
         "end_time": end_time.isoformat(),
         "provider": provider,
+        "provider_attribution": attribution,
     }
     zone_offset = _safe_text(row.get("zone_offset"), max_length=16)
     if zone_offset is not None:
@@ -786,7 +861,7 @@ def _sanitize_timeseries(
     raw_type = _safe_text(row.get("type"), max_length=64)
     value = _number(row.get("value"))
     unit = _safe_text(row.get("unit"), max_length=32)
-    provider = _provider(row)
+    provider, attribution = _provider(row)
     if (
         timestamp is None
         or not start.astimezone(UTC) <= timestamp < end.astimezone(UTC)
@@ -794,7 +869,6 @@ def _sanitize_timeseries(
         or raw_type not in WEARABLE_TIMESERIES_TYPES
         or value is None
         or unit is None
-        or provider is None
     ):
         return None
     result: dict[str, Any] = {
@@ -803,7 +877,11 @@ def _sanitize_timeseries(
         "value": value,
         "unit": unit,
         "provider": provider,
+        "provider_attribution": attribution,
     }
+    stream_key = _trusted_stream_key(row)
+    if stream_key is not None:
+        result[_INTERNAL_STREAM_KEY] = stream_key
     zone_offset = _safe_text(row.get("zone_offset"), max_length=16)
     if zone_offset is not None:
         result["zone_offset"] = zone_offset
@@ -817,19 +895,36 @@ def _aggregate_timeseries(
     *,
     series_type: str,
     resolution: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     """Enforce the requested resolution even if the upstream route ignores it."""
 
     interval_seconds = _TIMESERIES_RESOLUTION_SECONDS[resolution]
     buckets: dict[
-        tuple[datetime, str, str],
+        tuple[datetime, str, str, str],
         list[Mapping[str, Any]],
     ] = {}
+    unattributed: list[dict[str, Any]] = []
     for record in records:
         timestamp = _timestamp(record.get("timestamp"))
         unit = _safe_text(record.get("unit"), max_length=32)
         provider = _safe_text(record.get("provider"), max_length=64)
+        stream_key = _safe_text(
+            record.get(_INTERNAL_STREAM_KEY),
+            max_length=64,
+        )
         if timestamp is None or unit is None or provider is None:
+            continue
+        if stream_key is None:
+            # Matching provider or device labels do not prove that samples
+            # belong to one sensor. Preserve the original observation instead
+            # of inventing an aggregate or replacing its timestamp.
+            unattributed.append(
+                {
+                    key: value
+                    for key, value in record.items()
+                    if key != _INTERNAL_STREAM_KEY
+                }
+            )
             continue
         epoch_seconds = int(timestamp.timestamp())
         bucket_start = datetime.fromtimestamp(
@@ -837,17 +932,18 @@ def _aggregate_timeseries(
             tz=UTC,
         )
         buckets.setdefault(
-            (bucket_start, unit, provider),
+            (bucket_start, unit, provider, stream_key),
             [],
         ).append(record)
 
-    aggregated: list[dict[str, Any]] = []
-    for (bucket_start, unit, provider), bucket in sorted(
+    aggregated: list[dict[str, Any]] = unattributed
+    for (bucket_start, unit, provider, stream_key), bucket in sorted(
         buckets.items(),
         key=lambda item: (
             item[0][0],
             item[0][1],
             item[0][2],
+            item[0][3],
         ),
     ):
         values = [
@@ -868,13 +964,28 @@ def _aggregate_timeseries(
             "unit": unit,
             "provider": provider,
         }
+        attributions = {
+            value
+            for record in bucket
+            if (
+                value := _safe_text(
+                    record.get("provider_attribution"),
+                    max_length=32,
+                )
+            )
+            is not None
+        }
+        if len(attributions) == 1:
+            result["provider_attribution"] = attributions.pop()
+        elif attributions:
+            result["provider_attribution"] = "mixed"
         if (
             series_type in _SUM_TIMESERIES_TYPES
             and any(record.get("is_daily_total") is True for record in bucket)
         ):
             result["is_daily_total"] = True
         aggregated.append(result)
-    return aggregated
+    return aggregated, bool(unattributed)
 
 
 def _normalized_aggregate_value(
