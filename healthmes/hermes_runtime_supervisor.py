@@ -27,6 +27,7 @@ from healthmes.hermes_runtime_identity import (
     HERMES_RUNTIME_PROVIDER_ENV_NAMES,
     HermesDecisionRuntimeManifest,
     HermesRuntimeIdentityError,
+    seal_supervised_runtime,
     sign_runtime_attestation,
     validate_supervised_runtime,
 )
@@ -135,7 +136,7 @@ class HermesRuntimeProcess:
         if self._process is not None:
             return
         config = self._config
-        manifest, key, api_key = validate_supervised_runtime(
+        manifest, key, api_key = seal_supervised_runtime(
             manifest_path=config.manifest_path,
             attestation_key_path=config.attestation_key_path,
             hermes_home=config.hermes_home,
@@ -150,14 +151,32 @@ class HermesRuntimeProcess:
             self._environ,
             manifest=manifest,
         )
+        launch_manifest, launch_key, launch_api_key = (
+            validate_supervised_runtime(
+                manifest_path=config.manifest_path,
+                attestation_key_path=config.attestation_key_path,
+                hermes_home=config.hermes_home,
+                vendor_root=config.vendor_root,
+                environment=self._environ,
+                expected_launch_argv=manifest.launch_argv,
+            )
+        )
+        if (
+            launch_manifest != manifest
+            or launch_key != key
+            or not hmac.compare_digest(launch_api_key, api_key)
+        ):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_identity_changed"
+            )
         process = await asyncio.create_subprocess_exec(
-            *manifest.launch_argv,
+            *launch_manifest.launch_argv,
             cwd=str(config.vendor_root),
             env=child_env,
             start_new_session=True,
         )
         self._process = process
-        self._launch_argv = manifest.launch_argv
+        self._launch_argv = launch_manifest.launch_argv
         try:
             await self._wait_until_ready(
                 manifest=manifest,

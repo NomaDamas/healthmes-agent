@@ -25,8 +25,10 @@ HERMES_DECISION_SKILL_MCP_TOOL_NAMES = (
     "list_wellness_skills",
     "read_wellness_skill",
 )
-# Backward-compatible public name for the minimum search-only profile.
-HERMES_DECISION_MCP_TOOL_NAMES = HERMES_DECISION_SEARCH_MCP_TOOL_NAMES
+HERMES_DECISION_MCP_TOOL_NAMES = (
+    *HERMES_DECISION_SEARCH_MCP_TOOL_NAMES,
+    *HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
+)
 HERMES_DECISION_TOOL_DOMAINS: dict[str, str] = {
     "mcp__healthmes__search_activity": "activity",
     "mcp__healthmes__search_nutrition": "nutrition",
@@ -44,16 +46,8 @@ HERMES_DECISION_TOOL_ALLOWLIST = (
     HERMES_DECISION_SEARCH_TOOL_ALLOWLIST
     | HERMES_DECISION_SKILL_TOOL_ALLOWLIST
 )
-HERMES_DECISION_EXACT_MCP_TOOL_PROFILES = frozenset(
-    {
-        frozenset(HERMES_DECISION_SEARCH_MCP_TOOL_NAMES),
-        frozenset(
-            (
-                *HERMES_DECISION_SEARCH_MCP_TOOL_NAMES,
-                *HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
-            )
-        ),
-    }
+_HERMES_DECISION_EXACT_MCP_TOOL_PROFILE = frozenset(
+    HERMES_DECISION_MCP_TOOL_NAMES
 )
 
 # The API-server platform is explicitly limited to the HealthMes MCP server.
@@ -322,12 +316,20 @@ def _asserted_profile(
         healthmes.get("tools"),
         code="hermes_decision_profile_mcp_invalid",
     )
+    if (
+        filters.get("resources") is not False
+        or filters.get("prompts") is not False
+    ):
+        raise HermesDecisionProfileError(
+            "hermes_decision_profile_mcp_invalid"
+        )
     include = filters.get("include")
     exclude = filters.get("exclude")
     if (
         not isinstance(include, list)
         or any(not isinstance(item, str) for item in include)
-        or frozenset(include) not in HERMES_DECISION_EXACT_MCP_TOOL_PROFILES
+        or frozenset(include)
+        != _HERMES_DECISION_EXACT_MCP_TOOL_PROFILE
         or len(include) != len(set(include))
         or exclude not in (None, [], ())
     ):
@@ -354,6 +356,8 @@ def _asserted_profile(
                 f"{parsed_url.scheme}://{parsed_url.netloc}"
                 f"{parsed_url.path.rstrip('/')}"
             ),
+            "resources": False,
+            "prompts": False,
             "tools": sorted(include),
         },
     }

@@ -110,6 +110,12 @@ def test_full_run_builds_only_attested_decision_runtime(
     assert set(profile["platforms"]) == {"api_server"}
     assert profile["platform_toolsets"] == {"api_server": ["healthmes"]}
     assert set(profile["mcp_servers"]) == {"healthmes"}
+    assert (
+        profile["mcp_servers"]["healthmes"]["tools"]["resources"] is False
+    )
+    assert (
+        profile["mcp_servers"]["healthmes"]["tools"]["prompts"] is False
+    )
     assert profile["mcp_servers"]["healthmes"]["tools"]["include"] == list(
         HERMES_DECISION_MCP_TOOL_NAMES
     )
@@ -144,6 +150,8 @@ def test_full_run_builds_only_attested_decision_runtime(
     ).verify()
     manifest = load_runtime_manifest(manifest_path)
     key = load_attestation_key(key_path)
+    assert manifest.sealed is False
+    assert manifest.execution_artifacts == ()
     assert manifest.profile_semantic_digest == profile_digest
     assert manifest.hermes_home == str(decision_home.resolve())
     assert manifest.public_origin == "http://127.0.0.1:8645"
@@ -165,8 +173,9 @@ def test_full_run_builds_only_attested_decision_runtime(
             b"provider-secret"
         ).hexdigest()
     }
-    assert manifest.launch_argv[-3:] == (
-        "hermes",
+    assert manifest.launch_argv[-4:] == (
+        "-m",
+        "hermes_cli.main",
         "gateway",
         "run",
     )

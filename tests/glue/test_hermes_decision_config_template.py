@@ -69,6 +69,12 @@ def test_template_is_a_dedicated_filtered_decision_profile(
         "api_server": ["healthmes"]
     }
     assert set(config["mcp_servers"]) == {"healthmes"}
+    assert (
+        config["mcp_servers"]["healthmes"]["tools"]["resources"] is False
+    )
+    assert (
+        config["mcp_servers"]["healthmes"]["tools"]["prompts"] is False
+    )
     assert config["mcp_servers"]["healthmes"]["tools"]["include"] == list(
         HERMES_DECISION_MCP_TOOL_NAMES
     )

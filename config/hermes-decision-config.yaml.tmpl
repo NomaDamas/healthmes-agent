@@ -1,7 +1,9 @@
 # Dedicated Hermes profile for the HealthMes wellness decision runtime.
 #
 # Run this profile in its own HERMES_HOME. It intentionally has no Telegram,
-# webhook, cron, skill, direct Open Wearables, native, or mutation tools.
+# webhook, cron, Hermes-native skill, direct Open Wearables, native, or
+# mutation tools. Reviewed HealthMes wellness skills remain readable only
+# through the two exact MCP tools listed below.
 
 {%- if decision_hermes_model or decision_hermes_provider %}
 model:
@@ -79,8 +81,12 @@ mcp_servers:
     {%- endif %}
     timeout: 120
     tools:
+      resources: false
+      prompts: false
       include:
         - search_activity
         - search_calendar
         - search_nutrition
         - search_wearable
+        - list_wellness_skills
+        - read_wellness_skill

@@ -2245,14 +2245,6 @@ def _parse_final_draft(raw_text: str) -> HermesDecisionDraftEnvelope:
             raise HermesResponsesContractError(
                 "hermes_persistence_intent_missing"
             )
-        if "persistence_intent" not in DecisionDraft.model_fields:
-            if decision.get("persistence_intent") != "none":
-                raise HermesResponsesContractError(
-                    "hermes_final_json_invalid"
-                )
-            decision = dict(decision)
-            decision.pop("persistence_intent")
-            payload = {**payload, "decision": decision}
         return strict_model_validate(
             HermesDecisionDraftEnvelope,
             payload,

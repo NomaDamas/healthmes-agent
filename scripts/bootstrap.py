@@ -73,6 +73,9 @@ GENERATED_DECISION_ATTESTATION_KEY_PATH = (
 )
 NATIVE_DECISION_PUBLIC_ORIGIN = "http://127.0.0.1:8645"
 DOCKER_DECISION_PUBLIC_ORIGIN = "http://hermes-decision:8645"
+NATIVE_DECISION_VENV = (
+    REPO_ROOT / "data" / "runtime" / "hermes-decision-venv"
+)
 GENERATED_DECISION_PUBLIC_ORIGINS = frozenset(
     {
         NATIVE_DECISION_PUBLIC_ORIGIN,
@@ -1633,15 +1636,10 @@ def run(args: argparse.Namespace) -> int:
     else:
         runtime_home = decision_home.expanduser().resolve()
         runtime_vendor_root = VENDOR_HERMES.resolve()
-        uv_binary = shutil.which("uv")
-        if uv_binary is None:
-            raise ValueError("uv is required to launch the native Hermes runtime")
         launch_argv = (
-            str(Path(uv_binary).resolve()),
-            "run",
-            "--directory",
-            str(VENDOR_HERMES.resolve()),
-            "hermes",
+            str(NATIVE_DECISION_VENV / "bin" / "python"),
+            "-m",
+            "hermes_cli.main",
             "gateway",
             "run",
         )

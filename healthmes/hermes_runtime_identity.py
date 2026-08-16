@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import stat
+import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -30,7 +31,7 @@ from pydantic import (
 )
 
 HERMES_DECISION_RUNTIME_MODEL_ALIAS = "healthmes-decision-runtime"
-HERMES_RUNTIME_MANIFEST_SCHEMA = "healthmes.hermes-runtime.v1"
+HERMES_RUNTIME_MANIFEST_SCHEMA = "healthmes.hermes-runtime.v2"
 HERMES_RUNTIME_ATTESTATION_SCHEMA = "healthmes.hermes-runtime-attestation.v1"
 HERMES_RUNTIME_ATTESTATION_PATH = "/healthmes/runtime-attestation"
 HERMES_RUNTIME_HEALTH_PATH = "/healthmes/runtime-health"
@@ -65,7 +66,20 @@ HERMES_RUNTIME_REQUIRED_ENV_NAMES = (
     "HERMES_MANAGED_DIR",
     "HERMES_WRITE_SAFE_ROOT",
     "PYTHONDONTWRITEBYTECODE",
+    "PYTHONPYCACHEPREFIX",
     "PYTHONUNBUFFERED",
+)
+HERMES_RUNTIME_EXECUTION_ARTIFACT_NAMES = (
+    "child_launcher",
+    "child_environment",
+    "vendor_entrypoint",
+    "supervisor_interpreter",
+    "supervisor_module",
+    "identity_module",
+)
+HERMES_RUNTIME_CONTROL_SOURCE_NAMES = (
+    "supervisor_module",
+    "identity_module",
 )
 
 _MAX_MANIFEST_BYTES = 64_000
@@ -73,22 +87,47 @@ _MAX_PROFILE_BYTES = 256_000
 _MAX_HOME_ARTIFACT_BYTES = 512_000
 _MAX_ATTESTATION_KEY_BYTES = 512
 _MAX_VENDOR_ARTIFACT_BYTES = 32_000_000
+_MAX_EXECUTION_ARTIFACT_BYTES = 256_000_000
+_MAX_VENDOR_FINGERPRINT_FILES = 10_000
+_MAX_VENDOR_FINGERPRINT_BYTES = 512_000_000
 _HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _NONCE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
-_VENDOR_FINGERPRINT_PATHS = (
+_VENDOR_FINGERPRINT_ROOT_FILES = (
+    "MANIFEST.in",
+    "hermes",
     "pyproject.toml",
     "uv.lock",
-    "gateway/platforms/api_server.py",
-    "gateway/config.py",
-    "gateway/run.py",
-    "agent/conversation_loop.py",
-    "run_agent.py",
-    "tools/mcp_tool.py",
-    "tools/skills_sync.py",
-    "hermes_cli/plugins.py",
-    "hermes_cli/main.py",
-    "hermes_constants.py",
-    "docker/stage2-hook.sh",
+)
+_VENDOR_FINGERPRINT_TREES = (
+    "agent",
+    "gateway",
+    "hermes_cli",
+    "providers",
+    "tools",
+    "plugins/model-providers",
+)
+_VENDOR_FINGERPRINT_IMMEDIATE_PYTHON_DIRS = (
+    "plugins",
+)
+_VENDOR_FINGERPRINT_IGNORED_DIRECTORIES = frozenset(
+    {
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+    }
+)
+_VENDOR_FINGERPRINT_IGNORED_SUFFIXES = (
+    ".md",
+    ".pyc",
+    ".pyo",
+    ".so",
+    ".swp",
+    ".swo",
 )
 _FORBIDDEN_HOME_FILES = frozenset(
     {
@@ -106,6 +145,7 @@ _FORBIDDEN_HOME_FILES = frozenset(
 )
 _FORBIDDEN_NONEMPTY_HOME_DIRS = (
     ".codex",
+    ".pycache-disabled",
     "cron",
     "hooks",
     "memories",
@@ -130,6 +170,28 @@ class HermesRuntimeNamedDigest(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class HermesRuntimeExecutionArtifact(BaseModel):
+    """One actual file whose bytes can change the launched runtime."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1, max_length=255)
+    path: str = Field(min_length=1, max_length=4_096)
+    resolved_path: str = Field(min_length=1, max_length=4_096)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mode: int = Field(ge=0, le=0o7777)
+
+    @model_validator(mode="after")
+    def validate_paths(self) -> HermesRuntimeExecutionArtifact:
+        if not Path(self.path).is_absolute():
+            raise ValueError("Hermes execution artifact path must be absolute")
+        if not Path(self.resolved_path).is_absolute():
+            raise ValueError(
+                "Hermes execution artifact resolved path must be absolute"
+            )
+        return self
+
+
 class HermesRuntimeEnvironmentValue(BaseModel):
     """One exact non-secret environment value bound into runtime identity."""
 
@@ -148,7 +210,7 @@ class HermesDecisionRuntimeManifest(BaseModel):
         populate_by_name=True,
     )
 
-    schema_name: Literal["healthmes.hermes-runtime.v1"] = Field(
+    schema_name: Literal["healthmes.hermes-runtime.v2"] = Field(
         alias="schema"
     )
     runtime_id: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -165,6 +227,18 @@ class HermesDecisionRuntimeManifest(BaseModel):
     vendor_root: str = Field(min_length=1, max_length=4_096)
     vendor_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     launch_argv: tuple[str, ...] = Field(min_length=1, max_length=32)
+    sealed: bool
+    control_source_artifacts: tuple[
+        HermesRuntimeNamedDigest,
+        ...,
+    ] = Field(
+        min_length=len(HERMES_RUNTIME_CONTROL_SOURCE_NAMES),
+        max_length=len(HERMES_RUNTIME_CONTROL_SOURCE_NAMES),
+    )
+    execution_artifacts: tuple[
+        HermesRuntimeExecutionArtifact,
+        ...,
+    ] = Field(default=(), max_length=len(HERMES_RUNTIME_EXECUTION_ARTIFACT_NAMES))
     home_artifacts: tuple[HermesRuntimeNamedDigest, ...] = Field(
         min_length=len(HERMES_RUNTIME_HOME_ARTIFACT_NAMES),
         max_length=len(HERMES_RUNTIME_HOME_ARTIFACT_NAMES),
@@ -186,6 +260,34 @@ class HermesDecisionRuntimeManifest(BaseModel):
             raise ValueError("Hermes vendor root must be absolute")
         if any(not item or "\x00" in item for item in self.launch_argv):
             raise ValueError("Hermes launch argv is invalid")
+        if (
+            len(self.launch_argv) != 5
+            or not Path(self.launch_argv[0]).is_absolute()
+            or self.launch_argv[1:]
+            != ("-m", "hermes_cli.main", "gateway", "run")
+        ):
+            raise ValueError(
+                "Hermes launch argv must use the dedicated Python module"
+            )
+        execution_names = tuple(
+            item.name for item in self.execution_artifacts
+        )
+        if self.sealed:
+            if execution_names != HERMES_RUNTIME_EXECUTION_ARTIFACT_NAMES:
+                raise ValueError(
+                    "Hermes runtime execution artifacts are invalid"
+                )
+        elif self.execution_artifacts:
+            raise ValueError(
+                "Unsealed Hermes runtime must not claim execution artifacts"
+            )
+        control_source_names = tuple(
+            item.name for item in self.control_source_artifacts
+        )
+        if control_source_names != HERMES_RUNTIME_CONTROL_SOURCE_NAMES:
+            raise ValueError(
+                "Hermes runtime control sources are invalid"
+            )
         artifact_names = tuple(item.name for item in self.home_artifacts)
         if artifact_names != HERMES_RUNTIME_HOME_ARTIFACT_NAMES:
             raise ValueError("Hermes runtime home artifacts are invalid")
@@ -305,6 +407,12 @@ def build_runtime_manifest(
             vendor_fingerprint_source or vendor_root
         ),
         "launch_argv": list(launch_argv),
+        "sealed": False,
+        "control_source_artifacts": [
+            item.model_dump(mode="json")
+            for item in runtime_control_source_artifacts()
+        ],
+        "execution_artifacts": [],
         "home_artifacts": [
             item.model_dump(mode="json") for item in artifacts
         ],
@@ -337,6 +445,7 @@ def runtime_required_environment(hermes_home: Path) -> dict[str, str]:
         "HERMES_MANAGED_DIR": str(managed_dir),
         "HERMES_WRITE_SAFE_ROOT": str(home),
         "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPYCACHEPREFIX": str(home / ".pycache-disabled"),
         "PYTHONUNBUFFERED": "1",
     }
 
@@ -441,6 +550,10 @@ def validate_expected_runtime(
     """Bind local expected artifacts before trusting a remote proof."""
 
     manifest = load_runtime_manifest(manifest_path)
+    if not manifest.sealed:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_manifest_unsealed"
+        )
     key = load_attestation_key(attestation_key_path)
     try:
         profile_root = profile_path.expanduser().parent
@@ -502,6 +615,10 @@ def validate_supervised_runtime(
     vendor_root: Path,
     environment: Mapping[str, str] | None = None,
     expected_launch_argv: tuple[str, ...] | None = None,
+    require_sealed: bool = True,
+    supervisor_interpreter: Path | None = None,
+    supervisor_module: Path | None = None,
+    identity_module: Path | None = None,
 ) -> tuple[HermesDecisionRuntimeManifest, bytes, str]:
     """Validate the exact files and paths the supervisor will execute."""
 
@@ -569,7 +686,188 @@ def validate_supervised_runtime(
                 "hermes_runtime_provider_environment_mismatch"
             )
     _assert_no_broad_home_artifacts(hermes_home)
+    actual_control_sources = runtime_control_source_artifacts(
+        supervisor_module=supervisor_module,
+        identity_module=identity_module,
+    )
+    if actual_control_sources != manifest.control_source_artifacts:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_control_source_mismatch"
+        )
+    if manifest.sealed:
+        actual_execution_artifacts = runtime_execution_artifacts(
+            manifest=manifest,
+            vendor_root=vendor_root,
+            supervisor_interpreter=supervisor_interpreter,
+            supervisor_module=supervisor_module,
+            identity_module=identity_module,
+        )
+        if actual_execution_artifacts != manifest.execution_artifacts:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_execution_artifact_mismatch"
+            )
+    elif require_sealed:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_manifest_unsealed"
+        )
     return manifest, key, api_key
+
+
+def seal_supervised_runtime(
+    *,
+    manifest_path: Path,
+    attestation_key_path: Path,
+    hermes_home: Path,
+    vendor_root: Path,
+    environment: Mapping[str, str] | None = None,
+    expected_launch_argv: tuple[str, ...] | None = None,
+    supervisor_interpreter: Path | None = None,
+    supervisor_module: Path | None = None,
+    identity_module: Path | None = None,
+) -> tuple[HermesDecisionRuntimeManifest, bytes, str]:
+    """Bind actual launch files into the manifest before child execution."""
+
+    manifest, key, api_key = validate_supervised_runtime(
+        manifest_path=manifest_path,
+        attestation_key_path=attestation_key_path,
+        hermes_home=hermes_home,
+        vendor_root=vendor_root,
+        environment=environment,
+        expected_launch_argv=expected_launch_argv,
+        require_sealed=False,
+        supervisor_interpreter=supervisor_interpreter,
+        supervisor_module=supervisor_module,
+        identity_module=identity_module,
+    )
+    if manifest.sealed:
+        return manifest, key, api_key
+
+    artifacts = runtime_execution_artifacts(
+        manifest=manifest,
+        vendor_root=vendor_root,
+        supervisor_interpreter=supervisor_interpreter,
+        supervisor_module=supervisor_module,
+        identity_module=identity_module,
+    )
+    payload = manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude={"runtime_id"},
+    )
+    payload["sealed"] = True
+    payload["execution_artifacts"] = [
+        artifact.model_dump(mode="json") for artifact in artifacts
+    ]
+    payload["runtime_id"] = _sha256_json(payload)
+    sealed_manifest = _manifest_validate(payload)
+
+    current = load_runtime_manifest(manifest_path)
+    if current != manifest:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_identity_changed"
+        )
+    write_runtime_manifest(manifest_path, sealed_manifest)
+    return validate_supervised_runtime(
+        manifest_path=manifest_path,
+        attestation_key_path=attestation_key_path,
+        hermes_home=hermes_home,
+        vendor_root=vendor_root,
+        environment=environment,
+        expected_launch_argv=expected_launch_argv,
+        supervisor_interpreter=supervisor_interpreter,
+        supervisor_module=supervisor_module,
+        identity_module=identity_module,
+    )
+
+
+def runtime_execution_artifacts(
+    *,
+    manifest: HermesDecisionRuntimeManifest,
+    vendor_root: Path,
+    supervisor_interpreter: Path | None = None,
+    supervisor_module: Path | None = None,
+    identity_module: Path | None = None,
+) -> tuple[HermesRuntimeExecutionArtifact, ...]:
+    """Hash the concrete executables and modules used by the supervisor."""
+
+    launcher = Path(manifest.launch_argv[0])
+    runtime_paths = (
+        ("child_launcher", launcher, True),
+        (
+            "child_environment",
+            launcher.parent.parent / "pyvenv.cfg",
+            False,
+        ),
+        (
+            "vendor_entrypoint",
+            vendor_root.expanduser() / "hermes_cli" / "main.py",
+            False,
+        ),
+        (
+            "supervisor_interpreter",
+            Path(sys.executable)
+            if supervisor_interpreter is None
+            else supervisor_interpreter,
+            True,
+        ),
+        (
+            "supervisor_module",
+            Path(__file__).with_name("hermes_runtime_supervisor.py")
+            if supervisor_module is None
+            else supervisor_module,
+            False,
+        ),
+        (
+            "identity_module",
+            Path(__file__) if identity_module is None else identity_module,
+            False,
+        ),
+    )
+    return tuple(
+        _execution_artifact(name, path, executable=executable)
+        for name, path, executable in runtime_paths
+    )
+
+
+def runtime_control_source_artifacts(
+    *,
+    supervisor_module: Path | None = None,
+    identity_module: Path | None = None,
+) -> tuple[HermesRuntimeNamedDigest, ...]:
+    """Hash HealthMes-owned source before a runtime is allowed to seal."""
+
+    paths = (
+        (
+            "supervisor_module",
+            Path(__file__).with_name("hermes_runtime_supervisor.py")
+            if supervisor_module is None
+            else supervisor_module,
+        ),
+        (
+            "identity_module",
+            Path(__file__) if identity_module is None else identity_module,
+        ),
+    )
+    artifacts: list[HermesRuntimeNamedDigest] = []
+    for name, path in paths:
+        requested = path.expanduser()
+        if not requested.is_absolute():
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_control_source_path_invalid"
+            )
+        content = _read_regular_file(
+            requested,
+            code="hermes_runtime_control_source",
+            max_bytes=_MAX_HOME_ARTIFACT_BYTES,
+            owner_only=False,
+        )
+        artifacts.append(
+            HermesRuntimeNamedDigest(
+                name=name,
+                sha256=hashlib.sha256(content).hexdigest(),
+            )
+        )
+    return tuple(artifacts)
 
 
 def new_attestation_nonce() -> str:
@@ -587,6 +885,10 @@ def sign_runtime_attestation(
 ) -> HermesRuntimeAttestation:
     """Create a nonce-bound HMAC proof."""
 
+    if not manifest.sealed:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_manifest_unsealed"
+        )
     if not _NONCE.fullmatch(nonce):
         raise HermesRuntimeIdentityError(
             "hermes_runtime_attestation_nonce_invalid"
@@ -659,11 +961,17 @@ def verify_runtime_attestation(
 
 
 def vendor_fingerprint(vendor_root: Path) -> str:
-    """Fingerprint the Hermes files that define launch/API behavior."""
+    """Fingerprint the complete canonical Hermes reasoning source surface."""
 
-    root = vendor_root.expanduser().resolve()
+    root = _validated_directory(
+        vendor_root.expanduser(),
+        code="hermes_runtime_vendor",
+    )
+    relative_paths = _vendor_runtime_relative_paths(root)
     digest = hashlib.sha256()
-    for relative in _VENDOR_FINGERPRINT_PATHS:
+    digest.update(b"healthmes.hermes-vendor-runtime.v2\x00")
+    total_bytes = 0
+    for relative in relative_paths:
         path = root / relative
         content = _read_regular_file(
             path,
@@ -671,10 +979,127 @@ def vendor_fingerprint(vendor_root: Path) -> str:
             max_bytes=_MAX_VENDOR_ARTIFACT_BYTES,
             owner_only=False,
         )
-        digest.update(relative.encode("ascii"))
+        total_bytes += len(content)
+        if total_bytes > _MAX_VENDOR_FINGERPRINT_BYTES:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_vendor_too_large"
+            )
+        digest.update(relative.as_posix().encode("utf-8"))
         digest.update(b"\x00")
         digest.update(hashlib.sha256(content).digest())
+        digest.update(b"\x00")
+    if relative_paths != _vendor_runtime_relative_paths(root):
+        raise HermesRuntimeIdentityError("hermes_runtime_vendor_unsafe")
     return digest.hexdigest()
+
+
+def _vendor_runtime_relative_paths(root: Path) -> tuple[Path, ...]:
+    paths: set[Path] = set()
+    for name in _VENDOR_FINGERPRINT_ROOT_FILES:
+        paths.add(Path(name))
+    try:
+        root_entries = tuple(os.scandir(root))
+    except OSError as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_vendor_unreadable"
+        ) from exc
+    for entry in root_entries:
+        if entry.name.endswith(".py"):
+            if entry.is_symlink() or not entry.is_file(
+                follow_symlinks=False
+            ):
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_vendor_unsafe"
+                )
+            paths.add(Path(entry.name))
+    for relative in _VENDOR_FINGERPRINT_IMMEDIATE_PYTHON_DIRS:
+        directory = _validated_directory(
+            root / relative,
+            code="hermes_runtime_vendor",
+        )
+        try:
+            entries = tuple(os.scandir(directory))
+        except OSError as exc:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_vendor_unreadable"
+            ) from exc
+        for entry in entries:
+            if entry.name.endswith(".py"):
+                if entry.is_symlink() or not entry.is_file(
+                    follow_symlinks=False
+                ):
+                    raise HermesRuntimeIdentityError(
+                        "hermes_runtime_vendor_unsafe"
+                    )
+                paths.add(Path(relative) / entry.name)
+    for relative in _VENDOR_FINGERPRINT_TREES:
+        directory = _validated_directory(
+            root / relative,
+            code="hermes_runtime_vendor",
+        )
+        paths.update(
+            _walk_vendor_runtime_tree(
+                root=root,
+                directory=directory,
+            )
+        )
+    ordered = tuple(sorted(paths, key=lambda path: path.as_posix()))
+    if not ordered or len(ordered) > _MAX_VENDOR_FINGERPRINT_FILES:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_vendor_file_count_invalid"
+        )
+    return ordered
+
+
+def _walk_vendor_runtime_tree(
+    *,
+    root: Path,
+    directory: Path,
+) -> tuple[Path, ...]:
+    discovered: list[Path] = []
+    pending = [directory]
+    while pending:
+        current = pending.pop()
+        try:
+            entries = sorted(
+                os.scandir(current),
+                key=lambda entry: entry.name,
+                reverse=True,
+            )
+        except OSError as exc:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_vendor_unreadable"
+            ) from exc
+        for entry in entries:
+            if entry.name in _VENDOR_FINGERPRINT_IGNORED_DIRECTORIES:
+                continue
+            path = Path(entry.path)
+            if entry.is_symlink():
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_vendor_unsafe"
+                )
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(path)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_vendor_unsafe"
+                )
+            if entry.name == ".DS_Store" or entry.name.endswith(
+                _VENDOR_FINGERPRINT_IGNORED_SUFFIXES
+            ):
+                continue
+            try:
+                discovered.append(path.relative_to(root))
+            except ValueError as exc:
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_vendor_unsafe"
+                ) from exc
+            if len(discovered) > _MAX_VENDOR_FINGERPRINT_FILES:
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_vendor_file_count_invalid"
+                )
+    return tuple(discovered)
 
 
 def _profile_runtime_identity(
@@ -760,6 +1185,65 @@ def _provider_environment_digests(
     )
 
 
+def _execution_artifact(
+    name: str,
+    path: Path,
+    *,
+    executable: bool,
+) -> HermesRuntimeExecutionArtifact:
+    requested = path.expanduser()
+    if not requested.is_absolute():
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_path_invalid"
+        )
+    try:
+        requested_before = requested.lstat()
+        resolved = requested.resolve(strict=True)
+    except OSError as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_unreadable"
+        ) from exc
+    if not (
+        stat.S_ISREG(requested_before.st_mode)
+        or stat.S_ISLNK(requested_before.st_mode)
+    ):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_unsafe"
+        )
+    content = _read_regular_file(
+        resolved,
+        code="hermes_runtime_execution_artifact",
+        max_bytes=_MAX_EXECUTION_ARTIFACT_BYTES,
+        owner_only=False,
+    )
+    try:
+        resolved_after = requested.resolve(strict=True)
+        resolved_metadata = resolved_after.lstat()
+    except OSError as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_unreadable"
+        ) from exc
+    if (
+        resolved_after != resolved
+        or not stat.S_ISREG(resolved_metadata.st_mode)
+    ):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_unsafe"
+        )
+    mode = stat.S_IMODE(resolved_metadata.st_mode)
+    if executable and not mode & 0o111:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_not_executable"
+        )
+    return HermesRuntimeExecutionArtifact(
+        name=name,
+        path=str(requested),
+        resolved_path=str(resolved),
+        sha256=hashlib.sha256(content).hexdigest(),
+        mode=mode,
+    )
+
+
 def _assert_no_broad_home_artifacts(hermes_home: Path) -> None:
     for name in _FORBIDDEN_HOME_FILES:
         path = hermes_home / name
@@ -805,6 +1289,19 @@ def _validate_runtime_home_directory(path: Path) -> None:
         raise HermesRuntimeIdentityError(
             "hermes_runtime_home_permissions"
         )
+
+
+def _validated_directory(path: Path, *, code: str) -> Path:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise HermesRuntimeIdentityError(f"{code}_unreadable") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
+        raise HermesRuntimeIdentityError(f"{code}_unsafe")
+    try:
+        return path.resolve(strict=True)
+    except OSError as exc:
+        raise HermesRuntimeIdentityError(f"{code}_unreadable") from exc
 
 
 def _read_regular_file(

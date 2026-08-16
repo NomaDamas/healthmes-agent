@@ -315,10 +315,15 @@ def test_local_start_uses_only_optional_dedicated_decision_runtime() -> None:
     assert "HEALTHMES_DECISION_HERMES_PROVIDER" in configured_body
     assert "requires both" in configured_body
     assert "if decision_runtime_configured; then" in start_body
+    assert 'UV_PROJECT_ENVIRONMENT="$HERMES_DECISION_VENV"' in start_body
+    assert "uv sync --frozen --no-dev" in start_body
     assert "scripts/bootstrap.py" in start_body
     assert "healthmes.hermes_runtime_supervisor" in start_body
     assert start_body.index("scripts/bootstrap.py") < start_body.index(
         "healthmes.hermes_runtime_supervisor"
+    )
+    assert start_body.index("uv sync --frozen --no-dev") < start_body.index(
+        "scripts/bootstrap.py"
     )
     assert start_body.index("healthmes.hermes_runtime_supervisor") < (
         start_body.index('start_process "Open Wearables"')

@@ -36,6 +36,37 @@ class DecisionAgent(Protocol):
     def close(self) -> None: ...
 
 
+class _RequestPhase:
+    """Coordinate caller cancellation with the finalization commit boundary."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._finalization_started = False
+        self._cancellation_requested = False
+
+    def begin_finalization(self) -> bool:
+        """Enter the durable phase unless caller cancellation won the race."""
+
+        with self._lock:
+            if self._cancellation_requested:
+                return False
+            self._finalization_started = True
+            return True
+
+    def cancel_reasoning(
+        self,
+        task: asyncio.Task[DecisionResult],
+    ) -> bool:
+        """Cancel only while the request is still inside model reasoning."""
+
+        with self._lock:
+            if self._finalization_started:
+                return False
+            self._cancellation_requested = True
+            task.cancel()
+            return True
+
+
 def _consume_task_result(task: asyncio.Future[Any]) -> None:
     try:
         task.exception()
@@ -47,9 +78,10 @@ class HealthMesDecisionEngine:
     """Own one natural-language decision through durable finalization.
 
     Public calls are bound to one caller event loop while requests are active.
-    Caller cancellation does not cancel the underlying decision: shutdown must
-    still be able to drain an accepted request through source validation and
-    DecisionRecord persistence.
+    Caller cancellation stops model reasoning and therefore closes an active
+    Hermes Responses stream. Once finalization starts, cancellation no longer
+    interrupts the durable commit boundary; shutdown drains that accepted
+    finalization exactly as before.
     """
 
     def __init__(
@@ -106,8 +138,11 @@ class HealthMesDecisionEngine:
     async def _run_request(
         self,
         request: DecisionRequest,
+        phase: _RequestPhase,
     ) -> DecisionResult:
         run = await self._agent.ask(request)
+        if not phase.begin_finalization():
+            raise asyncio.CancelledError
         async_finalize = getattr(self._finalizer, "afinalize", None)
         if callable(async_finalize):
             return await async_finalize(request, run)
@@ -121,10 +156,11 @@ class HealthMesDecisionEngine:
         self,
         loop: asyncio.AbstractEventLoop,
         request: DecisionRequest,
-    ) -> asyncio.Task[DecisionResult]:
+    ) -> tuple[asyncio.Task[DecisionResult], _RequestPhase]:
         if not isinstance(request, DecisionRequest):
             raise TypeError("request must be a DecisionRequest")
         task_name = f"healthmes-decision-{request.request_id}"
+        phase = _RequestPhase()
         with self._state_lock:
             if self._closing or self._closed:
                 raise DecisionEngineClosedError(
@@ -144,7 +180,7 @@ class HealthMesDecisionEngine:
                     "HealthMes decision engine is at capacity"
                 )
             self._loop = loop
-            request_coroutine = self._run_request(request)
+            request_coroutine = self._run_request(request, phase)
             try:
                 task = loop.create_task(
                     request_coroutine,
@@ -155,7 +191,7 @@ class HealthMesDecisionEngine:
                 raise
             self._active.add(task)
             task.add_done_callback(self._request_finished)
-            return task
+            return task, phase
 
     def _request_finished(
         self,
@@ -171,8 +207,17 @@ class HealthMesDecisionEngine:
     ) -> DecisionResult:
         """Run one accepted request through reasoning and final persistence."""
 
-        task = self._track_request(asyncio.get_running_loop(), request)
-        return await asyncio.shield(task)
+        task, phase = self._track_request(
+            asyncio.get_running_loop(),
+            request,
+        )
+        try:
+            done, _pending = await asyncio.wait((task,))
+        except asyncio.CancelledError:
+            phase.cancel_reasoning(task)
+            raise
+        assert task in done
+        return task.result()
 
     async def ask(self, request: DecisionRequest) -> DecisionResult:
         """Compatibility wrapper for the canonical ``ask_wellness`` API."""

@@ -64,6 +64,21 @@ class _StubAgent:
         self.closed = True
 
 
+class _BlockingAgent(_StubAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def ask(self, request: DecisionRequest) -> object:
+        del request
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled.set()
+
+
 class _BlockingFinalizer:
     def __init__(self) -> None:
         self.started = threading.Event()
@@ -203,6 +218,33 @@ async def test_caller_cancellation_does_not_cancel_finalization() -> None:
     finalizer.release.set()
     await closing
 
+    assert agent.closed is True
+
+
+async def test_caller_cancellation_propagates_during_reasoning() -> None:
+    agent = _BlockingAgent()
+
+    class UnusedFinalizer:
+        async def afinalize(
+            self,
+            request: DecisionRequest,
+            _run: object,
+        ) -> DecisionResult:
+            raise AssertionError(request)
+
+    engine = HealthMesDecisionEngine(
+        agent=agent,  # type: ignore[arg-type]
+        finalizer=UnusedFinalizer(),  # type: ignore[arg-type]
+    )
+    caller = asyncio.create_task(engine.ask_wellness(_request()))
+    await asyncio.wait_for(agent.started.wait(), timeout=1)
+
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    await asyncio.wait_for(agent.cancelled.wait(), timeout=1)
+    await engine.aclose()
     assert agent.closed is True
 
 

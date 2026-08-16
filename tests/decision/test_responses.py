@@ -26,6 +26,7 @@ from healthmes.decision import (
     ContextStatus,
     DecisionBudget,
     DecisionCaller,
+    DecisionPersistenceIntent,
     DecisionRequest,
     DecisionSearchBudgetUsage,
     DecisionStatus,
@@ -43,7 +44,7 @@ from healthmes.decision import (
     source_ref_id,
 )
 from healthmes.decision.hermes_profile import (
-    HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
+    HERMES_DECISION_SEARCH_MCP_TOOL_NAMES,
 )
 from healthmes.decision.responses import (
     HERMES_DECISION_DRAFT_SCHEMA,
@@ -51,6 +52,7 @@ from healthmes.decision.responses import (
     HERMES_RESPONSES_PATH,
     HERMES_SESSION_PATH,
     HERMES_TOOLSETS_PATH,
+    _parse_final_draft,
 )
 from healthmes.mcp_server import server as mcp_server
 
@@ -131,13 +133,20 @@ def _decision_profile(
     tools: tuple[str, ...] = HERMES_DECISION_MCP_TOOL_NAMES,
     extra_server: bool = False,
     enabled: bool | None = None,
+    resources: bool | None = False,
+    prompts: bool | None = False,
     profile_api_key: str = "k" * 64,
     expected_api_key: str | None = None,
 ) -> HermesDecisionProfileAssertion:
+    tool_settings: dict[str, object] = {"include": list(tools)}
+    if resources is not None:
+        tool_settings["resources"] = resources
+    if prompts is not None:
+        tool_settings["prompts"] = prompts
     servers: dict[str, dict] = {
         "healthmes": {
             "url": "http://127.0.0.1:8100/mcp",
-            "tools": {"include": list(tools)},
+            "tools": tool_settings,
         }
     }
     if enabled is not None:
@@ -194,7 +203,10 @@ def _final_response(
 ) -> dict:
     decision = dict(decision)
     if include_persistence_intent:
-        decision.setdefault("persistence_intent", "none")
+        decision.setdefault(
+            "persistence_intent",
+            "action" if decision.get("proposed_action") is True else "none",
+        )
     envelope = {
         "schema": HERMES_DECISION_DRAFT_SCHEMA,
         "decision": decision,
@@ -851,12 +863,65 @@ async def test_agent_rejects_missing_persistence_intent() -> None:
 
 
 @pytest.mark.parametrize(
+    ("intent", "proposed_action", "used_source_ref_ids"),
+    (
+        ("none", False, []),
+        ("action", True, ["sr_" + "0" * 32]),
+        ("risk", True, ["sr_" + "0" * 32]),
+        ("mutation", False, ["sr_" + "0" * 32]),
+        ("explicit_tracking", False, []),
+    ),
+)
+def test_final_envelope_uses_typed_persistence_intent_contract(
+    intent: str,
+    proposed_action: bool,
+    used_source_ref_ids: list[str],
+) -> None:
+    envelope = {
+        "schema": HERMES_DECISION_DRAFT_SCHEMA,
+        "decision": {
+            "status": "completed",
+            "answer": "Bounded answer.",
+            "proposed_action": proposed_action,
+            "persistence_intent": intent,
+            "used_source_ref_ids": used_source_ref_ids,
+        },
+    }
+
+    parsed = _parse_final_draft(json.dumps(envelope))
+
+    assert parsed.decision.persistence_intent is DecisionPersistenceIntent(
+        intent
+    )
+
+
+@pytest.mark.parametrize("intent", (None, 1, True, "save"))
+def test_final_envelope_rejects_invalid_persistence_intent(
+    intent: object,
+) -> None:
+    envelope = {
+        "schema": HERMES_DECISION_DRAFT_SCHEMA,
+        "decision": {
+            "status": "completed",
+            "answer": "Invalid persistence intent.",
+            "persistence_intent": intent,
+        },
+    }
+
+    with pytest.raises(
+        HermesResponsesContractError,
+        match="hermes_final_json_invalid",
+    ):
+        _parse_final_draft(json.dumps(envelope))
+
+
+@pytest.mark.parametrize(
     "tools",
     (
+        HERMES_DECISION_SEARCH_MCP_TOOL_NAMES,
         ("search_activity", "search_calendar", "search_nutrition"),
         (
             *HERMES_DECISION_MCP_TOOL_NAMES,
-            *HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
             "unexpected_tool",
         ),
         (
@@ -879,6 +944,97 @@ def test_dedicated_profile_requires_an_exact_tool_surface(
         match="hermes_decision_profile_mcp_invalid",
     ):
         assertion.verify()
+
+
+@pytest.mark.parametrize(
+    ("resources", "prompts"),
+    (
+        (None, False),
+        (True, False),
+        (False, None),
+        (False, True),
+    ),
+)
+def test_dedicated_profile_disables_mcp_resources_and_prompts_exactly(
+    tmp_path: Path,
+    resources: bool | None,
+    prompts: bool | None,
+) -> None:
+    assertion = _decision_profile(
+        tmp_path / "unsafe-mcp-utilities.yaml",
+        resources=resources,
+        prompts=prompts,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="hermes_decision_profile_mcp_invalid",
+    ):
+        assertion.verify()
+
+
+def test_dedicated_profile_rejects_misplaced_mcp_utility_flags(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "misplaced-mcp-utilities.yaml"
+    assertion = _decision_profile(
+        path,
+        resources=None,
+        prompts=None,
+    )
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    server = profile["mcp_servers"]["healthmes"]
+    server["resources"] = False
+    server["prompts"] = False
+    path.write_text(
+        yaml.safe_dump(profile, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="hermes_decision_profile_mcp_invalid",
+    ):
+        assertion.verify()
+
+
+def test_dedicated_profile_digest_binds_disabled_mcp_utilities(
+    tmp_path: Path,
+) -> None:
+    details = _decision_profile(
+        tmp_path / "decision-config.yaml"
+    ).verify_details()
+    asserted = {
+        "schema": "healthmes.hermes-decision-profile.v1",
+        "platform": "api_server",
+        "runtime_model_name": "healthmes-decision-runtime",
+        "model_route": {
+            "alias": MODEL,
+            "model": MODEL,
+            "provider": PROVIDER,
+        },
+        "platform_toolsets": ["healthmes"],
+        "native_disabled": sorted(
+            HERMES_DECISION_NATIVE_TOOLSET_DENYLIST
+        ),
+        "mcp": {
+            "server": "healthmes",
+            "origin": "http://127.0.0.1:8100/mcp",
+            "resources": False,
+            "prompts": False,
+            "tools": sorted(HERMES_DECISION_MCP_TOOL_NAMES),
+        },
+    }
+    expected = hashlib.sha256(
+        json.dumps(
+            asserted,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+
+    assert details.semantic_digest == expected
 
 
 @pytest.mark.asyncio
@@ -950,10 +1106,7 @@ async def test_agent_accepts_profile_bound_reviewed_skill_tools(
         timeout_seconds=5,
         profile_assertion=_decision_profile(
             tmp_path / "decision-config.yaml",
-            tools=(
-                *HERMES_DECISION_MCP_TOOL_NAMES,
-                *HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
-            ),
+            tools=HERMES_DECISION_MCP_TOOL_NAMES,
         ),
         clock=lambda: NOW,
     )
@@ -1035,10 +1188,7 @@ async def test_agent_rejects_drifted_reviewed_skill_content(
         timeout_seconds=5,
         profile_assertion=_decision_profile(
             tmp_path / "decision-config.yaml",
-            tools=(
-                *HERMES_DECISION_MCP_TOOL_NAMES,
-                *HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
-            ),
+            tools=HERMES_DECISION_MCP_TOOL_NAMES,
         ),
         clock=lambda: NOW,
     )

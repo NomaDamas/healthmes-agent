@@ -9,6 +9,7 @@ OW_PID="$RUNTIME_DIR/open-wearables.pid"
 WORKER_PID="$RUNTIME_DIR/open-wearables-worker.pid"
 BEAT_PID="$RUNTIME_DIR/open-wearables-beat.pid"
 HERMES_DECISION_PID="$RUNTIME_DIR/hermes-decision.pid"
+HERMES_DECISION_VENV="$RUNTIME_DIR/hermes-decision-venv"
 HEALTHMES_LOG="$RUNTIME_DIR/healthmes.log"
 OW_LOG="$RUNTIME_DIR/open-wearables.log"
 WORKER_LOG="$RUNTIME_DIR/open-wearables-worker.log"
@@ -348,6 +349,11 @@ start_apps() {
     bash "$DEV_MAC_SCRIPT" services-start
     resolve_ow_api_key
     if decision_runtime_configured; then
+        mkdir -p "$RUNTIME_DIR"
+        info "syncing dedicated Hermes decision runtime"
+        UV_PROJECT_ENVIRONMENT="$HERMES_DECISION_VENV" \
+            uv sync --frozen --no-dev \
+            --directory "$REPO_ROOT/vendor/hermes-agent"
         uv run python "$REPO_ROOT/scripts/bootstrap.py" --mode native
         load_runtime_env
         [ -n "${HEALTHMES_DECISION_HERMES_PROFILE_PATH:-}" ] \

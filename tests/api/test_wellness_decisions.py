@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -30,6 +33,8 @@ from healthmes.decision import (
     ExecutionScope,
     HealthMesDecisionAgent,
     HealthMesDecisionEngine,
+    HermesHttpResponsesTransport,
+    HermesResponsesDecisionAgent,
     HermesResponsesTransportError,
     PersistenceStatus,
     PrivacyLevel,
@@ -207,6 +212,37 @@ class MissingResponsesTransport:
         raise AssertionError("no Hermes session was created")
 
 
+class _CancellationSearchService:
+    def __init__(self) -> None:
+        self.aborted = asyncio.Event()
+
+    def begin(self, _request):
+        return SimpleNamespace(session_id="ds_" + "a" * 32)
+
+    def abort(self, _session_id):
+        self.aborted.set()
+        return None
+
+
+class _UnusedFinalizer:
+    async def afinalize(self, request, _run):
+        raise AssertionError(request)
+
+
+class _BlockingHermesStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self):
+        self.started.set()
+        await asyncio.Event().wait()
+        yield b""
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
 class FailingNutritionProvider:
     metadata = ContextProviderMetadata(
         provider_id="nutrition",
@@ -252,6 +288,94 @@ class ProviderFailureRuntime:
         raise AssertionError(
             "a failed provider call must terminate before another LLM step"
         )
+
+
+@pytest.mark.asyncio
+async def test_rest_disconnect_cancels_hermes_responses_stream(
+    settings,
+) -> None:
+    upstream = _BlockingHermesStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/toolsets":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "platform": "api_server",
+                    "data": [],
+                },
+            )
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": MODEL,
+                            "object": "model",
+                            "created": 1,
+                            "owned_by": "hermes",
+                            "permission": [],
+                            "root": MODEL,
+                            "parent": "healthmes-decision-runtime",
+                        }
+                    ],
+                },
+            )
+        assert request.url.path == "/v1/responses"
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "x-hermes-session-id": "cancelled-rest-session",
+            },
+            stream=upstream,
+        )
+
+    search_service = _CancellationSearchService()
+    agent = HermesResponsesDecisionAgent(
+        transport=HermesHttpResponsesTransport(
+            base_url="http://127.0.0.1:8645",
+            http_transport=httpx.MockTransport(handler),
+        ),
+        search_service=search_service,  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        session_ttl_seconds=30,
+        session_purge_interval_seconds=10,
+    )
+    await agent.start()
+    engine = HealthMesDecisionEngine(
+        agent=agent,
+        finalizer=_UnusedFinalizer(),  # type: ignore[arg-type]
+    )
+    app = create_app(_secured_settings(settings))
+    app.state.decision_engine = engine
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:8100",
+        ) as client:
+            caller = asyncio.create_task(
+                client.post(
+                    "/v1/wellness-decisions",
+                    headers=_bearer(),
+                    json={"question": "Should I keep working?"},
+                )
+            )
+            await asyncio.wait_for(upstream.started.wait(), timeout=1)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+        await asyncio.wait_for(upstream.closed.wait(), timeout=1)
+        await asyncio.wait_for(search_service.aborted.wait(), timeout=1)
+    finally:
+        await engine.aclose()
 
 
 def test_rest_contract_is_server_owned_and_hides_internal_trace(
