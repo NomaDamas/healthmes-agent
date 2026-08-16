@@ -18,7 +18,7 @@ validation, or persistence code.
 - Do not call Open Wearables directly, issue raw REST/SQL/filesystem requests,
   use native web/search tools, or start a second agent conversation.
 - Do not call capture, calendar mutation, settings mutation, task mutation,
-  medical-record mutation, or generic `record_decision` tools from this
+  medical-record mutation, or generic decision-record mutation tools from this
   read-only decision turn.
 
 ## Select evidence autonomously

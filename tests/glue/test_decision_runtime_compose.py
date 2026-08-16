@@ -49,8 +49,6 @@ def test_compose_keeps_decision_runtime_out_of_core_stack() -> None:
     }
 
     healthmes_env = _environment(healthmes["environment"])
-    assert healthmes_env["HEALTHMES_HERMES_WEBHOOK_URL"] == ""
-    assert healthmes_env["HEALTHMES_HERMES_WEBHOOK_SECRET"] == ""
     assert healthmes_env["HEALTHMES_DECISION_HERMES_BASE_URL"] == (
         "${HEALTHMES_DECISION_HERMES_BASE_URL:-}"
     )

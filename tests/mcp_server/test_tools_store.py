@@ -1,4 +1,4 @@
-"""Tests for the store-backed MCP tools (tasks / schedule / food / decisions).
+"""Tests for the store-backed MCP tools (tasks / schedule / food).
 
 Everything runs against the in-memory sqlite store; DB side effects are
 verified through a direct session from the same factory.
@@ -13,8 +13,6 @@ from fastmcp.exceptions import ToolError
 from pydantic import SecretStr
 from sqlalchemy import select
 
-from healthmes.api.auth import viewer_token
-from healthmes.api.briefing import decision_viewer_url
 from healthmes.calendars.adjustments import MAX_EVIDENCE_CLOCK_SKEW
 from healthmes.calendars.base import ExternalEvent
 from healthmes.calendars.state import (
@@ -29,6 +27,7 @@ from healthmes.store import (
     CalendarMutationProposal,
     CalendarMutationStatus,
     CalendarSource,
+    DecisionKind,
     DecisionRecord,
     EnergyDemand,
     FoodLog,
@@ -39,19 +38,6 @@ from healthmes.store import (
 )
 from healthmes.trusted_session import issue_trusted_session_proof
 
-TREE = {
-    "type": "rule",
-    "label": "readiness low",
-    "detail": "sleep debt 20, hrv z -1.41",
-    "children": [
-        {"type": "input", "label": "sleep_debt=20"},
-        {
-            "type": "option",
-            "label": "move deep work to tomorrow",
-            "children": [{"type": "action", "label": "propose 09:00-11:00 block"}],
-        },
-    ],
-}
 OWNER_USER_ID = "owner-user"
 OWNER_CHAT_ID = "owner-chat"
 CALENDAR_ACCOUNT_GENERATION = "c" * 32
@@ -114,7 +100,6 @@ def calendar_reply_arguments(
 
 def test_adjustment_handle_secret_is_dedicated_and_fails_closed() -> None:
     unrelated_secrets = Settings(
-        hermes_webhook_secret=SecretStr("webhook-secret"),
         api_token=SecretStr("api-token"),
         _env_file=None,
     )
@@ -125,7 +110,6 @@ def test_adjustment_handle_secret_is_dedicated_and_fails_closed() -> None:
     dedicated_secret = "a" * 64
     configured = Settings(
         calendar_adjustment_secret=SecretStr(dedicated_secret),
-        hermes_webhook_secret=SecretStr("webhook-secret"),
         api_token=SecretStr("api-token"),
         _env_file=None,
     )
@@ -415,6 +399,20 @@ class TestScheduleTools:
             rows = list(session.scalars(select(ScheduleProposal)))
             assert len(rows) == 2
             assert all(row.status == ProposalStatus.PROPOSED for row in rows)
+            assert {
+                str(row.decision_record_id) for row in rows
+            } == {result["decision_record_id"]}
+            decision = session.scalars(select(DecisionRecord)).one()
+            assert decision.id == uuid.UUID(result["decision_record_id"])
+            assert decision.kind is DecisionKind.SCHEDULE_CHANGE
+            assert decision.decision_request_id is None
+            assert decision.tree["detail"] == {
+                "proposal_count": 2,
+                "confirmation_required": True,
+            }
+        assert result["decision_url"].endswith(
+            f"/decisions/{result['decision_record_id']}"
+        )
 
     async def test_propose_timed_intake_uses_only_current_account_generation(
         self,
@@ -1399,6 +1397,7 @@ class TestCaptureTools:
             assert row.description == "Bibimbap with extra vegetables"
             assert row.meal_type == "lunch"
             assert row.media_path == "media/2026-07-08/lunch.jpg"
+            assert list(session.scalars(select(DecisionRecord))) == []
 
     async def test_log_food_validation(self, mcp_client):
         with pytest.raises(ToolError, match="description"):
@@ -1406,186 +1405,4 @@ class TestCaptureTools:
         with pytest.raises(ToolError, match="meal_type"):
             await mcp_client.call_tool(
                 "log_food", {"description": "toast", "meal_type": "brunch"}
-            )
-
-    async def test_record_decision_returns_viewer_url(
-        self, mcp_client, call_tool, store_factory
-    ):
-        result = await call_tool(
-            mcp_client,
-            "record_decision",
-            {
-                "kind": "schedule_change",
-                "summary": "Moved deep work to tomorrow morning due to low readiness.",
-                "tree": TREE,
-                "llm_model": "claude-x",
-                "tokens": 1234,
-            },
-        )
-        decision_id = result["decision_id"]
-        assert result["viewer_url"] == f"http://healthmes.test:8100/decisions/{decision_id}"
-        with store_factory() as session:
-            row = session.get(DecisionRecord, uuid.UUID(decision_id))
-            assert row is not None
-            assert row.tree["children"][0]["label"] == "sleep_debt=20"
-            assert row.llm_model == "claude-x"
-
-    async def test_record_decision_viewer_url_embeds_the_derived_token(
-        self, mcp_client, call_tool, tmp_path
-    ):
-        """Token-configured instance: the MCP link must stay byte-identical to
-        the API construction (healthmes.api.auth.viewer_url is the single
-        copy) — derived read-only credential embedded, never the API token."""
-        token = "mcp-viewer-link-test-token"
-        secured = Settings(
-            database_url="sqlite+pysqlite:///:memory:",
-            public_base_url="http://healthmes.test:8100",
-            api_token=SecretStr(token),
-            data_dir=tmp_path / "data-secured",
-            scheduler_enabled=False,
-            _env_file=None,
-        )
-        server_module.set_settings(secured)  # mcp_env teardown resets this
-
-        result = await call_tool(
-            mcp_client,
-            "record_decision",
-            {"kind": "alert", "summary": "tokenized viewer link", "tree": TREE},
-        )
-        decision_id = result["decision_id"]
-        assert result["viewer_url"] == decision_viewer_url(secured, decision_id)
-        assert result["viewer_url"].endswith(f"?token={viewer_token(token)}")
-        assert token not in result["viewer_url"]
-
-    async def test_record_decision_links_to_proposals(self, mcp_client, call_tool):
-        decision = await call_tool(
-            mcp_client,
-            "record_decision",
-            {"kind": "schedule_change", "summary": "plan", "tree": TREE},
-        )
-        created = await call_tool(mcp_client, "upsert_task", {"title": "Deep work"})
-        result = await call_tool(
-            mcp_client,
-            "propose_schedule_blocks",
-            {
-                "blocks": [
-                    {
-                        "task_id": created["task"]["id"],
-                        "start": "2026-07-10T09:00:00Z",
-                        "end": "2026-07-10T10:00:00Z",
-                    }
-                ],
-                "decision_record_id": decision["decision_id"],
-            },
-        )
-        assert result["status"] == "ok"
-
-    async def test_record_alert_decision_binds_exact_trigger_once(
-        self,
-        mcp_client,
-        call_tool,
-        store_factory,
-    ):
-        trigger = TriggerEvent(
-            fired_at=dt.datetime(2026, 7, 9, 14, 0, tzinfo=dt.UTC),
-            rule_id="calendar_task_intake",
-            payload={"summary": "Schedule this task"},
-            alert_sent=True,
-            dedup_key="calendar-task:correlation-test",
-        )
-        with store_factory() as session:
-            session.add(trigger)
-            session.commit()
-            trigger_id = trigger.id
-
-        start = dt.datetime.now(dt.UTC).replace(
-            hour=9, minute=0, second=0, microsecond=0
-        ) + dt.timedelta(days=1)
-        proposed = await call_tool(
-            mcp_client,
-            "propose_schedule_blocks",
-            {
-                "blocks": [
-                    {
-                        "title": "Correlated alert block",
-                        "start": start.isoformat(),
-                        "end": (start + dt.timedelta(hours=1)).isoformat(),
-                    }
-                ]
-            },
-        )
-        proposal_id = proposed["proposals"][0]["id"]
-        result = await call_tool(
-            mcp_client,
-            "record_decision",
-            {
-                "kind": "alert",
-                "summary": "Correlated alert",
-                "tree": TREE,
-                "trigger_event_id": str(trigger_id),
-                "schedule_proposal_ids": [proposal_id],
-            },
-        )
-        assert result["schedule_proposal_ids"] == [proposal_id]
-        with store_factory() as session:
-            row = session.get(DecisionRecord, uuid.UUID(result["decision_id"]))
-            assert row is not None
-            assert row.trigger_event_id == trigger_id
-            proposal = session.get(ScheduleProposal, uuid.UUID(proposal_id))
-            assert proposal is not None
-            assert proposal.decision_record_id == row.id
-
-        with pytest.raises(ToolError, match="already has a decision"):
-            await mcp_client.call_tool(
-                "record_decision",
-                {
-                    "kind": "alert",
-                    "summary": "Duplicate correlation",
-                    "tree": TREE,
-                    "trigger_event_id": str(trigger_id),
-                },
-            )
-        with pytest.raises(ToolError, match="valid only for kind='alert'"):
-            await mcp_client.call_tool(
-                "record_decision",
-                {
-                    "kind": "insight",
-                    "summary": "Wrong kind",
-                    "tree": TREE,
-                    "trigger_event_id": str(trigger_id),
-                },
-            )
-        with pytest.raises(ToolError, match="not found"):
-            await mcp_client.call_tool(
-                "record_decision",
-                {
-                    "kind": "alert",
-                    "summary": "Missing trigger",
-                    "tree": TREE,
-                    "trigger_event_id": str(uuid.uuid4()),
-                },
-            )
-
-    async def test_record_decision_tree_validation(self, mcp_client):
-        with pytest.raises(ToolError, match="kind"):
-            await mcp_client.call_tool(
-                "record_decision", {"kind": "vibe", "summary": "s", "tree": TREE}
-            )
-        with pytest.raises(ToolError, match="node type"):
-            await mcp_client.call_tool(
-                "record_decision",
-                {
-                    "kind": "alert",
-                    "summary": "s",
-                    "tree": {"type": "wat", "label": "x"},
-                },
-            )
-        with pytest.raises(ToolError, match="label"):
-            await mcp_client.call_tool(
-                "record_decision",
-                {
-                    "kind": "alert",
-                    "summary": "s",
-                    "tree": {"type": "rule", "label": "ok", "children": [{"type": "input"}]},
-                },
             )

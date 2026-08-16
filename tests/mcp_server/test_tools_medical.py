@@ -16,7 +16,11 @@ from sqlalchemy import select
 
 from healthmes.mcp_server import server as server_module
 from healthmes.mcp_server.ow_client import OWClient
-from healthmes.store import MedicalRecord, MedicalRecordKind
+from healthmes.store import (
+    DecisionRecord,
+    MedicalRecord,
+    MedicalRecordKind,
+)
 
 
 def _seed_ok_charge(fake_ow) -> None:
@@ -81,6 +85,7 @@ class TestCreateMedicalRecord:
 
         with store_factory() as session:
             row = session.scalars(select(MedicalRecord)).one()
+            assert list(session.scalars(select(DecisionRecord))) == []
         assert str(row.id) == result["medical_record_id"]
         assert row.kind is MedicalRecordKind.MEDICATION
         assert row.description == "Tylenol 500mg, 2 tablets after lunch"

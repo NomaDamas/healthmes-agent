@@ -13,7 +13,7 @@
 HealthMes의 자유 형식 wellness 질문 경로는 하나다.
 
 ```text
-App / Web / Channel / Proactive / Scheduled
+REST / Future Channel Wrapper / Proactive / Scheduled
                     |
                     v
         HealthMesDecisionService
@@ -114,6 +114,12 @@ Proactive  -> DecisionIngress.PROACTIVE
 Scheduled  -> DecisionIngress.SCHEDULED
 ```
 
+현재 concrete channel 구현은 UI-neutral `DecisionChannelAdapter`다. 이 adapter는
+`source`, `session_id`, privacy, budget과 hints를 보존해 canonical service를
+정확히 한 번 호출한다. 실제 Telegram, iOS, Android 또는 웹 inbound는 구현하지
+않았으며, 디바이스/채널 팀이 이 계약을 감싸야 한다. 그 wrapper가 별도 LLM loop를
+만들거나 Hermes를 직접 호출해서는 안 된다.
+
 서버가 owner, timezone, local/hosted execution scope와 요청 예산을 구성한다.
 클라이언트가 owner ID나 보존기간을 임의로 넣어 조회 범위를 바꾸지 않는다.
 
@@ -170,6 +176,7 @@ Docker Compose에서도 `hermes-decision`만 `healthmes: service_healthy`에
 
 이 command는 자유 형식 질문을 해석하거나 여러 domain을 자율 검색하지 않는다.
 새로운 wellness 판단이 필요하면 같은 `HealthMesDecisionService`를 호출해야 한다.
+일반 `/mcp`에는 임의 DecisionRecord를 만드는 범용 mutation tool이 없다.
 
 ## 3. HealthMes MCP 하나의 의미
 
@@ -443,6 +450,11 @@ compact record의 요약은 LLM 자유 텍스트를 저장하지 않는다. Heal
 저장한다. runtime/model, intent, confidence, `source_refs`, 안전한 limitation과
 시각은 함께 저장하지만 원문 질문, 전체 답변, model-authored `record_summary`,
 transcript, 전체 tool payload, 사진·음성 bytes는 복제하지 않는다.
+
+자유 형식 판단의 write authority는 `DecisionFinalizer` 하나뿐이다. 단,
+캘린더 confirmation처럼 사용자가 이미 의도를 확정한 bounded internal command는
+자기 workflow 안에서만 제한된 감사 레코드를 만들 수 있다. routine capture와
+summary는 DecisionRecord를 만들지 않는다.
 
 `DecisionRecord`는 `decision` 데이터 클래스의
 `1d/7d/14d/30d/90d/forever` 정책을 따른다. read API도 `expires_at <= now`인

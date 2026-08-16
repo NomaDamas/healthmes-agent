@@ -17,7 +17,6 @@ TRANCHE_1_TOOLS = {
     "propose_schedule_blocks",
     "resolve_schedule_proposal",
     "log_food",
-    "record_decision",
     "get_caffeine_proposal",
 }
 TRANCHE_2_TOOLS = {

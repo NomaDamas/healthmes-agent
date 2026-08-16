@@ -3,8 +3,8 @@
 Design (docs/PLAN.md 1.5): MCP tools return deterministic facts — lookups and
 *interpreted* deltas with confidence/coverage — never raw series dumps and
 never LLM judgment. Health tools read the open-wearables REST API through
-:class:`healthmes.mcp_server.ow_client.OWClient`; task/schedule/food/decision
-tools use the healthmes domain store. All numeric interpretation lives in
+:class:`healthmes.mcp_server.ow_client.OWClient`; task/schedule/food tools use
+the healthmes domain store. All numeric interpretation lives in
 :mod:`healthmes.mcp_server.interpret`.
 
 The server is exposed over Streamable HTTP for mounting at ``/mcp`` on the
@@ -16,7 +16,7 @@ Tranche-1 tools:
   ``get_personal_baselines`` (open-wearables interpreted reads)
 - ``list_tasks`` / ``upsert_task`` / ``get_schedule`` /
   ``propose_schedule_blocks`` (schedule domain, propose-then-confirm gate)
-- ``log_food`` / ``record_decision`` (capture + explainability)
+- ``log_food`` (bounded capture command)
 
 Tranche-2 tools (docs/PLAN.md Phase 2, Layer B second tranche):
 - ``get_cognitive_energy_forecast`` — persisted ``cognitive_energy_estimate``
@@ -54,7 +54,7 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes import schedule_proposals
@@ -192,7 +192,6 @@ from healthmes.store import (
     ScheduleProposal,
     Task,
     TaskSource,
-    TriggerEvent,
     WeeklyGoal,
     get_session_factory,
     session_scope,
@@ -239,9 +238,6 @@ MEDICAL_HEALTH_CONTEXT_KEY = "health"
 MEDICAL_CAPTURE_CONTEXT_KEY = "capture"
 MAX_MEDICAL_RANGE_DAYS = 365
 MAX_MEDICAL_LIST_LIMIT = 500
-DECISION_TREE_NODE_TYPES = frozenset({"input", "rule", "llm_step", "option", "action"})
-MAX_TREE_DEPTH = 12
-MAX_TREE_NODES = 500
 SCHEDULE_PROPOSAL_TTL = dt.timedelta(hours=24)
 
 _RANGE_PATTERN = re.compile(r"^(\d{1,3})d$")
@@ -254,7 +250,7 @@ mcp: FastMCP = FastMCP(
     instructions=(
         "HealthMes Layer B tools: deterministic, pre-interpreted health context "
         "(baselines, deltas, confidence/coverage — never raw series) plus the "
-        "task/schedule/food/decision domain of the HealthMes assistant. "
+        "task/schedule/food domain of the HealthMes assistant. "
         "Health tools may honestly return status=insufficient_data; treat low "
         "confidence as a reason to avoid categorical advice. For planning use "
         "get_cognitive_energy_forecast (hourly local-day energy windows), "
@@ -3300,6 +3296,32 @@ class ScheduleBlockIn(BaseModel):
     end: str = Field(description="Block end, ISO-8601, after start")
 
 
+def _create_schedule_proposal_decision(
+    session: Session,
+    *,
+    proposal_count: int,
+) -> uuid.UUID:
+    """Create the bounded audit record owned by schedule proposal creation."""
+    row = DecisionRecord(
+        kind=DecisionKind.SCHEDULE_CHANGE,
+        summary="Schedule proposals awaiting confirmation",
+        tree={
+            "type": "action",
+            "label": "Schedule proposals created",
+            "detail": {
+                "proposal_count": proposal_count,
+                "confirmation_required": True,
+            },
+            "children": [],
+        },
+        llm_model=None,
+        tokens=None,
+    )
+    session.add(row)
+    session.flush()
+    return row.id
+
+
 @mcp.tool
 def propose_schedule_blocks(
     blocks: list[ScheduleBlockIn],
@@ -3311,8 +3333,10 @@ def propose_schedule_blocks(
     auto-created) — use `title` to propose a whole plan without pre-creating
     tasks. Creates proposals in `proposed` state; nothing is written to any
     calendar until the user confirms. Each returned block lists overlapping
-    mirrored calendar events as `conflicts`. Optionally link the
-    decision_record_id of the reasoning that produced the plan.
+    mirrored calendar events as `conflicts`. Every proposal is linked to one
+    bounded internal schedule-change DecisionRecord. A trusted caller may
+    supply an existing `decision_record_id`; otherwise this command creates a
+    compact deterministic record itself.
     """
     if not blocks:
         raise ToolError("blocks must not be empty")
@@ -3353,6 +3377,11 @@ def propose_schedule_blocks(
         calendar_visibility_snapshots: list[CalendarVisibility] = []
         if decision_uuid is not None and session.get(DecisionRecord, decision_uuid) is None:
             raise ToolError(f"decision_record {decision_record_id} not found")
+        if decision_uuid is None:
+            decision_uuid = _create_schedule_proposal_decision(
+                session,
+                proposal_count=len(parsed),
+            )
         for index, (_, start, end) in enumerate(parsed):
             violation = actual_sleep_violation(
                 session,
@@ -3464,7 +3493,12 @@ def propose_schedule_blocks(
             )
         for visibility in calendar_visibility_snapshots:
             _require_calendar_visibility_snapshot(visibility)
-    return {"status": "ok", "proposals": created}
+    return {
+        "status": "ok",
+        "decision_record_id": str(decision_uuid),
+        "decision_url": _decision_viewer_url(decision_uuid),
+        "proposals": created,
+    }
 
 
 @mcp.tool
@@ -4566,157 +4600,6 @@ def list_medical_records(
         "truncated": truncated,
         "records": records,
         "data_dir": str(data_dir.expanduser().resolve()),
-    }
-
-
-def _validate_tree(node: Any, depth: int = 0, count: int = 0) -> int:
-    """Validate a decision-tree node recursively; returns the node count."""
-    if depth > MAX_TREE_DEPTH:
-        raise ToolError(f"decision tree exceeds max depth {MAX_TREE_DEPTH}")
-    if not isinstance(node, dict):
-        raise ToolError("every decision tree node must be an object")
-    node_type = node.get("type")
-    if node_type not in DECISION_TREE_NODE_TYPES:
-        raise ToolError(
-            f"node type must be one of {sorted(DECISION_TREE_NODE_TYPES)}, got {node_type!r}"
-        )
-    label = node.get("label")
-    if not isinstance(label, str) or not label.strip():
-        raise ToolError("every decision tree node needs a non-empty 'label'")
-    count += 1
-    if count > MAX_TREE_NODES:
-        raise ToolError(f"decision tree exceeds max node count {MAX_TREE_NODES}")
-    children = node.get("children", [])
-    if children is None:
-        children = []
-    if not isinstance(children, list):
-        raise ToolError("'children' must be a list of nodes")
-    for child in children:
-        count = _validate_tree(child, depth + 1, count)
-    return count
-
-
-def _claim_schedule_proposals(
-    session: Session,
-    proposals: list[tuple[str, uuid.UUID]],
-    decision_record_id: uuid.UUID,
-) -> None:
-    """Atomically attach pending proposals to one decision record."""
-    for proposal_id, proposal_uuid in proposals:
-        claimed = session.execute(
-            update(ScheduleProposal)
-            .where(
-                ScheduleProposal.id == proposal_uuid,
-                ScheduleProposal.status == ProposalStatus.PROPOSED,
-                ScheduleProposal.decision_record_id.is_(None),
-            )
-            .values(decision_record_id=decision_record_id)
-        )
-        if claimed.rowcount == 1:
-            continue
-        proposal = session.get(
-            ScheduleProposal,
-            proposal_uuid,
-            populate_existing=True,
-        )
-        if proposal is None:
-            raise ToolError(f"schedule_proposal {proposal_id} not found")
-        if proposal.status != ProposalStatus.PROPOSED:
-            raise ToolError(f"schedule_proposal {proposal_id} is not pending")
-        raise ToolError(
-            f"schedule_proposal {proposal_id} already has a decision record"
-        )
-
-
-@mcp.tool
-def record_decision(
-    kind: str,
-    summary: str,
-    tree: dict[str, Any],
-    llm_model: str | None = None,
-    tokens: int | None = None,
-    trigger_event_id: str | None = None,
-    schedule_proposal_ids: list[str] | None = None,
-) -> dict[str, Any]:
-    """Persist an explainable decision record and get its viewer link.
-
-    `kind` is schedule_change / alert / insight / capture. `tree` is the
-    recursive node structure {id?, type: input|rule|llm_step|option|action,
-    label, detail?, children[]} — deterministic layers pre-fill input/rule
-    nodes; append your own llm_step/option/action nodes honestly (never
-    rewrite pre-filled ones). Webhook alerts must pass their trusted
-    trigger_event_id unchanged so native clients can resolve the exact
-    decision and proposal. When proposals were created before this call, pass
-    their returned ids as schedule_proposal_ids; they are linked to this
-    decision atomically. Returns the decision viewer URL to attach to any alert
-    or message about this decision.
-    """
-    if kind not in {k.value for k in DecisionKind}:
-        raise ToolError(
-            f"kind must be one of {sorted(k.value for k in DecisionKind)}, got {kind!r}"
-        )
-    if not summary.strip():
-        raise ToolError("summary must not be empty")
-    _validate_tree(tree)
-    trigger_uuid = (
-        _parse_uuid(trigger_event_id, "trigger_event_id")
-        if trigger_event_id is not None
-        else None
-    )
-    if trigger_uuid is not None and kind != DecisionKind.ALERT.value:
-        raise ToolError("trigger_event_id is valid only for kind='alert'")
-    proposal_uuids = [
-        _parse_uuid(value, f"schedule_proposal_ids[{index}]")
-        for index, value in enumerate(schedule_proposal_ids or [])
-    ]
-    if len(set(proposal_uuids)) != len(proposal_uuids):
-        raise ToolError("schedule_proposal_ids must not contain duplicates")
-    with _store_session() as session:
-        if trigger_uuid is not None:
-            if session.get(TriggerEvent, trigger_uuid) is None:
-                raise ToolError(f"trigger_event {trigger_event_id} not found")
-            existing = session.scalar(
-                select(DecisionRecord.id)
-                .where(DecisionRecord.trigger_event_id == trigger_uuid)
-                .limit(1)
-            )
-            if existing is not None:
-                raise ToolError(
-                    f"trigger_event {trigger_event_id} already has a decision record"
-                )
-        row = DecisionRecord(
-            kind=DecisionKind(kind),
-            tree=tree,
-            summary=summary,
-            llm_model=llm_model,
-            tokens=tokens,
-            trigger_event_id=trigger_uuid,
-        )
-        session.add(row)
-        session.flush()
-        _claim_schedule_proposals(
-            session,
-            list(
-                zip(
-                    schedule_proposal_ids or [],
-                    proposal_uuids,
-                    strict=True,
-                )
-            ),
-            row.id,
-        )
-        decision_id = str(row.id)
-    # Viewer pages are opened from the phone browser (no headers); the shared
-    # construction point embeds the derived read-only credential — never the
-    # API token itself. (Function-local import keeps healthmes.api off this
-    # module's import path.)
-    from healthmes.api.auth import viewer_url
-
-    return {
-        "status": "ok",
-        "decision_id": decision_id,
-        "schedule_proposal_ids": [str(value) for value in proposal_uuids],
-        "viewer_url": viewer_url(_active_settings(), f"/decisions/{decision_id}"),
     }
 
 

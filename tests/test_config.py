@@ -12,8 +12,6 @@ ALL_ENV_VARS = [
     "HEALTHMES_OW_BASE_URL",
     "HEALTHMES_OW_API_KEY",
     "HEALTHMES_OW_USER_ID",
-    "HEALTHMES_HERMES_WEBHOOK_URL",
-    "HEALTHMES_HERMES_WEBHOOK_SECRET",
     "HEALTHMES_DECISION_HERMES_BASE_URL",
     "HEALTHMES_DECISION_HERMES_API_KEY",
     "HEALTHMES_DECISION_CORRELATION_SECRET",
@@ -78,9 +76,6 @@ def test_defaults(monkeypatch) -> None:
     assert settings.ow_base_url == "http://localhost:8000"
     assert settings.ow_api_key.get_secret_value() == ""
     assert settings.ow_user_id is None
-    # Canonical deployments have no generic Hermes inbound reasoning route.
-    assert settings.hermes_webhook_url == ""
-    assert settings.hermes_webhook_secret.get_secret_value() == ""
     assert settings.decision_hermes_base_url is None
     assert settings.decision_hermes_api_key.get_secret_value() == ""
     assert settings.decision_correlation_secret.get_secret_value() == ""
@@ -258,7 +253,6 @@ def test_unprefixed_env_vars_are_ignored(monkeypatch) -> None:
 
 def test_secrets_are_not_leaked_in_repr(monkeypatch) -> None:
     monkeypatch.setenv("HEALTHMES_OW_API_KEY", "super-secret-key")
-    monkeypatch.setenv("HEALTHMES_HERMES_WEBHOOK_SECRET", "hmac-secret")
     monkeypatch.setenv("HEALTHMES_API_TOKEN", "bearer-secret")
     monkeypatch.setenv(
         "HEALTHMES_DECISION_HERMES_API_KEY",
@@ -276,13 +270,11 @@ def test_secrets_are_not_leaked_in_repr(monkeypatch) -> None:
     settings = _clean_settings()
 
     assert "super-secret-key" not in repr(settings)
-    assert "hmac-secret" not in repr(settings)
     assert "bearer-secret" not in repr(settings)
     assert "decision-runtime-secret" not in repr(settings)
     assert "decision-correlation-secret" not in repr(settings)
     assert "calendar-adjustment-secret-that-is-long-enough" not in repr(settings)
     assert settings.ow_api_key.get_secret_value() == "super-secret-key"
-    assert settings.hermes_webhook_secret.get_secret_value() == "hmac-secret"
     assert settings.api_token.get_secret_value() == "bearer-secret"
     assert (
         settings.decision_hermes_api_key.get_secret_value()

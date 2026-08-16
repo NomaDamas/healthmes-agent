@@ -62,7 +62,6 @@ from healthmes.engine.rules import (
     TriggerFire,
     TriggerRule,
 )
-from healthmes.engine.webhook import WebhookResult
 from healthmes.mcp_server import interpret
 from healthmes.store.enums import CalendarMutationStatus, ProposalStatus
 from healthmes.store.models import (
@@ -202,7 +201,7 @@ class AlertSender(Protocol):
         *,
         fired_at: datetime,
         trigger_event_id: uuid.UUID,
-    ) -> WebhookResult | DecisionDispatchResult: ...
+    ) -> DecisionDispatchResult: ...
 
 
 class _UnavailableAlertSender:
@@ -216,9 +215,9 @@ class _UnavailableAlertSender:
         *,
         fired_at: datetime,
         trigger_event_id: uuid.UUID,
-    ) -> WebhookResult:
+    ) -> DecisionDispatchResult:
         del fire, fired_at, trigger_event_id
-        return WebhookResult(
+        return DecisionDispatchResult(
             ok=False,
             status_code=503,
             detail="canonical decision alert sender is not configured",
@@ -807,13 +806,14 @@ def _decision_metadata(
 
 def _merge_decision_result(
     payload: dict[str, Any],
-    result: WebhookResult | DecisionDispatchResult,
+    result: DecisionDispatchResult,
 ) -> dict[str, Any]:
-    if not isinstance(result, DecisionDispatchResult):
+    metadata = _decision_metadata(result)
+    if not metadata:
         return payload
     merged = {
         **payload,
-        "decision": _decision_metadata(result),
+        "decision": metadata,
     }
     if result.decision_record_id is not None:
         merged["decision_record_id"] = str(
@@ -1172,8 +1172,7 @@ class TriggerEvaluator:
                 fired_at=fired_at,
                 trigger_event_id=event.id,
             )
-            if isinstance(result, DecisionDispatchResult):
-                self._link_decision_record(session, event, result)
+            self._link_decision_record(session, event, result)
         except Exception as exc:
             outcome = self._handle_send_exception(session, fire, event, payload, exc)
             session.commit()
@@ -1187,22 +1186,14 @@ class TriggerEvaluator:
                 "push": {
                     "sent": True,
                     "status_code": result.status_code,
-                    "channel": (
-                        result.channel
-                        if isinstance(result, DecisionDispatchResult)
-                        and result.channel is not None
-                        else "webhook"
-                    ),
+                    "channel": result.channel or "delivery",
                 },
             }
             outcome = FireOutcome(fire=fire, status="pushed")
             session.commit()
             return outcome
 
-        ready_for_native = (
-            isinstance(result, DecisionDispatchResult)
-            and result.ready_for_native
-        )
+        ready_for_native = result.ready_for_native
         reasoning_required = bool(
             getattr(self._alert_sender, "requires_reasoning", False)
         )
@@ -1216,11 +1207,6 @@ class TriggerEvaluator:
                     "sent": True,
                     "channel": "native",
                     "upstream_ok": False,
-                    **(
-                        {"webhook_ok": False}
-                        if not reasoning_required
-                        else {}
-                    ),
                     "status_code": result.status_code,
                     "detail": result.detail,
                 },
@@ -1237,7 +1223,7 @@ class TriggerEvaluator:
                     "channel": (
                         "decision"
                         if reasoning_required
-                        else "webhook"
+                        else "delivery"
                     ),
                     "last_status_code": result.status_code,
                     "last_error": result.detail,
@@ -1312,8 +1298,8 @@ class TriggerEvaluator:
                 "push": {
                     "sent": True,
                     "channel": "native",
-                    "webhook_ok": False,
-                    "webhook_error": str(exc),
+                    "upstream_ok": False,
+                    "upstream_error": str(exc),
                 },
             }
             return FireOutcome(fire=fire, status="pushed")
@@ -1325,7 +1311,7 @@ class TriggerEvaluator:
                 "channel": (
                     "decision"
                     if reasoning_required
-                    else "webhook"
+                    else "delivery"
                 ),
                 "last_error": str(exc),
             },

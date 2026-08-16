@@ -126,9 +126,8 @@ services:
     image: healthmes:latest
     pull_policy: never
     env_file:
-      # Optional root .env for secrets (HEALTHMES_OW_API_KEY,
-      # HEALTHMES_HERMES_WEBHOOK_SECRET, ...). In-cluster endpoints below
-      # take precedence over any host-oriented values in .env.
+      # Optional root .env for secrets. In-cluster endpoints below take
+      # precedence over any host-oriented values in .env.
       - path: ./.env
         required: false
     # The image CMD is just `python -m healthmes`; migrations run here so the
@@ -137,11 +136,6 @@ services:
     environment:
       - HEALTHMES_DATABASE_URL=postgresql+psycopg://healthmes:healthmes@postgres:5432/healthmes
       - HEALTHMES_OW_BASE_URL=http://ow-backend:8000
-      # Canonical reasoning enters only through /v1/wellness-decisions.
-      # Proactive alerts remain bounded native records; no generic Hermes
-      # webhook/Telegram agent route is part of this deployment.
-      - HEALTHMES_HERMES_WEBHOOK_URL=
-      - HEALTHMES_HERMES_WEBHOOK_SECRET=
       - HEALTHMES_NATIVE_ALERT_DELIVERY=true
       - HEALTHMES_DECISION_HERMES_BASE_URL=${HEALTHMES_DECISION_HERMES_BASE_URL:-}
       - HEALTHMES_DECISION_HERMES_MODEL=${HEALTHMES_DECISION_HERMES_MODEL:-}

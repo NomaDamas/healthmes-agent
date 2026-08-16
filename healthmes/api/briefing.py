@@ -48,11 +48,12 @@ Data sources and honesty rules:
   :data:`ALERT_RECENT_HOURS`). The store has no resolution tracking yet, so
   "unresolved" == "recent" — a documented placeholder policy for the domain
   expert to refine. ``top.decision_url`` links the earliest alert-kind
-  decision linked to the trigger event by the webhook correlation ID, else
+  decision linked to the trigger event by the decision-dispatch correlation
+  ID, else
   ``null``.
 - **decision URLs** come from :func:`healthmes.api.auth.viewer_url` — the one
-  construction point shared with the MCP ``record_decision`` tool and the
-  weekly report: ``{public_base_url}/decisions/{id}`` plus the *derived
+  construction point shared by the finalizer, bounded command workflows, and
+  the weekly report: ``{public_base_url}/decisions/{id}`` plus the *derived
   read-only* ``?token=`` credential when an API token is configured, so links
   stay browser-tappable without ever embedding the full-access token.
 
@@ -202,7 +203,7 @@ def decision_viewer_url(settings: Settings, decision_id: uuid.UUID | str) -> str
     """Browser-tappable viewer link for one decision record.
 
     Thin wrapper over :func:`healthmes.api.auth.viewer_url` — the single
-    construction point shared with the ``record_decision`` MCP tool and the
+    construction point shared with finalizer/internal command records and the
     weekly report, so the derived read-only credential is embedded (never
     re-derived) when an API token is configured.
     """

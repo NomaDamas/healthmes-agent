@@ -2,8 +2,8 @@
 
 No network, no Docker, no real credentials: the store runs on in-memory
 sqlite (same ``create_db_engine`` safety settings as production), health
-signals come from in-test fakes, and webhook pushes go to recording fakes or
-an httpx.MockTransport. The shared ``settings`` fixture comes from the
+signals come from in-test fakes, and external deliveries go to recording
+fakes or an httpx.MockTransport. The shared ``settings`` fixture comes from the
 top-level tests/conftest.py.
 """
 

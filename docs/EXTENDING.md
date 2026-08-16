@@ -55,7 +55,7 @@ Ground rules for skill authors:
   expose direct Open Wearables tools.
 - **Never instruct raw REST calls** — decision data access must go through
   bounded HealthMes MCP tools so returned source references can be validated.
-- Do not instruct the runtime to call `record_decision` for every lookup.
+- Do not instruct the runtime to call a generic decision-record writer.
   HealthMes stores a compact decision only for behavior-changing actions,
   material risk warnings, or an explicit `persistence_requested: true`
   request. A simple source-backed lookup remains unpersisted by default. An

@@ -1,6 +1,6 @@
 ---
 name: healthmes-planner
-description: "Health-aware schedule assistant: decompose weekly goals, place tasks by cognitive energy, propose-then-confirm calendar blocks, record every decision."
+description: "Health-aware schedule assistant: decompose weekly goals, place tasks by cognitive energy, and propose-then-confirm calendar blocks."
 version: 1.0.0
 author: HealthMes Agent
 license: MIT
@@ -64,9 +64,9 @@ Morning calendar-nudge tools may also be present on the `healthmes` server:
 
 - The user dumps weekly goals or todos ("this week I need to ...").
 - Cron briefings: morning plan, evening review, weekly planning.
-- A HealthMes webhook alert fired (stress spike, low recovery vs heavy
-  afternoon, external calendar change, deadline risk) and you must
-  re-plan and notify.
+- A HealthMes proactive or scheduled DecisionRequest reports a stress spike,
+  low recovery vs heavy afternoon, external calendar change, or deadline
+  risk and planning is actually needed.
 - The user asks to move, add, or drop scheduled work.
 
 ## When NOT to use
@@ -194,8 +194,11 @@ Rules:
 
 ## Briefing procedures (cron)
 
-These run via Hermes cron (registered by `scripts/bootstrap.py`) and deliver
-to Telegram. Each briefing is ONE message in the notification grammar.
+These procedures apply when a HealthMes-owned scheduled DecisionRequest is
+routed through the canonical decision service. Bootstrap does not install a
+separate Hermes cron reasoning path. A later delivery adapter may render the
+result in Telegram or another channel. Each briefing is ONE message in the
+notification grammar.
 
 - **Morning plan (07:00).** First call
   `mcp__healthmes__evaluate_morning_calendar_nudge` exactly once. If it
@@ -228,10 +231,10 @@ to Telegram. Each briefing is ONE message in the notification grammar.
   surface one health-schedule pattern worth knowing (with evidence), then
   ask for next week's goal dump and run the core workflow on the reply.
 
-## Webhook alerts (proactive loop)
+## Proactive decision ingress
 
-When invoked from the `healthmes-alerts` webhook route, the prompt contains
-the trigger payload (`rule_id`, summary, evidence keys):
+When HealthMes submits a proactive DecisionRequest, the prompt contains a
+bounded trigger signal (`rule_id`, summary, evidence keys):
 
 1. Verify the situation with the MCP tools (never trust the payload alone —
    fetch the current scores/schedule it points at).

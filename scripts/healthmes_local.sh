@@ -236,10 +236,6 @@ load_runtime_env() {
     [ -f "$REPO_ROOT/config/open-wearables.env" ] \
         && source "$REPO_ROOT/config/open-wearables.env"
     set +a
-    # Canonical wellness reasoning enters only through DecisionRequest.
-    # Never let a legacy generic Hermes webhook leak in from dotenv or shell.
-    export HEALTHMES_HERMES_WEBHOOK_URL=
-    export HEALTHMES_HERMES_WEBHOOK_SECRET=
 }
 
 resolve_ow_api_key() {

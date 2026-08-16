@@ -26,8 +26,6 @@ def settings(tmp_path) -> Settings:
         ow_base_url="http://open-wearables.test",
         ow_api_key="test-ow-api-key",
         ow_user_id=None,
-        hermes_webhook_url="http://hermes.test:8644/webhooks/healthmes-alerts",
-        hermes_webhook_secret="test-webhook-secret",
         decision_hermes_api_key="test-decision-hermes-api-key-32-bytes",
         decision_correlation_secret=(
             "test-decision-correlation-secret-32-bytes"

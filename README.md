@@ -3,8 +3,9 @@
 HealthMes Agent is a **proactive, health-aware personal assistant**: it reads
 your wearable data (11 providers via open-wearables), your calendar and your
 app usage, estimates your cognitive energy hour by hour, plans your week
-around it, and **messages you first** on Telegram when something needs to
-change — every proactive decision explorable as a flowchart in the browser.
+around it, and surfaces proactive alerts through a HealthMes-owned delivery
+stream when something needs to change — retained decisions are explorable as
+flowcharts in the browser.
 
 It is glue around two unmodified vendored upstreams:
 
@@ -16,8 +17,8 @@ It is glue around two unmodified vendored upstreams:
 
 Everything HealthMes adds lives at the repo root (`healthmes/`, `skills/`,
 `config/`, `scripts/`, `apps/`), talking to the vendors only over their
-public contracts (REST, MCP, webhook, rendered config). Architecture and
-rationale: [`docs/PLAN.md`](docs/PLAN.md).
+public contracts (REST, MCP, rendered config, and bounded delivery
+interfaces). Architecture and rationale: [`docs/PLAN.md`](docs/PLAN.md).
 
 Canonical PR #138 target:
 
@@ -69,10 +70,10 @@ Apple prerequisites, and verification criteria are tracked in
   without it, so medical data is never network-readable unauthenticated.
 - Proactive alert loop (`healthmes/engine/`): deterministic 10-minute trigger
   sweep (stress spike vs baseline, low recovery + heavy afternoon, external
-  schedule changes, deadline risk) currently sends an HMAC-signed webhook to
-  Hermes for Telegram delivery. PR #138 routes wellness reasoning for these
-  triggers to the same internal HealthMes DecisionRequest ingress as
-  interactive questions; Telegram remains an outbound delivery adapter.
+  schedule changes, deadline risk) routes wellness reasoning through the same
+  internal `HealthMesDecisionService` ingress as interactive questions.
+  Completed results are placed in the durable alert/native-delivery path; no
+  generic Hermes webhook reasoning route remains.
   Alert hygiene is already built in: per-rule cooldown, daily budget, quiet
   hours, dedup keys, and per-rule crash isolation.
 - Hermes decision bootstrap (`scripts/bootstrap.py`): renders and attests an
@@ -98,9 +99,11 @@ Apple prerequisites, and verification criteria are tracked in
   joined with calendar + app usage), `compare_impact` (does factor X move
   metric Y for me?), task/schedule CRUD (`list_tasks`, `upsert_task`,
   `get_schedule`, `propose_schedule_blocks`), `log_food`,
-  `create_medical_record`, `list_medical_records`, `record_decision` —
-  all returning interpreted deltas with confidence/coverage, honest
-  `insufficient_data` when signals are thin.
+  `create_medical_record`, `list_medical_records` — all returning interpreted
+  deltas with confidence/coverage, honest `insufficient_data` when signals
+  are thin. The generic MCP decision writer was removed: only the finalizer
+  may persist free-form wellness decisions, while bounded command workflows
+  retain their own audit writes.
 - Sake nutrition evidence slice: uploaded food/drink photos are analyzed into
   the versioned `NutritionObservation` contract by local Ollama (default) or an
   explicitly authorized OpenAI, Gemini, Anthropic, or xAI provider. The
@@ -119,9 +122,11 @@ Apple prerequisites, and verification criteria are tracked in
   transcription are not implemented. The original caffeine tools still return
   a daily total only after every item and the complete local day are explicitly
   confirmed; generic caffeine decisions cannot emit actionable proposals.
-- Decision viewer: every proactive decision is a `decision_record` tree
-  rendered as a Mermaid flowchart at `/decisions/{id}` (vendored Mermaid,
-  no CDN), with a paginated index at `/decisions`.
+- Decision viewer: proactive actions, actionable risks, and explicit tracking
+  that pass finalization may produce a compact `decision_record` rendered as
+  a Mermaid flowchart at `/decisions/{id}` (vendored Mermaid, no CDN), with a
+  paginated index at `/decisions`. Routine lookup/capture responses do not
+  create one.
 - Insights: template-based aggregations only (no freeform mining), including
   the focus template ("14–16h focus drop: sleep deficit + Slack 9
   launches/hour").
@@ -199,12 +204,12 @@ Apple prerequisites, and verification criteria are tracked in
   `docs/INPUT-CONTROL-PLANE.ko.md`.
 
 **Medical-lite & backups (Phase 3)**
-- Capture via Telegram (no new app): the `healthmes-capture` skill routes
-  photos/voice to `log_food` or `create_medical_record` (medication/symptom)
-  with an LLM-written description, media path and a capture-time health
-  snapshot; one-tap correction preserves the original. Medical data never
-  leaves the machine except the description text sent to the LLM;
-  `doctor-visit-summary` assembles a local briefing file for appointments.
+- UI-neutral capture commands accept food, medication, and symptom records
+  with media paths, transcripts, and a capture-time health snapshot.
+  `healthmes-capture` documents how a bounded channel workflow may map
+  photos/voice to those commands, but PR #138 does not install a Telegram or
+  device inbound adapter. Routine capture does not create a DecisionRecord.
+  `doctor-visit-summary` assembles a local briefing file without creating one.
 - Local-first encrypted partial backups (`healthmes/backup/`): versioned
   snapshot envelope (healthmes DB dump, raw ingest, optional open-wearables
   dump, media tree, optional Hermes state) → tar → age encryption
@@ -237,7 +242,8 @@ Apple prerequisites, and verification criteria are tracked in
   Since grown into the full iOS app (issue #10, matrix below).
 - Local-first throughout: the apps pair with **your own** healthmes instance
   (base URL + bearer token) and talk to nothing else; polling only, no
-  APNs/FCM relay — Telegram remains the reliable push channel. All
+  APNs/FCM relay. The durable `/v1/alerts` stream is the current product-owned
+  delivery surface; guaranteed real-time push is future work. All
   widget/watch rendering is deliberately placeholder: the notification/watch
   UX design is reserved for the healthcare domain expert
   (worksheet: `docs/design/WATCH-NOTIFICATIONS.ko.md`, issue #7).
@@ -262,8 +268,8 @@ The glance plumbing above grew into five surfaces, all speaking the same
 contracts (`GET /v1/briefing/glance` with ETag/304, `GET /v1/alerts`,
 `/reports/weekly.json`, the §8.5 notification grammar, capture via
 `POST /v1/media` + food/medical endpoints) against the **paired instance
-only** — no third-party SDKs, no analytics, no push relay (polling only;
-Telegram stays the guaranteed-delivery channel). Visuals stay
+only** — no third-party SDKs, no analytics, and no push relay (polling only).
+Visuals stay
 placeholder-labeled for the domain expert
 (`docs/design/WATCH-NOTIFICATIONS.ko.md`); information architecture and
 plumbing are real and tested.
@@ -284,9 +290,11 @@ models, so a schema change fails CI before any app breaks. Per-surface
 honest verification status (proven by build/test vs. still needs real
 hardware) lives in each app's README.
 
-**Skills** (`skills/`, copied into the Hermes home by bootstrap):
+**Skills** (`skills/`, exposed through the reviewed HealthMes catalog or used
+by separate bounded command workflows; bootstrap does not install them into
+the isolated decision profile):
 `healthmes-planner` (goal dump → task breakdown → energy-aware block
-proposals → decision recording), `healthmes-capture` (food + medical),
+proposals → finalizer-classified result), `healthmes-capture` (food + medical),
 `healthmes-caffeine` (exact event + current sleep + explicit user bounds →
 read-only bounded preparation proposal),
 `healthmes-nutrition` (photo observation review + caffeine confirmation),
@@ -313,7 +321,7 @@ make mac-services-stop    # stop the ephemeral postgres + redis
 
 With no `.env` at all, the service runs against a repo-local sqlite file —
 `make mac-run` alone is a working single-process demo. The full experience
-(Telegram agent + wearable syncs) needs the credentials matrix in
+(wellness reasoning + wearable syncs) needs the credentials matrix in
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) and
 `uv run python scripts/bootstrap.py` for the Hermes side.
 
@@ -334,6 +342,8 @@ docker compose --profile decision up -d --build
 
 The `decision` profile starts the HealthMes-owned `hermes-decision`
 supervisor in addition to postgres, redis, Open Wearables, and HealthMes.
+The core Open Wearables services include `ow-beat`, the Celery Beat process
+that schedules periodic provider syncs.
 Omit that profile only when intentionally running the core data/MCP stack
 without wellness reasoning.
 

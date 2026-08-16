@@ -163,7 +163,7 @@ class TestViewerLinks:
         )
         # Token configured: the derived read-only credential is embedded —
         # never the API token itself. Every emitter (decision viewer, glance
-        # deep links, weekly report, MCP record_decision) goes through here.
+        # deep links and weekly reports) goes through here.
         secured = settings.model_copy(update={"api_token": SecretStr(TOKEN)})
         url = viewer_url(secured, "/reports/weekly")
         assert url == (

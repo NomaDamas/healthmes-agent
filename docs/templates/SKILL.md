@@ -14,7 +14,7 @@ Rules that reviews enforce (docs/EXTENDING.md §1):
   product decision runtime.
 - Never instruct raw REST calls — decision data access goes through bounded
   HealthMes MCP tools so source references can be validated.
-- Do not call a generic record_decision tool. HealthMes validates sources and
+- Do not call a generic decision-record writer. HealthMes validates sources and
   conditionally writes a compact record after the runtime returns.
 - Gate advice on confidence: on "low" or "insufficient_data", say the data
   is too thin — never give categorical advice.

@@ -153,6 +153,8 @@ from healthmes.decision.search import (
     UnknownDecisionSearchSessionError,
 )
 from healthmes.decision.service import (
+    DecisionChannelAdapter,
+    DecisionChannelRequest,
     DecisionIngress,
     DecisionRuntimeNotConfiguredError,
     DecisionServiceRequest,
@@ -191,6 +193,8 @@ __all__ = [
     "DecisionAgentRun",
     "DecisionBudget",
     "DecisionCaller",
+    "DecisionChannelAdapter",
+    "DecisionChannelRequest",
     "DecisionContextHints",
     "DecisionContextSearchSessionService",
     "DecisionDraft",

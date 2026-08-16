@@ -50,6 +50,11 @@ autonomous LLM/tool loop를 실행하고 HealthMes가 그 loop의 제품 입출�
 | Domain provider | 전문 계산/조회 | Activity, Nutrition, Calendar, Wearable 결과와 provenance |
 | `DecisionFinalizer` | 결과 확정 | source 재검증, effective persistence intent, compact record 또는 미저장 |
 
+외부 채널이 붙을 때는 `DecisionChannelAdapter`가 `source`, `session_id`, privacy,
+budget과 hints를 그대로 `HealthMesDecisionService`에 한 번 전달한다. 현재 실제
+Telegram/UI inbound는 없고 adapter contract만 있다. 채널 구현이 Hermes를 직접
+호출하거나 별도 agent loop를 추가하면 단일 runtime 보장을 깨뜨린다.
+
 ## 2. 한 요청의 실제 순서
 
 ```text
@@ -262,6 +267,10 @@ build_configured_decision_engine(...)
 `HealthMesDecisionService`가 REST, channel, proactive와 scheduled 요청의 공통
 진입점이다. bounded command가 별도 endpoint를 가지더라도 자유 형식 LLM 판단을
 하지 않으므로 두 번째 reasoning 경로가 아니다.
+
+일반 HealthMes MCP에는 임의 판단을 저장하는 writer가 없다. 자유 형식 결과는
+`DecisionFinalizer`만 조건부 저장하며, 캘린더 confirmation 같은 제한된 internal
+command만 자기 workflow 안에서 감사 레코드를 남길 수 있다.
 
 ### 프로세스 시작 경계
 

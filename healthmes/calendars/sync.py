@@ -104,7 +104,7 @@ class EventChange:
     new_end_at: datetime | None = None
 
     def to_payload(self) -> dict[str, object]:
-        """JSON-safe dict for trigger payloads / webhook bodies / the journal."""
+        """JSON-safe dict for trigger delivery payloads and the journal."""
         payload = asdict(self)
         payload["calendar_source"] = self.calendar_source.value
         payload["kind"] = self.kind.value
@@ -177,7 +177,7 @@ class SyncDiff:
         )
 
     def to_payload(self) -> dict[str, object]:
-        """JSON-safe dict for trigger payloads / webhook bodies / the journal."""
+        """JSON-safe dict for trigger delivery payloads and the journal."""
         return {
             "created": [change.to_payload() for change in self.created],
             "moved": [change.to_payload() for change in self.moved],

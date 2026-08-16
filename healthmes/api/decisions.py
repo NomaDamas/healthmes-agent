@@ -7,7 +7,8 @@ JSON surface (agent / tooling):
 - ``GET /decisions/{id}.json`` — the same payload at the viewer-adjacent URL
   (append ``.json`` to any alert link).
 
-HTML surface (every Telegram alert links ``{public_base_url}/decisions/{id}``):
+HTML surface (retained alert records may link
+``{public_base_url}/decisions/{id}``):
 
 - ``GET /`` — static landing shell (links only, no data).
 - ``GET /decisions`` — paginated index page, newest first — the weekly-report
@@ -18,8 +19,8 @@ HTML surface (every Telegram alert links ``{public_base_url}/decisions/{id}``):
 - ``GET /static/mermaid.min.js`` — vendored Mermaid bundle served locally
   (no CDN, local-first).
 
-Decision records are written by the agent through the ``record_decision`` MCP
-tool; there are no REST write endpoints.
+Decision records are written only by the wellness finalizer or bounded
+internal command workflows; there are no REST or generic MCP write endpoints.
 """
 
 import uuid

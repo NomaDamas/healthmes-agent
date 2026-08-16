@@ -393,7 +393,8 @@ app (+ screensaver), and the web pages the service itself serves (decision
 viewer, weekly report). All are **local-first**: each app pairs with your
 own healthmes instance (base URL + bearer token) and talks to nothing else;
 polling only (ETag/304, 5-minute cache floor), no APNs/FCM/WNS relay —
-Telegram remains the guaranteed-delivery channel. Visual design stays
+the durable `/v1/alerts` stream is the current product-owned delivery
+surface, while guaranteed real-time push remains future work. Visual design stays
 deliberately placeholder-labeled — the notification/watch UX belongs to the
 healthcare domain expert (`docs/design/WATCH-NOTIFICATIONS.ko.md`; the PLAN
 §8.5 notification grammar is the design system). The apps are not part of
@@ -506,7 +507,7 @@ shapes are pinned in `tests/api/`):
 | `GET /v1/nutrition-observations[/{id}]` | bearer | Reads immutable structured observations. Estimates remain exact/range/unknown and are never promoted to confirmed intake merely because they were stored. |
 | `POST /v1/nutrition-observations/{id}/confirm` | bearer | Appends a confirmed/corrected/rejected caffeine event. Confirmed/corrected requests must provide one finite non-negative `caffeine_mg` for every item in the observation. |
 | `POST /v1/nutrition-observations/daily-confirmations` | bearer | Appends a local-day coverage event. `total_intake_complete: true` is accepted only when the ID set contains every observation for that local date. |
-| `POST /v1/medical-records` | bearer | REST twin of the `create_medical_record` MCP tool (the Telegram capture-skill contract): `{kind: medication\|symptom, description, media_path?, transcript?, context?}`. The server attaches the deterministic health snapshot under `context.health` (degrades to `{status: unavailable}` when open-wearables is down — capture never fails for infra reasons); caller context is stored under `context.capture`. |
+| `POST /v1/medical-records` | bearer | REST twin of the bounded `create_medical_record` capture command: `{kind: medication\|symptom, description, media_path?, transcript?, context?}`. The server attaches the deterministic health snapshot under `context.health` (degrades to `{status: unavailable}` when open-wearables is down — capture never fails for infra reasons); caller context is stored under `context.capture`. |
 | `GET /v1/alerts` | bearer | Alert history in glance semantics ("unresolved == recently pushed"): `?hours=1..168` (default 24), paginated `Page` envelope, newest first. Items carry the §8.5 grammar recorded at fire time (`summary`/`evidence`/`proposal`) + `decision_url`; `alerts[0]` agrees verbatim with the glance top alert (test-pinned). |
 | `POST /v1/schedule/proposals/{id}/accept` / `/decline` | bearer | The apps' ✅/❌ actions. Second tap → `409 invalid_transition` with `detail {current, requested}` (render "already resolved"); unknown id → 404. |
 | `POST /v1/food-logs` | bearer | Accepts `media_path` from `POST /v1/media` (≤500 chars). |
@@ -523,7 +524,8 @@ Client caveats worth knowing (all handled by the shipped apps):
   otherwise they route into the app. Lifting this needs a server-side
   linkage field.
 - Push relay (APNs/FCM/WNS) is out of scope **by design** — notification
-  delivery is OS-budgeted polling; Telegram is the guaranteed channel.
+  delivery is OS-budgeted polling and no guaranteed real-time channel ships
+  in the canonical runtime.
 
 ## 캘린더 연결 (calendar connect)
 
@@ -603,14 +605,13 @@ corresponding integrations stay inactive.
 
 | Feature | Credential | Where |
 |---|---|---|
-| Telegram alerts/chat (the 90% UX) | bot token from @BotFather | `TELEGRAM_BOT_TOKEN` in `.env` (used by the hermes gateway) |
-| The agent itself (Claude API) | Anthropic API key | `ANTHROPIC_API_KEY` in `.env` (hermes gateway) |
-| Health data reads (MCP tools, triggers, insights) | open-wearables API key from its developer portal (`:8000/docs`) | `HEALTHMES_OW_API_KEY` (+ `OPEN_WEARABLES_API_KEY` for the vendored MCP server) |
+| Wellness Decision Agent | selected model-provider credential | provider key matching `HEALTHMES_DECISION_HERMES_PROVIDER` in `.env`; the isolated runtime is provider-agnostic |
+| Health data reads (HealthMes MCP tools, triggers, insights) | open-wearables API key from its developer portal (`:8000/docs`) | `HEALTHMES_OW_API_KEY`; the product runtime does not start or expose the vendored Open Wearables MCP server |
 | Wearable provider syncs | per-provider OAuth apps (Garmin, Oura, ...) | `config/open-wearables.env` (see the vendor backend docs) |
 | Google Calendar mirror | OAuth client secret + one interactive consent | one-time client secret to `{HEALTHMES_DATA_DIR}/google/client_secret.json`, then `uv run healthmes connect google` (see "캘린더 연결") — the stored token auto-enables the mirror; `HEALTHMES_GOOGLE_CALENDAR_ENABLED=true` still works (polled every `HEALTHMES_GOOGLE_POLL_MINUTES` — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
 | Apple Calendar (iCloud CalDAV) mirror | app-specific password from appleid.apple.com | `uv run healthmes connect icloud --username <apple-id>` (see "캘린더 연결") — the stored creds file auto-enables the mirror; the env pair `HEALTHMES_CALDAV_USERNAME` + `HEALTHMES_CALDAV_APP_PASSWORD` (+ `HEALTHMES_CALDAV_ENABLED=true`) still works and overrides it (polled every `HEALTHMES_CALDAV_POLL_MINUTES` — needs `HEALTHMES_SCHEDULER_ENABLED=true`) |
-| Proactive alert push (HealthMes -> Hermes) | shared HMAC secret | `HEALTHMES_HERMES_WEBHOOK_SECRET` — generated into `.env` by `scripts/bootstrap.py` |
-| Calendar adjustment confirmation handles | dedicated signing secret | `HEALTHMES_CALENDAR_ADJUSTMENT_SECRET` — generated into `.env` by `scripts/bootstrap.py`; never shared with webhook or API authentication |
+| Proactive wellness reasoning | the configured decision model/provider | the same isolated `hermes-decision` runtime used by `POST /v1/wellness-decisions`; there is no generic Hermes webhook secret |
+| Calendar adjustment confirmation handles | dedicated signing secret | `HEALTHMES_CALENDAR_ADJUSTMENT_SECRET` — generated into `.env` by `scripts/bootstrap.py`; never shared with model or API authentication |
 | Encrypted backups (CLI + weekly job) | a passphrase you choose (and must not lose) | `HEALTHMES_BACKUP_PASSPHRASE` in `.env`, or `--passphrase-file` |
 | Remote vault replication (ciphertext-only, optional) | S3-compatible bucket + access keys (AWS S3 / Cloudflare R2 / MinIO) | `HEALTHMES_VAULT_BUCKET` (+ `HEALTHMES_VAULT_ENDPOINT`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`/`_REGION`/`_PREFIX`); opt in with `HEALTHMES_BACKUP_PROVIDER=remote_vault` or `--provider remote` |
 | Companion & desktop apps (Android/Wear/iOS/watchOS/macOS/Windows) | the service's `HEALTHMES_API_TOKEN` (same LAN rule as the collector) | entered in each app's pairing screen together with the base URL |
@@ -664,9 +665,8 @@ Services and host ports (all overridable via `.env`):
 | ow-backend | 8000 | open-wearables FastAPI (`/docs`)                  |
 | ow-worker  | —    | open-wearables celery worker                      |
 | ow-beat    | —    | open-wearables periodic sync scheduler            |
-| ow-mcp     | 8200 | vendor MCP server over Streamable HTTP (see note) |
 | healthmes  | 8100 | this repo's service (`/health`, `/v1/*`, `/mcp`, `/decisions`, `/cognitive-energy/forecast`; runs `alembic upgrade head` on start) |
-| hermes     | 8644 | hermes gateway webhook receiver (`/webhooks/healthmes-alerts`) |
+| hermes-decision | — | optional isolated `/v1/responses` runtime behind the `decision` Compose profile; only HealthMes calls it |
 
 Smoke test:
 
@@ -682,31 +682,23 @@ Notes:
   `postgres_data` volume. To re-run it: `docker compose down -v` (destroys
   data) and `up` again. (`make mac-setup` is the native equivalent.)
 - Compose injects docker service hostnames (`postgres`, `redis`,
-  `ow-backend`, `hermes`) via container `environment:`; code and config
-  defaults always stay localhost-native.
-- `ow-mcp`: `vendor/open-wearables/mcp` has no Dockerfile and its entrypoint
-  defaults to stdio, so compose mounts the vendor dir read-only into the
-  official `ghcr.io/astral-sh/uv` Python image and serves it via
-  `uv run --frozen fastmcp run app/main.py:mcp --transport http --port 8200`.
-  Dependencies are resolved from the mounted `uv.lock` into a
-  container-local venv on each start. The *primary* integration path per
-  `docs/PLAN.md` is stdio inside the hermes container (the vendor dir is
-  also mounted there at `/opt/vendor/open-wearables-mcp`).
-- `hermes` deviates from the vendor compose in two documented ways: bridge
-  networking instead of `network_mode: host` (service DNS; macOS support),
-  and `HERMES_HOME` bind-mounted at `./data/hermes` so `scripts/bootstrap.py`
-  (Phase 0, later agent) can render `config/hermes-config.yaml.tmpl` into it
-  from the host.
-- Hermes config is **generated**: edit `config/hermes-config.yaml.tmpl`, not
-  `./data/hermes/config.yaml`.
+  `ow-backend`) via container `environment:`; code and config defaults always
+  stay localhost-native. HealthMes reads wearable data from `ow-backend`
+  through its bounded REST/provider adapter.
+- `hermes-decision` runs only under the `decision` profile. It uses the
+  isolated, manifest-bound `./data/hermes/decision` home and is reachable
+  only as HealthMes' Responses runtime, not as a public channel or webhook.
+- Hermes decision config is **generated**: edit
+  `config/hermes-decision-config.yaml.tmpl`, not the rendered
+  `./data/hermes/decision/config.yaml`.
 
 ## Layout
 
 ```
 healthmes/            service package (FastAPI composition root in app.py, settings in config.py)
   store/              SQLAlchemy models + engine/session singletons (healthmes DB)
-  engine/             deterministic engines (trigger rules/sweep, webhook push,
-                      cognitive-energy engine, scheduler)
+  engine/             deterministic engines (trigger rules/sweep, canonical
+                      decision dispatch, cognitive-energy engine, scheduler)
   calendars/          Google / iCloud CalDAV sync backends + mirror service
   mcp_server/         fastmcp Layer-B tools (14), served at exactly /mcp
   api/                REST routes (/v1/*, incl. the glance briefing), error
@@ -765,8 +757,8 @@ mirroring the run targets:
   because compose binds 0.0.0.0), curls `:8100/health` and verifies the
   bearer gate (401 without the token, 200 with) — the live half of the
   PLAN §11 "compose boot + Phase-0 demo query" smoke. The demo-query half
-  needs real Telegram/Anthropic/wearable credentials CI does not have; its
-  contracts are pinned by the offline test suite instead.
+  needs a real decision-model provider and wearable credentials CI does not
+  have; its contracts are pinned by the offline test suite instead.
 
 Everything the two test jobs run is reproducible locally with the same
 commands; the test suite is offline by convention (see "Tests and lint"

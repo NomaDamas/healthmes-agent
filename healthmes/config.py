@@ -58,16 +58,6 @@ class Settings(BaseSettings):
         "to auto-discovery via GET /api/v1/users (works only when the API key "
         "sees exactly one user).",
     )
-    hermes_webhook_url: str = Field(
-        default="",
-        description="Legacy generic Hermes webhook route. Canonical "
-        "deployments leave this blank so all wellness reasoning enters "
-        "through POST /v1/wellness-decisions.",
-    )
-    hermes_webhook_secret: SecretStr = Field(
-        default=SecretStr(""),
-        description="HMAC secret shared with the Hermes webhook route.",
-    )
     decision_hermes_base_url: str | None = Field(
         default=None,
         max_length=2_048,
@@ -303,19 +293,17 @@ class Settings(BaseSettings):
         "containers run UTC clocks, so compose forwards HEALTHMES_TIMEZONE).",
     )
 
-    # Delivery: proactive alerts reach the user through the Hermes webhook
-    # (phone+watch via Telegram) AND/OR the native companion apps, which poll
-    # /v1/alerts + /v1/briefing/glance. With native delivery on, a fired
-    # trigger is surfaced to the apps even when no Hermes webhook is
-    # configured or its push fails — so the phone gets alerts without Telegram.
+    # Delivery: proactive decisions are written to the durable alert stream
+    # consumed by native companion apps through /v1/alerts and
+    # /v1/briefing/glance. A later bounded delivery adapter may relay the same
+    # result to another channel without creating a second reasoning path.
     native_alert_delivery: bool = Field(
         default=True,
-        description="Surface fired triggers to the native companion apps "
-        "(/v1/alerts + glance) regardless of the Hermes webhook outcome — "
-        "enables phone/watch alerts without Telegram. Alert hygiene (quiet "
-        "hours, cooldown, daily budget, dedup) still applies. On by default "
-        "(PLAN §13: alerts must work with zero setup); set false to make "
-        "Telegram the only channel.",
+        description="Surface completed proactive decisions to the native "
+        "companion apps (/v1/alerts + glance). Alert hygiene (quiet hours, "
+        "cooldown, daily budget, dedup) still applies. On by default "
+        "(PLAN §13: alerts must work with zero setup); set false only when "
+        "another bounded delivery adapter owns display.",
     )
 
     # Raw-first ingest receiver (PLAN §13; healthmes/api/ingest.py). Bridge
@@ -430,7 +418,7 @@ class Settings(BaseSettings):
     )
 
     # Alert hygiene (docs/PLAN.md §11: a noisy assistant gets muted within a
-    # week). Consumed by healthmes/engine/triggers.py before any webhook push.
+    # week). Consumed by healthmes/engine/triggers.py before decision dispatch.
     quiet_hours_start: datetime.time = Field(
         default=datetime.time(22, 30),
         description="Start of the do-not-disturb window (local time, e.g. '22:30'). "

@@ -300,15 +300,7 @@ def test_local_start_uses_only_optional_dedicated_decision_runtime() -> None:
     load_env_body = _function_body(text, "load_runtime_env")
 
     assert "sync_hermes_ow_api_key" not in text
-    last_source = load_env_body.rindex("source ")
-    assert (
-        load_env_body.index("export HEALTHMES_HERMES_WEBHOOK_URL=")
-        > last_source
-    )
-    assert (
-        load_env_body.index("export HEALTHMES_HERMES_WEBHOOK_SECRET=")
-        > last_source
-    )
+    assert "HEALTHMES_HERMES_WEBHOOK" not in load_env_body
     assert "HEALTHMES_DECISION_HERMES_MODEL" in configured_body
     assert "HEALTHMES_DECISION_HERMES_PROVIDER" in configured_body
     assert "requires both" in configured_body

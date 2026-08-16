@@ -18,6 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from healthmes.calendars import creds
 from healthmes.calendars.adjustments import provider_revision_fingerprint
 from healthmes.config import Settings
+from healthmes.engine.decision_dispatch import DecisionDispatchResult
 from healthmes.engine.rules import (
     RecoverySnapshot,
     StressSnapshot,
@@ -37,7 +38,6 @@ from healthmes.engine.triggers import (
     default_now_provider,
     is_in_quiet_hours,
 )
-from healthmes.engine.webhook import WebhookResult
 from healthmes.store import Base, create_db_engine
 from healthmes.store.enums import (
     CalendarMutationOperation,
@@ -127,14 +127,18 @@ class FakeAlertSender:
         *,
         fired_at: datetime,
         trigger_event_id: uuid.UUID,
-    ) -> WebhookResult:
+    ) -> DecisionDispatchResult:
         self.sent.append((fire, fired_at, trigger_event_id))
         if self.ok:
-            return WebhookResult(ok=True, status_code=202)
-        return WebhookResult(
+            return DecisionDispatchResult(
+                ok=True,
+                status_code=202,
+                channel="test",
+            )
+        return DecisionDispatchResult(
             ok=False,
             status_code=502,
-            detail="gateway unavailable",
+            detail="delivery unavailable",
             retryable=self.retryable,
         )
 
@@ -143,11 +147,11 @@ class RaisingAlertSender:
     """AlertSender double whose send() *raises* (transport blew up mid-send).
 
     Distinct from ``FakeAlertSender(ok=False)``, which returns a clean
-    ``WebhookResult(ok=False)`` — a gateway that answered non-2xx.
+    ``DecisionDispatchResult(ok=False)`` — a sender that answered non-2xx.
     """
 
     def __init__(self, exc: Exception | None = None) -> None:
-        self.exc = exc if exc is not None else RuntimeError("webhook transport exploded")
+        self.exc = exc if exc is not None else RuntimeError("delivery transport exploded")
         self.calls = 0
 
     def send(
@@ -156,7 +160,7 @@ class RaisingAlertSender:
         *,
         fired_at: datetime,
         trigger_event_id: uuid.UUID,
-    ) -> WebhookResult:
+    ) -> DecisionDispatchResult:
         self.calls += 1
         raise self.exc
 
@@ -273,10 +277,14 @@ def test_fresh_fire_is_persisted_and_pushed(settings, session_factory, alert_sen
     assert event.alert_sent is True
     assert event.payload["summary"] == fire.summary
     assert event.payload["evidence"]["recent_value"] == 85.0
-    assert event.payload["push"] == {"sent": True, "status_code": 202, "channel": "webhook"}
+    assert event.payload["push"] == {
+        "sent": True,
+        "status_code": 202,
+        "channel": "test",
+    }
 
 
-def test_trigger_event_is_committed_before_webhook_dispatch(settings, tmp_path) -> None:
+def test_trigger_event_is_committed_before_alert_dispatch(settings, tmp_path) -> None:
     engine = create_db_engine(f"sqlite+pysqlite:///{tmp_path / 'trigger-visibility.db'}")
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -321,7 +329,7 @@ def test_dispatching_event_retries_with_same_correlation_id(
                 "summary": "observation",
                 "proposal": "proposal",
                 "evidence": {},
-                "push": {"state": "dispatching", "channel": "webhook"},
+                "push": {"state": "dispatching", "channel": "delivery"},
             },
         )
         with session_factory() as session:
@@ -405,13 +413,13 @@ def test_failed_push_is_recorded_and_not_retried(settings, session_factory) -> N
     assert event.payload["push"]["status_code"] == 502
 
 
-def test_native_delivery_surfaces_alert_without_webhook(settings, session_factory) -> None:
+def test_native_delivery_surfaces_alert_when_sender_fails(settings, session_factory) -> None:
     """native_alert_delivery on: a fired trigger is marked delivered even when
-    the webhook is absent/fails, so the companion apps surface it via
+    a non-reasoning sender fails, so the companion apps surface it via
     /v1/alerts + glance (phone alerts without Telegram — user request). Alert
     hygiene still gates it."""
     native_settings = settings.model_copy(update={"native_alert_delivery": True})
-    sender = FakeAlertSender(ok=False)  # no Hermes webhook configured / unreachable
+    sender = FakeAlertSender(ok=False)
     with freeze_time("2026-07-09 14:00:00"):
         evaluator = make_evaluator(native_settings, session_factory, sender, rules=(fixed_rule,))
         report = evaluator.evaluate_once()
@@ -419,15 +427,17 @@ def test_native_delivery_surfaces_alert_without_webhook(settings, session_factor
     assert [o.status for o in report.outcomes] == ["pushed"]
     [event] = all_events(session_factory)
     # Surfaced for native polling (glance/alerts filter on alert_sent) despite
-    # the webhook failure — the phone gets it without Telegram.
+    # the upstream delivery failure.
     assert event.alert_sent is True
     assert event.payload["push"]["channel"] == "native"
-    assert event.payload["push"]["webhook_ok"] is False
+    assert event.payload["push"]["upstream_ok"] is False
 
 
-def test_native_delivery_off_keeps_webhook_only_semantics(settings, session_factory) -> None:
-    """Native off (explicit — the default is on per PLAN §13): a failed
-    webhook leaves the alert undelivered."""
+def test_native_delivery_off_keeps_failed_sender_undelivered(
+    settings,
+    session_factory,
+) -> None:
+    """Native off leaves a failed non-reasoning sender undelivered."""
     off_settings = settings.model_copy(update={"native_alert_delivery": False})
     sender = FakeAlertSender(ok=False)
     with freeze_time("2026-07-09 14:00:00"):
@@ -479,7 +489,7 @@ def test_sender_exception_recovers_on_next_sweep(settings, session_factory) -> N
 
 def test_sender_exception_native_on_delivers_natively(settings, session_factory) -> None:
     """native on: a raising sender still surfaces the alert to companion apps —
-    the row is kept, marked delivered natively, webhook flagged as failed."""
+    the row is kept and marked delivered natively."""
     native_settings = settings.model_copy(update={"native_alert_delivery": True})
     sender = RaisingAlertSender()
     with freeze_time("2026-07-09 14:00:00"):
@@ -490,8 +500,8 @@ def test_sender_exception_native_on_delivers_natively(settings, session_factory)
     [event] = all_events(session_factory)
     assert event.alert_sent is True
     assert event.payload["push"]["channel"] == "native"
-    assert event.payload["push"]["webhook_ok"] is False
-    assert "webhook_error" in event.payload["push"]
+    assert event.payload["push"]["upstream_ok"] is False
+    assert "upstream_error" in event.payload["push"]
 
 
 # ---------------------------------------------------------------------------

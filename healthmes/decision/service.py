@@ -78,12 +78,43 @@ class DecisionServiceRequest(BaseModel):
         return self
 
 
+class DecisionChannelRequest(BaseModel):
+    """UI-neutral payload for a future app or messaging-channel adapter."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    request_id: uuid.UUID | None = None
+    question: str = Field(min_length=1, max_length=8_000)
+    source: str = Field(min_length=1, max_length=48)
+    session_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+    )
+    requested_at: AwareDatetime | None = None
+    requested_privacy_level: PrivacyLevel = PrivacyLevel.AGGREGATE
+    persistence_requested: StrictBool = False
+    budget: DecisionBudget = Field(default_factory=DecisionBudget)
+    hints: DecisionContextHints = Field(
+        default_factory=DecisionContextHints
+    )
+
+
 class DecisionEngine(Protocol):
     """Minimal engine surface used by the application-level service."""
 
     async def ask_wellness(
         self,
         request: DecisionRequest,
+    ) -> DecisionResult: ...
+
+
+class DecisionService(Protocol):
+    """Canonical service surface allowed behind product ingress adapters."""
+
+    async def ask_wellness(
+        self,
+        submission: DecisionServiceRequest,
     ) -> DecisionResult: ...
 
 
@@ -157,6 +188,46 @@ class HealthMesDecisionService:
                 "HealthMes decision runtime is not configured"
             )
         return await engine.ask_wellness(request)
+
+
+class DecisionChannelAdapter:
+    """Route a channel message through the canonical decision service once.
+
+    Device and messaging teams may wrap this adapter with their platform
+    ingress. They must not add a second LLM loop or call Hermes directly.
+    """
+
+    def __init__(self, *, service: DecisionService) -> None:
+        if not callable(getattr(service, "ask_wellness", None)):
+            raise TypeError("service must provide ask_wellness")
+        self._service = service
+
+    async def ask_wellness(
+        self,
+        submission: DecisionChannelRequest,
+    ) -> DecisionResult:
+        if not isinstance(submission, DecisionChannelRequest):
+            raise TypeError(
+                "submission must be a DecisionChannelRequest"
+            )
+        return await self._service.ask_wellness(
+            DecisionServiceRequest(
+                request_id=submission.request_id,
+                question=submission.question,
+                ingress=DecisionIngress.CHANNEL,
+                source=submission.source,
+                session_id=submission.session_id,
+                requested_at=submission.requested_at,
+                requested_privacy_level=(
+                    submission.requested_privacy_level
+                ),
+                persistence_requested=(
+                    submission.persistence_requested
+                ),
+                budget=submission.budget,
+                hints=submission.hints,
+            )
+        )
 
 
 def _caller_channel(submission: DecisionServiceRequest) -> str:

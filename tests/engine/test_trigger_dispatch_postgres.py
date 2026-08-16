@@ -11,8 +11,8 @@ from sqlalchemy import event
 from sqlalchemy.orm import sessionmaker
 
 from healthmes.config import Settings
+from healthmes.engine.decision_dispatch import DecisionDispatchResult
 from healthmes.engine.triggers import HealthSignals, TriggerEvaluator, TriggerFire
-from healthmes.engine.webhook import WebhookResult
 from healthmes.store import Base, create_db_engine
 from healthmes.store.models import TriggerEvent
 
@@ -27,10 +27,20 @@ class CountingSender:
         self.calls = 0
         self._lock = threading.Lock()
 
-    def send(self, fire, *, fired_at, trigger_event_id) -> WebhookResult:
+    def send(
+        self,
+        fire,
+        *,
+        fired_at,
+        trigger_event_id,
+    ) -> DecisionDispatchResult:
         with self._lock:
             self.calls += 1
-        return WebhookResult(ok=True, status_code=202)
+        return DecisionDispatchResult(
+            ok=True,
+            status_code=202,
+            channel="test",
+        )
 
 
 @pytest.mark.skipif(
@@ -151,7 +161,7 @@ def test_postgres_pending_dispatch_has_one_concurrent_owner() -> None:
                     "summary": "observation",
                     "proposal": "proposal",
                     "evidence": {},
-                    "push": {"state": "dispatching", "channel": "webhook"},
+                    "push": {"state": "dispatching", "channel": "delivery"},
                 },
             )
         )
