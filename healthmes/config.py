@@ -59,11 +59,10 @@ class Settings(BaseSettings):
         "sees exactly one user).",
     )
     hermes_webhook_url: str = Field(
-        default="http://localhost:8644/webhooks/healthmes-alerts",
-        description="Hermes gateway webhook route URL for proactive alert pushes. "
-        "Port 8644 is DEFAULT_PORT in vendor/hermes-agent/gateway/platforms/"
-        "webhook.py; the path is /webhooks/{route_name} with route "
-        "'healthmes-alerts' (config/hermes-config.yaml.tmpl).",
+        default="",
+        description="Legacy generic Hermes webhook route. Canonical "
+        "deployments leave this blank so all wellness reasoning enters "
+        "through POST /v1/wellness-decisions.",
     )
     hermes_webhook_secret: SecretStr = Field(
         default=SecretStr(""),
@@ -101,6 +100,23 @@ class Settings(BaseSettings):
         description="Rendered dedicated Hermes decision config validated "
         "before the HTTP runtime starts. Production HTTP composition requires "
         "this artifact; injected test transports may omit it.",
+    )
+    decision_hermes_runtime_manifest_path: Path | None = Field(
+        default=None,
+        description="Content-bound manifest emitted by bootstrap for the "
+        "dedicated Hermes supervisor. Production HTTP composition requires "
+        "this artifact.",
+    )
+    decision_hermes_attestation_key_path: Path | None = Field(
+        default=None,
+        description="Owner-only key shared by HealthMes and its dedicated "
+        "Hermes supervisor for nonce-bound runtime attestation.",
+    )
+    decision_hermes_allow_attested_private_http: bool = Field(
+        default=False,
+        description="Allow cleartext HTTP only for a private/container Hermes "
+        "origin that passes runtime attestation immediately before execution. "
+        "Public remote origins still require HTTPS.",
     )
     decision_hermes_discovery_timeout_seconds: float = Field(
         default=5.0,
@@ -565,6 +581,8 @@ class Settings(BaseSettings):
         "decision_hermes_model",
         "decision_hermes_provider",
         "decision_hermes_profile_path",
+        "decision_hermes_runtime_manifest_path",
+        "decision_hermes_attestation_key_path",
         "backup_dir",
         "ow_database_url",
         "hermes_home",
@@ -637,11 +655,13 @@ class Settings(BaseSettings):
             if (
                 parsed.hostname is not None
                 and not is_loopback_host(parsed.hostname)
+                and not self.decision_hermes_allow_attested_private_http
             ):
                 raise ValueError(
                     "local decision execution requires a loopback Hermes "
-                    "origin; set decision_execution_scope='hosted' for "
-                    "remote or cloud processing"
+                    "origin or an explicitly attested private runtime; set "
+                    "decision_execution_scope='hosted' for remote or cloud "
+                    "processing"
                 )
         if (
             self.decision_hermes_session_ttl_seconds

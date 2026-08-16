@@ -1,76 +1,31 @@
 #!/usr/bin/env python3
-"""Bootstrap the Hermes agent plane for HealthMes (docs/PLAN.md Phase 0).
+"""Bootstrap the dedicated Hermes Responses runtime for HealthMes.
 
-Idempotent glue between this repo and a Hermes home directory. It never
-touches ``vendor/``; the only artifacts land inside ``$HERMES_HOME`` (a
-directory outside the vendor tree) and the repo-root ``.env``:
-
-1. Render ``config/hermes-config.yaml.tmpl`` (Jinja2) from env/.env into
-   ``$HERMES_HOME/config.yaml`` — the file both the gateway
-   (vendor/hermes-agent/gateway/config.py::load_gateway_config) and the MCP
-   client (vendor/hermes-agent/tools/mcp_tool.py via hermes_cli.config)
-   read. If a config.yaml already exists, the rendered mapping is
-   deep-merged over it (rendered keys win, unrelated user keys survive) and
-   the previous file is backed up once.
-2. Copy each ``skills/<name>/`` directory (must contain SKILL.md) into
-   ``$HERMES_HOME/skills/<name>`` — the discovery path scanned by
-   vendor/hermes-agent/tools/skills_tool.py (SKILLS_DIR = HERMES_HOME/skills).
-   A copy, not a symlink: the vendor trust check resolves symlinks
-   (skills_tool.py ``skill_md.resolve().relative_to(trusted)``) and logs a
-   "skill file is outside the trusted skills directory" security warning on
-   every skill load — every alert and briefing. Copies inside $HERMES_HOME
-   resolve as trusted, and they work identically in docker mode where
-   ./data/hermes is the only path mounted into the hermes container.
-   Legacy symlinks from earlier bootstraps are migrated to copies.
-3. Generate missing secrets into ``.env`` (currently the webhook HMAC
-   secret shared between healthmes triggers and the Hermes webhook route).
-4. Install the briefing state-snapshot script (scripts/
-   healthmes_briefing_snapshot.py) into ``$HERMES_HOME/scripts/`` plus a
-   sidecar JSON carrying the healthmes base URL — the vendor cron scheduler
-   only runs ``script:`` files from inside that directory
-   (cron/scheduler.py::_run_job_script path guard) and injects their stdout
-   into the briefing prompt as context (docs/PLAN.md section 4).
-5. Register the three cron briefings (morning plan 07:00, evening review
-   21:30, weekly planning Sunday 18:00), and reconcile an existing
-   HealthMes-managed morning job, against
-   vendor/hermes-agent/cron/jobs.py::create_job, each with ``script=`` set
-   to the installed snapshot. The vendor module is imported and called
-   directly when importable AND croniter is available (cron-expression
-   schedules require it); otherwise the exact job payload ``create_job``
-   would produce is written to ``$HERMES_HOME/cron/jobs.json`` in the
-   vendor's ``{"jobs": [...], "updated_at": ...}`` envelope. Fallback
-   timestamps honor the Hermes timezone the same way the vendor does
-   (HERMES_TIMEZONE env, then the config.yaml ``timezone`` key —
-   vendor/hermes-agent/hermes_time.py).
+The canonical deployment has one reasoning ingress:
+``POST /v1/wellness-decisions``. This command writes only the isolated
+``$HERMES_HOME/decision`` profile and its content-bound manifest and
+attestation key. It deliberately leaves the legacy general Hermes home,
+Telegram, webhooks, cron jobs, and installed Hermes skills untouched.
 
 Run targets (HERMES_HOME resolution, highest precedence first):
   --hermes-home flag > HERMES_HOME env var > mode default
-  (native: ~/.hermes, docker: <repo>/data/hermes — the host side of the
-  ``./data/hermes:/opt/data`` bind mount in docker-compose.yml).
-
-Mode only changes *defaults*; explicit environment variables always win, so
-no docker service hostname is ever hardcoded for the native path:
-
-  variable                     native default                  docker default
-  OW_MCP_DIR                   <repo>/vendor/open-wearables/mcp  /opt/vendor/open-wearables-mcp
-  OW_MCP_VENV_DIR              <repo>/data/ow-mcp-venv           /opt/data/ow-mcp-venv
-  OW_MCP_UV_CACHE_DIR          <repo>/data/uv-cache              /opt/data/uv-cache
-  OW_BASE_URL                  http://localhost:8000             http://ow-backend:8000
-  HEALTHMES_MCP_URL            http://localhost:<port>/mcp       http://healthmes:8100/mcp
+  (native: ~/.hermes, docker: <repo>/data/hermes).
 
 Usage:
   uv run python scripts/bootstrap.py [--dry-run] [--mode native|docker]
-      [--hermes-home PATH] [--env-file PATH] [--print-config]
+      [--hermes-home PATH] [--env-file PATH]
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+import stat
 import sys
 import tempfile
 import uuid
@@ -83,6 +38,17 @@ from zoneinfo import ZoneInfo
 
 import yaml
 from jinja2 import Environment, StrictUndefined
+
+from healthmes.decision.hermes_profile import (
+    HermesDecisionProfileAssertion,
+)
+from healthmes.hermes_runtime_identity import (
+    HERMES_RUNTIME_PROVIDER_ENV_NAMES,
+    build_runtime_manifest,
+    runtime_home_artifact_sha256,
+    write_new_attestation_key,
+    write_runtime_manifest,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_PATH = REPO_ROOT / "config" / "hermes-config.yaml.tmpl"
@@ -99,6 +65,36 @@ GENERATED_DECISION_API_KEY = "HEALTHMES_DECISION_HERMES_API_KEY"
 GENERATED_DECISION_PROFILE_PATH = (
     "HEALTHMES_DECISION_HERMES_PROFILE_PATH"
 )
+GENERATED_DECISION_MANIFEST_PATH = (
+    "HEALTHMES_DECISION_HERMES_RUNTIME_MANIFEST_PATH"
+)
+GENERATED_DECISION_ATTESTATION_KEY_PATH = (
+    "HEALTHMES_DECISION_HERMES_ATTESTATION_KEY_PATH"
+)
+NATIVE_DECISION_PUBLIC_ORIGIN = "http://127.0.0.1:8645"
+DOCKER_DECISION_PUBLIC_ORIGIN = "http://hermes-decision:8645"
+GENERATED_DECISION_PUBLIC_ORIGINS = frozenset(
+    {
+        NATIVE_DECISION_PUBLIC_ORIGIN,
+        DOCKER_DECISION_PUBLIC_ORIGIN,
+    }
+)
+DECISION_SOUL = (
+    "You are the dedicated Hermes execution runtime for HealthMes wellness "
+    "decisions. Accept reasoning only through the configured API-server "
+    "Responses route. Follow the per-request HealthMes instructions and use "
+    "only the explicitly configured HealthMes MCP tools. Do not initiate "
+    "messages, scheduled work, webhook reasoning, or unrelated tasks.\n"
+)
+DECISION_ENV = (
+    "# Managed by HealthMes. Provider credentials are supplied only through\n"
+    "# the manifest-bound supervisor environment; do not add values here.\n"
+)
+DECISION_HOME_ARTIFACT_CONTENT = {
+    "SOUL.md": DECISION_SOUL,
+    ".env": DECISION_ENV,
+    ".no-bundled-skills": "",
+}
 
 # Non-generatable credentials we can only warn about.
 WARN_IF_MISSING = (
@@ -395,6 +391,129 @@ def ensure_decision_profile_path(
     return generated
 
 
+def ensure_generated_path(
+    env_file: Path,
+    env: dict[str, str],
+    *,
+    key: str,
+    path: Path,
+    plan: Plan,
+) -> str:
+    """Persist one bootstrap-owned artifact path unless explicitly set."""
+
+    existing = env.get(key, "").strip()
+    if existing:
+        return existing
+    generated = str(path.expanduser().resolve())
+    plan.act(f"set {key} in {env_file} to {generated}")
+    if not plan.dry_run:
+        upsert_env_var(env_file, key, generated)
+    return generated
+
+
+def validate_generated_path_override(
+    env: Mapping[str, str],
+    *,
+    key: str,
+    expected_path: Path,
+) -> None:
+    """Reject a path override that would detach the attested runtime bundle."""
+
+    configured = env.get(key, "").strip()
+    if not configured:
+        return
+    if (
+        Path(configured).expanduser().resolve()
+        != expected_path.expanduser().resolve()
+    ):
+        raise ValueError(f"{key} must point to {expected_path}")
+
+
+def validate_dedicated_home_path(decision_home: Path) -> None:
+    """Reject a symlink or non-directory before any bootstrap mutation."""
+
+    try:
+        metadata = decision_home.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValueError(
+            f"dedicated Hermes runtime home is unreadable: {decision_home}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode) or decision_home.is_symlink()
+    ):
+        raise ValueError(
+            f"dedicated Hermes runtime home is unsafe: {decision_home}"
+        )
+
+
+def prepare_dedicated_home(
+    decision_home: Path,
+    plan: Plan,
+) -> None:
+    """Create or tighten the validated owner-only runtime directory."""
+
+    validate_dedicated_home_path(decision_home)
+    plan.act(f"ensure owner-only dedicated runtime home {decision_home}")
+    if plan.dry_run:
+        return
+    decision_home.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(decision_home, 0o700)
+    verified = decision_home.lstat()
+    if (
+        not stat.S_ISDIR(verified.st_mode)
+        or decision_home.is_symlink()
+        or stat.S_IMODE(verified.st_mode) != 0o700
+    ):
+        raise ValueError(
+            f"dedicated Hermes runtime home is unsafe: {decision_home}"
+        )
+
+
+def resolve_decision_public_origin(
+    env: Mapping[str, str],
+    *,
+    mode: str,
+) -> tuple[str, bool]:
+    """Switch bootstrap-owned defaults while preserving a custom origin."""
+
+    generated = (
+        DOCKER_DECISION_PUBLIC_ORIGIN
+        if mode == "docker"
+        else NATIVE_DECISION_PUBLIC_ORIGIN
+    )
+    configured = env.get(
+        "HEALTHMES_DECISION_HERMES_BASE_URL",
+        "",
+    ).strip()
+    if not configured or configured in GENERATED_DECISION_PUBLIC_ORIGINS:
+        return generated, configured != generated
+    return configured, False
+
+
+def ensure_docker_bind_identity(
+    env_file: Path,
+    env: dict[str, str],
+    plan: Plan,
+) -> None:
+    """Bind the container user to the owner of the 0600 runtime files."""
+
+    for key, generated in (
+        ("HERMES_UID", str(os.getuid())),
+        ("HERMES_GID", str(os.getgid())),
+    ):
+        configured = env.get(key, "").strip()
+        if configured:
+            if not configured.isdecimal():
+                raise ValueError(f"{key} must be a non-negative integer")
+            continue
+        plan.act(f"set {key} in {env_file} to {generated}")
+        env[key] = generated
+        if not plan.dry_run:
+            upsert_env_var(env_file, key, generated)
+
+
 # ---------------------------------------------------------------------------
 # Template rendering
 # ---------------------------------------------------------------------------
@@ -418,6 +537,54 @@ def mode_defaults(mode: str, repo_root: Path, env: dict[str, str]) -> dict[str, 
         "ow_base_url": env.get("HEALTHMES_OW_BASE_URL", "").strip()
         or "http://localhost:8000",
         "healthmes_mcp_url": f"http://localhost:{healthmes_port}/mcp",
+    }
+
+
+def build_decision_context(
+    env: Mapping[str, str],
+    mode: str,
+    repo_root: Path,
+) -> dict[str, str]:
+    """Build only the values consumed by the dedicated decision profile."""
+
+    defaults = mode_defaults(mode, repo_root, dict(env))
+    return {
+        "healthmes_mcp_url": env.get("HEALTHMES_MCP_URL", "").strip()
+        or defaults["healthmes_mcp_url"],
+        "healthmes_api_token": env.get(
+            "HEALTHMES_API_TOKEN",
+            "",
+        ).strip(),
+        "decision_hermes_host": env.get(
+            "HEALTHMES_DECISION_HERMES_INTERNAL_HOST",
+            "",
+        ).strip()
+        or "127.0.0.1",
+        "decision_hermes_port": env.get(
+            "HEALTHMES_DECISION_HERMES_INTERNAL_PORT",
+            "",
+        ).strip()
+        or "8646",
+        "decision_hermes_api_key": env.get(
+            GENERATED_DECISION_API_KEY,
+            "",
+        ).strip(),
+        "decision_hermes_model": env.get(
+            "HEALTHMES_DECISION_HERMES_MODEL",
+            "",
+        ).strip(),
+        "decision_hermes_provider": env.get(
+            "HEALTHMES_DECISION_HERMES_PROVIDER",
+            "",
+        ).strip(),
+        "decision_hermes_model_base_url": env.get(
+            "HEALTHMES_DECISION_HERMES_MODEL_BASE_URL",
+            "",
+        ).strip(),
+        "decision_hermes_model_api_key": env.get(
+            "HEALTHMES_DECISION_HERMES_MODEL_API_KEY",
+            "",
+        ).strip(),
     }
 
 
@@ -473,13 +640,15 @@ def build_context(
         # agent keeps reaching its Layer-B tools behind auth.
         "healthmes_api_token": env.get("HEALTHMES_API_TOKEN", "").strip(),
         "decision_hermes_host": env.get(
-            "HEALTHMES_DECISION_HERMES_HOST",
+            "HEALTHMES_DECISION_HERMES_INTERNAL_HOST",
             "",
-        ).strip(),
+        ).strip()
+        or "127.0.0.1",
         "decision_hermes_port": env.get(
-            "HEALTHMES_DECISION_HERMES_PORT",
+            "HEALTHMES_DECISION_HERMES_INTERNAL_PORT",
             "",
-        ).strip(),
+        ).strip()
+        or "8646",
         "decision_hermes_api_key": env.get(
             GENERATED_DECISION_API_KEY,
             "",
@@ -566,6 +735,143 @@ def write_config(hermes_home: Path, rendered: str, plan: Plan) -> Path:
         )
         _chmod_quiet(config_path, 0o600)
     return config_path
+
+
+def write_exact_decision_config(
+    decision_home: Path,
+    rendered: str,
+    plan: Plan,
+) -> Path:
+    """Atomically replace the dedicated profile without preserving broad keys."""
+
+    config_path = decision_home / "config.yaml"
+    if (
+        config_path.is_file()
+        and config_path.read_text(encoding="utf-8") == rendered
+    ):
+        plan.act(f"keep {config_path} (exact decision profile is current)")
+        if not plan.dry_run:
+            os.chmod(config_path, 0o600)
+        return config_path
+    plan.act(f"replace {config_path} with the exact dedicated profile")
+    if not plan.dry_run:
+        decision_home.mkdir(parents=True, exist_ok=True)
+        _backup_runtime_artifact(config_path)
+        _atomic_write_text(config_path, rendered, mode=0o600)
+    return config_path
+
+
+def write_decision_runtime_artifacts(
+    decision_home: Path,
+    plan: Plan,
+) -> None:
+    """Write fixed runtime files while archiving any prior user content."""
+
+    for name, content in DECISION_HOME_ARTIFACT_CONTENT.items():
+        path = decision_home / name
+        if path.is_file() and path.read_text(encoding="utf-8") == content:
+            plan.act(f"keep {path} (managed runtime artifact is current)")
+            if not plan.dry_run:
+                os.chmod(path, 0o600)
+            continue
+        plan.act(f"replace {path} with the managed runtime artifact")
+        if not plan.dry_run:
+            decision_home.mkdir(parents=True, exist_ok=True)
+            _backup_runtime_artifact(path)
+            _atomic_write_text(path, content, mode=0o600)
+
+
+def _backup_runtime_artifact(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(
+            f"dedicated Hermes runtime artifact is unsafe: {path}"
+        )
+    backup_dir = path.parent.parent / "decision-runtime-backups"
+    backup_name = path.name.lstrip(".") or "artifact"
+    backup_path = backup_dir / f"{backup_name}.pre-healthmes-runtime"
+    if backup_path.exists():
+        return
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, backup_path)
+    _chmod_quiet(backup_path, 0o600)
+
+
+def assert_dedicated_home_has_no_broad_reasoning(
+    decision_home: Path,
+) -> None:
+    """Fail closed instead of deleting unknown state from an existing home."""
+
+    forbidden_files = [
+        decision_home / name
+        for name in (
+            ".anthropic_oauth.json",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "MEMORY.md",
+            "USER.md",
+            "auth.json",
+            "config.yaml.pre-healthmes-runtime",
+            "mcp.json",
+            "webhook_subscriptions.json",
+        )
+        if (decision_home / name).exists()
+        or (decision_home / name).is_symlink()
+    ]
+    forbidden_dirs: list[Path] = []
+    for name in (
+        ".codex",
+        "cron",
+        "hooks",
+        "memories",
+        "mcp-tokens",
+        "plugins",
+        "profiles",
+        "scripts",
+        "skills",
+    ):
+        path = decision_home / name
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            forbidden_dirs.append(path)
+            continue
+        if not path.is_dir():
+            continue
+        try:
+            next(path.iterdir())
+        except StopIteration:
+            continue
+        forbidden_dirs.append(path)
+    forbidden = [*forbidden_files, *forbidden_dirs]
+    if forbidden:
+        rendered = ", ".join(
+            str(path) for path in sorted(forbidden, key=str)
+        )
+        raise ValueError(
+            "dedicated Hermes home contains broad reasoning artifacts; "
+            f"archive them before bootstrap: {rendered}"
+        )
+
+
+def _atomic_write_text(path: Path, content: str, *, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _chmod_quiet(path: Path, mode: int) -> None:
@@ -1150,6 +1456,33 @@ def register_cron_jobs(hermes_home: Path, plan: Plan) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _decision_profile_digest(
+    *,
+    rendered: str,
+    model: str,
+    provider: str,
+    api_key: str,
+    persisted_path: Path | None,
+) -> str:
+    if persisted_path is not None:
+        path = persisted_path
+        return HermesDecisionProfileAssertion(
+            path,
+            expected_model=model,
+            expected_provider=provider,
+            expected_api_key=api_key,
+        ).verify()
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "config.yaml"
+        path.write_text(rendered, encoding="utf-8")
+        return HermesDecisionProfileAssertion(
+            path,
+            expected_model=model,
+            expected_provider=provider,
+            expected_api_key=api_key,
+        ).verify()
+
+
 def resolve_hermes_home(args: argparse.Namespace, repo_root: Path) -> Path:
     if args.hermes_home:
         return Path(args.hermes_home).expanduser()
@@ -1165,8 +1498,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="bootstrap.py",
         description=(
-            "Render the Hermes config, link HealthMes skills, mint missing "
-            "secrets, and register the cron briefings (idempotent)."
+            "Render and attest the single dedicated Hermes Responses runtime "
+            "used by HealthMes wellness decisions."
         ),
     )
     parser.add_argument(
@@ -1180,8 +1513,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="native",
         help=(
             "Default-value profile: 'native' targets a mac-local stack "
-            "(localhost endpoints, ~/.hermes); 'docker' targets the "
-            "docker-compose stack (in-cluster endpoints, ./data/hermes). "
+            "(localhost endpoints, ~/.hermes/decision); 'docker' targets the "
+            "docker-compose stack (in-cluster endpoints, "
+            "./data/hermes/decision). "
             "Explicit env vars always override either profile."
         ),
     )
@@ -1194,16 +1528,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=str(REPO_ROOT / ".env"),
         help="dotenv file to read and to receive generated secrets (default: <repo>/.env).",
     )
-    parser.add_argument(
-        "--print-config",
-        action="store_true",
-        help="Print the rendered config.yaml to stdout.",
-    )
-    parser.add_argument(
-        "--skip-cron",
-        action="store_true",
-        help="Skip cron briefing registration.",
-    )
     return parser.parse_args(argv)
 
 
@@ -1214,60 +1538,176 @@ def run(args: argparse.Namespace) -> int:
     decision_home = hermes_home / "decision"
     env = resolve_env(env_file)
 
-    for key in WARN_IF_MISSING:
-        if not env.get(key, "").strip():
-            plan.warn(
-                f"{key} is not set (in {env_file} or the environment); the "
-                f"rendered config will contain an empty value"
-            )
-    if not env.get("TELEGRAM_HOME_CHAT_ID", "").strip():
-        # Without it the rendered config has neither telegram.home_channel nor
-        # the alert route's deliver_extra.chat_id, so `deliver: telegram`
-        # (cron briefings + webhook alerts) fails at send time with "No
-        # chat_id or home channel" (vendor gateway/platforms/webhook.py)
-        # until a home channel exists.
-        plan.warn(
-            "TELEGRAM_HOME_CHAT_ID is not set: cron briefings and webhook "
-            "alerts have no Telegram delivery target and will fail at send "
-            "time until you set it (re-run bootstrap) or send /sethome to "
-            "the bot in your Telegram chat"
+    model = env.get("HEALTHMES_DECISION_HERMES_MODEL", "").strip()
+    provider = env.get(
+        "HEALTHMES_DECISION_HERMES_PROVIDER",
+        "",
+    ).strip()
+    if not model or not provider:
+        raise ValueError(
+            "HEALTHMES_DECISION_HERMES_MODEL and "
+            "HEALTHMES_DECISION_HERMES_PROVIDER are required"
+        )
+    profile_path = decision_home / "config.yaml"
+    manifest_path = decision_home / "runtime-manifest.json"
+    key_path = decision_home / "runtime-attestation.key"
+    validate_dedicated_home_path(decision_home)
+    assert_dedicated_home_has_no_broad_reasoning(decision_home)
+    for key, expected_path in (
+        (GENERATED_DECISION_PROFILE_PATH, profile_path),
+        (GENERATED_DECISION_MANIFEST_PATH, manifest_path),
+        (GENERATED_DECISION_ATTESTATION_KEY_PATH, key_path),
+    ):
+        validate_generated_path_override(
+            env,
+            key=key,
+            expected_path=expected_path,
         )
 
-    webhook_secret = ensure_webhook_secret(env_file, env, plan)
-    ensure_calendar_adjustment_secret(env_file, env, plan)
     decision_api_key = ensure_decision_api_key(env_file, env, plan)
     env[GENERATED_DECISION_API_KEY] = decision_api_key
-    decision_profile_path = ensure_decision_profile_path(
+    decision_profile_path = ensure_generated_path(
         env_file,
         env,
-        decision_home / "config.yaml",
-        plan,
+        key=GENERATED_DECISION_PROFILE_PATH,
+        path=profile_path,
+        plan=plan,
     )
     env[GENERATED_DECISION_PROFILE_PATH] = decision_profile_path
-    context = build_context(env, args.mode, REPO_ROOT, webhook_secret)
-    rendered = render_template(context)
+    configured_manifest_path = ensure_generated_path(
+        env_file,
+        env,
+        key=GENERATED_DECISION_MANIFEST_PATH,
+        path=manifest_path,
+        plan=plan,
+    )
+    configured_key_path = ensure_generated_path(
+        env_file,
+        env,
+        key=GENERATED_DECISION_ATTESTATION_KEY_PATH,
+        path=key_path,
+        plan=plan,
+    )
+    env[GENERATED_DECISION_MANIFEST_PATH] = configured_manifest_path
+    env[GENERATED_DECISION_ATTESTATION_KEY_PATH] = configured_key_path
+    if args.mode == "docker":
+        ensure_docker_bind_identity(env_file, env, plan)
+
+    context = build_decision_context(env, args.mode, REPO_ROOT)
     decision_rendered = render_template(
         context,
         template_path=DECISION_TEMPLATE_PATH,
     )
 
-    if args.print_config:
-        print(rendered)
-
-    write_config(hermes_home, rendered, plan)
-    write_config(decision_home, decision_rendered, plan)
-    install_skills(REPO_ROOT, hermes_home, plan)
-    # Before cron registration: the jobs reference this script by name and
-    # create_job's lifecycle guard reads it from $HERMES_HOME/scripts/.
-    install_snapshot_script(hermes_home, context, plan)
-    if args.skip_cron:
-        plan.act("skip cron registration (--skip-cron)")
+    prepare_dedicated_home(decision_home, plan)
+    write_exact_decision_config(decision_home, decision_rendered, plan)
+    write_decision_runtime_artifacts(decision_home, plan)
+    if args.dry_run:
+        attestation_key = secrets.token_bytes(32)
+        plan.act(f"generate owner-only attestation key {key_path}")
     else:
-        method = register_cron_jobs(hermes_home, plan)
-        plan.act(f"cron registration method: {method}")
+        attestation_key = write_new_attestation_key(key_path)
+        plan.act(f"keep owner-only attestation key {key_path}")
+
+    profile_digest = _decision_profile_digest(
+        rendered=decision_rendered,
+        model=model,
+        provider=provider,
+        api_key=decision_api_key,
+        persisted_path=(profile_path if not args.dry_run else None),
+    )
+    public_origin, update_public_origin = resolve_decision_public_origin(
+        env,
+        mode=args.mode,
+    )
+    if args.mode == "docker":
+        runtime_home = Path("/opt/data")
+        runtime_vendor_root = Path("/opt/hermes")
+        launch_argv = (
+            "/opt/hermes/.venv/bin/python",
+            "-m",
+            "hermes_cli.main",
+            "gateway",
+            "run",
+        )
+    else:
+        runtime_home = decision_home.expanduser().resolve()
+        runtime_vendor_root = VENDOR_HERMES.resolve()
+        uv_binary = shutil.which("uv")
+        if uv_binary is None:
+            raise ValueError("uv is required to launch the native Hermes runtime")
+        launch_argv = (
+            str(Path(uv_binary).resolve()),
+            "run",
+            "--directory",
+            str(VENDOR_HERMES.resolve()),
+            "hermes",
+            "gateway",
+            "run",
+        )
+    if update_public_origin:
+        plan.act(
+            "set HEALTHMES_DECISION_HERMES_BASE_URL in "
+            f"{env_file} to {public_origin}"
+        )
+        if not args.dry_run:
+            upsert_env_var(
+                env_file,
+                "HEALTHMES_DECISION_HERMES_BASE_URL",
+                public_origin,
+            )
+    internal_origin = (
+        f"http://{context['decision_hermes_host']}:"
+        f"{context['decision_hermes_port']}"
+    )
+    if args.dry_run:
+        home_artifact_sha256 = {
+            "config.yaml": hashlib.sha256(
+                decision_rendered.encode("utf-8")
+            ).hexdigest(),
+            **{
+                name: hashlib.sha256(content.encode("utf-8")).hexdigest()
+                for name, content in DECISION_HOME_ARTIFACT_CONTENT.items()
+            },
+        }
+    else:
+        home_artifact_sha256 = runtime_home_artifact_sha256(
+            decision_home
+        )
+    provider_environment = {
+        name: value
+        for name, value in env.items()
+        if name in HERMES_RUNTIME_PROVIDER_ENV_NAMES and value
+    }
+    manifest = build_runtime_manifest(
+        profile_bytes=decision_rendered.encode("utf-8"),
+        profile_semantic_digest=profile_digest,
+        model=model,
+        provider=provider,
+        api_key=decision_api_key,
+        attestation_key=attestation_key,
+        hermes_home=runtime_home,
+        public_origin=public_origin,
+        internal_origin=internal_origin,
+        vendor_root=runtime_vendor_root,
+        launch_argv=launch_argv,
+        home_artifact_sha256=home_artifact_sha256,
+        provider_environment=provider_environment,
+        vendor_fingerprint_source=VENDOR_HERMES,
+    )
+    plan.act(
+        f"write content-bound runtime manifest {manifest_path} "
+        f"({manifest.runtime_id})"
+    )
+    if not args.dry_run:
+        write_runtime_manifest(manifest_path, manifest)
+
+    plan.act(
+        "leave the legacy general Hermes home untouched and do not install "
+        "HealthMes Telegram, webhook, skill, MCP, or cron reasoning there"
+    )
 
     plan.report()
-    print(f"[bootstrap] HERMES_HOME: {hermes_home} (mode: {args.mode})")
     print(
         "[bootstrap] decision HERMES_HOME: "
         f"{decision_home} (profile: {decision_home / 'config.yaml'})"

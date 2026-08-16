@@ -47,6 +47,7 @@ from healthmes.decision.responses import (
     HermesHttpResponsesTransport,
     HermesResponsesDecisionAgent,
     HermesResponsesTransport,
+    HermesRuntimeAttestationAssertion,
 )
 from healthmes.decision.runtime import DecisionRuntime
 from healthmes.decision.search import (
@@ -288,11 +289,18 @@ def resolve_decision_execution_scope(
     base_url = settings.decision_hermes_base_url
     if base_url is not None and scope is ExecutionScope.LOCAL:
         hostname = urlsplit(base_url).hostname
-        if hostname is None or not is_loopback_host(hostname):
+        if (
+            hostname is None
+            or (
+                not is_loopback_host(hostname)
+                and not settings.decision_hermes_allow_attested_private_http
+            )
+        ):
             raise ValueError(
-                "local decision execution requires a loopback Hermes origin; "
-                "configure HEALTHMES_DECISION_EXECUTION_SCOPE=hosted for "
-                "remote or cloud processing"
+                "local decision execution requires a loopback or explicitly "
+                "attested private Hermes origin; configure "
+                "HEALTHMES_DECISION_EXECUTION_SCOPE=hosted for remote or "
+                "cloud processing"
             )
     return scope
 
@@ -378,12 +386,30 @@ def build_configured_decision_engine(
 
     execution_scope = resolve_decision_execution_scope(settings)
     profile_path = settings.decision_hermes_profile_path
+    manifest_path = settings.decision_hermes_runtime_manifest_path
+    attestation_key_path = settings.decision_hermes_attestation_key_path
     api_key = settings.decision_hermes_api_key.get_secret_value().strip()
-    if transport is None and profile_path is None:
-        raise ValueError(
-            "decision_hermes_profile_path is required for the production "
-            "Hermes Responses runtime"
-        )
+    if transport is None:
+        missing_artifacts = [
+            name
+            for name, value in (
+                ("decision_hermes_profile_path", profile_path),
+                (
+                    "decision_hermes_runtime_manifest_path",
+                    manifest_path,
+                ),
+                (
+                    "decision_hermes_attestation_key_path",
+                    attestation_key_path,
+                ),
+            )
+            if value is None
+        ]
+        if missing_artifacts:
+            raise ValueError(
+                ", ".join(missing_artifacts)
+                + " are required for the production Hermes Responses runtime"
+            )
     profile_assertion = (
         HermesDecisionProfileAssertion(
             profile_path,
@@ -401,6 +427,21 @@ def build_configured_decision_engine(
                 "decision_hermes_api_key is required for the production "
                 "Hermes Responses runtime"
             )
+        if (
+            profile_assertion is None
+            or manifest_path is None
+            or attestation_key_path is None
+        ):
+            raise AssertionError("decision runtime artifacts were not checked")
+        runtime_attestation = HermesRuntimeAttestationAssertion(
+            manifest_path=manifest_path,
+            attestation_key_path=attestation_key_path,
+            profile_assertion=profile_assertion,
+            expected_origin=base_url,
+            expected_model=model,
+            expected_provider=provider,
+            expected_api_key=api_key,
+        )
         selected_transport = HermesHttpResponsesTransport(
             base_url=base_url,
             api_key=api_key,
@@ -409,6 +450,10 @@ def build_configured_decision_engine(
             ),
             max_response_timeout_seconds=(
                 settings.decision_hermes_max_iteration_timeout_seconds
+            ),
+            runtime_attestation=runtime_attestation,
+            allow_attested_private_http=(
+                settings.decision_hermes_allow_attested_private_http
             ),
         )
     policy_resolver = DatabaseDecisionPolicyResolver(

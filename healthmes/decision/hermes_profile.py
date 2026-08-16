@@ -15,20 +15,45 @@ import yaml
 
 HERMES_DECISION_MCP_SERVER = "healthmes"
 HERMES_DECISION_RUNTIME_MODEL_NAME = "healthmes-decision-runtime"
-HERMES_DECISION_MCP_TOOL_NAMES = (
+HERMES_DECISION_SEARCH_MCP_TOOL_NAMES = (
     "search_activity",
     "search_calendar",
     "search_nutrition",
     "search_wearable",
 )
+HERMES_DECISION_SKILL_MCP_TOOL_NAMES = (
+    "list_wellness_skills",
+    "read_wellness_skill",
+)
+# Backward-compatible public name for the minimum search-only profile.
+HERMES_DECISION_MCP_TOOL_NAMES = HERMES_DECISION_SEARCH_MCP_TOOL_NAMES
 HERMES_DECISION_TOOL_DOMAINS: dict[str, str] = {
     "mcp__healthmes__search_activity": "activity",
     "mcp__healthmes__search_nutrition": "nutrition",
     "mcp__healthmes__search_calendar": "calendar",
     "mcp__healthmes__search_wearable": "wearable",
 }
-HERMES_DECISION_TOOL_ALLOWLIST = frozenset(
+HERMES_DECISION_SEARCH_TOOL_ALLOWLIST = frozenset(
     HERMES_DECISION_TOOL_DOMAINS
+)
+HERMES_DECISION_SKILL_TOOL_ALLOWLIST = frozenset(
+    f"mcp__{HERMES_DECISION_MCP_SERVER}__{name}"
+    for name in HERMES_DECISION_SKILL_MCP_TOOL_NAMES
+)
+HERMES_DECISION_TOOL_ALLOWLIST = (
+    HERMES_DECISION_SEARCH_TOOL_ALLOWLIST
+    | HERMES_DECISION_SKILL_TOOL_ALLOWLIST
+)
+HERMES_DECISION_EXACT_MCP_TOOL_PROFILES = frozenset(
+    {
+        frozenset(HERMES_DECISION_SEARCH_MCP_TOOL_NAMES),
+        frozenset(
+            (
+                *HERMES_DECISION_SEARCH_MCP_TOOL_NAMES,
+                *HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
+            )
+        ),
+    }
 )
 
 # The API-server platform is explicitly limited to the HealthMes MCP server.
@@ -74,6 +99,15 @@ class HermesDecisionProfileError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class HermesDecisionProfileDetails:
+    """Verified semantic digest and exact MCP surface."""
+
+    semantic_digest: str
+    mcp_tool_names: tuple[str, ...]
+    full_tool_names: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
 class HermesDecisionProfileAssertion:
     """Validate a local deployment artifact before contacting Hermes."""
 
@@ -83,6 +117,11 @@ class HermesDecisionProfileAssertion:
     expected_api_key: str | None = None
 
     def verify(self) -> str:
+        return self.verify_details().semantic_digest
+
+    def verify_details(self) -> HermesDecisionProfileDetails:
+        """Validate and return the exact tool surface bound by the profile."""
+
         path = self.path.expanduser()
         try:
             if not path.is_file():
@@ -116,13 +155,21 @@ class HermesDecisionProfileAssertion:
             expected_provider=self.expected_provider,
             expected_api_key=self.expected_api_key,
         )
+        mcp_tool_names = tuple(asserted["mcp"]["tools"])
         encoded = json.dumps(
             asserted,
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
         ).encode("ascii")
-        return hashlib.sha256(encoded).hexdigest()
+        return HermesDecisionProfileDetails(
+            semantic_digest=hashlib.sha256(encoded).hexdigest(),
+            mcp_tool_names=mcp_tool_names,
+            full_tool_names=frozenset(
+                f"mcp__{HERMES_DECISION_MCP_SERVER}__{name}"
+                for name in mcp_tool_names
+            ),
+        )
 
 
 def _asserted_profile(
@@ -280,8 +327,8 @@ def _asserted_profile(
     if (
         not isinstance(include, list)
         or any(not isinstance(item, str) for item in include)
-        or set(include) != set(HERMES_DECISION_MCP_TOOL_NAMES)
-        or len(include) != len(HERMES_DECISION_MCP_TOOL_NAMES)
+        or frozenset(include) not in HERMES_DECISION_EXACT_MCP_TOOL_PROFILES
+        or len(include) != len(set(include))
         or exclude not in (None, [], ())
     ):
         raise HermesDecisionProfileError(
@@ -307,7 +354,7 @@ def _asserted_profile(
                 f"{parsed_url.scheme}://{parsed_url.netloc}"
                 f"{parsed_url.path.rstrip('/')}"
             ),
-            "tools": sorted(HERMES_DECISION_MCP_TOOL_NAMES),
+            "tools": sorted(include),
         },
     }
 

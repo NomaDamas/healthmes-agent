@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import ipaddress
 import json
 import logging
 import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import Event
 from time import monotonic
 from typing import Any, Literal, Protocol
@@ -36,7 +39,8 @@ from healthmes.decision.contracts import (
 )
 from healthmes.decision.hermes_profile import (
     HERMES_DECISION_RUNTIME_MODEL_NAME,
-    HERMES_DECISION_TOOL_ALLOWLIST,
+    HERMES_DECISION_SEARCH_TOOL_ALLOWLIST,
+    HERMES_DECISION_SKILL_TOOL_ALLOWLIST,
     HERMES_DECISION_TOOL_DOMAINS,
     HermesDecisionProfileAssertion,
     HermesDecisionProfileError,
@@ -50,6 +54,14 @@ from healthmes.decision.validation import (
     normalize_untrusted_json,
     strict_model_validate,
 )
+from healthmes.hermes_runtime_identity import (
+    HERMES_RUNTIME_ATTESTATION_PATH,
+    HermesDecisionRuntimeManifest,
+    HermesRuntimeIdentityError,
+    new_attestation_nonce,
+    validate_expected_runtime,
+    verify_runtime_attestation,
+)
 
 HERMES_RESPONSES_PATH = "/v1/responses"
 HERMES_MODELS_PATH = "/v1/models"
@@ -57,10 +69,12 @@ HERMES_TOOLSETS_PATH = "/v1/toolsets"
 HERMES_SESSION_PATH = "/api/sessions/{session_id}"
 HERMES_DECISION_DRAFT_SCHEMA = "healthmes.decision-draft.v1"
 HERMES_RESPONSES_POLICY_VERSION = "healthmes-responses-policy.v1"
+HERMES_WELLNESS_SKILL_CATALOG_SCHEMA = "healthmes-wellness-skills.v1"
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_TOOLSETS_RESPONSE_BYTES = 256_000
 _MAX_MODELS_RESPONSE_BYTES = 256_000
+_MAX_ATTESTATION_RESPONSE_BYTES = 128_000
 _MAX_SESSIONS_RESPONSE_BYTES = 1_000_000
 _MAX_RESPONSES_RESPONSE_BYTES = 2_000_000
 _MAX_TOOL_OUTPUT_BYTES = 1_000_000
@@ -68,6 +82,7 @@ _MAX_SSE_EVENT_BYTES = 1_250_000
 _MAX_SSE_EVENTS = 2_048
 _MAX_HERMES_SESSION_ID_LENGTH = 256
 _SESSION_ID_CONTROL = re.compile(r"[\r\n\x00]")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _utc(value: datetime) -> datetime:
@@ -254,6 +269,39 @@ class HermesResponsesHttpResult:
     session_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class HermesRuntimeAttestationAssertion:
+    """Expected local artifacts for one pre-execution runtime proof."""
+
+    manifest_path: Path
+    attestation_key_path: Path
+    profile_assertion: HermesDecisionProfileAssertion
+    expected_origin: str
+    expected_model: str
+    expected_provider: str
+    expected_api_key: str = field(repr=False)
+    max_age_seconds: int = 30
+
+    def expected_bundle(
+        self,
+    ) -> tuple[HermesDecisionRuntimeManifest, bytes]:
+        if self.max_age_seconds <= 0 or self.max_age_seconds > 300:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_attestation_window_invalid"
+            )
+        profile_digest = self.profile_assertion.verify()
+        return validate_expected_runtime(
+            manifest_path=self.manifest_path,
+            attestation_key_path=self.attestation_key_path,
+            profile_path=self.profile_assertion.path,
+            profile_semantic_digest=profile_digest,
+            expected_origin=self.expected_origin,
+            expected_model=self.expected_model,
+            expected_provider=self.expected_provider,
+            expected_api_key=self.expected_api_key,
+        )
+
+
 class HermesResponsesTransport(Protocol):
     """Documented Hermes HTTP boundary; no vendor Python imports."""
 
@@ -293,6 +341,10 @@ class HermesHttpResponsesTransport:
         api_key: str | None = None,
         discovery_timeout_seconds: float = 5,
         max_response_timeout_seconds: float = 120,
+        runtime_attestation: (
+            HermesRuntimeAttestationAssertion | None
+        ) = None,
+        allow_attested_private_http: bool = False,
         http_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if discovery_timeout_seconds <= 0:
@@ -302,12 +354,28 @@ class HermesHttpResponsesTransport:
         self._base_url = _validated_hermes_origin(
             base_url,
             api_key=api_key,
+            allow_attested_private_http=(
+                allow_attested_private_http
+                and runtime_attestation is not None
+            ),
         )
+        hostname = urlsplit(self._base_url).hostname
+        if (
+            hostname is None
+            or (
+                not is_loopback_host(hostname)
+                and runtime_attestation is None
+            )
+        ):
+            raise ValueError(
+                "remote Hermes runtime requires content-bound attestation"
+            )
         self._api_key = api_key.strip() if api_key else None
         self._discovery_timeout_seconds = discovery_timeout_seconds
         self._max_response_timeout_seconds = (
             max_response_timeout_seconds
         )
+        self._runtime_attestation = runtime_attestation
         self._http_transport = http_transport
 
     async def get_toolsets(self) -> Mapping[str, Any]:
@@ -347,10 +415,46 @@ class HermesHttpResponsesTransport:
             raise HermesResponsesTransportError(
                 "hermes_streaming_contract_required"
             )
+        await self._attest_runtime()
         return await self._request_sse_response(
             body,
             timeout_seconds=bounded_timeout,
         )
+
+    async def _attest_runtime(self) -> None:
+        assertion = self._runtime_attestation
+        if assertion is None:
+            return
+        try:
+            manifest, key = assertion.expected_bundle()
+            nonce = new_attestation_nonce()
+            payload, _headers = await self._request_json(
+                "POST",
+                HERMES_RUNTIME_ATTESTATION_PATH,
+                json_body={"nonce": nonce},
+                timeout_seconds=self._discovery_timeout_seconds,
+                max_response_bytes=_MAX_ATTESTATION_RESPONSE_BYTES,
+            )
+            verify_runtime_attestation(
+                payload,
+                expected_manifest=manifest,
+                key=key,
+                nonce=nonce,
+                max_age_seconds=assertion.max_age_seconds,
+            )
+        except (
+            HermesDecisionProfileError,
+            HermesRuntimeIdentityError,
+        ) as exc:
+            raise HermesResponsesContractError(str(exc)) from exc
+        except HermesResponsesError as exc:
+            raise HermesResponsesTransportError(
+                "hermes_runtime_attestation_unavailable"
+            ) from exc
+        except Exception as exc:
+            raise HermesResponsesTransportError(
+                "hermes_runtime_attestation_unavailable"
+            ) from exc
 
     async def list_sessions(
         self,
@@ -1209,6 +1313,7 @@ class HermesResponsesDecisionAgent:
         self._session_purge_max_pages = session_purge_max_pages
         self._profile_assertion = profile_assertion
         self._profile_digest: str | None = None
+        self._tool_allowlist = HERMES_DECISION_SEARCH_TOOL_ALLOWLIST
         self._owns_search_service = owns_search_service
         self._clock = clock or (lambda: datetime.now(UTC))
         self._closed = Event()
@@ -1239,9 +1344,9 @@ class HermesResponsesDecisionAgent:
                 return
             try:
                 if self._profile_assertion is not None:
-                    self._profile_digest = (
-                        self._profile_assertion.verify()
-                    )
+                    details = self._profile_assertion.verify_details()
+                    self._profile_digest = details.semantic_digest
+                    self._tool_allowlist = details.full_tool_names
                 raw_toolsets, raw_models = await asyncio.gather(
                     self._transport.get_toolsets(),
                     self._transport.get_models(),
@@ -1338,6 +1443,7 @@ class HermesResponsesDecisionAgent:
                 decision_session_id=handle.session_id,
                 model=self._model,
                 profile_digest=self._profile_digest,
+                tool_allowlist=self._tool_allowlist,
             )
             response = await _before_deadline(
                 self._transport.create_response(
@@ -1356,6 +1462,7 @@ class HermesResponsesDecisionAgent:
                 provider=self._provider,
                 started_at=started_at,
                 finished_at=_utc(self._clock()),
+                tool_allowlist=self._tool_allowlist,
             )
         except asyncio.CancelledError:
             snapshot = _preserve_or_abort_search_session(
@@ -1610,6 +1717,7 @@ def _responses_request(
     decision_session_id: str,
     model: str,
     profile_digest: str | None,
+    tool_allowlist: frozenset[str],
 ) -> dict[str, Any]:
     request_payload = {
         "schema": "healthmes.decision-request.v1",
@@ -1627,12 +1735,29 @@ def _responses_request(
         "budget": request.budget.model_dump(mode="json", round_trip=True),
         "decision_session_id": decision_session_id,
     }
+    search_tools = sorted(
+        tool_allowlist & HERMES_DECISION_SEARCH_TOOL_ALLOWLIST
+    )
+    skill_tools = sorted(
+        tool_allowlist & HERMES_DECISION_SKILL_TOOL_ALLOWLIST
+    )
     instructions = (
         "You are the only LLM reasoning loop for one HealthMes wellness "
         "decision. Choose zero or more of exactly these tools as needed: "
-        + ", ".join(sorted(HERMES_DECISION_TOOL_ALLOWLIST))
-        + ". Every tool call MUST include decision_session_id exactly as "
-        "provided in the request. Never call native Hermes tools, another "
+        + ", ".join(sorted(tool_allowlist))
+        + ". Search tools "
+        + ", ".join(search_tools)
+        + " MUST include decision_session_id exactly as provided in the "
+        "request. "
+        + (
+            "The read-only skill tools "
+            + ", ".join(skill_tools)
+            + " do not accept decision_session_id; use them only for reviewed "
+            "wellness guidance. "
+            if skill_tools
+            else ""
+        )
+        + "Never call native Hermes tools, another "
         "MCP server, mutation tools, memory, filesystem, network, shell, "
         "skills_list, or skill_view. Use tool results as authoritative. "
         "Missing, partial, stale, denied, and unavailable data are not zero. "
@@ -1640,9 +1765,11 @@ def _responses_request(
         "or prose. The object must have exactly two keys: "
         '{"schema":"healthmes.decision-draft.v1","decision":...}. '
         "The decision value must contain only DecisionDraft fields: status, "
-        "answer, proposed_action, used_source_ref_ids, limitations, "
-        "clarification_question, confidence, uncertainty, and "
-        "follow_up_question. Use only source reference IDs returned by tools. "
+        "answer, proposed_action, persistence_intent, used_source_ref_ids, "
+        "limitations, clarification_question, confidence, uncertainty, and "
+        "follow_up_question. persistence_intent is required on every response "
+        "and must be one of none, action, risk, mutation, or "
+        "explicit_tracking. Use only source reference IDs returned by tools. "
         "A proposed action requires at least one source reference. Ask one "
         "concrete clarification question when a required candidate amount, "
         "identity, time, or user fact is missing. Do not diagnose disease."
@@ -1682,6 +1809,7 @@ def _run_from_response(
     provider: str,
     started_at: datetime,
     finished_at: datetime,
+    tool_allowlist: frozenset[str],
 ) -> DecisionAgentRun:
     try:
         response = strict_model_validate(
@@ -1699,12 +1827,25 @@ def _run_from_response(
     function_pairs, final_text = _validate_transcript(
         response.output,
         decision_session_id=snapshot.session_id,
+        tool_allowlist=tool_allowlist,
+    )
+    search_pairs = tuple(
+        pair
+        for pair in function_pairs
+        if pair[0].name in HERMES_DECISION_SEARCH_TOOL_ALLOWLIST
+    )
+    skill_pairs = tuple(
+        pair
+        for pair in function_pairs
+        if pair[0].name in HERMES_DECISION_SKILL_TOOL_ALLOWLIST
     )
     tool_trace = _snapshot_tool_trace(snapshot)
-    if len(function_pairs) != len(tool_trace):
+    if len(search_pairs) != len(tool_trace):
         raise HermesResponsesContractError(
             "hermes_tool_trace_mismatch"
         )
+    for call, output in skill_pairs:
+        _validate_skill_tool_pair(call, output)
 
     trace_by_query = {
         str(record.query.query_id): record for record in tool_trace
@@ -1716,7 +1857,7 @@ def _run_from_response(
     transcript_ref_ids: set[str] = set()
     seen_queries: set[str] = set()
     transcript_query_ids: list[str] = []
-    for call, output in function_pairs:
+    for call, output in search_pairs:
         result = _parse_tool_output(output.output)
         query_id = str(result.query_id)
         record = trace_by_query.get(query_id)
@@ -1817,6 +1958,7 @@ def _validate_transcript(
     raw_items: tuple[dict[str, Any], ...],
     *,
     decision_session_id: str,
+    tool_allowlist: frozenset[str],
 ) -> tuple[
     tuple[tuple[HermesFunctionCallItem, HermesFunctionOutputItem], ...],
     str,
@@ -1845,7 +1987,7 @@ def _validate_transcript(
                     HermesFunctionCallItem,
                     raw_item,
                 )
-                if call.name not in HERMES_DECISION_TOOL_ALLOWLIST:
+                if call.name not in tool_allowlist:
                     raise HermesResponsesContractError(
                         "hermes_tool_not_allowed"
                     )
@@ -1858,10 +2000,16 @@ def _validate_transcript(
                     code="hermes_tool_arguments_invalid",
                     max_bytes=256_000,
                 )
-                if arguments.get("decision_session_id") != decision_session_id:
+                if (
+                    call.name in HERMES_DECISION_SEARCH_TOOL_ALLOWLIST
+                    and arguments.get("decision_session_id")
+                    != decision_session_id
+                ):
                     raise HermesResponsesContractError(
                         "hermes_decision_session_mismatch"
                     )
+                if call.name in HERMES_DECISION_SKILL_TOOL_ALLOWLIST:
+                    _validate_skill_tool_arguments(call.name, arguments)
                 calls[call.call_id] = call
             elif item_type == "function_call_output":
                 if final_seen:
@@ -1908,6 +2056,16 @@ def _validate_transcript(
 
 
 def _parse_tool_output(raw_output: str) -> ContextSearchResult:
+    payload = _unwrap_tool_output(raw_output)
+    try:
+        return strict_model_validate(ContextSearchResult, payload)
+    except Exception as exc:
+        raise HermesResponsesContractError(
+            "hermes_tool_output_invalid"
+        ) from exc
+
+
+def _unwrap_tool_output(raw_output: str) -> dict[str, Any]:
     outer = _parse_json_object(
         raw_output,
         code="hermes_tool_output_invalid",
@@ -1933,12 +2091,132 @@ def _parse_tool_output(raw_output: str) -> ContextSearchResult:
         raise HermesResponsesContractError(
             "hermes_tool_output_invalid"
         )
-    try:
-        return strict_model_validate(ContextSearchResult, payload)
-    except Exception as exc:
+    return payload
+
+
+def _validate_skill_tool_arguments(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> None:
+    if tool_name == "mcp__healthmes__list_wellness_skills":
+        if arguments:
+            raise HermesResponsesContractError(
+                "hermes_skill_tool_arguments_invalid"
+            )
+        return
+    if tool_name == "mcp__healthmes__read_wellness_skill":
+        name = arguments.get("name")
+        if (
+            set(arguments) != {"name"}
+            or not isinstance(name, str)
+            or not name.strip()
+            or len(name) > 255
+        ):
+            raise HermesResponsesContractError(
+                "hermes_skill_tool_arguments_invalid"
+            )
+        return
+    raise HermesResponsesContractError("hermes_tool_not_allowed")
+
+
+def _validate_skill_tool_pair(
+    call: HermesFunctionCallItem,
+    output: HermesFunctionOutputItem,
+) -> None:
+    arguments = _parse_json_object(
+        call.arguments,
+        code="hermes_skill_tool_arguments_invalid",
+        max_bytes=256_000,
+    )
+    _validate_skill_tool_arguments(call.name, arguments)
+    payload = _unwrap_tool_output(output.output)
+    if payload.get("schema") != HERMES_WELLNESS_SKILL_CATALOG_SCHEMA:
         raise HermesResponsesContractError(
-            "hermes_tool_output_invalid"
+            "hermes_skill_tool_output_invalid"
+        )
+    if call.name == "mcp__healthmes__list_wellness_skills":
+        skills = payload.get("skills")
+        if set(payload) != {"schema", "skills"} or not isinstance(
+            skills, list
+        ):
+            raise HermesResponsesContractError(
+                "hermes_skill_tool_output_invalid"
+            )
+        names: set[str] = set()
+        for metadata in skills:
+            name = _validate_skill_metadata(metadata)
+            if name in names:
+                raise HermesResponsesContractError(
+                    "hermes_skill_tool_output_invalid"
+                )
+            names.add(name)
+        return
+    if call.name != "mcp__healthmes__read_wellness_skill":
+        raise HermesResponsesContractError("hermes_tool_not_allowed")
+    if set(payload) != {"schema", "skill", "content"}:
+        raise HermesResponsesContractError(
+            "hermes_skill_tool_output_invalid"
+        )
+    metadata = payload.get("skill")
+    content = payload.get("content")
+    name = _validate_skill_metadata(metadata)
+    if name != arguments["name"] or not isinstance(content, str):
+        raise HermesResponsesContractError(
+            "hermes_skill_tool_output_invalid"
+        )
+    try:
+        encoded = content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise HermesResponsesContractError(
+            "hermes_skill_tool_output_invalid"
         ) from exc
+    if (
+        len(encoded) != metadata["bytes"]
+        or hashlib.sha256(encoded).hexdigest() != metadata["sha256"]
+    ):
+        raise HermesResponsesContractError(
+            "hermes_skill_tool_output_invalid"
+        )
+
+
+def _validate_skill_metadata(raw: Any) -> str:
+    if type(raw) is not dict or set(raw) not in (
+        {"name", "description", "sha256", "bytes"},
+        {"name", "description", "sha256", "bytes", "version"},
+    ):
+        raise HermesResponsesContractError(
+            "hermes_skill_tool_output_invalid"
+        )
+    name = raw.get("name")
+    description = raw.get("description")
+    digest = raw.get("sha256")
+    byte_count = raw.get("bytes")
+    version = raw.get("version")
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or len(name) > 255
+        or not isinstance(description, str)
+        or not description.strip()
+        or len(description) > 4_096
+        or not isinstance(digest, str)
+        or _SHA256.fullmatch(digest) is None
+        or isinstance(byte_count, bool)
+        or not isinstance(byte_count, int)
+        or not 0 < byte_count <= 64_000
+        or (
+            "version" in raw
+            and (
+                not isinstance(version, str)
+                or not version.strip()
+                or len(version) > 255
+            )
+        )
+    ):
+        raise HermesResponsesContractError(
+            "hermes_skill_tool_output_invalid"
+        )
+    return name
 
 
 def _parse_final_draft(raw_text: str) -> HermesDecisionDraftEnvelope:
@@ -1952,6 +2230,29 @@ def _parse_final_draft(raw_text: str) -> HermesDecisionDraftEnvelope:
             code="hermes_final_json_invalid",
             max_bytes=64_000,
         )
+        if set(payload) != {"schema", "decision"} or payload.get(
+            "schema"
+        ) != HERMES_DECISION_DRAFT_SCHEMA:
+            raise HermesResponsesContractError(
+                "hermes_final_json_invalid"
+            )
+        decision = payload.get("decision")
+        if type(decision) is not dict:
+            raise HermesResponsesContractError(
+                "hermes_final_json_invalid"
+            )
+        if "persistence_intent" not in decision:
+            raise HermesResponsesContractError(
+                "hermes_persistence_intent_missing"
+            )
+        if "persistence_intent" not in DecisionDraft.model_fields:
+            if decision.get("persistence_intent") != "none":
+                raise HermesResponsesContractError(
+                    "hermes_final_json_invalid"
+                )
+            decision = dict(decision)
+            decision.pop("persistence_intent")
+            payload = {**payload, "decision": decision}
         return strict_model_validate(
             HermesDecisionDraftEnvelope,
             payload,
@@ -2209,6 +2510,7 @@ def _validated_hermes_origin(
     value: str,
     *,
     api_key: str | None,
+    allow_attested_private_http: bool = False,
 ) -> str:
     if not isinstance(value, str):
         raise TypeError("Hermes base_url must be a string")
@@ -2225,7 +2527,12 @@ def _validated_hermes_origin(
     ):
         raise ValueError("Hermes base_url must be an HTTP(S) origin")
     loopback = is_loopback_host(parsed.hostname)
-    if not loopback and parsed.scheme != "https":
+    private_http = (
+        parsed.scheme == "http"
+        and allow_attested_private_http
+        and _is_private_runtime_host(parsed.hostname)
+    )
+    if not loopback and parsed.scheme != "https" and not private_http:
         raise ValueError("remote Hermes base_url must use HTTPS")
     if not loopback and not (api_key and api_key.strip()):
         raise ValueError("remote Hermes base_url requires an api_key")
@@ -2233,6 +2540,18 @@ def _validated_hermes_origin(
     return urlunsplit(
         (parsed.scheme, parsed.netloc, path, "", "")
     )
+
+
+def _is_private_runtime_host(host: str) -> bool:
+    """Allow attested cleartext only on a private service address."""
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # Docker Compose service names are single-label DNS records on the
+        # stack bridge. Public DNS names still require HTTPS.
+        return "." not in host and host.lower() != "localhost"
+    return address.is_private or address.is_loopback or address.is_link_local
 
 
 def _validated_session_id(value: str | None) -> str:

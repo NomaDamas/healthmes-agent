@@ -125,7 +125,11 @@ def test_production_composition_requires_rendered_decision_profile(
 
     with pytest.raises(
         ValueError,
-        match="decision_hermes_profile_path is required",
+        match=(
+            "decision_hermes_profile_path, "
+            "decision_hermes_runtime_manifest_path, "
+            "decision_hermes_attestation_key_path are required"
+        ),
     ):
         composition.build_configured_decision_engine(
             settings=configured,
@@ -143,6 +147,12 @@ def test_production_composition_requires_dedicated_api_key(
             "decision_hermes_model": "decision-model",
             "decision_hermes_provider": "decision-provider",
             "decision_hermes_profile_path": tmp_path / "config.yaml",
+            "decision_hermes_runtime_manifest_path": (
+                tmp_path / "runtime-manifest.json"
+            ),
+            "decision_hermes_attestation_key_path": (
+                tmp_path / "runtime-attestation.key"
+            ),
             "decision_hermes_api_key": SecretStr(""),
         }
     )
@@ -155,3 +165,64 @@ def test_production_composition_requires_dedicated_api_key(
             settings=configured,
             session_factory=sessionmaker[Session](),
         )
+
+
+def test_production_composition_uses_attested_responses_transport(
+    settings,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured_transport: dict[str, object] = {}
+    captured_engine: dict[str, object] = {}
+    expected_engine = object()
+    search_service = object()
+
+    class StubTransport:
+        def __init__(self, **kwargs) -> None:
+            captured_transport.update(kwargs)
+
+    def build_responses(**kwargs):
+        captured_engine.update(kwargs)
+        return expected_engine
+
+    monkeypatch.setattr(
+        composition,
+        "HermesHttpResponsesTransport",
+        StubTransport,
+    )
+    monkeypatch.setattr(
+        composition,
+        "build_healthmes_responses_decision_engine",
+        build_responses,
+    )
+    configured = settings.model_copy(
+        update={
+            "decision_hermes_base_url": "http://127.0.0.1:8645",
+            "decision_hermes_model": "decision-model",
+            "decision_hermes_provider": "decision-provider",
+            "decision_hermes_profile_path": tmp_path / "config.yaml",
+            "decision_hermes_runtime_manifest_path": (
+                tmp_path / "runtime-manifest.json"
+            ),
+            "decision_hermes_attestation_key_path": (
+                tmp_path / "runtime-attestation.key"
+            ),
+            "decision_hermes_api_key": SecretStr("k" * 64),
+        }
+    )
+
+    engine = composition.build_configured_decision_engine(
+        settings=configured,
+        session_factory=sessionmaker[Session](),
+        search_service=search_service,  # type: ignore[arg-type]
+    )
+
+    assert engine is expected_engine
+    assert captured_transport["base_url"] == "http://127.0.0.1:8645"
+    attestation = captured_transport["runtime_attestation"]
+    assert attestation.manifest_path == tmp_path / "runtime-manifest.json"
+    assert attestation.attestation_key_path == (
+        tmp_path / "runtime-attestation.key"
+    )
+    assert captured_engine["transport"].__class__ is StubTransport
+    assert captured_engine["search_service"] is search_service

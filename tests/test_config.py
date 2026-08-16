@@ -19,6 +19,9 @@ ALL_ENV_VARS = [
     "HEALTHMES_DECISION_HERMES_MODEL",
     "HEALTHMES_DECISION_HERMES_PROVIDER",
     "HEALTHMES_DECISION_HERMES_PROFILE_PATH",
+    "HEALTHMES_DECISION_HERMES_RUNTIME_MANIFEST_PATH",
+    "HEALTHMES_DECISION_HERMES_ATTESTATION_KEY_PATH",
+    "HEALTHMES_DECISION_HERMES_ALLOW_ATTESTED_PRIVATE_HTTP",
     "HEALTHMES_DECISION_HERMES_DISCOVERY_TIMEOUT_SECONDS",
     "HEALTHMES_DECISION_HERMES_MAX_ITERATION_TIMEOUT_SECONDS",
     "HEALTHMES_DECISION_HERMES_SESSION_TTL_SECONDS",
@@ -74,15 +77,17 @@ def test_defaults(monkeypatch) -> None:
     assert settings.ow_base_url == "http://localhost:8000"
     assert settings.ow_api_key.get_secret_value() == ""
     assert settings.ow_user_id is None
-    # 8644 = DEFAULT_PORT in vendor/hermes-agent/gateway/platforms/webhook.py;
-    # 'healthmes-alerts' is the route name in config/hermes-config.yaml.tmpl.
-    assert settings.hermes_webhook_url == "http://localhost:8644/webhooks/healthmes-alerts"
+    # Canonical deployments have no generic Hermes inbound reasoning route.
+    assert settings.hermes_webhook_url == ""
     assert settings.hermes_webhook_secret.get_secret_value() == ""
     assert settings.decision_hermes_base_url is None
     assert settings.decision_hermes_api_key.get_secret_value() == ""
     assert settings.decision_hermes_model is None
     assert settings.decision_hermes_provider is None
     assert settings.decision_hermes_profile_path is None
+    assert settings.decision_hermes_runtime_manifest_path is None
+    assert settings.decision_hermes_attestation_key_path is None
+    assert settings.decision_hermes_allow_attested_private_http is False
     assert settings.decision_hermes_discovery_timeout_seconds == 5
     assert settings.decision_hermes_max_iteration_timeout_seconds == 120
     assert settings.decision_hermes_session_ttl_seconds == 900
@@ -222,6 +227,9 @@ def test_blank_optional_env_vars_behave_like_unset(monkeypatch) -> None:
         "HEALTHMES_OW_DATABASE_URL",
         "HEALTHMES_HERMES_HOME",
         "HEALTHMES_OW_USER_ID",
+        "HEALTHMES_DECISION_HERMES_PROFILE_PATH",
+        "HEALTHMES_DECISION_HERMES_RUNTIME_MANIFEST_PATH",
+        "HEALTHMES_DECISION_HERMES_ATTESTATION_KEY_PATH",
     ):
         monkeypatch.setenv(var, "")
 
@@ -232,6 +240,9 @@ def test_blank_optional_env_vars_behave_like_unset(monkeypatch) -> None:
     assert settings.ow_database_url is None
     assert settings.hermes_home is None
     assert settings.ow_user_id is None
+    assert settings.decision_hermes_profile_path is None
+    assert settings.decision_hermes_runtime_manifest_path is None
+    assert settings.decision_hermes_attestation_key_path is None
 
 
 def test_unprefixed_env_vars_are_ignored(monkeypatch) -> None:
@@ -304,6 +315,18 @@ def test_decision_runtime_bundle_from_environment(monkeypatch) -> None:
         "/tmp/hermes-decision/config.yaml",
     )
     monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_RUNTIME_MANIFEST_PATH",
+        "/tmp/hermes-decision/runtime-manifest.json",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_ATTESTATION_KEY_PATH",
+        "/tmp/hermes-decision/runtime-attestation.key",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_ALLOW_ATTESTED_PRIVATE_HTTP",
+        "true",
+    )
+    monkeypatch.setenv(
         "HEALTHMES_DECISION_OWNER_PRINCIPAL_ID",
         " local-owner ",
     )
@@ -316,6 +339,13 @@ def test_decision_runtime_bundle_from_environment(monkeypatch) -> None:
     assert settings.decision_hermes_profile_path == Path(
         "/tmp/hermes-decision/config.yaml"
     )
+    assert settings.decision_hermes_runtime_manifest_path == Path(
+        "/tmp/hermes-decision/runtime-manifest.json"
+    )
+    assert settings.decision_hermes_attestation_key_path == Path(
+        "/tmp/hermes-decision/runtime-attestation.key"
+    )
+    assert settings.decision_hermes_allow_attested_private_http is True
     assert settings.decision_owner_principal_id == "local-owner"
 
 
@@ -364,6 +394,20 @@ def test_local_decision_scope_rejects_remote_hermes_origin() -> None:
         decision_execution_scope="hosted",
     )
     assert hosted.decision_execution_scope == "hosted"
+
+
+def test_local_decision_scope_allows_explicit_attested_private_origin() -> None:
+    settings = _clean_settings(
+        decision_hermes_base_url="http://hermes-decision:8645",
+        decision_hermes_model="gpt-5.6-sol",
+        decision_hermes_provider="openai",
+        decision_hermes_allow_attested_private_http=True,
+    )
+
+    assert settings.decision_execution_scope == "local"
+    assert settings.decision_hermes_base_url == (
+        "http://hermes-decision:8645"
+    )
 
 
 def test_decision_capacity_bounds() -> None:

@@ -1,30 +1,28 @@
-"""Tests for scripts/bootstrap.py.
+"""Contracts for the dedicated HealthMes Hermes decision bootstrap."""
 
-Covers: template rendering into a tmp HERMES_HOME, skill copy-install into
-the Hermes discovery path, secret generation into .env, cron briefing
-registration, idempotency of the whole pipeline, --dry-run inertness, and
-docker-mode defaults. Everything runs against tmp paths — the developer's
-real ~/.hermes is never touched.
-"""
+from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import hashlib
+import os
+import stat
 from pathlib import Path
 
 import pytest
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_SKILLS = (
-    "doctor-visit-summary",
-    "healthmes-caffeine",
-    "healthmes-capture",
-    "healthmes-nutrition",
-    "healthmes-nutrition-decision",
-    "healthmes-planner",
-    "healthmes-sleep",
-    "healthmes-stress",
-    "healthmes-wellness-decision",
+from healthmes.decision import (
+    HERMES_DECISION_MCP_TOOL_NAMES,
+    HermesDecisionProfileAssertion,
 )
+from healthmes.hermes_runtime_identity import (
+    HERMES_RUNTIME_HOME_ARTIFACT_NAMES,
+    HERMES_RUNTIME_PROVIDER_ENV_NAMES,
+    load_attestation_key,
+    load_runtime_manifest,
+    runtime_home_artifact_sha256,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 pytestmark = pytest.mark.usefixtures("clean_env")
 
@@ -33,12 +31,13 @@ pytestmark = pytest.mark.usefixtures("clean_env")
 def env_file(tmp_path: Path) -> Path:
     path = tmp_path / ".env"
     path.write_text(
-        "TELEGRAM_BOT_TOKEN=123456:test-token\n"
-        "HEALTHMES_TELEGRAM_OWNER_USER_ID=owner-user\n"
-        "HEALTHMES_TELEGRAM_OWNER_CHAT_ID=owner-chat\n"
-        "OPEN_WEARABLES_API_KEY=ow-test-key\n"
         "HEALTHMES_DECISION_HERMES_MODEL=decision-model\n"
-        "HEALTHMES_DECISION_HERMES_PROVIDER=openai\n",
+        "HEALTHMES_DECISION_HERMES_PROVIDER=openai\n"
+        "OPENAI_API_KEY=provider-secret\n"
+        # These legacy values must not influence the dedicated runtime.
+        "TELEGRAM_BOT_TOKEN=legacy-telegram-secret\n"
+        "HEALTHMES_TELEGRAM_OWNER_USER_ID=*\n"
+        "HEALTHMES_TELEGRAM_OWNER_CHAT_ID=*\n",
         encoding="utf-8",
     )
     return path
@@ -49,653 +48,568 @@ def hermes_home(tmp_path: Path) -> Path:
     return tmp_path / "hermes-home"
 
 
-def run_bootstrap(bootstrap, hermes_home: Path, env_file: Path, *extra: str) -> int:
+def run_bootstrap(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    *extra: str,
+) -> int:
     return bootstrap.main(
-        ["--hermes-home", str(hermes_home), "--env-file", str(env_file), *extra]
+        [
+            "--hermes-home",
+            str(hermes_home),
+            "--env-file",
+            str(env_file),
+            *extra,
+        ]
     )
 
 
-# ---------------------------------------------------------------------------
-# Full native run
-# ---------------------------------------------------------------------------
+def _decision_home(hermes_home: Path) -> Path:
+    return hermes_home / "decision"
 
 
-def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys):
+def _load_profile(hermes_home: Path) -> dict:
+    return yaml.safe_load(
+        (_decision_home(hermes_home) / "config.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def test_full_run_builds_only_attested_decision_runtime(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    capsys,
+) -> None:
+    hermes_home.mkdir()
+    general_config = hermes_home / "config.yaml"
+    general_config.write_text(
+        "platforms:\n  telegram:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    general_cron = hermes_home / "cron" / "jobs.json"
+    general_cron.parent.mkdir()
+    general_cron.write_text('{"jobs":[{"name":"user-job"}]}\n')
+
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
 
-    # 1. config.yaml rendered and parseable, with vendor-contract keys.
-    config = yaml.safe_load((hermes_home / "config.yaml").read_text())
-    assert config["platforms"]["telegram"]["token"] == "123456:test-token"
-    assert config["platforms"]["telegram"]["extra"]["allow_from"] == ["owner-user"]
-    route = config["platforms"]["webhook"]["extra"]["routes"]["healthmes-alerts"]
-    assert route["skills"] == ["healthmes-planner"]
-    assert route["deliver"] == "telegram"
-
-    # The generated HMAC secret is shared between .env and the route.
-    env_values = bootstrap.load_env_file(env_file)
-    secret = env_values["HEALTHMES_HERMES_WEBHOOK_SECRET"]
-    assert secret and route["secret"] == secret
-
-    # Native defaults: localhost endpoints, repo-local vendored MCP dir.
-    servers = config["mcp_servers"]
-    assert servers["healthmes"]["url"] == "http://localhost:8100/mcp"
-    trusted = servers["healthmes"]["trusted_session_proof"]
-    assert trusted["owner_user_id"] == "owner-user"
-    assert trusted["owner_chat_id"] == "owner-chat"
-    ow = servers["open_wearables"]
-    assert ow["env"]["OPEN_WEARABLES_API_URL"] == "http://localhost:8000"
-    assert ow["env"]["OPEN_WEARABLES_API_KEY"] == "ow-test-key"
-    assert str(REPO_ROOT / "vendor" / "open-wearables" / "mcp") in ow["args"]
-
-    # 2. A separate decision profile exposes only four HealthMes read tools.
-    decision_config = yaml.safe_load(
-        (hermes_home / "decision" / "config.yaml").read_text()
+    # The legacy general Hermes home is not modified or populated.
+    assert general_config.read_text(encoding="utf-8") == (
+        "platforms:\n  telegram:\n    enabled: true\n"
     )
-    assert set(decision_config["platforms"]) == {"api_server"}
-    assert decision_config["platform_toolsets"] == {
-        "api_server": ["healthmes"]
+    assert general_cron.read_text() == '{"jobs":[{"name":"user-job"}]}\n'
+    assert not (hermes_home / "skills").exists()
+    assert not (hermes_home / "scripts").exists()
+
+    decision_home = _decision_home(hermes_home)
+    assert stat.S_IMODE(decision_home.stat().st_mode) == 0o700
+    profile_path = decision_home / "config.yaml"
+    profile = _load_profile(hermes_home)
+    assert set(profile["platforms"]) == {"api_server"}
+    assert profile["platform_toolsets"] == {"api_server": ["healthmes"]}
+    assert set(profile["mcp_servers"]) == {"healthmes"}
+    assert profile["mcp_servers"]["healthmes"]["tools"]["include"] == list(
+        HERMES_DECISION_MCP_TOOL_NAMES
+    )
+    assert profile["mcp_servers"]["healthmes"]["url"] == (
+        "http://localhost:8100/mcp"
+    )
+    assert "telegram" not in profile["platforms"]
+    assert "webhook" not in profile["platforms"]
+
+    env = bootstrap.load_env_file(env_file)
+    assert len(env["HEALTHMES_DECISION_HERMES_API_KEY"]) == 64
+    assert env["HEALTHMES_DECISION_HERMES_BASE_URL"] == (
+        "http://127.0.0.1:8645"
+    )
+    assert env["HEALTHMES_DECISION_HERMES_PROFILE_PATH"] == str(
+        profile_path.resolve()
+    )
+    manifest_path = decision_home / "runtime-manifest.json"
+    key_path = decision_home / "runtime-attestation.key"
+    assert env["HEALTHMES_DECISION_HERMES_RUNTIME_MANIFEST_PATH"] == str(
+        manifest_path.resolve()
+    )
+    assert env["HEALTHMES_DECISION_HERMES_ATTESTATION_KEY_PATH"] == str(
+        key_path.resolve()
+    )
+
+    profile_digest = HermesDecisionProfileAssertion(
+        profile_path,
+        expected_model="decision-model",
+        expected_provider="openai",
+        expected_api_key=env["HEALTHMES_DECISION_HERMES_API_KEY"],
+    ).verify()
+    manifest = load_runtime_manifest(manifest_path)
+    key = load_attestation_key(key_path)
+    assert manifest.profile_semantic_digest == profile_digest
+    assert manifest.hermes_home == str(decision_home.resolve())
+    assert manifest.public_origin == "http://127.0.0.1:8645"
+    assert manifest.internal_origin == "http://127.0.0.1:8646"
+    assert manifest.vendor_root == str(
+        (REPO_ROOT / "vendor" / "hermes-agent").resolve()
+    )
+    assert manifest.model_alias == "healthmes-decision-runtime"
+    assert manifest.model == "decision-model"
+    assert manifest.provider == "openai"
+    assert manifest.attestation_key_sha256 == hashlib.sha256(key).hexdigest()
+    assert {
+        item.name: item.sha256 for item in manifest.home_artifacts
+    } == runtime_home_artifact_sha256(decision_home)
+    assert {
+        item.name: item.sha256 for item in manifest.provider_environment
+    } == {
+        "OPENAI_API_KEY": hashlib.sha256(
+            b"provider-secret"
+        ).hexdigest()
     }
-    assert set(decision_config["mcp_servers"]) == {"healthmes"}
-    assert decision_config["mcp_servers"]["healthmes"]["tools"][
-        "include"
-    ] == [
-        "search_activity",
-        "search_calendar",
-        "search_nutrition",
-        "search_wearable",
-    ]
-    assert decision_config["platforms"]["api_server"]["extra"]["key"] == (
-        env_values["HEALTHMES_DECISION_HERMES_API_KEY"]
-    )
-    assert decision_config["platforms"]["api_server"]["extra"][
-        "model_routes"
-    ] == {
-        "decision-model": {
-            "model": "decision-model",
-            "provider": "openai",
-        }
-    }
-    assert env_values["HEALTHMES_DECISION_HERMES_PROFILE_PATH"] == str(
-        (hermes_home / "decision" / "config.yaml").resolve()
+    assert manifest.launch_argv[-3:] == (
+        "hermes",
+        "gateway",
+        "run",
     )
 
-    # 3. Skills copied into the discovery path (SKILLS_DIR = home/skills).
-    # Copies, not symlinks: the vendor trust check resolves symlinks and
-    # would log a security warning on every skill load (skills_tool.py).
-    for skill in EXPECTED_SKILLS:
-        dest = hermes_home / "skills" / skill
-        assert dest.is_dir() and not dest.is_symlink()
-        assert (dest / "SKILL.md").read_text() == (
-            REPO_ROOT / "skills" / skill / "SKILL.md"
-        ).read_text()
-
-    # 4. Briefing snapshot script + base-url sidecar installed into the
-    # scheduler's only allowed script location ($HERMES_HOME/scripts/).
-    installed_script = hermes_home / "scripts" / "healthmes_briefing_snapshot.py"
-    assert installed_script.is_file()
-    assert installed_script.read_text() == (
-        REPO_ROOT / "scripts" / "healthmes_briefing_snapshot.py"
-    ).read_text()
-    sidecar = yaml.safe_load((hermes_home / "scripts" / "healthmes_snapshot.json").read_text())
-    assert sidecar == {"base_url": "http://localhost:8100"}  # native default
-
-    # No api token configured: the MCP registration carries no auth header
-    # and the sidecar carries no token key.
-    assert "headers" not in servers["healthmes"]
-
-    # 5. Cron briefings registered in the vendor jobs.json envelope.
-    jobs_doc = yaml.safe_load((hermes_home / "cron" / "jobs.json").read_text())
-    assert set(jobs_doc) >= {"jobs", "updated_at"}
-    jobs = {job["name"]: job for job in jobs_doc["jobs"]}
-    assert set(jobs) == {
-        "healthmes-morning-plan",
-        "healthmes-evening-review",
-        "healthmes-weekly-plan",
-    }
-    assert jobs["healthmes-morning-plan"]["schedule"]["expr"] == "0 7 * * *"
-    assert jobs["healthmes-evening-review"]["schedule"]["expr"] == "30 21 * * *"
-    assert jobs["healthmes-weekly-plan"]["schedule"]["expr"] == "0 18 * * 0"
-    for job in jobs.values():
-        assert job["skills"] == ["healthmes-planner"]
-        assert job["deliver"] == "telegram"
-        assert job["enabled"] is True
-        # Context-injection script (PLAN §4): relative name resolving under
-        # $HERMES_HOME/scripts/ — exactly where step 3 installed it.
-        assert job["script"] == "healthmes_briefing_snapshot.py"
-        # next_run_at is a parseable timestamp (scheduler contract).
-        datetime.fromisoformat(job["next_run_at"])
-
-    out = capsys.readouterr().out
-    assert "cron registration method:" in out
-
-
-def test_second_run_is_idempotent(bootstrap, hermes_home, env_file):
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    config_before = (hermes_home / "config.yaml").read_text()
-    jobs_before = yaml.safe_load((hermes_home / "cron" / "jobs.json").read_text())
-    env_before = env_file.read_text()
-
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-
-    assert (hermes_home / "config.yaml").read_text() == config_before
-    jobs_after = yaml.safe_load((hermes_home / "cron" / "jobs.json").read_text())
-    assert len(jobs_after["jobs"]) == 3
-    assert [j["id"] for j in jobs_after["jobs"]] == [
-        j["id"] for j in jobs_before["jobs"]
-    ]
-    assert env_file.read_text() == env_before
-
-
-def test_exact_legacy_morning_cron_is_upgraded_without_resetting_runtime_state(
-    bootstrap, hermes_home, env_file
-):
-    created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
-    legacy = bootstrap.build_fallback_job(
-        prompt=(
-            "Morning briefing. A HealthMes state snapshot (open tasks, "
-            "today's events, pending proposals, energy forecast) is injected "
-            "above; use it as context and read today's readiness via the "
-            "healthmes MCP tools, then propose today's block layout based "
-            "on the energy picture. One message in the standard notification "
-            "grammar."
-        ),
-        schedule="0 7 * * *",
-        name="healthmes-morning-plan",
-        deliver="telegram",
-        skills=["healthmes-planner"],
-        script=bootstrap.SNAPSHOT_SCRIPT_NAME,
-        now=created_at,
-    )
-    legacy.update(
-        {
-            "enabled": False,
-            "state": "paused",
-            "paused_at": "2026-07-02T08:00:00+00:00",
-            "paused_reason": "user requested",
-            "repeat": {"times": None, "completed": 9},
-            "next_run_at": "2026-07-03T08:30:00+00:00",
-            "last_run_at": "2026-07-02T08:30:00+00:00",
-            "last_status": "error",
-            "last_error": "legacy failure",
-            "last_delivery_error": "legacy delivery failure",
-        }
-    )
-    jobs_file = hermes_home / "cron" / "jobs.json"
-    bootstrap._write_jobs_envelope(jobs_file, [legacy], now=created_at)
-
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-
-    jobs = yaml.safe_load(jobs_file.read_text())["jobs"]
-    morning = next(job for job in jobs if job["name"] == "healthmes-morning-plan")
-    desired = next(
-        job for job in bootstrap.BRIEFING_JOBS if job["name"] == "healthmes-morning-plan"
-    )
-    assert morning["id"] == legacy["id"]
-    for field in bootstrap.HEALTHMES_MANAGED_CRON_FIELDS:
-        if field == "schedule":
-            assert morning[field]["expr"] == desired[field]
-        else:
-            assert morning[field] == desired[field]
-    assert morning["origin"] == bootstrap.HEALTHMES_CRON_ORIGIN
-    for field in (
-        "enabled",
-        "state",
-        "paused_at",
-        "paused_reason",
-        "repeat",
-        "created_at",
-        "next_run_at",
-        "last_run_at",
-        "last_status",
-        "last_error",
-        "last_delivery_error",
+    for name in (
+        *HERMES_RUNTIME_HOME_ARTIFACT_NAMES,
+        "runtime-manifest.json",
+        "runtime-attestation.key",
     ):
-        assert morning[field] == legacy[field]
+        mode = stat.S_IMODE((decision_home / name).stat().st_mode)
+        assert mode == 0o600
+    for forbidden in (
+        "cron",
+        "hooks",
+        "memories",
+        "mcp-tokens",
+        "plugins",
+        "scripts",
+        "skills",
+    ):
+        assert not (decision_home / forbidden).exists()
+
+    output = capsys.readouterr().out
+    assert "content-bound runtime manifest" in output
+    assert "do not install HealthMes Telegram, webhook" in output
+    assert "cron registration method" not in output
 
 
-def test_unmanaged_same_name_healthmes_prompt_cron_is_not_overwritten(
-    bootstrap, hermes_home, env_file
-):
-    created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
-    user_job = bootstrap.build_fallback_job(
-        prompt="Run my private HealthMes morning workflow.",
-        schedule="15 6 * * *",
-        name="healthmes-morning-plan",
-        deliver="local",
-        skills=["personal-planner"],
-        script="personal_morning.py",
-        origin={"source": "user"},
-        now=created_at,
+def test_second_run_is_byte_idempotent(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    decision_home = _decision_home(hermes_home)
+    tracked = (
+        "config.yaml",
+        "SOUL.md",
+        ".env",
+        ".no-bundled-skills",
+        "runtime-manifest.json",
+        "runtime-attestation.key",
     )
-    jobs_file = hermes_home / "cron" / "jobs.json"
-    bootstrap._write_jobs_envelope(jobs_file, [user_job], now=created_at)
+    before = {
+        name: (decision_home / name).read_bytes() for name in tracked
+    }
+    env_before = env_file.read_bytes()
 
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
 
-    jobs = yaml.safe_load(jobs_file.read_text())["jobs"]
-    unchanged = next(job for job in jobs if job["id"] == user_job["id"])
-    assert unchanged == user_job
+    assert {
+        name: (decision_home / name).read_bytes() for name in tracked
+    } == before
+    assert env_file.read_bytes() == env_before
 
 
-@pytest.mark.parametrize("origin_state", ["null", "missing"])
-def test_originless_same_name_healthmes_prompt_cron_is_not_overwritten(
-    bootstrap, hermes_home, env_file, origin_state
-):
-    created_at = datetime(2026, 7, 1, 7, 0, tzinfo=UTC)
-    user_job = bootstrap.build_fallback_job(
-        prompt="Run my private HealthMes morning workflow.",
-        schedule="15 6 * * *",
-        name="healthmes-morning-plan",
-        deliver="local",
-        skills=["personal-planner"],
-        script="personal_morning.py",
-        now=created_at,
-    )
-    if origin_state == "missing":
-        user_job.pop("origin")
-    jobs_file = hermes_home / "cron" / "jobs.json"
-    bootstrap._write_jobs_envelope(jobs_file, [user_job], now=created_at)
+def test_dry_run_is_inert_and_reports_dedicated_artifacts(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    capsys,
+) -> None:
+    before = env_file.read_bytes()
 
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-
-    jobs = yaml.safe_load(jobs_file.read_text())["jobs"]
-    unchanged = next(job for job in jobs if job["id"] == user_job["id"])
-    assert unchanged == user_job
-
-
-def test_dry_run_writes_nothing(bootstrap, hermes_home, env_file, capsys):
-    env_before = env_file.read_text()
-    assert run_bootstrap(bootstrap, hermes_home, env_file, "--dry-run") == 0
+    assert run_bootstrap(
+        bootstrap,
+        hermes_home,
+        env_file,
+        "--dry-run",
+    ) == 0
 
     assert not hermes_home.exists()
-    assert env_file.read_text() == env_before
-
-    out = capsys.readouterr().out
-    # The dry-run still reports the full expected tree.
-    assert "config.yaml" in out
-    assert "healthmes-planner" in out
-    assert "healthmes-morning-plan" in out
-    assert out.count("[dry-run] would") >= 5
-
-
-# ---------------------------------------------------------------------------
-# Secrets
-# ---------------------------------------------------------------------------
+    assert env_file.read_bytes() == before
+    output = capsys.readouterr().out
+    assert "decision/config.yaml" in output
+    assert "runtime-manifest.json" in output
+    assert "runtime-attestation.key" in output
+    assert "healthmes-morning-plan" not in output
+    assert "healthmes-planner" not in output
 
 
-def test_existing_secret_is_preserved(bootstrap, hermes_home, env_file):
+@pytest.mark.parametrize(
+    "content",
+    (
+        "",
+        "HEALTHMES_DECISION_HERMES_MODEL=decision-model\n",
+        "HEALTHMES_DECISION_HERMES_PROVIDER=openai\n",
+    ),
+)
+def test_model_and_provider_are_required_before_any_write(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    content: str,
+) -> None:
+    env_file.write_text(content, encoding="utf-8")
+    before = env_file.read_bytes()
+
+    with pytest.raises(ValueError, match="MODEL and .*PROVIDER are required"):
+        run_bootstrap(bootstrap, hermes_home, env_file)
+
+    assert env_file.read_bytes() == before
+    assert not hermes_home.exists()
+
+
+def test_existing_api_key_is_preserved(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
     env_file.write_text(
-        env_file.read_text() + "HEALTHMES_HERMES_WEBHOOK_SECRET=keep-me\n",
+        env_file.read_text(encoding="utf-8")
+        + "HEALTHMES_DECISION_HERMES_API_KEY="
+        + "a" * 64
+        + "\n",
         encoding="utf-8",
     )
+
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    assert bootstrap.load_env_file(env_file)["HEALTHMES_HERMES_WEBHOOK_SECRET"] == "keep-me"
-    config = yaml.safe_load((hermes_home / "config.yaml").read_text())
-    route = config["platforms"]["webhook"]["extra"]["routes"]["healthmes-alerts"]
-    assert route["secret"] == "keep-me"
+
+    env = bootstrap.load_env_file(env_file)
+    assert env["HEALTHMES_DECISION_HERMES_API_KEY"] == "a" * 64
+    profile = _load_profile(hermes_home)
+    assert profile["platforms"]["api_server"]["extra"]["key"] == "a" * 64
 
 
-def test_empty_secret_assignment_is_filled_in_place(bootstrap, hermes_home, env_file):
+def test_short_existing_api_key_fails_closed(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
     env_file.write_text(
-        env_file.read_text() + "HEALTHMES_HERMES_WEBHOOK_SECRET=\n",
+        env_file.read_text(encoding="utf-8")
+        + "HEALTHMES_DECISION_HERMES_API_KEY=short\n",
         encoding="utf-8",
     )
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    content = env_file.read_text()
-    assert content.count("HEALTHMES_HERMES_WEBHOOK_SECRET=") == 1
-    assert bootstrap.load_env_file(env_file)["HEALTHMES_HERMES_WEBHOOK_SECRET"]
+    before = env_file.read_bytes()
+
+    with pytest.raises(ValueError, match="at least 32 characters"):
+        run_bootstrap(bootstrap, hermes_home, env_file)
+
+    assert env_file.read_bytes() == before
+    assert not hermes_home.exists()
 
 
-def test_missing_env_file_is_created_for_secret(bootstrap, hermes_home, tmp_path):
-    env_file = tmp_path / "fresh.env"
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    assert env_file.is_file()
-    assert bootstrap.load_env_file(env_file)["HEALTHMES_HERMES_WEBHOOK_SECRET"]
-
-
-def test_adjustment_secret_is_generated_separately_and_preserved(
-    bootstrap, hermes_home, env_file
-):
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    first = bootstrap.load_env_file(env_file)
-    adjustment_secret = first["HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"]
-    decision_api_key = first["HEALTHMES_DECISION_HERMES_API_KEY"]
-    decision_profile_path = first[
-        "HEALTHMES_DECISION_HERMES_PROFILE_PATH"
-    ]
-
-    assert len(adjustment_secret) == 64
-    assert len(decision_api_key) == 64
-    assert adjustment_secret != first["HEALTHMES_HERMES_WEBHOOK_SECRET"]
-    assert decision_api_key not in {
-        adjustment_secret,
-        first["HEALTHMES_HERMES_WEBHOOK_SECRET"],
-    }
-    config = yaml.safe_load((hermes_home / "config.yaml").read_text())
-    proof_config = config["mcp_servers"]["healthmes"]["trusted_session_proof"]
-    assert proof_config["secret_env"] == "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"
-    assert "secret" not in proof_config
-    assert set(proof_config["confirmations"]) == {
-        "resolve_calendar_adjustment",
-        "resolve_schedule_proposal",
-    }
-
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    assert (
-        bootstrap.load_env_file(env_file)["HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"]
-        == adjustment_secret
-    )
-    assert (
-        bootstrap.load_env_file(env_file)[
-            "HEALTHMES_DECISION_HERMES_API_KEY"
-        ]
-        == decision_api_key
-    )
-    assert (
-        bootstrap.load_env_file(env_file)[
-            "HEALTHMES_DECISION_HERMES_PROFILE_PATH"
-        ]
-        == decision_profile_path
-    )
-
-
-# ---------------------------------------------------------------------------
-# Existing-config merge
-# ---------------------------------------------------------------------------
-
-
-def test_existing_config_is_merged_not_clobbered(bootstrap, hermes_home, env_file):
-    hermes_home.mkdir(parents=True)
-    (hermes_home / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "model": {"default": "user-chosen-model"},
-                "platforms": {"telegram": {"token": "stale-token"}},
-            }
-        ),
+@pytest.mark.parametrize(
+    "key",
+    (
+        "HEALTHMES_DECISION_HERMES_PROFILE_PATH",
+        "HEALTHMES_DECISION_HERMES_RUNTIME_MANIFEST_PATH",
+        "HEALTHMES_DECISION_HERMES_ATTESTATION_KEY_PATH",
+    ),
+)
+def test_runtime_artifact_path_override_cannot_detach_identity(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    key: str,
+    tmp_path: Path,
+) -> None:
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8")
+        + f"{key}={tmp_path / 'other-runtime-artifact'}\n",
         encoding="utf-8",
     )
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    before = env_file.read_bytes()
 
-    config = yaml.safe_load((hermes_home / "config.yaml").read_text())
-    # Unmanaged user keys survive; managed keys are overwritten.
-    assert config["model"] == {"default": "user-chosen-model"}
-    assert config["platforms"]["telegram"]["token"] == "123456:test-token"
-    assert "mcp_servers" in config
-    # The pre-merge file was backed up exactly once.
-    backup = hermes_home / "config.yaml.healthmes-backup"
-    assert backup.is_file()
-    assert "stale-token" in backup.read_text()
+    with pytest.raises(ValueError, match=f"{key} must point"):
+        run_bootstrap(bootstrap, hermes_home, env_file)
+
+    assert env_file.read_bytes() == before
+    assert not hermes_home.exists()
 
 
-# ---------------------------------------------------------------------------
-# Docker mode
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("kind", "name"),
+    (
+        ("file", "auth.json"),
+        ("file", ".anthropic_oauth.json"),
+        ("dir", ".codex"),
+        ("dir", "cron"),
+        ("dir", "mcp-tokens"),
+        ("dir", "skills"),
+    ),
+)
+def test_broad_runtime_state_is_rejected_before_bootstrap_mutates_env(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    kind: str,
+    name: str,
+) -> None:
+    path = _decision_home(hermes_home) / name
+    if kind == "file":
+        path.parent.mkdir(parents=True)
+        path.write_text("legacy credential or state\n", encoding="utf-8")
+    else:
+        path.mkdir(parents=True)
+        (path / "state").write_text("legacy state\n", encoding="utf-8")
+    before = env_file.read_bytes()
+
+    with pytest.raises(
+        ValueError,
+        match="contains broad reasoning artifacts",
+    ):
+        run_bootstrap(bootstrap, hermes_home, env_file)
+
+    assert env_file.read_bytes() == before
+    assert not (_decision_home(hermes_home) / "config.yaml").exists()
 
 
-def test_docker_mode_defaults(bootstrap, hermes_home, env_file):
-    assert run_bootstrap(bootstrap, hermes_home, env_file, "--mode", "docker") == 0
+def test_symlinked_dedicated_home_is_rejected_before_bootstrap_mutates_env(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "other-home"
+    target.mkdir()
+    hermes_home.mkdir()
+    _decision_home(hermes_home).symlink_to(target, target_is_directory=True)
+    before = env_file.read_bytes()
 
-    config = yaml.safe_load((hermes_home / "config.yaml").read_text())
-    servers = config["mcp_servers"]
-    # In-cluster endpoints and the compose mount points from docker-compose.yml.
-    assert servers["healthmes"]["url"] == "http://healthmes:8100/mcp"
-    ow = servers["open_wearables"]
-    assert ow["env"]["OPEN_WEARABLES_API_URL"] == "http://ow-backend:8000"
-    assert "/opt/vendor/open-wearables-mcp" in ow["args"]
-    assert ow["env"]["UV_PROJECT_ENVIRONMENT"] == "/opt/data/ow-mcp-venv"
+    with pytest.raises(ValueError, match="runtime home is unsafe"):
+        run_bootstrap(bootstrap, hermes_home, env_file)
 
-    # Skills are copied into $HERMES_HOME/skills, which is the bind mount
-    # (./data/hermes) the hermes container sees — same layout as native mode.
-    dest = hermes_home / "skills" / "healthmes-planner"
-    assert dest.is_dir() and not dest.is_symlink()
-    assert (dest / "SKILL.md").is_file()
-
-    # The snapshot sidecar carries the in-cluster healthmes endpoint; the
-    # script itself stays byte-identical to the repo copy (URL via sidecar,
-    # never hardcoded — the hard localhost-default rule).
-    sidecar = yaml.safe_load((hermes_home / "scripts" / "healthmes_snapshot.json").read_text())
-    assert sidecar == {"base_url": "http://healthmes:8100"}
-    decision = yaml.safe_load(
-        (hermes_home / "decision" / "config.yaml").read_text()
-    )
-    assert (
-        decision["mcp_servers"]["healthmes"]["url"]
-        == "http://healthmes:8100/mcp"
-    )
+    assert env_file.read_bytes() == before
+    assert list(target.iterdir()) == []
 
 
-def test_env_overrides_beat_mode_defaults(bootstrap, hermes_home, env_file, monkeypatch):
-    monkeypatch.setenv("HEALTHMES_MCP_URL", "http://127.0.0.1:9999/mcp")
-    monkeypatch.setenv("OW_BASE_URL", "http://127.0.0.1:8811")
-    assert run_bootstrap(bootstrap, hermes_home, env_file, "--mode", "docker") == 0
-    config = yaml.safe_load((hermes_home / "config.yaml").read_text())
-    assert config["mcp_servers"]["healthmes"]["url"] == "http://127.0.0.1:9999/mcp"
-    ow_env = config["mcp_servers"]["open_wearables"]["env"]
-    assert ow_env["OPEN_WEARABLES_API_URL"] == "http://127.0.0.1:8811"
-
-
-def test_api_token_flows_into_mcp_headers_and_sidecar(
-    bootstrap, hermes_home, env_file, monkeypatch
-):
-    """With HEALTHMES_API_TOKEN set, the agent side must keep working: the
-    rendered MCP registration carries the bearer header (mcp_tool.py url
-    transports support `headers:`) and the briefing snapshot sidecar carries
-    the token for its REST fetches."""
-    monkeypatch.setenv("HEALTHMES_API_TOKEN", "glue-token")
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-
-    config = yaml.safe_load((hermes_home / "config.yaml").read_text())
-    healthmes = config["mcp_servers"]["healthmes"]
-    assert healthmes["headers"] == {"Authorization": "Bearer glue-token"}
-
-    sidecar = yaml.safe_load(
-        (hermes_home / "scripts" / "healthmes_snapshot.json").read_text()
-    )
-    assert sidecar == {
-        "base_url": "http://localhost:8100",
-        "api_token": "glue-token",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Skill discovery / copy repair
-# ---------------------------------------------------------------------------
-
-
-def test_repo_skills_are_discovered(bootstrap):
-    names = [path.name for path in bootstrap.discover_skill_dirs(REPO_ROOT)]
-    assert names == list(EXPECTED_SKILLS)
-
-
-def test_planner_skill_documents_morning_nudge_trust_boundary():
-    skill = (REPO_ROOT / "skills" / "healthmes-planner" / "SKILL.md").read_text(
-        encoding="utf-8"
-    )
-    normalized = " ".join(skill.split())
-
-    assert "External (user-created) events never move" in normalized
-    assert "user-confirmed Google `SHORTEN`" in normalized
-    assert "eligible external event through `resolve_calendar_adjustment`" in normalized
-    assert "one eligible Google event may be shortened" in normalized
-    assert (
-        "mcp__healthmes__evaluate_morning_calendar_nudge` exactly once"
-        in normalized
-    )
-    assert "`적용 <handle>` / `그대로 <handle>`" in normalized
-    assert "do not call `clarify`, and do not wait for a reply" in normalized
-    assert "Only live Telegram replies may call" in normalized
-    assert "mcp__healthmes__resolve_calendar_adjustment" in normalized
-    assert "exact combined reply as `response`" in normalized
-    assert "unchanged `<handle>` as `reply_handle`" in normalized
-    assert "Do not pass a proposal id or response channel" in normalized
-    assert (
-        "Do not rewrite, shorten, translate, log, or expose the handle"
-        in normalized
-    )
-
-
-def test_sleep_skill_uses_healthmes_wearable_boundary():
-    skill = (REPO_ROOT / "skills" / "healthmes-sleep" / "SKILL.md").read_text(
-        encoding="utf-8"
-    )
-    normalized = " ".join(skill.split())
-
-    assert "mcp__healthmes__search_wearable" in normalized
-    assert "Never call Open Wearables directly" not in normalized
-    assert "never enumerate wearable users" in normalized
-    assert "exact target-date record" in normalized
-
-
-def test_wildcard_telegram_owner_is_rejected(bootstrap, tmp_path):
-    env = {
-        "HEALTHMES_TELEGRAM_OWNER_USER_ID": "*",
-        "HEALTHMES_TELEGRAM_OWNER_CHAT_ID": "owner-chat",
-    }
-
-    with pytest.raises(ValueError, match="explicit"):
-        bootstrap.build_context(
-            env,
-            "native",
-            tmp_path,
-            "webhook-secret",
-        )
-
-
-def test_legacy_symlink_is_migrated_to_copy(bootstrap, hermes_home, env_file, tmp_path):
-    """Symlinks left by earlier bootstrap versions become real copies."""
-    skills_home = hermes_home / "skills"
-    skills_home.mkdir(parents=True)
-    stale_target = tmp_path / "elsewhere"
-    stale_target.mkdir()
-    (skills_home / "healthmes-planner").symlink_to(stale_target)
+def test_existing_dedicated_home_permissions_are_tightened(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    decision_home = _decision_home(hermes_home)
+    decision_home.mkdir(parents=True, mode=0o755)
+    decision_home.chmod(0o755)
 
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    dest = skills_home / "healthmes-planner"
-    assert dest.is_dir() and not dest.is_symlink()
-    assert (dest / "SKILL.md").read_text() == (
-        REPO_ROOT / "skills" / "healthmes-planner" / "SKILL.md"
-    ).read_text()
+
+    assert stat.S_IMODE(decision_home.stat().st_mode) == 0o700
 
 
-def test_drifted_skill_copy_is_resynced(bootstrap, hermes_home, env_file):
-    """An edited installed copy is resynced from the repo on re-run."""
+def test_drifted_profile_is_replaced_exactly_and_archived(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    decision_home = _decision_home(hermes_home)
+    decision_home.mkdir(parents=True)
+    profile_path = decision_home / "config.yaml"
+    profile_path.write_text(
+        "platforms:\n  telegram:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    dest = hermes_home / "skills" / "healthmes-planner"
-    (dest / "SKILL.md").write_text("tampered\n", encoding="utf-8")
-    (dest / "stale-extra.md").write_text("leftover\n", encoding="utf-8")
 
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    assert (dest / "SKILL.md").read_text() == (
-        REPO_ROOT / "skills" / "healthmes-planner" / "SKILL.md"
-    ).read_text()
-    assert not (dest / "stale-extra.md").exists()
-
-
-# ---------------------------------------------------------------------------
-# Telegram delivery-target warning
-# ---------------------------------------------------------------------------
+    profile = _load_profile(hermes_home)
+    assert set(profile["platforms"]) == {"api_server"}
+    backup = (
+        hermes_home
+        / "decision-runtime-backups"
+        / "config.yaml.pre-healthmes-runtime"
+    )
+    assert "telegram" in backup.read_text(encoding="utf-8")
+    assert not (decision_home / "decision-runtime-backups").exists()
 
 
-def test_missing_home_chat_id_warns_about_delivery(bootstrap, hermes_home, env_file, capsys):
-    """Without TELEGRAM_HOME_CHAT_ID the rendered config has neither a
-    telegram home_channel nor deliver_extra.chat_id, so `deliver: telegram`
-    fails at send time (vendor gateway 'No chat_id or home channel') — the
-    bootstrap must say so instead of staying silent."""
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    err = capsys.readouterr().err
-    assert "TELEGRAM_HOME_CHAT_ID" in err
-    assert "/sethome" in err
+def test_docker_mode_binds_container_runtime_identity(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    assert run_bootstrap(
+        bootstrap,
+        hermes_home,
+        env_file,
+        "--mode",
+        "docker",
+    ) == 0
+
+    profile = _load_profile(hermes_home)
+    assert profile["mcp_servers"]["healthmes"]["url"] == (
+        "http://healthmes:8100/mcp"
+    )
+    assert profile["platforms"]["api_server"]["extra"]["port"] == 8646
+    manifest = load_runtime_manifest(
+        _decision_home(hermes_home) / "runtime-manifest.json"
+    )
+    assert manifest.hermes_home == "/opt/data"
+    assert manifest.vendor_root == "/opt/hermes"
+    assert manifest.public_origin == "http://hermes-decision:8645"
+    assert manifest.internal_origin == "http://127.0.0.1:8646"
+    assert manifest.launch_argv == (
+        "/opt/hermes/.venv/bin/python",
+        "-m",
+        "hermes_cli.main",
+        "gateway",
+        "run",
+    )
+    assert bootstrap.load_env_file(env_file)[
+        "HEALTHMES_DECISION_HERMES_BASE_URL"
+    ] == "http://hermes-decision:8645"
+    assert bootstrap.load_env_file(env_file)["HERMES_UID"] == str(
+        os.getuid()
+    )
+    assert bootstrap.load_env_file(env_file)["HERMES_GID"] == str(
+        os.getgid()
+    )
 
 
-def test_home_chat_id_set_does_not_warn(bootstrap, hermes_home, env_file, capsys):
+@pytest.mark.parametrize(
+    ("first_mode", "second_mode", "expected_origin"),
+    (
+        ("native", "docker", "http://hermes-decision:8645"),
+        ("docker", "native", "http://127.0.0.1:8645"),
+    ),
+)
+def test_mode_switch_replaces_only_bootstrap_owned_public_origin(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    first_mode: str,
+    second_mode: str,
+    expected_origin: str,
+) -> None:
+    assert run_bootstrap(
+        bootstrap,
+        hermes_home,
+        env_file,
+        "--mode",
+        first_mode,
+    ) == 0
+    assert run_bootstrap(
+        bootstrap,
+        hermes_home,
+        env_file,
+        "--mode",
+        second_mode,
+    ) == 0
+
+    assert bootstrap.load_env_file(env_file)[
+        "HEALTHMES_DECISION_HERMES_BASE_URL"
+    ] == expected_origin
+    manifest = load_runtime_manifest(
+        _decision_home(hermes_home) / "runtime-manifest.json"
+    )
+    assert manifest.public_origin == expected_origin
+
+
+def test_mode_switch_preserves_custom_public_origin(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    custom_origin = "https://decision.example.test"
     env_file.write_text(
-        env_file.read_text() + "TELEGRAM_HOME_CHAT_ID=987654321\n", encoding="utf-8"
+        env_file.read_text(encoding="utf-8")
+        + "HEALTHMES_DECISION_HERMES_BASE_URL="
+        + custom_origin
+        + "\n",
+        encoding="utf-8",
     )
-    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    assert "TELEGRAM_HOME_CHAT_ID" not in capsys.readouterr().err
+
+    assert run_bootstrap(
+        bootstrap,
+        hermes_home,
+        env_file,
+        "--mode",
+        "docker",
+    ) == 0
+
+    assert bootstrap.load_env_file(env_file)[
+        "HEALTHMES_DECISION_HERMES_BASE_URL"
+    ] == custom_origin
+    manifest = load_runtime_manifest(
+        _decision_home(hermes_home) / "runtime-manifest.json"
+    )
+    assert manifest.public_origin == custom_origin
 
 
-# ---------------------------------------------------------------------------
-# Hermes-timezone-aware fallback clock (vendor hermes_time.py parity)
-# ---------------------------------------------------------------------------
-
-
-def test_hermes_now_honors_env_timezone(bootstrap, tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_TIMEZONE", "Asia/Seoul")  # fixed +09:00, no DST
-    now = bootstrap._hermes_now(tmp_path)
-    assert now.utcoffset() == timedelta(hours=9)
-
-
-def test_hermes_now_honors_config_timezone_key(bootstrap, tmp_path, monkeypatch):
-    monkeypatch.delenv("HERMES_TIMEZONE", raising=False)
-    (tmp_path / "config.yaml").write_text("timezone: Asia/Kolkata\n", encoding="utf-8")
-    now = bootstrap._hermes_now(tmp_path)
-    assert now.utcoffset() == timedelta(hours=5, minutes=30)  # fixed +05:30
-
-
-def test_hermes_now_env_beats_config_and_bad_values_fall_back(
-    bootstrap, tmp_path, monkeypatch
-):
-    (tmp_path / "config.yaml").write_text("timezone: Asia/Kolkata\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_TIMEZONE", "Asia/Seoul")
-    assert bootstrap._hermes_now(tmp_path).utcoffset() == timedelta(hours=9)
-
-    # Invalid names fall back to server-local time, never crash (vendor
-    # hermes_time._get_zoneinfo behavior).
-    monkeypatch.setenv("HERMES_TIMEZONE", "Not/AZone")
-    (tmp_path / "config.yaml").unlink()
-    now = bootstrap._hermes_now(tmp_path)
-    assert now.tzinfo is not None
-    assert now.utcoffset() == datetime.now().astimezone().utcoffset()
-
-
-def test_payload_fallback_jobs_use_hermes_timezone(
-    bootstrap, hermes_home, env_file, monkeypatch, capsys
-):
-    """Forcing the no-croniter fallback path: created_at/next_run_at must be
-    stamped in the configured Hermes timezone (as vendor create_job does via
-    hermes_time.now()), so the first briefing fires on the right wall clock."""
-    monkeypatch.setenv("HERMES_TIMEZONE", "Asia/Seoul")
-    monkeypatch.setattr(bootstrap, "_import_vendor_cron_jobs", lambda home: None)
+def test_decision_profile_honors_only_decision_and_healthmes_overrides(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "HEALTHMES_MCP_URL",
+        "https://healthmes.example.test/mcp",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_MODEL_BASE_URL",
+        "https://models.example.test/v1",
+    )
+    monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_MODEL_API_KEY",
+        "model-route-secret",
+    )
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "must-not-be-read")
 
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
-    assert "payload-fallback" in capsys.readouterr().out
 
-    jobs_doc = yaml.safe_load((hermes_home / "cron" / "jobs.json").read_text())
-    jobs = {job["name"]: job for job in jobs_doc["jobs"]}
-    assert len(jobs) == 3
-    for job in jobs.values():
-        for key in ("created_at", "next_run_at"):
-            assert datetime.fromisoformat(job[key]).utcoffset() == timedelta(hours=9)
-    # The wall-clock hour of the first run matches the cron expression in
-    # the configured zone (07:00 KST, not 07:00 system-local).
-    morning_next = datetime.fromisoformat(jobs["healthmes-morning-plan"]["next_run_at"])
-    assert (morning_next.hour, morning_next.minute) == (7, 0)
-
-
-# ---------------------------------------------------------------------------
-# Fallback cron next-run computation
-# ---------------------------------------------------------------------------
-
-
-def test_next_cron_run_daily_and_weekly(bootstrap):
-    # 2026-07-08 is a Wednesday.
-    now = datetime(2026, 7, 8, 8, 0, tzinfo=UTC)
-    assert bootstrap._next_cron_run("0 7 * * *", now) == datetime(
-        2026, 7, 9, 7, 0, tzinfo=UTC
+    profile = _load_profile(hermes_home)
+    assert profile["mcp_servers"]["healthmes"]["url"] == (
+        "https://healthmes.example.test/mcp"
     )
-    assert bootstrap._next_cron_run("30 21 * * *", now) == datetime(
-        2026, 7, 8, 21, 30, tzinfo=UTC
+    assert profile["model"]["base_url"] == (
+        "https://models.example.test/v1"
     )
-    # cron weekday 0 = Sunday -> 2026-07-12.
-    assert bootstrap._next_cron_run("0 18 * * 0", now) == datetime(
-        2026, 7, 12, 18, 0, tzinfo=UTC
+    assert profile["model"]["api_key"] == "model-route-secret"
+    encoded = (
+        _decision_home(hermes_home) / "runtime-manifest.json"
+    ).read_text(encoding="ascii")
+    assert "provider-secret" not in encoded
+    assert "legacy-telegram-secret" not in encoded
+    assert "must-not-be-read" not in encoded
+
+
+def test_provider_environment_manifest_is_an_exact_allowlist(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8")
+        + "UNRELATED_API_KEY=unrelated-secret\n"
+        + "ANTHROPIC_API_KEY=second-provider-secret\n",
+        encoding="utf-8",
     )
-    # A weekly schedule whose slot already passed today rolls a full week.
-    sunday_evening = datetime(2026, 7, 12, 19, 0, tzinfo=UTC)
-    assert bootstrap._next_cron_run("0 18 * * 0", sunday_evening) == datetime(
-        2026, 7, 19, 18, 0, tzinfo=UTC
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    manifest = load_runtime_manifest(
+        _decision_home(hermes_home) / "runtime-manifest.json"
     )
-    with pytest.raises(ValueError):
-        bootstrap._next_cron_run("*/5 * * * *", now)
+    names = {item.name for item in manifest.provider_environment}
+    assert names == {"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}
+    assert names.issubset(HERMES_RUNTIME_PROVIDER_ENV_NAMES)
+    manifest_text = (
+        _decision_home(hermes_home) / "runtime-manifest.json"
+    ).read_text(encoding="ascii")
+    assert "second-provider-secret" not in manifest_text
+    assert "unrelated-secret" not in manifest_text

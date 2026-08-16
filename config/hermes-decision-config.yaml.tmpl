@@ -24,7 +24,7 @@ platforms:
     enabled: true
     extra:
       host: "{{ decision_hermes_host | default('127.0.0.1', true) }}"
-      port: {{ decision_hermes_port | default(8645, true) }}
+      port: {{ decision_hermes_port | default(8646, true) }}
       key: "{{ decision_hermes_api_key }}"
       model_name: "healthmes-decision-runtime"
       model_routes:

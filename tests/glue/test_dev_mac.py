@@ -295,17 +295,50 @@ def test_launch_agent_enables_scheduler_for_background_calendar_polling() -> Non
     assert environment["HEALTHMES_SCHEDULER_ENABLED"] == "true"
 
 
-def test_local_start_syncs_resolved_ow_key_into_hermes_before_apps() -> None:
+def test_local_start_uses_only_optional_dedicated_decision_runtime() -> None:
     text = LOCAL_SCRIPT.read_text(encoding="utf-8")
     start_body = _function_body(text, "start_apps")
-    sync_body = _function_body(text, "sync_hermes_ow_api_key")
+    configured_body = _function_body(text, "decision_runtime_configured")
+    load_env_body = _function_body(text, "load_runtime_env")
 
-    assert "sync_hermes_ow_api_key" in text
-    assert '[ "$result" = "updated" ] || return' not in sync_body
-    assert start_body.index("resolve_ow_api_key") < start_body.index("sync_hermes_ow_api_key")
-    assert start_body.index("sync_hermes_ow_api_key") < start_body.index(
-        'start_process "Open Wearables"'
+    assert "sync_hermes_ow_api_key" not in text
+    last_source = load_env_body.rindex("source ")
+    assert (
+        load_env_body.index("export HEALTHMES_HERMES_WEBHOOK_URL=")
+        > last_source
     )
+    assert (
+        load_env_body.index("export HEALTHMES_HERMES_WEBHOOK_SECRET=")
+        > last_source
+    )
+    assert "HEALTHMES_DECISION_HERMES_MODEL" in configured_body
+    assert "HEALTHMES_DECISION_HERMES_PROVIDER" in configured_body
+    assert "requires both" in configured_body
+    assert "if decision_runtime_configured; then" in start_body
+    assert "scripts/bootstrap.py" in start_body
+    assert "healthmes.hermes_runtime_supervisor" in start_body
+    assert start_body.index("scripts/bootstrap.py") < start_body.index(
+        "healthmes.hermes_runtime_supervisor"
+    )
+    assert start_body.index("healthmes.hermes_runtime_supervisor") < (
+        start_body.index('start_process "Open Wearables"')
+    )
+    assert (
+        "Hermes decision runtime disabled (model/provider not configured)"
+        in start_body
+    )
+
+
+def test_local_runtime_supervises_and_stops_decision_process() -> None:
+    text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+    daemon_body = _function_body(text, "cmd_daemon")
+    stop_body = _function_body(text, "stop_apps")
+    status_body = _function_body(text, "cmd_status")
+
+    assert '"$HERMES_DECISION_PID"' in daemon_body
+    assert "decision_runtime_configured" in daemon_body
+    assert 'stop_process "Hermes decision runtime"' in stop_body
+    assert 'service_status "Hermes decision runtime"' in status_body
 
 
 def test_local_runtime_starts_and_supervises_open_wearables_beat() -> None:

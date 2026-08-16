@@ -8,18 +8,18 @@ HEALTHMES_PID="$RUNTIME_DIR/healthmes.pid"
 OW_PID="$RUNTIME_DIR/open-wearables.pid"
 WORKER_PID="$RUNTIME_DIR/open-wearables-worker.pid"
 BEAT_PID="$RUNTIME_DIR/open-wearables-beat.pid"
+HERMES_DECISION_PID="$RUNTIME_DIR/hermes-decision.pid"
 HEALTHMES_LOG="$RUNTIME_DIR/healthmes.log"
 OW_LOG="$RUNTIME_DIR/open-wearables.log"
 WORKER_LOG="$RUNTIME_DIR/open-wearables-worker.log"
 BEAT_LOG="$RUNTIME_DIR/open-wearables-beat.log"
+HERMES_DECISION_LOG="$RUNTIME_DIR/hermes-decision.log"
 DASHBOARD_URL="${HEALTHMES_DASHBOARD_URL:-http://127.0.0.1:${HEALTHMES_PORT:-8100}/sleep}"
 DEV_MAC_SCRIPT="${HEALTHMES_DEV_MAC_SCRIPT:-$REPO_ROOT/scripts/dev_mac.sh}"
 LAUNCH_AGENT_LABEL="com.healthmes.local"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 LAUNCH_AGENT_PLIST="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
 LAUNCH_AGENT_TEMPLATE="$REPO_ROOT/config/$LAUNCH_AGENT_LABEL.plist.in"
-HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
-HERMES_GATEWAY_LABEL="ai.hermes.gateway"
 LAUNCHCTL_BIN="${HEALTHMES_LAUNCHCTL_BIN:-launchctl}"
 PS_BIN="${HEALTHMES_PS_BIN:-ps}"
 KILL_BIN="${HEALTHMES_KILL_BIN:-/bin/kill}"
@@ -235,6 +235,10 @@ load_runtime_env() {
     [ -f "$REPO_ROOT/config/open-wearables.env" ] \
         && source "$REPO_ROOT/config/open-wearables.env"
     set +a
+    # Canonical wellness reasoning enters only through DecisionRequest.
+    # Never let a legacy generic Hermes webhook leak in from dotenv or shell.
+    export HEALTHMES_HERMES_WEBHOOK_URL=
+    export HEALTHMES_HERMES_WEBHOOK_SECRET=
 }
 
 resolve_ow_api_key() {
@@ -258,44 +262,15 @@ resolve_ow_api_key() {
     export HEALTHMES_OW_API_KEY="$api_key"
 }
 
-sync_hermes_ow_api_key() {
-    local config_path="$HERMES_HOME_DIR/config.yaml" result
-    [ -f "$config_path" ] || return
-    result="$(
-        uv run python - "$config_path" <<'PY'
-import os
-import sys
-import tempfile
-from pathlib import Path
-
-import yaml
-
-path = Path(sys.argv[1])
-config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-env = config.setdefault("mcp_servers", {}).setdefault(
-    "open_wearables", {}
-).setdefault("env", {})
-key = os.environ["HEALTHMES_OW_API_KEY"]
-if env.get("OPEN_WEARABLES_API_KEY") == key:
-    print("unchanged")
-    raise SystemExit
-env["OPEN_WEARABLES_API_KEY"] = key
-fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-with os.fdopen(fd, "w", encoding="utf-8") as stream:
-    yaml.safe_dump(config, stream, sort_keys=False, allow_unicode=True)
-os.chmod(temp_name, 0o600)
-os.replace(temp_name, path)
-print("updated")
-PY
-    )"
-    if [ "$result" != "updated" ]; then
-        return 0
+decision_runtime_configured() {
+    local model provider
+    model="$(trim_whitespace "${HEALTHMES_DECISION_HERMES_MODEL:-}")"
+    provider="$(trim_whitespace "${HEALTHMES_DECISION_HERMES_PROVIDER:-}")"
+    if [ -z "$model" ] && [ -z "$provider" ]; then
+        return 1
     fi
-    info "synchronized Open Wearables credential into Hermes"
-    if "$LAUNCHCTL_BIN" print "gui/$UID/$HERMES_GATEWAY_LABEL" >/dev/null 2>&1; then
-        "$LAUNCHCTL_BIN" kickstart -k "gui/$UID/$HERMES_GATEWAY_LABEL"
-        info "restarted Hermes gateway to reload MCP credentials"
-    fi
+    [ -n "$model" ] && [ -n "$provider" ] \
+        || die "decision runtime requires both HEALTHMES_DECISION_HERMES_MODEL and HEALTHMES_DECISION_HERMES_PROVIDER"
 }
 
 install_launch_agent() {
@@ -368,10 +343,38 @@ cmd_update() {
 }
 
 start_apps() {
+    local decision_home quoted_home quoted_vendor
     load_runtime_env
     bash "$DEV_MAC_SCRIPT" services-start
     resolve_ow_api_key
-    sync_hermes_ow_api_key
+    if decision_runtime_configured; then
+        uv run python "$REPO_ROOT/scripts/bootstrap.py" --mode native
+        load_runtime_env
+        [ -n "${HEALTHMES_DECISION_HERMES_PROFILE_PATH:-}" ] \
+            || die "bootstrap did not configure the decision profile"
+        decision_home="$(dirname "$HEALTHMES_DECISION_HERMES_PROFILE_PATH")"
+        printf -v quoted_home '%q' "$decision_home"
+        printf -v quoted_vendor '%q' "$REPO_ROOT/vendor/hermes-agent"
+        stop_process "Hermes decision runtime" "$HERMES_DECISION_PID"
+        start_process "Hermes decision runtime" \
+            "$HERMES_DECISION_PID" "$HERMES_DECISION_LOG" \
+            "exec env HERMES_HOME=$quoted_home uv run python -m healthmes.hermes_runtime_supervisor --hermes-home $quoted_home --vendor-root $quoted_vendor"
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+            if curl --fail --silent --max-time 1 \
+                "http://127.0.0.1:${HEALTHMES_DECISION_RUNTIME_PORT:-8645}/healthmes/runtime-health" \
+                >/dev/null; then
+                break
+            fi
+            "$SLEEP_BIN" 1
+        done
+        curl --fail --silent --max-time 1 \
+            "http://127.0.0.1:${HEALTHMES_DECISION_RUNTIME_PORT:-8645}/healthmes/runtime-health" \
+            >/dev/null \
+            || die "Hermes decision runtime did not become ready; see $HERMES_DECISION_LOG"
+    else
+        stop_process "Hermes decision runtime" "$HERMES_DECISION_PID"
+        info "Hermes decision runtime disabled (model/provider not configured)"
+    fi
     start_process "Open Wearables" "$OW_PID" "$OW_LOG" \
         "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow"
     start_process "Open Wearables worker" "$WORKER_PID" "$WORKER_LOG" \
@@ -396,10 +399,13 @@ cmd_daemon() {
     start_apps
     while true; do
         "$SLEEP_BIN" 5
+        load_runtime_env
         if ! pid_running "$HEALTHMES_PID" \
             || ! pid_running "$OW_PID" \
             || ! pid_running "$WORKER_PID" \
-            || ! pid_running "$BEAT_PID"; then
+            || ! pid_running "$BEAT_PID" \
+            || { decision_runtime_configured \
+                && ! pid_running "$HERMES_DECISION_PID"; }; then
             start_apps
         fi
     done
@@ -410,6 +416,7 @@ stop_apps() {
     stop_process "Open Wearables beat" "$BEAT_PID"
     stop_process "Open Wearables worker" "$WORKER_PID"
     stop_process "Open Wearables" "$OW_PID"
+    stop_process "Hermes decision runtime" "$HERMES_DECISION_PID"
 }
 
 cmd_stop() {
@@ -428,6 +435,7 @@ service_status() {
 }
 
 cmd_status() {
+    service_status "Hermes decision runtime" "$HERMES_DECISION_PID"
     service_status "HealthMes" "$HEALTHMES_PID"
     service_status "Open Wearables" "$OW_PID"
     service_status "Open Wearables worker" "$WORKER_PID"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,6 +41,9 @@ from healthmes.decision import (
     ToolCallRecord,
     ToolCallStatus,
     source_ref_id,
+)
+from healthmes.decision.hermes_profile import (
+    HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
 )
 from healthmes.decision.responses import (
     HERMES_DECISION_DRAFT_SCHEMA,
@@ -186,7 +190,11 @@ def _final_response(
     decision: dict,
     *,
     output_prefix: list[dict] | None = None,
+    include_persistence_intent: bool = True,
 ) -> dict:
+    decision = dict(decision)
+    if include_persistence_intent:
+        decision.setdefault("persistence_intent", "none")
     envelope = {
         "schema": HERMES_DECISION_DRAFT_SCHEMA,
         "decision": decision,
@@ -583,6 +591,7 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
         "channel": "rest",
         "execution_scope": "local",
     }
+    assert "persistence_intent is required" in payload["instructions"]
     assert transport.deleted_sessions == [
         HERMES_SESSION_ID,
         HERMES_SESSION_ID,
@@ -811,6 +820,238 @@ async def test_agent_rejects_malformed_or_oversized_final_output(
 
     assert run.draft.status is DecisionStatus.FAILED
     assert run.draft.limitations == [expected_code]
+
+
+@pytest.mark.asyncio
+async def test_agent_rejects_missing_persistence_intent() -> None:
+    transport = _Transport(
+        _final_response(
+            {
+                "status": "completed",
+                "answer": "This is missing a required intent.",
+            },
+            include_persistence_intent=False,
+        )
+    )
+    agent = HermesResponsesDecisionAgent(
+        transport=transport,
+        search_service=_SearchService(_empty_snapshot()),  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        clock=lambda: NOW,
+    )
+
+    run = await agent.ask(_request())
+
+    assert run.draft.status is DecisionStatus.FAILED
+    assert run.draft.limitations == [
+        "hermes_persistence_intent_missing"
+    ]
+
+
+@pytest.mark.parametrize(
+    "tools",
+    (
+        ("search_activity", "search_calendar", "search_nutrition"),
+        (
+            *HERMES_DECISION_MCP_TOOL_NAMES,
+            *HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
+            "unexpected_tool",
+        ),
+        (
+            *HERMES_DECISION_MCP_TOOL_NAMES,
+            "search_activity",
+        ),
+    ),
+)
+def test_dedicated_profile_requires_an_exact_tool_surface(
+    tmp_path: Path,
+    tools: tuple[str, ...],
+) -> None:
+    assertion = _decision_profile(
+        tmp_path / "invalid-tools.yaml",
+        tools=tools,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="hermes_decision_profile_mcp_invalid",
+    ):
+        assertion.verify()
+
+
+@pytest.mark.asyncio
+async def test_agent_accepts_profile_bound_reviewed_skill_tools(
+    tmp_path: Path,
+) -> None:
+    skill_name = "healthmes-wellness-decision"
+    content = "---\nname: healthmes-wellness-decision\n---\nGuidance.\n"
+    metadata = {
+        "name": skill_name,
+        "description": "Reviewed wellness guidance.",
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "bytes": len(content.encode("utf-8")),
+        "version": "1",
+    }
+    output_prefix = [
+        {
+            "type": "function_call",
+            "name": "mcp__healthmes__list_wellness_skills",
+            "arguments": "{}",
+            "call_id": "list-skills",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "list-skills",
+            "output": json.dumps(
+                {
+                    "structuredContent": {
+                        "schema": "healthmes-wellness-skills.v1",
+                        "skills": [metadata],
+                    }
+                }
+            ),
+        },
+        {
+            "type": "function_call",
+            "name": "mcp__healthmes__read_wellness_skill",
+            "arguments": json.dumps({"name": skill_name}),
+            "call_id": "read-skill",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "read-skill",
+            "output": json.dumps(
+                {
+                    "structuredContent": {
+                        "schema": "healthmes-wellness-skills.v1",
+                        "skill": metadata,
+                        "content": content,
+                    }
+                }
+            ),
+        },
+    ]
+    transport = _Transport(
+        _final_response(
+            {
+                "status": "completed",
+                "answer": "Take a short break.",
+            },
+            output_prefix=output_prefix,
+        )
+    )
+    agent = HermesResponsesDecisionAgent(
+        transport=transport,
+        search_service=_SearchService(_empty_snapshot()),  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        profile_assertion=_decision_profile(
+            tmp_path / "decision-config.yaml",
+            tools=(
+                *HERMES_DECISION_MCP_TOOL_NAMES,
+                *HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
+            ),
+        ),
+        clock=lambda: NOW,
+    )
+
+    try:
+        run = await agent.ask(_request())
+    finally:
+        await agent.aclose()
+
+    assert run.draft.status is DecisionStatus.COMPLETED
+    assert run.tool_trace == ()
+    instructions = transport.response_calls[0]["instructions"]
+    assert "mcp__healthmes__list_wellness_skills" in instructions
+    assert "do not accept decision_session_id" in instructions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ("bytes", "sha256", "name"))
+async def test_agent_rejects_drifted_reviewed_skill_content(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    requested_name = "healthmes-wellness-decision"
+    content = "Reviewed guidance.\n"
+    metadata = {
+        "name": (
+            "healthmes-caffeine"
+            if drift == "name"
+            else requested_name
+        ),
+        "description": "Reviewed wellness guidance.",
+        "sha256": (
+            "0" * 64
+            if drift == "sha256"
+            else hashlib.sha256(content.encode("utf-8")).hexdigest()
+        ),
+        "bytes": (
+            len(content.encode("utf-8")) + 1
+            if drift == "bytes"
+            else len(content.encode("utf-8"))
+        ),
+    }
+    transport = _Transport(
+        _final_response(
+            {
+                "status": "completed",
+                "answer": "This output is not trusted.",
+            },
+            output_prefix=[
+                {
+                    "type": "function_call",
+                    "name": "mcp__healthmes__read_wellness_skill",
+                    "arguments": json.dumps({"name": requested_name}),
+                    "call_id": "read-skill",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "read-skill",
+                    "output": json.dumps(
+                        {
+                            "structuredContent": {
+                                "schema": (
+                                    "healthmes-wellness-skills.v1"
+                                ),
+                                "skill": metadata,
+                                "content": content,
+                            }
+                        }
+                    ),
+                },
+            ],
+        )
+    )
+    agent = HermesResponsesDecisionAgent(
+        transport=transport,
+        search_service=_SearchService(_empty_snapshot()),  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        profile_assertion=_decision_profile(
+            tmp_path / "decision-config.yaml",
+            tools=(
+                *HERMES_DECISION_MCP_TOOL_NAMES,
+                *HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
+            ),
+        ),
+        clock=lambda: NOW,
+    )
+
+    try:
+        run = await agent.ask(_request())
+    finally:
+        await agent.aclose()
+
+    assert run.draft.status is DecisionStatus.FAILED
+    assert run.draft.limitations == [
+        "hermes_skill_tool_output_invalid"
+    ]
 
 
 @pytest.mark.asyncio
