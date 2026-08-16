@@ -273,10 +273,10 @@ Android와 ActivityWatch descriptor도 꺼진 값으로 보인다. Decision Agen
 
 ## 4. iPhone Screen Time 연결 seam
 
-현재 일반 앱은 이 seam을 lifecycle에서 호출하지 않으므로 자동으로 report를
-전송하지 않는다. 일반 빌드의 unavailable adapter와 향후 지원 SDK, 승인
-entitlement 및 compile condition을 갖춘 조건부 collector는 모두 다음 엔진
-seam을 통해 연결한다.
+앱 lifecycle, 권한 승인 직후 sync, foreground catch-up, pairing 변경과
+Screen Time 전용 `BGAppRefreshTask`는 같은 UI-neutral 엔진 seam에 연결되어 있다.
+실제 설정 화면은 device-team 범위이며, 사용자가 명시적으로 opt-in한 뒤
+`requestAuthorizationAndSync()`를 호출해야 한다.
 
 ```text
 사용자 authorize 선택
@@ -308,12 +308,11 @@ ScreenTimeActivitySyncService.sync(pairing:)
           activity.* WellnessEvent
 ```
 
-2026-08-16 현재 코드는 주입 가능한 service core와 transport/report contract를
-테스트하지만 Apple collector 경로는 일반 빌드에서 컴파일하지 않고 앱 lifecycle도
-연결하지 않는다. PR #138의 Issue #168은 UI를 수정하지 않고 권한 승인 직후 첫
-sync, foreground catch-up, Screen Time 전용 best-effort background task와
-offline outbox를 연결한다. 설정 화면, entitlement 승인, 실제 배포 서명과 실기기
-검증은 device-team 또는 Apple 외부 조건이다.
+현재 PR은 service core, transport/report contract, lifecycle, bounded outbox,
+background registration과 source-side privacy exclusion을 연결한다. 설정 화면은
+추가하지 않는다. Apple API를 실제 컴파일할 수 있는지는 아래 SDK capability
+probe가 결정하며, distribution signing과 실기기 검증은 저장소의 unsigned
+빌드가 대신 증명하지 않는다.
 
 `GET /v1/activity/devices/{device_id}/collection`의
 `raw_retention_cutoff`는 중앙 `activity_raw` 보존 정책으로부터 계산된다. 최초
@@ -344,12 +343,33 @@ ID를 사용하고, key를 잃어 새 `ios-collector-v1-*` ID가 생기면 서�
 빌드가 이 capability를 갖지 않으면 가짜 0분을 전송하지 않는다.
 `capability=unavailable`과 구체적인 reason을 서버에 보고한다.
 
-현재 collector 구현은 `HEALTHMES_IOS_26_4_SCREENTIME_EXPORT` 조건에서만 실제
-Apple API를 컴파일한다. 현재 저장소의 일반 빌드는 안전한 unavailable adapter를
-제공하지만 앱 lifecycle은 아직 sync seam을 호출하지 않는다. Issue #168이
-lifecycle을 연결한 뒤에도 일반 빌드는 unavailable report를 전송한다. 지원
-SDK에서 entitlement와 이 build condition을 device-team target에 함께 설정하고
-실제 기기로 검증해야 한다.
+`HealthMesCompanionScreenTimeOptIn`은 capability를 주장하는 "eligible" 구성이
+아니라 사용자가 기능을 요청한 구성이다. 다음 스크립트만 SDK capability
+condition을 생성한다.
+
+```bash
+cd apps/ios-companion
+xcodegen generate
+bash Scripts/build-screen-time-opt-in.sh build
+```
+
+스크립트는 선택한 SDK에서
+`AuthorizationStatus.approvedWithDataAccess`와
+`DeviceActivityData.activityData(filteredBy:using:)`를 실제 type-check한다.
+성공할 때만 `HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE`을 주입해 Apple collector
+코드를 컴파일한다. 실패하면 opt-in 요청은
+`ios_screen_time_export_sdk_unavailable` unavailable adapter로 명시적으로 닫힌다.
+일반 빌드는 별도의 `ios_screen_time_normal_build_unavailable` 경계를 유지한다.
+
+SDK probe 성공만으로 실제 기기 수집이 보장되지는 않는다. opt-in entitlement
+파일은 `com.apple.developer.family-controls`와
+`com.apple.developer.family-controls.app-and-website-usage`를 선언한다. 실제
+빌드는 이 두 capability가 App ID와 signed provisioning profile에도 포함되어야
+하고, Family Controls는 App Store 제출 전에 Apple 사용 허가가 필요하다. 사용자
+승인은 `approvedWithDataAccess`까지 도달해야 한다. 고객 설치에서는 기기가 EU에
+있고 Apple Account 국가/지역도 EU여야 하며, Apple-provided development/test
+profile을 사용하는 개발·테스트만 다른 지역에서 가능하다. unsigned CI는 이러한
+서명·계정·지역 조건이나 실제 iPhone 수집을 증명하지 않는다.
 
 ## 5. Screen Time 데이터 의미
 
@@ -481,8 +501,9 @@ Open Wearables의 HealthMes mirror는 범용 `normalized`와 섞지 않고 전�
 ## 8. 비범위와 후속
 
 - iOS/Android/desktop 실제 설정 화면
-- iPhone 권한 설명·설정 UI와 실제 distribution signing
+- iPhone 권한 설명·설정 UI
 - Apple entitlement 신청과 실제 기기 dogfood
+- App ID capability, signed provisioning profile과 distribution 검증
 - hosted/mobile-only Personal Data Node
 - GPS/location 수집
 

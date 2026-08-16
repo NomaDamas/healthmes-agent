@@ -159,6 +159,65 @@ private struct ScreenTimeActiveSync {
     let task: Task<ScreenTimeSyncOutcome, Error>
 }
 
+private final class ScreenTimeSyncWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation:
+        CheckedContinuation<ScreenTimeSyncOutcome, Error>?
+    private var pendingResult:
+        Result<ScreenTimeSyncOutcome, Error>?
+    private var cancelled = false
+
+    func install(
+        _ continuation:
+            CheckedContinuation<ScreenTimeSyncOutcome, Error>
+    ) {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        if let pendingResult {
+            lock.unlock()
+            continuation.resume(with: pendingResult)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func complete(
+        _ result: Result<ScreenTimeSyncOutcome, Error>
+    ) {
+        lock.lock()
+        guard !cancelled else {
+            lock.unlock()
+            return
+        }
+        if let continuation {
+            self.continuation = nil
+            lock.unlock()
+            continuation.resume(with: result)
+            return
+        }
+        pendingResult = result
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !cancelled, pendingResult == nil else {
+            lock.unlock()
+            return
+        }
+        cancelled = true
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(throwing: CancellationError())
+    }
+}
+
 private enum ScreenTimeUploadFailurePolicy {
     static func isRetryable(_ error: Error) -> Bool {
         if error is CancellationError {
@@ -292,7 +351,7 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             ScreenTimeActivityReportIdentity.destinationID(for: pairing)
         await cancelActiveSyncIfDestinationChanged(destinationID)
         if let activeSync {
-            return try await valuePropagatingCancellation(
+            return try await valueIsolatingWaiterCancellation(
                 from: activeSync.task
             )
         }
@@ -309,21 +368,39 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             destinationID: destinationID,
             task: task
         )
-        defer {
-            if activeSync?.id == id {
-                activeSync = nil
-            }
+        Task { [weak self] in
+            _ = await task.result
+            await self?.clearActiveSync(id: id)
         }
-        return try await valuePropagatingCancellation(from: task)
+        return try await valueIsolatingWaiterCancellation(from: task)
     }
 
-    private func valuePropagatingCancellation(
+    /// The sync pipeline is service-owned, not caller-owned.
+    ///
+    /// Cancelling one foreground/background waiter must not cancel uploads
+    /// observed by another waiter. The pipeline also continues with zero
+    /// waiters so it can finish an idempotent upload or persist retry work.
+    /// A pairing destination change below is the only global cancellation
+    /// boundary; this app-lifetime service has no separate shutdown path.
+    private func valueIsolatingWaiterCancellation(
         from task: Task<ScreenTimeSyncOutcome, Error>
     ) async throws -> ScreenTimeSyncOutcome {
-        try await withTaskCancellationHandler {
-            try await task.value
+        let waiter = ScreenTimeSyncWaiter()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                waiter.install(continuation)
+                Task {
+                    waiter.complete(await task.result)
+                }
+            }
         } onCancel: {
-            task.cancel()
+            waiter.cancel()
+        }
+    }
+
+    private func clearActiveSync(id: UUID) {
+        if activeSync?.id == id {
+            activeSync = nil
         }
     }
 

@@ -118,6 +118,11 @@ xcodegen generate
 xcodebuild -project HealthMesCompanion.xcodeproj -scheme HealthMesCompanion \
   -destination "generic/platform=iOS Simulator" build CODE_SIGNING_ALLOWED=NO
 
+# Screen Time opt-in request. The script type-checks Apple's export APIs in
+# the selected SDK. Unsupported SDKs still build, but select the explicit
+# fail-closed adapter instead of pretending the collector is eligible.
+bash Scripts/build-screen-time-opt-in.sh build
+
 # watchOS app + complication extension
 xcodebuild -project HealthMesCompanion.xcodeproj -scheme HealthMesWatchApp \
   -destination "generic/platform=watchOS Simulator" build CODE_SIGNING_ALLOWED=NO
@@ -183,7 +188,8 @@ allowlist statically known domains.)
 ## Layout
 
 ```
-project.yml                  # XcodeGen spec (6 targets, 2 schemes)
+project.yml                  # XcodeGen spec (6 targets, 3 schemes)
+Scripts/                     # SDK capability probe + opt-in unsigned build
 Sources/Shared/              # PLATFORM-AGNOSTIC (Foundation+Security only;
                              # no UIKit/SwiftUI/ActivityKit) — compiled into
                              # every target and reusable verbatim by the
@@ -221,8 +227,10 @@ UITests/                     # XCUITest daily-loop acceptance (self-skipping)
 Verified at authoring time on this machine (Xcode 26.3, iOS 26.2 /
 watchOS 26.2 simulators, XcodeGen 2.45.4):
 
-- `xcodegen generate`; **both schemes build** (`generic/platform=iOS
-  Simulator`, `generic/platform=watchOS Simulator`, `CODE_SIGNING_ALLOWED=NO`).
+- `xcodegen generate`; the normal iOS and watchOS schemes build unsigned.
+  `HealthMesCompanionScreenTimeOptIn` also builds on Xcode 26.3/iOS SDK 26.2,
+  but intentionally selects `ios_screen_time_export_sdk_unavailable` because
+  that SDK does not expose the required App & Website Usage export symbols.
 - **The host-less unit-test suite passed** on an iPhone simulator (iOS 26.2):
   glance/alerts/weekly-report contract decoding (incl. empty shapes and the
   naive-datetime variant), multipart/JSON request builders byte-for-byte,
@@ -254,18 +262,27 @@ watchOS 26.2 simulators, XcodeGen 2.45.4):
 
 ## Screen Time activity engine seam
 
-`ScreenTimeActivitySyncService` is intentionally UI-neutral. A future
-device-team screen/lifecycle integration calls:
+`ScreenTimeActivityRuntime` and `ScreenTimeActivitySyncService` are
+UI-neutral. The app lifecycle is connected now:
 
 ```text
-requestAuthorization()
-sync(pairing:now:timezone:)
+explicit device-UI opt-in
+  -> requestAuthorizationAndSync()
+  -> successful authorization immediately enters sync
+
+app active / pairing changed / Screen Time BGAppRefreshTask
+  -> the same single-flight sync + persistent outbox pipeline
 ```
 
-In a gate-enabled, entitled build, each successfully lifecycle-wired sync
-would fetch the paired HealthMes node's current device collection settings,
-remove excluded apps on-device, replace bundle identifiers with device-keyed
-HMAC pseudonyms, and upload one authoritative snapshot to
+The device team still owns the settings screen. It should call
+`requestAuthorizationAndSync()` only after an explicit user action and
+`approveExcludedAppsAndSync(_:)` after confirming the exact opaque exclusion
+set. Foreground catch-up and best-effort background scheduling are already
+wired in `HealthMesCompanionApp` and `ScreenTimeActivityRuntime`.
+
+Each sync fetches the paired HealthMes node's current device collection
+settings, removes excluded apps on-device, replaces bundle identifiers with
+device-keyed HMAC pseudonyms, and uploads one authoritative snapshot to
 `POST /v1/activity/ios/report`. The first authorized sync and the first sync
 after a timezone change are deliberately limited to the latest completed
 local hour. Later syncs in the same timezone reconcile from that consent
@@ -296,14 +313,35 @@ response. An identical retry returns that response before evaluating later
 mutable collection settings; sequence reuse with different content remains a
 conflict.
 
-The current normal build uses an explicit unavailable adapter. The actual
-Apple export implementation is compiled only with
-`HEALTHMES_IOS_26_4_SCREENTIME_EXPORT` and additionally requires a supporting
-SDK/OS, Apple's App & Website Usage entitlement, data-access authorization,
-and eligible Apple customer/region access. This repository does not yet add
-that entitlement, compile condition, Screen Time-specific background task,
-settings UI, app-lifecycle call site, signing, or real-device validation.
-See `docs/INPUT-CONTROL-PLANE.ko.md`.
+Concurrent callers share a service-owned task. Cancelling one waiter does not
+cancel another foreground/background waiter, and the task may finish with no
+waiters so an idempotent upload or outbox write is not abandoned. A pairing
+destination change is the explicit global cancellation boundary.
+
+The normal build always uses an unavailable adapter. The
+`HealthMesCompanionScreenTimeOptIn` scheme expresses user/product intent, not
+proof that the current Apple SDK is eligible. Build it through
+`Scripts/build-screen-time-opt-in.sh`; the script type-checks
+`AuthorizationStatus.approvedWithDataAccess` and
+`DeviceActivityData.activityData(filteredBy:using:)` against the selected SDK.
+Only a successful probe injects
+`HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE`, which is the sole condition that
+compiles the real collector. Otherwise the opt-in build remains usable but
+reports `ios_screen_time_export_sdk_unavailable` without fake zero usage.
+
+The opt-in entitlement declaration is present in
+`Configurations/HealthMesCompanion-ScreenTimeOptIn.entitlements`. Actual
+collection additionally requires a supporting SDK and iOS release, a signed
+provisioning profile whose App ID includes both `Family Controls` and
+`Family Controls App and Website Usage`, and user authorization that reaches
+`approvedWithDataAccess`. Family Controls permission is required before App
+Store submission. Customer installations can use the export only while the
+device is in the EU and its Apple Account country or region is also in the
+EU; Apple-provisioned development/test builds may be exercised in other
+regions. None of signing-profile eligibility, runtime authorization, region
+eligibility, or real-iPhone behavior is proved by this repository's unsigned
+builds. The settings UI is also still device-team work. See
+`docs/INPUT-CONTROL-PLANE.ko.md`.
 
 **Not yet verified (honest list):**
 

@@ -18,8 +18,8 @@ name: HealthMesCompanion
 configs:
   Debug: debug
   Release: release
-  ScreenTimeEligibleDebug: debug
-  ScreenTimeEligibleRelease: release
+  ScreenTimeOptInDebug: debug
+  ScreenTimeOptInRelease: release
 options:
   bundleIdPrefix: com.healthmes
   createIntermediateGroups: true
@@ -59,16 +59,18 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion
         TARGETED_DEVICE_FAMILY: "1"
       configs:
-        ScreenTimeEligibleDebug:
+        ScreenTimeOptInDebug:
           CODE_SIGN_ENTITLEMENTS: >-
-            Configurations/HealthMesCompanion-ScreenTimeEligible.entitlements
+            Configurations/HealthMesCompanion-ScreenTimeOptIn.entitlements
           SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
-            $(inherited) HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
-        ScreenTimeEligibleRelease:
+            $(inherited) HEALTHMES_SCREENTIME_OPT_IN_REQUESTED
+            $(HEALTHMES_SCREENTIME_SDK_CONDITION)
+        ScreenTimeOptInRelease:
           CODE_SIGN_ENTITLEMENTS: >-
-            Configurations/HealthMesCompanion-ScreenTimeEligible.entitlements
+            Configurations/HealthMesCompanion-ScreenTimeOptIn.entitlements
           SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
-            $(inherited) HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
+            $(inherited) HEALTHMES_SCREENTIME_OPT_IN_REQUESTED
+            $(HEALTHMES_SCREENTIME_SDK_CONDITION)
     info:
       path: Support/HealthMesCompanion-Info.plist
       properties:
@@ -269,12 +271,14 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.tests
       configs:
-        ScreenTimeEligibleDebug:
+        ScreenTimeOptInDebug:
           SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
-            $(inherited) HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
-        ScreenTimeEligibleRelease:
+            $(inherited) HEALTHMES_SCREENTIME_OPT_IN_REQUESTED
+            $(HEALTHMES_SCREENTIME_SDK_CONDITION)
+        ScreenTimeOptInRelease:
           SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
-            $(inherited) HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
+            $(inherited) HEALTHMES_SCREENTIME_OPT_IN_REQUESTED
+            $(HEALTHMES_SCREENTIME_SDK_CONDITION)
     info:
       path: Support/HealthMesCompanionTests-Info.plist
       properties: {}
@@ -307,22 +311,22 @@ schemes:
       targets:
         - HealthMesCompanionTests
         - HealthMesCompanionUITests
-  HealthMesCompanionScreenTimeEligible:
+  HealthMesCompanionScreenTimeOptIn:
     build:
       targets:
         HealthMesCompanion: all
     run:
-      config: ScreenTimeEligibleDebug
+      config: ScreenTimeOptInDebug
     test:
-      config: ScreenTimeEligibleDebug
+      config: ScreenTimeOptInDebug
       targets:
         - HealthMesCompanionTests
     profile:
-      config: ScreenTimeEligibleRelease
+      config: ScreenTimeOptInRelease
     analyze:
-      config: ScreenTimeEligibleDebug
+      config: ScreenTimeOptInDebug
     archive:
-      config: ScreenTimeEligibleRelease
+      config: ScreenTimeOptInRelease
   HealthMesWatchApp:
     build:
       targets:

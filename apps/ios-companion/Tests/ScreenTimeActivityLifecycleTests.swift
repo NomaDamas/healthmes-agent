@@ -1000,7 +1000,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(counts.collection, 1)
     }
 
-    func testCallerCancellationStopsActualSingleFlightPipeline()
+    func testSoleWaiterCancellationLeavesServiceOwnedPipelineRunning()
         async throws
     {
         let outboxStorage = temporaryOutbox()
@@ -1018,7 +1018,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         let counter = ScreenTimeLifecycleTestCounter()
         let transport = ScreenTimeLifecycleTestTransport(
             state: collectionState(),
-            stateDelayNanoseconds: 1_000_000_000
+            stateDelayNanoseconds: 100_000_000
         )
         let service = ScreenTimeActivitySyncService(
             deviceID: "ios-lifecycle-device",
@@ -1045,20 +1045,98 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
 
         do {
             _ = try await work.value
-            XCTFail("expected caller cancellation to stop sync")
+            XCTFail("expected the cancelled waiter to stop waiting")
         } catch is CancellationError {
             // Expected.
         }
+        let replacement = try await service.sync(
+            pairing: pairing(),
+            now: date("2026-08-16T10:34:00Z"),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
         let counts = await counter.values()
         let stateCalls = await transport.capturedStateCalls()
         let reports = await transport.capturedReports()
 
+        guard case .uploaded = replacement else {
+            return XCTFail("expected replacement waiter to join the pipeline")
+        }
         XCTAssertEqual(stateCalls, 1)
-        XCTAssertEqual(counts.collection, 0)
-        XCTAssertTrue(reports.isEmpty)
+        XCTAssertEqual(counts.collection, 1)
+        XCTAssertEqual(reports.count, 1)
     }
 
-    func testURLSessionUploadCancellationDoesNotCreateRetryWork()
+    func testCancellingOneOfTwoWaitersDoesNotCancelTheOther()
+        async throws
+    {
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let counter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            stateDelayNanoseconds: 100_000_000
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let now = date("2026-08-16T10:34:00Z")
+        let first = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+        }
+        let second = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        second.cancel()
+
+        do {
+            _ = try await second.value
+            XCTFail("expected only the second waiter to cancel")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let firstOutcome = try await first.value
+        let counts = await counter.values()
+        let stateCalls = await transport.capturedStateCalls()
+        let reports = await transport.capturedReports()
+
+        guard case .uploaded = firstOutcome else {
+            return XCTFail("expected the first waiter to complete")
+        }
+        XCTAssertEqual(stateCalls, 1)
+        XCTAssertEqual(counts.collection, 1)
+        XCTAssertEqual(reports.count, 1)
+    }
+
+    func testDestinationRemovalCancelsURLSessionWithoutRetryWork()
         async throws
     {
         let outboxStorage = temporaryOutbox()
@@ -1119,11 +1197,11 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         }
         await fulfillment(of: [uploadStarted], timeout: 2)
 
-        work.cancel()
+        try await service.reconcilePendingUploads(pairing: nil)
 
         do {
             _ = try await work.value
-            XCTFail("expected upload cancellation")
+            XCTFail("expected destination removal to cancel upload")
         } catch is CancellationError {
             // Expected.
         }
@@ -1569,24 +1647,30 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
     }
 
     @MainActor
-    func testNormalBuildCollectorRemainsUnavailable() async throws {
-        #if HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
+    func testBuildCollectorFailClosedReasonMatchesCapability()
+        async throws
+    {
+        #if HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE
         throw XCTSkip(
             "The normal-build fail-closed assertion is not for the "
-                + "explicit ScreenTimeEligible configuration."
+                + "SDK-capable Screen Time opt-in configuration."
         )
         #else
         let collector = ScreenTimeActivityCollectorFactory.make(
             pseudonymKeyData: Data(repeating: 0x11, count: 32)
         )
         let result = try await collector.requestAuthorization()
+        #if HEALTHMES_SCREENTIME_OPT_IN_REQUESTED
+        let expectedReason =
+            "ios_screen_time_export_sdk_unavailable"
+        #else
+        let expectedReason =
+            "ios_screen_time_normal_build_unavailable"
+        #endif
 
         XCTAssertEqual(result.capability, .unavailable)
         XCTAssertEqual(result.permissionStatus, .unavailable)
-        XCTAssertEqual(
-            result.reason,
-            "ios_screen_time_normal_build_unavailable"
-        )
+        XCTAssertEqual(result.reason, expectedReason)
         XCTAssertTrue(result.samples.isEmpty)
         #endif
     }

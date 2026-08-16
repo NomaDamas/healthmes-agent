@@ -129,18 +129,17 @@ criteria are tracked in
   snapshots, and stores them in the same `WellnessEvent` data plane used by
   other wellness inputs. Desktop ActivityWatch data can be imported through
   the bounded localhost adapter and scheduled through the HealthMes engine.
-  The iOS companion now has Screen Time report contracts and a UI-neutral
-  sync-service seam, a Keychain-derived stable collector identity, and an
-  explicit-registration fail-closed boundary for new iPhone collectors. The
-  repository's normal build does not enable
-  `HEALTHMES_IOS_26_4_SCREENTIME_EXPORT`, so it selects the unavailable
-  adapter and collects no Apple activity instead of inventing zero usage.
-  As of 2026-08-16 the app lifecycle and Screen Time-specific background
-  wiring are not connected yet; issue #168 owns the UI-neutral authorization,
-  first-sync, foreground catch-up, best-effort background, and outbox
-  lifecycle for PR #138. A production collector still requires a supporting
-  SDK/OS, approved entitlement, authorization UI, signing, and real-device
-  validation outside this repository. Retention, deletion,
+  The iOS companion now has Screen Time report contracts, a Keychain-derived
+  stable collector identity, source-side privacy exclusions, and one
+  single-flight/bounded-outbox pipeline used after authorization, on
+  foreground activation, pairing changes, and Screen Time background refresh.
+  The normal build selects an unavailable adapter. The explicit
+  `HealthMesCompanionScreenTimeOptIn` build probes the selected SDK and
+  compiles the real collector only when Apple's App & Website Usage export
+  symbols are available; unsupported SDKs fail closed without inventing zero
+  usage. Production collection still requires a supporting SDK/OS, Apple
+  capability approval, matching signed provisioning, device-UI opt-in, and
+  real-iPhone validation. Retention, deletion,
   cross-device-aware hourly/daily aggregation, focus/overwork/recovery
   context, REST and MCP surfaces are implemented. The fixed `question_kind`
   resolver remains compatibility-only. As of 2026-08-16 the production

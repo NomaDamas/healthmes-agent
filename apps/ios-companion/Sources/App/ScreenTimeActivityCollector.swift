@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-#if HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
+#if HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE
 import DeviceActivity
 import FamilyControls
 #endif
@@ -15,7 +15,7 @@ enum ScreenTimeActivityCollectorFactory {
                 reason: "ios_screen_time_pseudonym_key_unavailable"
             )
         }
-        #if HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
+        #if HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE
         if #available(iOS 26.4, *) {
             return IOS264ScreenTimeActivityCollector(
                 pseudonymizer: ScreenTimeAppPseudonymizer(
@@ -25,6 +25,10 @@ enum ScreenTimeActivityCollectorFactory {
         }
         return UnavailableScreenTimeActivityCollector(
             reason: "ios_screen_time_export_requires_ios_26_4"
+        )
+        #elseif HEALTHMES_SCREENTIME_OPT_IN_REQUESTED
+        return UnavailableScreenTimeActivityCollector(
+            reason: "ios_screen_time_export_sdk_unavailable"
         )
         #else
         return UnavailableScreenTimeActivityCollector(
@@ -157,7 +161,7 @@ struct ScreenTimePseudonymKeyStore {
     }
 }
 
-#if HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
+#if HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE
 @available(iOS 26.4, *)
 struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
     private struct UsageKey: Hashable {

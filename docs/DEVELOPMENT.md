@@ -346,17 +346,26 @@ the service must listen on the LAN: set `HEALTHMES_HOST=0.0.0.0` **and**
 token — the surface carries medical data), then enter the same token in the
 app. The fragmentation term of the energy engine activates automatically
 once samples arrive. iOS Screen Time has a separate aggregate-only server
-contract and injectable `ScreenTimeActivitySyncService` core. A future
-gate-enabled, entitled build can fetch collection policy, source-filter
-excluded apps, and submit completed local-hour snapshots to
-`POST /v1/activity/ios/report`. The normal repository build always selects
-the unavailable adapter and collects no Apple activity. Issue #168 owns the
-UI-neutral authorization callback, first sync, foreground catch-up, Screen
-Time-specific best-effort background scheduling and offline outbox. Compile
-configuration, the authorization UI, Apple entitlement approval, distribution
-signing and real-device verification remain device-team or external work;
-that work must use `docs/INPUT-CONTROL-PLANE.ko.md` rather than inventing a
-second settings model.
+contract and injectable `ScreenTimeActivitySyncService` core. Authorization
+success, foreground activation, pairing changes and a Screen Time-specific
+`BGAppRefreshTask` now enter the same single-flight sync and bounded-outbox
+pipeline. The normal repository build always selects the unavailable adapter
+and collects no Apple activity.
+
+`HealthMesCompanionScreenTimeOptIn` is an opt-in request scheme, not an
+eligibility assertion. Run
+`bash Scripts/build-screen-time-opt-in.sh build` from
+`apps/ios-companion`; it type-checks the required Apple APIs in the selected
+SDK and compiles the real collector only when the probe succeeds. Unsupported
+SDKs compile the explicit `ios_screen_time_export_sdk_unavailable` adapter.
+The device settings UI remains device-team work. A real build also needs a
+provisioning profile whose App ID includes both Family Controls entitlements;
+Family Controls permission is required before App Store submission. Customer
+use is limited to a device in the EU with an EU-country/region Apple Account,
+while Apple-provisioned development/test builds may be exercised elsewhere.
+Signed-profile eligibility, `approvedWithDataAccess`, and real-iPhone
+verification remain external to unsigned CI. Device code must use
+`docs/INPUT-CONTROL-PLANE.ko.md` rather than inventing a second settings model.
 
 ## Companion & desktop apps (issues #7 · #10 · #11)
 
@@ -757,9 +766,12 @@ support `workflow_dispatch`; nothing is ever signed):
   (`:app`, `:companion`, `:wear`) and runs the JVM unit-test suites, exactly
   the locally-proven matrix from `apps/android-usage/README.md`. No emulator.
 - **`apple-apps.yml`** (macos) — two jobs. `ios`: XcodeGen + unsigned
-  simulator builds of the iOS and watchOS schemes, then the XCTest/XCUITest
-  suite on an iPhone simulator picked from the runner's newest installed iOS
-  runtime (UI tests self-skip without a live paired instance). `macos`:
+  simulator builds of the normal iOS and watchOS schemes, then the
+  XCTest/XCUITest suite on an iPhone simulator picked from the runner's newest
+  installed iOS runtime (UI tests self-skip without a live paired instance).
+  The Screen Time opt-in build is reproduced with
+  `Scripts/build-screen-time-opt-in.sh`; unsupported runner SDKs compile its
+  fail-closed adapter rather than the Apple collector. `macos`:
   XcodeGen + unsigned native builds of the menu bar app, widget extension
   and screensaver schemes, then the XCTest suite. Both jobs run when either
   Apple directory changes, because the macOS targets compile
