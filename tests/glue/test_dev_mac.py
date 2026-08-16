@@ -108,7 +108,7 @@ def test_local_start_syncs_resolved_ow_key_into_hermes_before_apps() -> None:
         "sync_hermes_ow_api_key"
     )
     assert start_body.index("sync_hermes_ow_api_key") < start_body.index(
-        'start_process "Open Wearables"'
+        "start_open_wearables"
     )
 
 
@@ -138,12 +138,104 @@ def test_local_runtime_starts_and_supervises_open_wearables_beat() -> None:
     start_body = _function_body(local_text, "cmd_start")
     daemon_body = _function_body(local_text, "cmd_daemon")
     stop_body = _function_body(local_text, "stop_apps")
+    stop_ow_body = _function_body(local_text, "stop_open_wearables")
     status_body = _function_body(local_text, "cmd_status")
 
     assert 'start_process "Open Wearables beat"' in start_body
     assert '"$BEAT_PID"' in daemon_body
     assert 'stop_process "Open Wearables beat"' in stop_body
+    assert "stop_open_wearables" in stop_body
+    assert 'open_wearables_listener_is_managed "$pid"' in stop_ow_body
+    assert 'stop_process "Open Wearables" "$OW_PID" "$pid"' in stop_ow_body
     assert 'service_status "Open Wearables beat"' in status_body
+
+
+def test_local_runtime_adopts_the_open_wearables_listener_pid() -> None:
+    text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+    body = _function_body(text, "start_open_wearables")
+    listener_body = _function_body(text, "open_wearables_listener_pid")
+    assert "open_wearables_listener_pid" in body
+    assert 'printf \'%s\\n\' "$listener_pid" >"$OW_PID"' in body
+    assert 'Open Wearables port ${API_PORT:-8000} is already owned' in body
+    assert 'ps -o ppid= -p "$pid"' in listener_body
+    assert 'printf \'%s\\n\' "$pid"' in listener_body
+    assert "open_wearables_listener_is_managed" in body
+    assert 'if open_wearables_listener_is_managed "$pid"' in body
+    assert 'rm -f "$OW_PID"' in body
+    guard_body = _function_body(text, "open_wearables_listener_is_managed")
+    assert 'fastapi run app/main.py' in guard_body
+    assert 'lsof -nP -iTCP:"${API_PORT:-8000}" -sTCP:LISTEN -t' in guard_body
+    assert 'lsof -n -a -p "$pid" -d cwd -Fn' in guard_body
+    assert '"$REPO_ROOT/vendor/open-wearables/backend"' in guard_body
+    assert body.count('open_wearables_listener_is_managed "$listener_pid"') == 2
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_local_runtime_recovers_a_stale_pid_without_restarting_a_listener(tmp_path) -> None:
+    prelude = LOCAL_SCRIPT.read_text(encoding="utf-8").split(
+        '\ncase "${1:-}" in\n', 1
+    )[0]
+    harness = tmp_path / "runtime-harness.sh"
+    harness.write_text(
+        prelude
+        + r'''
+runtime_dir="$(mktemp -d)"
+sleep 30 & stale_pid=$!
+sleep 30 & managed_pid=$!
+trap 'kill "$stale_pid" "$managed_pid" 2>/dev/null || true' EXIT
+OW_PID="$runtime_dir/open-wearables.pid"
+OW_LOG="$runtime_dir/open-wearables.log"
+RUNTIME_DIR="$runtime_dir"
+printf '%s\n' "$stale_pid" >"$OW_PID"
+open_wearables_listener_is_managed() { [ "$1" = "$managed_pid" ]; }
+open_wearables_listener_pid() { printf '%s\n' "$managed_pid"; }
+start_process() { return 1; }
+start_open_wearables
+start_open_wearables
+test "$(<"$OW_PID")" = "$managed_pid"
+''',
+        encoding="utf-8",
+    )
+
+    subprocess.run(["bash", str(harness)], check=True)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_local_runtime_recovers_after_a_temporary_listener_gap(tmp_path) -> None:
+    prelude = LOCAL_SCRIPT.read_text(encoding="utf-8").split(
+        '\ncase "${1:-}" in\n', 1
+    )[0]
+    harness = tmp_path / "recovery-harness.sh"
+    harness.write_text(
+        prelude
+        + r'''
+runtime_dir="$(mktemp -d)"
+sleep 30 & managed_pid=$!
+trap 'kill "$managed_pid" 2>/dev/null || true' EXIT
+OW_PID="$runtime_dir/open-wearables.pid"
+OW_LOG="$runtime_dir/open-wearables.log"
+RUNTIME_DIR="$runtime_dir"
+listener_ready=false
+open_wearables_listener_is_managed() { [ "$1" = "$managed_pid" ]; }
+open_wearables_listener_pid() {
+    if [ "$listener_ready" = true ]; then
+        printf '%s\n' "$managed_pid"
+    fi
+}
+start_process() { listener_ready=true; }
+sleep() { :; }
+start_open_wearables
+test "$(<"$OW_PID")" = "$managed_pid"
+''',
+        encoding="utf-8",
+    )
+
+    subprocess.run(["bash", str(harness)], check=True)
+
+
+def test_local_open_wearables_boots_a_single_production_listener() -> None:
+    body = _function_body(SCRIPT.read_text(encoding="utf-8"), "cmd_ow")
+    assert "ENVIRONMENT=production exec bash scripts/start/app.sh" in body
 
 
 def test_manual_mac_runtime_exposes_open_wearables_beat_target() -> None:

@@ -20,7 +20,9 @@ from healthmes.api.auth import viewer_token
 from healthmes.api.connect import build_oura_card
 from healthmes.app import create_app
 from healthmes.calendars import creds
+from healthmes.calendars.runtime_status import record_calendar_status
 from healthmes.mcp_server.ow_client import OWClientError
+from healthmes.store.enums import CalendarSource
 
 TOKEN = "connect-page-api-token"
 APP_PASSWORD = "abcd-efgh-ijkl-mnop"
@@ -119,6 +121,19 @@ def test_mixed_state_renders_per_calendar(client, settings) -> None:
     assert "연결됨" in text and "미연결" in text
     assert "uv run healthmes connect google" in text
     assert "uv run healthmes connect icloud" not in text  # connected: no command
+
+
+def test_calendar_runtime_failures_stay_on_their_own_provider_card(client, settings) -> None:
+    connect_google(settings.data_dir)
+    connect_icloud(settings.data_dir)
+    record_calendar_status(
+        settings.data_dir, CalendarSource.GOOGLE, mode="mirror", error=RuntimeError()
+    )
+    text = client.get("/connect").text
+    assert "Google Calendar mirror" in text
+    assert "Google mirror 동기화 실패 (RuntimeError)" in text
+    assert "Apple/iCloud Calendar write" in text
+    assert "iCloud write 동기화 실패" not in text
 
 
 def test_gating_matches_viewer_pages(settings) -> None:

@@ -58,6 +58,7 @@ from healthmes.calendars.sleep_job import (
     SleepReconciliationError,
     preview_recent_sleep,
 )
+from healthmes.calendars.sleep_recheck import recheck_sleep_night
 from healthmes.config import Settings, get_settings, is_loopback_host
 from healthmes.store import dispose_engine, init_engine
 
@@ -530,6 +531,13 @@ def _cmd_sleep_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sleep_recheck(args: argparse.Namespace) -> int:
+    settings = _cli_settings()
+    result = asyncio.run(recheck_sleep_night(settings, args.date))
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def _add_passphrase_file(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--passphrase-file",
@@ -712,6 +720,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Local sleep date (YYYY-MM-DD); default is today in the configured timezone.",
     )
     sleep_reconcile.set_defaults(func=_cmd_sleep_reconcile)
+    sleep_recheck = sleep_sub.add_parser(
+        "recheck",
+        help="Read only Open Wearables recheck for one named night; never writes Calendar.",
+    )
+    sleep_recheck.add_argument(
+        "--dry-run", action="store_true", required=True,
+        help="Required safety gate: requery only; never mutate Open Wearables or Calendar.",
+    )
+    sleep_recheck.add_argument("--date", type=dt.date.fromisoformat, required=True)
+    sleep_recheck.set_defaults(func=_cmd_sleep_recheck)
 
     return parser
 

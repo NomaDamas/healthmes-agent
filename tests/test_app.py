@@ -96,7 +96,7 @@ class TestMcpWiring:
             response = client.post("/mcp", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
 
             assert response.status_code == 200
-            assert response.headers.get("mcp-session-id")
+            assert response.headers.get("mcp-session-id") is None
             assert '"serverInfo"' in response.text
             assert '"healthmes"' in response.text
 

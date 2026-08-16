@@ -30,6 +30,7 @@ from healthmes.api import (
     insights,
     media,
     medical,
+    privacy,
     reports,
     schedule,
     sleep,
@@ -58,6 +59,7 @@ routers: list[APIRouter] = [
     connect.router,
     google_oauth.router,
     sleep.router,
+    privacy.router,
 ]
 
 

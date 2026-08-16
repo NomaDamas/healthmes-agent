@@ -7,6 +7,7 @@ from typing import Any, Protocol
 
 from healthmes.calendars import creds
 from healthmes.calendars.google_client import resolve_google_client_secret
+from healthmes.calendars.runtime_status import read_calendar_status
 from healthmes.config import Settings, resolve_timezone
 from healthmes.mcp_server.ow_client import (
     OWAuthError,
@@ -126,8 +127,22 @@ def build_connection_cards(settings: Settings) -> list[ConnectionCard]:
 def _google_card(settings: Settings) -> ConnectionCard:
     state = creds.google_connection_state(settings.data_dir)
     if state == "connected":
+        runtime = read_calendar_status(settings.data_dir).get("google", {})
+        if runtime.get("state") == "error":
+            return ConnectionCard(
+                "google", "Google Calendar mirror", False,
+                f"Google mirror 동기화 실패 ({runtime.get('error_type', 'unknown')})",
+                badge_label="오류",
+            )
         return ConnectionCard(
-            "google", "Google Calendar", True, "Google OAuth credential 확인됨"
+            "google",
+            "Google Calendar mirror",
+            True,
+            (
+                "Google mirror 정상"
+                if runtime.get("state") == "ok"
+                else "Google OAuth credential 확인됨"
+            ),
         )
     notes: list[str] = []
     if state == "invalid":
@@ -162,10 +177,19 @@ def _icloud_card(settings: Settings) -> ConnectionCard:
             if resolved.source == "env"
             else "CLI로 저장된 CalDAV credential 사용 중"
         )
-        return ConnectionCard("icloud", "iCloud 캘린더 (CalDAV)", True, detail)
+        runtime = read_calendar_status(settings.data_dir).get("caldav", {})
+        if runtime.get("state") == "error":
+            return ConnectionCard(
+                "icloud", "Apple/iCloud Calendar write", False,
+                f"Apple/iCloud write 동기화 실패 ({runtime.get('error_type', 'unknown')})",
+                badge_label="오류",
+            )
+        return ConnectionCard(
+            "icloud", "Apple/iCloud Calendar write", True,
+            "Apple/iCloud write 정상" if runtime.get("state") == "ok" else detail,
+        )
     return ConnectionCard(
-        "icloud",
-        "iCloud 캘린더 (CalDAV)",
+        "icloud", "Apple/iCloud Calendar write",
         False,
         "미연결 — 앱 암호 한 번 입력으로 연결됩니다 (숨김 프롬프트).",
         command=ICLOUD_CONNECT_COMMAND,
