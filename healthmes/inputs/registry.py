@@ -238,9 +238,9 @@ _SOURCES = (
                 execution="device",
                 requires_instance=True,
                 description=(
-                    "Unavailable in normal repository builds. A gate-enabled, "
-                    "entitled iPhone build may request Apple's App & Website "
-                    "Usage data authorization."
+                    "Unavailable in normal repository builds. An eligible, "
+                    "signed, entitlement-approved iPhone build may request "
+                    "Apple's App & Website Usage data authorization."
                 ),
             ),
             InputActionDescriptor(
@@ -248,9 +248,10 @@ _SOURCES = (
                 execution="device",
                 requires_instance=True,
                 description=(
-                    "Unavailable in normal repository builds. A gate-enabled, "
-                    "entitled build with lifecycle wiring may upload completed "
-                    "Screen Time hours as an authoritative snapshot."
+                    "Unavailable in normal repository builds. After user "
+                    "authorization, the wired foreground and best-effort "
+                    "background lifecycle may upload completed Screen Time "
+                    "hours as authoritative snapshots."
                 ),
             ),
         ),
@@ -269,9 +270,9 @@ _SOURCES = (
             "ios_screen_time_normal_build_unavailable",
             "ios_screen_time_export_requires_ios_26_4",
             "ios_screen_time_export_requires_apple_entitlement",
+            "ios_screen_time_export_requires_signed_provisioning",
+            "ios_screen_time_export_requires_user_authorization",
             "ios_screen_time_export_customer_access_is_eu_limited",
-            "ios_screen_time_lifecycle_not_wired",
-            "ios_screen_time_background_task_not_registered",
             "ios_screen_time_not_real_device_verified",
         ),
     ),

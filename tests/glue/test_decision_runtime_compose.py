@@ -12,6 +12,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 DECISION_BIND_SOURCE = REPO_ROOT / "data" / "hermes" / "decision"
+README_FILE = REPO_ROOT / "README.md"
 
 
 def _environment(entries: list[str]) -> dict[str, str]:
@@ -96,6 +97,23 @@ def test_compose_launches_only_healthmes_owned_supervisor_surface() -> None:
     serialized = yaml.safe_dump(runtime)
     assert "/v1/model/iterations" not in serialized
     assert "gateway run" not in serialized
+
+
+def test_readme_uses_canonical_profile_gated_decision_launch() -> None:
+    readme = README_FILE.read_text(encoding="utf-8")
+    docker_section = readme.split("### Docker alternative", 1)[1].split(
+        "### Runtime diagnostics",
+        1,
+    )[0]
+    bootstrap = "uv run python scripts/bootstrap.py --mode docker"
+    launch = "docker compose --profile decision up -d --build"
+
+    assert bootstrap in docker_section
+    assert launch in docker_section
+    assert docker_section.index(bootstrap) < docker_section.index(launch)
+    assert "`HEALTHMES_DECISION_HERMES_MODEL`" in docker_section
+    assert "`HEALTHMES_DECISION_HERMES_PROVIDER`" in docker_section
+    assert "`HERMES_MODEL`/`HERMES_PROVIDER`" not in readme
 
 
 @pytest.mark.skipif(

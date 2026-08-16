@@ -319,12 +319,23 @@ With no `.env` at all, the service runs against a repo-local sqlite file —
 
 ### Docker alternative
 
+Before bootstrap, set `HEALTHMES_API_TOKEN`,
+`HEALTHMES_DECISION_HERMES_MODEL`,
+`HEALTHMES_DECISION_HERMES_PROVIDER`, and the matching provider API key in
+`.env`. Bootstrap requires both decision model variables and writes the
+dedicated runtime profile used by Compose.
+
 ```bash
 install -m 600 .env.example .env
 install -m 600 config/open-wearables.env.example config/open-wearables.env
-docker compose up -d --build     # postgres, redis, open-wearables (+worker,
-                                 # +ow-beat, +mcp), healthmes, hermes gateway
+uv run python scripts/bootstrap.py --mode docker
+docker compose --profile decision up -d --build
 ```
+
+The `decision` profile starts the HealthMes-owned `hermes-decision`
+supervisor in addition to postgres, redis, Open Wearables, and HealthMes.
+Omit that profile only when intentionally running the core data/MCP stack
+without wellness reasoning.
 
 Set `HEALTHMES_TIMEZONE` (e.g. `Asia/Seoul`) in `.env` for the compose path —
 container clocks are UTC. The compose path also **requires**
@@ -342,7 +353,8 @@ The vendor `hermes` / `hermes chat` CLI remains available for isolated Hermes
 runtime diagnostics, but calling it directly is not an equivalent HealthMes
 wellness path and must not be used for product QA. See
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). The model can be selected with
-`HERMES_MODEL`/`HERMES_PROVIDER` in `.env`; HealthMes keeps the product
+`HEALTHMES_DECISION_HERMES_MODEL` /
+`HEALTHMES_DECISION_HERMES_PROVIDER` in `.env`; HealthMes keeps the product
 contract provider-agnostic.
 
 ### Extending with domain knowledge

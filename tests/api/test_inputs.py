@@ -160,7 +160,42 @@ def test_unified_inputs_lists_stable_ui_contract(client) -> None:
     }
     assert ios["privacy"]["raw_content_collected"] is False
     assert ios["privacy"]["default_llm_exposure"] == "aggregate_only"
-    assert "ios_screen_time_export_requires_ios_26_4" in ios["limitations"]
+    assert ios["actions"] == [
+        {
+            "action": "authorize",
+            "execution": "device",
+            "method": None,
+            "endpoint": None,
+            "requires_instance": True,
+            "description": (
+                "Unavailable in normal repository builds. An eligible, "
+                "signed, entitlement-approved iPhone build may request "
+                "Apple's App & Website Usage data authorization."
+            ),
+        },
+        {
+            "action": "sync",
+            "execution": "device",
+            "method": None,
+            "endpoint": None,
+            "requires_instance": True,
+            "description": (
+                "Unavailable in normal repository builds. After user "
+                "authorization, the wired foreground and best-effort "
+                "background lifecycle may upload completed Screen Time "
+                "hours as authoritative snapshots."
+            ),
+        },
+    ]
+    assert ios["limitations"] == [
+        "ios_screen_time_normal_build_unavailable",
+        "ios_screen_time_export_requires_ios_26_4",
+        "ios_screen_time_export_requires_apple_entitlement",
+        "ios_screen_time_export_requires_signed_provisioning",
+        "ios_screen_time_export_requires_user_authorization",
+        "ios_screen_time_export_customer_access_is_eu_limited",
+        "ios_screen_time_not_real_device_verified",
+    ]
     assert ios["revision"].startswith("sha256:")
     assert len(ios["revision"]) == 71
 

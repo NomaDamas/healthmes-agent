@@ -12,11 +12,13 @@ import pytest
 from fastapi.testclient import TestClient
 from freezegun import freeze_time
 from pydantic import SecretStr
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from healthmes.api.auth import viewer_token
 from healthmes.app import create_app
 from healthmes.decision import (
+    DECISION_PAYLOAD_SCHEMA,
     ContextAccessLayer,
     ContextAccessPolicy,
     ContextCapability,
@@ -25,10 +27,15 @@ from healthmes.decision import (
     ContextQuery,
     ContextResult,
     ContextStatus,
+    DecisionAgentRun,
     DecisionBudget,
+    DecisionCaller,
+    DecisionDraft,
     DecisionEngineBusyError,
     DecisionEngineClosedError,
     DecisionFinalizer,
+    DecisionPersistenceIntent,
+    DecisionRequest,
     DecisionResult,
     DecisionStatus,
     DomainAccessGrant,
@@ -50,6 +57,7 @@ from healthmes.store import (
     DecisionKind,
     DecisionRecord,
     create_db_engine,
+    get_session_factory,
     session_scope,
 )
 from tests.decision.test_e2e import (
@@ -928,6 +936,136 @@ def test_unknown_commit_outcome_returns_202_and_recovery_location(
     assert pending.json()["error"]["code"] == (
         "wellness_decision_not_found"
     )
+
+
+def test_decision_recovery_returns_compact_persisted_result(
+    settings,
+) -> None:
+    app = create_app(settings)
+    sensitive_answer = "Private recovery marker: take a short break."
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        assert client.get(
+            f"/v1/wellness-decisions/{uuid.uuid4()}"
+        ).status_code == 404
+        with freeze_time("2026-08-16 12:00:00"):
+            current = datetime.now(UTC)
+            decision_request = DecisionRequest(
+                question="Track this private recovery-marker check-in.",
+                requested_at=current,
+                timezone="UTC",
+                persistence_requested=True,
+                caller=DecisionCaller(
+                    principal_id="rest-owner",
+                    authenticated=True,
+                    execution_scope=ExecutionScope.LOCAL,
+                    channel="rest",
+                ),
+            )
+            run = DecisionAgentRun(
+                request_id=decision_request.request_id,
+                turn_id=decision_request.turn_id,
+                draft=DecisionDraft(
+                    status=DecisionStatus.COMPLETED,
+                    answer=sensitive_answer,
+                    persistence_intent=(
+                        DecisionPersistenceIntent.EXPLICIT_TRACKING
+                    ),
+                    confidence=0.75,
+                ),
+                runtime=RuntimeMetadata(
+                    runtime="scripted",
+                    model="api-replay-v1",
+                    input_tokens=3,
+                    output_tokens=2,
+                ),
+                steps_used=1,
+                system_policy_version=(
+                    "healthmes-decision-policy.api-replay-test"
+                ),
+                started_at=current,
+                finished_at=current,
+            )
+            policy = ContextAccessPolicy(
+                owner_principal_id="rest-owner",
+                grants=(),
+            )
+            finalizer = DecisionFinalizer(
+                access_layer=ContextAccessLayer(
+                    ContextProviderRegistry(),
+                    clock=lambda: current,
+                ),
+                session_factory=get_session_factory(),
+                policy_resolver=lambda _request: policy,
+                fingerprint_key=FINGERPRINT_KEY,
+                clock=lambda: current,
+            )
+            try:
+                persisted = finalizer.finalize(
+                    decision_request,
+                    run,
+                )
+            finally:
+                finalizer.close()
+
+            assert persisted.status is DecisionStatus.COMPLETED
+            assert (
+                persisted.persistence_status
+                is PersistenceStatus.PERSISTED
+            )
+            assert persisted.decision_record_id is not None
+            with session_scope() as session:
+                row = session.scalar(
+                    select(DecisionRecord).where(
+                        DecisionRecord.decision_request_id
+                        == decision_request.request_id
+                    )
+                )
+                assert row is not None
+                assert row.decision_payload is not None
+                assert (
+                    row.decision_payload["schema"]
+                    == DECISION_PAYLOAD_SCHEMA
+                )
+                serialized = json.dumps(
+                    row.decision_payload,
+                    sort_keys=True,
+                )
+                assert sensitive_answer not in serialized
+                assert decision_request.question not in serialized
+                assert "tool_trace" not in row.decision_payload
+
+            response = client.get(
+                f"/v1/wellness-decisions/{decision_request.request_id}"
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "request_id": str(decision_request.request_id),
+        "turn_id": str(decision_request.turn_id),
+        "status": "completed",
+        "answer": "A wellness decision was explicitly tracked.",
+        "proposed_action": False,
+        "source_refs": [],
+        "limitations": ["decision_response_compacted"],
+        "clarification_question": None,
+        "confidence": 0.75,
+        "uncertainty": None,
+        "follow_up_question": None,
+        "persistence_status": "persisted",
+        "decision_record_id": str(persisted.decision_record_id),
+        "runtime": {
+            "runtime": "scripted",
+            "model": "api-replay-v1",
+            "provider": None,
+            "input_tokens": 3,
+            "output_tokens": 2,
+        },
+    }
 
 
 def test_decision_recovery_returns_404_for_unknown_request(
