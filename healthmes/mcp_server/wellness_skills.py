@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ MAX_WELLNESS_SKILL_BYTES = 64_000
 REVIEWED_WELLNESS_SKILLS = (
     "healthmes-wellness-decision",
     "healthmes-caffeine",
-    "healthmes-nutrition",
+    "healthmes-nutrition-decision",
     "healthmes-sleep",
     "healthmes-stress",
 )
@@ -58,20 +59,7 @@ def _load_skill(name: str) -> tuple[dict[str, Any], str]:
         raise WellnessSkillCatalogError(
             "wellness_skill_not_reviewed"
         )
-    root = _SKILLS_ROOT.resolve()
-    path = (_SKILLS_ROOT / name / "SKILL.md").resolve()
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise WellnessSkillCatalogError(
-            "wellness_skill_path_invalid"
-        ) from exc
-    try:
-        encoded = path.read_bytes()
-    except OSError as exc:
-        raise WellnessSkillCatalogError(
-            "wellness_skill_unavailable"
-        ) from exc
+    encoded = _read_skill_bytes(name)
     if len(encoded) > MAX_WELLNESS_SKILL_BYTES:
         raise WellnessSkillCatalogError(
             "wellness_skill_too_large"
@@ -106,6 +94,35 @@ def _load_skill(name: str) -> tuple[dict[str, Any], str]:
     if version is not None:
         metadata["version"] = str(version)
     return metadata, content
+
+
+def _read_skill_bytes(name: str) -> bytes:
+    packaged = (
+        files("healthmes")
+        .joinpath("_wellness_skills")
+        .joinpath(name)
+        .joinpath("SKILL.md")
+    )
+    try:
+        if packaged.is_file():
+            return packaged.read_bytes()
+    except OSError:
+        pass
+
+    root = _SKILLS_ROOT.resolve()
+    path = (_SKILLS_ROOT / name / "SKILL.md").resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise WellnessSkillCatalogError(
+            "wellness_skill_path_invalid"
+        ) from exc
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise WellnessSkillCatalogError(
+            "wellness_skill_unavailable"
+        ) from exc
 
 
 def _frontmatter(content: str) -> dict[str, Any]:

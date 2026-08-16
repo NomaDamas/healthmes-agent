@@ -283,6 +283,7 @@ class DecisionRequest(BaseModel):
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
     caller: DecisionCaller
     requested_privacy_level: PrivacyLevel = PrivacyLevel.AGGREGATE
+    persistence_requested: bool = False
     budget: DecisionBudget = Field(default_factory=DecisionBudget)
     hints: DecisionContextHints = Field(default_factory=DecisionContextHints)
     compatibility_preset: CompatibilityPreset | None = None
@@ -339,6 +340,7 @@ class DecisionRequest(BaseModel):
         requested_at: datetime | None = None,
         hints: DecisionContextHints | None = None,
         requested_privacy_level: PrivacyLevel = PrivacyLevel.AGGREGATE,
+        persistence_requested: bool = False,
     ) -> DecisionRequest:
         return cls(
             question=question or _COMPATIBILITY_QUESTIONS[preset],
@@ -346,6 +348,7 @@ class DecisionRequest(BaseModel):
             timezone=timezone,
             caller=caller,
             requested_privacy_level=requested_privacy_level,
+            persistence_requested=persistence_requested,
             hints=hints or DecisionContextHints(),
             compatibility_preset=preset,
         )

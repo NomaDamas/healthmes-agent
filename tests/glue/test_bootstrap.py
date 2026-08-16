@@ -19,6 +19,7 @@ EXPECTED_SKILLS = (
     "healthmes-caffeine",
     "healthmes-capture",
     "healthmes-nutrition",
+    "healthmes-nutrition-decision",
     "healthmes-planner",
     "healthmes-sleep",
     "healthmes-stress",

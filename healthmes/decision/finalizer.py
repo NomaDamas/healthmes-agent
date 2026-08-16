@@ -406,8 +406,10 @@ def decision_request_fingerprint(request: DecisionRequest) -> str:
     payload = canonical.model_dump(
         mode="json",
         round_trip=True,
-        exclude={"request_id", "turn_id"},
+        exclude={"request_id", "turn_id", "persistence_requested"},
     )
+    if canonical.persistence_requested:
+        payload["persistence_requested"] = True
     encoded = json.dumps(
         payload,
         allow_nan=False,
@@ -496,7 +498,10 @@ class DecisionFinalizer:
                 _failure_result(
                     run,
                     code=_FINALIZATION_CAPACITY_EXHAUSTED,
-                    persistence_required=_run_requires_persistence(run),
+                    persistence_required=_run_requires_persistence(
+                        request,
+                        run,
+                    ),
                 )
             )
             return control
@@ -507,7 +512,10 @@ class DecisionFinalizer:
                     _failure_result(
                         run,
                         code=_FINALIZATION_TIMEOUT,
-                        persistence_required=_run_requires_persistence(run),
+                        persistence_required=_run_requires_persistence(
+                            request,
+                            run,
+                        ),
                     )
                 )
                 return control
@@ -524,7 +532,10 @@ class DecisionFinalizer:
                 result = _failure_result(
                     run,
                     code=_PERSISTENCE_FAILURE,
-                    persistence_required=_run_requires_persistence(run),
+                    persistence_required=_run_requires_persistence(
+                        request,
+                        run,
+                    ),
                 )
             control.prepare_result(result)
             with self._workers_lock:
@@ -543,7 +554,10 @@ class DecisionFinalizer:
             result = _failure_result(
                 run,
                 code=_PERSISTENCE_FAILURE,
-                persistence_required=_run_requires_persistence(run),
+                persistence_required=_run_requires_persistence(
+                    request,
+                    run,
+                ),
             )
             control.prepare_result(result)
             with self._workers_lock:
@@ -626,7 +640,6 @@ class DecisionFinalizer:
         run: DecisionAgentRun,
         control: _FinalizationControl,
     ) -> DecisionResult:
-        del request
         phase, result, published_in_time = control.response_snapshot()
         if published_in_time:
             if phase is _FinalizationPhase.COMMITTED and result is not None:
@@ -637,7 +650,10 @@ class DecisionFinalizer:
                 return _failure_result(
                     run,
                     code=_FINALIZATION_TIMEOUT,
-                    persistence_required=_run_requires_persistence(run),
+                    persistence_required=_run_requires_persistence(
+                        request,
+                        run,
+                    ),
                 )
             if result is not None:
                 return result
@@ -658,7 +674,10 @@ class DecisionFinalizer:
                 return _failure_result(
                     run,
                     code=_FINALIZATION_TIMEOUT,
-                    persistence_required=_run_requires_persistence(run),
+                    persistence_required=_run_requires_persistence(
+                        request,
+                        run,
+                    ),
                 )
             if final_result is not None:
                 return final_result
@@ -670,7 +689,7 @@ class DecisionFinalizer:
         return _failure_result(
             run,
             code=_FINALIZATION_TIMEOUT,
-            persistence_required=_run_requires_persistence(run),
+            persistence_required=_run_requires_persistence(request, run),
         )
 
     def _finalize_inline(
@@ -746,7 +765,14 @@ class DecisionFinalizer:
                 persistence_required=False,
             )
 
-        persistence_required = _run_requires_persistence(canonical_run)
+        effective_persistence_intent = _effective_persistence_intent(
+            canonical_request,
+            canonical_run,
+        )
+        persistence_required = (
+            effective_persistence_intent
+            is not DecisionPersistenceIntent.NONE
+        )
         fingerprint = decision_request_fingerprint(canonical_request)
         finalization_deadline = control.deadline
 
@@ -806,6 +832,7 @@ class DecisionFinalizer:
                 used_ids=used_ids,
                 candidates=source_candidates,
                 fingerprint=fingerprint,
+                persistence_intent=effective_persistence_intent,
                 deadline=finalization_deadline,
                 control=control,
             )
@@ -824,6 +851,7 @@ class DecisionFinalizer:
                     used_ids=used_ids,
                     candidates=source_candidates,
                     fingerprint=fingerprint,
+                    persistence_intent=effective_persistence_intent,
                     insert_if_missing=False,
                     deadline=finalization_deadline,
                     control=control,
@@ -888,6 +916,7 @@ class DecisionFinalizer:
         used_ids: Sequence[str],
         candidates: SourceCandidates,
         fingerprint: str,
+        persistence_intent: DecisionPersistenceIntent,
         insert_if_missing: bool = True,
         deadline: float | None = None,
         control: _FinalizationControl | None = None,
@@ -1015,6 +1044,7 @@ class DecisionFinalizer:
                                     run,
                                     result,
                                     request_fingerprint=fingerprint,
+                                    persistence_intent=persistence_intent,
                                 )
                                 _ensure_finalization_deadline(deadline)
                                 row = DecisionRecord(
@@ -1570,12 +1600,22 @@ def _validate_stored_payload(
         )
     else:
         raise ValueError("stored decision payload schema is unsupported")
+    canonical_payload = payload.model_dump(
+        mode="json",
+        round_trip=True,
+        by_alias=True,
+    )
+    if (
+        isinstance(payload, _StoredDecisionPayloadV1)
+        and isinstance(normalized.value.get("request"), dict)
+        and "persistence_requested" not in normalized.value["request"]
+    ):
+        canonical_payload["request"].pop(
+            "persistence_requested",
+            None,
+        )
     canonical = normalize_untrusted_json(
-        payload.model_dump(
-            mode="json",
-            round_trip=True,
-            by_alias=True,
-        ),
+        canonical_payload,
         max_bytes=_MAX_STORED_JSON_BYTES,
     )
     if _json_digest(canonical.value) != _json_digest(normalized.value):
@@ -1731,11 +1771,35 @@ def _unknown_result(run: DecisionAgentRun | Any) -> DecisionResult:
     )
 
 
-def _run_requires_persistence(run: DecisionAgentRun | Any) -> bool:
-    return bool(
-        isinstance(run, DecisionAgentRun)
-        and run.draft.status is DecisionStatus.COMPLETED
-        and run.draft.persistence_intent
+def _effective_persistence_intent(
+    request: DecisionRequest | Any,
+    run: DecisionAgentRun | Any,
+) -> DecisionPersistenceIntent:
+    """Classify persistence from trusted request state and bounded output."""
+
+    if not isinstance(request, DecisionRequest) or not isinstance(
+        run,
+        DecisionAgentRun,
+    ):
+        return DecisionPersistenceIntent.NONE
+    draft = run.draft
+    if draft.status is not DecisionStatus.COMPLETED:
+        return DecisionPersistenceIntent.NONE
+    if draft.proposed_action:
+        if draft.persistence_intent is DecisionPersistenceIntent.RISK:
+            return DecisionPersistenceIntent.RISK
+        return DecisionPersistenceIntent.ACTION
+    if request.persistence_requested:
+        return DecisionPersistenceIntent.EXPLICIT_TRACKING
+    return DecisionPersistenceIntent.NONE
+
+
+def _run_requires_persistence(
+    request: DecisionRequest | Any,
+    run: DecisionAgentRun | Any,
+) -> bool:
+    return (
+        _effective_persistence_intent(request, run)
         is not DecisionPersistenceIntent.NONE
     )
 
@@ -1832,6 +1896,7 @@ def _decision_payload(
     result: DecisionResult,
     *,
     request_fingerprint: str,
+    persistence_intent: DecisionPersistenceIntent,
 ) -> dict[str, Any]:
     stored_result = result.model_copy(
         update={"tool_trace": []},
@@ -1865,7 +1930,7 @@ def _decision_payload(
                 request.requested_privacy_level.value
             ),
         ),
-        persistence_intent=run.draft.persistence_intent,
+        persistence_intent=persistence_intent,
         result=stored_result,
         run=stored_run,
         source_refs=tuple(result.source_refs),
@@ -1899,22 +1964,46 @@ def _source_attestations(
     }
     attestations: list[_StoredSourceAttestation] = []
     for record in trace:
+        selected_result_refs = tuple(
+            source_ref
+            for source_ref in (
+                record.result.source_refs
+                if record.result is not None
+                else ()
+            )
+            if source_ref.reference_id in selected_ids
+        )
         if (
             record.status is not ToolCallStatus.COMPLETED
             or record.result is None
-            or not selected_ids.intersection(
-                source_ref.reference_id
-                for source_ref in record.result.source_refs
-            )
+            or not selected_result_refs
         ):
             continue
         attestations.append(
             _StoredSourceAttestation(
-                query=record.effective_query or record.query,
-                source_refs=tuple(record.result.source_refs),
+                query=_attestation_query(
+                    record.effective_query or record.query
+                ),
+                source_refs=selected_result_refs,
             )
         )
     return tuple(attestations)
+
+
+def _attestation_query(query: ContextQuery) -> ContextQuery:
+    """Remove model-authored prose while retaining revalidation selectors."""
+
+    return query.model_copy(
+        update={
+            "parameters": {
+                key: value
+                for key, value in query.parameters.items()
+                if key != "query"
+            },
+            "purpose": None,
+        },
+        deep=True,
+    )
 
 
 def _tool_trace_summary(record: ToolCallRecord) -> dict[str, Any]:

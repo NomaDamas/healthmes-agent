@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
@@ -62,6 +63,12 @@ from healthmes.store import (
 NOW = datetime(2026, 8, 12, 6, tzinfo=UTC)
 WINDOW_START = NOW - timedelta(hours=2)
 WINDOW_END = NOW - timedelta(hours=1)
+LEGACY_V1_FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "fixtures"
+    / "decision"
+    / "decision-private-v1.json"
+)
 
 
 class StoredNutritionProvider:
@@ -126,6 +133,7 @@ def _request(
     question: str = "Should I take a break now?",
     request_id: uuid.UUID | None = None,
     turn_id: uuid.UUID | None = None,
+    persistence_requested: bool = False,
 ) -> DecisionRequest:
     return DecisionRequest(
         request_id=request_id or uuid.uuid4(),
@@ -133,6 +141,7 @@ def _request(
         question=question,
         requested_at=NOW,
         timezone="UTC",
+        persistence_requested=persistence_requested,
         caller=DecisionCaller(
             principal_id="owner",
             authenticated=True,
@@ -412,6 +421,7 @@ def test_finalizer_persists_and_revalidates_the_effective_query(persistence):
     _engine, factory = persistence
     with factory() as session:
         ref = _source_ref(_event(session))
+        unused_ref = _source_ref(_event(session))
     request = _request()
     requested_query = _query().model_copy(update={"limit": 250})
     effective_query = requested_query.model_copy(update={"limit": 25})
@@ -420,7 +430,8 @@ def test_finalizer_persists_and_revalidates_the_effective_query(persistence):
         request,
         _run(
             request,
-            [ref],
+            [ref, unused_ref],
+            used_ids=[ref.reference_id],
             query=requested_query,
             effective_query=effective_query,
         ),
@@ -435,6 +446,30 @@ def test_finalizer_persists_and_revalidates_the_effective_query(persistence):
         ][0]["query"]
         assert stored_query["limit"] == 25
         assert stored_query["query_id"] == str(requested_query.query_id)
+        assert row.decision_payload["source_attestations"][0][
+            "source_refs"
+        ] == [ref.model_dump(mode="json")]
+
+
+def test_attestation_query_removes_model_authored_search_text():
+    query = _query().model_copy(
+        update={
+            "parameters": {
+                "date": "2026-08-12",
+                "query": "private free-form food search",
+                "request_id": str(uuid.uuid4()),
+            },
+            "purpose": "model-authored explanation",
+        }
+    )
+
+    stored = finalizer_module._attestation_query(query)
+
+    assert stored.parameters == {
+        "date": "2026-08-12",
+        "request_id": query.parameters["request_id"],
+    }
+    assert stored.purpose is None
 
 
 def test_source_backed_information_is_not_persisted_without_intent(
@@ -464,9 +499,10 @@ def test_source_backed_information_is_not_persisted_without_intent(
     (
         DecisionPersistenceIntent.RISK,
         DecisionPersistenceIntent.MUTATION,
+        DecisionPersistenceIntent.EXPLICIT_TRACKING,
     ),
 )
-def test_risk_and_mutation_intents_are_persisted(
+def test_model_intent_alone_cannot_force_persistence(
     persistence,
     persistence_intent,
 ):
@@ -486,21 +522,44 @@ def test_risk_and_mutation_intents_are_persisted(
     )
 
     assert result.status is DecisionStatus.COMPLETED
+    assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
+
+
+def test_actionable_risk_is_persisted_as_risk(persistence):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+
+    result = _finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            proposed_action=True,
+            persistence_intent=DecisionPersistenceIntent.RISK,
+        ),
+    )
+
     assert result.persistence_status is PersistenceStatus.PERSISTED
     with factory() as session:
         row = session.scalars(sa.select(DecisionRecord)).one()
         assert row.decision_payload is not None
-        assert (
-            row.decision_payload["persistence_intent"]
-            == persistence_intent.value
-        )
+        assert row.decision_payload["persistence_intent"] == "risk"
 
 
 def test_explicit_tracking_can_persist_a_source_free_result(
     persistence,
 ):
     _engine, factory = persistence
-    request = _request(question="Please retain this check-in.")
+    request = _request(
+        question="Please retain this check-in.",
+        persistence_requested=True,
+    )
 
     result = _finalizer(factory).finalize(
         request,
@@ -1924,6 +1983,27 @@ def test_retry_reads_and_revalidates_legacy_v1_payload(persistence):
         assert session.scalar(
             sa.select(sa.func.count()).select_from(DecisionRecord)
         ) == 1
+
+
+def test_historical_v1_fixture_remains_canonical_and_fingerprint_stable():
+    fixture = json.loads(LEGACY_V1_FIXTURE.read_text(encoding="utf-8"))
+
+    assert "persistence_requested" not in fixture["request"]
+    normalized = finalizer_module.normalize_untrusted_json(
+        fixture,
+        max_bytes=finalizer_module._MAX_STORED_JSON_BYTES,
+    )
+    stored = finalizer_module._validate_stored_payload(normalized)
+    request = DecisionRequest.model_validate(fixture["request"])
+
+    assert isinstance(
+        stored,
+        finalizer_module._StoredDecisionPayloadV1,
+    )
+    assert (
+        finalizer_module.decision_request_fingerprint(request)
+        == fixture["request_fingerprint"]
+    )
 
 
 @pytest.mark.parametrize("mutation", ("delete", "expire", "change"))

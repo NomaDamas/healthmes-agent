@@ -418,6 +418,7 @@ def test_rest_contract_is_server_owned_and_hides_internal_trace(
             headers=_bearer(),
             json={
                 "question": " Should I keep working? ",
+                "persistence_requested": True,
                 "hints": {"local_date": DAY.isoformat()},
             },
         )
@@ -437,6 +438,7 @@ def test_rest_contract_is_server_owned_and_hides_internal_trace(
     assert request.caller.execution_scope is ExecutionScope.LOCAL
     assert request.caller.channel == "rest"
     assert request.requested_privacy_level is PrivacyLevel.AGGREGATE
+    assert request.persistence_requested is True
     assert request.budget == DecisionBudget()
     assert request.hints.local_date == DAY
     assert request.hints.related_record_ids == {}

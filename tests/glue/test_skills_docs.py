@@ -70,6 +70,7 @@ def test_skill_dirs_all_checked() -> None:
         "healthmes-caffeine",
         "healthmes-capture",
         "healthmes-nutrition",
+        "healthmes-nutrition-decision",
         "healthmes-planner",
         "healthmes-sleep",
         "healthmes-stress",

@@ -112,6 +112,7 @@ def test_natural_language_request_roundtrips_without_required_preset():
         question="Why was my focus fragmented today?",
         requested_at=T0,
         timezone="Asia/Seoul",
+        persistence_requested=True,
         caller=_caller(),
         hints=DecisionContextHints(
             local_date=T0.date(),
@@ -127,6 +128,7 @@ def test_natural_language_request_roundtrips_without_required_preset():
 
     assert restored == request
     assert restored.requested_at == T0
+    assert restored.persistence_requested is True
     assert restored.compatibility_preset is None
     assert "compatibility_preset" not in (
         DecisionRequest.model_json_schema().get("required") or []

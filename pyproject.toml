@@ -66,6 +66,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["healthmes"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"skills/healthmes-wellness-decision" = "healthmes/_wellness_skills/healthmes-wellness-decision"
+"skills/healthmes-caffeine" = "healthmes/_wellness_skills/healthmes-caffeine"
+"skills/healthmes-nutrition-decision" = "healthmes/_wellness_skills/healthmes-nutrition-decision"
+"skills/healthmes-sleep" = "healthmes/_wellness_skills/healthmes-sleep"
+"skills/healthmes-stress" = "healthmes/_wellness_skills/healthmes-stress"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # importlib mode lets multiple tests/<area>/ dirs use identical file names

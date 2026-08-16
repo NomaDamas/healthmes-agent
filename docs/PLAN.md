@@ -352,14 +352,16 @@ worktree 격리의 상세 계약은
 - `healthmes/engine/triggers.py` + internal DecisionRequest + outbound delivery
   (§4), 같은 ingress를 사용하는 scheduled briefing
 - 스킬: `healthmes-wellness-decision` 공통 조회 지침,
+  `healthmes-nutrition-decision` read-only 영양·카페인 조회 지침,
   `healthmes-planner`(목표 덤프→태스크 분해→배치 룰→확인된 캘린더 제안),
   `healthmes-capture`(bounded capture command)
 - 인사이트 v1: 템플릿 SQL 상관 (시간대별/요일별/캘린더 키워드별 스트레스, 활동유형 vs 스트레스) — 자유 데이터마이닝 아님
 
 **Phase 2 — 인지에너지 + 설명가능성 UI + Android 사용량 (~3–4주)**
 - `cognitive_energy.py` + baseline + 매시간 persist (§3), **Layer B 2차분**: `get_cognitive_energy_forecast`, `get_stress_timeline`(캘린더·앱사용 조인), `compare_impact`
-- source-validated conditional DecisionRecord E2E: 행동 제안·mutation·위험
-  경고만 compact record로 저장하고 단순 조회는 기본 미저장, 저장된 판단은
+- source-validated conditional DecisionRecord E2E: 행동 제안·행동 가능한 위험
+  경고·trusted explicit tracking만 compact record로 저장하고 단순 조회는 기본
+  미저장. mutation audit는 별도 command workflow가 소유하며, 저장된 판단은
   Mermaid 뷰어에서 확인
 - `apps/android-usage/` + `/v1/app-usage/batch`, fragmentation 항 활성화
 - 집중도 인사이트 ("14–16시 집중 저하: 수면 부족 + Slack 시간당 9회 실행")

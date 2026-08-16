@@ -7,7 +7,6 @@ vendor/
 data/
 docs/
 tests/
-skills/
 node_modules/
 __pycache__/
 *.py[cod]

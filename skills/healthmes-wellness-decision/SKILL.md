@@ -62,15 +62,18 @@ Return exactly one persistence intent:
 
 - `none`: simple lookup, explanation, or summary.
 - `action`: a concrete behavior recommendation the user may follow.
-- `risk`: an important safety warning that should remain inspectable.
-- `mutation`: only when a separate confirmed command workflow actually
-  changed data; the read-only decision runtime normally cannot use this.
-- `explicit_tracking`: the user explicitly asked HealthMes to retain this
-  result.
+- `risk`: an actionable safety warning that should remain inspectable.
+- `mutation`: reserved for a separate confirmed command workflow. This
+  read-only decision runtime cannot establish it and must normally use
+  `none` instead.
+- `explicit_tracking`: advisory only when the user asked HealthMes to retain
+  this result; HealthMes independently checks the trusted request flag.
 
-Consulting source data alone is never a reason to persist. HealthMes validates
-the intent and source references and writes only a compact DecisionRecord when
-required.
+Consulting source data alone is never a reason to persist. The model cannot
+force storage by choosing an intent. HealthMes derives the effective intent
+from a completed actionable result or the trusted `persistence_requested`
+request flag, validates source references, and writes only a compact
+DecisionRecord when required.
 
 ## Final contract
 

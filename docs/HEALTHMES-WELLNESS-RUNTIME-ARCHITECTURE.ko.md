@@ -465,8 +465,9 @@ PR #138 목표 DecisionRecord 원칙:
 | 단순 정보 조회 | 저장하지 않거나 짧은 운영 trace |
 | 사용자가 식사·활동을 기록 | 해당 domain event 저장 |
 | 사용자 행동을 바꾸는 제안 | compact record 저장 |
-| 캘린더·설정 등 실제 mutation | audit에 필요한 compact record 저장 |
-| 의료적 위험 경고 또는 명시적 추적 요청 | compact record 저장 |
+| 캘린더·설정 등 실제 mutation | 해당 command workflow의 audit가 소유; wellness runtime은 저장 사유로 인정하지 않음 |
+| 행동 가능한 중요 위험 경고 | compact record 저장 |
+| UI/API가 `persistence_requested=true`로 보낸 명시적 추적 요청 | compact record 저장 |
 
 compact record에는 request ID, 시각, 모델/runtime, 짧은 결론, 사용한
 `source_refs`, 제안된 행동과 outcome 연결 ID만 둔다. 사진 bytes, 전체 MCP
@@ -477,14 +478,35 @@ payload와 전체 prompt를 기본 저장하지 않는다.
 - request/turn ID, 요청 시각, timezone, execution/privacy scope
 - 모델/runtime와 token 계측
 - 최종 답변, confidence, limitation과 실제 사용한 `source_refs`
-- 선택된 source를 재검증하는 데 필요한 bounded query attestation
+- 실제 사용한 source만 재검증하는 데 필요한 bounded typed query attestation
 - 해당 query의 access 결과
 - `none/action/risk/mutation/explicit_tracking` persistence intent
 
-질문 원문, caller principal, 전체 tool payload, 사진·음성 bytes, 전체 transcript와
-사용하지 않은 tool trace는 저장하지 않는다. `none`인 단순 조회는 source를
-사용했더라도 DecisionRecord를 만들지 않는다. `action`, `risk`, `mutation`,
-`explicit_tracking`만 compact record를 만들며, v1 레코드는 읽기 호환을 유지한다.
+질문 원문, caller principal, query의 model-authored `purpose`/자유 텍스트 검색어,
+전체 tool payload, 사진·음성 bytes, 전체 transcript, 사용하지 않은 source와 tool
+trace는 저장하지 않는다. `none`인 단순 조회는 source를 사용했더라도
+DecisionRecord를 만들지 않는다.
+
+LLM이 반환한 persistence intent는 신뢰 입력이 아니다. HealthMes가 다음처럼 최종
+effective intent를 계산한다.
+
+| 조건 | effective intent |
+|---|---|
+| 완료된 구체적 행동 제안 | `action` |
+| 완료된 행동 가능한 중요 위험 경고 | `risk` |
+| 행동 제안은 없고 trusted request의 `persistence_requested=true` | `explicit_tracking` |
+| LLM이 `mutation`/`explicit_tracking`을 주장했지만 위 조건이 없음 | `none` |
+| 단순 조회·요약 | `none` |
+
+따라서 read-only wellness runtime은 mutation audit를 만들지 않는다. 실제 mutation은
+별도 command workflow가 자신의 audit를 소유한다. 과거
+`healthmes.decision-private.v1` 레코드는 고정 historical fixture와 기존
+fingerprint를 기준으로 읽기 호환을 유지한다.
+
+검토된 Skill은 wheel의 `healthmes/_wellness_skills` package resource에 포함하고,
+source/Docker 실행에서는 repository `skills/`를 fallback으로 사용한다. catalog는
+mutation 중심 `healthmes-nutrition` 대신 read-only
+`healthmes-nutrition-decision`을 노출한다.
 
 Hermes `/v1/responses` 호출은 `store=false`이며 `previous_response_id`,
 `conversation`과 장기 memory tool을 사용하지 않는다. 다만 현재 Hermes

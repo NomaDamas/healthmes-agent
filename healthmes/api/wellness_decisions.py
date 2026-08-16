@@ -115,6 +115,7 @@ class WellnessDecisionInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     question: str = Field(min_length=1, max_length=8_000)
+    persistence_requested: bool = False
     hints: WellnessDecisionTimeHints = Field(
         default_factory=WellnessDecisionTimeHints
     )
@@ -328,6 +329,7 @@ async def create_wellness_decision(
                 channel="rest",
             ),
             requested_privacy_level=PrivacyLevel.AGGREGATE,
+            persistence_requested=body.persistence_requested,
             budget=DecisionBudget(),
             hints=body.hints.to_domain(),
         )
