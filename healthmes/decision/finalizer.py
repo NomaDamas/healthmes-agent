@@ -1332,7 +1332,7 @@ def _trace_source_candidates(
             refs[source_ref.reference_id] = source_ref
             candidates.setdefault(source_ref.reference_id, []).append(
                 _SourceAttempt(
-                    query=record.query,
+                    query=record.effective_query or record.query,
                     supporting_refs=supporting_refs,
                 )
             )
@@ -1785,7 +1785,7 @@ def _tool_trace_summary(record: ToolCallRecord) -> dict[str, Any]:
     result = record.result
     stored = _StoredToolTraceRecord(
         call_id=record.call_id,
-        query=record.query,
+        query=record.effective_query or record.query,
         status=record.status,
         started_at=record.started_at,
         finished_at=record.finished_at,

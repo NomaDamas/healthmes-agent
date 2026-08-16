@@ -56,9 +56,20 @@ SearchLimit = Annotated[
         ),
     ),
 ]
+OpaqueCursor = Annotated[
+    str,
+    Field(
+        min_length=69,
+        max_length=69,
+        pattern=r"^hmc1_[0-9a-f]{64}$",
+        description=(
+            "Opaque provider cursor returned by the immediately preceding "
+            "page for the same capability, window, privacy, and filters."
+        ),
+    ),
+]
 LookbackDays = Annotated[int, Field(ge=1, le=90)]
 MinimumMinutes = Annotated[int, Field(ge=1, le=1_440)]
-AggregatePrivacySelection = Literal["aggregate"]
 PrivacySelection = Literal["aggregate", "identity"]
 
 ActivityCapability = Literal[
@@ -66,8 +77,17 @@ ActivityCapability = Literal[
     "activity.focus",
     "activity.overwork",
     "activity.recovery",
+    "activity.timeline",
 ]
-ActivityGranularity = Literal["summary", "day", "window"]
+ActivityGranularity = Literal["summary", "day", "window", "record"]
+ActivityPlatform = Literal[
+    "android",
+    "ios",
+    "macos",
+    "windows",
+    "linux",
+    "unknown",
+]
 ActivityField = Literal[
     "status",
     "date",
@@ -92,6 +112,8 @@ ActivityField = Literal[
     "risk_level",
     "signals",
     "threshold_uncertainties",
+    "count",
+    "records",
 ]
 
 NutritionCapability = Literal[
@@ -138,8 +160,9 @@ CalendarCapability = Literal[
     "calendar.day-summary",
     "calendar.busy-intervals",
     "calendar.available-windows",
+    "calendar.event-detail",
 ]
-CalendarGranularity = Literal["summary", "day", "window"]
+CalendarGranularity = Literal["summary", "day", "window", "record"]
 CalendarField = Literal[
     "status",
     "date",
@@ -153,6 +176,8 @@ CalendarField = Literal[
     "intervals",
     "available_minutes",
     "windows",
+    "count",
+    "events",
 ]
 
 WearableCapability = Literal[
@@ -160,8 +185,18 @@ WearableCapability = Literal[
     "wearable.sleep",
     "wearable.recovery",
     "wearable.stress",
+    "wearable.metric-detail",
 ]
-WearableGranularity = Literal["summary", "day"]
+WearableGranularity = Literal["summary", "day", "record"]
+WearableKind = Literal["load", "recovery", "sleep", "stress"]
+WearableMetric = Literal[
+    "actual_sleep",
+    "charge",
+    "hrv",
+    "sleep_debt",
+    "stress",
+    "yesterday_load",
+]
 WearableField = Literal[
     "status",
     "reason",
@@ -174,6 +209,8 @@ WearableField = Literal[
     "stress",
     "charge",
     "yesterday_load",
+    "count",
+    "records",
 ]
 
 ServiceResolver = Callable[[], DecisionContextSearchSessionService]
@@ -258,9 +295,15 @@ def register_domain_search_tools(
         end: IsoDateTime | None = None,
         date: IsoDate | None = None,
         lookback_days: LookbackDays | None = None,
+        cursor: OpaqueCursor | None = None,
+        device_id: Annotated[
+            str | None,
+            Field(min_length=1, max_length=255),
+        ] = None,
+        platform: ActivityPlatform | None = None,
         granularity: ActivityGranularity = "summary",
         fields: Annotated[list[ActivityField] | None, Field(max_length=64)] = None,
-        privacy_level: AggregatePrivacySelection = "aggregate",
+        privacy_level: PrivacySelection = "aggregate",
         limit: SearchLimit = 100,
     ) -> dict[str, Any]:
         """Search one bounded Activity capability through an existing decision session."""
@@ -279,6 +322,9 @@ def register_domain_search_tools(
             parameters={
                 "date": date,
                 "lookback_days": lookback_days,
+                "cursor": cursor,
+                "device_id": device_id,
+                "platform": platform,
             },
         )
 
@@ -342,9 +388,10 @@ def register_domain_search_tools(
         end: IsoDateTime | None = None,
         date: IsoDate | None = None,
         minimum_minutes: MinimumMinutes | None = None,
+        cursor: OpaqueCursor | None = None,
         granularity: CalendarGranularity = "summary",
         fields: Annotated[list[CalendarField] | None, Field(max_length=64)] = None,
-        privacy_level: AggregatePrivacySelection = "aggregate",
+        privacy_level: PrivacySelection = "aggregate",
         limit: SearchLimit = 100,
     ) -> dict[str, Any]:
         """Search bounded mirrored Calendar availability without event titles."""
@@ -363,6 +410,7 @@ def register_domain_search_tools(
             parameters={
                 "date": date,
                 "minimum_minutes": minimum_minutes,
+                "cursor": cursor,
             },
         )
 
@@ -373,9 +421,12 @@ def register_domain_search_tools(
         start: IsoDateTime | None = None,
         end: IsoDateTime | None = None,
         date: IsoDate | None = None,
+        cursor: OpaqueCursor | None = None,
+        kind: WearableKind | None = None,
+        metric: WearableMetric | None = None,
         granularity: WearableGranularity = "summary",
         fields: Annotated[list[WearableField] | None, Field(max_length=64)] = None,
-        privacy_level: AggregatePrivacySelection = "aggregate",
+        privacy_level: PrivacySelection = "aggregate",
         limit: SearchLimit = 100,
     ) -> dict[str, Any]:
         """Search one retained Wearable summary capability without raw series."""
@@ -391,5 +442,10 @@ def register_domain_search_tools(
             fields=fields,
             privacy_level=privacy_level,
             limit=limit,
-            parameters={"date": date},
+            parameters={
+                "date": date,
+                "cursor": cursor,
+                "kind": kind,
+                "metric": metric,
+            },
         )

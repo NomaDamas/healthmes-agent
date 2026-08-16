@@ -769,6 +769,7 @@ class ToolCallRecord(BaseModel):
 
     call_id: uuid.UUID = Field(default_factory=uuid.uuid4)
     query: ContextQuery
+    effective_query: ContextQuery | None = None
     status: ToolCallStatus
     started_at: AwareDatetime
     finished_at: AwareDatetime
@@ -803,6 +804,14 @@ class ToolCallRecord(BaseModel):
     def validate_trace(self) -> ToolCallRecord:
         if self.finished_at < self.started_at:
             raise ValueError("finished_at must not be before started_at")
+        if self.effective_query is not None and (
+            self.effective_query.query_id != self.query.query_id
+            or self.effective_query.provider_id != self.query.provider_id
+            or self.effective_query.capability != self.query.capability
+        ):
+            raise ValueError(
+                "effective query must preserve query and provider identity"
+            )
         if self.status is ToolCallStatus.COMPLETED:
             if self.result is None:
                 raise ValueError("completed tool calls require a result")

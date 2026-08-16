@@ -92,6 +92,7 @@ def _wellness_event(
     event_type: str,
     source_provider: str,
     source_record_id: str,
+    source_device: str = "test-device",
     observed_at: datetime = DAY_START,
     recorded_at: datetime = NOW,
     payload: dict | None = None,
@@ -103,7 +104,7 @@ def _wellness_event(
         recorded_at=recorded_at,
         timezone="UTC",
         source_provider=source_provider,
-        source_device="test-device",
+        source_device=source_device,
         source_record_id=source_record_id,
         capture_method="test",
         quality_flags={},
@@ -503,6 +504,82 @@ async def test_activity_provider_treats_legacy_ios_launches_as_unknown(
     assert "launches_unavailable_for_some_sources" in result.limitations
 
 
+async def test_activity_timeline_cursor_is_stable_and_filter_bound(
+    session,
+) -> None:
+    events = [
+        _wellness_event(
+            event_type=APP_HOUR_EVENT,
+            source_provider="activitywatch",
+            source_device="desktop-a",
+            source_record_id=f"activity-hour-{hour}",
+            observed_at=DAY_START + timedelta(hours=hour),
+            payload={
+                "kind": "app_hour",
+                "platform": "macos",
+                "app_id": f"private.app.{hour}",
+                "category": "productivity",
+                "foreground_seconds": 1200,
+                "launches": hour,
+                "launches_observed": True,
+            },
+        )
+        for hour in (8, 9, 10)
+    ]
+    session.add_all(events)
+    session.flush()
+    registry = ContextProviderRegistry((ActivityContextProvider(),))
+
+    def query(*, cursor: str | None = None, platform: str = "macos"):
+        parameters = {"platform": platform}
+        if cursor is not None:
+            parameters["cursor"] = cursor
+        return ContextQuery(
+            provider_id="activity",
+            capability="activity.timeline",
+            start=DAY_START + timedelta(hours=8),
+            end=DAY_START + timedelta(hours=11),
+            granularity="record",
+            privacy_level="identity",
+            limit=1,
+            parameters=parameters,
+        )
+
+    first = await registry.execute(session, query(), now=NOW)
+    repeated = await registry.execute(session, query(), now=NOW)
+    assert first.status is ContextStatus.OK
+    assert repeated.payload == first.payload
+    assert repeated.next_cursor == first.next_cursor
+    assert first.next_cursor is not None
+    assert first.payload["records"][0]["record_id"] == str(events[0].id)
+
+    second = await registry.execute(
+        session,
+        query(cursor=first.next_cursor),
+        now=NOW,
+    )
+    assert second.status is ContextStatus.OK
+    assert second.payload["records"][0]["record_id"] == str(events[1].id)
+    assert second.next_cursor is not None
+
+    changed_filter = await registry.execute(
+        session,
+        query(cursor=first.next_cursor, platform="windows"),
+        now=NOW,
+    )
+    assert changed_filter.status is ContextStatus.FAILED
+    assert changed_filter.limitations == ["invalid_provider_query"]
+
+    replacement = "0" if first.next_cursor[-1] != "0" else "1"
+    tampered = await registry.execute(
+        session,
+        query(cursor=first.next_cursor[:-1] + replacement),
+        now=NOW,
+    )
+    assert tampered.status is ContextStatus.FAILED
+    assert tampered.limitations == ["invalid_provider_query"]
+
+
 async def test_nutrition_adapter_returns_only_structured_capture_context(
     session,
     monkeypatch,
@@ -785,6 +862,84 @@ async def test_wearable_adapter_normalizes_upstream_source_reference(session):
     assert "wearable_source_refs_are_readiness_level" in result.limitations
 
 
+async def test_wearable_metric_cursor_is_stable_and_filter_bound(session):
+    recorded_at = "2026-08-10T08:00:00+00:00"
+
+    async def reader(day: date):
+        return {
+            "status": "ok",
+            "date": day.isoformat(),
+            "actual_sleep": {
+                "status": "ok",
+                "value": 420,
+                "unit": "minutes",
+                "recorded_at": recorded_at,
+            },
+            "hrv": {
+                "status": "ok",
+                "value": 48,
+                "unit": "ms",
+                "recorded_at": recorded_at,
+            },
+            "stress": {
+                "status": "ok",
+                "value": 42,
+                "recorded_at": recorded_at,
+            },
+            "freshness": {
+                "recorded_at": recorded_at,
+                "status": "derived_from_readiness_blocks",
+            },
+            "coverage": {
+                "status": "readiness_blocks",
+                "ratio": 1.0,
+            },
+            "limitations": [],
+        }
+
+    registry = ContextProviderRegistry((WearableContextProvider(reader),))
+
+    def query(*, cursor: str | None = None, kind: str | None = None):
+        parameters = {"date": "2026-08-10"}
+        if cursor is not None:
+            parameters["cursor"] = cursor
+        if kind is not None:
+            parameters["kind"] = kind
+        return ContextQuery(
+            provider_id="wearable",
+            capability="wearable.metric-detail",
+            granularity="record",
+            limit=1,
+            parameters=parameters,
+        )
+
+    first = await registry.execute(session, query(), now=NOW)
+    repeated = await registry.execute(session, query(), now=NOW)
+    assert first.status is ContextStatus.OK
+    assert repeated.payload == first.payload
+    assert repeated.next_cursor == first.next_cursor
+    assert first.next_cursor is not None
+
+    second = await registry.execute(
+        session,
+        query(cursor=first.next_cursor),
+        now=NOW,
+    )
+    assert second.status is ContextStatus.OK
+    assert (
+        second.payload["records"][0]["metric"]
+        != first.payload["records"][0]["metric"]
+    )
+
+    changed_filter = await registry.execute(
+        session,
+        query(cursor=first.next_cursor, kind="stress"),
+        now=NOW,
+    )
+    assert changed_filter.status is ContextStatus.FAILED
+    assert changed_filter.limitations == ["invalid_provider_query"]
+
+
 async def test_calendar_adapter_returns_merged_aggregate_without_titles(
     session,
 ):
@@ -824,7 +979,84 @@ async def test_calendar_adapter_returns_merged_aggregate_without_titles(
         }
     ]
     assert "Private meeting title" not in result.model_dump_json()
-    assert result.source_refs[0].record_id == str(row.id)
+    assert len(result.source_refs) == 1
+    assert (
+        result.source_refs[0].source_provider
+        == "healthmes-calendar-aggregate"
+    )
+    assert result.source_refs[0].resource_type == "calendar.aggregate"
+    assert result.source_refs[0].record_id.startswith("aggregate:v1:")
+    assert result.source_refs[0].content_digest is not None
+    assert str(row.id) not in result.model_dump_json()
+
+
+async def test_calendar_detail_cursor_is_stable_and_omits_private_text(
+    session,
+) -> None:
+    rows = [
+        CalendarEventMirror(
+            external_id=f"private-event-{hour}",
+            calendar_source=CalendarSource.GOOGLE,
+            summary=f"Private title {hour}",
+            start_at=DAY_START + timedelta(hours=hour),
+            end_at=DAY_START + timedelta(hours=hour + 1),
+            is_all_day=False,
+        )
+        for hour in (8, 9, 10)
+    ]
+    session.add_all(rows)
+    session.flush()
+    registry = ContextProviderRegistry(
+        (CalendarContextProvider(sources=(CalendarSource.GOOGLE,)),)
+    )
+
+    def query(
+        *,
+        cursor: str | None = None,
+        start: datetime = DAY_START + timedelta(hours=8),
+    ):
+        parameters = {}
+        if cursor is not None:
+            parameters["cursor"] = cursor
+        return ContextQuery(
+            provider_id="calendar",
+            capability="calendar.event-detail",
+            start=start,
+            end=DAY_START + timedelta(hours=11),
+            granularity="record",
+            privacy_level="identity",
+            limit=1,
+            parameters=parameters,
+        )
+
+    first = await registry.execute(session, query(), now=NOW)
+    repeated = await registry.execute(session, query(), now=NOW)
+    assert first.status is ContextStatus.OK
+    assert repeated.payload == first.payload
+    assert repeated.next_cursor == first.next_cursor
+    assert first.next_cursor is not None
+    assert first.payload["events"][0]["event_id"] == str(rows[0].id)
+    assert "Private title" not in first.model_dump_json()
+    assert "private-event" not in first.model_dump_json()
+
+    second = await registry.execute(
+        session,
+        query(cursor=first.next_cursor),
+        now=NOW,
+    )
+    assert second.status is ContextStatus.OK
+    assert second.payload["events"][0]["event_id"] == str(rows[1].id)
+
+    changed_window = await registry.execute(
+        session,
+        query(
+            cursor=first.next_cursor,
+            start=DAY_START + timedelta(hours=9),
+        ),
+        now=NOW,
+    )
+    assert changed_window.status is ContextStatus.FAILED
+    assert changed_window.limitations == ["invalid_provider_query"]
 
 
 async def test_calendar_adapter_hides_expired_rows_before_maintenance(
@@ -862,7 +1094,12 @@ async def test_calendar_adapter_hides_expired_rows_before_maintenance(
     result = await registry.execute(session, query, now=NOW)
 
     assert result.payload["event_count"] == 0
-    assert result.source_refs == []
+    assert len(result.source_refs) == 1
+    assert (
+        result.source_refs[0].source_provider
+        == "healthmes-calendar-aggregate"
+    )
+    assert str(expired.id) not in result.model_dump_json()
 
 
 async def test_calendar_dynamic_connection_filters_and_revokes_mirror_rows(
@@ -901,9 +1138,8 @@ async def test_calendar_dynamic_connection_filters_and_revokes_mirror_rows(
 
     assert result.status is ContextStatus.OK
     assert result.payload["event_count"] == 1
-    assert [ref.record_id for ref in result.source_refs] == [
-        str(google.id)
-    ]
+    assert len(result.source_refs) == 1
+    assert result.source_refs[0].record_id.startswith("aggregate:v1:")
     assert str(caldav.id) not in result.model_dump_json()
 
     connected.clear()
@@ -987,9 +1223,9 @@ async def test_calendar_provider_requires_first_sync_and_current_generation(
     visible = await registry.execute(session, query, now=NOW)
 
     assert visible.payload["event_count"] == 1
-    assert [ref.record_id for ref in visible.source_refs] == [
-        str(first.id)
-    ]
+    assert len(visible.source_refs) == 1
+    first_ref_id = visible.source_refs[0].record_id
+    assert first_ref_id.startswith("aggregate:v1:")
 
     second_generation = _connect_google(
         settings,
@@ -1025,9 +1261,9 @@ async def test_calendar_provider_requires_first_sync_and_current_generation(
     reconnected = await registry.execute(session, query, now=NOW)
 
     assert reconnected.payload["event_count"] == 1
-    assert [ref.record_id for ref in reconnected.source_refs] == [
-        str(second.id)
-    ]
+    assert len(reconnected.source_refs) == 1
+    assert reconnected.source_refs[0].record_id.startswith("aggregate:v1:")
+    assert reconnected.source_refs[0].record_id != first_ref_id
     assert str(first.id) not in reconnected.model_dump_json()
 
 
@@ -1104,8 +1340,8 @@ async def test_calendar_empty_query_outside_sync_coverage_is_not_complete(
     assert result.payload["status"] == "insufficient_data"
     assert result.coverage.status is CoverageStatus.PARTIAL
     assert result.coverage.ratio == 0
-    assert result.observed_start is None
-    assert result.observed_end is None
+    assert result.observed_start == datetime(2026, 7, 1, tzinfo=UTC)
+    assert result.observed_end == datetime(2026, 7, 2, tzinfo=UTC)
     assert "calendar_query_outside_sync_coverage" in result.limitations
 
 
@@ -1215,7 +1451,8 @@ async def test_calendar_recent_failure_marks_retained_rows_partial(
 
     assert result.status is ContextStatus.PARTIAL
     assert result.payload["event_count"] == 1
-    assert result.source_refs[0].record_id == str(row.id)
+    assert result.source_refs[0].record_id.startswith("aggregate:v1:")
+    assert str(row.id) not in result.model_dump_json()
     assert result.freshness.as_of == NOW - timedelta(minutes=10)
     assert "calendar_recent_sync_failure" in result.limitations
     assert "Private retained meeting" not in result.model_dump_json()

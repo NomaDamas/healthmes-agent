@@ -43,6 +43,7 @@ SEARCH_CAPABILITIES = {
         "activity.focus",
         "activity.overwork",
         "activity.recovery",
+        "activity.timeline",
     },
     "search_nutrition": {
         "nutrition.intake-history",
@@ -53,12 +54,14 @@ SEARCH_CAPABILITIES = {
         "calendar.day-summary",
         "calendar.busy-intervals",
         "calendar.available-windows",
+        "calendar.event-detail",
     },
     "search_wearable": {
         "wearable.readiness",
         "wearable.sleep",
         "wearable.recovery",
         "wearable.stress",
+        "wearable.metric-detail",
     },
 }
 SEARCH_PROPERTIES = {
@@ -69,6 +72,9 @@ SEARCH_PROPERTIES = {
         "end",
         "date",
         "lookback_days",
+        "cursor",
+        "device_id",
+        "platform",
         "granularity",
         "fields",
         "privacy_level",
@@ -98,6 +104,7 @@ SEARCH_PROPERTIES = {
         "end",
         "date",
         "minimum_minutes",
+        "cursor",
         "granularity",
         "fields",
         "privacy_level",
@@ -109,6 +116,9 @@ SEARCH_PROPERTIES = {
         "start",
         "end",
         "date",
+        "cursor",
+        "kind",
+        "metric",
         "granularity",
         "fields",
         "privacy_level",
@@ -392,23 +402,56 @@ async def test_domain_search_schemas_are_exact_bounded_and_identity_safe(
         assert properties["limit"]["minimum"] == 1
         assert properties["limit"]["maximum"] == 1_000
 
+    for name in SEARCH_CAPABILITIES:
+        properties = tools[name].inputSchema["properties"]
+        assert properties["privacy_level"]["enum"] == [
+            "aggregate",
+            "identity",
+        ]
     for name in (
         "search_activity",
         "search_calendar",
         "search_wearable",
     ):
-        assert tools[name].inputSchema["properties"]["privacy_level"][
-            "const"
-        ] == "aggregate"
-    assert tools["search_nutrition"].inputSchema["properties"][
-        "privacy_level"
-    ]["enum"] == ["aggregate", "identity"]
+        properties = tools[name].inputSchema["properties"]
+        cursor = _schema_value(properties["cursor"])
+        assert cursor["minLength"] == 69
+        assert cursor["maxLength"] == 69
+        assert cursor["pattern"] == "^hmc1_[0-9a-f]{64}$"
+    assert (
+        "cursor"
+        not in tools["search_nutrition"].inputSchema["properties"]
+    )
     activity = tools["search_activity"].inputSchema["properties"]
     assert _schema_value(activity["lookback_days"])["maximum"] == 90
+    assert _schema_value(activity["device_id"])["maxLength"] == 255
+    assert set(_schema_value(activity["platform"])["enum"]) == {
+        "android",
+        "ios",
+        "linux",
+        "macos",
+        "unknown",
+        "windows",
+    }
     calendar = tools["search_calendar"].inputSchema["properties"]
     assert _schema_value(calendar["minimum_minutes"])["maximum"] == 1_440
     nutrition = tools["search_nutrition"].inputSchema["properties"]
     assert _schema_value(nutrition["text_query"])["maxLength"] == 500
+    wearable = tools["search_wearable"].inputSchema["properties"]
+    assert set(_schema_value(wearable["kind"])["enum"]) == {
+        "load",
+        "recovery",
+        "sleep",
+        "stress",
+    }
+    assert set(_schema_value(wearable["metric"])["enum"]) == {
+        "actual_sleep",
+        "charge",
+        "hrv",
+        "sleep_debt",
+        "stress",
+        "yesterday_load",
+    }
 
 
 async def test_four_tools_share_one_budget_and_always_roll_back(
@@ -470,11 +513,15 @@ async def test_four_tools_share_one_budget_and_always_roll_back(
     ]
 
     assert [result["status"] for result in results] == [
-        "unavailable",
-        "unavailable",
-        "unavailable",
-        "unavailable",
+        "failed",
+        "failed",
+        "failed",
+        "failed",
     ]
+    assert all(
+        "provider_execution_failed" in result["limitations"]
+        for result in results
+    )
     assert [
         result["access_audit"]["budget"]["tool_calls_used"]
         for result in results
@@ -494,19 +541,18 @@ async def test_four_tools_share_one_budget_and_always_roll_back(
         }
         json.dumps(result)
 
-    exhausted = await call_tool(
-        mcp_client,
-        "search_activity",
-        {
-            "decision_session_id": handle.session_id,
-            "capability": "activity.focus",
-            "date": "2026-08-16",
-        },
-    )
-    assert exhausted["status"] == "denied"
-    assert exhausted["limitations"] == [
-        "turn_tool_call_budget_exhausted"
-    ]
+    with pytest.raises(
+        ToolError,
+        match="decision_search_tool_call_budget_exhausted",
+    ):
+        await mcp_client.call_tool(
+            "search_activity",
+            {
+                "decision_session_id": handle.session_id,
+                "capability": "activity.focus",
+                "date": "2026-08-16",
+            },
+        )
     assert sum(len(provider.queries) for provider in providers) == 4
     assert {
         query.timezone
@@ -558,6 +604,11 @@ async def test_unknown_expired_and_input_bounds_fail_before_provider_access(
         await mcp_client.call_tool(
             "search_activity",
             {**arguments, "limit": 0},
+        )
+    with pytest.raises(ToolError):
+        await mcp_client.call_tool(
+            "search_activity",
+            {**arguments, "cursor": "not-an-opaque-cursor"},
         )
 
     clock.monotonic += 3

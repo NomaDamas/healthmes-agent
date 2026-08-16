@@ -233,6 +233,7 @@ def _run(
     proposed_action: bool = True,
     status: DecisionStatus = DecisionStatus.COMPLETED,
     query: ContextQuery | None = None,
+    effective_query: ContextQuery | None = None,
     payload: dict[str, int] | None = None,
     runtime: RuntimeMetadata | None = None,
     answer: str | None = None,
@@ -260,6 +261,7 @@ def _run(
     )
     record = ToolCallRecord(
         query=query,
+        effective_query=effective_query,
         status=ToolCallStatus.COMPLETED,
         started_at=NOW,
         finished_at=NOW,
@@ -394,6 +396,33 @@ def test_source_backed_action_is_atomically_persisted(persistence):
         assert str(ref.record_id) not in visible
         assert "query_id" not in visible
         assert "tool_trace" not in visible
+
+
+def test_finalizer_persists_and_revalidates_the_effective_query(persistence):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    requested_query = _query().model_copy(update={"limit": 250})
+    effective_query = requested_query.model_copy(update={"limit": 25})
+
+    result = _finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            query=requested_query,
+            effective_query=effective_query,
+        ),
+    )
+
+    assert result.status is DecisionStatus.COMPLETED
+    with factory() as session:
+        row = session.get(DecisionRecord, result.decision_record_id)
+        assert row is not None
+        stored_query = row.decision_payload["tool_trace"][0]["query"]
+        assert stored_query["limit"] == 25
+        assert stored_query["query_id"] == str(requested_query.query_id)
 
 
 def test_source_backed_information_is_persisted_without_action(persistence):

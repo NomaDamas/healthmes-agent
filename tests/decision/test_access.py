@@ -1153,7 +1153,7 @@ async def test_postflight_rejects_cross_session_calendar_all_day_change(
             )
 
             assert result.status is ContextStatus.DENIED
-            assert result.limitations == ["source_ref_identity_mismatch"]
+            assert result.limitations == ["source_ref_content_changed"]
             assert provider.cached is not None
             assert provider.cached.is_all_day is False
     finally:
@@ -3936,7 +3936,8 @@ async def test_calendar_day_summary_uses_requested_partial_window(session):
 
     assert result.payload["event_count"] == 1
     assert result.payload["busy_minutes"] == 60
-    assert result.source_refs[0].record_id == str(morning.id)
+    assert result.source_refs[0].record_id.startswith("aggregate:v1:")
+    assert str(morning.id) not in result.model_dump_json()
     assert str(afternoon.id) not in result.model_dump_json()
 
 
@@ -3980,8 +3981,11 @@ async def test_calendar_empty_success_metadata_survives_access_gateway(
     )
 
     assert result.status is ContextStatus.PARTIAL
-    assert result.payload == {"status": "empty_success"}
-    assert result.source_refs == []
+    assert result.payload["status"] == "empty_success"
+    assert result.payload["event_count"] == 0
+    assert result.payload["busy_minutes"] == 0
+    assert len(result.source_refs) == 1
+    assert result.source_refs[0].record_id.startswith("aggregate:v1:")
     assert result.observed_start == DAY_START
     assert result.observed_end == DAY_END
     assert result.collected_at == collected_at

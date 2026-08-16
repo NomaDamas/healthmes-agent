@@ -558,6 +558,81 @@ def test_postgres_finalizer_row_lock_timeout_is_auditable() -> None:
         assert retry.persistence_status is PersistenceStatus.PERSISTED
 
 
+def test_postgres_calendar_aggregate_rows_are_locked_during_finalization(
+    ) -> None:
+    with _postgres_store(pool_size=2) as store:
+        with store.factory() as session:
+            row = CalendarEventMirror(
+                external_id="postgres-calendar-aggregate-lock",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="Private meeting",
+                start_at=NOW + timedelta(hours=1),
+                end_at=NOW + timedelta(hours=2),
+                is_all_day=False,
+                created_at=NOW - timedelta(minutes=2),
+                updated_at=NOW - timedelta(minutes=1),
+            )
+            session.add(row)
+            session.commit()
+            row_id = row.id
+
+        policy = ContextAccessPolicy(
+            owner_principal_id="owner",
+            grants=(DomainAccessGrant(domain="calendar"),),
+        )
+        request = _request()
+        query = ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            parameters={"date": NOW.date().isoformat()},
+            timezone="UTC",
+        )
+        access_layer = ContextAccessLayer(
+            ContextProviderRegistry(
+                (
+                    CalendarContextProvider(
+                        sources=(CalendarSource.GOOGLE,),
+                    ),
+                )
+            ),
+            clock=lambda: NOW,
+        )
+        turn = access_layer.start_turn(request, policy=policy)
+        with store.factory() as session:
+            context = asyncio.run(turn.query(session, query))
+            session.rollback()
+        assert len(context.source_refs) == 1
+        assert context.source_refs[0].record_id.startswith("aggregate:v1:")
+        run = _run(request, query, context, turn.trace)
+        finalizer = DecisionFinalizer(
+            access_layer=access_layer,
+            session_factory=store.factory,
+            policy_resolver=lambda _request: policy,
+            timeout_seconds=0.2,
+            clock=lambda: NOW,
+        )
+
+        with store.factory() as blocker:
+            blocker.scalar(
+                sa.select(CalendarEventMirror)
+                .where(CalendarEventMirror.id == row_id)
+                .with_for_update()
+            )
+            started = time.monotonic()
+            result = finalizer.finalize(request, run)
+            elapsed = time.monotonic() - started
+            assert 0.15 <= elapsed < 2
+            assert result.status is DecisionStatus.FAILED
+            assert result.persistence_status is PersistenceStatus.FAILED
+            assert result.limitations == [
+                "decision_finalization_timeout"
+            ]
+            blocker.rollback()
+
+        retry = finalizer.finalize(request, run)
+        assert retry.persistence_status is PersistenceStatus.PERSISTED
+
+
 def test_postgres_finalizer_statement_timeout_is_auditable() -> None:
     class SlowPolicyResolver:
         def __call__(self, _request):
@@ -678,9 +753,9 @@ def test_postgres_calendar_visibility_change_after_flush_rolls_back(
             ContextStatus.OK,
             ContextStatus.PARTIAL,
         }
-        assert [ref.record_id for ref in context.source_refs] == [
-            str(row_id)
-        ]
+        assert len(context.source_refs) == 1
+        assert context.source_refs[0].record_id.startswith("aggregate:v1:")
+        assert str(row_id) not in context.model_dump_json()
         run = _run(request, query, context, turn.trace)
 
         class SyncChangingSession(Session):
@@ -781,9 +856,9 @@ def test_postgres_finalizer_rejects_calendar_row_expired_before_maintenance(
             ContextStatus.OK,
             ContextStatus.PARTIAL,
         }
-        assert [ref.record_id for ref in context.source_refs] == [
-            str(row_id)
-        ]
+        assert len(context.source_refs) == 1
+        assert context.source_refs[0].record_id.startswith("aggregate:v1:")
+        assert str(row_id) not in context.model_dump_json()
         run = _run(request, query, context, turn.trace)
         finalizer = DecisionFinalizer(
             access_layer=access_layer,
@@ -796,7 +871,7 @@ def test_postgres_finalizer_rejects_calendar_row_expired_before_maintenance(
 
         assert result.status is DecisionStatus.FAILED
         assert result.persistence_status is PersistenceStatus.FAILED
-        assert "source_ref_record_missing" in result.limitations
+        assert "source_ref_content_changed" in result.limitations
         with store.factory() as session:
             assert session.get(CalendarEventMirror, row_id) is not None
             assert session.scalar(

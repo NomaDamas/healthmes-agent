@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -24,6 +25,7 @@ from healthmes.decision import (
     DecisionCaller,
     DecisionContextSearchSessionService,
     DecisionRequest,
+    DecisionSearchBudgetError,
     DecisionSearchQueryError,
     DecisionSearchSessionState,
     DomainAccessGrant,
@@ -34,6 +36,7 @@ from healthmes.decision import (
     PrivacyLevel,
     ProvenanceSupport,
     SourceRef,
+    ToolCallStatus,
     UnknownDecisionSearchSessionError,
 )
 from healthmes.store import Base, WellnessEvent, create_db_engine
@@ -129,6 +132,36 @@ class SearchProvider:
                 ratio=1,
             ),
         )
+
+
+class CommitAttemptProvider(SearchProvider):
+    async def query(self, session, query, *, now):
+        self.queries.append(query)
+        backing_session = session._session
+        backing_session.add(
+            WellnessEvent(
+                event_type="nutrition.read-only-escape.v1",
+                schema_version=1,
+                observed_at=now,
+                recorded_at=now,
+                timezone=query.timezone,
+                source_provider="read-only-escape",
+                source_device=None,
+                source_record_id=str(uuid.uuid4()),
+                capture_method="test",
+                quality_flags={},
+                confidence=1,
+                coverage=1,
+                sensitivity="nutrition",
+                consent_scope="personal",
+                expires_at=now + timedelta(days=1),
+                payload={},
+                raw_object_id=None,
+                derived_from=None,
+            )
+        )
+        backing_session.commit()
+        raise AssertionError("read-only database transaction allowed commit")
 
 
 @pytest.fixture
@@ -293,20 +326,21 @@ async def test_repeated_calls_share_one_context_access_budget(
     )
 
     first = await _search(service, handle.session_id)
-    second = await _search(
-        service,
-        handle.session_id,
-        fields=("count",),
-    )
+    with pytest.raises(
+        DecisionSearchBudgetError,
+        match="decision_search_tool_call_budget_exhausted",
+    ):
+        await _search(
+            service,
+            handle.session_id,
+            fields=("count",),
+        )
 
     assert first.status is ContextStatus.PARTIAL
     assert first.access_audit.budget.tool_calls_used == 1
-    assert second.status is ContextStatus.DENIED
-    assert second.limitations == ["turn_tool_call_budget_exhausted"]
-    assert second.access_audit.budget.tool_calls_used == 2
     snapshot = service.inspect(handle.session_id)
-    assert len(snapshot.results) == 2
-    assert snapshot.budget.tool_calls_used == 2
+    assert len(snapshot.tool_trace) == 1
+    assert snapshot.budget.tool_calls_used == 1
     finished = service.finish(handle.session_id)
     assert finished.state is DecisionSearchSessionState.FINISHED
 
@@ -473,16 +507,62 @@ async def test_range_limit_and_encoded_byte_bounds_use_access_layer(
     }
     byte_limited_handle = service.begin(
         _request(
-            budget=DecisionBudget(max_context_bytes=1_024),
+            budget=DecisionBudget(max_context_bytes=4_096),
         )
     )
-    byte_limited = await _search(
-        service,
-        byte_limited_handle.session_id,
-        fields=("value",),
+    with pytest.raises(
+        DecisionSearchBudgetError,
+        match="decision_search_context_byte_budget_exhausted",
+    ):
+        await _search(
+            service,
+            byte_limited_handle.session_id,
+            fields=("value",),
+        )
+    byte_snapshot = service.inspect(byte_limited_handle.session_id)
+    assert byte_snapshot.tool_trace[-1].status is ToolCallStatus.FAILED
+    assert (
+        byte_snapshot.tool_trace[-1].error_code
+        == "turn_context_byte_budget_exhausted"
     )
-    assert byte_limited.status is ContextStatus.DENIED
-    assert byte_limited.limitations == ["result_payload_exceeds_limit"]
+    assert len(
+        json.dumps(
+            byte_snapshot.model_dump(mode="json", round_trip=True),
+            separators=(",", ":"),
+        ).encode()
+    ) <= byte_snapshot.budget.context_bytes_limit
+
+
+async def test_snapshot_preserves_server_canonical_query_and_effective_query(
+    store_factory,
+) -> None:
+    clock = MutableClock()
+    provider = SearchProvider()
+    service = _service(
+        store_factory,
+        provider,
+        [_policy(max_rows=2)],
+        clock,
+    )
+    handle = service.begin(_request())
+
+    await _search(
+        service,
+        handle.session_id,
+        start=NOW - timedelta(days=90),
+        limit=5,
+        fields=("records",),
+        parameters={},
+    )
+
+    trace = service.inspect(handle.session_id).tool_trace
+    assert len(trace) == 1
+    assert trace[0].query.limit == 5
+    assert trace[0].query.fields == ["records"]
+    assert trace[0].query.timezone == "UTC"
+    assert trace[0].effective_query is not None
+    assert trace[0].effective_query.limit == 2
+    assert trace[0].effective_query.parameters == {}
 
 
 async def test_source_ref_budget_is_shared_and_snapshot_order_is_stable(
@@ -625,3 +705,29 @@ async def test_expired_source_refs_are_denied_and_search_does_not_mutate(
             select(func.count()).select_from(WellnessEvent)
         )
     assert after == before
+
+
+async def test_database_read_only_transaction_blocks_provider_commit(
+    store_factory,
+) -> None:
+    clock = MutableClock()
+    provider = CommitAttemptProvider()
+    service = _service(
+        store_factory,
+        provider,
+        [_policy()],
+        clock,
+    )
+    handle = service.begin(_request())
+
+    result = await _search(service, handle.session_id)
+
+    assert result.status is ContextStatus.FAILED
+    assert result.limitations == ["provider_execution_failed"]
+    with store_factory() as session:
+        assert (
+            session.scalar(
+                select(func.count()).select_from(WellnessEvent)
+            )
+            == 0
+        )

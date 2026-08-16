@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
+from itertools import combinations
 from threading import Lock
 from typing import Any
 
@@ -57,6 +58,14 @@ from healthmes.decision.contracts import (
     SourceRef,
     source_ref_id,
 )
+from healthmes.decision.domain_providers import (
+    CALENDAR_AGGREGATE_DERIVER,
+    CALENDAR_AGGREGATE_RESOURCE_TYPE,
+    CALENDAR_AGGREGATE_SOURCE_PROVIDER,
+    _calendar_rows,
+    calendar_aggregate_content_digest,
+    calendar_aggregate_identity,
+)
 from healthmes.decision.providers import (
     ContextCapability,
     ContextProviderRegistry,
@@ -75,6 +84,7 @@ from healthmes.nutrition.intake_service import (
     INTERACTION_EVENT,
     OUTCOME_EVENT,
 )
+from healthmes.storage import retention_cutoff
 from healthmes.store import (
     CalendarEventMirror,
     StorageObject,
@@ -948,6 +958,7 @@ class ContextAccessTurn:
             reject_duplicate_effective_queries
         )
         self._effective_query_fingerprints: set[str] = set()
+        self._effective_queries: dict[uuid.UUID, ContextQuery] = {}
         self._trace: list[AccessAuditEntry] = []
         self._calls = 0
         self._context_bytes = 0
@@ -958,6 +969,16 @@ class ContextAccessTurn:
     def trace(self) -> tuple[AccessAuditEntry, ...]:
         with self._budget_lock:
             return tuple(self._trace)
+
+    def effective_query_for(
+        self,
+        query_id: uuid.UUID,
+    ) -> ContextQuery | None:
+        """Return the server-canonical query used for one audited call."""
+
+        with self._budget_lock:
+            query = self._effective_queries.get(query_id)
+            return query.model_copy(deep=True) if query is not None else None
 
     @property
     def calls_used(self) -> int:
@@ -989,12 +1010,19 @@ class ContextAccessTurn:
         query: ContextQuery,
         *,
         reason_codes: Sequence[str],
+        effective_query: ContextQuery | None = None,
     ) -> ContextResult:
         """Record a fail-closed denial without invoking a provider."""
 
         canonical = strict_model_validate(ContextQuery, query)
+        canonical_effective = (
+            strict_model_validate(ContextQuery, effective_query)
+            if effective_query is not None
+            else None
+        )
         return self._deny(
             canonical,
+            effective_query=canonical_effective,
             now=_as_utc(self._layer._clock()),
             reason_codes=tuple(reason_codes),
         )
@@ -1521,6 +1549,7 @@ class ContextAccessTurn:
         validated, source_limitations = _validate_source_ref(
             session,
             canonical_ref,
+            query=effective_query,
             grant=grant,
             query_bounds=bounds,
             query_timezone=effective_query.timezone,
@@ -2112,6 +2141,7 @@ class ContextAccessTurn:
             validated = _validate_source_ref(
                 session,
                 source_ref,
+                query=query,
                 grant=grant,
                 query_bounds=bounds,
                 query_timezone=query.timezone,
@@ -2226,6 +2256,9 @@ class ContextAccessTurn:
             payload_bytes=payload_bytes,
         )
         with self._budget_lock:
+            self._effective_queries[query.query_id] = (
+                effective or query
+            ).model_copy(deep=True)
             self._trace.append(entry)
 
 
@@ -2637,6 +2670,7 @@ def _validate_source_ref(
     session: Session,
     source_ref: SourceRef,
     *,
+    query: ContextQuery,
     grant: DomainAccessGrant,
     query_bounds: tuple[datetime | None, datetime | None],
     query_timezone: str,
@@ -2662,6 +2696,21 @@ def _validate_source_ref(
     )
     if source_ref.reference_id != expected_reference_id:
         return None, ("source_ref_identity_mismatch",)
+    if (
+        source_ref.source_provider
+        == CALENDAR_AGGREGATE_SOURCE_PROVIDER
+    ):
+        return _validate_calendar_aggregate_source_ref(
+            session,
+            source_ref,
+            query=query,
+            now=now,
+            require_content_digest=require_content_digest,
+            allowed_calendar_connections=allowed_calendar_connections,
+            calendar_connection_limitations=(
+                calendar_connection_limitations
+            ),
+        )
     try:
         record_uuid = uuid.UUID(source_ref.record_id)
     except ValueError:
@@ -2846,6 +2895,152 @@ def _validate_source_ref(
         )
 
     return None, ("source_ref_record_missing",)
+
+
+def _validate_calendar_aggregate_source_ref(
+    session: Session,
+    source_ref: SourceRef,
+    *,
+    query: ContextQuery,
+    now: datetime,
+    require_content_digest: bool,
+    allowed_calendar_connections: (
+        Mapping[CalendarSource, str]
+        | frozenset[CalendarSource]
+        | None
+    ),
+    calendar_connection_limitations: tuple[str, ...],
+) -> tuple[SourceRef | None, tuple[str, ...]]:
+    if (
+        source_ref.domain != "calendar"
+        or query.provider_id != "calendar"
+        or query.capability
+        not in {
+            "calendar.day-summary",
+            "calendar.busy-intervals",
+            "calendar.available-windows",
+        }
+        or source_ref.resource_type
+        != CALENDAR_AGGREGATE_RESOURCE_TYPE
+        or source_ref.schema_version != 1
+        or source_ref.derived_by != CALENDAR_AGGREGATE_DERIVER
+        or source_ref.sensitivity != "calendar-metadata"
+        or source_ref.content_digest is None
+    ):
+        return None, ("source_ref_identity_mismatch",)
+    bounds = _query_bounds(query, now=now)
+    if isinstance(bounds, str) or bounds[0] is None or bounds[1] is None:
+        return None, ("source_ref_outside_query",)
+    start, end = bounds
+    if (
+        source_ref.observed_start != start
+        or source_ref.observed_end != end
+        or (
+            source_ref.collected_at is not None
+            and source_ref.collected_at > now + _MAX_FUTURE_SKEW
+        )
+    ):
+        return None, ("source_ref_observation_mismatch",)
+    scopes: list[
+        tuple[
+            tuple[CalendarSource, ...],
+            Mapping[CalendarSource, str] | None,
+            Mapping[str, str] | Sequence[str],
+        ]
+    ] = []
+    if isinstance(allowed_calendar_connections, Mapping):
+        generations = dict(allowed_calendar_connections)
+        sources = tuple(sorted(generations, key=lambda item: item.value))
+        scopes.append(
+            (
+                sources,
+                generations,
+                {
+                    source.value: generations[source]
+                    for source in sources
+                },
+            )
+        )
+    elif allowed_calendar_connections is not None:
+        sources = tuple(
+            sorted(
+                allowed_calendar_connections,
+                key=lambda item: item.value,
+            )
+        )
+        scopes.append(
+            (
+                sources,
+                None,
+                [source.value for source in sources],
+            )
+        )
+    elif calendar_connection_limitations:
+        return None, (
+            calendar_connection_limitations
+        )
+    else:
+        # Compatibility for local callers that configure the provider with a
+        # fixed source set but do not repeat that resolver on the access layer.
+        # CalendarSource is deliberately tiny, so matching the opaque identity
+        # does not require exposing the selected source names in SourceRef.
+        values = tuple(CalendarSource)
+        for size in range(1, len(values) + 1):
+            for candidate in combinations(values, size):
+                scopes.append(
+                    (
+                        candidate,
+                        None,
+                        [source.value for source in candidate],
+                    )
+                )
+    matching_scopes = [
+        scope
+        for scope in scopes
+        if calendar_aggregate_identity(
+            capability=query.capability,
+            start=start,
+            end=end,
+            timezone=query.timezone,
+            granularity=query.granularity,
+            parameters=query.parameters,
+            source_scope=scope[2],
+        )
+        == source_ref.record_id
+    ]
+    if len(matching_scopes) != 1:
+        return None, ("source_ref_identity_mismatch",)
+    sources, generations, source_scope = matching_scopes[0]
+    if not sources:
+        return None, ("calendar_not_connected",)
+    rows = _calendar_rows(
+        session,
+        start=start,
+        end=end,
+        retained_after=retention_cutoff(
+            session,
+            "calendar_mirror",
+            now=now,
+        ),
+        sources=sources,
+        account_generations=generations,
+        lock_for_share=require_content_digest,
+    )
+    content_digest = calendar_aggregate_content_digest(
+        rows,
+        capability=query.capability,
+        start=start,
+        end=end,
+        timezone=query.timezone,
+        granularity=query.granularity,
+        parameters=query.parameters,
+        source_scope=source_scope,
+    )
+    return _attest_source_content(
+        source_ref,
+        content_digest=content_digest,
+        require_content_digest=require_content_digest,
+    )
 
 
 def _wearable_observation_content_id(
@@ -3033,7 +3228,10 @@ def _source_refs_depend_on_calendar(
     source_refs: Sequence[SourceRef],
 ) -> bool:
     for source_ref in source_refs:
-        if source_ref.source_provider == "healthmes-calendar-mirror":
+        if source_ref.source_provider in {
+            "healthmes-calendar-mirror",
+            CALENDAR_AGGREGATE_SOURCE_PROVIDER,
+        }:
             return True
         record_id = _source_ref_record_uuid(source_ref)
         if record_id is None:
@@ -3193,6 +3391,12 @@ def _source_ref_times(
             )
             if calendar is not None:
                 collected.append(_as_utc(calendar.updated_at))
+                continue
+        if (
+            ref.source_provider == CALENDAR_AGGREGATE_SOURCE_PROVIDER
+            and ref.collected_at is not None
+        ):
+            collected.append(ref.collected_at)
     return (
         observed_start,
         observed_end,

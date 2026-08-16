@@ -450,6 +450,17 @@ def test_tool_trace_must_match_query_and_result():
                 update={"query_id": uuid.uuid4()}
             ),
         )
+    with pytest.raises(ValidationError, match="effective query"):
+        ToolCallRecord(
+            query=query,
+            effective_query=query.model_copy(
+                update={"query_id": uuid.uuid4()}
+            ),
+            status=ToolCallStatus.COMPLETED,
+            started_at=T0,
+            finished_at=T1,
+            result=result,
+        )
 
 
 def test_action_draft_requires_valid_source_reference():

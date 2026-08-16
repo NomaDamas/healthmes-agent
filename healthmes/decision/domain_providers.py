@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -19,6 +22,8 @@ from healthmes.activity.context import (
     overwork_context,
     recovery_activity_context,
 )
+from healthmes.activity.contracts import ActivityPlatform
+from healthmes.activity.repository import RAW_EVENT_TYPES
 from healthmes.activity.resolver import (
     _normalize_wearable_context,
 )
@@ -153,6 +158,58 @@ _MINIMUM_MINUTES_PARAMETER = ContextParameterSpec(
     minimum=1,
     maximum=1_440,
 )
+_CURSOR_PATTERN = re.compile(r"^hmc1_[0-9a-f]{64}$")
+_CURSOR_PARAMETER = ContextParameterSpec(
+    name="cursor",
+    value_type=ContextParameterType.STRING,
+    min_length=69,
+    max_length=69,
+)
+_DEVICE_ID_PARAMETER = ContextParameterSpec(
+    name="device_id",
+    value_type=ContextParameterType.STRING,
+    min_length=1,
+    max_length=255,
+)
+_PLATFORM_PARAMETER = ContextParameterSpec(
+    name="platform",
+    value_type=ContextParameterType.STRING,
+    min_length=1,
+    max_length=32,
+    allowed_values=tuple(item.value for item in ActivityPlatform),
+)
+_WEARABLE_KIND_VALUES = (
+    "load",
+    "recovery",
+    "sleep",
+    "stress",
+)
+_WEARABLE_METRIC_VALUES = (
+    "actual_sleep",
+    "charge",
+    "hrv",
+    "sleep_debt",
+    "stress",
+    "yesterday_load",
+)
+_WEARABLE_KIND_PARAMETER = ContextParameterSpec(
+    name="kind",
+    value_type=ContextParameterType.STRING,
+    min_length=1,
+    max_length=16,
+    allowed_values=_WEARABLE_KIND_VALUES,
+)
+_WEARABLE_METRIC_PARAMETER = ContextParameterSpec(
+    name="metric",
+    value_type=ContextParameterType.STRING,
+    min_length=1,
+    max_length=32,
+    allowed_values=_WEARABLE_METRIC_VALUES,
+)
+
+CALENDAR_AGGREGATE_SOURCE_PROVIDER = "healthmes-calendar-aggregate"
+CALENDAR_AGGREGATE_RESOURCE_TYPE = "calendar.aggregate"
+CALENDAR_AGGREGATE_DERIVER = "calendar.aggregate.v1"
 
 _ENVELOPE_KEYS = {
     "coverage",
@@ -172,6 +229,8 @@ _ACTIVITY_NESTED_FIELDS = (
     "active_minutes",
     "active_minutes_upper",
     "active_time_range",
+    "active_seconds",
+    "app_id",
     "app_launches_or_switches",
     "app_launches_or_switches_range",
     "baseline_minutes",
@@ -180,6 +239,7 @@ _ACTIVITY_NESTED_FIELDS = (
     "confidence",
     "conflict",
     "coverage",
+    "device_id",
     "days_with_data",
     "deduplication",
     "delta_minutes",
@@ -189,12 +249,12 @@ _ACTIVITY_NESTED_FIELDS = (
     "hours_with_data",
     "idle_and_break_minutes",
     "kind",
+    "launches_observed",
     "known_seconds",
     "launches_or_switches_per_active_hour",
     "late_activity_minutes",
     "late_activity_time_range",
     "launches",
-    "launches_observed",
     "longest_active_block_minutes",
     "longest_block",
     "lookback_baseline_delta",
@@ -203,6 +263,7 @@ _ACTIVITY_NESTED_FIELDS = (
     "metrics",
     "method",
     "precision",
+    "records",
     "ratio",
     "required_days",
     "seven_day_baseline_delta",
@@ -212,6 +273,10 @@ _ACTIVITY_NESTED_FIELDS = (
     "threshold_uncertainties",
     "total_active_minutes",
     "timezone",
+    "platform",
+    "source_provider",
+    "source_record_id",
+    "state",
     "upper_bound",
     "upper_bound_minutes",
     "value_minutes",
@@ -354,6 +419,7 @@ _NUTRITION_RAW_FIELDS = tuple(sorted(_RAW_KEYS))
 _WEARABLE_NESTED_FIELDS = (
     "actual_sleep",
     "baseline_median",
+    "block",
     "category",
     "charge",
     "confidence",
@@ -372,6 +438,7 @@ _WEARABLE_NESTED_FIELDS = (
     "last_night",
     "local_date",
     "max_avg_heart_rate_bpm",
+    "metric",
     "n_days",
     "nights_counted",
     "observed_at",
@@ -381,6 +448,7 @@ _WEARABLE_NESTED_FIELDS = (
     "ratio",
     "reason",
     "recorded_at",
+    "records",
     "scale",
     "score",
     "sleep_debt",
@@ -405,9 +473,24 @@ _WEARABLE_NESTED_FIELDS = (
     "z_score",
 )
 _WEARABLE_IDENTITY_FIELDS = ("provider", "source")
+_WEARABLE_METRIC_KIND = {
+    "actual_sleep": "sleep",
+    "charge": "recovery",
+    "hrv": "recovery",
+    "sleep_debt": "sleep",
+    "stress": "stress",
+    "yesterday_load": "load",
+}
 _CALENDAR_NESTED_FIELDS = (
+    "calendar_source",
     "end",
+    "event_id",
+    "event_type",
+    "events",
+    "has_attendees",
     "intervals",
+    "is_agent_created",
+    "is_recurring",
     "start",
     "timezone",
     "window",
@@ -484,6 +567,241 @@ def _as_utc(value: datetime) -> datetime:
         value.replace(tzinfo=UTC)
         if value.tzinfo is None
         else value.astimezone(UTC)
+    )
+
+
+def _canonical_digest(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        _json_value(value),
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _cursor_scope(
+    query: ContextQuery,
+    *,
+    parameters: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    selected_parameters = parameters or {
+        key: value
+        for key, value in query.parameters.items()
+        if key != "cursor"
+    }
+    return {
+        "provider_id": query.provider_id,
+        "capability": query.capability,
+        "start": query.start,
+        "end": query.end,
+        "timezone": query.timezone,
+        "granularity": query.granularity,
+        "privacy_level": query.privacy_level.value,
+        "parameters": selected_parameters,
+    }
+
+
+def _opaque_cursor(
+    namespace: str,
+    *,
+    scope: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> str:
+    return "hmc1_" + _canonical_digest(
+        {
+            "schema": "healthmes.domain-cursor.v1",
+            "namespace": namespace,
+            "scope": scope,
+            "identity": identity,
+        }
+    )
+
+
+def _page_items(
+    items: Sequence[Any],
+    *,
+    query: ContextQuery,
+    namespace: str,
+    identity: Callable[[Any], Mapping[str, Any]],
+) -> tuple[list[Any], str | None]:
+    supplied = query.parameters.get("cursor")
+    if supplied is not None and (
+        not isinstance(supplied, str)
+        or _CURSOR_PATTERN.fullmatch(supplied) is None
+    ):
+        raise ValueError("cursor is invalid")
+    scope = _cursor_scope(query)
+    offset = 0
+    if supplied is not None:
+        for index, item in enumerate(items):
+            if (
+                _opaque_cursor(
+                    namespace,
+                    scope=scope,
+                    identity=identity(item),
+                )
+                == supplied
+            ):
+                offset = index + 1
+                break
+        else:
+            raise ValueError("cursor is invalid for this result set")
+    selected = list(items[offset : offset + query.limit])
+    has_more = offset + len(selected) < len(items)
+    next_cursor = (
+        _opaque_cursor(
+            namespace,
+            scope=scope,
+            identity=identity(selected[-1]),
+        )
+        if selected and has_more
+        else None
+    )
+    return selected, next_cursor
+
+
+def _calendar_row_digest_payload(
+    row: CalendarEventMirror,
+) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "calendar_source": row.calendar_source.value,
+        "connection_generation": row.connection_generation,
+        "external_id": row.external_id,
+        "start_at": _as_utc(row.start_at),
+        "end_at": _as_utc(row.end_at),
+        "healthmes_kind": row.healthmes_kind,
+        "is_all_day": row.is_all_day,
+        "status": row.status,
+        "updated_at": _as_utc(row.updated_at),
+    }
+
+
+def calendar_aggregate_identity(
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    granularity: str,
+    parameters: Mapping[str, Any],
+    source_scope: Mapping[str, str] | Sequence[str],
+) -> str:
+    """Return the opaque identity for one aggregate calendar query."""
+
+    normalized_scope = (
+        dict(sorted(source_scope.items()))
+        if isinstance(source_scope, Mapping)
+        else sorted(str(value) for value in source_scope)
+    )
+    return "aggregate:v1:" + _canonical_digest(
+        {
+            "schema": "healthmes.calendar-aggregate-identity.v1",
+            "capability": capability,
+            "start": _as_utc(start),
+            "end": _as_utc(end),
+            "timezone": timezone,
+            "granularity": granularity,
+            "parameters": {
+                key: value
+                for key, value in parameters.items()
+                if key != "cursor"
+            },
+            "source_scope": normalized_scope,
+        }
+    )
+
+
+def calendar_aggregate_content_digest(
+    rows: Sequence[CalendarEventMirror],
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    granularity: str,
+    parameters: Mapping[str, Any],
+    source_scope: Mapping[str, str] | Sequence[str],
+) -> str:
+    """Digest the exact retained rows used by a calendar aggregate."""
+
+    record_id = calendar_aggregate_identity(
+        capability=capability,
+        start=start,
+        end=end,
+        timezone=timezone,
+        granularity=granularity,
+        parameters=parameters,
+        source_scope=source_scope,
+    )
+    ordered_rows = sorted(
+        rows,
+        key=lambda row: (_as_utc(row.start_at), str(row.id)),
+    )
+    return _canonical_digest(
+        {
+            "schema": "healthmes.calendar-aggregate-content.v1",
+            "record_id": record_id,
+            "rows": [
+                _calendar_row_digest_payload(row)
+                for row in ordered_rows
+            ],
+        }
+    )
+
+
+def calendar_aggregate_source_ref(
+    rows: Sequence[CalendarEventMirror],
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    granularity: str,
+    parameters: Mapping[str, Any],
+    source_scope: Mapping[str, str] | Sequence[str],
+    collected_at: datetime | None,
+    coverage: float | None,
+) -> SourceRef:
+    """Create one revalidatable ref without exposing per-event timestamps."""
+
+    return SourceRef(
+        domain="calendar",
+        resource_type=CALENDAR_AGGREGATE_RESOURCE_TYPE,
+        record_id=calendar_aggregate_identity(
+            capability=capability,
+            start=start,
+            end=end,
+            timezone=timezone,
+            granularity=granularity,
+            parameters=parameters,
+            source_scope=source_scope,
+        ),
+        source_provider=CALENDAR_AGGREGATE_SOURCE_PROVIDER,
+        observed_start=_as_utc(start),
+        observed_end=_as_utc(end),
+        collected_at=(
+            _as_utc(collected_at)
+            if collected_at is not None
+            else None
+        ),
+        schema_version=1,
+        derived_by=CALENDAR_AGGREGATE_DERIVER,
+        freshness=FreshnessStatus.UNKNOWN,
+        coverage=coverage,
+        content_digest=calendar_aggregate_content_digest(
+            rows,
+            capability=capability,
+            start=start,
+            end=end,
+            timezone=timezone,
+            granularity=granularity,
+            parameters=parameters,
+            source_scope=source_scope,
+        ),
+        sensitivity="calendar-metadata",
     )
 
 
@@ -963,6 +1281,7 @@ def _result(
     now: datetime,
     extra_limitations: Sequence[str] = (),
     truncated: bool = False,
+    next_cursor: str | None = None,
     observed_start: datetime | None = None,
     observed_end: datetime | None = None,
     collected_at: datetime | None = None,
@@ -1005,6 +1324,7 @@ def _result(
         coverage=_coverage(raw),
         limitations=sorted(limitations),
         truncated=truncated,
+        next_cursor=next_cursor,
     )
 
 
@@ -1168,6 +1488,116 @@ def _validate_nutrition_snapshot_window(
         raise ValueError("nutrition snapshot exceeds context range")
 
 
+def _activity_row_window(
+    row: WellnessEvent,
+) -> tuple[datetime, datetime]:
+    payload = row.payload
+    start = _as_utc(row.observed_at)
+    if payload.get("kind") == "app_hour":
+        return start, start + timedelta(hours=1)
+    raw_end = payload.get("end_at")
+    parsed_end = (
+        _timestamp(raw_end, timezone=row.timezone or "UTC")
+        if isinstance(raw_end, str)
+        else None
+    )
+    return start, parsed_end or (start + timedelta(microseconds=1))
+
+
+def _activity_detail_rows(
+    session: Session,
+    *,
+    start: datetime,
+    end: datetime,
+    now: datetime,
+    device_id: str | None,
+    platform: str | None,
+) -> list[WellnessEvent]:
+    statement = select(WellnessEvent).where(
+        WellnessEvent.event_type.in_(RAW_EVENT_TYPES),
+        WellnessEvent.observed_at < end,
+        WellnessEvent.observed_at >= start - timedelta(days=1),
+        or_(
+            WellnessEvent.expires_at.is_(None),
+            WellnessEvent.expires_at > now,
+        ),
+    )
+    retained_after = retention_cutoff(
+        session,
+        "activity_raw",
+        now=now,
+    )
+    if retained_after is not None:
+        statement = statement.where(
+            WellnessEvent.observed_at >= retained_after
+        )
+    if device_id is not None:
+        statement = statement.where(
+            WellnessEvent.source_device == device_id
+        )
+    rows = list(
+        session.scalars(
+            statement.order_by(
+                WellnessEvent.observed_at,
+                WellnessEvent.id,
+            )
+        )
+    )
+    selected: list[WellnessEvent] = []
+    for row in rows:
+        row_start, row_end = _activity_row_window(row)
+        if row_start >= end or row_end <= start:
+            continue
+        if platform is not None and row.payload.get("platform") != platform:
+            continue
+        selected.append(row)
+    return selected
+
+
+def _activity_detail_record(
+    row: WellnessEvent,
+) -> dict[str, Any]:
+    payload = row.payload
+    start, end = _activity_row_window(row)
+    common = {
+        "record_id": str(row.id),
+        "kind": str(payload.get("kind") or ""),
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "platform": str(payload.get("platform") or "unknown"),
+        "device_id": row.source_device,
+        "source_provider": row.source_provider,
+        "source_record_id": row.source_record_id,
+        "app_id": payload.get("app_id"),
+        "category": payload.get("category"),
+        "launches": payload.get("launches"),
+    }
+    if payload.get("kind") == "app_hour":
+        common.update(
+            {
+                "active_seconds": payload.get("foreground_seconds"),
+                "launches_observed": payload.get(
+                    "launches_observed",
+                    True,
+                ),
+                "state": "active",
+            }
+        )
+    else:
+        common.update(
+            {
+                "active_seconds": round(
+                    (end - start).total_seconds()
+                    if payload.get("state") == "active"
+                    else 0
+                ),
+                "launches_observed": True,
+                "state": payload.get("state"),
+            }
+        )
+    return common
+
+
 class ActivityContextProvider:
     """Typed access to deterministic activity metrics and classifications."""
 
@@ -1292,6 +1722,47 @@ class ActivityContextProvider:
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="One local day's finalized or provisional activity.",
             ),
+            ContextCapability(
+                capability="activity.timeline",
+                description=(
+                    "Bounded retained activity records with optional device and "
+                    "platform filters. App and device identity require an "
+                    "explicit identity privacy request."
+                ),
+                granularities=("record", "window"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=("status", "count", "records"),
+                nested_output_fields=_ACTIVITY_NESTED_FIELDS,
+                identity_fields=(
+                    "app_id",
+                    "device_id",
+                    "source_provider",
+                    "source_record_id",
+                ),
+                limit_output_fields=("records",),
+                parameters=("cursor", "device_id", "platform"),
+                parameter_specs=(
+                    _CURSOR_PARAMETER,
+                    _DEVICE_ID_PARAMETER,
+                    _PLATFORM_PARAMETER,
+                ),
+                max_lookback_days=31,
+                default_lookback_days=1,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="activity",
+                limitation_codes=_ACTIVITY_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation="Retained raw activity rows at query time.",
+            ),
         ),
     )
 
@@ -1303,6 +1774,80 @@ class ActivityContextProvider:
         now: datetime,
     ) -> ContextResult:
         _validate_query(self.metadata, query)
+        if query.capability == "activity.timeline":
+            if query.start is None or query.end is None:
+                day = _query_day(query, now=now)
+                start, end = local_day_bounds(day, query.timezone)
+                end = min(end, now + timedelta(seconds=1))
+            else:
+                start, end = query.start, query.end
+            rows = _activity_detail_rows(
+                session,
+                start=start,
+                end=end,
+                now=now,
+                device_id=(
+                    str(query.parameters["device_id"])
+                    if query.parameters.get("device_id") is not None
+                    else None
+                ),
+                platform=(
+                    str(query.parameters["platform"])
+                    if query.parameters.get("platform") is not None
+                    else None
+                ),
+            )
+            selected, next_cursor = _page_items(
+                rows,
+                query=query,
+                namespace="activity.timeline",
+                identity=lambda row: {
+                    "observed_at": _as_utc(row.observed_at),
+                    "id": str(row.id),
+                },
+            )
+            refs, complete = _event_source_refs(
+                session,
+                [row.id for row in selected],
+                domain="activity",
+                derived_by="activity.timeline.v1",
+                now=now,
+            )
+            latest = max(
+                (_as_utc(row.recorded_at) for row in selected),
+                default=None,
+            )
+            raw = {
+                "status": "ok" if rows else "insufficient_data",
+                "count": len(rows),
+                "records": [
+                    _activity_detail_record(row)
+                    for row in selected
+                ],
+                "freshness": {
+                    "recorded_at": (
+                        latest.isoformat() if latest is not None else None
+                    ),
+                    "status": (
+                        "stored_activity_records"
+                        if latest is not None
+                        else "unavailable"
+                    ),
+                },
+                "coverage": {"ratio": 1.0 if rows else None},
+            }
+            return _result(
+                query,
+                raw,
+                refs=refs,
+                refs_complete=complete,
+                now=now,
+                truncated=next_cursor is not None,
+                next_cursor=next_cursor,
+                observed_start=start if not refs else None,
+                observed_end=end if not refs else None,
+                collected_at=latest if not refs else None,
+            )
         if query.capability == "activity.overwork":
             day = _query_anchor_day(query, now=now)
             start, end = local_day_bounds(day, query.timezone)
@@ -1882,6 +2427,46 @@ class WearableContextProvider:
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Latest daily stress or resilience observation.",
             ),
+            ContextCapability(
+                capability="wearable.metric-detail",
+                description=(
+                    "Bounded allowlisted readiness metric blocks with optional "
+                    "kind and metric filters. No raw wearable series is exposed."
+                ),
+                granularities=("record", "day"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=(
+                    "status",
+                    "date",
+                    "count",
+                    "records",
+                ),
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                limit_output_fields=("records",),
+                parameters=("date", "cursor", "kind", "metric"),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                    _WEARABLE_KIND_PARAMETER,
+                    _WEARABLE_METRIC_PARAMETER,
+                ),
+                max_lookback_days=1,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation="Latest retained daily wearable snapshot.",
+            ),
         ),
     )
 
@@ -1929,6 +2514,98 @@ class WearableContextProvider:
                     status=CoverageStatus.UNAVAILABLE
                 ),
                 limitations=sorted(limitations),
+            )
+        if query.capability == "wearable.metric-detail":
+            selected_kind = query.parameters.get("kind")
+            selected_metric = query.parameters.get("metric")
+            if (
+                selected_metric is not None
+                and selected_kind is not None
+                and _WEARABLE_METRIC_KIND[str(selected_metric)]
+                != selected_kind
+            ):
+                raise ValueError("wearable kind and metric filters conflict")
+            metrics = [
+                (
+                    _WEARABLE_METRIC_KIND[metric],
+                    metric,
+                    raw[metric],
+                )
+                for metric in _WEARABLE_METRIC_VALUES
+                if isinstance(raw.get(metric), Mapping)
+                and (
+                    selected_kind is None
+                    or _WEARABLE_METRIC_KIND[metric] == selected_kind
+                )
+                and (
+                    selected_metric is None
+                    or metric == selected_metric
+                )
+            ]
+            selected, next_cursor = _page_items(
+                metrics,
+                query=query,
+                namespace="wearable.metric-detail",
+                identity=lambda item: {
+                    "snapshot_event_id": str(snapshot.event_id),
+                    "kind": item[0],
+                    "metric": item[1],
+                },
+            )
+            raw = {
+                "status": "ok" if metrics else "insufficient_data",
+                "date": day.isoformat(),
+                "count": len(metrics),
+                "records": [
+                    {
+                        "kind": kind,
+                        "metric": metric,
+                        "block": block,
+                    }
+                    for kind, metric, block in selected
+                ],
+                "freshness": raw.get("freshness"),
+                "coverage": raw.get("coverage"),
+                "limitations": sorted(
+                    {
+                        *_limitations(raw),
+                        *limitations,
+                    }
+                ),
+            }
+            freshness = _freshness(
+                raw,
+                now=now,
+                timezone=query.timezone,
+            )
+            refs = [
+                SourceRef(
+                    domain="wearable",
+                    resource_type=(
+                        OPEN_WEARABLES_OBSERVATION_EVENT_TYPE
+                    ),
+                    record_id=str(snapshot.event_id),
+                    source_provider=(
+                        OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+                    ),
+                    observed_start=snapshot.observed_start,
+                    observed_end=snapshot.observed_end,
+                    collected_at=snapshot.collected_at,
+                    schema_version=1,
+                    derived_by="wearable.metric-detail.snapshot.v1",
+                    freshness=freshness.status,
+                    coverage=snapshot.coverage,
+                    sensitivity="wearable",
+                )
+            ]
+            return _result(
+                query,
+                raw,
+                refs=refs,
+                refs_complete=True,
+                now=now,
+                truncated=next_cursor is not None,
+                next_cursor=next_cursor,
             )
         selected = {
             "wearable.sleep": {"sleep_debt", "actual_sleep", "hrv"},
@@ -2070,6 +2747,7 @@ def _calendar_rows(
     retained_after: datetime | None,
     sources: Sequence[CalendarSource] | None = None,
     account_generations: Mapping[CalendarSource, str] | None = None,
+    lock_for_share: bool = False,
 ) -> list[CalendarEventMirror]:
     statement = select(CalendarEventMirror).where(
         CalendarEventMirror.start_at < end,
@@ -2102,11 +2780,13 @@ def _calendar_rows(
         statement = statement.where(
             CalendarEventMirror.calendar_source.in_(sources)
         )
-    return list(
-        session.scalars(
-            statement.order_by(CalendarEventMirror.start_at)
-        )
+    statement = statement.order_by(
+        CalendarEventMirror.start_at,
+        CalendarEventMirror.id,
     )
+    if lock_for_share and session.get_bind().dialect.name == "postgresql":
+        statement = statement.with_for_update(read=True)
+    return list(session.scalars(statement))
 
 
 def _merged_spans(
@@ -2328,8 +3008,11 @@ class CalendarContextProvider:
                 ),
                 nested_output_fields=_CALENDAR_NESTED_FIELDS,
                 limit_output_fields=("intervals",),
-                parameters=("date",),
-                parameter_specs=(_DATE_PARAMETER,),
+                parameters=("date", "cursor"),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                ),
                 max_lookback_days=31,
                 sensitivity="calendar-metadata",
                 limitation_codes=_CALENDAR_LIMITATION_CODES,
@@ -2356,12 +3039,48 @@ class CalendarContextProvider:
                 ),
                 nested_output_fields=_CALENDAR_NESTED_FIELDS,
                 limit_output_fields=("windows",),
-                parameters=("date", "minimum_minutes"),
+                parameters=("date", "minimum_minutes", "cursor"),
                 parameter_specs=(
                     _DATE_PARAMETER,
                     _MINIMUM_MINUTES_PARAMETER,
+                    _CURSOR_PARAMETER,
                 ),
                 max_lookback_days=31,
+                sensitivity="calendar-metadata",
+                limitation_codes=_CALENDAR_LIMITATION_CODES,
+                allows_future=True,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation="Latest local calendar mirror state.",
+            ),
+            ContextCapability(
+                capability="calendar.event-detail",
+                description=(
+                    "Bounded event identity and timing metadata without titles, "
+                    "notes, attendee identities, or raw provider payloads."
+                ),
+                granularities=("record", "window"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=("status", "count", "events"),
+                nested_output_fields=_CALENDAR_NESTED_FIELDS,
+                identity_fields=(
+                    "calendar_source",
+                    "event_id",
+                    "events",
+                ),
+                limit_output_fields=("events",),
+                parameters=("date", "cursor"),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                ),
+                max_lookback_days=31,
+                privacy_levels=(PrivacyLevel.IDENTITY,),
                 sensitivity="calendar-metadata",
                 limitation_codes=_CALENDAR_LIMITATION_CODES,
                 allows_future=True,
@@ -2629,7 +3348,6 @@ class CalendarContextProvider:
                 sources=sources,
                 account_generations=ready_generations,
             )
-        refs = _calendar_source_refs(rows)
         status, freshness, coverage, completeness_limitations = (
             _calendar_completeness(
                 rows=rows,
@@ -2643,6 +3361,73 @@ class CalendarContextProvider:
         )
         if visibility_limitations:
             status = "partial" if rows else "insufficient_data"
+        source_scope: Mapping[str, str] | Sequence[str] = (
+            {
+                source.value: generation
+                for source, generation in account_generations.items()
+            }
+            if account_generations is not None
+            else [source.value for source in sources]
+        )
+        if query.capability == "calendar.event-detail":
+            selected, next_cursor = _page_items(
+                rows,
+                query=query,
+                namespace="calendar.event-detail",
+                identity=lambda row: {
+                    "start_at": _as_utc(row.start_at),
+                    "id": str(row.id),
+                    "updated_at": _as_utc(row.updated_at),
+                },
+            )
+            refs = _calendar_source_refs(selected)
+            raw = {
+                "status": status,
+                "count": len(rows),
+                "events": [
+                    {
+                        "event_id": str(row.id),
+                        "calendar_source": row.calendar_source.value,
+                        "start": _as_utc(row.start_at).isoformat(),
+                        "end": _as_utc(row.end_at).isoformat(),
+                        "has_attendees": row.has_attendees,
+                        "is_recurring": row.is_recurring,
+                        "is_agent_created": row.is_agent_created,
+                        "event_type": row.event_type,
+                    }
+                    for row in selected
+                ],
+                "freshness": {
+                    "recorded_at": (
+                        freshness.isoformat() if freshness else None
+                    ),
+                    "status": (
+                        "calendar_sync_success"
+                        if freshness
+                        else "unavailable"
+                    ),
+                },
+                "coverage": coverage,
+                "limitations": sorted(
+                    {
+                        "calendar_titles_omitted",
+                        *completeness_limitations,
+                        *visibility_limitations,
+                    }
+                ),
+            }
+            return _result(
+                query,
+                raw,
+                refs=refs,
+                refs_complete=True,
+                now=now,
+                truncated=next_cursor is not None,
+                next_cursor=next_cursor,
+                observed_start=start if not refs else None,
+                observed_end=end if not refs else None,
+                collected_at=freshness if not refs else None,
+            )
         spans = _merged_spans(rows, start=start, end=end)
         if query.capability == "calendar.day-summary":
             busy_minutes = round(
@@ -2676,7 +3461,15 @@ class CalendarContextProvider:
             )
         else:
             if query.capability == "calendar.busy-intervals":
-                selected = spans[: query.limit]
+                selected, next_cursor = _page_items(
+                    spans,
+                    query=query,
+                    namespace="calendar.busy-intervals",
+                    identity=lambda span: {
+                        "start": span[0],
+                        "end": span[1],
+                    },
+                )
                 raw = {
                     "status": status,
                     "window": {
@@ -2700,7 +3493,7 @@ class CalendarContextProvider:
                         }
                         for span_start, span_end in selected
                     ],
-                    "truncated": len(spans) > query.limit,
+                    "truncated": next_cursor is not None,
                 }
             else:
                 minimum = query.parameters.get("minimum_minutes", 15)
@@ -2718,7 +3511,15 @@ class CalendarContextProvider:
                     cursor = max(cursor, span_end)
                 if (end - cursor).total_seconds() >= float(minimum) * 60:
                     available.append((cursor, end))
-                selected = available[: query.limit]
+                selected, next_cursor = _page_items(
+                    available,
+                    query=query,
+                    namespace="calendar.available-windows",
+                    identity=lambda window: {
+                        "start": window[0],
+                        "end": window[1],
+                    },
+                )
                 raw = {
                     "status": status,
                     "window": {
@@ -2741,7 +3542,7 @@ class CalendarContextProvider:
                         }
                         for window_start, window_end in selected
                     ],
-                    "truncated": len(available) > query.limit,
+                    "truncated": next_cursor is not None,
                 }
         raw["freshness"] = {
             "recorded_at": freshness.isoformat() if freshness else None,
@@ -2760,22 +3561,37 @@ class CalendarContextProvider:
                 *visibility_limitations,
             }
         )
+        aggregate_ref = calendar_aggregate_source_ref(
+            rows,
+            capability=query.capability,
+            start=start,
+            end=end,
+            timezone=query.timezone,
+            granularity=query.granularity,
+            parameters=query.parameters,
+            source_scope=source_scope,
+            collected_at=freshness,
+            coverage=(
+                float(coverage["ratio"])
+                if isinstance(coverage.get("ratio"), int | float)
+                and not isinstance(coverage.get("ratio"), bool)
+                else None
+            ),
+        )
         return _result(
             query,
             raw,
-            refs=refs,
+            refs=(aggregate_ref,),
             refs_complete=True,
             now=now,
             truncated=bool(raw.get("truncated")),
-            observed_start=(
-                start if not refs and status == "empty_success" else None
-            ),
-            observed_end=(
-                end if not refs and status == "empty_success" else None
-            ),
-            collected_at=(
-                freshness
-                if not refs and status == "empty_success"
+            next_cursor=(
+                next_cursor
+                if query.capability
+                in {
+                    "calendar.busy-intervals",
+                    "calendar.available-windows",
+                }
                 else None
             ),
         )
