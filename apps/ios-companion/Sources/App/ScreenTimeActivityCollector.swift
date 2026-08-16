@@ -2,9 +2,31 @@ import Foundation
 import Security
 
 #if HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE
+import Combine
 import DeviceActivity
 import FamilyControls
 #endif
+
+enum ScreenTimeAuthorizationChangeObserverFactory {
+    @MainActor
+    static func make() -> any ScreenTimeAuthorizationChangeObserving {
+        #if HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE
+        if #available(iOS 26.4, *) {
+            return IOS264ScreenTimeAuthorizationChangeObserver()
+        }
+        #endif
+        return UnavailableScreenTimeAuthorizationChangeObserver()
+    }
+}
+
+@MainActor
+private final class UnavailableScreenTimeAuthorizationChangeObserver:
+    ScreenTimeAuthorizationChangeObserving
+{
+    func start(
+        onChange _: @escaping @MainActor @Sendable () async -> Void
+    ) {}
+}
 
 enum ScreenTimeActivityCollectorFactory {
     static func make(
@@ -162,6 +184,28 @@ struct ScreenTimePseudonymKeyStore {
 }
 
 #if HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE
+@available(iOS 26.4, *)
+@MainActor
+private final class IOS264ScreenTimeAuthorizationChangeObserver:
+    ScreenTimeAuthorizationChangeObserving
+{
+    private var cancellable: AnyCancellable?
+
+    func start(
+        onChange: @escaping @MainActor @Sendable () async -> Void
+    ) {
+        guard cancellable == nil else { return }
+        cancellable = AuthorizationCenter.shared
+            .$authorizationStatus
+            .dropFirst()
+            .sink { _ in
+                Task { @MainActor in
+                    await onChange()
+                }
+            }
+    }
+}
+
 @available(iOS 26.4, *)
 struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
     private struct UsageKey: Hashable {

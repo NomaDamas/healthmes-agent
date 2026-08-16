@@ -63,6 +63,10 @@ enum ScreenTimeSyncOutcome: Equatable {
     case skipped(reason: String)
 }
 
+enum ScreenTimeActivityCollectionError: Error, Equatable {
+    case exportFailed
+}
+
 protocol ScreenTimeActivityTransport {
     func collectionState(
         pairing: Pairing,
@@ -630,8 +634,11 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             lease == .background,
             !activeSync.waiterLeases.values.contains(.foreground)
         {
+            // Detach before cancellation can suspend. A foreground caller
+            // arriving while the old pipeline unwinds must start fresh
+            // rather than inherit the cancelled task.
+            self.activeSync = nil
             activeSync.task.cancel()
-            self.activeSync = activeSync
             return activeSync.task
         }
         self.activeSync = activeSync
@@ -733,12 +740,11 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             if Task.isCancelled {
                 throw CancellationError()
             }
-            result = ScreenTimeCollectorResult(
-                capability: .unavailable,
-                permissionStatus: .unavailable,
-                reason: "ios_screen_time_activity_data_unavailable",
-                samples: []
-            )
+            // Export/data failures are transient collection failures, not
+            // authorization changes. Reporting `.unavailable` here would
+            // advance the permission generation and move the collection
+            // boundary, permanently skipping the failed historical window.
+            throw ScreenTimeActivityCollectionError.exportFailed
         }
         if result.permitsAggregateUpload {
             let currentAuthorization =

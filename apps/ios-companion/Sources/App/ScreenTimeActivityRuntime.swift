@@ -1,19 +1,6 @@
 import BackgroundTasks
 import Foundation
 
-private final class ScreenTimeBackgroundTaskCompletion {
-    private let lock = NSLock()
-    private var completed = false
-
-    func complete(_ task: BGTask, success: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !completed else { return }
-        completed = true
-        task.setTaskCompleted(success: success)
-    }
-}
-
 /// App-lifecycle facade for the UI-neutral Screen Time engine.
 ///
 /// Device UI code should call `requestAuthorizationAndSync()` after an
@@ -31,6 +18,8 @@ final class ScreenTimeActivityRuntime {
     static let minimumInterval: TimeInterval = 60 * 60
 
     private let lifecycle: ScreenTimeActivityLifecycleController
+    private let authorizationObserver:
+        any ScreenTimeAuthorizationChangeObserving
     private var registered = false
     private var pairingObserver: NSObjectProtocol?
 
@@ -39,10 +28,19 @@ final class ScreenTimeActivityRuntime {
             syncService: ScreenTimeActivitySyncService.live(),
             pairingProvider: { PairingStore.shared.load() }
         )
+        authorizationObserver =
+            ScreenTimeAuthorizationChangeObserverFactory.make()
     }
 
-    init(lifecycle: ScreenTimeActivityLifecycleController) {
+    init(
+        lifecycle: ScreenTimeActivityLifecycleController,
+        authorizationObserver:
+            (any ScreenTimeAuthorizationChangeObserving)? = nil
+    ) {
         self.lifecycle = lifecycle
+        self.authorizationObserver =
+            authorizationObserver
+            ?? ScreenTimeAuthorizationChangeObserverFactory.make()
     }
 
     func register() {
@@ -70,6 +68,11 @@ final class ScreenTimeActivityRuntime {
                 _ = await self.lifecycle.pairingDidChange()
                 self.schedule()
             }
+        }
+        authorizationObserver.start { [weak self] in
+            guard let self else { return }
+            _ = await self.lifecycle.authorizationDidChange()
+            self.schedule()
         }
     }
 
@@ -154,24 +157,23 @@ final class ScreenTimeActivityRuntime {
 
     private func handle(_ task: BGAppRefreshTask) {
         schedule()
-        let completion = ScreenTimeBackgroundTaskCompletion()
-        let work = Task { @MainActor [weak self] in
-            guard let self else {
-                completion.complete(task, success: false)
-                return
+        let runner = ScreenTimeBackgroundRefreshRunner(
+            operation: { [weak self] in
+                guard let self else { return false }
+                let result = await self.lifecycle.catchUp(
+                    trigger: .backgroundRefresh
+                )
+                return result.completedWithoutError
+            },
+            completion: { success in
+                task.setTaskCompleted(success: success)
             }
-            let result = await lifecycle.catchUp(
-                trigger: .backgroundRefresh
-            )
-            guard !Task.isCancelled else { return }
-            completion.complete(
-                task,
-                success: result.completedWithoutError
-            )
-        }
+        )
         task.expirationHandler = {
-            work.cancel()
-            completion.complete(task, success: false)
+            Task { @MainActor in
+                runner.expire()
+            }
         }
+        runner.start()
     }
 }

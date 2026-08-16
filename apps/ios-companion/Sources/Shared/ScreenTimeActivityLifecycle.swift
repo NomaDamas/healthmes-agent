@@ -44,6 +44,13 @@ protocol ScreenTimeActivitySyncing: Sendable {
     ) async throws
 }
 
+@MainActor
+protocol ScreenTimeAuthorizationChangeObserving: AnyObject {
+    func start(
+        onChange: @escaping @MainActor @Sendable () async -> Void
+    )
+}
+
 extension ScreenTimeActivitySyncing {
     func sync(
         pairing: Pairing,
@@ -114,15 +121,6 @@ final class ScreenTimeActivityLifecycleController {
                 )
             )
         }
-        guard authorization.permitsAggregateUpload else {
-            return ScreenTimeAuthorizationSyncResult(
-                authorization: authorization,
-                sync: .skipped(
-                    reason: authorization.reason
-                        ?? "ios_screen_time_authorization_not_granted"
-                )
-            )
-        }
         return ScreenTimeAuthorizationSyncResult(
             authorization: authorization,
             sync: await catchUp(
@@ -130,6 +128,17 @@ final class ScreenTimeActivityLifecycleController {
                 timezone: timezone,
                 trigger: .authorizationChanged
             )
+        )
+    }
+
+    func authorizationDidChange(
+        now: Date = Date(),
+        timezone: TimeZone = .current
+    ) async -> ScreenTimeActivityLifecycleResult {
+        await catchUp(
+            now: now,
+            timezone: timezone,
+            trigger: .authorizationChanged
         )
     }
 
@@ -243,6 +252,12 @@ final class ScreenTimeActivityLifecycleController {
                 return "ios_screen_time_pseudonym_key_changed"
             case .invalidExcludedAppToken:
                 return "ios_screen_time_invalid_excluded_app_token"
+            }
+        }
+        if let error = error as? ScreenTimeActivityCollectionError {
+            switch error {
+            case .exportFailed:
+                return "ios_screen_time_activity_export_failed"
             }
         }
         guard let error = error as? HealthMesAPIError else {

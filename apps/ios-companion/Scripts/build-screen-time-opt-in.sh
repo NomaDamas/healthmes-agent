@@ -45,6 +45,7 @@ case "${sdk}" in
 esac
 
 cat >"${probe_root}/ScreenTimeSDKProbe.swift" <<'SWIFT'
+import Combine
 import DeviceActivity
 import FamilyControls
 import Foundation
@@ -52,6 +53,7 @@ import Foundation
 @available(iOS 26.4, *)
 func probeAppAndWebsiteUsageExport() {
     _ = AuthorizationStatus.approvedWithDataAccess
+    _ = AuthorizationCenter.shared.$authorizationStatus
     let filter = DeviceActivityFilter(
         segment: .hourly(
             during: DateInterval(start: Date(), duration: 3_600)
