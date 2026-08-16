@@ -32,6 +32,11 @@ private struct FixedScreenTimeCollector: ScreenTimeActivityCollecting {
     }
 
     @MainActor
+    func currentAuthorizationStatus() async -> ScreenTimeCollectorResult {
+        result
+    }
+
+    @MainActor
     func requestAuthorization() async throws -> ScreenTimeCollectorResult {
         result
     }
@@ -49,6 +54,16 @@ private struct RejectingScreenTimeCollector: ScreenTimeActivityCollecting {
 
     init(pseudonymKeyID: String? = nil) {
         self.pseudonymKeyID = pseudonymKeyID
+    }
+
+    @MainActor
+    func currentAuthorizationStatus() async -> ScreenTimeCollectorResult {
+        ScreenTimeCollectorResult(
+            capability: .aggregate,
+            permissionStatus: .granted,
+            reason: nil,
+            samples: []
+        )
     }
 
     @MainActor

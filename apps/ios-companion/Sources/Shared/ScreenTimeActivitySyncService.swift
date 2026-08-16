@@ -26,6 +26,9 @@ protocol ScreenTimeActivityCollecting {
     var pseudonymKeyID: String? { get }
 
     @MainActor
+    func currentAuthorizationStatus() async -> ScreenTimeCollectorResult
+
+    @MainActor
     func requestAuthorization() async throws -> ScreenTimeCollectorResult
 
     func collect(
@@ -38,9 +41,25 @@ extension ScreenTimeActivityCollecting {
     var pseudonymKeyID: String? { nil }
 }
 
+extension ScreenTimeCollectorResult {
+    var permitsAggregateUpload: Bool {
+        capability == .aggregate && permissionStatus == .granted
+    }
+}
+
 enum ScreenTimeSyncOutcome: Equatable {
     case uploaded(ScreenTimeActivityBatchResult)
     case unavailableReported(reason: String)
+    case queued(
+        reason: String,
+        retryAt: Date,
+        queueDepth: Int
+    )
+    case deferred(
+        reason: String,
+        retryAt: Date,
+        queueDepth: Int
+    )
     case skipped(reason: String)
 }
 
@@ -100,6 +119,12 @@ final class URLSessionScreenTimeActivityTransport:
         do {
             (data, response) = try await session.data(for: request)
         } catch {
+            if error is CancellationError
+                || Task.isCancelled
+                || (error as? URLError)?.code == .cancelled
+            {
+                throw CancellationError()
+            }
             throw HealthMesAPIError.transport(underlying: error)
         }
         guard let http = response as? HTTPURLResponse else {
@@ -123,22 +148,107 @@ final class URLSessionScreenTimeActivityTransport:
     }
 }
 
-actor ScreenTimeActivitySyncService {
+private struct ScreenTimeUploadAttemptFailure: Error {
+    let report: ScreenTimeActivityReport
+    let underlying: Error
+}
+
+private struct ScreenTimeActiveSync {
+    let id: UUID
+    let destinationID: String
+    let task: Task<ScreenTimeSyncOutcome, Error>
+}
+
+private enum ScreenTimeUploadFailurePolicy {
+    static func isRetryable(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return false
+        }
+        guard let error = error as? HealthMesAPIError else {
+            return false
+        }
+        switch error {
+        case .unauthorized, .transport, .decoding:
+            return true
+        case .httpStatus(let statusCode):
+            return statusCode == 408
+                || statusCode == 425
+                || statusCode == 429
+                || statusCode >= 500
+        case .server(let statusCode, let code, _, _):
+            return statusCode == 408
+                || statusCode == 425
+                || statusCode == 429
+                || statusCode >= 500
+                || code == "activity_write_conflict"
+        case .notPaired:
+            return false
+        }
+    }
+
+    static func shouldDiscard(_ error: Error) -> Bool {
+        guard
+            case .server(_, let code, _, _)? =
+                error as? HealthMesAPIError
+        else {
+            return false
+        }
+        return [
+            "activity_collection_blocked",
+            "activity_future_data",
+            "activity_outside_retention",
+            "activity_source_conflict",
+            "activity_source_mode_conflict",
+            "ios_exclusion_reapproval_required",
+            "snapshot_retry_response_unavailable",
+            "stale_collection_revision",
+        ].contains(code)
+    }
+
+    static func reason(_ error: Error) -> String {
+        if error is CancellationError {
+            return "cancelled"
+        }
+        guard let error = error as? HealthMesAPIError else {
+            return "ios_screen_time_upload_failed"
+        }
+        switch error {
+        case .notPaired:
+            return "not_paired"
+        case .unauthorized:
+            return "pairing_unauthorized"
+        case .transport:
+            return "network_unavailable"
+        case .decoding:
+            return "invalid_server_response"
+        case .httpStatus(let statusCode):
+            return "http_\(statusCode)"
+        case .server(_, let code, _, _):
+            return code
+        }
+    }
+}
+
+actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
     private let deviceID: String
     private let collector: any ScreenTimeActivityCollecting
     private let transport: any ScreenTimeActivityTransport
     private let stateStore: ScreenTimeSyncStateStore
+    private let outbox: ScreenTimeActivityOutbox
+    private var activeSync: ScreenTimeActiveSync?
 
     init(
         deviceID: String,
         collector: any ScreenTimeActivityCollecting,
         transport: any ScreenTimeActivityTransport,
-        stateStore: ScreenTimeSyncStateStore = .shared
+        stateStore: ScreenTimeSyncStateStore = .shared,
+        outbox: ScreenTimeActivityOutbox = .shared
     ) {
         self.deviceID = deviceID
         self.collector = collector
         self.transport = transport
         self.stateStore = stateStore
+        self.outbox = outbox
     }
 
     func requestAuthorization() async throws -> ScreenTimeCollectorResult {
@@ -159,14 +269,100 @@ actor ScreenTimeActivitySyncService {
         )
     }
 
+    func reconcilePendingUploads(
+        pairing: Pairing?
+    ) async throws {
+        await cancelActiveSyncIfDestinationChanged(
+            pairing.map(
+                ScreenTimeActivityReportIdentity.destinationID
+            )
+        )
+        try await outbox.reconcile(
+            deviceID: deviceID,
+            pairing: pairing
+        )
+    }
+
     func sync(
         pairing: Pairing,
         now: Date = Date(),
         timezone: TimeZone = .current
     ) async throws -> ScreenTimeSyncOutcome {
+        let destinationID =
+            ScreenTimeActivityReportIdentity.destinationID(for: pairing)
+        await cancelActiveSyncIfDestinationChanged(destinationID)
+        if let activeSync {
+            return try await valuePropagatingCancellation(
+                from: activeSync.task
+            )
+        }
+        let id = UUID()
+        let task = Task {
+            try await self.performSync(
+                pairing: pairing,
+                now: now,
+                timezone: timezone
+            )
+        }
+        activeSync = ScreenTimeActiveSync(
+            id: id,
+            destinationID: destinationID,
+            task: task
+        )
+        defer {
+            if activeSync?.id == id {
+                activeSync = nil
+            }
+        }
+        return try await valuePropagatingCancellation(from: task)
+    }
+
+    private func valuePropagatingCancellation(
+        from task: Task<ScreenTimeSyncOutcome, Error>
+    ) async throws -> ScreenTimeSyncOutcome {
+        try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private func cancelActiveSyncIfDestinationChanged(
+        _ destinationID: String?
+    ) async {
+        guard
+            let activeSync,
+            activeSync.destinationID != destinationID
+        else {
+            return
+        }
+        activeSync.task.cancel()
+        _ = try? await activeSync.task.value
+        if self.activeSync?.id == activeSync.id {
+            self.activeSync = nil
+        }
+    }
+
+    private func performSync(
+        pairing: Pairing,
+        now: Date,
+        timezone: TimeZone
+    ) async throws -> ScreenTimeSyncOutcome {
+        try await outbox.reconcile(
+            deviceID: deviceID,
+            pairing: pairing
+        )
         let state = try await transport.collectionState(
             pairing: pairing,
             deviceID: deviceID
+        )
+        let authorization =
+            await collector.currentAuthorizationStatus()
+        try await outbox.reconcile(
+            deviceID: deviceID,
+            pairing: pairing,
+            state: state,
+            authorization: authorization
         )
         if let reason = ScreenTimeSyncPlanner.skipReason(
             state: state,
@@ -174,6 +370,14 @@ actor ScreenTimeActivitySyncService {
         ) {
             return .skipped(reason: reason)
         }
+
+        if let pendingOutcome = try await flushPendingUploads(
+            pairing: pairing,
+            now: now
+        ) {
+            return pendingOutcome
+        }
+
         let pseudonymBoundaryAccepted =
             await stateStore.preparePseudonymBoundary(
                 deviceID: deviceID,
@@ -200,13 +404,34 @@ actor ScreenTimeActivitySyncService {
             retentionCutoff: state.rawRetentionCutoff,
             earliestCollectionStart: earliestCollectionStart
         )
-        let result = try await collector.collect(
-            window: window,
-            excludedAppTokens: Set(state.excludedApps)
-        )
+        var result: ScreenTimeCollectorResult
+        do {
+            result = try await collector.collect(
+                window: window,
+                excludedAppTokens: Set(state.excludedApps)
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            result = ScreenTimeCollectorResult(
+                capability: .unavailable,
+                permissionStatus: .unavailable,
+                reason: "ios_screen_time_activity_data_unavailable",
+                samples: []
+            )
+        }
+        if result.permitsAggregateUpload {
+            let currentAuthorization =
+                await collector.currentAuthorizationStatus()
+            if !currentAuthorization.permitsAggregateUpload {
+                result = currentAuthorization
+            }
+        }
         guard
-            result.capability == .aggregate,
-            result.permissionStatus == .granted,
+            result.permitsAggregateUpload,
             let pseudonymKeyID = collector.pseudonymKeyID
         else {
             let generation = await stateStore.collectionGeneration(
@@ -220,19 +445,23 @@ actor ScreenTimeActivitySyncService {
                         ? "ios_screen_time_pseudonym_key_unavailable"
                         : "ios_screen_time_unavailable"
                 )
-            _ = try await transport.upload(
-                pairing: pairing,
-                report: .unavailable(
-                    deviceID: deviceID,
-                    timezone: timezone.identifier,
-                    permissionStatus: result.permissionStatus,
-                    reason: reason,
-                    collectedAt: now,
-                    collectionRevision: state.configRevision,
-                    collectionGeneration: generation
-                )
+            let report = ScreenTimeActivityReport.unavailable(
+                deviceID: deviceID,
+                timezone: timezone.identifier,
+                permissionStatus: result.permissionStatus,
+                reason: reason,
+                collectedAt: now,
+                collectionRevision: state.configRevision,
+                collectionGeneration: generation
             )
-            return .unavailableReported(reason: reason)
+            return try await deliver(
+                pairing: pairing,
+                report: report,
+                now: now,
+                success: { _ in
+                    .unavailableReported(reason: reason)
+                }
+            )
         }
 
         _ = try await stateStore.acceptTimezoneBoundary(
@@ -263,20 +492,182 @@ actor ScreenTimeActivitySyncService {
             samples: result.samples
         )
 
+        return try await deliver(
+            pairing: pairing,
+            report: report,
+            now: now,
+            success: ScreenTimeSyncOutcome.uploaded
+        )
+    }
+
+    private func flushPendingUploads(
+        pairing: Pairing,
+        now: Date
+    ) async throws -> ScreenTimeSyncOutcome? {
+        while true {
+            let authorization =
+                await collector.currentAuthorizationStatus()
+            try await outbox.reconcile(
+                deviceID: deviceID,
+                pairing: pairing,
+                authorization: authorization
+            )
+            guard
+                let entry = await outbox.oldest(
+                    deviceID: deviceID,
+                    pairing: pairing
+                )
+            else {
+                return nil
+            }
+            let queueDepth = await outbox.pendingCount(
+                deviceID: deviceID,
+                pairing: pairing
+            )
+            guard entry.nextAttemptAt <= now else {
+                return .deferred(
+                    reason: "retry_backoff",
+                    retryAt: entry.nextAttemptAt,
+                    queueDepth: queueDepth
+                )
+            }
+            do {
+                _ = try await uploadWithFenceRecovery(
+                    pairing: pairing,
+                    report: entry.report
+                )
+                try await outbox.markSucceeded(id: entry.id)
+            } catch let failure as ScreenTimeUploadAttemptFailure {
+                if ScreenTimeUploadFailurePolicy.isRetryable(
+                    failure.underlying
+                ) {
+                    let failedEntry: ScreenTimeActivityOutboxEntry?
+                    if failure.report == entry.report {
+                        failedEntry = try await outbox.markFailed(
+                            id: entry.id,
+                            now: now
+                        )
+                    } else {
+                        failedEntry =
+                            try await outbox.replaceAndMarkFailed(
+                                id: entry.id,
+                                with: failure.report,
+                                pairing: pairing,
+                                now: now
+                            )
+                    }
+                    let retryAt = failedEntry?.nextAttemptAt
+                        ?? now.addingTimeInterval(60)
+                    return .queued(
+                        reason: ScreenTimeUploadFailurePolicy.reason(
+                            failure.underlying
+                        ),
+                        retryAt: retryAt,
+                        queueDepth: await outbox.pendingCount(
+                            deviceID: deviceID,
+                            pairing: pairing
+                        )
+                    )
+                }
+                if ScreenTimeUploadFailurePolicy.shouldDiscard(
+                    failure.underlying
+                ) {
+                    try await outbox.markSucceeded(id: entry.id)
+                    return .skipped(
+                        reason: ScreenTimeUploadFailurePolicy.reason(
+                            failure.underlying
+                        )
+                    )
+                }
+                throw failure.underlying
+            }
+        }
+    }
+
+    private func deliver(
+        pairing: Pairing,
+        report: ScreenTimeActivityReport,
+        now: Date,
+        success: (ScreenTimeActivityBatchResult) -> ScreenTimeSyncOutcome
+    ) async throws -> ScreenTimeSyncOutcome {
         do {
-            let response = try await transport.upload(
+            return success(
+                try await uploadWithFenceRecovery(
+                    pairing: pairing,
+                    report: report
+                )
+            )
+        } catch let failure as ScreenTimeUploadAttemptFailure {
+            if ScreenTimeUploadFailurePolicy.isRetryable(
+                failure.underlying
+            ) {
+                let entry = try await outbox.enqueue(
+                    report: failure.report,
+                    pairing: pairing,
+                    now: now
+                )
+                let failedEntry = try await outbox.markFailed(
+                    id: entry.id,
+                    now: now
+                )
+                return .queued(
+                    reason: ScreenTimeUploadFailurePolicy.reason(
+                        failure.underlying
+                    ),
+                    retryAt: failedEntry?.nextAttemptAt
+                        ?? now.addingTimeInterval(60),
+                    queueDepth: await outbox.pendingCount(
+                        deviceID: deviceID,
+                        pairing: pairing
+                    )
+                )
+            }
+            if ScreenTimeUploadFailurePolicy.shouldDiscard(
+                failure.underlying
+            ) {
+                return .skipped(
+                    reason: ScreenTimeUploadFailurePolicy.reason(
+                        failure.underlying
+                    )
+                )
+            }
+            throw failure.underlying
+        }
+    }
+
+    private func uploadWithFenceRecovery(
+        pairing: Pairing,
+        report: ScreenTimeActivityReport
+    ) async throws -> ScreenTimeActivityBatchResult {
+        do {
+            return try await transport.upload(
                 pairing: pairing,
                 report: report
             )
-            return .uploaded(response)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as HealthMesAPIError
             where ScreenTimeSyncPlanner.shouldResetSnapshotFence(error)
         {
-            let response = try await transport.upload(
-                pairing: pairing,
-                report: report.resettingSnapshotFence()
+            let resetReport = report.resettingSnapshotFence()
+            do {
+                return try await transport.upload(
+                    pairing: pairing,
+                    report: resetReport
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw ScreenTimeUploadAttemptFailure(
+                    report: resetReport,
+                    underlying: error
+                )
+            }
+        } catch {
+            throw ScreenTimeUploadAttemptFailure(
+                report: report,
+                underlying: error
             )
-            return .uploaded(response)
         }
     }
 }

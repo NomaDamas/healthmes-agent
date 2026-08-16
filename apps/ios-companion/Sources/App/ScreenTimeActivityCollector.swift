@@ -38,6 +38,13 @@ struct UnavailableScreenTimeActivityCollector: ScreenTimeActivityCollecting {
     let reason: String
 
     @MainActor
+    func currentAuthorizationStatus() async
+        -> ScreenTimeCollectorResult
+    {
+        unavailable()
+    }
+
+    @MainActor
     func requestAuthorization() async throws -> ScreenTimeCollectorResult {
         unavailable()
     }
@@ -62,6 +69,24 @@ struct UnavailableScreenTimeActivityCollector: ScreenTimeActivityCollecting {
 enum ScreenTimePseudonymKeyError: Error {
     case randomGenerationFailed
     case keychainWriteFailed
+}
+
+enum ScreenTimeAuthorizationFailurePolicy {
+    static func reportableResult(
+        current: ScreenTimeCollectorResult
+    ) -> ScreenTimeCollectorResult {
+        switch current.permissionStatus {
+        case .denied, .restricted, .revoked, .unavailable:
+            return current
+        case .granted, .unknown:
+            return ScreenTimeCollectorResult(
+                capability: .unavailable,
+                permissionStatus: .unavailable,
+                reason: "ios_screen_time_authorization_failed",
+                samples: []
+            )
+        }
+    }
 }
 
 struct ScreenTimePseudonymKeyStore {
@@ -149,11 +174,25 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
     }
 
     @MainActor
+    func currentAuthorizationStatus() async
+        -> ScreenTimeCollectorResult
+    {
+        statusResult()
+    }
+
+    @MainActor
     func requestAuthorization() async throws -> ScreenTimeCollectorResult {
-        try await AuthorizationCenter.shared.requestAuthorization(
-            for: .individual
-        )
-        return statusResult()
+        do {
+            try await AuthorizationCenter.shared.requestAuthorization(
+                for: .individual
+            )
+            return statusResult()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return ScreenTimeAuthorizationFailurePolicy
+                .reportableResult(current: statusResult())
+        }
     }
 
     func collect(
@@ -165,12 +204,13 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
             return status
         }
 
+        // Omitting users and devices scopes the export to the current person
+        // and this iPhone. Using `.all` would mix Share Across Devices data
+        // into this installation's device ID.
         let filter = DeviceActivityFilter(
             segment: .hourly(
                 during: DateInterval(start: window.start, end: window.end)
-            ),
-            users: .all,
-            devices: .init([.iPhone])
+            )
         )
         var usage: [UsageKey: Int] = [:]
         var authoritativeBucketStarts = Set<Date>()

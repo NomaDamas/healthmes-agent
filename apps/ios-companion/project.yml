@@ -15,6 +15,11 @@
 # those files verbatim. Sources/SharedActivity is the iOS-only ActivityKit
 # attributes shared between the app and its widget extension.
 name: HealthMesCompanion
+configs:
+  Debug: debug
+  Release: release
+  ScreenTimeEligibleDebug: debug
+  ScreenTimeEligibleRelease: release
 options:
   bundleIdPrefix: com.healthmes
   createIntermediateGroups: true
@@ -50,8 +55,20 @@ targets:
     settings:
       base:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: Configurations/HealthMesCompanion.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion
         TARGETED_DEVICE_FAMILY: "1"
+      configs:
+        ScreenTimeEligibleDebug:
+          CODE_SIGN_ENTITLEMENTS: >-
+            Configurations/HealthMesCompanion-ScreenTimeEligible.entitlements
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
+            $(inherited) HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
+        ScreenTimeEligibleRelease:
+          CODE_SIGN_ENTITLEMENTS: >-
+            Configurations/HealthMesCompanion-ScreenTimeEligible.entitlements
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
+            $(inherited) HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
     info:
       path: Support/HealthMesCompanion-Info.plist
       properties:
@@ -73,6 +90,7 @@ targets:
         UIBackgroundModes: [fetch]
         BGTaskSchedulerPermittedIdentifiers:
           - com.healthmes.companion.refresh
+          - com.healthmes.companion.screen-time-refresh
         # Capture shortcuts (photos re-encoded to JPEG, voice memos to m4a;
         # bytes go only to the paired instance's POST /v1/media).
         NSCameraUsageDescription: >-
@@ -92,14 +110,6 @@ targets:
         # viewer URLs must never cross an untrusted network in clear text.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
-    entitlements:
-      path: Support/HealthMesCompanion.entitlements
-      properties:
-        com.apple.security.application-groups:
-          - group.com.healthmes.companion
-        keychain-access-groups:
-          - $(AppIdentifierPrefix)group.com.healthmes.companion
-
   # ------------------------------------------- iOS home + lock-screen widgets
   # Also hosts the focus-block Live Activity UI (ActivityKit renders live
   # activities from the widget extension).
@@ -249,6 +259,7 @@ targets:
     platform: iOS
     sources:
       - Sources/Shared
+      - Sources/App/ScreenTimeActivityCollector.swift
       - path: Tests
         excludes:
           - Fixtures
@@ -257,6 +268,13 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.healthmes.companion.tests
+      configs:
+        ScreenTimeEligibleDebug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
+            $(inherited) HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
+        ScreenTimeEligibleRelease:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: >-
+            $(inherited) HEALTHMES_IOS_26_4_SCREENTIME_EXPORT
     info:
       path: Support/HealthMesCompanionTests-Info.plist
       properties: {}
@@ -289,6 +307,22 @@ schemes:
       targets:
         - HealthMesCompanionTests
         - HealthMesCompanionUITests
+  HealthMesCompanionScreenTimeEligible:
+    build:
+      targets:
+        HealthMesCompanion: all
+    run:
+      config: ScreenTimeEligibleDebug
+    test:
+      config: ScreenTimeEligibleDebug
+      targets:
+        - HealthMesCompanionTests
+    profile:
+      config: ScreenTimeEligibleRelease
+    analyze:
+      config: ScreenTimeEligibleDebug
+    archive:
+      config: ScreenTimeEligibleRelease
   HealthMesWatchApp:
     build:
       targets:

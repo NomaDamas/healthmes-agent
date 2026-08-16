@@ -889,6 +889,10 @@ public enum ScreenTimeActivityHTTP {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
         request.httpBody = try encoder().encode(report)
+        request.setValue(
+            try ScreenTimeActivityReportIdentity.reportID(report),
+            forHTTPHeaderField: "Idempotency-Key"
+        )
         return request
     }
 
