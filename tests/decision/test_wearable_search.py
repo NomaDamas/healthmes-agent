@@ -42,6 +42,7 @@ from healthmes.wearables.provenance import (
     persist_open_wearables_query_snapshot,
 )
 from healthmes.wearables.search import (
+    BoundedOpenWearablesSearch,
     WearableSearchFetch,
     WearableSearchRequest,
 )
@@ -1301,6 +1302,208 @@ async def test_live_exact_boundary_with_verified_streams_stays_complete(
                 event.payload["result"]["stream_attribution_status"]
                 == "verified"
             )
+    finally:
+        service.close()
+        engine.dispose()
+
+
+class UnalignedWindowTimeseriesClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-16T10:10:00Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                },
+                {
+                    "timestamp": "2026-08-16T10:45:00Z",
+                    "type": "steps",
+                    "value": 20,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                },
+                {
+                    "timestamp": "2026-08-16T11:02:00Z",
+                    "type": "steps",
+                    "value": 30,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                },
+            ],
+            "pagination": {"next_cursor": None},
+        }
+
+
+async def test_live_unaligned_timeseries_stays_inside_query_window(
+    tmp_path,
+) -> None:
+    start = datetime(2026, 8, 16, 10, 5, tzinfo=UTC)
+    end = datetime(2026, 8, 16, 11, 5, tzinfo=UTC)
+    engine, factory = _file_store(
+        tmp_path,
+        "detail-live-timeseries-unaligned-window.db",
+    )
+    search = BoundedOpenWearablesSearch(
+        UnalignedWindowTimeseriesClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+    service = _service(
+        factory,
+        WearableContextProvider(
+            search_reader=search,
+            snapshot_session_factory=factory,
+        ),
+    )
+    try:
+        handle = service.begin(_request())
+        result = await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.timeseries",
+            start=start,
+            end=end,
+            granularity="series",
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+        )
+
+        records = result.payload["records"]
+        assert [record["value"] for record in records] == [30, 30]
+        assert [record["timestamp"] for record in records] == [
+            start.isoformat(),
+            "2026-08-16T11:00:00+00:00",
+        ]
+        assert all(
+            start
+            <= datetime.fromisoformat(record["timestamp"])
+            < end
+            for record in records
+        )
+        assert [
+            record["provenance"]["observed_at"] for record in records
+        ] == [record["timestamp"] for record in records]
+        assert result.status is ContextStatus.OK
+        assert result.source_refs[0].observed_start == start
+        assert result.source_refs[0].observed_end == end
+        with factory() as observer:
+            event = observer.get(
+                WellnessEvent,
+                UUID(result.source_refs[0].record_id),
+            )
+            assert event is not None
+            assert event.payload["retention_basis_at"] == start.isoformat()
+            assert [
+                record["timestamp"]
+                for record in event.payload["result"]["records"]
+            ] == [
+                start.isoformat(),
+                "2026-08-16T11:00:00+00:00",
+            ]
+    finally:
+        service.close()
+        engine.dispose()
+
+
+async def test_retained_unaligned_timeseries_stays_inside_query_window(
+    tmp_path,
+) -> None:
+    start = datetime(2026, 8, 16, 10, 5, tzinfo=UTC)
+    end = datetime(2026, 8, 16, 11, 5, tzinfo=UTC)
+    engine, factory = _file_store(
+        tmp_path,
+        "detail-retained-timeseries-unaligned-window.db",
+    )
+    with factory() as session:
+        persist_open_wearables_query_snapshot(
+            session,
+            capability="wearable.timeseries",
+            start=start,
+            end=end,
+            timezone="UTC",
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+            result={
+                "status": "ok",
+                "records": [
+                    {
+                        "timestamp": "2026-08-16T10:10:00+00:00",
+                        "series_type": "steps",
+                        "value": 30,
+                        "unit": "count",
+                        "provider": "apple_health",
+                        "provider_attribution": "declared",
+                    },
+                    {
+                        "timestamp": "2026-08-16T11:02:00+00:00",
+                        "series_type": "steps",
+                        "value": 30,
+                        "unit": "count",
+                        "provider": "apple_health",
+                        "provider_attribution": "declared",
+                    },
+                ],
+                "stream_attribution_status": "verified",
+                "coverage": {"ratio": 1.0},
+                "limitations": [],
+            },
+            collected_at=NOW,
+            now=NOW,
+        )
+        session.commit()
+
+    async def unavailable_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        raise RuntimeError("upstream unavailable")
+
+    service = _service(
+        factory,
+        WearableContextProvider(
+            search_reader=unavailable_reader,
+            snapshot_session_factory=factory,
+        ),
+    )
+    try:
+        handle = service.begin(_request())
+        result = await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.timeseries",
+            start=start,
+            end=end,
+            granularity="series",
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+        )
+
+        records = result.payload["records"]
+        assert [record["timestamp"] for record in records] == [
+            start.isoformat(),
+            "2026-08-16T11:00:00+00:00",
+        ]
+        assert all(
+            start
+            <= datetime.fromisoformat(record["timestamp"])
+            < end
+            for record in records
+        )
+        assert [
+            record["provenance"]["observed_at"] for record in records
+        ] == [record["timestamp"] for record in records]
+        assert result.source_refs[0].observed_start == start
+        assert result.source_refs[0].observed_end == end
     finally:
         service.close()
         engine.dispose()

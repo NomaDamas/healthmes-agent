@@ -199,6 +199,8 @@ def normalize_retained_wearable_timeseries(
     if resolution not in WEARABLE_TIMESERIES_RESOLUTIONS:
         raise ValueError("wearable timeseries resolution is not allowlisted")
 
+    start_utc = start.astimezone(UTC)
+    end_utc = end.astimezone(UTC)
     normalized: list[dict[str, Any]] = []
     discarded = 0
     for record in records:
@@ -212,7 +214,7 @@ def normalize_retained_wearable_timeseries(
         provider = _safe_text(record.get("provider"), max_length=64)
         if (
             timestamp is None
-            or not start.astimezone(UTC) <= timestamp < end.astimezone(UTC)
+            or not start_utc <= timestamp < end_utc
             or retained_type != series_type
             or value is None
             or unit is None
@@ -224,8 +226,13 @@ def normalize_retained_wearable_timeseries(
             timestamp,
             resolution=resolution,
         )
+        public_timestamp = _bounded_bucket_timestamp(
+            bucket_start,
+            start=start_utc,
+            end=end_utc,
+        )
         result: dict[str, Any] = {
-            "timestamp": bucket_start.isoformat(),
+            "timestamp": public_timestamp.isoformat(),
             "series_type": series_type,
             "value": value,
             "unit": unit,
@@ -386,12 +393,12 @@ class BoundedOpenWearablesSearch:
             sanitized.append(clean)
         stream_attribution_unavailable = False
         if request.capability == "wearable.timeseries":
-            sanitized, stream_attribution_unavailable = (
-                _aggregate_timeseries(
+            sanitized, stream_attribution_unavailable = _aggregate_timeseries(
                 sanitized,
                 series_type=str(request.parameters["series_type"]),
                 resolution=str(request.parameters["resolution"]),
-                )
+                start=request.start,
+                end=request.end,
             )
         sanitized.sort(key=_row_sort_key)
 
@@ -571,9 +578,6 @@ async def _collect_cursor_pages(
         page_limit = min(_PAGE_SIZE, remaining)
         payload = await fetch(page_limit, cursor)
         page = _response_page(payload, max_rows=page_limit)
-        rows.extend(page.rows)
-        raw_rows += page.raw_count
-        discarded_rows += page.discarded_rows
         pagination = _response_pagination(payload)
         if (
             "next_cursor" not in pagination
@@ -596,16 +600,20 @@ async def _collect_cursor_pages(
             )
         next_cursor = raw_cursor
         has_more = bool(next_cursor or raw_has_more)
-        if raw_rows > MAX_WEARABLE_SEARCH_ROWS:
-            return rows, True, discarded_rows
-        if not has_more:
-            return rows, False, discarded_rows
-        if (
+        if has_more and (
             next_cursor is None
             or next_cursor == cursor
             or next_cursor in seen_cursors
         ):
             return rows, True, discarded_rows
+        rows.extend(page.rows)
+        raw_rows += page.raw_count
+        discarded_rows += page.discarded_rows
+        if raw_rows > MAX_WEARABLE_SEARCH_ROWS:
+            return rows, True, discarded_rows
+        if not has_more:
+            return rows, False, discarded_rows
+        assert next_cursor is not None
         seen_cursors.add(next_cursor)
         cursor = next_cursor
     return rows, has_more, discarded_rows
@@ -1036,9 +1044,13 @@ def _aggregate_timeseries(
     *,
     series_type: str,
     resolution: str,
+    start: datetime,
+    end: datetime,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Enforce the requested resolution even if the upstream route ignores it."""
 
+    start_utc = start.astimezone(UTC)
+    end_utc = end.astimezone(UTC)
     buckets: dict[
         tuple[datetime, str, str, str],
         list[Mapping[str, Any]],
@@ -1058,6 +1070,11 @@ def _aggregate_timeseries(
             timestamp,
             resolution=resolution,
         )
+        public_timestamp = _bounded_bucket_timestamp(
+            bucket_start,
+            start=start_utc,
+            end=end_utc,
+        )
         if stream_key is None:
             # Matching provider or device labels do not prove that samples
             # belong to one sensor. Keep observations separate while still
@@ -1067,7 +1084,7 @@ def _aggregate_timeseries(
                 for key, value in record.items()
                 if key != _INTERNAL_STREAM_KEY
             }
-            coarsened["timestamp"] = bucket_start.isoformat()
+            coarsened["timestamp"] = public_timestamp.isoformat()
             unattributed.append(coarsened)
             continue
         buckets.setdefault(
@@ -1075,7 +1092,7 @@ def _aggregate_timeseries(
             [],
         ).append(record)
 
-    aggregated: list[dict[str, Any]] = unattributed
+    aggregated = list(unattributed)
     for (bucket_start, unit, provider, stream_key), bucket in sorted(
         buckets.items(),
         key=lambda item: (
@@ -1093,7 +1110,11 @@ def _aggregate_timeseries(
         if not values:
             continue
         result: dict[str, Any] = {
-            "timestamp": bucket_start.isoformat(),
+            "timestamp": _bounded_bucket_timestamp(
+                bucket_start,
+                start=start_utc,
+                end=end_utc,
+            ).isoformat(),
             "series_type": series_type,
             "value": _normalized_aggregate_value(
                 bucket,
@@ -1138,6 +1159,18 @@ def _resolution_bucket_start(
         epoch_seconds - (epoch_seconds % interval_seconds),
         tz=UTC,
     )
+
+
+def _bounded_bucket_timestamp(
+    bucket_start: datetime,
+    *,
+    start: datetime,
+    end: datetime,
+) -> datetime:
+    bounded = max(bucket_start, start.astimezone(UTC))
+    if bounded >= end.astimezone(UTC):
+        raise ValueError("wearable timeseries bucket is outside query bounds")
+    return bounded
 
 
 def _normalized_aggregate_value(

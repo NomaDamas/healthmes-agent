@@ -715,6 +715,61 @@ async def test_cursor_pagination_continues_after_fully_malformed_page() -> None:
     assert fetched.limitations == ("wearable_rows_discarded",)
 
 
+class RepeatingCursorTimeseriesClient:
+    def __init__(self) -> None:
+        self.calls: list[str | None] = []
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        self.calls.append(cursor)
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:10:00Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                }
+            ],
+            "pagination": {
+                "next_cursor": "repeated-page",
+                "has_more": True,
+            },
+        }
+
+
+async def test_cursor_cycle_does_not_aggregate_repeated_page() -> None:
+    client = RepeatingCursorTimeseriesClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert client.calls == [None, "repeated-page"]
+    assert [record["value"] for record in fetched.records] == [10]
+    assert fetched.upstream_truncated is True
+    assert fetched.limitations == (
+        "wearable_upstream_page_limit_reached",
+    )
+
+
 class MissingOffsetPaginationClient:
     def __init__(self) -> None:
         self.calls: list[tuple[int, int]] = []
