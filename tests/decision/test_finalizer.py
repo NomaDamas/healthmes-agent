@@ -21,6 +21,7 @@ from healthmes.activity.locking import activity_write_lock
 from healthmes.decision import (
     DECISION_PAYLOAD_SCHEMA,
     DECISION_RECORD_SCHEMA,
+    CalendarContextProvider,
     ContextAccessLayer,
     ContextAccessPolicy,
     ContextCapability,
@@ -45,6 +46,7 @@ from healthmes.decision import (
     FreshnessStatus,
     HealthMesDecisionEngine,
     PersistenceStatus,
+    PrivacyLevel,
     RuntimeMetadata,
     SourceRef,
     ToolCallRecord,
@@ -54,6 +56,8 @@ from healthmes.decision import (
 from healthmes.decision.access import _current_source_content_digest
 from healthmes.store import (
     Base,
+    CalendarEventMirror,
+    CalendarSource,
     DecisionKind,
     DecisionRecord,
     WellnessEvent,
@@ -63,6 +67,7 @@ from healthmes.store import (
 NOW = datetime(2026, 8, 12, 6, tzinfo=UTC)
 WINDOW_START = NOW - timedelta(hours=2)
 WINDOW_END = NOW - timedelta(hours=1)
+FINGERPRINT_KEY = b"test-decision-fingerprint-key-32-bytes"
 LEGACY_V1_FIXTURE = (
     Path(__file__).resolve().parents[1]
     / "fixtures"
@@ -134,6 +139,7 @@ def _request(
     request_id: uuid.UUID | None = None,
     turn_id: uuid.UUID | None = None,
     persistence_requested: bool = False,
+    channel: str = "proactive:test",
 ) -> DecisionRequest:
     return DecisionRequest(
         request_id=request_id or uuid.uuid4(),
@@ -146,6 +152,7 @@ def _request(
             principal_id="owner",
             authenticated=True,
             execution_scope=ExecutionScope.LOCAL,
+            channel=channel,
         ),
     )
 
@@ -364,6 +371,7 @@ def _finalizer(
             policy_resolver
             or (lambda _request: policy or _policy())
         ),
+        fingerprint_key=FINGERPRINT_KEY,
         timeout_seconds=timeout_seconds,
         max_workers=max_workers,
         clock=lambda: NOW,
@@ -379,6 +387,33 @@ def _payload_digest(payload: dict) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def test_request_fingerprint_is_keyed_and_stable() -> None:
+    request = _request(
+        question="A short private question",
+        channel="rest",
+    )
+
+    fingerprint = finalizer_module.decision_request_fingerprint(
+        request,
+        key=FINGERPRINT_KEY,
+    )
+    repeated = finalizer_module.decision_request_fingerprint(
+        request,
+        key=FINGERPRINT_KEY,
+    )
+    other_key = finalizer_module.decision_request_fingerprint(
+        request,
+        key=b"different-test-fingerprint-key-32-bytes",
+    )
+    unkeyed_guess = hashlib.sha256(
+        finalizer_module._decision_request_fingerprint_payload(request)
+    ).hexdigest()
+
+    assert fingerprint == repeated
+    assert fingerprint != other_key
+    assert fingerprint != unkeyed_guess
 
 
 def test_source_backed_action_is_atomically_persisted(persistence):
@@ -460,30 +495,157 @@ def test_finalizer_persists_and_revalidates_the_effective_query(persistence):
         ][0]["query"]
         assert stored_query["limit"] == 25
         assert stored_query["query_id"] == str(requested_query.query_id)
+        assert stored_query["parameters"] == {}
+        assert stored_query["purpose"] is None
         assert row.decision_payload["source_attestations"][0][
             "source_refs"
         ] == [ref.model_dump(mode="json")]
 
 
-def test_attestation_query_removes_model_authored_search_text():
+def test_attestation_query_removes_all_model_authored_selectors():
+    private_request_id = str(uuid.uuid4())
     query = _query().model_copy(
         update={
             "parameters": {
                 "date": "2026-08-12",
                 "query": "private free-form food search",
-                "request_id": str(uuid.uuid4()),
+                "request_id": private_request_id,
+                "nutrient": "private-nutrient",
+                "device_id": "private-device",
+                "cursor": "private-cursor",
             },
             "purpose": "model-authored explanation",
         }
     )
 
     stored = finalizer_module._attestation_query(query)
+    serialized = stored.model_dump_json()
+
+    assert stored.parameters == {}
+    assert stored.purpose is None
+    assert "private free-form food search" not in serialized
+    assert private_request_id not in serialized
+    assert "private-nutrient" not in serialized
+    assert "private-device" not in serialized
+    assert "private-cursor" not in serialized
+
+
+def test_attestation_query_keeps_only_calendar_identity_parameters():
+    query = ContextQuery(
+        provider_id="calendar",
+        capability="calendar.available-windows",
+        timezone="UTC",
+        parameters={
+            "date": "2026-08-12",
+            "minimum_minutes": 30,
+            "cursor": "private-cursor",
+        },
+        purpose="model-authored explanation",
+    )
+
+    stored = finalizer_module._attestation_query(query)
 
     assert stored.parameters == {
         "date": "2026-08-12",
-        "request_id": query.parameters["request_id"],
+        "minimum_minutes": 30,
     }
     assert stored.purpose is None
+
+
+def test_attestation_query_uses_fixed_scoped_raw_revalidation_purpose():
+    query = _query().model_copy(
+        update={
+            "privacy_level": PrivacyLevel.SCOPED_RAW,
+            "purpose": "model-authored private explanation",
+        }
+    )
+
+    stored = finalizer_module._attestation_query(query)
+
+    assert stored.purpose == "stored_source_revalidation"
+    assert "model-authored" not in stored.model_dump_json()
+
+
+def test_calendar_aggregate_retry_revalidates_minimal_selector(
+    persistence,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        session.add(
+            CalendarEventMirror(
+                external_id="calendar-aggregate-retry",
+                calendar_source=CalendarSource.GOOGLE,
+                summary="Private meeting",
+                start_at=NOW + timedelta(hours=1),
+                end_at=NOW + timedelta(hours=2),
+                is_all_day=False,
+                created_at=NOW - timedelta(minutes=2),
+                updated_at=NOW - timedelta(minutes=1),
+            )
+        )
+        session.commit()
+
+    policy = _policy(domain="calendar")
+    registry = ContextProviderRegistry(
+        (
+            CalendarContextProvider(
+                sources=(CalendarSource.GOOGLE,),
+            ),
+        )
+    )
+    access_layer = ContextAccessLayer(registry, clock=lambda: NOW)
+    request = _request()
+    query = ContextQuery(
+        provider_id="calendar",
+        capability="calendar.available-windows",
+        parameters={
+            "date": NOW.date().isoformat(),
+            "minimum_minutes": 30,
+        },
+        timezone="UTC",
+    )
+    turn = access_layer.start_turn(request, policy=policy)
+    with factory() as session:
+        context = asyncio.run(turn.query(session, query))
+        session.rollback()
+    assert len(context.source_refs) == 1
+
+    finalizer = _finalizer(
+        factory,
+        policy=policy,
+        registry=registry,
+    )
+    first = finalizer.finalize(
+        request,
+        _run(request, list(context.source_refs), query=query),
+    )
+    assert first.persistence_status is PersistenceStatus.PERSISTED
+
+    with factory() as session:
+        row = session.get(DecisionRecord, first.decision_record_id)
+        assert row is not None
+        selector = row.decision_payload["source_attestations"][0][
+            "query"
+        ]
+        assert selector["parameters"] == {
+            "date": NOW.date().isoformat(),
+            "minimum_minutes": 30,
+        }
+        assert selector["purpose"] is None
+
+    retry_request = request.model_copy(update={"turn_id": uuid.uuid4()})
+    retry = finalizer.finalize(
+        retry_request,
+        _run(
+            retry_request,
+            list(context.source_refs),
+            query=query.model_copy(update={"query_id": uuid.uuid4()}),
+        ),
+    )
+
+    assert retry.status is DecisionStatus.COMPLETED
+    assert retry.persistence_status is PersistenceStatus.PERSISTED
+    assert retry.decision_record_id == first.decision_record_id
 
 
 def test_source_backed_information_is_not_persisted_without_intent(
@@ -506,6 +668,55 @@ def test_source_backed_information_is_not_persisted_without_intent(
         assert session.scalar(
             sa.select(sa.func.count()).select_from(DecisionRecord)
         ) == 0
+
+
+def test_rest_model_action_cannot_force_persistence(persistence):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request(channel="rest")
+
+    result = _finalizer(factory).finalize(
+        request,
+        _run(request, [ref], proposed_action=True),
+    )
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert result.proposed_action is False
+    assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
+    assert (
+        "decision_action_not_persistence_eligible"
+        in result.limitations
+    )
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
+
+
+@pytest.mark.parametrize(
+    "channel",
+    ("proactive:focus-fragmentation", "scheduled:morning"),
+)
+def test_trusted_automatic_action_can_persist(
+    persistence,
+    channel,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request(channel=channel)
+
+    result = _finalizer(factory).finalize(
+        request,
+        _run(request, [ref], proposed_action=True),
+    )
+
+    assert result.persistence_status is PersistenceStatus.PERSISTED
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 1
 
 
 @pytest.mark.parametrize(
@@ -2164,6 +2375,14 @@ def test_retry_reads_and_revalidates_legacy_v1_payload(persistence):
                 for entry in run.access_trace
             ],
         }
+        row.decision_request_fingerprint = (
+            finalizer_module._legacy_decision_request_fingerprint(
+                request
+            )
+        )
+        legacy_payload["request_fingerprint"] = (
+            row.decision_request_fingerprint
+        )
         row.decision_payload = legacy_payload
         row.decision_payload_digest = _payload_digest(legacy_payload)
         row.summary = "HealthMes wellness action recorded"
@@ -2191,9 +2410,10 @@ def test_retry_reads_and_revalidates_legacy_v1_payload(persistence):
     (
         "healthmes.decision-private.v2",
         "healthmes.decision-private.v3",
+        "healthmes.decision-private.v4",
     ),
 )
-def test_retry_reads_and_revalidates_legacy_v2_v3_payloads(
+def test_retry_reads_and_revalidates_legacy_v2_v3_v4_payloads(
     persistence,
     legacy_schema,
 ):
@@ -2211,14 +2431,35 @@ def test_retry_reads_and_revalidates_legacy_v2_v3_payloads(
         assert row is not None
         assert row.decision_payload is not None
         current = copy.deepcopy(row.decision_payload)
+        legacy_fingerprint = (
+            finalizer_module._legacy_decision_request_fingerprint(
+                request
+            )
+        )
+        source_attestations = [
+            {
+                "query": (
+                    record.effective_query or record.query
+                ).model_dump(mode="json", round_trip=True),
+                "source_refs": [
+                    source_ref.model_dump(
+                        mode="json",
+                        round_trip=True,
+                    )
+                    for source_ref in record.result.source_refs
+                ],
+            }
+            for record in run.tool_trace
+            if record.result is not None
+        ]
         common = {
             "schema": legacy_schema,
-            "request_fingerprint": row.decision_request_fingerprint,
+            "request_fingerprint": legacy_fingerprint,
             "request": current["request"],
             "persistence_intent": "action",
             "run": current["run"],
             "source_refs": current["source_refs"],
-            "source_attestations": current["source_attestations"],
+            "source_attestations": source_attestations,
             "access_trace": current["access_trace"],
         }
         if legacy_schema.endswith(".v2"):
@@ -2229,7 +2470,7 @@ def test_retry_reads_and_revalidates_legacy_v2_v3_payloads(
                     deep=True,
                 ).model_dump(mode="json", round_trip=True),
             }
-        else:
+        elif legacy_schema.endswith(".v3"):
             legacy_payload = {
                 **common,
                 "outcome": {
@@ -2249,9 +2490,25 @@ def test_retry_reads_and_revalidates_legacy_v2_v3_payloads(
                     ),
                 },
             }
+        else:
+            historical_v4_summary = (
+                "Historical privacy-safe wellness action recorded"
+            )
+            legacy_payload = {
+                **common,
+                "outcome": {
+                    **current["outcome"],
+                    "record_summary": historical_v4_summary,
+                },
+            }
+        row.decision_request_fingerprint = legacy_fingerprint
         row.decision_payload = legacy_payload
         row.decision_payload_digest = _payload_digest(legacy_payload)
-        row.summary = "HealthMes wellness action recorded"
+        row.summary = (
+            historical_v4_summary
+            if legacy_schema.endswith(".v4")
+            else "HealthMes wellness action recorded"
+        )
         session.commit()
 
     retry_request = request.model_copy(
@@ -2287,7 +2544,9 @@ def test_historical_v1_fixture_remains_canonical_and_fingerprint_stable():
         finalizer_module._StoredDecisionPayloadV1,
     )
     assert (
-        finalizer_module.decision_request_fingerprint(request)
+        finalizer_module._legacy_decision_request_fingerprint(
+            request
+        )
         == fixture["request_fingerprint"]
     )
 

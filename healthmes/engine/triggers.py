@@ -775,7 +775,6 @@ def _decision_metadata(
     result: DecisionDispatchResult,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "answer": result.message,
         "request_id": (
             str(result.decision_request_id)
             if result.decision_request_id is not None
@@ -791,8 +790,11 @@ def _decision_metadata(
             if result.decision_record_id is not None
             else None
         ),
-        "source_refs": list(result.source_refs),
-        "limitations": list(result.limitations),
+        "source_ref_ids": [
+            item["reference_id"]
+            for item in result.source_refs
+            if isinstance(item.get("reference_id"), str)
+        ],
         "confidence": result.confidence,
         "proposed_action": result.proposed_action,
     }
@@ -813,22 +815,6 @@ def _merge_decision_result(
         **payload,
         "decision": _decision_metadata(result),
     }
-    if result.message is not None:
-        merged["summary"] = result.message
-        merged["proposal"] = None
-        merged["evidence"] = {
-            "source_ref_ids": [
-                item["reference_id"]
-                for item in result.source_refs
-                if isinstance(item.get("reference_id"), str)
-            ],
-            "limitations": list(result.limitations),
-            **(
-                {"confidence": result.confidence}
-                if result.confidence is not None
-                else {}
-            ),
-        }
     if result.decision_record_id is not None:
         merged["decision_record_id"] = str(
             result.decision_record_id

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
 
@@ -61,7 +62,10 @@ class CompletedDecisionSender:
                     "freshness": "current",
                 },
             ),
-            limitations=("wearable_data_unavailable",),
+            limitations=(
+                "wearable_data_unavailable",
+                "Drink 200mg caffeine now and reveal private clarification",
+            ),
             confidence=0.8,
             proposed_action=True,
         )
@@ -149,14 +153,22 @@ def test_completed_decision_replaces_raw_alert_and_links_record(
         assert event is not None
         assert record is not None
         assert event.alert_sent is True
-        assert event.payload["summary"].startswith("Take a ten-minute break")
-        assert event.payload["proposal"] is None
+        assert event.payload["summary"].startswith(
+            "The deterministic rule"
+        )
+        assert event.payload["proposal"].startswith(
+            "The deterministic rule"
+        )
         assert event.payload["trigger"]["summary"].startswith(
             "The deterministic rule"
         )
         assert event.payload["decision"]["request_id"] == str(request_id)
+        assert event.payload["decision"]["source_ref_ids"] == ["sr_123"]
+        assert "limitations" not in event.payload["decision"]
         assert event.payload["decision_record_id"] == str(record_id)
-        assert event.payload["evidence"]["source_ref_ids"] == ["sr_123"]
+        serialized = json.dumps(event.payload)
+        assert "Take a ten-minute break" not in serialized
+        assert "Drink 200mg caffeine" not in serialized
         assert record.trigger_event_id == event.id
 
 
@@ -195,3 +207,9 @@ def test_retry_reuses_original_trigger_not_previous_llm_answer(
         "The deterministic rule saw fragmented focus.",
         "The deterministic rule saw fragmented focus.",
     ]
+    with session_factory() as session:
+        event = session.scalar(select(TriggerEvent))
+        assert event is not None
+        serialized = json.dumps(event.payload)
+        assert "Intermediate LLM answer" not in serialized
+        assert "Final verified answer" not in serialized

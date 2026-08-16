@@ -49,6 +49,7 @@ from healthmes.store import (
 )
 
 NOW = datetime(2026, 8, 12, 6, tzinfo=UTC)
+FINGERPRINT_KEY = b"test-decision-fingerprint-key-32-bytes"
 
 
 def _settings(tmp_path, database_url: str) -> Settings:
@@ -88,10 +89,12 @@ def _request() -> DecisionRequest:
         question="Should I take a break before my next meeting?",
         requested_at=NOW,
         timezone="UTC",
+        persistence_requested=True,
         caller=DecisionCaller(
             principal_id="owner",
             authenticated=True,
             execution_scope=ExecutionScope.LOCAL,
+            channel="rest",
         ),
     )
 
@@ -263,6 +266,7 @@ def test_finalization_commits_before_racing_calendar_disconnect(
         access_layer=access_layer,
         session_factory=factory,
         policy_resolver=resolve,
+        fingerprint_key=FINGERPRINT_KEY,
         clock=lambda: NOW,
     )
     result_holder = []
@@ -336,6 +340,7 @@ def test_calendar_disconnect_finishes_before_racing_finalization(
         access_layer=access_layer,
         session_factory=factory,
         policy_resolver=resolve,
+        fingerprint_key=FINGERPRINT_KEY,
         clock=lambda: NOW,
     )
     result_holder = []
@@ -417,6 +422,7 @@ def test_calendar_sync_visibility_change_after_flush_rolls_back_decision(
         access_layer=access_layer,
         session_factory=changing_factory,
         policy_resolver=lambda _request: _policy(),
+        fingerprint_key=FINGERPRINT_KEY,
         clock=lambda: NOW,
     )
 

@@ -16,6 +16,7 @@ ALL_ENV_VARS = [
     "HEALTHMES_HERMES_WEBHOOK_SECRET",
     "HEALTHMES_DECISION_HERMES_BASE_URL",
     "HEALTHMES_DECISION_HERMES_API_KEY",
+    "HEALTHMES_DECISION_CORRELATION_SECRET",
     "HEALTHMES_DECISION_HERMES_MODEL",
     "HEALTHMES_DECISION_HERMES_PROVIDER",
     "HEALTHMES_DECISION_HERMES_PROFILE_PATH",
@@ -82,6 +83,7 @@ def test_defaults(monkeypatch) -> None:
     assert settings.hermes_webhook_secret.get_secret_value() == ""
     assert settings.decision_hermes_base_url is None
     assert settings.decision_hermes_api_key.get_secret_value() == ""
+    assert settings.decision_correlation_secret.get_secret_value() == ""
     assert settings.decision_hermes_model is None
     assert settings.decision_hermes_provider is None
     assert settings.decision_hermes_profile_path is None
@@ -263,6 +265,10 @@ def test_secrets_are_not_leaked_in_repr(monkeypatch) -> None:
         "decision-runtime-secret",
     )
     monkeypatch.setenv(
+        "HEALTHMES_DECISION_CORRELATION_SECRET",
+        "decision-correlation-secret",
+    )
+    monkeypatch.setenv(
         "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET",
         "calendar-adjustment-secret-that-is-long-enough",
     )
@@ -273,6 +279,7 @@ def test_secrets_are_not_leaked_in_repr(monkeypatch) -> None:
     assert "hmac-secret" not in repr(settings)
     assert "bearer-secret" not in repr(settings)
     assert "decision-runtime-secret" not in repr(settings)
+    assert "decision-correlation-secret" not in repr(settings)
     assert "calendar-adjustment-secret-that-is-long-enough" not in repr(settings)
     assert settings.ow_api_key.get_secret_value() == "super-secret-key"
     assert settings.hermes_webhook_secret.get_secret_value() == "hmac-secret"
@@ -280,6 +287,10 @@ def test_secrets_are_not_leaked_in_repr(monkeypatch) -> None:
     assert (
         settings.decision_hermes_api_key.get_secret_value()
         == "decision-runtime-secret"
+    )
+    assert (
+        settings.decision_correlation_secret.get_secret_value()
+        == "decision-correlation-secret"
     )
     assert (
         settings.calendar_adjustment_secret.get_secret_value()

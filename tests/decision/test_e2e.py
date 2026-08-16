@@ -82,6 +82,7 @@ QUESTION = (
     "100mg 카페인 커피를 더 마시면서 계속 일해도 될까?"
 )
 CALENDAR_ACCOUNT_GENERATION = "a" * 32
+FINGERPRINT_KEY = b"test-decision-fingerprint-key-32-bytes"
 
 
 def _policy() -> ContextAccessPolicy:
@@ -104,10 +105,12 @@ def _request() -> DecisionRequest:
         question=QUESTION,
         requested_at=NOW,
         timezone="UTC",
+        persistence_requested=True,
         caller=DecisionCaller(
             principal_id="owner",
             authenticated=True,
             execution_scope=ExecutionScope.LOCAL,
+            channel="rest",
         ),
     )
 
@@ -158,6 +161,7 @@ def _build_stepwise_test_engine(
             access_layer=access_layer,
             session_factory=session_factory,
             policy_resolver=policy_resolver,
+            fingerprint_key=FINGERPRINT_KEY,
             clock=clock,
         ),
     )

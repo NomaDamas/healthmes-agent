@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import re
 import threading
@@ -51,6 +52,7 @@ from healthmes.decision.contracts import (
     DecisionResult,
     DecisionStatus,
     PersistenceStatus,
+    PrivacyLevel,
     RuntimeMetadata,
     SourceRef,
     ToolCallRecord,
@@ -70,11 +72,25 @@ from healthmes.store import DecisionKind, DecisionRecord
 from healthmes.timing import steady_time
 
 DECISION_RECORD_SCHEMA = "healthmes.decision-record.v1"
-DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v4"
+DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v5"
 _LEGACY_DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v1"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V2 = "healthmes.decision-private.v2"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V3 = "healthmes.decision-private.v3"
+_LEGACY_DECISION_PAYLOAD_SCHEMA_V4 = "healthmes.decision-private.v4"
 _PERSISTENCE_FAILURE = "decision_record_persistence_failed"
+_ACTION_NOT_PERSISTENCE_ELIGIBLE = (
+    "decision_action_not_persistence_eligible"
+)
+_FINGERPRINT_CONTEXT = b"healthmes-decision-request-fingerprint-v1\x00"
+_MIN_FINGERPRINT_KEY_BYTES = 32
+_STORED_REVALIDATION_PURPOSE = "stored_source_revalidation"
+_STORED_REVALIDATION_PARAMETERS = {
+    ("calendar", "calendar.day-summary"): frozenset({"date"}),
+    ("calendar", "calendar.busy-intervals"): frozenset({"date"}),
+    ("calendar", "calendar.available-windows"): frozenset(
+        {"date", "minimum_minutes"}
+    ),
+}
 _MAX_STORED_JSON_BYTES = 2_000_000
 _MAX_STORED_OUTCOME_SUMMARY_LENGTH = 160
 _MAX_STORED_LIMITATION_CODES = 32
@@ -121,6 +137,7 @@ AccessPolicyResolver = Callable[[DecisionRequest], ContextAccessPolicy]
 class _SourceAttempt:
     query: ContextQuery
     supporting_refs: tuple[SourceRef, ...]
+    server_revalidation_selector: bool = False
 
 
 SourceCandidates = Mapping[str, tuple[_SourceAttempt, ...]]
@@ -234,6 +251,31 @@ class _StoredSourceAttestation(BaseModel):
         if len(reference_ids) != len(set(reference_ids)):
             raise ValueError(
                 "source attestation refs must be unique"
+            )
+        return self
+
+
+class _StoredSourceAttestationV5(_StoredSourceAttestation):
+    """Privacy-safe server selector sufficient for later revalidation."""
+
+    @model_validator(mode="after")
+    def validate_server_selector(self) -> _StoredSourceAttestationV5:
+        allowed_parameters = _STORED_REVALIDATION_PARAMETERS.get(
+            (self.query.provider_id, self.query.capability),
+            frozenset(),
+        )
+        if not set(self.query.parameters).issubset(allowed_parameters):
+            raise ValueError(
+                "stored revalidation selector contains private parameters"
+            )
+        if self.query.privacy_level is PrivacyLevel.SCOPED_RAW:
+            if self.query.purpose != _STORED_REVALIDATION_PURPOSE:
+                raise ValueError(
+                    "scoped raw revalidation requires the server purpose"
+                )
+        elif self.query.purpose is not None:
+            raise ValueError(
+                "stored revalidation selectors cannot retain model purpose"
             )
         return self
 
@@ -450,6 +492,51 @@ class _StoredDecisionPayloadV4(BaseModel):
             raise ValueError(
                 "stored action and risk outcomes require source refs"
             )
+        return self
+
+
+class _StoredDecisionPayloadV5(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+    )
+
+    schema_name: Literal["healthmes.decision-private.v5"] = Field(
+        alias="schema"
+    )
+    request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request: _StoredDecisionRequestMetadata
+    persistence_intent: DecisionPersistenceIntent
+    outcome: _StoredDecisionOutcome
+    run: _StoredRun
+    source_refs: tuple[SourceRef, ...]
+    source_attestations: tuple[_StoredSourceAttestationV5, ...]
+    access_trace: tuple[AccessAuditEntry, ...]
+
+    @model_validator(mode="after")
+    def validate_persistence_contract(
+        self,
+    ) -> _StoredDecisionPayloadV5:
+        if self.persistence_intent in {
+            DecisionPersistenceIntent.NONE,
+            DecisionPersistenceIntent.MUTATION,
+        }:
+            raise ValueError(
+                "stored decisions require a read-only persistence intent"
+            )
+        action_or_risk = self.persistence_intent in {
+            DecisionPersistenceIntent.ACTION,
+            DecisionPersistenceIntent.RISK,
+        }
+        if self.outcome.proposed_action is not action_or_risk:
+            raise ValueError(
+                "stored persistence intent conflicts with proposed_action"
+            )
+        if action_or_risk and not self.source_refs:
+            raise ValueError(
+                "stored action and risk outcomes require source refs"
+            )
         if self.outcome.record_summary != _stored_outcome_summary(
             self.persistence_intent
         ):
@@ -462,6 +549,7 @@ StoredDecisionPayload = (
     | _StoredDecisionPayloadV2
     | _StoredDecisionPayloadV3
     | _StoredDecisionPayloadV4
+    | _StoredDecisionPayloadV5
 )
 
 
@@ -614,8 +702,39 @@ class _FinalizationControl:
             )
 
 
-def decision_request_fingerprint(request: DecisionRequest) -> str:
-    """Hash semantic request contents while excluding retry correlation IDs."""
+def decision_request_fingerprint(
+    request: DecisionRequest,
+    *,
+    key: bytes,
+) -> str:
+    """Authenticate semantic request contents without storing the question."""
+
+    secret = bytes(key)
+    if len(secret) < _MIN_FINGERPRINT_KEY_BYTES:
+        raise ValueError(
+            "decision fingerprint key must contain at least 32 bytes"
+        )
+    return hmac.new(
+        secret,
+        _FINGERPRINT_CONTEXT + _decision_request_fingerprint_payload(request),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _legacy_decision_request_fingerprint(
+    request: DecisionRequest,
+) -> str:
+    """Read-only compatibility hash for historical v1 payloads."""
+
+    return hashlib.sha256(
+        _decision_request_fingerprint_payload(request)
+    ).hexdigest()
+
+
+def _decision_request_fingerprint_payload(
+    request: DecisionRequest,
+) -> bytes:
+    """Return canonical semantic bytes shared by current and legacy formats."""
 
     canonical = strict_model_validate(DecisionRequest, request)
     payload = canonical.model_dump(
@@ -632,7 +751,7 @@ def decision_request_fingerprint(request: DecisionRequest) -> str:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return encoded
 
 
 def decision_result_from_record(
@@ -666,6 +785,7 @@ class DecisionFinalizer:
         access_layer: ContextAccessLayer,
         session_factory: SessionFactory,
         policy_resolver: AccessPolicyResolver,
+        fingerprint_key: bytes,
         timeout_seconds: float = _DEFAULT_FINALIZATION_TIMEOUT_SECONDS,
         max_workers: int = 8,
         clock: Callable[[], datetime] | None = None,
@@ -674,9 +794,14 @@ class DecisionFinalizer:
             raise ValueError("finalization timeout must be positive")
         if max_workers < 1:
             raise ValueError("finalization max_workers must be positive")
+        if len(fingerprint_key) < _MIN_FINGERPRINT_KEY_BYTES:
+            raise ValueError(
+                "decision fingerprint key must contain at least 32 bytes"
+            )
         self._access_layer = access_layer
         self._session_factory = session_factory
         self._policy_resolver = policy_resolver
+        self._fingerprint_key = bytes(fingerprint_key)
         self._timeout_seconds = timeout_seconds
         self._worker_slots = threading.BoundedSemaphore(max_workers)
         self._workers_lock = threading.Lock()
@@ -998,7 +1123,10 @@ class DecisionFinalizer:
             effective_persistence_intent
             is not DecisionPersistenceIntent.NONE
         )
-        fingerprint = decision_request_fingerprint(canonical_request)
+        fingerprint = decision_request_fingerprint(
+            canonical_request,
+            key=self._fingerprint_key,
+        )
         finalization_deadline = control.deadline
 
         try:
@@ -1568,6 +1696,9 @@ class DecisionFinalizer:
                     query,
                     candidate,
                     context_source_refs=attempt.supporting_refs,
+                    server_revalidation_selector=(
+                        attempt.server_revalidation_selector
+                    ),
                     now=validation_now,
                     calendar_visibility_snapshot=(
                         calendar_visibility_snapshot
@@ -1691,6 +1822,9 @@ def _existing_stored_decision(
         request_id=request.request_id,
         turn_id=request.turn_id,
         fingerprint=fingerprint,
+        legacy_fingerprint=_legacy_decision_request_fingerprint(
+            request
+        ),
     )
 
 
@@ -1700,6 +1834,7 @@ def _correlated_stored_decision(
     request_id: uuid.UUID,
     turn_id: uuid.UUID,
     fingerprint: str,
+    legacy_fingerprint: str | None = None,
 ) -> _StoredDecision | str | None:
     if not rows:
         return None
@@ -1723,15 +1858,24 @@ def _correlated_stored_decision(
         return "decision_turn_id_conflict"
     if by_request is None:
         return "decision_turn_id_conflict"
-    return _stored_decision(by_request, fingerprint=fingerprint)
+    return _stored_decision(
+        by_request,
+        fingerprint=fingerprint,
+        legacy_fingerprint=legacy_fingerprint,
+    )
 
 
 def _stored_decision(
     row: DecisionRecord,
     *,
     fingerprint: str,
+    legacy_fingerprint: str | None = None,
 ) -> _StoredDecision | str:
-    if row.decision_request_fingerprint != fingerprint:
+    row_fingerprint = row.decision_request_fingerprint
+    if (
+        row_fingerprint != fingerprint
+        and row_fingerprint != legacy_fingerprint
+    ):
         return "decision_request_id_conflict"
     if (
         row.decision_request_id is None
@@ -1753,7 +1897,8 @@ def _stored_decision(
     if isinstance(payload, _StoredDecisionPayloadV1):
         result = payload.result
         request_ids_match = (
-            decision_request_fingerprint(payload.request) == fingerprint
+            _legacy_decision_request_fingerprint(payload.request)
+            == row_fingerprint
             and payload.request.request_id == row.decision_request_id
             and payload.request.turn_id == row.decision_turn_id
         )
@@ -1783,7 +1928,7 @@ def _stored_decision(
         access_trace = payload.access_trace
         persistence_intent = payload.persistence_intent
     if (
-        payload.request_fingerprint != fingerprint
+        payload.request_fingerprint != row_fingerprint
         or not request_ids_match
         or result.request_id != row.decision_request_id
         or result.turn_id != row.decision_turn_id
@@ -1806,10 +1951,9 @@ def _stored_decision(
         or (
             isinstance(
                 payload,
-                (
-                    _StoredDecisionPayloadV3,
-                    _StoredDecisionPayloadV4,
-                ),
+                _StoredDecisionPayloadV3
+                | _StoredDecisionPayloadV4
+                | _StoredDecisionPayloadV5,
             )
             and row.retention_basis_at is None
         )
@@ -1859,8 +2003,12 @@ def _validate_stored_payload(
         payload = _StoredDecisionPayloadV3.model_validate(
             normalized.value
         )
-    elif schema_name == DECISION_PAYLOAD_SCHEMA:
+    elif schema_name == _LEGACY_DECISION_PAYLOAD_SCHEMA_V4:
         payload = _StoredDecisionPayloadV4.model_validate(
+            normalized.value
+        )
+    elif schema_name == DECISION_PAYLOAD_SCHEMA:
+        payload = _StoredDecisionPayloadV5.model_validate(
             normalized.value
         )
     else:
@@ -1917,6 +2065,10 @@ def _stored_source_candidates(
                 _SourceAttempt(
                     query=record.query,
                     supporting_refs=supporting_refs,
+                    server_revalidation_selector=isinstance(
+                        record,
+                        _StoredSourceAttestationV5,
+                    ),
                 )
             )
     return (
@@ -1929,7 +2081,11 @@ def _stored_source_candidates(
 
 
 def _result_from_stored_outcome(
-    payload: _StoredDecisionPayloadV3 | _StoredDecisionPayloadV4,
+    payload: (
+        _StoredDecisionPayloadV3
+        | _StoredDecisionPayloadV4
+        | _StoredDecisionPayloadV5
+    ),
 ) -> DecisionResult:
     outcome = payload.outcome
     answer = (
@@ -1960,7 +2116,10 @@ def _stored_row_summary(
     payload: StoredDecisionPayload,
     result: DecisionResult,
 ) -> str:
-    if isinstance(payload, _StoredDecisionPayloadV4):
+    if isinstance(
+        payload,
+        _StoredDecisionPayloadV4 | _StoredDecisionPayloadV5,
+    ):
         return payload.outcome.record_summary
     return _public_summary(result)
 
@@ -2014,6 +2173,11 @@ def _result_without_persistence(
             draft.limitations,
             _tool_trace_limitations(run.tool_trace),
             extra_limitations,
+            (
+                (_ACTION_NOT_PERSISTENCE_ELIGIBLE,)
+                if draft.proposed_action
+                else ()
+            ),
         ),
         clarification_question=draft.clarification_question,
         confidence=draft.confidence,
@@ -2077,7 +2241,7 @@ def _effective_persistence_intent(
     request: DecisionRequest | Any,
     run: DecisionAgentRun | Any,
 ) -> DecisionPersistenceIntent:
-    """Classify persistence from trusted request state and bounded output."""
+    """Classify persistence from trusted ingress plus bounded model output."""
 
     if not isinstance(request, DecisionRequest) or not isinstance(
         run,
@@ -2087,12 +2251,18 @@ def _effective_persistence_intent(
     draft = run.draft
     if draft.status is not DecisionStatus.COMPLETED:
         return DecisionPersistenceIntent.NONE
-    if draft.proposed_action:
+    if request.persistence_requested:
+        if draft.proposed_action:
+            if draft.persistence_intent is DecisionPersistenceIntent.RISK:
+                return DecisionPersistenceIntent.RISK
+            return DecisionPersistenceIntent.ACTION
+        return DecisionPersistenceIntent.EXPLICIT_TRACKING
+    if draft.proposed_action and request.caller.channel.startswith(
+        ("proactive:", "scheduled:")
+    ):
         if draft.persistence_intent is DecisionPersistenceIntent.RISK:
             return DecisionPersistenceIntent.RISK
         return DecisionPersistenceIntent.ACTION
-    if request.persistence_requested:
-        return DecisionPersistenceIntent.EXPLICIT_TRACKING
     return DecisionPersistenceIntent.NONE
 
 
@@ -2229,7 +2399,7 @@ def _decision_payload(
         attestation.query.query_id
         for attestation in source_attestations
     }
-    payload_model = _StoredDecisionPayloadV4(
+    payload_model = _StoredDecisionPayloadV5(
         schema_name=DECISION_PAYLOAD_SCHEMA,
         request_fingerprint=request_fingerprint,
         request=_StoredDecisionRequestMetadata(
@@ -2302,11 +2472,11 @@ def _source_attestations(
     trace: Sequence[ToolCallRecord],
     *,
     selected_refs: Sequence[SourceRef],
-) -> tuple[_StoredSourceAttestation, ...]:
+) -> tuple[_StoredSourceAttestationV5, ...]:
     selected_ids = {
         source_ref.reference_id for source_ref in selected_refs
     }
-    attestations: list[_StoredSourceAttestation] = []
+    attestations: list[_StoredSourceAttestationV5] = []
     for record in trace:
         selected_result_refs = tuple(
             source_ref
@@ -2324,7 +2494,7 @@ def _source_attestations(
         ):
             continue
         attestations.append(
-            _StoredSourceAttestation(
+            _StoredSourceAttestationV5(
                 query=_attestation_query(
                     record.effective_query or record.query
                 ),
@@ -2335,16 +2505,24 @@ def _source_attestations(
 
 
 def _attestation_query(query: ContextQuery) -> ContextQuery:
-    """Remove model-authored prose while retaining revalidation selectors."""
+    """Build a minimal server-derived selector for source revalidation."""
 
+    allowed_parameters = _STORED_REVALIDATION_PARAMETERS.get(
+        (query.provider_id, query.capability),
+        frozenset(),
+    )
     return query.model_copy(
         update={
             "parameters": {
                 key: value
                 for key, value in query.parameters.items()
-                if key != "query"
+                if key in allowed_parameters
             },
-            "purpose": None,
+            "purpose": (
+                _STORED_REVALIDATION_PURPOSE
+                if query.privacy_level is PrivacyLevel.SCOPED_RAW
+                else None
+            ),
         },
         deep=True,
     )

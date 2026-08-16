@@ -59,6 +59,9 @@ VENDOR_HERMES = REPO_ROOT / "vendor" / "hermes-agent"
 GENERATED_SECRET_KEY = "HEALTHMES_HERMES_WEBHOOK_SECRET"
 GENERATED_ADJUSTMENT_SECRET_KEY = "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"
 GENERATED_DECISION_API_KEY = "HEALTHMES_DECISION_HERMES_API_KEY"
+GENERATED_DECISION_CORRELATION_SECRET = (
+    "HEALTHMES_DECISION_CORRELATION_SECRET"
+)
 GENERATED_DECISION_PROFILE_PATH = (
     "HEALTHMES_DECISION_HERMES_PROFILE_PATH"
 )
@@ -305,6 +308,37 @@ def ensure_decision_api_key(
     plan.act(f"generate {GENERATED_DECISION_API_KEY} into {env_file}")
     if not plan.dry_run:
         upsert_env_var(env_file, GENERATED_DECISION_API_KEY, generated)
+    return generated
+
+
+def ensure_decision_correlation_secret(
+    env_file: Path,
+    env: dict[str, str],
+    plan: Plan,
+) -> str:
+    """Return the stable decision correlation secret, minting it once."""
+
+    existing = env.get(
+        GENERATED_DECISION_CORRELATION_SECRET,
+        "",
+    ).strip()
+    if existing:
+        if len(existing) < 32:
+            raise ValueError(
+                f"{GENERATED_DECISION_CORRELATION_SECRET} must contain at "
+                "least 32 characters"
+            )
+        return existing
+    generated = secrets.token_hex(32)
+    plan.act(
+        f"generate {GENERATED_DECISION_CORRELATION_SECRET} into {env_file}"
+    )
+    if not plan.dry_run:
+        upsert_env_var(
+            env_file,
+            GENERATED_DECISION_CORRELATION_SECRET,
+            generated,
+        )
     return generated
 
 
@@ -1092,7 +1126,6 @@ def run(args: argparse.Namespace) -> int:
             "HEALTHMES_DECISION_HERMES_MODEL and "
             "HEALTHMES_DECISION_HERMES_PROVIDER are required"
         )
-    remove_legacy_healthmes_cron_reasoning(hermes_home, plan)
 
     profile_path = decision_home / "config.yaml"
     manifest_path = decision_home / "runtime-manifest.json"
@@ -1110,8 +1143,28 @@ def run(args: argparse.Namespace) -> int:
             expected_path=expected_path,
         )
 
+    for key in (
+        GENERATED_DECISION_API_KEY,
+        GENERATED_DECISION_CORRELATION_SECRET,
+    ):
+        existing_secret = env.get(key, "").strip()
+        if existing_secret and len(existing_secret) < 32:
+            raise ValueError(
+                f"{key} must contain at least 32 characters"
+            )
+
+    remove_legacy_healthmes_cron_reasoning(hermes_home, plan)
+
     decision_api_key = ensure_decision_api_key(env_file, env, plan)
     env[GENERATED_DECISION_API_KEY] = decision_api_key
+    decision_correlation_secret = ensure_decision_correlation_secret(
+        env_file,
+        env,
+        plan,
+    )
+    env[GENERATED_DECISION_CORRELATION_SECRET] = (
+        decision_correlation_secret
+    )
     decision_profile_path = ensure_generated_path(
         env_file,
         env,

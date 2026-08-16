@@ -28,6 +28,10 @@ def settings(tmp_path) -> Settings:
         ow_user_id=None,
         hermes_webhook_url="http://hermes.test:8644/webhooks/healthmes-alerts",
         hermes_webhook_secret="test-webhook-secret",
+        decision_hermes_api_key="test-decision-hermes-api-key-32-bytes",
+        decision_correlation_secret=(
+            "test-decision-correlation-secret-32-bytes"
+        ),
         calendar_adjustment_secret="test-calendar-adjustment-secret-32-characters",
         telegram_owner_user_id="",
         telegram_owner_chat_id="",

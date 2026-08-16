@@ -79,6 +79,6 @@ def test_scheduled_job_uses_durable_trigger_outbox_once(
         events = session.scalars(select(TriggerEvent)).all()
         assert len(events) == 1
         assert events[0].rule_id == "scheduled_briefing.morning"
-        assert events[0].payload["summary"] == (
-            "Completed scheduled_briefing.morning."
+        assert events[0].payload["summary"].startswith(
+            "Prepare the user's morning wellness briefing"
         )

@@ -1532,6 +1532,7 @@ class ContextAccessTurn:
         source_ref: SourceRef,
         *,
         context_source_refs: Sequence[SourceRef] = (),
+        server_revalidation_selector: bool = False,
         now: datetime | None = None,
         calendar_visibility_snapshot: CalendarVisibility | None = None,
     ) -> tuple[SourceRef | None, tuple[str, ...]]:
@@ -1553,6 +1554,9 @@ class ContextAccessTurn:
             canonical_query,
             now=checked_at,
             normalization_now=checked_at,
+            server_revalidation_selector=(
+                server_revalidation_selector
+            ),
         )
         if isinstance(preflight, ContextResult):
             return None, tuple(
@@ -1825,6 +1829,7 @@ class ContextAccessTurn:
         *,
         now: datetime,
         normalization_now: datetime,
+        server_revalidation_selector: bool = False,
     ) -> (
         tuple[
             ContextQuery,
@@ -1893,17 +1898,40 @@ class ContextAccessTurn:
                 now=now,
                 reason_codes=("query_parameters_unsupported",),
             )
-        try:
-            validate_context_parameters(
-                query.parameters,
-                capability.parameter_specs,
-            )
-        except ValueError:
-            return self._deny(
-                query,
-                now=now,
-                reason_codes=("query_parameters_invalid",),
-            )
+        if server_revalidation_selector:
+            # The persisted v5 contract already restricts this to a
+            # capability-specific, server-generated selector. Required
+            # model parameters may be absent because revalidation checks the
+            # exact source refs rather than re-running the original search.
+            try:
+                validate_context_parameters(
+                    query.parameters,
+                    tuple(
+                        spec
+                        for spec in capability.parameter_specs
+                        if spec.name in query.parameters
+                    ),
+                )
+            except ValueError:
+                return self._deny(
+                    query,
+                    now=now,
+                    reason_codes=(
+                        "stored_revalidation_selector_invalid",
+                    ),
+                )
+        else:
+            try:
+                validate_context_parameters(
+                    query.parameters,
+                    capability.parameter_specs,
+                )
+            except ValueError:
+                return self._deny(
+                    query,
+                    now=now,
+                    reason_codes=("query_parameters_invalid",),
+                )
         date_range_error = _explicit_date_range_error(query)
         if date_range_error is not None:
             return self._deny(

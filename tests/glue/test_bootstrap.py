@@ -129,6 +129,7 @@ def test_full_run_builds_only_attested_decision_runtime(
 
     env = bootstrap.load_env_file(env_file)
     assert len(env["HEALTHMES_DECISION_HERMES_API_KEY"]) == 64
+    assert len(env["HEALTHMES_DECISION_CORRELATION_SECRET"]) == 64
     assert env["HEALTHMES_DECISION_HERMES_BASE_URL"] == (
         "http://127.0.0.1:8645"
     )
@@ -473,6 +474,25 @@ def test_existing_api_key_is_preserved(
     assert profile["platforms"]["api_server"]["extra"]["key"] == "a" * 64
 
 
+def test_existing_correlation_secret_is_preserved(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8")
+        + "HEALTHMES_DECISION_CORRELATION_SECRET="
+        + "c" * 64
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    env = bootstrap.load_env_file(env_file)
+    assert env["HEALTHMES_DECISION_CORRELATION_SECRET"] == "c" * 64
+
+
 def test_short_existing_api_key_fails_closed(
     bootstrap,
     hermes_home: Path,
@@ -490,6 +510,48 @@ def test_short_existing_api_key_fails_closed(
 
     assert env_file.read_bytes() == before
     assert not hermes_home.exists()
+
+
+def test_short_existing_correlation_secret_fails_closed(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> None:
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    jobs_file.parent.mkdir(parents=True)
+    jobs_file.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "legacy-origin",
+                        "name": "healthmes-weekly-plan",
+                        "origin": {
+                            "source": (
+                                bootstrap.HEALTHMES_CRON_ORIGIN_SOURCE
+                            ),
+                            "version": 1,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8")
+        + "HEALTHMES_DECISION_CORRELATION_SECRET=short\n",
+        encoding="utf-8",
+    )
+    before_env = env_file.read_bytes()
+    before_jobs = jobs_file.read_bytes()
+
+    with pytest.raises(ValueError, match="at least 32 characters"):
+        run_bootstrap(bootstrap, hermes_home, env_file)
+
+    assert env_file.read_bytes() == before_env
+    assert jobs_file.read_bytes() == before_jobs
+    assert not _decision_home(hermes_home).exists()
 
 
 @pytest.mark.parametrize(

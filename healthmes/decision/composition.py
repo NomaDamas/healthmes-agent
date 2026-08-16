@@ -104,6 +104,7 @@ def build_healthmes_responses_decision_engine(
     search_service: DecisionContextSearchSessionService,
     session_factory: sessionmaker[Session],
     policy_resolver: AccessPolicyResolver,
+    fingerprint_key: bytes,
     model: str,
     provider: str,
     timeout_seconds: float = 60,
@@ -147,6 +148,7 @@ def build_healthmes_responses_decision_engine(
             access_layer=search_service.access_layer,
             session_factory=session_factory,
             policy_resolver=policy_resolver,
+            fingerprint_key=fingerprint_key,
             timeout_seconds=finalization_timeout_seconds,
             max_workers=max_pending_requests,
             clock=clock,
@@ -327,6 +329,19 @@ def build_configured_decision_engine(
     manifest_path = settings.decision_hermes_runtime_manifest_path
     attestation_key_path = settings.decision_hermes_attestation_key_path
     api_key = settings.decision_hermes_api_key.get_secret_value().strip()
+    if len(api_key.encode("utf-8")) < 32:
+        raise ValueError(
+            "decision_hermes_api_key is required and must contain at least "
+            "32 bytes for the dedicated Hermes runtime"
+        )
+    correlation_secret = (
+        settings.decision_correlation_secret.get_secret_value().strip()
+    )
+    if len(correlation_secret.encode("utf-8")) < 32:
+        raise ValueError(
+            "decision_correlation_secret is required and must contain at "
+            "least 32 bytes for authenticated decision correlation"
+        )
     if transport is None:
         missing_artifacts = [
             name
@@ -418,6 +433,7 @@ def build_configured_decision_engine(
         search_service=selected_search_service,
         session_factory=session_factory,
         policy_resolver=policy_resolver,
+        fingerprint_key=correlation_secret.encode("utf-8"),
         model=model,
         provider=provider,
         timeout_seconds=settings.decision_timeout_seconds,

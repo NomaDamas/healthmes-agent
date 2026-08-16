@@ -60,6 +60,7 @@ from tests.decision.test_e2e import (
 TOKEN = "wellness-decision-api-token"
 MODEL = "test-model"
 PROVIDER = "test-provider"
+FINGERPRINT_KEY = b"test-decision-fingerprint-key-32-bytes"
 
 
 def _bearer(token: str = TOKEN) -> dict[str, str]:
@@ -1053,6 +1054,7 @@ def test_real_provider_failure_reaches_rest_as_503(settings) -> None:
             access_layer=access_layer,
             session_factory=factory,
             policy_resolver=lambda _request: policy,
+            fingerprint_key=FINGERPRINT_KEY,
             clock=lambda: NOW,
         ),
     )
@@ -1114,6 +1116,7 @@ def test_real_invalid_provider_query_reaches_rest_as_503(settings) -> None:
             access_layer=access_layer,
             session_factory=factory,
             policy_resolver=lambda _request: policy,
+            fingerprint_key=FINGERPRINT_KEY,
             clock=lambda: NOW,
         ),
     )

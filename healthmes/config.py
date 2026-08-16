@@ -81,6 +81,12 @@ class Settings(BaseSettings):
         "runtime. Production HTTP composition requires it; bootstrap creates "
         "the matching profile credential.",
     )
+    decision_correlation_secret: SecretStr = Field(
+        default=SecretStr(""),
+        description="Stable owner secret used only to authenticate decision "
+        "request fingerprints. Keep it unchanged when rotating the Hermes "
+        "runtime credential; bootstrap generates it independently.",
+    )
     decision_hermes_model: str | None = Field(
         default=None,
         max_length=128,

@@ -83,6 +83,7 @@ pytestmark = pytest.mark.skipif(
 NOW = datetime(2026, 8, 12, 6, tzinfo=UTC)
 WINDOW_START = NOW - timedelta(hours=2)
 WINDOW_END = NOW - timedelta(hours=1)
+FINGERPRINT_KEY = b"test-decision-fingerprint-key-32-bytes"
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +204,7 @@ def _request(
             principal_id="owner",
             authenticated=True,
             execution_scope=ExecutionScope.LOCAL,
+            channel="proactive:postgres-test",
         ),
     )
 
@@ -356,6 +358,7 @@ def _finalizer(
         policy_resolver=(
             policy_resolver or (lambda _request: _policy())
         ),
+        fingerprint_key=FINGERPRINT_KEY,
         timeout_seconds=timeout_seconds,
         clock=lambda: NOW,
     )
@@ -720,6 +723,7 @@ def test_postgres_calendar_aggregate_rows_are_locked_during_finalization(
             access_layer=access_layer,
             session_factory=store.factory,
             policy_resolver=lambda _request: policy,
+            fingerprint_key=FINGERPRINT_KEY,
             timeout_seconds=0.2,
             clock=lambda: NOW,
         )
@@ -813,6 +817,7 @@ def test_postgres_calendar_aggregate_blocks_phantom_insert_until_commit(
             access_layer=access_layer,
             session_factory=finalizer_factory,
             policy_resolver=lambda _request: policy,
+            fingerprint_key=FINGERPRINT_KEY,
             timeout_seconds=5,
             clock=lambda: NOW,
         )
@@ -1033,6 +1038,7 @@ def test_postgres_calendar_visibility_change_after_flush_rolls_back(
             access_layer=access_layer,
             session_factory=changing_factory,
             policy_resolver=lambda _request: policy,
+            fingerprint_key=FINGERPRINT_KEY,
             clock=lambda: NOW,
         )
 
@@ -1105,6 +1111,7 @@ def test_postgres_finalizer_rejects_calendar_row_expired_before_maintenance(
             access_layer=access_layer,
             session_factory=store.factory,
             policy_resolver=lambda _request: policy,
+            fingerprint_key=FINGERPRINT_KEY,
             clock=lambda: NOW + timedelta(days=2),
         )
 
