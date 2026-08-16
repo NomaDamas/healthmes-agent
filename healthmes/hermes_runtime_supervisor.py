@@ -10,7 +10,7 @@ import json
 import os
 import signal
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -69,6 +69,11 @@ class HermesRuntimeSupervisorConfig:
     port: int = 8645
     startup_timeout_seconds: float = 30
     mcp_probe_timeout_seconds: float = 5
+    health_check_interval_seconds: float = 2
+    health_check_timeout_seconds: float = 1
+    unhealthy_threshold: int = 3
+    restart_backoff_initial_seconds: float = 0.25
+    restart_backoff_max_seconds: float = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,20 +124,48 @@ class HermesRuntimeProcess:
         self._state: HermesRuntimeState | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._launch_argv: tuple[str, ...] | None = None
+        self._healthy = False
+        self._closing = False
+        self._lifecycle_lock = asyncio.Lock()
+        self._monitor_task: asyncio.Task[None] | None = None
 
     @property
     def state(self) -> HermesRuntimeState:
-        if self._state is None:
-            raise RuntimeError("Hermes runtime is not ready")
         process = self._process
         if process is None or process.returncode is not None:
             raise HermesRuntimeIdentityError(
                 "hermes_runtime_child_not_running"
             )
-        return self._state
+        state = self._state
+        if state is None:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_not_ready"
+            )
+        if not getattr(self, "_healthy", True):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_unhealthy"
+            )
+        return state
 
     def revalidate(self) -> HermesRuntimeState:
         state = self.state
+        return self._validate_bound_state(expected=state)
+
+    def _validate_bound_state(
+        self,
+        *,
+        expected: HermesRuntimeState | None = None,
+    ) -> HermesRuntimeState:
+        process = self._process
+        if process is None or process.returncode is not None:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_not_running"
+            )
+        state = self._state
+        if state is None:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_not_ready"
+            )
         launch_argv = self._launch_argv
         if launch_argv is None:
             raise HermesRuntimeIdentityError(
@@ -147,7 +180,8 @@ class HermesRuntimeProcess:
             expected_launch_argv=launch_argv,
         )
         if (
-            manifest != state.manifest
+            (expected is not None and state != expected)
+            or manifest != state.manifest
             or key != state.attestation_key
             or not hmac.compare_digest(api_key, state.api_key)
         ):
@@ -170,9 +204,39 @@ class HermesRuntimeProcess:
         return state
 
     async def start(self) -> None:
-        if self._process is not None:
+        """Strictly launch and verify one child for direct callers."""
+
+        self._closing = False
+        async with self._lifecycle_lock:
+            if self._child_is_available():
+                return
+            await self._stop_child()
+            await self._launch_child()
+
+    async def start_observable(self) -> None:
+        """Start recovery in the background so the parent can serve health."""
+
+        self._closing = False
+        monitor = self._monitor_task
+        if monitor is not None and not monitor.done():
             return
+        self._monitor_task = asyncio.create_task(
+            self._monitor_runtime(),
+            name="healthmes-hermes-runtime-watchdog",
+        )
+
+    def _child_is_available(self) -> bool:
+        process = self._process
+        return (
+            process is not None
+            and process.returncode is None
+            and self._state is not None
+            and self._healthy
+        )
+
+    async def _launch_child(self) -> None:
         config = self._config
+        self._healthy = False
         manifest, key, api_key = seal_supervised_runtime(
             manifest_path=config.manifest_path,
             attestation_key_path=config.attestation_key_path,
@@ -242,7 +306,7 @@ class HermesRuntimeProcess:
                     "hermes_runtime_identity_changed"
                 )
         except BaseException:
-            await self.aclose()
+            await self._stop_child()
             raise
         self._state = HermesRuntimeState(
             manifest=manifest,
@@ -250,6 +314,144 @@ class HermesRuntimeProcess:
             api_key=api_key,
             mcp_inventory=inventory,
         )
+        self._healthy = True
+
+    async def _monitor_runtime(self) -> None:
+        restart_delay = 0.0
+        unhealthy_count = 0
+        while not self._closing:
+            process = self._process
+            if (
+                process is None
+                or process.returncode is not None
+                or self._state is None
+            ):
+                if process is not None or self._state is not None:
+                    restart_delay = _next_restart_backoff(
+                        restart_delay,
+                        initial=(
+                            self._config.restart_backoff_initial_seconds
+                        ),
+                        maximum=self._config.restart_backoff_max_seconds,
+                    )
+                self._healthy = False
+                try:
+                    async with self._lifecycle_lock:
+                        if self._closing:
+                            return
+                        await self._stop_child()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    restart_delay = _next_restart_backoff(
+                        restart_delay,
+                        initial=(
+                            self._config.restart_backoff_initial_seconds
+                        ),
+                        maximum=self._config.restart_backoff_max_seconds,
+                    )
+                    await asyncio.sleep(restart_delay)
+                    continue
+                if restart_delay > 0:
+                    await asyncio.sleep(restart_delay)
+                if self._closing:
+                    return
+                try:
+                    async with self._lifecycle_lock:
+                        if self._closing:
+                            return
+                        if not self._child_is_available():
+                            await self._launch_child()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    restart_delay = _next_restart_backoff(
+                        restart_delay,
+                        initial=(
+                            self._config.restart_backoff_initial_seconds
+                        ),
+                        maximum=self._config.restart_backoff_max_seconds,
+                    )
+                    continue
+                unhealthy_count = 0
+                continue
+
+            await asyncio.sleep(
+                self._config.health_check_interval_seconds
+            )
+            if self._closing:
+                return
+            if (
+                self._process is not process
+                or process.returncode is not None
+            ):
+                self._healthy = False
+                continue
+
+            identity_invalid = False
+            try:
+                healthy = await self._probe_child_health()
+            except asyncio.CancelledError:
+                raise
+            except HermesRuntimeIdentityError:
+                healthy = False
+                identity_invalid = True
+            except Exception:
+                healthy = False
+
+            if healthy:
+                self._healthy = True
+                unhealthy_count = 0
+                restart_delay = 0
+                continue
+
+            self._healthy = False
+            unhealthy_count += 1
+            if (
+                not identity_invalid
+                and unhealthy_count < self._config.unhealthy_threshold
+            ):
+                continue
+
+            try:
+                async with self._lifecycle_lock:
+                    if self._process is process:
+                        await self._stop_child()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                restart_delay = _next_restart_backoff(
+                    restart_delay,
+                    initial=self._config.restart_backoff_initial_seconds,
+                    maximum=self._config.restart_backoff_max_seconds,
+                )
+                await asyncio.sleep(restart_delay)
+                continue
+            unhealthy_count = 0
+            restart_delay = _next_restart_backoff(
+                restart_delay,
+                initial=self._config.restart_backoff_initial_seconds,
+                maximum=self._config.restart_backoff_max_seconds,
+            )
+
+    async def _probe_child_health(self) -> bool:
+        state = self._validate_bound_state()
+        headers = {"Authorization": f"Bearer {state.api_key}"}
+        try:
+            async with httpx.AsyncClient(
+                base_url=state.manifest.internal_origin,
+                headers=headers,
+                follow_redirects=False,
+            ) as client:
+                response = await client.get(
+                    "/v1/models",
+                    timeout=self._config.health_check_timeout_seconds,
+                )
+        except httpx.HTTPError:
+            return False
+        if response.status_code != 200:
+            return False
+        return self._validate_bound_state(expected=state) == state
 
     async def _wait_until_ready(
         self,
@@ -316,16 +518,22 @@ class HermesRuntimeProcess:
                 "hermes_runtime_mcp_inventory_unavailable"
             ) from exc
 
-    async def aclose(self) -> None:
+    async def _stop_child(self) -> None:
         process = self._process
-        self._process = None
         self._state = None
         self._launch_argv = None
-        if process is None or process.returncode is not None:
+        self._healthy = False
+        if process is None:
+            return
+        if process.returncode is not None:
+            if self._process is process:
+                self._process = None
             return
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
+            if self._process is process:
+                self._process = None
             return
         try:
             await asyncio.wait_for(process.wait(), timeout=10)
@@ -333,8 +541,36 @@ class HermesRuntimeProcess:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
+                if self._process is process:
+                    self._process = None
                 return
             await process.wait()
+        if self._process is process:
+            self._process = None
+
+    async def aclose(self) -> None:
+        self._closing = True
+        monitor = self._monitor_task
+        self._monitor_task = None
+        if monitor is not None and monitor is not asyncio.current_task():
+            monitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await monitor
+        async with self._lifecycle_lock:
+            await self._stop_child()
+
+
+def _next_restart_backoff(
+    current: float,
+    *,
+    initial: float,
+    maximum: float,
+) -> float:
+    """Return a positive exponential delay capped at ``maximum``."""
+
+    if current <= 0:
+        return min(initial, maximum)
+    return min(maximum, max(initial, current * 2))
 
 
 async def _probe_live_mcp_schema_digests(
@@ -406,7 +642,15 @@ def create_supervisor_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        await controller.start()
+        observable_start = getattr(
+            controller,
+            "start_observable",
+            None,
+        )
+        if callable(observable_start):
+            await observable_start()
+        else:
+            await controller.start()
         try:
             yield
         finally:
@@ -567,6 +811,12 @@ def create_supervisor_app(
         )
         try:
             upstream = await client.send(upstream_request, stream=True)
+        except httpx.HTTPError as exc:
+            await client.aclose()
+            raise HTTPException(
+                status_code=503,
+                detail="runtime upstream unavailable",
+            ) from exc
         except BaseException:
             await client.aclose()
             raise
@@ -698,6 +948,56 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             )
         ),
     )
+    parser.add_argument(
+        "--health-check-interval",
+        type=float,
+        default=float(
+            os.environ.get(
+                "HEALTHMES_DECISION_RUNTIME_HEALTH_INTERVAL_SECONDS",
+                "2",
+            )
+        ),
+    )
+    parser.add_argument(
+        "--health-check-timeout",
+        type=float,
+        default=float(
+            os.environ.get(
+                "HEALTHMES_DECISION_RUNTIME_HEALTH_TIMEOUT_SECONDS",
+                "1",
+            )
+        ),
+    )
+    parser.add_argument(
+        "--unhealthy-threshold",
+        type=int,
+        default=int(
+            os.environ.get(
+                "HEALTHMES_DECISION_RUNTIME_UNHEALTHY_THRESHOLD",
+                "3",
+            )
+        ),
+    )
+    parser.add_argument(
+        "--restart-backoff-initial",
+        type=float,
+        default=float(
+            os.environ.get(
+                "HEALTHMES_DECISION_RUNTIME_RESTART_BACKOFF_INITIAL_SECONDS",
+                "0.25",
+            )
+        ),
+    )
+    parser.add_argument(
+        "--restart-backoff-max",
+        type=float,
+        default=float(
+            os.environ.get(
+                "HEALTHMES_DECISION_RUNTIME_RESTART_BACKOFF_MAX_SECONDS",
+                "5",
+            )
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -721,6 +1021,11 @@ def main(argv: list[str] | None = None) -> None:
         port=args.port,
         startup_timeout_seconds=args.startup_timeout,
         mcp_probe_timeout_seconds=args.mcp_probe_timeout,
+        health_check_interval_seconds=args.health_check_interval,
+        health_check_timeout_seconds=args.health_check_timeout,
+        unhealthy_threshold=args.unhealthy_threshold,
+        restart_backoff_initial_seconds=args.restart_backoff_initial,
+        restart_backoff_max_seconds=args.restart_backoff_max,
     )
     if not 1 <= config.port <= 65_535:
         raise SystemExit("invalid runtime port")
@@ -728,6 +1033,21 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("startup timeout must be positive")
     if config.mcp_probe_timeout_seconds <= 0:
         raise SystemExit("MCP probe timeout must be positive")
+    if config.health_check_interval_seconds <= 0:
+        raise SystemExit("health check interval must be positive")
+    if config.health_check_timeout_seconds <= 0:
+        raise SystemExit("health check timeout must be positive")
+    if config.unhealthy_threshold < 1:
+        raise SystemExit("unhealthy threshold must be positive")
+    if config.restart_backoff_initial_seconds <= 0:
+        raise SystemExit("restart backoff initial must be positive")
+    if (
+        config.restart_backoff_max_seconds
+        < config.restart_backoff_initial_seconds
+    ):
+        raise SystemExit(
+            "restart backoff max must be at least the initial delay"
+        )
     controller = HermesRuntimeProcess(config)
     uvicorn.run(
         create_supervisor_app(controller),

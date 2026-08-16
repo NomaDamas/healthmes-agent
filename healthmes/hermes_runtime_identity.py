@@ -88,6 +88,7 @@ HERMES_RUNTIME_EXECUTION_ARTIFACT_NAMES = (
 HERMES_RUNTIME_CONTROL_SOURCE_NAMES = (
     "supervisor_module",
     "identity_module",
+    "mcp_inventory_module",
 )
 
 _MAX_MANIFEST_BYTES = 64_000
@@ -542,6 +543,29 @@ def write_runtime_manifest(
     _atomic_write(path, content.encode("ascii"), mode=0o600)
 
 
+def runtime_manifest_matches_preseal_identity(
+    existing: HermesDecisionRuntimeManifest,
+    prepared: HermesDecisionRuntimeManifest,
+) -> bool:
+    """Return whether ``existing`` seals the exact prepared runtime intent."""
+
+    if prepared.sealed:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_prepared_manifest_sealed"
+        )
+    if not existing.sealed:
+        return existing == prepared
+    payload = existing.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude={"runtime_id"},
+    )
+    payload["sealed"] = False
+    payload["execution_artifacts"] = []
+    payload["runtime_id"] = _sha256_json(payload)
+    return _manifest_validate(payload) == prepared
+
+
 def load_attestation_key(path: Path) -> bytes:
     """Read an owner-only hex key without following a symlink."""
 
@@ -656,6 +680,7 @@ def validate_supervised_runtime(
     supervisor_interpreter: Path | None = None,
     supervisor_module: Path | None = None,
     identity_module: Path | None = None,
+    mcp_inventory_module: Path | None = None,
 ) -> tuple[HermesDecisionRuntimeManifest, bytes, str]:
     """Validate the exact files and paths the supervisor will execute."""
 
@@ -726,6 +751,7 @@ def validate_supervised_runtime(
     actual_control_sources = runtime_control_source_artifacts(
         supervisor_module=supervisor_module,
         identity_module=identity_module,
+        mcp_inventory_module=mcp_inventory_module,
     )
     if actual_control_sources != manifest.control_source_artifacts:
         raise HermesRuntimeIdentityError(
@@ -761,6 +787,7 @@ def seal_supervised_runtime(
     supervisor_interpreter: Path | None = None,
     supervisor_module: Path | None = None,
     identity_module: Path | None = None,
+    mcp_inventory_module: Path | None = None,
 ) -> tuple[HermesDecisionRuntimeManifest, bytes, str]:
     """Bind actual launch files into the manifest before child execution."""
 
@@ -775,6 +802,7 @@ def seal_supervised_runtime(
         supervisor_interpreter=supervisor_interpreter,
         supervisor_module=supervisor_module,
         identity_module=identity_module,
+        mcp_inventory_module=mcp_inventory_module,
     )
     if manifest.sealed:
         return manifest, key, api_key
@@ -814,6 +842,7 @@ def seal_supervised_runtime(
         supervisor_interpreter=supervisor_interpreter,
         supervisor_module=supervisor_module,
         identity_module=identity_module,
+        mcp_inventory_module=mcp_inventory_module,
     )
 
 
@@ -870,6 +899,7 @@ def runtime_control_source_artifacts(
     *,
     supervisor_module: Path | None = None,
     identity_module: Path | None = None,
+    mcp_inventory_module: Path | None = None,
 ) -> tuple[HermesRuntimeNamedDigest, ...]:
     """Hash HealthMes-owned source before a runtime is allowed to seal."""
 
@@ -883,6 +913,12 @@ def runtime_control_source_artifacts(
         (
             "identity_module",
             Path(__file__) if identity_module is None else identity_module,
+        ),
+        (
+            "mcp_inventory_module",
+            Path(__file__).with_name("hermes_mcp_inventory.py")
+            if mcp_inventory_module is None
+            else mcp_inventory_module,
         ),
     )
     artifacts: list[HermesRuntimeNamedDigest] = []

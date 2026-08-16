@@ -16,11 +16,16 @@ from healthmes.decision import (
     HermesDecisionProfileAssertion,
 )
 from healthmes.hermes_runtime_identity import (
+    HERMES_RUNTIME_CONTROL_SOURCE_NAMES,
     HERMES_RUNTIME_HOME_ARTIFACT_NAMES,
     HERMES_RUNTIME_PROVIDER_ENV_NAMES,
+    HermesDecisionRuntimeManifest,
+    HermesRuntimeIdentityError,
     load_attestation_key,
     load_runtime_manifest,
     runtime_home_artifact_sha256,
+    seal_supervised_runtime,
+    validate_supervised_runtime,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -76,6 +81,44 @@ def _load_profile(hermes_home: Path) -> dict:
             encoding="utf-8"
         )
     )
+
+
+def _configure_sealable_native_runtime(
+    bootstrap,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_venv = tmp_path / "runtime-venv"
+    runtime_bin = runtime_venv / "bin"
+    runtime_bin.mkdir(parents=True)
+    launcher = runtime_bin / "python"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    (runtime_venv / "pyvenv.cfg").write_text(
+        "home = /test/python\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bootstrap, "NATIVE_DECISION_VENV", runtime_venv)
+
+
+def _seal_bootstrapped_runtime(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+) -> HermesDecisionRuntimeManifest:
+    decision_home = _decision_home(hermes_home)
+    env = {
+        name: value
+        for name, value in bootstrap.load_env_file(env_file).items()
+        if name in HERMES_RUNTIME_PROVIDER_ENV_NAMES and value
+    }
+    return seal_supervised_runtime(
+        manifest_path=decision_home / "runtime-manifest.json",
+        attestation_key_path=decision_home / "runtime-attestation.key",
+        hermes_home=decision_home,
+        vendor_root=REPO_ROOT / "vendor" / "hermes-agent",
+        environment=env,
+    )[0]
 
 
 def test_full_run_builds_only_attested_decision_runtime(
@@ -402,6 +445,112 @@ def test_second_run_is_byte_idempotent(
         name: (decision_home / name).read_bytes() for name in tracked
     } == before
     assert env_file.read_bytes() == env_before
+
+
+def test_second_run_preserves_unchanged_sealed_runtime_manifest(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_sealable_native_runtime(bootstrap, tmp_path, monkeypatch)
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    sealed = _seal_bootstrapped_runtime(
+        bootstrap,
+        hermes_home,
+        env_file,
+    )
+    manifest_path = _decision_home(hermes_home) / "runtime-manifest.json"
+    before = manifest_path.read_bytes()
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    assert manifest_path.read_bytes() == before
+    assert load_runtime_manifest(manifest_path) == sealed
+    assert load_runtime_manifest(manifest_path).sealed is True
+
+
+def test_changed_bootstrap_inputs_publish_unsealed_intent_for_supervisor(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_sealable_native_runtime(bootstrap, tmp_path, monkeypatch)
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    sealed = _seal_bootstrapped_runtime(
+        bootstrap,
+        hermes_home,
+        env_file,
+    )
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8").replace(
+            "HEALTHMES_DECISION_HERMES_MODEL=decision-model",
+            "HEALTHMES_DECISION_HERMES_MODEL=decision-model-v2",
+        ),
+        encoding="utf-8",
+    )
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    manifest_path = _decision_home(hermes_home) / "runtime-manifest.json"
+    changed = load_runtime_manifest(manifest_path)
+    assert changed.sealed is False
+    assert changed.execution_artifacts == ()
+    assert changed.runtime_id != sealed.runtime_id
+    resealed = _seal_bootstrapped_runtime(
+        bootstrap,
+        hermes_home,
+        env_file,
+    )
+    assert resealed.sealed is True
+    assert resealed.runtime_id != changed.runtime_id
+
+
+def test_runtime_identity_binds_mcp_inventory_policy_source(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    tmp_path: Path,
+) -> None:
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    decision_home = _decision_home(hermes_home)
+    manifest = load_runtime_manifest(
+        decision_home / "runtime-manifest.json"
+    )
+    assert tuple(
+        artifact.name for artifact in manifest.control_source_artifacts
+    ) == HERMES_RUNTIME_CONTROL_SOURCE_NAMES
+
+    from healthmes import hermes_mcp_inventory
+
+    changed_policy = tmp_path / "hermes_mcp_inventory.py"
+    changed_policy.write_bytes(
+        Path(hermes_mcp_inventory.__file__).read_bytes()
+        + b"\n# changed policy\n"
+    )
+    provider_environment = {
+        name: value
+        for name, value in bootstrap.load_env_file(env_file).items()
+        if name in HERMES_RUNTIME_PROVIDER_ENV_NAMES and value
+    }
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_control_source_mismatch",
+    ):
+        validate_supervised_runtime(
+            manifest_path=decision_home / "runtime-manifest.json",
+            attestation_key_path=decision_home
+            / "runtime-attestation.key",
+            hermes_home=decision_home,
+            vendor_root=REPO_ROOT / "vendor" / "hermes-agent",
+            environment=provider_environment,
+            require_sealed=False,
+            mcp_inventory_module=changed_policy,
+        )
 
 
 def test_dry_run_is_inert_and_reports_dedicated_artifacts(

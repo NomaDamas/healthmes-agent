@@ -42,8 +42,12 @@ from healthmes.decision.hermes_profile import (
 )
 from healthmes.hermes_runtime_identity import (
     HERMES_RUNTIME_PROVIDER_ENV_NAMES,
+    HermesDecisionRuntimeManifest,
+    HermesRuntimeIdentityError,
     build_runtime_manifest,
+    load_runtime_manifest,
     runtime_home_artifact_sha256,
+    runtime_manifest_matches_preseal_identity,
     write_new_attestation_key,
     write_runtime_manifest,
 )
@@ -642,6 +646,40 @@ def write_decision_runtime_artifacts(
             decision_home.mkdir(parents=True, exist_ok=True)
             _backup_runtime_artifact(path)
             _atomic_write_text(path, content, mode=0o600)
+
+
+def write_prepared_runtime_manifest(
+    path: Path,
+    manifest: HermesDecisionRuntimeManifest,
+    plan: Plan,
+) -> None:
+    """Preserve an equivalent seal; publish changed intent as unsealed."""
+
+    existing = None
+    if path.is_file():
+        try:
+            existing = load_runtime_manifest(path)
+        except HermesRuntimeIdentityError:
+            pass
+    if (
+        existing is not None
+        and runtime_manifest_matches_preseal_identity(
+            existing,
+            manifest,
+        )
+    ):
+        state = "supervisor-sealed" if existing.sealed else "prepared"
+        plan.act(
+            f"keep {state} content-bound runtime manifest {path} "
+            f"({existing.runtime_id})"
+        )
+        return
+    plan.act(
+        f"write content-bound runtime manifest {path} "
+        f"({manifest.runtime_id}) for supervisor sealing"
+    )
+    if not plan.dry_run:
+        write_runtime_manifest(path, manifest)
 
 
 def _backup_runtime_artifact(path: Path) -> None:
@@ -1274,12 +1312,11 @@ def run(args: argparse.Namespace) -> int:
         provider_environment=provider_environment,
         vendor_fingerprint_source=VENDOR_HERMES,
     )
-    plan.act(
-        f"write content-bound runtime manifest {manifest_path} "
-        f"({manifest.runtime_id})"
+    write_prepared_runtime_manifest(
+        manifest_path,
+        manifest,
+        plan,
     )
-    if not args.dry_run:
-        write_runtime_manifest(manifest_path, manifest)
 
     plan.act(
         "leave general Hermes config, Telegram, webhook, skills, and unowned "
