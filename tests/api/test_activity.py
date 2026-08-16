@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from freezegun import freeze_time
 from sqlalchemy import select
 
 import healthmes.activity.api as activity_api_module
@@ -23,6 +24,14 @@ from healthmes.store import WellnessEvent
 IOS_KEY_FINGERPRINT = "1" * 40
 IOS_KEY_ID = f"ios-key-{IOS_KEY_FINGERPRINT}"
 IOS_APP_TOKEN = f"ios-app-v2-{IOS_KEY_FINGERPRINT}-" + ("a" * 40)
+
+
+@pytest.fixture(autouse=True)
+def stable_activity_api_wall_clock(client):
+    """Build FastAPI first, then freeze activity API wall-clock checks."""
+    assert client.get("/v1/activity/devices/clock-prime/collection").status_code == 200
+    with freeze_time("2026-08-14 12:00:00", tick=True, real_asyncio=True):
+        yield
 
 
 def _seed_legacy_ios_exclusion(
