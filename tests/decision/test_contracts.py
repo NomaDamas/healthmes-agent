@@ -483,6 +483,7 @@ def test_action_draft_requires_valid_source_reference():
     draft = DecisionDraft(
         status=DecisionStatus.COMPLETED,
         answer="Take a short break before deciding.",
+        record_summary="Take a short break before deciding.",
         proposed_action=True,
         persistence_intent=DecisionPersistenceIntent.ACTION,
         used_source_ref_ids=[reference_id],
@@ -493,6 +494,7 @@ def test_action_draft_requires_valid_source_reference():
         DecisionDraft(
             status=DecisionStatus.COMPLETED,
             answer="Take a break.",
+            record_summary="Take a break.",
             proposed_action=True,
             persistence_intent=DecisionPersistenceIntent.ACTION,
         )
@@ -516,6 +518,29 @@ def test_decision_draft_preserves_uncertainty_and_follow_up():
     assert draft.confidence == 0.6
     assert draft.uncertainty == "Sleep coverage is partial."
     assert draft.follow_up_question is not None
+
+
+def test_record_summary_is_bounded_and_completed_only():
+    summary = "Pause for ten minutes before choosing more caffeine."
+    draft = DecisionDraft(
+        status=DecisionStatus.COMPLETED,
+        answer="A longer private answer.",
+        record_summary=summary,
+    )
+
+    assert draft.record_summary == summary
+    with pytest.raises(ValidationError, match="160 characters"):
+        DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="Answer.",
+            record_summary="x" * 161,
+        )
+    with pytest.raises(ValidationError, match="only completed"):
+        DecisionDraft(
+            status=DecisionStatus.NEEDS_CLARIFICATION,
+            clarification_question="Which drink?",
+            record_summary=summary,
+        )
 
 
 def test_persistence_intent_contract_rejects_inconsistent_drafts():

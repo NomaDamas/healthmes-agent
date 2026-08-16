@@ -24,6 +24,7 @@ from healthmes.timezones import parse_timezone
 
 MAX_QUESTION_LENGTH = 8_000
 MAX_ANSWER_LENGTH = 16_000
+MAX_RECORD_SUMMARY_LENGTH = 160
 MAX_LIMITATIONS = 100
 MAX_SOURCE_REFS = 500
 MAX_TOOL_TRACE = 64
@@ -892,6 +893,10 @@ class DecisionDraft(BaseModel):
 
     status: DecisionStatus
     answer: str | None = Field(default=None, max_length=MAX_ANSWER_LENGTH)
+    record_summary: str | None = Field(
+        default=None,
+        max_length=MAX_RECORD_SUMMARY_LENGTH,
+    )
     proposed_action: bool = False
     persistence_intent: DecisionPersistenceIntent = (
         DecisionPersistenceIntent.NONE
@@ -921,6 +926,20 @@ class DecisionDraft(BaseModel):
             value,
             label="answer",
             max_length=MAX_ANSWER_LENGTH,
+        )
+
+    @field_validator("record_summary")
+    @classmethod
+    def validate_record_summary(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        return _bounded_text(
+            value,
+            label="record_summary",
+            max_length=MAX_RECORD_SUMMARY_LENGTH,
         )
 
     @field_validator(
@@ -973,6 +992,13 @@ class DecisionDraft(BaseModel):
         ):
             raise ValueError(
                 "only completed decisions may request persistence"
+            )
+        if (
+            self.status is not DecisionStatus.COMPLETED
+            and self.record_summary is not None
+        ):
+            raise ValueError(
+                "only completed decisions may include record_summary"
             )
         if self.status is DecisionStatus.NEEDS_CLARIFICATION:
             if self.clarification_question is None:

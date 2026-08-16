@@ -87,6 +87,21 @@ _SESSION_ID_CONTROL = re.compile(r"[\r\n\x00]")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
+class _DuplicateJsonMember(ValueError):
+    """Raised before duplicate JSON object members can collapse."""
+
+
+def _reject_duplicate_json_members(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJsonMember(key)
+        value[key] = item
+    return value
+
+
 def _utc(value: datetime) -> datetime:
     return (
         value.replace(tzinfo=UTC)
@@ -2131,11 +2146,16 @@ def _responses_request(
         "or prose. The object must have exactly two keys: "
         '{"schema":"healthmes.decision-draft.v1","decision":...}. '
         "The decision value must contain only DecisionDraft fields: status, "
-        "answer, proposed_action, persistence_intent, used_source_ref_ids, "
-        "limitations, clarification_question, confidence, uncertainty, and "
-        "follow_up_question. persistence_intent is required on every response "
-        "and must be one of none, action, risk, mutation, or "
-        "explicit_tracking. Use only source reference IDs returned by tools. "
+        "answer, record_summary, proposed_action, persistence_intent, "
+        "used_source_ref_ids, limitations, clarification_question, "
+        "confidence, uncertainty, and follow_up_question. "
+        "persistence_intent is required on every response and must be one of "
+        "none, action, risk, mutation, or explicit_tracking. When the result "
+        "may be retained because persistence_intent is not none or the "
+        "request has persistence_requested=true, record_summary is required. "
+        "It must be a privacy-minimized conclusion of at most 160 characters, "
+        "not a truncation of the answer, and must omit raw identifiers and "
+        "sensitive detail. Use only source reference IDs returned by tools. "
         "A proposed action requires at least one source reference. Ask one "
         "concrete clarification question when a required candidate amount, "
         "identity, time, or user fact is missing. Do not diagnose disease."
@@ -2635,10 +2655,16 @@ def _parse_json_object(
     if len(encoded) > max_bytes:
         raise HermesResponsesContractError(code)
     try:
-        decoder = json.JSONDecoder()
+        decoder = json.JSONDecoder(
+            object_pairs_hook=_reject_duplicate_json_members
+        )
         value, end = decoder.raw_decode(raw.lstrip())
         trailing = raw.lstrip()[end:]
-    except (UnicodeEncodeError, json.JSONDecodeError) as exc:
+    except (
+        UnicodeEncodeError,
+        json.JSONDecodeError,
+        _DuplicateJsonMember,
+    ) as exc:
         raise HermesResponsesContractError(code) from exc
     if trailing.strip() or type(value) is not dict:
         raise HermesResponsesContractError(code)

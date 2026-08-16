@@ -144,10 +144,11 @@ Hermes 마지막 assistant text는 JSON 하나여야 한다.
 
 ```json
 {
-  "object": "healthmes.decision-draft.v1",
-  "draft": {
+  "schema": "healthmes.decision-draft.v1",
+  "decision": {
     "status": "completed",
     "answer": "짧은 사용자 답변",
+    "record_summary": "오후 카페인은 피하고 10분 쉬기",
     "proposed_action": true,
     "persistence_intent": "action",
     "used_source_ref_ids": [
@@ -170,6 +171,7 @@ Hermes 마지막 assistant text는 JSON 하나여야 한다.
 - 짝이 없는 function call/output
 - 실제 결과에 없는 source ref
 - status와 answer/clarification invariant 불일치
+- 저장 대상인데 160자 이하의 privacy-minimized `record_summary`가 없음
 - response size 또는 요청 deadline 초과
 
 ## 7. 조건부 Finalization
@@ -185,7 +187,8 @@ trusted caller의 명시적 추적 요청  -> explicit_tracking
 ```
 
 `none`이면 DecisionRecord를 만들지 않는다. 저장하는 경우에도 원문 질문, 전체 답변,
-transcript와 tool payload를 복제하지 않는다.
+transcript와 tool payload를 복제하지 않는다. 대신 LLM이 별도로 작성한 160자 이하의
+`record_summary`만 저장해 나중에 실제 결론과 제안 행동을 복구할 수 있게 한다.
 
 finalizer는 다음을 하나의 bounded write 절차로 처리한다.
 

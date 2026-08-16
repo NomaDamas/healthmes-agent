@@ -45,6 +45,9 @@ where the agent should apply this skill — and when it should NOT.
 
 - Return the strict `healthmes.decision-draft.v1` envelope requested by the
   system instructions.
+- If the result may be retained, provide a privacy-minimized
+  `record_summary` of at most 160 characters. Do not truncate the full answer
+  or include raw identifiers and payload detail.
 - Do not mutate calendar, settings, tasks, food records, or medical records
   from the decision-read runtime. A separately confirmed mutation workflow
   owns those actions.

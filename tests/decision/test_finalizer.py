@@ -247,6 +247,7 @@ def _run(
     payload: dict[str, int] | None = None,
     runtime: RuntimeMetadata | None = None,
     answer: str | None = None,
+    record_summary: str | None = None,
     context_status: ContextStatus = ContextStatus.OK,
     result_limitations: list[str] | None = None,
     draft_limitations: list[str] | None = None,
@@ -288,24 +289,33 @@ def _run(
         ),
     }
     if status is DecisionStatus.COMPLETED:
+        selected_intent = (
+            persistence_intent
+            or (
+                DecisionPersistenceIntent.ACTION
+                if proposed_action
+                else DecisionPersistenceIntent.NONE
+            )
+        )
         draft_kwargs.update(
             {
                 "answer": answer
                 or "Take a short break before choosing more caffeine.",
                 "proposed_action": proposed_action,
-                "persistence_intent": (
-                    persistence_intent
-                    or (
-                        DecisionPersistenceIntent.ACTION
-                        if proposed_action
-                        else DecisionPersistenceIntent.NONE
-                    )
-                ),
+                "persistence_intent": selected_intent,
                 "confidence": 0.8,
                 "uncertainty": "Only the retained context was considered.",
                 "limitations": draft_limitations or [],
             }
         )
+        if (
+            selected_intent is not DecisionPersistenceIntent.NONE
+            or request.persistence_requested
+        ):
+            draft_kwargs["record_summary"] = (
+                record_summary
+                or "Pause before choosing more caffeine."
+            )
     elif status is DecisionStatus.NEEDS_CLARIFICATION:
         draft_kwargs["clarification_question"] = (
             "Which drink are you considering?"
@@ -709,9 +719,10 @@ def test_public_record_redacts_internal_source_reference_ids(
         assert ref.reference_id not in str(row.tree)
         assert row.decision_payload is not None
         assert "result" not in row.decision_payload
-        assert row.decision_payload["outcome"]["summary"] == (
-            "A wellness action recommendation was recorded."
+        assert row.decision_payload["outcome"]["record_summary"] == (
+            "Pause before choosing more caffeine."
         )
+        assert row.summary == "Pause before choosing more caffeine."
         assert answer not in json.dumps(row.decision_payload)
         assert "question" not in row.decision_payload["request"]
         assert "caller" not in row.decision_payload["request"]
@@ -776,13 +787,43 @@ def test_long_sensitive_answer_is_returned_but_never_persisted(
         ):
             assert secret not in persisted
         outcome = row.decision_payload["outcome"]
-        assert len(outcome["summary"]) <= 160
+        assert outcome["record_summary"] == (
+            "Pause before choosing more caffeine."
+        )
         assert outcome["limitation_codes"] == ["context_stale"]
 
         recovered = decision_result_from_record(row)
-        assert recovered.answer == outcome["summary"]
+        assert recovered.answer == outcome["record_summary"]
         assert sensitive_marker not in recovered.answer
         assert "decision_response_compacted" in recovered.limitations
+
+
+def test_persisted_decision_requires_compact_record_summary(
+    persistence,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+    run = run.model_copy(
+        update={
+            "draft": run.draft.model_copy(
+                update={"record_summary": None}
+            )
+        },
+        deep=True,
+    )
+
+    result = _finalizer(factory).finalize(request, run)
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+    assert result.limitations == ["decision_record_summary_missing"]
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
 
 
 def test_clarification_is_not_persisted(persistence):
@@ -2045,6 +2086,7 @@ def test_retry_reads_and_revalidates_legacy_v1_payload(persistence):
         }
         row.decision_payload = legacy_payload
         row.decision_payload_digest = _payload_digest(legacy_payload)
+        row.summary = "HealthMes wellness action recorded"
         session.commit()
 
     retry_request = request.model_copy(

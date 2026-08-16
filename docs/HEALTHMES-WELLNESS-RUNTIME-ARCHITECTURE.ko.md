@@ -400,7 +400,8 @@ HealthMes는 다음을 검증한다.
 | 실제 식사·활동 기록 | 해당 domain event |
 | 설정·캘린더 mutation | 해당 command workflow audit |
 
-compact record는 짧은 outcome, runtime/model, intent, confidence,
+compact record는 전체 답변을 잘라 만든 문자열이 아니라 LLM이 별도로 작성한
+160자 이하의 privacy-minimized `record_summary`, runtime/model, intent, confidence,
 `source_refs`, 안전한 limitation과 시각만 저장한다. 원문 질문, 전체 답변,
 transcript, 전체 tool payload, 사진·음성 bytes는 복제하지 않는다.
 

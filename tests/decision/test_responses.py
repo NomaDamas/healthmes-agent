@@ -214,6 +214,11 @@ def _final_response(
             "persistence_intent",
             "action" if decision.get("proposed_action") is True else "none",
         )
+    if decision.get("persistence_intent") != "none":
+        decision.setdefault(
+            "record_summary",
+            "Take a short break before choosing more caffeine.",
+        )
     envelope = {
         "schema": HERMES_DECISION_DRAFT_SCHEMA,
         "decision": decision,
@@ -879,6 +884,48 @@ async def test_agent_rejects_malformed_or_oversized_final_output(
 
     assert run.draft.status is DecisionStatus.FAILED
     assert run.draft.limitations == [expected_code]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final_text",
+    (
+        (
+            '{"schema":"healthmes.decision-draft.v1",'
+            '"schema":"healthmes.decision-draft.v0",'
+            '"decision":{"status":"completed","answer":"No.",'
+            '"persistence_intent":"none"}}'
+        ),
+        (
+            '{"schema":"healthmes.decision-draft.v1",'
+            '"decision":{"status":"completed","answer":"Yes.",'
+            '"answer":"No.","persistence_intent":"none"}}'
+        ),
+    ),
+)
+async def test_agent_rejects_duplicate_json_members(
+    final_text: str,
+) -> None:
+    response = _final_response(
+        {
+            "status": "completed",
+            "answer": "This value is replaced.",
+        }
+    )
+    response["output"][-1]["content"][0]["text"] = final_text
+    agent = HermesResponsesDecisionAgent(
+        transport=_Transport(response),
+        search_service=_SearchService(_empty_snapshot()),  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        clock=lambda: NOW,
+    )
+
+    run = await agent.ask(_request())
+
+    assert run.draft.status is DecisionStatus.FAILED
+    assert run.draft.limitations == ["hermes_final_json_invalid"]
 
 
 @pytest.mark.asyncio
