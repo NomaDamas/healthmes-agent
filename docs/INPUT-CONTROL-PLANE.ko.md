@@ -328,6 +328,31 @@ fresh run으로 합쳐 기존 run 직후 최신 authorization/config/timezone으
 조회한다. 설정 UI는 서버 PUT이 성공한 뒤
 `ScreenTimeActivityRuntime.inputConfigurationDidChange()`를 호출해야 한다.
 
+수집이 끝났다는 사실만으로 업로드를 허용하지 않는다. 새 aggregate 또는 로컬
+outbox 항목을 전송하기 직전에 서버 collection state와 현재 Apple authorization을
+다시 읽는 final upload fence를 적용한다. authorization 또는 input configuration
+변경 알림은 service-owned control epoch를 증가시켜 실행 중인 이전 generation이
+다음 POST를 시작하지 못하게 한다. revision, enabled, pause, exclusions 같은
+안정적인 설정이 바뀌었거나 새 retention cutoff가 실제 snapshot window 또는
+bucket을 침범했다면 현재 조건과 맞지 않는 outbox 항목을 제거하고 오래된 수집
+결과를 버린 뒤 최신 설정으로 다시 수집한다. 서버가 현재 시각으로 계산하여
+매 조회마다 조금씩 전진하는 retention cutoff timestamp 자체는 설정 변경으로
+간주하지 않는다.
+
+서버가 `stale_collection_revision`, `activity_outside_retention`,
+`activity_collection_blocked`, `ios_exclusion_reapproval_required`를 반환하면
+같은 private payload를 quarantine하거나 재전송하지 않는다. pending payload는
+즉시 삭제하고 fresh collection으로 전환하며, 새로 만든 payload는 outbox에
+기록하지 않는다. 일반적인 영구 데이터 충돌만 bounded quarantine을 사용한다.
+설정이 계속 흔들리는 경우에는 최대 3회의 fresh attempt 뒤
+`ios_screen_time_collection_configuration_changed`로 이번 sync를 종료하여
+무한 반복을 막는다.
+
+Apple authorization이 `granted`여도 collector가
+`ios_screen_time_activity_data_unavailable` 같은 export capability 오류를
+반환할 수 있다. 이 경우를 설정 변경으로 오인하지 않고 unavailable reason을
+그대로 보고하되 aggregate는 업로드하지 않는다.
+
 foreground 호출 취소는 이미 시작한 idempotent upload나 retry 저장을 중단하지
 않는다. 반면 iOS가 `BGAppRefreshTask`를 만료시키면 background lease가 실제
 service-owned pipeline을 취소한다. 같은 pipeline을 기다리는 foreground waiter가
@@ -394,6 +419,9 @@ condition을 생성한다.
 cd apps/ios-companion
 xcodegen generate
 bash Scripts/build-screen-time-opt-in.sh build
+bash Scripts/build-screen-time-opt-in.sh test \
+  -only-testing:HealthMesCompanionTests/ScreenTimeActivityContractTests \
+  -only-testing:HealthMesCompanionTests/ScreenTimeActivityLifecycleTests
 ```
 
 스크립트는 선택한 SDK에서
@@ -403,6 +431,13 @@ bash Scripts/build-screen-time-opt-in.sh build
 코드를 컴파일한다. 실패하면 opt-in 요청은
 `ios_screen_time_export_sdk_unavailable` unavailable adapter로 명시적으로 닫힌다.
 일반 빌드는 별도의 `ios_screen_time_normal_build_unavailable` 경계를 유지한다.
+`test`는 `HEALTHMES_SCREENTIME_DESTINATION`이 없으면 설치된 최신 iOS runtime의
+사용 가능한 iPhone simulator를 자동 선택한다. 특정 기기를 고정해야 하면
+`platform=iOS Simulator,id=<UDID>`를 환경변수로 전달한다.
+`HEALTHMES_SCREENTIME_SDK=iphoneos`의 build/analyze/archive 기본 destination은
+`generic/platform=iOS`다. `iphoneos test`는 generic destination에서 실행할 수
+없으므로 `HEALTHMES_SCREENTIME_DESTINATION=platform=iOS,id=<실기기 UDID>`를
+반드시 명시해야 하며, 누락하면 스크립트가 실행 전에 실패한다.
 
 SDK probe 성공만으로 실제 기기 수집이 보장되지는 않는다. opt-in entitlement
 파일은 `com.apple.developer.family-controls`와

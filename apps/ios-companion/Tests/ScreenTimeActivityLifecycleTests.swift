@@ -203,6 +203,33 @@ private struct ScreenTimeLifecycleSequencedThrowingCollector:
 private enum ScreenTimeLifecycleUploadAction {
     case succeed
     case fail(HealthMesAPIError)
+    case failUnknown
+}
+
+private actor ScreenTimeLifecycleUploadGate {
+    private var remainingBlocks: Int
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    init(blockCount: Int = 1) {
+        remainingBlocks = max(0, blockCount)
+    }
+
+    func suspendIfNeeded() async {
+        guard remainingBlocks > 0 else { return }
+        remainingBlocks -= 1
+        await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func releaseNext() {
+        guard !continuations.isEmpty else { return }
+        continuations.removeFirst().resume()
+    }
+
+    func waitingCount() -> Int {
+        continuations.count
+    }
 }
 
 private final class ScreenTimeLifecycleCancellationURLProtocol:
@@ -268,8 +295,10 @@ private final class ScreenTimeLifecycleCancellationURLProtocol:
 private actor ScreenTimeLifecycleTestTransport:
     ScreenTimeActivityTransport
 {
-    private let state: ScreenTimeCollectionState
+    private let states: [ScreenTimeCollectionState]
     private let stateDelayNanoseconds: UInt64
+    private let uploadDelayNanoseconds: UInt64
+    private let uploadGate: ScreenTimeLifecycleUploadGate?
     private var uploadActions: [ScreenTimeLifecycleUploadAction]
     private var stateCalls = 0
     private var reports: [ScreenTimeActivityReport] = []
@@ -279,17 +308,37 @@ private actor ScreenTimeLifecycleTestTransport:
     init(
         state: ScreenTimeCollectionState,
         uploadActions: [ScreenTimeLifecycleUploadAction] = [],
-        stateDelayNanoseconds: UInt64 = 0
+        stateDelayNanoseconds: UInt64 = 0,
+        uploadDelayNanoseconds: UInt64 = 0,
+        uploadGate: ScreenTimeLifecycleUploadGate? = nil
     ) {
-        self.state = state
+        states = [state]
         self.uploadActions = uploadActions
         self.stateDelayNanoseconds = stateDelayNanoseconds
+        self.uploadDelayNanoseconds = uploadDelayNanoseconds
+        self.uploadGate = uploadGate
+    }
+
+    init(
+        states: [ScreenTimeCollectionState],
+        uploadActions: [ScreenTimeLifecycleUploadAction] = [],
+        stateDelayNanoseconds: UInt64 = 0,
+        uploadDelayNanoseconds: UInt64 = 0,
+        uploadGate: ScreenTimeLifecycleUploadGate? = nil
+    ) {
+        precondition(!states.isEmpty)
+        self.states = states
+        self.uploadActions = uploadActions
+        self.stateDelayNanoseconds = stateDelayNanoseconds
+        self.uploadDelayNanoseconds = uploadDelayNanoseconds
+        self.uploadGate = uploadGate
     }
 
     func collectionState(
         pairing: Pairing,
         deviceID _: String
     ) async throws -> ScreenTimeCollectionState {
+        let state = states[min(stateCalls, states.count - 1)]
         stateCalls += 1
         statePairings.append(pairing)
         if stateDelayNanoseconds > 0 {
@@ -306,12 +355,22 @@ private actor ScreenTimeLifecycleTestTransport:
     ) async throws -> ScreenTimeActivityBatchResult {
         reports.append(report)
         reportPairings.append(pairing)
+        if let uploadGate {
+            await uploadGate.suspendIfNeeded()
+        }
+        if uploadDelayNanoseconds > 0 {
+            try await Task.sleep(
+                nanoseconds: uploadDelayNanoseconds
+            )
+        }
         if !uploadActions.isEmpty {
             switch uploadActions.removeFirst() {
             case .succeed:
                 break
             case .fail(let error):
                 throw error
+            case .failUnknown:
+                throw ScreenTimeLifecycleTestError.collectionFailed
             }
         }
         return ScreenTimeActivityBatchResult(
@@ -349,6 +408,7 @@ private actor ScreenTimeLifecycleBlockingTransport:
     private var stateCancellations = 0
     private var reports: [ScreenTimeActivityReport] = []
     private var stateWaiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
 
     init(state: ScreenTimeCollectionState) {
         self.state = state
@@ -359,6 +419,9 @@ private actor ScreenTimeLifecycleBlockingTransport:
         deviceID _: String
     ) async throws -> ScreenTimeCollectionState {
         stateCalls += 1
+        if released {
+            return state
+        }
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 stateWaiters.append(continuation)
@@ -389,6 +452,7 @@ private actor ScreenTimeLifecycleBlockingTransport:
     }
 
     func releaseStateCalls() {
+        released = true
         let waiters = stateWaiters
         stateWaiters.removeAll()
         waiters.forEach { $0.resume() }
@@ -676,6 +740,13 @@ private final class ScreenTimeLifecycleBackgroundTask:
 }
 
 final class ScreenTimeActivityLifecycleTests: XCTestCase {
+    private struct GrantedSupersedeRaceResult {
+        let activeOutcome: ScreenTimeSyncOutcome
+        let freshOutcome: ScreenTimeSyncOutcome
+        let reports: [ScreenTimeActivityReport]
+        let entries: [ScreenTimeActivityOutboxEntry]
+    }
+
     private func date(_ value: String) -> Date {
         ISO8601DateFormatter().date(from: value)!
     }
@@ -801,6 +872,111 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         XCTFail("timed out waiting for Screen Time state call")
+    }
+
+    private func waitForReports(
+        _ expectedCount: Int,
+        from transport: ScreenTimeLifecycleTestTransport
+    ) async throws {
+        for _ in 0..<400 {
+            if await transport.capturedReports().count >= expectedCount {
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTFail("timed out waiting for Screen Time upload")
+    }
+
+    private func waitForBlockedUploads(
+        _ expectedCount: Int,
+        at gate: ScreenTimeLifecycleUploadGate
+    ) async throws {
+        for _ in 0..<400 {
+            if await gate.waitingCount() >= expectedCount {
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTFail("timed out waiting for blocked Screen Time upload")
+    }
+
+    private func runGrantedAuthorizationSupersedeRace(
+        firstAction: ScreenTimeLifecycleUploadAction,
+        retryPolicy: ScreenTimeActivityRetryPolicy = .default
+    ) async throws -> GrantedSupersedeRaceResult {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(
+            retryPolicy: retryPolicy,
+            now: now
+        )
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        _ = try await outboxStorage.0.enqueue(
+            report: report(generation: 100),
+            pairing: pairing(),
+            now: now.addingTimeInterval(-60)
+        )
+        let gate = ScreenTimeLifecycleUploadGate()
+        let granted = collectorResult()
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            uploadActions: [firstAction, .succeed],
+            uploadGate: gate
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: granted,
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let active = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+        }
+        try await waitForBlockedUploads(1, at: gate)
+        let fresh = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!,
+                trigger: .authorizationChanged
+            )
+        }
+        try await waitForWaiterCounts(
+            active: 1,
+            pending: 1,
+            from: service
+        )
+        await gate.releaseNext()
+
+        let activeOutcome = try await active.value
+        let freshOutcome = try await fresh.value
+        let reports = await transport.capturedReports()
+        let entries = await outboxStorage.0.allEntries()
+        return GrantedSupersedeRaceResult(
+            activeOutcome: activeOutcome,
+            freshOutcome: freshOutcome,
+            reports: reports,
+            entries: entries
+        )
     }
 
     private func waitForStateCalls(
@@ -1603,6 +1779,107 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(pending, 0)
     }
 
+    func testUnclassifiedHTTPClientErrorsAreQuarantined()
+        async throws
+    {
+        for statusCode in [400, 403, 404] {
+            let now = date("2026-08-16T10:34:00Z")
+            let outboxStorage = temporaryOutbox(now: now)
+            let stateStorage = isolatedStateStore()
+            let transport = ScreenTimeLifecycleTestTransport(
+                state: collectionState(),
+                uploadActions: [
+                    .fail(.httpStatus(statusCode))
+                ]
+            )
+            let service = ScreenTimeActivitySyncService(
+                deviceID: "ios-lifecycle-device",
+                collector: ScreenTimeLifecycleTestCollector(
+                    result: collectorResult(),
+                    pseudonymKeyID:
+                        "ios-key-" + String(repeating: "1", count: 40)
+                ),
+                transport: transport,
+                stateStore: stateStorage.0,
+                outbox: outboxStorage.0
+            )
+
+            let outcome = try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+            let quarantined =
+                await outboxStorage.0.quarantinedEntries()
+
+            XCTAssertEqual(
+                outcome,
+                .skipped(reason: "http_\(statusCode)")
+            )
+            XCTAssertEqual(quarantined.count, 1)
+            XCTAssertEqual(
+                quarantined[0].terminalStatusCode,
+                statusCode
+            )
+            XCTAssertEqual(quarantined[0].failedAttempts, 0)
+
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+    }
+
+    func testUnknownCompletedPostFailureIsQuarantined()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            uploadActions: [.failUnknown]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let quarantined =
+            await outboxStorage.0.quarantinedEntries()
+
+        XCTAssertEqual(
+            outcome,
+            .skipped(reason: "ios_screen_time_upload_failed")
+        )
+        XCTAssertEqual(quarantined.count, 1)
+        XCTAssertNil(quarantined[0].terminalStatusCode)
+    }
+
     func testFenceResetFailureQuarantinesResetReport() async throws {
         let now = date("2026-08-16T10:34:00Z")
         let outboxStorage = temporaryOutbox(now: now)
@@ -1876,7 +2153,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         )
         let collectorState =
             ScreenTimeLifecycleSequencedCollectorState(
-                authorizationResults: [granted],
+                authorizationResults: [granted, revoked],
                 collectionResult: revoked
             )
         let transport = ScreenTimeLifecycleTestTransport(
@@ -2117,7 +2394,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         let reports = await transport.capturedReports()
 
         XCTAssertEqual(outcomes[0], outcomes[1])
-        XCTAssertEqual(stateCalls, 1)
+        XCTAssertEqual(stateCalls, 3)
         XCTAssertEqual(reports.count, 1)
         XCTAssertEqual(counts.collection, 1)
     }
@@ -2186,9 +2463,9 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         let stateCalls = await transport.capturedStateCalls()
         let reports = await transport.capturedReports()
 
-        XCTAssertEqual(stateCalls, 2)
-        XCTAssertEqual(counts.collection, 2)
-        XCTAssertEqual(reports.count, 2)
+        XCTAssertEqual(stateCalls, 4)
+        XCTAssertEqual(counts.collection, 1)
+        XCTAssertEqual(reports.count, 1)
     }
 
     func testTimezoneChangeQueuesFreshRunWithLatestTimezone()
@@ -2310,7 +2587,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         guard case .uploaded = replacement else {
             return XCTFail("expected replacement waiter to join the pipeline")
         }
-        XCTAssertEqual(stateCalls, 1)
+        XCTAssertEqual(stateCalls, 3)
         XCTAssertEqual(counts.collection, 1)
         XCTAssertEqual(reports.count, 1)
     }
@@ -2383,7 +2660,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         guard case .uploaded = firstOutcome else {
             return XCTFail("expected the first waiter to complete")
         }
-        XCTAssertEqual(stateCalls, 1)
+        XCTAssertEqual(stateCalls, 3)
         XCTAssertEqual(counts.collection, 1)
         XCTAssertEqual(reports.count, 1)
     }
@@ -2391,7 +2668,8 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
     func testBackgroundExpirationCancelsServiceOwnedPipeline()
         async throws
     {
-        let outboxStorage = temporaryOutbox()
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
         defer {
             try? FileManager.default.removeItem(
                 at: outboxStorage.1
@@ -2403,6 +2681,15 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
                 forName: stateStorage.2
             )
         }
+        let queuedReport = report(
+            sequence: 7,
+            start: date("2026-08-16T08:00:00Z")
+        )
+        let queuedEntry = try await outboxStorage.0.enqueue(
+            report: queuedReport,
+            pairing: pairing(),
+            now: now.addingTimeInterval(-60)
+        )
         let uploadStarted = expectation(
             description: "background upload started"
         )
@@ -2443,7 +2730,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         let work = Task {
             try await service.sync(
                 pairing: pairing(),
-                now: date("2026-08-16T10:34:00Z"),
+                now: now,
                 timezone: TimeZone(secondsFromGMT: 0)!,
                 trigger: .backgroundRefresh
             )
@@ -2461,7 +2748,14 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         await fulfillment(of: [uploadStopped], timeout: 2)
         let entries = await outboxStorage.0.allEntries()
 
-        XCTAssertTrue(entries.isEmpty)
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries[0].id, queuedEntry.id)
+        XCTAssertEqual(entries[0].report, queuedReport)
+        XCTAssertEqual(entries[0].failedAttempts, 1)
+        XCTAssertEqual(
+            entries[0].nextAttemptAt,
+            now.addingTimeInterval(60)
+        )
     }
 
     func testBackgroundExpirationDetachesBeforeForegroundReplacement()
@@ -2533,7 +2827,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         guard case .uploaded = foregroundOutcome else {
             return XCTFail("expected a fresh foreground pipeline")
         }
-        XCTAssertEqual(stateCalls, 2)
+        XCTAssertEqual(stateCalls, 4)
         XCTAssertEqual(counts.collection, 1)
         XCTAssertEqual(reports.count, 1)
     }
@@ -2608,7 +2902,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         guard case .uploaded = foregroundOutcome else {
             return XCTFail("expected foreground waiter to complete")
         }
-        XCTAssertEqual(stateCalls, 1)
+        XCTAssertEqual(stateCalls, 3)
         XCTAssertEqual(counts.collection, 1)
         XCTAssertEqual(reports.count, 1)
     }
@@ -2835,10 +3129,1076 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(pairings.state, [
             firstPairing,
             secondPairing,
+            secondPairing,
+            secondPairing,
         ])
         XCTAssertEqual(pairings.report, [secondPairing])
         XCTAssertEqual(reports.count, 1)
         XCTAssertEqual(counts.collection, 1)
+    }
+
+    func testRevisionChangeDuringCollectionPurgesOldOutboxAndRecollects()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        _ = try await outboxStorage.0.enqueue(
+            report: report(revision: 3),
+            pairing: pairing(),
+            now: now
+        )
+        let counter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleTestTransport(
+            states: [
+                collectionState(configRevision: 3),
+                collectionState(configRevision: 4),
+                collectionState(configRevision: 4),
+                collectionState(configRevision: 4),
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let counts = await counter.values()
+        let entries = await outboxStorage.0.allEntries()
+
+        guard case .uploaded = outcome else {
+            return XCTFail("expected revision 4 recollection to upload")
+        }
+        XCTAssertEqual(counts.collection, 2)
+        XCTAssertEqual(reports.count, 1)
+        XCTAssertEqual(reports[0].collectionRevision, 4)
+        XCTAssertTrue(entries.isEmpty)
+    }
+
+    func testDisableObservedAfterCollectionPreventsStaleUpload()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let counter = ScreenTimeLifecycleTestCounter()
+        let disabled = collectionState(
+            enabled: false,
+            configRevision: 4
+        )
+        let transport = ScreenTimeLifecycleTestTransport(
+            states: [
+                collectionState(configRevision: 3),
+                disabled,
+                disabled,
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let counts = await counter.values()
+
+        XCTAssertEqual(
+            outcome,
+            .skipped(reason: "collection_disabled")
+        )
+        XCTAssertEqual(counts.collection, 1)
+        XCTAssertTrue(reports.isEmpty)
+    }
+
+    func testPauseObservedAfterCollectionPreventsStaleUpload()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let counter = ScreenTimeLifecycleTestCounter()
+        let paused = collectionState(
+            pausedUntil: date("2026-08-16T12:00:00Z"),
+            configRevision: 4
+        )
+        let transport = ScreenTimeLifecycleTestTransport(
+            states: [
+                collectionState(configRevision: 3),
+                paused,
+                paused,
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let counts = await counter.values()
+
+        XCTAssertEqual(
+            outcome,
+            .skipped(reason: "collection_paused")
+        )
+        XCTAssertEqual(counts.collection, 1)
+        XCTAssertTrue(reports.isEmpty)
+    }
+
+    func testRetentionChangeDuringCollectionRecollectsWithinNewCutoff()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let counter = ScreenTimeLifecycleTestCounter()
+        let retained = collectionState(
+            configRevision: 4,
+            rawRetentionCutoff: date("2026-08-16T07:30:00Z")
+        )
+        let transport = ScreenTimeLifecycleTestTransport(
+            states: [
+                collectionState(configRevision: 3),
+                retained,
+                retained,
+                retained,
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let counts = await counter.values()
+
+        guard case .uploaded = outcome else {
+            return XCTFail("expected recollection within new retention")
+        }
+        XCTAssertEqual(counts.collection, 2)
+        XCTAssertEqual(reports.count, 1)
+        XCTAssertEqual(reports[0].collectionRevision, 4)
+        XCTAssertEqual(
+            reports[0].snapshotStart,
+            date("2026-08-16T09:00:00Z")
+        )
+    }
+
+    func testMovingRetentionCutoffDoesNotMasqueradeAsConfigChange()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let counter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleTestTransport(
+            states: [
+                collectionState(
+                    rawRetentionCutoff:
+                        date("2026-08-15T06:00:00Z")
+                ),
+                collectionState(
+                    rawRetentionCutoff:
+                        date("2026-08-15T06:00:01Z")
+                ),
+                collectionState(
+                    rawRetentionCutoff:
+                        date("2026-08-15T06:00:02Z")
+                ),
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let counts = await counter.values()
+        let stateCalls = await transport.capturedStateCalls()
+
+        guard case .uploaded = outcome else {
+            return XCTFail("expected moving cutoff to remain uploadable")
+        }
+        XCTAssertEqual(counts.collection, 1)
+        XCTAssertEqual(stateCalls, 3)
+        XCTAssertEqual(reports.count, 1)
+    }
+
+    func testAuthorizationRevokedAfterFinalFenceBlocksAggregatePost()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let granted = collectorResult()
+        let revoked = collectorResult(
+            capability: .unavailable,
+            permission: .revoked,
+            reason: "ios_screen_time_permission_revoked"
+        )
+        let collectorState =
+            ScreenTimeLifecycleSequencedCollectorState(
+                authorizationResults: [
+                    granted,
+                    granted,
+                    granted,
+                    revoked,
+                ],
+                collectionResult: granted
+            )
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState()
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleSequencedCollector(
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                state: collectorState
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let collectionCalls =
+            await collectorState.capturedCollectionCalls()
+
+        XCTAssertEqual(
+            outcome,
+            .unavailableReported(
+                reason: "ios_screen_time_permission_revoked"
+            )
+        )
+        XCTAssertEqual(collectionCalls, 2)
+        XCTAssertEqual(reports.count, 1)
+        XCTAssertEqual(reports[0].capability, .unavailable)
+        XCTAssertEqual(reports[0].permissionStatus, .revoked)
+        XCTAssertFalse(
+            reports.contains(where: { $0.capability == .aggregate })
+        )
+    }
+
+    func testGrantedSupersedeSettlesSuccessfulQueuedPost()
+        async throws
+    {
+        let result = try await runGrantedAuthorizationSupersedeRace(
+            firstAction: .succeed
+        )
+
+        XCTAssertEqual(
+            result.activeOutcome,
+            .skipped(reason: "ios_screen_time_sync_superseded")
+        )
+        guard case .uploaded = result.freshOutcome else {
+            return XCTFail("expected the fresh pipeline to upload")
+        }
+        XCTAssertEqual(
+            result.reports.filter {
+                $0.collectionGeneration == 100
+            }.count,
+            1
+        )
+        XCTAssertTrue(result.entries.isEmpty)
+    }
+
+    func testGrantedSupersedeBacksOffRetryableQueuedPost()
+        async throws
+    {
+        let retryPolicy = ScreenTimeActivityRetryPolicy(
+            initialDelay: 10,
+            maximumDelay: 10
+        )
+        let result = try await runGrantedAuthorizationSupersedeRace(
+            firstAction: .fail(
+                .transport(
+                    underlying:
+                        ScreenTimeLifecycleTestError.collectionFailed
+                )
+            ),
+            retryPolicy: retryPolicy
+        )
+
+        XCTAssertEqual(
+            result.activeOutcome,
+            .skipped(reason: "ios_screen_time_sync_superseded")
+        )
+        XCTAssertEqual(
+            result.freshOutcome,
+            .deferred(
+                reason: "retry_backoff",
+                retryAt:
+                    date("2026-08-16T10:34:00Z")
+                    .addingTimeInterval(10),
+                queueDepth: 1
+            )
+        )
+        XCTAssertEqual(result.reports.count, 1)
+        XCTAssertEqual(result.entries.count, 1)
+        XCTAssertEqual(result.entries[0].failedAttempts, 1)
+        XCTAssertNil(result.entries[0].terminalReason)
+    }
+
+    func testGrantedSupersedeDeletesCollectionRefreshRejection()
+        async throws
+    {
+        let result = try await runGrantedAuthorizationSupersedeRace(
+            firstAction: .fail(
+                .server(
+                    statusCode: 422,
+                    code: "activity_outside_retention",
+                    message: "collection window expired",
+                    detail: nil
+                )
+            )
+        )
+
+        XCTAssertEqual(
+            result.activeOutcome,
+            .skipped(reason: "ios_screen_time_sync_superseded")
+        )
+        guard case .uploaded = result.freshOutcome else {
+            return XCTFail("expected fresh collection after rejection")
+        }
+        XCTAssertEqual(
+            result.reports.filter {
+                $0.collectionGeneration == 100
+            }.count,
+            1
+        )
+        XCTAssertTrue(result.entries.isEmpty)
+    }
+
+    func testGrantedSupersedeQuarantinesTerminalQueuedPost()
+        async throws
+    {
+        let result = try await runGrantedAuthorizationSupersedeRace(
+            firstAction: .fail(
+                .server(
+                    statusCode: 422,
+                    code: "activity_source_conflict",
+                    message: "terminal aggregate",
+                    detail: nil
+                )
+            )
+        )
+
+        XCTAssertEqual(
+            result.activeOutcome,
+            .skipped(reason: "ios_screen_time_sync_superseded")
+        )
+        guard case .uploaded = result.freshOutcome else {
+            return XCTFail("expected fresh collection after quarantine")
+        }
+        XCTAssertEqual(
+            result.reports.filter {
+                $0.collectionGeneration == 100
+            }.count,
+            1
+        )
+        XCTAssertEqual(result.entries.count, 1)
+        XCTAssertEqual(
+            result.entries[0].terminalReason,
+            "activity_source_conflict"
+        )
+    }
+
+    func testFenceResetSupersessionPersistsResetReportWithBackoff()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let retryPolicy = ScreenTimeActivityRetryPolicy(
+            initialDelay: 10,
+            maximumDelay: 10
+        )
+        let outboxStorage = temporaryOutbox(
+            retryPolicy: retryPolicy,
+            now: now
+        )
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let original = report(generation: 100)
+        _ = try await outboxStorage.0.enqueue(
+            report: original,
+            pairing: pairing(),
+            now: now.addingTimeInterval(-60)
+        )
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            uploadActions: [
+                .fail(
+                    .server(
+                        statusCode: 409,
+                        code:
+                            "activity_snapshot_fence_reset_required",
+                        message: "reset required",
+                        detail: nil
+                    )
+                ),
+                .succeed,
+            ],
+            stateDelayNanoseconds: 100_000_000
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let active = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+        }
+        try await waitForReports(1, from: transport)
+        try await waitForStateCalls(4, from: transport)
+        let fresh = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!,
+                trigger: .authorizationChanged
+            )
+        }
+
+        let activeOutcome = try await active.value
+        let freshOutcome = try await fresh.value
+        let reports = await transport.capturedReports()
+        let entries = await outboxStorage.0.allEntries()
+
+        XCTAssertEqual(
+            activeOutcome,
+            .skipped(reason: "ios_screen_time_sync_superseded")
+        )
+        XCTAssertEqual(
+            freshOutcome,
+            .deferred(
+                reason: "retry_backoff",
+                retryAt: now.addingTimeInterval(10),
+                queueDepth: 1
+            )
+        )
+        XCTAssertEqual(reports, [original])
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertTrue(entries[0].report.resetSnapshotFence)
+        XCTAssertNotEqual(entries[0].report, original)
+        XCTAssertEqual(entries[0].failedAttempts, 1)
+        XCTAssertEqual(
+            entries[0].nextAttemptAt,
+            now.addingTimeInterval(10)
+        )
+        XCTAssertNil(entries[0].terminalReason)
+    }
+
+    func testAuthorizationTriggerDuringTerminalUploadFencesNextQueuedItem()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        _ = try await outboxStorage.0.enqueue(
+            report: report(generation: 100),
+            pairing: pairing(),
+            now: now.addingTimeInterval(-120)
+        )
+        _ = try await outboxStorage.0.enqueue(
+            report: report(generation: 101),
+            pairing: pairing(),
+            now: now.addingTimeInterval(-60)
+        )
+        let granted = collectorResult()
+        let revoked = collectorResult(
+            capability: .unavailable,
+            permission: .revoked,
+            reason: "ios_screen_time_permission_revoked"
+        )
+        let collectorState =
+            ScreenTimeLifecycleSequencedCollectorState(
+                authorizationResults: [
+                    granted,
+                    granted,
+                    granted,
+                    granted,
+                    revoked,
+                ],
+                collectionResult: granted
+            )
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            uploadActions: [
+                .fail(
+                    .server(
+                        statusCode: 422,
+                        code: "activity_source_conflict",
+                        message: "terminal aggregate",
+                        detail: nil
+                    )
+                ),
+                .succeed,
+            ],
+            uploadDelayNanoseconds: 300_000_000
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleSequencedCollector(
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                state: collectorState
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let active = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+        }
+        try await waitForReports(1, from: transport)
+        let authorizationChange = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!,
+                trigger: .authorizationChanged
+            )
+        }
+
+        let activeOutcome = try await active.value
+        let freshOutcome = try await authorizationChange.value
+        let reports = await transport.capturedReports()
+        let entries = await outboxStorage.0.allEntries()
+        let aggregateReports = reports.filter {
+            $0.capability == .aggregate
+        }
+
+        XCTAssertEqual(
+            activeOutcome,
+            .skipped(reason: "ios_screen_time_sync_superseded")
+        )
+        XCTAssertEqual(
+            freshOutcome,
+            .unavailableReported(
+                reason: "ios_screen_time_permission_revoked"
+            )
+        )
+        XCTAssertEqual(aggregateReports.count, 1)
+        XCTAssertEqual(reports.last?.capability, .unavailable)
+        XCTAssertTrue(entries.isEmpty)
+    }
+
+    func testPendingStaleRevisionIsDeletedAndRecollected()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        _ = try await outboxStorage.0.enqueue(
+            report: report(revision: 3),
+            pairing: pairing(),
+            now: now.addingTimeInterval(-60)
+        )
+        let counter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleTestTransport(
+            states: [
+                collectionState(configRevision: 3),
+                collectionState(configRevision: 3),
+                collectionState(configRevision: 3),
+                collectionState(configRevision: 4),
+                collectionState(configRevision: 4),
+                collectionState(configRevision: 4),
+            ],
+            uploadActions: [
+                .fail(
+                    .server(
+                        statusCode: 409,
+                        code: "stale_collection_revision",
+                        message: "stale queued aggregate",
+                        detail: nil
+                    )
+                ),
+                .succeed,
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let counts = await counter.values()
+        let entries = await outboxStorage.0.allEntries()
+
+        guard case .uploaded = outcome else {
+            return XCTFail("expected stale queued report recovery")
+        }
+        XCTAssertEqual(counts.collection, 2)
+        XCTAssertEqual(
+            reports.map(\.collectionRevision),
+            [3, 4]
+        )
+        XCTAssertTrue(entries.isEmpty)
+    }
+
+    func testCollectorUnavailableIsReportedWhileAuthorizationIsGranted()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let granted = collectorResult()
+        let unavailable = collectorResult(
+            capability: .unavailable,
+            permission: .granted,
+            reason: "ios_screen_time_snapshot_exceeds_upload_limit"
+        )
+        let collectorState =
+            ScreenTimeLifecycleSequencedCollectorState(
+                authorizationResults: [granted],
+                collectionResult: unavailable
+            )
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState()
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleSequencedCollector(
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                state: collectorState
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let collectionCalls =
+            await collectorState.capturedCollectionCalls()
+
+        XCTAssertEqual(
+            outcome,
+            .unavailableReported(
+                reason: "ios_screen_time_snapshot_exceeds_upload_limit"
+            )
+        )
+        XCTAssertEqual(collectionCalls, 1)
+        XCTAssertEqual(reports.count, 1)
+        XCTAssertEqual(reports[0].capability, .unavailable)
+        XCTAssertEqual(reports[0].permissionStatus, .granted)
+    }
+
+    func testControlPlaneRejectionsNeverQuarantinePrivatePayload()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let codes = [
+            "activity_outside_retention",
+            "activity_collection_blocked",
+            "ios_exclusion_reapproval_required",
+        ]
+
+        for code in codes {
+            let outboxStorage = temporaryOutbox(now: now)
+            defer {
+                try? FileManager.default.removeItem(
+                    at: outboxStorage.1
+                )
+            }
+            let stateStorage = isolatedStateStore()
+            defer {
+                stateStorage.1.removePersistentDomain(
+                    forName: stateStorage.2
+                )
+            }
+            let counter = ScreenTimeLifecycleTestCounter()
+            let rejection = ScreenTimeLifecycleUploadAction.fail(
+                .server(
+                    statusCode: 422,
+                    code: code,
+                    message: "control plane changed",
+                    detail: nil
+                )
+            )
+            let transport = ScreenTimeLifecycleTestTransport(
+                state: collectionState(),
+                uploadActions: [
+                    rejection,
+                    rejection,
+                    rejection,
+                ]
+            )
+            let service = ScreenTimeActivitySyncService(
+                deviceID: "ios-lifecycle-device",
+                collector: ScreenTimeLifecycleTestCollector(
+                    result: collectorResult(),
+                    pseudonymKeyID:
+                        "ios-key-" + String(repeating: "1", count: 40),
+                    counter: counter
+                ),
+                transport: transport,
+                stateStore: stateStorage.0,
+                outbox: outboxStorage.0
+            )
+
+            let outcome = try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+            let entries = await outboxStorage.0.allEntries()
+            let counts = await counter.values()
+            let reports = await transport.capturedReports()
+
+            XCTAssertEqual(
+                outcome,
+                .skipped(
+                    reason:
+                        "ios_screen_time_collection_configuration_changed"
+                ),
+                code
+            )
+            XCTAssertEqual(counts.collection, 3, code)
+            XCTAssertEqual(reports.count, 3, code)
+            XCTAssertTrue(entries.isEmpty, code)
+        }
+    }
+
+    func testServerStaleRevisionTriggersFreshCollectionInsteadOfQuarantine()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let counter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleTestTransport(
+            states: [
+                collectionState(configRevision: 3),
+                collectionState(configRevision: 3),
+                collectionState(configRevision: 3),
+                collectionState(configRevision: 4),
+                collectionState(configRevision: 4),
+                collectionState(configRevision: 4),
+            ],
+            uploadActions: [
+                .fail(
+                    .server(
+                        statusCode: 409,
+                        code: "stale_collection_revision",
+                        message: "collection settings changed",
+                        detail: nil
+                    )
+                ),
+                .succeed,
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let counts = await counter.values()
+        let pending = await outboxStorage.0.pendingCount(
+            deviceID: "ios-lifecycle-device",
+            pairing: pairing()
+        )
+        let quarantined = await outboxStorage.0.quarantinedCount(
+            deviceID: "ios-lifecycle-device",
+            pairing: pairing()
+        )
+
+        guard case .uploaded = outcome else {
+            return XCTFail("expected fresh revision to recover")
+        }
+        XCTAssertEqual(counts.collection, 2)
+        XCTAssertEqual(
+            reports.map(\.collectionRevision),
+            [3, 4]
+        )
+        XCTAssertEqual(pending, 0)
+        XCTAssertEqual(quarantined, 0)
+    }
+
+    func testRepeatedCollectionChangesStopAfterThreeFreshAttempts()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let counter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleTestTransport(
+            states: [
+                collectionState(configRevision: 1),
+                collectionState(configRevision: 2),
+                collectionState(configRevision: 2),
+                collectionState(configRevision: 3),
+                collectionState(configRevision: 3),
+                collectionState(configRevision: 4),
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let counts = await counter.values()
+        let stateCalls = await transport.capturedStateCalls()
+
+        XCTAssertEqual(
+            outcome,
+            .skipped(
+                reason:
+                    "ios_screen_time_collection_configuration_changed"
+            )
+        )
+        XCTAssertEqual(counts.collection, 3)
+        XCTAssertEqual(stateCalls, 6)
+        XCTAssertTrue(reports.isEmpty)
     }
 
     func testDisabledPurgesPendingDataWithoutCollectingOrUploading()

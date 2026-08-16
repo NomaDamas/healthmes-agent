@@ -194,6 +194,17 @@ private struct ScreenTimeUploadAttemptFailure: Error {
     let underlying: Error
 }
 
+private enum ScreenTimeSyncControl: Error {
+    case collectionConfigurationChanged
+    case pipelineSuperseded
+}
+
+private struct ScreenTimeUploadFence {
+    let state: ScreenTimeCollectionState
+    let authorization: ScreenTimeCollectorResult
+    let controlEpoch: UInt64
+}
+
 private struct ScreenTimeSyncRequest {
     let pairing: Pairing
     let destinationID: String
@@ -347,32 +358,33 @@ private enum ScreenTimeUploadFailurePolicy {
     }
 
     static func shouldQuarantine(_ error: Error) -> Bool {
+        if error is CancellationError
+            || error is ScreenTimeSyncControl
+            || requiresCollectionRefresh(error)
+            || isRetryable(error)
+        {
+            return false
+        }
+        // A POST was started and the failure is neither transient nor a
+        // collection-policy refresh. Quarantine every remaining response so
+        // malformed 4xx responses and unknown transport implementations
+        // cannot be replayed immediately forever.
+        return true
+    }
+
+    static func requiresCollectionRefresh(_ error: Error) -> Bool {
         guard let error = error as? HealthMesAPIError else {
             return false
         }
-        switch error {
-        case .server(let statusCode, let code, _, _):
-            if statusCode == 422 {
-                return true
-            }
-            if statusCode == 409 {
-                return code != "activity_write_conflict"
-            }
-            return [
-                "activity_collection_blocked",
-                "activity_future_data",
-                "activity_outside_retention",
-                "activity_source_conflict",
-                "activity_source_mode_conflict",
-                "ios_exclusion_reapproval_required",
-                "snapshot_retry_response_unavailable",
-                "stale_collection_revision",
-            ].contains(code)
-        case .httpStatus(let statusCode):
-            return statusCode == 409 || statusCode == 422
-        case .notPaired, .unauthorized, .transport, .decoding:
+        guard case .server(_, let code, _, _) = error else {
             return false
         }
+        return [
+            "activity_collection_blocked",
+            "activity_outside_retention",
+            "ios_exclusion_reapproval_required",
+            "stale_collection_revision",
+        ].contains(code)
     }
 
     static func statusCode(_ error: Error) -> Int? {
@@ -423,6 +435,7 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
     private let cleanupDeviceIDs: Set<String>
     private var activeSync: ScreenTimeActiveSync?
     private var pendingSync: ScreenTimePendingSync?
+    private var controlEpoch: UInt64 = 0
 
     init(
         deviceID: String,
@@ -474,6 +487,7 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
     }
 
     func disableAndPurge(now: Date) async throws {
+        controlEpoch &+= 1
         let activeTask = activeSync?.task
         let pendingTask = pendingSync?.task
         activeSync = nil
@@ -515,6 +529,9 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         trigger: ScreenTimeSyncTrigger = .routine
     ) async throws -> ScreenTimeSyncOutcome {
         try Task.checkCancellation()
+        if trigger.requiresFreshRun {
+            controlEpoch &+= 1
+        }
         let request = ScreenTimeSyncRequest(
             pairing: pairing,
             destinationID:
@@ -784,24 +801,52 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         now: Date,
         timezone: TimeZone
     ) async throws -> ScreenTimeSyncOutcome {
+        for attempt in 0..<3 {
+            let expectedControlEpoch = controlEpoch
+            do {
+                return try await performSyncAttempt(
+                    pairing: pairing,
+                    now: now,
+                    timezone: timezone,
+                    expectedControlEpoch: expectedControlEpoch
+                )
+            } catch ScreenTimeSyncControl.collectionConfigurationChanged {
+                if attempt == 2 {
+                    return .skipped(
+                        reason:
+                            "ios_screen_time_collection_configuration_changed"
+                    )
+                }
+            } catch ScreenTimeSyncControl.pipelineSuperseded {
+                return .skipped(
+                    reason: "ios_screen_time_sync_superseded"
+                )
+            }
+        }
+        return .skipped(
+            reason: "ios_screen_time_collection_configuration_changed"
+        )
+    }
+
+    private func performSyncAttempt(
+        pairing: Pairing,
+        now: Date,
+        timezone: TimeZone,
+        expectedControlEpoch: UInt64
+    ) async throws -> ScreenTimeSyncOutcome {
+        try requireCurrentControlEpoch(expectedControlEpoch)
         try await outbox.reconcile(
             deviceID: deviceID,
             pairing: pairing,
             now: now
         )
-        let state = try await transport.collectionState(
+        try requireCurrentControlEpoch(expectedControlEpoch)
+        let initialFence = try await refreshedUploadFence(
             pairing: pairing,
-            deviceID: deviceID
+            now: now,
+            expectedControlEpoch: expectedControlEpoch
         )
-        let authorization =
-            await collector.currentAuthorizationStatus()
-        try await outbox.reconcile(
-            deviceID: deviceID,
-            pairing: pairing,
-            state: state,
-            authorization: authorization,
-            now: now
-        )
+        let state = initialFence.state
         if let reason = ScreenTimeSyncPlanner.skipReason(
             state: state,
             now: now
@@ -859,11 +904,25 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
                 // A transient export failure must not starve reports already
                 // durably queued. Re-check authorization first so a grant
                 // revoked during export cannot leak the older aggregate.
-                if let pendingOutcome = try await flushPendingUploads(
+                let fence = try await refreshedUploadFence(
                     pairing: pairing,
-                    authorization: currentAuthorization,
-                    now: now
+                    now: now,
+                    expectedControlEpoch: expectedControlEpoch
+                )
+                if collectionContractChanged(
+                    from: state,
+                    to: fence.state
                 ) {
+                    throw ScreenTimeSyncControl
+                        .collectionConfigurationChanged
+                }
+                let pending = try await flushPendingUploads(
+                    pairing: pairing,
+                    initialFence: fence,
+                    now: now,
+                    expectedControlEpoch: expectedControlEpoch
+                )
+                if let pendingOutcome = pending.outcome {
                     return pendingOutcome
                 }
                 throw ScreenTimeActivityCollectionError.exportFailed
@@ -876,18 +935,44 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
                 result = currentAuthorization
             }
         }
-        try await outbox.reconcile(
-            deviceID: deviceID,
+        var uploadFence = try await refreshedUploadFence(
             pairing: pairing,
-            authorization: result,
-            now: now
+            now: now,
+            expectedControlEpoch: expectedControlEpoch
         )
-        if let pendingOutcome = try await flushPendingUploads(
-            pairing: pairing,
-            authorization: result,
+        result = try validatedCollectionResult(
+            result,
+            initialState: state,
+            window: window,
+            uploadFence: uploadFence
+        )
+        if let reason = ScreenTimeSyncPlanner.skipReason(
+            state: uploadFence.state,
             now: now
         ) {
+            return .skipped(reason: reason)
+        }
+        let pending = try await flushPendingUploads(
+            pairing: pairing,
+            initialFence: uploadFence,
+            now: now,
+            expectedControlEpoch: expectedControlEpoch
+        )
+        if let pendingOutcome = pending.outcome {
             return pendingOutcome
+        }
+        uploadFence = pending.fence
+        result = try validatedCollectionResult(
+            result,
+            initialState: state,
+            window: window,
+            uploadFence: uploadFence
+        )
+        if let reason = ScreenTimeSyncPlanner.skipReason(
+            state: uploadFence.state,
+            now: now
+        ) {
+            return .skipped(reason: reason)
         }
         guard
             result.permitsAggregateUpload,
@@ -910,13 +995,14 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
                 permissionStatus: result.permissionStatus,
                 reason: reason,
                 collectedAt: now,
-                collectionRevision: state.configRevision,
+                collectionRevision: uploadFence.state.configRevision,
                 collectionGeneration: generation
             )
             return try await deliver(
                 pairing: pairing,
                 report: report,
                 now: now,
+                expectedControlEpoch: expectedControlEpoch,
                 success: { _ in
                     .unavailableReported(reason: reason)
                 }
@@ -941,7 +1027,7 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             timezone: timezone.identifier,
             pseudonymKeyID: pseudonymKeyID,
             collectedAt: now,
-            collectionRevision: state.configRevision,
+            collectionRevision: uploadFence.state.configRevision,
             collectionGeneration: generation,
             snapshotSequence: sequence,
             snapshotStart: window.start,
@@ -955,48 +1041,105 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             pairing: pairing,
             report: report,
             now: now,
+            expectedControlEpoch: expectedControlEpoch,
             success: ScreenTimeSyncOutcome.uploaded
         )
     }
 
     private func flushPendingUploads(
         pairing: Pairing,
-        authorization: ScreenTimeCollectorResult,
-        now: Date
-    ) async throws -> ScreenTimeSyncOutcome? {
+        initialFence: ScreenTimeUploadFence,
+        now: Date,
+        expectedControlEpoch: UInt64
+    ) async throws -> (
+        outcome: ScreenTimeSyncOutcome?,
+        fence: ScreenTimeUploadFence
+    ) {
+        var fence = initialFence
         while true {
+            try requireCurrentControlEpoch(expectedControlEpoch)
             try await outbox.reconcile(
                 deviceID: deviceID,
                 pairing: pairing,
-                authorization: authorization,
+                state: fence.state,
+                authorization: fence.authorization,
                 now: now
             )
+            if let reason = ScreenTimeSyncPlanner.skipReason(
+                state: fence.state,
+                now: now
+            ) {
+                return (.skipped(reason: reason), fence)
+            }
             guard
                 let entry = await outbox.oldest(
                     deviceID: deviceID,
                     pairing: pairing
                 )
             else {
-                return nil
+                return (nil, fence)
             }
             let queueDepth = await outbox.pendingCount(
                 deviceID: deviceID,
                 pairing: pairing
             )
             guard entry.nextAttemptAt <= now else {
-                return .deferred(
-                    reason: "retry_backoff",
-                    retryAt: entry.nextAttemptAt,
-                    queueDepth: queueDepth
+                return (
+                    .deferred(
+                        reason: "retry_backoff",
+                        retryAt: entry.nextAttemptAt,
+                        queueDepth: queueDepth
+                    ),
+                    fence
                 )
             }
             do {
                 _ = try await uploadWithFenceRecovery(
                     pairing: pairing,
-                    report: entry.report
+                    report: entry.report,
+                    now: now,
+                    expectedControlEpoch: expectedControlEpoch
                 )
                 try await outbox.markSucceeded(id: entry.id)
+                // Once a POST starts, settle that exact durable item before
+                // allowing a newer control epoch to stop this pipeline.
+                try requireCurrentControlEpoch(expectedControlEpoch)
+                fence = try await refreshedUploadFence(
+                    pairing: pairing,
+                    now: now,
+                    expectedControlEpoch: expectedControlEpoch
+                )
             } catch let failure as ScreenTimeUploadAttemptFailure {
+                if failure.underlying is CancellationError {
+                    _ = try await markInterruptedUpload(
+                        entry: entry,
+                        report: failure.report,
+                        pairing: pairing,
+                        now: now
+                    )
+                    throw CancellationError()
+                }
+                if let control =
+                    failure.underlying as? ScreenTimeSyncControl
+                {
+                    _ = try await markInterruptedUpload(
+                        entry: entry,
+                        report: failure.report,
+                        pairing: pairing,
+                        now: now
+                    )
+                    throw control
+                }
+                if ScreenTimeUploadFailurePolicy
+                    .requiresCollectionRefresh(failure.underlying)
+                {
+                    try await outbox.markSucceeded(id: entry.id)
+                    try requireCurrentControlEpoch(
+                        expectedControlEpoch
+                    )
+                    throw ScreenTimeSyncControl
+                        .collectionConfigurationChanged
+                }
                 if ScreenTimeUploadFailurePolicy.isRetryable(
                     failure.underlying
                 ) {
@@ -1017,7 +1160,7 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
                     }
                     let retryAt = failedEntry?.nextAttemptAt
                         ?? now.addingTimeInterval(60)
-                    return .queued(
+                    let outcome = ScreenTimeSyncOutcome.queued(
                         reason: ScreenTimeUploadFailurePolicy.reason(
                             failure.underlying
                         ),
@@ -1026,6 +1169,13 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
                             deviceID: deviceID,
                             pairing: pairing
                         )
+                    )
+                    try requireCurrentControlEpoch(
+                        expectedControlEpoch
+                    )
+                    return (
+                        outcome,
+                        fence
                     )
                 }
                 if ScreenTimeUploadFailurePolicy.shouldQuarantine(
@@ -1043,8 +1193,16 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
                             ),
                         now: now
                     )
+                    try requireCurrentControlEpoch(
+                        expectedControlEpoch
+                    )
                     // A malformed or permanently stale item must not starve
                     // newer snapshots in the oldest-first queue.
+                    fence = try await refreshedUploadFence(
+                        pairing: pairing,
+                        now: now,
+                        expectedControlEpoch: expectedControlEpoch
+                    )
                     continue
                 }
                 throw failure.underlying
@@ -1052,20 +1210,97 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         }
     }
 
+    @discardableResult
+    private func markInterruptedUpload(
+        entry: ScreenTimeActivityOutboxEntry,
+        report: ScreenTimeActivityReport,
+        pairing: Pairing,
+        now: Date
+    ) async throws -> ScreenTimeActivityOutboxEntry? {
+        if report == entry.report {
+            return try await outbox.markFailed(
+                id: entry.id,
+                now: now
+            )
+        }
+        return try await outbox.replaceAndMarkFailed(
+            id: entry.id,
+            with: report,
+            pairing: pairing,
+            now: now
+        )
+    }
+
+    private func refreshedUploadFence(
+        pairing: Pairing,
+        now: Date,
+        expectedControlEpoch: UInt64
+    ) async throws -> ScreenTimeUploadFence {
+        try requireCurrentControlEpoch(expectedControlEpoch)
+        let state = try await transport.collectionState(
+            pairing: pairing,
+            deviceID: deviceID
+        )
+        try requireCurrentControlEpoch(expectedControlEpoch)
+        let authorization =
+            await collector.currentAuthorizationStatus()
+        try requireCurrentControlEpoch(expectedControlEpoch)
+        try await outbox.reconcile(
+            deviceID: deviceID,
+            pairing: pairing,
+            state: state,
+            authorization: authorization,
+            now: now
+        )
+        try requireCurrentControlEpoch(expectedControlEpoch)
+        return ScreenTimeUploadFence(
+            state: state,
+            authorization: authorization,
+            controlEpoch: expectedControlEpoch
+        )
+    }
+
     private func deliver(
         pairing: Pairing,
         report: ScreenTimeActivityReport,
         now: Date,
+        expectedControlEpoch: UInt64,
         success: (ScreenTimeActivityBatchResult) -> ScreenTimeSyncOutcome
     ) async throws -> ScreenTimeSyncOutcome {
         do {
             return success(
                 try await uploadWithFenceRecovery(
                     pairing: pairing,
-                    report: report
+                    report: report,
+                    now: now,
+                    expectedControlEpoch: expectedControlEpoch
                 )
             )
         } catch let failure as ScreenTimeUploadAttemptFailure {
+            if failure.underlying is CancellationError {
+                _ = try await enqueueInterruptedUpload(
+                    pairing: pairing,
+                    report: failure.report,
+                    now: now
+                )
+                throw CancellationError()
+            }
+            if let control =
+                failure.underlying as? ScreenTimeSyncControl
+            {
+                _ = try await enqueueInterruptedUpload(
+                    pairing: pairing,
+                    report: failure.report,
+                    now: now
+                )
+                throw control
+            }
+            if ScreenTimeUploadFailurePolicy
+                .requiresCollectionRefresh(failure.underlying)
+            {
+                throw ScreenTimeSyncControl
+                    .collectionConfigurationChanged
+            }
             if ScreenTimeUploadFailurePolicy.isRetryable(
                 failure.underlying
             ) {
@@ -1120,39 +1355,218 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         }
     }
 
+    @discardableResult
+    private func enqueueInterruptedUpload(
+        pairing: Pairing,
+        report: ScreenTimeActivityReport,
+        now: Date
+    ) async throws -> ScreenTimeActivityOutboxEntry? {
+        let entry = try await outbox.enqueue(
+            report: report,
+            pairing: pairing,
+            now: now
+        )
+        return try await outbox.markFailed(
+            id: entry.id,
+            now: now
+        )
+    }
+
     private func uploadWithFenceRecovery(
         pairing: Pairing,
-        report: ScreenTimeActivityReport
+        report: ScreenTimeActivityReport,
+        now: Date,
+        expectedControlEpoch: UInt64
     ) async throws -> ScreenTimeActivityBatchResult {
         do {
-            return try await transport.upload(
+            return try await uploadAfterRefreshingFence(
                 pairing: pairing,
-                report: report
+                report: report,
+                now: now,
+                expectedControlEpoch: expectedControlEpoch
             )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch let error as HealthMesAPIError
-            where ScreenTimeSyncPlanner.shouldResetSnapshotFence(error)
-        {
+        } catch let failure as ScreenTimeUploadAttemptFailure {
+            guard
+                let apiError = failure.underlying as? HealthMesAPIError,
+                ScreenTimeSyncPlanner.shouldResetSnapshotFence(apiError)
+            else {
+                throw failure
+            }
             let resetReport = report.resettingSnapshotFence()
             do {
-                return try await transport.upload(
+                return try await uploadAfterRefreshingFence(
                     pairing: pairing,
-                    report: resetReport
+                    report: resetReport,
+                    now: now,
+                    expectedControlEpoch: expectedControlEpoch
                 )
-            } catch is CancellationError {
-                throw CancellationError()
+            } catch let retryFailure
+                as ScreenTimeUploadAttemptFailure
+            {
+                throw retryFailure
             } catch {
+                // The first POST received a definitive reset response. Even
+                // if cancellation or supersession happens while refreshing
+                // the second fence, persist the replacement report so the
+                // original snapshot cannot be replayed.
                 throw ScreenTimeUploadAttemptFailure(
                     report: resetReport,
                     underlying: error
                 )
             }
+        }
+    }
+
+    private func uploadAfterRefreshingFence(
+        pairing: Pairing,
+        report: ScreenTimeActivityReport,
+        now: Date,
+        expectedControlEpoch: UInt64
+    ) async throws -> ScreenTimeActivityBatchResult {
+        let fence = try await refreshedUploadFence(
+            pairing: pairing,
+            now: now,
+            expectedControlEpoch: expectedControlEpoch
+        )
+        guard reportCanUpload(
+            report,
+            through: fence,
+            now: now
+        ) else {
+            throw ScreenTimeSyncControl
+                .collectionConfigurationChanged
+        }
+        try requireCurrentControlEpoch(expectedControlEpoch)
+        do {
+            return try await transport.upload(
+                pairing: pairing,
+                report: report
+            )
         } catch {
             throw ScreenTimeUploadAttemptFailure(
                 report: report,
                 underlying: error
             )
+        }
+    }
+
+    private func requireCurrentControlEpoch(
+        _ expectedControlEpoch: UInt64
+    ) throws {
+        guard controlEpoch == expectedControlEpoch else {
+            throw ScreenTimeSyncControl.pipelineSuperseded
+        }
+    }
+
+    private func collectionContractChanged(
+        from previous: ScreenTimeCollectionState,
+        to current: ScreenTimeCollectionState
+    ) -> Bool {
+        previous.deviceID != current.deviceID
+            || previous.enabled != current.enabled
+            || Set(previous.excludedApps) != Set(current.excludedApps)
+            || previous.pausedUntil != current.pausedUntil
+            || previous.effectiveCollecting
+                != current.effectiveCollecting
+            || previous.blockedReason != current.blockedReason
+            || previous.configRevision != current.configRevision
+    }
+
+    private func validatedCollectionResult(
+        _ collected: ScreenTimeCollectorResult,
+        initialState: ScreenTimeCollectionState,
+        window: ScreenTimeCollectionWindow,
+        uploadFence: ScreenTimeUploadFence
+    ) throws -> ScreenTimeCollectorResult {
+        if collectionContractChanged(
+            from: initialState,
+            to: uploadFence.state
+        ) {
+            throw ScreenTimeSyncControl.collectionConfigurationChanged
+        }
+        if collected.permitsAggregateUpload,
+            retentionInvalidates(
+                window: window,
+                result: collected,
+                cutoff: uploadFence.state.rawRetentionCutoff
+            )
+        {
+            throw ScreenTimeSyncControl.collectionConfigurationChanged
+        }
+        if collected.permitsAggregateUpload {
+            return uploadFence.authorization.permitsAggregateUpload
+                ? collected
+                : uploadFence.authorization
+        }
+        if uploadFence.authorization.permitsAggregateUpload {
+            return collected
+        }
+        return uploadFence.authorization
+    }
+
+    private func retentionInvalidates(
+        window: ScreenTimeCollectionWindow,
+        result: ScreenTimeCollectorResult,
+        cutoff: Date?
+    ) -> Bool {
+        guard let cutoff else { return false }
+        if window.start <= cutoff {
+            return true
+        }
+        if result.samples.contains(where: { $0.bucketStart <= cutoff }) {
+            return true
+        }
+        return result.authoritativeBucketStarts.contains(where: {
+            $0 <= cutoff
+        })
+    }
+
+    private func reportCanUpload(
+        _ report: ScreenTimeActivityReport,
+        through fence: ScreenTimeUploadFence,
+        now: Date
+    ) -> Bool {
+        guard fence.controlEpoch == controlEpoch else {
+            return false
+        }
+        guard
+            ScreenTimeSyncPlanner.skipReason(
+                state: fence.state,
+                now: now
+            ) == nil,
+            report.collectionRevision == fence.state.configRevision
+        else {
+            return false
+        }
+        if let cutoff = fence.state.rawRetentionCutoff {
+            if let snapshotStart = report.snapshotStart,
+                snapshotStart <= cutoff
+            {
+                return false
+            }
+            if report.samples.contains(where: {
+                $0.bucketStart <= cutoff
+            }) {
+                return false
+            }
+            if report.authoritativeBucketStarts.contains(where: {
+                $0 <= cutoff
+            }) {
+                return false
+            }
+        }
+        switch report.capability {
+        case .aggregate:
+            return report.permissionStatus == .granted
+                && fence.authorization.permitsAggregateUpload
+        case .unavailable:
+            if fence.authorization.permitsAggregateUpload {
+                return report.permissionStatus == .granted
+                    || report.permissionStatus == .unavailable
+                    || report.permissionStatus == .unknown
+            }
+            return report.permissionStatus
+                == fence.authorization.permissionStatus
         }
     }
 }

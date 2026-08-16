@@ -17,10 +17,50 @@ esac
 
 sdk="${HEALTHMES_SCREENTIME_SDK:-iphonesimulator}"
 configuration="${HEALTHMES_SCREENTIME_CONFIGURATION:-ScreenTimeOptInDebug}"
-destination="${HEALTHMES_SCREENTIME_DESTINATION:-generic/platform=iOS Simulator}"
 sdk_path="$(xcrun --sdk "${sdk}" --show-sdk-path)"
 probe_root="$(mktemp -d "${TMPDIR:-/tmp}/healthmes-screentime-sdk.XXXXXX")"
 trap 'rm -rf "${probe_root}"' EXIT
+
+destination="${HEALTHMES_SCREENTIME_DESTINATION:-}"
+if [[ -z "${destination}" ]]; then
+  if [[ "${action}" == "test" && "${sdk}" == iphonesimulator* ]]; then
+    simulators_json="${probe_root}/simulators.json"
+    xcrun simctl list devices available --json >"${simulators_json}"
+    simulator_id="$(
+      python3 - "${simulators_json}" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    devices = json.load(handle)["devices"]
+
+best = None
+for runtime, entries in devices.items():
+    match = re.search(r"iOS-(\d+)-(\d+)", runtime)
+    if not match:
+        continue
+    version = (int(match.group(1)), int(match.group(2)))
+    for device in entries:
+        if device.get("isAvailable") and device["name"].startswith("iPhone"):
+            if best is None or version > best[0]:
+                best = (version, device["udid"])
+
+if best is None:
+    sys.exit("no available iPhone simulator")
+print(best[1])
+PY
+    )"
+    destination="platform=iOS Simulator,id=${simulator_id}"
+  elif [[ "${action}" == "test" && "${sdk}" == iphoneos* ]]; then
+    echo "HEALTHMES_SCREENTIME_DESTINATION must name a concrete physical iPhone for iphoneos tests (for example: platform=iOS,id=<UDID>)" >&2
+    exit 64
+  elif [[ "${sdk}" == iphoneos* ]]; then
+    destination="generic/platform=iOS"
+  else
+    destination="generic/platform=iOS Simulator"
+  fi
+fi
 
 case "${configuration}" in
   ScreenTimeOptInDebug|ScreenTimeOptInRelease)
