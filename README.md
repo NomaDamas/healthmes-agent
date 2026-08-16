@@ -41,9 +41,8 @@ HealthMes MCP
 source validation + conditional compact decision record
 ```
 
-This is the target architecture, not an assertion that the current PR branch
-already implements every edge. The current-to-target gaps and completion
-criteria are tracked in
+PR #138 implements this runtime boundary. Exact capability limits, external
+Apple prerequisites, and verification criteria are tracked in
 [`docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md).
 
 ## What works today
@@ -71,7 +70,7 @@ criteria are tracked in
 - Proactive alert loop (`healthmes/engine/`): deterministic 10-minute trigger
   sweep (stress spike vs baseline, low recovery + heavy afternoon, external
   schedule changes, deadline risk) currently sends an HMAC-signed webhook to
-  Hermes for Telegram delivery. PR #138 migrates wellness reasoning for these
+  Hermes for Telegram delivery. PR #138 routes wellness reasoning for these
   triggers to the same internal HealthMes DecisionRequest ingress as
   interactive questions; Telegram remains an outbound delivery adapter.
   Alert hygiene is already built in: per-rule cooldown, daily budget, quiet
@@ -336,6 +335,9 @@ the service refuses to start unauthenticated on a non-loopback bind).
 
 Product wellness questions must use `POST /v1/wellness-decisions`; this is
 the single HealthMes ingress that owns source validation and finalization.
+HealthMes starts its core `/health` and `/mcp` surfaces before the optional
+Hermes decision runtime. The first decision lazily validates the runtime and
+retries verification on a later request after a transient failure.
 The vendor `hermes` / `hermes chat` CLI remains available for isolated Hermes
 runtime diagnostics, but calling it directly is not an equivalent HealthMes
 wellness path and must not be used for product QA. See

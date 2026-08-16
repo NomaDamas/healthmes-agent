@@ -34,6 +34,10 @@ HealthMes와 Hermes가 각각 LLM loop를 하나씩 가지지 않는다. Hermes�
 autonomous LLM/tool loop를 실행하고 HealthMes가 그 loop의 제품 입출력과 데이터
 경계를 소유한다.
 
+외부 제품 ingress는 `POST /v1/wellness-decisions` 하나다. 내부
+`POST /v1/responses`는 `HermesResponsesDecisionAgent`가 사용하는 구현 계약이며
+두 번째 사용자 경로가 아니다.
+
 ## 1. 컴포넌트 책임
 
 | 컴포넌트 | 추상화 수준 | 책임 |
@@ -148,7 +152,7 @@ Hermes 마지막 assistant text는 JSON 하나여야 한다.
   "decision": {
     "status": "completed",
     "answer": "짧은 사용자 답변",
-    "record_summary": "오후 카페인은 피하고 10분 쉬기",
+    "record_summary": null,
     "proposed_action": true,
     "persistence_intent": "action",
     "used_source_ref_ids": [
@@ -171,8 +175,11 @@ Hermes 마지막 assistant text는 JSON 하나여야 한다.
 - 짝이 없는 function call/output
 - 실제 결과에 없는 source ref
 - status와 answer/clarification invariant 불일치
-- 저장 대상인데 160자 이하의 privacy-minimized `record_summary`가 없음
 - response size 또는 요청 deadline 초과
+
+`record_summary`는 과거 runtime과의 호환을 위한 선택 transient hint다. 값이
+있으면 원문 답변 복사, identifier와 민감정보를 포함하지 않는지 검증하지만,
+HealthMes는 이 모델 작성 문장을 장기 저장하지 않는다.
 
 ## 7. 조건부 Finalization
 
@@ -187,8 +194,20 @@ trusted caller의 명시적 추적 요청  -> explicit_tracking
 ```
 
 `none`이면 DecisionRecord를 만들지 않는다. 저장하는 경우에도 원문 질문, 전체 답변,
-transcript와 tool payload를 복제하지 않는다. 대신 LLM이 별도로 작성한 160자 이하의
-`record_summary`만 저장해 나중에 실제 결론과 제안 행동을 복구할 수 있게 한다.
+모델 작성 `record_summary`, transcript와 tool payload를 복제하지 않는다. 대신
+검증된 effective persistence intent로부터 HealthMes가 다음 category-only 요약 중
+하나를 생성해 저장한다.
+
+```text
+action            -> A wellness action recommendation was recorded.
+risk              -> A wellness risk warning was recorded.
+explicit_tracking -> A wellness decision was explicitly tracked.
+```
+
+따라서 저장 레코드만으로 원래의 상세 조언 문장을 재생하지 않는다. 상세 답변은
+현재 요청의 `DecisionResult`로만 반환하고, 장기 레코드는 최소한의 종류,
+source_refs와 runtime metadata만 남긴다. 과거 payload v1-v4는 read compatibility를
+유지하지만 새 쓰기는 privacy-safe v5 형식을 사용한다.
 
 finalizer는 다음을 하나의 bounded write 절차로 처리한다.
 
@@ -243,6 +262,20 @@ build_configured_decision_engine(...)
 `HealthMesDecisionService`가 REST, channel, proactive와 scheduled 요청의 공통
 진입점이다. bounded command가 별도 endpoint를 가지더라도 자유 형식 LLM 판단을
 하지 않으므로 두 번째 reasoning 경로가 아니다.
+
+### 프로세스 시작 경계
+
+HealthMes core는 optional Hermes runtime보다 먼저 시작한다.
+
+```text
+HealthMes /health + /mcp ready
+  -> Hermes decision runtime ready
+  -> 첫 ask()가 profile/model/toolset을 lazy 검증
+```
+
+첫 검증 실패는 해당 요청만 `blocked`로 만들고 다음 요청에서 재시도한다. 이 순서로
+Hermes가 HealthMes MCP를 필요로 하면서 HealthMes startup이 Hermes를 기다리는
+순환 의존을 제거한다.
 
 ## 10. 확장 원칙
 

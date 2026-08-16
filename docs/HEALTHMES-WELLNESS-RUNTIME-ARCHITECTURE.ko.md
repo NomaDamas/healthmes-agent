@@ -2,8 +2,8 @@
 
 > **결정일:** 2026-08-16
 >
-> **상태:** PR #138의 canonical 아키텍처. 구현과 문서가 다르면 이 문서의
-> 책임 경계를 기준으로 코드를 수정한다.
+> **상태:** PR #138의 canonical 아키텍처이자 현재 구현 기준. 구현과 문서가
+> 다르면 이 문서의 책임 경계를 기준으로 수정한다.
 >
 > **범위:** 자유 형식 wellness 판단, HealthMes MCP, 도메인 저장 경계,
 > 조건부 판단 기록, iPhone Screen Time 수집 lifecycle과 입력 설정 계약.
@@ -40,6 +40,10 @@ App / Web / Channel / Proactive / Scheduled
  source_refs 검증 + 필요한 경우만 compact DecisionRecord
 ```
 
+`POST /v1/wellness-decisions`가 외부 제품 ingress다. 도식 안의 Hermes
+`/v1/responses`는 HealthMes가 내부에서 호출하는 runtime 계약이며, 앱이나
+사용자가 선택할 수 있는 두 번째 제품 경로가 아니다.
+
 두 개의 LLM loop를 합치는 방식은 다음과 같다.
 
 - **HealthMes**가 제품 ingress, 데이터, 도구 계약, 저장·보존, 결과 검증을
@@ -49,6 +53,9 @@ App / Web / Channel / Proactive / Scheduled
 - HealthMes가 Hermes에게 한 번씩 생각을 요청하고 직접 tool loop를 돌리는
   split-runtime은 사용하지 않는다.
 - 폐기된 `/v1/model/iterations` adapter, 공개 builder와 계약 문서는 제거한다.
+- MVP는 subagent를 spawn하지 않는다. 하나의 Hermes turn이 필요한 HealthMes
+  도구를 직접 선택한다. 향후 위임을 추가해도 외부 ingress와 데이터 접근 계약은
+  그대로 유지해야 한다.
 
 ## 1. Capability Boundary
 
@@ -125,6 +132,32 @@ DecisionServiceRequest
 Hermes CLI나 Hermes `/v1/responses`를 사용자가 직접 호출한 결과는 HealthMes 제품
 판단이 아니다. 그것은 HealthMes ingress, source 검증과 조건부 기록을 우회한다.
 
+### 시작 순서와 지연 runtime 검증
+
+HealthMes의 `/mcp`가 먼저 열려야 Hermes가 도구를 등록할 수 있으므로 두 프로세스가
+서로의 startup을 기다리게 만들지 않는다.
+
+```text
+bootstrap / migration
+  -> Open Wearables와 background workers
+  -> HealthMes 시작
+  -> HealthMes /health와 /mcp 준비
+  -> optional Hermes decision runtime 시작
+  -> Hermes runtime-health 준비
+  -> 첫 wellness 질문에서 profile/model/toolset 검증
+```
+
+Docker Compose에서도 `hermes-decision`만 `healthmes: service_healthy`에
+의존한다. HealthMes는 Hermes에 역의존하지 않는다. 따라서 Hermes가 아직
+설정되지 않았거나 일시적으로 내려가 있어도 core ingest, 저장, `/health`와
+`/mcp`는 시작된다.
+
+첫 질문의 lazy 검증이 실패하면 그 요청은 안전하게 `blocked`로 반환한다. 검증
+성공 상태를 거짓으로 캐시하지 않으므로 다음 질문은 runtime 검증을 다시 시도한다.
+`HealthMesDecisionEngine.astart()`는 배포 도구가 명시적으로 readiness를
+확인하고 싶을 때 사용할 수 있는 선택 API로 남지만 FastAPI lifespan의 선행
+조건은 아니다.
+
 ### bounded command는 두 번째 reasoning 경로가 아니다
 
 사용자가 이미 의도를 확정한 쓰기는 별도 command로 남을 수 있다.
@@ -177,6 +210,11 @@ Context Access Layer
 LLM은 `question_kind -> 고정 domain 표`를 따르지 않는다. 첫 결과의
 `coverage`, `freshness`, `limitations`를 보고 다른 domain이나 기간을 추가로
 조회할 수 있다.
+
+검색은 기본적으로 한 Hermes agent가 수행한다. 별도 wearable, nutrition 또는
+calendar subagent를 만들지 않아도 각 tool이 domain 경계와 source provenance를
+보존한다. subagent는 병렬 비용, 격리 또는 장시간 작업이 실제로 필요해질 때의
+확장 수단이지 현재 데이터 통합의 전제조건이 아니다.
 
 hosted multi-user 제품에서는 이 단일-owner 계약을 재사용하면 안 된다. 그때는
 HealthMes가 서명한 request-scoped principal envelope 또는 사용자별 MCP session이
@@ -482,7 +520,7 @@ decision domain access와 retention 변경은 같은 write fence 안에서 원�
 
 ## 10. 완료 기준과 비범위
 
-PR #138 완료 기준:
+PR #138 구현 기준:
 
 - 공식 자유 형식 reasoning ingress가 하나다.
 - Hermes `/v1/responses`가 유일한 LLM/tool loop다.
