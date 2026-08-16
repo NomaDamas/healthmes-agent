@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
@@ -198,6 +199,76 @@ async def test_file_backed_first_use_daily_snapshot_survives_read_only_search(
         engine.dispose()
 
 
+async def test_daily_context_timeout_uses_retained_snapshot(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(tmp_path, "daily-timeout.db")
+
+    async def initial_reader(day: date) -> dict:
+        return {
+            "status": "ok",
+            "date": day.isoformat(),
+            "stress": {
+                "status": "ok",
+                "value": 38,
+                "recorded_at": "2026-08-16T08:00:00+00:00",
+            },
+            "freshness": {
+                "recorded_at": "2026-08-16T08:00:00+00:00",
+                "status": "current",
+            },
+            "coverage": {"ratio": 1.0},
+            "limitations": [],
+        }
+
+    initial_service = _service(
+        factory,
+        WearableContextProvider(
+            initial_reader,
+            snapshot_session_factory=factory,
+        ),
+    )
+    handle = initial_service.begin(_request())
+    initial = await initial_service.search(
+        handle.session_id,
+        domain="wearable",
+        capability="wearable.stress",
+        parameters={"date": "2026-08-16"},
+    )
+    initial_service.finish(handle.session_id)
+    initial_service.close()
+
+    async def stalled_reader(_day: date) -> dict:
+        await asyncio.sleep(1)
+        raise AssertionError("timeout must cancel the upstream context read")
+
+    fallback_service = _service(
+        factory,
+        WearableContextProvider(
+            stalled_reader,
+            snapshot_session_factory=factory,
+            upstream_timeout_seconds=0.001,
+        ),
+    )
+    try:
+        handle = fallback_service.begin(_request())
+        fallback = await fallback_service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.stress",
+            parameters={"date": "2026-08-16"},
+        )
+
+        assert fallback.status is ContextStatus.PARTIAL
+        assert fallback.payload["stress"]["value"] == 38
+        assert fallback.source_refs == initial.source_refs
+        assert "open_wearables_context_timeout" in fallback.limitations
+        assert "wearable_snapshot_fallback_used" in fallback.limitations
+    finally:
+        fallback_service.close()
+        engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("capability", "granularity", "parameters"),
     DETAIL_DATE_CASES,
@@ -264,6 +335,7 @@ async def test_exact_retention_boundary_persists_by_oldest_record(
                 {
                     "category": "stress",
                     "recorded_at": observed_at.isoformat(),
+                    "provider": "garmin",
                     "value": 42,
                 },
             )
@@ -318,6 +390,7 @@ async def test_detail_query_clamps_to_shorter_retention_policy(
                     "recorded_at": (
                         NOW - timedelta(hours=1)
                     ).isoformat(),
+                    "provider": "garmin",
                     "value": 42,
                 },
             )
@@ -396,12 +469,14 @@ async def test_file_backed_detail_search_uses_stable_mirror_ref_and_cursor(
                     "series_type": "heart_rate",
                     "value": 72,
                     "unit": "bpm",
+                    "provider": "apple_health",
                 },
                 {
                     "timestamp": "2026-08-16T08:10:00+00:00",
                     "series_type": "heart_rate",
                     "value": 76,
                     "unit": "bpm",
+                    "provider": "apple_health",
                 },
             )
         )
@@ -462,6 +537,24 @@ async def test_file_backed_detail_search_uses_stable_mirror_ref_and_cursor(
         assert source_ref.observed_start == DETAIL_START
         assert source_ref.observed_end == DETAIL_END
         assert finished.source_refs == (source_ref,)
+        first_provenance = first.payload["records"][0]["provenance"]
+        second_provenance = second.payload["records"][0]["provenance"]
+        assert first_provenance == {
+            "source_ref_id": source_ref.reference_id,
+            "row_digest": first_provenance["row_digest"],
+            "upstream_provider": "apple_health",
+            "observed_at": "2026-08-16T08:05:00+00:00",
+            "mode": "live_upstream_mirrored",
+        }
+        assert len(first_provenance["row_digest"]) == 64
+        assert second_provenance == {
+            "source_ref_id": source_ref.reference_id,
+            "row_digest": second_provenance["row_digest"],
+            "upstream_provider": "apple_health",
+            "observed_at": "2026-08-16T08:10:00+00:00",
+            "mode": "retained_local_mirror",
+        }
+        assert len(second_provenance["row_digest"]) == 64
         with factory() as observer:
             event = observer.get(
                 WellnessEvent,
@@ -502,6 +595,7 @@ async def test_detail_search_falls_back_to_exact_retained_query(
                 {
                     "category": "recovery",
                     "recorded_at": "2026-08-16T08:00:00+00:00",
+                    "provider": "oura",
                     "value": 82,
                 },
             )
@@ -560,8 +654,34 @@ async def test_detail_search_falls_back_to_exact_retained_query(
         assert fallback.payload["provenance_mode"] == (
             "retained_local_mirror"
         )
-        assert fallback.payload["records"] == initial.payload["records"]
         assert fallback.source_refs == initial.source_refs
+        initial_record = initial.payload["records"][0]
+        fallback_record = fallback.payload["records"][0]
+        assert {
+            key: value
+            for key, value in fallback_record.items()
+            if key != "provenance"
+        } == {
+            key: value
+            for key, value in initial_record.items()
+            if key != "provenance"
+        }
+        assert (
+            fallback_record["provenance"]["source_ref_id"]
+            == initial_record["provenance"]["source_ref_id"]
+        )
+        assert (
+            fallback_record["provenance"]["row_digest"]
+            == initial_record["provenance"]["row_digest"]
+        )
+        assert (
+            initial_record["provenance"]["mode"]
+            == "live_upstream_mirrored"
+        )
+        assert (
+            fallback_record["provenance"]["mode"]
+            == "retained_local_mirror"
+        )
         assert "open_wearables_detail_unavailable" in fallback.limitations
         assert (
             "wearable_query_snapshot_fallback_used"
@@ -570,6 +690,129 @@ async def test_detail_search_falls_back_to_exact_retained_query(
     finally:
         fallback_service.close()
         engine.dispose()
+
+
+async def test_detail_search_timeout_uses_exact_retained_query(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(tmp_path, "detail-timeout.db")
+
+    async def initial_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": "2026-08-16T08:00:00+00:00",
+                    "provider": "garmin",
+                    "value": 42,
+                },
+            )
+        )
+
+    initial_service = _service(
+        factory,
+        WearableContextProvider(
+            search_reader=initial_reader,
+            snapshot_session_factory=factory,
+        ),
+    )
+    handle = initial_service.begin(_request())
+    initial = await initial_service.search(
+        handle.session_id,
+        domain="wearable",
+        capability="wearable.health-scores",
+        start=DETAIL_START,
+        end=DETAIL_END,
+        granularity="record",
+        parameters={"category": "stress"},
+    )
+    initial_service.finish(handle.session_id)
+    initial_service.close()
+
+    async def stalled_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        await asyncio.sleep(1)
+        raise AssertionError("timeout must cancel the upstream search")
+
+    fallback_service = _service(
+        factory,
+        WearableContextProvider(
+            search_reader=stalled_reader,
+            snapshot_session_factory=factory,
+            upstream_timeout_seconds=0.001,
+        ),
+    )
+    try:
+        handle = fallback_service.begin(_request())
+        fallback = await fallback_service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.health-scores",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="record",
+            parameters={"category": "stress"},
+        )
+
+        assert fallback.status is not ContextStatus.FAILED
+        assert fallback.source_refs == initial.source_refs
+        assert "open_wearables_detail_timeout" in fallback.limitations
+        assert (
+            "wearable_query_snapshot_fallback_used"
+            in fallback.limitations
+        )
+        assert (
+            fallback.payload["records"][0]["provenance"]["mode"]
+            == "retained_local_mirror"
+        )
+    finally:
+        fallback_service.close()
+        engine.dispose()
+
+
+async def test_detail_search_discards_rows_without_provider(
+    session,
+) -> None:
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": "2026-08-16T08:00:00+00:00",
+                    "value": 99,
+                },
+                {
+                    "category": "stress",
+                    "recorded_at": "2026-08-16T08:05:00+00:00",
+                    "provider": "garmin",
+                    "value": 42,
+                },
+            )
+        )
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.health-scores",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="record",
+            parameters={"category": "stress"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["count"] == 1
+    assert result.payload["records"][0]["value"] == 42
+    assert "wearable_rows_discarded" in result.limitations
 
 
 async def test_wearable_consent_denial_happens_before_upstream_access(

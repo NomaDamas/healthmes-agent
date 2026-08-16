@@ -669,3 +669,86 @@ async def test_search_discards_user_id_echoed_in_allowlisted_text() -> None:
     assert fetched.records == ()
     assert fetched.discarded_rows == 1
     assert fetched.limitations == ("wearable_rows_discarded",)
+
+
+class MissingProviderClient:
+    async def get_health_scores(self, _user_id, **_kwargs):
+        return {
+            "data": [
+                {
+                    "category": "stress",
+                    "recorded_at": "2026-08-10T08:00:00Z",
+                    "value": 42,
+                }
+            ],
+            "pagination": {"has_more": False},
+        }
+
+    async def get_activity_summaries(
+        self,
+        _user_id,
+        *_args,
+        **_kwargs,
+    ):
+        return {
+            "data": [{"date": "2026-08-10", "steps": 8000}],
+            "pagination": {"next_cursor": None},
+        }
+
+    async def get_workouts(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                }
+            ],
+            "pagination": {"next_cursor": None},
+        }
+
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                }
+            ],
+            "pagination": {"next_cursor": None},
+        }
+
+
+@pytest.mark.parametrize(
+    "wearable_request",
+    (
+        _request("wearable.health-scores"),
+        _request(
+            "wearable.summaries",
+            summary_kind="activity",
+        ),
+        _request("wearable.workouts"),
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+        ),
+    ),
+)
+async def test_search_discards_rows_without_provider(
+    wearable_request: WearableSearchRequest,
+) -> None:
+    search = BoundedOpenWearablesSearch(
+        MissingProviderClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(wearable_request)
+
+    assert fetched.records == ()
+    assert fetched.discarded_rows == 1
+    assert fetched.limitations == ("wearable_rows_discarded",)

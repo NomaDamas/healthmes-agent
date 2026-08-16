@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -533,7 +534,9 @@ _WEARABLE_NESTED_FIELDS = (
     "nights_counted",
     "observed_at",
     "observed_on",
+    "mode",
     "provider",
+    "provenance",
     "qualifier",
     "ratio",
     "reason",
@@ -550,6 +553,7 @@ _WEARABLE_NESTED_FIELDS = (
     "sleep_duration_seconds",
     "sleep_efficiency_percent",
     "source",
+    "source_ref_id",
     "stale_days",
     "start",
     "start_time",
@@ -566,6 +570,7 @@ _WEARABLE_NESTED_FIELDS = (
     "total_minutes",
     "types",
     "unit",
+    "upstream_provider",
     "usable_blocks",
     "value",
     "variant",
@@ -577,8 +582,9 @@ _WEARABLE_NESTED_FIELDS = (
     "yesterday_load",
     "zone_offset",
     "z_score",
+    "row_digest",
 )
-_WEARABLE_IDENTITY_FIELDS = ("provider", "source")
+_WEARABLE_IDENTITY_FIELDS = ("source",)
 _WEARABLE_METRIC_KIND = {
     "actual_sleep": "sleep",
     "charge": "recovery",
@@ -649,7 +655,9 @@ _NUTRITION_HISTORY_MIN_SCAN = 100
 _NUTRITION_HISTORY_MAX_SCAN = 5_000
 _WEARABLE_LIMITATION_CODES = (
     "open_wearables_context_unavailable",
+    "open_wearables_context_timeout",
     "open_wearables_detail_unavailable",
+    "open_wearables_detail_timeout",
     "wearable_payload_limit_reached",
     "wearable_readiness_evidence_ids_unavailable",
     "wearable_query_snapshot_fallback_used",
@@ -699,6 +707,77 @@ def _canonical_digest(value: Mapping[str, Any]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _wearable_fetch_with_required_provider(
+    fetched: WearableSearchFetch,
+) -> WearableSearchFetch:
+    records = tuple(
+        dict(record)
+        for record in fetched.records
+        if isinstance(record.get("provider"), str)
+        and bool(str(record["provider"]).strip())
+    )
+    return WearableSearchFetch(
+        records=records,
+        upstream_truncated=fetched.upstream_truncated,
+        payload_trimmed=fetched.payload_trimmed,
+        discarded_rows=(
+            fetched.discarded_rows
+            + len(fetched.records)
+            - len(records)
+        ),
+    )
+
+
+def _wearable_record_observed_at(
+    record: Mapping[str, Any],
+    *,
+    timezone: str,
+) -> str:
+    for field in ("timestamp", "recorded_at", "start_time"):
+        raw = record.get(field)
+        if not isinstance(raw, str):
+            continue
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("wearable record timestamp must be aware")
+        return parsed.astimezone(UTC).isoformat()
+    raw_day = record.get("date")
+    if not isinstance(raw_day, str):
+        raise ValueError("wearable record observation is missing")
+    observed_day = date.fromisoformat(raw_day)
+    zone = parse_timezone(timezone)
+    return datetime(
+        observed_day.year,
+        observed_day.month,
+        observed_day.day,
+        tzinfo=zone,
+    ).astimezone(UTC).isoformat()
+
+
+def _wearable_record_with_provenance(
+    record: Mapping[str, Any],
+    *,
+    source_ref: SourceRef,
+    provenance_mode: str,
+    timezone: str,
+) -> dict[str, Any]:
+    provider = record.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        raise ValueError("wearable record provider is missing")
+    normalized = dict(record)
+    normalized["provenance"] = {
+        "source_ref_id": source_ref.reference_id,
+        "row_digest": _canonical_digest(record),
+        "upstream_provider": provider,
+        "observed_at": _wearable_record_observed_at(
+            record,
+            timezone=timezone,
+        ),
+        "mode": provenance_mode,
+    }
+    return normalized
 
 
 def _cursor_scope(
@@ -2770,10 +2849,20 @@ class WearableContextProvider:
         *,
         search_reader: WearableSearchReader | None = None,
         snapshot_session_factory: sessionmaker[Session] | None = None,
+        upstream_timeout_seconds: float = 8.0,
     ) -> None:
+        if (
+            not isfinite(upstream_timeout_seconds)
+            or upstream_timeout_seconds <= 0
+            or upstream_timeout_seconds > 30
+        ):
+            raise ValueError(
+                "upstream_timeout_seconds must be within (0, 30]"
+            )
         self._reader = reader
         self._search_reader = search_reader
         self._snapshot_session_factory = snapshot_session_factory
+        self._upstream_timeout_seconds = upstream_timeout_seconds
 
     async def query(
         self,
@@ -3045,13 +3134,19 @@ class WearableContextProvider:
         fetched: WearableSearchFetch | None = None
         if self._search_reader is not None:
             try:
-                fetched = await self._search_reader(request)
+                async with asyncio.timeout(
+                    self._upstream_timeout_seconds
+                ):
+                    fetched = await self._search_reader(request)
+            except TimeoutError:
+                limitations.add("open_wearables_detail_timeout")
             except Exception:
                 limitations.add("open_wearables_detail_unavailable")
         else:
             limitations.add("open_wearables_detail_unavailable")
 
         if fetched is not None:
+            fetched = _wearable_fetch_with_required_provider(fetched)
             stored_result: dict[str, Any] = {
                 "status": (
                     "empty_success"
@@ -3268,24 +3363,32 @@ class WearableContextProvider:
             now=now,
             timezone=query.timezone,
         )
-        refs = [
-            SourceRef(
-                domain="wearable",
-                resource_type=OPEN_WEARABLES_QUERY_EVENT_TYPE,
-                record_id=str(snapshot.event_id),
-                source_provider=(
-                    OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
-                ),
-                observed_start=snapshot.start,
-                observed_end=snapshot.end,
-                collected_at=snapshot.collected_at,
-                schema_version=1,
-                derived_by=f"{query.capability}.mirror.v1",
-                freshness=freshness.status,
-                coverage=snapshot.coverage,
-                sensitivity="wearable",
+        source_ref = SourceRef(
+            domain="wearable",
+            resource_type=OPEN_WEARABLES_QUERY_EVENT_TYPE,
+            record_id=str(snapshot.event_id),
+            source_provider=(
+                OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+            ),
+            observed_start=snapshot.start,
+            observed_end=snapshot.end,
+            collected_at=snapshot.collected_at,
+            schema_version=1,
+            derived_by=f"{query.capability}.mirror.v1",
+            freshness=freshness.status,
+            coverage=snapshot.coverage,
+            sensitivity="wearable",
+        )
+        raw["records"] = [
+            _wearable_record_with_provenance(
+                record,
+                source_ref=source_ref,
+                provenance_mode=provenance_mode,
+                timezone=query.timezone,
             )
+            for record in selected
         ]
+        refs = [source_ref]
         return _result(
             query,
             raw,
@@ -3314,12 +3417,18 @@ class WearableContextProvider:
         normalized: dict[str, Any] | None = None
         if self._reader is not None:
             try:
+                async with asyncio.timeout(
+                    self._upstream_timeout_seconds
+                ):
+                    upstream = await self._reader(day)
                 normalized = _normalize_wearable_context(
-                    await self._reader(day),
+                    upstream,
                     day=day,
                     now=now,
                     timezone=parse_timezone(timezone),
                 )
+            except TimeoutError:
+                limitations.add("open_wearables_context_timeout")
             except Exception:
                 limitations.add("open_wearables_context_unavailable")
 

@@ -560,19 +560,19 @@ def _sanitize_health_score(
 ) -> dict[str, Any] | None:
     recorded_at = _timestamp(row.get("recorded_at"))
     category = _safe_text(row.get("category"), max_length=32)
+    provider = _provider(row)
     if (
         recorded_at is None
         or not start.astimezone(UTC) <= recorded_at < end.astimezone(UTC)
         or category not in WEARABLE_HEALTH_SCORE_CATEGORIES
+        or provider is None
     ):
         return None
     result: dict[str, Any] = {
         "category": category,
         "recorded_at": recorded_at.isoformat(),
+        "provider": provider,
     }
-    provider = _provider(row)
-    if provider is not None:
-        result["provider"] = provider
     _put_number(result, row, "value")
     qualifier = _safe_text(row.get("qualifier"), max_length=64)
     if qualifier is not None:
@@ -614,18 +614,21 @@ def _sanitize_summary(
     timezone: str,
 ) -> dict[str, Any] | None:
     observed_day = _day(row.get("date"))
+    provider = _provider(row)
     zone = parse_timezone(timezone)
     first_day = start.astimezone(zone).date()
     last_day = (end - timedelta(microseconds=1)).astimezone(zone).date()
-    if observed_day is None or not first_day <= observed_day <= last_day:
+    if (
+        observed_day is None
+        or not first_day <= observed_day <= last_day
+        or provider is None
+    ):
         return None
     result: dict[str, Any] = {
         "summary_kind": kind,
         "date": observed_day.isoformat(),
+        "provider": provider,
     }
-    provider = _provider(row)
-    if provider is not None:
-        result["provider"] = provider
     if kind == "activity":
         for field in (
             "steps",
@@ -737,22 +740,22 @@ def _sanitize_workout(
     start_time = _timestamp(row.get("start_time"))
     end_time = _timestamp(row.get("end_time"))
     workout_type = _safe_text(row.get("type"), max_length=64)
+    provider = _provider(row)
     if (
         start_time is None
         or end_time is None
         or end_time <= start_time
         or not start.astimezone(UTC) <= start_time < end.astimezone(UTC)
         or workout_type is None
+        or provider is None
     ):
         return None
     result: dict[str, Any] = {
         "workout_type": workout_type,
         "start_time": start_time.isoformat(),
         "end_time": end_time.isoformat(),
+        "provider": provider,
     }
-    provider = _provider(row)
-    if provider is not None:
-        result["provider"] = provider
     zone_offset = _safe_text(row.get("zone_offset"), max_length=16)
     if zone_offset is not None:
         result["zone_offset"] = zone_offset
@@ -783,6 +786,7 @@ def _sanitize_timeseries(
     raw_type = _safe_text(row.get("type"), max_length=64)
     value = _number(row.get("value"))
     unit = _safe_text(row.get("unit"), max_length=32)
+    provider = _provider(row)
     if (
         timestamp is None
         or not start.astimezone(UTC) <= timestamp < end.astimezone(UTC)
@@ -790,6 +794,7 @@ def _sanitize_timeseries(
         or raw_type not in WEARABLE_TIMESERIES_TYPES
         or value is None
         or unit is None
+        or provider is None
     ):
         return None
     result: dict[str, Any] = {
@@ -797,10 +802,8 @@ def _sanitize_timeseries(
         "series_type": raw_type,
         "value": value,
         "unit": unit,
+        "provider": provider,
     }
-    provider = _provider(row)
-    if provider is not None:
-        result["provider"] = provider
     zone_offset = _safe_text(row.get("zone_offset"), max_length=16)
     if zone_offset is not None:
         result["zone_offset"] = zone_offset
@@ -819,14 +822,14 @@ def _aggregate_timeseries(
 
     interval_seconds = _TIMESERIES_RESOLUTION_SECONDS[resolution]
     buckets: dict[
-        tuple[datetime, str, str | None],
+        tuple[datetime, str, str],
         list[Mapping[str, Any]],
     ] = {}
     for record in records:
         timestamp = _timestamp(record.get("timestamp"))
         unit = _safe_text(record.get("unit"), max_length=32)
         provider = _safe_text(record.get("provider"), max_length=64)
-        if timestamp is None or unit is None:
+        if timestamp is None or unit is None or provider is None:
             continue
         epoch_seconds = int(timestamp.timestamp())
         bucket_start = datetime.fromtimestamp(
@@ -844,7 +847,7 @@ def _aggregate_timeseries(
         key=lambda item: (
             item[0][0],
             item[0][1],
-            item[0][2] or "",
+            item[0][2],
         ),
     ):
         values = [
@@ -863,9 +866,8 @@ def _aggregate_timeseries(
                 series_type=series_type,
             ),
             "unit": unit,
+            "provider": provider,
         }
-        if provider is not None:
-            result["provider"] = provider
         if (
             series_type in _SUM_TIMESERIES_TYPES
             and any(record.get("is_daily_total") is True for record in bucket)
