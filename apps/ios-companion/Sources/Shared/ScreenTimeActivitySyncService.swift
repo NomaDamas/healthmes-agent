@@ -67,6 +67,37 @@ enum ScreenTimeActivityCollectionError: Error, Equatable {
     case exportFailed
 }
 
+enum ScreenTimeActivityCollectionFailure: Equatable {
+    case unauthorized
+    case unavailable
+    case transient
+}
+
+enum ScreenTimeActivityCollectionFailurePolicy {
+    static func result(
+        for failure: ScreenTimeActivityCollectionFailure
+    ) throws -> ScreenTimeCollectorResult {
+        switch failure {
+        case .unauthorized:
+            return ScreenTimeCollectorResult(
+                capability: .unavailable,
+                permissionStatus: .revoked,
+                reason: "ios_screen_time_permission_revoked",
+                samples: []
+            )
+        case .unavailable:
+            return ScreenTimeCollectorResult(
+                capability: .unavailable,
+                permissionStatus: .unavailable,
+                reason: "ios_screen_time_activity_data_unavailable",
+                samples: []
+            )
+        case .transient:
+            throw ScreenTimeActivityCollectionError.exportFailed
+        }
+    }
+}
+
 protocol ScreenTimeActivityTransport {
     func collectionState(
         pairing: Pairing,

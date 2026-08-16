@@ -54,6 +54,9 @@ import Foundation
 func probeAppAndWebsiteUsageExport() {
     _ = AuthorizationStatus.approvedWithDataAccess
     _ = AuthorizationCenter.shared.$authorizationStatus
+    _ = DeviceActivityData.Error.unauthorized
+    _ = DeviceActivityData.Error.unavailable
+    _ = DeviceActivityData.Error.missingData
     let filter = DeviceActivityFilter(
         segment: .hourly(
             during: DateInterval(start: Date(), duration: 3_600)

@@ -1,3 +1,4 @@
+import BackgroundTasks
 import Foundation
 import XCTest
 
@@ -416,6 +417,72 @@ private actor ScreenTimeLifecycleMockSyncService:
     }
 }
 
+@MainActor
+private final class ScreenTimeLifecycleAuthorizationObserver:
+    ScreenTimeAuthorizationChangeObserving
+{
+    private var onChange:
+        (@MainActor @Sendable () async -> Void)?
+
+    func start(
+        onChange: @escaping @MainActor @Sendable () async -> Void
+    ) {
+        self.onChange = onChange
+    }
+
+    func emitChange() async {
+        await onChange?()
+    }
+}
+
+@MainActor
+private final class ScreenTimeLifecycleBackgroundTasks:
+    ScreenTimeBackgroundTaskManaging
+{
+    private(set) var registrations = 0
+    private(set) var schedules = 0
+    private var handler:
+        (
+            @MainActor
+            (any ScreenTimeBackgroundRefreshTask) -> Void
+        )?
+
+    func register(
+        handler:
+            @escaping @MainActor
+            (any ScreenTimeBackgroundRefreshTask) -> Void
+    ) {
+        registrations += 1
+        self.handler = handler
+    }
+
+    func schedule() {
+        schedules += 1
+    }
+
+    func launch() -> ScreenTimeLifecycleBackgroundTask {
+        let task = ScreenTimeLifecycleBackgroundTask()
+        handler?(task)
+        return task
+    }
+}
+
+@MainActor
+private final class ScreenTimeLifecycleBackgroundTask:
+    ScreenTimeBackgroundRefreshTask
+{
+    var expirationHandler: (() -> Void)?
+    private(set) var completionValues: [Bool] = []
+
+    func setTaskCompleted(success: Bool) {
+        completionValues.append(success)
+    }
+
+    func expire() {
+        expirationHandler?()
+    }
+}
+
 final class ScreenTimeActivityLifecycleTests: XCTestCase {
     private func date(_ value: String) -> Date {
         ISO8601DateFormatter().date(from: value)!
@@ -570,6 +637,36 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         XCTFail("timed out waiting for Screen Time cancellation")
+    }
+
+    private func waitForLifecycleCalls(
+        authorization expectedAuthorization: Int,
+        sync expectedSync: Int,
+        from service: ScreenTimeLifecycleMockSyncService
+    ) async throws {
+        for _ in 0..<400 {
+            let calls = await service.calls()
+            if calls.authorization >= expectedAuthorization,
+                calls.sync >= expectedSync
+            {
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTFail("timed out waiting for Screen Time lifecycle calls")
+    }
+
+    @MainActor
+    private func waitForBackgroundCompletion(
+        _ task: ScreenTimeLifecycleBackgroundTask
+    ) async throws {
+        for _ in 0..<400 {
+            if !task.completionValues.isEmpty {
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTFail("timed out waiting for background task completion")
     }
 
     private func isolatedStateStore()
@@ -2384,6 +2481,174 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
     }
 
     @MainActor
+    func testRuntimeRegisterRestoresOptInAndWiresAuthorizationChanges()
+        async throws
+    {
+        let suiteName =
+            "healthmes.screen-time.runtime-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        intentStore.setOptedIn(true)
+        let observer = ScreenTimeLifecycleAuthorizationObserver()
+        let backgroundTasks = ScreenTimeLifecycleBackgroundTasks()
+        let service = ScreenTimeLifecycleMockSyncService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "test")
+        )
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationObserver: observer,
+            authorizationIntentStore: intentStore,
+            backgroundTasks: backgroundTasks,
+            notificationCenter: NotificationCenter()
+        )
+
+        runtime.register()
+        try await waitForLifecycleCalls(
+            authorization: 1,
+            sync: 1,
+            from: service
+        )
+        XCTAssertEqual(backgroundTasks.registrations, 1)
+        XCTAssertEqual(backgroundTasks.schedules, 1)
+
+        await observer.emitChange()
+        try await waitForLifecycleCalls(
+            authorization: 1,
+            sync: 2,
+            from: service
+        )
+        XCTAssertEqual(backgroundTasks.schedules, 2)
+
+        _ = await runtime.foregroundCatchUp(
+            now: date("2026-08-16T10:34:00Z"),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let calls = await service.calls()
+
+        XCTAssertEqual(calls.authorization, 2)
+        XCTAssertEqual(calls.sync, 3)
+        XCTAssertEqual(
+            calls.syncTriggers,
+            [
+                .authorizationChanged,
+                .authorizationChanged,
+                .authorizationChanged,
+            ]
+        )
+        XCTAssertEqual(backgroundTasks.schedules, 3)
+    }
+
+    @MainActor
+    func testRuntimeBackgroundExpirationCancelsOptedInPipeline()
+        async throws
+    {
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let suiteName =
+            "healthmes.screen-time.runtime-bg-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        let transport = ScreenTimeLifecycleBlockingTransport(
+            state: collectionState()
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let backgroundTasks = ScreenTimeLifecycleBackgroundTasks()
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationObserver:
+                ScreenTimeLifecycleAuthorizationObserver(),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: backgroundTasks,
+            notificationCenter: NotificationCenter()
+        )
+        runtime.register()
+        intentStore.setOptedIn(true)
+
+        let task = backgroundTasks.launch()
+        try await waitForStateCalls(1, from: transport)
+        task.expire()
+        try await waitForStateCancellations(1, from: transport)
+        try await waitForBackgroundCompletion(task)
+        await transport.releaseStateCalls()
+
+        XCTAssertEqual(task.completionValues, [false])
+        XCTAssertEqual(backgroundTasks.registrations, 1)
+        XCTAssertEqual(backgroundTasks.schedules, 1)
+    }
+
+    @MainActor
+    func testExplicitAuthorizationPersistsOptInUntilDeviceTeamClearsIt()
+        async
+    {
+        let suiteName =
+            "healthmes.screen-time.intent-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        let service = ScreenTimeLifecycleMockSyncService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "test")
+        )
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: NotificationCenter()
+        )
+
+        XCTAssertFalse(intentStore.isOptedIn)
+        _ = await runtime.requestAuthorizationAndSync()
+        XCTAssertTrue(intentStore.isOptedIn)
+
+        runtime.clearAuthorizationOptIn()
+        XCTAssertFalse(intentStore.isOptedIn)
+    }
+
+    @MainActor
     func testBuildCollectorFailClosedReasonMatchesCapability()
         async throws
     {
@@ -2449,6 +2714,40 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
                 "ios_screen_time_authorization_failed"
             )
             XCTAssertTrue(result.samples.isEmpty)
+        }
+    }
+
+    func testCollectionFailurePolicySeparatesAuthorizationAndExport()
+        throws
+    {
+        let unauthorized =
+            try ScreenTimeActivityCollectionFailurePolicy.result(
+                for: .unauthorized
+            )
+        let unavailable =
+            try ScreenTimeActivityCollectionFailurePolicy.result(
+                for: .unavailable
+            )
+
+        XCTAssertEqual(unauthorized.permissionStatus, .revoked)
+        XCTAssertEqual(
+            unauthorized.reason,
+            "ios_screen_time_permission_revoked"
+        )
+        XCTAssertEqual(unavailable.permissionStatus, .unavailable)
+        XCTAssertEqual(
+            unavailable.reason,
+            "ios_screen_time_activity_data_unavailable"
+        )
+        XCTAssertThrowsError(
+            try ScreenTimeActivityCollectionFailurePolicy.result(
+                for: .transient
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ScreenTimeActivityCollectionError,
+                .exportFailed
+            )
         }
     }
 }

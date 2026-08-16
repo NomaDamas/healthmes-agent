@@ -262,6 +262,8 @@ targets:
     sources:
       - Sources/Shared
       - Sources/App/ScreenTimeActivityCollector.swift
+      - Sources/App/ScreenTimeActivityLiveFactory.swift
+      - Sources/App/ScreenTimeActivityRuntime.swift
       - path: Tests
         excludes:
           - Fixtures

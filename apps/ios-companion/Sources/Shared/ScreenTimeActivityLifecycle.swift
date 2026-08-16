@@ -51,6 +51,25 @@ protocol ScreenTimeAuthorizationChangeObserving: AnyObject {
     )
 }
 
+struct ScreenTimeAuthorizationIntentStore {
+    private static let optedInKey =
+        "healthmes.screen-time.authorization-opt-in.v1"
+
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = AppGroup.userDefaults) {
+        self.defaults = defaults
+    }
+
+    var isOptedIn: Bool {
+        defaults.bool(forKey: Self.optedInKey)
+    }
+
+    func setOptedIn(_ optedIn: Bool) {
+        defaults.set(optedIn, forKey: Self.optedInKey)
+    }
+}
+
 extension ScreenTimeActivitySyncing {
     func sync(
         pairing: Pairing,
@@ -84,6 +103,11 @@ struct ScreenTimeAuthorizationSyncResult: Equatable {
     let sync: ScreenTimeActivityLifecycleResult
 }
 
+struct ScreenTimeAuthorizationAttempt: Equatable {
+    let authorization: ScreenTimeCollectorResult?
+    let failureReason: String?
+}
+
 /// UI-neutral entry point for the future device settings surface.
 ///
 /// A device UI should call `requestAuthorizationAndSync()` after explicit
@@ -106,18 +130,13 @@ final class ScreenTimeActivityLifecycleController {
         now: Date = Date(),
         timezone: TimeZone = .current
     ) async -> ScreenTimeAuthorizationSyncResult {
-        let authorization: ScreenTimeCollectorResult
-        do {
-            authorization =
-                try await syncService.requestAuthorization()
-        } catch {
+        let attempt = await requestAuthorization()
+        guard let authorization = attempt.authorization else {
             return ScreenTimeAuthorizationSyncResult(
                 authorization: nil,
                 sync: .failed(
-                    reason: Self.failureReason(
-                        for: error,
-                        fallback: "ios_screen_time_authorization_failed"
-                    )
+                    reason: attempt.failureReason
+                        ?? "ios_screen_time_authorization_failed"
                 )
             )
         }
@@ -129,6 +148,24 @@ final class ScreenTimeActivityLifecycleController {
                 trigger: .authorizationChanged
             )
         )
+    }
+
+    func requestAuthorization() async -> ScreenTimeAuthorizationAttempt {
+        do {
+            return ScreenTimeAuthorizationAttempt(
+                authorization:
+                    try await syncService.requestAuthorization(),
+                failureReason: nil
+            )
+        } catch {
+            return ScreenTimeAuthorizationAttempt(
+                authorization: nil,
+                failureReason: Self.failureReason(
+                    for: error,
+                    fallback: "ios_screen_time_authorization_failed"
+                )
+            )
+        }
     }
 
     func authorizationDidChange(

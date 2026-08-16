@@ -251,7 +251,22 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
         guard status.permissionStatus == .granted else {
             return status
         }
+        do {
+            return try await collectAuthorized(
+                window: window,
+                excludedAppTokens: excludedAppTokens
+            )
+        } catch let error as DeviceActivityData.Error {
+            return try ScreenTimeActivityCollectionFailurePolicy.result(
+                for: collectionFailure(for: error)
+            )
+        }
+    }
 
+    private func collectAuthorized(
+        window: ScreenTimeCollectionWindow,
+        excludedAppTokens: Set<String>
+    ) async throws -> ScreenTimeCollectorResult {
         // Omitting users and devices scopes the export to the current person
         // and this iPhone. Using `.all` would mix Share Across Devices data
         // into this installation's device ID.
@@ -372,6 +387,21 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
             samples: completeSamples,
             authoritativeBucketStarts: authoritativeBucketStarts
         )
+    }
+
+    private func collectionFailure(
+        for error: DeviceActivityData.Error
+    ) -> ScreenTimeActivityCollectionFailure {
+        switch error {
+        case .unauthorized:
+            return .unauthorized
+        case .unavailable:
+            return .unavailable
+        case .missingData:
+            return .transient
+        @unknown default:
+            return .transient
+        }
     }
 
     @MainActor
