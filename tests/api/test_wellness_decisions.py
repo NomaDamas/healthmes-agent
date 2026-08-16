@@ -32,7 +32,6 @@ from healthmes.decision import (
     DecisionStatus,
     DomainAccessGrant,
     ExecutionScope,
-    HealthMesDecisionAgent,
     HealthMesDecisionEngine,
     HermesHttpResponsesTransport,
     HermesResponsesDecisionAgent,
@@ -44,6 +43,7 @@ from healthmes.decision import (
     ToolCallRecord,
     ToolCallStatus,
 )
+from healthmes.decision.agent import HealthMesDecisionAgent
 from healthmes.store import (
     Base,
     DecisionKind,

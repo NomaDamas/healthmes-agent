@@ -18,10 +18,7 @@ from healthmes.decision.access import (
     ContextAccessPolicy,
     DomainAccessGrant,
 )
-from healthmes.decision.agent import (
-    AccessPolicyResolver,
-    HealthMesDecisionAgent,
-)
+from healthmes.decision.agent import AccessPolicyResolver
 from healthmes.decision.contracts import (
     ExecutionScope,
     PrivacyLevel,
@@ -49,7 +46,6 @@ from healthmes.decision.responses import (
     HermesResponsesTransport,
     HermesRuntimeAttestationAssertion,
 )
-from healthmes.decision.runtime import DecisionRuntime
 from healthmes.decision.search import (
     DecisionContextSearchSessionService,
 )
@@ -91,90 +87,6 @@ def build_context_provider_registry(
             ),
         )
     )
-
-
-def build_healthmes_decision_engine(
-    *,
-    runtime: DecisionRuntime,
-    session_factory: sessionmaker[Session],
-    policy_resolver: AccessPolicyResolver,
-    calendar_settings: Settings | None = None,
-    wearable_reader: WearableReader | None = None,
-    calendar_sync_health_store: SyncHealthStore | None = None,
-    calendar_sources: tuple[CalendarSource, ...] = (),
-    calendar_source_resolver: CalendarSourceResolver | None = None,
-    calendar_account_generation_resolver: (
-        Callable[[CalendarSource], str | None] | None
-    ) = None,
-    timeout_seconds: float = 60,
-    finalization_timeout_seconds: float = 5,
-    max_pending_requests: int = 8,
-    clock: Callable[[], datetime] | None = None,
-) -> HealthMesDecisionEngine:
-    """Build the production decision flow with one policy and gateway.
-
-    There is deliberately no broad-consent default. The application boundary
-    must resolve the authenticated owner's current policy for every request.
-    """
-
-    if not callable(policy_resolver):
-        raise TypeError("policy_resolver must be callable")
-
-    registry = build_context_provider_registry(
-        calendar_settings=calendar_settings,
-        wearable_reader=wearable_reader,
-        session_factory=session_factory,
-        calendar_sync_health_store=calendar_sync_health_store,
-        calendar_sources=calendar_sources,
-        calendar_source_resolver=calendar_source_resolver,
-        calendar_account_generation_resolver=(
-            calendar_account_generation_resolver
-        ),
-    )
-    access_layer = ContextAccessLayer(
-        registry,
-        clock=clock,
-        calendar_settings=calendar_settings,
-        calendar_sync_health_store=calendar_sync_health_store,
-        calendar_sources=calendar_sources,
-        calendar_source_resolver=calendar_source_resolver,
-        calendar_account_generation_resolver=(
-            calendar_account_generation_resolver
-        ),
-    )
-    agent = HealthMesDecisionAgent(
-        access_layer=access_layer,
-        runtime=runtime,
-        session_factory=session_factory,
-        policy_resolver=policy_resolver,
-        timeout_seconds=timeout_seconds,
-        clock=clock,
-    )
-    try:
-        finalizer = DecisionFinalizer(
-            access_layer=access_layer,
-            session_factory=session_factory,
-            policy_resolver=policy_resolver,
-            timeout_seconds=finalization_timeout_seconds,
-            max_workers=max_pending_requests,
-            clock=clock,
-        )
-        return HealthMesDecisionEngine(
-            agent=agent,
-            finalizer=finalizer,
-            max_pending_requests=max_pending_requests,
-            shutdown_timeout_seconds=(
-                timeout_seconds + finalization_timeout_seconds + 1
-            ),
-        )
-    except BaseException:
-        try:
-            agent.close()
-        except Exception:
-            _LOGGER.exception(
-                "failed to close Decision Agent after composition failure"
-            )
-        raise
 
 
 def build_healthmes_responses_decision_engine(

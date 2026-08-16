@@ -3,7 +3,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, date, datetime, timedelta
 
-import pytest
 from freezegun import freeze_time
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -22,23 +21,27 @@ from healthmes.calendars.state import (
 )
 from healthmes.config import Settings
 from healthmes.decision import (
+    ContextAccessLayer,
     ContextAccessPolicy,
     ContextStatus,
     DatabaseDecisionPolicyResolver,
     DecisionCaller,
     DecisionDraft,
+    DecisionFinalizer,
     DecisionPersistenceIntent,
     DecisionRequest,
     DecisionStatus,
     DomainAccessGrant,
     ExecutionScope,
+    HealthMesDecisionEngine,
     PersistenceStatus,
     RuntimeMetadata,
     RuntimeStepOutput,
-    build_healthmes_decision_engine,
+    build_context_provider_registry,
     ensure_decision_domain_policies,
     update_decision_domain_policy,
 )
+from healthmes.decision.agent import HealthMesDecisionAgent
 from healthmes.nutrition.contracts import (
     Confidence,
     DailyIntakeConfirmation,
@@ -105,6 +108,57 @@ def _request() -> DecisionRequest:
             principal_id="owner",
             authenticated=True,
             execution_scope=ExecutionScope.LOCAL,
+        ),
+    )
+
+
+def _build_stepwise_test_engine(
+    *,
+    runtime,
+    session_factory,
+    policy_resolver,
+    calendar_sync_health_store=None,
+    calendar_sources=(),
+    calendar_source_resolver=None,
+    calendar_account_generation_resolver=None,
+    timeout_seconds=60,
+    clock=None,
+) -> HealthMesDecisionEngine:
+    """Compose the legacy stepwise loop only for deterministic core tests."""
+
+    registry = build_context_provider_registry(
+        session_factory=session_factory,
+        calendar_sync_health_store=calendar_sync_health_store,
+        calendar_sources=calendar_sources,
+        calendar_source_resolver=calendar_source_resolver,
+        calendar_account_generation_resolver=(
+            calendar_account_generation_resolver
+        ),
+    )
+    access_layer = ContextAccessLayer(
+        registry,
+        clock=clock,
+        calendar_sync_health_store=calendar_sync_health_store,
+        calendar_sources=calendar_sources,
+        calendar_source_resolver=calendar_source_resolver,
+        calendar_account_generation_resolver=(
+            calendar_account_generation_resolver
+        ),
+    )
+    return HealthMesDecisionEngine(
+        agent=HealthMesDecisionAgent(
+            access_layer=access_layer,
+            runtime=runtime,
+            session_factory=session_factory,
+            policy_resolver=policy_resolver,
+            timeout_seconds=timeout_seconds,
+            clock=clock,
+        ),
+        finalizer=DecisionFinalizer(
+            access_layer=access_layer,
+            session_factory=session_factory,
+            policy_resolver=policy_resolver,
+            clock=clock,
         ),
     )
 
@@ -567,7 +621,7 @@ async def test_natural_language_decision_uses_four_real_domains_and_persists(
                 _seed_calendar(session, calendar_health)
                 session.commit()
 
-            decision_engine = build_healthmes_decision_engine(
+            decision_engine = _build_stepwise_test_engine(
                 runtime=runtime,
                 session_factory=factory,
                 policy_resolver=lambda _request: _policy(),
@@ -641,7 +695,6 @@ async def test_natural_language_decision_uses_four_real_domains_and_persists(
     finally:
         db_engine.dispose()
 
-
 async def test_calendar_revocation_after_query_prevents_decision_persistence(
     tmp_path,
 ) -> None:
@@ -660,7 +713,7 @@ async def test_calendar_revocation_after_query_prevents_decision_persistence(
             _seed_calendar(session, calendar_health)
             session.commit()
 
-        decision_engine = build_healthmes_decision_engine(
+        decision_engine = _build_stepwise_test_engine(
             runtime=runtime,
             session_factory=factory,
             policy_resolver=lambda _request: _policy(),
@@ -708,7 +761,7 @@ async def test_domain_consent_revocation_after_query_blocks_persistence(
         owner_principal_id="owner",
         execution_scope=ExecutionScope.LOCAL,
     )
-    decision_engine = build_healthmes_decision_engine(
+    decision_engine = _build_stepwise_test_engine(
         runtime=ActivityConsentRevocationRuntime(factory),
         session_factory=factory,
         policy_resolver=resolver,
@@ -742,7 +795,7 @@ async def test_missing_activity_stops_before_unrelated_domains(
         "decision-empty-e2e.db",
     )
     runtime = AdaptiveCrossDomainRuntime()
-    decision_engine = build_healthmes_decision_engine(
+    decision_engine = _build_stepwise_test_engine(
         runtime=runtime,
         session_factory=factory,
         policy_resolver=lambda _request: _policy(),
@@ -765,25 +818,6 @@ async def test_missing_activity_stops_before_unrelated_domains(
                     select(func.count()).select_from(DecisionRecord)
                 )
                 == 0
-            )
-    finally:
-        db_engine.dispose()
-
-
-def test_production_builder_requires_an_explicit_policy_resolver(
-    tmp_path,
-) -> None:
-    _database_url, db_engine, factory = _persistence(
-        tmp_path,
-        "decision-builder-e2e.db",
-    )
-    try:
-        with pytest.raises(TypeError, match="policy_resolver"):
-            build_healthmes_decision_engine(
-                runtime=AdaptiveCrossDomainRuntime(),
-                session_factory=factory,
-                policy_resolver=None,  # type: ignore[arg-type]
-                clock=lambda: NOW,
             )
     finally:
         db_engine.dispose()

@@ -41,7 +41,6 @@ from healthmes.decision import (
     DomainAccessGrant,
     ExecutionScope,
     FreshnessStatus,
-    HealthMesDecisionAgent,
     NutritionContextProvider,
     PrivacyLevel,
     ProvenanceSupport,
@@ -52,6 +51,7 @@ from healthmes.decision import (
     ToolCallStatus,
     source_ref_id,
 )
+from healthmes.decision.agent import HealthMesDecisionAgent
 from healthmes.store import Base, WellnessEvent, create_db_engine
 
 NOW = datetime(2026, 8, 11, 6, tzinfo=UTC)
