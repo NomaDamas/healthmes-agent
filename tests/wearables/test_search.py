@@ -513,6 +513,42 @@ async def test_search_stops_at_three_pages_and_250_rows() -> None:
     )
 
 
+class OversizedPageClient:
+    async def get_health_scores(self, _user_id, *, limit, **_kwargs):
+        return {
+            "data": [{} for _ in range(limit + 1)],
+            "pagination": {"has_more": False},
+        }
+
+    async def get_workouts(
+        self,
+        _user_id,
+        *_args,
+        limit,
+        **_kwargs,
+    ):
+        return {
+            "data": [{} for _ in range(limit + 1)],
+            "pagination": {"next_cursor": None},
+        }
+
+
+@pytest.mark.parametrize(
+    "capability",
+    ("wearable.health-scores", "wearable.workouts"),
+)
+async def test_search_rejects_page_larger_than_requested_limit(
+    capability: str,
+) -> None:
+    search = BoundedOpenWearablesSearch(
+        OversizedPageClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    with pytest.raises(ValueError, match="requested row limit"):
+        await search(_request(capability))
+
+
 async def test_search_trims_sanitized_payload_to_180kb() -> None:
     client = PagedHealthScoreClient(verbose=True)
     search = BoundedOpenWearablesSearch(

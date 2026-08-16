@@ -4,11 +4,17 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 
+import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from healthmes.decision.access import ContextAccessLayer
+from healthmes.decision.access import (
+    ContextAccessLayer,
+    ContextAccessPolicy,
+    DomainAccessGrant,
+)
 from healthmes.decision.contracts import (
+    ContextQuery,
     ContextStatus,
     DecisionCaller,
     DecisionRequest,
@@ -24,10 +30,12 @@ from healthmes.decision.providers import ContextProviderRegistry
 from healthmes.decision.search import (
     DecisionContextSearchSessionService,
 )
+from healthmes.storage import update_retention_policy
 from healthmes.store import Base, WellnessEvent, create_db_engine
 from healthmes.wearables.provenance import (
     OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
     OPEN_WEARABLES_QUERY_EVENT_TYPE,
+    OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
 )
 from healthmes.wearables.search import (
     WearableSearchFetch,
@@ -37,6 +45,27 @@ from healthmes.wearables.search import (
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
 DETAIL_START = datetime(2026, 8, 16, 8, tzinfo=UTC)
 DETAIL_END = DETAIL_START + timedelta(hours=1)
+DETAIL_DATE_CASES = (
+    (
+        "wearable.health-scores",
+        "record",
+        {"category": "stress"},
+    ),
+    (
+        "wearable.summaries",
+        "summary",
+        {"summary_kind": "activity"},
+    ),
+    ("wearable.workouts", "record", {}),
+    (
+        "wearable.timeseries",
+        "series",
+        {
+            "series_type": "heart_rate",
+            "resolution": "1hour",
+        },
+    ),
+)
 
 
 def _request() -> DecisionRequest:
@@ -48,6 +77,19 @@ def _request() -> DecisionRequest:
             principal_id="owner",
             authenticated=True,
             execution_scope=ExecutionScope.LOCAL,
+        ),
+    )
+
+
+def _turn(provider: WearableContextProvider):
+    return ContextAccessLayer(
+        ContextProviderRegistry((provider,)),
+        clock=lambda: NOW,
+    ).start_turn(
+        _request(),
+        policy=ContextAccessPolicy(
+            owner_principal_id="owner",
+            grants=(DomainAccessGrant(domain="wearable"),),
         ),
     )
 
@@ -154,6 +196,187 @@ async def test_file_backed_first_use_daily_snapshot_survives_read_only_search(
     finally:
         service.close()
         engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("capability", "granularity", "parameters"),
+    DETAIL_DATE_CASES,
+)
+async def test_detail_date_shorthand_normalizes_before_provider_search(
+    session,
+    capability: str,
+    granularity: str,
+    parameters: dict[str, str],
+) -> None:
+    calls: list[WearableSearchRequest] = []
+
+    async def search_reader(
+        request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        calls.append(request)
+        return WearableSearchFetch(records=())
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    result = await _turn(provider).query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability=capability,
+            granularity=granularity,
+            parameters={
+                "date": "2026-08-16",
+                **parameters,
+            },
+        ),
+    )
+
+    assert result.status is not ContextStatus.FAILED
+    assert len(calls) == 1
+    assert calls[0].start == datetime(2026, 8, 16, tzinfo=UTC)
+    assert calls[0].end == NOW + timedelta(seconds=1)
+    assert calls[0].parameters == parameters
+    event = session.get(
+        WellnessEvent,
+        UUID(result.source_refs[0].record_id),
+    )
+    assert event is not None
+    assert event.payload["query"]["parameters"] == parameters
+
+
+async def test_exact_retention_boundary_persists_by_oldest_record(
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "30d",
+        now=NOW,
+    )
+    calls: list[WearableSearchRequest] = []
+    observed_at = NOW - timedelta(hours=1)
+
+    async def search_reader(
+        request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        calls.append(request)
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": observed_at.isoformat(),
+                    "value": 42,
+                },
+            )
+        )
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.health-scores",
+            start=NOW - timedelta(days=30),
+            end=NOW,
+            granularity="record",
+            parameters={"category": "stress"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is not ContextStatus.FAILED
+    assert calls[0].start == NOW - timedelta(days=30)
+    event = session.get(
+        WellnessEvent,
+        UUID(result.source_refs[0].record_id),
+    )
+    assert event is not None
+    assert event.payload["retention_basis_at"] == observed_at.isoformat()
+    assert event.expires_at.replace(tzinfo=UTC) == (
+        observed_at + timedelta(days=30)
+    )
+
+
+async def test_detail_query_clamps_to_shorter_retention_policy(
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "7d",
+        now=NOW,
+    )
+    calls: list[WearableSearchRequest] = []
+
+    async def search_reader(
+        request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        calls.append(request)
+        return WearableSearchFetch(
+            records=(
+                {
+                    "category": "stress",
+                    "recorded_at": (
+                        NOW - timedelta(hours=1)
+                    ).isoformat(),
+                    "value": 42,
+                },
+            )
+        )
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.health-scores",
+            start=NOW - timedelta(days=30),
+            end=NOW,
+            granularity="record",
+        ),
+        now=NOW,
+    )
+
+    assert result.status is not ContextStatus.FAILED
+    assert calls[0].start == NOW - timedelta(days=7)
+    assert "wearable_retention_window_trimmed" in result.limitations
+
+
+async def test_detail_query_fully_before_retention_skips_upstream(
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "7d",
+        now=NOW,
+    )
+    calls = 0
+
+    async def search_reader(
+        request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        nonlocal calls
+        calls += 1
+        return WearableSearchFetch(records=())
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.health-scores",
+            start=NOW - timedelta(days=20),
+            end=NOW - timedelta(days=8),
+            granularity="record",
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.UNAVAILABLE
+    assert result.limitations == [
+        "wearable_query_outside_retention_window"
+    ]
+    assert calls == 0
 
 
 async def test_file_backed_detail_search_uses_stable_mirror_ref_and_cursor(

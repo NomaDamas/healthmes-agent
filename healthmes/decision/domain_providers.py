@@ -93,6 +93,7 @@ from healthmes.timezones import parse_timezone
 from healthmes.wearables.provenance import (
     OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
     OPEN_WEARABLES_QUERY_EVENT_TYPE,
+    OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
     OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
     WearableQuerySnapshot,
     WearableSnapshot,
@@ -652,6 +653,8 @@ _WEARABLE_LIMITATION_CODES = (
     "wearable_payload_limit_reached",
     "wearable_readiness_evidence_ids_unavailable",
     "wearable_query_snapshot_fallback_used",
+    "wearable_query_outside_retention_window",
+    "wearable_retention_window_trimmed",
     "wearable_rows_discarded",
     "wearable_snapshot_fallback_used",
     "wearable_snapshot_persistence_failed",
@@ -2981,10 +2984,36 @@ class WearableContextProvider:
         now: datetime,
     ) -> ContextResult:
         start, end = self._detail_bounds(query, now=now)
+        limitations: set[str] = set()
+        retained_after = retention_cutoff(
+            session,
+            OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+            now=now,
+        )
+        if retained_after is not None:
+            if end <= retained_after:
+                return ContextResult(
+                    query_id=query.query_id,
+                    provider_id=query.provider_id,
+                    capability=query.capability,
+                    status=ContextStatus.UNAVAILABLE,
+                    freshness=ContextFreshness(
+                        status=FreshnessStatus.UNAVAILABLE
+                    ),
+                    coverage=ContextCoverage(
+                        status=CoverageStatus.UNAVAILABLE
+                    ),
+                    limitations=[
+                        "wearable_query_outside_retention_window"
+                    ],
+                )
+            if start < retained_after:
+                start = retained_after
+                limitations.add("wearable_retention_window_trimmed")
         parameters = {
             key: value
             for key, value in query.parameters.items()
-            if key != "cursor"
+            if key not in {"cursor", "date"}
         }
         request = WearableSearchRequest(
             capability=query.capability,
@@ -3013,7 +3042,6 @@ class WearableContextProvider:
                     now=now,
                 )
 
-        limitations: set[str] = set()
         fetched: WearableSearchFetch | None = None
         if self._search_reader is not None:
             try:
@@ -3033,7 +3061,12 @@ class WearableContextProvider:
                     else "ok"
                 ),
                 "records": list(fetched.records),
-                "limitations": list(fetched.limitations),
+                "limitations": sorted(
+                    {
+                        *fetched.limitations,
+                        *limitations,
+                    }
+                ),
             }
             if not fetched.limitations:
                 stored_result["coverage"] = {"ratio": 1.0}

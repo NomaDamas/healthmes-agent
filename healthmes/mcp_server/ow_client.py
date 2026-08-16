@@ -19,6 +19,7 @@ The optional ``transport`` argument exists so tests can inject
 """
 
 import inspect
+import json
 import logging
 import os
 from collections.abc import Mapping
@@ -44,6 +45,7 @@ SUMMARIES_MAX_LIMIT = 100  # summaries.py sleep/recovery: Query(ge=1, le=100)
 ACTIVITY_MAX_LIMIT = 400  # summaries.py activity: Query(ge=1, le=400)
 EVENTS_MAX_LIMIT = 100  # events.py: Query(ge=1, le=100)
 TIMESERIES_MAX_LIMIT = 100  # timeseries.py: Query(ge=1, le=100)
+MAX_RESPONSE_BYTES = 512_000
 
 Resolution = Literal["raw", "1min", "5min", "15min", "1hour"]
 
@@ -113,21 +115,64 @@ class OWClient:
                 timeout=self.timeout,
                 transport=self._transport,
             ) as client:
-                response = await client.get(url, headers=self.headers, params=params)
+                async with client.stream(
+                    "GET",
+                    url,
+                    headers=self.headers,
+                    params=params,
+                ) as response:
+                    if response.status_code == 401:
+                        raise OWAuthError(
+                            "open-wearables rejected the API key (401)"
+                        )
+                    if response.status_code == 404:
+                        raise OWNotFoundError(
+                            "open-wearables resource not found (404)"
+                        )
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError:
+                        raise OWClientError(
+                            "open-wearables request failed "
+                            f"({response.status_code})"
+                        ) from None
+
+                    content_length = response.headers.get("content-length")
+                    if content_length is not None:
+                        try:
+                            declared_bytes = int(content_length)
+                        except ValueError:
+                            raise OWClientError(
+                                "open-wearables returned an invalid "
+                                "content length"
+                            ) from None
+                        if (
+                            declared_bytes < 0
+                            or declared_bytes > MAX_RESPONSE_BYTES
+                        ):
+                            raise OWClientError(
+                                "open-wearables response exceeded the "
+                                "byte limit"
+                            )
+
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(body) + len(chunk) > MAX_RESPONSE_BYTES:
+                            raise OWClientError(
+                                "open-wearables response exceeded the "
+                                "byte limit"
+                            )
+                        body.extend(chunk)
         except httpx.HTTPError:
             raise OWClientError("open-wearables request failed (transport)") from None
 
-        if response.status_code == 401:
-            raise OWAuthError("open-wearables rejected the API key (401)")
-        if response.status_code == 404:
-            raise OWNotFoundError("open-wearables resource not found (404)")
         try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
             raise OWClientError(
-                f"open-wearables request failed ({response.status_code})"
+                "open-wearables returned invalid JSON"
             ) from None
-        return response.json()
+        return payload
 
     # ------------------------------------------------------------------
     # Users (routes/v1/users.py — OldPaginatedResponse: items/total/page/limit)

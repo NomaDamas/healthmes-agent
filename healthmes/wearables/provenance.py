@@ -115,6 +115,7 @@ class WearableQuerySnapshot:
     end: datetime
     timezone: str
     collected_at: datetime
+    retention_basis_at: datetime
     coverage: float | None
 
 
@@ -751,7 +752,7 @@ def _normalize_query_scope(
         {
             str(key): value
             for key, value in parameters.items()
-            if key != "cursor"
+            if key not in {"cursor", "date"}
         },
         max_bytes=16_000,
     )
@@ -831,6 +832,95 @@ def _query_source_record_id(
     return f"query:{query_digest}:{observation_digest}"
 
 
+def _query_retention_basis(
+    result: Mapping[str, Any],
+    *,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    collected_at: datetime,
+) -> datetime:
+    """Use the oldest retained record, not the requested window, for expiry."""
+
+    observed_start = _aware_utc(start, field="start")
+    observed_end = _aware_utc(end, field="end")
+    collected = _aware_utc(collected_at, field="collected_at")
+    records = result.get("records")
+    if not isinstance(records, list):
+        raise ValueError("wearable query result records are invalid")
+    if not records:
+        return collected
+
+    zone = parse_timezone(timezone)
+    observations: list[datetime] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ValueError(
+                "wearable query result record is invalid"
+            )
+        observation: datetime | None = None
+        raw_timestamp: Any = None
+        if (
+            isinstance(record.get("summary_kind"), str)
+            and isinstance(record.get("date"), str)
+        ):
+            try:
+                observed_day = date.fromisoformat(str(record["date"]))
+            except ValueError:
+                observed_day = None
+            if observed_day is not None:
+                observation = datetime.combine(
+                    observed_day,
+                    time.min,
+                    tzinfo=zone,
+                ).astimezone(UTC)
+                observation = max(observation, observed_start)
+        else:
+            raw_timestamp = next(
+                (
+                    record.get(field)
+                    for field in (
+                        "timestamp",
+                        "recorded_at",
+                        "start_time",
+                    )
+                    if record.get(field) is not None
+                ),
+                None,
+            )
+        if observation is None and isinstance(raw_timestamp, str):
+            try:
+                parsed = datetime.fromisoformat(
+                    raw_timestamp.replace("Z", "+00:00")
+                )
+            except ValueError:
+                parsed = None
+            if parsed is not None and parsed.tzinfo is not None:
+                observation = parsed.astimezone(UTC)
+        elif observation is None and isinstance(record.get("date"), str):
+            try:
+                observed_day = date.fromisoformat(str(record["date"]))
+            except ValueError:
+                observed_day = None
+            if observed_day is not None:
+                observation = datetime.combine(
+                    observed_day,
+                    time.min,
+                    tzinfo=zone,
+                ).astimezone(UTC)
+                observation = max(observation, observed_start)
+        if (
+            observation is None
+            or observation < observed_start
+            or observation >= observed_end
+        ):
+            raise ValueError(
+                "wearable query result record observation is invalid"
+            )
+        observations.append(observation)
+    return min(observations)
+
+
 def _query_payload(
     *,
     scope: Mapping[str, Any],
@@ -838,6 +928,7 @@ def _query_payload(
     result: Mapping[str, Any],
     result_digest: str,
     collected_at: datetime,
+    retention_basis_at: datetime,
 ) -> dict[str, Any]:
     return _normalize_json(
         {
@@ -847,6 +938,7 @@ def _query_payload(
             "result": dict(result),
             "result_digest": result_digest,
             "collected_at": collected_at.isoformat(),
+            "retention_basis_at": retention_basis_at.isoformat(),
             "window": {
                 "start": scope["start"],
                 "end": scope["end"],
@@ -884,6 +976,13 @@ def persist_open_wearables_query_snapshot(
             parameters=parameters,
         )
         normalized_result = _normalize_query_result(result)
+        retention_basis_at = _query_retention_basis(
+            normalized_result,
+            start=datetime.fromisoformat(str(scope["start"])),
+            end=datetime.fromisoformat(str(scope["end"])),
+            timezone=timezone,
+            collected_at=collected,
+        )
         result_digest = hashlib.sha256(
             _canonical_json(normalized_result)
         ).hexdigest()
@@ -898,8 +997,8 @@ def persist_open_wearables_query_snapshot(
             result=normalized_result,
             result_digest=result_digest,
             collected_at=collected,
+            retention_basis_at=retention_basis_at,
         )
-        observed_start = datetime.fromisoformat(str(scope["start"]))
         coverage = _context_coverage(normalized_result)
         event = session.scalar(
             select(WellnessEvent).where(
@@ -912,7 +1011,7 @@ def persist_open_wearables_query_snapshot(
             policy = _retention_policy(session)
             expires_at = _expiry(
                 policy,
-                observed_at=observed_start,
+                observed_at=retention_basis_at,
             )
             if expires_at is not None and expires_at <= current:
                 raise ValueError(
@@ -922,7 +1021,7 @@ def persist_open_wearables_query_snapshot(
             event = WellnessEvent(
                 event_type=OPEN_WEARABLES_QUERY_EVENT_TYPE,
                 schema_version=1,
-                observed_at=observed_start,
+                observed_at=retention_basis_at,
                 recorded_at=collected,
                 timezone=timezone,
                 source_provider=OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
@@ -1054,6 +1153,13 @@ def wearable_query_snapshot_from_event(
             datetime.fromisoformat(str(payload["collected_at"])),
             field="collected_at",
         )
+        retention_basis_at = _query_retention_basis(
+            normalized_result,
+            start=start,
+            end=end,
+            timezone=timezone,
+            collected_at=collected_at,
+        )
         expected_source_record_id = _query_source_record_id(
             query_digest=query_digest,
             collected_at=collected_at,
@@ -1065,6 +1171,7 @@ def wearable_query_snapshot_from_event(
             result=normalized_result,
             result_digest=result_digest,
             collected_at=collected_at,
+            retention_basis_at=retention_basis_at,
         )
         if (
             end <= start
@@ -1079,7 +1186,7 @@ def wearable_query_snapshot_from_event(
             or event.sensitivity != "wearable"
             or event.consent_scope != "personal"
             or event.raw_object_id is not None
-            or _database_utc(event.observed_at) != start
+            or _database_utc(event.observed_at) != retention_basis_at
             or _database_utc(event.recorded_at) != collected_at
             or event.coverage != _context_coverage(normalized_result)
             or event.quality_flags
@@ -1095,6 +1202,8 @@ def wearable_query_snapshot_from_event(
             }
             or payload.get("query_digest") != query_digest
             or payload.get("result_digest") != result_digest
+            or payload.get("retention_basis_at")
+            != retention_basis_at.isoformat()
             or _canonical_json(payload) != _canonical_json(expected_payload)
             or (
                 event.expires_at is not None
@@ -1113,6 +1222,7 @@ def wearable_query_snapshot_from_event(
         end=end,
         timezone=timezone,
         collected_at=collected_at,
+        retention_basis_at=retention_basis_at,
         coverage=event.coverage,
     )
 

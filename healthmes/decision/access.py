@@ -98,6 +98,7 @@ from healthmes.store.enums import CalendarSource
 from healthmes.timezones import parse_timezone
 from healthmes.wearables.provenance import (
     OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
+    OPEN_WEARABLES_QUERY_EVENT_TYPE,
     OPEN_WEARABLES_SNAPSHOT_EVENT_TYPE,
     OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
 )
@@ -3351,6 +3352,25 @@ def _validate_wellness_event_ref(
 ) -> tuple[SourceRef | None, tuple[str, ...]]:
     if not event.event_type.startswith(f"{source_ref.domain}."):
         return None, ("source_ref_domain_mismatch",)
+    expected_observed_start = _as_utc(event.observed_at)
+    if event.event_type == OPEN_WEARABLES_QUERY_EVENT_TYPE:
+        window = event.payload.get("window")
+        raw_start = (
+            window.get("start")
+            if isinstance(window, Mapping)
+            else None
+        )
+        try:
+            parsed_start = (
+                datetime.fromisoformat(raw_start)
+                if isinstance(raw_start, str)
+                else None
+            )
+        except ValueError:
+            parsed_start = None
+        if parsed_start is None or parsed_start.tzinfo is None:
+            return None, ("source_ref_identity_mismatch",)
+        expected_observed_start = parsed_start.astimezone(UTC)
     expected_observed_end, valid_window = _wellness_event_observed_end(
         event
     )
@@ -3359,7 +3379,7 @@ def _validate_wellness_event_ref(
         or event.event_type != source_ref.resource_type
         or event.source_provider != source_ref.source_provider
         or event.schema_version != source_ref.schema_version
-        or _as_utc(event.observed_at) != source_ref.observed_start
+        or expected_observed_start != source_ref.observed_start
         or expected_observed_end != source_ref.observed_end
         or (
             source_ref.collected_at is not None
@@ -3632,7 +3652,19 @@ def _wellness_event_observed_end(
     if observed_end.tzinfo is None:
         return None, False
     observed_end = observed_end.astimezone(UTC)
-    if observed_end <= _as_utc(event.observed_at):
+    observed_start = _as_utc(event.observed_at)
+    if event.event_type == OPEN_WEARABLES_QUERY_EVENT_TYPE:
+        raw_start = window.get("start")
+        if not isinstance(raw_start, str):
+            return None, False
+        try:
+            observed_start = datetime.fromisoformat(raw_start)
+        except ValueError:
+            return None, False
+        if observed_start.tzinfo is None:
+            return None, False
+        observed_start = observed_start.astimezone(UTC)
+    if observed_end <= observed_start:
         return None, False
     return observed_end, True
 

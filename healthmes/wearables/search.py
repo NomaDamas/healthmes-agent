@@ -398,8 +398,9 @@ async def _collect_offset_pages(
         remaining = MAX_WEARABLE_SEARCH_ROWS + 1 - len(rows)
         if remaining <= 0:
             return rows, True
-        payload = await fetch(min(_PAGE_SIZE, remaining), offset)
-        page = _response_rows(payload)
+        page_limit = min(_PAGE_SIZE, remaining)
+        payload = await fetch(page_limit, offset)
+        page = _response_rows(payload, max_rows=page_limit)
         rows.extend(page)
         pagination = payload.get("pagination")
         has_more = bool(
@@ -428,8 +429,9 @@ async def _collect_cursor_pages(
         remaining = MAX_WEARABLE_SEARCH_ROWS + 1 - len(rows)
         if remaining <= 0:
             return rows, True
-        payload = await fetch(min(_PAGE_SIZE, remaining), cursor)
-        page = _response_rows(payload)
+        page_limit = min(_PAGE_SIZE, remaining)
+        payload = await fetch(page_limit, cursor)
+        page = _response_rows(payload, max_rows=page_limit)
         rows.extend(page)
         pagination = payload.get("pagination")
         if isinstance(pagination, Mapping):
@@ -448,10 +450,18 @@ async def _collect_cursor_pages(
     return rows, has_more
 
 
-def _response_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _response_rows(
+    payload: Mapping[str, Any],
+    *,
+    max_rows: int,
+) -> list[dict[str, Any]]:
     values = payload.get("data")
     if not isinstance(values, list):
         raise ValueError("open-wearables returned an invalid page")
+    if len(values) > max_rows:
+        raise ValueError(
+            "open-wearables page exceeded the requested row limit"
+        )
     return [dict(value) for value in values if isinstance(value, Mapping)]
 
 

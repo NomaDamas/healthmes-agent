@@ -688,6 +688,8 @@ def test_bounded_query_snapshot_is_stable_retained_and_tamper_evident(
         "series_type": "heart_rate",
         "resolution": "1min",
     }
+    assert event.payload["retention_basis_at"] == start.isoformat()
+    assert first.retention_basis_at == start
     assert event.expires_at.replace(tzinfo=UTC) == (
         start + timedelta(days=30)
     )
@@ -835,7 +837,15 @@ def test_bounded_query_snapshot_rejects_expired_observation_window(
             parameters={},
             result={
                 "status": "ok",
-                "records": [],
+                "records": [
+                    {
+                        "category": "stress",
+                        "recorded_at": (
+                            NOW - timedelta(days=2)
+                        ).isoformat(),
+                        "value": 42,
+                    }
+                ],
                 "limitations": [],
             },
             collected_at=NOW,
@@ -843,3 +853,69 @@ def test_bounded_query_snapshot_rejects_expired_observation_window(
         )
 
     assert _query_count(session) == 0
+
+
+def test_empty_query_snapshot_uses_collection_time_for_retention(
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "1d",
+        now=NOW,
+    )
+
+    snapshot = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.health-scores",
+        start=NOW - timedelta(days=2),
+        end=NOW - timedelta(days=1),
+        timezone="UTC",
+        parameters={"date": "2026-08-08"},
+        result={
+            "status": "empty_success",
+            "records": [],
+            "limitations": [],
+        },
+        collected_at=NOW,
+        now=NOW,
+    )
+
+    event = session.get(WellnessEvent, snapshot.event_id)
+    assert event is not None
+    assert snapshot.retention_basis_at == NOW
+    assert event.observed_at.replace(tzinfo=UTC) == NOW
+    assert event.expires_at.replace(tzinfo=UTC) == (
+        NOW + timedelta(days=1)
+    )
+    assert event.payload["query"]["parameters"] == {}
+
+
+def test_summary_retention_uses_summary_day_not_previous_bedtime(
+    session,
+) -> None:
+    start = datetime(2026, 8, 10, tzinfo=UTC)
+    snapshot = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.summaries",
+        start=start,
+        end=start + timedelta(days=1),
+        timezone="UTC",
+        parameters={"summary_kind": "sleep"},
+        result={
+            "status": "ok",
+            "records": [
+                {
+                    "summary_kind": "sleep",
+                    "date": "2026-08-10",
+                    "start_time": "2026-08-09T23:00:00+00:00",
+                    "end_time": "2026-08-10T07:00:00+00:00",
+                }
+            ],
+            "limitations": [],
+        },
+        collected_at=NOW,
+        now=NOW,
+    )
+
+    assert snapshot.retention_basis_at == start
