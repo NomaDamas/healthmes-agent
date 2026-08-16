@@ -183,6 +183,78 @@ WearableSearchReader = Callable[
 ]
 
 
+def normalize_retained_wearable_timeseries(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    series_type: str,
+    resolution: str,
+    start: datetime,
+    end: datetime,
+) -> WearableSearchFetch:
+    """Reapply current privacy rules to previously stored public records."""
+
+    if series_type not in WEARABLE_TIMESERIES_TYPES:
+        raise ValueError("wearable timeseries type is not allowlisted")
+    if resolution not in WEARABLE_TIMESERIES_RESOLUTIONS:
+        raise ValueError("wearable timeseries resolution is not allowlisted")
+
+    normalized: list[dict[str, Any]] = []
+    discarded = 0
+    rebucketed = False
+    for record in records:
+        timestamp = _timestamp(record.get("timestamp"))
+        retained_type = _safe_text(
+            record.get("series_type"),
+            max_length=64,
+        )
+        value = _number(record.get("value"))
+        unit = _safe_text(record.get("unit"), max_length=32)
+        provider = _safe_text(record.get("provider"), max_length=64)
+        if (
+            timestamp is None
+            or not start.astimezone(UTC) <= timestamp < end.astimezone(UTC)
+            or retained_type != series_type
+            or value is None
+            or unit is None
+            or provider is None
+        ):
+            discarded += 1
+            continue
+        bucket_start = _resolution_bucket_start(
+            timestamp,
+            resolution=resolution,
+        )
+        rebucketed = rebucketed or bucket_start != timestamp
+        result: dict[str, Any] = {
+            "timestamp": bucket_start.isoformat(),
+            "series_type": series_type,
+            "value": value,
+            "unit": unit,
+            "provider": provider,
+        }
+        attribution = _safe_text(
+            record.get("provider_attribution"),
+            max_length=32,
+        )
+        if attribution is not None:
+            result["provider_attribution"] = attribution
+        zone_offset = _safe_text(
+            record.get("zone_offset"),
+            max_length=16,
+        )
+        if zone_offset is not None:
+            result["zone_offset"] = zone_offset
+        if type(record.get("is_daily_total")) is bool:
+            result["is_daily_total"] = record["is_daily_total"]
+        normalized.append(result)
+    normalized.sort(key=_row_sort_key)
+    return WearableSearchFetch(
+        records=tuple(normalized),
+        discarded_rows=discarded,
+        stream_attribution_unavailable=rebucketed,
+    )
+
+
 def validate_wearable_search_request(
     request: WearableSearchRequest,
 ) -> None:
@@ -462,12 +534,13 @@ async def _collect_offset_pages(
         rows.extend(page.rows)
         raw_rows += page.raw_count
         discarded_rows += page.discarded_rows
-        pagination = payload.get("pagination")
-        has_more = bool(
-            pagination.get("has_more")
-            if isinstance(pagination, Mapping)
-            else False
-        )
+        pagination = _response_pagination(payload)
+        raw_has_more = pagination.get("has_more")
+        if type(raw_has_more) is not bool:
+            raise ValueError(
+                "open-wearables returned invalid offset pagination"
+            )
+        has_more = raw_has_more
         if raw_rows > MAX_WEARABLE_SEARCH_ROWS:
             return rows, True, discarded_rows
         if not has_more:
@@ -500,14 +573,28 @@ async def _collect_cursor_pages(
         rows.extend(page.rows)
         raw_rows += page.raw_count
         discarded_rows += page.discarded_rows
-        pagination = payload.get("pagination")
-        if isinstance(pagination, Mapping):
-            raw_cursor = pagination.get("next_cursor")
-            next_cursor = str(raw_cursor) if raw_cursor else None
-            has_more = bool(next_cursor or pagination.get("has_more"))
-        else:
-            next_cursor = None
-            has_more = False
+        pagination = _response_pagination(payload)
+        if (
+            "next_cursor" not in pagination
+            and "has_more" not in pagination
+        ):
+            raise ValueError(
+                "open-wearables returned invalid cursor pagination"
+            )
+        raw_has_more = pagination.get("has_more", False)
+        if type(raw_has_more) is not bool:
+            raise ValueError(
+                "open-wearables returned invalid cursor pagination"
+            )
+        raw_cursor = pagination.get("next_cursor")
+        if raw_cursor is not None and (
+            not isinstance(raw_cursor, str) or not raw_cursor
+        ):
+            raise ValueError(
+                "open-wearables returned invalid cursor pagination"
+            )
+        next_cursor = raw_cursor
+        has_more = bool(next_cursor or raw_has_more)
         if raw_rows > MAX_WEARABLE_SEARCH_ROWS:
             return rows, True, discarded_rows
         if not has_more:
@@ -543,6 +630,17 @@ def _response_page(
         raw_count=len(values),
         discarded_rows=len(values) - len(rows),
     )
+
+
+def _response_pagination(
+    payload: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    pagination = payload.get("pagination")
+    if not isinstance(pagination, Mapping):
+        raise ValueError(
+            "open-wearables returned invalid pagination metadata"
+        )
+    return pagination
 
 
 def _normalized_key(value: str) -> str:
@@ -940,7 +1038,6 @@ def _aggregate_timeseries(
 ) -> tuple[list[dict[str, Any]], bool]:
     """Enforce the requested resolution even if the upstream route ignores it."""
 
-    interval_seconds = _TIMESERIES_RESOLUTION_SECONDS[resolution]
     buckets: dict[
         tuple[datetime, str, str, str],
         list[Mapping[str, Any]],
@@ -956,10 +1053,9 @@ def _aggregate_timeseries(
         )
         if timestamp is None or unit is None or provider is None:
             continue
-        epoch_seconds = int(timestamp.timestamp())
-        bucket_start = datetime.fromtimestamp(
-            epoch_seconds - (epoch_seconds % interval_seconds),
-            tz=UTC,
+        bucket_start = _resolution_bucket_start(
+            timestamp,
+            resolution=resolution,
         )
         if stream_key is None:
             # Matching provider or device labels do not prove that samples
@@ -1028,6 +1124,19 @@ def _aggregate_timeseries(
             result["is_daily_total"] = True
         aggregated.append(result)
     return aggregated, bool(unattributed)
+
+
+def _resolution_bucket_start(
+    timestamp: datetime,
+    *,
+    resolution: str,
+) -> datetime:
+    interval_seconds = _TIMESERIES_RESOLUTION_SECONDS[resolution]
+    epoch_seconds = int(timestamp.timestamp())
+    return datetime.fromtimestamp(
+        epoch_seconds - (epoch_seconds % interval_seconds),
+        tz=UTC,
+    )
 
 
 def _normalized_aggregate_value(

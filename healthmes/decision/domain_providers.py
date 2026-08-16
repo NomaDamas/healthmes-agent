@@ -116,6 +116,7 @@ from healthmes.wearables.search import (
     WearableSearchFetch,
     WearableSearchReader,
     WearableSearchRequest,
+    normalize_retained_wearable_timeseries,
     validate_wearable_search_request,
 )
 
@@ -681,6 +682,15 @@ _WEARABLE_LIMITATION_CODES = (
     "wearable_source_refs_are_readiness_level",
     "wearable_stream_attribution_unavailable",
     "wearable_upstream_page_limit_reached",
+)
+_WEARABLE_INCOMPLETE_RESULT_LIMITATIONS = frozenset(
+    {
+        "wearable_payload_limit_reached",
+        "wearable_provider_attribution_unavailable",
+        "wearable_rows_discarded",
+        "wearable_stream_attribution_unavailable",
+        "wearable_upstream_page_limit_reached",
+    }
 )
 _WEARABLE_PROVIDER_FAMILIES = frozenset(
     {
@@ -3415,6 +3425,17 @@ class WearableContextProvider:
             )
             if isinstance(record, Mapping)
         ]
+        retained_limitations = set(_limitations(stored))
+        if query.capability == "wearable.timeseries":
+            normalized_fetch = normalize_retained_wearable_timeseries(
+                public_records,
+                series_type=str(query.parameters["series_type"]),
+                resolution=str(query.parameters["resolution"]),
+                start=snapshot.start,
+                end=snapshot.end,
+            )
+            public_records = list(normalized_fetch.records)
+            retained_limitations.update(normalized_fetch.limitations)
         occurrence_by_digest: dict[str, int] = {}
         page_entries: list[dict[str, Any]] = []
         for record in public_records:
@@ -3438,7 +3459,7 @@ class WearableContextProvider:
         )
         selected = [entry["record"] for entry in selected_entries]
         limitations = {
-            *_limitations(stored),
+            *retained_limitations,
             *(value for value in extra_limitations if value),
         }
         upstream_truncated = bool(
@@ -3460,8 +3481,19 @@ class WearableContextProvider:
             limitations.add(
                 "wearable_provider_attribution_unavailable"
             )
+        incomplete_result = bool(
+            _WEARABLE_INCOMPLETE_RESULT_LIMITATIONS & limitations
+        )
+        stored_status = stored.get("status", "partial")
+        if incomplete_result and str(stored_status).casefold() not in {
+            "error",
+            "failed",
+            "not_configured",
+            "unavailable",
+        }:
+            stored_status = "partial"
         raw = {
-            "status": stored.get("status", "partial"),
+            "status": stored_status,
             "count": len(selected),
             "records": selected,
             "window": {
@@ -3473,7 +3505,11 @@ class WearableContextProvider:
                 "recorded_at": snapshot.collected_at.isoformat(),
                 "status": provenance_mode,
             },
-            "coverage": stored.get("coverage", {}),
+            "coverage": (
+                {}
+                if incomplete_result
+                else stored.get("coverage", {})
+            ),
             "limitations": sorted(limitations),
         }
         freshness = _freshness(

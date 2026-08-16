@@ -1021,6 +1021,124 @@ async def test_detail_search_reads_legacy_snapshot_without_provider(
         engine.dispose()
 
 
+async def test_retained_timeseries_reapplies_resolution_without_merging(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(
+        tmp_path,
+        "detail-retained-timeseries-resolution.db",
+    )
+    with factory() as session:
+        persist_open_wearables_query_snapshot(
+            session,
+            capability="wearable.timeseries",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            timezone="UTC",
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+            result={
+                "status": "ok",
+                "records": [
+                    {
+                        "timestamp": "2026-08-16T08:05:37+00:00",
+                        "series_type": "steps",
+                        "value": 10,
+                        "unit": "count",
+                        "provider": "apple_health",
+                        "provider_attribution": "source_exact_alias",
+                    },
+                    {
+                        "timestamp": "2026-08-16T08:25:49+00:00",
+                        "series_type": "steps",
+                        "value": 20,
+                        "unit": "count",
+                        "provider": "apple_health",
+                        "provider_attribution": "source_exact_alias",
+                    },
+                ],
+                "coverage": {"ratio": 1.0},
+                "limitations": [],
+            },
+            collected_at=NOW,
+            now=NOW,
+        )
+        session.commit()
+
+    calls = 0
+
+    async def unavailable_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("upstream unavailable")
+
+    service = _service(
+        factory,
+        WearableContextProvider(
+            search_reader=unavailable_reader,
+            snapshot_session_factory=factory,
+        ),
+    )
+    try:
+        handle = service.begin(_request())
+        first = await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.timeseries",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="series",
+            limit=1,
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+        )
+        assert first.next_cursor is not None
+        second = await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.timeseries",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="series",
+            limit=1,
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+                "cursor": first.next_cursor,
+            },
+        )
+
+        assert calls == 1
+        assert [
+            first.payload["records"][0]["value"],
+            second.payload["records"][0]["value"],
+        ] == [10, 20]
+        assert [
+            first.payload["records"][0]["timestamp"],
+            second.payload["records"][0]["timestamp"],
+        ] == [
+            "2026-08-16T08:00:00+00:00",
+            "2026-08-16T08:00:00+00:00",
+        ]
+        assert first.status is ContextStatus.PARTIAL
+        assert second.status is ContextStatus.PARTIAL
+        assert second.coverage.status is CoverageStatus.UNKNOWN
+        assert second.coverage.ratio is None
+        assert (
+            "wearable_stream_attribution_unavailable"
+            in second.limitations
+        )
+    finally:
+        service.close()
+        engine.dispose()
+
+
 async def test_detail_search_timeout_uses_exact_retained_query(
     tmp_path,
 ) -> None:
@@ -1162,6 +1280,52 @@ async def test_detail_search_degrades_fully_discarded_page_to_partial(
         )
 
     provider = WearableContextProvider(search_reader=search_reader)
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.health-scores",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="record",
+            parameters={"category": "stress"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["status"] == "partial"
+    assert result.coverage.status is CoverageStatus.UNKNOWN
+    assert result.coverage.ratio is None
+    assert "wearable_rows_discarded" in result.limitations
+
+
+async def test_retained_fully_discarded_page_normalizes_legacy_status(
+    session,
+) -> None:
+    persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.health-scores",
+        start=DETAIL_START,
+        end=DETAIL_END,
+        timezone="UTC",
+        parameters={"category": "stress"},
+        result={
+            "status": "empty_success",
+            "records": [],
+            "limitations": ["wearable_rows_discarded"],
+        },
+        collected_at=NOW,
+        now=NOW,
+    )
+    session.commit()
+
+    async def unavailable_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        raise RuntimeError("upstream unavailable")
+
+    provider = WearableContextProvider(search_reader=unavailable_reader)
     result = await provider.query(
         session,
         ContextQuery(

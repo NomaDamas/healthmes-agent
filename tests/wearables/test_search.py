@@ -648,6 +648,71 @@ async def test_cursor_pagination_continues_after_fully_malformed_page() -> None:
     assert fetched.limitations == ("wearable_rows_discarded",)
 
 
+class MissingOffsetPaginationClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int]] = []
+        self.rows = [
+            {
+                "category": "stress",
+                "provider": "garmin",
+                "recorded_at": (
+                    START + timedelta(minutes=index)
+                ).isoformat(),
+                "value": index,
+            }
+            for index in range(101)
+        ]
+
+    async def get_health_scores(
+        self,
+        _user_id,
+        *,
+        limit: int,
+        offset: int,
+        **_kwargs,
+    ):
+        self.calls.append((limit, offset))
+        return {"data": self.rows[offset : offset + limit]}
+
+
+async def test_offset_pagination_rejects_missing_pagination_metadata() -> None:
+    client = MissingOffsetPaginationClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    with pytest.raises(ValueError, match="pagination"):
+        await search(_request("wearable.health-scores"))
+
+    assert client.calls == [(100, 0)]
+
+
+class NonMappingCursorPaginationClient:
+    async def get_workouts(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                    "provider": "garmin",
+                }
+            ],
+            "pagination": [],
+        }
+
+
+async def test_cursor_pagination_rejects_non_mapping_metadata() -> None:
+    search = BoundedOpenWearablesSearch(
+        NonMappingCursorPaginationClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    with pytest.raises(ValueError, match="pagination"):
+        await search(_request("wearable.workouts"))
+
+
 class OversizedPageClient:
     async def get_health_scores(self, _user_id, *, limit, **_kwargs):
         return {
