@@ -6,6 +6,8 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event as ThreadEvent
+from time import monotonic
 from types import SimpleNamespace
 
 import httpx
@@ -13,6 +15,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+import healthmes.decision.responses as responses_module
 from healthmes.app import create_app
 from healthmes.decision import (
     HERMES_DECISION_MCP_TOOL_NAMES,
@@ -478,6 +481,11 @@ class _Transport:
         self.session_list_calls: list[tuple[int, int]] = []
         self.response_calls: list[dict] = []
         self.deleted_sessions: list[str] = []
+        self.runtime_verifications = 0
+
+    async def verify_runtime(self, *, timeout_seconds: float) -> None:
+        assert timeout_seconds > 0
+        self.runtime_verifications += 1
 
     async def get_toolsets(self) -> dict:
         self.toolset_calls += 1
@@ -494,6 +502,7 @@ class _Transport:
         timeout_seconds: float,
     ) -> HermesResponsesHttpResult:
         assert timeout_seconds > 0
+        await self.verify_runtime(timeout_seconds=timeout_seconds)
         self.response_calls.append(dict(payload))
         return HermesResponsesHttpResult(
             payload=self.response,
@@ -584,12 +593,14 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
     )
 
     run = await agent.ask(_request())
+    await agent.aclose()
 
     assert run.draft.status is DecisionStatus.COMPLETED
     assert run.draft.answer == "Take a short break."
     assert run.steps_used == 1
     assert transport.toolset_calls == 1
     assert transport.model_calls == 1
+    assert transport.runtime_verifications == 2
     assert len(transport.response_calls) == 1
     payload = transport.response_calls[0]
     assert payload["store"] is False
@@ -610,6 +621,38 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
     ]
     assert search.finished == 1
     assert search.aborted == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_is_verified_at_startup_and_before_every_decision() -> None:
+    transport = _Transport(
+        _final_response(
+            {
+                "status": "completed",
+                "answer": "Take a short break.",
+            }
+        )
+    )
+    agent = HermesResponsesDecisionAgent(
+        transport=transport,
+        search_service=_SearchService(_empty_snapshot()),  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        clock=lambda: NOW,
+    )
+
+    await agent.start()
+    assert transport.runtime_verifications == 1
+
+    first = await agent.ask(_request())
+    second = await agent.ask(_request())
+    await agent.aclose()
+
+    assert first.draft.status is DecisionStatus.COMPLETED
+    assert second.draft.status is DecisionStatus.COMPLETED
+    assert transport.runtime_verifications == 3
+    assert len(transport.response_calls) == 2
 
 
 @pytest.mark.asyncio
@@ -1567,6 +1610,218 @@ async def test_agent_timeout_aborts_search_session() -> None:
     assert search.finished == 0
     assert search.aborted == 1
     assert transport.deleted_sessions == []
+
+
+@pytest.mark.asyncio
+async def test_absolute_deadline_bounds_slow_search_begin() -> None:
+    class SlowBeginSearch(_SearchService):
+        def __init__(self) -> None:
+            super().__init__(_empty_snapshot())
+            self.started = ThreadEvent()
+            self.release = ThreadEvent()
+
+        def begin(self, request: DecisionRequest) -> SimpleNamespace:
+            self.started.set()
+            self.release.wait(timeout=1)
+            return super().begin(request)
+
+    search = SlowBeginSearch()
+    agent = HermesResponsesDecisionAgent(
+        transport=_Transport(
+            _final_response(
+                {
+                    "status": "completed",
+                    "answer": "This must not execute.",
+                }
+            )
+        ),
+        search_service=search,  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=0.03,
+        session_ttl_seconds=1,
+        session_purge_interval_seconds=0.5,
+        clock=lambda: NOW,
+    )
+
+    started = monotonic()
+    run = await agent.ask(_request())
+    elapsed = monotonic() - started
+    search.release.set()
+    for _ in range(50):
+        if search.aborted == 1:
+            break
+        await asyncio.sleep(0.01)
+    await agent.aclose()
+
+    assert search.started.is_set()
+    assert elapsed < 0.2
+    assert run.draft.limitations == ["hermes_responses_timeout"]
+    assert search.aborted == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_deadline_cancels_precreated_async_operation() -> None:
+    operation = asyncio.create_task(asyncio.Event().wait())
+    await asyncio.sleep(0)
+
+    with pytest.raises(TimeoutError):
+        await responses_module._before_deadline(
+            operation,
+            monotonic() - 1,
+        )
+    await asyncio.sleep(0)
+
+    assert operation.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_absolute_deadline_bounds_slow_search_finish() -> None:
+    class SlowFinishSearch(_SearchService):
+        def __init__(self) -> None:
+            super().__init__(_empty_snapshot())
+            self.started = ThreadEvent()
+            self.release = ThreadEvent()
+
+        def finish(self, session_id: str) -> SimpleNamespace:
+            self.started.set()
+            self.release.wait(timeout=1)
+            return super().finish(session_id)
+
+    search = SlowFinishSearch()
+    agent = HermesResponsesDecisionAgent(
+        transport=_Transport(
+            _final_response(
+                {
+                    "status": "completed",
+                    "answer": "This must time out before validation.",
+                }
+            )
+        ),
+        search_service=search,  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=0.03,
+        cleanup_retry_seconds=0,
+        session_ttl_seconds=1,
+        session_purge_interval_seconds=0.5,
+        clock=lambda: NOW,
+    )
+
+    started = monotonic()
+    run = await agent.ask(_request())
+    elapsed = monotonic() - started
+    search.release.set()
+    await agent.aclose()
+
+    assert search.started.is_set()
+    assert elapsed < 0.2
+    assert run.draft.limitations == ["hermes_responses_timeout"]
+    assert search.aborted == 1
+
+
+@pytest.mark.asyncio
+async def test_absolute_deadline_bounds_slow_transcript_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_started = ThreadEvent()
+    release_validation = ThreadEvent()
+    original = responses_module._run_from_response
+
+    def slow_validation(*args, **kwargs):
+        validation_started.set()
+        release_validation.wait(timeout=1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        responses_module,
+        "_run_from_response",
+        slow_validation,
+    )
+    search = _SearchService(_empty_snapshot())
+    agent = HermesResponsesDecisionAgent(
+        transport=_Transport(
+            _final_response(
+                {
+                    "status": "completed",
+                    "answer": "This validation must time out.",
+                }
+            )
+        ),
+        search_service=search,  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=0.03,
+        session_ttl_seconds=1,
+        session_purge_interval_seconds=0.5,
+        clock=lambda: NOW,
+    )
+
+    started = monotonic()
+    run = await agent.ask(_request())
+    elapsed = monotonic() - started
+    release_validation.set()
+    await agent.aclose()
+
+    assert validation_started.is_set()
+    assert elapsed < 0.2
+    assert run.draft.limitations == ["hermes_responses_timeout"]
+    assert search.finished == 1
+    assert search.aborted == 0
+
+
+@pytest.mark.asyncio
+async def test_slow_cleanup_is_response_detached_bounded_and_observable() -> None:
+    class SlowCleanupTransport(_Transport):
+        def __init__(self) -> None:
+            super().__init__(
+                _final_response(
+                    {
+                        "status": "completed",
+                        "answer": "Cleanup must not delay this response.",
+                    }
+                )
+            )
+            self.cleanup_started = asyncio.Event()
+            self.release_cleanup = asyncio.Event()
+
+        async def delete_session(self, session_id: str) -> None:
+            self.deleted_sessions.append(session_id)
+            self.cleanup_started.set()
+            await self.release_cleanup.wait()
+
+    transport = SlowCleanupTransport()
+    agent = HermesResponsesDecisionAgent(
+        transport=transport,
+        search_service=_SearchService(_empty_snapshot()),  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=0.03,
+        cleanup_attempts=1,
+        cleanup_timeout_seconds=0.05,
+        session_ttl_seconds=1,
+        session_purge_interval_seconds=0.5,
+        clock=lambda: NOW,
+    )
+
+    started = monotonic()
+    run = await agent.ask(_request())
+    response_elapsed = monotonic() - started
+    await asyncio.wait_for(transport.cleanup_started.wait(), timeout=0.2)
+    pending = agent.cleanup_status()
+    shutdown_started = monotonic()
+    await agent.aclose()
+    shutdown_elapsed = monotonic() - shutdown_started
+    finished = agent.cleanup_status()
+
+    assert run.draft.status is DecisionStatus.COMPLETED
+    assert response_elapsed < 0.2
+    assert pending.scheduled == 1
+    assert pending.pending == 1
+    assert shutdown_elapsed < 0.2
+    assert finished.scheduled == 1
+    assert finished.failed == 1
+    assert finished.pending == 0
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,12 @@ from healthmes.decision import (
     ensure_decision_domain_policies,
     update_decision_domain_policy,
 )
+from healthmes.hermes_mcp_inventory import (
+    HERMES_DECISION_MCP_TOOL_NAMES,
+    expected_hermes_mcp_inventory,
+    schema_digests_from_mcp_tools,
+    validate_model_visible_mcp_inventory,
+)
 from healthmes.mcp_server import server as server_module
 from healthmes.store import WellnessEvent
 
@@ -452,6 +458,21 @@ async def test_domain_search_schemas_are_exact_bounded_and_identity_safe(
         "stress",
         "yesterday_load",
     }
+
+
+async def test_live_healthmes_mcp_schemas_match_decision_runtime_inventory(
+    mcp_client,
+) -> None:
+    tools = await mcp_client.list_tools()
+    schema_digests = schema_digests_from_mcp_tools(
+        tools,
+        included_names=HERMES_DECISION_MCP_TOOL_NAMES,
+    )
+
+    assert (
+        validate_model_visible_mcp_inventory(schema_digests)
+        == expected_hermes_mcp_inventory()
+    )
 
 
 async def test_four_tools_share_one_budget_and_always_roll_back(

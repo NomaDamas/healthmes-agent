@@ -9,7 +9,7 @@ import hmac
 import json
 import os
 import signal
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,13 +20,24 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
 
+from healthmes.hermes_mcp_inventory import (
+    HERMES_DECISION_MCP_TOOL_NAMES,
+    HermesMcpInventoryError,
+    HermesMcpToolInventory,
+    schema_digests_from_mcp_tools,
+    validate_model_visible_mcp_inventory,
+)
 from healthmes.hermes_runtime_identity import (
     HERMES_RUNTIME_ATTESTATION_PATH,
     HERMES_RUNTIME_HEALTH_PATH,
     HERMES_RUNTIME_PROVIDER_ENV_NAMES,
     HermesDecisionRuntimeManifest,
     HermesRuntimeIdentityError,
+    HermesRuntimeMcpConnection,
+    load_runtime_mcp_connection,
     seal_supervised_runtime,
     sign_runtime_attestation,
     validate_supervised_runtime,
@@ -40,6 +51,10 @@ _FORWARDED_RESPONSE_HEADERS = frozenset(
         "x-hermes-session-id",
     }
 )
+McpInventoryProbe = Callable[
+    [HermesRuntimeMcpConnection, float],
+    Awaitable[Mapping[str, str]],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +68,7 @@ class HermesRuntimeSupervisorConfig:
     host: str = "127.0.0.1"
     port: int = 8645
     startup_timeout_seconds: float = 30
+    mcp_probe_timeout_seconds: float = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +78,7 @@ class HermesRuntimeState:
     manifest: HermesDecisionRuntimeManifest
     attestation_key: bytes
     api_key: str
+    mcp_inventory: HermesMcpToolInventory
 
 
 class RuntimeController(Protocol):
@@ -73,6 +90,9 @@ class RuntimeController(Protocol):
 
     def revalidate(self) -> HermesRuntimeState:
         """Return state only while the exact launched child remains valid."""
+
+    async def attest(self) -> HermesRuntimeState:
+        """Revalidate the child and its live model-visible MCP inventory."""
 
     async def start(self) -> None:
         """Start and verify the dedicated child."""
@@ -89,9 +109,13 @@ class HermesRuntimeProcess:
         config: HermesRuntimeSupervisorConfig,
         *,
         environ: Mapping[str, str] | None = None,
+        mcp_inventory_probe: McpInventoryProbe | None = None,
     ) -> None:
         self._config = config
         self._environ = dict(os.environ if environ is None else environ)
+        self._mcp_inventory_probe = (
+            mcp_inventory_probe or _probe_live_mcp_schema_digests
+        )
         self._state: HermesRuntimeState | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._launch_argv: tuple[str, ...] | None = None
@@ -129,6 +153,19 @@ class HermesRuntimeProcess:
         ):
             raise HermesRuntimeIdentityError(
                 "hermes_runtime_identity_changed"
+            )
+        return state
+
+    async def attest(self) -> HermesRuntimeState:
+        state = self.revalidate()
+        inventory = await self._probe_runtime_inventory()
+        verified = self.revalidate()
+        if (
+            verified != state
+            or inventory != state.mcp_inventory
+        ):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_mcp_inventory_changed"
             )
         return state
 
@@ -182,6 +219,7 @@ class HermesRuntimeProcess:
                 manifest=manifest,
                 api_key=api_key,
             )
+            inventory = await self._probe_runtime_inventory()
             verified_manifest, verified_key, verified_api_key = (
                 validate_supervised_runtime(
                     manifest_path=config.manifest_path,
@@ -210,6 +248,7 @@ class HermesRuntimeProcess:
             manifest=manifest,
             attestation_key=key,
             api_key=api_key,
+            mcp_inventory=inventory,
         )
 
     async def _wait_until_ready(
@@ -247,6 +286,36 @@ class HermesRuntimeProcess:
                     raise TimeoutError("Hermes child startup timed out")
                 await asyncio.sleep(min(0.1, remaining))
 
+    async def _probe_runtime_inventory(
+        self,
+    ) -> HermesMcpToolInventory:
+        connection = load_runtime_mcp_connection(
+            self._config.hermes_home
+        )
+        try:
+            async with asyncio.timeout(
+                self._config.mcp_probe_timeout_seconds
+            ):
+                schema_digests = await self._mcp_inventory_probe(
+                    connection,
+                    self._config.mcp_probe_timeout_seconds,
+                )
+            return validate_model_visible_mcp_inventory(schema_digests)
+        except asyncio.CancelledError:
+            raise
+        except HermesMcpInventoryError as exc:
+            raise HermesRuntimeIdentityError(str(exc)) from exc
+        except HermesRuntimeIdentityError:
+            raise
+        except TimeoutError as exc:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_mcp_inventory_timeout"
+            ) from exc
+        except Exception as exc:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_mcp_inventory_unavailable"
+            ) from exc
+
     async def aclose(self) -> None:
         process = self._process
         self._process = None
@@ -266,6 +335,28 @@ class HermesRuntimeProcess:
             except ProcessLookupError:
                 return
             await process.wait()
+
+
+async def _probe_live_mcp_schema_digests(
+    connection: HermesRuntimeMcpConnection,
+    timeout_seconds: float,
+) -> Mapping[str, str]:
+    """Reach the configured MCP server and return the filtered live schemas."""
+
+    transport = StreamableHttpTransport(
+        connection.url,
+        headers=connection.header_mapping(),
+    )
+    async with Client(
+        transport,
+        timeout=timeout_seconds,
+        init_timeout=timeout_seconds,
+    ) as client:
+        tools = await client.list_tools(max_pages=8)
+    return schema_digests_from_mcp_tools(
+        tools,
+        included_names=HERMES_DECISION_MCP_TOOL_NAMES,
+    )
 
 
 def build_child_environment(
@@ -358,11 +449,12 @@ def create_supervisor_app(
         if not isinstance(nonce, str):
             raise HTTPException(status_code=400, detail="invalid nonce")
         try:
-            state = controller.revalidate()
+            state = await controller.attest()
             proof = sign_runtime_attestation(
                 manifest=state.manifest,
                 key=state.attestation_key,
                 nonce=nonce,
+                mcp_inventory=state.mcp_inventory,
             )
         except HermesRuntimeIdentityError as exc:
             raise HTTPException(
@@ -404,7 +496,7 @@ def create_supervisor_app(
             separators=(",", ":"),
         ).encode("utf-8")
         try:
-            state = controller.revalidate()
+            state = await controller.attest()
         except HermesRuntimeIdentityError as exc:
             raise HTTPException(
                 status_code=503,
@@ -596,6 +688,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             )
         ),
     )
+    parser.add_argument(
+        "--mcp-probe-timeout",
+        type=float,
+        default=float(
+            os.environ.get(
+                "HEALTHMES_DECISION_RUNTIME_MCP_PROBE_TIMEOUT_SECONDS",
+                "5",
+            )
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -618,11 +720,14 @@ def main(argv: list[str] | None = None) -> None:
         host=args.host,
         port=args.port,
         startup_timeout_seconds=args.startup_timeout,
+        mcp_probe_timeout_seconds=args.mcp_probe_timeout,
     )
     if not 1 <= config.port <= 65_535:
         raise SystemExit("invalid runtime port")
     if config.startup_timeout_seconds <= 0:
         raise SystemExit("startup timeout must be positive")
+    if config.mcp_probe_timeout_seconds <= 0:
+        raise SystemExit("MCP probe timeout must be positive")
     controller = HermesRuntimeProcess(config)
     uvicorn.run(
         create_supervisor_app(controller),

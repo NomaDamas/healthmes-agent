@@ -10,6 +10,10 @@ from typing import Any
 
 import yaml
 
+from healthmes.hermes_mcp_inventory import (
+    HERMES_DECISION_MCP_TOOL_NAMES,
+)
+
 WELLNESS_SKILL_CATALOG_VERSION = "healthmes-wellness-skills.v1"
 MAX_WELLNESS_SKILL_BYTES = 64_000
 REVIEWED_WELLNESS_SKILLS = (
@@ -19,14 +23,7 @@ REVIEWED_WELLNESS_SKILLS = (
     "healthmes-sleep",
     "healthmes-stress",
 )
-CANONICAL_WELLNESS_DECISION_TOOLS = (
-    "search_activity",
-    "search_nutrition",
-    "search_calendar",
-    "search_wearable",
-    "list_wellness_skills",
-    "read_wellness_skill",
-)
+CANONICAL_WELLNESS_DECISION_TOOLS = HERMES_DECISION_MCP_TOOL_NAMES
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2] / "skills"
 _MCP_TOOL_REFERENCE = re.compile(

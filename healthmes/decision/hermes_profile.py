@@ -13,7 +13,11 @@ from urllib.parse import urlsplit
 
 import yaml
 
-HERMES_DECISION_MCP_SERVER = "healthmes"
+from healthmes.hermes_mcp_inventory import (
+    HERMES_DECISION_MCP_SERVER,
+    HERMES_DECISION_MCP_TOOL_NAMES,
+)
+
 HERMES_DECISION_RUNTIME_MODEL_NAME = "healthmes-decision-runtime"
 HERMES_DECISION_SEARCH_MCP_TOOL_NAMES = (
     "search_activity",
@@ -24,10 +28,6 @@ HERMES_DECISION_SEARCH_MCP_TOOL_NAMES = (
 HERMES_DECISION_SKILL_MCP_TOOL_NAMES = (
     "list_wellness_skills",
     "read_wellness_skill",
-)
-HERMES_DECISION_MCP_TOOL_NAMES = (
-    *HERMES_DECISION_SEARCH_MCP_TOOL_NAMES,
-    *HERMES_DECISION_SKILL_MCP_TOOL_NAMES,
 )
 HERMES_DECISION_TOOL_DOMAINS: dict[str, str] = {
     "mcp__healthmes__search_activity": "activity",

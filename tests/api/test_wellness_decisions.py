@@ -187,6 +187,9 @@ class MissingResponsesTransport:
     def __init__(self) -> None:
         self.response_calls = 0
 
+    async def verify_runtime(self, *, timeout_seconds: float) -> None:
+        assert timeout_seconds > 0
+
     async def get_toolsets(self) -> dict[str, Any]:
         return {
             "object": "list",

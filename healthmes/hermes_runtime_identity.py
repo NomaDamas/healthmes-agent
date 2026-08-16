@@ -17,6 +17,7 @@ import stat
 import sys
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -30,9 +31,16 @@ from pydantic import (
     model_validator,
 )
 
+from healthmes.hermes_mcp_inventory import (
+    HERMES_DECISION_MCP_SERVER,
+    HERMES_DECISION_MCP_TOOL_NAMES,
+    HermesMcpToolInventory,
+    expected_hermes_mcp_inventory,
+)
+
 HERMES_DECISION_RUNTIME_MODEL_ALIAS = "healthmes-decision-runtime"
 HERMES_RUNTIME_MANIFEST_SCHEMA = "healthmes.hermes-runtime.v2"
-HERMES_RUNTIME_ATTESTATION_SCHEMA = "healthmes.hermes-runtime-attestation.v1"
+HERMES_RUNTIME_ATTESTATION_SCHEMA = "healthmes.hermes-runtime-attestation.v2"
 HERMES_RUNTIME_ATTESTATION_PATH = "/healthmes/runtime-attestation"
 HERMES_RUNTIME_HEALTH_PATH = "/healthmes/runtime-health"
 HERMES_RUNTIME_HOME_ARTIFACT_NAMES = (
@@ -159,6 +167,20 @@ _FORBIDDEN_NONEMPTY_HOME_DIRS = (
 
 class HermesRuntimeIdentityError(ValueError):
     """A dedicated runtime artifact failed closed validation."""
+
+
+@dataclass(frozen=True, slots=True)
+class HermesRuntimeMcpConnection:
+    """Manifest-bound connection details used only for live MCP probing."""
+
+    url: str
+    headers: tuple[tuple[str, str], ...] = field(
+        default=(),
+        repr=False,
+    )
+
+    def header_mapping(self) -> dict[str, str]:
+        return dict(self.headers)
 
 
 class HermesRuntimeNamedDigest(BaseModel):
@@ -348,11 +370,12 @@ class HermesRuntimeAttestation(BaseModel):
     )
 
     schema_name: Literal[
-        "healthmes.hermes-runtime-attestation.v1"
+        "healthmes.hermes-runtime-attestation.v2"
     ] = Field(alias="schema")
     nonce: str = Field(min_length=32, max_length=128)
     issued_at: int = Field(ge=0)
     runtime: HermesDecisionRuntimeManifest
+    mcp_inventory: HermesMcpToolInventory
     signature: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -467,6 +490,20 @@ def runtime_home_artifact_sha256(hermes_home: Path) -> dict[str, str]:
         )
         digests[name] = hashlib.sha256(content).hexdigest()
     return digests
+
+
+def load_runtime_mcp_connection(
+    hermes_home: Path,
+) -> HermesRuntimeMcpConnection:
+    """Load the exact filtered HealthMes MCP endpoint from the sealed profile."""
+
+    profile = _read_regular_file(
+        hermes_home.expanduser() / "config.yaml",
+        code="hermes_runtime_profile",
+        max_bytes=_MAX_PROFILE_BYTES,
+        owner_only=True,
+    )
+    return _profile_mcp_connection(profile)
 
 
 def load_runtime_manifest(path: Path) -> HermesDecisionRuntimeManifest:
@@ -881,9 +918,10 @@ def sign_runtime_attestation(
     manifest: HermesDecisionRuntimeManifest,
     key: bytes,
     nonce: str,
+    mcp_inventory: HermesMcpToolInventory | None = None,
     issued_at: int | None = None,
 ) -> HermesRuntimeAttestation:
-    """Create a nonce-bound HMAC proof."""
+    """Create a nonce-bound HMAC proof over runtime and live MCP inventory."""
 
     if not manifest.sealed:
         raise HermesRuntimeIdentityError(
@@ -894,11 +932,16 @@ def sign_runtime_attestation(
             "hermes_runtime_attestation_nonce_invalid"
         )
     issued = int(time.time()) if issued_at is None else issued_at
+    inventory = mcp_inventory or expected_hermes_mcp_inventory()
     unsigned = {
         "schema": HERMES_RUNTIME_ATTESTATION_SCHEMA,
         "nonce": nonce,
         "issued_at": issued,
         "runtime": manifest.model_dump(mode="json", by_alias=True),
+        "mcp_inventory": inventory.model_dump(
+            mode="json",
+            by_alias=True,
+        ),
     }
     signature = hmac.new(
         _attestation_key_bytes(key),
@@ -916,10 +959,11 @@ def verify_runtime_attestation(
     expected_manifest: HermesDecisionRuntimeManifest,
     key: bytes,
     nonce: str,
+    expected_mcp_inventory: HermesMcpToolInventory | None = None,
     now: int | None = None,
     max_age_seconds: int = 30,
 ) -> HermesRuntimeAttestation:
-    """Verify freshness, challenge, exact manifest, and HMAC."""
+    """Verify freshness, runtime identity, live inventory, and HMAC."""
 
     try:
         proof = HermesRuntimeAttestation.model_validate(raw)
@@ -942,6 +986,13 @@ def verify_runtime_attestation(
     if proof.runtime != expected_manifest:
         raise HermesRuntimeIdentityError(
             "hermes_runtime_attestation_identity_mismatch"
+        )
+    expected_inventory = (
+        expected_mcp_inventory or expected_hermes_mcp_inventory()
+    )
+    if proof.mcp_inventory != expected_inventory:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_mcp_inventory_mismatch"
         )
     unsigned = proof.model_dump(
         mode="json",
@@ -1141,6 +1192,90 @@ def _profile_runtime_identity(
         model,
         provider,
         _normalize_origin(f"http://{host}:{port}"),
+    )
+
+
+def _profile_mcp_connection(
+    profile_bytes: bytes,
+) -> HermesRuntimeMcpConnection:
+    if len(profile_bytes) > _MAX_PROFILE_BYTES:
+        raise HermesRuntimeIdentityError("hermes_runtime_profile_too_large")
+    try:
+        profile = yaml.safe_load(profile_bytes)
+        servers = profile["mcp_servers"]
+        if (
+            not isinstance(servers, Mapping)
+            or set(servers) != {HERMES_DECISION_MCP_SERVER}
+        ):
+            raise TypeError
+        healthmes = servers[HERMES_DECISION_MCP_SERVER]
+        if not isinstance(healthmes, Mapping):
+            raise TypeError
+        url = healthmes["url"]
+        tools = healthmes["tools"]
+        if not isinstance(tools, Mapping):
+            raise TypeError
+        include = tools["include"]
+        headers = healthmes.get("headers", {})
+    except (KeyError, TypeError, yaml.YAMLError) as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_mcp_profile_invalid"
+        ) from exc
+    if healthmes.get("enabled", True) is not True:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_mcp_profile_invalid"
+        )
+    if (
+        tools.get("resources") is not False
+        or tools.get("prompts") is not False
+        or not isinstance(include, list)
+        or any(not isinstance(item, str) for item in include)
+        or frozenset(include) != frozenset(HERMES_DECISION_MCP_TOOL_NAMES)
+        or len(include) != len(set(include))
+        or tools.get("exclude") not in (None, [], ())
+    ):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_mcp_filter_invalid"
+        )
+    if not isinstance(url, str):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_mcp_profile_invalid"
+        )
+    parsed = urlsplit(url.strip())
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_mcp_profile_invalid"
+        )
+    if (
+        not isinstance(headers, Mapping)
+        or len(headers) > 16
+        or any(
+            not isinstance(name, str)
+            or not isinstance(value, str)
+            or not name
+            or len(name) > 128
+            or len(value) > 8_192
+            or any(char in name for char in "\r\n\x00:")
+            or any(char in value for char in "\r\n\x00")
+            for name, value in headers.items()
+        )
+    ):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_mcp_headers_invalid"
+        )
+    return HermesRuntimeMcpConnection(
+        url=(
+            f"{parsed.scheme}://{parsed.netloc}"
+            f"{parsed.path.rstrip('/') or '/'}"
+        ),
+        headers=tuple(sorted(headers.items())),
     )
 
 

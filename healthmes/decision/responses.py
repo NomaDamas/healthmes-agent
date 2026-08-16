@@ -10,10 +10,11 @@ import logging
 import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from concurrent.futures import Future as ConcurrentFuture
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event
+from threading import BoundedSemaphore, Event, Lock, Thread
 from time import monotonic
 from typing import Any, Literal, Protocol
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -54,6 +55,7 @@ from healthmes.decision.validation import (
     normalize_untrusted_json,
     strict_model_validate,
 )
+from healthmes.hermes_mcp_inventory import expected_hermes_mcp_inventory
 from healthmes.hermes_runtime_identity import (
     HERMES_RUNTIME_ATTESTATION_PATH,
     HermesDecisionRuntimeManifest,
@@ -305,6 +307,9 @@ class HermesRuntimeAttestationAssertion:
 class HermesResponsesTransport(Protocol):
     """Documented Hermes HTTP boundary; no vendor Python imports."""
 
+    async def verify_runtime(self, *, timeout_seconds: float) -> None:
+        """Verify the signed runtime and live six-tool MCP inventory."""
+
     async def get_toolsets(self) -> Mapping[str, Any]:
         """Return the authenticated ``GET /v1/toolsets`` payload."""
 
@@ -317,7 +322,7 @@ class HermesResponsesTransport(Protocol):
         *,
         timeout_seconds: float,
     ) -> HermesResponsesHttpResult:
-        """Run exactly one complete Hermes autonomous agent turn."""
+        """Reverify runtime, then run one complete autonomous agent turn."""
 
     async def list_sessions(
         self,
@@ -396,6 +401,19 @@ class HermesHttpResponsesTransport:
         )
         return payload
 
+    async def verify_runtime(self, *, timeout_seconds: float) -> None:
+        """Verify the supervisor proof within the caller's remaining budget."""
+
+        bounded_timeout = min(
+            timeout_seconds,
+            self._discovery_timeout_seconds,
+        )
+        if bounded_timeout <= 0:
+            raise HermesResponsesTransportError(
+                "hermes_responses_deadline_expired"
+            )
+        await self._attest_runtime(timeout_seconds=bounded_timeout)
+
     async def create_response(
         self,
         payload: Mapping[str, Any],
@@ -415,13 +433,19 @@ class HermesHttpResponsesTransport:
             raise HermesResponsesTransportError(
                 "hermes_streaming_contract_required"
             )
-        await self._attest_runtime()
+        deadline = monotonic() + bounded_timeout
+        await self.verify_runtime(timeout_seconds=bounded_timeout)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise HermesResponsesTransportError(
+                "hermes_responses_deadline_expired"
+            )
         return await self._request_sse_response(
             body,
-            timeout_seconds=bounded_timeout,
+            timeout_seconds=remaining,
         )
 
-    async def _attest_runtime(self) -> None:
+    async def _attest_runtime(self, *, timeout_seconds: float) -> None:
         assertion = self._runtime_attestation
         if assertion is None:
             return
@@ -432,7 +456,7 @@ class HermesHttpResponsesTransport:
                 "POST",
                 HERMES_RUNTIME_ATTESTATION_PATH,
                 json_body={"nonce": nonce},
-                timeout_seconds=self._discovery_timeout_seconds,
+                timeout_seconds=timeout_seconds,
                 max_response_bytes=_MAX_ATTESTATION_RESPONSE_BYTES,
             )
             verify_runtime_attestation(
@@ -440,6 +464,7 @@ class HermesHttpResponsesTransport:
                 expected_manifest=manifest,
                 key=key,
                 nonce=nonce,
+                expected_mcp_inventory=expected_hermes_mcp_inventory(),
                 max_age_seconds=assertion.max_age_seconds,
             )
         except (
@@ -1248,6 +1273,191 @@ def _normalize_sse_message(
         ) from exc
 
 
+class _SyncPhaseCapacityError(RuntimeError):
+    pass
+
+
+def _consume_async_future(future: asyncio.Future[Any]) -> None:
+    try:
+        future.exception()
+    except BaseException:
+        pass
+
+
+class _BoundedSyncPhaseRunner:
+    """Run blocking phases on bounded daemon workers without extending deadlines."""
+
+    def __init__(self, *, max_workers: int) -> None:
+        if not 1 <= max_workers <= 64:
+            raise ValueError("sync phase max_workers must be between 1 and 64")
+        self._slots = BoundedSemaphore(max_workers)
+        self._lock = Lock()
+        self._active: set[ConcurrentFuture[Any]] = set()
+        self._closed = Event()
+
+    async def run[T](
+        self,
+        operation: Callable[[], T],
+        *,
+        deadline: float,
+        late_result: Callable[[T], None] | None = None,
+    ) -> T:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        future = self._submit(operation)
+        wrapped = asyncio.wrap_future(future)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(wrapped),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            self._observe_late(future, late_result=late_result)
+            wrapped.add_done_callback(_consume_async_future)
+            raise
+        except asyncio.CancelledError:
+            self._observe_late(future, late_result=late_result)
+            wrapped.add_done_callback(_consume_async_future)
+            raise
+        if monotonic() > deadline:
+            if late_result is not None:
+                self._call_late_result(late_result, result)
+            raise TimeoutError
+        return result
+
+    def submit_detached(
+        self,
+        operation: Callable[[], Any],
+        *,
+        label: str,
+    ) -> bool:
+        try:
+            future = self._submit(operation)
+        except _SyncPhaseCapacityError:
+            _LOGGER.error(
+                "Hermes detached sync phase capacity exhausted: %s",
+                label,
+            )
+            return False
+
+        def completed(done: ConcurrentFuture[Any]) -> None:
+            try:
+                done.result()
+            except BaseException:
+                _LOGGER.exception(
+                    "Hermes detached sync phase failed: %s",
+                    label,
+                )
+
+        future.add_done_callback(completed)
+        return True
+
+    async def aclose(self, *, timeout_seconds: float) -> None:
+        self._closed.set()
+        deadline = monotonic() + timeout_seconds
+        while True:
+            with self._lock:
+                active = tuple(self._active)
+            if not active:
+                return
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                _LOGGER.error(
+                    "Hermes sync phase shutdown left %d daemon worker(s)",
+                    len(active),
+                )
+                return
+            await asyncio.sleep(min(0.01, remaining))
+
+    def close(self) -> None:
+        self._closed.set()
+
+    def _submit[T](
+        self,
+        operation: Callable[[], T],
+    ) -> ConcurrentFuture[T]:
+        if self._closed.is_set() or not self._slots.acquire(blocking=False):
+            raise _SyncPhaseCapacityError
+        future: ConcurrentFuture[T] = ConcurrentFuture()
+        with self._lock:
+            if self._closed.is_set():
+                self._slots.release()
+                raise _SyncPhaseCapacityError
+            self._active.add(future)
+
+        def worker() -> None:
+            try:
+                result = operation()
+            except BaseException as exc:
+                try:
+                    future.set_exception(exc)
+                finally:
+                    with self._lock:
+                        self._active.discard(future)
+                    self._slots.release()
+            else:
+                try:
+                    future.set_result(result)
+                finally:
+                    with self._lock:
+                        self._active.discard(future)
+                    self._slots.release()
+
+        thread = Thread(
+            target=worker,
+            name="healthmes-hermes-sync-phase",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except BaseException:
+            with self._lock:
+                self._active.discard(future)
+            self._slots.release()
+            raise
+        return future
+
+    @staticmethod
+    def _observe_late[T](
+        future: ConcurrentFuture[T],
+        *,
+        late_result: Callable[[T], None] | None,
+    ) -> None:
+        def completed(done: ConcurrentFuture[T]) -> None:
+            try:
+                result = done.result()
+            except BaseException:
+                return
+            if late_result is not None:
+                _BoundedSyncPhaseRunner._call_late_result(
+                    late_result,
+                    result,
+                )
+
+        future.add_done_callback(completed)
+
+    @staticmethod
+    def _call_late_result[T](
+        handler: Callable[[T], None],
+        result: T,
+    ) -> None:
+        try:
+            handler(result)
+        except BaseException:
+            _LOGGER.exception("Hermes late sync result cleanup failed")
+
+
+@dataclass(frozen=True, slots=True)
+class HermesSessionCleanupStatus:
+    """Observable state for response-detached Hermes transcript cleanup."""
+
+    scheduled: int
+    succeeded: int
+    failed: int
+    pending: int
+
+
 class HermesResponsesDecisionAgent:
     """Use one Hermes autonomous turn and HealthMes search session."""
 
@@ -1262,6 +1472,8 @@ class HermesResponsesDecisionAgent:
         cleanup_attempts: int = 2,
         cleanup_timeout_seconds: float = 5,
         cleanup_retry_seconds: float = 0.05,
+        sync_phase_max_workers: int = 8,
+        sync_phase_shutdown_timeout_seconds: float = 0.25,
         session_ttl_seconds: float = 900,
         session_purge_interval_seconds: float = 60,
         session_purge_max_pages: int = 5,
@@ -1281,6 +1493,18 @@ class HermesResponsesDecisionAgent:
         if cleanup_retry_seconds < 0 or cleanup_retry_seconds > 1:
             raise ValueError(
                 "cleanup_retry_seconds must be between 0 and 1"
+            )
+        if not 1 <= sync_phase_max_workers <= 64:
+            raise ValueError(
+                "sync_phase_max_workers must be between 1 and 64"
+            )
+        if (
+            sync_phase_shutdown_timeout_seconds <= 0
+            or sync_phase_shutdown_timeout_seconds > 30
+        ):
+            raise ValueError(
+                "sync_phase_shutdown_timeout_seconds must be greater "
+                "than 0 and at most 30"
             )
         if session_ttl_seconds <= timeout_seconds:
             raise ValueError(
@@ -1306,6 +1530,9 @@ class HermesResponsesDecisionAgent:
         self._cleanup_attempts = cleanup_attempts
         self._cleanup_timeout_seconds = cleanup_timeout_seconds
         self._cleanup_retry_seconds = cleanup_retry_seconds
+        self._sync_phase_shutdown_timeout_seconds = (
+            sync_phase_shutdown_timeout_seconds
+        )
         self._session_ttl_seconds = session_ttl_seconds
         self._session_purge_interval_seconds = (
             session_purge_interval_seconds
@@ -1321,6 +1548,14 @@ class HermesResponsesDecisionAgent:
         self._profile_verified = False
         self._maintenance_stop: asyncio.Event | None = None
         self._maintenance_task: asyncio.Task[None] | None = None
+        self._cleanup_tasks: set[asyncio.Task[bool]] = set()
+        self._cleanup_state_lock = Lock()
+        self._cleanup_scheduled = 0
+        self._cleanup_succeeded = 0
+        self._cleanup_failed = 0
+        self._sync_runner = _BoundedSyncPhaseRunner(
+            max_workers=sync_phase_max_workers
+        )
         self._session_purge_offset = 0
         self._metadata = RuntimeMetadata(
             runtime="hermes",
@@ -1329,7 +1564,7 @@ class HermesResponsesDecisionAgent:
         )
 
     async def start(self) -> None:
-        """Probe the authenticated native-tool profile before decisions."""
+        """Probe profile, live inventory, native tools, and model route."""
 
         if self._closed.is_set():
             raise HermesResponsesTransportError(
@@ -1342,14 +1577,29 @@ class HermesResponsesDecisionAgent:
         async with self._profile_lock:
             if self._profile_verified:
                 return
+            deadline = monotonic() + self._timeout_seconds
             try:
                 if self._profile_assertion is not None:
-                    details = self._profile_assertion.verify_details()
+                    details = await self._sync_runner.run(
+                        self._profile_assertion.verify_details,
+                        deadline=deadline,
+                    )
                     self._profile_digest = details.semantic_digest
                     self._tool_allowlist = details.full_tool_names
-                raw_toolsets, raw_models = await asyncio.gather(
-                    self._transport.get_toolsets(),
-                    self._transport.get_models(),
+                await _before_deadline(
+                    self._transport.verify_runtime(
+                        timeout_seconds=_remaining_before_deadline(
+                            deadline
+                        ),
+                    ),
+                    deadline,
+                )
+                raw_toolsets, raw_models = await _before_deadline(
+                    asyncio.gather(
+                        self._transport.get_toolsets(),
+                        self._transport.get_models(),
+                    ),
+                    deadline,
                 )
                 strict_model_validate(
                     HermesToolsetsResponse,
@@ -1361,7 +1611,18 @@ class HermesResponsesDecisionAgent:
                 )
                 _validate_model_route(models, expected_model=self._model)
                 if self._profile_assertion is not None:
-                    await self._purge_expired_sessions()
+                    await _before_deadline(
+                        self._purge_expired_sessions(),
+                        deadline,
+                    )
+            except TimeoutError as exc:
+                raise HermesResponsesTransportError(
+                    "hermes_tool_profile_timeout"
+                ) from exc
+            except _SyncPhaseCapacityError as exc:
+                raise HermesResponsesTransportError(
+                    "hermes_sync_phase_capacity_exhausted"
+                ) from exc
             except HermesDecisionProfileError as exc:
                 raise HermesResponsesContractError(str(exc)) from exc
             except HermesResponsesError:
@@ -1383,7 +1644,7 @@ class HermesResponsesDecisionAgent:
                 )
 
     async def ask(self, raw_request: DecisionRequest) -> DecisionAgentRun:
-        """Execute one request through Hermes and return finalizer input."""
+        """Execute one request under one absolute pre-finalization deadline."""
 
         started_at = _utc(self._clock())
         deadline = monotonic() + self._timeout_seconds
@@ -1420,8 +1681,27 @@ class HermesResponsesDecisionAgent:
                 status=DecisionStatus.BLOCKED,
             )
 
+        handle: Any | None = None
         try:
-            handle = self._search_service.begin(request)
+            handle = await self._sync_runner.run(
+                lambda: self._search_service.begin(request),
+                deadline=deadline,
+                late_result=self._abort_late_search_handle,
+            )
+        except TimeoutError:
+            return self._failure_run(
+                request=request,
+                started_at=started_at,
+                code="hermes_responses_timeout",
+                status=DecisionStatus.BLOCKED,
+            )
+        except _SyncPhaseCapacityError:
+            return self._failure_run(
+                request=request,
+                started_at=started_at,
+                code="hermes_sync_phase_capacity_exhausted",
+                status=DecisionStatus.BLOCKED,
+            )
         except Exception:
             return self._failure_run(
                 request=request,
@@ -1431,13 +1711,8 @@ class HermesResponsesDecisionAgent:
 
         session_id: str | None = None
         snapshot: DecisionSearchSessionSnapshot | None = None
-        cleanup_failed = False
         try:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise HermesResponsesTransportError(
-                    "hermes_responses_deadline_expired"
-                )
+            remaining = _remaining_before_deadline(deadline)
             response_request = _responses_request(
                 request,
                 decision_session_id=handle.session_id,
@@ -1453,42 +1728,52 @@ class HermesResponsesDecisionAgent:
                 deadline,
             )
             session_id = response.session_id
-            snapshot = self._search_service.finish(handle.session_id)
-            run = _run_from_response(
-                request=request,
-                raw_response=response.payload,
-                snapshot=snapshot,
-                expected_model=self._model,
-                provider=self._provider,
-                started_at=started_at,
-                finished_at=_utc(self._clock()),
-                tool_allowlist=self._tool_allowlist,
+            snapshot = await self._sync_runner.run(
+                lambda: self._search_service.finish(handle.session_id),
+                deadline=deadline,
+            )
+            run = await self._sync_runner.run(
+                lambda: _run_from_response(
+                    request=request,
+                    raw_response=response.payload,
+                    snapshot=snapshot,
+                    expected_model=self._model,
+                    provider=self._provider,
+                    started_at=started_at,
+                    finished_at=_utc(self._clock()),
+                    tool_allowlist=self._tool_allowlist,
+                ),
+                deadline=deadline,
             )
         except asyncio.CancelledError:
-            snapshot = _preserve_or_abort_search_session(
-                snapshot,
-                service=self._search_service,
-                session_id=handle.session_id,
-            )
+            if snapshot is None:
+                self._detach_search_abort(handle.session_id)
             raise
         except TimeoutError:
-            snapshot = _preserve_or_abort_search_session(
-                snapshot,
-                service=self._search_service,
-                session_id=handle.session_id,
-            )
+            if snapshot is None:
+                self._detach_search_abort(handle.session_id)
             run = self._failure_run(
                 request=request,
                 started_at=started_at,
                 code="hermes_responses_timeout",
                 snapshot=snapshot,
             )
-        except HermesResponsesError as exc:
-            snapshot = _preserve_or_abort_search_session(
-                snapshot,
-                service=self._search_service,
-                session_id=handle.session_id,
+        except _SyncPhaseCapacityError:
+            if snapshot is None:
+                self._detach_search_abort(handle.session_id)
+            run = self._failure_run(
+                request=request,
+                started_at=started_at,
+                code="hermes_sync_phase_capacity_exhausted",
+                status=DecisionStatus.BLOCKED,
+                snapshot=snapshot,
             )
+        except HermesResponsesError as exc:
+            if snapshot is None:
+                snapshot = await self._abort_search_before_deadline(
+                    handle.session_id,
+                    deadline=deadline,
+                )
             run = self._failure_run(
                 request=request,
                 started_at=started_at,
@@ -1503,11 +1788,11 @@ class HermesResponsesDecisionAgent:
                 snapshot=snapshot,
             )
         except Exception:
-            snapshot = _preserve_or_abort_search_session(
-                snapshot,
-                service=self._search_service,
-                session_id=handle.session_id,
-            )
+            if snapshot is None:
+                snapshot = await self._abort_search_before_deadline(
+                    handle.session_id,
+                    deadline=deadline,
+                )
             run = self._failure_run(
                 request=request,
                 started_at=started_at,
@@ -1516,24 +1801,79 @@ class HermesResponsesDecisionAgent:
             )
         finally:
             if session_id is not None:
-                cleanup_failed = not await self._cleanup_session(
-                    session_id,
-                )
-
-        if cleanup_failed:
-            limitations = list(run.draft.limitations)
-            if "hermes_session_cleanup_failed" not in limitations:
-                limitations.append("hermes_session_cleanup_failed")
-            run = run.model_copy(
-                update={
-                    "draft": run.draft.model_copy(
-                        update={"limitations": limitations},
-                        deep=True,
-                    )
-                },
-                deep=True,
-            )
+                self._schedule_cleanup(session_id)
         return run
+
+    async def _abort_search_before_deadline(
+        self,
+        session_id: str,
+        *,
+        deadline: float,
+    ) -> DecisionSearchSessionSnapshot | None:
+        try:
+            return await self._sync_runner.run(
+                lambda: self._search_service.abort(session_id),
+                deadline=deadline,
+            )
+        except (TimeoutError, _SyncPhaseCapacityError):
+            self._detach_search_abort(session_id)
+        except Exception:
+            return None
+        return None
+
+    def _abort_late_search_handle(self, handle: Any) -> None:
+        session_id = getattr(handle, "session_id", None)
+        if isinstance(session_id, str):
+            _abort_search_session(self._search_service, session_id)
+
+    def _detach_search_abort(self, session_id: str) -> None:
+        self._sync_runner.submit_detached(
+            lambda: self._search_service.abort(session_id),
+            label="decision-search-abort",
+        )
+
+    def _schedule_cleanup(self, session_id: str) -> None:
+        task = asyncio.create_task(
+            self._tracked_cleanup_session(session_id),
+            name=f"healthmes-hermes-session-cleanup-{session_id[:24]}",
+        )
+        with self._cleanup_state_lock:
+            self._cleanup_scheduled += 1
+            self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_task_finished)
+
+    async def _tracked_cleanup_session(self, session_id: str) -> bool:
+        succeeded = False
+        try:
+            succeeded = await self._cleanup_session(session_id)
+            return succeeded
+        finally:
+            with self._cleanup_state_lock:
+                if succeeded:
+                    self._cleanup_succeeded += 1
+                else:
+                    self._cleanup_failed += 1
+
+    def _cleanup_task_finished(self, task: asyncio.Task[bool]) -> None:
+        with self._cleanup_state_lock:
+            self._cleanup_tasks.discard(task)
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    def cleanup_status(self) -> HermesSessionCleanupStatus:
+        """Return bounded cleanup counters without exposing session IDs."""
+
+        with self._cleanup_state_lock:
+            return HermesSessionCleanupStatus(
+                scheduled=self._cleanup_scheduled,
+                succeeded=self._cleanup_succeeded,
+                failed=self._cleanup_failed,
+                pending=sum(
+                    not task.done() for task in self._cleanup_tasks
+                ),
+            )
 
     async def _cleanup_session(
         self,
@@ -1645,20 +1985,41 @@ class HermesResponsesDecisionAgent:
                 )
 
     async def aclose(self) -> None:
-        if self._closed.is_set():
-            task = self._maintenance_task
-            if task is not None and not task.done():
-                await asyncio.gather(task, return_exceptions=True)
-            return
         self._closed.set()
         if self._maintenance_stop is not None:
             self._maintenance_stop.set()
         task = self._maintenance_task
-        if task is not None:
+        if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        await self._drain_cleanup_tasks()
+        await self._sync_runner.aclose(
+            timeout_seconds=self._sync_phase_shutdown_timeout_seconds
+        )
         if self._owns_search_service:
             self._search_service.close()
+
+    async def _drain_cleanup_tasks(self) -> None:
+        with self._cleanup_state_lock:
+            tasks = tuple(self._cleanup_tasks)
+        if not tasks:
+            return
+        _done, pending = await asyncio.wait(
+            tasks,
+            timeout=self._cleanup_timeout_seconds,
+        )
+        for cleanup in pending:
+            cleanup.cancel()
+        if pending:
+            _cancelled, still_pending = await asyncio.wait(
+                pending,
+                timeout=min(0.1, self._cleanup_timeout_seconds),
+            )
+            if still_pending:
+                _LOGGER.error(
+                    "Hermes cleanup shutdown left %d task(s) pending",
+                    len(still_pending),
+                )
 
     def close(self) -> None:
         if self._closed.is_set():
@@ -1669,6 +2030,11 @@ class HermesResponsesDecisionAgent:
         task = self._maintenance_task
         if task is not None and not task.done():
             task.cancel()
+        with self._cleanup_state_lock:
+            cleanup_tasks = tuple(self._cleanup_tasks)
+        for cleanup in cleanup_tasks:
+            cleanup.cancel()
+        self._sync_runner.close()
         if self._owns_search_service:
             self._search_service.close()
 
@@ -2474,28 +2840,30 @@ def _abort_search_session(
         return None
 
 
-def _preserve_or_abort_search_session(
-    snapshot: DecisionSearchSessionSnapshot | None,
-    *,
-    service: DecisionContextSearchSessionService,
-    session_id: str,
-) -> DecisionSearchSessionSnapshot | None:
-    if snapshot is not None:
-        return snapshot
-    return _abort_search_session(service, session_id)
-
-
 async def _before_deadline[T](
     operation: Awaitable[T],
     deadline: float,
 ) -> T:
-    remaining = deadline - monotonic()
-    if remaining <= 0:
-        if hasattr(operation, "close"):
-            operation.close()
-        raise TimeoutError
+    try:
+        remaining = _remaining_before_deadline(deadline)
+    except TimeoutError:
+        cancel = getattr(operation, "cancel", None)
+        if callable(cancel):
+            cancel()
+        else:
+            close = getattr(operation, "close", None)
+            if callable(close):
+                close()
+        raise
     async with asyncio.timeout(remaining):
         return await operation
+
+
+def _remaining_before_deadline(deadline: float) -> float:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
 
 
 def _validated_hermes_origin(

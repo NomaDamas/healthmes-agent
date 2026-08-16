@@ -23,6 +23,13 @@ from healthmes.decision.responses import (
     HermesResponsesHttpResult,
     HermesRuntimeAttestationAssertion,
 )
+from healthmes.hermes_mcp_inventory import (
+    HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256,
+    HermesMcpInventoryError,
+    expected_hermes_mcp_inventory,
+    inventory_from_schema_digests,
+    validate_model_visible_mcp_inventory,
+)
 from healthmes.hermes_runtime_identity import (
     HERMES_RUNTIME_ATTESTATION_PATH,
     HERMES_RUNTIME_HOME_ARTIFACT_NAMES,
@@ -54,6 +61,7 @@ API_KEY = "k" * 64
 PUBLIC_ORIGIN = "http://127.0.0.1:8645"
 INTERNAL_ORIGIN = "http://127.0.0.1:8646"
 PROVIDER_ENV = {"OPENAI_API_KEY": "provider-secret"}
+EXPECTED_MCP_INVENTORY = expected_hermes_mcp_inventory()
 
 
 @dataclass(frozen=True)
@@ -247,6 +255,36 @@ def test_expected_runtime_binds_profile_home_origin_and_credentials(
 
     assert manifest == runtime_bundle.manifest
     assert key == runtime_bundle.key
+
+
+@pytest.mark.parametrize("tool_count", (0, 5, 7))
+def test_live_inventory_rejects_wrong_model_visible_tool_count(
+    tool_count: int,
+) -> None:
+    schema_digests = dict(HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256)
+    if tool_count == 0:
+        schema_digests.clear()
+    elif tool_count == 5:
+        schema_digests.pop("search_wearable")
+    else:
+        schema_digests["unexpected_tool"] = "0" * 64
+
+    with pytest.raises(
+        HermesMcpInventoryError,
+        match="hermes_runtime_mcp_inventory_",
+    ):
+        validate_model_visible_mcp_inventory(schema_digests)
+
+
+def test_live_inventory_rejects_canonical_tool_schema_drift() -> None:
+    schema_digests = dict(HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256)
+    schema_digests["search_activity"] = "0" * 64
+
+    with pytest.raises(
+        HermesMcpInventoryError,
+        match="hermes_runtime_mcp_schema_mismatch",
+    ):
+        validate_model_visible_mcp_inventory(schema_digests)
 
 
 @pytest.mark.parametrize(
@@ -523,6 +561,10 @@ async def test_runtime_process_seals_manifest_before_child_launch(
             vendor_root=runtime_bundle.vendor_root,
         ),
         environ=PROVIDER_ENV,
+        mcp_inventory_probe=lambda _connection, _timeout: asyncio.sleep(
+            0,
+            result=HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256,
+        ),
     )
     monkeypatch.setattr(
         process,
@@ -538,6 +580,71 @@ async def test_runtime_process_seals_manifest_before_child_launch(
         process.state.manifest.runtime_id
         != runtime_bundle.prepared_manifest.runtime_id
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_process_startup_fails_closed_on_live_inventory_drift(
+    runtime_bundle: RuntimeBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_runtime_manifest(
+        runtime_bundle.manifest_path,
+        runtime_bundle.prepared_manifest,
+    )
+    schema_digests = dict(HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256)
+    schema_digests.pop("search_wearable")
+
+    class FakeProcess:
+        returncode = None
+        pid = 424242
+
+    async def fake_create_subprocess_exec(
+        *_argv: str,
+        **_kwargs: Any,
+    ) -> FakeProcess:
+        return FakeProcess()
+
+    async def fake_wait_until_ready(**_kwargs: Any) -> None:
+        return None
+
+    async def fake_aclose() -> None:
+        process._process = None
+        process._state = None
+        process._launch_argv = None
+
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    process = HermesRuntimeProcess(
+        HermesRuntimeSupervisorConfig(
+            hermes_home=runtime_bundle.home,
+            manifest_path=runtime_bundle.manifest_path,
+            attestation_key_path=runtime_bundle.key_path,
+            vendor_root=runtime_bundle.vendor_root,
+        ),
+        environ=PROVIDER_ENV,
+        mcp_inventory_probe=lambda _connection, _timeout: asyncio.sleep(
+            0,
+            result=schema_digests,
+        ),
+    )
+    monkeypatch.setattr(
+        process,
+        "_wait_until_ready",
+        fake_wait_until_ready,
+    )
+    monkeypatch.setattr(process, "aclose", fake_aclose)
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_mcp_inventory_mismatch",
+    ):
+        await process.start()
+
+    assert process._process is None
+    assert process._state is None
 
 
 def test_child_environment_is_exact_and_scrubs_general_reasoning(
@@ -575,6 +682,7 @@ def test_runtime_process_state_rejects_a_stopped_child(
         manifest=runtime_bundle.manifest,
         attestation_key=runtime_bundle.key,
         api_key=API_KEY,
+        mcp_inventory=EXPECTED_MCP_INVENTORY,
     )
     process._process = SimpleNamespace(returncode=1)
 
@@ -632,7 +740,7 @@ async def test_transport_attests_immediately_before_responses(
         timeout_seconds: float,
     ) -> HermesResponsesHttpResult:
         nonlocal responses_called
-        assert timeout_seconds == 5
+        assert 0 < timeout_seconds <= 5
         responses_called = True
         return HermesResponsesHttpResult(
             payload={},
@@ -694,6 +802,66 @@ async def test_transport_rejects_attestation_mismatch_before_responses(
         )
 
 
+def test_attestation_rejects_signed_live_schema_drift(
+    runtime_bundle: RuntimeBundle,
+) -> None:
+    schema_digests = dict(HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256)
+    schema_digests["search_activity"] = "0" * 64
+    drifted_inventory = inventory_from_schema_digests(schema_digests)
+    nonce = "n" * 32
+    proof = sign_runtime_attestation(
+        manifest=runtime_bundle.manifest,
+        key=runtime_bundle.key,
+        nonce=nonce,
+        mcp_inventory=drifted_inventory,
+    )
+
+    from healthmes.hermes_runtime_identity import verify_runtime_attestation
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_mcp_inventory_mismatch",
+    ):
+        verify_runtime_attestation(
+            proof.model_dump(mode="json", by_alias=True),
+            expected_manifest=runtime_bundle.manifest,
+            key=runtime_bundle.key,
+            nonce=nonce,
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_attestation_fails_closed_after_live_inventory_drift(
+    runtime_bundle: RuntimeBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = object.__new__(HermesRuntimeProcess)
+    state = HermesRuntimeState(
+        manifest=runtime_bundle.manifest,
+        attestation_key=runtime_bundle.key,
+        api_key=API_KEY,
+        mcp_inventory=EXPECTED_MCP_INVENTORY,
+    )
+    process.revalidate = lambda: state
+
+    async def drifted_inventory():
+        schema_digests = dict(HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256)
+        schema_digests["search_activity"] = "0" * 64
+        return inventory_from_schema_digests(schema_digests)
+
+    monkeypatch.setattr(
+        process,
+        "_probe_runtime_inventory",
+        drifted_inventory,
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_mcp_inventory_changed",
+    ):
+        await process.attest()
+
+
 def test_arbitrary_remote_runtime_without_attestation_is_rejected() -> None:
     with pytest.raises(
         ValueError,
@@ -715,6 +883,7 @@ class _FakeController:
         self._state = state
         self.failure = failure
         self.revalidations = 0
+        self.attestations = 0
 
     @property
     def state(self) -> HermesRuntimeState:
@@ -725,6 +894,10 @@ class _FakeController:
     def revalidate(self) -> HermesRuntimeState:
         self.revalidations += 1
         return self.state
+
+    async def attest(self) -> HermesRuntimeState:
+        self.attestations += 1
+        return self.revalidate()
 
     async def start(self) -> None:
         return None
@@ -741,6 +914,7 @@ def test_supervisor_exposes_only_bounded_runtime_ingress(
             manifest=runtime_bundle.manifest,
             attestation_key=runtime_bundle.key,
             api_key=API_KEY,
+            mcp_inventory=EXPECTED_MCP_INVENTORY,
         )
     )
     app = create_supervisor_app(
@@ -761,6 +935,44 @@ def test_supervisor_exposes_only_bounded_runtime_ingress(
         )
 
     assert response.status_code == 400
+    assert controller.attestations == 0
+
+
+def test_supervisor_revalidates_live_inventory_before_each_response(
+    runtime_bundle: RuntimeBundle,
+) -> None:
+    class OneShotStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"event: response.completed\ndata: {}\n\n"
+
+    controller = _FakeController(
+        HermesRuntimeState(
+            manifest=runtime_bundle.manifest,
+            attestation_key=runtime_bundle.key,
+            api_key=API_KEY,
+            mcp_inventory=EXPECTED_MCP_INVENTORY,
+        )
+    )
+    app = create_supervisor_app(
+        controller,
+        proxy_transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=OneShotStream(),
+            )
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"stream": True, "store": False},
+        )
+
+    assert response.status_code == 200
+    assert controller.attestations == 1
 
 
 def test_supervisor_authenticates_before_parsing_responses_body(
@@ -771,6 +983,7 @@ def test_supervisor_authenticates_before_parsing_responses_body(
             manifest=runtime_bundle.manifest,
             attestation_key=runtime_bundle.key,
             api_key=API_KEY,
+            mcp_inventory=EXPECTED_MCP_INVENTORY,
         )
     )
 
@@ -782,6 +995,7 @@ def test_supervisor_authenticates_before_parsing_responses_body(
         )
 
     assert response.status_code == 401
+    assert controller.attestations == 0
 
 
 def test_supervisor_reports_stopped_runtime_as_unavailable(
@@ -792,6 +1006,7 @@ def test_supervisor_reports_stopped_runtime_as_unavailable(
             manifest=runtime_bundle.manifest,
             attestation_key=runtime_bundle.key,
             api_key=API_KEY,
+            mcp_inventory=EXPECTED_MCP_INVENTORY,
         ),
         failure=HermesRuntimeIdentityError(
             "hermes_runtime_child_not_running"
