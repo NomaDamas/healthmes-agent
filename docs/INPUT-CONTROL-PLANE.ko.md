@@ -97,8 +97,9 @@ PUT /v1/inputs/{source_id}/settings
 - `actions`: authorize/connect/sync 같은 동작의 실행 위치와 기존 endpoint
 - `privacy`: 원본 수집 여부, source-side 제외, 기본 LLM 노출 수준
 - `limitations`: OS, entitlement 또는 아직 구현되지 않은 기능
-- `revision`: descriptor 전체의 안정적인 SHA-256 digest. UI는 값이 바뀌면
-  현재 화면을 갱신한다.
+- `revision`: descriptor 전체의 안정적인 SHA-256 digest이자 설정 변경의
+  낙관적 동시성 토큰. 상세 GET의 `ETag`는 이 값을 따옴표로 감싼 값이며,
+  UI는 모든 설정 PUT에 그 `ETag`를 `If-Match`로 전송해야 한다.
 
 `actions`는 UI 명세이지 모든 동작을 대신 실행하는 범용 RPC가 아니다. iPhone
 authorize/sync action은 향후 gate-enabled·entitled 기기 빌드가 수행할 계약이며
@@ -128,6 +129,121 @@ connect는 기존 브라우저 OAuth endpoint를 사용한다.
 
 지원 보존 preset은 `1d`, `7d`, `14d`, `30d`, `90d`, `forever`다.
 `paused_until: null`은 pause를 해제한다.
+
+### 필수 설정 저장 흐름: GET -> 편집 -> If-Match PUT -> 재조회·재적용
+
+설정 UI는 목록에서 본 오래된 descriptor나 마지막 쓰기 우선 방식으로 저장하면
+안 된다. 데스크톱과 iPhone이 같은 domain 또는 data-class 설정을 동시에 바꿀 수
+있으므로 다음 compare-and-swap 흐름을 그대로 구현한다.
+
+```text
+1. GET /v1/inputs/{source_id}
+      base_descriptor = response body
+      base_etag       = response ETag
+      화면은 base_descriptor로 렌더링
+
+2. 사용자가 편집
+      pending_patch = 사용자가 실제로 바꾼 필드만 보존
+
+3. PUT /v1/inputs/{source_id}/settings
+      If-Match: <base_etag>
+      body: <pending_patch>
+
+4-a. 200
+      current_descriptor = response body
+      current_etag       = response ETag
+      dirty state를 지우고 성공 응답으로 화면 상태를 교체
+
+4-b. 428 input_settings_revision_required
+      헤더를 빠뜨린 클라이언트 오류로 취급
+      최신 descriptor/ETag를 다시 GET
+      pending_patch를 최신 descriptor에 재적용한 뒤 새 ETag로 PUT
+
+4-c. 409 input_settings_revision_conflict
+      서버 설정은 변경되지 않음
+      최신 descriptor/ETag를 다시 GET
+      pending_patch를 최신 descriptor에 재적용
+      겹친 필드 충돌을 해결한 뒤 새 ETag로 PUT
+```
+
+상세 GET 응답 body의 `revision`은 따옴표 없는
+`sha256:<64 lowercase hex>`이고, 응답 헤더는 같은 값을 HTTP entity tag로
+따옴표 처리한 `ETag: "sha256:<64 lowercase hex>"`다. PUT의 `If-Match`에는
+GET에서 받은 `ETag`를 그대로 사용하는 것이 권장된다. API는 정확히 일치하는
+따옴표 없는 revision도 허용하지만 wildcard, weak ETag, 여러 값, 대문자 hex와
+불완전한 digest는 `400 input_settings_revision_invalid`로 거부한다.
+
+```http
+GET /v1/inputs/activity.ios-screentime
+
+HTTP/1.1 200 OK
+ETag: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+{
+  "source_id": "activity.ios-screentime",
+  "revision": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+}
+```
+
+```http
+PUT /v1/inputs/activity.ios-screentime/settings
+If-Match: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+Content-Type: application/json
+
+{
+  "instance_id": "iphone-owner",
+  "enabled": true
+}
+```
+
+`If-Match`가 없으면 서버는 PUT을 실행하지 않고 다음 machine code를 반환한다.
+
+```json
+{
+  "error": {
+    "code": "input_settings_revision_required",
+    "message": "If-Match is required for input settings updates.",
+    "detail": null
+  }
+}
+```
+
+다른 클라이언트가 먼저 설정을 저장해 revision이 바뀌면 서버는 요청 전체를
+원자적으로 거부한다. collection, Decision 접근 동의와 retention 중 일부만
+적용되는 일은 없다.
+
+```json
+{
+  "error": {
+    "code": "input_settings_revision_conflict",
+    "message": "The input settings changed after the caller read them.",
+    "detail": {
+      "expected_revision": "sha256:<PUT에 사용한 revision>",
+      "current_revision": "sha256:<현재 서버 revision>"
+    }
+  }
+}
+```
+
+`current_revision`만 새 `If-Match`로 바꿔 같은 body를 즉시 재전송하면 안 된다.
+오류 응답에는 최신 설정값 전체가 없기 때문이다. 반드시 상세 GET으로
+`latest_descriptor`와 `latest_etag`를 함께 다시 받고 다음 3-way 규칙으로
+사용자 편집을 재적용한다.
+
+1. `pending_patch`에 없는 필드는 `latest_descriptor` 값을 유지한다.
+2. 사용자가 바꾼 필드의 최신 값이 `base_descriptor`와 같으면 사용자 값을
+   자동으로 다시 적용할 수 있다.
+3. 사용자가 바꾼 필드를 다른 클라이언트도 변경했다면 최신 값과 사용자 값을
+   보여 주고 명시적으로 선택받는다. stale descriptor 전체로 덮어쓰지 않는다.
+4. 재적용한 부분 patch를 `latest_etag`와 함께 PUT한다. 또 409가 발생하면 같은
+   과정을 제한된 횟수만 반복하고 사용자에게 최신 상태를 다시 보여 준다.
+
+200 응답을 받으면 요청에 사용한 이전 ETag를 계속 쓰지 않는다. 해당 응답 body를
+새 `current_descriptor`로, 응답 `ETag`를 새 `current_etag`로 저장하고 이후
+편집의 기준으로 사용한다. 의미상 동일한 no-op PUT은 revision을 바꾸지 않으므로
+같은 ETag가 성공 응답으로 돌아올 수 있다. domain 또는 data-class 공유 설정을
+바꿨다면 같은 값을 표시하는 다른 source descriptor도 무효화하고
+`GET /v1/inputs` 또는 각 상세 GET으로 갱신한다.
 
 ## 3. 설정 scope
 
@@ -355,10 +471,9 @@ Open Wearables의 HealthMes mirror는 범용 `normalized`와 섞지 않고 전�
 6. 새 `ios-collector-v1-*` instance는 설정 PUT으로 `enabled=true`를 명시하기
    전까지 수집되지 않는다. 기기 ID 변경을 자동 등록이나 기존 exclude 복사로
    처리하지 않는다.
-7. 설정 변경 후 PUT 응답 descriptor를 즉시 정본으로 사용한다.
-   PUT에는 마지막 GET에서 받은 `revision`을 함께 보내야 하며 서버가 stale
-   revision을 `409`로 거부하면 최신 descriptor를 다시 읽고 사용자가 변경을
-   재적용하게 한다.
+7. 설정 저장은 반드시 상세 GET의 `ETag`를 `If-Match`로 보내고, 428/409에서는
+   최신 descriptor와 ETag를 재조회해 사용자 편집을 재적용한다. 성공 후에는 PUT
+   응답 descriptor와 ETag를 다음 편집의 정본으로 사용한다.
 8. 실제 collection permission과 HealthMes Decision 접근 동의를 하나의 toggle로
    합치지 않는다.
 9. UI가 없어도 API와 수집 엔진은 독립적으로 테스트 가능해야 한다.
