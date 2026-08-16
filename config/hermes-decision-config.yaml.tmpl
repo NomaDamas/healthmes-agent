@@ -1,0 +1,86 @@
+# Dedicated Hermes profile for the HealthMes wellness decision runtime.
+#
+# Run this profile in its own HERMES_HOME. It intentionally has no Telegram,
+# webhook, cron, skill, direct Open Wearables, native, or mutation tools.
+
+{%- if decision_hermes_model or decision_hermes_provider %}
+model:
+  {%- if decision_hermes_model %}
+  default: "{{ decision_hermes_model }}"
+  {%- endif %}
+  {%- if decision_hermes_provider %}
+  provider: "{{ decision_hermes_provider }}"
+  {%- endif %}
+  {%- if decision_hermes_model_base_url %}
+  base_url: "{{ decision_hermes_model_base_url }}"
+  {%- endif %}
+  {%- if decision_hermes_model_api_key %}
+  api_key: "{{ decision_hermes_model_api_key }}"
+  {%- endif %}
+{%- endif %}
+
+platforms:
+  api_server:
+    enabled: true
+    extra:
+      host: "{{ decision_hermes_host | default('127.0.0.1', true) }}"
+      port: {{ decision_hermes_port | default(8645, true) }}
+      key: "{{ decision_hermes_api_key }}"
+      model_name: "healthmes-decision-runtime"
+      model_routes:
+        "{{ decision_hermes_model }}":
+          model: "{{ decision_hermes_model }}"
+          provider: "{{ decision_hermes_provider }}"
+          {%- if decision_hermes_model_base_url %}
+          base_url: "{{ decision_hermes_model_base_url }}"
+          {%- endif %}
+          {%- if decision_hermes_model_api_key %}
+          api_key: "{{ decision_hermes_model_api_key }}"
+          {%- endif %}
+
+platform_toolsets:
+  api_server:
+    - healthmes
+
+agent:
+  disabled_toolsets:
+    - browser
+    - clarify
+    - code_execution
+    - computer_use
+    - context_engine
+    - cronjob
+    - delegation
+    - discord
+    - discord_admin
+    - file
+    - homeassistant
+    - image_gen
+    - memory
+    - session_search
+    - skills
+    - spotify
+    - terminal
+    - todo
+    - tts
+    - video
+    - video_gen
+    - vision
+    - web
+    - x_search
+    - yuanbao
+
+mcp_servers:
+  healthmes:
+    url: "{{ healthmes_mcp_url | default('http://localhost:8100/mcp', true) }}"
+    {%- if healthmes_api_token %}
+    headers:
+      Authorization: "Bearer {{ healthmes_api_token }}"
+    {%- endif %}
+    timeout: 120
+    tools:
+      include:
+        - search_activity
+        - search_calendar
+        - search_nutrition
+        - search_wearable

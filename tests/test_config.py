@@ -18,8 +18,11 @@ ALL_ENV_VARS = [
     "HEALTHMES_DECISION_HERMES_API_KEY",
     "HEALTHMES_DECISION_HERMES_MODEL",
     "HEALTHMES_DECISION_HERMES_PROVIDER",
+    "HEALTHMES_DECISION_HERMES_PROFILE_PATH",
     "HEALTHMES_DECISION_HERMES_DISCOVERY_TIMEOUT_SECONDS",
     "HEALTHMES_DECISION_HERMES_MAX_ITERATION_TIMEOUT_SECONDS",
+    "HEALTHMES_DECISION_HERMES_SESSION_TTL_SECONDS",
+    "HEALTHMES_DECISION_HERMES_SESSION_PURGE_INTERVAL_SECONDS",
     "HEALTHMES_DECISION_TIMEOUT_SECONDS",
     "HEALTHMES_DECISION_FINALIZATION_TIMEOUT_SECONDS",
     "HEALTHMES_DECISION_EXECUTION_SCOPE",
@@ -79,8 +82,14 @@ def test_defaults(monkeypatch) -> None:
     assert settings.decision_hermes_api_key.get_secret_value() == ""
     assert settings.decision_hermes_model is None
     assert settings.decision_hermes_provider is None
+    assert settings.decision_hermes_profile_path is None
     assert settings.decision_hermes_discovery_timeout_seconds == 5
     assert settings.decision_hermes_max_iteration_timeout_seconds == 120
+    assert settings.decision_hermes_session_ttl_seconds == 900
+    assert (
+        settings.decision_hermes_session_purge_interval_seconds
+        == 60
+    )
     assert settings.decision_timeout_seconds == 60
     assert settings.decision_finalization_timeout_seconds == 5
     assert settings.decision_execution_scope == "local"
@@ -291,6 +300,10 @@ def test_decision_runtime_bundle_from_environment(monkeypatch) -> None:
         "openai",
     )
     monkeypatch.setenv(
+        "HEALTHMES_DECISION_HERMES_PROFILE_PATH",
+        "/tmp/hermes-decision/config.yaml",
+    )
+    monkeypatch.setenv(
         "HEALTHMES_DECISION_OWNER_PRINCIPAL_ID",
         " local-owner ",
     )
@@ -300,6 +313,9 @@ def test_decision_runtime_bundle_from_environment(monkeypatch) -> None:
     assert settings.decision_hermes_base_url == "http://127.0.0.1:8644"
     assert settings.decision_hermes_model == "gpt-5.6-sol"
     assert settings.decision_hermes_provider == "openai"
+    assert settings.decision_hermes_profile_path == Path(
+        "/tmp/hermes-decision/config.yaml"
+    )
     assert settings.decision_owner_principal_id == "local-owner"
 
 
@@ -355,6 +371,25 @@ def test_decision_capacity_bounds() -> None:
         _clean_settings(decision_max_pending_requests=0)
     with pytest.raises(ValueError):
         _clean_settings(decision_max_pending_requests=129)
+
+
+def test_decision_session_maintenance_bounds() -> None:
+    with pytest.raises(
+        ValueError,
+        match="session TTL must exceed",
+    ):
+        _clean_settings(
+            decision_timeout_seconds=60,
+            decision_hermes_session_ttl_seconds=60,
+        )
+    with pytest.raises(
+        ValueError,
+        match="purge interval must not exceed",
+    ):
+        _clean_settings(
+            decision_hermes_session_ttl_seconds=120,
+            decision_hermes_session_purge_interval_seconds=121,
+        )
 
 
 def test_is_loopback_host() -> None:

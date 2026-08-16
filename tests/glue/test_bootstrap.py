@@ -36,7 +36,9 @@ def env_file(tmp_path: Path) -> Path:
         "TELEGRAM_BOT_TOKEN=123456:test-token\n"
         "HEALTHMES_TELEGRAM_OWNER_USER_ID=owner-user\n"
         "HEALTHMES_TELEGRAM_OWNER_CHAT_ID=owner-chat\n"
-        "OPEN_WEARABLES_API_KEY=ow-test-key\n",
+        "OPEN_WEARABLES_API_KEY=ow-test-key\n"
+        "HEALTHMES_DECISION_HERMES_MODEL=decision-model\n"
+        "HEALTHMES_DECISION_HERMES_PROVIDER=openai\n",
         encoding="utf-8",
     )
     return path
@@ -85,7 +87,39 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     assert ow["env"]["OPEN_WEARABLES_API_KEY"] == "ow-test-key"
     assert str(REPO_ROOT / "vendor" / "open-wearables" / "mcp") in ow["args"]
 
-    # 2. Skills copied into the discovery path (SKILLS_DIR = home/skills).
+    # 2. A separate decision profile exposes only four HealthMes read tools.
+    decision_config = yaml.safe_load(
+        (hermes_home / "decision" / "config.yaml").read_text()
+    )
+    assert set(decision_config["platforms"]) == {"api_server"}
+    assert decision_config["platform_toolsets"] == {
+        "api_server": ["healthmes"]
+    }
+    assert set(decision_config["mcp_servers"]) == {"healthmes"}
+    assert decision_config["mcp_servers"]["healthmes"]["tools"][
+        "include"
+    ] == [
+        "search_activity",
+        "search_calendar",
+        "search_nutrition",
+        "search_wearable",
+    ]
+    assert decision_config["platforms"]["api_server"]["extra"]["key"] == (
+        env_values["HEALTHMES_DECISION_HERMES_API_KEY"]
+    )
+    assert decision_config["platforms"]["api_server"]["extra"][
+        "model_routes"
+    ] == {
+        "decision-model": {
+            "model": "decision-model",
+            "provider": "openai",
+        }
+    }
+    assert env_values["HEALTHMES_DECISION_HERMES_PROFILE_PATH"] == str(
+        (hermes_home / "decision" / "config.yaml").resolve()
+    )
+
+    # 3. Skills copied into the discovery path (SKILLS_DIR = home/skills).
     # Copies, not symlinks: the vendor trust check resolves symlinks and
     # would log a security warning on every skill load (skills_tool.py).
     for skill in EXPECTED_SKILLS:
@@ -95,7 +129,7 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
             REPO_ROOT / "skills" / skill / "SKILL.md"
         ).read_text()
 
-    # 3. Briefing snapshot script + base-url sidecar installed into the
+    # 4. Briefing snapshot script + base-url sidecar installed into the
     # scheduler's only allowed script location ($HERMES_HOME/scripts/).
     installed_script = hermes_home / "scripts" / "healthmes_briefing_snapshot.py"
     assert installed_script.is_file()
@@ -109,7 +143,7 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     # and the sidecar carries no token key.
     assert "headers" not in servers["healthmes"]
 
-    # 4. Cron briefings registered in the vendor jobs.json envelope.
+    # 5. Cron briefings registered in the vendor jobs.json envelope.
     jobs_doc = yaml.safe_load((hermes_home / "cron" / "jobs.json").read_text())
     assert set(jobs_doc) >= {"jobs", "updated_at"}
     jobs = {job["name"]: job for job in jobs_doc["jobs"]}
@@ -325,9 +359,18 @@ def test_adjustment_secret_is_generated_separately_and_preserved(
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
     first = bootstrap.load_env_file(env_file)
     adjustment_secret = first["HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"]
+    decision_api_key = first["HEALTHMES_DECISION_HERMES_API_KEY"]
+    decision_profile_path = first[
+        "HEALTHMES_DECISION_HERMES_PROFILE_PATH"
+    ]
 
     assert len(adjustment_secret) == 64
+    assert len(decision_api_key) == 64
     assert adjustment_secret != first["HEALTHMES_HERMES_WEBHOOK_SECRET"]
+    assert decision_api_key not in {
+        adjustment_secret,
+        first["HEALTHMES_HERMES_WEBHOOK_SECRET"],
+    }
     config = yaml.safe_load((hermes_home / "config.yaml").read_text())
     proof_config = config["mcp_servers"]["healthmes"]["trusted_session_proof"]
     assert proof_config["secret_env"] == "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"
@@ -341,6 +384,18 @@ def test_adjustment_secret_is_generated_separately_and_preserved(
     assert (
         bootstrap.load_env_file(env_file)["HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"]
         == adjustment_secret
+    )
+    assert (
+        bootstrap.load_env_file(env_file)[
+            "HEALTHMES_DECISION_HERMES_API_KEY"
+        ]
+        == decision_api_key
+    )
+    assert (
+        bootstrap.load_env_file(env_file)[
+            "HEALTHMES_DECISION_HERMES_PROFILE_PATH"
+        ]
+        == decision_profile_path
     )
 
 
@@ -401,6 +456,13 @@ def test_docker_mode_defaults(bootstrap, hermes_home, env_file):
     # never hardcoded — the hard localhost-default rule).
     sidecar = yaml.safe_load((hermes_home / "scripts" / "healthmes_snapshot.json").read_text())
     assert sidecar == {"base_url": "http://healthmes:8100"}
+    decision = yaml.safe_load(
+        (hermes_home / "decision" / "config.yaml").read_text()
+    )
+    assert (
+        decision["mcp_servers"]["healthmes"]["url"]
+        == "http://healthmes:8100/mcp"
+    )
 
 
 def test_env_overrides_beat_mode_defaults(bootstrap, hermes_home, env_file, monkeypatch):

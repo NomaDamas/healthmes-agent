@@ -40,10 +40,11 @@ from healthmes.calendars.sleep_job import build_sleep_reconciliation_job
 from healthmes.config import Settings, get_settings, resolve_timezone
 from healthmes.decision import (
     build_configured_decision_engine,
+    build_decision_context_search_session_service,
     ensure_decision_domain_policies,
 )
 from healthmes.decision.domain_providers import WearableReader
-from healthmes.decision.hermes import HermesIterationTransport
+from healthmes.decision.responses import HermesResponsesTransport
 from healthmes.engine.cognitive_energy import build_energy_job
 from healthmes.engine.scheduler import (
     create_scheduler,
@@ -114,7 +115,7 @@ def _initialize_activity_storage(
 def create_app(
     settings: Settings | None = None,
     *,
-    decision_transport: HermesIterationTransport | None = None,
+    decision_transport: HermesResponsesTransport | None = None,
     decision_wearable_reader: WearableReader | None = None,
     decision_clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
@@ -164,10 +165,22 @@ def create_app(
                     day.isoformat()
                 )
             )
+            decision_search_service = (
+                build_decision_context_search_session_service(
+                    settings=settings,
+                    session_factory=get_session_factory(),
+                    wearable_reader=wearable_reader,
+                    clock=decision_clock,
+                )
+            )
+            mcp_server.set_decision_search_session_service(
+                decision_search_service
+            )
             decision_engine = build_configured_decision_engine(
                 settings=settings,
                 session_factory=get_session_factory(),
                 transport=decision_transport,
+                search_service=decision_search_service,
                 wearable_reader=wearable_reader,
                 clock=decision_clock,
             )
@@ -183,6 +196,13 @@ def create_app(
                         app.state.decision_engine = None
 
                 cleanup.push_async_callback(close_decision_engine)
+                start_decision_engine = getattr(
+                    decision_engine,
+                    "astart",
+                    None,
+                )
+                if callable(start_decision_engine):
+                    await start_decision_engine()
 
             # Background loops are prepared even when globally disabled so
             # their configuration remains testable. Register shutdown before

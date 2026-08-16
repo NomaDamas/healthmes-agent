@@ -72,49 +72,70 @@ class Settings(BaseSettings):
     decision_hermes_base_url: str | None = Field(
         default=None,
         max_length=2_048,
-        description="Hermes origin exposing the HealthMes-required "
-        "single-model-iteration contract. None keeps the decision REST "
-        "entrypoint fail-closed; the generic Hermes chat endpoint is never "
-        "used as a fallback.",
+        description="Dedicated Hermes API-server origin exposing POST "
+        "/v1/responses for one complete autonomous HealthMes decision turn. "
+        "None keeps the decision REST entrypoint fail-closed.",
     )
     decision_hermes_api_key: SecretStr = Field(
         default=SecretStr(""),
-        description="Optional bearer credential for the dedicated Hermes "
-        "decision runtime. Remote origins require a credential.",
+        description="Bearer credential for the dedicated Hermes decision "
+        "runtime. Production HTTP composition requires it; bootstrap creates "
+        "the matching profile credential.",
     )
     decision_hermes_model: str | None = Field(
         default=None,
         max_length=128,
-        description="Exact model identity expected from Hermes decision "
-        "iterations. Required together with decision_hermes_provider and "
-        "decision_hermes_base_url.",
+        description="Exact model identity requested from and expected in the "
+        "single Hermes Responses result. Required together with "
+        "decision_hermes_provider and decision_hermes_base_url.",
     )
     decision_hermes_provider: str | None = Field(
         default=None,
         max_length=128,
-        description="Exact provider identity expected from Hermes decision "
-        "iterations. Required together with decision_hermes_model and "
+        description="Provider identity recorded for the dedicated Hermes "
+        "Responses runtime. Required together with decision_hermes_model and "
         "decision_hermes_base_url.",
+    )
+    decision_hermes_profile_path: Path | None = Field(
+        default=None,
+        description="Rendered dedicated Hermes decision config validated "
+        "before the HTTP runtime starts. Production HTTP composition requires "
+        "this artifact; injected test transports may omit it.",
     )
     decision_hermes_discovery_timeout_seconds: float = Field(
         default=5.0,
         gt=0,
         le=60,
-        description="Timeout for probing the Hermes single-iteration "
-        "capability contract.",
+        description="Timeout for authenticated Hermes tool-profile and "
+        "session-maintenance probes.",
     )
     decision_hermes_max_iteration_timeout_seconds: float = Field(
         default=120.0,
         gt=0,
         le=300,
-        description="Upper bound for one Hermes model iteration.",
+        description="Backward-compatible setting name for the upper bound on "
+        "one complete Hermes POST /v1/responses turn.",
+    )
+    decision_hermes_session_ttl_seconds: float = Field(
+        default=900.0,
+        gt=0,
+        le=86_400,
+        description="Maximum age of a transcript in the dedicated Hermes "
+        "decision state before bounded maintenance deletes it.",
+    )
+    decision_hermes_session_purge_interval_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=3_600,
+        description="Interval for purging expired sessions from the dedicated "
+        "Hermes decision state.",
     )
     decision_timeout_seconds: float = Field(
         default=60.0,
         gt=0,
         le=300,
-        description="Wall-clock deadline for one complete HealthMes decision "
-        "turn, including all model iterations and context calls.",
+        description="Wall-clock deadline for one complete Hermes autonomous "
+        "decision turn, including its MCP context calls.",
     )
     decision_finalization_timeout_seconds: float = Field(
         default=5.0,
@@ -543,6 +564,7 @@ class Settings(BaseSettings):
         "decision_hermes_base_url",
         "decision_hermes_model",
         "decision_hermes_provider",
+        "decision_hermes_profile_path",
         "backup_dir",
         "ow_database_url",
         "hermes_home",
@@ -621,6 +643,21 @@ class Settings(BaseSettings):
                     "origin; set decision_execution_scope='hosted' for "
                     "remote or cloud processing"
                 )
+        if (
+            self.decision_hermes_session_ttl_seconds
+            <= self.decision_timeout_seconds
+        ):
+            raise ValueError(
+                "decision Hermes session TTL must exceed the decision timeout"
+            )
+        if (
+            self.decision_hermes_session_purge_interval_seconds
+            > self.decision_hermes_session_ttl_seconds
+        ):
+            raise ValueError(
+                "decision Hermes session purge interval must not exceed "
+                "the session TTL"
+            )
         return self
 
     @field_validator("activitywatch_device_id")

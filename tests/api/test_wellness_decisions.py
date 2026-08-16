@@ -1,24 +1,17 @@
 from __future__ import annotations
 
-import copy
-import json
 import uuid
-from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
-from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
 from healthmes.api.auth import viewer_token
 from healthmes.app import create_app
-from healthmes.calendars import creds
-from healthmes.calendars.state import FileSyncHealthStore
 from healthmes.decision import (
-    HERMES_MODEL_ITERATION_CONTRACT,
     ContextAccessLayer,
     ContextAccessPolicy,
     ContextCapability,
@@ -37,7 +30,7 @@ from healthmes.decision import (
     ExecutionScope,
     HealthMesDecisionAgent,
     HealthMesDecisionEngine,
-    HermesModelIterationRequest,
+    HermesResponsesTransportError,
     PersistenceStatus,
     PrivacyLevel,
     RuntimeMetadata,
@@ -47,7 +40,6 @@ from healthmes.decision import (
 )
 from healthmes.store import (
     Base,
-    CalendarSource,
     DecisionKind,
     DecisionRecord,
     create_db_engine,
@@ -55,13 +47,7 @@ from healthmes.store import (
 )
 from tests.decision.test_e2e import (
     DAY,
-    DAY_START,
     NOW,
-    QUESTION,
-    _seed_activity,
-    _seed_calendar,
-    _seed_nutrition,
-    _seed_wearable,
 )
 
 TOKEN = "wellness-decision-api-token"
@@ -178,30 +164,47 @@ class UnknownPersistenceDecisionEngine:
         )
 
 
-class MissingHookTransport:
+class MissingResponsesTransport:
     def __init__(self) -> None:
-        self.iteration_calls = 0
+        self.response_calls = 0
 
-    async def get_capabilities(self) -> dict[str, Any]:
+    async def get_toolsets(self) -> dict[str, Any]:
         return {
-            "object": "hermes.api_server.capabilities",
-            "platform": "hermes-agent",
-            "model": MODEL,
-            "runtime": {"mode": "agent"},
-            "features": {"model_iteration": False},
-            "endpoints": {},
+            "object": "list",
+            "platform": "api_server",
+            "data": [],
         }
 
-    async def run_model_iteration(
+    async def get_models(self) -> dict[str, Any]:
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": MODEL,
+                    "object": "model",
+                    "created": 1,
+                    "owned_by": "hermes",
+                    "permission": [],
+                    "root": MODEL,
+                    "parent": "healthmes-decision-runtime",
+                }
+            ],
+        }
+
+    async def create_response(
         self,
+        _payload,
         *,
-        endpoint: str,
-        request: HermesModelIterationRequest,
         timeout_seconds: float,
-    ) -> dict[str, Any]:
-        del endpoint, request, timeout_seconds
-        self.iteration_calls += 1
-        raise AssertionError("an unavailable hook must never be called")
+    ):
+        assert timeout_seconds > 0
+        self.response_calls += 1
+        raise HermesResponsesTransportError(
+            "hermes_responses_endpoint_missing"
+        )
+
+    async def delete_session(self, _session_id: str) -> None:
+        raise AssertionError("no Hermes session was created")
 
 
 class FailingNutritionProvider:
@@ -248,155 +251,6 @@ class ProviderFailureRuntime:
             )
         raise AssertionError(
             "a failed provider call must terminate before another LLM step"
-        )
-
-
-def _capabilities() -> dict[str, Any]:
-    return {
-        "object": "hermes.api_server.capabilities",
-        "platform": "hermes-agent",
-        "model": MODEL,
-        "runtime": {
-            "mode": "split_runtime",
-            "tool_execution": "caller",
-            "split_runtime": True,
-        },
-        "features": {
-            "model_iteration": True,
-            "skills_api": True,
-        },
-        "endpoints": {
-            "model_iteration": {
-                "method": "POST",
-                "path": "/v1/model/iterations",
-                "contract": HERMES_MODEL_ITERATION_CONTRACT,
-                "max_model_calls": 1,
-                "tool_execution": "caller",
-                "session_mutation": False,
-                "supports": {
-                    "system_policy": True,
-                    "tool_allowlist": True,
-                    "conversation_snapshot": True,
-                    "structured_output": True,
-                    "usage": True,
-                    "external_deadline": True,
-                },
-            }
-        },
-    }
-
-
-def _response_envelope(
-    request: HermesModelIterationRequest,
-    *,
-    finish_reason: str,
-    tool_calls: list[dict[str, Any]],
-    output: dict[str, Any] | None,
-) -> dict[str, Any]:
-    return {
-        "object": "hermes.model_iteration.response",
-        "contract_version": HERMES_MODEL_ITERATION_CONTRACT,
-        "request_id": str(request.request_id),
-        "turn_id": str(request.turn_id),
-        "request_fingerprint": request.request_fingerprint,
-        "step_number": request.step_number,
-        "finish_reason": finish_reason,
-        "tool_calls": tool_calls,
-        "output": output,
-        "usage": {"input_tokens": 100, "output_tokens": 25},
-        "model": request.model,
-        "provider": request.provider,
-    }
-
-
-class FourDomainHermesTransport:
-    capabilities = (
-        "activity.focus",
-        "wearable.sleep",
-        "calendar.day-summary",
-        "nutrition.caffeine-ledger",
-    )
-
-    def __init__(self) -> None:
-        self.capability_calls = 0
-        self.requests: list[HermesModelIterationRequest] = []
-
-    async def get_capabilities(self) -> Mapping[str, Any]:
-        self.capability_calls += 1
-        return copy.deepcopy(_capabilities())
-
-    async def run_model_iteration(
-        self,
-        *,
-        endpoint: str,
-        request: HermesModelIterationRequest,
-        timeout_seconds: float,
-    ) -> Mapping[str, Any]:
-        assert endpoint == "/v1/model/iterations"
-        assert timeout_seconds > 0
-        self.requests.append(request.model_copy(deep=True))
-
-        history = request.turn_snapshot.history
-        if len(history) < len(self.capabilities):
-            capability = self.capabilities[len(history)]
-            tool = next(
-                item
-                for item in request.tools
-                if item.metadata["capability"] == capability
-            )
-            arguments: dict[str, Any] = {
-                "purpose": f"Use {capability} for the wellness decision.",
-            }
-            if capability == "activity.focus":
-                arguments.update(
-                    {
-                        "start": DAY_START.isoformat(),
-                        "end": NOW.isoformat(),
-                        "granularity": "window",
-                    }
-                )
-            else:
-                arguments["parameters"] = {
-                    "date": DAY.isoformat(),
-                }
-            return _response_envelope(
-                request,
-                finish_reason="tool_calls",
-                tool_calls=[
-                    {
-                        "call_id": f"call_{len(history) + 1}",
-                        "name": tool.name,
-                        "arguments": arguments,
-                    }
-                ],
-                output=None,
-            )
-
-        used_source_ref_ids = list(
-            dict.fromkeys(
-                source_ref_id
-                for exchange in history
-                for result in exchange.results
-                for source_ref_id in result.source_ref_ids
-            )
-        )
-        return _response_envelope(
-            request,
-            finish_reason="structured_output",
-            tool_calls=[],
-            output={
-                "status": "completed",
-                "answer": (
-                    "오늘 기록과 수면, 일정, 활동을 함께 보면 "
-                    "추가 카페인보다 먼저 쉬는 편이 낫습니다."
-                ),
-                "proposed_action": True,
-                "persistence_intent": "action",
-                "used_source_ref_ids": used_source_ref_ids,
-                "limitations": [],
-                "confidence": 0.8,
-                "uncertainty": "개인 카페인 민감도는 추가 확인이 필요합니다.",
-            },
         )
 
 
@@ -1090,10 +944,10 @@ def test_expected_safe_decision_stops_remain_structured_results(
     assert response.json()["limitations"] == [limitation]
 
 
-def test_missing_hermes_single_iteration_hook_fails_closed(
+def test_missing_hermes_responses_endpoint_fails_closed(
     settings,
 ) -> None:
-    transport = MissingHookTransport()
+    transport = MissingResponsesTransport()
     configured = settings.model_copy(
         update={
             "decision_hermes_base_url": "http://127.0.0.1:8644",
@@ -1125,139 +979,8 @@ def test_missing_hermes_single_iteration_hook_fails_closed(
         ),
         "detail": {
             "reason_codes": [
-                "hermes_single_iteration_not_advertised",
+                "hermes_responses_endpoint_missing",
             ]
         },
     }
-    assert transport.iteration_calls == 0
-
-
-def test_rest_to_hermes_four_domain_decision_persists_record(
-    settings,
-) -> None:
-    transport = FourDomainHermesTransport()
-    database_path = settings.data_dir / "decision-api-e2e.db"
-    configured = _secured_settings(
-        settings,
-        database_url=f"sqlite+pysqlite:///{database_path}",
-        decision_hermes_base_url="http://127.0.0.1:8644",
-        decision_hermes_model=MODEL,
-        decision_hermes_provider=PROVIDER,
-        decision_timeout_seconds=5,
-    )
-    token_path = configured.data_dir / "google" / "calendar_token.json"
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(
-        json.dumps(
-            {
-                "type": "authorized_user",
-                "refresh_token": "fake-refresh",
-                "client_id": "test.apps.googleusercontent.com",
-                "client_secret": "fake-secret",
-            }
-        ),
-        encoding="utf-8",
-    )
-    calendar_health = FileSyncHealthStore.for_data_dir(
-        configured.data_dir
-    )
-    account_generation = creds.calendar_account_generation(
-        configured,
-        CalendarSource.GOOGLE,
-    )
-    assert account_generation is not None
-
-    async def retained_wearable_only(_day):
-        raise RuntimeError("force the retained local snapshot path")
-
-    app = create_app(
-        configured,
-        decision_transport=transport,
-        decision_wearable_reader=retained_wearable_only,
-        decision_clock=lambda: NOW,
-    )
-
-    with TestClient(
-        app,
-        base_url="http://127.0.0.1:8100",
-        client=("127.0.0.1", 43123),
-    ) as client:
-        with session_scope() as session:
-            _seed_activity(session)
-            _seed_nutrition(session, configured)
-            _seed_wearable(session, local_day=DAY)
-            _seed_calendar(
-                session,
-                calendar_health,
-                account_generation,
-            )
-
-        response = client.post(
-            "/v1/wellness-decisions",
-            headers=_bearer(),
-            json={
-                "question": QUESTION,
-                "hints": {"local_date": DAY.isoformat()},
-            },
-        )
-
-        assert response.status_code == 200
-        body = response.json()
-        assert body["status"] == "completed"
-        assert body["persistence_status"] == "persisted"
-        assert body["decision_record_id"] is not None
-        assert body["proposed_action"] is True
-        assert body["runtime"]["runtime"] == "hermes"
-        assert body["runtime"]["model"] == MODEL
-        assert body["runtime"]["provider"] == PROVIDER
-        assert {item["domain"] for item in body["source_refs"]} == {
-            "activity",
-            "nutrition",
-            "wearable",
-            "calendar",
-        }
-        assert "tool_trace" not in body
-        assert "Private strategy meeting" not in response.text
-        assert "com.healthmes.private-editor" not in response.text
-        recovered = client.get(
-            f"/v1/wellness-decisions/{body['request_id']}",
-            headers=_bearer(),
-        )
-        assert recovered.status_code == 200
-        assert recovered.json() == body
-
-        with session_scope() as session:
-            assert session.scalar(
-                select(func.count()).select_from(DecisionRecord)
-            ) == 1
-            row = session.get(
-                DecisionRecord,
-                uuid.UUID(body["decision_record_id"]),
-            )
-            assert row is not None
-            assert row.decision_payload is not None
-            stored_request = row.decision_payload["request"]
-            assert "caller" not in stored_request
-            assert "question" not in stored_request
-            assert stored_request["execution_scope"] == "local"
-            assert (
-                stored_request["requested_privacy_level"]
-                == "aggregate"
-            )
-            serialized = json.dumps(row.decision_payload)
-            assert "Private strategy meeting" not in serialized
-            assert "com.healthmes.private-editor" not in serialized
-
-    assert transport.capability_calls == 1
-    assert len(transport.requests) == 5
-    assert [
-        exchange.tool_calls[0].capability
-        for request in transport.requests[1:]
-        for exchange in request.turn_snapshot.history[-1:]
-        if exchange.tool_calls
-    ] == list(FourDomainHermesTransport.capabilities)
-    assert all(
-        request.turn_snapshot.request.requested_privacy_level
-        is PrivacyLevel.AGGREGATE
-        for request in transport.requests
-    )
+    assert transport.response_calls == 1

@@ -47,10 +47,10 @@ Decision Finalizer
   사용한 source_refs를 검증하고 DecisionRecord를 저장한다.
 ```
 
-Hermes는 위 흐름의 모델 iteration을 실행하는 첫 번째 runtime adapter다. HealthMes는
-판단 계약, 반복 loop와 데이터 경계를 소유하고, Hermes는 모델 호출, 세션과 전달
-채널을 제공한다. Hermes의 범용 autonomous tool loop가 HealthMes loop를 대신하지
-않는다.
+Hermes는 위 흐름의 첫 번째 runtime adapter다. HealthMes는 판단 요청, 허용 도구,
+데이터 경계, 결과 검증과 기록을 소유한다. Hermes는 정확히 한 번의
+`POST /v1/responses` 요청 안에서 LLM 호출, MCP 도구 선택·실행과 반복 판단을
+자율적으로 수행한다. 두 제품이 별도의 LLM loop를 중복 실행하지 않는다.
 
 ## 1. 왜 바꾸는가
 
@@ -110,33 +110,31 @@ HealthMesDecisionAgent
         +-- TestRuntimeAdapter
 ```
 
-실행 loop의 소유권은 다음처럼 고정한다.
+실행 책임은 다음처럼 고정한다.
 
 ```text
 HealthMesDecisionAgent
-  for step in bounded_steps:
-    runtime.next_step(read_only_turn_snapshot)
-      -> tool_calls 또는 final draft 중 하나
+  -> DecisionRequest와 server-owned search session 생성
+  -> 전용 Hermes profile과 허용된 HealthMes MCP tool 확인
+  -> Hermes POST /v1/responses 정확히 한 번 호출
 
-    tool_calls:
-      HealthMes가 Context Access Layer를 통해 순차 실행
-      -> 검증된 RuntimeToolExchange를 다음 snapshot에 추가
+Hermes
+  -> 질문에 필요한 허용 MCP tool을 자율 선택
+  -> 같은 요청 안에서 tool 호출과 LLM 판단을 반복
+  -> strict DecisionDraft JSON 반환
 
-    final draft:
-      실제 반환된 source_refs의 부분집합인지 검사
-      context에 source_refs가 있으면 완료 답변이 최소 하나를 명시했는지 검사
-      -> Decision Finalizer로 전달
+HealthMesDecisionAgent
+  -> server-owned canonical tool_trace와 Hermes transcript 대조
+  -> 실제 tool result에 포함된 source_refs만 허용
+  -> Decision Finalizer로 전달
+  -> 성공한 Hermes session 삭제
 ```
 
-Runtime에는 provider callback, DB session, registry, `consume_step()`을 주지 않는다.
-또한 전체 `DecisionRequest`를 넘기지 않는다. 모델에는 질문, 질문 시각, 시간대,
-요청 privacy level, 조회 기간 hint, 관련 기록 존재 여부와 허용된 관련 domain만
-담은 `RuntimeDecisionRequest`를 제공한다. 선택된 record가 필요한 도구에는
-turn-scoped `rr_...` alias만 보이며 HealthMes가 내부 실제 ID로 치환한다.
-`principal_id`, `session_id`, channel과 실제 related record ID는 runtime 경계를
-넘지 않는다. 외부 `DecisionRequest.request_id/turn_id`도 넘기지 않고, agent가
-turn마다 새로 생성한 opaque runtime correlation UUID만 전달한다. 이 UUID는
-응답 correlation과 감사에만 사용되며 caller/session/record identity를 담지 않는다.
+Hermes에는 DB session이나 자유 SQL을 주지 않는다. 전용 profile에는 읽기 전용
+`search_activity`, `search_nutrition`, `search_wearable`, `search_calendar`만 노출한다.
+각 도구는 server-owned search session을 통해 Context Access Layer를 호출하므로
+권한, retention, privacy와 query cap을 우회할 수 없다. 일반 Hermes native tool,
+Skill, memory, mutation tool과 Open Wearables 직접 MCP는 이 profile에서 비활성화한다.
 도구 결과도 runtime 전용 최소 계약으로 다시 변환한다. 전체 `SourceRef`,
 raw-source handle, query UUID와 cursor는 내부 trace에만 남고 모델에는 검증된
 `source_ref_ids`, freshness, coverage, limitation과 질문에 필요한 payload만
@@ -277,17 +275,26 @@ Python payload 생성이나 SQLAlchemy `flush()`가 deadline을 넘긴 경우에
 
 ### 2.2 운영 설정, 실행 위치와 domain 동의
 
-Decision runtime은 세 설정이 모두 있을 때만 활성화된다.
+Decision runtime은 다음 설정이 모두 있을 때만 활성화된다.
 
 ```text
 HEALTHMES_DECISION_HERMES_BASE_URL
 HEALTHMES_DECISION_HERMES_MODEL
 HEALTHMES_DECISION_HERMES_PROVIDER
+HEALTHMES_DECISION_HERMES_PROFILE_PATH
+HEALTHMES_DECISION_HERMES_API_KEY
 ```
 
-일부만 설정하면 startup validation이 실패한다. Hermes가 전용 single-iteration
-계약을 광고하지 않으면 일반 chat endpoint로 fallback하지 않고 Decision REST
-호출을 `503 decision_runtime_unavailable`로 종료한다.
+일부만 설정하면 startup validation이 실패한다. 시작 시 HealthMes는 profile 파일을
+fail-closed 검증하고, 인증된 `GET /v1/toolsets`와 `GET /v1/models` probe로 실제
+Hermes가 정확한 tool allowlist와 model route를 제공하는지 확인한다. 검증 실패 시
+일반 Hermes profile이나 다른 chat endpoint로 fallback하지 않는다.
+profile의 전용 bearer key도 HealthMes transport key와 상수시간 비교한다.
+
+이 PR은 전용 Hermes process를 자동 실행하지 않는다. 운영자는 bootstrap이 생성한
+별도 `HERMES_HOME/decision/config.yaml`로 Hermes API server를 시작해야 하며,
+HealthMes는 시작 시 위 probe가 성공한 경우에만 요청을 받는다. native launcher와
+Docker service wiring은 #169의 runtime contract 범위 밖이다.
 
 실행 위치는 서버가 소유하는 명시적 설정이다.
 
@@ -624,22 +631,24 @@ HealthMes가 소유해야 하는 기능:
 - source reference와 finalization
 - DecisionRecord와 outcome 연결
 
-HealthMes 판단에서 Hermes의 전체 autonomous tool loop를 그대로 실행하면 step,
-deadline과 gateway 소유권이 다시 Hermes로 넘어가므로 사용하지 않는다.
-`HermesRuntimeAdapter.next_step()`은 HealthMes가 준 turn snapshot으로 정확히 한 번의
-모델 iteration만 실행하고, `tool_calls` 또는 final draft 중 하나를 반환해야 한다.
+HealthMes 판단은 Hermes의 autonomous tool loop를 사용한다. 단, 범용 Hermes
+profile을 그대로 재사용하지 않고 HealthMes가 만든 전용 profile과 server-owned
+search session만 제공한다. HealthMes는 정확히 한 번 `POST /v1/responses`를 호출하고
+Hermes가 그 요청 안에서 질문 해석, MCP 선택, 도구 실행과 최종 판단을 끝낸다.
 
-HealthMes 쪽 `HermesRuntimeAdapter`와 fail-closed 계약은 구현되어 있다. 다만 현재
-vendored Hermes에는 이 single-iteration generic hook이 없다. 따라서 기존 chat
-endpoint를 안전한 것처럼 fallback하지 않고 `unavailable`을 반환한다. 실제 Hermes
-모델 실행을 활성화하려면 HealthMes vendored tree를 직접 수정하지 않고 별도 Hermes
-저장소와 PR에서 다음 범용 확장을 구현해야 한다.
+응답은 신뢰하지 않고 다음을 다시 검증한다.
 
-- 필수 system policy 주입 hook
-- structured tool-call/final response 한 번 생성
-- model usage metadata 반환
-- tool allowlist와 이전 exchange snapshot 전달
-- 외부 HealthMes driver가 cancellation과 deadline을 소유할 수 있는 호출 경계
+- model identity와 strict `DecisionDraft` JSON
+- assistant tool call과 tool output의 완전한 1:1 pairing 및 순서
+- canonical `tool_trace`에 실제 기록된 도구 이름과 query arguments
+- 각 최종 `source_ref`가 실제 tool result에서 반환됐는지 여부
+- 세션 ID와 허용된 HealthMes MCP profile
+
+성공한 세션은 bounded retry로 즉시 삭제한다. timeout이나 upstream 오류로 즉시
+삭제할 수 없는 세션은 전용 state에만 남으며 TTL maintenance가 만료 뒤 제거한다.
+현재 Hermes Responses API가 실행 중 요청을 받은 직후 upstream에서 멈춘 경우,
+HealthMes가 원격 계산 자체를 강제 중단할 수는 없으므로 이 TTL은 orphaned transcript
+정리 경계이지 upstream model cancellation 보장은 아니다.
 
 HealthMes 전용 카페인, 활동 또는 영양 규칙을 Hermes core에 넣지 않는다.
 
@@ -652,33 +661,17 @@ LLM
   "활동과 수면 자료가 필요하다"
        |
        v
-HermesRuntimeAdapter.next_step
-  tool 요청만 반환
-       |
-       v
-HealthMesDecisionAgent
-  요청 검증과 step/tool budget 적용
+Hermes POST /v1/responses
+  허용된 HealthMes MCP tool을 자율 선택·실행
        |
        v
 Context Access Layer와 Domain Provider
 ```
 
 에이전트의 자율성과 MCP는 충돌하지 않는다. LLM이 어떤 도구를 언제 호출할지
-자율적으로 선택하고, HealthMes driver가 선택을 검증한 뒤 MCP 또는 in-process
-gateway로 안전하게 실행한다.
-
-아키텍처는 MCP에만 고정하지 않는다.
-
-```text
-ContextToolGateway
-  +-- MCPToolGateway       Hermes용
-  +-- InProcessToolGateway 미래 native runtime용
-  +-- FakeToolGateway      테스트용
-```
-
-현재 core E2E는 in-process Context Access Layer로 실행한다. MCP는 외부 agent나
-channel이 HealthMes 기능을 호출하는 integration surface로 유지하되, 권한 검사와
-finalization을 우회하는 별도 core 경로로 만들지 않는다.
+자율적으로 선택하고 실행한다. HealthMes MCP 도구 구현은 server-owned search
+session을 통해 Context Access Layer를 호출하므로 권한 검사와 finalization을
+우회하는 별도 core 경로가 생기지 않는다.
 
 ## 9. 중앙 데이터 조회
 
@@ -726,12 +719,12 @@ finalization을 우회하는 별도 core 경로로 만들지 않는다.
 | 항목 | 현재 구현 | 남은 경계 |
 |---|---|---|
 | 질문 입력 | 공개 `ask_wellness(DecisionRequest)`와 호환 `ask()` | API/MCP/UI별 얇은 호출 adapter |
-| 자료 선택 | HealthMes-owned 반복 `next_step` loop | 실제 runtime의 모델 품질 평가는 운영 단계 |
+| 자료 선택 | Hermes의 단일 Responses 요청 내부 autonomous MCP loop | 실제 runtime의 모델 품질 평가는 운영 단계 |
 | resolver | 고정 `question_kind`를 compatibility preset으로만 유지 | 기존 호출자 migration 뒤 축소 가능 |
 | Context layer | 권한, retention, timezone, privacy, query cap과 source ref 강제 | 새 provider 추가 시 동일 계약 준수 |
 | Domain provider | Activity, Nutrition, Wearable, Calendar 공통 registry | 새로운 wellness 입력 provider 확장 |
 | Skill | 필수 정책을 소유하지 않는 설명 계층 | channel별 표현 지침만 유지 |
-| Hermes | `HermesRuntimeAdapter`와 strict/fail-closed 계약 구현 | Hermes upstream single-iteration hook `#139` |
+| Hermes | 전용 filtered profile, 정확히 한 번의 Responses 호출과 strict transcript 검증 | upstream 취소 이후 원격 계산 중단 보장은 Hermes 지원 필요 |
 | 최종 판단 | runtime-neutral structured draft loop 구현 | 상용 LLM eval은 이 PR 비범위 |
 | 판단 저장 | finalizer가 source ref를 재검증하고 자동 저장 | 저장 backend 운영·관측성 보강 |
 | wearable provenance | normalized local snapshot과 stable source ref 구현 | vendor별 장기 호환성 모니터링 |
@@ -793,8 +786,8 @@ Nutrition, Wearable, Calendar 도구는 폐기하지 않는다. 새 Decision Age
 ### `DEC-04 HealthMes Decision Agent`
 
 - 자연어 질문을 받는 HealthMes-owned orchestration interface
-- HealthMes가 model iteration, step budget와 hard deadline을 직접 소유
-- runtime은 한 iteration마다 tool 요청 또는 final draft 중 하나만 반환
+- HealthMes가 DecisionRequest, search session, tool exposure와 hard deadline을 소유
+- Hermes가 한 Responses 요청 안에서 autonomous LLM/MCP loop를 소유
 - LLM이 tool catalog에서 도구를 선택하고 실제 결과에 따라 추가 요청
 - runtime에 provider callback, DB와 registry를 노출하지 않음
 - runtime history와 canonical trace를 deep snapshot으로 격리
@@ -820,33 +813,26 @@ Nutrition, Wearable, Calendar 도구는 폐기하지 않는다. 새 Decision Age
 cancellation 억제, 동기 event-loop blocking, step 우회와 source ref 위조가 성공
 결과에 반영되지 않는다.
 
-### `DEC-05 Hermes Runtime Adapter`
+### `DEC-05 Hermes Responses Runtime Adapter`
 
 - HealthMes system policy를 항상 주입
-- request/turn ID, privacy scope, 남은 예산과 deadline을 매 iteration에 전달
-- configured model/provider identity를 매 iteration에 고정하고 응답 변경을 거부
-- canonical request fingerprint를 응답 correlation과 idempotency key에 결합
-- 정책으로 허용된 HealthMes capability만 virtual tool allowlist로 노출
-- Hermes 내부 tool prefix를 adapter의 opaque mapping으로 캡슐화
-- 정확히 한 번의 model call 뒤 unexecuted tool call 또는 draft만 수신
-- correlation, model, usage, tool allowlist와 structured output을 fail-closed 검증
-- capability discovery와 model iteration 각각에 남은 turn deadline을 강제
+- 전용 Hermes profile에 네 개의 읽기 전용 HealthMes MCP search tool만 노출
+- 일반 native tool, Skill, memory, mutation과 Open Wearables 직접 MCP 비활성화
+- configured model/provider identity를 고정하고 응답 변경을 거부
+- `POST /v1/responses`를 정확히 한 번 호출
+- Hermes가 요청 내부의 자율 LLM/MCP tool loop를 소유
+- canonical server-side `tool_trace`와 transcript call/output을 fail-closed 대조
+- startup 때 인증된 toolset/model route probe 실행
 - decoded HTTP response를 streaming으로 읽고 2 MB에서 즉시 중단
 - `Accept-Encoding: identity`만 허용해 압축 해제 bomb을 body read 전에 거부
-- remote HTTPS runtime은 API key 없이는 구성하지 못하게 차단
-- 명시적 capability refresh 실패 시 이전 success cache를 즉시 폐기
+- 모든 production HTTP runtime은 전용 bearer key 없이는 구성하지 못하게 차단
 - Skill 설치 여부와 무관하게 같은 mandatory policy와 결과 계약을 적용
 - Skill은 얇은 channel/runtime 설명으로 제한
-- 현재 Hermes가 single-iteration hook을 광고하지 않으면 기존 chat endpoint로
-  fallback하지 않고 명시적 unavailable 상태를 반환
-- 별도 upstream 요구사항은
-  [#139](https://github.com/NomaDamas/healthmes-agent/issues/139)와
-  [`HERMES-MODEL-ITERATION-HOOK.ko.md`](contracts/HERMES-MODEL-ITERATION-HOOK.ko.md)
-  에서 추적
+- 성공 세션은 bounded retry로 삭제하고 실패 세션은 TTL maintenance로 정리
 
-**종료 조건:** HealthMes core가 Hermes 내부 클래스나 tool prefix에 직접 의존하지
-않고, fake transport에서는 전체 iteration 계약이 통과하며, hook이 없는 실제 Hermes는
-지원되는 것처럼 가장하지 않는다.
+**종료 조건:** HealthMes core가 Hermes 내부 클래스에 의존하지 않고, production
+경로가 정확히 한 번의 Responses 호출만 사용하며, profile·trace·draft·source ref
+불일치를 모두 성공 결과로 받아들이지 않는다.
 
 ### `DEC-06 Decision Finalizer`
 

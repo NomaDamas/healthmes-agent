@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable
 from threading import Lock
-from typing import Any
+from typing import Any, Protocol
 
-from healthmes.decision.agent import HealthMesDecisionAgent
+from healthmes.decision.agent import DecisionAgentRun
 from healthmes.decision.contracts import DecisionRequest, DecisionResult
 from healthmes.decision.finalizer import DecisionFinalizer
 
@@ -22,6 +23,17 @@ class DecisionEngineClosedError(RuntimeError):
 
 class DecisionEngineBusyError(RuntimeError):
     """Raised when the bounded Decision Agent admission queue is full."""
+
+
+class DecisionAgent(Protocol):
+    """Minimal agent contract owned by the public Decision Engine."""
+
+    def ask(
+        self,
+        request: DecisionRequest,
+    ) -> Awaitable[DecisionAgentRun]: ...
+
+    def close(self) -> None: ...
 
 
 def _consume_task_result(task: asyncio.Future[Any]) -> None:
@@ -43,7 +55,7 @@ class HealthMesDecisionEngine:
     def __init__(
         self,
         *,
-        agent: HealthMesDecisionAgent,
+        agent: DecisionAgent,
         finalizer: DecisionFinalizer,
         max_pending_requests: int = 8,
         shutdown_timeout_seconds: float = (
@@ -78,6 +90,18 @@ class HealthMesDecisionEngine:
         self._shutdown_task: asyncio.Task[None] | None = None
         self._closing = False
         self._closed = False
+
+    async def astart(self) -> None:
+        """Run an optional runtime readiness probe before serving requests."""
+
+        with self._state_lock:
+            if self._closing or self._closed:
+                raise DecisionEngineClosedError(
+                    "HealthMes decision engine is closing"
+                )
+        start_agent = getattr(self._agent, "start", None)
+        if callable(start_agent):
+            await start_agent()
 
     async def _run_request(
         self,
@@ -252,7 +276,11 @@ class HealthMesDecisionEngine:
                     await drain_finalizer()
         finally:
             try:
-                self._agent.close()
+                close_agent = getattr(self._agent, "aclose", None)
+                if callable(close_agent):
+                    await close_agent()
+                else:
+                    self._agent.close()
             finally:
                 with self._state_lock:
                     self._closed = True

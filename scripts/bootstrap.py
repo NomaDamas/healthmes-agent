@@ -86,12 +86,19 @@ from jinja2 import Environment, StrictUndefined
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_PATH = REPO_ROOT / "config" / "hermes-config.yaml.tmpl"
+DECISION_TEMPLATE_PATH = (
+    REPO_ROOT / "config" / "hermes-decision-config.yaml.tmpl"
+)
 VENDOR_HERMES = REPO_ROOT / "vendor" / "hermes-agent"
 
 # The one secret bootstrap may mint itself (shared HMAC between
 # healthmes/engine/triggers.py and the Hermes webhook route).
 GENERATED_SECRET_KEY = "HEALTHMES_HERMES_WEBHOOK_SECRET"
 GENERATED_ADJUSTMENT_SECRET_KEY = "HEALTHMES_CALENDAR_ADJUSTMENT_SECRET"
+GENERATED_DECISION_API_KEY = "HEALTHMES_DECISION_HERMES_API_KEY"
+GENERATED_DECISION_PROFILE_PATH = (
+    "HEALTHMES_DECISION_HERMES_PROFILE_PATH"
+)
 
 # Non-generatable credentials we can only warn about.
 WARN_IF_MISSING = (
@@ -145,6 +152,13 @@ TEMPLATE_KEYS = (
     "ow_mcp_uv_cache_dir",
     "healthmes_mcp_url",
     "healthmes_api_token",
+    "decision_hermes_host",
+    "decision_hermes_port",
+    "decision_hermes_api_key",
+    "decision_hermes_model",
+    "decision_hermes_provider",
+    "decision_hermes_model_base_url",
+    "decision_hermes_model_api_key",
 )
 
 # ---------------------------------------------------------------------------
@@ -334,6 +348,53 @@ def ensure_calendar_adjustment_secret(env_file: Path, env: dict[str, str], plan:
     return generated
 
 
+def ensure_decision_api_key(
+    env_file: Path,
+    env: dict[str, str],
+    plan: Plan,
+) -> str:
+    """Return the dedicated Hermes API key, minting it when absent."""
+
+    existing = env.get(GENERATED_DECISION_API_KEY, "").strip()
+    if existing:
+        if len(existing) < 32:
+            raise ValueError(
+                f"{GENERATED_DECISION_API_KEY} must contain at least "
+                "32 characters"
+            )
+        return existing
+    generated = secrets.token_hex(32)
+    plan.act(f"generate {GENERATED_DECISION_API_KEY} into {env_file}")
+    if not plan.dry_run:
+        upsert_env_var(env_file, GENERATED_DECISION_API_KEY, generated)
+    return generated
+
+
+def ensure_decision_profile_path(
+    env_file: Path,
+    env: dict[str, str],
+    profile_path: Path,
+    plan: Plan,
+) -> str:
+    """Persist the rendered profile path without replacing an override."""
+
+    existing = env.get(GENERATED_DECISION_PROFILE_PATH, "").strip()
+    if existing:
+        return existing
+    generated = str(profile_path.expanduser().resolve())
+    plan.act(
+        f"set {GENERATED_DECISION_PROFILE_PATH} in {env_file} "
+        f"to {generated}"
+    )
+    if not plan.dry_run:
+        upsert_env_var(
+            env_file,
+            GENERATED_DECISION_PROFILE_PATH,
+            generated,
+        )
+    return generated
+
+
 # ---------------------------------------------------------------------------
 # Template rendering
 # ---------------------------------------------------------------------------
@@ -411,6 +472,34 @@ def build_context(
         # rendered MCP registration carries the Authorization header so the
         # agent keeps reaching its Layer-B tools behind auth.
         "healthmes_api_token": env.get("HEALTHMES_API_TOKEN", "").strip(),
+        "decision_hermes_host": env.get(
+            "HEALTHMES_DECISION_HERMES_HOST",
+            "",
+        ).strip(),
+        "decision_hermes_port": env.get(
+            "HEALTHMES_DECISION_HERMES_PORT",
+            "",
+        ).strip(),
+        "decision_hermes_api_key": env.get(
+            GENERATED_DECISION_API_KEY,
+            "",
+        ).strip(),
+        "decision_hermes_model": env.get(
+            "HEALTHMES_DECISION_HERMES_MODEL",
+            "",
+        ).strip(),
+        "decision_hermes_provider": env.get(
+            "HEALTHMES_DECISION_HERMES_PROVIDER",
+            "",
+        ).strip(),
+        "decision_hermes_model_base_url": env.get(
+            "HEALTHMES_DECISION_HERMES_MODEL_BASE_URL",
+            "",
+        ).strip(),
+        "decision_hermes_model_api_key": env.get(
+            "HEALTHMES_DECISION_HERMES_MODEL_API_KEY",
+            "",
+        ).strip(),
     }
     for key in TEMPLATE_KEYS:
         context.setdefault(key, "")
@@ -1122,6 +1211,7 @@ def run(args: argparse.Namespace) -> int:
     plan = Plan(dry_run=args.dry_run)
     env_file = Path(args.env_file).expanduser()
     hermes_home = resolve_hermes_home(args, REPO_ROOT)
+    decision_home = hermes_home / "decision"
     env = resolve_env(env_file)
 
     for key in WARN_IF_MISSING:
@@ -1145,13 +1235,27 @@ def run(args: argparse.Namespace) -> int:
 
     webhook_secret = ensure_webhook_secret(env_file, env, plan)
     ensure_calendar_adjustment_secret(env_file, env, plan)
+    decision_api_key = ensure_decision_api_key(env_file, env, plan)
+    env[GENERATED_DECISION_API_KEY] = decision_api_key
+    decision_profile_path = ensure_decision_profile_path(
+        env_file,
+        env,
+        decision_home / "config.yaml",
+        plan,
+    )
+    env[GENERATED_DECISION_PROFILE_PATH] = decision_profile_path
     context = build_context(env, args.mode, REPO_ROOT, webhook_secret)
     rendered = render_template(context)
+    decision_rendered = render_template(
+        context,
+        template_path=DECISION_TEMPLATE_PATH,
+    )
 
     if args.print_config:
         print(rendered)
 
     write_config(hermes_home, rendered, plan)
+    write_config(decision_home, decision_rendered, plan)
     install_skills(REPO_ROOT, hermes_home, plan)
     # Before cron registration: the jobs reference this script by name and
     # create_job's lifecycle guard reads it from $HERMES_HOME/scripts/.
@@ -1164,6 +1268,10 @@ def run(args: argparse.Namespace) -> int:
 
     plan.report()
     print(f"[bootstrap] HERMES_HOME: {hermes_home} (mode: {args.mode})")
+    print(
+        "[bootstrap] decision HERMES_HOME: "
+        f"{decision_home} (profile: {decision_home / 'config.yaml'})"
+    )
     return 0
 
 
