@@ -7,16 +7,15 @@ reasoning, and runtime presentation do not silently replace one another:
 |---|---|---|
 | A channel workflow or presentation convention | A thin **skill** — one markdown file | No code |
 | A deterministic metric or specialist boundary | A **Context Provider / Layer B tool** | Python |
-| A cross-domain reasoning contract | The **HealthMes Decision Agent** policy, runtime contract, and evals | Python + prompt/eval design |
+| A cross-domain reasoning contract | The **HealthMes wellness runtime** contract, Skill catalog, and evals | Python + prompt/eval design |
 | A new correlation report | An **insight template** | Python (SQL-ish) |
 
 The hard boundary is: domain providers calculate exact facts and specialist
-limits; the HealthMes Decision Agent owns the LLM loop, mandatory policy,
-source validation, and finalization; skills only teach a replaceable runtime
-how to enter or present that workflow. A skill file is not an authorization,
-retention, privacy, calculation, or persistence enforcement mechanism. See
-`docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md` and
-`docs/contracts/HERMES-MODEL-ITERATION-HOOK.ko.md`.
+limits; Hermes owns one autonomous LLM/tool loop; HealthMes owns the product
+ingress, bounded tools, source validation, and conditional finalization.
+Skills only teach the runtime how to use that workflow. A skill file is not an
+authorization, retention, privacy, calculation, or persistence enforcement
+mechanism. See `docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`.
 
 ## 1. Adding a thin skill (no code)
 
@@ -35,8 +34,9 @@ description: Screen weekly data for sleep-apnea risk markers and advise follow-u
 When the user asks about snoring, daytime sleepiness, or during weekly review.
 
 # Procedure
-1. Call mcp__healthmes__get_health_scores with categories=["SLEEP"] for 14 days.
-2. Call mcp__open_wearables__get_timeseries with types=["spo2", "respiratory_rate"] …
+1. Call mcp__healthmes__search_wearable with metrics=["sleep"] for 14 days.
+2. If the bounded tool reports that SpO2 or respiratory coverage is unavailable,
+   say which source is missing rather than calling Open Wearables directly.
 3. If nightly SpO2 dips below … AND confidence is "high", say …
    If confidence is "low"/"insufficient_data", say the data is too thin — never
    give categorical advice on low confidence.
@@ -47,21 +47,23 @@ Ground rules for skill authors:
 - **Do not put mandatory product policy only in a skill.** Authorization,
   retention, privacy, exact calculations, tool budgets, source-reference
   validation, and decision persistence belong to HealthMes code.
-- **Reference tools by their registered names**: `mcp__healthmes__<tool>` and
-  `mcp__open_wearables__<tool>` (double underscores).
-- **Never instruct raw REST calls** — data access must go through MCP tools so
-  every decision stays reconstructable in the decision tree.
-- Legacy Hermes workflows still instruct `record_decision`; the
-  `HealthMesDecisionEngine` finalizer enforces persistence in code rather than
-  trusting this instruction alone. New service adapters should construct the
-  engine with `build_healthmes_decision_engine(...)` and call
-  `await engine.ask_wellness(request)`.
+- **Reference tools by their registered names**:
+  `mcp__healthmes__<tool>` (double underscores). The product runtime does not
+  expose direct Open Wearables tools.
+- **Never instruct raw REST calls** — decision data access must go through
+  bounded HealthMes MCP tools so returned source references can be validated.
+- Do not instruct the runtime to call `record_decision` for every lookup.
+  Conditional compact persistence after source validation is the target of
+  PR #138 issue #164, not the behavior of the current finalizer. Until #164
+  is integrated, every completed source-bearing decision is still stored.
+  Do not describe the target policy as shipped.
 - **Respect confidence**: the tools return `confidence` / `coverage` /
   `insufficient_data` honestly; skills must gate advice on them.
 - Multiple skills are welcome — one file per clinical question keeps them
-  composable. Register a skill for proactive alerts by listing it in the
-  webhook route (`config/hermes-config.yaml.tmpl` → `skills:`) or for
-  briefings in `scripts/bootstrap.py::BRIEFING_JOBS`.
+  composable. Add reviewed skills to the read-only wellness catalog used by
+  the HealthMes decision ingress. Proactive and scheduled requests use the
+  same catalog through the same internal DecisionRequest service; do not
+  create a separate direct-Hermes reasoning path.
 
 Install: `uv run python scripts/bootstrap.py` (idempotent; copies the skill
 into `$HERMES_HOME/skills/` and resyncs on every re-run).
@@ -125,18 +127,20 @@ make mac-run                 # boots API + /mcp on :8100
 open http://localhost:8100/docs         # REST playground (OpenAPI)
 ```
 
-- **Interactive tool QA from the terminal** — the vendor CLI talks to the same
-  MCP tools and skills the Telegram agent uses:
+- **End-to-end wellness reasoning QA** — call the HealthMes product ingress,
+  not the vendor CLI:
 
   ```bash
-  cd vendor/hermes-agent && \
-    HERMES_HOME=~/.hermes UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
-    uv run --frozen --no-dev --extra messaging hermes chat -q \
-    "오늘 무리해도 돼? get_daily_readiness_context로 근거 보여줘"
+  curl -sS http://localhost:8100/v1/wellness-decisions \
+    -H 'Content-Type: application/json' \
+    -d '{"question":"오늘 무리해도 돼? 필요한 자료를 찾아 근거와 함께 설명해줘."}'
   ```
 
-  (interactive session: `hermes` with no arguments; switch models with
-  `--model/--provider` or `HERMES_MODEL`/`HERMES_PROVIDER` in `.env`.)
+  Add the configured bearer header when `HEALTHMES_API_TOKEN` is enabled.
+  Direct `hermes` / `hermes chat` remains useful for isolated vendor-runtime
+  diagnostics, but it bypasses the HealthMes decision ingress, source
+  validation, and finalization policy. It must not be used to certify product
+  wellness behavior.
 
 - **Direct tool calls without an LLM** (fastest metric QA):
 
@@ -153,8 +157,12 @@ open http://localhost:8100/docs         # REST playground (OpenAPI)
   PY
   ```
 
-- **Decision audit**: every agent recommendation writes a `decision_record`;
-  open `http://localhost:8100/decisions` to review the tree (inputs → rules →
-  LLM rationale → action) and challenge the judgment.
+- **Decision audit**: PR #138 issue #164 targets compact persistence for
+  behavior-changing recommendations, mutations, material risk warnings, and
+  explicitly tracked decisions; after that target lands, simple lookups will
+  remain unpersisted by default.
+  Until #164 is integrated, the current finalizer still stores every completed
+  source-bearing decision. Open `http://localhost:8100/decisions` to review
+  records that the current build retained and challenge the judgment.
 - **Regression**: `make mac-test` — add one test per metric with a
   hand-computed vector; that is the contract your metric keeps forever.

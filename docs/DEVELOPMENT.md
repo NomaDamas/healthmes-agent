@@ -251,18 +251,23 @@ vendor tree (setuptools metadata, ignored by git) — harmless, delete it if
 you want the vendor tree pristine; the venv itself stays outside via
 `UV_PROJECT_ENVIRONMENT`.
 
-### CLI chat (same agent, no Telegram needed)
+### Hermes CLI diagnostics (not the HealthMes product ingress)
 
-The vendor CLI reads the same `$HERMES_HOME` config bootstrap renders, so the
-terminal agent has the identical MCP tools and skills as the Telegram bot:
+The vendor CLI reads the same `$HERMES_HOME` config bootstrap renders. Use it
+only to diagnose Hermes model/provider or MCP registration behavior:
 
 ```bash
 cd vendor/hermes-agent && \
   HERMES_HOME=~/.hermes UV_PROJECT_ENVIRONMENT=../../data/hermes-venv \
   uv run --frozen --no-dev --extra messaging hermes            # interactive
 # one-shot:
-#   ... hermes chat -q "How was my sleep this week?"
+#   ... hermes chat -q "List the tools visible to this runtime."
 ```
+
+Direct CLI chat bypasses the HealthMes DecisionRequest ingress, source
+validation, and finalization policy. End-to-end product wellness QA must call
+`POST /v1/wellness-decisions`; direct Hermes output is not proof that the
+HealthMes product path works.
 
 ### Choosing the LLM (not just Claude)
 
@@ -279,10 +284,12 @@ override: `hermes chat --model … --provider …`. All HealthMes glue
 
 ## Backups (local-first, encrypted)
 
-Snapshots bundle the healthmes DB dump, an optional open-wearables pg_dump,
-the media tree and the Hermes state, tar them and age-encrypt with a
-passphrase (docs/PLAN.md §9; format spec + remote-vault contract in
-`docs/BACKUP.md`):
+Snapshots bundle the healthmes DB dump, raw ingest, an optional
+open-wearables pg_dump, the media tree and optional Hermes state, then
+age-encrypt them with a passphrase (docs/PLAN.md §9; format spec +
+remote-vault contract in `docs/BACKUP.md`). This is a partial component
+snapshot: `.env`, external OAuth credentials and an unconfigured
+Open Wearables DB are not included.
 
 ```bash
 export HEALTHMES_BACKUP_PASSPHRASE='...'    # or set it in .env
@@ -343,11 +350,13 @@ contract and injectable `ScreenTimeActivitySyncService` core. A future
 gate-enabled, entitled build can fetch collection policy, source-filter
 excluded apps, and submit completed local-hour snapshots to
 `POST /v1/activity/ios/report`. The normal repository build always selects
-the unavailable adapter and collects no Apple activity. Compile configuration,
-authorization UI, app lifecycle, Screen Time-specific background scheduling,
-signing, and real-device verification remain device-team work; that work must
-use `docs/INPUT-CONTROL-PLANE.ko.md` rather than inventing a second settings
-model.
+the unavailable adapter and collects no Apple activity. Issue #168 owns the
+UI-neutral authorization callback, first sync, foreground catch-up, Screen
+Time-specific best-effort background scheduling and offline outbox. Compile
+configuration, the authorization UI, Apple entitlement approval, distribution
+signing and real-device verification remain device-team or external work;
+that work must use `docs/INPUT-CONTROL-PLANE.ko.md` rather than inventing a
+second settings model.
 
 ## Companion & desktop apps (issues #7 · #10 · #11)
 
@@ -782,10 +791,10 @@ add), ignoring VCS internals and derived artifacts (`.git`, `__pycache__`,
 `node_modules`, virtualenvs, caches). Exit codes: `0` in sync, `1` drift
 found, `2` usage error — so the drill is scriptable.
 
-When drift touches the coupling surface (docs/PLAN.md §11 — the
-open-wearables REST v1 routes + MCP tool names, and the Hermes
-config/skill/cron/webhook contracts), review the glue that pins it before
-syncing: `healthmes/mcp_server/`, `healthmes/engine/webhook.py`,
+When drift touches the coupling surface (docs/PLAN.md §11 — the Open
+Wearables REST v1 routes, Hermes `/v1/responses`, and the MCP/config/outbound
+delivery contracts), review the glue that pins it before syncing:
+`healthmes/mcp_server/`, the HealthMes decision ingress/runtime adapter,
 `config/hermes-config.yaml.tmpl`, `scripts/bootstrap.py` and their tests.
 After replacing the tree, re-run `uv run pytest -q` and
 `docker compose config -q` (CI runs both on the PR).

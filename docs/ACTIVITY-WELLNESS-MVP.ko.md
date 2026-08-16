@@ -59,7 +59,7 @@ HealthMes
   +-- WellnessEvent storage
   +-- activity/nutrition/wearable/calendar engines
   +-- Context Access Layer
-  +-- HealthMes Decision Agent contract
+  +-- HealthMes wellness request/result contract
   +-- decision policies
   +-- REST/MCP/skill contracts
   |
@@ -68,10 +68,10 @@ HealthMes
         +-- Hermes adaptation (future)
 ```
 
-Hermes는 HealthMes와 동등한 데이터·판단 계층이 아니다. 향후 HealthMes
-Decision Agent 계약과 MCP 도구를 실행하는 교체 가능한 agent/channel runtime
-adapter다. Skill은 핵심 판단 로직이 아니라 이 runtime을 연결하는 얇은 설명이다.
-이번 MVP는 Hermes 코드나 `vendor/hermes-agent/`를 변경하지 않는다.
+Hermes는 HealthMes와 동등한 데이터·판단 계층이 아니다. HealthMes의 공식
+ingress가 호출하는 단일 autonomous LLM/tool runtime이다. Skill은 핵심 판단
+로직이 아니라 이 runtime을 연결하는 얇은 설명이다. 이번 MVP는 Hermes 코드나
+`vendor/hermes-agent/`를 변경하지 않는다.
 
 ## 2. 실행 위치와 저장 결정
 
@@ -182,9 +182,11 @@ active activity interval
   데이터 접근 사용자 승인과 Apple의 제공 조건이 필요하다. 일반 빌드는
   unavailable adapter로 fail closed한다.
 - report contract, transport와 주입 가능한 sync-service core는 구현·테스트됐다.
-  실제 Apple collector 경로는 현재 SDK에서 컴파일되지 않았고, compile condition,
-  앱 lifecycle, Screen Time용 background task, entitlement, 권한 UI, 서명과
-  실기기 검증은 device-team 후속이다.
+  실제 Apple collector 경로는 현재 SDK에서 컴파일되지 않았다. 권한 승인 직후
+  sync, foreground catch-up, Screen Time용 best-effort background task와
+  persistent outbox 재전송은 UI가 아니라 PR #138 Issue #168이 소유하는
+  lifecycle 엔진 범위다. compile condition, Apple entitlement 승인, 권한 설명
+  UI, distribution signing과 실기기 검증만 device-team 또는 외부 조건이다.
 
 ## 4. 시간대별 집계 기준
 
@@ -385,17 +387,17 @@ HealthMes MCP/context contract
 HealthMes Context Access Layer
         |
         v
-HealthMes Decision Agent
+Hermes autonomous decision turn
         |
         v
-runtime adaptation, including Hermes
+HealthMes source validation and conditional finalization
 ```
 
 현재 `resolve_wellness_context(question_kind, ...)`와
 `healthmes-activity-wellness` 계약은 구현 호환용 preset이다. 목표 구조에서는 LLM
-Decision Agent가 필요한 도구를 자율적으로 선택하고, Context Access Layer는
+Hermes LLM이 필요한 도구를 자율적으로 선택하고, Context Access Layer는
 권한·retention·privacy와 source reference만 강제한다. 상세 개선안은
-[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+[`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
 를 따른다.
 
 ## 9. 교차 영역 질문
@@ -425,7 +427,7 @@ HealthMes decision
 ```
 
 Activity policy가 카페인 용량을 계산하지 않고, caffeine policy가 집중도를
-추측하지 않는다. HealthMes Decision Agent의 LLM이 필요한 전문 도구를 선택하고
+추측하지 않는다. Hermes의 단일 LLM turn이 필요한 전문 도구를 선택하고
 각 정책 결과의 경계를 유지한 채 최종 설명을 결합한다. Context Access Layer는
 선택된 자료의 권한, freshness, coverage와 source reference를 검사한다.
 
@@ -486,11 +488,13 @@ table과 canonical store에 원자적으로 투영한다.
   generation/sequence fence
 - unsupported/permission denied 상태
 
-현재 완료 조건: 조건부 collector가 제출할 aggregate를 같은 canonical activity
-저장소에 쓸 수 있고, 일반 빌드는 상세 timeline이나 가짜 0분을 만들지 않으며
-sync service가 호출되면 unavailable report를 만든다. 현재 앱 lifecycle은 이
-seam을 자동 호출하지 않는다. 실제 수집 완료 조건인 compile flag, entitlement,
-권한 UI, lifecycle/background 연결, 서명과 실기기 검증은 device-team 범위다.
+2026-08-16 PR #138 완료 조건: 조건부 collector가 제출할 aggregate를 같은
+canonical activity 저장소에 쓰고, 일반 빌드는 상세 timeline이나 가짜 0분을
+만들지 않는다. Issue #168의 UI-neutral lifecycle은 권한 승인 성공 후 첫 sync,
+foreground catch-up, Screen Time 전용 best-effort background task와 bounded
+persistent outbox 재전송을 연결한다. compile flag와 Apple entitlement 승인,
+권한 설명 UI, distribution signing과 실기기 검증은 device-team 또는 외부
+조건으로 남는다.
 
 ### Stage 4 - HealthMes processing
 
@@ -589,9 +593,9 @@ aggregate adapter도 같은 envelope를 사용한다.
 
 현재 고정 `question_kind` 호출자와의 호환 계약은
 [`HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`](contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md)
-에 남긴다. 목표 자연어 판단, 자율 tool selection, Hermes adapter와 자동
-DecisionRecord 저장은
-[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+에 남긴다. 목표 자연어 판단, 자율 tool selection, Hermes adapter와 선택적
+compact DecisionRecord 저장은
+[`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
 를 canonical target으로 사용한다. 실제 UI와 device dogfood는 이 엔진 구현과
 분리된 후속 작업이다.
 
@@ -898,7 +902,7 @@ DecisionRecord 저장은
   `status=known`인 specialist ledger의 유한한 0 이상
   `confirmed_caffeine_mg`, 완료 확인된 당일 섭취 boundary가 모두 있을 때만
   `candidate_ledger_complete=true`를 반환한다. 이 resolver는 context 전용이므로
-  HealthMes Decision Agent가 최종 종합·기록하기 전에는 항상
+  Hermes가 최종 종합하고 HealthMes가 source를 검증하기 전에는 항상
   `decision_ready=false`다.
 
 실제 iOS/Android/macOS/Watch 화면, 디바이스 dogfood, 실시간 동기화와 Hermes

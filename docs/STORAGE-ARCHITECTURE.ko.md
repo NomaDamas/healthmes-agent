@@ -8,6 +8,10 @@
 >
 > 음식 분석·음식 사진 인식은 sake가 담당한다. HealthMes는 그 결과를 공통
 > `WellnessEvent`로 받아 저장·맥락 연결만 한다.
+>
+> Agent runtime, MCP와 저장소 사이의 최신 연결 기준은
+> [`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
+> 를 따른다.
 
 ## 구현 상태 — 2026-08-14
 
@@ -52,12 +56,12 @@ Personal Data Node이며 데스크톱 웹과 모바일 UI는 동일한
 upload queue를 유지하고, iPhone Screen Time은 최근 완료 48시간을 반복 가능한
 authoritative snapshot으로 전송하도록 계약돼 있다. 단 최초 승인 직후와 timezone
 변경 직후에는 최신 완료 local-hour 1개에서 시작하고, 이후 같은 timezone에서만
-최대 48시간을 재조정한다. 현재 앱 lifecycle은
-Screen Time sync seam을 호출하지 않는다. 향후 lifecycle이 seam을 호출하면
-일반 iOS 빌드의 factory는 unavailable adapter를 반환하고 unavailable report를
-전송한다. 실제 snapshot에 필요한 compile flag, entitlement, 권한 UI,
-lifecycle/Screen Time background task, 서명과 실기기 검증은 device-team
-범위다.
+최대 48시간을 재조정한다. 현재 앱 lifecycle은 Screen Time sync seam을 호출하지
+않는다. PR #138의 Issue #168은 UI-neutral 권한 승인, foreground와 best-effort
+background lifecycle 및 offline outbox를 연결한다. 연결 후에도 일반 iOS 빌드의
+factory는 unavailable adapter를 반환하고 unavailable report를 전송한다. 실제
+snapshot에 필요한 compile flag와 Apple entitlement 승인, 권한 UI, distribution
+서명과 실기기 검증은 device-team 또는 외부 조건이다.
 
 iPhone collector ID는 Screen Time 가명화 Keychain key에서 안정적으로 파생되며
 새 `ios-collector-v1-*` instance는 중앙 input 설정에서 명시적으로 활성화하기
@@ -77,15 +81,17 @@ HealthMes는 **하나의 논리적 정본인 Personal Data Node**를 둔다.
               │ 증분 업로드
               ▼
 ┌─────────────────────────────────────────────┐
-│ Personal Data Node — 유일한 쓰기 정본       │
+│ Personal Data Node — 논리적 운영·백업 단위  │
 │                                             │
-│ Postgres                                    │
-│ 이벤트·정규화 데이터·특징·판단·보존 정책   │
+│ postgres service / postgres_data volume     │
+│  ├─ healthmes database                      │
+│  └─ open-wearables database                 │
 │                                             │
-│ HEALTHMES_DATA_DIR                          │
+│ healthmes_data volume / HEALTHMES_DATA_DIR  │
 │ 원본 payload·미디어·압축 시계열 chunk       │
 │                                             │
-│ HealthMes + Open Wearables + Hermes runtime │
+│ ./data/hermes bind mount                    │
+│ Hermes local runtime state                  │
 └──────────────────┬──────────────────────────┘
                    │
           클라이언트 암호화 후 복제
@@ -135,6 +141,19 @@ HealthMes는 **하나의 논리적 정본인 Personal Data Node**를 둔다.
 
 HealthMes는 현재 Python 서비스, Postgres, Open Wearables worker, Hermes runtime을
 사용한다. 이 작업은 휴대폰보다 노트북·Mac mini·홈서버에 적합하다.
+
+`하나의 논리적 정본`은 한 volume이나 한 database라는 뜻이 아니다. 현재 compose는
+하나의 Postgres service와 `postgres_data` volume 안에 `healthmes`와
+`open-wearables`라는 별도 database를 만든다. Activity, Nutrition과 Calendar는
+HealthMes DB 안에서 논리 파티션으로 분리하고, 상세 wearable 원본과 고빈도
+시계열은 Open Wearables DB에 둔다. 큰 HealthMes object는 `healthmes_data`,
+Hermes runtime state는 `./data/hermes`에 별도로 존재한다. 이들을 합쳐 하나의
+논리적 Personal Data Node로 운영하지만, **현재 backup은 전체 노드 복구본이
+아니다.** 현재 snapshot은 HealthMes DB, `media/`, `raw_ingest/`를 기본으로 하고
+설정된 경우에만 Open Wearables dump와 Hermes home을 포함하는 부분 백업이다.
+외부 provider credential, 일부 runtime volume과 연결 상태는 별도로 다시
+구성해야 한다. Hermes는 DB를 직접 읽지 않고 HealthMes MCP 하나를 통해 필요한
+domain 도구를 선택한다.
 
 ### 선택지 비교
 

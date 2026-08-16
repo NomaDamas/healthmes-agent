@@ -192,10 +192,12 @@ ScreenTimeActivitySyncService.sync(pairing:)
           activity.* WellnessEvent
 ```
 
-현재 PR은 주입 가능한 service core와 transport/report contract를 테스트하지만
-Apple collector 경로는 현재 SDK에서 컴파일하지 않는다. 앱 lifecycle, 설정 화면,
-Screen Time background task 등록, entitlement, compile condition, 실제 배포
-서명과 실기기 검증은 연결하지 않는다. 해당 파일은 device-team PR이 소유한다.
+2026-08-16 현재 코드는 주입 가능한 service core와 transport/report contract를
+테스트하지만 Apple collector 경로는 일반 빌드에서 컴파일하지 않고 앱 lifecycle도
+연결하지 않는다. PR #138의 Issue #168은 UI를 수정하지 않고 권한 승인 직후 첫
+sync, foreground catch-up, Screen Time 전용 best-effort background task와
+offline outbox를 연결한다. 설정 화면, entitlement 승인, 실제 배포 서명과 실기기
+검증은 device-team 또는 Apple 외부 조건이다.
 
 `GET /v1/activity/devices/{device_id}/collection`의
 `raw_retention_cutoff`는 중앙 `activity_raw` 보존 정책으로부터 계산된다. 최초
@@ -228,10 +230,10 @@ ID를 사용하고, key를 잃어 새 `ios-collector-v1-*` ID가 생기면 서�
 
 현재 collector 구현은 `HEALTHMES_IOS_26_4_SCREENTIME_EXPORT` 조건에서만 실제
 Apple API를 컴파일한다. 현재 저장소의 일반 빌드는 안전한 unavailable adapter를
-제공하지만 앱 lifecycle은 아직 sync seam을 호출하지 않는다. 향후 lifecycle이
-seam을 호출하면 일반 빌드는 unavailable report를 전송한다. 지원 SDK에서
-entitlement와 이 build condition을 device-team target에 함께 설정하고 실제
-기기로 검증해야 한다.
+제공하지만 앱 lifecycle은 아직 sync seam을 호출하지 않는다. Issue #168이
+lifecycle을 연결한 뒤에도 일반 빌드는 unavailable report를 전송한다. 지원
+SDK에서 entitlement와 이 build condition을 device-team target에 함께 설정하고
+실제 기기로 검증해야 한다.
 
 ## 5. Screen Time 데이터 의미
 
@@ -354,6 +356,9 @@ Open Wearables의 HealthMes mirror는 범용 `normalized`와 섞지 않고 전�
    전까지 수집되지 않는다. 기기 ID 변경을 자동 등록이나 기존 exclude 복사로
    처리하지 않는다.
 7. 설정 변경 후 PUT 응답 descriptor를 즉시 정본으로 사용한다.
+   PUT에는 마지막 GET에서 받은 `revision`을 함께 보내야 하며 서버가 stale
+   revision을 `409`로 거부하면 최신 descriptor를 다시 읽고 사용자가 변경을
+   재적용하게 한다.
 8. 실제 collection permission과 HealthMes Decision 접근 동의를 하나의 toggle로
    합치지 않는다.
 9. UI가 없어도 API와 수집 엔진은 독립적으로 테스트 가능해야 한다.
@@ -361,10 +366,14 @@ Open Wearables의 HealthMes mirror는 범용 `normalized`와 섞지 않고 전�
 ## 8. 비범위와 후속
 
 - iOS/Android/desktop 실제 설정 화면
-- iPhone background task와 lifecycle 연결
+- iPhone 권한 설명·설정 UI와 실제 distribution signing
 - Apple entitlement 신청과 실제 기기 dogfood
 - hosted/mobile-only Personal Data Node
 - GPS/location 수집
+
+iPhone collector의 **UI-neutral lifecycle 연결**은 비범위가 아니다. 지원 조건에서
+권한 승인 직후 첫 sync, foreground catch-up, best-effort background task와 offline
+outbox 재전송까지가 #168의 코드 범위다.
 - 가격과 cloud storage 과금
 
 GPS/location은 Issue #158에서 opt-in, coarse-first, excluded places, raw 좌표의

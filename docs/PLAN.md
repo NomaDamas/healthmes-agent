@@ -1,9 +1,17 @@
-<!-- Recovered verbatim from the cloud ultraplan session (2026-07-09, session_01NFxUZjjJqQqnSsc9se7biW). This is the authoritative implementation plan. "사용자 결정사항" below were set during that planning session — revisit if they change. -->
+<!--
+Originally recovered from the 2026-07-09 cloud ultraplan session, then updated
+by later owner decisions. This file preserves the broad product roadmap.
+HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md is authoritative for the current
+wellness runtime, MCP, storage, and iPhone Screen Time boundaries.
+-->
 # HealthMes Agent — 아키텍처 & 구현 플랜
 
 ## Context
 
-HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개인 비서**를 목표로 하는 오픈소스 프로젝트다. 현재 레포는 README + 두 개의 vendored 업스트림만 있는 day-zero 스캐폴드이며 글루 코드는 0줄이다.
+HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개인 비서**를
+목표로 하는 오픈소스 프로젝트다. 이 문서는 day-zero 계획에서 시작했지만 현재는
+HealthMes 서비스, 저장소, 수집기, 도메인 엔진과 앱 계약이 구현된 brownfield
+저장소의 장기 로드맵이다.
 
 - `vendor/hermes-agent/` — 성숙한 에이전트 런타임: 스킬 시스템, 메모리, 크론 스케줄러, 멀티채널 게이트웨이(Telegram 내장), MCP 클라이언트 지원
 - `vendor/open-wearables/` — 웨어러블 데이터 플랫폼: 11개 프로바이더(Garmin/Oura/Fitbit/Whoop/Polar/Suunto/Ultrahuman/Strava/Apple/Google/Samsung), 스트레스·수면·HRV 점수, FastAPI+Postgres, **자체 MCP 서버**(`mcp/`)
@@ -14,35 +22,54 @@ HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개�
 
 ## 1. 전체 아키텍처 — 3개 플레인, 벤더 코드 무수정
 
-**원칙 (2026-07-16 개정): `vendor/`는 "기본 무수정 + 필요 시 규율 있는 수정".** 모든 글루는 레포 루트의 `healthmes/` 패키지에 산다. 벤더를 신성불가침으로 두는 게 아니라, 업스트림 업데이트를 계속 받기 위한 **우선순위 규칙**이다:
+**현재 원칙 (2026-08-16): `vendor/`는 HealthMes 작업에서 read-only다.**
+모든 HealthMes 글루는 레포 루트의 `healthmes/` 패키지와 공개 계약에 산다.
 
-1. **확장점 먼저** — 플러그인·스킬·MCP·설정·글루로 해결 가능하면 벤더를 건드리지 않는다 (지금까지 전 기능이 이 방식으로 충분했다).
-2. **불가능하면 벤더 수정 허용** — 단 ⑴ `vendor(hermes):`/`vendor(ow):` prefix의 **분리 커밋**으로, ⑵ 커밋 메시지에 왜 확장점으로 안 됐는지 기록, ⑶ 업스트림 pull 시 재적용 가능하도록 최소 diff.
-3. **범용 가치가 있으면 업스트림 PR로 환원** — 우리 포크에만 쌓지 말 것 (오픈소스 선순환, 공모전 §기대효과의 실증이기도 함).
+1. **확장점 사용** — REST, MCP, webhook, config와 Skill 계약으로 연결한다.
+2. **Hermes 변경 분리** — 필요한 Hermes 변경은 Hermes 자체 저장소의 별도
+   branch/worktree/PR에서 제안한다. HealthMes PR이 vendored tree를 patch하지 않는다.
+3. **Open Wearables 변경 분리** — 필요한 upstream 변경도 별도 기여로 처리하고,
+   HealthMes는 문서화된 adapter 계약에만 의존한다.
 
+```text
+사용자 접점 / 선제 trigger
+        |
+        v
+HealthMes DecisionRequest ingress
+        |
+        v
+Hermes /v1/responses
+autonomous LLM + tool loop
+        |
+        | filtered healthmes MCP only
+        v
+HealthMes 서비스
+        |
+        +-- Activity / Nutrition / Calendar
+        +-- Wearable adapter
+                |
+                | bounded REST
+                v
+        Open Wearables data plane
 ```
-┌────────────────── 사용자 접점 ──────────────────┐
-│  Telegram (폰+워치 알림/음성응답)  의사결정 뷰어(웹) │
-└──────────┬──────────────────────────▲──────────┘
-           │ chat/push                │ alert 내 링크
-┌──────────▼──────────┐     ┌─────────┴──────────────┐
-│ 에이전트 플레인       │ MCP │ HealthMes 플레인 (신규)  │
-│ vendor/hermes-agent │◄───►│ healthmes/ 서비스       │
-│ gateway+cron+skills │◄─── │ FastAPI + fastmcp      │
-│ Claude API          │웹훅  │ 도메인 DB, 엔진, 캘린더  │
-└──────────┬──────────┘     └─────────┬──────────────┘
-           │ MCP (stdio)              │ REST (read-only)
-┌──────────▼──────────────────────────▼──────────────┐
-│ 데이터 플레인 — vendor/open-wearables               │
-│ FastAPI + Postgres + Celery + 11개 프로바이더        │
-│ mcp/ 서버 (activity/sleep/workouts/timeseries)     │
-└────────────────────────────────────────────────────┘
-```
 
-**핵심 연결 결정 (모두 실제 코드로 검증됨):**
-- **Hermes ↔ open-wearables: 기존 MCP 서버 그대로 사용.** Hermes `config.yaml`의 `mcp_servers`에 `vendor/open-wearables/mcp/`를 stdio 서버로 등록 (계약: `vendor/hermes-agent/tools/mcp_tool.py`). 코드 0줄, 도구가 요약값을 반환하므로 "클라우드 LLM에 최소 컨텍스트" 정책과도 일치. 에이전트의 직접 DB 접근은 스키마 커플링 때문에 기각.
-- **Hermes ↔ HealthMes: pull은 MCP, push는 게이트웨이 웹훅.** HealthMes FastAPI가 `/mcp`에 fastmcp 마운트(Streamable HTTP — `mcp_tool.py`가 `url:` 트랜스포트 지원). 선제 알림은 HealthMes → Hermes 웹훅 플랫폼(HMAC 서명, `gateway/platforms/webhook.py`의 route가 prompt 템플릿+skills+`deliver: telegram` 지원).
-- **HealthMes ↔ open-wearables: REST read-only.** 트리거/에너지 엔진은 LLM 없이 결정론적으로 데이터를 읽어야 하므로 `mcp/app/services/api_client.py`와 같은 API-key 클라이언트 패턴 재사용.
+**핵심 연결 결정 (PR #138 목표, 완료 전까지 구현 주장 금지):**
+- **현재 차이:** 2026-08-16 production Decision Agent는 아직 존재하지 않는
+  `/v1/model/iterations`를 요구하고, Hermes config에는 direct Open Wearables
+  MCP도 남아 있다. 아래 항목은 #162~#169와 E2E가 닫혀야 완료된다.
+- **제품 질문 경로는 하나:** Client → HealthMes
+  `POST /v1/wellness-decisions` → Hermes `/v1/responses` → HealthMes MCP.
+  Hermes가 기존 autonomous LLM/tool loop를 소유하며 HealthMes의 별도 model
+  iteration loop는 폐기한다.
+- **Hermes ↔ HealthMes:** Hermes가 보는 제품 데이터 도구는 단일 HealthMes
+  MCP다. HealthMes FastAPI가 `/mcp`에 fastmcp를 마운트한다. interactive,
+  channel과 proactive 입력은 모두 HealthMes의 같은 DecisionRequest service로
+  들어가며, Hermes channel은 최종 결과의 outbound delivery adapter로만 사용한다.
+- **Hermes ↔ Open Wearables:** 제품 경로에서 직접 MCP 연결하지 않는다. Hermes는
+  HealthMes MCP의 bounded wearable 도구만 호출한다.
+- **HealthMes ↔ Open Wearables:** `OWClient` REST read-only adapter를 사용한다.
+  트리거·에너지 엔진과 MCP wearable 도구가 같은 사용자, 기간, provenance와
+  local mirror 경계를 공유한다.
 - **글루 위치:** 루트에 `healthmes/`(uv 패키지, Python 3.12), `config/`, `scripts/`, 루트 `docker-compose.yml`(postgres+redis+open-wearables+healthmes+hermes). 벤더에 닿는 유일한 산출물은 `HERMES_HOME`에 렌더되는 config 파일과 스킬 심링크 — 둘 다 벤더 트리 밖.
 
 ## 1.5 지표 카탈로그 → 의사결정 도구 레이어 (스킬/MCP 설계)
@@ -64,16 +91,16 @@ HealthMes Agent는 헬스케어 데이터 기반의 **선제적(proactive) 개�
 
 ### Decision Agent와 도구 설계 원칙
 
-**2026-08-10 개정:** MCP 도구는 결정론적 사실과 전문 context를 제공하고,
-HealthMes Decision Agent의 LLM이 자연어 질문을 해석해 필요한 도구를 선택한다.
-Skill은 핵심 판단 절차의 source of truth가 아니라 runtime별 연결과 표현을 돕는
-얇은 adapter다. 권한, retention, 전문 정책과 DecisionRecord 저장 의무는
-HealthMes 코드와 계약이 강제한다. 상세 구조는
-[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md)
+**2026-08-16 개정:** MCP 도구는 결정론적 사실과 전문 context를 제공하고,
+Hermes의 단일 autonomous LLM loop가 자연어 질문을 해석해 필요한 HealthMes MCP
+도구를 선택한다. Skill은 핵심 판단 절차의 source of truth가 아니라 runtime별
+도구 사용법과 표현을 돕는 얇은 adapter다. 상세 구조는
+[`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
 를 따른다.
 
-- **Layer A — 벤더 MCP (그대로 등록):** 범용 조회 5종. 111개 시계열은 `get_timeseries(types=[...])`가 이미 커버 — 지표별 마이크로 도구 금지 (도구 선택 붕괴).
-- **Layer B — HealthMes MCP "해석된 컨텍스트" 도구 (결정론적, LLM엔 결과만):**
+- **Open Wearables data plane:** 별도 DB와 REST API를 유지한다. Hermes에 직접
+  MCP로 노출하지 않고 HealthMes의 bounded wearable adapter 뒤에 둔다.
+- **HealthMes MCP 도구 (결정론적 조회·계산):**
   | 도구 | 답하는 의사결정 질문 |
   |---|---|
   | `get_health_scores(range, categories)` | 벤더 MCP 갭 보충: STRESS/BODY_BATTERY/READINESS/RECOVERY + qualifier/components |
@@ -85,13 +112,14 @@ HealthMes 코드와 계약이 강제한다. 상세 구조는
   | `list_tasks / upsert_task / get_schedule / propose_schedule_blocks` | 일정 도메인 CRUD (propose-then-confirm 게이트) |
   | `log_food / create_medical_record / record_decision` | 캡처 + 설명가능성 |
   - 모든 Layer B 도구는 **원시 시계열이 아닌 해석된 델타 + confidence/coverage 필드**를 반환 (토큰 절약·프라이버시·환각 방지·설명가능성 4중 이득). 데이터가 빈약하면 "insufficient_data"를 정직하게 반환.
-- **Decision Layer — HealthMes Decision Agent:** LLM이 질문의 목적, 필요한 영역,
-  기간과 tool을 선택하고 첫 결과에 따라 추가 조회한다. 계산된 숫자와 전문 hard
-  boundary를 재작성하지 않고 여러 영역의 trade-off와 최종 설명을 담당한다.
-- **Runtime Layer — Hermes adapter + 얇은 Skill:** `healthmes-planner`,
-  `healthmes-capture`와 domain Skill은 Hermes의 도구 사용법, 채널 workflow와
-  표현 방식을 연결한다. Skill 스크립트가 REST나 DB를 직접 호출하는 것은 금지하며,
-  Skill 미로드로 권한·retention·전문 정책·최종 기록 보장이 사라져서는 안 된다.
+- **Decision runtime — Hermes + 얇은 Skill:** Hermes가 질문의 목적, 필요한 영역,
+  기간과 tool을 선택하고 첫 결과에 따라 추가 조회한다. HealthMes
+  `/v1/wellness-decisions` adapter는 제품 요청·응답 계약, source reference 검증과
+  선택적 compact 기록만 소유한다. Hermes의 마지막 자유 형식 text는
+  `healthmes.decision-draft.v1` JSON envelope로 strict parse하고, 실제 HealthMes
+  MCP transcript에 없는 source reference는 거부한다. `healthmes-planner`,
+  `healthmes-capture`와 domain Skill은 도구 사용법, 채널 workflow와 표현 방식을
+  연결한다.
 
 **다입력 플랫폼 해자:** Open Wearables 외 건강·행동·환경·일정·주관 상태·의료
 입력을 계속 추가할 수 있는 범용 인터페이스 자체를 독립적인 해자로 둔다. 모든
@@ -111,13 +139,14 @@ adapter·출력 채널을 포크하거나 교체할 수 있어야 한다. 모든
 [`ACTIVITY-WELLNESS-MVP.ko.md`](ACTIVITY-WELLNESS-MVP.ko.md)의 self-hosted
 MVP 경계를 따른다. 모호한 질문의 LLM tool selection, Context Access Layer와
 Hermes runtime 경계는
-[`HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md),
+[`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md),
 해자 정의는
 [`MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md`](MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md),
 현재 고정 resolver 호환 계약은
 [`HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`](contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md)
 를 사용한다. Activity Ingest는 Open Wearables를 다시 수집하지 않으며 각 domain
-context는 Context Access Layer를 거쳐 HealthMes Decision Agent가 종합한다.
+context는 HealthMes MCP의 bounded 도구를 거쳐 Hermes의 단일 autonomous turn이
+종합하고, HealthMes가 source reference와 저장 결과를 검증한다.
 
 **소유권 메모 (2026-08-05):** 음식 분석·음식 사진 인식의 추가 개발은 sake가
 담당한다. HealthMes는 기존 음식 기록 경로만 유지하고, sake의 결과를 공통 웰니스
@@ -173,10 +202,22 @@ score = 100
 
 ## 4. 선제적 Alert 루프
 
-**MVP 채널: Telegram 단일.** 폰+워치(Apple Watch/Wear OS 알림 미러링, 음성 빠른답장) 모두 커버, 접근성 좋음, Hermes 게이트웨이가 alert→응답→인터랙티브 세션 수명주기를 공짜로 제공. 벤더 코드 무수정으로 두 메커니즘:
+**MVP outbound 채널: Telegram 단일.** 폰+워치(Apple Watch/Wear OS 알림
+미러링, 음성 빠른답장)를 커버한다. 그러나 Telegram이 별도 wellness 판단 경로가
+되어서는 안 된다.
 
-1. **이벤트 구동 ("에이전트가 먼저 알림"):** `healthmes/engine/triggers.py`(APScheduler 10분 주기)가 결정론적 룰 평가 — 스트레스 스파이크 vs baseline, 낮은 body battery + 무거운 오후 일정, 외부 캘린더 변경이 기존 계획과 충돌, 데드라인 위험. 발화 시 → HMAC 서명 POST → Hermes 웹훅 route(`prompt` 템플릿 + `skills: [healthmes-planner]` + `deliver: telegram`) → 에이전트가 양쪽 MCP로 근거 조회 → `record_decision` 호출 → Telegram push → 사용자 응답 시 일반 게이트웨이 세션으로 Q&A. 중복 방지: `trigger_event.dedup_key`.
-2. **시간 구동 브리핑:** Hermes cron(`cron/jobs.py::create_job`, `scripts/bootstrap.py`가 등록) — 아침 플랜(07:00, "오늘 일정을 에너지 예보 기반으로 배치 제안"), 저녁 리뷰(21:30), 주간 계획(일요일). `script:` 컨텍스트 주입으로 상태 스냅샷 JSON을 프롬프트에 선주입해 도구 왕복 절약.
+1. **이벤트 구동 ("에이전트가 먼저 알림"):**
+   `healthmes/engine/triggers.py`가 결정론적 룰을 평가한다. 발화 시 같은 internal
+   DecisionRequest service를 호출하고, Hermes `/v1/responses`가 filtered
+   HealthMes MCP로 필요한 근거를 자율 조회한다. HealthMes가 source를 검증하고
+   필요한 경우 compact DecisionRecord를 저장한 뒤, 결과를 Telegram outbound
+   adapter로 전달한다. 중복 방지는 `trigger_event.dedup_key`가 담당한다.
+2. **시간 구동 브리핑:** 아침 플랜(07:00), 저녁 리뷰(21:30), 주간 계획(일요일)
+   스케줄은 입력 시점만 결정한다. 실제 wellness reasoning은 cron 안에서 별도
+   Hermes 대화를 시작하지 않고 같은 internal DecisionRequest service를 호출한다.
+
+2026-08-16 현재 webhook과 Hermes cron은 이 목표 경로로 완전히 이관되지 않았다.
+Issue #169와 #165가 runtime 연결과 E2E를 소유한다.
 
 ## 5. 의사결정 트리 설명가능성
 
@@ -217,9 +258,11 @@ receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한
   수집해 `POST /v1/activity/ios/report`로 보낸다. 앱 ID는 기기 Keychain key로
   HMAC 가명화하고 pickup을 launch로 가장하지 않는다. capability, entitlement,
   사용자·지역 조건이 맞지 않으면 사용시간 `0` 대신 명시적 unavailable 상태를
-  보고한다. 수집·sync service seam과 서버 계약은 구현됐고, entitlement,
-  lifecycle/background refresh, 실제 UI와 실기기 dogfood는 device-team
-  후속이다.
+  보고한다. 2026-08-16 현재 수집·sync service seam과 서버 계약은 구현됐지만
+  lifecycle은 아직 연결되지 않았다. PR #138의 Issue #168이 권한 승인 직후 첫
+  sync, foreground catch-up, best-effort background task와 offline outbox를
+  UI-neutral 코드로 연결한다. entitlement 승인, 실제 권한 UI, distribution
+  signing과 실기기 dogfood는 외부/device-team 조건이다.
 - **통합 설정:** 데스크톱 웹과 미래 iPhone UI는
   `GET /v1/inputs`, `GET /v1/inputs/{source_id}`,
   `PUT /v1/inputs/{source_id}/settings`를 사용한다. 이 API는 별도 설정 DB를
@@ -243,9 +286,14 @@ receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한
 두 벤더의 프론트엔드는 모두 소비자용 개인 건강 UI가 **아니다** (Hermes `web/` = 관리콘솔+채팅, open-wearables `frontend/` = 개발자 포털). 그러나 MVP에서 새 앱을 만들 필요가 없다 — 이 제품의 UX는 화면이 아니라 **대화와 알림의 일관된 문법**이기 때문.
 
 **3-표면 모델:**
-1. **Telegram = 일상 UX의 90%** — 선제 alert, 승인/거절, 음식·의료 캡처, 질문답변. 폰·워치·데스크톱 전부 자동 커버, 접근성(스크린리더·음성입력) 기본 제공.
+1. **Telegram = MVP outbound와 capture UX** — 선제 alert, 승인/거절,
+   음식·의료 캡처를 폰·워치·데스크톱에 전달한다. wellness 질문답변은 Telegram
+   channel adapter가 HealthMes DecisionRequest ingress를 호출한 뒤 결과를
+   전달해야 하며 Hermes direct conversation을 제품 경로로 사용하지 않는다.
 2. **의사결정 뷰어 웹페이지** (HealthMes 서비스가 서빙, 유일하게 새로 만드는 UI) — alert의 "자세히" 링크로 열리는 Mermaid 트리 + 주간 리포트 페이지. 모바일 브라우저 대응이면 충분.
-3. **Hermes web ChatPage** (이미 존재) — 데스크톱 파워유저의 긴 대화·설정·cron 관리용. 우리가 만들 것 없음.
+3. **Hermes web ChatPage** (이미 존재) — runtime 관리와 개발자 진단용이다.
+   제품 wellness 대화 UI로 노출하려면 별도 adapter가 HealthMes ingress를
+   호출해야 한다.
 
 **알림 문법 표준화 (planner/insight 스킬에 명시, 이것이 곧 제품 디자인):**
 ```
@@ -263,7 +311,11 @@ receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한
 
 MVP는 클라우드가 아닌 **시임(인터페이스)만** 정의:
 - `healthmes/backup/provider.py` — `BackupProvider` 프로토콜: `export_snapshot()`, `restore(path)`, `list_snapshots()`
-- 스냅샷 포맷(버전드 envelope): manifest.json + `healthmes` pg_dump + open-wearables pg_dump + `media/` + `HERMES_HOME` 메모리/상태 → tar → **age 암호화**(passphrase 파생)
+- 현재 스냅샷 포맷(버전드 envelope): manifest.json + HealthMes DB + `media/` +
+  `raw_ingest/`를 기본으로 하고, 설정된 경우 Open Wearables dump와
+  `HERMES_HOME`을 추가 → tar → **age 암호화**(passphrase 파생). 외부 provider
+  credential, 모든 compose volume과 연결 상태까지 복구하는 전체 Personal Data
+  Node 재해복구본은 아니다.
 - MVP 구현: `LocalDirectoryProvider` + CLI `healthmes backup create/restore` + 주간 자동 백업
 - 미래 유료 서비스 = 동일 프로토콜의 `RemoteVaultProvider`(S3 호환 + 클라이언트사이드 암호화, 서버는 평문 불가시). **이 인터페이스를 우회한 데이터 반출 금지.**
 - LLM 프라이버시(지금부터 강제): Claude API 호출만 머신 밖으로, 스킬은 요약-후-전송, MCP 도구는 집계값 반환, 원시 시계열/미디어는 반출 안 함.
@@ -279,21 +331,32 @@ worktree 격리의 상세 계약은
 **Phase 0 — 기반 & 글루 (~1–2주)**
 - 루트 `docker-compose.yml`: postgres(+healthmes db), redis, open-wearables backend+worker, healthmes 서비스, hermes gateway
 - `healthmes/` uv 패키지: FastAPI 스켈레톤, `store/` 모델+Alembic, fastmcp 마운트
-- `config/hermes-config.yaml.tmpl`: mcp_servers(open-wearables stdio + healthmes http), telegram 플랫폼, 웹훅 route
+- `config/hermes-config.yaml.tmpl`: API server에는 filtered HealthMes MCP만
+  등록하고 direct Open Wearables MCP와 mutation tool을 제외, Telegram은
+  outbound delivery로 구성
 - `scripts/bootstrap.py`: config 렌더 → `HERMES_HOME`, 스킬 심링크, API 키 생성, cron 등록
-- **종료 데모: Telegram에서 "이번 주 수면 어땠어?" → open-wearables MCP 경유 답변**
+- **종료 데모:** `POST /v1/wellness-decisions`에 "이번 주 수면 어땠어?" →
+  Hermes가 HealthMes MCP의 wearable search를 선택 → source_refs가 검증된 답변
+  → 같은 결과를 Telegram outbound adapter로 전달
 
 **Phase 1 — MVP: 데이터 인입 + 일정 비서 + 선제 alert + 기본 인사이트 (~4–6주)**
 - 도메인 모델(weekly_goal, task, calendar_event_mirror, schedule_proposal, food_log, trigger_event, insight) + REST
-- **Layer B MCP 도구 1차분**: `get_health_scores`(벤더 MCP 갭 보충 — 스트레스·body battery·내부 점수), `get_daily_readiness_context`, `get_personal_baselines`, 일정 CRUD(`list_tasks`/`upsert_task`/`get_schedule`/`propose_schedule_blocks`), `log_food`, `record_decision`
+- **Decision-read MCP 도구 1차분:** bounded
+  `search_activity/search_nutrition/search_calendar/search_wearable`과
+  specialist context 도구. 일정 CRUD와 `log_food` 같은 mutation은 별도 capture
+  또는 confirmation profile에만 노출하며 wellness decision turn에는 노출하지
+  않는다.
 - `healthmes/calendars/` Google + iCloud 동기화 (§6)
-- `healthmes/engine/triggers.py` + 웹훅 push (§4), Hermes cron 브리핑
+- `healthmes/engine/triggers.py` + internal DecisionRequest + outbound delivery
+  (§4), 같은 ingress를 사용하는 scheduled briefing
 - 스킬: `healthmes-planner`(목표 덤프→태스크 분해→배치 룰→캘린더 블록 제안→decision 기록), `healthmes-capture`(음식 경로만)
 - 인사이트 v1: 템플릿 SQL 상관 (시간대별/요일별/캘린더 키워드별 스트레스, 활동유형 vs 스트레스) — 자유 데이터마이닝 아님
 
 **Phase 2 — 인지에너지 + 설명가능성 UI + Android 사용량 (~3–4주)**
 - `cognitive_energy.py` + baseline + 매시간 persist (§3), **Layer B 2차분**: `get_cognitive_energy_forecast`, `get_stress_timeline`(캘린더·앱사용 조인), `compare_impact`
-- `decision_record` E2E: `record_decision` MCP 도구, 결정론 선기입, Mermaid 뷰어, 모든 alert에 링크
+- source-validated conditional DecisionRecord E2E: 행동 제안·mutation·위험
+  경고만 compact record로 저장하고 단순 조회는 기본 미저장, 저장된 판단은
+  Mermaid 뷰어에서 확인
 - `apps/android-usage/` + `/v1/app-usage/batch`, fragmentation 항 활성화
 - 집중도 인사이트 ("14–16시 집중 저하: 수면 부족 + Slack 시간당 9회 실행")
 
@@ -308,13 +371,21 @@ worktree 격리의 상세 계약은
 - **iOS 상세 foreground timeline은 하드월** — 조건부 Screen Time aggregate
   export seam만 사용하고 private API로 우회하지 않는다 (§7).
 - **캘린더 쓰기 신뢰:** propose-then-confirm으로 시작.
-- **벤더 드리프트:** 커플링 표면은 open-wearables REST v1 + MCP 도구명, Hermes config/skill/cron/웹훅 계약뿐. compose 부팅 + Phase-0 데모 쿼리를 CI 스모크 테스트로.
-- **MVP에서 잘라낸 것:** Telegram 외 모든 채널, 네이티브 워치/폰 앱(Android 사용량 수집기 제외), ML 전부, 자유형 인사이트 마이닝, React 의사결정 UI(Mermaid 먼저), 멀티유저, 클라우드 백업 서비스, production iOS Screen Time device integration, Hermes MoA 루프.
+- **벤더 드리프트:** 커플링 표면은 Open Wearables REST v1, Hermes
+  `/v1/responses`, MCP/config와 outbound delivery 계약으로 제한한다. compose
+  부팅 + Phase-0 demo query를 CI smoke test로 둔다.
+- **MVP에서 잘라낸 것:** Telegram 외 신규 UI, ML 전부, 자유형 인사이트
+  마이닝, React 의사결정 UI(Mermaid 먼저), 멀티유저, 클라우드 백업 서비스,
+  Apple entitlement 승인·distribution signing·실기기 iPhone Screen Time
+  dogfood, Hermes MoA 루프.
 - **이미 확보한 단순화:** Telegram=캡처앱(모바일 앱 하나 제거), MCP=글루(커스텀 통합 API 제거), 소유권 분할 캘린더 동기화(충돌 해결 제거), 룰 기반 에너지 엔진(ML 파이프라인 제거).
 
 ## 검증 방법
 
-- **Phase 0:** `docker compose up` → Telegram 봇에 "이번 주 수면 어땠어?" → open-wearables MCP 도구 호출로 실데이터 답변 확인. 스모크: `curl :8100/health`, `curl :8000/docs`.
+- **Phase 0:** `docker compose up` →
+  `POST /v1/wellness-decisions`에 "이번 주 수면 어땠어?" → Hermes transcript에서
+  HealthMes wearable search 호출과 source_refs 검증 확인 → 같은 결과의 outbound
+  Telegram 전달 확인. 스모크: `curl :8100/health`, `curl :8000/docs`.
 - **Phase 1:** 주간 목표 3개를 Telegram으로 덤프 → planner가 태스크 분해 + 캘린더 블록 제안 → 승인 → Google/iCloud 캘린더에 태깅된 이벤트 생성 확인. 외부에서 이벤트 이동 → 10분 내 `schedule_changed` alert 수신 확인. 음식 사진 전송 → `food_log` 행 + 디스크립션 확인.
 - **Phase 2:** `GET /cognitive-energy/forecast` 응답의 components 합산 검증(단위 테스트), alert 링크 → Mermaid 트리 페이지 렌더 확인, Android 기기에서 사용량 배치 인입 확인.
 - **Phase 3:** `healthmes backup create` → 새 환경 `restore` → 데모 쿼리 재통과. age 복호화 없이 스냅샷 열람 불가 확인.
@@ -322,11 +393,16 @@ worktree 격리의 상세 계약은
 
 ## 구현 시 핵심 파일
 
-- `vendor/hermes-agent/tools/mcp_tool.py` — `mcp_servers` config 계약 (두 MCP 브리지 연결점)
-- `vendor/hermes-agent/cron/jobs.py:940 create_job` — 브리핑 등록 시그니처 (schedule/skills/deliver/script)
-- `vendor/hermes-agent/gateway/platforms/webhook.py` — 선제 push용 HMAC 웹훅 route
+- `vendor/hermes-agent/tools/mcp_tool.py` — 읽기 전용 `mcp_servers` config 계약
+- `vendor/hermes-agent/cron/jobs.py:940 create_job` — 기존 cron 동작을 이해하기
+  위한 읽기 전용 참조. 목표 브리핑 판단은 HealthMes internal ingress를 사용한다.
+- `vendor/hermes-agent/gateway/platforms/webhook.py` — 기존 webhook 동작을
+  이해하기 위한 읽기 전용 참조. 목표 제품 경로는 direct wellness 판단에 사용하지
+  않는다.
 - `vendor/hermes-agent/skills/productivity/google-workspace/` — Google OAuth/Calendar 참조 구현 (에이전트 ad-hoc 조작용으로도 활용 가능)
-- `vendor/open-wearables/mcp/app/main.py` + `mcp/app/services/api_client.py` — 그대로 등록할 MCP 서버 + HealthMes 엔진이 재사용할 REST 클라이언트 패턴
+- `vendor/open-wearables/mcp/app/main.py` +
+  `mcp/app/services/api_client.py` — 기존 MCP와 HealthMes가 재사용할 REST client
+  pattern의 읽기 전용 참조. 제품 decision runtime에는 direct MCP를 등록하지 않는다.
 - `vendor/open-wearables/backend/app/constants/health_scores.py` — 에너지 엔진이 소비할 점수 카테고리 (STRESS는 Garmin만 → 내부 resilience 프록시)
 - `vendor/open-wearables/backend/app/algorithms/sleep.py` + `services/scores/resilience_service.py` — **재발명 금지 대상**: 내부 수면 점수(4-요소)와 HRV-CV 회복탄력성, 야간 HRV 재계산·수면구간 필터링 로직
 - `vendor/open-wearables/backend/app/api/routes/v1/summaries.py`, `health_scores.py`, `timeseries.py`, `events.py` — Layer B 도구가 프록시할 REST 표면
@@ -521,6 +597,7 @@ issue #10(풀 네이티브 폰 앱)·#11(macOS/Windows 데스크톱 글랜스)�
 - ⏸ 보류: **macOS companion 자체의 네이티브 활동 수집기** — 네이티브 앱 작업
   재개 시 별도 구현.
 - ⚠️ 조건부: 아이폰 상세 foreground timeline은 제공하지 않는다. Screen Time
-  aggregate export용 server/sync seam은 있으나 일반 빌드에서는 비활성이고
-  entitlement·lifecycle·실기기 통합은 후속이다.
+  aggregate export용 server/sync seam은 있으나 일반 빌드에서는 비활성이다.
+  PR #138은 Issue #168에서 UI-neutral lifecycle을 연결한다. entitlement 승인,
+  distribution signing과 실기기 통합은 외부 후속이다.
 - ❌ 불가(구조적): 피부전기활동(애플워치 센서 없음).

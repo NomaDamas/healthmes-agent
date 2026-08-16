@@ -1,8 +1,17 @@
 # HealthMes Decision Agent 아키텍처 결정
 
+> **2026-08-16 폐기 알림:** 이 문서의 HealthMes-owned model iteration loop와
+> `/v1/model/iterations` 전제는 최종 아키텍처로 채택하지 않는다. 현재 canonical
+> 기준은
+> [`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)다.
+> 이 문서는 PR #138 이전 구현의 안전성 설계와 마이그레이션 근거를 보존하기 위한
+> 역사 문서이며 새 runtime 구현의 source of truth가 아니다.
+
 > **결정일:** 2026-08-10
 >
-> **상태:** 승인된 아키텍처의 `DEC-01`부터 `DEC-07`까지 구현되었다.
+> **상태:** superseded. 당시 승인된 아키텍처의 `DEC-01`부터 `DEC-07`까지
+> 구현되었으나, 이중 LLM 경로와 현재 Hermes에 없는 hook 때문에 제품 runtime으로
+> 채택하지 않는다.
 > `DEC-08`의 공개 엔진 경계와 실제 4-domain E2E도 구현되었으며, 전체 회귀와
 > 독립 리뷰를 거쳐 merge-ready 상태를 검증한다. 고정 `question_kind` resolver는
 > 새 core 경로가 아니라 기존 호출자를 위한 호환 구현으로만 남는다.

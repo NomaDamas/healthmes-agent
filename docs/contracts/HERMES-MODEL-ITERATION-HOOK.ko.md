@@ -1,8 +1,15 @@
 # Hermes 단일 모델 Iteration 계약
 
+> **2026-08-16 폐기 알림:** HealthMes는 이 hook을 Hermes에 추가하지 않는다.
+> 공식 wellness 경로는 HealthMes
+> `POST /v1/wellness-decisions`가 Hermes의 기존 `POST /v1/responses`
+> autonomous tool loop를 호출하는 구조다. 최신 기준은
+> [`../HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](../HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)다.
+> 아래 내용은 검토했던 split-runtime 대안의 역사 기록이다.
+
 > **계약일:** 2026-08-11
 >
-> **상태:** HealthMes adapter 구현 완료, Hermes upstream hook 대기
+> **상태:** superseded. 구현·upstream 요청 대상이 아니다.
 >
 > **소유권:** HealthMes가 판단 loop, 정책, 도구 실행, 예산과 기록을
 > 소유한다. Hermes는 정확히 한 번의 provider/model 호출만 수행한다.

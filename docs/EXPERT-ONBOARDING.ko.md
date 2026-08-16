@@ -64,14 +64,18 @@
 임상 질문 하나 = 스킬 하나. 여러 개를 말아 넣는 걸 권장합니다.
 
 1. `docs/templates/SKILL.md`를 복사 → `skills/<스킬-이름>/SKILL.md`
-2. 절차 안에서 도구를 **등록명으로** 부르기: `mcp__healthmes__<도구>`,
-   `mcp__open_wearables__<도구>` (밑줄 두 개)
-3. 필수 규칙: ① REST 직접 호출 지시 금지(MCP만) ② 권고 후 반드시
-   `record_decision` ③ confidence 게이트 ④ 알림 문법(관찰→근거→제안) 준수
+2. 절차 안에서 도구를 **등록명으로** 부르기:
+   `mcp__healthmes__<도구>` (밑줄 두 개). 제품 판단 runtime에는 direct Open
+   Wearables 도구가 없다.
+3. 필수 규칙: ① REST 직접 호출 지시 금지(MCP만) ② mutation 도구 호출 금지
+   ③ confidence 게이트 ④ 알림 문법(관찰→근거→제안) 준수. source 검증 뒤
+   필요한 판단만 compact하게 저장하는 것은 PR #138 Issue #164의 목표다.
+   #164가 통합되기 전 현재 finalizer는 source가 있는 완료 판단을 모두 저장하므로,
+   조건부 저장을 이미 배포된 동작처럼 설명하지 않는다.
 4. 설치: `uv run python scripts/bootstrap.py` (재실행하면 내용 재동기화)
-5. 선제 알림에 연결하려면 `config/hermes-config.yaml.tmpl`의 route
-   `skills:` 목록에, 브리핑에 연결하려면 `scripts/bootstrap.py`의
-   `BRIEFING_JOBS`에 추가 (엔지니어와 함께)
+5. 검토가 끝난 Skill은 HealthMes의 read-only wellness catalog에 등록한다.
+   선제 알림과 정기 브리핑도 같은 internal DecisionRequest service에서 이 catalog를
+   사용해야 하며 별도 Hermes 직접 판단 경로를 만들지 않는다.
 
 기존 예시 5종이 최고의 교재입니다: `skills/healthmes-planner/`(가장 풍부),
 `healthmes-capture/`, `healthmes-sleep/`, `healthmes-stress/`,
@@ -101,10 +105,15 @@ make mac-setup && make mac-run     # sqlite로 전체 서비스 기동 (:8100)
 - **도구 직접 호출** (LLM 없이 지표 검증 — 가장 빠름): `docs/EXTENDING.md`
   §4의 fastmcp 스니펫으로 `get_daily_readiness_context` 등 호출, 픽스처
   데이터로 출력 구조·confidence 동작 확인
-- **에이전트 판단 QA**: 터미널에서 `hermes chat -q "..."` (LLM API 키 필요,
-  Claude 외 프로바이더도 가능 — `HERMES_MODEL`/`HERMES_PROVIDER`)
-- **판단 감사**: 모든 권고는 `http://localhost:8100/decisions`에 트리로
-  남음 — "왜 이 판단?"을 지표 근거까지 따라가며 반박하는 것이 QA의 본질
+- **에이전트 판단 QA**: `POST /v1/wellness-decisions`로 질문한다. 직접
+  `hermes chat`은 vendor runtime 진단에는 쓸 수 있지만 HealthMes ingress,
+  source 검증과 finalization 정책을 우회하므로 제품 wellness 동작을 검증하는
+  경로가 아니다.
+- **판단 감사**: 행동 변경 제안, mutation, 중요 위험 경고와 명시적 추적 대상만
+  compact record로 남기고 단순 조회를 기본 미저장하는 것은 Issue #164의
+  목표다. #164 통합 전 현재 finalizer는 source가 있는 완료 판단을 모두
+  저장한다. 현재 build가 저장한 기록은 `http://localhost:8100/decisions`에서
+  source reference를 따라가며 검토한다.
 - **회귀 고정**: 맞다고 확인한 케이스는 손계산 벡터로 테스트에 박제
 
 ### 4b. 실기기 QA (본인 워치로)

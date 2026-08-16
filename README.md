@@ -19,19 +19,32 @@ Everything HealthMes adds lives at the repo root (`healthmes/`, `skills/`,
 public contracts (REST, MCP, webhook, rendered config). Architecture and
 rationale: [`docs/PLAN.md`](docs/PLAN.md).
 
+Canonical PR #138 target:
+
+```text
+App / Web / channel adapter / proactive trigger
+        |
+        v
+HealthMes decision ingress + product contract
+        |
+        v
+Hermes /v1/responses autonomous LLM/tool loop
+        |
+        | one filtered product MCP server
+        v
+HealthMes MCP
+        |
+        +-- Activity / Nutrition / Calendar
+        +-- Wearable adapter --REST--> open-wearables data plane
+        |
+        v
+source validation + conditional compact decision record
 ```
-Telegram (phone + watch)          decision viewer (web)
-        │  chat/push                     ▲ links in alerts
-┌───────▼──────────┐    MCP    ┌─────────┴─────────────┐
-│  agent plane     │◄─────────►│  healthmes service    │
-│  hermes-agent    │◄──webhook─│  FastAPI + /mcp       │
-│  (vendored)      │           │  store·engines·sync   │
-└───────┬──────────┘           └─────────┬─────────────┘
-        │ MCP (stdio)                    │ REST (read-only)
-┌───────▼─────────────────────────────── ▼──────────────┐
-│  data plane — open-wearables (vendored)               │
-└───────────────────────────────────────────────────────┘
-```
+
+This is the target architecture, not an assertion that the current PR branch
+already implements every edge. The current-to-target gaps and completion
+criteria are tracked in
+[`docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md).
 
 ## What works today
 
@@ -57,9 +70,12 @@ Telegram (phone + watch)          decision viewer (web)
   without it, so medical data is never network-readable unauthenticated.
 - Proactive alert loop (`healthmes/engine/`): deterministic 10-minute trigger
   sweep (stress spike vs baseline, low recovery + heavy afternoon, external
-  schedule changes, deadline risk) → HMAC-signed webhook → Hermes → Telegram.
-  Alert hygiene built in: per-rule cooldown, daily budget, quiet hours,
-  dedup keys, per-rule crash isolation.
+  schedule changes, deadline risk) currently sends an HMAC-signed webhook to
+  Hermes for Telegram delivery. PR #138 migrates wellness reasoning for these
+  triggers to the same internal HealthMes DecisionRequest ingress as
+  interactive questions; Telegram remains an outbound delivery adapter.
+  Alert hygiene is already built in: per-rule cooldown, daily budget, quiet
+  hours, dedup keys, and per-rule crash isolation.
 - Hermes bootstrap (`scripts/bootstrap.py`): renders the gateway config,
   copy-installs `skills/`, registers morning/evening/weekly cron briefings.
   The 07:00 prompt calls the server-owned morning evaluator once, sends its
@@ -119,17 +135,25 @@ Telegram (phone + watch)          decision viewer (web)
   repository's normal build does not enable
   `HEALTHMES_IOS_26_4_SCREENTIME_EXPORT`, so it selects the unavailable
   adapter and collects no Apple activity instead of inventing zero usage.
-  A production collector still requires a supporting SDK/OS, approved
-  entitlement, authorization UI, lifecycle and Screen Time-specific
-  background-task wiring, signing, and real-device validation. Retention,
-  deletion,
+  As of 2026-08-16 the app lifecycle and Screen Time-specific background
+  wiring are not connected yet; issue #168 owns the UI-neutral authorization,
+  first-sync, foreground catch-up, best-effort background, and outbox
+  lifecycle for PR #138. A production collector still requires a supporting
+  SDK/OS, approved entitlement, authorization UI, signing, and real-device
+  validation outside this repository. Retention, deletion,
   cross-device-aware hourly/daily aggregation, focus/overwork/recovery
   context, REST and MCP surfaces are implemented. The fixed `question_kind`
-  resolver remains compatibility-only. The HealthMes Decision Agent owns
-  natural-language adaptive tool planning, source validation and automatic
-  `DecisionRecord` finalization; Hermes is connected through a strict
-  replaceable adapter whose upstream single-iteration hook is tracked
-  separately in issue #139. Its authenticated REST boundary exposes
+  resolver remains compatibility-only. As of 2026-08-16 the production
+  composition still depends on the unavailable split-runtime hook, so the
+  following is the PR #138 completion target rather than an implemented
+  claim. The target is one product
+  path: `POST /v1/wellness-decisions` delegates one complete autonomous turn
+  to Hermes `/v1/responses`; Hermes selects tools only from the unified
+  HealthMes MCP server, and HealthMes validates returned source references
+  and performs compact decision persistence when required. The abandoned
+  split-runtime `/v1/model/iterations` contract is retained only as history.
+  See `docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`. The authenticated
+  REST boundary exposes
   per-domain `activity` / `nutrition` / `wearable` / `calendar` consent,
   explicit local-versus-hosted execution scope, bounded request admission,
   and cancellation-safe shutdown that drains accepted finalization before
@@ -177,9 +201,13 @@ Telegram (phone + watch)          decision viewer (web)
   snapshot; one-tap correction preserves the original. Medical data never
   leaves the machine except the description text sent to the LLM;
   `doctor-visit-summary` assembles a local briefing file for appointments.
-- Local-first encrypted backups (`healthmes/backup/`): versioned snapshot
-  envelope (healthmes DB dump, optional open-wearables dump, media tree,
-  Hermes state) → tar → age encryption (passphrase). `healthmes backup
+- Local-first encrypted partial backups (`healthmes/backup/`): versioned
+  snapshot envelope (healthmes DB dump, raw ingest, optional open-wearables
+  dump, media tree, optional Hermes state) → tar → age encryption
+  (passphrase). It does not currently include `.env`, external OAuth
+  credentials, or an Open Wearables DB unless its dump URL is configured, so
+  it is not yet a complete Personal Data Node disaster-recovery image.
+  `healthmes backup
   create/list/restore` CLI + weekly scheduler job. The `BackupProvider`
   protocol is the seam for a future `RemoteVaultProvider` (ciphertext-only
   server) — see [`docs/BACKUP.md`](docs/BACKUP.md).
@@ -299,14 +327,16 @@ container clocks are UTC. The compose path also **requires**
 `HEALTHMES_API_TOKEN` (the container binds 0.0.0.0 and publishes the port;
 the service refuses to start unauthenticated on a non-loopback bind).
 
-### CLI chat & choosing your LLM
+### Runtime diagnostics & choosing your LLM
 
-The same agent is available from the terminal (no Telegram needed) via the
-vendor CLI, against the same skills and MCP tools — see the CLI section of
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). Claude is only the default
-model: any of the ~29 vendor provider plugins (OpenAI, Gemini, OpenRouter,
-Ollama, Bedrock, …) can be selected with `HERMES_MODEL`/`HERMES_PROVIDER` in
-`.env` — all HealthMes glue is provider-agnostic.
+Product wellness questions must use `POST /v1/wellness-decisions`; this is
+the single HealthMes ingress that owns source validation and finalization.
+The vendor `hermes` / `hermes chat` CLI remains available for isolated Hermes
+runtime diagnostics, but calling it directly is not an equivalent HealthMes
+wellness path and must not be used for product QA. See
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). The model can be selected with
+`HERMES_MODEL`/`HERMES_PROVIDER` in `.env`; HealthMes keeps the product
+contract provider-agnostic.
 
 ### Extending with domain knowledge
 
@@ -354,11 +384,11 @@ export HEALTHMES_BACKUP_PROVIDER=remote_vault    # weekly job replicates too
 Developer guide (run paths, credentials, tests, CI, vendor sync):
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
-Activity telemetry architecture, cross-domain moat, HealthMes-owned decision
-agent architecture, and the current runtime-independent compatibility contract:
+Activity telemetry architecture, cross-domain moat, canonical single wellness
+runtime, and the current runtime-independent compatibility contract:
 [`docs/ACTIVITY-WELLNESS-MVP.ko.md`](docs/ACTIVITY-WELLNESS-MVP.ko.md),
 [`docs/MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md`](docs/MOAT-CROSS-DOMAIN-WELLNESS-CONTEXT.ko.md),
-[`docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`](docs/HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md),
+[`docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md),
 [`docs/contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md`](docs/contracts/HEALTHMES-ACTIVITY-WELLNESS-SKILL.ko.md).
 
 ## References

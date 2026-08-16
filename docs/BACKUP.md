@@ -1,7 +1,8 @@
 # HealthMes Backup — Snapshot Format & Provider Contract
 
-Local-first with an encrypted backup *seam* (docs/PLAN.md §9): all HealthMes
-data leaves the live stores only as an **age-encrypted snapshot envelope**
+Local-first with an encrypted backup *seam* (docs/PLAN.md §9): the selected
+HealthMes component data leaves the live stores only as an **age-encrypted
+snapshot envelope**
 moving through the `BackupProvider` protocol
 (`healthmes/backup/provider.py`). `LocalDirectoryProvider` is the default;
 `RemoteVaultProvider` (`healthmes/backup/remote_vault.py`) implements the
@@ -11,7 +12,7 @@ service runs on. **Exporting data around this interface is forbidden** —
 that rule is what makes the remote vault a viable business: the server only
 ever stores ciphertext.
 
-## 1. Snapshot envelope format (schema_version 1)
+## 1. Snapshot envelope format (schema_version 2)
 
 A snapshot is a single immutable file:
 
@@ -23,6 +24,7 @@ healthmes-backup-<YYYYMMDDTHHMMSSZ>.tar.gz.age
         ├── db/healthmes.sqlite3        # OR db/healthmes.dump
         ├── db/open_wearables.dump      # optional
         ├── media/**                    # optional
+        ├── raw_ingest/**               # optional
         └── hermes/**                   # optional
 ```
 
@@ -43,6 +45,7 @@ healthmes-backup-<YYYYMMDDTHHMMSSZ>.tar.gz.age
 | `db/healthmes.dump` | postgres `HEALTHMES_DATABASE_URL` | `pg_dump --format=custom --no-owner --no-privileges`. |
 | `db/open_wearables.dump` | open-wearables database URL configured | `pg_dump -Fc` of the vendor database (same flags). |
 | `media/**` | `{HEALTHMES_DATA_DIR}/media` exists | Full media tree (photos/voice notes; the DB stores only relative paths, so DB + media restore reconnects everything). |
+| `raw_ingest/**` | `{HEALTHMES_DATA_DIR}/raw_ingest` exists | Raw-first ingest payloads referenced by the HealthMes DB. |
 | `hermes/**` | `HERMES_HOME` configured | Hermes agent memory/state (config, memory, cron state). |
 
 Exactly one of the two `db/healthmes.*` members is present. `pg_dump` is
@@ -61,7 +64,7 @@ keeping the archive self-contained and extraction safe under `tarfile`'s
 
 ```jsonc
 {
-  "schema_version": 1,              // integer; bumped on breaking layout change
+  "schema_version": 2,              // v2 adds raw_ingest
   "created_at": "2026-07-09T03:30:00+00:00",  // injected by the caller, tz-aware
   "healthmes_version": "0.1.0",
   "contents": {
@@ -70,6 +73,8 @@ keeping the archive self-contained and extraction safe under `tarfile`'s
     "media":       {"arcroot": "media",  "file_count": 12, "total_bytes": 5182034,
                     "skipped": [ {"path": "…", "reason": "symlink-outside-tree",
                                   "target": "/abs/target"} ]} | null,
+    "raw_ingest":  {"arcroot": "raw_ingest", "file_count": 3,
+                    "total_bytes": 1048576, "skipped": []} | null,
     "hermes_home": {"arcroot": "hermes", "file_count": 4, "total_bytes": 9182,
                     "skipped": []} | null
   },
@@ -87,6 +92,16 @@ the archive holds nothing undeclared) and only then replaces live targets.
 A snapshot with `schema_version` greater than the tool's supported version
 is refused with an upgrade hint; older versions must remain restorable
 forever (schema changes are additive or come with migration code).
+
+### Recovery boundary
+
+This envelope is a **partial component snapshot**, not a complete Personal
+Data Node image. It includes only the members listed in the manifest. It does
+not automatically include `.env`, provider OAuth credentials stored outside
+the selected Hermes home, external object stores, device secrets, or the
+Open Wearables database when `HEALTHMES_OW_DATABASE_URL` is unset. Restoring
+the snapshot therefore restores the archived data components; reconnecting
+external providers and secrets remains an operator step.
 
 ### Consistency caveats
 
