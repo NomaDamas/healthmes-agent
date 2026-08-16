@@ -108,6 +108,64 @@ private struct ScreenTimeLifecycleThrowingCollector:
     }
 }
 
+private actor ScreenTimeLifecycleSequencedCollectorState {
+    private var authorizationResults: [ScreenTimeCollectorResult]
+    private let collectionResult: ScreenTimeCollectorResult
+    private var collectionCalls = 0
+
+    init(
+        authorizationResults: [ScreenTimeCollectorResult],
+        collectionResult: ScreenTimeCollectorResult
+    ) {
+        self.authorizationResults = authorizationResults
+        self.collectionResult = collectionResult
+    }
+
+    func nextAuthorizationResult() -> ScreenTimeCollectorResult {
+        if authorizationResults.count > 1 {
+            return authorizationResults.removeFirst()
+        }
+        return authorizationResults[0]
+    }
+
+    func collect() -> ScreenTimeCollectorResult {
+        collectionCalls += 1
+        return collectionResult
+    }
+
+    func capturedCollectionCalls() -> Int {
+        collectionCalls
+    }
+}
+
+private struct ScreenTimeLifecycleSequencedCollector:
+    ScreenTimeActivityCollecting
+{
+    let pseudonymKeyID: String?
+    let state: ScreenTimeLifecycleSequencedCollectorState
+
+    @MainActor
+    func currentAuthorizationStatus() async
+        -> ScreenTimeCollectorResult
+    {
+        await state.nextAuthorizationResult()
+    }
+
+    @MainActor
+    func requestAuthorization() async throws
+        -> ScreenTimeCollectorResult
+    {
+        await state.nextAuthorizationResult()
+    }
+
+    func collect(
+        window _: ScreenTimeCollectionWindow,
+        excludedAppTokens _: Set<String>
+    ) async throws -> ScreenTimeCollectorResult {
+        await state.collect()
+    }
+}
+
 private enum ScreenTimeLifecycleUploadAction {
     case succeed
     case fail(HealthMesAPIError)
@@ -417,6 +475,83 @@ private actor ScreenTimeLifecycleMockSyncService:
     }
 }
 
+private actor ScreenTimeLifecycleBlockingAuthorizationService:
+    ScreenTimeActivitySyncing
+{
+    private let authorizationResult: ScreenTimeCollectorResult
+    private let syncResult: ScreenTimeSyncOutcome
+    private var authorizationCalls = 0
+    private var authorizationCancellations = 0
+    private var authorizationWaiters:
+        [CheckedContinuation<Void, Never>] = []
+    private var syncCalls = 0
+
+    init(
+        authorizationResult: ScreenTimeCollectorResult,
+        syncResult: ScreenTimeSyncOutcome
+    ) {
+        self.authorizationResult = authorizationResult
+        self.syncResult = syncResult
+    }
+
+    func requestAuthorization() async throws
+        -> ScreenTimeCollectorResult
+    {
+        authorizationCalls += 1
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                authorizationWaiters.append(continuation)
+            }
+        } onCancel: {
+            Task {
+                await self.recordAuthorizationCancellation()
+            }
+        }
+        try Task.checkCancellation()
+        return authorizationResult
+    }
+
+    func approveExcludedApps(
+        _: Set<String>
+    ) async throws {}
+
+    func sync(
+        pairing _: Pairing,
+        now _: Date,
+        timezone _: TimeZone,
+        trigger _: ScreenTimeSyncTrigger
+    ) async throws -> ScreenTimeSyncOutcome {
+        syncCalls += 1
+        return syncResult
+    }
+
+    func reconcilePendingUploads(
+        pairing _: Pairing?
+    ) async throws {}
+
+    func releaseAuthorizationCalls() {
+        let waiters = authorizationWaiters
+        authorizationWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func calls() -> (
+        authorization: Int,
+        cancellations: Int,
+        sync: Int
+    ) {
+        (
+            authorizationCalls,
+            authorizationCancellations,
+            syncCalls
+        )
+    }
+
+    private func recordAuthorizationCancellation() {
+        authorizationCancellations += 1
+    }
+}
+
 @MainActor
 private final class ScreenTimeLifecycleAuthorizationObserver:
     ScreenTimeAuthorizationChangeObserving
@@ -441,6 +576,7 @@ private final class ScreenTimeLifecycleBackgroundTasks:
 {
     private(set) var registrations = 0
     private(set) var schedules = 0
+    private(set) var cancellations = 0
     private var handler:
         (
             @MainActor
@@ -458,6 +594,10 @@ private final class ScreenTimeLifecycleBackgroundTasks:
 
     func schedule() {
         schedules += 1
+    }
+
+    func cancel() {
+        cancellations += 1
     }
 
     func launch() -> ScreenTimeLifecycleBackgroundTask {
@@ -654,6 +794,34 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         XCTFail("timed out waiting for Screen Time lifecycle calls")
+    }
+
+    private func waitForAuthorizationCalls(
+        _ expectedCount: Int,
+        from service:
+            ScreenTimeLifecycleBlockingAuthorizationService
+    ) async throws {
+        for _ in 0..<400 {
+            if await service.calls().authorization >= expectedCount {
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTFail("timed out waiting for authorization call")
+    }
+
+    private func waitForAuthorizationCancellations(
+        _ expectedCount: Int,
+        from service:
+            ScreenTimeLifecycleBlockingAuthorizationService
+    ) async throws {
+        for _ in 0..<400 {
+            if await service.calls().cancellations >= expectedCount {
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTFail("timed out waiting for authorization cancellation")
     }
 
     @MainActor
@@ -1179,7 +1347,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             reports[1].snapshotSequence,
             reports[2].snapshotSequence
         )
-        XCTAssertEqual(counts.collection, 2)
+        XCTAssertEqual(counts.collection, 3)
         XCTAssertEqual(pendingCount, 0)
     }
 
@@ -1240,6 +1408,78 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(reports.count, 1)
         XCTAssertEqual(reports[0].capability, .unavailable)
         XCTAssertEqual(reports[0].permissionStatus, .denied)
+        XCTAssertFalse(
+            reports.contains(where: { $0.capability == .aggregate })
+        )
+        XCTAssertTrue(entries.isEmpty)
+    }
+
+    func testExportDetectedRevocationFencesQueuedAggregate()
+        async throws
+    {
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        _ = try await outboxStorage.0.enqueue(
+            report: report(),
+            pairing: pairing(),
+            now: date("2026-08-16T10:00:00Z")
+        )
+        let granted = collectorResult()
+        let revoked = collectorResult(
+            capability: .unavailable,
+            permission: .revoked,
+            reason: "ios_screen_time_permission_revoked"
+        )
+        let collectorState =
+            ScreenTimeLifecycleSequencedCollectorState(
+                authorizationResults: [granted],
+                collectionResult: revoked
+            )
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState()
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleSequencedCollector(
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                state: collectorState
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: date("2026-08-16T10:34:00Z"),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let reports = await transport.capturedReports()
+        let entries = await outboxStorage.0.allEntries()
+        let collectionCalls =
+            await collectorState.capturedCollectionCalls()
+
+        XCTAssertEqual(
+            outcome,
+            .unavailableReported(
+                reason: "ios_screen_time_permission_revoked"
+            )
+        )
+        XCTAssertEqual(collectionCalls, 1)
+        XCTAssertEqual(reports.count, 1)
+        XCTAssertEqual(reports[0].capability, .unavailable)
+        XCTAssertEqual(reports[0].permissionStatus, .revoked)
         XCTAssertFalse(
             reports.contains(where: { $0.capability == .aggregate })
         )
@@ -2541,10 +2781,78 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             [
                 .authorizationChanged,
                 .authorizationChanged,
-                .authorizationChanged,
+                .routine,
             ]
         )
         XCTAssertEqual(backgroundTasks.schedules, 3)
+    }
+
+    @MainActor
+    func testRuntimeOptOutGatesEveryAutomaticCollectionEntryPoint()
+        async throws
+    {
+        let suiteName =
+            "healthmes.screen-time.opt-out-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        let observer = ScreenTimeLifecycleAuthorizationObserver()
+        let backgroundTasks = ScreenTimeLifecycleBackgroundTasks()
+        let notificationCenter = NotificationCenter()
+        let service = ScreenTimeLifecycleMockSyncService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "unused")
+        )
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationObserver: observer,
+            authorizationIntentStore: intentStore,
+            backgroundTasks: backgroundTasks,
+            notificationCenter: notificationCenter
+        )
+
+        runtime.register()
+        let foreground = await runtime.foregroundCatchUp()
+        await observer.emitChange()
+        notificationCenter.post(
+            name: Notification.Name("healthmes.pairing.changed"),
+            object: nil
+        )
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+        let configuration =
+            await runtime.inputConfigurationDidChange()
+        let exclusions =
+            await runtime.approveExcludedAppsAndSync([])
+        let backgroundTask = backgroundTasks.launch()
+        let calls = await service.calls()
+
+        XCTAssertEqual(
+            foreground,
+            .skipped(reason: "ios_screen_time_not_opted_in")
+        )
+        XCTAssertEqual(
+            configuration,
+            .skipped(reason: "ios_screen_time_not_opted_in")
+        )
+        XCTAssertEqual(
+            exclusions,
+            .skipped(reason: "ios_screen_time_not_opted_in")
+        )
+        XCTAssertEqual(calls.authorization, 0)
+        XCTAssertEqual(calls.sync, 0)
+        XCTAssertTrue(calls.approvedExclusions.isEmpty)
+        XCTAssertEqual(backgroundTasks.registrations, 1)
+        XCTAssertEqual(backgroundTasks.schedules, 0)
+        XCTAssertEqual(backgroundTask.completionValues, [true])
     }
 
     @MainActor
@@ -2605,12 +2913,73 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         try await waitForStateCalls(1, from: transport)
         task.expire()
         try await waitForStateCancellations(1, from: transport)
-        try await waitForBackgroundCompletion(task)
+        XCTAssertTrue(task.completionValues.isEmpty)
         await transport.releaseStateCalls()
+        try await waitForBackgroundCompletion(task)
 
         XCTAssertEqual(task.completionValues, [false])
         XCTAssertEqual(backgroundTasks.registrations, 1)
         XCTAssertEqual(backgroundTasks.schedules, 1)
+    }
+
+    @MainActor
+    func testRuntimeBackgroundExpirationWaitsForAuthorizationDetach()
+        async throws
+    {
+        let suiteName =
+            "healthmes.screen-time.auth-bg-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        let service = ScreenTimeLifecycleBlockingAuthorizationService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "test")
+        )
+        let backgroundTasks = ScreenTimeLifecycleBackgroundTasks()
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationObserver:
+                ScreenTimeLifecycleAuthorizationObserver(),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: backgroundTasks,
+            notificationCenter: NotificationCenter()
+        )
+        runtime.register()
+        intentStore.setOptedIn(true)
+
+        let backgroundTask = backgroundTasks.launch()
+        try await waitForAuthorizationCalls(1, from: service)
+        backgroundTask.expire()
+        try await waitForAuthorizationCancellations(1, from: service)
+        XCTAssertTrue(backgroundTask.completionValues.isEmpty)
+
+        let foreground = Task { @MainActor in
+            await runtime.foregroundCatchUp(
+                now: date("2026-08-16T10:34:00Z"),
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+        }
+        try await waitForAuthorizationCalls(2, from: service)
+        await service.releaseAuthorizationCalls()
+        try await waitForBackgroundCompletion(backgroundTask)
+        let foregroundResult = await foreground.value
+        let calls = await service.calls()
+
+        XCTAssertEqual(backgroundTask.completionValues, [false])
+        XCTAssertEqual(
+            foregroundResult,
+            .completed(.skipped(reason: "test"))
+        )
+        XCTAssertEqual(calls.authorization, 2)
+        XCTAssertEqual(calls.cancellations, 1)
+        XCTAssertEqual(calls.sync, 1)
     }
 
     @MainActor
@@ -2630,13 +2999,14 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             authorizationResult: collectorResult(),
             syncResult: .skipped(reason: "test")
         )
+        let backgroundTasks = ScreenTimeLifecycleBackgroundTasks()
         let runtime = ScreenTimeActivityRuntime(
             lifecycle: ScreenTimeActivityLifecycleController(
                 syncService: service,
                 pairingProvider: { self.pairing() }
             ),
             authorizationIntentStore: intentStore,
-            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            backgroundTasks: backgroundTasks,
             notificationCenter: NotificationCenter()
         )
 
@@ -2646,6 +3016,15 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
 
         runtime.clearAuthorizationOptIn()
         XCTAssertFalse(intentStore.isOptedIn)
+        let foreground = await runtime.foregroundCatchUp(
+            now: date("2026-08-16T10:34:00Z"),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        XCTAssertEqual(
+            foreground,
+            .skipped(reason: "ios_screen_time_not_opted_in")
+        )
+        XCTAssertEqual(backgroundTasks.cancellations, 1)
     }
 
     @MainActor

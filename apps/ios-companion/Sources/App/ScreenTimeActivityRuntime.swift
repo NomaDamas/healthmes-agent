@@ -15,6 +15,7 @@ protocol ScreenTimeBackgroundTaskManaging: AnyObject {
             (any ScreenTimeBackgroundRefreshTask) -> Void
     )
     func schedule()
+    func cancel()
 }
 
 @MainActor
@@ -81,6 +82,77 @@ private final class LiveScreenTimeBackgroundTaskManager:
             // opportunity when the OS declines background work.
         }
     }
+
+    func cancel() {
+        BGTaskScheduler.shared.cancel(
+            taskRequestWithIdentifier:
+                ScreenTimeActivityRuntime.taskIdentifier
+        )
+    }
+}
+
+private struct ScreenTimeAuthorizationRefresh {
+    let id: UUID
+    let task: Task<ScreenTimeAuthorizationAttempt, Never>
+    var waiterLeases: [UUID: ScreenTimeSyncCancellationLease]
+}
+
+private final class ScreenTimeAuthorizationWaiter:
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var continuation:
+        CheckedContinuation<ScreenTimeAuthorizationAttempt, Error>?
+    private var pendingResult: ScreenTimeAuthorizationAttempt?
+    private var cancelled = false
+
+    func install(
+        _ continuation:
+            CheckedContinuation<ScreenTimeAuthorizationAttempt, Error>
+    ) {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        if let pendingResult {
+            lock.unlock()
+            continuation.resume(returning: pendingResult)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func complete(_ result: ScreenTimeAuthorizationAttempt) {
+        lock.lock()
+        guard !cancelled else {
+            lock.unlock()
+            return
+        }
+        if let continuation {
+            self.continuation = nil
+            lock.unlock()
+            continuation.resume(returning: result)
+            return
+        }
+        pendingResult = result
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !cancelled, pendingResult == nil else {
+            lock.unlock()
+            return
+        }
+        cancelled = true
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(throwing: CancellationError())
+    }
 }
 
 /// App-lifecycle facade for the UI-neutral Screen Time engine.
@@ -108,11 +180,9 @@ final class ScreenTimeActivityRuntime {
     private let notificationCenter: NotificationCenter
     private var registered = false
     private var pairingObserver: NSObjectProtocol?
-    private var authorizationRefresh:
-        (
-            id: UUID,
-            task: Task<ScreenTimeAuthorizationAttempt, Never>
-        )?
+    private var authorizationRefresh: ScreenTimeAuthorizationRefresh?
+    private var backgroundRunners:
+        [UUID: ScreenTimeBackgroundRefreshRunner] = [:]
 
     private init() {
         lifecycle = ScreenTimeActivityLifecycleController(
@@ -162,19 +232,27 @@ final class ScreenTimeActivityRuntime {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                _ = await self.lifecycle.pairingDidChange()
+                _ = await self.automaticCatchUp(
+                    trigger: .inputConfigurationChanged,
+                    refreshAuthorization: false
+                )
                 self.schedule()
             }
         }
         authorizationObserver.start { [weak self] in
             guard let self else { return }
-            _ = await self.lifecycle.authorizationDidChange()
+            _ = await self.automaticCatchUp(
+                trigger: .authorizationChanged,
+                refreshAuthorization: false
+            )
             self.schedule()
         }
         if authorizationIntentStore.isOptedIn {
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                _ = await self.automaticCatchUp()
+                _ = await self.automaticCatchUp(
+                    trigger: .authorizationChanged
+                )
                 self.schedule()
             }
         }
@@ -217,6 +295,14 @@ final class ScreenTimeActivityRuntime {
     /// user disables this input. This does not revoke Apple's system grant.
     func clearAuthorizationOptIn() {
         authorizationIntentStore.setOptedIn(false)
+        backgroundTasks.cancel()
+        let runners = backgroundRunners.values
+        backgroundRunners.removeAll()
+        runners.forEach { $0.expire() }
+        if let authorizationRefresh {
+            self.authorizationRefresh = nil
+            authorizationRefresh.task.cancel()
+        }
     }
 
     /// UI seam for confirming the exact opaque exclusion set after a
@@ -227,6 +313,9 @@ final class ScreenTimeActivityRuntime {
         now: Date = Date(),
         timezone: TimeZone = .current
     ) async -> ScreenTimeActivityLifecycleResult {
+        guard authorizationIntentStore.isOptedIn else {
+            return .skipped(reason: "ios_screen_time_not_opted_in")
+        }
         let result =
             await lifecycle.approveExcludedAppsAndSync(
                 excludedAppTokens,
@@ -243,6 +332,9 @@ final class ScreenTimeActivityRuntime {
         now: Date = Date(),
         timezone: TimeZone = .current
     ) async -> ScreenTimeActivityLifecycleResult {
+        guard authorizationIntentStore.isOptedIn else {
+            return .skipped(reason: "ios_screen_time_not_opted_in")
+        }
         let result = await lifecycle.configurationDidChange(
             now: now,
             timezone: timezone
@@ -252,13 +344,19 @@ final class ScreenTimeActivityRuntime {
     }
 
     func schedule() {
+        guard authorizationIntentStore.isOptedIn else { return }
         backgroundTasks.schedule()
     }
 
     private func handle(
         _ task: any ScreenTimeBackgroundRefreshTask
     ) {
+        guard authorizationIntentStore.isOptedIn else {
+            task.setTaskCompleted(success: true)
+            return
+        }
         schedule()
+        let runnerID = UUID()
         let runner = ScreenTimeBackgroundRefreshRunner(
             operation: { [weak self] in
                 guard let self else { return false }
@@ -267,10 +365,14 @@ final class ScreenTimeActivityRuntime {
                 )
                 return result.completedWithoutError
             },
-            completion: { success in
+            completion: { [weak self] success in
                 task.setTaskCompleted(success: success)
+                self?.backgroundRunners.removeValue(
+                    forKey: runnerID
+                )
             }
         )
+        backgroundRunners[runnerID] = runner
         task.expirationHandler = {
             Task { @MainActor in
                 runner.expire()
@@ -282,23 +384,25 @@ final class ScreenTimeActivityRuntime {
     private func automaticCatchUp(
         now: Date = Date(),
         timezone: TimeZone = .current,
-        trigger: ScreenTimeSyncTrigger = .routine
+        trigger: ScreenTimeSyncTrigger = .routine,
+        refreshAuthorization: Bool = true
     ) async -> ScreenTimeActivityLifecycleResult {
         guard authorizationIntentStore.isOptedIn else {
+            return .skipped(
+                reason: "ios_screen_time_not_opted_in"
+            )
+        }
+        guard refreshAuthorization else {
             return await lifecycle.catchUp(
                 now: now,
                 timezone: timezone,
                 trigger: trigger
             )
         }
-        let syncTrigger: ScreenTimeSyncTrigger =
-            trigger == .backgroundRefresh
-            ? .backgroundRefresh
-            : .authorizationChanged
         return await authorizationAndSync(
             now: now,
             timezone: timezone,
-            trigger: syncTrigger
+            trigger: trigger
         ).sync
     }
 
@@ -307,7 +411,15 @@ final class ScreenTimeActivityRuntime {
         timezone: TimeZone,
         trigger: ScreenTimeSyncTrigger
     ) async -> ScreenTimeAuthorizationSyncResult {
-        let attempt = await authorizationAttempt()
+        let attempt: ScreenTimeAuthorizationAttempt
+        do {
+            attempt = try await authorizationAttempt(trigger: trigger)
+        } catch {
+            return ScreenTimeAuthorizationSyncResult(
+                authorization: nil,
+                sync: .failed(reason: "cancelled")
+            )
+        }
         guard !Task.isCancelled else {
             return ScreenTimeAuthorizationSyncResult(
                 authorization: attempt.authorization,
@@ -323,6 +435,14 @@ final class ScreenTimeActivityRuntime {
                 )
             )
         }
+        guard authorizationIntentStore.isOptedIn else {
+            return ScreenTimeAuthorizationSyncResult(
+                authorization: attempt.authorization,
+                sync: .skipped(
+                    reason: "ios_screen_time_not_opted_in"
+                )
+            )
+        }
         return ScreenTimeAuthorizationSyncResult(
             authorization: authorization,
             sync: await lifecycle.catchUp(
@@ -333,22 +453,107 @@ final class ScreenTimeActivityRuntime {
         )
     }
 
-    private func authorizationAttempt()
-        async -> ScreenTimeAuthorizationAttempt
-    {
-        if let authorizationRefresh {
-            return await authorizationRefresh.task.value
+    private func authorizationAttempt(
+        trigger: ScreenTimeSyncTrigger
+    ) async throws -> ScreenTimeAuthorizationAttempt {
+        let waiterID = UUID()
+        let refreshID: UUID
+        let task: Task<ScreenTimeAuthorizationAttempt, Never>
+        if var authorizationRefresh {
+            authorizationRefresh.waiterLeases[waiterID] =
+                trigger.cancellationLease
+            self.authorizationRefresh = authorizationRefresh
+            refreshID = authorizationRefresh.id
+            task = authorizationRefresh.task
+        } else {
+            let id = UUID()
+            let lifecycle = lifecycle
+            let newTask = Task { @MainActor in
+                await lifecycle.requestAuthorization()
+            }
+            authorizationRefresh = ScreenTimeAuthorizationRefresh(
+                id: id,
+                task: newTask,
+                waiterLeases: [
+                    waiterID: trigger.cancellationLease
+                ]
+            )
+            refreshID = id
+            task = newTask
         }
-        let id = UUID()
-        let lifecycle = lifecycle
-        let task = Task { @MainActor in
-            await lifecycle.requestAuthorization()
+
+        do {
+            let result =
+                try await valueIsolatingAuthorizationCancellation(
+                    from: task
+                )
+            removeAuthorizationWaiter(
+                refreshID: refreshID,
+                waiterID: waiterID,
+                completed: true
+            )
+            return result
+        } catch {
+            let cancelledTask = removeAuthorizationWaiter(
+                refreshID: refreshID,
+                waiterID: waiterID,
+                cancelledByCaller: Task.isCancelled
+            )
+            if let cancelledTask {
+                _ = await cancelledTask.value
+            }
+            throw error
         }
-        authorizationRefresh = (id: id, task: task)
-        let result = await task.value
-        if authorizationRefresh?.id == id {
-            authorizationRefresh = nil
+    }
+
+    private func valueIsolatingAuthorizationCancellation(
+        from task: Task<ScreenTimeAuthorizationAttempt, Never>
+    ) async throws -> ScreenTimeAuthorizationAttempt {
+        let waiter = ScreenTimeAuthorizationWaiter()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                continuation in
+                waiter.install(continuation)
+                Task {
+                    waiter.complete(await task.value)
+                }
+            }
+        } onCancel: {
+            waiter.cancel()
         }
-        return result
+    }
+
+    @discardableResult
+    private func removeAuthorizationWaiter(
+        refreshID: UUID,
+        waiterID: UUID,
+        cancelledByCaller: Bool = false,
+        completed: Bool = false
+    ) -> Task<ScreenTimeAuthorizationAttempt, Never>? {
+        guard var authorizationRefresh,
+            authorizationRefresh.id == refreshID,
+            let lease =
+                authorizationRefresh.waiterLeases.removeValue(
+                    forKey: waiterID
+                )
+        else {
+            return nil
+        }
+        if cancelledByCaller,
+            lease == .background,
+            !authorizationRefresh.waiterLeases.values.contains(
+                .foreground
+            )
+        {
+            self.authorizationRefresh = nil
+            authorizationRefresh.task.cancel()
+            return authorizationRefresh.task
+        }
+        if authorizationRefresh.waiterLeases.isEmpty, completed {
+            self.authorizationRefresh = nil
+        } else {
+            self.authorizationRefresh = authorizationRefresh
+        }
+        return nil
     }
 }

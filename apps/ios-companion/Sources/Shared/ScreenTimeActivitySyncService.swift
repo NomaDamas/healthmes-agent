@@ -726,13 +726,6 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             return .skipped(reason: reason)
         }
 
-        if let pendingOutcome = try await flushPendingUploads(
-            pairing: pairing,
-            now: now
-        ) {
-            return pendingOutcome
-        }
-
         let pseudonymBoundaryAccepted =
             await stateStore.preparePseudonymBoundary(
                 deviceID: deviceID,
@@ -783,6 +776,19 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             if !currentAuthorization.permitsAggregateUpload {
                 result = currentAuthorization
             }
+        }
+        try await outbox.reconcile(
+            deviceID: deviceID,
+            pairing: pairing,
+            authorization: result,
+            now: now
+        )
+        if let pendingOutcome = try await flushPendingUploads(
+            pairing: pairing,
+            authorization: result,
+            now: now
+        ) {
+            return pendingOutcome
         }
         guard
             result.permitsAggregateUpload,
@@ -856,11 +862,10 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
 
     private func flushPendingUploads(
         pairing: Pairing,
+        authorization: ScreenTimeCollectorResult,
         now: Date
     ) async throws -> ScreenTimeSyncOutcome? {
         while true {
-            let authorization =
-                await collector.currentAuthorizationStatus()
             try await outbox.reconcile(
                 deviceID: deviceID,
                 pairing: pairing,
