@@ -63,6 +63,9 @@ from healthmes.decision import (
     SourceRef,
     WearableContextProvider,
 )
+from healthmes.decision.domain_providers import (
+    calendar_aggregate_identity,
+)
 from healthmes.storage import update_retention_policy
 from healthmes.store import (
     Base,
@@ -889,6 +892,61 @@ async def test_unrelated_blocked_activity_device_does_not_block_query(
 
     assert result.status is ContextStatus.OK
     assert result.source_refs[0].record_id == str(selected.id)
+
+
+async def test_activity_interval_starting_before_query_is_retained_when_overlapping(
+    session,
+):
+    interval_start = datetime(2026, 8, 10, 8, 30, tzinfo=UTC)
+    interval_end = datetime(2026, 8, 10, 9, 30, tzinfo=UTC)
+    event = _event(
+        domain="activity",
+        event_type=APP_INTERVAL_EVENT,
+        source_provider="activitywatch",
+        source_device="overlap-device",
+        observed_at=interval_start,
+        recorded_at=interval_end,
+        sensitivity="activity-identity",
+    )
+    event.payload = {
+        "kind": "app_interval",
+        "platform": "macos",
+        "capability": "detailed",
+        "start_at": interval_start.isoformat(),
+        "end_at": interval_end.isoformat(),
+        "state": "active",
+        "app_id": "editor",
+        "launches": 1,
+        "category": "productivity",
+    }
+    session.add(event)
+    session.flush()
+    layer = ContextAccessLayer(
+        ContextProviderRegistry((ActivityContextProvider(),)),
+        clock=lambda: NOW,
+    )
+    turn = layer.start_turn(
+        _request(),
+        policy=_policy(domain="activity"),
+    )
+
+    result = await turn.query(
+        session,
+        ContextQuery(
+            provider_id="activity",
+            capability="activity.timeline",
+            start=datetime(2026, 8, 10, 9, tzinfo=UTC),
+            end=datetime(2026, 8, 10, 10, tzinfo=UTC),
+            granularity="window",
+        ),
+    )
+
+    assert result.status in {ContextStatus.OK, ContextStatus.PARTIAL}
+    assert len(result.source_refs) == 1
+    assert result.source_refs[0].record_id == str(event.id)
+    assert result.source_refs[0].observed_start == interval_start
+    assert result.source_refs[0].observed_end == interval_end
+    assert "source_ref_outside_query" not in result.limitations
 
 
 async def test_expired_activity_device_does_not_block_default_query(
@@ -3992,6 +4050,174 @@ async def test_calendar_empty_success_metadata_survives_access_gateway(
     assert result.coverage.status is CoverageStatus.COMPLETE
     assert "source_refs_unavailable" not in result.limitations
     assert "stable_provenance_missing" not in result.limitations
+
+
+async def test_calendar_aggregate_identity_uses_only_visible_current_generations(
+    session,
+):
+    google_generation = "a" * 64
+    stale_google_generation = "b" * 64
+    caldav_generation = "c" * 64
+    stale_caldav_generation = "d" * 64
+    connected = {
+        CalendarSource.GOOGLE,
+        CalendarSource.CALDAV,
+    }
+    generations = {
+        CalendarSource.GOOGLE: google_generation,
+        CalendarSource.CALDAV: caldav_generation,
+    }
+    health = InMemorySyncHealthStore()
+    health.record_success(
+        CalendarSource.GOOGLE,
+        NOW - timedelta(minutes=1),
+        event_count=1,
+        coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+        account_generation=google_generation,
+    )
+    health.record_success(
+        CalendarSource.CALDAV,
+        NOW - timedelta(minutes=1),
+        event_count=1,
+        coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+        account_generation=stale_caldav_generation,
+    )
+    session.add_all(
+        (
+            CalendarEventMirror(
+                external_id="visible-google",
+                calendar_source=CalendarSource.GOOGLE,
+                connection_generation=google_generation,
+                summary="Visible",
+                start_at=datetime(2026, 8, 10, 9, tzinfo=UTC),
+                end_at=datetime(2026, 8, 10, 10, tzinfo=UTC),
+                is_all_day=False,
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            CalendarEventMirror(
+                external_id="stale-google",
+                calendar_source=CalendarSource.GOOGLE,
+                connection_generation=stale_google_generation,
+                summary="Stale generation",
+                start_at=datetime(2026, 8, 10, 10, tzinfo=UTC),
+                end_at=datetime(2026, 8, 10, 11, tzinfo=UTC),
+                is_all_day=False,
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            CalendarEventMirror(
+                external_id="unsynced-caldav",
+                calendar_source=CalendarSource.CALDAV,
+                connection_generation=caldav_generation,
+                summary="Unsynced current generation",
+                start_at=datetime(2026, 8, 10, 11, tzinfo=UTC),
+                end_at=datetime(2026, 8, 10, 12, tzinfo=UTC),
+                is_all_day=False,
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        )
+    )
+    session.flush()
+
+    def resolve_sources():
+        return tuple(
+            sorted(connected, key=lambda source: source.value)
+        )
+
+    def resolve_generation(source):
+        return generations.get(source)
+
+    provider = CalendarContextProvider(
+        sync_health_store=health,
+        source_resolver=resolve_sources,
+        account_generation_resolver=resolve_generation,
+    )
+    layer = ContextAccessLayer(
+        ContextProviderRegistry((provider,)),
+        clock=lambda: NOW,
+        calendar_source_resolver=resolve_sources,
+        calendar_account_generation_resolver=resolve_generation,
+        calendar_sync_health_store=health,
+    )
+    turn = layer.start_turn(
+        _request(),
+        policy=_policy(domain="calendar"),
+    )
+    query = ContextQuery(
+        provider_id="calendar",
+        capability="calendar.day-summary",
+        start=DAY_START,
+        end=DAY_END,
+    )
+
+    result = await turn.query(session, query)
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["event_count"] == 1
+    assert len(result.source_refs) == 1
+    source_ref = result.source_refs[0]
+    assert source_ref.record_id == calendar_aggregate_identity(
+        capability=query.capability,
+        start=DAY_START,
+        end=DAY_END,
+        timezone="UTC",
+        granularity="summary",
+        parameters={},
+        source_scope={
+            CalendarSource.GOOGLE.value: google_generation,
+        },
+    )
+    checked, reasons = turn.revalidate_source_ref(
+        session,
+        query,
+        source_ref,
+        context_source_refs=(source_ref,),
+        now=NOW,
+    )
+    assert checked is not None
+    assert reasons == ()
+
+    health.record_success(
+        CalendarSource.CALDAV,
+        NOW,
+        event_count=1,
+        coverage_kind=SyncCoverageKind.FULL_COLLECTION,
+        account_generation=caldav_generation,
+    )
+    checked, reasons = turn.revalidate_source_ref(
+        session,
+        query,
+        source_ref,
+        context_source_refs=(source_ref,),
+        now=NOW,
+    )
+    assert checked is None
+    assert reasons == ("source_ref_identity_mismatch",)
+
+    generations[CalendarSource.GOOGLE] = stale_google_generation
+    checked, reasons = turn.revalidate_source_ref(
+        session,
+        query,
+        source_ref,
+        context_source_refs=(source_ref,),
+        now=NOW,
+    )
+    assert checked is None
+    assert reasons == ("source_ref_identity_mismatch",)
+
+    generations[CalendarSource.GOOGLE] = google_generation
+    connected.remove(CalendarSource.GOOGLE)
+    checked, reasons = turn.revalidate_source_ref(
+        session,
+        query,
+        source_ref,
+        context_source_refs=(source_ref,),
+        now=NOW,
+    )
+    assert checked is None
+    assert reasons == ("source_ref_identity_mismatch",)
 
 
 def test_access_policy_requires_explicit_grants_and_owner():

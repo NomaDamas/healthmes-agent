@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.decision.access import (
     AccessAuditEntry,
+    AccessOutcome,
     ContextAccessLayer,
     ContextAccessPolicy,
     ContextAccessTurn,
@@ -186,6 +187,7 @@ class _DecisionSearchSession:
     calls_started: int = 0
     wire_bytes: int = 0
     context_bytes: int = 0
+    terminal_error_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,7 +435,11 @@ class DecisionContextSearchSessionService:
                 raise BusyDecisionSearchSessionError()
             self._transition_locked(
                 record,
-                DecisionSearchSessionState.FINISHED,
+                (
+                    DecisionSearchSessionState.ABORTED
+                    if record.terminal_error_code is not None
+                    else DecisionSearchSessionState.FINISHED
+                ),
             )
         return self._snapshot(record)
 
@@ -594,6 +600,33 @@ class DecisionContextSearchSessionService:
                                 ),
                             )
                     self._ensure_active(record)
+        except asyncio.CancelledError:
+            error_code = "decision_search_tool_call_cancelled"
+            finished_at = _utc(self._clock())
+            effective_query = (
+                record.access_turn.effective_query_for(query.query_id)
+                or query
+            )
+            audit = _failed_access_audit(
+                query,
+                effective_query=effective_query,
+                occurred_at=finished_at,
+                error_code=error_code,
+            )
+            try:
+                self._store_failed_call(
+                    record,
+                    query=query,
+                    effective_query=effective_query,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    error_code=error_code,
+                    access_audit=audit,
+                )
+            finally:
+                with record.result_lock:
+                    record.terminal_error_code = error_code
+            raise
         except TimeoutError as exc:
             self._store_failed_call(
                 record,
@@ -790,12 +823,14 @@ class DecisionContextSearchSessionService:
         query: ContextQuery,
         started_at: datetime,
     ) -> None:
+        error_code = "decision_search_tool_call_cancelled"
         failure = ToolCallRecord(
             query=query,
+            effective_query=query,
             status=ToolCallStatus.FAILED,
             started_at=started_at,
             finished_at=started_at,
-            error_code="turn_context_byte_budget_exhausted",
+            error_code=error_code,
         )
         with record.result_lock:
             tool_trace = tuple(
@@ -805,6 +840,13 @@ class DecisionContextSearchSessionService:
             access_trace = tuple(
                 item.model_copy(deep=True)
                 for item in record.access_trace
+            ) + (
+                _failed_access_audit(
+                    query,
+                    effective_query=query,
+                    occurred_at=started_at,
+                    error_code=error_code,
+                ),
             )
         projected = self._project_snapshot_bytes(
             record,
@@ -904,6 +946,7 @@ class DecisionContextSearchSessionService:
         started_at: datetime,
         finished_at: datetime,
         error_code: str,
+        access_audit: AccessAuditEntry | None = None,
     ) -> None:
         failure = ToolCallRecord(
             query=query,
@@ -921,6 +964,10 @@ class DecisionContextSearchSessionService:
             access_trace = tuple(
                 item.model_copy(deep=True)
                 for item in record.access_trace
+            ) + (
+                (access_audit.model_copy(deep=True),)
+                if access_audit is not None
+                else ()
             )
         projected = self._project_snapshot_bytes(
             record,
@@ -944,6 +991,10 @@ class DecisionContextSearchSessionService:
             )
         with record.result_lock:
             record.tool_trace.append(failure)
+            if access_audit is not None:
+                record.access_trace.append(
+                    access_audit.model_copy(deep=True)
+                )
             record.context_bytes = max(
                 record.context_bytes,
                 projected,
@@ -1020,7 +1071,9 @@ class DecisionContextSearchSessionService:
         return DecisionSearchSessionSnapshot(
             session_id=record.session_id,
             state=(
-                DecisionSearchSessionState.FINISHED
+                DecisionSearchSessionState.ABORTED
+                if record.terminal_error_code is not None
+                else DecisionSearchSessionState.FINISHED
                 if terminal_projection
                 else record.state
             ),
@@ -1063,6 +1116,8 @@ class DecisionContextSearchSessionService:
         record: _DecisionSearchSession,
         current_monotonic: float,
     ) -> None:
+        if record.terminal_error_code is not None:
+            raise AbortedDecisionSearchSessionError()
         if (
             record.state is DecisionSearchSessionState.ACTIVE
             and current_monotonic >= record.deadline
@@ -1200,4 +1255,31 @@ def _policy_fingerprint(
         sort_keys=True,
         ensure_ascii=True,
         separators=(",", ":"),
+    )
+
+
+def _failed_access_audit(
+    query: ContextQuery,
+    *,
+    effective_query: ContextQuery,
+    occurred_at: datetime,
+    error_code: str,
+) -> AccessAuditEntry:
+    """Return the canonical audit record for an interrupted provider call."""
+
+    return AccessAuditEntry(
+        query_id=query.query_id,
+        provider_id=query.provider_id,
+        capability=query.capability,
+        outcome=AccessOutcome.PARTIAL,
+        occurred_at=occurred_at,
+        reason_codes=(error_code,),
+        requested_privacy_level=query.privacy_level,
+        effective_privacy_level=effective_query.privacy_level,
+        requested_start=query.start,
+        requested_end=query.end,
+        effective_start=effective_query.start,
+        effective_end=effective_query.end,
+        requested_limit=query.limit,
+        effective_limit=effective_query.limit,
     )

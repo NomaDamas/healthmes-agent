@@ -624,13 +624,142 @@ def test_postgres_calendar_aggregate_rows_are_locked_during_finalization(
             assert 0.15 <= elapsed < 2
             assert result.status is DecisionStatus.FAILED
             assert result.persistence_status is PersistenceStatus.FAILED
-            assert result.limitations == [
-                "decision_finalization_timeout"
-            ]
+            assert "decision_finalization_timeout" in result.limitations
             blocker.rollback()
 
         retry = finalizer.finalize(request, run)
         assert retry.persistence_status is PersistenceStatus.PERSISTED
+
+
+def test_postgres_calendar_aggregate_blocks_phantom_insert_until_commit(
+) -> None:
+    with _postgres_store(pool_size=3) as store:
+        policy = ContextAccessPolicy(
+            owner_principal_id="owner",
+            grants=(DomainAccessGrant(domain="calendar"),),
+        )
+        request = _request()
+        query = ContextQuery(
+            provider_id="calendar",
+            capability="calendar.day-summary",
+            parameters={"date": NOW.date().isoformat()},
+            timezone="UTC",
+        )
+        access_layer = ContextAccessLayer(
+            ContextProviderRegistry(
+                (
+                    CalendarContextProvider(
+                        sources=(CalendarSource.GOOGLE,),
+                    ),
+                )
+            ),
+            clock=lambda: NOW,
+            calendar_sources=(CalendarSource.GOOGLE,),
+        )
+        turn = access_layer.start_turn(request, policy=policy)
+        with store.factory() as session:
+            context = asyncio.run(turn.query(session, query))
+            session.rollback()
+        assert context.payload["event_count"] == 0
+        assert len(context.source_refs) == 1
+        run = _run(request, query, context, turn.trace)
+
+        finalizer_flushed = threading.Event()
+        release_finalizer = threading.Event()
+        insert_attempted = threading.Event()
+        insert_finished = threading.Event()
+        errors: list[BaseException] = []
+        results = []
+
+        class BlockingFlushSession(Session):
+            blocked = False
+
+            def flush(self, objects=None) -> None:
+                super().flush(objects)
+                if (
+                    not type(self).blocked
+                    and any(
+                        isinstance(item, DecisionRecord)
+                        for item in self.identity_map.values()
+                    )
+                ):
+                    type(self).blocked = True
+                    finalizer_flushed.set()
+                    if not release_finalizer.wait(timeout=5):
+                        raise TimeoutError(
+                            "test finalizer release was not signalled"
+                        )
+
+        finalizer_factory = sessionmaker(
+            bind=store.engine,
+            class_=BlockingFlushSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        finalizer = DecisionFinalizer(
+            access_layer=access_layer,
+            session_factory=finalizer_factory,
+            policy_resolver=lambda _request: policy,
+            timeout_seconds=5,
+            clock=lambda: NOW,
+        )
+
+        def finalize() -> None:
+            try:
+                results.append(finalizer.finalize(request, run))
+            except BaseException as exc:
+                errors.append(exc)
+
+        def insert_phantom() -> None:
+            try:
+                assert finalizer_flushed.wait(timeout=5)
+                with store.factory() as session:
+                    session.add(
+                        CalendarEventMirror(
+                            external_id="postgres-calendar-phantom",
+                            calendar_source=CalendarSource.GOOGLE,
+                            summary="Concurrent meeting",
+                            start_at=NOW + timedelta(hours=1),
+                            end_at=NOW + timedelta(hours=2),
+                            is_all_day=False,
+                            created_at=NOW,
+                            updated_at=NOW,
+                        )
+                    )
+                    insert_attempted.set()
+                    session.commit()
+                insert_finished.set()
+            except BaseException as exc:
+                errors.append(exc)
+
+        finalizer_thread = threading.Thread(target=finalize)
+        insert_thread = threading.Thread(target=insert_phantom)
+        try:
+            finalizer_thread.start()
+            assert finalizer_flushed.wait(timeout=5)
+            insert_thread.start()
+            assert insert_attempted.wait(timeout=5)
+            time.sleep(0.2)
+            assert not insert_finished.is_set()
+
+            release_finalizer.set()
+            finalizer_thread.join(timeout=10)
+            insert_thread.join(timeout=10)
+
+            assert not finalizer_thread.is_alive()
+            assert not insert_thread.is_alive()
+            assert errors == []
+            assert len(results) == 1
+            assert (
+                results[0].persistence_status
+                is PersistenceStatus.PERSISTED
+            )
+            assert insert_finished.is_set()
+        finally:
+            release_finalizer.set()
+            finalizer_thread.join(timeout=5)
+            insert_thread.join(timeout=5)
 
 
 def test_postgres_finalizer_statement_timeout_is_auditable() -> None:

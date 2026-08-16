@@ -132,6 +132,7 @@ def build_healthmes_decision_engine(
         clock=clock,
         calendar_settings=calendar_settings,
         calendar_sync_health_store=calendar_sync_health_store,
+        calendar_sources=calendar_sources,
         calendar_source_resolver=calendar_source_resolver,
         calendar_account_generation_resolver=(
             calendar_account_generation_resolver

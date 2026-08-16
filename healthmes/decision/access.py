@@ -27,11 +27,13 @@ from sqlalchemy.orm import Session
 
 from healthmes.activity.privacy import collection_gate
 from healthmes.activity.repository import (
+    APP_INTERVAL_EVENT,
     DELETION_PROVIDER,
     DELETION_TOMBSTONE_EVENT,
     RAW_EVENT_TYPES,
     event_bounds,
     get_control_payload,
+    parse_optional_datetime,
 )
 from healthmes.calendars.base import HealthmesEventKind
 from healthmes.calendars.repository import retained_calendar_statement
@@ -62,9 +64,11 @@ from healthmes.decision.domain_providers import (
     CALENDAR_AGGREGATE_DERIVER,
     CALENDAR_AGGREGATE_RESOURCE_TYPE,
     CALENDAR_AGGREGATE_SOURCE_PROVIDER,
+    _calendar_ready_account_generations,
     _calendar_rows,
     calendar_aggregate_content_digest,
     calendar_aggregate_identity,
+    canonical_calendar_source_scope,
 )
 from healthmes.decision.providers import (
     ContextCapability,
@@ -793,6 +797,7 @@ class ContextAccessLayer:
         calendar_source_resolver: (
             Callable[[], Sequence[CalendarSource]] | None
         ) = None,
+        calendar_sources: Sequence[CalendarSource] = (),
         calendar_account_generation_resolver: (
             Callable[[CalendarSource], str | None] | None
         ) = None,
@@ -804,9 +809,17 @@ class ContextAccessLayer:
             and not callable(calendar_source_resolver)
         ):
             raise TypeError("calendar_source_resolver must be callable")
+        if calendar_source_resolver is not None and calendar_sources:
+            raise ValueError(
+                "calendar_sources and calendar_source_resolver are "
+                "mutually exclusive"
+            )
         self.registry = registry
         self._clock = clock or (lambda: datetime.now(UTC))
         self._calendar_source_resolver = calendar_source_resolver
+        self._calendar_sources = frozenset(
+            CalendarSource(source) for source in calendar_sources
+        )
         if (
             calendar_account_generation_resolver is not None
             and not callable(calendar_account_generation_resolver)
@@ -870,21 +883,38 @@ class ContextAccessLayer:
 
         visibility = self.calendar_visibility_snapshot()
         if visibility is not None:
+            if (
+                not visibility.account_generations
+                and "calendar_not_connected"
+                in visibility.limitations
+            ):
+                return (
+                    {},
+                    ("calendar_source_disconnected",),
+                )
             return (
                 visibility.account_generations,
                 visibility.limitations,
             )
         if self._calendar_source_resolver is None:
-            return None, ()
-        try:
-            sources = frozenset(
-                CalendarSource(source)
-                for source in self._calendar_source_resolver()
-            )
-        except Exception:
+            if not self._calendar_sources:
+                return None, ()
+            sources = self._calendar_sources
+        else:
+            try:
+                sources = frozenset(
+                    CalendarSource(source)
+                    for source in self._calendar_source_resolver()
+                )
+            except Exception:
+                return (
+                    frozenset(),
+                    ("calendar_connection_state_unavailable",),
+                )
+        if not sources:
             return (
                 frozenset(),
-                ("calendar_connection_state_unavailable",),
+                ("calendar_source_disconnected",),
             )
         if self._calendar_account_generation_resolver is None:
             return sources, ()
@@ -910,7 +940,26 @@ class ContextAccessLayer:
                 {},
                 ("calendar_connection_state_unavailable",),
             )
-        return generations, ()
+        (
+            ready_generations,
+            _sync_states,
+            readiness_error,
+        ) = _calendar_ready_account_generations(
+            store=self._calendar_sync_health_store,
+            sources=tuple(
+                sorted(sources, key=lambda source: source.value)
+            ),
+            account_generations=generations,
+        )
+        if readiness_error is not None:
+            return {}, (readiness_error,)
+        assert ready_generations is not None
+        limitations = (
+            ("calendar_account_not_synced",)
+            if len(ready_generations) != len(generations)
+            else ()
+        )
+        return ready_generations, limitations
 
     def current_calendar_sources(
         self,
@@ -2950,15 +2999,33 @@ def _validate_calendar_aggregate_source_ref(
     ] = []
     if isinstance(allowed_calendar_connections, Mapping):
         generations = dict(allowed_calendar_connections)
-        sources = tuple(sorted(generations, key=lambda item: item.value))
+        sources = tuple(
+            source
+            for source, _generation in sorted(
+                generations.items(),
+                key=lambda item: item[0].value,
+            )
+        )
+        if not sources:
+            if (
+                calendar_connection_limitations
+                and "calendar_not_connected"
+                not in calendar_connection_limitations
+            ):
+                return None, calendar_connection_limitations
+            return None, (
+                "calendar_source_disconnected",
+            )
         scopes.append(
             (
                 sources,
                 generations,
-                {
-                    source.value: generations[source]
-                    for source in sources
-                },
+                canonical_calendar_source_scope(
+                    {
+                        source.value: generations[source]
+                        for source in sources
+                    }
+                ),
             )
         )
     elif allowed_calendar_connections is not None:
@@ -2968,11 +3035,15 @@ def _validate_calendar_aggregate_source_ref(
                 key=lambda item: item.value,
             )
         )
+        if not sources:
+            return None, ("calendar_source_disconnected",)
         scopes.append(
             (
                 sources,
                 None,
-                [source.value for source in sources],
+                canonical_calendar_source_scope(
+                    [source.value for source in sources]
+                ),
             )
         )
     elif calendar_connection_limitations:
@@ -2991,7 +3062,9 @@ def _validate_calendar_aggregate_source_ref(
                     (
                         candidate,
                         None,
-                        [source.value for source in candidate],
+                        canonical_calendar_source_scope(
+                            [source.value for source in candidate]
+                        ),
                     )
                 )
     matching_scopes = [
@@ -3528,6 +3601,22 @@ def _wearable_ref_in_provenance_window(
 def _wellness_event_observed_end(
     event: _WellnessEventSnapshot,
 ) -> tuple[datetime | None, bool]:
+    if event.event_type == APP_INTERVAL_EVENT:
+        raw_end = event.payload.get("end_at")
+        if raw_end is not None:
+            observed_end = parse_optional_datetime(raw_end)
+            start = _as_utc(event.observed_at)
+            if observed_end is None or observed_end <= start:
+                return None, False
+            return observed_end, True
+    if (
+        event.event_type in RAW_EVENT_TYPES
+        and event.event_type != APP_INTERVAL_EVENT
+    ):
+        start, observed_end = event_bounds(event)
+        if observed_end <= start:
+            return None, False
+        return observed_end, True
     window = event.payload.get("window")
     if window is None:
         return None, True

@@ -12,7 +12,7 @@ from enum import Enum
 from math import isfinite
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from healthmes.activity.aggregation import local_day_bounds
@@ -23,7 +23,12 @@ from healthmes.activity.context import (
     recovery_activity_context,
 )
 from healthmes.activity.contracts import ActivityPlatform
-from healthmes.activity.repository import RAW_EVENT_TYPES
+from healthmes.activity.repository import (
+    APP_INTERVAL_EVENT,
+    RAW_EVENT_TYPES,
+    event_bounds,
+    parse_optional_datetime,
+)
 from healthmes.activity.resolver import (
     _normalize_wearable_context,
 )
@@ -691,11 +696,7 @@ def calendar_aggregate_identity(
 ) -> str:
     """Return the opaque identity for one aggregate calendar query."""
 
-    normalized_scope = (
-        dict(sorted(source_scope.items()))
-        if isinstance(source_scope, Mapping)
-        else sorted(str(value) for value in source_scope)
-    )
+    normalized_scope = canonical_calendar_source_scope(source_scope)
     return "aggregate:v1:" + _canonical_digest(
         {
             "schema": "healthmes.calendar-aggregate-identity.v1",
@@ -712,6 +713,22 @@ def calendar_aggregate_identity(
             "source_scope": normalized_scope,
         }
     )
+
+
+def canonical_calendar_source_scope(
+    source_scope: Mapping[str, str] | Sequence[str],
+) -> dict[str, str] | tuple[str, ...]:
+    """Normalize the source/generation scope used by aggregate provenance."""
+
+    if isinstance(source_scope, Mapping):
+        return {
+            str(source): str(generation)
+            for source, generation in sorted(
+                source_scope.items(),
+                key=lambda item: str(item[0]),
+            )
+        }
+    return tuple(sorted({str(value) for value in source_scope}))
 
 
 def calendar_aggregate_content_digest(
@@ -989,6 +1006,18 @@ def _limitations(raw: Mapping[str, Any]) -> list[str]:
 
 
 def _event_observed_end(event: WellnessEvent) -> datetime | None:
+    if event.event_type == APP_INTERVAL_EVENT:
+        raw_end = event.payload.get("end_at")
+        if raw_end is not None:
+            end = parse_optional_datetime(raw_end)
+            start = _as_utc(event.observed_at)
+            return end if end is not None and end > start else None
+    if (
+        event.event_type in RAW_EVENT_TYPES
+        and event.event_type != APP_INTERVAL_EVENT
+    ):
+        start, end = event_bounds(event)
+        return end if end > start else None
     window = event.payload.get("window")
     if not isinstance(window, Mapping):
         return None
@@ -2749,6 +2778,14 @@ def _calendar_rows(
     account_generations: Mapping[CalendarSource, str] | None = None,
     lock_for_share: bool = False,
 ) -> list[CalendarEventMirror]:
+    if lock_for_share and session.get_bind().dialect.name == "postgresql":
+        # Row locks do not cover an empty result or gaps in a time range.
+        # This transaction-scoped table lock prevents a concurrent insert,
+        # update, or delete from changing the aggregate before finalization
+        # commits its DecisionRecord.
+        session.execute(
+            text("LOCK TABLE calendar_event_mirror IN SHARE MODE")
+        )
     statement = select(CalendarEventMirror).where(
         CalendarEventMirror.start_at < end,
         CalendarEventMirror.end_at > start,
@@ -2821,6 +2858,41 @@ def _calendar_sync_states(
         return tuple(store.load(source) for source in sources)
     except Exception:
         return None
+
+
+def _calendar_ready_account_generations(
+    *,
+    store: SyncHealthStore | None,
+    sources: Sequence[CalendarSource],
+    account_generations: Mapping[CalendarSource, str] | None,
+) -> tuple[
+    dict[CalendarSource, str] | None,
+    tuple[CalendarSyncHealth | None, ...] | None,
+    str | None,
+]:
+    """Resolve the exact account-generation scope safe for mirror reads."""
+
+    states = (
+        _calendar_sync_states(store, sources)
+        if store is not None
+        else None
+    )
+    if account_generations is None:
+        return None, states, None
+    if states is None:
+        return None, None, "calendar_sync_health_unavailable"
+    ready = {
+        source: account_generations[source]
+        for source, state in zip(sources, states, strict=True)
+        if (
+            state is not None
+            and state.account_generation == account_generations[source]
+            and state.last_success_at is not None
+        )
+    }
+    if not ready:
+        return {}, states, "calendar_account_not_synced"
+    return ready, states, None
 
 
 def _calendar_completeness(
@@ -3242,6 +3314,7 @@ class CalendarContextProvider:
             account_generations = dict(
                 visibility.account_generations
             )
+            row_generations = account_generations
             visibility_limitations = visibility.limitations
             if not visibility.available:
                 return _result(
@@ -3286,56 +3359,29 @@ class CalendarContextProvider:
                     refs_complete=True,
                     now=now,
                 )
-            sync_states = (
-                _calendar_sync_states(
-                    self._sync_health_store,
-                    sources,
-                )
-                if self._sync_health_store is not None
-                else None
+            (
+                ready_generations,
+                sync_states,
+                generation_readiness_error,
+            ) = _calendar_ready_account_generations(
+                store=self._sync_health_store,
+                sources=sources,
+                account_generations=account_generations,
             )
-            ready_generations = account_generations
-            if account_generations is not None:
-                if sync_states is None:
-                    return _result(
-                        query,
-                        {
-                            "status": "unavailable",
-                            "limitations": [
-                                "calendar_sync_health_unavailable"
-                            ],
-                        },
-                        refs=(),
-                        refs_complete=True,
-                        now=now,
-                    )
-                ready_generations = {
-                    source: account_generations[source]
-                    for source, state in zip(
-                        sources,
-                        sync_states,
-                        strict=True,
-                    )
-                    if (
-                        state is not None
-                        and state.account_generation
-                        == account_generations[source]
-                        and state.last_success_at is not None
-                    )
-                }
-                if not ready_generations:
-                    return _result(
-                        query,
-                        {
-                            "status": "unavailable",
-                            "limitations": [
-                                "calendar_account_not_synced"
-                            ],
-                        },
-                        refs=(),
-                        refs_complete=True,
-                        now=now,
-                    )
+            if generation_readiness_error is not None:
+                return _result(
+                    query,
+                    {
+                        "status": "unavailable",
+                        "limitations": [
+                            generation_readiness_error
+                        ],
+                    },
+                    refs=(),
+                    refs_complete=True,
+                    now=now,
+                )
+            row_generations = ready_generations
             rows = _calendar_rows(
                 session,
                 start=start,
@@ -3364,9 +3410,9 @@ class CalendarContextProvider:
         source_scope: Mapping[str, str] | Sequence[str] = (
             {
                 source.value: generation
-                for source, generation in account_generations.items()
+                for source, generation in row_generations.items()
             }
-            if account_generations is not None
+            if row_generations is not None
             else [source.value for source in sources]
         )
         if query.capability == "calendar.event-detail":

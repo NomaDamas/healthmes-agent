@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -162,6 +163,24 @@ class CommitAttemptProvider(SearchProvider):
         )
         backing_session.commit()
         raise AssertionError("read-only database transaction allowed commit")
+
+
+class CancellationProvider(SearchProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def query(self, session, query, *, now):
+        del session, now
+        self.queries.append(query)
+        self.started.set()
+        try:
+            await self.release.wait()
+        finally:
+            self.cancelled.set()
+        raise AssertionError("cancelled provider call resumed unexpectedly")
 
 
 @pytest.fixture
@@ -731,3 +750,54 @@ async def test_database_read_only_transaction_blocks_provider_commit(
             )
             == 0
         )
+
+
+async def test_cancelled_tool_call_is_audited_and_cannot_finish_normally(
+    store_factory,
+) -> None:
+    clock = MutableClock()
+    provider = CancellationProvider()
+    service = _service(
+        store_factory,
+        provider,
+        [_policy()],
+        clock,
+    )
+    handle = service.begin(_request())
+    task = asyncio.create_task(
+        _search(service, handle.session_id)
+    )
+    await provider.started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await provider.cancelled.wait()
+
+    snapshot = service.inspect(handle.session_id)
+    assert snapshot.state is DecisionSearchSessionState.ABORTED
+    assert snapshot.budget.tool_calls_used == 1
+    assert len(snapshot.tool_trace) == 1
+    assert snapshot.tool_trace[0].status is ToolCallStatus.FAILED
+    assert (
+        snapshot.tool_trace[0].error_code
+        == "decision_search_tool_call_cancelled"
+    )
+    assert len(snapshot.access_trace) == 1
+    assert snapshot.access_trace[0].reason_codes == (
+        "decision_search_tool_call_cancelled",
+    )
+
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        await _search(
+            service,
+            handle.session_id,
+            fields=("count",),
+        )
+
+    finished = service.finish(handle.session_id)
+    assert finished.state is DecisionSearchSessionState.ABORTED
+    assert finished.tool_trace == snapshot.tool_trace
+    assert finished.access_trace == snapshot.access_trace
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        service.inspect(handle.session_id)
