@@ -39,7 +39,7 @@ HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256 = {
         "989c29458d67f6e9089749b7eb41c3ac8d68843fa0ed0a8327857cfb0a3631a8"
     ),
     "search_wearable": (
-        "ea247ecc411831aad19a5ea485fe8a54e761368ebbe102e0c6379e9b65556ba2"
+        "1c3bc4752374ccbc39420a2860e2fcc1b51a016104c7edace56c07f606bcee7c"
     ),
 }
 
