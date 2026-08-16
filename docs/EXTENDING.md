@@ -21,8 +21,11 @@ mechanism. See `docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`.
 
 Skills are markdown instruction files the agent loads when planning, capturing,
 or presenting an answer. Each lives in `skills/<skill-name>/SKILL.md` and follows the
-vendor format (see the five existing skills as templates —
-`skills/healthmes-planner/SKILL.md` is the richest example).
+vendor format. Use the five reviewed read-only decision skills as templates:
+`healthmes-wellness-decision`, `healthmes-nutrition-decision`,
+`healthmes-caffeine`, `healthmes-sleep`, and `healthmes-stress`.
+`healthmes-planner` is a separate bounded command-workflow example; it is not
+accepted by the read-only wellness Skill catalog.
 
 ```markdown
 ---
@@ -54,10 +57,12 @@ Ground rules for skill authors:
   bounded HealthMes MCP tools so returned source references can be validated.
 - Do not instruct the runtime to call `record_decision` for every lookup.
   HealthMes stores a compact decision only for behavior-changing actions,
-  material risk warnings, actual mutations, or an explicit
-  `persistence_requested: true` request. A simple source-backed lookup remains
-  unpersisted by default. The runtime's self-reported persistence intent cannot
-  override this server-owned classifier.
+  material risk warnings, or an explicit `persistence_requested: true`
+  request. A simple source-backed lookup remains unpersisted by default. An
+  actual mutation is audited by its separate command workflow and is not a
+  persistence reason for the read-only wellness finalizer. The runtime's
+  self-reported persistence intent cannot override this server-owned
+  classifier.
 - **Respect confidence**: the tools return `confidence` / `coverage` /
   `insufficient_data` honestly; skills must gate advice on them.
 - Multiple skills are welcome — one file per clinical question keeps them
@@ -158,10 +163,12 @@ open http://localhost:8100/docs         # REST playground (OpenAPI)
   PY
   ```
 
-- **Decision audit**: HealthMes persists compact records for behavior-changing
-  recommendations, mutations, material risk warnings, and explicitly tracked
-  decisions. Simple lookups remain unpersisted by default. Open
-  `http://localhost:8100/decisions` to review retained records and challenge
-  the judgment.
+- **Decision audit**: HealthMes persists compact DecisionRecords for
+  behavior-changing recommendations, material risk warnings, and explicitly
+  tracked decisions. Simple lookups remain unpersisted by default. Actual
+  mutations keep their audit in the separate command workflow rather than the
+  read-only wellness DecisionRecord classifier. Open
+  `http://localhost:8100/decisions` to review retained decision records and
+  challenge the judgment.
 - **Regression**: `make mac-test` — add one test per metric with a
   hand-computed vector; that is the contract your metric keeps forever.

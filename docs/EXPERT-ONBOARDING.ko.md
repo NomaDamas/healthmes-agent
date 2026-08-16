@@ -69,18 +69,21 @@
    Wearables 도구가 없다.
 3. 필수 규칙: ① REST 직접 호출 지시 금지(MCP만) ② mutation 도구 호출 금지
    ③ confidence 게이트 ④ 알림 문법(관찰→근거→제안) 준수. source 검증 뒤
-   행동 변경 제안, 실제 mutation, 중요 위험 경고 또는 사용자가 명시적으로
-   추적을 요청한 판단만 compact하게 저장한다. 단순 조회는 source가 있어도
-   기본 미저장이다. 모델이 스스로 저장 의도를 표시해도 HealthMes의 서버 소유
-   분류기를 우회할 수 없다.
+   행동 변경 제안, 중요 위험 경고 또는 사용자가 명시적으로 추적을 요청한
+   판단만 compact DecisionRecord로 저장한다. 단순 조회는 source가 있어도 기본
+   미저장이다. 실제 mutation은 별도 command workflow가 자체 audit를 소유하며
+   read-only wellness finalizer의 저장 사유가 아니다. 모델이 스스로 저장 의도를
+   표시해도 HealthMes의 서버 소유 분류기를 우회할 수 없다.
 4. 설치: `uv run python scripts/bootstrap.py` (재실행하면 내용 재동기화)
 5. 검토가 끝난 Skill은 HealthMes의 read-only wellness catalog에 등록한다.
    선제 알림과 정기 브리핑도 같은 internal DecisionRequest service에서 이 catalog를
    사용해야 하며 별도 Hermes 직접 판단 경로를 만들지 않는다.
 
-기존 예시 5종이 최고의 교재입니다: `skills/healthmes-planner/`(가장 풍부),
-`healthmes-capture/`, `healthmes-sleep/`, `healthmes-stress/`,
-`doctor-visit-summary/`.
+read-only wellness Skill 작성에는 catalog가 검토한 5종을 교재로 사용합니다:
+`healthmes-wellness-decision`, `healthmes-nutrition-decision`,
+`healthmes-caffeine`, `healthmes-sleep`, `healthmes-stress`.
+`healthmes-planner`는 별도 bounded command workflow의 예시이며 read-only
+wellness Skill catalog에는 등록할 수 없습니다.
 
 ## 3. 새 메트릭(도구) 추가 (파이썬 — 엔지니어와 페어 가능)
 
@@ -110,10 +113,10 @@ make mac-setup && make mac-run     # sqlite로 전체 서비스 기동 (:8100)
   `hermes chat`은 vendor runtime 진단에는 쓸 수 있지만 HealthMes ingress,
   source 검증과 finalization 정책을 우회하므로 제품 wellness 동작을 검증하는
   경로가 아니다.
-- **판단 감사**: 행동 변경 제안, mutation, 중요 위험 경고와 명시적 추적 대상만
-  compact record로 남기고 단순 조회는 기본 미저장한다. 현재 build가 저장한
-  기록은 `http://localhost:8100/decisions`에서 source reference를 따라가며
-  검토한다.
+- **판단 감사**: 행동 변경 제안, 중요 위험 경고와 명시적 추적 대상만 compact
+  DecisionRecord로 남기고 단순 조회는 기본 미저장한다. 실제 mutation은 별도
+  command workflow의 audit에서 검토한다. 현재 build가 저장한 판단 기록은
+  `http://localhost:8100/decisions`에서 source reference를 따라가며 검토한다.
 - **회귀 고정**: 맞다고 확인한 케이스는 손계산 벡터로 테스트에 박제
 
 ### 4b. 실기기 QA (본인 워치로)
