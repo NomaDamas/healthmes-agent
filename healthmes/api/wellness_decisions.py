@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+from collections.abc import Awaitable
 from datetime import date
 from typing import Literal
 
@@ -204,6 +206,49 @@ def _service_unavailable(result: DecisionResult) -> tuple[str, ...]:
     )
 
 
+async def _wait_for_http_disconnect(request: Request) -> None:
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
+
+
+async def _run_until_http_disconnect[T](
+    request: Request,
+    operation: Awaitable[T],
+) -> T:
+    """Cancel active reasoning when the actual ASGI client disconnects."""
+
+    decision_task = asyncio.create_task(operation)
+    disconnect_task = asyncio.create_task(
+        _wait_for_http_disconnect(request)
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            (decision_task, disconnect_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if decision_task in done:
+            return decision_task.result()
+
+        decision_task.cancel()
+        try:
+            await decision_task
+        except asyncio.CancelledError:
+            pass
+        raise asyncio.CancelledError
+    finally:
+        if not decision_task.done():
+            decision_task.cancel()
+        if not disconnect_task.done():
+            disconnect_task.cancel()
+        await asyncio.gather(
+            decision_task,
+            disconnect_task,
+            return_exceptions=True,
+        )
+
+
 @router.get(
     "/settings",
     response_model=DecisionDomainSettingsOutput,
@@ -327,7 +372,10 @@ async def create_wellness_decision(
 
     decision_service = request.app.state.decision_service
     try:
-        result = await decision_service.ask_wellness(service_request)
+        result = await _run_until_http_disconnect(
+            request,
+            decision_service.ask_wellness(service_request),
+        )
     except ValidationError as exc:
         raise APIError(
             status.HTTP_422_UNPROCESSABLE_CONTENT,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
@@ -131,6 +132,19 @@ class BusyDecisionEngine:
         raise DecisionEngineBusyError(
             "HealthMes decision engine is at capacity"
         )
+
+
+class DisconnectAwareDecisionEngine:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def ask_wellness(self, _request):
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled.set()
 
 
 class FailedRuntimeDecisionEngine:
@@ -376,6 +390,77 @@ async def test_rest_disconnect_cancels_hermes_responses_stream(
         await asyncio.wait_for(search_service.aborted.wait(), timeout=1)
     finally:
         await engine.aclose()
+
+
+@pytest.mark.asyncio
+async def test_actual_asgi_disconnect_cancels_decision_reasoning(
+    settings,
+) -> None:
+    app = create_app(_secured_settings(settings))
+    engine = DisconnectAwareDecisionEngine()
+    app.state.decision_engine = engine
+    request_body = json.dumps(
+        {"question": "Should I keep working?"}
+    ).encode()
+    receive_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    await receive_queue.put(
+        {
+            "type": "http.request",
+            "body": request_body,
+            "more_body": False,
+        }
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return await receive_queue.get()
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/wellness-decisions",
+        "raw_path": b"/v1/wellness-decisions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"authorization", f"Bearer {TOKEN}".encode()),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(request_body)).encode()),
+        ],
+        "client": ("127.0.0.1", 43123),
+        "server": ("127.0.0.1", 8100),
+    }
+    request_task = asyncio.create_task(
+        app(scope, receive, send)  # type: ignore[arg-type]
+    )
+    started_task = asyncio.create_task(engine.started.wait())
+    done, _pending = await asyncio.wait(
+        (request_task, started_task),
+        timeout=1,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if request_task in done:
+        request_task.result()
+    assert started_task in done, {
+        "sent": sent,
+        "request_stack": [
+            f"{frame.f_code.co_filename}:{frame.f_lineno}"
+            for frame in request_task.get_stack()
+        ],
+    }
+
+    await receive_queue.put({"type": "http.disconnect"})
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(request_task, timeout=1)
+    await asyncio.wait_for(engine.cancelled.wait(), timeout=1)
+    assert sent == []
 
 
 def test_rest_contract_is_server_owned_and_hides_internal_trace(
