@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Event
@@ -64,6 +64,8 @@ _MAX_MODELS_RESPONSE_BYTES = 256_000
 _MAX_SESSIONS_RESPONSE_BYTES = 1_000_000
 _MAX_RESPONSES_RESPONSE_BYTES = 2_000_000
 _MAX_TOOL_OUTPUT_BYTES = 1_000_000
+_MAX_SSE_EVENT_BYTES = 1_250_000
+_MAX_SSE_EVENTS = 2_048
 _MAX_HERMES_SESSION_ID_LENGTH = 256
 _SESSION_ID_CONTROL = re.compile(r"[\r\n\x00]")
 
@@ -216,7 +218,7 @@ class HermesAssistantMessageItem(BaseModel):
 
 
 class HermesResponsesResponse(BaseModel):
-    """Strict non-streaming response emitted by vendored Hermes."""
+    """Strict completed response reconstructed from Hermes SSE events."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -246,7 +248,7 @@ class HermesDecisionDraftEnvelope(BaseModel):
 
 @dataclass(frozen=True, slots=True)
 class HermesResponsesHttpResult:
-    """Bounded JSON body plus the request-scoped Hermes session id."""
+    """Bounded reconstructed transcript plus its Hermes session id."""
 
     payload: dict[str, Any]
     session_id: str
@@ -340,19 +342,14 @@ class HermesHttpResponsesTransport:
             raise HermesResponsesTransportError(
                 "hermes_responses_deadline_expired"
             )
-        body, headers = await self._request_json(
-            "POST",
-            HERMES_RESPONSES_PATH,
-            json_body=dict(payload),
+        body = dict(payload)
+        if body.get("stream") is not True or body.get("store") is not False:
+            raise HermesResponsesTransportError(
+                "hermes_streaming_contract_required"
+            )
+        return await self._request_sse_response(
+            body,
             timeout_seconds=bounded_timeout,
-            max_response_bytes=_MAX_RESPONSES_RESPONSE_BYTES,
-        )
-        session_id = _validated_session_id(
-            headers.get("x-hermes-session-id")
-        )
-        return HermesResponsesHttpResult(
-            payload=body,
-            session_id=session_id,
         )
 
     async def list_sessions(
@@ -487,6 +484,664 @@ class HermesHttpResponsesTransport:
                 "hermes_response_invalid"
             )
         return normalized.value, response.headers
+
+    async def _request_sse_response(
+        self,
+        json_body: Mapping[str, Any],
+        *,
+        timeout_seconds: float,
+    ) -> HermesResponsesHttpResult:
+        headers = {
+            "Accept": "text/event-stream",
+            "Accept-Encoding": "identity",
+            "Content-Type": "application/json",
+        }
+        if self._api_key is not None:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                headers=headers,
+                follow_redirects=False,
+                transport=self._http_transport,
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    HERMES_RESPONSES_PATH,
+                    json=dict(json_body),
+                    timeout=timeout_seconds,
+                ) as response:
+                    if response.is_redirect:
+                        raise HermesResponsesTransportError(
+                            "hermes_redirect_rejected"
+                        )
+                    if (
+                        response.status_code < 200
+                        or response.status_code >= 300
+                    ):
+                        raise HermesResponsesTransportError(
+                            _http_error_code(response.status_code)
+                        )
+                    content_encoding = response.headers.get(
+                        "content-encoding",
+                        "",
+                    ).strip().lower()
+                    if content_encoding not in {"", "identity"}:
+                        raise HermesResponsesTransportError(
+                            "hermes_response_encoding_rejected"
+                        )
+                    content_type = response.headers.get(
+                        "content-type",
+                        "",
+                    ).split(";", 1)[0].strip().lower()
+                    if content_type != "text/event-stream":
+                        raise HermesResponsesTransportError(
+                            "hermes_sse_content_type_invalid"
+                        )
+                    content_length = response.headers.get("content-length")
+                    if content_length is not None:
+                        try:
+                            declared = int(content_length)
+                        except ValueError as exc:
+                            raise HermesResponsesTransportError(
+                                "hermes_response_invalid"
+                            ) from exc
+                        if declared > _MAX_RESPONSES_RESPONSE_BYTES:
+                            raise HermesResponsesTransportError(
+                                "hermes_response_too_large"
+                            )
+                    session_id = _validated_session_id(
+                        response.headers.get("x-hermes-session-id")
+                    )
+                    accumulator = _HermesResponsesSSEAccumulator()
+                    async for event_name, event_data in _iter_sse_events(
+                        response
+                    ):
+                        accumulator.consume(event_name, event_data)
+                    return HermesResponsesHttpResult(
+                        payload=accumulator.finish(),
+                        session_id=session_id,
+                    )
+        except asyncio.CancelledError:
+            # Exiting both stream contexts closes the socket. Vendored Hermes
+            # treats that disconnect as an agent.interrupt() signal.
+            raise
+        except HermesResponsesError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise HermesResponsesTransportError(
+                "hermes_responses_timeout"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HermesResponsesTransportError(
+                "hermes_responses_unavailable"
+            ) from exc
+
+
+class _HermesResponsesSSEAccumulator:
+    """Rebuild the untruncated current-turn transcript from SSE done events."""
+
+    def __init__(self) -> None:
+        self._next_sequence = 0
+        self._created: dict[str, Any] | None = None
+        self._terminal: HermesResponsesResponse | None = None
+        self._done_items: list[dict[str, Any]] = []
+        self._added_items: dict[int, tuple[str, str]] = {}
+        self._done_indexes: set[int] = set()
+        self._text_done: tuple[str, int, str] | None = None
+
+    def consume(self, event_name: str, raw_data: str) -> None:
+        if self._terminal is not None:
+            raise HermesResponsesContractError(
+                "hermes_sse_event_after_terminal"
+            )
+        event = _parse_sse_json(raw_data)
+        if event.get("type") != event_name:
+            raise HermesResponsesContractError(
+                "hermes_sse_event_type_mismatch"
+            )
+        sequence = event.get("sequence_number")
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence != self._next_sequence
+        ):
+            raise HermesResponsesContractError(
+                "hermes_sse_sequence_invalid"
+            )
+        self._next_sequence += 1
+        if self._next_sequence > _MAX_SSE_EVENTS:
+            raise HermesResponsesTransportError(
+                "hermes_response_too_large"
+            )
+
+        if event_name == "response.created":
+            self._consume_created(event)
+            return
+        if self._created is None:
+            raise HermesResponsesContractError(
+                "hermes_sse_created_missing"
+            )
+        if event_name == "response.output_item.added":
+            self._consume_item_added(event)
+        elif event_name == "response.output_item.done":
+            self._consume_item_done(event)
+        elif event_name == "response.output_text.delta":
+            self._consume_text_delta(event)
+        elif event_name == "response.output_text.done":
+            self._consume_text_done(event)
+        elif event_name == "response.completed":
+            self._consume_completed(event)
+        elif event_name == "response.failed":
+            self._consume_failed(event)
+        else:
+            raise HermesResponsesContractError(
+                "hermes_sse_event_not_allowed"
+            )
+
+    def finish(self) -> dict[str, Any]:
+        terminal = self._terminal
+        if self._created is None or terminal is None:
+            raise HermesResponsesContractError(
+                "hermes_sse_terminal_missing"
+            )
+        if not self._done_items:
+            raise HermesResponsesContractError(
+                "hermes_sse_transcript_missing"
+            )
+        if self._done_items[-1].get("type") != "message":
+            raise HermesResponsesContractError(
+                "hermes_final_message_invalid"
+            )
+        if self._text_done is None:
+            raise HermesResponsesContractError(
+                "hermes_sse_text_done_missing"
+            )
+        payload = terminal.model_dump(mode="python", round_trip=True)
+        payload["output"] = [
+            dict(item) for item in self._done_items
+        ]
+        return payload
+
+    def _consume_created(self, event: Mapping[str, Any]) -> None:
+        if self._created is not None or set(event) != {
+            "type",
+            "response",
+            "sequence_number",
+        }:
+            raise HermesResponsesContractError(
+                "hermes_sse_created_invalid"
+            )
+        response = _strict_mapping(
+            event.get("response"),
+            code="hermes_sse_created_invalid",
+        )
+        if set(response) != {
+            "id",
+            "object",
+            "status",
+            "created_at",
+            "model",
+            "output",
+        }:
+            raise HermesResponsesContractError(
+                "hermes_sse_created_invalid"
+            )
+        response_id = response.get("id")
+        model = response.get("model")
+        created_at = response.get("created_at")
+        if (
+            not isinstance(response_id, str)
+            or not 1 <= len(response_id) <= 255
+            or response.get("object") != "response"
+            or response.get("status") != "in_progress"
+            or isinstance(created_at, bool)
+            or not isinstance(created_at, int)
+            or created_at < 0
+            or not isinstance(model, str)
+            or not 1 <= len(model) <= 255
+            or response.get("output") != []
+        ):
+            raise HermesResponsesContractError(
+                "hermes_sse_created_invalid"
+            )
+        self._created = dict(response)
+
+    def _consume_item_added(self, event: Mapping[str, Any]) -> None:
+        if set(event) != {
+            "type",
+            "output_index",
+            "item",
+            "sequence_number",
+        }:
+            raise HermesResponsesContractError(
+                "hermes_sse_item_invalid"
+            )
+        index = _sse_output_index(event)
+        item = _strict_mapping(
+            event.get("item"),
+            code="hermes_sse_item_invalid",
+        )
+        item_id = item.get("id")
+        item_type = item.get("type")
+        if (
+            index in self._added_items
+            or not isinstance(item_id, str)
+            or not 1 <= len(item_id) <= 255
+            or item_type
+            not in {"function_call", "function_call_output", "message"}
+        ):
+            raise HermesResponsesContractError(
+                "hermes_sse_item_invalid"
+            )
+        self._added_items[index] = (item_id, item_type)
+
+    def _consume_item_done(self, event: Mapping[str, Any]) -> None:
+        if set(event) != {
+            "type",
+            "output_index",
+            "item",
+            "sequence_number",
+        }:
+            raise HermesResponsesContractError(
+                "hermes_sse_item_invalid"
+            )
+        index = _sse_output_index(event)
+        item = _strict_mapping(
+            event.get("item"),
+            code="hermes_sse_item_invalid",
+        )
+        item_id = item.get("id")
+        item_type = item.get("type")
+        if (
+            index in self._done_indexes
+            or self._added_items.get(index) != (item_id, item_type)
+        ):
+            raise HermesResponsesContractError(
+                "hermes_sse_item_invalid"
+            )
+        if item_type == "function_call":
+            normalized = _normalize_sse_function_call(item)
+        elif item_type == "function_call_output":
+            normalized = _normalize_sse_function_output(item)
+        elif item_type == "message":
+            normalized = _normalize_sse_message(item)
+            if self._text_done is None:
+                raise HermesResponsesContractError(
+                    "hermes_sse_text_done_missing"
+                )
+            text_item_id, text_index, text = self._text_done
+            if (
+                text_item_id != item_id
+                or text_index != index
+                or normalized["content"][0]["text"] != text
+            ):
+                raise HermesResponsesContractError(
+                    "hermes_sse_text_mismatch"
+                )
+        else:
+            raise HermesResponsesContractError(
+                "hermes_sse_item_invalid"
+            )
+        if any(
+            existing.get("type") == "message"
+            for existing in self._done_items
+        ):
+            raise HermesResponsesContractError(
+                "hermes_transcript_order_invalid"
+            )
+        self._done_indexes.add(index)
+        self._done_items.append(normalized)
+
+    def _consume_text_delta(self, event: Mapping[str, Any]) -> None:
+        if set(event) != {
+            "type",
+            "item_id",
+            "output_index",
+            "content_index",
+            "delta",
+            "logprobs",
+            "sequence_number",
+        }:
+            raise HermesResponsesContractError(
+                "hermes_sse_text_invalid"
+            )
+        _validate_sse_text_coordinates(event)
+        delta = event.get("delta")
+        if not isinstance(delta, str):
+            raise HermesResponsesContractError(
+                "hermes_sse_text_invalid"
+            )
+
+    def _consume_text_done(self, event: Mapping[str, Any]) -> None:
+        if set(event) != {
+            "type",
+            "item_id",
+            "output_index",
+            "content_index",
+            "text",
+            "logprobs",
+            "sequence_number",
+        }:
+            raise HermesResponsesContractError(
+                "hermes_sse_text_invalid"
+            )
+        item_id, index = _validate_sse_text_coordinates(event)
+        text = event.get("text")
+        if (
+            self._text_done is not None
+            or not isinstance(text, str)
+            or not 1 <= len(text) <= 64_000
+        ):
+            raise HermesResponsesContractError(
+                "hermes_sse_text_invalid"
+            )
+        self._text_done = (item_id, index, text)
+
+    def _consume_completed(self, event: Mapping[str, Any]) -> None:
+        if set(event) != {
+            "type",
+            "response",
+            "sequence_number",
+        }:
+            raise HermesResponsesContractError(
+                "hermes_sse_terminal_invalid"
+            )
+        try:
+            terminal = strict_model_validate(
+                HermesResponsesResponse,
+                event.get("response"),
+            )
+        except Exception as exc:
+            raise HermesResponsesContractError(
+                "hermes_sse_terminal_invalid"
+            ) from exc
+        created = self._created
+        if created is None or (
+            terminal.id != created["id"]
+            or terminal.created_at != created["created_at"]
+            or terminal.model != created["model"]
+        ):
+            raise HermesResponsesContractError(
+                "hermes_sse_terminal_mismatch"
+            )
+        if set(self._added_items) != self._done_indexes:
+            raise HermesResponsesContractError(
+                "hermes_sse_item_incomplete"
+            )
+        self._terminal = terminal
+
+    def _consume_failed(self, event: Mapping[str, Any]) -> None:
+        if set(event) != {
+            "type",
+            "response",
+            "sequence_number",
+        }:
+            raise HermesResponsesContractError(
+                "hermes_sse_terminal_invalid"
+            )
+        response = _strict_mapping(
+            event.get("response"),
+            code="hermes_sse_terminal_invalid",
+        )
+        created = self._created
+        if (
+            created is None
+            or response.get("id") != created["id"]
+            or response.get("object") != "response"
+            or response.get("status") != "failed"
+            or response.get("created_at") != created["created_at"]
+            or response.get("model") != created["model"]
+        ):
+            raise HermesResponsesContractError(
+                "hermes_sse_terminal_mismatch"
+            )
+        raise HermesResponsesContractError("hermes_response_failed")
+
+
+async def _iter_sse_events(
+    response: httpx.Response,
+) -> AsyncIterator[tuple[str, str]]:
+    total_bytes = 0
+    pending = bytearray()
+    event_name: str | None = None
+    data_lines: list[bytes] = []
+    event_bytes = 0
+
+    async for chunk in response.aiter_bytes():
+        total_bytes += len(chunk)
+        if total_bytes > _MAX_RESPONSES_RESPONSE_BYTES:
+            raise HermesResponsesTransportError(
+                "hermes_response_too_large"
+            )
+        pending.extend(chunk)
+        while True:
+            newline = pending.find(b"\n")
+            if newline < 0:
+                if len(pending) + event_bytes > _MAX_SSE_EVENT_BYTES:
+                    raise HermesResponsesTransportError(
+                        "hermes_response_too_large"
+                    )
+                break
+            raw_line = bytes(pending[:newline])
+            del pending[: newline + 1]
+            if raw_line.endswith(b"\r"):
+                raw_line = raw_line[:-1]
+            event_bytes += len(raw_line) + 1
+            if event_bytes > _MAX_SSE_EVENT_BYTES:
+                raise HermesResponsesTransportError(
+                    "hermes_response_too_large"
+                )
+            if not raw_line:
+                if event_name is None and not data_lines:
+                    event_bytes = 0
+                    continue
+                if event_name is None or not data_lines:
+                    raise HermesResponsesContractError(
+                        "hermes_sse_frame_invalid"
+                    )
+                try:
+                    data = b"\n".join(data_lines).decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise HermesResponsesContractError(
+                        "hermes_sse_frame_invalid"
+                    ) from exc
+                yield event_name, data
+                event_name = None
+                data_lines = []
+                event_bytes = 0
+                continue
+            if raw_line.startswith(b":"):
+                continue
+            field, separator, value = raw_line.partition(b":")
+            if not separator:
+                raise HermesResponsesContractError(
+                    "hermes_sse_frame_invalid"
+                )
+            if value.startswith(b" "):
+                value = value[1:]
+            if field == b"event":
+                if event_name is not None:
+                    raise HermesResponsesContractError(
+                        "hermes_sse_frame_invalid"
+                    )
+                try:
+                    event_name = value.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise HermesResponsesContractError(
+                        "hermes_sse_frame_invalid"
+                    ) from exc
+                if not event_name:
+                    raise HermesResponsesContractError(
+                        "hermes_sse_frame_invalid"
+                    )
+            elif field == b"data":
+                data_lines.append(value)
+            else:
+                raise HermesResponsesContractError(
+                    "hermes_sse_frame_invalid"
+                )
+    if pending or event_name is not None or data_lines or event_bytes:
+        raise HermesResponsesContractError(
+            "hermes_sse_frame_incomplete"
+        )
+
+
+def _parse_sse_json(raw: str) -> dict[str, Any]:
+    try:
+        decoded = json.loads(raw)
+        normalized = normalize_untrusted_json(
+            decoded,
+            max_bytes=_MAX_SSE_EVENT_BYTES,
+        )
+    except Exception as exc:
+        raise HermesResponsesContractError(
+            "hermes_sse_event_invalid"
+        ) from exc
+    if type(normalized.value) is not dict:
+        raise HermesResponsesContractError(
+            "hermes_sse_event_invalid"
+        )
+    return normalized.value
+
+
+def _strict_mapping(
+    value: Any,
+    *,
+    code: str,
+) -> Mapping[str, Any]:
+    if type(value) is not dict or any(
+        not isinstance(key, str) for key in value
+    ):
+        raise HermesResponsesContractError(code)
+    return value
+
+
+def _sse_output_index(event: Mapping[str, Any]) -> int:
+    index = event.get("output_index")
+    if (
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index <= 255
+    ):
+        raise HermesResponsesContractError(
+            "hermes_sse_item_invalid"
+        )
+    return index
+
+
+def _validate_sse_text_coordinates(
+    event: Mapping[str, Any],
+) -> tuple[str, int]:
+    item_id = event.get("item_id")
+    index = _sse_output_index(event)
+    if (
+        not isinstance(item_id, str)
+        or not 1 <= len(item_id) <= 255
+        or event.get("content_index") != 0
+        or event.get("logprobs") != []
+    ):
+        raise HermesResponsesContractError(
+            "hermes_sse_text_invalid"
+        )
+    return item_id, index
+
+
+def _normalize_sse_function_call(
+    item: Mapping[str, Any],
+) -> dict[str, Any]:
+    if set(item) != {
+        "id",
+        "type",
+        "status",
+        "name",
+        "call_id",
+        "arguments",
+    } or item.get("status") != "completed":
+        raise HermesResponsesContractError(
+            "hermes_sse_item_invalid"
+        )
+    payload = {
+        key: item[key]
+        for key in ("type", "name", "arguments", "call_id")
+    }
+    try:
+        return strict_model_validate(
+            HermesFunctionCallItem,
+            payload,
+        ).model_dump(mode="python")
+    except Exception as exc:
+        raise HermesResponsesContractError(
+            "hermes_sse_item_invalid"
+        ) from exc
+
+
+def _normalize_sse_function_output(
+    item: Mapping[str, Any],
+) -> dict[str, Any]:
+    if set(item) != {
+        "id",
+        "type",
+        "call_id",
+        "output",
+        "status",
+    } or item.get("status") != "completed":
+        raise HermesResponsesContractError(
+            "hermes_sse_item_invalid"
+        )
+    raw_output = item.get("output")
+    if (
+        not isinstance(raw_output, list)
+        or len(raw_output) != 1
+        or type(raw_output[0]) is not dict
+        or set(raw_output[0]) != {"type", "text"}
+        or raw_output[0].get("type") != "input_text"
+    ):
+        raise HermesResponsesContractError(
+            "hermes_sse_item_invalid"
+        )
+    payload = {
+        "type": "function_call_output",
+        "call_id": item.get("call_id"),
+        "output": raw_output[0].get("text"),
+    }
+    try:
+        return strict_model_validate(
+            HermesFunctionOutputItem,
+            payload,
+        ).model_dump(mode="python")
+    except Exception as exc:
+        raise HermesResponsesContractError(
+            "hermes_sse_item_invalid"
+        ) from exc
+
+
+def _normalize_sse_message(
+    item: Mapping[str, Any],
+) -> dict[str, Any]:
+    if set(item) != {
+        "id",
+        "type",
+        "status",
+        "role",
+        "content",
+    } or item.get("status") != "completed":
+        raise HermesResponsesContractError(
+            "hermes_sse_item_invalid"
+        )
+    payload = {
+        key: item[key]
+        for key in ("type", "role", "content")
+    }
+    try:
+        return strict_model_validate(
+            HermesAssistantMessageItem,
+            payload,
+        ).model_dump(mode="python")
+    except Exception as exc:
+        raise HermesResponsesContractError(
+            "hermes_sse_item_invalid"
+        ) from exc
 
 
 class HermesResponsesDecisionAgent:
@@ -1007,7 +1662,7 @@ def _responses_request(
             }
         ],
         "store": False,
-        "stream": False,
+        "stream": True,
     }
     if profile_digest is not None:
         payload["metadata"] = {

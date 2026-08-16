@@ -218,6 +218,108 @@ def _final_response(
     }
 
 
+def _sse_body(response: dict) -> bytes:
+    sequence = 0
+    frames: list[str] = []
+
+    def emit(event_type: str, payload: dict) -> None:
+        nonlocal sequence
+        event = {
+            "type": event_type,
+            **payload,
+            "sequence_number": sequence,
+        }
+        sequence += 1
+        frames.append(
+            f"event: {event_type}\n"
+            f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+        )
+
+    emit(
+        "response.created",
+        {
+            "response": {
+                "id": response["id"],
+                "object": "response",
+                "status": "in_progress",
+                "created_at": response["created_at"],
+                "model": response["model"],
+                "output": [],
+            }
+        },
+    )
+    for output_index, item in enumerate(response["output"]):
+        item_id = f"item-{output_index}"
+        item_type = item["type"]
+        if item_type == "function_call":
+            added = {
+                "id": item_id,
+                **item,
+                "status": "in_progress",
+            }
+            done = {**added, "status": "completed"}
+        elif item_type == "function_call_output":
+            output = [
+                {
+                    "type": "input_text",
+                    "text": item["output"],
+                }
+            ]
+            added = {
+                "id": item_id,
+                "type": item_type,
+                "call_id": item["call_id"],
+                "output": output,
+                "status": "completed",
+            }
+            done = dict(added)
+        else:
+            text = item["content"][0]["text"]
+            added = {
+                "id": item_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            }
+            emit(
+                "response.output_item.added",
+                {"output_index": output_index, "item": added},
+            )
+            emit(
+                "response.output_text.done",
+                {
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "text": text,
+                    "logprobs": [],
+                },
+            )
+            done = {
+                "id": item_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": item["content"],
+            }
+            emit(
+                "response.output_item.done",
+                {"output_index": output_index, "item": done},
+            )
+            continue
+        emit(
+            "response.output_item.added",
+            {"output_index": output_index, "item": added},
+        )
+        emit(
+            "response.output_item.done",
+            {"output_index": output_index, "item": done},
+        )
+    emit("response.completed", {"response": response})
+    return "".join(frames).encode()
+
+
 def _empty_snapshot() -> SimpleNamespace:
     return SimpleNamespace(
         session_id=DECISION_SESSION_ID,
@@ -471,7 +573,7 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
     assert len(transport.response_calls) == 1
     payload = transport.response_calls[0]
     assert payload["store"] is False
-    assert payload["stream"] is False
+    assert payload["stream"] is True
     assert "previous_response_id" not in payload
     assert "conversation" not in payload
     serialized_request = json.loads(payload["input"][0]["content"])
@@ -1408,15 +1510,21 @@ async def test_http_transport_uses_only_documented_responses_endpoints() -> None
         if request.url.path == HERMES_RESPONSES_PATH:
             payload = json.loads(request.content)
             assert payload["store"] is False
+            assert payload["stream"] is True
+            assert request.headers["accept"] == "text/event-stream"
+            response = _final_response(
+                {
+                    "status": "completed",
+                    "answer": "Take a short break.",
+                }
+            )
             return httpx.Response(
                 200,
-                headers={"X-Hermes-Session-Id": HERMES_SESSION_ID},
-                json=_final_response(
-                    {
-                        "status": "completed",
-                        "answer": "Take a short break.",
-                    }
-                ),
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "X-Hermes-Session-Id": HERMES_SESSION_ID,
+                },
+                content=_sse_body(response),
             )
         if request.url.path == "/api/sessions":
             assert request.url.params["source"] == "api_server"
@@ -1448,7 +1556,7 @@ async def test_http_transport_uses_only_documented_responses_endpoints() -> None
             "model": MODEL,
             "input": "question",
             "store": False,
-            "stream": False,
+            "stream": True,
         },
         timeout_seconds=5,
     )
@@ -1467,6 +1575,71 @@ async def test_http_transport_uses_only_documented_responses_endpoints() -> None
             HERMES_SESSION_PATH.format(session_id=HERMES_SESSION_ID),
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_http_stream_close_propagates_timeout_cancellation() -> None:
+    stream_started = asyncio.Event()
+    stream_closed = asyncio.Event()
+
+    class BlockingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            created = {
+                "type": "response.created",
+                "response": {
+                    "id": "resp-timeout",
+                    "object": "response",
+                    "status": "in_progress",
+                    "created_at": int(NOW.timestamp()),
+                    "model": MODEL,
+                    "output": [],
+                },
+                "sequence_number": 0,
+            }
+            yield (
+                "event: response.created\n"
+                f"data: {json.dumps(created)}\n\n"
+            ).encode()
+            stream_started.set()
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            stream_closed.set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == HERMES_RESPONSES_PATH
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "X-Hermes-Session-Id": HERMES_SESSION_ID,
+            },
+            stream=BlockingStream(),
+        )
+
+    transport = HermesHttpResponsesTransport(
+        base_url="http://127.0.0.1:8644",
+        api_key="secret",
+        http_transport=httpx.MockTransport(handler),
+    )
+    task = asyncio.create_task(
+        transport.create_response(
+            {
+                "model": MODEL,
+                "input": "question",
+                "store": False,
+                "stream": True,
+            },
+            timeout_seconds=5,
+        )
+    )
+    await asyncio.wait_for(stream_started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await asyncio.wait_for(stream_closed.wait(), timeout=1)
 
 
 @pytest.mark.asyncio
