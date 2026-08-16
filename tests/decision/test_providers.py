@@ -552,6 +552,7 @@ async def test_activity_timeline_cursor_is_stable_and_filter_bound(
     assert repeated.next_cursor == first.next_cursor
     assert first.next_cursor is not None
     assert first.payload["records"][0]["record_id"] == str(events[0].id)
+    assert first.payload["count"] == len(first.payload["records"]) == 1
 
     second = await registry.execute(
         session,
@@ -560,6 +561,7 @@ async def test_activity_timeline_cursor_is_stable_and_filter_bound(
     )
     assert second.status is ContextStatus.OK
     assert second.payload["records"][0]["record_id"] == str(events[1].id)
+    assert second.payload["count"] == len(second.payload["records"]) == 1
     assert second.next_cursor is not None
 
     changed_filter = await registry.execute(
@@ -578,6 +580,25 @@ async def test_activity_timeline_cursor_is_stable_and_filter_bound(
     )
     assert tampered.status is ContextStatus.FAILED
     assert tampered.limitations == ["invalid_provider_query"]
+
+    date_only = await registry.execute(
+        session,
+        ContextQuery(
+            provider_id="activity",
+            capability="activity.timeline",
+            granularity="record",
+            privacy_level="identity",
+            limit=2,
+            parameters={
+                "date": "2026-08-10",
+                "platform": "macos",
+            },
+        ),
+        now=NOW,
+    )
+    assert date_only.status is ContextStatus.OK
+    assert date_only.payload["count"] == 2
+    assert len(date_only.payload["records"]) == 2
 
 
 async def test_nutrition_adapter_returns_only_structured_capture_context(
@@ -914,7 +935,11 @@ async def test_wearable_metric_cursor_is_stable_and_filter_bound(session):
         )
 
     first = await registry.execute(session, query(), now=NOW)
-    repeated = await registry.execute(session, query(), now=NOW)
+    repeated = await registry.execute(
+        session,
+        query(),
+        now=NOW + timedelta(seconds=1),
+    )
     assert first.status is ContextStatus.OK
     assert repeated.payload == first.payload
     assert repeated.next_cursor == first.next_cursor
@@ -923,7 +948,7 @@ async def test_wearable_metric_cursor_is_stable_and_filter_bound(session):
     second = await registry.execute(
         session,
         query(cursor=first.next_cursor),
-        now=NOW,
+        now=NOW + timedelta(seconds=2),
     )
     assert second.status is ContextStatus.OK
     assert (
@@ -1036,6 +1061,7 @@ async def test_calendar_detail_cursor_is_stable_and_omits_private_text(
     assert repeated.next_cursor == first.next_cursor
     assert first.next_cursor is not None
     assert first.payload["events"][0]["event_id"] == str(rows[0].id)
+    assert first.payload["count"] == len(first.payload["events"]) == 1
     assert "Private title" not in first.model_dump_json()
     assert "private-event" not in first.model_dump_json()
 
@@ -1046,6 +1072,7 @@ async def test_calendar_detail_cursor_is_stable_and_omits_private_text(
     )
     assert second.status is ContextStatus.OK
     assert second.payload["events"][0]["event_id"] == str(rows[1].id)
+    assert second.payload["count"] == len(second.payload["events"]) == 1
 
     changed_window = await registry.execute(
         session,

@@ -1775,8 +1775,9 @@ class ActivityContextProvider:
                     "source_record_id",
                 ),
                 limit_output_fields=("records",),
-                parameters=("cursor", "device_id", "platform"),
+                parameters=("date", "cursor", "device_id", "platform"),
                 parameter_specs=(
+                    _DATE_PARAMETER,
                     _CURSOR_PARAMETER,
                     _DEVICE_ID_PARAMETER,
                     _PLATFORM_PARAMETER,
@@ -1848,7 +1849,7 @@ class ActivityContextProvider:
             )
             raw = {
                 "status": "ok" if rows else "insufficient_data",
-                "count": len(rows),
+                "count": len(selected),
                 "records": [
                     _activity_detail_record(row)
                     for row in selected
@@ -2576,7 +2577,9 @@ class WearableContextProvider:
                 query=query,
                 namespace="wearable.metric-detail",
                 identity=lambda item: {
-                    "snapshot_event_id": str(snapshot.event_id),
+                    "snapshot_content_event_id": str(
+                        snapshot.content_event_id
+                    ),
                     "kind": item[0],
                     "metric": item[1],
                 },
@@ -3429,7 +3432,7 @@ class CalendarContextProvider:
             refs = _calendar_source_refs(selected)
             raw = {
                 "status": status,
-                "count": len(rows),
+                "count": len(selected),
                 "events": [
                     {
                         "event_id": str(row.id),
