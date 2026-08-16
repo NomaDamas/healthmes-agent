@@ -26,6 +26,9 @@ from healthmes.nutrition.vision import (
     create_vision_provider,
 )
 
+pytestmark = pytest.mark.usefixtures("legacy_fixture_clock")
+
+
 EXTRACTION = {
     "status": "insufficient_data",
     "confidence": "low",

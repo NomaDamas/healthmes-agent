@@ -30,6 +30,8 @@ from healthmes.storage import register_storage_object
 from healthmes.store import WellnessEvent
 from healthmes.trusted_session import issue_trusted_session_proof
 
+pytestmark = pytest.mark.usefixtures("legacy_fixture_clock")
+
 
 def _observation(observed_at: dt.datetime, media_path: str) -> NutritionObservation:
     return NutritionObservation(

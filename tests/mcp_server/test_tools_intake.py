@@ -20,6 +20,8 @@ from healthmes.nutrition.transcription import TranscriptionResult
 from healthmes.storage import register_storage_object
 from healthmes.trusted_session import issue_trusted_session_proof
 
+pytestmark = pytest.mark.usefixtures("legacy_fixture_clock")
+
 
 def _trusted(tool_name, arguments):
     proof = issue_trusted_session_proof(

@@ -52,6 +52,8 @@ from healthmes.activity.service import (
 from healthmes.storage import update_retention_policy
 from healthmes.store import AppUsageSample, WellnessEvent
 
+pytestmark = pytest.mark.usefixtures("legacy_fixture_clock")
+
 
 def _window_event(*, title: str, event_id: int | None = None) -> dict:
     event = {

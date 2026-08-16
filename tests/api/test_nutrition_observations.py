@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from sqlalchemy import select
 
 from healthmes.nutrition.contracts import (
@@ -22,6 +23,9 @@ from healthmes.nutrition.schema import (
 from healthmes.nutrition.vision import VisionInvalidOutput, VisionUnavailable
 from healthmes.storage import run_storage_maintenance
 from healthmes.store import RetentionPolicy, StorageObject, WellnessEvent
+
+pytestmark = pytest.mark.usefixtures("legacy_api_fixture_clock")
+
 
 JPEG = b"\xff\xd8\xff\xe0synthetic-coffee"
 
