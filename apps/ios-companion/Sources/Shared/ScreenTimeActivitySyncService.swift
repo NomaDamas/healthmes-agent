@@ -337,29 +337,57 @@ private enum ScreenTimeUploadFailurePolicy {
                 || statusCode == 425
                 || statusCode == 429
                 || statusCode >= 500
-                || code == "activity_write_conflict"
+                || (
+                    statusCode == 409
+                        && code == "activity_write_conflict"
+                )
         case .notPaired:
             return false
         }
     }
 
-    static func shouldDiscard(_ error: Error) -> Bool {
-        guard
-            case .server(_, let code, _, _)? =
-                error as? HealthMesAPIError
-        else {
+    static func shouldQuarantine(_ error: Error) -> Bool {
+        guard let error = error as? HealthMesAPIError else {
             return false
         }
-        return [
-            "activity_collection_blocked",
-            "activity_future_data",
-            "activity_outside_retention",
-            "activity_source_conflict",
-            "activity_source_mode_conflict",
-            "ios_exclusion_reapproval_required",
-            "snapshot_retry_response_unavailable",
-            "stale_collection_revision",
-        ].contains(code)
+        switch error {
+        case .server(let statusCode, let code, _, _):
+            if statusCode == 422 {
+                return true
+            }
+            if statusCode == 409 {
+                return code != "activity_write_conflict"
+            }
+            return [
+                "activity_collection_blocked",
+                "activity_future_data",
+                "activity_outside_retention",
+                "activity_source_conflict",
+                "activity_source_mode_conflict",
+                "ios_exclusion_reapproval_required",
+                "snapshot_retry_response_unavailable",
+                "stale_collection_revision",
+            ].contains(code)
+        case .httpStatus(let statusCode):
+            return statusCode == 409 || statusCode == 422
+        case .notPaired, .unauthorized, .transport, .decoding:
+            return false
+        }
+    }
+
+    static func statusCode(_ error: Error) -> Int? {
+        guard let error = error as? HealthMesAPIError else {
+            return nil
+        }
+        switch error {
+        case .server(let statusCode, _, _, _):
+            return statusCode
+        case .httpStatus(let statusCode),
+            .unauthorized(let statusCode):
+            return statusCode
+        case .notPaired, .transport, .decoding:
+            return nil
+        }
     }
 
     static func reason(_ error: Error) -> String {
@@ -392,6 +420,7 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
     private let transport: any ScreenTimeActivityTransport
     private let stateStore: ScreenTimeSyncStateStore
     private let outbox: ScreenTimeActivityOutbox
+    private let cleanupDeviceIDs: Set<String>
     private var activeSync: ScreenTimeActiveSync?
     private var pendingSync: ScreenTimePendingSync?
 
@@ -400,13 +429,15 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         collector: any ScreenTimeActivityCollecting,
         transport: any ScreenTimeActivityTransport,
         stateStore: ScreenTimeSyncStateStore = .shared,
-        outbox: ScreenTimeActivityOutbox = .shared
+        outbox: ScreenTimeActivityOutbox = .shared,
+        cleanupDeviceIDs: Set<String> = []
     ) {
         self.deviceID = deviceID
         self.collector = collector
         self.transport = transport
         self.stateStore = stateStore
         self.outbox = outbox
+        self.cleanupDeviceIDs = cleanupDeviceIDs.union([deviceID])
     }
 
     func requestAuthorization() async throws -> ScreenTimeCollectorResult {
@@ -466,10 +497,12 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         } catch {
             persistenceError = error
         }
-        await stateStore.resetAfterOptOut(
-            deviceID: deviceID,
-            now: now
-        )
+        for cleanupDeviceID in cleanupDeviceIDs {
+            await stateStore.resetAfterOptOut(
+                deviceID: cleanupDeviceID,
+                now: now
+            )
+        }
         if let persistenceError {
             throw persistenceError
         }
@@ -995,15 +1028,24 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
                         )
                     )
                 }
-                if ScreenTimeUploadFailurePolicy.shouldDiscard(
+                if ScreenTimeUploadFailurePolicy.shouldQuarantine(
                     failure.underlying
                 ) {
-                    try await outbox.markSucceeded(id: entry.id)
-                    return .skipped(
+                    _ = try await outbox.markTerminal(
+                        id: entry.id,
+                        report: failure.report,
                         reason: ScreenTimeUploadFailurePolicy.reason(
                             failure.underlying
-                        )
+                        ),
+                        statusCode:
+                            ScreenTimeUploadFailurePolicy.statusCode(
+                                failure.underlying
+                            ),
+                        now: now
                     )
+                    // A malformed or permanently stale item must not starve
+                    // newer snapshots in the oldest-first queue.
+                    continue
                 }
                 throw failure.underlying
             }
@@ -1048,9 +1090,26 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
                     )
                 )
             }
-            if ScreenTimeUploadFailurePolicy.shouldDiscard(
+            if ScreenTimeUploadFailurePolicy.shouldQuarantine(
                 failure.underlying
             ) {
+                let entry = try await outbox.enqueue(
+                    report: failure.report,
+                    pairing: pairing,
+                    now: now
+                )
+                _ = try await outbox.markTerminal(
+                    id: entry.id,
+                    report: failure.report,
+                    reason: ScreenTimeUploadFailurePolicy.reason(
+                        failure.underlying
+                    ),
+                    statusCode:
+                        ScreenTimeUploadFailurePolicy.statusCode(
+                            failure.underlying
+                        ),
+                    now: now
+                )
                 return .skipped(
                     reason: ScreenTimeUploadFailurePolicy.reason(
                         failure.underlying

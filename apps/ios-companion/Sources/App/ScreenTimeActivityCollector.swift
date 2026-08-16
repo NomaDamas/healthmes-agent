@@ -96,6 +96,7 @@ struct UnavailableScreenTimeActivityCollector: ScreenTimeActivityCollecting {
 enum ScreenTimePseudonymKeyError: Error {
     case randomGenerationFailed
     case keychainWriteFailed
+    case keychainDeleteFailed
 }
 
 enum ScreenTimeAuthorizationFailurePolicy {
@@ -142,6 +143,27 @@ struct ScreenTimePseudonymKeyStore {
             return stored
         }
         throw ScreenTimePseudonymKeyError.keychainWriteFailed
+    }
+
+    func delete() throws {
+        var unexpectedFailure = false
+        for accessGroup in [
+            AppGroup.keychainIdentifier,
+            nil,
+        ] {
+            let status = SecItemDelete(
+                baseQuery(accessGroup: accessGroup) as CFDictionary
+            )
+            if status != errSecSuccess,
+                status != errSecItemNotFound,
+                status != errSecMissingEntitlement
+            {
+                unexpectedFailure = true
+            }
+        }
+        if unexpectedFailure {
+            throw ScreenTimePseudonymKeyError.keychainDeleteFailed
+        }
     }
 
     private func read(accessGroup: String?) -> Data? {
@@ -344,8 +366,8 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
         var usage: [UsageKey: Int] = [:]
         var observedBucketStarts = Set<Date>()
         var confirmedZeroBuckets = Set<Date>()
-        var privacyFilteredBuckets = Set<Date>()
-        var incompleteMetadataBuckets = Set<Date>()
+        var bucketObservations:
+            [Date: ScreenTimeActivityBucketObservation] = [:]
         let results = DeviceActivityData.activityData(
             filteredBy: filter,
             using: .live
@@ -364,25 +386,41 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                             .rounded(.toNearestOrAwayFromZero)
                     )
                 )
-                if segmentSeconds == 0 {
-                    confirmedZeroBuckets.insert(bucketStart)
-                    continue
-                }
-                var resolvedSeconds = 0
+                var knownApplicationSeconds = 0
+                var representedAppSeconds = 0
+                var privacyFilteredSeconds = 0
+                var unresolvedApplicationSeconds = 0
+                var websiteActivitySeconds = 0
                 for try await categoryActivity in segment.categories {
-                    guard
+                    let category: String
+                    if
                         let categoryToken =
                             categoryActivity.category.token,
                         let metadata =
                             categoryMetadata[categoryToken]
-                    else {
-                        incompleteMetadataBuckets.insert(bucketStart)
-                        continue
+                    {
+                        category = ScreenTimeCategoryNormalizer
+                            .normalize(
+                                metadata.localizedDisplayName,
+                                opaqueFallback: metadata.opaqueToken
+                            )
+                    } else if
+                        let categoryToken =
+                            categoryActivity.category.token,
+                        let encodedToken =
+                            try? JSONEncoder().encode(categoryToken)
+                    {
+                        category = ScreenTimeCategoryNormalizer
+                            .normalize(
+                                nil,
+                                opaqueFallback:
+                                    pseudonymizer.categoryToken(
+                                        encodedToken: encodedToken
+                                    )
+                            )
+                    } else {
+                        category = "other"
                     }
-                    let category = ScreenTimeCategoryNormalizer.normalize(
-                        metadata.localizedDisplayName,
-                        opaqueFallback: metadata.opaqueToken
-                    )
                     for try await appActivity in categoryActivity.applications {
                         let seconds = max(
                             0,
@@ -392,23 +430,24 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                             )
                         )
                         guard seconds > 0 else { continue }
+                        knownApplicationSeconds += seconds
                         guard
                             let applicationToken =
                                 appActivity.application.token,
                             let bundleIdentifier =
                                 applicationBundleIDs[applicationToken]
                         else {
-                            incompleteMetadataBuckets.insert(bucketStart)
+                            unresolvedApplicationSeconds += seconds
                             continue
                         }
-                        resolvedSeconds += seconds
                         let token = pseudonymizer.appToken(
                             bundleIdentifier: bundleIdentifier
                         )
                         guard !excludedAppTokens.contains(token) else {
-                            privacyFilteredBuckets.insert(bucketStart)
+                            privacyFilteredSeconds += seconds
                             continue
                         }
+                        representedAppSeconds += seconds
                         let key = UsageKey(
                             bucketStart: bucketStart,
                             opaqueAppToken: token,
@@ -416,17 +455,63 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                         )
                         usage[key, default: 0] += seconds
                     }
+                    for try await websiteActivity
+                        in categoryActivity.webDomains
+                    {
+                        websiteActivitySeconds += max(
+                            0,
+                            Int(
+                                websiteActivity.totalActivityDuration
+                                    .rounded(.toNearestOrAwayFromZero)
+                            )
+                        )
+                    }
                 }
-                if resolvedSeconds < segmentSeconds {
-                    incompleteMetadataBuckets.insert(bucketStart)
+
+                let activityNotRepresentedByApplications = max(
+                    0,
+                    segmentSeconds
+                        - min(segmentSeconds, knownApplicationSeconds)
+                )
+                let websiteOnlySeconds = min(
+                    activityNotRepresentedByApplications,
+                    websiteActivitySeconds
+                )
+                let otherwiseUnknownSeconds = max(
+                    0,
+                    activityNotRepresentedByApplications
+                        - websiteOnlySeconds
+                )
+                let observation = ScreenTimeActivityBucketObservation(
+                    bucketStart: bucketStart,
+                    observedActivitySeconds: segmentSeconds,
+                    representedAppSeconds: representedAppSeconds,
+                    privacyFilteredSeconds: privacyFilteredSeconds,
+                    websiteActivitySeconds: websiteOnlySeconds,
+                    unknownActivitySeconds:
+                        unresolvedApplicationSeconds
+                        + otherwiseUnknownSeconds
+                )
+                if let existing = bucketObservations[bucketStart] {
+                    bucketObservations[bucketStart] =
+                        existing.merging(observation)
+                } else {
+                    bucketObservations[bucketStart] = observation
+                }
+                if
+                    segmentSeconds == 0,
+                    representedAppSeconds == 0,
+                    privacyFilteredSeconds == 0,
+                    websiteOnlySeconds == 0,
+                    unresolvedApplicationSeconds == 0,
+                    otherwiseUnknownSeconds == 0
+                {
+                    confirmedZeroBuckets.insert(bucketStart)
                 }
             }
         }
 
         let accumulatedUsage = usage.compactMap { key, seconds in
-            guard !incompleteMetadataBuckets.contains(key.bucketStart) else {
-                return nil
-            }
             return ScreenTimeAccumulatedUsage(
                 bucketStart: key.bucketStart,
                 opaqueAppToken: key.opaqueAppToken,
@@ -437,14 +522,10 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
         let completeSamples = ScreenTimeSamplePlanner.samples(
             usage: accumulatedUsage,
             confirmedZeroBuckets: confirmedZeroBuckets,
-            privacyTaintedBuckets: privacyFilteredBuckets,
+            bucketObservations: bucketObservations,
             window: window,
             pseudonymizer: pseudonymizer
         )
-        let authoritativeBucketStarts =
-            observedBucketStarts.subtracting(
-                incompleteMetadataBuckets
-            )
 
         guard completeSamples.count <= 5_000 else {
             return ScreenTimeCollectorResult(
@@ -459,7 +540,7 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
             permissionStatus: .granted,
             reason: nil,
             samples: completeSamples,
-            authoritativeBucketStarts: authoritativeBucketStarts
+            authoritativeBucketStarts: observedBucketStarts
         )
     }
 

@@ -171,7 +171,10 @@ final class ScreenTimeActivityRuntime {
     /// Source data is bucketed hourly. iOS may run substantially later.
     static let minimumInterval: TimeInterval = 60 * 60
 
-    private let lifecycle: ScreenTimeActivityLifecycleController
+    private var lifecycle: ScreenTimeActivityLifecycleController?
+    private let lifecycleFactory:
+        @MainActor () -> ScreenTimeActivityLifecycleController
+    private let identityReset: @MainActor () throws -> Void
     private let authorizationObserver:
         any ScreenTimeAuthorizationChangeObserving
     private let authorizationIntentStore:
@@ -189,14 +192,22 @@ final class ScreenTimeActivityRuntime {
         [UUID: ScreenTimeBackgroundRefreshRunner] = [:]
 
     private init() {
-        lifecycle = ScreenTimeActivityLifecycleController(
-            syncService: ScreenTimeActivitySyncService.live(),
-            pairingProvider: { PairingStore.shared.load() }
-        )
+        let intentStore = ScreenTimeAuthorizationIntentStore()
+        lifecycle = nil
+        lifecycleFactory = {
+            ScreenTimeActivityLifecycleController(
+                syncService: ScreenTimeActivitySyncService.live(
+                    authorizationIntentStore: intentStore
+                ),
+                pairingProvider: { PairingStore.shared.load() }
+            )
+        }
+        identityReset = {
+            try ScreenTimePseudonymKeyStore().delete()
+        }
         authorizationObserver =
             ScreenTimeAuthorizationChangeObserverFactory.make()
-        authorizationIntentStore =
-            ScreenTimeAuthorizationIntentStore()
+        authorizationIntentStore = intentStore
         backgroundTasks = LiveScreenTimeBackgroundTaskManager()
         notificationCenter = .default
         nowProvider = Date.init
@@ -215,9 +226,13 @@ final class ScreenTimeActivityRuntime {
         notificationCenter: NotificationCenter = .default,
         nowProvider: @escaping @MainActor () -> Date = Date.init,
         timezoneProvider:
-            @escaping @MainActor () -> TimeZone = { .current }
+            @escaping @MainActor () -> TimeZone = { .current },
+        identityReset:
+            @escaping @MainActor () throws -> Void = {}
     ) {
         self.lifecycle = lifecycle
+        lifecycleFactory = { lifecycle }
+        self.identityReset = identityReset
         self.authorizationObserver =
             authorizationObserver
             ?? ScreenTimeAuthorizationChangeObserverFactory.make()
@@ -244,8 +259,7 @@ final class ScreenTimeActivityRuntime {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 await self.runAutomaticCatchUp(
-                    trigger: .inputConfigurationChanged,
-                    refreshAuthorization: false
+                    trigger: .inputConfigurationChanged
                 )
             }
         }
@@ -257,24 +271,21 @@ final class ScreenTimeActivityRuntime {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 await self.runAutomaticCatchUp(
-                    trigger: .inputConfigurationChanged,
-                    refreshAuthorization: false
+                    trigger: .inputConfigurationChanged
                 )
             }
         }
         authorizationObserver.start { [weak self] in
             guard let self else { return }
             await self.runAutomaticCatchUp(
-                trigger: .authorizationChanged,
-                refreshAuthorization: false
+                trigger: .authorizationChanged
             )
         }
         if authorizationIntentStore.isOptedIn {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 await self.runAutomaticCatchUp(
-                    trigger: .authorizationChanged,
-                    refreshAuthorization: true
+                    trigger: .authorizationChanged
                 )
             }
         }
@@ -288,6 +299,15 @@ final class ScreenTimeActivityRuntime {
         now: Date = Date(),
         timezone: TimeZone = .current
     ) async -> ScreenTimeAuthorizationSyncResult {
+        if authorizationIntentStore.isPrivacyCleanupPending {
+            let cleanup = await completePrivacyCleanup(now: now)
+            if case .failed = cleanup {
+                return ScreenTimeAuthorizationSyncResult(
+                    authorization: nil,
+                    sync: cleanup
+                )
+            }
+        }
         authorizationIntentStore.setOptedIn(true)
         let result =
             await authorizationAndSync(
@@ -319,9 +339,13 @@ final class ScreenTimeActivityRuntime {
     func clearAuthorizationOptIn(
         now: Date = Date()
     ) async -> ScreenTimeActivityLifecycleResult {
+        // Resolve the opted-in cleanup identity before setting the persistent
+        // pending fence. This never creates identity for a user who has not
+        // opted in because the live factory remains fail-closed in that case.
+        let cleanupLifecycle = lifecycleController()
         // Persist intent first so every entry point rejects new work while
         // in-flight pipelines are being detached and purged.
-        authorizationIntentStore.setOptedIn(false)
+        authorizationIntentStore.beginPrivacyCleanup()
         backgroundTasks.cancel()
 
         let tasks = Array(automaticTasks.values)
@@ -336,7 +360,6 @@ final class ScreenTimeActivityRuntime {
         backgroundRunners.removeAll()
         runners.forEach { $0.expire() }
 
-        let result = await lifecycle.disableAndPurge(now: now)
         if let authorizationTask {
             _ = await authorizationTask.value
         }
@@ -346,6 +369,36 @@ final class ScreenTimeActivityRuntime {
         for runner in runners {
             await runner.cancelAndWait()
         }
+        return await completePrivacyCleanup(
+            now: now,
+            using: cleanupLifecycle
+        )
+    }
+
+    private func completePrivacyCleanup(
+        now: Date,
+        using cleanupLifecycle:
+            ScreenTimeActivityLifecycleController? = nil
+    ) async -> ScreenTimeActivityLifecycleResult {
+        let result =
+            await (cleanupLifecycle ?? lifecycleController())
+                .disableAndPurge(now: now)
+        var identityCleanupFailed = false
+        do {
+            try identityReset()
+        } catch {
+            identityCleanupFailed = true
+        }
+        lifecycle = nil
+        if case .failed = result {
+            return result
+        }
+        if identityCleanupFailed {
+            return .failed(
+                reason: "ios_screen_time_identity_cleanup_failed"
+            )
+        }
+        authorizationIntentStore.completePrivacyCleanup()
         return result
     }
 
@@ -361,7 +414,8 @@ final class ScreenTimeActivityRuntime {
             return .skipped(reason: "ios_screen_time_not_opted_in")
         }
         let result =
-            await lifecycle.approveExcludedAppsAndSync(
+            await lifecycleController()
+                .approveExcludedAppsAndSync(
                 excludedAppTokens,
                 now: now,
                 timezone: timezone
@@ -379,7 +433,7 @@ final class ScreenTimeActivityRuntime {
         guard authorizationIntentStore.isOptedIn else {
             return .skipped(reason: "ios_screen_time_not_opted_in")
         }
-        let result = await lifecycle.configurationDidChange(
+        let result = await lifecycleController().configurationDidChange(
             now: now,
             timezone: timezone
         )
@@ -428,8 +482,7 @@ final class ScreenTimeActivityRuntime {
     }
 
     private func runAutomaticCatchUp(
-        trigger: ScreenTimeSyncTrigger,
-        refreshAuthorization: Bool
+        trigger: ScreenTimeSyncTrigger
     ) async {
         guard authorizationIntentStore.isOptedIn else {
             return
@@ -445,8 +498,7 @@ final class ScreenTimeActivityRuntime {
             _ = await self.automaticCatchUp(
                 now: now,
                 timezone: timezone,
-                trigger: trigger,
-                refreshAuthorization: refreshAuthorization
+                trigger: trigger
             )
             guard
                 !Task.isCancelled,
@@ -472,26 +524,18 @@ final class ScreenTimeActivityRuntime {
     private func automaticCatchUp(
         now: Date = Date(),
         timezone: TimeZone = .current,
-        trigger: ScreenTimeSyncTrigger = .routine,
-        refreshAuthorization: Bool = true
+        trigger: ScreenTimeSyncTrigger = .routine
     ) async -> ScreenTimeActivityLifecycleResult {
         guard authorizationIntentStore.isOptedIn else {
             return .skipped(
                 reason: "ios_screen_time_not_opted_in"
             )
         }
-        guard refreshAuthorization else {
-            return await lifecycle.catchUp(
-                now: now,
-                timezone: timezone,
-                trigger: trigger
-            )
-        }
-        return await authorizationAndSync(
+        return await lifecycleController().catchUp(
             now: now,
             timezone: timezone,
             trigger: trigger
-        ).sync
+        )
     }
 
     private func authorizationAndSync(
@@ -533,7 +577,7 @@ final class ScreenTimeActivityRuntime {
         }
         return ScreenTimeAuthorizationSyncResult(
             authorization: authorization,
-            sync: await lifecycle.catchUp(
+            sync: await lifecycleController().catchUp(
                 now: now,
                 timezone: timezone,
                 trigger: trigger
@@ -555,7 +599,7 @@ final class ScreenTimeActivityRuntime {
             task = authorizationRefresh.task
         } else {
             let id = UUID()
-            let lifecycle = lifecycle
+            let lifecycle = lifecycleController()
             let newTask = Task { @MainActor in
                 await lifecycle.requestAuthorization()
             }
@@ -641,5 +685,16 @@ final class ScreenTimeActivityRuntime {
             self.authorizationRefresh = authorizationRefresh
         }
         return nil
+    }
+
+    private func lifecycleController()
+        -> ScreenTimeActivityLifecycleController
+    {
+        if let lifecycle {
+            return lifecycle
+        }
+        let created = lifecycleFactory()
+        lifecycle = created
+        return created
     }
 }

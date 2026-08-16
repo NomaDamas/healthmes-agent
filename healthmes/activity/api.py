@@ -268,6 +268,12 @@ def _ios_batch(body: IOSCapabilityReport) -> ActivityBatchIn:
                 ),
                 coverage_seconds=sample.coverage_seconds,
                 coverage_only=sample.coverage_only,
+                coverage_status=sample.coverage_status,
+                observed_activity_seconds=sample.observed_activity_seconds,
+                represented_app_seconds=sample.represented_app_seconds,
+                privacy_filtered_seconds=sample.privacy_filtered_seconds,
+                website_activity_seconds=sample.website_activity_seconds,
+                unknown_activity_seconds=sample.unknown_activity_seconds,
                 bucket_complete=True,
                 snapshot_sequence=body.snapshot_sequence,
             )

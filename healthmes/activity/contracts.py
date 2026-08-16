@@ -138,6 +138,106 @@ class ActivityPermissionStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class IOSCoverageStatus(StrEnum):
+    COMPLETE = "complete"
+    PRIVACY_FILTERED = "privacy_filtered"
+    WEBSITE_ACTIVITY = "website_activity"
+    UNKNOWN_ACTIVITY = "unknown_activity"
+    MIXED_PARTIAL = "mixed_partial"
+
+
+def _validate_ios_coverage_marker(
+    *,
+    coverage_seconds: int | None,
+    coverage_status: IOSCoverageStatus | None,
+    observed_activity_seconds: int | None,
+    represented_app_seconds: int | None,
+    privacy_filtered_seconds: int | None,
+    website_activity_seconds: int | None,
+    unknown_activity_seconds: int | None,
+) -> None:
+    metadata = (
+        observed_activity_seconds,
+        represented_app_seconds,
+        privacy_filtered_seconds,
+        website_activity_seconds,
+        unknown_activity_seconds,
+    )
+    if coverage_status is None:
+        if coverage_seconds and all(value is None for value in metadata):
+            # Backwards-compatible complete-zero marker.
+            return
+        raise ValueError(
+            "coverage metadata requires coverage_status"
+        )
+
+    if any(value is None for value in metadata):
+        raise ValueError(
+            "coverage_status requires every coverage component"
+        )
+    assert observed_activity_seconds is not None
+    assert represented_app_seconds is not None
+    assert privacy_filtered_seconds is not None
+    assert website_activity_seconds is not None
+    assert unknown_activity_seconds is not None
+    observed = observed_activity_seconds
+    represented = represented_app_seconds
+    private = privacy_filtered_seconds
+    website = website_activity_seconds
+    unknown = unknown_activity_seconds
+    if represented + private + website + unknown != observed:
+        raise ValueError(
+            "coverage components must exactly partition observed activity"
+        )
+
+    partial_kinds = sum(value > 0 for value in (private, website, unknown))
+    if coverage_status is IOSCoverageStatus.COMPLETE:
+        if not coverage_seconds:
+            raise ValueError(
+                "complete coverage-only activity hours require positive coverage"
+            )
+        if partial_kinds:
+            raise ValueError(
+                "complete coverage cannot carry partial-coverage reasons"
+            )
+        if observed != 0 or represented != 0:
+            raise ValueError(
+                "complete coverage-only activity hours must represent zero usage"
+            )
+        return
+
+    if coverage_seconds is not None:
+        raise ValueError(
+            "partial coverage-only activity hours cannot claim full coverage"
+        )
+    if observed <= 0 or partial_kinds == 0:
+        raise ValueError(
+            "partial coverage-only activity hours require observed partial activity"
+        )
+    if (
+        coverage_status is IOSCoverageStatus.PRIVACY_FILTERED
+        and not (private > 0 and partial_kinds == 1)
+    ):
+        raise ValueError("privacy_filtered coverage requires only private activity")
+    if (
+        coverage_status is IOSCoverageStatus.WEBSITE_ACTIVITY
+        and not (website > 0 and partial_kinds == 1)
+    ):
+        raise ValueError("website_activity coverage requires only website activity")
+    if (
+        coverage_status is IOSCoverageStatus.UNKNOWN_ACTIVITY
+        and not (unknown > 0 and partial_kinds == 1)
+    ):
+        raise ValueError("unknown_activity coverage requires only unknown activity")
+    if (
+        coverage_status is IOSCoverageStatus.MIXED_PARTIAL
+        and partial_kinds < 2
+    ):
+        raise ValueError(
+            "mixed_partial coverage requires multiple partial-coverage reasons"
+        )
+
+
 class ActivityState(StrEnum):
     ACTIVE = "active"
     IDLE = "idle"
@@ -162,6 +262,32 @@ class AppHourRecord(BaseModel):
     category: str | None = Field(default=None, max_length=64)
     coverage_seconds: int | None = Field(default=None, ge=0, le=3600)
     coverage_only: bool = False
+    coverage_status: IOSCoverageStatus | None = None
+    observed_activity_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=3600,
+    )
+    represented_app_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=3600,
+    )
+    privacy_filtered_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=3600,
+    )
+    website_activity_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=3600,
+    )
+    unknown_activity_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=3600,
+    )
     bucket_complete: bool = True
     snapshot_sequence: int | None = Field(
         default=None,
@@ -177,6 +303,20 @@ class AppHourRecord(BaseModel):
     @model_validator(mode="after")
     def validate_coverage_only(self) -> AppHourRecord:
         if not self.coverage_only:
+            if any(
+                value is not None
+                for value in (
+                    self.coverage_status,
+                    self.observed_activity_seconds,
+                    self.represented_app_seconds,
+                    self.privacy_filtered_seconds,
+                    self.website_activity_seconds,
+                    self.unknown_activity_seconds,
+                )
+            ):
+                raise ValueError(
+                    "iOS coverage metadata requires a coverage-only record"
+                )
             return self
         if self.app_id != "__healthmes_coverage__":
             raise ValueError(
@@ -194,10 +334,15 @@ class AppHourRecord(BaseModel):
             raise ValueError(
                 "coverage-only activity hours cannot carry a category"
             )
-        if not self.coverage_seconds:
-            raise ValueError(
-                "coverage-only activity hours require positive coverage"
-            )
+        _validate_ios_coverage_marker(
+            coverage_seconds=self.coverage_seconds,
+            coverage_status=self.coverage_status,
+            observed_activity_seconds=self.observed_activity_seconds,
+            represented_app_seconds=self.represented_app_seconds,
+            privacy_filtered_seconds=self.privacy_filtered_seconds,
+            website_activity_seconds=self.website_activity_seconds,
+            unknown_activity_seconds=self.unknown_activity_seconds,
+        )
         return self
 
 
@@ -421,6 +566,32 @@ class IOSAggregateSample(BaseModel):
     )
     coverage_seconds: int | None = Field(default=None, ge=0, le=3600)
     coverage_only: bool = False
+    coverage_status: IOSCoverageStatus | None = None
+    observed_activity_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=3600,
+    )
+    represented_app_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=3600,
+    )
+    privacy_filtered_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=3600,
+    )
+    website_activity_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=3600,
+    )
+    unknown_activity_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=3600,
+    )
 
     @field_validator("bucket_start", mode="after")
     @classmethod
@@ -467,10 +638,15 @@ class IOSAggregateSample(BaseModel):
                 raise ValueError(
                     "coverage-only iOS samples cannot carry app or category identity"
                 )
-            if not self.coverage_seconds:
-                raise ValueError(
-                    "coverage-only iOS samples require positive coverage"
-                )
+            _validate_ios_coverage_marker(
+                coverage_seconds=self.coverage_seconds,
+                coverage_status=self.coverage_status,
+                observed_activity_seconds=self.observed_activity_seconds,
+                represented_app_seconds=self.represented_app_seconds,
+                privacy_filtered_seconds=self.privacy_filtered_seconds,
+                website_activity_seconds=self.website_activity_seconds,
+                unknown_activity_seconds=self.unknown_activity_seconds,
+            )
         else:
             if self.opaque_app_token is None:
                 raise ValueError(
@@ -478,6 +654,20 @@ class IOSAggregateSample(BaseModel):
                 )
             if self.category is None:
                 raise ValueError("iOS activity samples require a category")
+            if any(
+                value is not None
+                for value in (
+                    self.coverage_status,
+                    self.observed_activity_seconds,
+                    self.represented_app_seconds,
+                    self.privacy_filtered_seconds,
+                    self.website_activity_seconds,
+                    self.unknown_activity_seconds,
+                )
+            ):
+                raise ValueError(
+                    "iOS coverage metadata requires a coverage-only sample"
+                )
         return self
 
 
@@ -596,6 +786,49 @@ class IOSCapabilityReport(BaseModel):
             raise ValueError(
                 "iOS snapshot samples must contain unique source_record_id values"
             )
+        samples_by_bucket: dict[datetime, list[IOSAggregateSample]] = {}
+        for sample in self.samples:
+            samples_by_bucket.setdefault(sample.bucket_start, []).append(
+                sample
+            )
+        for bucket_samples in samples_by_bucket.values():
+            coverage_markers = [
+                sample for sample in bucket_samples if sample.coverage_only
+            ]
+            if len(coverage_markers) > 1:
+                raise ValueError(
+                    "one iOS bucket may contain at most one coverage marker"
+                )
+            if not coverage_markers:
+                continue
+            marker = coverage_markers[0]
+            app_samples = [
+                sample
+                for sample in bucket_samples
+                if not sample.coverage_only
+            ]
+            represented = sum(
+                sample.foreground_seconds for sample in app_samples
+            )
+            if marker.represented_app_seconds is None:
+                if represented:
+                    raise ValueError(
+                        "legacy complete coverage markers cannot accompany app activity"
+                    )
+            elif marker.represented_app_seconds != represented:
+                raise ValueError(
+                    "coverage represented_app_seconds must equal bucket app activity"
+                )
+            if (
+                marker.coverage_status is not IOSCoverageStatus.COMPLETE
+                and any(
+                    sample.coverage_seconds is not None
+                    for sample in app_samples
+                )
+            ):
+                raise ValueError(
+                    "partial-coverage bucket app samples cannot claim full coverage"
+                )
         token_key_ids = {
             key_id
             for sample in self.samples

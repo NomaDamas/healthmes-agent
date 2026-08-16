@@ -7,13 +7,20 @@ enum ScreenTimeActivityOutboxError: Error, Equatable {
 }
 
 struct ScreenTimeActivityOutboxEntry: Codable, Equatable {
-    let id: String
+    var id: String
     let destinationID: String
     let deviceID: String
     let enqueuedAt: Date
     var report: ScreenTimeActivityReport
     var failedAttempts: Int
     var nextAttemptAt: Date
+    var terminalReason: String? = nil
+    var terminalStatusCode: Int? = nil
+    var terminalAt: Date? = nil
+
+    var isTerminal: Bool {
+        terminalReason != nil
+    }
 }
 
 struct ScreenTimeActivityRetryPolicy: Equatable {
@@ -226,6 +233,7 @@ actor ScreenTimeActivityOutbox {
             .filter {
                 $0.deviceID == deviceID
                     && $0.destinationID == destinationID
+                    && !$0.isTerminal
             }
             .min(by: Self.entryOrder)
     }
@@ -253,6 +261,32 @@ actor ScreenTimeActivityOutbox {
                 afterFailedAttempts: candidate[index].failedAttempts,
                 now: now
             )
+        try persist(candidate)
+        entries = candidate
+        return candidate[index]
+    }
+
+    @discardableResult
+    func markTerminal(
+        id: String,
+        report: ScreenTimeActivityReport? = nil,
+        reason: String,
+        statusCode: Int?,
+        now: Date
+    ) throws -> ScreenTimeActivityOutboxEntry? {
+        try purgeExpired(now: now)
+        guard let index = entries.firstIndex(where: { $0.id == id }) else {
+            return nil
+        }
+        var candidate = entries
+        if let report {
+            candidate[index].report = report
+            candidate[index].id =
+                try ScreenTimeActivityReportIdentity.reportID(report)
+        }
+        candidate[index].terminalReason = reason
+        candidate[index].terminalStatusCode = statusCode
+        candidate[index].terminalAt = now
         try persist(candidate)
         entries = candidate
         return candidate[index]
@@ -314,7 +348,27 @@ actor ScreenTimeActivityOutbox {
         return entries.filter {
             $0.deviceID == deviceID
                 && $0.destinationID == destinationID
+                && !$0.isTerminal
         }.count
+    }
+
+    func quarantinedCount(
+        deviceID: String,
+        pairing: Pairing
+    ) -> Int {
+        let destinationID =
+            ScreenTimeActivityReportIdentity.destinationID(for: pairing)
+        return entries.filter {
+            $0.deviceID == deviceID
+                && $0.destinationID == destinationID
+                && $0.isTerminal
+        }.count
+    }
+
+    func quarantinedEntries() -> [ScreenTimeActivityOutboxEntry] {
+        entries
+            .filter(\.isTerminal)
+            .sorted(by: Self.entryOrder)
     }
 
     func allEntries() -> [ScreenTimeActivityOutboxEntry] {
@@ -355,9 +409,13 @@ actor ScreenTimeActivityOutbox {
                 try encodedData(candidate).count > maximumBytes
             guard exceedsCount || exceedsBytes else { break }
             guard
-                let removalIndex = candidate.firstIndex(where: {
-                    $0.id != preservedID
-                })
+                let removalIndex =
+                    candidate.firstIndex(where: {
+                        $0.id != preservedID && $0.isTerminal
+                    })
+                    ?? candidate.firstIndex(where: {
+                        $0.id != preservedID
+                    })
             else {
                 throw ScreenTimeActivityOutboxError.itemTooLarge(
                     maxBytes: maximumBytes

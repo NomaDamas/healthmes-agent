@@ -283,7 +283,7 @@ UI-neutral 엔진 seam에 연결되어 있다.
 사용자 authorize 선택
         |
         v
-ScreenTimeActivitySyncService.requestAuthorization()
+ScreenTimeActivityRuntime.requestAuthorizationAndSync()
 
 앱 foreground / pairing 변경 / 등록된 Screen Time background task
 저장된 input 또는 retention 설정 변경
@@ -310,6 +310,12 @@ ScreenTimeActivitySyncService.sync(pairing:)
           activity.* WellnessEvent
 ```
 
+cold launch, foreground, authorization status 변경 알림, background task는
+Apple 권한 UI를 호출하지 않는다. 이 자동 경로들은 저장된 opt-in을 확인하고
+`currentAuthorizationStatus()`로 현재 상태를 읽은 뒤 허용된 경우에만 sync한다.
+Apple의 `requestAuthorization()`을 호출할 수 있는 유일한 제품 경로는 사용자가
+직접 선택한 `requestAuthorizationAndSync()`이다.
+
 현재 PR은 service core, transport/report contract, lifecycle, bounded outbox,
 background registration과 source-side privacy exclusion을 연결한다. 설정 화면은
 추가하지 않는다. Apple API를 실제 컴파일할 수 있는지는 아래 SDK capability
@@ -334,6 +340,14 @@ service-owned pipeline을 취소한다. 같은 pipeline을 기다리는 foregrou
 제거된다. outbox 디렉터리와 atomic output 파일은 기기 backup에서 제외된다.
 이 14일 transport TTL은 중앙 `activity_raw` 보존기간 설정과 별도다.
 
+재시도 가능한 네트워크 오류, `408`, `425`, `429`, `5xx`,
+`409 activity_write_conflict`만 oldest-first backoff에 남는다. 영구 `422`와
+재시도 불가 또는 분류되지 않은 `409`는 reason, HTTP status, terminal 시각을
+가진 quarantine entry로 보존하되 전송 후보에서는 제외한다. 따라서 잘못된 과거
+snapshot 하나가 이후 정상 snapshot을 14일 동안 막지 않는다. stale snapshot,
+privacy/exclusion, collection generation fence는 서버가 반환한 구체적 reason을
+잃지 않는다.
+
 `GET /v1/activity/devices/{device_id}/collection`의
 `raw_retention_cutoff`는 중앙 `activity_raw` 보존 정책으로부터 계산된다. 최초
 승인 직후와 timezone 변경 직후에는 최신 완료 local-hour 1개만 조회해 이전
@@ -350,6 +364,15 @@ snapshot이 거부되지 않도록, cutoff를 올림한 뒤 추가로 완료 1�
 ID를 사용하고, key를 잃어 새 `ios-collector-v1-*` ID가 생기면 서버는
 `/v1/inputs/activity.ios-screentime/settings`에서 명시적으로 enable하기 전까지
 수집을 차단한다.
+
+이 Keychain key는 명시적 opt-in 전에는 읽거나 만들지 않는다. SDK가 export
+API를 제공하지 않는 빌드도 fallback persistent identifier를 만들지 않는다.
+opt-out은 수집 작업을 취소하고 Screen Time 전용 outbox와 파생 상태를 정리한 뒤
+기억해 둔 key-derived device ID와 key를 삭제한다. 이 device ID는 opt-in 뒤에만
+저장되며 프로세스 재시작 뒤에도 key를 다시 읽거나 만들지 않고 정확한 device
+namespace의 cleanup을 재개하는 데만 사용한다. key 삭제가 실패하면
+`privacy-cleanup-pending`을 유지하여 재 opt-in과 이전 identity 재사용을 막고,
+다음 명시적 opt-in에서 cleanup을 먼저 재시도한다.
 
 ### Apple capability 경계
 
@@ -390,6 +413,12 @@ SDK probe 성공만으로 실제 기기 수집이 보장되지는 않는다. opt
 있고 Apple Account 국가/지역도 EU여야 하며, Apple-provided development/test
 profile을 사용하는 개발·테스트만 다른 지역에서 가능하다. unsigned CI는 이러한
 서명·계정·지역 조건이나 실제 iPhone 수집을 증명하지 않는다.
+
+따라서 이 저장소에서 "코드 완료"는 계약, 수집 lifecycle, fail-closed adapter,
+서버 snapshot 의미, XCTest와 unsigned build를 검증했다는 뜻이다. Apple
+entitlement 승인, capability가 포함된 signed provisioning, eligible
+기기·계정·지역, 실기기 authorization/export, 실제 `BGAppRefreshTask` cadence는
+별도의 외부 승인과 iPhone dogfood 조건이다.
 
 ## 5. Screen Time 데이터 의미
 
@@ -436,12 +465,29 @@ launch가 unknown인 source를 횟수 계산에서 제외한다.
 없는 record를 보낸다. 이 record는 "관찰된 0분"과 "권한이 없어 관찰하지 못함"을
 구분하며 앱·카테고리 식별자를 포함할 수 없다.
 
-제외 앱의 활동이 있었던 시간은 이 zero-usage record를 만들지 않는다. 제외된
-앱의 시간과 identity는 저장하지 않되, 그 시간을 "실제 0분"으로 오인하지 않고
-coverage 결측으로 남긴다. 같은 시간에 허용 앱과 제외 앱 또는 bundle ID가 없는
-활동이 함께 있으면 허용 앱의 시간은 저장할 수 있지만 그 sample도
-`coverage_seconds=null`이다. 즉 알려진 일부 활동을 전체 시간의 완전한 관찰로
-과장하지 않는다.
+제외 앱, website-only, bundle ID가 없는 활동이 있었던 시간은 zero-usage
+record를 만들지 않는다. 허용 앱 record는 버리지 않고 저장하되
+`coverage_seconds=null`로 두고, 별도의 identity 없는 `coverage_only` marker가
+관찰 시간을 다음 값으로 정확히 나눈다.
+
+```text
+observed_activity_seconds
+  = represented_app_seconds
+  + privacy_filtered_seconds
+  + website_activity_seconds
+  + unknown_activity_seconds
+```
+
+marker의 `coverage_status`는 `privacy_filtered`, `website_activity`,
+`unknown_activity`, `mixed_partial` 중 하나다. 실제 관찰된 0분만 `complete`를
+사용한다. Apple segment total이 app 합보다 커도 유효한 app record를 버리지
+않으며, 차이는 website-only 또는 unknown으로 명시한다.
+
+수집기가 관찰한 모든 hour bucket은 authoritative replacement 대상이다. 따라서
+새 snapshot에 private app row가 빠지고 privacy marker만 남으면 서버는 과거
+private row를 삭제한다. 더 오래된 snapshot은
+`collection_generation + snapshot_sequence` fence에서 거부되어 삭제된 row를
+되살릴 수 없다.
 
 앱 가명화 HMAC key가 바뀌면 과거 `ios-app-*` 제외 token은 더 이상 같은 앱을
 가리키지 않는다. v2 token은

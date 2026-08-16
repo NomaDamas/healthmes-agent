@@ -56,6 +56,12 @@ protocol ScreenTimeAuthorizationChangeObserving: AnyObject {
 struct ScreenTimeAuthorizationIntentStore {
     private static let optedInKey =
         "healthmes.screen-time.authorization-opt-in.v1"
+    private static let cleanupPendingKey =
+        "healthmes.screen-time.privacy-cleanup-pending.v1"
+    private static let activeDeviceIDKey =
+        "healthmes.screen-time.active-device-id.v1"
+    private static let legacyFallbackDeviceIDKey =
+        "healthmes.screen-time.fallback-device-id.v1"
 
     private let defaults: UserDefaults
 
@@ -67,8 +73,57 @@ struct ScreenTimeAuthorizationIntentStore {
         defaults.bool(forKey: Self.optedInKey)
     }
 
+    var isPrivacyCleanupPending: Bool {
+        defaults.bool(forKey: Self.cleanupPendingKey)
+    }
+
+    var activeDeviceID: String? {
+        defaults.string(forKey: Self.activeDeviceIDKey)
+            .flatMap(Self.normalizedDeviceID)
+    }
+
+    var legacyFallbackDeviceID: String? {
+        defaults.string(forKey: Self.legacyFallbackDeviceIDKey)
+            .flatMap(Self.normalizedDeviceID)
+    }
+
+    var privacyCleanupDeviceIDs: Set<String> {
+        Set([activeDeviceID, legacyFallbackDeviceID].compactMap { $0 })
+    }
+
     func setOptedIn(_ optedIn: Bool) {
         defaults.set(optedIn, forKey: Self.optedInKey)
+    }
+
+    func rememberActiveDeviceID(_ deviceID: String) {
+        guard
+            isOptedIn,
+            !isPrivacyCleanupPending,
+            let normalized = Self.normalizedDeviceID(deviceID)
+        else {
+            return
+        }
+        defaults.set(normalized, forKey: Self.activeDeviceIDKey)
+    }
+
+    func beginPrivacyCleanup() {
+        defaults.set(false, forKey: Self.optedInKey)
+        defaults.set(true, forKey: Self.cleanupPendingKey)
+    }
+
+    func completePrivacyCleanup() {
+        defaults.removeObject(forKey: Self.cleanupPendingKey)
+        defaults.removeObject(forKey: Self.activeDeviceIDKey)
+        defaults.removeObject(forKey: Self.legacyFallbackDeviceIDKey)
+    }
+
+    private static func normalizedDeviceID(
+        _ value: String
+    ) -> String? {
+        let normalized = value.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        return normalized.isEmpty ? nil : normalized
     }
 }
 

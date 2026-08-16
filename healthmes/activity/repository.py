@@ -518,6 +518,32 @@ def _record_payload(
         }
         if record.coverage_only:
             payload["coverage_only"] = True
+        if record.coverage_status is not None:
+            payload["coverage_status"] = record.coverage_status.value
+        for key, value in (
+            (
+                "observed_activity_seconds",
+                record.observed_activity_seconds,
+            ),
+            (
+                "represented_app_seconds",
+                record.represented_app_seconds,
+            ),
+            (
+                "privacy_filtered_seconds",
+                record.privacy_filtered_seconds,
+            ),
+            (
+                "website_activity_seconds",
+                record.website_activity_seconds,
+            ),
+            (
+                "unknown_activity_seconds",
+                record.unknown_activity_seconds,
+            ),
+        ):
+            if value is not None:
+                payload[key] = value
         if not record.launches_observed:
             payload["launches_observed"] = False
         if record.snapshot_sequence is not None:
@@ -597,6 +623,12 @@ def _hour_snapshot_content(payload: dict[str, Any]) -> tuple[Any, ...]:
         payload.get("category"),
         payload.get("coverage_seconds"),
         payload.get("coverage_only", False),
+        payload.get("coverage_status"),
+        payload.get("observed_activity_seconds"),
+        payload.get("represented_app_seconds"),
+        payload.get("privacy_filtered_seconds"),
+        payload.get("website_activity_seconds"),
+        payload.get("unknown_activity_seconds"),
         payload.get("bucket_complete"),
     )
 

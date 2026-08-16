@@ -21,6 +21,14 @@ public enum ScreenTimeActivityPermissionStatus: String, Codable {
     case unknown
 }
 
+public enum ScreenTimeActivityCoverageStatus: String, Codable {
+    case complete
+    case privacyFiltered = "privacy_filtered"
+    case websiteActivity = "website_activity"
+    case unknownActivity = "unknown_activity"
+    case mixedPartial = "mixed_partial"
+}
+
 enum ScreenTimeDeviceIdentity {
     static func fromPseudonymKey(_ keyData: Data) -> String {
         var material = Data("healthmes-screen-time-device-v1\u{0}".utf8)
@@ -33,42 +41,19 @@ enum ScreenTimeDeviceIdentity {
     }
 }
 
-struct ScreenTimeFallbackDeviceIdentityStore {
-    private static let defaultsKey =
-        "healthmes.screen-time.fallback-device-id.v1"
-    private static let lock = NSLock()
-
-    private let defaults: UserDefaults
-
-    init(defaults: UserDefaults = AppGroup.userDefaults) {
-        self.defaults = defaults
-    }
-
-    func current() -> String {
-        Self.lock.lock()
-        defer { Self.lock.unlock() }
-        if let existing = defaults.string(
-            forKey: Self.defaultsKey
-        ), !existing.isEmpty {
-            return existing
-        }
-        let generated =
-            "ios-collector-unavailable-v1-\(UUID().uuidString.lowercased())"
-        defaults.set(generated, forKey: Self.defaultsKey)
-        return generated
-    }
-}
-
 struct ScreenTimeActivityIdentityResolution: Equatable {
     let deviceID: String
     let pseudonymKeyData: Data?
 }
 
 enum ScreenTimeActivityIdentityResolver {
+    static let unavailableDeviceID =
+        "ios-collector-unavailable-v1"
+
     static func resolve(
         explicitDeviceID: String?,
         pseudonymKeyLoader: () throws -> Data,
-        fallbackIdentityStore: ScreenTimeFallbackDeviceIdentityStore
+        rememberedDeviceID: String? = nil
     ) -> ScreenTimeActivityIdentityResolution {
         // The key is needed by the collector even when the caller supplies
         // an explicit device ID, so load it exactly once at this boundary.
@@ -82,13 +67,30 @@ enum ScreenTimeActivityIdentityResolver {
             resolvedDeviceID = ScreenTimeDeviceIdentity.fromPseudonymKey(
                 pseudonymKeyData
             )
+        } else if let rememberedDeviceID =
+            normalizedDeviceID(rememberedDeviceID)
+        {
+            resolvedDeviceID = rememberedDeviceID
         } else {
-            resolvedDeviceID = fallbackIdentityStore.current()
+            // Unavailable collectors never need a durable identity. A stable
+            // pseudonym namespace is created only after explicit opt-in and
+            // successful Keychain access.
+            resolvedDeviceID = unavailableDeviceID
         }
         return ScreenTimeActivityIdentityResolution(
             deviceID: resolvedDeviceID,
             pseudonymKeyData: pseudonymKeyData
         )
+    }
+
+    private static func normalizedDeviceID(
+        _ value: String?
+    ) -> String? {
+        let normalized = value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.flatMap {
+            $0.isEmpty ? nil : $0
+        }
     }
 }
 
@@ -100,6 +102,12 @@ public struct ScreenTimeActivitySample: Codable, Equatable {
     public let opaqueAppToken: String?
     public let coverageSeconds: Int?
     public let coverageOnly: Bool
+    public let coverageStatus: ScreenTimeActivityCoverageStatus?
+    public let observedActivitySeconds: Int?
+    public let representedAppSeconds: Int?
+    public let privacyFilteredSeconds: Int?
+    public let websiteActivitySeconds: Int?
+    public let unknownActivitySeconds: Int?
 
     public init(
         sourceRecordID: String,
@@ -108,7 +116,13 @@ public struct ScreenTimeActivitySample: Codable, Equatable {
         category: String?,
         opaqueAppToken: String?,
         coverageSeconds: Int?,
-        coverageOnly: Bool = false
+        coverageOnly: Bool = false,
+        coverageStatus: ScreenTimeActivityCoverageStatus? = nil,
+        observedActivitySeconds: Int? = nil,
+        representedAppSeconds: Int? = nil,
+        privacyFilteredSeconds: Int? = nil,
+        websiteActivitySeconds: Int? = nil,
+        unknownActivitySeconds: Int? = nil
     ) {
         self.sourceRecordID = sourceRecordID
         self.bucketStart = bucketStart
@@ -117,6 +131,12 @@ public struct ScreenTimeActivitySample: Codable, Equatable {
         self.opaqueAppToken = opaqueAppToken
         self.coverageSeconds = coverageSeconds
         self.coverageOnly = coverageOnly
+        self.coverageStatus = coverageStatus
+        self.observedActivitySeconds = observedActivitySeconds
+        self.representedAppSeconds = representedAppSeconds
+        self.privacyFilteredSeconds = privacyFilteredSeconds
+        self.websiteActivitySeconds = websiteActivitySeconds
+        self.unknownActivitySeconds = unknownActivitySeconds
     }
 
     enum CodingKeys: String, CodingKey {
@@ -127,6 +147,12 @@ public struct ScreenTimeActivitySample: Codable, Equatable {
         case opaqueAppToken = "opaque_app_token"
         case coverageSeconds = "coverage_seconds"
         case coverageOnly = "coverage_only"
+        case coverageStatus = "coverage_status"
+        case observedActivitySeconds = "observed_activity_seconds"
+        case representedAppSeconds = "represented_app_seconds"
+        case privacyFilteredSeconds = "privacy_filtered_seconds"
+        case websiteActivitySeconds = "website_activity_seconds"
+        case unknownActivitySeconds = "unknown_activity_seconds"
     }
 }
 
@@ -350,16 +376,167 @@ struct ScreenTimeAccumulatedUsage: Equatable {
     let foregroundSeconds: Int
 }
 
+struct ScreenTimeActivityBucketObservation: Equatable {
+    let bucketStart: Date
+    let observedActivitySeconds: Int
+    let representedAppSeconds: Int
+    let privacyFilteredSeconds: Int
+    let websiteActivitySeconds: Int
+    let unknownActivitySeconds: Int
+
+    init(
+        bucketStart: Date,
+        observedActivitySeconds: Int,
+        representedAppSeconds: Int,
+        privacyFilteredSeconds: Int,
+        websiteActivitySeconds: Int,
+        unknownActivitySeconds: Int
+    ) {
+        self.bucketStart = bucketStart
+        let representedCandidate = Self.clamp(
+            representedAppSeconds
+        )
+        let privacyCandidate = Self.clamp(
+            privacyFilteredSeconds
+        )
+        let websiteCandidate = Self.clamp(
+            websiteActivitySeconds
+        )
+        let unknownCandidate = Self.clamp(
+            unknownActivitySeconds
+        )
+        let componentTotal =
+            representedCandidate
+            + privacyCandidate
+            + websiteCandidate
+            + unknownCandidate
+        // DeviceActivity durations are fractional. Independent rounding can
+        // make the integer components exceed the rounded segment total by a
+        // second or two; preserve that coverage instead of silently turning
+        // a privacy/unknown bucket into complete coverage.
+        let observed = max(
+            Self.clamp(observedActivitySeconds),
+            min(3_600, componentTotal)
+        )
+        self.observedActivitySeconds = observed
+        var remaining = observed
+        let privacyFiltered = Self.consume(
+            privacyCandidate,
+            from: &remaining
+        )
+        let websiteActivity = Self.consume(
+            websiteCandidate,
+            from: &remaining
+        )
+        let explicitlyUnknown = Self.consume(
+            unknownCandidate,
+            from: &remaining
+        )
+        let represented = Self.consume(
+            representedCandidate,
+            from: &remaining
+        )
+        self.representedAppSeconds = represented
+        self.privacyFilteredSeconds = privacyFiltered
+        self.websiteActivitySeconds = websiteActivity
+        // Any unexplained segment activity remains explicitly unknown.
+        self.unknownActivitySeconds = explicitlyUnknown + remaining
+    }
+
+    var coverageStatus: ScreenTimeActivityCoverageStatus {
+        let partialKinds = [
+            privacyFilteredSeconds > 0,
+            websiteActivitySeconds > 0,
+            unknownActivitySeconds > 0,
+        ].filter { $0 }.count
+        switch partialKinds {
+        case 0:
+            return .complete
+        case 1 where privacyFilteredSeconds > 0:
+            return .privacyFiltered
+        case 1 where websiteActivitySeconds > 0:
+            return .websiteActivity
+        case 1:
+            return .unknownActivity
+        default:
+            return .mixedPartial
+        }
+    }
+
+    var isPartial: Bool {
+        coverageStatus != .complete
+    }
+
+    func merging(
+        _ other: ScreenTimeActivityBucketObservation
+    ) -> ScreenTimeActivityBucketObservation {
+        precondition(bucketStart == other.bucketStart)
+        return ScreenTimeActivityBucketObservation(
+            bucketStart: bucketStart,
+            observedActivitySeconds:
+                observedActivitySeconds
+                + other.observedActivitySeconds,
+            representedAppSeconds:
+                representedAppSeconds
+                + other.representedAppSeconds,
+            privacyFilteredSeconds:
+                privacyFilteredSeconds
+                + other.privacyFilteredSeconds,
+            websiteActivitySeconds:
+                websiteActivitySeconds
+                + other.websiteActivitySeconds,
+            unknownActivitySeconds:
+                unknownActivitySeconds
+                + other.unknownActivitySeconds
+        )
+    }
+
+    func replacingRepresentedAppSeconds(
+        _ representedAppSeconds: Int
+    ) -> ScreenTimeActivityBucketObservation {
+        ScreenTimeActivityBucketObservation(
+            bucketStart: bucketStart,
+            observedActivitySeconds: observedActivitySeconds,
+            representedAppSeconds: representedAppSeconds,
+            privacyFilteredSeconds: privacyFilteredSeconds,
+            websiteActivitySeconds: websiteActivitySeconds,
+            unknownActivitySeconds: unknownActivitySeconds
+        )
+    }
+
+    private static func clamp(
+        _ value: Int,
+        maximum: Int = 3_600
+    ) -> Int {
+        min(maximum, max(0, value))
+    }
+
+    private static func consume(
+        _ value: Int,
+        from remaining: inout Int
+    ) -> Int {
+        let consumed = clamp(value, maximum: remaining)
+        remaining -= consumed
+        return consumed
+    }
+}
+
 enum ScreenTimeSamplePlanner {
     static func samples(
         usage: [ScreenTimeAccumulatedUsage],
         confirmedZeroBuckets: Set<Date>,
-        privacyTaintedBuckets: Set<Date>,
+        bucketObservations:
+            [Date: ScreenTimeActivityBucketObservation] = [:],
         window: ScreenTimeCollectionWindow,
         pseudonymizer: ScreenTimeAppPseudonymizer
     ) -> [ScreenTimeActivitySample] {
-        let activitySamples = usage.map { value in
-            ScreenTimeActivitySample(
+        let normalizedUsage = normalizedUsage(
+            usage,
+            bucketObservations: bucketObservations
+        )
+        let activitySamples = normalizedUsage.map { value in
+            let observation = bucketObservations[value.bucketStart]
+            return ScreenTimeActivitySample(
                 sourceRecordID: pseudonymizer.sourceRecordID(
                     opaqueAppToken: value.opaqueAppToken,
                     bucketStart: value.bucketStart
@@ -371,17 +548,27 @@ enum ScreenTimeSamplePlanner {
                 ),
                 category: value.category,
                 opaqueAppToken: value.opaqueAppToken,
-                coverageSeconds: privacyTaintedBuckets.contains(
-                    value.bucketStart
-                )
+                coverageSeconds:
+                    observation?.isPartial == true
                     ? nil
                     : 3_600
             )
+        }
+        var representedByBucket: [Date: Int] = [:]
+        for sample in activitySamples {
+            representedByBucket[sample.bucketStart, default: 0] +=
+                sample.foregroundSeconds
         }
         let coverageSamples = ScreenTimeCoveragePlanner.confirmedZeroHourStarts(
             in: window,
             confirmedZeroBuckets: confirmedZeroBuckets
         )
+            .filter {
+                guard let observation = bucketObservations[$0] else {
+                    return true
+                }
+                return observation.observedActivitySeconds == 0
+            }
             .map { bucketStart in
                 ScreenTimeActivitySample(
                     sourceRecordID: pseudonymizer.coverageRecordID(
@@ -392,10 +579,58 @@ enum ScreenTimeSamplePlanner {
                     category: nil,
                     opaqueAppToken: nil,
                     coverageSeconds: 3_600,
-                    coverageOnly: true
+                    coverageOnly: true,
+                    coverageStatus: .complete,
+                    observedActivitySeconds: 0,
+                    representedAppSeconds: 0,
+                    privacyFilteredSeconds: 0,
+                    websiteActivitySeconds: 0,
+                    unknownActivitySeconds: 0
                 )
             }
-        return (activitySamples + coverageSamples)
+        let partialCoverageSamples = bucketObservations.values
+            .filter {
+                $0.bucketStart >= window.start
+                    && $0.bucketStart < window.end
+                    && $0.isPartial
+            }
+            .map { observation in
+                let normalizedObservation =
+                    observation.replacingRepresentedAppSeconds(
+                        representedByBucket[
+                            observation.bucketStart,
+                            default: 0
+                        ]
+                    )
+                return ScreenTimeActivitySample(
+                    sourceRecordID: pseudonymizer.coverageRecordID(
+                        bucketStart: normalizedObservation.bucketStart
+                    ),
+                    bucketStart: normalizedObservation.bucketStart,
+                    foregroundSeconds: 0,
+                    category: nil,
+                    opaqueAppToken: nil,
+                    coverageSeconds: nil,
+                    coverageOnly: true,
+                    coverageStatus:
+                        normalizedObservation.coverageStatus,
+                    observedActivitySeconds:
+                        normalizedObservation.observedActivitySeconds,
+                    representedAppSeconds:
+                        normalizedObservation.representedAppSeconds,
+                    privacyFilteredSeconds:
+                        normalizedObservation.privacyFilteredSeconds,
+                    websiteActivitySeconds:
+                        normalizedObservation.websiteActivitySeconds,
+                    unknownActivitySeconds:
+                        normalizedObservation.unknownActivitySeconds
+                )
+            }
+        return (
+            activitySamples
+                + coverageSamples
+                + partialCoverageSamples
+        )
             .sorted {
                 if $0.bucketStart != $1.bucketStart {
                     return $0.bucketStart < $1.bucketStart
@@ -403,6 +638,77 @@ enum ScreenTimeSamplePlanner {
                 return ($0.opaqueAppToken ?? "")
                     < ($1.opaqueAppToken ?? "")
             }
+    }
+
+    private static func normalizedUsage(
+        _ usage: [ScreenTimeAccumulatedUsage],
+        bucketObservations:
+            [Date: ScreenTimeActivityBucketObservation]
+    ) -> [ScreenTimeAccumulatedUsage] {
+        let groupedUsage = Dictionary(
+            grouping: usage,
+            by: \.bucketStart
+        )
+        var normalized: [ScreenTimeAccumulatedUsage] = []
+
+        for bucketStart in groupedUsage.keys.sorted() {
+            let bucketUsage = (groupedUsage[bucketStart] ?? [])
+                .sorted {
+                    if $0.foregroundSeconds != $1.foregroundSeconds {
+                        return $0.foregroundSeconds
+                            > $1.foregroundSeconds
+                    }
+                    if $0.opaqueAppToken != $1.opaqueAppToken {
+                        return $0.opaqueAppToken
+                            < $1.opaqueAppToken
+                    }
+                    return $0.category < $1.category
+                }
+            var seconds = bucketUsage.map {
+                min(3_600, max(0, $0.foregroundSeconds))
+            }
+            let total = seconds.reduce(0, +)
+            let target = min(
+                total,
+                bucketObservations[bucketStart]?
+                    .representedAppSeconds
+                    ?? 3_600
+            )
+            var excess = total - target
+
+            // Preserve every positive app row when possible. Fractional
+            // DeviceActivity durations can independently round an hour a
+            // second or two over its authoritative total.
+            for index in seconds.indices where excess > 0 {
+                let reduction = min(
+                    excess,
+                    max(0, seconds[index] - 1)
+                )
+                seconds[index] -= reduction
+                excess -= reduction
+            }
+            for index in seconds.indices where excess > 0 {
+                let reduction = min(excess, seconds[index])
+                seconds[index] -= reduction
+                excess -= reduction
+            }
+
+            for (value, foregroundSeconds) in zip(
+                bucketUsage,
+                seconds
+            ) where foregroundSeconds > 0 {
+                normalized.append(
+                    ScreenTimeAccumulatedUsage(
+                        bucketStart: value.bucketStart,
+                        opaqueAppToken: value.opaqueAppToken,
+                        category: value.category,
+                        foregroundSeconds: foregroundSeconds
+                    )
+                )
+            }
+        }
+
+        return normalized
     }
 }
 

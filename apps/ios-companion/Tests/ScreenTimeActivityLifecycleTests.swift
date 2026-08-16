@@ -6,6 +6,7 @@ private enum ScreenTimeLifecycleTestError: Error {
     case authorizationFailed
     case collectionFailed
     case exclusionApprovalFailed
+    case identityCleanupFailed
 }
 
 private actor ScreenTimeLifecycleTestCounter {
@@ -1450,6 +1451,283 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(pendingCount, 0)
     }
 
+    func testPermanent422IsQuarantinedAndDoesNotBlockNextSnapshot()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            uploadActions: [
+                .fail(
+                    .server(
+                        statusCode: 422,
+                        code: "activity_write_conflict",
+                        message: "permanent invalid snapshot",
+                        detail: nil
+                    )
+                ),
+                .succeed,
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let terminal = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let recovered = try await service.sync(
+            pairing: pairing(),
+            now: now.addingTimeInterval(1),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let quarantined =
+            await outboxStorage.0.quarantinedEntries()
+        let pending = await outboxStorage.0.pendingCount(
+            deviceID: "ios-lifecycle-device",
+            pairing: pairing()
+        )
+        let reports = await transport.capturedReports()
+
+        XCTAssertEqual(
+            terminal,
+            .skipped(reason: "activity_write_conflict")
+        )
+        guard case .uploaded = recovered else {
+            return XCTFail("expected later snapshot to upload")
+        }
+        XCTAssertEqual(reports.count, 2)
+        XCTAssertEqual(quarantined.count, 1)
+        XCTAssertEqual(
+            quarantined[0].terminalReason,
+            "activity_write_conflict"
+        )
+        XCTAssertEqual(quarantined[0].terminalStatusCode, 422)
+        XCTAssertEqual(pending, 0)
+    }
+
+    func testUnclassified409IsQuarantinedAndDoesNotBlockNextSnapshot()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            uploadActions: [
+                .fail(
+                    .server(
+                        statusCode: 409,
+                        code: "future_server_fence",
+                        message: "permanent fence",
+                        detail: nil
+                    )
+                ),
+                .succeed,
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let terminal = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let recovered = try await service.sync(
+            pairing: pairing(),
+            now: now.addingTimeInterval(1),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let quarantined =
+            await outboxStorage.0.quarantinedEntries()
+        let pending = await outboxStorage.0.pendingCount(
+            deviceID: "ios-lifecycle-device",
+            pairing: pairing()
+        )
+
+        XCTAssertEqual(
+            terminal,
+            .skipped(reason: "future_server_fence")
+        )
+        guard case .uploaded = recovered else {
+            return XCTFail("expected later snapshot to upload")
+        }
+        XCTAssertEqual(quarantined.count, 1)
+        XCTAssertEqual(
+            quarantined[0].terminalReason,
+            "future_server_fence"
+        )
+        XCTAssertEqual(quarantined[0].terminalStatusCode, 409)
+        XCTAssertEqual(pending, 0)
+    }
+
+    func testFenceResetFailureQuarantinesResetReport() async throws {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(at: outboxStorage.1)
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            uploadActions: [
+                .fail(
+                    .server(
+                        statusCode: 409,
+                        code: "activity_snapshot_fence_reset_required",
+                        message: "reset required",
+                        detail: nil
+                    )
+                ),
+                .fail(
+                    .server(
+                        statusCode: 409,
+                        code: "future_server_fence",
+                        message: "permanent reset rejection",
+                        detail: nil
+                    )
+                ),
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let quarantined =
+            await outboxStorage.0.quarantinedEntries()
+
+        XCTAssertEqual(
+            outcome,
+            .skipped(reason: "future_server_fence")
+        )
+        XCTAssertEqual(quarantined.count, 1)
+        XCTAssertTrue(quarantined[0].report.resetSnapshotFence)
+    }
+
+    func testRetryable409WriteConflictRemainsPending() async throws {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            uploadActions: [
+                .fail(
+                    .server(
+                        statusCode: 409,
+                        code: "activity_write_conflict",
+                        message: "retry transaction race",
+                        detail: nil
+                    )
+                )
+            ]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        let outcome = try await service.sync(
+            pairing: pairing(),
+            now: now,
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let pending = await outboxStorage.0.pendingCount(
+            deviceID: "ios-lifecycle-device",
+            pairing: pairing()
+        )
+        let quarantined = await outboxStorage.0.quarantinedCount(
+            deviceID: "ios-lifecycle-device",
+            pairing: pairing()
+        )
+
+        guard case .queued(
+            reason: "activity_write_conflict",
+            retryAt: _,
+            queueDepth: 1
+        ) = outcome else {
+            return XCTFail("expected write conflict to remain retryable")
+        }
+        XCTAssertEqual(pending, 1)
+        XCTAssertEqual(quarantined, 0)
+    }
+
     func testQueuedReportDrainsBeforeTransientCollectionFailure()
         async throws
     {
@@ -2828,6 +3106,85 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(sequenceAfterReset, 1)
     }
 
+    func testRestartedPrivacyCleanupTargetsRememberedDeviceWithoutKeyLoad()
+        async throws
+    {
+        let now = date("2026-08-16T12:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let deviceID = "ios-key-derived-device"
+        let legacyDeviceID = "ios-legacy-fallback-device"
+        _ = await stateStorage.0.allocateSnapshotSequence(
+            deviceID: deviceID
+        )
+        _ = await stateStorage.0.allocateSnapshotSequence(
+            deviceID: deviceID
+        )
+        _ = await stateStorage.0.allocateSnapshotSequence(
+            deviceID: legacyDeviceID
+        )
+        _ = await stateStorage.0.allocateSnapshotSequence(
+            deviceID: legacyDeviceID
+        )
+
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: stateStorage.1
+        )
+        intentStore.setOptedIn(true)
+        intentStore.rememberActiveDeviceID(deviceID)
+        stateStorage.1.set(
+            legacyDeviceID,
+            forKey: "healthmes.screen-time.fallback-device-id.v1"
+        )
+        intentStore.beginPrivacyCleanup()
+        XCTAssertEqual(
+            intentStore.privacyCleanupDeviceIDs,
+            [deviceID, legacyDeviceID]
+        )
+        var keyLoadCount = 0
+        let service = ScreenTimeActivitySyncService.live(
+            transport: ScreenTimeLifecycleTestTransport(
+                state: collectionState()
+            ),
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0,
+            pseudonymKeyLoader: {
+                keyLoadCount += 1
+                return Data(repeating: 0x11, count: 32)
+            },
+            authorizationIntentStore: intentStore
+        )
+
+        try await service.disableAndPurge(now: now)
+        let sequenceAfterCleanup =
+            await stateStorage.0.allocateSnapshotSequence(
+                deviceID: deviceID
+            )
+        let legacySequenceAfterCleanup =
+            await stateStorage.0.allocateSnapshotSequence(
+                deviceID: legacyDeviceID
+            )
+
+        XCTAssertEqual(keyLoadCount, 0)
+        XCTAssertEqual(sequenceAfterCleanup, 1)
+        XCTAssertEqual(legacySequenceAfterCleanup, 1)
+        XCTAssertEqual(intentStore.activeDeviceID, deviceID)
+        XCTAssertEqual(
+            intentStore.legacyFallbackDeviceID,
+            legacyDeviceID
+        )
+    }
+
     func testServiceDisableCancelsPipelinePurgesOutboxAndResetsState()
         async throws
     {
@@ -3208,19 +3565,19 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
 
         runtime.register()
         try await waitForLifecycleCalls(
-            authorization: 1,
+            authorization: 0,
             sync: 1,
             from: service
         )
         var calls = await service.calls()
         XCTAssertEqual(backgroundTasks.registrations, 1)
         XCTAssertEqual(backgroundTasks.schedules, 1)
-        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.authorization, 0)
         XCTAssertEqual(calls.sync, 1)
 
         await observer.emitChange()
         try await waitForLifecycleCalls(
-            authorization: 1,
+            authorization: 0,
             sync: 2,
             from: service
         )
@@ -3232,7 +3589,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         )
         calls = await service.calls()
 
-        XCTAssertEqual(calls.authorization, 2)
+        XCTAssertEqual(calls.authorization, 0)
         XCTAssertEqual(calls.sync, 3)
         XCTAssertEqual(
             calls.syncTriggers,
@@ -3283,7 +3640,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         )
         runtime.register()
         try await waitForLifecycleCalls(
-            authorization: 1,
+            authorization: 0,
             sync: 1,
             from: service
         )
@@ -3294,7 +3651,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             object: nil
         )
         try await waitForLifecycleCalls(
-            authorization: 1,
+            authorization: 0,
             sync: 2,
             from: service
         )
@@ -3304,14 +3661,14 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             object: nil
         )
         try await waitForLifecycleCalls(
-            authorization: 1,
+            authorization: 0,
             sync: 3,
             from: service
         )
         await runtime.waitForAutomaticWork()
         let calls = await service.calls()
 
-        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.authorization, 0)
         XCTAssertEqual(
             calls.syncTriggers,
             [
@@ -3459,7 +3816,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
     }
 
     @MainActor
-    func testRuntimeBackgroundExpirationWaitsForAuthorizationDetach()
+    func testRuntimeBackgroundAndForegroundNeverRequestAuthorization()
         async throws
     {
         let suiteName =
@@ -3491,31 +3848,22 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         intentStore.setOptedIn(true)
 
         let backgroundTask = backgroundTasks.launch()
-        try await waitForAuthorizationCalls(1, from: service)
-        backgroundTask.expire()
-        try await waitForAuthorizationCancellations(1, from: service)
-        XCTAssertTrue(backgroundTask.completionValues.isEmpty)
-
-        let foreground = Task { @MainActor in
-            await runtime.foregroundCatchUp(
-                now: date("2026-08-16T10:34:00Z"),
-                timezone: TimeZone(secondsFromGMT: 0)!
-            )
-        }
-        try await waitForAuthorizationCalls(2, from: service)
-        await service.releaseAuthorizationCalls()
         try await waitForBackgroundCompletion(backgroundTask)
-        let foregroundResult = await foreground.value
+
+        let foregroundResult = await runtime.foregroundCatchUp(
+            now: date("2026-08-16T10:34:00Z"),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
         let calls = await service.calls()
 
-        XCTAssertEqual(backgroundTask.completionValues, [false])
+        XCTAssertEqual(backgroundTask.completionValues, [true])
         XCTAssertEqual(
             foregroundResult,
             .completed(.skipped(reason: "test"))
         )
-        XCTAssertEqual(calls.authorization, 2)
-        XCTAssertEqual(calls.cancellations, 1)
-        XCTAssertEqual(calls.sync, 1)
+        XCTAssertEqual(calls.authorization, 0)
+        XCTAssertEqual(calls.cancellations, 0)
+        XCTAssertEqual(calls.sync, 2)
     }
 
     @MainActor
@@ -3549,11 +3897,24 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertFalse(intentStore.isOptedIn)
         _ = await runtime.requestAuthorizationAndSync()
         XCTAssertTrue(intentStore.isOptedIn)
+        XCTAssertFalse(intentStore.isPrivacyCleanupPending)
+        intentStore.rememberActiveDeviceID("ios-lifecycle-device")
+        defaults.set(
+            "ios-legacy-fallback-device",
+            forKey: "healthmes.screen-time.fallback-device-id.v1"
+        )
+        XCTAssertEqual(
+            intentStore.activeDeviceID,
+            "ios-lifecycle-device"
+        )
 
         let disabled = await runtime.clearAuthorizationOptIn(
             now: date("2026-08-16T10:34:00Z")
         )
         XCTAssertFalse(intentStore.isOptedIn)
+        XCTAssertFalse(intentStore.isPrivacyCleanupPending)
+        XCTAssertNil(intentStore.activeDeviceID)
+        XCTAssertNil(intentStore.legacyFallbackDeviceID)
         let foreground = await runtime.foregroundCatchUp(
             now: date("2026-08-16T10:34:00Z"),
             timezone: TimeZone(secondsFromGMT: 0)!
@@ -3568,7 +3929,85 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             .skipped(reason: "ios_screen_time_disabled")
         )
         let calls = await service.calls()
+        XCTAssertEqual(calls.authorization, 1)
         XCTAssertEqual(calls.disable, 1)
+    }
+
+    @MainActor
+    func testIdentityCleanupFailureBlocksReuseUntilCleanupSucceeds()
+        async
+    {
+        let suiteName =
+            "healthmes.screen-time.cleanup-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        let service = ScreenTimeLifecycleMockSyncService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "test")
+        )
+        var shouldFailCleanup = true
+        var cleanupAttempts = 0
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: NotificationCenter(),
+            identityReset: {
+                cleanupAttempts += 1
+                if shouldFailCleanup {
+                    throw ScreenTimeLifecycleTestError
+                        .identityCleanupFailed
+                }
+            }
+        )
+
+        _ = await runtime.requestAuthorizationAndSync()
+        intentStore.rememberActiveDeviceID("ios-lifecycle-device")
+        let firstOptOut = await runtime.clearAuthorizationOptIn()
+        let blockedOptIn = await runtime.requestAuthorizationAndSync()
+        var calls = await service.calls()
+
+        XCTAssertEqual(
+            firstOptOut,
+            .failed(
+                reason: "ios_screen_time_identity_cleanup_failed"
+            )
+        )
+        XCTAssertEqual(
+            blockedOptIn.sync,
+            .failed(
+                reason: "ios_screen_time_identity_cleanup_failed"
+            )
+        )
+        XCTAssertNil(blockedOptIn.authorization)
+        XCTAssertFalse(intentStore.isOptedIn)
+        XCTAssertTrue(intentStore.isPrivacyCleanupPending)
+        XCTAssertEqual(
+            intentStore.activeDeviceID,
+            "ios-lifecycle-device"
+        )
+        XCTAssertEqual(cleanupAttempts, 2)
+        XCTAssertEqual(calls.authorization, 1)
+
+        shouldFailCleanup = false
+        let resumed = await runtime.requestAuthorizationAndSync()
+        calls = await service.calls()
+
+        XCTAssertEqual(resumed.authorization, collectorResult())
+        XCTAssertTrue(intentStore.isOptedIn)
+        XCTAssertFalse(intentStore.isPrivacyCleanupPending)
+        XCTAssertNil(intentStore.activeDeviceID)
+        XCTAssertEqual(cleanupAttempts, 3)
+        XCTAssertEqual(calls.authorization, 2)
+        XCTAssertEqual(calls.disable, 3)
     }
 
     @MainActor

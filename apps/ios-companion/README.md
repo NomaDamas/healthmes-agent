@@ -285,6 +285,12 @@ are already wired in `HealthMesCompanionApp` and
 `ScreenTimeActivityRuntime`. A timezone change is detected on the next
 lifecycle sync and also receives a fresh run.
 
+Cold launch, foreground activation, authorization-status notifications, and
+background refresh never call Apple's authorization UI. They only inspect the
+current status and sync when the user has already opted in. The sole
+authorization entry point is the explicit device-team
+`requestAuthorizationAndSync()` seam.
+
 Each sync fetches the paired HealthMes node's current device collection
 settings, removes excluded apps on-device, replaces bundle identifiers with
 device-keyed HMAC pseudonyms, and uploads one authoritative snapshot to
@@ -311,8 +317,26 @@ must save `ios-app-v2-<key fingerprint>-<app HMAC>` tokens generated under the
 current key and then call the UI-neutral `approveExcludedApps(_:)` seam. The
 service rejects legacy or stale-key tokens, and clearing the list does not
 silently approve a later set. Hours containing excluded or identity-missing
-activity never become false zero-usage hours; if allowed activity shares that
-hour, its duration remains usable but `coverage_seconds` is omitted.
+activity never become false zero-usage hours. Valid allowed app rows remain
+usable, while a separate identity-free `coverage_only` marker partitions the
+observed hour into represented app, privacy-filtered, website-only, and
+unknown seconds. Its status is one of `privacy_filtered`,
+`website_activity`, `unknown_activity`, or `mixed_partial`; only a genuinely
+empty observed hour uses `complete`. Every observed bucket remains
+authoritative, so a newer privacy-filtered snapshot deletes previously stored
+private rows, and the generation/sequence fence prevents an older snapshot
+from restoring them.
+
+The pseudonym Keychain key is not loaded or created before explicit opt-in,
+and an SDK-unsupported build does not create a fallback persistent device
+identifier. Opt-out cancels collection, purges the dedicated outbox and local
+derived state for the remembered key-derived device, then deletes both that
+remembered identity and the pseudonym key. The remembered device ID is
+created only after opt-in and lets cleanup resume safely after a process
+restart without loading or creating a key. If identity deletion fails, a
+persistent cleanup-pending fence blocks re-opt-in and key reuse until cleanup
+succeeds.
+
 Successful authoritative snapshot fences also retain the first server
 response. An identical retry returns that response before evaluating later
 mutable collection settings; sequence reuse with different content remains a
@@ -332,7 +356,12 @@ The local retry outbox is bounded to 8 entries and 16 MiB and has a fixed
 app restart and before sync/retry mutation, including before an offline
 collection-state request. Its directory and atomic output file are excluded
 from device backup. This transport TTL is separate from the configurable
-central `activity_raw` retention policy.
+central `activity_raw` retention policy. Retryable transport/server failures
+remain in oldest-first backoff. Permanent `422` responses and non-retryable
+`409` responses are retained as observable terminal quarantine entries and
+are skipped by delivery, so a bad snapshot cannot block later valid snapshots
+for the full TTL. `409 activity_write_conflict` remains retryable, while stale
+and privacy/generation fence responses keep their explicit server semantics.
 
 The normal build always uses an unavailable adapter. The
 `HealthMesCompanionScreenTimeOptIn` scheme expresses user/product intent, not
@@ -349,6 +378,15 @@ they select the opt-in entitlement file, inject the capability probe result,
 register the Screen Time BGTask identifier, and compile the runtime seams into
 the host-less test target. Removing them would make the entitlement and
 lifecycle paths unbuildable rather than reduce device-team UI scope.
+
+Repository code completion and Apple/device enablement are separate:
+
+- Repository validation can prove contracts, lifecycle behavior, the
+  fail-closed SDK adapter, server snapshot semantics, and unsigned builds.
+- Apple entitlement approval, matching signed provisioning, an eligible
+  device/account region, user authorization on hardware, exported Screen Time
+  data, and real `BGAppRefreshTask` cadence require external approval and
+  real-iPhone dogfood.
 
 The opt-in entitlement declaration is present in
 `Configurations/HealthMesCompanion-ScreenTimeOptIn.entitlements`. Actual

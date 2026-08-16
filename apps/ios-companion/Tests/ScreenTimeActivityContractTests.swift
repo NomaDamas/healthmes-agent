@@ -267,7 +267,13 @@ final class ScreenTimeActivityContractTests: XCTestCase {
             category: nil,
             opaqueAppToken: nil,
             coverageSeconds: 3_600,
-            coverageOnly: true
+            coverageOnly: true,
+            coverageStatus: .complete,
+            observedActivitySeconds: 0,
+            representedAppSeconds: 0,
+            privacyFilteredSeconds: 0,
+            websiteActivitySeconds: 0,
+            unknownActivitySeconds: 0
         )
 
         let data = try ScreenTimeActivityHTTP.encoder().encode(sample)
@@ -278,6 +284,8 @@ final class ScreenTimeActivityContractTests: XCTestCase {
         XCTAssertEqual(object["coverage_only"] as? Bool, true)
         XCTAssertEqual(object["foreground_seconds"] as? Int, 0)
         XCTAssertEqual(object["coverage_seconds"] as? Int, 3_600)
+        XCTAssertEqual(object["coverage_status"] as? String, "complete")
+        XCTAssertEqual(object["observed_activity_seconds"] as? Int, 0)
         XCTAssertNil(object["category"])
         XCTAssertNil(object["opaque_app_token"])
     }
@@ -301,7 +309,7 @@ final class ScreenTimeActivityContractTests: XCTestCase {
         XCTAssertEqual(zeroUsageHours, [first, last])
     }
 
-    func testSamplePlannerMakesPrivacyTaintedCoverageUnknown() {
+    func testSamplePlannerKeepsAllowedAppsAndMarksPrivateCoverage() {
         let key = Data(repeating: 0xAB, count: 32)
         let pseudonymizer = ScreenTimeAppPseudonymizer(keyData: key)
         let bucket = date("2026-08-14T09:00:00Z")
@@ -324,18 +332,34 @@ final class ScreenTimeActivityContractTests: XCTestCase {
                 )
             ],
             confirmedZeroBuckets: [],
-            privacyTaintedBuckets: [bucket],
+            bucketObservations: [
+                bucket: ScreenTimeActivityBucketObservation(
+                    bucketStart: bucket,
+                    observedActivitySeconds: 1_500,
+                    representedAppSeconds: 900,
+                    privacyFilteredSeconds: 600,
+                    websiteActivitySeconds: 0,
+                    unknownActivitySeconds: 0
+                )
+            ],
             window: window,
             pseudonymizer: pseudonymizer
         )
 
-        XCTAssertEqual(samples.count, 1)
-        XCTAssertEqual(samples[0].foregroundSeconds, 900)
-        XCTAssertNil(samples[0].coverageSeconds)
-        XCTAssertFalse(samples[0].coverageOnly)
+        XCTAssertEqual(samples.count, 2)
+        let marker = samples[0]
+        let allowed = samples[1]
+        XCTAssertTrue(marker.coverageOnly)
+        XCTAssertEqual(marker.coverageStatus, .privacyFiltered)
+        XCTAssertEqual(marker.observedActivitySeconds, 1_500)
+        XCTAssertEqual(marker.representedAppSeconds, 900)
+        XCTAssertEqual(marker.privacyFilteredSeconds, 600)
+        XCTAssertEqual(allowed.foregroundSeconds, 900)
+        XCTAssertNil(allowed.coverageSeconds)
+        XCTAssertFalse(allowed.coverageOnly)
     }
 
-    func testSamplePlannerDoesNotExposePrivateOnlyHourAsZeroUsage() {
+    func testSamplePlannerMarksPrivateOnlyHourWithoutFalseZero() {
         let pseudonymizer = ScreenTimeAppPseudonymizer(
             keyData: Data(repeating: 0xAB, count: 32)
         )
@@ -349,12 +373,207 @@ final class ScreenTimeActivityContractTests: XCTestCase {
         let samples = ScreenTimeSamplePlanner.samples(
             usage: [],
             confirmedZeroBuckets: [],
-            privacyTaintedBuckets: [bucket],
+            bucketObservations: [
+                bucket: ScreenTimeActivityBucketObservation(
+                    bucketStart: bucket,
+                    observedActivitySeconds: 600,
+                    representedAppSeconds: 0,
+                    privacyFilteredSeconds: 600,
+                    websiteActivitySeconds: 0,
+                    unknownActivitySeconds: 0
+                )
+            ],
             window: window,
             pseudonymizer: pseudonymizer
         )
 
-        XCTAssertTrue(samples.isEmpty)
+        XCTAssertEqual(samples.count, 1)
+        XCTAssertTrue(samples[0].coverageOnly)
+        XCTAssertEqual(samples[0].coverageStatus, .privacyFiltered)
+        XCTAssertEqual(samples[0].observedActivitySeconds, 600)
+        XCTAssertEqual(samples[0].foregroundSeconds, 0)
+        XCTAssertNil(samples[0].coverageSeconds)
+    }
+
+    func testSamplePlannerMarksWebsiteOnlyAndUnknownHours() {
+        let pseudonymizer = ScreenTimeAppPseudonymizer(
+            keyData: Data(repeating: 0xAB, count: 32)
+        )
+        let websiteBucket = date("2026-08-14T09:00:00Z")
+        let unknownBucket = date("2026-08-14T10:00:00Z")
+        let window = ScreenTimeCollectionWindow(
+            start: websiteBucket,
+            end: unknownBucket.addingTimeInterval(3_600),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+
+        let samples = ScreenTimeSamplePlanner.samples(
+            usage: [],
+            confirmedZeroBuckets: [],
+            bucketObservations: [
+                websiteBucket: ScreenTimeActivityBucketObservation(
+                    bucketStart: websiteBucket,
+                    observedActivitySeconds: 1_200,
+                    representedAppSeconds: 0,
+                    privacyFilteredSeconds: 0,
+                    websiteActivitySeconds: 1_200,
+                    unknownActivitySeconds: 0
+                ),
+                unknownBucket: ScreenTimeActivityBucketObservation(
+                    bucketStart: unknownBucket,
+                    observedActivitySeconds: 450,
+                    representedAppSeconds: 0,
+                    privacyFilteredSeconds: 0,
+                    websiteActivitySeconds: 0,
+                    unknownActivitySeconds: 450
+                ),
+            ],
+            window: window,
+            pseudonymizer: pseudonymizer
+        )
+
+        XCTAssertEqual(samples.map(\.coverageStatus), [
+            .websiteActivity,
+            .unknownActivity,
+        ])
+        XCTAssertEqual(samples[0].websiteActivitySeconds, 1_200)
+        XCTAssertEqual(samples[1].unknownActivitySeconds, 450)
+    }
+
+    func testBucketObservationMarksMixedAndPartitionsObservedTime() {
+        let bucket = date("2026-08-14T09:00:00Z")
+        let observation = ScreenTimeActivityBucketObservation(
+            bucketStart: bucket,
+            observedActivitySeconds: 1_200,
+            representedAppSeconds: 600,
+            privacyFilteredSeconds: 300,
+            websiteActivitySeconds: 200,
+            unknownActivitySeconds: 0
+        )
+
+        XCTAssertEqual(observation.coverageStatus, .mixedPartial)
+        XCTAssertEqual(
+            observation.representedAppSeconds
+                + observation.privacyFilteredSeconds
+                + observation.websiteActivitySeconds
+                + observation.unknownActivitySeconds,
+            observation.observedActivitySeconds
+        )
+        XCTAssertEqual(observation.unknownActivitySeconds, 100)
+    }
+
+    func testBucketObservationPreservesRoundedPrivateCoverage() {
+        let observation = ScreenTimeActivityBucketObservation(
+            bucketStart: date("2026-08-14T09:00:00Z"),
+            observedActivitySeconds: 1,
+            representedAppSeconds: 1,
+            privacyFilteredSeconds: 1,
+            websiteActivitySeconds: 0,
+            unknownActivitySeconds: 0
+        )
+
+        XCTAssertEqual(observation.observedActivitySeconds, 2)
+        XCTAssertEqual(observation.representedAppSeconds, 1)
+        XCTAssertEqual(observation.privacyFilteredSeconds, 1)
+        XCTAssertEqual(observation.coverageStatus, .privacyFiltered)
+    }
+
+    func testSamplePlannerNormalizesRoundedHourWithoutDroppingApps()
+        throws
+    {
+        let pseudonymizer = ScreenTimeAppPseudonymizer(
+            keyData: Data(repeating: 0xAB, count: 32)
+        )
+        let bucket = date("2026-08-14T09:00:00Z")
+        let window = ScreenTimeCollectionWindow(
+            start: bucket,
+            end: bucket.addingTimeInterval(3_600),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let observation = ScreenTimeActivityBucketObservation(
+            bucketStart: bucket,
+            observedActivitySeconds: 3_600,
+            representedAppSeconds: 3_601,
+            privacyFilteredSeconds: 1,
+            websiteActivitySeconds: 0,
+            unknownActivitySeconds: 0
+        )
+
+        let samples = ScreenTimeSamplePlanner.samples(
+            usage: [
+                ScreenTimeAccumulatedUsage(
+                    bucketStart: bucket,
+                    opaqueAppToken: "allowed-app-a",
+                    category: "productivity",
+                    foregroundSeconds: 1_801
+                ),
+                ScreenTimeAccumulatedUsage(
+                    bucketStart: bucket,
+                    opaqueAppToken: "allowed-app-b",
+                    category: "productivity",
+                    foregroundSeconds: 1_800
+                ),
+            ],
+            confirmedZeroBuckets: [],
+            bucketObservations: [bucket: observation],
+            window: window,
+            pseudonymizer: pseudonymizer
+        )
+
+        let apps = samples.filter { !$0.coverageOnly }
+        let marker = try XCTUnwrap(
+            samples.first(where: \.coverageOnly)
+        )
+
+        XCTAssertEqual(apps.count, 2)
+        XCTAssertTrue(apps.allSatisfy { $0.foregroundSeconds > 0 })
+        XCTAssertEqual(
+            apps.reduce(0) { $0 + $1.foregroundSeconds },
+            3_599
+        )
+        XCTAssertEqual(marker.observedActivitySeconds, 3_600)
+        XCTAssertEqual(marker.representedAppSeconds, 3_599)
+        XCTAssertEqual(marker.privacyFilteredSeconds, 1)
+    }
+
+    func testSamplePlannerDoesNotEmitFalseZeroAfterMergedActivity() {
+        let pseudonymizer = ScreenTimeAppPseudonymizer(
+            keyData: Data(repeating: 0xAB, count: 32)
+        )
+        let bucket = date("2026-08-14T09:00:00Z")
+        let window = ScreenTimeCollectionWindow(
+            start: bucket,
+            end: bucket.addingTimeInterval(3_600),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let observation = ScreenTimeActivityBucketObservation(
+            bucketStart: bucket,
+            observedActivitySeconds: 900,
+            representedAppSeconds: 900,
+            privacyFilteredSeconds: 0,
+            websiteActivitySeconds: 0,
+            unknownActivitySeconds: 0
+        )
+
+        let samples = ScreenTimeSamplePlanner.samples(
+            usage: [
+                ScreenTimeAccumulatedUsage(
+                    bucketStart: bucket,
+                    opaqueAppToken: "allowed-app",
+                    category: "productivity",
+                    foregroundSeconds: 900
+                )
+            ],
+            confirmedZeroBuckets: [bucket],
+            bucketObservations: [bucket: observation],
+            window: window,
+            pseudonymizer: pseudonymizer
+        )
+
+        XCTAssertEqual(samples.count, 1)
+        XCTAssertFalse(samples[0].coverageOnly)
+        XCTAssertEqual(samples[0].foregroundSeconds, 900)
+        XCTAssertEqual(samples[0].coverageSeconds, 3_600)
     }
 
     func testSamplePlannerEmitsCoverageOnlyForTrulyEmptyHour() {
@@ -371,7 +590,6 @@ final class ScreenTimeActivityContractTests: XCTestCase {
         let samples = ScreenTimeSamplePlanner.samples(
             usage: [],
             confirmedZeroBuckets: [bucket],
-            privacyTaintedBuckets: [],
             window: window,
             pseudonymizer: pseudonymizer
         )
@@ -455,21 +673,23 @@ final class ScreenTimeActivityContractTests: XCTestCase {
         XCTAssertEqual(first.count, 57)
     }
 
-    func testFallbackDeviceIdentityIsStableWithoutKeychain() {
-        let suite = "screen-time-fallback-\(UUID().uuidString)"
+    func testUnavailableDeviceIdentityDoesNotPersistLocalIdentifier() {
+        let suite = "screen-time-unavailable-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
         defer { defaults.removePersistentDomain(forName: suite) }
-        let store = ScreenTimeFallbackDeviceIdentityStore(
-            defaults: defaults
-        )
 
-        let first = store.current()
-        let repeated = store.current()
+        let first = ScreenTimeActivityIdentityResolver
+            .unavailableDeviceID
+        let repeated = ScreenTimeActivityIdentityResolver
+            .unavailableDeviceID
 
         XCTAssertEqual(first, repeated)
-        XCTAssertTrue(
-            first.hasPrefix("ios-collector-unavailable-v1-")
+        XCTAssertEqual(first, "ios-collector-unavailable-v1")
+        XCTAssertNil(
+            defaults.string(
+                forKey: "healthmes.screen-time.fallback-device-id.v1"
+            )
         )
     }
 
@@ -486,11 +706,7 @@ final class ScreenTimeActivityContractTests: XCTestCase {
             pseudonymKeyLoader: {
                 loadCount += 1
                 return key
-            },
-            fallbackIdentityStore:
-                ScreenTimeFallbackDeviceIdentityStore(
-                    defaults: defaults
-                )
+            }
         )
 
         XCTAssertEqual(loadCount, 1)
@@ -499,6 +715,30 @@ final class ScreenTimeActivityContractTests: XCTestCase {
             identity.deviceID,
             ScreenTimeDeviceIdentity.fromPseudonymKey(key)
         )
+    }
+
+    func testIdentityResolverUsesRememberedDeviceOnlyWhenKeyLoadFails() {
+        let key = Data(repeating: 0x11, count: 32)
+        let derived = ScreenTimeActivityIdentityResolver.resolve(
+            explicitDeviceID: nil,
+            pseudonymKeyLoader: { key },
+            rememberedDeviceID: "remembered-device"
+        )
+        let recovered = ScreenTimeActivityIdentityResolver.resolve(
+            explicitDeviceID: nil,
+            pseudonymKeyLoader: {
+                throw ScreenTimeCollectorTestError
+                    .pseudonymKeyUnavailable
+            },
+            rememberedDeviceID: " remembered-device "
+        )
+
+        XCTAssertEqual(
+            derived.deviceID,
+            ScreenTimeDeviceIdentity.fromPseudonymKey(key)
+        )
+        XCTAssertEqual(recovered.deviceID, "remembered-device")
+        XCTAssertNil(recovered.pseudonymKeyData)
     }
 
     func testCollectionStateDecodesForFutureSettingsUI() throws {
@@ -1241,11 +1481,6 @@ final class ScreenTimeActivityContractTests: XCTestCase {
         defer {
             stateStore.1.removePersistentDomain(forName: stateStore.2)
         }
-        let fallbackIdentityStore =
-            ScreenTimeFallbackDeviceIdentityStore(
-                defaults: stateStore.1
-            )
-        let fallbackDeviceID = fallbackIdentityStore.current()
         var loadCount = 0
         let identity = ScreenTimeActivityIdentityResolver.resolve(
             explicitDeviceID: nil,
@@ -1253,8 +1488,7 @@ final class ScreenTimeActivityContractTests: XCTestCase {
                 loadCount += 1
                 throw ScreenTimeCollectorTestError
                     .pseudonymKeyUnavailable
-            },
-            fallbackIdentityStore: fallbackIdentityStore
+            }
         )
         let transport = RecordingScreenTimeTransport(
             state: collectionState()
@@ -1283,7 +1517,10 @@ final class ScreenTimeActivityContractTests: XCTestCase {
 
         XCTAssertEqual(loadCount, 1)
         XCTAssertNil(identity.pseudonymKeyData)
-        XCTAssertEqual(identity.deviceID, fallbackDeviceID)
+        XCTAssertEqual(
+            identity.deviceID,
+            ScreenTimeActivityIdentityResolver.unavailableDeviceID
+        )
         XCTAssertEqual(
             outcome,
             .unavailableReported(
@@ -1291,11 +1528,78 @@ final class ScreenTimeActivityContractTests: XCTestCase {
             )
         )
         XCTAssertEqual(reports.count, 1)
-        XCTAssertEqual(reports[0].deviceID, fallbackDeviceID)
+        XCTAssertEqual(
+            reports[0].deviceID,
+            ScreenTimeActivityIdentityResolver.unavailableDeviceID
+        )
         XCTAssertEqual(
             reports[0].reason,
             "ios_screen_time_pseudonym_key_unavailable"
         )
+    }
+
+    func testLiveFactoryDoesNotLoadIdentityBeforeOptIn() {
+        let stateStore = isolatedStateStore()
+        defer {
+            stateStore.1.removePersistentDomain(forName: stateStore.2)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: stateStore.1
+        )
+        var loadCount = 0
+
+        _ = ScreenTimeActivitySyncService.live(
+            transport: RecordingScreenTimeTransport(
+                state: collectionState()
+            ),
+            stateStore: stateStore.0,
+            pseudonymKeyLoader: {
+                loadCount += 1
+                return Data(repeating: 0x11, count: 32)
+            },
+            authorizationIntentStore: intentStore
+        )
+
+        XCTAssertEqual(loadCount, 0)
+    }
+
+    func testUnsupportedBuildDoesNotLoadOrPersistIdentityAfterOptIn()
+        throws
+    {
+        #if HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE
+        throw XCTSkip(
+            "SDK-capable builds create the pseudonym key after opt-in."
+        )
+        #else
+        let stateStore = isolatedStateStore()
+        defer {
+            stateStore.1.removePersistentDomain(forName: stateStore.2)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: stateStore.1
+        )
+        intentStore.setOptedIn(true)
+        var loadCount = 0
+
+        _ = ScreenTimeActivitySyncService.live(
+            transport: RecordingScreenTimeTransport(
+                state: collectionState()
+            ),
+            stateStore: stateStore.0,
+            pseudonymKeyLoader: {
+                loadCount += 1
+                return Data(repeating: 0x11, count: 32)
+            },
+            authorizationIntentStore: intentStore
+        )
+
+        XCTAssertEqual(loadCount, 0)
+        XCTAssertNil(
+            stateStore.1.string(
+                forKey: "healthmes.screen-time.fallback-device-id.v1"
+            )
+        )
+        #endif
     }
 
     func testSyncServiceUploadsRetentionClippedAggregate() async throws {

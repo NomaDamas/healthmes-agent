@@ -1161,6 +1161,143 @@ def test_ios_coverage_only_sample_rejects_identity_or_activity(client) -> None:
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize(
+    "coverage_fields",
+    (
+        {
+            "coverage_status": "privacy_filtered",
+            "observed_activity_seconds": 600,
+            "represented_app_seconds": 0,
+            "privacy_filtered_seconds": 500,
+            "website_activity_seconds": 0,
+            "unknown_activity_seconds": 0,
+        },
+        {
+            "coverage_status": "website_activity",
+            "observed_activity_seconds": 600,
+            "represented_app_seconds": 0,
+            "privacy_filtered_seconds": 0,
+            "website_activity_seconds": 600,
+        },
+        {
+            "coverage_status": "complete",
+            "observed_activity_seconds": 1,
+            "represented_app_seconds": 1,
+            "privacy_filtered_seconds": 0,
+            "website_activity_seconds": 0,
+            "unknown_activity_seconds": 0,
+        },
+    ),
+)
+def test_ios_coverage_marker_requires_explicit_exact_partition(
+    client,
+    coverage_fields,
+) -> None:
+    sample = {
+        "source_record_id": "invalid-partial-coverage",
+        "bucket_start": "2026-08-13T10:00:00Z",
+        "foreground_seconds": 0,
+        "category": None,
+        "opaque_app_token": None,
+        "coverage_seconds": (
+            3600
+            if coverage_fields["coverage_status"] == "complete"
+            else None
+        ),
+        "coverage_only": True,
+        **coverage_fields,
+    }
+    payload = _ios_snapshot(
+        device_id="iphone-invalid-partial-coverage",
+        sequence=1,
+        start="2026-08-13T10:00:00Z",
+        end="2026-08-13T11:00:00Z",
+        collected_at="2026-08-13T12:00:00Z",
+        samples=[sample],
+    )
+
+    response = client.post("/v1/activity/ios/report", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_ios_bucket_rejects_inconsistent_coverage_contract(client) -> None:
+    bucket = "2026-08-13T10:00:00Z"
+    app = {
+        **_ios_sample(
+            "allowed-app",
+            bucket_start=bucket,
+            category="productivity",
+            foreground_seconds=600,
+        ),
+        "coverage_seconds": None,
+    }
+    marker = {
+        "source_record_id": "partial-marker",
+        "bucket_start": bucket,
+        "foreground_seconds": 0,
+        "category": None,
+        "opaque_app_token": None,
+        "coverage_seconds": None,
+        "coverage_only": True,
+        "coverage_status": "privacy_filtered",
+        "observed_activity_seconds": 1200,
+        "represented_app_seconds": 500,
+        "privacy_filtered_seconds": 700,
+        "website_activity_seconds": 0,
+        "unknown_activity_seconds": 0,
+    }
+    duplicate_marker = {
+        **marker,
+        "source_record_id": "second-partial-marker",
+    }
+
+    mismatched = client.post(
+        "/v1/activity/ios/report",
+        json=_ios_snapshot(
+            device_id="iphone-inconsistent-coverage",
+            sequence=1,
+            start=bucket,
+            end="2026-08-13T11:00:00Z",
+            collected_at="2026-08-13T12:00:00Z",
+            samples=[app, marker],
+        ),
+    )
+    duplicate = client.post(
+        "/v1/activity/ios/report",
+        json=_ios_snapshot(
+            device_id="iphone-duplicate-coverage",
+            sequence=1,
+            start=bucket,
+            end="2026-08-13T11:00:00Z",
+            collected_at="2026-08-13T12:00:00Z",
+            samples=[marker, duplicate_marker],
+        ),
+    )
+    false_full_coverage = client.post(
+        "/v1/activity/ios/report",
+        json=_ios_snapshot(
+            device_id="iphone-false-full-coverage",
+            sequence=1,
+            start=bucket,
+            end="2026-08-13T11:00:00Z",
+            collected_at="2026-08-13T12:00:00Z",
+            samples=[
+                {**app, "coverage_seconds": 3600},
+                {
+                    **marker,
+                    "represented_app_seconds": 600,
+                    "privacy_filtered_seconds": 600,
+                },
+            ],
+        ),
+    )
+
+    assert mismatched.status_code == 422
+    assert duplicate.status_code == 422
+    assert false_full_coverage.status_code == 422
+
+
 def test_ios_activity_sample_requires_token_when_exclusions_are_configured(
     client,
     session,
@@ -1588,12 +1725,27 @@ def test_ios_post_privacy_authoritative_bucket_removes_private_rows(
         # raw Screen Time coverage is intentionally not claimed.
         "coverage_seconds": None,
     }
+    partial_coverage = {
+        "source_record_id": "partial-coverage-hour",
+        "bucket_start": bucket_start,
+        "foreground_seconds": 0,
+        "category": None,
+        "opaque_app_token": None,
+        "coverage_seconds": None,
+        "coverage_only": True,
+        "coverage_status": "privacy_filtered",
+        "observed_activity_seconds": 1500,
+        "represented_app_seconds": 900,
+        "privacy_filtered_seconds": 600,
+        "website_activity_seconds": 0,
+        "unknown_activity_seconds": 0,
+    }
     post_privacy = _ios_snapshot(
         device_id=device_id,
         sequence=101,
         collected_at="2026-08-01T13:05:00Z",
         authoritative_bucket_starts=[bucket_start],
-        samples=[filtered_allowed],
+        samples=[filtered_allowed, partial_coverage],
     )
 
     created = client.post("/v1/activity/ios/report", json=initial)
@@ -1605,7 +1757,7 @@ def test_ios_post_privacy_authoritative_bucket_removes_private_rows(
     assert created.status_code == 200
     assert created.json()["created"] == 2
     assert replaced.status_code == 200
-    rows = list(
+    rows_after_replacement = list(
         session.scalars(
             select(WellnessEvent).where(
                 WellnessEvent.event_type == APP_HOUR_EVENT,
@@ -1613,9 +1765,47 @@ def test_ios_post_privacy_authoritative_bucket_removes_private_rows(
             )
         )
     )
-    assert len(rows) == 1
-    assert rows[0].payload["app_id"] == IOS_APP_TOKEN
-    assert rows[0].payload["coverage_seconds"] is None
+    assert len(rows_after_replacement) == 2
+    allowed_row = next(
+        row
+        for row in rows_after_replacement
+        if not row.payload.get("coverage_only")
+    )
+    coverage_row = next(
+        row
+        for row in rows_after_replacement
+        if row.payload.get("coverage_only")
+    )
+    assert allowed_row.payload["app_id"] == IOS_APP_TOKEN
+    assert allowed_row.payload["coverage_seconds"] is None
+    assert coverage_row.payload["app_id"] == "__healthmes_coverage__"
+    assert coverage_row.payload["coverage_status"] == "privacy_filtered"
+    assert coverage_row.payload["observed_activity_seconds"] == 1500
+    assert coverage_row.payload["represented_app_seconds"] == 900
+    assert coverage_row.payload["privacy_filtered_seconds"] == 600
+    assert all(
+        row.payload["app_id"] != IOS_PRIVATE_APP_TOKEN
+        for row in rows_after_replacement
+    )
+
+    stale = client.post("/v1/activity/ios/report", json=initial)
+
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "activity_source_conflict"
+    session.expire_all()
+    rows_after_stale = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT,
+                WellnessEvent.source_device == device_id,
+            )
+        )
+    )
+    assert len(rows_after_stale) == 2
+    assert all(
+        row.payload["app_id"] != IOS_PRIVATE_APP_TOKEN
+        for row in rows_after_stale
+    )
 
 
 def test_ios_snapshot_preserves_hours_not_marked_authoritative(
