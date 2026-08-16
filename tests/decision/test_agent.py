@@ -529,6 +529,7 @@ async def test_runtime_request_omits_caller_and_record_identifiers(
             channel="private-channel",
         ),
         requested_privacy_level=PrivacyLevel.IDENTITY,
+        persistence_requested=True,
         hints=DecisionContextHints(
             local_date=NOW.date(),
             start=NOW,
@@ -549,6 +550,7 @@ async def test_runtime_request_omits_caller_and_record_identifiers(
     assert turn_request.requested_at == request.requested_at
     assert turn_request.timezone == request.timezone
     assert turn_request.requested_privacy_level is PrivacyLevel.IDENTITY
+    assert turn_request.persistence_requested is True
     assert turn_request.hints.has_related_records is True
     assert turn_request.hints.related_domains == ("activity",)
     serialized = turn_request.model_dump_json()
@@ -559,6 +561,7 @@ async def test_runtime_request_omits_caller_and_record_identifiers(
     assert str(request.request_id) not in serialized
     assert str(request.turn_id) not in serialized
     assert not hasattr(turn_request, "caller")
+    assert "record_summary" in runtime.turns[0].system_policy
     runtime_turn = runtime.turns[0]
     assert runtime_turn.request_id != request.request_id
     assert runtime_turn.turn_id != request.turn_id

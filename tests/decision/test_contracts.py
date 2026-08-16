@@ -483,7 +483,7 @@ def test_action_draft_requires_valid_source_reference():
     draft = DecisionDraft(
         status=DecisionStatus.COMPLETED,
         answer="Take a short break before deciding.",
-        record_summary="Take a short break before deciding.",
+        record_summary="Pause briefly before making the next choice.",
         proposed_action=True,
         persistence_intent=DecisionPersistenceIntent.ACTION,
         used_source_ref_ids=[reference_id],
@@ -494,7 +494,7 @@ def test_action_draft_requires_valid_source_reference():
         DecisionDraft(
             status=DecisionStatus.COMPLETED,
             answer="Take a break.",
-            record_summary="Take a break.",
+            record_summary="Pause before continuing.",
             proposed_action=True,
             persistence_intent=DecisionPersistenceIntent.ACTION,
         )
@@ -540,6 +540,33 @@ def test_record_summary_is_bounded_and_completed_only():
             status=DecisionStatus.NEEDS_CLARIFICATION,
             clarification_question="Which drink?",
             record_summary=summary,
+        )
+
+
+@pytest.mark.parametrize(
+    "record_summary",
+    (
+        "A longer private answer.",
+        "A longer private",
+        "Contact private@example.com before continuing.",
+        "Use source sr_0123456789abcdef0123456789abcdef.",
+        "Open https://example.test/private before continuing.",
+        "User 123e4567-e89b-12d3-a456-426614174000 should pause.",
+        "Block com.example.private.app during focus.",
+        "Call +82 10-1234-5678 before continuing.",
+    ),
+)
+def test_record_summary_rejects_copied_or_sensitive_text(
+    record_summary,
+):
+    with pytest.raises(
+        ValidationError,
+        match="record_summary must",
+    ):
+        DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="A longer private answer.",
+            record_summary=record_summary,
         )
 
 

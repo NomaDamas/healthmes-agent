@@ -175,6 +175,7 @@ def _decision_fixture(
         draft=DecisionDraft(
             status=DecisionStatus.COMPLETED,
             answer="Take a short break before the next meeting.",
+            record_summary="Pause briefly before the next meeting.",
             proposed_action=True,
             persistence_intent=DecisionPersistenceIntent.ACTION,
             used_source_ref_ids=[

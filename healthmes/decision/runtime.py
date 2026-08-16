@@ -415,6 +415,7 @@ class RuntimeDecisionRequest(BaseModel):
     requested_at: AwareDatetime
     timezone: str = Field(min_length=1, max_length=64)
     requested_privacy_level: PrivacyLevel = PrivacyLevel.AGGREGATE
+    persistence_requested: bool = False
     hints: RuntimeDecisionContextHints = Field(
         default_factory=RuntimeDecisionContextHints
     )

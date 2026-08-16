@@ -490,6 +490,10 @@ class AdaptiveCrossDomainRuntime:
                     "함께 보면 지금은 추가 카페인보다 먼저 쉬는 편이 "
                     "낫습니다."
                 ),
+                record_summary=(
+                    "현재 컨텍스트에서는 추가 카페인보다 휴식을 먼저 "
+                    "선택합니다."
+                ),
                 proposed_action=True,
                 persistence_intent=DecisionPersistenceIntent.ACTION,
                 used_source_ref_ids=used_source_ref_ids,
@@ -536,6 +540,10 @@ class CalendarRevocationRuntime:
             draft=DecisionDraft(
                 status=DecisionStatus.COMPLETED,
                 answer="The calendar looked busy before access was revoked.",
+                record_summary=(
+                    "Calendar access changed before the recommendation "
+                    "could be retained."
+                ),
                 proposed_action=True,
                 persistence_intent=DecisionPersistenceIntent.ACTION,
                 used_source_ref_ids=list(result.source_ref_ids),
@@ -584,6 +592,10 @@ class ActivityConsentRevocationRuntime:
             draft=DecisionDraft(
                 status=DecisionStatus.COMPLETED,
                 answer="Activity consent changed during this decision.",
+                record_summary=(
+                    "Activity access changed before the recommendation "
+                    "could be retained."
+                ),
                 proposed_action=True,
                 persistence_intent=DecisionPersistenceIntent.ACTION,
                 used_source_ref_ids=list(result.source_ref_ids),

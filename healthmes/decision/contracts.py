@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -32,6 +33,29 @@ MAX_TOOL_TRACE = 64
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _SOURCE_REF_ID = re.compile(r"^sr_[0-9a-f]{32}$")
 _CONTENT_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_RECORD_SUMMARY_SENSITIVE_PATTERNS = (
+    re.compile(
+        r"(?<![A-Za-z0-9_])sr_[0-9a-f]{32}(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?<![\w.+-])[\w.+-]{1,64}@"
+        r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:https?|file)://\S+", re.IGNORECASE),
+    re.compile(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+        r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?<![A-Za-z0-9])(?:[A-Za-z0-9-]+\.){2,}"
+        r"[A-Za-z]{2,}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?<!\d)\+?\d[\d .()-]{7,}\d(?!\d)"),
+)
 
 
 def _utc(value: datetime) -> datetime:
@@ -96,6 +120,48 @@ def _unique_strings(
     if len(cleaned) != len(set(cleaned)):
         raise ValueError(f"{label} must contain unique values")
     return cleaned
+
+
+def _comparison_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def validate_record_summary_for_storage(
+    *,
+    answer: str | None,
+    record_summary: str,
+) -> str:
+    """Validate the bounded conclusion that may enter a DecisionRecord."""
+
+    summary = _bounded_text(
+        record_summary,
+        label="record_summary",
+        max_length=MAX_RECORD_SUMMARY_LENGTH,
+    )
+    if any(
+        pattern.search(summary) is not None
+        for pattern in _RECORD_SUMMARY_SENSITIVE_PATTERNS
+    ):
+        raise ValueError(
+            "record_summary must omit raw identifiers and sensitive detail"
+        )
+    if answer is not None:
+        normalized_answer = _comparison_text(answer)
+        normalized_summary = _comparison_text(summary)
+        if (
+            normalized_answer
+            and normalized_summary
+            and (
+                normalized_summary in normalized_answer
+                or normalized_answer in normalized_summary
+            )
+        ):
+            raise ValueError(
+                "record_summary must be separately written, not copied or "
+                "truncated from answer"
+            )
+    return summary
 
 
 class PrivacyLevel(StrEnum):
@@ -1036,6 +1102,11 @@ class DecisionDraft(BaseModel):
             raise ValueError(
                 "action, risk, and mutation persistence require at least "
                 "one source reference"
+            )
+        if self.record_summary is not None:
+            validate_record_summary_for_storage(
+                answer=self.answer,
+                record_summary=self.record_summary,
             )
         return self
 

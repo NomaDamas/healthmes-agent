@@ -601,7 +601,10 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
         clock=lambda: NOW,
     )
 
-    run = await agent.ask(_request())
+    request = _request().model_copy(
+        update={"persistence_requested": True}
+    )
+    run = await agent.ask(request)
     await agent.aclose()
 
     assert run.draft.status is DecisionStatus.COMPLETED
@@ -619,6 +622,7 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
     serialized_request = json.loads(payload["input"][0]["content"])
     assert serialized_request["request_id"] == str(run.request_id)
     assert serialized_request["decision_session_id"] == DECISION_SESSION_ID
+    assert serialized_request["persistence_requested"] is True
     assert serialized_request["caller"] == {
         "channel": "rest",
         "execution_scope": "local",
@@ -926,6 +930,16 @@ async def test_agent_rejects_duplicate_json_members(
 
     assert run.draft.status is DecisionStatus.FAILED
     assert run.draft.limitations == ["hermes_final_json_invalid"]
+
+
+def test_sse_event_parser_rejects_duplicate_json_members() -> None:
+    with pytest.raises(HermesResponsesContractError) as exc_info:
+        responses_module._parse_sse_json(
+            '{"type":"response.completed",'
+            '"type":"response.failed","sequence_number":0}'
+        )
+
+    assert exc_info.value.code == "hermes_sse_event_invalid"
 
 
 @pytest.mark.asyncio

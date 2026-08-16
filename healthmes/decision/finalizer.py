@@ -55,6 +55,7 @@ from healthmes.decision.contracts import (
     SourceRef,
     ToolCallRecord,
     ToolCallStatus,
+    validate_record_summary_for_storage,
 )
 from healthmes.decision.validation import (
     NormalizedJson,
@@ -387,6 +388,10 @@ class _StoredDecisionOutcome(BaseModel):
     def validate_outcome(self) -> _StoredDecisionOutcome:
         if self.status is not DecisionStatus.COMPLETED:
             raise ValueError("stored outcomes must be completed")
+        validate_record_summary_for_storage(
+            answer=None,
+            record_summary=self.record_summary,
+        )
         if any(
             _SAFE_LIMITATION_CODE.fullmatch(value) is None
             for value in self.limitation_codes
@@ -998,6 +1003,20 @@ class DecisionFinalizer:
                 code="decision_record_summary_missing",
                 persistence_required=True,
             )
+        if persistence_required:
+            try:
+                validate_record_summary_for_storage(
+                    answer=canonical_run.draft.answer,
+                    record_summary=(
+                        canonical_run.draft.record_summary or ""
+                    ),
+                )
+            except ValueError:
+                return _failure_result(
+                    canonical_run,
+                    code="decision_record_summary_invalid",
+                    persistence_required=True,
+                )
         fingerprint = decision_request_fingerprint(canonical_request)
         finalization_deadline = control.deadline
 
@@ -1797,7 +1816,7 @@ def _stored_decision(
         or payload.run.runtime != result.runtime
         or row.kind is not DecisionKind.INSIGHT
         or row.tree != _decision_tree(result)
-        or row.summary != _public_summary(result)
+        or row.summary != _stored_row_summary(payload, result)
         or row.llm_model
         != (
             payload.run.runtime.model[:64]
@@ -1957,6 +1976,15 @@ def _result_from_stored_outcome(
         runtime=payload.run.runtime,
         tool_trace=[],
     )
+
+
+def _stored_row_summary(
+    payload: StoredDecisionPayload,
+    result: DecisionResult,
+) -> str:
+    if isinstance(payload, _StoredDecisionPayloadV4):
+        return payload.outcome.record_summary
+    return _public_summary(result)
 
 
 def _persisted_result(
@@ -2375,11 +2403,6 @@ def _public_summary(
 ) -> str:
     if compact_summary is not None:
         return compact_summary
-    if (
-        _COMPACT_RECOVERY_LIMITATION in result.limitations
-        and result.answer is not None
-    ):
-        return result.answer
     if result.proposed_action:
         return "HealthMes wellness action recorded"
     return "HealthMes wellness decision recorded"

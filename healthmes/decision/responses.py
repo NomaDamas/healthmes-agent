@@ -70,7 +70,7 @@ HERMES_MODELS_PATH = "/v1/models"
 HERMES_TOOLSETS_PATH = "/v1/toolsets"
 HERMES_SESSION_PATH = "/api/sessions/{session_id}"
 HERMES_DECISION_DRAFT_SCHEMA = "healthmes.decision-draft.v1"
-HERMES_RESPONSES_POLICY_VERSION = "healthmes-responses-policy.v1"
+HERMES_RESPONSES_POLICY_VERSION = "healthmes-responses-policy.v2"
 HERMES_WELLNESS_SKILL_CATALOG_SCHEMA = "healthmes-wellness-skills.v1"
 
 _LOGGER = logging.getLogger(__name__)
@@ -1133,20 +1133,17 @@ async def _iter_sse_events(
 
 def _parse_sse_json(raw: str) -> dict[str, Any]:
     try:
-        decoded = json.loads(raw)
-        normalized = normalize_untrusted_json(
-            decoded,
+        return _parse_json_object(
+            raw,
+            code="hermes_sse_event_invalid",
             max_bytes=_MAX_SSE_EVENT_BYTES,
         )
+    except HermesResponsesContractError:
+        raise
     except Exception as exc:
         raise HermesResponsesContractError(
             "hermes_sse_event_invalid"
         ) from exc
-    if type(normalized.value) is not dict:
-        raise HermesResponsesContractError(
-            "hermes_sse_event_invalid"
-        )
-    return normalized.value
 
 
 def _strict_mapping(
@@ -2108,6 +2105,7 @@ def _responses_request(
         "requested_at": request.requested_at.isoformat(),
         "timezone": request.timezone,
         "requested_privacy_level": request.requested_privacy_level.value,
+        "persistence_requested": request.persistence_requested,
         "caller": {
             "channel": request.caller.channel,
             "execution_scope": request.caller.execution_scope.value,

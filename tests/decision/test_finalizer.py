@@ -826,6 +826,45 @@ def test_persisted_decision_requires_compact_record_summary(
         ) == 0
 
 
+@pytest.mark.parametrize(
+    "record_summary",
+    (
+        "Take a short break before choosing more caffeine.",
+        "Contact private@example.com before continuing.",
+        "Use source sr_0123456789abcdef0123456789abcdef.",
+    ),
+)
+def test_finalizer_rejects_forged_invalid_compact_record_summary(
+    persistence,
+    record_summary,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+    run = run.model_copy(
+        update={
+            "draft": run.draft.model_copy(
+                update={"record_summary": record_summary}
+            )
+        },
+        deep=True,
+    )
+
+    result = _finalizer(factory).finalize(request, run)
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
+    assert result.limitations == [
+        "invalid_decision_finalization_input"
+    ]
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
+
+
 def test_clarification_is_not_persisted(persistence):
     _engine, factory = persistence
     request = _request()
@@ -2084,6 +2123,91 @@ def test_retry_reads_and_revalidates_legacy_v1_payload(persistence):
                 for entry in run.access_trace
             ],
         }
+        row.decision_payload = legacy_payload
+        row.decision_payload_digest = _payload_digest(legacy_payload)
+        row.summary = "HealthMes wellness action recorded"
+        session.commit()
+
+    retry_request = request.model_copy(
+        update={"turn_id": uuid.uuid4()}
+    )
+    retry = finalizer.finalize(
+        retry_request,
+        _run(retry_request, [ref]),
+    )
+
+    assert retry.decision_record_id == first.decision_record_id
+    assert retry.turn_id == first.turn_id
+    assert retry.persistence_status is PersistenceStatus.PERSISTED
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 1
+
+
+@pytest.mark.parametrize(
+    "legacy_schema",
+    (
+        "healthmes.decision-private.v2",
+        "healthmes.decision-private.v3",
+    ),
+)
+def test_retry_reads_and_revalidates_legacy_v2_v3_payloads(
+    persistence,
+    legacy_schema,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+    finalizer = _finalizer(factory)
+    first = finalizer.finalize(request, run)
+    assert first.decision_record_id is not None
+
+    with factory() as session:
+        row = session.get(DecisionRecord, first.decision_record_id)
+        assert row is not None
+        assert row.decision_payload is not None
+        current = copy.deepcopy(row.decision_payload)
+        common = {
+            "schema": legacy_schema,
+            "request_fingerprint": row.decision_request_fingerprint,
+            "request": current["request"],
+            "persistence_intent": "action",
+            "run": current["run"],
+            "source_refs": current["source_refs"],
+            "source_attestations": current["source_attestations"],
+            "access_trace": current["access_trace"],
+        }
+        if legacy_schema.endswith(".v2"):
+            legacy_payload = {
+                **common,
+                "result": first.model_copy(
+                    update={"tool_trace": []},
+                    deep=True,
+                ).model_dump(mode="json", round_trip=True),
+            }
+        else:
+            legacy_payload = {
+                **common,
+                "outcome": {
+                    "status": first.status.value,
+                    "summary": (
+                        finalizer_module._stored_outcome_summary(
+                            DecisionPersistenceIntent.ACTION
+                        )
+                    ),
+                    "proposed_action": first.proposed_action,
+                    "limitation_codes": current["outcome"][
+                        "limitation_codes"
+                    ],
+                    "confidence": first.confidence,
+                    "decision_record_id": str(
+                        first.decision_record_id
+                    ),
+                },
+            }
         row.decision_payload = legacy_payload
         row.decision_payload_digest = _payload_digest(legacy_payload)
         row.summary = "HealthMes wellness action recorded"
