@@ -543,6 +543,28 @@ async def test_search_supports_allowlisted_daily_summaries(
     assert "private-connection" not in encoded
 
 
+async def test_daily_summary_requires_the_full_local_day() -> None:
+    search = BoundedOpenWearablesSearch(
+        SummaryClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.summaries",
+            start=START + timedelta(hours=8),
+            end=START + timedelta(hours=9),
+            summary_kind="sleep",
+        )
+    )
+
+    assert fetched.records == ()
+    assert fetched.limitations == (
+        "wearable_rows_discarded",
+        "wearable_summary_window_partial",
+    )
+
+
 class PagedHealthScoreClient:
     def __init__(self, *, verbose: bool = False) -> None:
         self.calls: list[tuple[int, int]] = []
@@ -767,6 +789,85 @@ async def test_cursor_cycle_does_not_aggregate_repeated_page() -> None:
     assert fetched.upstream_truncated is True
     assert fetched.limitations == (
         "wearable_upstream_page_limit_reached",
+    )
+
+
+class OverlappingCursorTimeseriesClient:
+    def __init__(self, *, conflicting: bool = False) -> None:
+        self.calls: list[str | None] = []
+        self.conflicting = conflicting
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        self.calls.append(cursor)
+        value = 20 if cursor == "page-2" and self.conflicting else 10
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:10:00Z",
+                    "type": "steps",
+                    "value": value,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                }
+            ],
+            "pagination": {
+                "next_cursor": "page-2" if cursor is None else None,
+                "has_more": cursor is None,
+            },
+        }
+
+
+async def test_distinct_cursor_pages_deduplicate_the_same_sample() -> None:
+    client = OverlappingCursorTimeseriesClient()
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert client.calls == [None, "page-2"]
+    assert [record["value"] for record in fetched.records] == [10]
+    assert fetched.upstream_truncated is False
+    assert fetched.limitations == ()
+
+
+async def test_conflicting_cursor_duplicates_remain_visible_and_partial() -> None:
+    client = OverlappingCursorTimeseriesClient(conflicting=True)
+    search = BoundedOpenWearablesSearch(
+        client,  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+
+    fetched = await search(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert [record["value"] for record in fetched.records] == [10, 20]
+    assert fetched.limitations == (
+        "wearable_conflicting_duplicate_rows",
+        "wearable_stream_attribution_unavailable",
     )
 
 

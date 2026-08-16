@@ -116,6 +116,7 @@ from healthmes.wearables.search import (
     WearableSearchFetch,
     WearableSearchReader,
     WearableSearchRequest,
+    normalize_retained_wearable_summaries,
     normalize_retained_wearable_timeseries,
     validate_wearable_search_request,
 )
@@ -669,6 +670,7 @@ _WEARABLE_LIMITATION_CODES = (
     "open_wearables_context_timeout",
     "open_wearables_detail_unavailable",
     "open_wearables_detail_timeout",
+    "wearable_conflicting_duplicate_rows",
     "wearable_payload_limit_reached",
     "wearable_readiness_evidence_ids_unavailable",
     "wearable_query_snapshot_fallback_used",
@@ -681,15 +683,21 @@ _WEARABLE_LIMITATION_CODES = (
     "wearable_snapshot_writer_unavailable",
     "wearable_source_refs_are_readiness_level",
     "wearable_stream_attribution_unavailable",
+    "wearable_summary_window_partial",
     "wearable_upstream_page_limit_reached",
 )
 _WEARABLE_INCOMPLETE_RESULT_LIMITATIONS = frozenset(
     {
+        "open_wearables_detail_unavailable",
+        "open_wearables_detail_timeout",
+        "wearable_conflicting_duplicate_rows",
         "wearable_payload_limit_reached",
         "wearable_provider_attribution_unavailable",
+        "wearable_query_snapshot_fallback_used",
         "wearable_retention_window_trimmed",
         "wearable_rows_discarded",
         "wearable_stream_attribution_unavailable",
+        "wearable_summary_window_partial",
         "wearable_upstream_page_limit_reached",
     }
 )
@@ -821,6 +829,10 @@ def _wearable_fetch_with_required_provider(
             + len(fetched.records)
             - len(records)
         ),
+        summary_window_partial=fetched.summary_window_partial,
+        conflicting_duplicate_rows=(
+            fetched.conflicting_duplicate_rows
+        ),
         stream_attribution_unavailable=(
             fetched.stream_attribution_unavailable
         ),
@@ -830,27 +842,54 @@ def _wearable_fetch_with_required_provider(
 def _wearable_record_observed_at(
     record: Mapping[str, Any],
     *,
+    source_ref: SourceRef,
     timezone: str,
 ) -> str:
-    for field in ("timestamp", "recorded_at", "start_time"):
-        raw = record.get(field)
-        if not isinstance(raw, str):
-            continue
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            raise ValueError("wearable record timestamp must be aware")
-        return parsed.astimezone(UTC).isoformat()
+    observed: datetime | None = None
     raw_day = record.get("date")
-    if not isinstance(raw_day, str):
+    if (
+        isinstance(record.get("summary_kind"), str)
+        and isinstance(raw_day, str)
+    ):
+        observed_day = date.fromisoformat(raw_day)
+        zone = parse_timezone(timezone)
+        observed = datetime(
+            observed_day.year,
+            observed_day.month,
+            observed_day.day,
+            tzinfo=zone,
+        ).astimezone(UTC)
+    if observed is None:
+        for field in ("timestamp", "recorded_at", "start_time"):
+            raw = record.get(field)
+            if not isinstance(raw, str):
+                continue
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError(
+                    "wearable record timestamp must be aware"
+                )
+            observed = parsed.astimezone(UTC)
+            break
+    if observed is None and isinstance(raw_day, str):
+        observed_day = date.fromisoformat(raw_day)
+        zone = parse_timezone(timezone)
+        observed = datetime(
+            observed_day.year,
+            observed_day.month,
+            observed_day.day,
+            tzinfo=zone,
+        ).astimezone(UTC)
+    if observed is None:
         raise ValueError("wearable record observation is missing")
-    observed_day = date.fromisoformat(raw_day)
-    zone = parse_timezone(timezone)
-    return datetime(
-        observed_day.year,
-        observed_day.month,
-        observed_day.day,
-        tzinfo=zone,
-    ).astimezone(UTC).isoformat()
+    if observed < source_ref.observed_start or (
+        source_ref.observed_end is not None
+        and observed >= source_ref.observed_end
+    ):
+        raise ValueError(
+            "wearable record observation is outside source ref"
+        )
+    return observed.isoformat()
 
 
 def _wearable_record_with_provenance(
@@ -872,6 +911,7 @@ def _wearable_record_with_provenance(
         "provider_attribution": attribution,
         "observed_at": _wearable_record_observed_at(
             normalized,
+            source_ref=source_ref,
             timezone=timezone,
         ),
         "mode": provenance_mode,
@@ -3195,8 +3235,24 @@ class WearableContextProvider:
                         "wearable_query_outside_retention_window"
                     ],
                 )
-            if start < retained_after:
-                start = retained_after
+            if start <= retained_after:
+                start = retained_after + timedelta(microseconds=1)
+                if end <= start:
+                    return ContextResult(
+                        query_id=query.query_id,
+                        provider_id=query.provider_id,
+                        capability=query.capability,
+                        status=ContextStatus.UNAVAILABLE,
+                        freshness=ContextFreshness(
+                            status=FreshnessStatus.UNAVAILABLE
+                        ),
+                        coverage=ContextCoverage(
+                            status=CoverageStatus.UNAVAILABLE
+                        ),
+                        limitations=[
+                            "wearable_query_outside_retention_window"
+                        ],
+                    )
                 limitations.add("wearable_retention_window_trimmed")
         parameters = {
             key: value
@@ -3437,7 +3493,17 @@ class WearableContextProvider:
             if isinstance(record, Mapping)
         ]
         retained_limitations = set(_limitations(stored))
-        if query.capability == "wearable.timeseries":
+        if query.capability == "wearable.summaries":
+            normalized_fetch = normalize_retained_wearable_summaries(
+                public_records,
+                kind=str(query.parameters["summary_kind"]),
+                start=snapshot.start,
+                end=snapshot.end,
+                timezone=query.timezone,
+            )
+            public_records = list(normalized_fetch.records)
+            retained_limitations.update(normalized_fetch.limitations)
+        elif query.capability == "wearable.timeseries":
             normalized_fetch = normalize_retained_wearable_timeseries(
                 public_records,
                 series_type=str(query.parameters["series_type"]),
@@ -3545,11 +3611,7 @@ class WearableContextProvider:
             schema_version=1,
             derived_by=f"{query.capability}.mirror.v1",
             freshness=freshness.status,
-            coverage=(
-                None
-                if "wearable_retention_window_trimmed" in limitations
-                else snapshot.coverage
-            ),
+            coverage=snapshot.coverage,
             sensitivity="wearable",
         )
         raw["records"] = [

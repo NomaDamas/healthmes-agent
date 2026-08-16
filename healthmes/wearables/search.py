@@ -8,7 +8,7 @@ import json
 import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from functools import partial
 from typing import Any
 
@@ -154,6 +154,8 @@ class WearableSearchFetch:
     upstream_truncated: bool = False
     payload_trimmed: bool = False
     discarded_rows: int = 0
+    summary_window_partial: bool = False
+    conflicting_duplicate_rows: bool = False
     stream_attribution_unavailable: bool = False
 
     @property
@@ -165,6 +167,10 @@ class WearableSearchFetch:
             values.append("wearable_payload_limit_reached")
         if self.discarded_rows:
             values.append("wearable_rows_discarded")
+        if self.summary_window_partial:
+            values.append("wearable_summary_window_partial")
+        if self.conflicting_duplicate_rows:
+            values.append("wearable_conflicting_duplicate_rows")
         if self.stream_attribution_unavailable:
             values.append("wearable_stream_attribution_unavailable")
         if any(
@@ -181,6 +187,47 @@ WearableSearchReader = Callable[
     [WearableSearchRequest],
     Awaitable[WearableSearchFetch],
 ]
+
+
+def normalize_retained_wearable_summaries(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    kind: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+) -> WearableSearchFetch:
+    """Filter legacy mirrors against the exact retained summary window."""
+
+    if kind not in WEARABLE_SUMMARY_KINDS:
+        raise ValueError("wearable summary kind is not allowlisted")
+    normalized: list[dict[str, Any]] = []
+    discarded = 0
+    for record in records:
+        observed_day = _day(record.get("date"))
+        if (
+            record.get("summary_kind") != kind
+            or observed_day is None
+            or not _summary_day_fully_covered(
+                observed_day,
+                start=start,
+                end=end,
+                timezone=timezone,
+            )
+        ):
+            discarded += 1
+            continue
+        normalized.append(dict(record))
+    normalized.sort(key=_row_sort_key)
+    return WearableSearchFetch(
+        records=tuple(normalized),
+        discarded_rows=discarded,
+        summary_window_partial=_summary_window_is_partial(
+            start=start,
+            end=end,
+            timezone=timezone,
+        ),
+    )
 
 
 def normalize_retained_wearable_timeseries(
@@ -338,6 +385,7 @@ class BoundedOpenWearablesSearch:
         if not isinstance(user_id, str) or not user_id:
             raise LookupError("open-wearables user is unavailable")
 
+        summary_window_partial = False
         if request.capability == "wearable.health-scores":
             rows, truncated, discarded = await self._health_scores(
                 user_id,
@@ -354,6 +402,11 @@ class BoundedOpenWearablesSearch:
                 request,
             )
             kind = str(request.parameters["summary_kind"])
+            summary_window_partial = _summary_window_is_partial(
+                start=request.start,
+                end=request.end,
+                timezone=request.timezone,
+            )
             sanitizer = partial(
                 _sanitize_summary,
                 kind=kind,
@@ -391,8 +444,12 @@ class BoundedOpenWearablesSearch:
                 discarded += 1
                 continue
             sanitized.append(clean)
+        conflicting_duplicate_rows = False
         stream_attribution_unavailable = False
         if request.capability == "wearable.timeseries":
+            sanitized, conflicting_duplicate_rows = (
+                _deduplicate_timeseries_records(sanitized)
+            )
             sanitized, stream_attribution_unavailable = _aggregate_timeseries(
                 sanitized,
                 series_type=str(request.parameters["series_type"]),
@@ -417,6 +474,8 @@ class BoundedOpenWearablesSearch:
             upstream_truncated=truncated or row_trimmed,
             payload_trimmed=payload_trimmed,
             discarded_rows=discarded,
+            summary_window_partial=summary_window_partial,
+            conflicting_duplicate_rows=conflicting_duplicate_rows,
             stream_attribution_unavailable=(
                 stream_attribution_unavailable
             ),
@@ -845,12 +904,14 @@ def _sanitize_summary(
 ) -> dict[str, Any] | None:
     observed_day = _day(row.get("date"))
     provider, attribution = _provider(row)
-    zone = parse_timezone(timezone)
-    first_day = start.astimezone(zone).date()
-    last_day = (end - timedelta(microseconds=1)).astimezone(zone).date()
     if (
         observed_day is None
-        or not first_day <= observed_day <= last_day
+        or not _summary_day_fully_covered(
+            observed_day,
+            start=start,
+            end=end,
+            timezone=timezone,
+        )
     ):
         return None
     result: dict[str, Any] = {
@@ -1043,6 +1104,117 @@ def _sanitize_timeseries(
     if type(row.get("is_daily_total")) is bool:
         result["is_daily_total"] = row["is_daily_total"]
     return result
+
+
+def _summary_day_bounds(
+    observed_day: date,
+    *,
+    timezone: str,
+) -> tuple[datetime, datetime]:
+    zone = parse_timezone(timezone)
+    day_start = datetime.combine(observed_day, time.min, tzinfo=zone)
+    day_end = datetime.combine(
+        observed_day + timedelta(days=1),
+        time.min,
+        tzinfo=zone,
+    )
+    return day_start.astimezone(UTC), day_end.astimezone(UTC)
+
+
+def _summary_day_fully_covered(
+    observed_day: date,
+    *,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+) -> bool:
+    day_start, day_end = _summary_day_bounds(
+        observed_day,
+        timezone=timezone,
+    )
+    return (
+        start.astimezone(UTC) <= day_start
+        and day_end <= end.astimezone(UTC)
+    )
+
+
+def _summary_window_is_partial(
+    *,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+) -> bool:
+    zone = parse_timezone(timezone)
+    start_utc = start.astimezone(UTC)
+    end_utc = end.astimezone(UTC)
+    start_boundary, _ = _summary_day_bounds(
+        start_utc.astimezone(zone).date(),
+        timezone=timezone,
+    )
+    end_boundary, _ = _summary_day_bounds(
+        end_utc.astimezone(zone).date(),
+        timezone=timezone,
+    )
+    return start_utc != start_boundary or end_utc != end_boundary
+
+
+def _timeseries_row_identity(
+    record: Mapping[str, Any],
+) -> tuple[str, ...] | None:
+    timestamp = _safe_text(record.get("timestamp"), max_length=64)
+    series_type = _safe_text(record.get("series_type"), max_length=64)
+    unit = _safe_text(record.get("unit"), max_length=32)
+    provider = _safe_text(record.get("provider"), max_length=64)
+    stream_key = _safe_text(
+        record.get(_INTERNAL_STREAM_KEY),
+        max_length=64,
+    )
+    if None in (timestamp, series_type, unit, provider, stream_key):
+        return None
+    return (
+        str(timestamp),
+        str(series_type),
+        str(unit),
+        str(provider),
+        str(stream_key),
+        str(record.get("is_daily_total") is True),
+    )
+
+
+def _deduplicate_timeseries_records(
+    records: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Remove exact cursor overlap while retaining conflicting observations."""
+
+    selected: list[dict[str, Any]] = []
+    variants: dict[tuple[str, ...], dict[str, int]] = {}
+    conflicting = False
+    for raw_record in records[: MAX_WEARABLE_SEARCH_ROWS + 1]:
+        record = dict(raw_record)
+        identity = _timeseries_row_identity(record)
+        if identity is None:
+            selected.append(record)
+            continue
+        digest = hashlib.sha256(
+            json.dumps(
+                record,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        identity_variants = variants.setdefault(identity, {})
+        if digest in identity_variants:
+            continue
+        if identity_variants:
+            conflicting = True
+            for index in identity_variants.values():
+                selected[index].pop(_INTERNAL_STREAM_KEY, None)
+            record.pop(_INTERNAL_STREAM_KEY, None)
+        identity_variants[digest] = len(selected)
+        selected.append(record)
+    return selected, conflicting
 
 
 def _aggregate_timeseries(

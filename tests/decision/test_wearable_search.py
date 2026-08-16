@@ -360,7 +360,10 @@ async def test_exact_retention_boundary_persists_by_oldest_record(
     )
 
     assert result.status is not ContextStatus.FAILED
-    assert calls[0].start == NOW - timedelta(days=30)
+    assert calls[0].start == (
+        NOW - timedelta(days=30) + timedelta(microseconds=1)
+    )
+    assert "wearable_retention_window_trimmed" in result.limitations
     event = session.get(
         WellnessEvent,
         UUID(result.source_refs[0].record_id),
@@ -370,6 +373,73 @@ async def test_exact_retention_boundary_persists_by_oldest_record(
     assert event.expires_at.replace(tzinfo=UTC) == (
         observed_at + timedelta(days=30)
     )
+
+
+class RetentionBoundaryTimeseriesClient:
+    async def get_timeseries(self, _user_id, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-09T12:30:00Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                }
+            ],
+            "pagination": {
+                "next_cursor": None,
+                "has_more": False,
+            },
+        }
+
+
+async def test_retention_cutoff_timeseries_bucket_remains_persistable(
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "7d",
+        now=NOW,
+    )
+    search = BoundedOpenWearablesSearch(
+        RetentionBoundaryTimeseriesClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )
+    provider = WearableContextProvider(search_reader=search)
+    cutoff = NOW - timedelta(days=7)
+
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.timeseries",
+            start=cutoff,
+            end=cutoff + timedelta(hours=1),
+            granularity="series",
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+        ),
+        now=NOW,
+    )
+
+    safe_start = cutoff + timedelta(microseconds=1)
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["records"][0]["timestamp"] == (
+        safe_start.isoformat()
+    )
+    assert result.source_refs[0].observed_start == safe_start
+    event = session.get(
+        WellnessEvent,
+        UUID(result.source_refs[0].record_id),
+    )
+    assert event is not None
+    assert event.payload["retention_basis_at"] == safe_start.isoformat()
+    assert event.expires_at.replace(tzinfo=UTC) > NOW
 
 
 async def test_detail_query_clamps_to_shorter_retention_policy(
@@ -414,11 +484,15 @@ async def test_detail_query_clamps_to_shorter_retention_policy(
     )
 
     assert result.status is ContextStatus.PARTIAL
-    assert calls[0].start == NOW - timedelta(days=7)
+    assert calls[0].start == (
+        NOW - timedelta(days=7) + timedelta(microseconds=1)
+    )
     assert "wearable_retention_window_trimmed" in result.limitations
     assert result.coverage.status is CoverageStatus.UNKNOWN
     assert result.coverage.ratio is None
-    assert result.source_refs[0].observed_start == NOW - timedelta(days=7)
+    assert result.source_refs[0].observed_start == (
+        NOW - timedelta(days=7) + timedelta(microseconds=1)
+    )
     assert result.source_refs[0].coverage is None
     event = session.get(
         WellnessEvent,
@@ -466,6 +540,51 @@ async def test_detail_query_fully_before_retention_skips_upstream(
         "wearable_query_outside_retention_window"
     ]
     assert calls == 0
+
+
+async def test_daily_summary_provenance_uses_the_summary_day(
+    session,
+) -> None:
+    day_start = datetime(2026, 8, 10, tzinfo=UTC)
+
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=(
+                {
+                    "summary_kind": "sleep",
+                    "date": "2026-08-10",
+                    "provider": "oura",
+                    "provider_attribution": "declared",
+                    "start_time": "2026-08-09T23:00:00+00:00",
+                    "end_time": "2026-08-10T07:00:00+00:00",
+                    "duration_minutes": 480,
+                },
+            )
+        )
+
+    result = await WearableContextProvider(
+        search_reader=search_reader
+    ).query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.summaries",
+            start=day_start,
+            end=day_start + timedelta(days=1),
+            granularity="summary",
+            parameters={"summary_kind": "sleep"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.OK
+    assert result.source_refs[0].observed_start == day_start
+    assert (
+        result.payload["records"][0]["provenance"]["observed_at"]
+        == day_start.isoformat()
+    )
 
 
 async def test_file_backed_detail_search_uses_stable_mirror_ref_and_cursor(
@@ -920,7 +1039,14 @@ async def test_detail_search_falls_back_to_exact_retained_query(
         assert fallback.payload["provenance_mode"] == (
             "retained_local_mirror"
         )
-        assert fallback.source_refs == initial.source_refs
+        assert fallback.status is ContextStatus.PARTIAL
+        assert fallback.coverage.status is CoverageStatus.UNKNOWN
+        assert fallback.coverage.ratio is None
+        assert (
+            fallback.source_refs[0].reference_id
+            == initial.source_refs[0].reference_id
+        )
+        assert fallback.source_refs[0].coverage == 1
         initial_record = initial.payload["records"][0]
         fallback_record = fallback.payload["records"][0]
         assert {
@@ -956,6 +1082,63 @@ async def test_detail_search_falls_back_to_exact_retained_query(
     finally:
         fallback_service.close()
         engine.dispose()
+
+
+async def test_retained_partial_day_summary_is_filtered(
+    session,
+) -> None:
+    persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.summaries",
+        start=DETAIL_START,
+        end=DETAIL_END,
+        timezone="UTC",
+        parameters={"summary_kind": "sleep"},
+        result={
+            "status": "ok",
+            "records": [
+                {
+                    "summary_kind": "sleep",
+                    "date": "2026-08-16",
+                    "provider": "oura",
+                    "provider_attribution": "declared",
+                    "start_time": "2026-08-15T23:00:00+00:00",
+                    "end_time": "2026-08-16T07:00:00+00:00",
+                }
+            ],
+            "coverage": {"ratio": 1.0},
+            "limitations": [],
+        },
+        collected_at=NOW,
+        now=NOW,
+    )
+    session.commit()
+
+    async def unavailable_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        raise RuntimeError("upstream unavailable")
+
+    result = await WearableContextProvider(
+        search_reader=unavailable_reader
+    ).query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.summaries",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="summary",
+            parameters={"summary_kind": "sleep"},
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert result.payload["records"] == []
+    assert result.coverage.status is CoverageStatus.UNKNOWN
+    assert "wearable_rows_discarded" in result.limitations
+    assert "wearable_summary_window_partial" in result.limitations
 
 
 async def test_detail_search_reads_legacy_snapshot_without_provider(
@@ -1589,8 +1772,14 @@ async def test_detail_search_timeout_uses_exact_retained_query(
             parameters={"category": "stress"},
         )
 
-        assert fallback.status is not ContextStatus.FAILED
-        assert fallback.source_refs == initial.source_refs
+        assert fallback.status is ContextStatus.PARTIAL
+        assert fallback.coverage.status is CoverageStatus.UNKNOWN
+        assert fallback.coverage.ratio is None
+        assert (
+            fallback.source_refs[0].reference_id
+            == initial.source_refs[0].reference_id
+        )
+        assert fallback.source_refs[0].coverage == 1
         assert "open_wearables_detail_timeout" in fallback.limitations
         assert (
             "wearable_query_snapshot_fallback_used"
