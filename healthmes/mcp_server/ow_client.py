@@ -66,6 +66,10 @@ class OWNotFoundError(OWClientError):
     """The requested resource does not exist (HTTP 404)."""
 
 
+class OWPayloadError(OWClientError):
+    """The backend returned a successful response with an invalid body."""
+
+
 class OWClient:
     """Async client for the open-wearables backend REST API (read-only consumer)."""
 
@@ -169,7 +173,7 @@ class OWClient:
         try:
             payload = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            raise OWClientError(
+            raise OWPayloadError(
                 "open-wearables returned invalid JSON"
             ) from None
         return payload
