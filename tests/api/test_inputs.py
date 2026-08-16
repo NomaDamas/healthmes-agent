@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import sqlalchemy as sa
+from jsonschema import Draft202012Validator
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
@@ -65,6 +66,45 @@ def _put_settings(
         headers={"If-Match": if_match},
         json=body,
     )
+
+
+def _resolve_openapi_schema(
+    document: dict,
+    schema: dict,
+) -> dict:
+    reference = schema.get("$ref")
+    if reference is None:
+        return schema
+    prefix = "#/components/schemas/"
+    assert reference.startswith(prefix)
+    return document["components"]["schemas"][
+        reference.removeprefix(prefix)
+    ]
+
+
+def _assert_error_matches_openapi(
+    client,
+    response,
+) -> None:
+    document = client.get("/openapi.json").json()
+    operation = document["paths"][
+        "/v1/inputs/{source_id}/settings"
+    ]["put"]
+    schema = operation["responses"][str(response.status_code)]["content"][
+        "application/json"
+    ]["schema"]
+    validation_root = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": schema["$ref"],
+        "components": document["components"],
+    }
+    errors = sorted(
+        Draft202012Validator(validation_root).iter_errors(
+            response.json()
+        ),
+        key=lambda item: tuple(str(part) for part in item.absolute_path),
+    )
+    assert errors == []
 
 
 def _seed_legacy_ios_exclusion(
@@ -176,6 +216,7 @@ def test_input_settings_requires_a_well_formed_if_match(client) -> None:
         missing.json()["error"]["code"]
         == "input_settings_revision_required"
     )
+    _assert_error_matches_openapi(client, missing)
 
     malformed_values = (
         "",
@@ -199,6 +240,7 @@ def test_input_settings_requires_a_well_formed_if_match(client) -> None:
             response.json()["error"]["code"]
             == "input_settings_revision_invalid"
         )
+        _assert_error_matches_openapi(client, response)
 
     duplicate = client.put(
         "/v1/inputs/activity.android/settings",
@@ -616,6 +658,7 @@ def test_stale_input_settings_update_changes_no_setting_group(client) -> None:
     )
 
     assert stale.status_code == 409
+    _assert_error_matches_openapi(client, stale)
     error = stale.json()["error"]
     assert error["code"] == "input_settings_revision_conflict"
     assert error["detail"] == {
@@ -1160,27 +1203,42 @@ def test_input_settings_openapi_requires_if_match(client) -> None:
         expected_etag_header
     )
 
-    components = schema["components"]["schemas"]
-
     def response_schema(status_code: str) -> dict:
-        reference = operation["responses"][status_code]["content"][
+        return _resolve_openapi_schema(
+            schema,
+            operation["responses"][status_code]["content"][
             "application/json"
-        ]["schema"]["$ref"]
-        return components[reference.rsplit("/", 1)[-1]]
+            ]["schema"],
+        )
 
     invalid = response_schema("400")
     required = response_schema("428")
     conflict = response_schema("409")
-    assert invalid["properties"]["error"]["$ref"].endswith(
-        "_InputRevisionInvalidError"
+    invalid_error = _resolve_openapi_schema(
+        schema,
+        invalid["properties"]["error"],
     )
-    assert required["properties"]["error"]["$ref"].endswith(
-        "_InputRevisionRequiredError"
+    required_error = _resolve_openapi_schema(
+        schema,
+        required["properties"]["error"],
     )
-    conflict_error_ref = conflict["properties"]["error"]["$ref"]
-    conflict_error = components[conflict_error_ref.rsplit("/", 1)[-1]]
-    detail_ref = conflict_error["properties"]["detail"]["$ref"]
-    conflict_detail = components[detail_ref.rsplit("/", 1)[-1]]
+    conflict_error = _resolve_openapi_schema(
+        schema,
+        conflict["properties"]["error"],
+    )
+    assert invalid_error["properties"]["code"]["const"] == (
+        "input_settings_revision_invalid"
+    )
+    assert required_error["properties"]["code"]["const"] == (
+        "input_settings_revision_required"
+    )
+    assert conflict_error["properties"]["code"]["const"] == (
+        "input_settings_revision_conflict"
+    )
+    conflict_detail = _resolve_openapi_schema(
+        schema,
+        conflict_error["properties"]["detail"],
+    )
     assert conflict_detail["required"] == [
         "expected_revision",
         "current_revision",
