@@ -33,6 +33,19 @@ def test_compose_keeps_decision_runtime_out_of_core_stack() -> None:
     assert "hermes" not in services
     assert runtime["profiles"] == ["decision"]
     assert "hermes-decision" not in healthmes["depends_on"]
+    assert healthmes["healthcheck"]["test"] == [
+        "CMD",
+        "python",
+        "-c",
+        (
+            "import urllib.request; "
+            "urllib.request.urlopen("
+            "'http://127.0.0.1:8100/health', timeout=2).read()"
+        ),
+    ]
+    assert runtime["depends_on"] == {
+        "healthmes": {"condition": "service_healthy"}
+    }
 
     healthmes_env = _environment(healthmes["environment"])
     assert healthmes_env["HEALTHMES_HERMES_WEBHOOK_URL"] == ""

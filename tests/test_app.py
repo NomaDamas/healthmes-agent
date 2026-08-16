@@ -187,6 +187,53 @@ class TestStoreWiring:
         assert mcp_server._settings_override is None
         assert store_session._engine is None
 
+    def test_health_and_mcp_start_before_optional_decision_runtime(
+        self,
+        settings,
+        monkeypatch,
+    ) -> None:
+        """Core HTTP and MCP must not wait for the optional Hermes runtime."""
+        import healthmes.app as app_module
+
+        class DeferredDecisionEngine:
+            def __init__(self) -> None:
+                self.start_calls = 0
+                self.close_calls = 0
+
+            async def astart(self) -> None:
+                self.start_calls += 1
+                raise AssertionError(
+                    "the optional decision runtime must start lazily"
+                )
+
+            async def aclose(self) -> None:
+                self.close_calls += 1
+
+        engine = DeferredDecisionEngine()
+        monkeypatch.setattr(
+            app_module,
+            "build_configured_decision_engine",
+            lambda **_kwargs: engine,
+        )
+
+        app = create_app(settings)
+        with TestClient(
+            app,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43123),
+        ) as client:
+            assert client.get("/health").json() == {"status": "ok"}
+            response = client.post(
+                "/mcp",
+                json=_MCP_INITIALIZE,
+                headers=_MCP_HEADERS,
+            )
+            assert response.status_code == 200
+            assert app.state.decision_engine is engine
+            assert engine.start_calls == 0
+
+        assert engine.close_calls == 1
+
     def test_scheduler_setup_failure_closes_decisions_mcp_and_database(
         self,
         settings,

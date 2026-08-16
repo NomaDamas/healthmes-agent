@@ -175,6 +175,17 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     restart: on-failure
 
   hermes-decision:
@@ -216,6 +227,9 @@ services:
       - XAI_API_KEY=${XAI_API_KEY:-}
     expose:
       - "8645"
+    depends_on:
+      healthmes:
+        condition: service_healthy
     healthcheck:
       test:
         [

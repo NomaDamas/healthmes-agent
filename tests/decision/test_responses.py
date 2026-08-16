@@ -669,6 +669,44 @@ async def test_runtime_is_verified_at_startup_and_before_every_decision() -> Non
 
 
 @pytest.mark.asyncio
+async def test_lazy_runtime_probe_retries_after_transient_failure() -> None:
+    class FlakyRuntimeTransport(_Transport):
+        async def verify_runtime(self, *, timeout_seconds: float) -> None:
+            await super().verify_runtime(timeout_seconds=timeout_seconds)
+            if self.runtime_verifications == 1:
+                raise RuntimeError("runtime is still starting")
+
+    transport = FlakyRuntimeTransport(
+        _final_response(
+            {
+                "status": "completed",
+                "answer": "Take a short break.",
+            }
+        )
+    )
+    agent = HermesResponsesDecisionAgent(
+        transport=transport,
+        search_service=_SearchService(_empty_snapshot()),  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        clock=lambda: NOW,
+    )
+
+    first = await agent.ask(_request())
+    second = await agent.ask(_request())
+    await agent.aclose()
+
+    assert first.draft.status is DecisionStatus.BLOCKED
+    assert first.draft.limitations == ["hermes_tool_profile_unavailable"]
+    assert second.draft.status is DecisionStatus.COMPLETED
+    assert transport.runtime_verifications == 3
+    assert transport.toolset_calls == 1
+    assert transport.model_calls == 1
+    assert len(transport.response_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_agent_rejects_transcript_order_that_disagrees_with_trace() -> None:
     first_trace, first_result, first_ref = _activity_trace(
         "2026-08-16:first",
@@ -2442,7 +2480,7 @@ def test_production_rest_path_probes_then_uses_one_responses_turn(
         base_url="http://127.0.0.1:8100",
         client=("127.0.0.1", 43123),
     ) as client:
-        assert transport.toolset_calls == 1
+        assert transport.toolset_calls == 0
         decision_engine = app.state.decision_engine
         assert decision_engine is not None
         assert (
@@ -2456,6 +2494,7 @@ def test_production_rest_path_probes_then_uses_one_responses_turn(
         )
 
     assert response.status_code == 200
+    assert transport.toolset_calls == 1
     assert response.json()["answer"] == "Take a short break."
     assert len(transport.response_calls) == 1
     assert transport.deleted_sessions == [HERMES_SESSION_ID]

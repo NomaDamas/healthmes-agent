@@ -323,8 +323,19 @@ def test_local_start_uses_only_optional_dedicated_decision_runtime() -> None:
     assert start_body.index("uv sync --frozen --no-dev") < start_body.index(
         "scripts/bootstrap.py"
     )
-    assert start_body.index("healthmes.hermes_runtime_supervisor") < (
-        start_body.index('start_process "Open Wearables"')
+    assert start_body.index("scripts/bootstrap.py") < start_body.index(
+        'start_process "Open Wearables"'
+    )
+    assert start_body.index('start_process "Open Wearables"') < (
+        start_body.index('start_process "HealthMes"')
+    )
+    assert start_body.index('start_process "HealthMes"') < start_body.index(
+        "http://127.0.0.1:${HEALTHMES_PORT:-8100}/health"
+    )
+    assert start_body.index(
+        "http://127.0.0.1:${HEALTHMES_PORT:-8100}/health"
+    ) < start_body.index(
+        "healthmes.hermes_runtime_supervisor"
     )
     assert (
         "Hermes decision runtime disabled (model/provider not configured)"

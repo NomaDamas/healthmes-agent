@@ -344,11 +344,12 @@ cmd_update() {
 }
 
 start_apps() {
-    local decision_home quoted_home quoted_vendor
+    local decision_home= quoted_home= quoted_vendor= decision_enabled=false
     load_runtime_env
     bash "$DEV_MAC_SCRIPT" services-start
     resolve_ow_api_key
     if decision_runtime_configured; then
+        decision_enabled=true
         mkdir -p "$RUNTIME_DIR"
         info "syncing dedicated Hermes decision runtime"
         UV_PROJECT_ENVIRONMENT="$HERMES_DECISION_VENV" \
@@ -362,6 +363,31 @@ start_apps() {
         printf -v quoted_home '%q' "$decision_home"
         printf -v quoted_vendor '%q' "$REPO_ROOT/vendor/hermes-agent"
         stop_process "Hermes decision runtime" "$HERMES_DECISION_PID"
+    else
+        stop_process "Hermes decision runtime" "$HERMES_DECISION_PID"
+        info "Hermes decision runtime disabled (model/provider not configured)"
+    fi
+    start_process "Open Wearables" "$OW_PID" "$OW_LOG" \
+        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow"
+    start_process "Open Wearables worker" "$WORKER_PID" "$WORKER_LOG" \
+        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow-worker"
+    start_process "Open Wearables beat" "$BEAT_PID" "$BEAT_LOG" \
+        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow-beat"
+    start_process "HealthMes" "$HEALTHMES_PID" "$HEALTHMES_LOG" \
+        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' run"
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+        if curl --fail --silent --max-time 1 \
+            "http://127.0.0.1:${HEALTHMES_PORT:-8100}/health" \
+            >/dev/null; then
+            break
+        fi
+        "$SLEEP_BIN" 1
+    done
+    curl --fail --silent --max-time 1 \
+        "http://127.0.0.1:${HEALTHMES_PORT:-8100}/health" \
+        >/dev/null \
+        || die "HealthMes did not become ready; see $HEALTHMES_LOG"
+    if [ "$decision_enabled" = true ]; then
         start_process "Hermes decision runtime" \
             "$HERMES_DECISION_PID" "$HERMES_DECISION_LOG" \
             "exec env HERMES_HOME=$quoted_home uv run python -m healthmes.hermes_runtime_supervisor --hermes-home $quoted_home --vendor-root $quoted_vendor"
@@ -377,18 +403,7 @@ start_apps() {
             "http://127.0.0.1:${HEALTHMES_DECISION_RUNTIME_PORT:-8645}/healthmes/runtime-health" \
             >/dev/null \
             || die "Hermes decision runtime did not become ready; see $HERMES_DECISION_LOG"
-    else
-        stop_process "Hermes decision runtime" "$HERMES_DECISION_PID"
-        info "Hermes decision runtime disabled (model/provider not configured)"
     fi
-    start_process "Open Wearables" "$OW_PID" "$OW_LOG" \
-        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow"
-    start_process "Open Wearables worker" "$WORKER_PID" "$WORKER_LOG" \
-        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow-worker"
-    start_process "Open Wearables beat" "$BEAT_PID" "$BEAT_LOG" \
-        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' ow-beat"
-    start_process "HealthMes" "$HEALTHMES_PID" "$HEALTHMES_LOG" \
-        "exec bash '$REPO_ROOT/scripts/dev_mac.sh' run"
     info "dashboard: $DASHBOARD_URL"
 }
 

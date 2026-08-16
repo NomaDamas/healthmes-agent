@@ -202,13 +202,6 @@ def create_app(
                         app.state.decision_engine = None
 
                 cleanup.push_async_callback(close_decision_engine)
-                start_decision_engine = getattr(
-                    decision_engine,
-                    "astart",
-                    None,
-                )
-                if callable(start_decision_engine):
-                    await start_decision_engine()
 
             decision_alert_sender = None
             if decision_engine is not None:
