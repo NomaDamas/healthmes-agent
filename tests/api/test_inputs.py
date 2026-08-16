@@ -1100,7 +1100,9 @@ def test_postgres_legacy_retention_writer_invalidates_input_revision(
 
 
 def test_input_settings_openapi_requires_if_match(client) -> None:
-    operation = client.get("/openapi.json").json()["paths"][
+    schema = client.get("/openapi.json").json()
+    paths = schema["paths"]
+    operation = paths[
         "/v1/inputs/{source_id}/settings"
     ]["put"]
     parameters = [
@@ -1138,6 +1140,55 @@ def test_input_settings_openapi_requires_if_match(client) -> None:
         "and preserves the revision, so that revision remains reusable."
     )
     assert {"400", "409", "428"} <= set(operation["responses"])
+
+    expected_etag_header = {
+        "description": (
+            "Strong input descriptor revision. Send this exact value as "
+            "If-Match on the next settings update."
+        ),
+        "schema": {
+            "type": "string",
+            "pattern": '^"sha256:[0-9a-f]{64}"$',
+            "example": '"sha256:' + ("0" * 64) + '"',
+        },
+    }
+    detail_get = paths["/v1/inputs/{source_id}"]["get"]
+    assert detail_get["responses"]["200"]["headers"]["ETag"] == (
+        expected_etag_header
+    )
+    assert operation["responses"]["200"]["headers"]["ETag"] == (
+        expected_etag_header
+    )
+
+    components = schema["components"]["schemas"]
+
+    def response_schema(status_code: str) -> dict:
+        reference = operation["responses"][status_code]["content"][
+            "application/json"
+        ]["schema"]["$ref"]
+        return components[reference.rsplit("/", 1)[-1]]
+
+    invalid = response_schema("400")
+    required = response_schema("428")
+    conflict = response_schema("409")
+    assert invalid["properties"]["error"]["$ref"].endswith(
+        "_InputRevisionInvalidError"
+    )
+    assert required["properties"]["error"]["$ref"].endswith(
+        "_InputRevisionRequiredError"
+    )
+    conflict_error_ref = conflict["properties"]["error"]["$ref"]
+    conflict_error = components[conflict_error_ref.rsplit("/", 1)[-1]]
+    detail_ref = conflict_error["properties"]["detail"]["$ref"]
+    conflict_detail = components[detail_ref.rsplit("/", 1)[-1]]
+    assert conflict_detail["required"] == [
+        "expected_revision",
+        "current_revision",
+    ]
+    for name in conflict_detail["required"]:
+        assert conflict_detail["properties"][name]["pattern"] == (
+            "^sha256:[0-9a-f]{64}$"
+        )
 
 
 def test_retention_preset_reenables_a_disabled_policy(

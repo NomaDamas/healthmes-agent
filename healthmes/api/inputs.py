@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 from fastapi import APIRouter, Request, Response, status
+from pydantic import BaseModel, ConfigDict, Field
 
 from healthmes.api.errors import APIError
 from healthmes.inputs import (
@@ -39,6 +41,66 @@ _IF_MATCH_OPENAPI_PARAMETER = {
         ],
     },
 }
+_ETAG_OPENAPI_HEADER = {
+    "description": (
+        "Strong input descriptor revision. Send this exact value as "
+        "If-Match on the next settings update."
+    ),
+    "schema": {
+        "type": "string",
+        "pattern": rf'^"{_REVISION_VALUE}"$',
+        "example": '"sha256:' + ("0" * 64) + '"',
+    },
+}
+
+
+class _InputRevisionInvalidError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal["input_settings_revision_invalid"]
+    message: str
+    detail: None = None
+
+
+class _InputRevisionInvalidEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    error: _InputRevisionInvalidError
+
+
+class _InputRevisionRequiredError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal["input_settings_revision_required"]
+    message: str
+    detail: None = None
+
+
+class _InputRevisionRequiredEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    error: _InputRevisionRequiredError
+
+
+class _InputRevisionConflictDetail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: str = Field(pattern=rf"^{_REVISION_VALUE}$")
+    current_revision: str = Field(pattern=rf"^{_REVISION_VALUE}$")
+
+
+class _InputRevisionConflictError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal["input_settings_revision_conflict"]
+    message: str
+    detail: _InputRevisionConflictDetail
+
+
+class _InputRevisionConflictEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    error: _InputRevisionConflictError
 
 
 def _registry(request: Request) -> InputSourceRegistry:
@@ -94,7 +156,16 @@ def list_inputs(
     )
 
 
-@router.get("/{source_id}", response_model=InputSourceDescriptor)
+@router.get(
+    "/{source_id}",
+    response_model=InputSourceDescriptor,
+    responses={
+        status.HTTP_200_OK: {
+            "description": "Current input source descriptor.",
+            "headers": {"ETag": _ETAG_OPENAPI_HEADER},
+        },
+    },
+)
 def get_input(
     source_id: str,
     request: Request,
@@ -119,14 +190,24 @@ def get_input(
     ),
     openapi_extra={"parameters": [_IF_MATCH_OPENAPI_PARAMETER]},
     responses={
+        status.HTTP_200_OK: {
+            "description": (
+                "Updated descriptor, or the unchanged descriptor for a "
+                "semantic no-op."
+            ),
+            "headers": {"ETag": _ETAG_OPENAPI_HEADER},
+        },
         status.HTTP_400_BAD_REQUEST: {
             "description": "Malformed If-Match revision.",
+            "model": _InputRevisionInvalidEnvelope,
         },
         status.HTTP_409_CONFLICT: {
             "description": "The input descriptor revision is stale.",
+            "model": _InputRevisionConflictEnvelope,
         },
         status.HTTP_428_PRECONDITION_REQUIRED: {
             "description": "The required If-Match revision is missing.",
+            "model": _InputRevisionRequiredEnvelope,
         },
     },
 )
