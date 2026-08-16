@@ -235,6 +235,25 @@ backup is kept), resync skill copies, and skip already-registered jobs.
 `HERMES_HOME`, `TELEGRAM_HOME_CHAT_ID`, and the other inputs come from the
 environment or `.env` (see the bootstrap section of `.env.example`).
 
+The wellness decision runtime uses a separate rendered profile at
+`config/hermes-decision-config.yaml.tmpl`. It exposes one product MCP server,
+`healthmes`, and exactly six read-only tools:
+
+```text
+search_activity
+search_nutrition
+search_calendar
+search_wearable
+list_wellness_skills
+read_wellness_skill
+```
+
+Do not add direct `open_wearables`, native Hermes toolsets, mutation tools,
+memory, browser, terminal, or writable Skill tools to this profile. Product
+wellness requests enter through `POST /v1/wellness-decisions`; the server
+calls Hermes `/v1/responses` once and validates the live tool profile,
+transcript, strict result envelope, and source references.
+
 Running the gateway natively (verified live on macOS with dummy creds):
 
 ```bash

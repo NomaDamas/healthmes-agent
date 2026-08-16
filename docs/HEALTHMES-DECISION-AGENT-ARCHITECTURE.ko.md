@@ -1,962 +1,259 @@
-# HealthMes Decision Agent 아키텍처 결정
+# HealthMes Decision Agent 컴포넌트 아키텍처
 
-> **2026-08-16 폐기 알림:** 이 문서의 HealthMes-owned model iteration loop와
-> `/v1/model/iterations` 전제는 최종 아키텍처로 채택하지 않는다. 현재 canonical
-> 기준은
-> [`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)다.
-> 이 문서는 PR #138 이전 구현의 안전성 설계와 마이그레이션 근거를 보존하기 위한
-> 역사 문서이며 새 runtime 구현의 source of truth가 아니다.
-
-> **결정일:** 2026-08-10
+> **결정일:** 2026-08-16
 >
-> **상태:** superseded. 당시 승인된 아키텍처의 `DEC-01`부터 `DEC-07`까지
-> 구현되었으나, 이중 LLM 경로와 현재 Hermes에 없는 hook 때문에 제품 runtime으로
-> 채택하지 않는다.
-> `DEC-08`의 공개 엔진 경계와 실제 4-domain E2E도 구현되었으며, 전체 회귀와
-> 독립 리뷰를 거쳐 merge-ready 상태를 검증한다. 고정 `question_kind` resolver는
-> 새 core 경로가 아니라 기존 호출자를 위한 호환 구현으로만 남는다.
+> **상태:** 현재 단일-runtime 구현의 내부 컴포넌트 기준.
 >
-> **범위:** 엔진, 데이터 조회, LLM 판단, Hermes adaptation과 의사결정 기록.
-> 실제 iOS, Android, 데스크톱 UI는 포함하지 않는다.
+> 제품 전체 경계와 저장 구조는
+> [`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
+> 를 먼저 읽는다.
 
 ## TLDR
 
-HealthMes의 두뇌는 Skill 문서도, Hermes 자체도, 고정 질문 표도 아니다.
+“HealthMes Decision Agent”는 한 Python 클래스 이름이 아니라 다음 컴포넌트의
+합성으로 제공되는 제품 기능이다.
 
 ```text
-사용자 질문
-    |
-    v
-HealthMes Decision Agent
-  LLM이 질문을 이해하고 필요한 도구를 선택한다.
-    |
-    v
-Context Access Layer
-  권한, 보존기간, 시간대, 개인정보와 조회 한도를 검사한다.
-    |
-    v
-Activity / Nutrition / Wearable / Calendar provider
-  정확한 수치와 전문 context를 계산하거나 조회한다.
-    |
-    v
-HealthMes Decision Agent
-  여러 영역을 종합하고 설명한다.
-    |
-    v
-Decision Finalizer
-  사용한 source_refs를 검증하고 DecisionRecord를 저장한다.
+HealthMesDecisionService
+          |
+          v
+HealthMesDecisionEngine
+          |
+          +-- HermesResponsesDecisionAgent
+          |       |
+          |       +-- Hermes /v1/responses
+          |       +-- HealthMes MCP tool loop
+          |
+          +-- DecisionFinalizer
+                  |
+                  +-- source revalidation
+                  +-- conditional persistence
 ```
 
-Hermes는 위 흐름의 첫 번째 runtime adapter다. HealthMes는 판단 요청, 허용 도구,
-데이터 경계, 결과 검증과 기록을 소유한다. Hermes는 정확히 한 번의
-`POST /v1/responses` 요청 안에서 LLM 호출, MCP 도구 선택·실행과 반복 판단을
-자율적으로 수행한다. 두 제품이 별도의 LLM loop를 중복 실행하지 않는다.
+HealthMes와 Hermes가 각각 LLM loop를 하나씩 가지지 않는다. Hermes가 유일한
+autonomous LLM/tool loop를 실행하고 HealthMes가 그 loop의 제품 입출력과 데이터
+경계를 소유한다.
 
-## 1. 왜 바꾸는가
+## 1. 컴포넌트 책임
 
-이 작업을 시작하기 전 구현에는 다음 문제가 있었다.
-
-1. 호출자가 `activity_summary`, `focus`, `overwork`, `recovery`,
-   `caffeine_for_focus` 중 하나를 먼저 골라야 한다.
-2. 선택된 `question_kind`가 조회할 영역을 고정한다.
-3. resolver가 "무엇을 볼지 선택"과 "안전하게 자료를 가져오기"를 동시에 맡는다.
-4. 최종 자연어 판단을 실행하는 HealthMes-owned LLM 계층이 없다.
-5. 핵심 절차 일부가 Skill 문서에만 있어서 Skill이 로드되지 않으면 보장이 약해진다.
-6. `evidence`가 의료적 증거처럼 들리지만 실제로는 데이터 행의 추적 ID다.
-7. 원본 데이터는 질문과 권한에 따라 필요할 수 있는데 전면 금지로 표현돼 있다.
-8. `record_decision` 도구는 있지만 최종 판단 뒤 반드시 저장되도록 강제되지 않는다.
-
-고정 질문 표는 데모와 회귀 테스트에는 유용하지만 HealthMes의 목표인 모호한 복합
-질문을 처리하기에는 부족하다.
-
-```text
-"왜 오늘 집중이 안 되지?"
-
-고정 표
-  focus -> activity + wearable + calendar
-
-필요한 실제 동작
-  LLM이 activity부터 확인
-  -> 수면 신호가 필요하면 wearable 조회
-  -> 회의 영향이 보이면 calendar 조회
-  -> 늦은 카페인이 언급되면 nutrition 조회
-  -> 자료가 부족하면 사용자에게 질문
-```
-
-## 2. 목표 아키텍처
-
-```text
-┌──────────── HealthMes Decision Agent ────────────┐
-│ 질문 해석 · 도구 선택 · 반복 조회 · 종합 · 설명   │
-│ HealthMes-owned system policy와 결과 계약         │
-└─────────────────────┬─────────────────────────────┘
-                      │ ContextToolGateway
-                      ▼
-┌────── Context Access Layer / Source Gateway ─────┐
-│ auth · retention · timezone · privacy · query cap │
-│ 허용된 context와 source_refs만 반환               │
-└────────┬──────────┬──────────┬──────────┬─────────┘
-         ▼          ▼          ▼          ▼
-     Activity   Nutrition   Wearable   Calendar
-     provider   provider    provider   provider
-         └──── HealthMes 통합 저장·인덱스 ────┘
-
-Runtime implementation
-
-HealthMesDecisionAgent
-        |
-        +-- HermesRuntimeAdapter
-        +-- FutureNativeRuntimeAdapter
-        +-- TestRuntimeAdapter
-```
-
-실행 책임은 다음처럼 고정한다.
-
-```text
-HealthMesDecisionAgent
-  -> DecisionRequest와 server-owned search session 생성
-  -> 전용 Hermes profile과 허용된 HealthMes MCP tool 확인
-  -> Hermes POST /v1/responses 정확히 한 번 호출
-
-Hermes
-  -> 질문에 필요한 허용 MCP tool을 자율 선택
-  -> 같은 요청 안에서 tool 호출과 LLM 판단을 반복
-  -> strict DecisionDraft JSON 반환
-
-HealthMesDecisionAgent
-  -> server-owned canonical tool_trace와 Hermes transcript 대조
-  -> 실제 tool result에 포함된 source_refs만 허용
-  -> Decision Finalizer로 전달
-  -> 성공한 Hermes session 삭제
-```
-
-Hermes에는 DB session이나 자유 SQL을 주지 않는다. 전용 profile에는 읽기 전용
-`search_activity`, `search_nutrition`, `search_wearable`, `search_calendar`만 노출한다.
-각 도구는 server-owned search session을 통해 Context Access Layer를 호출하므로
-권한, retention, privacy와 query cap을 우회할 수 없다. 일반 Hermes native tool,
-Skill, memory, mutation tool과 Open Wearables 직접 MCP는 이 profile에서 비활성화한다.
-도구 결과도 runtime 전용 최소 계약으로 다시 변환한다. 전체 `SourceRef`,
-raw-source handle, query UUID와 cursor는 내부 trace에만 남고 모델에는 검증된
-`source_ref_ids`, freshness, coverage, limitation과 질문에 필요한 payload만
-전달한다. payload 안에 선택 record ID가 반복되어도 동일한 `rr_...` alias로
-치환한다. UUID의 hyphen/hex/URN 및 대소문자 변형은 하나의 canonical identity로
-합쳐 한 alias만 사용한다. 권한이나 domain 불일치로 조회 도구에 연결되지 않은
-related record도 질문 문자열에서는 익명화하되 tool catalog에는 노출하지 않는다.
-따라서 step 수와 tool 실행은 모델의 자발적 준수에 의존하지 않는다.
-
-중요한 분리는 다음과 같다.
-
-```text
-LLM
-  무엇을 알아봐야 하는지 결정한다.
-
-Context Access Layer
-  요청한 자료 중 무엇을 실제로 제공할 수 있는지 강제한다.
-
-Domain provider
-  정확한 값과 전문 파생값을 계산한다.
-
-Decision Finalizer
-  실제 사용한 자료와 최종 답변을 검증하고 저장한다.
-```
-
-### 2.1 공개 엔진 경계와 수명주기
-
-UI, API와 MCP adapter가 공통으로 호출할 canonical Python 경계는 다음과 같다.
-
-```text
-build_healthmes_decision_engine(...)
-  같은 ContextAccessLayer와 policy_resolver를
-  HealthMesDecisionAgent와 DecisionFinalizer에 주입
-        |
-        v
-await engine.ask_wellness(DecisionRequest)
-        |
-        +-- agent.ask(): 질문 해석과 반복 context tool loop
-        |
-        +-- finalizer.finalize(): source_refs 재검증과 DecisionRecord 저장
-        |
-        v
-DecisionResult
-```
-
-`ask()`는 기존 내부 호출자를 위한 호환 wrapper이고, 새 UI와 service adapter는
-`ask_wellness()`를 사용한다. production composition root에는 broad-consent
-기본값이 없다. 인증된 사용자의 현재 정책을 반환하는 `policy_resolver`를 명시하지
-않으면 엔진을 구성할 수 없다.
-
-종료 경계도 제품 계약의 일부다.
-
-```text
-수락된 요청 ──> LLM/provider 실행 ──> finalization ──> record 저장
-                         |
-caller 취소 -------------+  내부 작업은 취소하지 않음
-
-await engine.aclose()
-  1. 새 요청 거부
-  2. 이미 수락한 요청의 finalization 대기
-  3. HTTP에 UNKNOWN을 반환한 commit worker까지 DB connection 정리 대기
-  4. agent runtime 종료
-```
-
-따라서 HTTP 연결이나 UI task가 먼저 취소돼도 이미 생성된 행동 제안의 감사 기록이
-중간에 유실되지 않는다. async application은 `await aclose()`를 사용하며, 실행 중인
-event loop 안에서 동기 `close()`를 호출하면 명시적으로 거부한다. 애플리케이션
-lifespan 자체가 반복 취소되더라도 Decision Engine 종료를 끝낸 뒤 MCP와 DB를
-닫으므로 finalization이 이미 dispose된 저장소를 참조하지 않는다. composition이
-agent worker 생성 뒤 실패하면 worker도 즉시 회수한다.
-
-응답 deadline과 저장소 수명은 서로 다른 계약이다. `COMMITTING`에서 deadline이
-지나면 호출자에게는 즉시 `UNKNOWN`을 반환하지만, finalizer는 해당 worker를 계속
-추적한다. 정상 종료 시 `aclose()`는 그 commit 시도와 session/connection cleanup이
-끝날 때까지 기다린 뒤에만 DB teardown을 허용한다. 따라서 특히 in-memory SQLite의
-`StaticPool` connection을 commit 도중 `dispose()`하는 경쟁이 없다. 반대로 이미
-시작된 DB commit은 안전하게 취소할 수 없으므로, 비정상적으로 응답하지 않는 DB
-driver는 HTTP 응답 deadline보다 프로세스 종료를 더 오래 지연시킬 수 있다. 종료
-timeout으로 아직 agent 단계에 있는 요청을 취소할 때는 finalizer admission을 먼저
-봉쇄하므로, 취소를 늦게 관찰한 요청이 DB teardown 직전에 새 worker를 만들 수 없다.
-commit 성공만으로 최초 성공 응답을 공개하지 않는다. session/connection cleanup,
-worker capacity 반환, active-worker 제거까지 모두 deadline 전에 끝난 시각을
-publication 시각으로 기록한다. publication이 deadline 뒤라면 최초 응답은 계속
-`UNKNOWN`이며, 실제 저장 성공 여부는 request ID 복구 endpoint에서만 확인한다.
-`DecisionFinalizer`를 엔진 밖에서 직접 소유하는 adapter나 테스트도 같은 규칙을
-지켜야 한다. 동기 owner는 `finalizer.close()`, async owner는
-`await finalizer.aclose()`를 호출한 뒤 session factory의 engine을 dispose한다.
-`aclose()`는 호출 task가 취소되더라도 이미 승인된 worker의 drain을 끝낸 뒤
-취소를 다시 전달하므로, async cleanup stack이 DB dispose로 먼저 넘어가지 않는다.
-deadline 결과를 받았다는 사실만으로 background worker의 connection cleanup까지
-끝났다고 가정하면 안 된다.
-
-finalization 자체도 무기한 기다리지 않는다.
-
-```text
-HEALTHMES_DECISION_FINALIZATION_TIMEOUT_SECONDS=5
-
-하나의 총 deadline
-  -> preflight 정책 조회
-  -> process write lock
-  -> SQLite file lock 또는 PostgreSQL advisory lock
-  -> transaction 안의 정책 재검사
-  -> source row lock과 재검증
-  -> result와 private payload 생성
-  -> DecisionRecord flush
-  -> commit 직전 마지막 deadline 검사
-  -> 제한된 retry
-```
-
-SQLite는 HealthMes process/file lock뿐 아니라 protocol 밖의 외부 writer가 잡은
-`BEGIN IMMEDIATE`도 임시 `busy_timeout`으로 제한하고, 끝난 뒤 기존 30초 설정을
-복원한다. PostgreSQL은 advisory lock polling과 transaction-local `lock_timeout`,
-`statement_timeout`을 같은 남은 deadline으로 제한한다. Deadline 결과는 commit
-경계에 따라 다르게 처리한다.
-
-```text
-PRE_COMMIT에서 deadline 초과
-  -> commit 진입을 영구 차단
-  -> rollback
-  -> decision_finalization_timeout
-  -> HTTP 503 decision_service_unavailable
-
-COMMITTING에서 deadline 초과
-  -> 저장 성공/실패를 추측하지 않음
-  -> persistence_status=unknown
-  -> HTTP 202 + Location: /v1/wellness-decisions/{request_id}
-  -> 같은 request_id로 저장 결과 재조회
-```
-
-이 제한 덕분에 commit 시작 전 저장소 잠금과 계산은 deadline 뒤 영구 차단된다.
-Python payload 생성이나 SQLAlchemy `flush()`가 deadline을 넘긴 경우에는
-`commit()`을 호출하지 않고 rollback한다. 반대로 DB driver가 이미 commit을 시작한
-뒤 응답만 늦는 상황에서는 실패나 성공으로 단정하지 않으며, 안전한 DB teardown을
-위해 shutdown은 해당 worker를 drain한다. commit이 실제 완료되면 복구 endpoint가
-저장된 private payload와 digest를 다시 검증한
-`PersistenceStatus.PERSISTED` 결과를 반환하고, 아직 행이 없으면 `404`이므로 호출자는
-같은 request ID로 다시 조회할 수 있다.
-
-### 2.2 운영 설정, 실행 위치와 domain 동의
-
-Decision runtime은 다음 설정이 모두 있을 때만 활성화된다.
-
-```text
-HEALTHMES_DECISION_HERMES_BASE_URL
-HEALTHMES_DECISION_HERMES_MODEL
-HEALTHMES_DECISION_HERMES_PROVIDER
-HEALTHMES_DECISION_HERMES_PROFILE_PATH
-HEALTHMES_DECISION_HERMES_API_KEY
-```
-
-일부만 설정하면 startup validation이 실패한다. 시작 시 HealthMes는 profile 파일을
-fail-closed 검증하고, 인증된 `GET /v1/toolsets`와 `GET /v1/models` probe로 실제
-Hermes가 정확한 tool allowlist와 model route를 제공하는지 확인한다. 검증 실패 시
-일반 Hermes profile이나 다른 chat endpoint로 fallback하지 않는다.
-profile의 전용 bearer key도 HealthMes transport key와 상수시간 비교한다.
-
-이 PR은 전용 Hermes process를 자동 실행하지 않는다. 운영자는 bootstrap이 생성한
-별도 `HERMES_HOME/decision/config.yaml`로 Hermes API server를 시작해야 하며,
-HealthMes는 시작 시 위 probe가 성공한 경우에만 요청을 받는다. native launcher와
-Docker service wiring은 #169의 runtime contract 범위 밖이다.
-
-실행 위치는 서버가 소유하는 명시적 설정이다.
-
-```text
-HEALTHMES_DECISION_EXECUTION_SCOPE=local
-  -> Hermes origin은 loopback이어야 함
-
-HEALTHMES_DECISION_EXECUTION_SCOPE=hosted
-  -> 질문과 허용된 aggregate context가 외부 모델로 갈 수 있음
-```
-
-loopback Hermes가 cloud model을 대신 호출하는 경우에도 운영자는 `hosted`를
-명시해야 한다. 클라이언트는 request body에서 실행 위치, principal, privacy level,
-budget 또는 허용 domain을 바꿀 수 없다.
-
-domain 동의는 `decision_domain_policy`에 저장하며 서버 시작 시 누락된 네 domain만
-로컬 기본값인 enabled로 만든다. 이미 사용자가 바꾼 값은 재시작 뒤에도 보존한다.
-`hosted`로 바꾸는 행위는 현재 enabled인 domain의 aggregate context를 외부 runtime에
-보내도록 운영자가 명시적으로 승인하는 설정 변경이다.
-
-```text
-GET /v1/wellness-decisions/settings
-PUT /v1/wellness-decisions/settings/{domain}
-
-domain = activity | nutrition | wearable | calendar
-```
-
-두 endpoint는 전체 REST/MCP와 같은 bearer 또는 loopback-only 인증 경계 안에 있다.
-Decision Agent는 planning 때만 정책 snapshot을 믿지 않는다. 각 context tool 호출
-직전과 provider 실행 직후에 현재 정책을 다시 읽는다. domain의 `enabled` 상태,
-revision, 실행 범위, privacy 또는 query limit이 실행 중 바뀌면 provider 결과를
-버리고 `domain_consent_changed`로 turn을 중단한다. 따라서 사용자가 실행 중
-`off -> on`으로 빠르게 되돌려도 revision 변화가 감지된다. Finalization
-transaction 안에서도 정책을 다시 읽고 row lock을 건다. 이미 철회된 consent는
-`domain_consent_denied`로 기록 저장을 거부한다. Calendar는 별도로 현재 연결된
-credential source만 읽으며, 연결 해제된 source의 오래된 mirror row를 판단에
-재사용하지 않는다.
-
-Google과 iCloud/CalDAV credential 저장·삭제도 finalization과 같은 process 및
-database write fence를 사용한다. OAuth나 CalDAV 네트워크 통신은 잠금 밖에서 하고,
-owner-only 임시 파일을 atomic replace하는 짧은 credential 변경만 fence 안에서
-수행한다.
-
-```text
-finalization이 먼저 fence 획득
-  -> 검증된 Calendar source로 DecisionRecord commit
-  -> 그 뒤 disconnect
-
-disconnect가 먼저 fence 획득
-  -> credential 삭제
-  -> 그 뒤 finalization은 calendar_source_disconnected로 실패
-```
-
-따라서 두 작업이 동시에 실행돼도 "연결 해제된 캘린더를 사용했지만 판단 기록은
-나중에 저장된" 중간 상태가 생기지 않는다.
-
-Calendar 원격 실행 경로는 credential 파일의 secret-safe digest를 connection
-generation으로 사용한다.
-
-```text
-Calendar poll / sleep scheduler / sleep web preview·apply
-  -> source별 calendar connection lock
-  -> 현재 credential generation 확인
-  -> generation이 바뀌면 cached backend 폐기
-  -> 연결이 없으면 원격 호출 없이 실패
-  -> 현재 generation으로 새 backend 생성
-  -> lock을 유지한 동안에만 원격 read/write
-```
-
-sync 도중 disconnect가 시작되면 disconnect는 현재 원격 작업이 끝날 때까지
-기다린다. disconnect가 완료된 다음 실행은 이전 cached backend를 호출하지 않는다.
-재연결 뒤에는 새 generation으로 새 backend를 만든다. Open Wearables 수면 조회는
-이 lock 밖에서 먼저 수행하고, 캘린더 preview/apply에 필요한 원격 작업만 lock
-안에서 수행하므로 async event loop를 wearable 네트워크 I/O 동안 막지 않는다.
-Google token refresh는 credential 파일 digest compare-and-swap도 사용하므로
-refresh 도중 파일이 삭제되거나 교체되면 오래된 refresh 결과를 저장하지 않는다.
-
-`decision_domain_policy` migration의 downgrade도 동의 상태를 조용히 잃지 않는다.
-offline downgrade는 현재 행을 확인할 수 없어 항상 거부하고, 하나라도
-`enabled=false`인 행이 있으면 online downgrade도 거부한다. PostgreSQL은 검사와
-table drop 사이에 사용자가 동의를 철회하는 race까지 막도록 table을
-`ACCESS EXCLUSIVE`로 잠근다. 모든 행이 enabled일 때만 명시적 downgrade를 허용한다.
-
-요청 admission도 무제한 queue가 아니다.
-
-```text
-HEALTHMES_DECISION_MAX_PENDING_REQUESTS=8
-```
-
-실행 중인 요청과 수락된 대기 요청을 합쳐 이 수를 넘으면 새 요청은 runtime에
-도달하지 않고 `429 decision_engine_busy`로 즉시 거부된다. runtime contract,
-identity 또는 실행 실패는 성공 응답으로 위장하지 않고
-`503 decision_runtime_unavailable`로 변환한다. 정책 resolver, provider catalog,
-tool 실행, source contract 또는 DecisionRecord 저장과 같은 HealthMes 내부 실패도
-`503 decision_service_unavailable`로 변환한다.
-
-반대로 다음은 서비스 장애가 아니라 안전하게 중단한 정상 제품 결과이므로
-구조화된 `DecisionResult`와 HTTP `200`을 유지한다.
-
-- 사용자가 허용한 step, tool, source 또는 context byte 예산 소진
-- domain consent, privacy 또는 retention 정책에 따른 차단
-- 조회 뒤 원본 삭제, 만료, 연결 해제로 source ref 재검증이 실패한 경우
-- 자료 부족으로 추가 질문이 필요한 경우
-
-즉 HTTP 상태는 `FAILED` 문자열만 보고 결정하지 않는다. 호출자가 설정이나 질문을
-바꿔 해결할 수 있는 안전한 중단과, 운영자가 runtime/provider/storage를 복구해야
-하는 내부 장애를 reason code로 분류한다.
-
-## 3. 각 부품의 책임
-
-### 3.1 전문 도메인 provider
-
-기존의 "전문 도메인 엔진"은 모든 영역이 동일한 형태의 계산 엔진이라는 오해를
-줄 수 있으므로 `Domain Context Provider`를 상위 이름으로 사용한다.
-
-| Provider | 책임 | 하지 않는 일 |
+| 컴포넌트 | 추상화 수준 | 책임 |
 |---|---|---|
-| Activity | 사용시간, active/idle, 연속 활동, 분절, 야간 사용, baseline 계산 | 최종 휴식 명령 또는 카페인 판단 |
-| Nutrition | 섭취 관찰, 사용자 확인, 영양소, 카페인 ledger와 후보 식품 context | 수면이나 집중 상태 추측 |
-| Wearable | Open Wearables 수면, HRV, 스트레스, 회복 context 조회와 정규화 | 다른 영역을 대신한 최종 판단 |
-| Calendar | 일정 시간, busy 구간, 회의 밀도와 가용 시간 계산 | 일정의 의미나 건강 원인 확정 |
+| `HealthMesDecisionService` | 제품 ingress | REST/channel/proactive/scheduled 요청을 server-owned `DecisionRequest`로 변환 |
+| `HealthMesDecisionEngine` | 수명주기 | admission, agent 실행, finalization, shutdown과 결과 publication |
+| `HermesResponsesDecisionAgent` | runtime adapter | Hermes 한 turn 호출, transcript·envelope·tool/source 검증, session cleanup |
+| `DecisionContextSearchSessionService` | tool session | tool budget, canonical trace, begin/finish/abort와 source 집합 |
+| `ContextAccessLayer` | 데이터 접근 경계 | consent, retention, timezone, privacy, row/byte/call limit |
+| Domain provider | 전문 계산/조회 | Activity, Nutrition, Calendar, Wearable 결과와 provenance |
+| `DecisionFinalizer` | 결과 확정 | source 재검증, effective persistence intent, compact record 또는 미저장 |
 
-숫자 합산, 단위 변환, 시간대 경계, 중복 제거와 누락 데이터 처리는 LLM에게 맡기지
-않는다. 재현 가능해야 하는 계산은 provider와 전문 정책이 담당한다.
-
-### 3.2 Context Access Layer
-
-기존 `Context Broker` 또는 cross-domain resolver를 두 역할로 나눈다.
+## 2. 한 요청의 실제 순서
 
 ```text
-의미 선택
-  LLM Decision Agent가 담당
-
-데이터 접근과 검증
-  Context Access Layer가 담당
+1. 사용자 질문
+2. HealthMesDecisionService가 owner/timezone/scope를 채움
+3. HealthMesDecisionEngine이 요청 admission
+4. HermesResponsesDecisionAgent가 search session 시작
+5. Hermes /v1/responses 호출
+6. Hermes가 HealthMes MCP 도구를 자율·반복 호출
+7. search session이 canonical tool trace와 source_refs 보관
+8. Hermes가 healthmes.decision-draft.v1 JSON 반환
+9. adapter가 tool call/output, allowlist와 used refs 검증
+10. DecisionFinalizer가 source와 현재 정책을 다시 확인
+11. 필요하면 compact DecisionRecord 저장
+12. 공통 DecisionResult 반환
 ```
 
-Context Access Layer는 다음만 강제한다.
+Hermes 호출은 “한 번”이지만 그 한 요청 안에서는 여러 LLM/tool iteration이
+일어난다. HealthMes가 매 iteration마다 Hermes를 다시 호출하는 구조가 아니다.
 
-- 요청한 데이터 영역과 기간에 대한 사용자 권한
-- 데이터별 retention과 삭제 상태
-- 사용자 local timezone과 조회 시간 범위
-- 개인정보 공개 단계와 민감도
-- 한 번에 읽을 수 있는 기간, 행 수와 원본 크기
-- 중복, stale data, coverage와 freshness
-- 실제 반환한 record와 summary의 `source_refs`
+## 3. LLM이 결정하는 것과 코드가 결정하는 것
 
-성능이 높은 LLM도 접근 권한이나 삭제된 데이터의 재노출을 보장하는 보안 경계가 될
-수 없다. 따라서 LLM의 성능과 Context Access Layer의 필요성은 대체 관계가 아니다.
+### LLM
 
-### 3.3 HealthMes Decision Agent
+```text
+질문 의도
+먼저 볼 domain
+추가 조회가 필요한지
+여러 domain 사이의 의미
+사용자에게 설명할 결론
+자료가 부족할 때 물어볼 질문
+```
 
-이 계층이 HealthMes가 소유하는 실제 제품 두뇌다.
+### HealthMes 코드
 
-- 자연어 질문과 사용자 의도를 해석한다.
-- 사용 가능한 context tool catalog를 본다.
-- 필요한 provider, 기간, granularity와 필드를 선택한다.
-- 첫 조회 결과를 보고 추가 도구를 반복 호출할 수 있다.
-- 데이터가 부족하면 필요한 사실을 사용자에게 묻는다.
-- 전문 정책 결과를 재계산하지 않고 여러 영역의 trade-off를 종합한다.
-- 관찰, 불확실성, 대안과 최종 설명을 만든다.
-- 각 model iteration과 전체 deadline을 코드에서 직접 계산한다.
-- runtime에는 개인정보를 제거한 읽기 전용 `RuntimeDecisionRequest`, 허용 tool
-  catalog와 이전 tool 결과 snapshot만 제공한다.
-- runtime이 반환한 tool 요청을 직접 검증하고 Context Access Layer를 통해
-  실행한다.
+```text
+허용된 6개 tool profile
+현재 owner와 domain consent
+retention cutoff
+timezone과 query budget
+정확한 domain 집계
+source_refs 정합성
+저장할지 여부와 compact payload
+```
 
-질문을 미리 다섯 종류로 제한하지 않는다. 필요한 도구는 질문과 첫 조회 결과에 따라
-달라질 수 있다.
+결정론적 계층이 있다는 것이 질문 종류를 고정한다는 뜻은 아니다. LLM은 자유롭게
+도구를 고르고, 코드는 선택된 도구가 실제 데이터 규칙을 지키도록 한다.
 
-#### hard deadline과 실행 격리
+## 4. Tool과 Skill
 
-하나의 장기 실행 `HealthMesDecisionAgent`는 하나의 daemon worker event loop를
-소유한다. runtime과 provider coroutine은 이 안정된 loop에서 실행하므로 loop-bound
-client를 요청마다 다른 event loop에서 재사용하지 않는다. 같은 runtime instance의
-전체 decision turn은 직렬화되어 동시 요청의 임시 상태가 서로 섞이지 않는다. API
-event loop는 `time.sleep()` 같은 동기 블로킹 코드와 분리된 wall-clock deadline을
-소유한다. worker thread와 event loop는 `HealthMesDecisionAgent` 구성 단계에서
-미리 시작하고 ready 상태까지 확인하므로 `ask()`가 `Thread.start()`를 실행하지
-않는다. request deadline은 `ask()` 진입부터 외부 request의 strict validation,
-동기 policy resolution, provider catalog 검증, access turn 준비와 runtime/provider
-실행 전체에 적용된다. worker가 취소를 늦게 처리해도 호출자는 deadline에 맞춰
-반환받고 늦게 도착한 결과는 canonical trace에 반영되지 않는다. validation이
-끝나기 전에 timeout되면 신뢰할 수 없는 caller ID 대신 새 fallback request/turn
-UUID를 반환한다.
+Decision runtime tool allowlist:
 
-hard timeout 뒤 async runtime이 cancellation을 정상 수용해 turn을 종료하면 같은
-worker를 재사용한다. cancellation이 끝나지 않은 경우 다음 요청의 짧고 bounded된
-확인 구간 뒤 quarantine하고 `runtime_worker_unavailable`로 실패시킨다. 같은
-agent는 새 worker를 만들지 않으므로 종료되지 않는 동기 코드가 요청마다 daemon
-thread를 하나씩 늘릴 수 없고, 한 agent에서 orphan 가능한 worker는 최대 하나다.
-운영자는 agent를 장기 실행 singleton으로 구성하고 정상 shutdown에서 `close()`를
-호출한다. active turn 중 `close()`가 호출되더라도 완료 결과를 caller future에
-전달한 뒤 loop를 종료한다.
+```text
+mcp__healthmes__search_activity
+mcp__healthmes__search_nutrition
+mcp__healthmes__search_calendar
+mcp__healthmes__search_wearable
+mcp__healthmes__list_wellness_skills
+mcp__healthmes__read_wellness_skill
+```
 
-일반 caller cancellation은 hard timeout과 구분한다. 취소가 worker에서 정상적으로
-정리되면 다음 turn이 같은 loop를 재사용한다. 취소된 동기 코드가 끝나지 않아 다음
-대기 turn까지 timeout되면 worker를 quarantine해 이후 요청을 fail-fast 한다.
+Skill catalog는 도메인 전문가가 작성한 읽기 전용 지침을 제공한다. Skill은 도구를
+직접 실행하지 않고, runtime이 어떤 도구를 언제 참고할지 설명한다.
 
-이 경계에는 명시적인 호환성 계약이 있다.
+VLM 사진 분석, 식사 확정, 설정 변경과 캘린더 mutation은 이 read-only decision
+profile에 넣지 않는다. 이들은 각 bounded intake/command workflow가 소유하고,
+필요한 판단만 같은 Decision Service에 요청한다.
 
-- runtime과 provider는 API event loop에 귀속된 `asyncio.Event`, task 또는 client를
-  worker 경계 밖에서 만든 뒤 공유하지 않는다.
-- async client가 필요하면 첫 worker 호출 안에서 생성해 같은 agent worker에
-  귀속하거나 worker-safe한 client factory를 사용한다.
-- SQLite session은 worker 안에서 만들며 기존 `check_same_thread=False` 설정을
-  사용한다.
-- 외부 Pydantic model instance는 신뢰하지 않는다. nested model까지 plain value로
-  변환한 뒤 validator를 다시 실행하고 deep copy한다.
-- registry는 provider metadata의 검증된 snapshot을 등록 시 보관하며, provider에는
-  canonical query가 아닌 별도의 deep copy만 전달한다.
-- `source_ref_id`는 source identity에서 다시 계산하며, gateway 정규화 뒤 동일해진
-  query는 첫 실제 조회 시각으로 고정한 turn normalization time을 기준으로 중복
-  실행하지 않는다.
+## 5. Source Refs와 Canonical Trace
 
-### 3.4 Decision Finalizer
+Hermes transcript는 신뢰 가능한 DB trace가 아니다. 모델이 본 function output과
+HealthMes가 실제 실행한 search session trace를 대조한다.
 
-최종 기록을 LLM의 기억이나 Skill 지침에만 맡기지 않는다.
+```text
+Hermes function_call
+  -> HealthMes MCP
+  -> canonical ContextQuery
+  -> canonical ContextResult
+  -> SourceRef 집합
+  -> Hermes function_call_output
+```
 
-- 최종 답변이 인용한 `source_refs`가 실제 tool 결과에 있었는지 검사한다.
-- 존재하지 않는 ID, 만료된 자료와 허용되지 않은 원본 참조를 거부한다.
-- 저장 조건을 만족한 판단만 request/turn ID, runtime, bounded outcome,
-  gateway/tool 결과와 source 재검증이 생성한 안전한 limitation code,
-  source attestation을 compact `DecisionRecord`로 저장한다. 질문·답변 전문,
-  LLM이 자유 작성한 limitation, transcript, tool payload와 media는 저장하지 않는다.
-- 저장이 필요한 판단인데 기록에 실패하면 성공한 결정으로 표시하지 않는다.
-- 저장된 Wellness 판단은 storage data class `decision`의 보존기간과
-  `retention_basis_at`/`expires_at`을 적용한다.
+최종 `used_source_ref_ids`는 canonical SourceRef 집합의 부분집합이어야 한다.
+모델이 ref를 새로 만들거나 다른 요청의 ref를 재사용하면 성공으로 승격하지 않는다.
 
-## 4. source_refs의 뜻
+`source_refs`는 다음 용도로 사용한다.
 
-`evidence`는 "이 답변이 의학적으로 증명됐다"는 뜻이 아니다. 답변에 사용한 데이터가
-어디에서 왔는지 다시 찾기 위한 provenance다. 새 계약에서는 `source_refs`를
-기본 이름으로 사용한다.
+- 답변이 어느 관측값과 파생값을 사용했는지 추적
+- finalization 직전 source와 policy 재검증
+- compact DecisionRecord와 결과 설명 연결
+- 삭제·retention 변경 후 stale 답변 복구 방지
+
+## 6. Strict 결과 계약
+
+Hermes 마지막 assistant text는 JSON 하나여야 한다.
 
 ```json
 {
-  "domain": "activity",
-  "record_id": "wellness-event-uuid",
-  "source_provider": "activitywatch",
-  "observed_start": "2026-08-10T09:00:00+09:00",
-  "observed_end": "2026-08-10T10:00:00+09:00",
-  "schema_version": 1,
-  "derived_by": "activity.hour-summary.v1",
-  "freshness": "current",
-  "coverage": 0.87
+  "object": "healthmes.decision-draft.v1",
+  "draft": {
+    "status": "completed",
+    "answer": "짧은 사용자 답변",
+    "proposed_action": true,
+    "persistence_intent": "action",
+    "used_source_ref_ids": [
+      "sr_0123456789abcdef0123456789abcdef"
+    ],
+    "limitations": [],
+    "clarification_question": null,
+    "confidence": 0.8,
+    "uncertainty": null,
+    "follow_up_question": null
+  }
 }
 ```
 
-모든 필드를 LLM에 길게 넣을 필요는 없다. 모델에는 필요한 최소 참조를 주고,
-DecisionRecord에는 답변 전문 대신 재검증에 필요한 bounded provenance와
-`source_refs`만 보존한다.
+다음은 계약 위반이다.
 
-기존 `evidence_ids`와 최상위 `evidence`는 호환 기간 동안 유지하되 내부적으로
-`source_refs`로 정규화한다.
+- JSON 앞뒤 자유 텍스트나 code fence
+- 알 수 없는 field
+- 허용되지 않은 tool
+- 짝이 없는 function call/output
+- 실제 결과에 없는 source ref
+- status와 answer/clarification invariant 불일치
+- response size 또는 요청 deadline 초과
 
-## 5. 원본 데이터 정책
+## 7. 조건부 Finalization
 
-원본을 절대 보내지 않는 것도, 모든 원본을 자동으로 보내는 것도 잘못이다.
-
-### Level 1: 기본 집계
-
-일반적인 집중, 과로, 회복 질문의 기본값이다.
-
-- 활동 시간과 category
-- 수면, HRV와 회복 summary
-- 일정 busy minutes
-- 확인된 영양소와 섭취량
-
-앱 이름, 창 제목, URL, 사진과 음성 bytes는 포함하지 않는다.
-
-### Level 2: 제한된 identity
-
-질문에 identity가 필요하고 사용자가 허용한 경우에만 사용한다.
-
-- "어떤 앱 때문에 집중이 끊겼어?"의 앱 이름
-- "어떤 일정 뒤에 피곤했어?"의 허용된 일정 제목
-- 사용자가 직접 고른 식품 또는 기록 이름
-
-### Level 3: scoped raw
-
-원본 분석 자체가 질문의 목적일 때만 별도 호출로 사용한다.
-
-- 음식 사진을 Nutrition VLM에 전달
-- 음성을 로컬 transcription provider에 전달
-- 사용자가 명시적으로 요청한 민감 원본 분석
-
-원본은 해당 분석 provider에만 전달하고, 이후 일반 의사결정 turn에는 구조화 결과와
-`source_refs`를 사용한다. 창 제목, URL, 화면 pixel과 raw wearable timeseries는
-명시적 권한, 목적과 제한된 보존 정책 없이는 Level 3으로 승격하지 않는다.
-
-## 6. Skill의 위치
-
-Skill은 HealthMes의 두뇌나 데이터 엔진이 아니다. 특정 runtime이 HealthMes 계약을
-잘 호출하도록 돕는 설명과 workflow adapter다.
+LLM이 `persistence_intent`를 주장했다고 그대로 저장하지 않는다.
 
 ```text
-잘못된 구조
-  Skill 문서가 권한, 안전 규칙, 자료 선택, 최종 기록을 모두 소유
-
-목표 구조
-  HealthMes 코드와 계약이 강제할 것을 강제
-  Skill은 도구 이름, 표현 방식과 runtime 사용법만 설명
+구체적 행동 제안                  -> action
+행동 가능한 중요 위험 경고        -> risk
+trusted caller의 명시적 추적 요청  -> explicit_tracking
+단순 조회                         -> none
+근거 없는 LLM 저장 주장            -> none
 ```
 
-HealthMes의 필수 system policy는 Skill을 사용자가 우연히 열어야만 적용되는 방식이
-아니라 Decision Agent를 시작할 때 항상 주입한다.
+`none`이면 DecisionRecord를 만들지 않는다. 저장하는 경우에도 원문 질문, 전체 답변,
+transcript와 tool payload를 복제하지 않는다.
 
-Skill이 담당할 수 있는 내용:
-
-- Hermes에서 HealthMes Decision Agent를 어떻게 호출하는가
-- 사용자에게 관찰, 근거, 제안과 한계를 어떻게 보여주는가
-- 특정 채널에서 확인 질문을 어떻게 표현하는가
-
-Skill에만 두면 안 되는 내용:
-
-- retention과 권한 검사
-- 섭취량 합계와 시간대 계산
-- 카페인 전문 안전 경계
-- source reference 검증
-- DecisionRecord 저장 의무
-
-## 7. Hermes의 위치
-
-Hermes는 범용 Agent Runtime이며 HealthMes와 동등한 제품 계층이 아니다.
-
-Hermes가 제공하는 기능:
-
-- LLM provider와 model 실행
-- 일반 대화와 범용 tool-calling 기능
-- MCP 도구 발견과 실행
-- 세션, gateway, cron과 전달 채널
-- Skill 문서 로딩
-
-HealthMes가 소유해야 하는 기능:
-
-- `HealthMesDecisionAgent` 요청과 결과 계약
-- HealthMes system policy
-- context tool catalog와 privacy scope
-- source reference와 finalization
-- DecisionRecord와 outcome 연결
-
-HealthMes 판단은 Hermes의 autonomous tool loop를 사용한다. 단, 범용 Hermes
-profile을 그대로 재사용하지 않고 HealthMes가 만든 전용 profile과 server-owned
-search session만 제공한다. HealthMes는 정확히 한 번 `POST /v1/responses`를 호출하고
-Hermes가 그 요청 안에서 질문 해석, MCP 선택, 도구 실행과 최종 판단을 끝낸다.
-
-응답은 신뢰하지 않고 다음을 다시 검증한다.
-
-- model identity와 strict `DecisionDraft` JSON
-- assistant tool call과 tool output의 완전한 1:1 pairing 및 순서
-- canonical `tool_trace`에 실제 기록된 도구 이름과 query arguments
-- 각 최종 `source_ref`가 실제 tool result에서 반환됐는지 여부
-- 세션 ID와 허용된 HealthMes MCP profile
-
-성공한 세션은 bounded retry로 즉시 삭제한다. timeout이나 upstream 오류로 즉시
-삭제할 수 없는 세션은 전용 state에만 남으며 TTL maintenance가 만료 뒤 제거한다.
-현재 Hermes Responses API가 실행 중 요청을 받은 직후 upstream에서 멈춘 경우,
-HealthMes가 원격 계산 자체를 강제 중단할 수는 없으므로 이 TTL은 orphaned transcript
-정리 경계이지 upstream model cancellation 보장은 아니다.
-
-HealthMes 전용 카페인, 활동 또는 영양 규칙을 Hermes core에 넣지 않는다.
-
-## 8. MCP의 위치
-
-MCP는 판단기가 아니라 runtime과 HealthMes 도구 사이의 통신 규격이다.
+finalizer는 다음을 하나의 bounded write 절차로 처리한다.
 
 ```text
-LLM
-  "활동과 수면 자료가 필요하다"
-       |
-       v
-Hermes POST /v1/responses
-  허용된 HealthMes MCP tool을 자율 선택·실행
-       |
-       v
-Context Access Layer와 Domain Provider
+현재 정책 재조회
+write-plane fence
+source row/generation 재검증
+retention basis와 expires_at 계산
+compact payload 생성
+flush와 commit
+publication
 ```
 
-에이전트의 자율성과 MCP는 충돌하지 않는다. LLM이 어떤 도구를 언제 호출할지
-자율적으로 선택하고 실행한다. HealthMes MCP 도구 구현은 server-owned search
-session을 통해 Context Access Layer를 호출하므로 권한 검사와 finalization을
-우회하는 별도 core 경로가 생기지 않는다.
+commit 시작 전 deadline이면 실패로 확정하고 late write를 막는다. commit이 이미
+시작된 뒤 outcome을 알 수 없으면 성공/실패를 추측하지 않고 `unknown`을 반환하며,
+request ID recovery가 실제 저장 결과를 확인한다.
 
-## 9. 중앙 데이터 조회
-
-에이전트가 중앙 데이터베이스에 자유 SQL을 실행하는 구조는 채택하지 않는다.
-대신 하나의 논리적 tool catalog를 통해 모든 웰니스 영역을 탐색한다.
+## 8. 취소와 종료
 
 ```text
-통합 접근
-  list_context_capabilities
-  search_wellness_context
-  get_activity_context
-  get_nutrition_context
-  get_wearable_context
-  get_calendar_context
-  specialized policy tools
+HTTP client disconnect
+  -> 진행 중 Hermes reasoning 취소
+  -> search session abort
+  -> transport stream 종료
+
+finalization이 이미 irreversible commit 단계
+  -> commit outcome 추적 계속
+  -> app shutdown이 DB teardown 전에 drain
 ```
 
-물리적으로 모든 데이터를 한 테이블에 억지로 넣을 필요는 없다.
+요청 전체에는 absolute deadline이 적용된다. startup/profile 검증, search session,
+Hermes call, response parse, finish/abort와 cleanup이 서로 독립된 무한 timeout을
+갖지 않는다.
 
-- Activity와 Nutrition은 공통 `WellnessEvent` envelope를 사용한다.
-- Calendar는 외부 일정의 소유권을 유지하는 local mirror를 사용한다.
-- Open Wearables raw 저장은 vendor 호환을 위해 분리할 수 있다.
-- HealthMes 판단에 사용한 normalized wearable summary와 provenance는 로컬
-  source reference 또는 mirror로 남긴다.
+성공 Hermes session은 bounded retry로 삭제한다. 실패 응답에 session ID가 없는
+현재 upstream 한계는 전용 state directory와 TTL purge로 제한한다.
 
-즉 "한곳"은 하나의 거대한 테이블이 아니라 하나의 권한, 조회, provenance와
-의사결정 기록 체계를 뜻한다.
+## 9. 단일 Runtime 보장
 
-## 10. 결정론과 LLM의 경계
-
-| 결정론적으로 강제 | LLM이 판단 |
-|---|---|
-| 권한, consent와 retention | 질문의 목적 |
-| 시간대, 기간과 단위 계산 | 필요한 영역과 도구 |
-| 중복 제거와 정확한 합계 | 추가 조회 필요 여부 |
-| freshness, coverage와 missing data | 여러 영역의 trade-off |
-| 전문 정책의 숫자와 hard boundary | 사용자에게 설명할 대안 |
-| source reference 검증과 저장 | 자연어 답변 |
-
-질문 종류에 따라 조회 영역을 고정하는 것은 폐기하지만, 계산과 보안까지 LLM에게
-넘기지는 않는다.
-
-## 11. 현재 구현과 남은 경계
-
-| 항목 | 현재 구현 | 남은 경계 |
-|---|---|---|
-| 질문 입력 | 공개 `ask_wellness(DecisionRequest)`와 호환 `ask()` | API/MCP/UI별 얇은 호출 adapter |
-| 자료 선택 | Hermes의 단일 Responses 요청 내부 autonomous MCP loop | 실제 runtime의 모델 품질 평가는 운영 단계 |
-| resolver | 고정 `question_kind`를 compatibility preset으로만 유지 | 기존 호출자 migration 뒤 축소 가능 |
-| Context layer | 권한, retention, timezone, privacy, query cap과 source ref 강제 | 새 provider 추가 시 동일 계약 준수 |
-| Domain provider | Activity, Nutrition, Wearable, Calendar 공통 registry | 새로운 wellness 입력 provider 확장 |
-| Skill | 필수 정책을 소유하지 않는 설명 계층 | channel별 표현 지침만 유지 |
-| Hermes | 전용 filtered profile, 정확히 한 번의 Responses 호출과 strict transcript 검증 | upstream 취소 이후 원격 계산 중단 보장은 Hermes 지원 필요 |
-| 최종 판단 | runtime-neutral structured draft loop 구현 | 상용 LLM eval은 이 PR 비범위 |
-| 판단 저장 | finalizer가 source ref를 재검증하고 자동 저장 | 저장 backend 운영·관측성 보강 |
-| wearable provenance | normalized local snapshot과 stable source ref 구현 | vendor별 장기 호환성 모니터링 |
-| activity server/data plane | ActivityWatch scheduler, iOS ingest/storage 계약, cross-device overlap-aware bounded aggregation, 조건부 Screen Time sync-service seam | 정확한 cross-device dedup, compile flag, entitlement, lifecycle/background task, 실제 device UI와 dogfood |
-| production 조립 | FastAPI lifespan singleton, DB policy resolver, REST adapter와 cancellation-safe cleanup 구현 | 다른 channel/UI의 얇은 호출 adapter |
-| E2E | 실제 네 domain 저장소에서 자연어 질문부터 DecisionRecord 재조회까지 검증 | 실제 상용 LLM 네트워크 평가는 별도 |
-
-## 12. 마이그레이션
-
-현재 API와 테스트를 한 번에 깨지 않는다.
+현재 production composition은 다음 builder만 사용한다.
 
 ```text
-현재
-  resolve_wellness_context(question_kind, ...)
-
-과도기
-  question_kind를 generic ContextQuery preset으로 변환
-  기존 응답의 evidence_ids 유지
-  새 내부 응답에는 source_refs 추가
-
-목표
-  ask_wellness(DecisionRequest)
-  -> LLM tool planning
-  -> Context Access Layer
-  -> Decision Finalizer
+build_configured_decision_engine(...)
+  -> build_healthmes_responses_decision_engine(...)
+  -> HermesResponsesDecisionAgent
 ```
 
-기존 `get_activity_summary`, `get_focus_context`, `get_overwork_context`와 전문
-Nutrition, Wearable, Calendar 도구는 폐기하지 않는다. 새 Decision Agent가 선택할
-수 있는 typed tools로 재사용한다.
+폐기된 split-runtime의 public adapter, builder와
+`/v1/model/iterations` 계약은 제품 코드에서 제거한다. 테스트가 해당 endpoint의
+404를 확인하는 것은 재등장을 막기 위한 negative invariant다.
 
-## 13. 구현 계획
+`HealthMesDecisionService`가 REST, channel, proactive와 scheduled 요청의 공통
+진입점이다. bounded command가 별도 endpoint를 가지더라도 자유 형식 LLM 판단을
+하지 않으므로 두 번째 reasoning 경로가 아니다.
 
-### `DEC-01 Decision contracts`
+## 10. 확장 원칙
 
-- `DecisionRequest`, `ContextQuery`, `ContextResult`, `SourceRef`,
-  `DecisionResult` 정의
-- `question_kind`는 compatibility preset으로 명시
-- runtime이나 MCP 이름에 종속되지 않는 계약 작성
-
-**종료 조건:** 자연어 질문과 tool query가 고정 질문 enum 없이 표현된다.
-
-### `DEC-02 Context Provider Registry`
-
-- Activity, Nutrition, Wearable, Calendar provider를 동일 registry에 등록
-- provider capability, 지원 기간, granularity와 sensitivity 선언
-- broad discovery와 전문 정책 도구를 함께 노출
-
-**종료 조건:** 새 입력 영역을 resolver의 `if/elif` 수정 없이 등록할 수 있다.
-
-### `DEC-03 Context Access Layer`
-
-- authorization, consent, retention과 timezone 검사
-- privacy Level 1, 2, 3 강제
-- query cap, freshness, coverage와 `source_refs` 정규화
-
-**종료 조건:** 모델이 금지된 원본이나 만료 데이터를 요청해도 반환되지 않는다.
-
-### `DEC-04 HealthMes Decision Agent`
-
-- 자연어 질문을 받는 HealthMes-owned orchestration interface
-- HealthMes가 DecisionRequest, search session, tool exposure와 hard deadline을 소유
-- Hermes가 한 Responses 요청 안에서 autonomous LLM/MCP loop를 소유
-- LLM이 tool catalog에서 도구를 선택하고 실제 결과에 따라 추가 요청
-- runtime에 provider callback, DB와 registry를 노출하지 않음
-- runtime history와 canonical trace를 deep snapshot으로 격리
-- 실제 tool result에 없는 source reference ID 거부
-- source reference가 있는 context를 사용한 완료 답변의 source reference 생략 거부
-- runtime request에서 caller/session/record 식별자를 제거하고 turn-scoped record
-  alias와 허용 domain만 공개
-- runtime/provider를 API event loop와 분리하고 wall-clock deadline 강제
-- worker를 구성 단계에서 prewarm하고 request validation, policy/catalog/access
-  준비에 하나의 deadline 적용
-- cooperative timeout cancellation 뒤 worker 재사용, stuck turn만 quarantine
-- active turn shutdown 시 결과 전달 후 worker loop 종료
-- 같은 runtime을 사용하는 전체 turn 직렬화와 cancellation-safe 재사용
-- provider metadata/query snapshot으로 post-filter allowlist 변조 차단
-- tool parameter마다 type, 길이, 범위, enum과 format 계약 강제
-- nested Pydantic instance를 포함한 외부 결과 전체 재검증
-- gateway normalization 후 동일한 effective query 중복 실행 거부
-- configured runtime/model identity 변경 거부
-- 부족한 자료에 대한 추가 질문
-- 전문 정책 경계를 유지한 최종 종합
-
-**종료 조건:** 같은 문장이라도 실제 context에 따라 호출 도구가 달라지고, runtime의
-cancellation 억제, 동기 event-loop blocking, step 우회와 source ref 위조가 성공
-결과에 반영되지 않는다.
-
-### `DEC-05 Hermes Responses Runtime Adapter`
-
-- HealthMes system policy를 항상 주입
-- 전용 Hermes profile에 네 개의 읽기 전용 HealthMes MCP search tool만 노출
-- 일반 native tool, Skill, memory, mutation과 Open Wearables 직접 MCP 비활성화
-- configured model/provider identity를 고정하고 응답 변경을 거부
-- `POST /v1/responses`를 정확히 한 번 호출
-- Hermes가 요청 내부의 자율 LLM/MCP tool loop를 소유
-- canonical server-side `tool_trace`와 transcript call/output을 fail-closed 대조
-- startup 때 인증된 toolset/model route probe 실행
-- decoded HTTP response를 streaming으로 읽고 2 MB에서 즉시 중단
-- `Accept-Encoding: identity`만 허용해 압축 해제 bomb을 body read 전에 거부
-- 모든 production HTTP runtime은 전용 bearer key 없이는 구성하지 못하게 차단
-- Skill 설치 여부와 무관하게 같은 mandatory policy와 결과 계약을 적용
-- Skill은 얇은 channel/runtime 설명으로 제한
-- 성공 세션은 bounded retry로 삭제하고 실패 세션은 TTL maintenance로 정리
-
-**종료 조건:** HealthMes core가 Hermes 내부 클래스에 의존하지 않고, production
-경로가 정확히 한 번의 Responses 호출만 사용하며, profile·trace·draft·source ref
-불일치를 모두 성공 결과로 받아들이지 않는다.
-
-### `DEC-06 Decision Finalizer`
-
-- tool result에서 반환된 `source_refs` allowlist 생성
-- 최종 답변의 참조와 limitation 검증
-- `DecisionRecord` 자동 저장
-- 저장 실패와 불완전 판단을 명시적 상태로 반환
-
-**종료 조건:** 행동 제안이 포함된 모든 성공 응답에 검증된 DecisionRecord가 있다.
-
-### `DEC-07 Data completeness`
-
-- Open Wearables normalized summary의 안정적 source reference 또는 local mirror
-- ActivityWatch 자동 주기 import
-- iOS capability 범위 안의 Screen Time aggregate collection/sync seam
-- 여러 기기의 겹친 활동시간 처리 정책
-
-**종료 조건:** 선택 가능한 각 provider가 freshness, coverage와 provenance를 반환한다.
-
-### `DEC-08 End-to-end verification`
-
-- 모호한 질문에서 LLM tool selection 검증
-- 첫 결과에 따라 추가 영역을 조회하는 multi-turn tool test
-- privacy Level별 허용과 거부
-- 누락 데이터를 0으로 바꾸지 않는 테스트
-- source reference 위조 거부
-- 최종 DecisionRecord 저장 테스트
-
-**종료 조건:** 다음 전체 흐름이 자동 테스트로 증명된다.
+새 wellness domain을 추가할 때 순서는 다음과 같다.
 
 ```text
-자연어 질문
-  -> LLM 자율 도구 선택
-  -> 권한과 privacy가 적용된 context
-  -> 여러 영역 종합
-  -> 검증된 source_refs
-  -> DecisionRecord 저장
+1. 저장/외부 provider 경계
+2. bounded domain query와 provenance
+3. Context Access Layer capability
+4. HealthMes MCP search tool 또는 기존 search 확장
+5. read-only domain Skill
+6. cross-domain E2E와 source-ref 검증
 ```
 
-현재 E2E는 다음 실제 저장 경로를 사용한다.
-
-```text
-"오늘 집중이 흐트러지고 피곤한데,
- 100mg 카페인 커피를 더 마시면서 계속 일해도 될까?"
-        |
-        v
-Activity 저장 이벤트와 focus 집계
-        |
-        v
-Open Wearables local sleep snapshot
-        |
-        v
-Calendar local mirror
-        |
-        v
-Nutrition confirmed caffeine ledger
-        |
-        v
-네 domain의 content digest가 있는 SourceRef 재검증
-        |
-        v
-DecisionRecord 저장
-        |
-        v
-DB dispose/reopen 뒤 같은 record 재조회
-```
-
-Activity 자료가 없으면 첫 결과 뒤 즉시 `needs_clarification`으로 끝내며 Wearable,
-Calendar와 Nutrition을 관성적으로 조회하지 않고 record도 저장하지 않는다.
-privacy 거부, missing/partial data, source ref 위조와 저장 실패는 같은 production
-component를 사용하는 focused failure tests에서 별도로 검증한다.
-
-## 14. 채택하지 않는 대안
-
-### 고성능 LLM에 DB 직접 개방
-
-권한, retention, SQL 안정성, 개인정보와 재현성을 모델 성능에 의존하므로 기각한다.
-
-### HealthMes 핵심을 하나의 Skill에 구현
-
-Skill 미로드, prompt drift와 runtime 교체 시 핵심 보장이 사라지므로 기각한다.
-
-### Hermes core에 HealthMes 규칙 직접 삽입
-
-업스트림 동기화와 제품 소유권이 꼬이므로 기각한다. 필요한 generic hook만 별도
-Hermes PR로 제안한다.
-
-### 새 LLM runtime 전체 재구현
-
-Hermes가 이미 provider, tool loop, session과 channel을 제공하므로 MVP에서는
-중복 구현이다. HealthMes-owned interface와 adapter만 만든다.
-
-## 15. 완료 정의
-
-이 개선은 문서나 Skill 추가만으로 완료되지 않는다.
-
-1. 고정 `question_kind` 없이 자연어 질문을 받을 수 있다.
-2. LLM이 상황에 따라 서로 다른 도구를 선택하고 추가 조회할 수 있다.
-3. Context Access Layer가 권한, retention과 privacy를 코드로 강제한다.
-4. Domain Provider가 정확한 수치와 전문 정책을 소유한다.
-5. 최종 답변은 실제 tool output의 `source_refs`만 사용할 수 있다.
-6. 행동 제안은 자동으로 `DecisionRecord`에 저장된다.
-7. Hermes 없이도 계약 테스트가 가능하고 Hermes는 교체 가능한 adapter다.
-8. UI 구현 없이 엔진과 runtime 연결의 end-to-end 테스트가 통과한다.
-9. runtime이 cancellation을 억제하거나 이전 결과 snapshot을 변경해도 반환 결과와
-   canonical trace가 deadline 이후 변하지 않는다.
-10. runtime 또는 provider가 event loop를 동기적으로 막아도 API 호출은 wall-clock
-    deadline 안에 실패로 반환된다.
-11. timeout으로 worker가 종료되지 않아도 같은 agent가 새 thread를 계속 만들지 않고
-    이후 요청을 fail-fast 한다.
-12. 각 tool 호출 전후 consent revision이 달라지면 결과를 버리며,
-    `off -> on` 경합도 허용된 것으로 오인하지 않는다.
-13. finalization의 payload 생성 또는 flush가 deadline을 넘기면 commit하지 않는다.
-14. Calendar sync, sleep scheduler와 sleep web 경로는 disconnect 뒤 stale backend를
-    호출하지 않고 reconnect 뒤 새 credential generation으로 backend를 재생성한다.
-15. commit 시작 전 timeout은 늦은 `DecisionRecord` 생성을 영구 차단하고, commit
-    시작 후 timeout은 `UNKNOWN`으로 반환한 뒤 request ID 조회로만 결과를 복구한다.
-16. `UNKNOWN` 응답 뒤에도 commit worker를 추적하며, app shutdown은 worker와 DB
-    connection cleanup을 drain한 뒤에만 저장소를 dispose한다.
-17. 엔진 밖에서 `DecisionFinalizer`를 직접 소유하는 호출자도 `close()` 또는
-    `aclose()`로 worker를 drain한 뒤 저장소를 dispose한다.
+새 domain마다 별도 agent, 별도 제품 MCP나 별도 질문 taxonomy를 만들지 않는다.
+필요한 데이터 특성만 논리적으로 분리하고 같은 Decision Service와 source 계약에
+연결한다.

@@ -147,15 +147,14 @@ criteria are tracked in
   real-iPhone validation. Retention, deletion,
   cross-device-aware hourly/daily aggregation, focus/overwork/recovery
   context, REST and MCP surfaces are implemented. The fixed `question_kind`
-  resolver remains compatibility-only. As of 2026-08-16 the production
-  composition still depends on the unavailable split-runtime hook, so the
-  following is the PR #138 completion target rather than an implemented
-  claim. The target is one product
-  path: `POST /v1/wellness-decisions` delegates one complete autonomous turn
-  to Hermes `/v1/responses`; Hermes selects tools only from the unified
-  HealthMes MCP server, and HealthMes validates returned source references
-  and performs compact decision persistence when required. The abandoned
-  split-runtime `/v1/model/iterations` contract is retained only as history.
+  resolver remains compatibility-only. The product has one free-form
+  reasoning path: `POST /v1/wellness-decisions` delegates one complete
+  autonomous turn to Hermes `/v1/responses`; Hermes selects only the six
+  read-only decision tools exposed by the unified HealthMes MCP server.
+  HealthMes validates the canonical tool trace and returned source
+  references, then persists a compact DecisionRecord only for actions,
+  actionable risks, or explicit tracking. The split-runtime
+  `/v1/model/iterations` adapter and public builder have been removed.
   See `docs/HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`. The authenticated
   REST boundary exposes
   per-domain `activity` / `nutrition` / `wearable` / `calendar` consent,

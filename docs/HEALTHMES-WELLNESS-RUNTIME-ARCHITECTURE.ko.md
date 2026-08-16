@@ -2,452 +2,283 @@
 
 > **결정일:** 2026-08-16
 >
-> **상태:** PR #138의 canonical target. 이 문서가 Decision runtime, MCP,
-> 저장 경계와 iPhone Screen Time 수집 계약의 최상위 기준이다.
+> **상태:** PR #138의 canonical 아키텍처. 구현과 문서가 다르면 이 문서의
+> 책임 경계를 기준으로 코드를 수정한다.
 >
-> **구현 추적:** PR #138과 그 하위 이슈. 문서에 `목표`라고 표시된 항목은
-> 해당 이슈가 닫히고 테스트가 통과하기 전까지 완료로 간주하지 않는다.
+> **범위:** 자유 형식 wellness 판단, HealthMes MCP, 도메인 저장 경계,
+> 조건부 판단 기록, iPhone Screen Time 수집 lifecycle과 입력 설정 계약.
 
 ## TLDR
 
-아래 그림은 **PR #138이 완료됐을 때의 목표 구조**다. 현재 production
-composition은 아직 `/v1/model/iterations`를 사용하므로 이 문서만 병합해서 완료로
-간주하지 않는다.
-
-HealthMes에는 자유 형식 wellness 질문을 해석하고 판단하는 **reasoning 경로가
-하나만** 있어야 한다.
+HealthMes의 자유 형식 wellness 질문 경로는 하나다.
 
 ```text
-App / Web / Channel adapter / Proactive trigger
-  |
-  | public REST or internal DecisionRequest ingress
-  v
-HealthMes Wellness Decision Service
-  |
-  | Hermes /v1/responses
-  v
-Hermes autonomous LLM + tool loop
-  |
-  | only one product MCP server: healthmes
-  | decision-read tools only
-  v
-HealthMes MCP
-  |
-  +-- Activity tools
-  +-- Nutrition / caffeine / VLM tools
-  +-- Calendar tools
-  +-- Wearable tools
-  |     |
-  |     +-- bounded REST calls to Open Wearables
-  |
-  +-- source_refs and compact decision persistence
+App / Web / Channel / Proactive / Scheduled
+                    |
+                    v
+        HealthMesDecisionService
+                    |
+                    v
+       POST /v1/wellness-decisions
+       또는 같은 내부 service 호출
+                    |
+                    v
+       Hermes /v1/responses 한 번
+                    |
+          autonomous LLM/tool loop
+                    |
+                    v
+       filtered HealthMes MCP 하나
+                    |
+     +--------------+--------------+--------------+
+     |              |              |              |
+ Activity       Nutrition       Calendar       Wearable
+     |              |              |              |
+     +--------------+--------------+--------------+
+                    |
+                    v
+ source_refs 검증 + 필요한 경우만 compact DecisionRecord
 ```
 
-기존처럼 Hermes가 직접 처리하는 경로와 HealthMes가 별도 LLM loop를 돌리는
-경로를 동시에 운영하지 않는다. `POST /v1/model/iterations`는 현재 Hermes에
-존재하지 않으며, 그 endpoint를 전제로 한 split-runtime 설계는 폐기한다.
+두 개의 LLM loop를 합치는 방식은 다음과 같다.
 
-식사 기록, 설정 변경, 캘린더 제안 확인처럼 사용자가 이미 의도를 명시한 작업은
-별도의 bounded command workflow로 처리할 수 있다. 이 workflow는 자유 형식
-wellness 판단을 수행하지 않으며 decision-read profile을 우회해 자료를 탐색하지
-않는다.
+- **HealthMes**가 제품 ingress, 데이터, 도구 계약, 저장·보존, 결과 검증을
+  소유한다.
+- **Hermes**가 한 `/v1/responses` 요청 안에서 질문 해석, 도구 선택, 반복 조회와
+  최종 종합을 소유한다.
+- HealthMes가 Hermes에게 한 번씩 생각을 요청하고 직접 tool loop를 돌리는
+  split-runtime은 사용하지 않는다.
+- 폐기된 `/v1/model/iterations` adapter, 공개 builder와 계약 문서는 제거한다.
 
-## 0. 현재 상태와 PR #138 종료 상태
+## 1. Capability Boundary
 
-| 영역 | 2026-08-16 현재 코드 | PR #138 종료 상태 |
-|---|---|---|
-| 제품 API | `POST /v1/wellness-decisions` 존재 | 그대로 공식 API 하나만 유지 |
-| LLM 실행 | HealthMes loop가 존재하지 않는 Hermes `/v1/model/iterations`를 요구 | Hermes `/v1/responses`가 전체 LLM·tool loop를 한 번 실행 |
-| Hermes tool surface | `healthmes`, `open_wearables` MCP와 API server 기본 도구가 함께 노출될 수 있음 | API server에는 filtered `healthmes` MCP의 decision-read 도구만 허용 |
-| 최종 결과 | HealthMes 내부 iteration 계약이 `DecisionDraft`를 직접 요구 | Hermes 최종 텍스트를 엄격한 JSON envelope로 검증해 `DecisionDraft`로 변환 |
-| domain consent | 기존 HealthMes Context Access Layer에서 검사 | HealthMes MCP의 decision context 도구도 동일한 현재 owner policy를 사용 |
-| 채널 입력 | Telegram이 Hermes `run_conversation()`을 직접 실행 | 모든 자유 형식 wellness 질문은 HealthMes ingress를 사용하고 Hermes 직접 채널 판단은 비활성 |
-| 명시적 command | 캡처·확인과 자유 형식 판단의 경계가 혼재 | 식사 기록·설정 변경·확인 응답은 별도 bounded command workflow이며 wellness reasoning을 수행하지 않음 |
-| iPhone lifecycle | report/transport/sync seam은 있으나 앱 lifecycle 자동 실행은 없음 | 권한 승인 직후, foreground catch-up, background 기회, outbox 재전송 연결 |
-
-따라서 이 표의 오른쪽 열과 E2E 테스트가 모두 완료되기 전에는 README나 PR
-설명에서 단일 runtime 또는 iPhone 자동 수집을 구현 완료라고 표현하지 않는다.
-
-## 1. capability boundary
-
-### HealthMes가 소유한다
+### HealthMes가 소유하는 것
 
 ```text
-제품 API
-REST·channel·proactive 요청을 같은 DecisionRequest로 바꾸는 ingress
-데이터 수집·정규화·저장·보존
-Activity / Nutrition / Calendar / Wearable 도구
-Open Wearables 접근 adapter
-VLM 분석 adapter
-source_refs 계약
-compact DecisionRecord 정책
-입력 설정 API
-명시적 capture / confirmation command 계약
+제품 REST/internal ingress
+DecisionRequest와 DecisionResult 계약
+Activity / Nutrition / Calendar 저장과 검색
+Open Wearables 접근 adapter와 wearable mirror
+입력 설정, 보존기간과 삭제
+Context Access Layer와 source_refs
+조건부 compact DecisionRecord
+VLM/텍스트/음성 intake command 계약
 ```
 
-HealthMes는 질문별 고정 조회 표나 별도의 두 번째 LLM loop를 소유하지 않는다.
-
-### Hermes가 소유한다
+### Hermes가 소유하는 것
 
 ```text
-LLM 호출
+LLM provider 호출
 자연어 질문 해석
-필요한 MCP 도구의 자율 선택
+허용된 MCP 도구의 자율 선택
 도구 결과를 본 뒤 추가 도구 호출
-여러 domain의 종합 판단
-최종 자연어 답변
-세션·채널 전달
+여러 wellness domain의 종합
+strict HealthMes 최종 envelope 생성
 ```
 
-Hermes는 HealthMes보다 상위 제품이 아니다. HealthMes가 선택한 첫 runtime이며
-나중에 다른 agent runtime으로 교체할 수 있는 실행 부품이다.
+Hermes는 HealthMes와 동등한 상위 제품이 아니다. HealthMes가 사용하는 교체 가능한
+agent runtime이다. 현재 runtime이 Hermes라는 뜻이지, HealthMes의 데이터와 제품
+정책을 Hermes가 소유한다는 뜻은 아니다.
 
-### Skill이 소유한다
+### Skill이 소유하는 것
 
-Skill은 코드 엔진이 아니라 Hermes가 읽는 제품 사용 설명이다.
+Skill은 실행 엔진이나 DB adapter가 아니라 검토된 도메인 지침이다.
 
 ```text
-질문의 wellness 목적을 해석하는 방식
-HealthMes MCP 도구를 찾는 방법
-불확실성·한계·추가 질문을 표현하는 방식
-기록 질문과 섭취 전 질문을 구분하는 대화 규칙
+도구를 언제 참고할지
+전문 영역의 hard boundary
+불확실성과 추가 질문 표현
+섭취 기록과 섭취 전 질문의 대화 차이
 ```
 
-Skill은 DB를 직접 읽지 않고, Open Wearables MCP를 직접 호출하지 않으며,
-보존기간·권한·정확한 합계 계산을 대신 구현하지 않는다.
+권한, 보존기간, 정확한 합계, source 검증과 저장 여부는 Skill 문서에 맡기지 않고
+HealthMes 코드가 강제한다.
 
-API server decision turn에는 Hermes의 쓰기 가능한 `skill_manage`를 노출하지
-않는다. HealthMes가 검토된 wellness Skill을 읽기 전용 catalog로 제공하거나,
-선택한 공통 Skill 내용을 request instructions에 포함한다. 따라서 도메인
-전문가의 Skill은 계속 판단 지침으로 쓰이지만 runtime이 임의로 Skill 파일을
-수정하지 못한다.
+## 2. 공식 판단 경로는 하나
 
-## 2. 왜 경로는 하나여야 하는가
+### 자유 형식 reasoning
 
-기존 두 경로는 같은 질문에 서로 다른 도구, prompt, 기록 규칙과 답변을 사용할 수
-있다.
+다음 입력은 모두 같은 `HealthMesDecisionService`를 호출한다.
 
 ```text
-폐기할 구조
-
-사용자 질문
-   |
-   +-- A. Hermes /v1/responses
-   |      Hermes가 LLM과 MCP loop 실행
-   |
-   +-- B. /v1/wellness-decisions
-          HealthMes가 별도 LLM loop 실행
-          -> 존재하지 않는 /v1/model/iterations 필요
+REST       -> DecisionIngress.REST
+Channel    -> DecisionIngress.CHANNEL
+Proactive  -> DecisionIngress.PROACTIVE
+Scheduled  -> DecisionIngress.SCHEDULED
 ```
 
-이 구조에는 네 문제가 있다.
-
-1. B는 현재 실행할 수 없다.
-2. A와 B가 서로 다른 판단 결과를 낼 수 있다.
-3. 도구와 Skill을 두 경로에 중복 등록해야 한다.
-4. 어떤 경로가 제품의 정식 기록·관찰 대상인지 모호하다.
-
-채택 구조는 다음과 같다.
+서버가 owner, timezone, local/hosted execution scope와 요청 예산을 구성한다.
+클라이언트가 owner ID나 보존기간을 임의로 넣어 조회 범위를 바꾸지 않는다.
 
 ```text
-채택 구조
-
-모든 wellness reasoning UI·API client·channel adapter·proactive trigger
-       |
-       v
-HealthMes DecisionRequest ingress
-       |
-       +-- public: POST /v1/wellness-decisions
-       +-- internal: the same decision service contract
-       |
-       | HealthMes request envelope와 product metadata
-       v
-Hermes /v1/responses
-       |
-       | 한 번의 autonomous agent turn
-       | 질문 해석 -> MCP 선택 -> 반복 조회 -> 최종 답변
-       v
-HealthMes response adapter
-       |
-       +-- 사용된 source_refs 검증
-       +-- 필요할 때만 compact DecisionRecord 저장
-       +-- 공통 DecisionResult 반환
+DecisionServiceRequest
+  -> server-owned DecisionRequest
+  -> HealthMesDecisionEngine
+  -> HermesResponsesDecisionAgent
+  -> Hermes POST /v1/responses
+  -> HealthMes MCP 반복 호출
+  -> strict DecisionDraft
+  -> DecisionFinalizer
+  -> DecisionResult
 ```
 
-Hermes `/v1/responses`를 클라이언트나 Telegram이 직접 호출하는 것은
-HealthMes 제품의 wellness 경로가 아니다. 현재 Hermes Telegram platform은
-별도의 `run_conversation()`을 실행하므로, PR #138의 canonical 배포에서는
-wellness 질문용 inbound를 비활성화하고 outbound delivery에만 사용한다. 미래
-Telegram·앱·웹 adapter는 UI를 소유해도 판단은 위 HealthMes ingress를 호출한다.
-이 규칙을 지키지 않으면 source 검증과 compact 기록 정책을 건너뛰는 두 번째
-판단 경로가 다시 생긴다.
+Hermes CLI나 Hermes `/v1/responses`를 사용자가 직접 호출한 결과는 HealthMes 제품
+판단이 아니다. 그것은 HealthMes ingress, source 검증과 조건부 기록을 우회한다.
 
-반대로 다음 command는 별도의 작은 경로를 유지할 수 있다.
+### bounded command는 두 번째 reasoning 경로가 아니다
+
+사용자가 이미 의도를 확정한 쓰기는 별도 command로 남을 수 있다.
 
 ```text
-식사 섭취 확정 -> Nutrition ingest command
-설정 저장      -> Input settings command
-적용 <handle>  -> Calendar confirmation command
+식사 섭취 확정      -> Nutrition ingest command
+입력 설정 변경      -> Input settings command
+캘린더 제안 승인    -> Calendar confirmation command
 ```
 
-이 command들은 사용자가 명시한 쓰기를 검증하고 실행할 뿐 질문 의미를 해석하거나
-여러 domain을 자율 검색하지 않는다. command 처리 중 새로운 wellness 판단이
-필요해지면 내부 `DecisionRequest`를 호출하고 그 결과를 받은 뒤 별도 확인을
-요청해야 한다.
-
-### 자유 형식 Hermes 응답을 구조화하는 계약
-
-Hermes `/v1/responses` 자체는 JSON Schema 기반의 HealthMes 전용 최종 객체를
-보장하지 않는다. `output`에는 tool call, tool output과 마지막 자유 형식 assistant
-text가 들어간다. 따라서 HealthMes adapter가 기존
-`healthmes.decision.contracts.DecisionDraft`와 정확히 연결된 strict envelope를
-추가한다.
-
-```text
-HealthMes instructions
-  -> 마지막 assistant text는 healthmes.decision-draft.v1 JSON 하나만 반환
-  -> Hermes는 그 전에 필요한 HealthMes MCP 도구를 자율 반복 호출
-  -> adapter가 전체 function_call / function_call_output 쌍을 검증
-  -> envelope 안의 draft를 기존 DecisionDraft Pydantic model로 strict parse
-  -> used_source_ref_ids가 실제 HealthMes tool output의 부분집합인지 검증
-```
-
-```json
-{
-  "object": "healthmes.decision-draft.v1",
-  "draft": {
-    "status": "completed",
-    "answer": "...",
-    "proposed_action": false,
-    "used_source_ref_ids": ["sr_0123456789abcdef0123456789abcdef"],
-    "limitations": [],
-    "clarification_question": null,
-    "confidence": 0.8,
-    "uncertainty": null,
-    "follow_up_question": null
-  }
-}
-```
-
-`DecisionDraft`의 enum, 길이 제한, source ID 정규식과 status별 invariant가 그대로
-적용된다. 예를 들어 `completed`는 answer가 필요하고, `proposed_action=true`는
-실제 source ref가 필요하며, clarification은 행동을 제안할 수 없다. 코드 fence,
-JSON 앞뒤 설명, 알 수 없는 필드, 잘못된 source ref 또는 허용되지 않은 도구 호출이
-있으면 정상 답변으로 승격하지 않는다. 이 계약은 Skill 문서가 아니라 HealthMes
-parser와 테스트가 강제한다.
+이 command는 자유 형식 질문을 해석하거나 여러 domain을 자율 검색하지 않는다.
+새로운 wellness 판단이 필요하면 같은 `HealthMesDecisionService`를 호출해야 한다.
 
 ## 3. HealthMes MCP 하나의 의미
 
-MCP 서버가 하나라는 말은 데이터가 한 테이블에 섞인다는 뜻이 아니다. 에이전트가
-찾아야 할 **제품 도구 카탈로그의 입구가 하나**라는 뜻이다.
+MCP 서버가 하나라는 것은 모든 데이터를 한 DB나 한 테이블에 섞는다는 뜻이 아니다.
+Hermes가 보는 **제품 데이터 도구의 입구가 하나**라는 뜻이다.
+
+Decision runtime에 노출되는 도구는 정확히 다음 6개다.
 
 ```text
-Hermes
-  |
-  | mcp__healthmes__*
-  v
-HealthMes MCP server
-  |
-  +-- search_activity(...)
-  +-- get_activity_summary(...)
-  +-- search_nutrition(...)
-  +-- analyze_intake_capture(...)
-  +-- get_caffeine_context(...)
-  +-- search_calendar(...)
-  +-- get_schedule(...)
-  +-- search_wearable(...)
-  +-- get_sleep/readiness/stress context(...)
-  +-- record or retrieve a compact decision(...)
+search_activity
+search_nutrition
+search_calendar
+search_wearable
+list_wellness_skills
+read_wellness_skill
 ```
 
-LLM은 고정 `question_kind` 표를 따르지 않는다. 도구 설명과 반환 결과를 보고 필요한
-domain, 기간과 상세도를 자율적으로 선택한다. 각 도구는 범위, 결과 수와 payload
-크기가 제한돼야 하며 cursor 또는 명시적 time range를 사용한다.
-
-### Decision context 도구와 consent
-
-기존 범용 MCP 도구를 그대로 호출하는 것만으로는 Decision Agent의 domain consent를
-보장할 수 없다. 따라서 source-bearing 조회는 HealthMes MCP 안의 전용 bounded
-context 도구가 담당한다. PR #138은 **한 사용자가 소유하는 self-hosted Personal
-Data Node**가 MVP 경계다.
+앞의 네 도구는 데이터를 읽고, 뒤의 두 도구는 검토된 Skill을 읽는다. decision
+profile에는 mutation, raw SQL, terminal, browser, memory, writable Skill,
+direct Open Wearables MCP를 노출하지 않는다.
 
 ```text
-Hermes가 domain context 도구 호출
-  -> HealthMes가 서버 설정의 단일 owner identity 사용
-  -> DB의 최신 per-domain consent와 execution scope 조회
-  -> Context Access Layer가 retention, privacy, timezone, range, row limit 검사
-  -> ContextResult + SourceRef + access audit 반환
+Hermes LLM
+   |
+   | mcp__healthmes__search_*
+   v
+DecisionContextSearchSessionService
+   |
+   v
+Context Access Layer
+   |
+   +-- Activity provider  -> HealthMes DB
+   +-- Nutrition provider -> HealthMes DB
+   +-- Calendar provider  -> HealthMes DB mirror
+   +-- Wearable provider  -> retained mirror 또는 bounded OWClient
 ```
 
-Hermes의 정적 bearer token은 end-user identity가 아니라 HealthMes가 허용한
-service-to-service credential이다. Hermes나 Skill은 owner ID, consent 결과 또는
-보존기간을 인자로 정하지 못한다. 사용자가 설정을 끄면 다음 도구 호출부터 현재 DB
-policy가 적용된다. 일반 HealthMes MCP 도구가 존재하더라도 검증된 decision
-source로 채택되는 것은 이 표준 context envelope를 반환한 도구뿐이다.
+LLM은 `question_kind -> 고정 domain 표`를 따르지 않는다. 첫 결과의
+`coverage`, `freshness`, `limitations`를 보고 다른 domain이나 기간을 추가로
+조회할 수 있다.
 
-hosted multi-user 제품에서는 이 단일-owner 계약을 재사용하면 안 된다. 그때는
-HealthMes가 서명한 request-scoped principal envelope 또는 사용자별 MCP session이
-별도 설계돼야 한다.
-
-### Hermes API server tool surface
-
-`/v1/responses`는 Hermes의 `platform_toolsets.api_server` 설정을 사용한다.
-server 이름만 허용하면 그 server의 mutation tool까지 노출되므로 두 단계 필터를
-모두 사용한다. 또한 `platform_toolsets.api_server: [healthmes]` 하나만으로
-native tool이 절대 노출되지 않는다고 가정하지 않는다. credential과 설정 상태에
-따른 toolset 복구를 막기 위해 bootstrap은 API server용 deny-by-default profile을
-함께 생성한다.
-
-```yaml
-platform_toolsets:
-  api_server:
-    - healthmes
-
-agent:
-  # 실제 목록은 bootstrap이 Hermes native toolset catalog에서 생성한다.
-  # healthmes MCP는 native toolset이 아니므로 이 목록에 넣지 않는다.
-  disabled_toolsets:
-    - web
-    - search
-    - x_search
-    - terminal
-    - file
-    - browser
-    - delegation
-    - memory
-    - skills
-
-mcp_servers:
-  healthmes:
-    tools:
-      include:
-        - search_activity
-        - search_nutrition
-        - search_calendar
-        - search_wearable
-        - list_wellness_skills
-        - read_wellness_skill
-```
-
-실제 include 목록은 코드의 decision-read profile이 정본이며 위 목록은 최소
-형태다. `healthmes`는 유일한 제품 MCP server 이름이다. Hermes 내장
-`skills_list`, `skill_view`, `skill_manage`, HealthMes mutation tools, terminal,
-file write, browser, delegation과 direct `open_wearables` MCP는 wellness decision
-turn에 노출하지 않는다. HealthMes response adapter도 설정만 신뢰하지 않고 실제
-transcript의 tool name allowlist를 다시 검사한다. 사후 검증은 이미 실행된
-mutation을 되돌릴 수 없으므로 **등록 전 include filter가 1차 경계**다.
-
-배포 시작 검사는 다음 두 검증을 모두 통과해야 한다.
-
-1. 렌더된 Hermes config에는 `healthmes` MCP 하나와 정확한
-   `mcp_servers.healthmes.tools.include` 목록만 존재한다.
-2. 인증된 `GET /v1/toolsets` 결과에서 API server용 native toolset이 하나라도
-   `enabled=true`면 HealthMes decision runtime은 fail closed한다.
-
-`GET /v1/toolsets`는 native toolset 검사용이며 MCP 도구 allowlist의 정본은
-렌더된 config와 HealthMes의 decision-read profile이다. transcript 검사는
-잘못된 배포를 탐지하는 2차 방어이지 실행 전 경계를 대신하지 않는다.
-
-### Open Wearables
-
-Open Wearables의 상세 DB는 별도 물리 저장소로 유지한다. 그러나 Hermes에 별도
-`open_wearables` MCP 서버를 노출하지 않는다.
+예:
 
 ```text
-Hermes
-  |
-  v
-HealthMes MCP wearable tools
-  |
-  v
-OWClient
-  |
-  v
-Open Wearables REST API / DB
+"이 커피를 마시고 계속 일해도 될까?"
+  -> nutrition/caffeine 후보와 오늘 ledger
+  -> 필요하면 wearable 수면/readiness
+  -> 필요하면 activity 연속 작업/휴식
+  -> 필요하면 calendar 다음 일정
+  -> 현재 시각까지 종합
 ```
 
-이 경계의 목적은 Open Wearables를 숨기는 것이 아니라 다음을 한 곳에서 보장하는
-것이다.
+고정 `question_kind` resolver는 기존 호출자 호환용 preset일 뿐 공식 자연어
+reasoning 경로가 아니다.
 
-- 동일 사용자와 시간대 선택
-- bounded range와 결과 크기
-- retention된 local mirror 우선 사용
-- 안정적인 `source_refs`
-- HealthMes 도구 naming과 response shape
-- Activity·Nutrition·Calendar 결과와 동일한 방식의 조합
+### 실행 전·후 검증
 
-## 4. 저장 아키텍처
+1. 렌더된 Hermes decision config는 제품 MCP로 `healthmes` 하나만 가진다.
+2. `mcp_servers.healthmes.tools.include`는 위 6개와 정확히 일치한다.
+3. Hermes native toolset은 deny-by-default다.
+4. runtime 시작 시 live tool profile과 model route를 검증하고 drift가 있으면
+   fail closed한다.
+5. 실행 후 transcript의 tool name, call/output pair와 source ref를 다시 검증한다.
 
-Personal Data Node가 하나의 논리적 정본이다. 물리 저장소는 데이터 성격에 따라
-분리한다.
+사후 검증만으로 이미 실행된 mutation을 되돌릴 수 없으므로 config/include 검사가
+1차 경계이고 transcript 검사는 2차 경계다.
+
+## 4. LLM, Gateway와 Domain Provider
+
+세 책임은 서로 대체하지 않는다.
+
+| 계층 | 책임 | 하지 않는 일 |
+|---|---|---|
+| Hermes LLM | 무엇을 알아볼지 결정하고 여러 결과를 종합 | DB 직접 조회, 보존기간 계산 |
+| Context Access Layer | 요청한 자료를 실제 제공할 수 있는지 검사 | 질문 의미 분류, 최종 조언 |
+| Domain provider | 정확한 수치, 집계, coverage와 source_refs 계산 | “커피를 마셔라” 같은 최종 판단 |
+
+Context Access Layer는 고정 질문 표가 아니다. LLM이 요청한 조회에 대해 다음만
+결정론적으로 검사한다.
+
+```text
+현재 domain 사용 동의
+실행 위치와 privacy level
+사용자 retention cutoff
+timezone과 기간
+row/byte/call budget
+현재 source generation과 freshness
+```
+
+고성능 LLM을 사용해도 삭제된 행, stale device revision, timezone cutoff, 중복
+합산과 DB transaction을 확실하게 지키지는 못한다. 따라서 LLM에 DB나 자유 SQL을
+직접 주지 않는다.
+
+## 5. 중앙 Personal Data Node와 저장 경계
+
+HealthMes는 하나의 **논리적 Personal Data Node**를 사용하지만 물리 저장은 데이터
+성격에 맞게 분리한다.
 
 ```text
 Personal Data Node
 |
-+-- postgres service / postgres_data volume
-|   |
-|   +-- healthmes database
-|   |   +-- WellnessEvent: Activity
-|   |   +-- WellnessEvent: Nutrition / caffeine
-|   |   +-- CalendarEventMirror
-|   |   +-- normalized wearable snapshots
-|   |   +-- settings / retention / indexes / cursors
-|   |   +-- optional compact DecisionRecord
-|   |
-|   +-- open-wearables database
-|       +-- detailed sleep
-|       +-- workouts
-|       +-- provider health scores
-|       +-- high-frequency wearable timeseries
++-- healthmes database
+|   +-- Activity WellnessEvent
+|   +-- Nutrition/caffeine WellnessEvent와 confirmation
+|   +-- CalendarEventMirror
+|   +-- normalized wearable snapshot/provenance
+|   +-- input settings, retention, cursors, source refs
+|   +-- optional compact DecisionRecord
 |
-+-- healthmes_data volume / HEALTHMES_DATA_DIR
-|   |
-|   +-- photos
-|   +-- audio
-|   +-- large raw payloads
-|   +-- compressed high-frequency chunks
++-- open-wearables database
+|   +-- provider 상세 수면
+|   +-- workout 상세
+|   +-- health scores
+|   +-- 고빈도 wearable timeseries
 |
-+-- ./data/hermes bind mount
-    +-- local runtime state
++-- HEALTHMES_DATA_DIR
+|   +-- 사진, 음성, raw ingest, 큰 object
+|
++-- Hermes runtime state
+    +-- request-scoped transcript와 runtime metadata
 ```
 
-Activity, Nutrition과 Calendar마다 별도 물리 DB를 만들지 않는다. HealthMes DB
-안에서 event type, table, index와 retention class로 논리 분리한다. Open
-Wearables는 같은 Postgres service와 `postgres_data` volume을 사용하지만 별도
-database와 schema owner를 가진다. `HEALTHMES_DATA_DIR`의 large object volume과
-Hermes의 local runtime bind mount도 서로 다르다. 이 물리 경계들을 backup
-manifest와 Personal Data Node 운영 계약이 논리적으로 한 묶음으로 관리한다.
+Activity, Nutrition과 Calendar는 HealthMes DB 안에서 table, event type, index와
+retention class로 논리 분리한다. 상세 wearable 원본은 Open Wearables DB에 둔다.
+HealthMes는 검색에 필요한 retained mirror와 provenance만 저장하고 필요할 때
+`OWClient`로 상세 데이터를 bounded 조회한다.
 
-현재 `healthmes backup` snapshot은 Personal Data Node 전체를 자동 복구하는
-완전 백업이 아니다. HealthMes DB, `media/`, `raw_ingest/`, 선택적 Hermes home,
-그리고 `HEALTHMES_OW_DATABASE_URL`이 설정된 경우의 Open Wearables DB dump만
-포함하는 **부분 스냅샷**이다. `.env`, 외부 OAuth credential, 별도 credential
-store와 설정되지 않은 Open Wearables DB는 포함되지 않는다. PR #138은 backup
-manifest와 compose 설정이 이 한계를 명시하고 restore drill이 포함된 구성요소만
-복구한다고 검증한다. 전체 Personal Data Node 재해복구는 별도 범위다.
+Hermes는 어느 DB도 직접 읽지 않는다. HealthMes MCP가 각 저장소 차이를 숨기는
+통합 인터페이스다.
 
-### 중앙 검색
+현재 backup은 Personal Data Node 전체의 완전 복구본이 아니다. HealthMes DB,
+`media/`, `raw_ingest/`, 설정된 경우의 Open Wearables dump와 Hermes home을
+포함하는 부분 snapshot이다. 외부 OAuth credential과 포함되지 않은 runtime
+volume은 다시 연결해야 한다.
 
-“중앙화”는 하나의 SQL 테이블을 LLM에 직접 열어주는 것이 아니다.
+## 6. Source Refs
 
-```text
-LLM이 질문을 해석
-  -> HealthMes MCP의 domain search tool 선택
-  -> domain adapter가 자기 저장소를 bounded query
-  -> 정규화된 result + source_refs 반환
-  -> LLM이 필요하면 다른 domain을 추가 조회
-```
-
-따라서 “커피를 마셔도 될까?”에는 nutrition/caffeine, 현재 시각, 수면,
-activity와 calendar를 필요에 따라 조합할 수 있고, “어떤 앱이 집중을
-방해했나?”에는 activity의 identity-level 조회만 선택할 수 있다.
-
-## 5. source_refs와 DecisionRecord
-
-`source_refs`는 의료적 증명이 아니라 답변에 사용한 데이터의 추적 주소다.
+`source_refs`는 의료적 증명이 아니라 답변에 실제 사용한 데이터의 추적 주소다.
 
 ```json
 {
+  "reference_id": "sr_0123456789abcdef0123456789abcdef",
   "domain": "activity",
   "source_id": "wellness-event-uuid",
   "observed_at": "2026-08-16T09:00:00+09:00",
@@ -455,145 +286,84 @@ activity와 calendar를 필요에 따라 조합할 수 있고, “어떤 앱이 
 }
 ```
 
-HealthMes는 Hermes가 최종 답변에 표시한 reference가 실제 MCP 결과에 있었는지
-검증한다. 모든 원본 payload를 복제하거나 답변 전문을 무기한 저장할 필요는 없다.
+HealthMes는 다음을 검증한다.
 
-PR #138 목표 DecisionRecord 원칙:
+- Hermes가 사용했다고 쓴 ref가 실제 tool output에 있었는가
+- 그 source가 아직 보존기간 안에 있는가
+- 사용자가 해당 domain을 계속 허용하는가
+- provider generation이나 calendar 연결이 바뀌지 않았는가
 
-| 질문/행동 | 기본 저장 |
+사진 bytes, 앱 창 제목과 전체 wearable 시계열을 모든 질문에 보내지 않는다.
+반대로 질문에 꼭 필요하고 사용자가 허용한 identity detail은 aggregate-only
+규칙으로 무조건 막지 않는다. 원칙은 전면 금지가 아니라 **필요한 최소 범위**다.
+
+## 7. 조건부 Compact DecisionRecord
+
+모든 질문을 영구 저장하지 않는다.
+
+| 결과 | 기본 저장 |
 |---|---|
-| 단순 정보 조회 | 저장하지 않거나 짧은 운영 trace |
-| 사용자가 식사·활동을 기록 | 해당 domain event 저장 |
-| 사용자 행동을 바꾸는 제안 | compact record 저장 |
-| 캘린더·설정 등 실제 mutation | 해당 command workflow의 audit가 소유; wellness runtime은 저장 사유로 인정하지 않음 |
-| 행동 가능한 중요 위험 경고 | compact record 저장 |
-| UI/API가 `persistence_requested=true`로 보낸 명시적 추적 요청 | compact record 저장 |
+| 단순 조회·요약 | 저장하지 않음 |
+| 구체적인 행동 변경 제안 | compact record |
+| 행동 가능한 중요 위험 경고 | compact record |
+| 명시적 추적 요청 | compact record |
+| 실제 식사·활동 기록 | 해당 domain event |
+| 설정·캘린더 mutation | 해당 command workflow audit |
 
-compact record에는 request ID, 시각, 모델/runtime, 짧은 결론, 사용한
-`source_refs`, 제안된 행동과 outcome 연결 ID만 둔다. 사진 bytes, 전체 MCP
-payload와 전체 prompt를 기본 저장하지 않는다.
+compact record는 짧은 outcome, runtime/model, intent, confidence,
+`source_refs`, 안전한 limitation과 시각만 저장한다. 원문 질문, 전체 답변,
+transcript, 전체 tool payload, 사진·음성 bytes는 복제하지 않는다.
 
-2026-08-16 구현된 `healthmes.decision-private.v3`는 다음만 저장한다.
+`DecisionRecord`는 `decision` 데이터 클래스의
+`1d/7d/14d/30d/90d/forever` 정책을 따른다. read API도 `expires_at <= now`인
+레코드를 반환하지 않아야 하며 maintenance 지연이 privacy 경계 지연으로 이어지지
+않아야 한다.
 
-- request/turn ID, 요청 시각, timezone, execution/privacy scope
-- 모델/runtime와 token 계측
-- `action`, `risk`, `explicit_tracking` 중 persistence intent
-- intent에서 결정론적으로 만든 160자 이하 outcome summary, confidence와
-  gateway/tool 결과 및 source 재검증에서 생성된 안전한 limitation code
-- 실제 사용한 `source_refs`
-- 실제 사용한 source만 재검증하는 데 필요한 bounded typed query attestation
-- 해당 query의 access 결과
+Hermes 호출은 `store=false`이고 장기 memory를 사용하지 않는다. 성공 session은
+turn 종료 후 bounded cleanup한다. 현재 Hermes 실패 응답은 session ID를 항상
+제공하지 않으므로 실패 session은 전용 state 경로와 짧은 TTL purge로 제한한다.
+이 transient state는 DecisionRecord나 사용자 장기 정본이 아니다.
 
-질문 원문, caller principal, query의 model-authored `purpose`/자유 텍스트 검색어,
-LLM 답변 전문, uncertainty/follow-up 자유 텍스트, LLM이 자유 작성한 limitation,
-전체 tool payload, 사진·음성 bytes, 전체 transcript, 사용하지 않은 source와 tool
-trace는 저장하지 않는다. 최초 `DecisionResult`는 LLM의 완전한 답변을 사용자에게
-반환하지만, DB와 장애 복구 응답은 compact outcome만 사용하고
-`decision_response_compacted` limitation을 표시한다. `none`인 단순 조회는 source를
-사용했더라도 DecisionRecord를 만들지 않는다.
+## 8. iPhone Screen Time
 
-LLM이 반환한 persistence intent는 신뢰 입력이 아니다. HealthMes가 다음처럼 최종
-effective intent를 계산한다.
-
-| 조건 | effective intent |
-|---|---|
-| 완료된 구체적 행동 제안 | `action` |
-| 완료된 행동 가능한 중요 위험 경고 | `risk` |
-| 행동 제안은 없고 trusted request의 `persistence_requested=true` | `explicit_tracking` |
-| LLM이 `mutation`/`explicit_tracking`을 주장했지만 위 조건이 없음 | `none` |
-| 단순 조회·요약 | `none` |
-
-따라서 read-only wellness runtime은 mutation audit를 만들지 않는다. 실제 mutation은
-별도 command workflow가 자신의 audit를 소유한다. 과거
-`healthmes.decision-private.v1`과 `v2` 레코드는 기존 fingerprint와 source 재검증
-계약으로 읽기 호환을 유지한다. 새 write는 항상 `v3`다.
-
-`DecisionRecord`는 storage data class `decision`의
-`1d/7d/14d/30d/90d/forever` 정책을 따른다. 판단을 확정하고 source를 재검증한
-시각이 `retention_basis_at`이며 finite 정책이면 그 시각에 보존일을 더한 값을
-`expires_at`으로 기록한다. 설정 변경과 maintenance는 finalization과 같은
-write-plane fence를 사용하고 `expires_at <= now`인 행을 삭제한다. 기존
-비-Wellness DecisionRecord는 correlation ID가 없으므로 이 정책의 대상이 아니며,
-이를 참조하던 proposal FK는 DB의 `ON DELETE SET NULL` 계약으로 자식 기록을
-보존한다.
-
-검토된 Skill은 wheel의 `healthmes/_wellness_skills` package resource에 포함하고,
-source/Docker 실행에서는 repository `skills/`를 fallback으로 사용한다. catalog는
-mutation 중심 `healthmes-nutrition` 대신 read-only
-`healthmes-nutrition-decision`을 노출한다.
-
-Hermes `/v1/responses` 호출은 `store=false`이며 `previous_response_id`,
-`conversation`과 장기 memory tool을 사용하지 않는다. 다만 현재 Hermes
-`AIAgent`는 `store=false`와 별개로 request-scoped transcript를 로컬
-`state.db`에 쓴다. 성공 응답은 `X-Hermes-Session-Id`를 반환하므로 Adapter가
-turn 종료 후 session 삭제를 요청하고, 실패한 cleanup은 bounded retry 대상으로
-남긴다.
-
-현재 Hermes `/v1/responses`의 500 실패 응답에는 session ID가 없다. 따라서
-HealthMes가 실패 turn을 즉시 정확히 지운다고 보장할 수 없다. PR #138은 Hermes
-runtime state를 전용 경로에 격리하고 짧은 TTL purge를 적용하며, 성공 session은
-즉시 삭제한다. 실패 session까지 즉시 삭제하려면 Hermes가 실패 응답에도
-session ID를 반환하거나 caller 지정 session ID를 지원하는 별도 upstream 계약이
-필요하다. 이 transient state는 DecisionRecord가 아니며 cloud나 무기한 정본으로
-취급하지 않는다. Hermes upstream이 truly ephemeral session을 제공하기 전까지
-“모든 실패 session이 즉시 삭제된다”거나 “disk에 한 번도 쓰지 않는다”고
-주장하지 않는다.
-
-## 6. iPhone Screen Time 수집
-
-iPhone Screen Time은 `activity monitoring` 입력이다. 성공한 집계는 Android와
-ActivityWatch처럼 HealthMes DB의 `activity.*` WellnessEvent 파티션으로 들어간다.
-
-2026-08-16 현재는 서버 report ingest와 iOS collector/sync seam까지 존재하지만,
-실제 앱 lifecycle에서 자동 실행하지 않는다. 아래 흐름은 #168의 구현 종료 상태다.
+iPhone Screen Time은 별도 wellness domain이 아니라 `activity monitoring` 입력이다.
 
 ```text
-iPhone
-  |
-  +-- 사용자가 Apple 권한 승인
-  +-- 완료된 local hour별 사용시간 집계
-  +-- app identity는 기기 안에서 가명화
-  +-- 제외 앱은 업로드 전에 제거
-  +-- 암호화된 local outbox
-  |
-  v
-POST /v1/activity/ios/report
-  |
-  v
-HealthMes activity WellnessEvent + hourly/daily aggregate
+Apple authorization
+  -> 완료된 local-hour aggregate
+  -> 기기 내 app identity 가명화
+  -> 제외 앱 source-side 제거
+  -> bounded local outbox
+  -> POST /v1/activity/ios/report
+  -> HealthMes activity WellnessEvent
 ```
 
-소스코드가 완성할 수 있는 범위:
+저장소 코드가 제공하는 lifecycle:
 
-- 지원 OS/SDK에서 capability 감지
-- 권한 요청 adapter
-- 완료된 시간 버킷 수집
-- 앱 ID 가명화와 source-side exclusion
-- 첫 권한 승인 직후 sync
-- app foreground 진입 시 catch-up
-- OS가 시간을 줄 때 best-effort background sync
-- 네트워크 실패 outbox와 재전송
-- denied, restricted, unavailable 상태의 명시적 보고
-- 서버 snapshot fence와 retention 적용
+```text
+권한 승인 성공 -> 즉시 첫 sync
+foreground     -> catch-up sync
+background     -> OS가 허용한 기회에 best-effort sync
+offline        -> bounded outbox 후 다음 기회에 재전송
+설정 변경      -> 같은 single-flight pipeline 재실행
+```
 
-소스코드만으로 완료할 수 없는 외부 조건:
+일반/미지원 빌드는 사용시간 0을 위조하지 않고 unavailable을 보고한다.
 
-- Apple이 통제하는 entitlement/capability 승인
-- 실제 Team ID와 distribution signing
-- Apple이 허용한 지역·계정·OS 조건
-- 실제 iPhone에서의 최종 dogfood
+다음은 코드만으로 완료할 수 없는 Apple 외부조건이다.
 
-따라서 “자동 수집”의 정확한 의미는 **사용자가 권한을 승인하고 지원 조건이
-충족되면 즉시 첫 sync를 시도하고, 이후 background 기회와 foreground 진입 때
-자동 catch-up한다**는 뜻이다. iOS는 임의의 24시간 상시 daemon을 보장하지 않는다.
+- App & Website Usage entitlement 승인
+- 실제 Team ID와 provisioning/signing
+- 지원 OS, 지역과 Apple Account 조건
+- 실제 iPhone dogfood
 
-디바이스 팀은 권한 안내 화면과 설정 UI를 소유한다. #168은 UI를 만들지 않지만,
-그 UI가 permission adapter를 호출한 직후 첫 sync가 실행되고 앱 lifecycle event가
-collector coordinator로 전달되는 코드 연결은 소유한다.
+따라서 “자동 수집”은 지원 조건과 사용자 승인이 충족된 뒤 lifecycle 기회마다
+자동 sync한다는 뜻이지, iOS에서 24시간 임의 daemon을 보장한다는 뜻이 아니다.
+실제 권한 화면과 설정 UI는 device team 범위다.
 
-## 7. 입력 설정과 보존
+## 9. 통합 입력 설정
 
-모든 디바이스 UI는 같은 계약을 사용한다.
+데스크톱 웹과 미래 모바일 UI는 같은 UI-neutral API를 사용한다.
 
 ```text
 GET  /v1/inputs
@@ -601,63 +371,41 @@ GET  /v1/inputs/{source_id}
 PUT  /v1/inputs/{source_id}/settings
 ```
 
-설정 범위:
+descriptor에는 capability, 연결/권한 상태, action metadata, privacy limitation,
+retention preset과 revision이 포함된다.
 
-- input/instance 활성화와 일시정지
-- 앱 또는 활동 제외
-- Decision Agent 조회 허용
-- 데이터 클래스별 `1d/7d/14d/30d/90d/forever`
-- 연결, 권한 요청과 sync action descriptor
-
-GET descriptor의 `revision`은 PUT에서 compare-and-swap으로 검증한다. 데스크톱과
-휴대전화가 같은 설정을 동시에 바꾸면 오래된 revision을 가진 요청은 `409`로
-거부하고 최신 descriptor를 다시 읽게 한다. UI는 별도 설정 목록을 하드코딩하지
-않고 API가 반환한 capability, action, limitation과 setting definition을 렌더링한다.
-
-## 8. 구현 순서와 완료 조건
+설정 저장은 다음 순서를 사용한다.
 
 ```text
-1. canonical docs와 deprecated 계약 정리
-2. HealthMes MCP에 bounded Activity/Nutrition/Calendar/Wearable search 추가
-3. /wellness-decisions -> Hermes /v1/responses 단일 adapter
-4. direct channel 판단과 direct open_wearables MCP 제거
-5. read-only wellness Skill catalog와 decision tool profile 추가
-6. source_refs 검증 + 조건부 compact DecisionRecord + 성공 Hermes session cleanup
-   + 실패 session 전용 TTL purge
-7. iPhone Screen Time lifecycle/background/outbox 연결
-8. input settings revision CAS
-9. cross-domain E2E + app build + regression + independent review
+GET descriptor와 ETag
+  -> 사용자가 편집
+  -> PUT + If-Match
+  -> 성공하면 새 descriptor/ETag
+  -> 409이면 최신 GET 후 사용자 변경을 재적용
 ```
 
-최종 완료 조건:
+동일 revision을 사용한 경쟁 변경은 하나만 성공한다. input enable/exclusion,
+decision domain access와 retention 변경은 같은 write fence 안에서 원자적으로
+적용한다.
 
-- 자연어 질문이 공식 API 하나로 들어간다.
-- 자유 형식 channel 질문과 proactive reasoning도 같은 internal
-  DecisionRequest ingress를 사용한다.
-- capture와 명시적 confirmation은 bounded command로만 동작하며 reasoning
-  ingress를 우회해 자율 조회하지 않는다.
-- Hermes가 고정 질문 표 없이 HealthMes MCP 도구를 자율 선택한다.
-- Hermes 설정에는 제품용 MCP가 `healthmes` 하나만 있다.
-- Hermes API server에는 decision-read include profile 밖의 도구가 없다.
-- runtime 시작 시 native toolset 또는 MCP profile drift를 발견하면 fail closed한다.
-- wearable 상세 조회도 HealthMes MCP를 통해 bounded하게 가능하다.
-- Activity, Nutrition, Calendar와 Wearable을 한 답변에서 조합할 수 있다.
-- 답변의 `source_refs`가 실제 도구 결과와 일치한다.
-- 저장 대상 질문만 compact DecisionRecord로 남는다.
-- 성공 Hermes session은 즉시 정리되고 실패 session은 전용 state TTL로
-  제한된다. 실패 session 즉시 삭제는 upstream 계약 없이는 완료라고 주장하지
-  않는다.
-- 지원되는 iPhone에서 권한 승인 후 자동 첫 sync/catch-up seam이 연결된다.
-- 입력 설정은 stale revision 덮어쓰기를 거부한다.
-- UI와 `vendor/hermes-agent/`를 수정하지 않는다.
-- Python, Android와 Apple build/test가 모두 통과한다.
+## 10. 완료 기준과 비범위
 
-## 9. 폐기된 설계
+PR #138 완료 기준:
 
-다음 문서는 역사와 기존 코드 이해용이며 새 구현의 기준이 아니다.
+- 공식 자유 형식 reasoning ingress가 하나다.
+- Hermes `/v1/responses`가 유일한 LLM/tool loop다.
+- decision runtime에 HealthMes MCP 6개 읽기 도구만 노출된다.
+- Activity, Nutrition, Calendar와 Wearable을 질문에 따라 자율 조합한다.
+- 실제 tool output에 없는 source ref를 성공 답변으로 저장하지 않는다.
+- 단순 조회는 미저장, 행동·위험·명시 추적만 compact 저장한다.
+- iPhone Screen Time lifecycle/outbox code와 입력 설정 CAS가 검증된다.
+- UI와 `vendor/hermes-agent/`는 수정하지 않는다.
 
-- `HEALTHMES-DECISION-AGENT-ARCHITECTURE.ko.md`의 HealthMes-owned LLM loop
-- `contracts/HERMES-MODEL-ITERATION-HOOK.ko.md`의
-  `POST /v1/model/iterations`
-- Hermes에 `healthmes`와 `open_wearables` MCP를 동시에 제품 노출하는 구조
-- `question_kind -> fixed domains`를 주 자연어 판단 경로로 사용하는 구조
+비범위:
+
+- Apple entitlement 승인과 실제 iPhone dogfood
+- hosted multi-user identity와 휴대폰 단독 hosted node
+- 실시간 multi-master device sync
+- 가격·과금 정책
+- 완전한 Personal Data Node disaster recovery
+- 디바이스 UI

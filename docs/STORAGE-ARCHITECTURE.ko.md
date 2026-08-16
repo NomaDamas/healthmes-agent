@@ -6,8 +6,10 @@
 > **범위:** 다입력 웰니스 플랫폼의 로컬·모바일·노트북·iCloud·관리형 클라우드
 > 저장, 데이터별 보존기간, 용량 관리, 삭제·복구, 병렬 개발 격리.
 >
-> 음식 분석·음식 사진 인식은 sake가 담당한다. HealthMes는 그 결과를 공통
-> `WellnessEvent`로 받아 저장·맥락 연결만 한다.
+> 사진·텍스트·음성 식사 입력은 Nutrition intake engine이 구조화한다. 초기
+> caffeine use case에서 시작한 sake 관측 schema는 전체 Nutrition input의 부분
+> 집합으로 보존하며, 결과는 공통 `WellnessEvent`와 Nutrition 전용 확인/ledger
+> 구조에 저장한다.
 >
 > Agent runtime, MCP와 저장소 사이의 최신 연결 기준은
 > [`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
@@ -26,7 +28,8 @@
 - 매시간 storage maintenance scheduler
 - `/storage` 컴퓨터 웹 관리 화면과 `/v1/storage/*` API
 - 기존 LocalDirectory/RemoteVault 암호화 백업 상태 표시
-- sake `NutritionObservation`을 원형 그대로 `WellnessEvent.payload`에 저장
+- VLM 기반 `NutritionObservation`을 provenance와 함께
+  `WellnessEvent.payload`에 저장
 - 음식/음료 사진, 구조화 관측값, 사용자 확인을 서로 다른 보존 클래스로 분리
 - Android와 ActivityWatch를 같은 `activity.*` `WellnessEvent` 파티션에
   저장하며, 서버가 조건부 iPhone Screen Time aggregate도 같은 파티션에
@@ -44,7 +47,7 @@
 |---|---:|---|
 | `nutrition_media` | 7일 | 원본 사진과 사진에서 읽은 라벨·근거·warning |
 | `nutrition_raw_capture` | 14일 | 식사 원문, 음성 transcript, 미디어 참조, 섭취 결과 note |
-| `nutrition_observation` | 90일 | sake VLM 구조화 관측값과 provenance |
+| `nutrition_observation` | 90일 | VLM/텍스트/음성에서 구조화한 영양 관측값과 provenance |
 | `nutrition_confirmation` | 무기한 | 항목별 사용자 확인과 일일 완전성 확인 |
 | `decision` | 무기한 | 조건부 Wellness 판단의 compact outcome, source refs와 runtime |
 

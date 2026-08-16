@@ -53,18 +53,19 @@ HealthMes 서비스
         Open Wearables data plane
 ```
 
-**핵심 연결 결정 (PR #138 목표, 완료 전까지 구현 주장 금지):**
-- **현재 차이:** 2026-08-16 production Decision Agent는 아직 존재하지 않는
-  `/v1/model/iterations`를 요구하고, Hermes config에는 direct Open Wearables
-  MCP도 남아 있다. 아래 항목은 #162~#169와 E2E가 닫혀야 완료된다.
+**핵심 연결 결정 (PR #138 canonical 구현):**
+- **단일 runtime:** production composition은 HealthMes
+  `POST /v1/wellness-decisions`에서 Hermes `/v1/responses`를 정확히 한 번
+  호출한다. 폐기된 `/v1/model/iterations` adapter와 공개 builder는 제거했다.
 - **제품 질문 경로는 하나:** Client → HealthMes
   `POST /v1/wellness-decisions` → Hermes `/v1/responses` → HealthMes MCP.
-  Hermes가 기존 autonomous LLM/tool loop를 소유하며 HealthMes의 별도 model
-  iteration loop는 폐기한다.
+  Hermes가 autonomous LLM/tool loop를 소유하고 HealthMes는 제품 ingress,
+  데이터 도구, source 검증과 조건부 compact 기록을 소유한다.
 - **Hermes ↔ HealthMes:** Hermes가 보는 제품 데이터 도구는 단일 HealthMes
-  MCP다. HealthMes FastAPI가 `/mcp`에 fastmcp를 마운트한다. interactive,
-  channel과 proactive 입력은 모두 HealthMes의 같은 DecisionRequest service로
-  들어가며, Hermes channel은 최종 결과의 outbound delivery adapter로만 사용한다.
+  MCP의 `search_activity`, `search_nutrition`, `search_calendar`,
+  `search_wearable`, `list_wellness_skills`, `read_wellness_skill` 6개다.
+  REST, channel, proactive와 scheduled 입력은 모두 같은
+  `HealthMesDecisionService`로 들어간다.
 - **Hermes ↔ Open Wearables:** 제품 경로에서 직접 MCP 연결하지 않는다. Hermes는
   HealthMes MCP의 bounded wearable 도구만 호출한다.
 - **HealthMes ↔ Open Wearables:** `OWClient` REST read-only adapter를 사용한다.
@@ -260,11 +261,10 @@ receipt 상태일 뿐 새 사용자 동작이나 추가 calendar mutation 권한
   수집해 `POST /v1/activity/ios/report`로 보낸다. 앱 ID는 기기 Keychain key로
   HMAC 가명화하고 pickup을 launch로 가장하지 않는다. capability, entitlement,
   사용자·지역 조건이 맞지 않으면 사용시간 `0` 대신 명시적 unavailable 상태를
-  보고한다. 2026-08-16 현재 수집·sync service seam과 서버 계약은 구현됐지만
-  lifecycle은 아직 연결되지 않았다. PR #138의 Issue #168이 권한 승인 직후 첫
-  sync, foreground catch-up, best-effort background task와 offline outbox를
-  UI-neutral 코드로 연결한다. entitlement 승인, 실제 권한 UI, distribution
-  signing과 실기기 dogfood는 외부/device-team 조건이다.
+  보고한다. 권한 승인 직후 첫 sync, foreground catch-up, best-effort
+  background task와 bounded offline outbox는 같은 UI-neutral single-flight
+  pipeline에 연결한다. entitlement 승인, 실제 권한 UI, distribution signing과
+  실기기 dogfood는 외부/device-team 조건이다.
 - **통합 설정:** 데스크톱 웹과 미래 iPhone UI는
   `GET /v1/inputs`, `GET /v1/inputs/{source_id}`,
   `PUT /v1/inputs/{source_id}/settings`를 사용한다. 이 API는 별도 설정 DB를
