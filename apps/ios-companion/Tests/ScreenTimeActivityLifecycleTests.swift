@@ -408,7 +408,9 @@ private actor ScreenTimeLifecycleMockSyncService:
     private var approvedExclusions: [Set<String>] = []
     private var syncCalls = 0
     private var syncTriggers: [ScreenTimeSyncTrigger] = []
+    private var syncTimezones: [String] = []
     private var reconciledPairings: [Pairing?] = []
+    private var disableCalls = 0
 
     init(
         authorizationResult: ScreenTimeCollectorResult,
@@ -444,11 +446,12 @@ private actor ScreenTimeLifecycleMockSyncService:
     func sync(
         pairing _: Pairing,
         now _: Date,
-        timezone _: TimeZone,
+        timezone: TimeZone,
         trigger: ScreenTimeSyncTrigger
     ) async throws -> ScreenTimeSyncOutcome {
         syncCalls += 1
         syncTriggers.append(trigger)
+        syncTimezones.append(timezone.identifier)
         return syncResult
     }
 
@@ -458,19 +461,27 @@ private actor ScreenTimeLifecycleMockSyncService:
         reconciledPairings.append(pairing)
     }
 
+    func disableAndPurge(now _: Date) async throws {
+        disableCalls += 1
+    }
+
     func calls() -> (
         authorization: Int,
         approvedExclusions: [Set<String>],
         sync: Int,
         syncTriggers: [ScreenTimeSyncTrigger],
-        reconciledPairings: [Pairing?]
+        syncTimezones: [String],
+        reconciledPairings: [Pairing?],
+        disable: Int
     ) {
         (
             authorizationCalls,
             approvedExclusions,
             syncCalls,
             syncTriggers,
-            reconciledPairings
+            syncTimezones,
+            reconciledPairings,
+            disableCalls
         )
     }
 }
@@ -485,6 +496,7 @@ private actor ScreenTimeLifecycleBlockingAuthorizationService:
     private var authorizationWaiters:
         [CheckedContinuation<Void, Never>] = []
     private var syncCalls = 0
+    private var disableCalls = 0
 
     init(
         authorizationResult: ScreenTimeCollectorResult,
@@ -529,6 +541,10 @@ private actor ScreenTimeLifecycleBlockingAuthorizationService:
         pairing _: Pairing?
     ) async throws {}
 
+    func disableAndPurge(now _: Date) async throws {
+        disableCalls += 1
+    }
+
     func releaseAuthorizationCalls() {
         let waiters = authorizationWaiters
         authorizationWaiters.removeAll()
@@ -538,12 +554,14 @@ private actor ScreenTimeLifecycleBlockingAuthorizationService:
     func calls() -> (
         authorization: Int,
         cancellations: Int,
-        sync: Int
+        sync: Int,
+        disable: Int
     ) {
         (
             authorizationCalls,
             authorizationCancellations,
-            syncCalls
+            syncCalls,
+            disableCalls
         )
     }
 
@@ -777,6 +795,23 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         XCTFail("timed out waiting for Screen Time cancellation")
+    }
+
+    private func waitForWaiterCounts(
+        active expectedActive: Int,
+        pending expectedPending: Int = 0,
+        from service: ScreenTimeActivitySyncService
+    ) async throws {
+        for _ in 0..<400 {
+            let counts = await service.waiterCounts()
+            if counts.active == expectedActive,
+                counts.pending == expectedPending
+            {
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTFail("timed out waiting for Screen Time waiters")
     }
 
     private func waitForLifecycleCalls(
@@ -1178,11 +1213,11 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
     func testOutboxReconcileDropsWrongPairingRevisionAndRetention()
         async throws
     {
-        let storage = temporaryOutbox()
+        let now = date("2026-08-16T10:05:00Z")
+        let storage = temporaryOutbox(now: now)
         defer {
             try? FileManager.default.removeItem(at: storage.1)
         }
-        let now = date("2026-08-16T10:05:00Z")
         let firstPairing = pairing(token: "first")
         let secondPairing = pairing(token: "second")
         _ = try await storage.0.enqueue(
@@ -1192,7 +1227,8 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         )
         try await storage.0.reconcile(
             deviceID: "ios-lifecycle-device",
-            pairing: secondPairing
+            pairing: secondPairing,
+            now: now
         )
         let entriesAfterPairingChange =
             await storage.0.allEntries()
@@ -1206,7 +1242,8 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         try await storage.0.reconcile(
             deviceID: "ios-lifecycle-device",
             pairing: secondPairing,
-            state: collectionState(configRevision: 3)
+            state: collectionState(configRevision: 3),
+            now: now
         )
         let entriesAfterRevisionChange =
             await storage.0.allEntries()
@@ -1225,7 +1262,8 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             state: collectionState(
                 rawRetentionCutoff:
                     date("2026-08-16T09:30:00Z")
-            )
+            ),
+            now: now
         )
         let entriesAfterRetentionChange =
             await storage.0.allEntries()
@@ -1235,23 +1273,53 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
     func testOutboxReconcilePurgesObsoleteDeviceIdentity()
         async throws
     {
-        let storage = temporaryOutbox()
+        let now = date("2026-08-16T10:05:00Z")
+        let storage = temporaryOutbox(now: now)
         defer {
             try? FileManager.default.removeItem(at: storage.1)
         }
         _ = try await storage.0.enqueue(
             report: report(deviceID: "obsolete-device"),
             pairing: pairing(),
-            now: date("2026-08-16T10:05:00Z")
+            now: now
         )
 
         try await storage.0.reconcile(
             deviceID: "ios-lifecycle-device",
-            pairing: pairing()
+            pairing: pairing(),
+            now: now
         )
         let entries = await storage.0.allEntries()
 
         XCTAssertTrue(entries.isEmpty)
+    }
+
+    func testOutboxPrivacyPurgeOnlyRemovesSelectedDevice()
+        async throws
+    {
+        let now = date("2026-08-16T10:05:00Z")
+        let storage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(at: storage.1)
+        }
+        _ = try await storage.0.enqueue(
+            report: report(deviceID: "ios-lifecycle-device"),
+            pairing: pairing(),
+            now: now
+        )
+        _ = try await storage.0.enqueue(
+            report: report(deviceID: "other-device"),
+            pairing: pairing(),
+            now: now
+        )
+
+        let removed = try await storage.0.purge(
+            deviceID: "ios-lifecycle-device"
+        )
+        let entries = await storage.0.allEntries()
+
+        XCTAssertEqual(removed, 1)
+        XCTAssertEqual(entries.map(\.deviceID), ["other-device"])
     }
 
     func testOfflineReportIsRetriedExactlyBeforeFreshSnapshot()
@@ -1782,7 +1850,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
                 timezone: TimeZone(secondsFromGMT: 0)!
             )
         }
-        try await Task.sleep(nanoseconds: 20_000_000)
+        try await waitForStateCalls(1, from: transport)
 
         work.cancel()
 
@@ -1856,7 +1924,10 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
                 timezone: TimeZone(secondsFromGMT: 0)!
             )
         }
-        try await Task.sleep(nanoseconds: 20_000_000)
+        try await waitForWaiterCounts(
+            active: 2,
+            from: service
+        )
 
         second.cancel()
 
@@ -2078,7 +2149,10 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
                 timezone: TimeZone(secondsFromGMT: 0)!
             )
         }
-        try await Task.sleep(nanoseconds: 20_000_000)
+        try await waitForWaiterCounts(
+            active: 2,
+            from: service
+        )
 
         background.cancel()
 
@@ -2225,7 +2299,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
                 timezone: TimeZone(secondsFromGMT: 0)!
             )
         }
-        try await Task.sleep(nanoseconds: 20_000_000)
+        try await waitForStateCalls(1, from: transport)
 
         let second = try await service.sync(
             pairing: secondPairing,
@@ -2433,6 +2507,153 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertTrue(reports.isEmpty)
         XCTAssertEqual(generationAfterFailure, initialGeneration)
         XCTAssertEqual(boundaryAfterFailure, initialBoundary)
+    }
+
+    func testOptOutResetAdvancesGenerationAndClearsCollectionBoundaries()
+        async throws
+    {
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let deviceID = "ios-lifecycle-device"
+        let timezone = TimeZone(secondsFromGMT: 0)!
+        let initialNow = date("2026-08-16T09:34:00Z")
+        let resetNow = date("2026-08-16T12:34:00Z")
+        let pseudonymKeyID =
+            "ios-key-" + String(repeating: "1", count: 40)
+        let excludedToken =
+            "ios-app-v2-"
+            + String(repeating: "1", count: 40)
+            + "-"
+            + String(repeating: "a", count: 40)
+        let initialGeneration =
+            await stateStorage.0.collectionGeneration(
+                deviceID: deviceID,
+                permissionStatus: .granted,
+                now: initialNow
+            )
+        _ = try await stateStorage.0.acceptTimezoneBoundary(
+            deviceID: deviceID,
+            timezone: timezone,
+            now: initialNow
+        )
+        _ = await stateStorage.0.preparePseudonymBoundary(
+            deviceID: deviceID,
+            pseudonymKeyID: pseudonymKeyID,
+            excludedAppTokens: [],
+            now: initialNow
+        )
+        _ = await stateStorage.0.allocateSnapshotSequence(
+            deviceID: deviceID
+        )
+
+        await stateStorage.0.resetAfterOptOut(
+            deviceID: deviceID,
+            now: resetNow
+        )
+
+        let generationAfterReset =
+            await stateStorage.0.collectionGeneration(
+                deviceID: deviceID,
+                permissionStatus: .granted,
+                now: resetNow
+            )
+        let boundaryAfterReset =
+            try await stateStorage.0.proposedTimezoneBoundary(
+                deviceID: deviceID,
+                timezone: timezone,
+                now: resetNow
+            )
+        let pseudonymBoundary =
+            await stateStorage.0.preparePseudonymBoundary(
+                deviceID: deviceID,
+                pseudonymKeyID: pseudonymKeyID,
+                excludedAppTokens: [excludedToken],
+                now: resetNow
+            )
+        let sequenceAfterReset =
+            await stateStorage.0.allocateSnapshotSequence(
+                deviceID: deviceID
+            )
+
+        XCTAssertGreaterThan(
+            generationAfterReset,
+            initialGeneration
+        )
+        XCTAssertEqual(
+            boundaryAfterReset,
+            date("2026-08-16T11:00:00Z")
+        )
+        XCTAssertTrue(
+            pseudonymBoundary.requiresExclusionReapproval
+        )
+        XCTAssertEqual(sequenceAfterReset, 1)
+    }
+
+    func testServiceDisableCancelsPipelinePurgesOutboxAndResetsState()
+        async throws
+    {
+        let now = date("2026-08-16T10:34:00Z")
+        let outboxStorage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        _ = try await outboxStorage.0.enqueue(
+            report: report(),
+            pairing: pairing(),
+            now: now
+        )
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            stateDelayNanoseconds: 5_000_000_000
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let work = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+        }
+        try await waitForStateCalls(1, from: transport)
+
+        try await service.disableAndPurge(
+            now: now.addingTimeInterval(1)
+        )
+
+        do {
+            _ = try await work.value
+            XCTFail("expected opt-out to cancel the active pipeline")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let entries = await outboxStorage.0.allEntries()
+        let counts = await service.waiterCounts()
+
+        XCTAssertTrue(entries.isEmpty)
+        XCTAssertEqual(counts.active, 0)
+        XCTAssertEqual(counts.pending, 0)
     }
 
     @MainActor
@@ -2716,12 +2937,11 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             of: [cancelled, completed],
             timeout: 2
         )
-        await Task.yield()
         XCTAssertEqual(completionValues, [false])
     }
 
     @MainActor
-    func testRuntimeRegisterRestoresOptInAndWiresAuthorizationChanges()
+    func testRuntimeRegisterOnlyWiresLifecycleEntryPoints()
         async throws
     {
         let suiteName =
@@ -2752,39 +2972,114 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         )
 
         runtime.register()
-        try await waitForLifecycleCalls(
-            authorization: 1,
-            sync: 1,
-            from: service
-        )
+        var calls = await service.calls()
         XCTAssertEqual(backgroundTasks.registrations, 1)
-        XCTAssertEqual(backgroundTasks.schedules, 1)
+        XCTAssertEqual(backgroundTasks.schedules, 0)
+        XCTAssertEqual(calls.authorization, 0)
+        XCTAssertEqual(calls.sync, 0)
 
         await observer.emitChange()
         try await waitForLifecycleCalls(
-            authorization: 1,
-            sync: 2,
+            authorization: 0,
+            sync: 1,
             from: service
         )
-        XCTAssertEqual(backgroundTasks.schedules, 2)
+        XCTAssertEqual(backgroundTasks.schedules, 1)
 
         _ = await runtime.foregroundCatchUp(
             now: date("2026-08-16T10:34:00Z"),
             timezone: TimeZone(secondsFromGMT: 0)!
         )
-        let calls = await service.calls()
+        calls = await service.calls()
 
-        XCTAssertEqual(calls.authorization, 2)
-        XCTAssertEqual(calls.sync, 3)
+        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.sync, 2)
         XCTAssertEqual(
             calls.syncTriggers,
             [
                 .authorizationChanged,
-                .authorizationChanged,
                 .routine,
             ]
         )
-        XCTAssertEqual(backgroundTasks.schedules, 3)
+        XCTAssertEqual(backgroundTasks.schedules, 2)
+    }
+
+    @MainActor
+    func testRuntimeTimezoneAndPairingObserversUseCurrentConfiguration()
+        async throws
+    {
+        let suiteName =
+            "healthmes.screen-time.observer-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        intentStore.setOptedIn(true)
+        let notificationCenter = NotificationCenter()
+        let service = ScreenTimeLifecycleMockSyncService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "test")
+        )
+        var timezone = TimeZone(secondsFromGMT: 0)!
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationObserver:
+                ScreenTimeLifecycleAuthorizationObserver(),
+            authorizationIntentStore: intentStore,
+            backgroundTasks:
+                ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: notificationCenter,
+            nowProvider: {
+                self.date("2026-08-16T10:34:00Z")
+            },
+            timezoneProvider: { timezone }
+        )
+        runtime.register()
+
+        timezone = TimeZone(secondsFromGMT: 9 * 60 * 60)!
+        notificationCenter.post(
+            name: Notification.Name.NSSystemTimeZoneDidChange,
+            object: nil
+        )
+        try await waitForLifecycleCalls(
+            authorization: 0,
+            sync: 1,
+            from: service
+        )
+
+        notificationCenter.post(
+            name: Notification.Name("healthmes.pairing.changed"),
+            object: nil
+        )
+        try await waitForLifecycleCalls(
+            authorization: 0,
+            sync: 2,
+            from: service
+        )
+        await runtime.waitForAutomaticWork()
+        let calls = await service.calls()
+
+        XCTAssertEqual(calls.authorization, 0)
+        XCTAssertEqual(
+            calls.syncTriggers,
+            [
+                .inputConfigurationChanged,
+                .inputConfigurationChanged,
+            ]
+        )
+        XCTAssertEqual(
+            calls.syncTimezones,
+            [
+                timezone.identifier,
+                timezone.identifier,
+            ]
+        )
     }
 
     @MainActor
@@ -2821,13 +3116,6 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         runtime.register()
         let foreground = await runtime.foregroundCatchUp()
         await observer.emitChange()
-        notificationCenter.post(
-            name: Notification.Name("healthmes.pairing.changed"),
-            object: nil
-        )
-        for _ in 0..<5 {
-            await Task.yield()
-        }
         let configuration =
             await runtime.inputConfigurationDidChange()
         let exclusions =
@@ -3014,7 +3302,9 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         _ = await runtime.requestAuthorizationAndSync()
         XCTAssertTrue(intentStore.isOptedIn)
 
-        runtime.clearAuthorizationOptIn()
+        let disabled = await runtime.clearAuthorizationOptIn(
+            now: date("2026-08-16T10:34:00Z")
+        )
         XCTAssertFalse(intentStore.isOptedIn)
         let foreground = await runtime.foregroundCatchUp(
             now: date("2026-08-16T10:34:00Z"),
@@ -3025,6 +3315,12 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             .skipped(reason: "ios_screen_time_not_opted_in")
         )
         XCTAssertEqual(backgroundTasks.cancellations, 1)
+        XCTAssertEqual(
+            disabled,
+            .skipped(reason: "ios_screen_time_disabled")
+        )
+        let calls = await service.calls()
+        XCTAssertEqual(calls.disable, 1)
     }
 
     @MainActor

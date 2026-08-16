@@ -178,9 +178,13 @@ final class ScreenTimeActivityRuntime {
         ScreenTimeAuthorizationIntentStore
     private let backgroundTasks: any ScreenTimeBackgroundTaskManaging
     private let notificationCenter: NotificationCenter
+    private let nowProvider: @MainActor () -> Date
+    private let timezoneProvider: @MainActor () -> TimeZone
     private var registered = false
     private var pairingObserver: NSObjectProtocol?
+    private var timezoneObserver: NSObjectProtocol?
     private var authorizationRefresh: ScreenTimeAuthorizationRefresh?
+    private var automaticTasks: [UUID: Task<Void, Never>] = [:]
     private var backgroundRunners:
         [UUID: ScreenTimeBackgroundRefreshRunner] = [:]
 
@@ -195,6 +199,8 @@ final class ScreenTimeActivityRuntime {
             ScreenTimeAuthorizationIntentStore()
         backgroundTasks = LiveScreenTimeBackgroundTaskManager()
         notificationCenter = .default
+        nowProvider = Date.init
+        timezoneProvider = { .current }
     }
 
     init(
@@ -206,7 +212,10 @@ final class ScreenTimeActivityRuntime {
                 ScreenTimeAuthorizationIntentStore(),
         backgroundTasks:
             (any ScreenTimeBackgroundTaskManaging)? = nil,
-        notificationCenter: NotificationCenter = .default
+        notificationCenter: NotificationCenter = .default,
+        nowProvider: @escaping @MainActor () -> Date = Date.init,
+        timezoneProvider:
+            @escaping @MainActor () -> TimeZone = { .current }
     ) {
         self.lifecycle = lifecycle
         self.authorizationObserver =
@@ -217,6 +226,8 @@ final class ScreenTimeActivityRuntime {
             backgroundTasks
             ?? LiveScreenTimeBackgroundTaskManager()
         self.notificationCenter = notificationCenter
+        self.nowProvider = nowProvider
+        self.timezoneProvider = timezoneProvider
     }
 
     func register() {
@@ -232,29 +243,31 @@ final class ScreenTimeActivityRuntime {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                _ = await self.automaticCatchUp(
+                await self.runAutomaticCatchUp(
                     trigger: .inputConfigurationChanged,
                     refreshAuthorization: false
                 )
-                self.schedule()
+            }
+        }
+        timezoneObserver = notificationCenter.addObserver(
+            forName: Notification.Name.NSSystemTimeZoneDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.runAutomaticCatchUp(
+                    trigger: .inputConfigurationChanged,
+                    refreshAuthorization: false
+                )
             }
         }
         authorizationObserver.start { [weak self] in
             guard let self else { return }
-            _ = await self.automaticCatchUp(
+            await self.runAutomaticCatchUp(
                 trigger: .authorizationChanged,
                 refreshAuthorization: false
             )
-            self.schedule()
-        }
-        if authorizationIntentStore.isOptedIn {
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                _ = await self.automaticCatchUp(
-                    trigger: .authorizationChanged
-                )
-                self.schedule()
-            }
         }
     }
 
@@ -291,18 +304,40 @@ final class ScreenTimeActivityRuntime {
         return result
     }
 
-    /// Device-team seam for stopping automatic status restoration after the
+    /// Device-team seam for applying the local privacy boundary after the
     /// user disables this input. This does not revoke Apple's system grant.
-    func clearAuthorizationOptIn() {
+    @discardableResult
+    func clearAuthorizationOptIn(
+        now: Date = Date()
+    ) async -> ScreenTimeActivityLifecycleResult {
+        // Persist intent first so every entry point rejects new work while
+        // in-flight pipelines are being detached and purged.
         authorizationIntentStore.setOptedIn(false)
         backgroundTasks.cancel()
-        let runners = backgroundRunners.values
+
+        let tasks = Array(automaticTasks.values)
+        automaticTasks.removeAll()
+        tasks.forEach { $0.cancel() }
+
+        let authorizationTask = authorizationRefresh?.task
+        authorizationRefresh = nil
+        authorizationTask?.cancel()
+
+        let runners = Array(backgroundRunners.values)
         backgroundRunners.removeAll()
         runners.forEach { $0.expire() }
-        if let authorizationRefresh {
-            self.authorizationRefresh = nil
-            authorizationRefresh.task.cancel()
+
+        let result = await lifecycle.disableAndPurge(now: now)
+        if let authorizationTask {
+            _ = await authorizationTask.value
         }
+        for task in tasks {
+            _ = await task.result
+        }
+        for runner in runners {
+            await runner.cancelAndWait()
+        }
+        return result
     }
 
     /// UI seam for confirming the exact opaque exclusion set after a
@@ -361,6 +396,8 @@ final class ScreenTimeActivityRuntime {
             operation: { [weak self] in
                 guard let self else { return false }
                 let result = await self.automaticCatchUp(
+                    now: self.nowProvider(),
+                    timezone: self.timezoneProvider(),
                     trigger: .backgroundRefresh
                 )
                 return result.completedWithoutError
@@ -379,6 +416,48 @@ final class ScreenTimeActivityRuntime {
             }
         }
         runner.start()
+    }
+
+    private func runAutomaticCatchUp(
+        trigger: ScreenTimeSyncTrigger,
+        refreshAuthorization: Bool
+    ) async {
+        guard authorizationIntentStore.isOptedIn else {
+            return
+        }
+        let taskID = UUID()
+        let now = nowProvider()
+        let timezone = timezoneProvider()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.automaticTasks.removeValue(forKey: taskID)
+            }
+            _ = await self.automaticCatchUp(
+                now: now,
+                timezone: timezone,
+                trigger: trigger,
+                refreshAuthorization: refreshAuthorization
+            )
+            guard
+                !Task.isCancelled,
+                self.authorizationIntentStore.isOptedIn
+            else {
+                return
+            }
+            self.schedule()
+        }
+        automaticTasks[taskID] = task
+        _ = await task.result
+    }
+
+    func waitForAutomaticWork() async {
+        while !automaticTasks.isEmpty {
+            let tasks = Array(automaticTasks.values)
+            for task in tasks {
+                _ = await task.result
+            }
+        }
     }
 
     private func automaticCatchUp(
@@ -541,9 +620,7 @@ final class ScreenTimeActivityRuntime {
         }
         if cancelledByCaller,
             lease == .background,
-            !authorizationRefresh.waiterLeases.values.contains(
-                .foreground
-            )
+            authorizationRefresh.waiterLeases.isEmpty
         {
             self.authorizationRefresh = nil
             authorizationRefresh.task.cancel()

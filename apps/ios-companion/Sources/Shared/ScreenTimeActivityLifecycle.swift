@@ -42,6 +42,8 @@ protocol ScreenTimeActivitySyncing: Sendable {
     func reconcilePendingUploads(
         pairing: Pairing?
     ) async throws
+
+    func disableAndPurge(now: Date) async throws
 }
 
 @MainActor
@@ -264,6 +266,23 @@ final class ScreenTimeActivityLifecycleController {
             timezone: timezone,
             trigger: .inputConfigurationChanged
         )
+    }
+
+    func disableAndPurge(
+        now: Date = Date()
+    ) async -> ScreenTimeActivityLifecycleResult {
+        do {
+            try await syncService.disableAndPurge(now: now)
+            return .skipped(reason: "ios_screen_time_disabled")
+        } catch {
+            return .failed(
+                reason: Self.failureReason(
+                    for: error,
+                    fallback:
+                        "ios_screen_time_disable_cleanup_failed"
+                )
+            )
+        }
     }
 
     private static func failureReason(

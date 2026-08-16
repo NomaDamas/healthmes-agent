@@ -733,6 +733,42 @@ actor ScreenTimeSyncStateStore {
         return next
     }
 
+    func resetAfterOptOut(
+        deviceID: String,
+        now: Date
+    ) {
+        let generationKey = defaultsKey(
+            "generation",
+            deviceID: deviceID
+        )
+        let currentGeneration = (
+            defaults.object(forKey: generationKey) as? NSNumber
+        )?.intValue ?? 0
+        let timestamp = max(
+            1,
+            Int((now.timeIntervalSince1970 * 1_000).rounded())
+        )
+
+        for kind in [
+            "pseudonym-key-id",
+            "approved-exclusions-digest",
+            "collection-timezone",
+            "timezone-boundary",
+            "permission-status",
+            "sequence",
+        ] {
+            defaults.removeObject(
+                forKey: defaultsKey(kind, deviceID: deviceID)
+            )
+        }
+        // Never reuse the pre-opt-out generation. This fences any response
+        // that may have reached the server immediately before cancellation.
+        defaults.set(
+            max(currentGeneration + 1, timestamp),
+            forKey: generationKey
+        )
+    }
+
     private func ensureCollectionGeneration(
         deviceID: String,
         now: Date

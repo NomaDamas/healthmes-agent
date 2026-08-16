@@ -436,12 +436,43 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         )
     }
 
+    func disableAndPurge(now: Date) async throws {
+        let activeTask = activeSync?.task
+        let pendingTask = pendingSync?.task
+        activeSync = nil
+        pendingSync = nil
+        pendingTask?.cancel()
+        activeTask?.cancel()
+
+        if let pendingTask {
+            _ = await pendingTask.result
+        }
+        if let activeTask {
+            _ = await activeTask.result
+        }
+
+        var persistenceError: Error?
+        do {
+            try await outbox.purge(deviceID: deviceID)
+        } catch {
+            persistenceError = error
+        }
+        await stateStore.resetAfterOptOut(
+            deviceID: deviceID,
+            now: now
+        )
+        if let persistenceError {
+            throw persistenceError
+        }
+    }
+
     func sync(
         pairing: Pairing,
         now: Date = Date(),
         timezone: TimeZone = .current,
         trigger: ScreenTimeSyncTrigger = .routine
     ) async throws -> ScreenTimeSyncOutcome {
+        try Task.checkCancellation()
         let request = ScreenTimeSyncRequest(
             pairing: pairing,
             destinationID:
@@ -641,11 +672,11 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             }
             if cancelledByCaller,
                 lease == .background,
-                !pendingSync.waiterLeases.values.contains(.foreground)
+                pendingSync.waiterLeases.isEmpty
             {
                 pendingSync.task.cancel()
                 self.pendingSync = nil
-                return nil
+                return pendingSync.task
             }
             self.pendingSync = pendingSync
             return nil
@@ -663,7 +694,7 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         }
         if cancelledByCaller,
             lease == .background,
-            !activeSync.waiterLeases.values.contains(.foreground)
+            activeSync.waiterLeases.isEmpty
         {
             // Detach before cancellation can suspend. A foreground caller
             // arriving while the old pipeline unwinds must start fresh
@@ -674,6 +705,13 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         }
         self.activeSync = activeSync
         return nil
+    }
+
+    func waiterCounts() -> (active: Int, pending: Int) {
+        (
+            activeSync?.waiterLeases.count ?? 0,
+            pendingSync?.waiterLeases.count ?? 0
+        )
     }
 
     private func cancelSyncsIfDestinationChanged(

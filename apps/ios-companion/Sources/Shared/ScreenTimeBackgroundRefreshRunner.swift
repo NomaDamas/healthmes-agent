@@ -12,7 +12,7 @@ final class ScreenTimeBackgroundRefreshRunner {
     private let operation: Operation
     private var completion: Completion?
     private var work: Task<Void, Never>?
-    private var expiring = false
+    private var expirationWork: Task<Void, Never>?
 
     init(
         operation: @escaping Operation,
@@ -33,21 +33,28 @@ final class ScreenTimeBackgroundRefreshRunner {
     }
 
     func expire() {
-        guard completion != nil, !expiring else { return }
-        expiring = true
+        guard completion != nil, expirationWork == nil else {
+            return
+        }
         let work = work
         work?.cancel()
-        Task { @MainActor [weak self] in
+        expirationWork = Task { @MainActor [weak self] in
             _ = await work?.result
             self?.finish(success: false)
         }
+    }
+
+    func cancelAndWait() async {
+        expire()
+        let expirationWork = expirationWork
+        _ = await expirationWork?.result
     }
 
     private func finish(success: Bool) {
         guard let completion else { return }
         self.completion = nil
         work = nil
-        expiring = false
+        expirationWork = nil
         completion(success)
     }
 }

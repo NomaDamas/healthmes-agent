@@ -5,6 +5,7 @@ import Security
 import Combine
 import DeviceActivity
 import FamilyControls
+import ManagedSettings
 #endif
 
 enum ScreenTimeAuthorizationChangeObserverFactory {
@@ -214,6 +215,11 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
         let category: String
     }
 
+    private struct CategoryMetadata {
+        let localizedDisplayName: String?
+        let opaqueToken: String
+    }
+
     private let pseudonymizer: ScreenTimeAppPseudonymizer
     var pseudonymKeyID: String? { pseudonymizer.keyID }
 
@@ -275,8 +281,55 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                 during: DateInterval(start: window.start, end: window.end)
             )
         )
+        let activityData = FamilyActivityData.shared
+        let installedApplications =
+            try await activityData.installedApplications
+        let activityCategories =
+            try await activityData.activityCategories
+        let applicationBundleIDs =
+            Dictionary(
+                uniqueKeysWithValues:
+                    installedApplications.compactMap {
+                        application
+                            -> (ApplicationToken, String)? in
+                        guard
+                            let token = application.token,
+                            let bundleIdentifier =
+                                application.bundleIdentifier
+                        else {
+                            return nil
+                        }
+                        return (token, bundleIdentifier)
+                    }
+            )
+        let categoryMetadata =
+            Dictionary(
+                uniqueKeysWithValues:
+                    activityCategories.compactMap {
+                        category
+                            -> (ActivityCategoryToken, CategoryMetadata)? in
+                        guard
+                            let token = category.token,
+                            let encodedToken =
+                                try? JSONEncoder().encode(token)
+                        else {
+                            return nil
+                        }
+                        return (
+                            token,
+                            CategoryMetadata(
+                                localizedDisplayName:
+                                    category.localizedDisplayName,
+                                opaqueToken:
+                                    pseudonymizer.categoryToken(
+                                        encodedToken: encodedToken
+                                    )
+                            )
+                        )
+                    }
+            )
         var usage: [UsageKey: Int] = [:]
-        var authoritativeBucketStarts = Set<Date>()
+        var observedBucketStarts = Set<Date>()
         var confirmedZeroBuckets = Set<Date>()
         var privacyTaintedBuckets = Set<Date>()
         let results = DeviceActivityData.activityData(
@@ -289,7 +342,7 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                 guard bucketStart >= window.start, bucketStart < window.end else {
                     continue
                 }
-                authoritativeBucketStarts.insert(bucketStart)
+                observedBucketStarts.insert(bucketStart)
                 let segmentSeconds = max(
                     0,
                     Int(
@@ -303,20 +356,18 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                 }
                 var attributedSeconds = 0
                 for try await categoryActivity in segment.categories {
-                    let opaqueCategoryToken = categoryActivity.category.token
-                        .flatMap { token in
-                            guard
-                                let encoded = try? JSONEncoder().encode(token)
-                            else {
-                                return nil
-                            }
-                            return pseudonymizer.categoryToken(
-                                encodedToken: encoded
-                            )
-                        }
+                    guard
+                        let categoryToken =
+                            categoryActivity.category.token,
+                        let metadata =
+                            categoryMetadata[categoryToken]
+                    else {
+                        privacyTaintedBuckets.insert(bucketStart)
+                        continue
+                    }
                     let category = ScreenTimeCategoryNormalizer.normalize(
-                        categoryActivity.category.localizedDisplayName,
-                        opaqueFallback: opaqueCategoryToken
+                        metadata.localizedDisplayName,
+                        opaqueFallback: metadata.opaqueToken
                     )
                     for try await appActivity in categoryActivity.applications {
                         let seconds = max(
@@ -328,8 +379,10 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                         )
                         guard seconds > 0 else { continue }
                         guard
+                            let applicationToken =
+                                appActivity.application.token,
                             let bundleIdentifier =
-                                appActivity.application.bundleIdentifier
+                                applicationBundleIDs[applicationToken]
                         else {
                             privacyTaintedBuckets.insert(bucketStart)
                             continue
@@ -371,6 +424,10 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
             window: window,
             pseudonymizer: pseudonymizer
         )
+        let authoritativeBucketStarts =
+            observedBucketStarts.subtracting(
+                privacyTaintedBuckets
+            )
 
         guard completeSamples.count <= 5_000 else {
             return ScreenTimeCollectorResult(

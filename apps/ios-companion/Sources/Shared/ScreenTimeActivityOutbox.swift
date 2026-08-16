@@ -322,6 +322,18 @@ actor ScreenTimeActivityOutbox {
     }
 
     @discardableResult
+    func purge(deviceID: String) throws -> Int {
+        let candidate = entries.filter {
+            $0.deviceID != deviceID
+        }
+        let removed = entries.count - candidate.count
+        guard removed > 0 else { return 0 }
+        try persist(candidate)
+        entries = candidate
+        return removed
+    }
+
+    @discardableResult
     func purgeExpired(now: Date) throws -> Int {
         let candidate = Self.retainedEntries(
             entries,

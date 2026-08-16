@@ -51,9 +51,11 @@ import FamilyControls
 import Foundation
 
 @available(iOS 26.4, *)
-func probeAppAndWebsiteUsageExport() {
+func probeAppAndWebsiteUsageExport() async throws {
     _ = AuthorizationStatus.approvedWithDataAccess
     _ = AuthorizationCenter.shared.$authorizationStatus
+    _ = try await FamilyActivityData.shared.installedApplications
+    _ = try await FamilyActivityData.shared.activityCategories
     _ = DeviceActivityData.Error.unauthorized
     _ = DeviceActivityData.Error.unavailable
     _ = DeviceActivityData.Error.missingData
