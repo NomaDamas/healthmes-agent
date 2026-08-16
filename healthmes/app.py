@@ -39,6 +39,7 @@ from healthmes.calendars.jobs import build_calendar_jobs
 from healthmes.calendars.sleep_job import build_sleep_reconciliation_job
 from healthmes.config import Settings, get_settings, resolve_timezone
 from healthmes.decision import (
+    HealthMesDecisionService,
     build_configured_decision_engine,
     build_decision_context_search_session_service,
     ensure_decision_domain_policies,
@@ -263,6 +264,11 @@ def create_app(
     app.state.settings = settings
     app.state.decision_clock = decision_clock
     app.state.decision_engine = None
+    app.state.decision_service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: app.state.decision_engine,
+        clock=decision_clock,
+    )
     app.state.scheduler = None
     install_local_sessions(app)
     install_google_oauth(app)

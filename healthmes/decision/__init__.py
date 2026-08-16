@@ -172,6 +172,12 @@ from healthmes.decision.search import (
     FinishedDecisionSearchSessionError,
     UnknownDecisionSearchSessionError,
 )
+from healthmes.decision.service import (
+    DecisionIngress,
+    DecisionRuntimeNotConfiguredError,
+    DecisionServiceRequest,
+    HealthMesDecisionService,
+)
 
 __all__ = [
     "AccessAuditEntry",
@@ -212,6 +218,7 @@ __all__ = [
     "DecisionEngineBusyError",
     "DecisionEngineClosedError",
     "DecisionFinalizer",
+    "DecisionIngress",
     "DecisionRequest",
     "DECISION_PAYLOAD_SCHEMA",
     "DECISION_RECORD_SCHEMA",
@@ -221,6 +228,8 @@ __all__ = [
     "DecisionRuntimeError",
     "DecisionRuntimeTurn",
     "DecisionRuntimeUnavailableError",
+    "DecisionRuntimeNotConfiguredError",
+    "DecisionServiceRequest",
     "DecisionSearchBudgetError",
     "DecisionSearchBudgetUsage",
     "DecisionSearchPolicyError",
@@ -252,6 +261,7 @@ __all__ = [
     "HERMES_MODEL_ITERATION_PATH",
     "HealthMesDecisionAgent",
     "HealthMesDecisionEngine",
+    "HealthMesDecisionService",
     "HermesHttpIterationTransport",
     "HermesIterationTransport",
     "HermesModelIterationRequest",

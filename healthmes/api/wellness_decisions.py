@@ -23,20 +23,18 @@ from healthmes.activity.locking import (
     lock_activity_write_plane,
 )
 from healthmes.api.errors import APIError
-from healthmes.config import resolve_timezone
 from healthmes.decision import (
     DECISION_DOMAINS,
-    DecisionBudget,
-    DecisionCaller,
     DecisionContextHints,
     DecisionEngineBusyError,
     DecisionEngineClosedError,
-    DecisionRequest,
+    DecisionIngress,
     DecisionResult,
+    DecisionRuntimeNotConfiguredError,
+    DecisionServiceRequest,
     DecisionStatus,
     ExecutionScope,
     PersistenceStatus,
-    PrivacyLevel,
     RuntimeMetadata,
     SourceRef,
     decision_result_from_record,
@@ -308,30 +306,11 @@ async def create_wellness_decision(
 ) -> WellnessDecisionOutput:
     """Run one server-owned, aggregate-only local decision turn."""
 
-    settings = request.app.state.settings
-    requested_at = (
-        request.app.state.decision_clock()
-        if request.app.state.decision_clock is not None
-        else None
-    )
     try:
-        decision_request = DecisionRequest(
+        service_request = DecisionServiceRequest(
             question=body.question,
-            **(
-                {"requested_at": requested_at}
-                if requested_at is not None
-                else {}
-            ),
-            timezone=str(resolve_timezone(settings)),
-            caller=DecisionCaller(
-                principal_id=settings.decision_owner_principal_id,
-                authenticated=True,
-                execution_scope=resolve_decision_execution_scope(settings),
-                channel="rest",
-            ),
-            requested_privacy_level=PrivacyLevel.AGGREGATE,
+            ingress=DecisionIngress.REST,
             persistence_requested=body.persistence_requested,
-            budget=DecisionBudget(),
             hints=body.hints.to_domain(),
         )
     except ValidationError as exc:
@@ -346,15 +325,26 @@ async def create_wellness_decision(
             ),
         ) from exc
 
-    engine = getattr(request.app.state, "decision_engine", None)
-    if engine is None:
+    decision_service = request.app.state.decision_service
+    try:
+        result = await decision_service.ask_wellness(service_request)
+    except ValidationError as exc:
+        raise APIError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "validation_error",
+            "Request validation failed",
+            detail=exc.errors(
+                include_url=False,
+                include_context=False,
+                include_input=False,
+            ),
+        ) from exc
+    except DecisionRuntimeNotConfiguredError as exc:
         raise APIError(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "decision_runtime_not_configured",
             "The HealthMes decision runtime is not configured.",
-        )
-    try:
-        result = await engine.ask_wellness(decision_request)
+        ) from exc
     except DecisionEngineBusyError as exc:
         raise APIError(
             status.HTTP_429_TOO_MANY_REQUESTS,
