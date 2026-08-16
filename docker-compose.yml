@@ -119,42 +119,6 @@ services:
       - ow-backend
     restart: on-failure
 
-  ow-mcp:
-    # vendor/open-wearables/mcp has no Dockerfile and its entrypoint
-    # (app/main.py -> mcp.run()) defaults to stdio, so we mount the vendor dir
-    # read-only into the official uv image and use the fastmcp CLI to serve the
-    # same server object over Streamable HTTP — zero vendor modification.
-    # Dependencies resolve from the mounted uv.lock into a container-local venv
-    # on each start (UV_PROJECT_ENVIRONMENT keeps the mount read-only).
-    #
-    # NOTE: the primary integration path in docs/PLAN.md registers this MCP
-    # server as a *stdio* subprocess inside the hermes container (see the
-    # vendor mount on the `hermes` service + config/hermes-config.yaml.tmpl).
-    # This service is the HTTP alternative and a compose-level smoke surface.
-    image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
-    working_dir: /srv/ow-mcp
-    command:
-      [
-        "uv", "run", "--frozen",
-        "fastmcp", "run", "app/main.py:mcp",
-        "--transport", "http",
-        "--host", "0.0.0.0",
-        "--port", "8200",
-      ]
-    environment:
-      - UV_PROJECT_ENVIRONMENT=/opt/venv
-      - UV_CACHE_DIR=/opt/uv-cache
-      # Env names verbatim from vendor/open-wearables/mcp/app/config.py.
-      - OPEN_WEARABLES_API_URL=http://ow-backend:8000
-      - OPEN_WEARABLES_API_KEY=${OPEN_WEARABLES_API_KEY:-}
-    volumes:
-      - ./vendor/open-wearables/mcp:/srv/ow-mcp:ro
-    ports:
-      - "${OW_MCP_PORT:-8200}:8200"
-    depends_on:
-      - ow-backend
-    restart: on-failure
-
   healthmes:
     build:
       context: .

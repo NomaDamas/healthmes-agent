@@ -57,8 +57,8 @@ def test_skill_docs_use_registry_tool_names(skill_md: Path) -> None:
         f"(vendor mcp_prefixed_tool_name)"
     )
 
-    # And each skill documents at least one correctly-formed name for a
-    # server registered by config/hermes-config.yaml.tmpl.
+    # And each skill documents at least one correctly-formed name for the
+    # HealthMes product MCP boundary.
     valid_starts = tuple(f"`{prefix}{server}{delim}" for server in (*SERVERS, "<server>"))
     assert any(start in text for start in valid_starts), (
         f"{skill_md} documents no {prefix}<server>{delim}<tool> names "

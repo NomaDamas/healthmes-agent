@@ -51,7 +51,6 @@ from healthmes.hermes_runtime_identity import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TEMPLATE_PATH = REPO_ROOT / "config" / "hermes-config.yaml.tmpl"
 DECISION_TEMPLATE_PATH = (
     REPO_ROOT / "config" / "hermes-decision-config.yaml.tmpl"
 )
@@ -99,14 +98,6 @@ DECISION_HOME_ARTIFACT_CONTENT = {
     ".no-bundled-skills": "",
 }
 
-# Non-generatable credentials we can only warn about.
-WARN_IF_MISSING = (
-    "TELEGRAM_BOT_TOKEN",
-    "OPEN_WEARABLES_API_KEY",
-    "HEALTHMES_TELEGRAM_OWNER_USER_ID",
-    "HEALTHMES_TELEGRAM_OWNER_CHAT_ID",
-)
-
 # Briefing state-snapshot script (docs/PLAN.md section 4 `script:` context
 # injection). The vendor scheduler resolves relative script paths under
 # $HERMES_HOME/scripts/ and rejects anything outside it, so bootstrap copies
@@ -126,38 +117,6 @@ HEALTHMES_MANAGED_CRON_FIELDS = (
     "skills",
     "deliver",
     "script",
-)
-
-# Every variable the template references. Optional ones render as "" so the
-# template's `| default(..., true)` fallbacks kick in under StrictUndefined.
-TEMPLATE_KEYS = (
-    "telegram_bot_token",
-    "telegram_home_chat_id",
-    "telegram_home_chat_name",
-    "telegram_allowed_user_ids",
-    "telegram_owner_user_id",
-    "telegram_owner_chat_id",
-    "hermes_webhook_port",
-    "hermes_webhook_secret",
-    "healthmes_alert_prompt",
-    "hermes_model",
-    "hermes_provider",
-    "hermes_model_base_url",
-    "hermes_model_api_key",
-    "ow_mcp_dir",
-    "ow_base_url",
-    "ow_api_key",
-    "ow_mcp_venv_dir",
-    "ow_mcp_uv_cache_dir",
-    "healthmes_mcp_url",
-    "healthmes_api_token",
-    "decision_hermes_host",
-    "decision_hermes_port",
-    "decision_hermes_api_key",
-    "decision_hermes_model",
-    "decision_hermes_provider",
-    "decision_hermes_model_base_url",
-    "decision_hermes_model_api_key",
 )
 
 # ---------------------------------------------------------------------------
@@ -522,27 +481,6 @@ def ensure_docker_bind_identity(
 # ---------------------------------------------------------------------------
 
 
-def mode_defaults(mode: str, repo_root: Path, env: dict[str, str]) -> dict[str, str]:
-    """Per-mode default values (env vars always take precedence)."""
-    if mode == "docker":
-        return {
-            "ow_mcp_dir": "/opt/vendor/open-wearables-mcp",
-            "ow_mcp_venv_dir": "/opt/data/ow-mcp-venv",
-            "ow_mcp_uv_cache_dir": "/opt/data/uv-cache",
-            "ow_base_url": "http://ow-backend:8000",
-            "healthmes_mcp_url": "http://healthmes:8100/mcp",
-        }
-    healthmes_port = env.get("HEALTHMES_PORT", "8100").strip() or "8100"
-    return {
-        "ow_mcp_dir": str(repo_root / "vendor" / "open-wearables" / "mcp"),
-        "ow_mcp_venv_dir": str(repo_root / "data" / "ow-mcp-venv"),
-        "ow_mcp_uv_cache_dir": str(repo_root / "data" / "uv-cache"),
-        "ow_base_url": env.get("HEALTHMES_OW_BASE_URL", "").strip()
-        or "http://localhost:8000",
-        "healthmes_mcp_url": f"http://localhost:{healthmes_port}/mcp",
-    }
-
-
 def build_decision_context(
     env: Mapping[str, str],
     mode: str,
@@ -550,10 +488,16 @@ def build_decision_context(
 ) -> dict[str, str]:
     """Build only the values consumed by the dedicated decision profile."""
 
-    defaults = mode_defaults(mode, repo_root, dict(env))
+    del repo_root
+    healthmes_port = env.get("HEALTHMES_PORT", "8100").strip() or "8100"
+    default_mcp_url = (
+        "http://healthmes:8100/mcp"
+        if mode == "docker"
+        else f"http://localhost:{healthmes_port}/mcp"
+    )
     return {
         "healthmes_mcp_url": env.get("HEALTHMES_MCP_URL", "").strip()
-        or defaults["healthmes_mcp_url"],
+        or default_mcp_url,
         "healthmes_api_token": env.get(
             "HEALTHMES_API_TOKEN",
             "",
@@ -591,94 +535,11 @@ def build_decision_context(
     }
 
 
-def build_context(
-    env: dict[str, str],
-    mode: str,
-    repo_root: Path,
-    webhook_secret: str,
-) -> dict[str, Any]:
-    """Template context: every TEMPLATE_KEYS entry is present (maybe '')."""
-    defaults = mode_defaults(mode, repo_root, env)
-    owner_user_id = env.get("HEALTHMES_TELEGRAM_OWNER_USER_ID", "").strip()
-    owner_chat_id = env.get("HEALTHMES_TELEGRAM_OWNER_CHAT_ID", "").strip()
-    if "*" in {owner_user_id, owner_chat_id}:
-        raise ValueError("Telegram owner user/chat ids must be explicit; '*' is forbidden")
-    context: dict[str, Any] = {
-        "telegram_bot_token": env.get("TELEGRAM_BOT_TOKEN", "").strip(),
-        "telegram_home_chat_id": env.get("TELEGRAM_HOME_CHAT_ID", "").strip(),
-        "telegram_home_chat_name": env.get("TELEGRAM_HOME_CHAT_NAME", "").strip(),
-        "telegram_allowed_user_ids": [owner_user_id] if owner_user_id else [],
-        "telegram_owner_user_id": owner_user_id,
-        "telegram_owner_chat_id": owner_chat_id,
-        "hermes_webhook_port": env.get("HERMES_WEBHOOK_PORT", "").strip(),
-        "hermes_webhook_secret": webhook_secret,
-        "healthmes_alert_prompt": env.get("HEALTHMES_ALERT_PROMPT", "").strip(),
-        # LLM selection (optional). Omitted -> the vendor auto-defaults to
-        # Anthropic/Claude. Any of the ~29 vendor model-provider plugins
-        # (vendor/hermes-agent/plugins/model-providers/) can be selected;
-        # keys land in the root `model:` section that both the gateway and
-        # the `hermes chat` CLI resolve (hermes_cli/config.py
-        # ::_normalize_root_model_keys — model.default/provider/base_url).
-        "hermes_model": env.get("HERMES_MODEL", "").strip(),
-        "hermes_provider": env.get("HERMES_PROVIDER", "").strip(),
-        "hermes_model_base_url": env.get("HERMES_MODEL_BASE_URL", "").strip(),
-        # Providers with a fixed key env (ANTHROPIC_API_KEY, XAI_API_KEY,
-        # GEMINI_API_KEY/GOOGLE_API_KEY) do not need this; the `custom`
-        # OpenAI-compatible provider reads model.api_key from config.
-        "hermes_model_api_key": env.get("HERMES_MODEL_API_KEY", "").strip(),
-        "ow_mcp_dir": env.get("OW_MCP_DIR", "").strip() or defaults["ow_mcp_dir"],
-        "ow_base_url": env.get("OW_BASE_URL", "").strip() or defaults["ow_base_url"],
-        "ow_api_key": (
-            env.get("OPEN_WEARABLES_API_KEY", "").strip()
-            or env.get("HEALTHMES_OW_API_KEY", "").strip()
-        ),
-        "ow_mcp_venv_dir": env.get("OW_MCP_VENV_DIR", "").strip()
-        or defaults["ow_mcp_venv_dir"],
-        "ow_mcp_uv_cache_dir": env.get("OW_MCP_UV_CACHE_DIR", "").strip()
-        or defaults["ow_mcp_uv_cache_dir"],
-        "healthmes_mcp_url": env.get("HEALTHMES_MCP_URL", "").strip()
-        or defaults["healthmes_mcp_url"],
-        # Bearer token of the healthmes surface (REST + /mcp). When set, the
-        # rendered MCP registration carries the Authorization header so the
-        # agent keeps reaching its Layer-B tools behind auth.
-        "healthmes_api_token": env.get("HEALTHMES_API_TOKEN", "").strip(),
-        "decision_hermes_host": env.get(
-            "HEALTHMES_DECISION_HERMES_INTERNAL_HOST",
-            "",
-        ).strip()
-        or "127.0.0.1",
-        "decision_hermes_port": env.get(
-            "HEALTHMES_DECISION_HERMES_INTERNAL_PORT",
-            "",
-        ).strip()
-        or "8646",
-        "decision_hermes_api_key": env.get(
-            GENERATED_DECISION_API_KEY,
-            "",
-        ).strip(),
-        "decision_hermes_model": env.get(
-            "HEALTHMES_DECISION_HERMES_MODEL",
-            "",
-        ).strip(),
-        "decision_hermes_provider": env.get(
-            "HEALTHMES_DECISION_HERMES_PROVIDER",
-            "",
-        ).strip(),
-        "decision_hermes_model_base_url": env.get(
-            "HEALTHMES_DECISION_HERMES_MODEL_BASE_URL",
-            "",
-        ).strip(),
-        "decision_hermes_model_api_key": env.get(
-            "HEALTHMES_DECISION_HERMES_MODEL_API_KEY",
-            "",
-        ).strip(),
-    }
-    for key in TEMPLATE_KEYS:
-        context.setdefault(key, "")
-    return context
-
-
-def render_template(context: dict[str, Any], template_path: Path = TEMPLATE_PATH) -> str:
+def render_template(
+    context: dict[str, Any],
+    *,
+    template_path: Path,
+) -> str:
     """Render the Jinja2 template and fail fast if the result is not YAML."""
     jinja_env = Environment(undefined=StrictUndefined, keep_trailing_newline=True)
     rendered = jinja_env.from_string(

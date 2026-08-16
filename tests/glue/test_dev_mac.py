@@ -235,9 +235,7 @@ def test_ow_env_freezes_uv_against_vendor_lock_rewrites() -> None:
     """load_ow_env must export UV_FROZEN=1: `uv sync` and the bare `uv run`
     inside vendor scripts/start/*.sh would otherwise be allowed to rewrite
     vendor/open-wearables/backend/uv.lock on pyproject drift — a write into
-    the read-only vendor tree. (The hermes config template and the ow-mcp
-    compose service pass --frozen explicitly; this is the same guarantee for
-    the mac-native path.)"""
+    the read-only vendor tree."""
     body = _function_body(SCRIPT.read_text(encoding="utf-8"), "load_ow_env")
     assert re.search(r"^\s*export UV_FROZEN=1\s*$", body, re.MULTILINE)
     # The venv redirect that keeps the vendored backend's venv out of vendor/.
