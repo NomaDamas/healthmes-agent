@@ -49,7 +49,15 @@ from healthmes.decision.responses import (
 from healthmes.decision.search import (
     DecisionContextSearchSessionService,
 )
+from healthmes.mcp_server.ow_client import (
+    OWClient,
+    resolve_single_user_id,
+)
 from healthmes.store.enums import CalendarSource
+from healthmes.wearables.search import (
+    BoundedOpenWearablesSearch,
+    WearableSearchReader,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,6 +66,7 @@ def build_context_provider_registry(
     *,
     calendar_settings: Settings | None = None,
     wearable_reader: WearableReader | None = None,
+    wearable_search_reader: WearableSearchReader | None = None,
     session_factory: sessionmaker[Session] | None = None,
     calendar_sync_health_store: SyncHealthStore | None = None,
     calendar_sources: tuple[CalendarSource, ...] = (),
@@ -74,6 +83,7 @@ def build_context_provider_registry(
             NutritionContextProvider(),
             WearableContextProvider(
                 wearable_reader,
+                search_reader=wearable_search_reader,
                 snapshot_session_factory=session_factory,
             ),
             CalendarContextProvider(
@@ -87,7 +97,6 @@ def build_context_provider_registry(
             ),
         )
     )
-
 
 def build_healthmes_responses_decision_engine(
     *,
@@ -222,6 +231,7 @@ def build_decision_context_search_session_service(
     settings: Settings,
     session_factory: sessionmaker[Session],
     wearable_reader: WearableReader | None = None,
+    wearable_search_reader: WearableSearchReader | None = None,
     clock: Callable[[], datetime] | None = None,
     monotonic_clock: Callable[[], float] | None = None,
 ) -> DecisionContextSearchSessionService:
@@ -238,9 +248,24 @@ def build_decision_context_search_session_service(
         return creds.calendar_account_generation(settings, source)
 
     sync_health_store = FileSyncHealthStore.for_data_dir(settings.data_dir)
+    selected_wearable_search_reader = wearable_search_reader
+    if selected_wearable_search_reader is None:
+        open_wearables = OWClient.from_settings(settings)
+
+        async def resolve_open_wearables_user() -> str:
+            return await resolve_single_user_id(
+                open_wearables,
+                settings,
+            )
+
+        selected_wearable_search_reader = BoundedOpenWearablesSearch(
+            open_wearables,
+            resolve_open_wearables_user,
+        )
     registry = build_context_provider_registry(
         calendar_settings=settings,
         wearable_reader=wearable_reader,
+        wearable_search_reader=selected_wearable_search_reader,
         session_factory=session_factory,
         calendar_sync_health_store=sync_health_store,
         calendar_source_resolver=source_resolver,
@@ -281,6 +306,7 @@ def build_configured_decision_engine(
     transport: HermesResponsesTransport | None = None,
     search_service: DecisionContextSearchSessionService | None = None,
     wearable_reader: WearableReader | None = None,
+    wearable_search_reader: WearableSearchReader | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> HealthMesDecisionEngine | None:
     """Compose production decisions through one Hermes Responses turn."""
@@ -382,6 +408,7 @@ def build_configured_decision_engine(
                 settings=settings,
                 session_factory=session_factory,
                 wearable_reader=wearable_reader,
+                wearable_search_reader=wearable_search_reader,
                 clock=clock,
             )
         )

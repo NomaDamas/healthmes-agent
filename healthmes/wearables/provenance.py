@@ -29,13 +29,17 @@ OPEN_WEARABLES_SNAPSHOT_EVENT_TYPE = "wearable.open-wearables-snapshot.v1"
 OPEN_WEARABLES_OBSERVATION_EVENT_TYPE = (
     "wearable.open-wearables-observation.v1"
 )
+OPEN_WEARABLES_QUERY_EVENT_TYPE = "wearable.open-wearables-query.v1"
 OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER = "healthmes-open-wearables-mirror"
 OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS = "wearable_normalized"
 
 _SNAPSHOT_SCHEMA = "healthmes.open-wearables-snapshot.v1"
 _OBSERVATION_SCHEMA = "healthmes.open-wearables-observation.v1"
+_QUERY_SCHEMA = "healthmes.open-wearables-query.v1"
 _MAX_CONTEXT_BYTES = 1_000_000
 _MAX_PAYLOAD_BYTES = 2_000_000
+_MAX_QUERY_RESULT_BYTES = 220_000
+_MAX_QUERY_ROWS = 250
 _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 20_000
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
@@ -64,6 +68,17 @@ _UPSTREAM_PROVENANCE_KEYS = (
     "source_refs",
     "evidence_ids",
 )
+_PRIVATE_IDENTITY_KEYS = frozenset(
+    {
+        "accountid",
+        "connectionid",
+        "datasourceid",
+        "deviceid",
+        "externaluserid",
+        "recordid",
+        "userid",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +101,21 @@ class WearableSnapshot:
         if max_age < timedelta(0):
             raise ValueError("max_age must not be negative")
         return _aware_utc(now, field="now") - self.collected_at > max_age
+
+
+@dataclass(frozen=True, slots=True)
+class WearableQuerySnapshot:
+    """One bounded, sanitized Open Wearables query retained by HealthMes."""
+
+    event_id: uuid.UUID
+    capability: str
+    query_digest: str
+    result: dict[str, Any]
+    start: datetime
+    end: datetime
+    timezone: str
+    collected_at: datetime
+    coverage: float | None
 
 
 def _aware_utc(value: datetime, *, field: str) -> datetime:
@@ -119,6 +149,29 @@ def _reject_secret_keys(value: Any, *, path: str = "$") -> None:
     if isinstance(value, Sequence) and not isinstance(value, str | bytes):
         for index, item in enumerate(value):
             _reject_secret_keys(item, path=f"{path}[{index}]")
+
+
+def _reject_private_identity_keys(value: Any, *, path: str = "$") -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized = "".join(
+                character
+                for character in str(key).casefold()
+                if character.isalnum()
+            )
+            if normalized == "id" or any(
+                normalized == identity
+                or normalized.endswith(identity)
+                for identity in _PRIVATE_IDENTITY_KEYS
+            ):
+                raise ValueError(
+                    f"wearable snapshot contains a private identity at {path}"
+                )
+            _reject_private_identity_keys(item, path=f"{path}.{key}")
+        return
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        for index, item in enumerate(value):
+            _reject_private_identity_keys(item, path=f"{path}[{index}]")
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -672,6 +725,445 @@ def commit_open_wearables_snapshot(
             collected_at=collected_at,
             now=now,
         )
+
+
+def _normalize_query_scope(
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    parameters: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    normalized_capability = capability.strip().casefold()
+    if (
+        not normalized_capability
+        or len(normalized_capability) > 128
+        or not normalized_capability.startswith("wearable.")
+    ):
+        raise ValueError("invalid wearable query capability")
+    observed_start = _aware_utc(start, field="start")
+    observed_end = _aware_utc(end, field="end")
+    if observed_end <= observed_start:
+        raise ValueError("wearable query end must be after start")
+    parse_timezone(timezone)
+    normalized_parameters = _normalize_json(
+        {
+            str(key): value
+            for key, value in parameters.items()
+            if key != "cursor"
+        },
+        max_bytes=16_000,
+    )
+    assert isinstance(normalized_parameters, dict)
+    _reject_secret_keys(normalized_parameters)
+    _reject_private_identity_keys(normalized_parameters)
+    scope = {
+        "capability": normalized_capability,
+        "start": observed_start.isoformat(),
+        "end": observed_end.isoformat(),
+        "timezone": timezone,
+        "parameters": normalized_parameters,
+    }
+    query_digest = hashlib.sha256(
+        _canonical_json(
+            {
+                "schema": _QUERY_SCHEMA,
+                "query": scope,
+            }
+        )
+    ).hexdigest()
+    return scope, query_digest
+
+
+def open_wearables_query_digest(
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    parameters: Mapping[str, Any],
+) -> str:
+    """Return the stable identity for one bounded wearable query."""
+
+    _scope, query_digest = _normalize_query_scope(
+        capability=capability,
+        start=start,
+        end=end,
+        timezone=timezone,
+        parameters=parameters,
+    )
+    return query_digest
+
+
+def _normalize_query_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_json(
+        dict(result),
+        max_bytes=_MAX_QUERY_RESULT_BYTES,
+    )
+    assert isinstance(normalized, dict)
+    _reject_secret_keys(normalized)
+    _reject_private_identity_keys(normalized)
+    records = normalized.get("records")
+    if (
+        not isinstance(records, list)
+        or len(records) > _MAX_QUERY_ROWS
+    ):
+        raise ValueError("wearable query result records are invalid")
+    return normalized
+
+
+def _query_source_record_id(
+    *,
+    query_digest: str,
+    collected_at: datetime,
+    result_digest: str,
+) -> str:
+    observation_digest = hashlib.sha256(
+        _canonical_json(
+            {
+                "collected_at": collected_at.isoformat(),
+                "query_digest": query_digest,
+                "result_digest": result_digest,
+            }
+        )
+    ).hexdigest()
+    return f"query:{query_digest}:{observation_digest}"
+
+
+def _query_payload(
+    *,
+    scope: Mapping[str, Any],
+    query_digest: str,
+    result: Mapping[str, Any],
+    result_digest: str,
+    collected_at: datetime,
+) -> dict[str, Any]:
+    return _normalize_json(
+        {
+            "schema": _QUERY_SCHEMA,
+            "query": dict(scope),
+            "query_digest": query_digest,
+            "result": dict(result),
+            "result_digest": result_digest,
+            "collected_at": collected_at.isoformat(),
+            "window": {
+                "start": scope["start"],
+                "end": scope["end"],
+            },
+        },
+        max_bytes=_MAX_PAYLOAD_BYTES,
+    )
+
+
+def persist_open_wearables_query_snapshot(
+    session: Session,
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    parameters: Mapping[str, Any],
+    result: Mapping[str, Any],
+    collected_at: datetime,
+    now: datetime,
+) -> WearableQuerySnapshot:
+    """Persist one bounded sanitized query result under the wellness fence."""
+
+    with activity_write_lock():
+        lock_activity_write_plane(session)
+        current = _aware_utc(now, field="now")
+        collected = _aware_utc(collected_at, field="collected_at")
+        if collected > current + _MAX_CLOCK_SKEW:
+            raise ValueError("collected_at is too far in the future")
+        scope, query_digest = _normalize_query_scope(
+            capability=capability,
+            start=start,
+            end=end,
+            timezone=timezone,
+            parameters=parameters,
+        )
+        normalized_result = _normalize_query_result(result)
+        result_digest = hashlib.sha256(
+            _canonical_json(normalized_result)
+        ).hexdigest()
+        source_record_id = _query_source_record_id(
+            query_digest=query_digest,
+            collected_at=collected,
+            result_digest=result_digest,
+        )
+        payload = _query_payload(
+            scope=scope,
+            query_digest=query_digest,
+            result=normalized_result,
+            result_digest=result_digest,
+            collected_at=collected,
+        )
+        observed_start = datetime.fromisoformat(str(scope["start"]))
+        coverage = _context_coverage(normalized_result)
+        event = session.scalar(
+            select(WellnessEvent).where(
+                WellnessEvent.source_provider
+                == OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+                WellnessEvent.source_record_id == source_record_id,
+            )
+        )
+        if event is None:
+            policy = _retention_policy(session)
+            expires_at = _expiry(
+                policy,
+                observed_at=observed_start,
+            )
+            if expires_at is not None and expires_at <= current:
+                raise ValueError(
+                    "wearable query falls outside the normalized "
+                    "retention window"
+                )
+            event = WellnessEvent(
+                event_type=OPEN_WEARABLES_QUERY_EVENT_TYPE,
+                schema_version=1,
+                observed_at=observed_start,
+                recorded_at=collected,
+                timezone=timezone,
+                source_provider=OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+                source_device=None,
+                source_record_id=source_record_id,
+                capture_method="import",
+                quality_flags={
+                    "query_digest": query_digest,
+                    "result_digest": result_digest,
+                },
+                confidence=None,
+                coverage=coverage,
+                sensitivity="wearable",
+                consent_scope="personal",
+                retention_policy_id=policy.id,
+                expires_at=expires_at,
+                payload=payload,
+                raw_object_id=None,
+                derived_from={
+                    "source": "open-wearables",
+                    "mode": "bounded-query-mirror",
+                    "query_digest": query_digest,
+                },
+            )
+            try:
+                with session.begin_nested():
+                    session.add(event)
+                    session.flush([event])
+            except IntegrityError:
+                concurrent = session.scalar(
+                    select(WellnessEvent)
+                    .where(
+                        WellnessEvent.source_provider
+                        == OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+                        WellnessEvent.source_record_id
+                        == source_record_id,
+                    )
+                    .with_for_update()
+                )
+                if concurrent is None:
+                    raise
+                event = concurrent
+        snapshot = wearable_query_snapshot_from_event(
+            session,
+            event,
+            now=current,
+        )
+        if snapshot is None:
+            raise ValueError("stored wearable query snapshot failed validation")
+        return snapshot
+
+
+def commit_open_wearables_query_snapshot(
+    session_factory: sessionmaker[Session],
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    parameters: Mapping[str, Any],
+    result: Mapping[str, Any],
+    collected_at: datetime,
+    now: datetime,
+) -> WearableQuerySnapshot:
+    """Commit one query mirror independently from a read-only search session."""
+
+    with session_scope(session_factory) as session:
+        bind = session.get_bind()
+        if isinstance(bind.pool, StaticPool):
+            raise RuntimeError(
+                "independent wearable commits require a distinct physical "
+                "database connection"
+            )
+        return persist_open_wearables_query_snapshot(
+            session,
+            capability=capability,
+            start=start,
+            end=end,
+            timezone=timezone,
+            parameters=parameters,
+            result=result,
+            collected_at=collected_at,
+            now=now,
+        )
+
+
+def wearable_query_snapshot_from_event(
+    session: Session,
+    event: WellnessEvent,
+    *,
+    now: datetime,
+) -> WearableQuerySnapshot | None:
+    """Validate and detach one retained bounded query event."""
+
+    current = _aware_utc(now, field="now")
+    try:
+        payload = event.payload
+        if not isinstance(payload, Mapping):
+            return None
+        scope = payload["query"]
+        result = payload["result"]
+        if not isinstance(scope, Mapping) or not isinstance(result, Mapping):
+            return None
+        capability = str(scope["capability"])
+        timezone = str(scope["timezone"])
+        start = _aware_utc(
+            datetime.fromisoformat(str(scope["start"])),
+            field="query.start",
+        )
+        end = _aware_utc(
+            datetime.fromisoformat(str(scope["end"])),
+            field="query.end",
+        )
+        parameters = scope["parameters"]
+        if not isinstance(parameters, Mapping):
+            return None
+        expected_scope, query_digest = _normalize_query_scope(
+            capability=capability,
+            start=start,
+            end=end,
+            timezone=timezone,
+            parameters=parameters,
+        )
+        normalized_result = _normalize_query_result(result)
+        result_digest = hashlib.sha256(
+            _canonical_json(normalized_result)
+        ).hexdigest()
+        collected_at = _aware_utc(
+            datetime.fromisoformat(str(payload["collected_at"])),
+            field="collected_at",
+        )
+        expected_source_record_id = _query_source_record_id(
+            query_digest=query_digest,
+            collected_at=collected_at,
+            result_digest=result_digest,
+        )
+        expected_payload = _query_payload(
+            scope=expected_scope,
+            query_digest=query_digest,
+            result=normalized_result,
+            result_digest=result_digest,
+            collected_at=collected_at,
+        )
+        if (
+            end <= start
+            or event.event_type != OPEN_WEARABLES_QUERY_EVENT_TYPE
+            or event.schema_version != 1
+            or event.source_provider
+            != OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+            or event.source_record_id != expected_source_record_id
+            or event.timezone != timezone
+            or event.source_device is not None
+            or event.capture_method != "import"
+            or event.sensitivity != "wearable"
+            or event.consent_scope != "personal"
+            or event.raw_object_id is not None
+            or _database_utc(event.observed_at) != start
+            or _database_utc(event.recorded_at) != collected_at
+            or event.coverage != _context_coverage(normalized_result)
+            or event.quality_flags
+            != {
+                "query_digest": query_digest,
+                "result_digest": result_digest,
+            }
+            or event.derived_from
+            != {
+                "source": "open-wearables",
+                "mode": "bounded-query-mirror",
+                "query_digest": query_digest,
+            }
+            or payload.get("query_digest") != query_digest
+            or payload.get("result_digest") != result_digest
+            or _canonical_json(payload) != _canonical_json(expected_payload)
+            or (
+                event.expires_at is not None
+                and _database_utc(event.expires_at) <= current
+            )
+        ):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    return WearableQuerySnapshot(
+        event_id=event.id,
+        capability=capability,
+        query_digest=query_digest,
+        result=normalized_result,
+        start=start,
+        end=end,
+        timezone=timezone,
+        collected_at=collected_at,
+        coverage=event.coverage,
+    )
+
+
+def latest_retained_open_wearables_query_snapshot(
+    session: Session,
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    parameters: Mapping[str, Any],
+    now: datetime,
+) -> WearableQuerySnapshot | None:
+    """Load the newest valid mirror for one exact bounded query."""
+
+    _scope, query_digest = _normalize_query_scope(
+        capability=capability,
+        start=start,
+        end=end,
+        timezone=timezone,
+        parameters=parameters,
+    )
+    current = _aware_utc(now, field="now")
+    prefix = f"query:{query_digest}:%"
+    rows = session.scalars(
+        select(WellnessEvent)
+        .where(
+            WellnessEvent.event_type == OPEN_WEARABLES_QUERY_EVENT_TYPE,
+            WellnessEvent.source_provider
+            == OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+            WellnessEvent.source_record_id.like(prefix),
+            or_(
+                WellnessEvent.expires_at.is_(None),
+                WellnessEvent.expires_at > current,
+            ),
+        )
+        .order_by(
+            WellnessEvent.recorded_at.desc(),
+            WellnessEvent.created_at.desc(),
+        )
+    )
+    for event in rows:
+        snapshot = wearable_query_snapshot_from_event(
+            session,
+            event,
+            now=current,
+        )
+        if snapshot is not None and snapshot.query_digest == query_digest:
+            return snapshot
+    return None
 
 
 def wearable_snapshot_from_event(

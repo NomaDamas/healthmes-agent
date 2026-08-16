@@ -8,13 +8,17 @@ from healthmes.storage.service import update_retention_policy
 from healthmes.store import WellnessEvent
 from healthmes.wearables.provenance import (
     OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
+    OPEN_WEARABLES_QUERY_EVENT_TYPE,
     OPEN_WEARABLES_SNAPSHOT_EVENT_TYPE,
     OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
     OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
     commit_open_wearables_snapshot,
+    latest_retained_open_wearables_query_snapshot,
     latest_retained_open_wearables_snapshot,
     persist_open_wearables_observation,
+    persist_open_wearables_query_snapshot,
     persist_open_wearables_snapshot,
+    wearable_query_snapshot_from_event,
 )
 
 DAY = date(2026, 8, 10)
@@ -63,6 +67,17 @@ def _observation_count(session) -> int:
         .where(
             WellnessEvent.event_type
             == OPEN_WEARABLES_OBSERVATION_EVENT_TYPE
+        )
+    )
+
+
+def _query_count(session) -> int:
+    return session.scalar(
+        select(func.count())
+        .select_from(WellnessEvent)
+        .where(
+            WellnessEvent.event_type
+            == OPEN_WEARABLES_QUERY_EVENT_TYPE
         )
     )
 
@@ -610,3 +625,221 @@ def test_independent_writer_never_commits_caller_static_pool_transaction(
         assert observer.scalar(
             select(func.count()).select_from(WellnessEvent)
         ) == 0
+
+
+def test_bounded_query_snapshot_is_stable_retained_and_tamper_evident(
+    session,
+) -> None:
+    start = datetime(2026, 8, 10, 8, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    result = {
+        "status": "ok",
+        "records": [
+            {
+                "timestamp": start.isoformat(),
+                "series_type": "heart_rate",
+                "value": 72,
+                "unit": "bpm",
+            }
+        ],
+        "limitations": [],
+        "coverage": {"ratio": 1.0},
+    }
+
+    first = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.timeseries",
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters={
+            "series_type": "heart_rate",
+            "resolution": "1min",
+            "cursor": "not-part-of-query-identity",
+        },
+        result=result,
+        collected_at=NOW,
+        now=NOW,
+    )
+    repeated = persist_open_wearables_query_snapshot(
+        session,
+        capability="wearable.timeseries",
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters={
+            "series_type": "heart_rate",
+            "resolution": "1min",
+        },
+        result=result,
+        collected_at=NOW,
+        now=NOW,
+    )
+
+    assert repeated.event_id == first.event_id
+    assert _query_count(session) == 1
+    event = session.get(WellnessEvent, first.event_id)
+    assert event is not None
+    assert event.source_provider == OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+    assert event.source_record_id.startswith(
+        f"query:{first.query_digest}:"
+    )
+    assert event.payload["query"]["parameters"] == {
+        "series_type": "heart_rate",
+        "resolution": "1min",
+    }
+    assert event.expires_at.replace(tzinfo=UTC) == (
+        start + timedelta(days=30)
+    )
+    assert wearable_query_snapshot_from_event(
+        session,
+        event,
+        now=NOW,
+    ) == first
+    retained = latest_retained_open_wearables_query_snapshot(
+        session,
+        capability="wearable.timeseries",
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters={
+            "series_type": "heart_rate",
+            "resolution": "1min",
+        },
+        now=NOW,
+    )
+    assert retained == first
+
+    event.payload = {
+        **event.payload,
+        "result": {
+            **result,
+            "records": [
+                {
+                    **result["records"][0],
+                    "value": 999,
+                }
+            ],
+        },
+    }
+    session.flush([event])
+
+    assert wearable_query_snapshot_from_event(
+        session,
+        event,
+        now=NOW,
+    ) is None
+    assert latest_retained_open_wearables_query_snapshot(
+        session,
+        capability="wearable.timeseries",
+        start=start,
+        end=end,
+        timezone="UTC",
+        parameters={
+            "series_type": "heart_rate",
+            "resolution": "1min",
+        },
+        now=NOW,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("parameters", "result"),
+    (
+        (
+            {"user_id": "private-user"},
+            {
+                "status": "ok",
+                "records": [],
+                "limitations": [],
+            },
+        ),
+        (
+            {},
+            {
+                "status": "ok",
+                "records": [{"connection_id": "private-connection"}],
+                "limitations": [],
+            },
+        ),
+        (
+            {},
+            {
+                "status": "ok",
+                "records": [{"user_connection_id": "private-connection"}],
+                "limitations": [],
+            },
+        ),
+        (
+            {},
+            {
+                "status": "ok",
+                "records": [{"id": "raw-upstream-record"}],
+                "limitations": [],
+            },
+        ),
+        (
+            {},
+            {
+                "status": "ok",
+                "records": [{"authorization": "Bearer secret-value"}],
+                "limitations": [],
+            },
+        ),
+    ),
+)
+def test_bounded_query_snapshot_rejects_identity_and_secrets(
+    session,
+    parameters,
+    result,
+) -> None:
+    with pytest.raises(ValueError) as exc_info:
+        persist_open_wearables_query_snapshot(
+            session,
+            capability="wearable.health-scores",
+            start=datetime(2026, 8, 10, tzinfo=UTC),
+            end=datetime(2026, 8, 11, tzinfo=UTC),
+            timezone="UTC",
+            parameters=parameters,
+            result=result,
+            collected_at=NOW,
+            now=NOW,
+        )
+
+    assert "private-user" not in str(exc_info.value)
+    assert "private-connection" not in str(exc_info.value)
+    assert "secret-value" not in str(exc_info.value)
+    assert _query_count(session) == 0
+
+
+def test_bounded_query_snapshot_rejects_expired_observation_window(
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "1d",
+        now=NOW,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="outside the normalized retention window",
+    ):
+        persist_open_wearables_query_snapshot(
+            session,
+            capability="wearable.health-scores",
+            start=NOW - timedelta(days=2),
+            end=NOW - timedelta(days=1),
+            timezone="UTC",
+            parameters={},
+            result={
+                "status": "ok",
+                "records": [],
+                "limitations": [],
+            },
+            collected_at=NOW,
+            now=NOW,
+        )
+
+    assert _query_count(session) == 0

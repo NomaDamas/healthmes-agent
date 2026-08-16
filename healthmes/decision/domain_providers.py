@@ -92,10 +92,29 @@ from healthmes.store.enums import CalendarSource
 from healthmes.timezones import parse_timezone
 from healthmes.wearables.provenance import (
     OPEN_WEARABLES_OBSERVATION_EVENT_TYPE,
+    OPEN_WEARABLES_QUERY_EVENT_TYPE,
     OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER,
+    WearableQuerySnapshot,
     WearableSnapshot,
+    commit_open_wearables_query_snapshot,
+    commit_open_wearables_snapshot,
+    latest_retained_open_wearables_query_snapshot,
     latest_retained_open_wearables_snapshot,
     persist_open_wearables_observation,
+    persist_open_wearables_query_snapshot,
+    wearable_query_snapshot_from_event,
+    wearable_snapshot_from_event,
+)
+from healthmes.wearables.search import (
+    WEARABLE_DETAIL_CAPABILITIES,
+    WEARABLE_HEALTH_SCORE_CATEGORIES,
+    WEARABLE_SUMMARY_KINDS,
+    WEARABLE_TIMESERIES_RESOLUTIONS,
+    WEARABLE_TIMESERIES_TYPES,
+    WearableSearchFetch,
+    WearableSearchReader,
+    WearableSearchRequest,
+    validate_wearable_search_request,
 )
 
 WearableReader = Callable[[date], Awaitable[dict[str, Any]]]
@@ -210,6 +229,37 @@ _WEARABLE_METRIC_PARAMETER = ContextParameterSpec(
     min_length=1,
     max_length=32,
     allowed_values=_WEARABLE_METRIC_VALUES,
+)
+_WEARABLE_SCORE_CATEGORY_PARAMETER = ContextParameterSpec(
+    name="category",
+    value_type=ContextParameterType.STRING,
+    min_length=1,
+    max_length=32,
+    allowed_values=WEARABLE_HEALTH_SCORE_CATEGORIES,
+)
+_WEARABLE_SUMMARY_KIND_PARAMETER = ContextParameterSpec(
+    name="summary_kind",
+    value_type=ContextParameterType.STRING,
+    required=True,
+    min_length=1,
+    max_length=16,
+    allowed_values=WEARABLE_SUMMARY_KINDS,
+)
+_WEARABLE_SERIES_TYPE_PARAMETER = ContextParameterSpec(
+    name="series_type",
+    value_type=ContextParameterType.STRING,
+    required=True,
+    min_length=1,
+    max_length=64,
+    allowed_values=WEARABLE_TIMESERIES_TYPES,
+)
+_WEARABLE_RESOLUTION_PARAMETER = ContextParameterSpec(
+    name="resolution",
+    value_type=ContextParameterType.STRING,
+    required=True,
+    min_length=1,
+    max_length=16,
+    allowed_values=WEARABLE_TIMESERIES_RESOLUTIONS,
 )
 
 CALENDAR_AGGREGATE_SOURCE_PROVIDER = "healthmes-calendar-aggregate"
@@ -422,29 +472,63 @@ _NUTRITION_IDENTITY_FIELDS = (
 )
 _NUTRITION_RAW_FIELDS = tuple(sorted(_RAW_KEYS))
 _WEARABLE_NESTED_FIELDS = (
+    "active_calories_kcal",
+    "active_minutes",
     "actual_sleep",
+    "avg_bpm",
+    "avg_heart_rate_bpm",
+    "avg_hrv_rmssd_ms",
+    "avg_hrv_sdnn_ms",
+    "avg_pace_sec_per_km",
+    "avg_respiratory_rate",
+    "avg_spo2_percent",
+    "awake_minutes",
     "baseline_median",
     "block",
+    "calories_kcal",
     "category",
     "charge",
+    "component",
+    "components",
     "confidence",
     "coverage",
     "current",
     "date",
+    "deep_minutes",
     "delta",
     "delta_pct",
+    "distance_meters",
     "duration_minutes",
+    "duration_seconds",
     "earliest_available_work_time",
+    "efficiency_percent",
+    "elevation_gain_meters",
+    "elevation_meters",
     "entries",
+    "end",
+    "end_time",
     "freshest_at",
     "freshness",
+    "floors_climbed",
+    "heart_rate",
     "hrv",
     "index",
+    "intensity_minutes",
+    "interruptions_count",
+    "is_daily_total",
     "last_night",
+    "light",
+    "light_minutes",
     "local_date",
+    "max_bpm",
     "max_avg_heart_rate_bpm",
+    "max_heart_rate_bpm",
     "metric",
+    "min_bpm",
+    "moderate",
     "n_days",
+    "nap_count",
+    "nap_duration_minutes",
     "nights_counted",
     "observed_at",
     "observed_on",
@@ -454,27 +538,43 @@ _WEARABLE_NESTED_FIELDS = (
     "reason",
     "recorded_at",
     "records",
+    "recovery_score",
+    "rem_minutes",
+    "resting_heart_rate_bpm",
     "scale",
     "score",
+    "sedentary_minutes",
+    "series_type",
     "sleep_debt",
+    "sleep_duration_seconds",
+    "sleep_efficiency_percent",
     "source",
     "stale_days",
     "start",
+    "start_time",
+    "stages",
     "status",
+    "steps",
     "stress",
+    "summary_kind",
+    "timestamp",
     "time_in_bed_minutes",
     "total_blocks",
     "total_calories_kcal",
+    "total_duration_minutes",
     "total_minutes",
     "types",
     "unit",
     "usable_blocks",
     "value",
     "variant",
+    "vigorous",
     "wake_time",
     "window_days",
+    "workout_type",
     "workouts",
     "yesterday_load",
+    "zone_offset",
     "z_score",
 )
 _WEARABLE_IDENTITY_FIELDS = ("provider", "source")
@@ -548,11 +648,23 @@ _NUTRITION_HISTORY_MIN_SCAN = 100
 _NUTRITION_HISTORY_MAX_SCAN = 5_000
 _WEARABLE_LIMITATION_CODES = (
     "open_wearables_context_unavailable",
+    "open_wearables_detail_unavailable",
+    "wearable_payload_limit_reached",
     "wearable_readiness_evidence_ids_unavailable",
+    "wearable_query_snapshot_fallback_used",
+    "wearable_rows_discarded",
     "wearable_snapshot_fallback_used",
     "wearable_snapshot_persistence_failed",
     "wearable_snapshot_writer_unavailable",
     "wearable_source_refs_are_readiness_level",
+    "wearable_upstream_page_limit_reached",
+)
+_WEARABLE_DETAIL_OUTPUT_FIELDS = (
+    "status",
+    "count",
+    "records",
+    "window",
+    "provenance_mode",
 )
 _CALENDAR_LIMITATION_CODES = (
     "calendar_account_not_synced",
@@ -2497,6 +2609,155 @@ class WearableContextProvider:
                 provenance=ProvenanceSupport.STABLE,
                 freshness_expectation="Latest retained daily wearable snapshot.",
             ),
+            ContextCapability(
+                capability="wearable.health-scores",
+                description=(
+                    "Bounded sanitized Open Wearables health scores. "
+                    "Provider user IDs and raw database fields are omitted."
+                ),
+                granularities=("record", "window"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=_WEARABLE_DETAIL_OUTPUT_FIELDS,
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                limit_output_fields=("records",),
+                parameters=("date", "cursor", "category"),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                    _WEARABLE_SCORE_CATEGORY_PARAMETER,
+                ),
+                max_lookback_days=30,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation=(
+                    "Live bounded query mirrored locally, with retained fallback."
+                ),
+            ),
+            ContextCapability(
+                capability="wearable.summaries",
+                description=(
+                    "Bounded daily activity, sleep, or recovery summaries "
+                    "with allowlisted metrics only."
+                ),
+                granularities=("summary", "day", "window"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=_WEARABLE_DETAIL_OUTPUT_FIELDS,
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                limit_output_fields=("records",),
+                parameters=("date", "cursor", "summary_kind"),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                    _WEARABLE_SUMMARY_KIND_PARAMETER,
+                ),
+                max_lookback_days=30,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation=(
+                    "Live bounded query mirrored locally, with retained fallback."
+                ),
+            ),
+            ContextCapability(
+                capability="wearable.workouts",
+                description=(
+                    "Bounded workout sessions without upstream record IDs, "
+                    "names, routes, or GPS coordinates."
+                ),
+                granularities=("record", "window"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=_WEARABLE_DETAIL_OUTPUT_FIELDS,
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                limit_output_fields=("records",),
+                parameters=("date", "cursor"),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                ),
+                max_lookback_days=30,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation=(
+                    "Live bounded query mirrored locally, with retained fallback."
+                ),
+            ),
+            ContextCapability(
+                capability="wearable.timeseries",
+                description=(
+                    "One allowlisted non-raw wearable series with a "
+                    "resolution-specific time window."
+                ),
+                granularities=("series", "window"),
+                query_fields=(
+                    "start",
+                    "end",
+                    "timezone",
+                    "fields",
+                    "limit",
+                ),
+                output_fields=_WEARABLE_DETAIL_OUTPUT_FIELDS,
+                nested_output_fields=_WEARABLE_NESTED_FIELDS,
+                identity_fields=_WEARABLE_IDENTITY_FIELDS,
+                limit_output_fields=("records",),
+                parameters=(
+                    "date",
+                    "cursor",
+                    "series_type",
+                    "resolution",
+                ),
+                parameter_specs=(
+                    _DATE_PARAMETER,
+                    _CURSOR_PARAMETER,
+                    _WEARABLE_SERIES_TYPE_PARAMETER,
+                    _WEARABLE_RESOLUTION_PARAMETER,
+                ),
+                max_lookback_days=30,
+                privacy_levels=(
+                    PrivacyLevel.AGGREGATE,
+                    PrivacyLevel.IDENTITY,
+                ),
+                sensitivity="wearable",
+                limitation_codes=_WEARABLE_LIMITATION_CODES,
+                provenance=ProvenanceSupport.STABLE,
+                freshness_expectation=(
+                    "Resolution-bounded live query mirrored locally."
+                ),
+            ),
         ),
     )
 
@@ -2504,11 +2765,11 @@ class WearableContextProvider:
         self,
         reader: WearableReader | None = None,
         *,
+        search_reader: WearableSearchReader | None = None,
         snapshot_session_factory: sessionmaker[Session] | None = None,
     ) -> None:
         self._reader = reader
-        # Kept for source compatibility. Provider writes use the caller-owned
-        # unit of work so a second Session cannot commit unrelated SQLite data.
+        self._search_reader = search_reader
         self._snapshot_session_factory = snapshot_session_factory
 
     async def query(
@@ -2519,6 +2780,12 @@ class WearableContextProvider:
         now: datetime,
     ) -> ContextResult:
         _validate_query(self.metadata, query)
+        if query.capability in WEARABLE_DETAIL_CAPABILITIES:
+            return await self._query_detail(
+                session,
+                query,
+                now=now,
+            )
         day = _query_day(query, now=now)
         raw, snapshot, limitations = await self._snapshot_context(
             session,
@@ -2533,8 +2800,11 @@ class WearableContextProvider:
                 capability=query.capability,
                 status=(
                     ContextStatus.FAILED
-                    if "wearable_snapshot_persistence_failed"
-                    in limitations
+                    if {
+                        "wearable_snapshot_persistence_failed",
+                        "wearable_snapshot_writer_unavailable",
+                    }
+                    & limitations
                     else ContextStatus.UNAVAILABLE
                 ),
                 freshness=ContextFreshness(
@@ -2703,6 +2973,298 @@ class WearableContextProvider:
             ),
         )
 
+    async def _query_detail(
+        self,
+        session: Session,
+        query: ContextQuery,
+        *,
+        now: datetime,
+    ) -> ContextResult:
+        start, end = self._detail_bounds(query, now=now)
+        parameters = {
+            key: value
+            for key, value in query.parameters.items()
+            if key != "cursor"
+        }
+        request = WearableSearchRequest(
+            capability=query.capability,
+            start=start,
+            end=end,
+            timezone=query.timezone,
+            parameters=parameters,
+        )
+        validate_wearable_search_request(request)
+
+        if query.parameters.get("cursor") is not None:
+            retained = latest_retained_open_wearables_query_snapshot(
+                session,
+                capability=query.capability,
+                start=start,
+                end=end,
+                timezone=query.timezone,
+                parameters=parameters,
+                now=now,
+            )
+            if retained is not None:
+                return self._detail_result(
+                    query,
+                    retained,
+                    provenance_mode="retained_local_mirror",
+                    now=now,
+                )
+
+        limitations: set[str] = set()
+        fetched: WearableSearchFetch | None = None
+        if self._search_reader is not None:
+            try:
+                fetched = await self._search_reader(request)
+            except Exception:
+                limitations.add("open_wearables_detail_unavailable")
+        else:
+            limitations.add("open_wearables_detail_unavailable")
+
+        if fetched is not None:
+            stored_result: dict[str, Any] = {
+                "status": (
+                    "empty_success"
+                    if not fetched.records
+                    else "partial"
+                    if fetched.limitations
+                    else "ok"
+                ),
+                "records": list(fetched.records),
+                "limitations": list(fetched.limitations),
+            }
+            if not fetched.limitations:
+                stored_result["coverage"] = {"ratio": 1.0}
+            snapshot, store_limitation = self._store_detail_snapshot(
+                session,
+                query=query,
+                start=start,
+                end=end,
+                parameters=parameters,
+                result=stored_result,
+                now=now,
+            )
+            if snapshot is not None:
+                return self._detail_result(
+                    query,
+                    snapshot,
+                    provenance_mode="live_upstream_mirrored",
+                    now=now,
+                )
+            limitations.add(store_limitation)
+
+        retained = latest_retained_open_wearables_query_snapshot(
+            session,
+            capability=query.capability,
+            start=start,
+            end=end,
+            timezone=query.timezone,
+            parameters=parameters,
+            now=now,
+        )
+        if retained is not None:
+            limitations.add("wearable_query_snapshot_fallback_used")
+            return self._detail_result(
+                query,
+                retained,
+                provenance_mode="retained_local_mirror",
+                now=now,
+                extra_limitations=tuple(limitations),
+            )
+
+        failed = bool(
+            {
+                "wearable_snapshot_persistence_failed",
+                "wearable_snapshot_writer_unavailable",
+            }
+            & limitations
+        )
+        return ContextResult(
+            query_id=query.query_id,
+            provider_id=query.provider_id,
+            capability=query.capability,
+            status=(
+                ContextStatus.FAILED
+                if failed
+                else ContextStatus.UNAVAILABLE
+            ),
+            freshness=ContextFreshness(
+                status=FreshnessStatus.UNAVAILABLE
+            ),
+            coverage=ContextCoverage(
+                status=CoverageStatus.UNAVAILABLE
+            ),
+            limitations=sorted(limitations),
+        )
+
+    @staticmethod
+    def _detail_bounds(
+        query: ContextQuery,
+        *,
+        now: datetime,
+    ) -> tuple[datetime, datetime]:
+        if query.start is not None and query.end is not None:
+            return _as_utc(query.start), _as_utc(query.end)
+        day = _query_day(query, now=now)
+        start, day_end = local_day_bounds(day, query.timezone)
+        end = min(day_end, now + timedelta(seconds=1))
+        if end <= start:
+            raise ValueError("wearable detail window has not started")
+        return start, end
+
+    def _store_detail_snapshot(
+        self,
+        session: Session,
+        *,
+        query: ContextQuery,
+        start: datetime,
+        end: datetime,
+        parameters: Mapping[str, Any],
+        result: Mapping[str, Any],
+        now: datetime,
+    ) -> tuple[WearableQuerySnapshot | None, str]:
+        factory = self._snapshot_session_factory
+        if factory is not None:
+            try:
+                committed = commit_open_wearables_query_snapshot(
+                    factory,
+                    capability=query.capability,
+                    start=start,
+                    end=end,
+                    timezone=query.timezone,
+                    parameters=parameters,
+                    result=result,
+                    collected_at=now,
+                    now=now,
+                )
+            except RuntimeError:
+                if not isinstance(session, Session):
+                    return None, "wearable_snapshot_writer_unavailable"
+            except Exception:
+                return None, "wearable_snapshot_persistence_failed"
+            else:
+                event = session.get(WellnessEvent, committed.event_id)
+                if event is None:
+                    return None, "wearable_snapshot_persistence_failed"
+                loaded = wearable_query_snapshot_from_event(
+                    session,
+                    event,
+                    now=now,
+                )
+                return (
+                    (loaded, "")
+                    if loaded is not None
+                    else (
+                        None,
+                        "wearable_snapshot_persistence_failed",
+                    )
+                )
+        if not isinstance(session, Session):
+            return None, "wearable_snapshot_writer_unavailable"
+        try:
+            snapshot = persist_open_wearables_query_snapshot(
+                session,
+                capability=query.capability,
+                start=start,
+                end=end,
+                timezone=query.timezone,
+                parameters=parameters,
+                result=result,
+                collected_at=now,
+                now=now,
+            )
+        except Exception:
+            return None, "wearable_snapshot_persistence_failed"
+        return snapshot, ""
+
+    @staticmethod
+    def _detail_result(
+        query: ContextQuery,
+        snapshot: WearableQuerySnapshot,
+        *,
+        provenance_mode: str,
+        now: datetime,
+        extra_limitations: Sequence[str] = (),
+    ) -> ContextResult:
+        stored = dict(snapshot.result)
+        raw_records = stored.get("records")
+        records = (
+            list(raw_records)
+            if isinstance(raw_records, list)
+            else []
+        )
+        selected, next_cursor = _page_items(
+            records,
+            query=query,
+            namespace=query.capability,
+            identity=lambda item: {
+                "record_digest": _canonical_digest(item),
+            },
+        )
+        limitations = {
+            *_limitations(stored),
+            *(value for value in extra_limitations if value),
+        }
+        upstream_truncated = bool(
+            {
+                "wearable_upstream_page_limit_reached",
+                "wearable_payload_limit_reached",
+            }
+            & limitations
+        )
+        raw = {
+            "status": stored.get("status", "partial"),
+            "count": len(selected),
+            "records": selected,
+            "window": {
+                "start": snapshot.start.isoformat(),
+                "end": snapshot.end.isoformat(),
+            },
+            "provenance_mode": provenance_mode,
+            "freshness": {
+                "recorded_at": snapshot.collected_at.isoformat(),
+                "status": provenance_mode,
+            },
+            "coverage": stored.get("coverage", {}),
+            "limitations": sorted(limitations),
+        }
+        freshness = _freshness(
+            raw,
+            now=now,
+            timezone=query.timezone,
+        )
+        refs = [
+            SourceRef(
+                domain="wearable",
+                resource_type=OPEN_WEARABLES_QUERY_EVENT_TYPE,
+                record_id=str(snapshot.event_id),
+                source_provider=(
+                    OPEN_WEARABLES_SNAPSHOT_SOURCE_PROVIDER
+                ),
+                observed_start=snapshot.start,
+                observed_end=snapshot.end,
+                collected_at=snapshot.collected_at,
+                schema_version=1,
+                derived_by=f"{query.capability}.mirror.v1",
+                freshness=freshness.status,
+                coverage=snapshot.coverage,
+                sensitivity="wearable",
+            )
+        ]
+        return _result(
+            query,
+            raw,
+            refs=refs,
+            refs_complete=True,
+            now=now,
+            truncated=(
+                next_cursor is not None or upstream_truncated
+            ),
+            next_cursor=next_cursor,
+        )
+
     async def _snapshot_context(
         self,
         session: Session,
@@ -2733,21 +3295,20 @@ class WearableContextProvider:
             and _status(normalized)
             not in {ContextStatus.UNAVAILABLE, ContextStatus.FAILED}
         ):
-            try:
-                snapshot = persist_open_wearables_observation(
-                    session,
-                    normalized_context=normalized,
-                    local_day=day,
-                    timezone=timezone,
-                    collected_at=now,
-                    now=now,
+            snapshot, store_limitation = self._store_daily_snapshot(
+                session,
+                normalized_context=normalized,
+                local_day=day,
+                timezone=timezone,
+                now=now,
+            )
+            if snapshot is not None:
+                return (
+                    dict(snapshot.normalized_context),
+                    snapshot,
+                    limitations,
                 )
-            except Exception:
-                limitations.add(
-                    "wearable_snapshot_persistence_failed"
-                )
-            else:
-                return normalized, snapshot, limitations
+            limitations.add(store_limitation)
         elif normalized is not None:
             limitations.add("open_wearables_context_unavailable")
 
@@ -2769,6 +3330,63 @@ class WearableContextProvider:
         if self._reader is None:
             limitations.add("open_wearables_context_unavailable")
         return None, None, limitations
+
+    def _store_daily_snapshot(
+        self,
+        session: Session,
+        *,
+        normalized_context: dict[str, Any],
+        local_day: date,
+        timezone: str,
+        now: datetime,
+    ) -> tuple[WearableSnapshot | None, str]:
+        factory = self._snapshot_session_factory
+        if factory is not None:
+            try:
+                committed = commit_open_wearables_snapshot(
+                    factory,
+                    normalized_context=normalized_context,
+                    local_day=local_day,
+                    timezone=timezone,
+                    collected_at=now,
+                    now=now,
+                )
+            except RuntimeError:
+                if not isinstance(session, Session):
+                    return None, "wearable_snapshot_writer_unavailable"
+            except Exception:
+                return None, "wearable_snapshot_persistence_failed"
+            else:
+                event = session.get(WellnessEvent, committed.event_id)
+                if event is None:
+                    return None, "wearable_snapshot_persistence_failed"
+                loaded = wearable_snapshot_from_event(
+                    session,
+                    event,
+                    now=now,
+                )
+                return (
+                    (loaded, "")
+                    if loaded is not None
+                    else (
+                        None,
+                        "wearable_snapshot_persistence_failed",
+                    )
+                )
+        if not isinstance(session, Session):
+            return None, "wearable_snapshot_writer_unavailable"
+        try:
+            snapshot = persist_open_wearables_observation(
+                session,
+                normalized_context=normalized_context,
+                local_day=local_day,
+                timezone=timezone,
+                collected_at=now,
+                now=now,
+            )
+        except Exception:
+            return None, "wearable_snapshot_persistence_failed"
+        return snapshot, ""
 
 
 def _calendar_rows(

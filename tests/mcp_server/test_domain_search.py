@@ -63,6 +63,10 @@ SEARCH_CAPABILITIES = {
         "calendar.event-detail",
     },
     "search_wearable": {
+        "wearable.health-scores",
+        "wearable.summaries",
+        "wearable.timeseries",
+        "wearable.workouts",
         "wearable.readiness",
         "wearable.sleep",
         "wearable.recovery",
@@ -125,6 +129,10 @@ SEARCH_PROPERTIES = {
         "cursor",
         "kind",
         "metric",
+        "category",
+        "summary_kind",
+        "series_type",
+        "resolution",
         "granularity",
         "fields",
         "privacy_level",
@@ -458,6 +466,35 @@ async def test_domain_search_schemas_are_exact_bounded_and_identity_safe(
         "stress",
         "yesterday_load",
     }
+    assert set(_schema_value(wearable["category"])["enum"]) == {
+        "activity",
+        "body_battery",
+        "readiness",
+        "recovery",
+        "resilience",
+        "sleep",
+        "strain",
+        "stress",
+    }
+    assert set(_schema_value(wearable["summary_kind"])["enum"]) == {
+        "activity",
+        "recovery",
+        "sleep",
+    }
+    assert set(_schema_value(wearable["resolution"])["enum"]) == {
+        "1min",
+        "5min",
+        "15min",
+        "1hour",
+    }
+    assert "raw" not in _schema_value(wearable["resolution"])["enum"]
+    assert set(_schema_value(wearable["granularity"])["enum"]) == {
+        "summary",
+        "day",
+        "record",
+        "window",
+        "series",
+    }
 
 
 async def test_live_healthmes_mcp_schemas_match_decision_runtime_inventory(
@@ -587,6 +624,65 @@ async def test_four_tools_share_one_budget_and_always_roll_back(
             )
             == 0
         )
+
+
+async def test_wearable_detail_capabilities_infer_safe_granularity(
+    mcp_client,
+    call_tool,
+    store_factory,
+) -> None:
+    clock = MutableClock()
+    provider = RollbackProbeProvider(WearableContextProvider.metadata)
+    service = _database_service(
+        store_factory,
+        (provider,),
+        clock,
+    )
+    server_module.set_decision_search_session_service(service)
+    handle = service.begin(_request(max_tool_calls=4))
+    common = {
+        "decision_session_id": handle.session_id,
+        "start": "2026-08-16T08:00:00Z",
+        "end": "2026-08-16T09:00:00Z",
+    }
+
+    calls = (
+        {
+            **common,
+            "capability": "wearable.health-scores",
+        },
+        {
+            **common,
+            "capability": "wearable.summaries",
+            "summary_kind": "sleep",
+        },
+        {
+            **common,
+            "capability": "wearable.workouts",
+        },
+        {
+            **common,
+            "capability": "wearable.timeseries",
+            "series_type": "heart_rate",
+            "resolution": "1min",
+        },
+    )
+
+    for arguments in calls:
+        result = await call_tool(
+            mcp_client,
+            "search_wearable",
+            arguments,
+        )
+        assert result["status"] == "failed"
+        assert "provider_execution_failed" in result["limitations"]
+
+    assert [query.granularity for query in provider.queries] == [
+        "record",
+        "summary",
+        "record",
+        "series",
+    ]
 
 
 async def test_unknown_expired_and_input_bounds_fail_before_provider_access(

@@ -186,8 +186,18 @@ WearableCapability = Literal[
     "wearable.recovery",
     "wearable.stress",
     "wearable.metric-detail",
+    "wearable.health-scores",
+    "wearable.summaries",
+    "wearable.workouts",
+    "wearable.timeseries",
 ]
-WearableGranularity = Literal["summary", "day", "record"]
+WearableGranularity = Literal[
+    "summary",
+    "day",
+    "record",
+    "window",
+    "series",
+]
 WearableKind = Literal["load", "recovery", "sleep", "stress"]
 WearableMetric = Literal[
     "actual_sleep",
@@ -197,6 +207,39 @@ WearableMetric = Literal[
     "stress",
     "yesterday_load",
 ]
+WearableHealthScoreCategory = Literal[
+    "activity",
+    "body_battery",
+    "readiness",
+    "recovery",
+    "resilience",
+    "sleep",
+    "strain",
+    "stress",
+]
+WearableSummaryKind = Literal["activity", "recovery", "sleep"]
+WearableTimeseriesType = Literal[
+    "active_time",
+    "body_temperature",
+    "energy",
+    "exercise_time",
+    "garmin_body_battery",
+    "garmin_stress_level",
+    "heart_rate",
+    "heart_rate_variability_rmssd",
+    "heart_rate_variability_sdnn",
+    "oxygen_saturation",
+    "physical_effort",
+    "respiratory_rate",
+    "resting_heart_rate",
+    "skin_temperature",
+    "skin_temperature_deviation",
+    "stand_time",
+    "steps",
+    "time_in_daylight",
+    "vo2_max",
+]
+WearableTimeseriesResolution = Literal["1min", "5min", "15min", "1hour"]
 WearableField = Literal[
     "status",
     "reason",
@@ -211,6 +254,8 @@ WearableField = Literal[
     "yesterday_load",
     "count",
     "records",
+    "window",
+    "provenance_mode",
 ]
 
 ServiceResolver = Callable[[], DecisionContextSearchSessionService]
@@ -232,6 +277,19 @@ def _aware(value: str | None, field: str) -> datetime | None:
 
 def _privacy(value: PrivacySelection) -> PrivacyLevel:
     return PrivacyLevel(value)
+
+
+def _wearable_granularity(
+    capability: WearableCapability,
+    requested: WearableGranularity | None,
+) -> WearableGranularity:
+    if requested is not None:
+        return requested
+    return {
+        "wearable.health-scores": "record",
+        "wearable.workouts": "record",
+        "wearable.timeseries": "series",
+    }.get(capability, "summary")  # type: ignore[return-value]
 
 
 async def _search(
@@ -424,12 +482,16 @@ def register_domain_search_tools(
         cursor: OpaqueCursor | None = None,
         kind: WearableKind | None = None,
         metric: WearableMetric | None = None,
-        granularity: WearableGranularity = "summary",
+        category: WearableHealthScoreCategory | None = None,
+        summary_kind: WearableSummaryKind | None = None,
+        series_type: WearableTimeseriesType | None = None,
+        resolution: WearableTimeseriesResolution | None = None,
+        granularity: WearableGranularity | None = None,
         fields: Annotated[list[WearableField] | None, Field(max_length=64)] = None,
         privacy_level: PrivacySelection = "aggregate",
         limit: SearchLimit = 100,
     ) -> dict[str, Any]:
-        """Search one retained Wearable summary capability without raw series."""
+        """Search bounded wearable context through HealthMes-owned mirrors."""
 
         return await _search(
             service_resolver,
@@ -438,7 +500,10 @@ def register_domain_search_tools(
             capability=capability,
             start=start,
             end=end,
-            granularity=granularity,
+            granularity=_wearable_granularity(
+                capability,
+                granularity,
+            ),
             fields=fields,
             privacy_level=privacy_level,
             limit=limit,
@@ -447,5 +512,9 @@ def register_domain_search_tools(
                 "cursor": cursor,
                 "kind": kind,
                 "metric": metric,
+                "category": category,
+                "summary_kind": summary_kind,
+                "series_type": series_type,
+                "resolution": resolution,
             },
         )
