@@ -69,9 +69,10 @@
    Wearables 도구가 없다.
 3. 필수 규칙: ① REST 직접 호출 지시 금지(MCP만) ② mutation 도구 호출 금지
    ③ confidence 게이트 ④ 알림 문법(관찰→근거→제안) 준수. source 검증 뒤
-   필요한 판단만 compact하게 저장하는 것은 PR #138 Issue #164의 목표다.
-   #164가 통합되기 전 현재 finalizer는 source가 있는 완료 판단을 모두 저장하므로,
-   조건부 저장을 이미 배포된 동작처럼 설명하지 않는다.
+   행동 변경 제안, 실제 mutation, 중요 위험 경고 또는 사용자가 명시적으로
+   추적을 요청한 판단만 compact하게 저장한다. 단순 조회는 source가 있어도
+   기본 미저장이다. 모델이 스스로 저장 의도를 표시해도 HealthMes의 서버 소유
+   분류기를 우회할 수 없다.
 4. 설치: `uv run python scripts/bootstrap.py` (재실행하면 내용 재동기화)
 5. 검토가 끝난 Skill은 HealthMes의 read-only wellness catalog에 등록한다.
    선제 알림과 정기 브리핑도 같은 internal DecisionRequest service에서 이 catalog를
@@ -110,10 +111,9 @@ make mac-setup && make mac-run     # sqlite로 전체 서비스 기동 (:8100)
   source 검증과 finalization 정책을 우회하므로 제품 wellness 동작을 검증하는
   경로가 아니다.
 - **판단 감사**: 행동 변경 제안, mutation, 중요 위험 경고와 명시적 추적 대상만
-  compact record로 남기고 단순 조회를 기본 미저장하는 것은 Issue #164의
-  목표다. #164 통합 전 현재 finalizer는 source가 있는 완료 판단을 모두
-  저장한다. 현재 build가 저장한 기록은 `http://localhost:8100/decisions`에서
-  source reference를 따라가며 검토한다.
+  compact record로 남기고 단순 조회는 기본 미저장한다. 현재 build가 저장한
+  기록은 `http://localhost:8100/decisions`에서 source reference를 따라가며
+  검토한다.
 - **회귀 고정**: 맞다고 확인한 케이스는 손계산 벡터로 테스트에 박제
 
 ### 4b. 실기기 QA (본인 워치로)

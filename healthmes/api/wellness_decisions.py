@@ -12,6 +12,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     ValidationError,
     model_validator,
 )
@@ -115,7 +116,7 @@ class WellnessDecisionInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     question: str = Field(min_length=1, max_length=8_000)
-    persistence_requested: bool = False
+    persistence_requested: StrictBool = False
     hints: WellnessDecisionTimeHints = Field(
         default_factory=WellnessDecisionTimeHints
     )

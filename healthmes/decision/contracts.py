@@ -15,6 +15,7 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    StrictBool,
     field_validator,
     model_validator,
 )
@@ -283,7 +284,7 @@ class DecisionRequest(BaseModel):
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
     caller: DecisionCaller
     requested_privacy_level: PrivacyLevel = PrivacyLevel.AGGREGATE
-    persistence_requested: bool = False
+    persistence_requested: StrictBool = False
     budget: DecisionBudget = Field(default_factory=DecisionBudget)
     hints: DecisionContextHints = Field(default_factory=DecisionContextHints)
     compatibility_preset: CompatibilityPreset | None = None

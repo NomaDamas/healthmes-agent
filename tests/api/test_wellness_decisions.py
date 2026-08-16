@@ -444,6 +444,34 @@ def test_rest_contract_is_server_owned_and_hides_internal_trace(
     assert request.hints.related_record_ids == {}
 
 
+@pytest.mark.parametrize("value", ("true", "yes", "on", 1))
+def test_rest_rejects_non_boolean_persistence_consent(
+    settings,
+    value,
+) -> None:
+    secured = _secured_settings(settings)
+    engine = RecordingDecisionEngine()
+    app = create_app(secured)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:8100",
+        client=("127.0.0.1", 43123),
+    ) as client:
+        app.state.decision_engine = engine
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers=_bearer(),
+            json={
+                "question": "Track this decision.",
+                "persistence_requested": value,
+            },
+        )
+
+    assert response.status_code == 422
+    assert engine.requests == []
+
+
 def test_hosted_scope_is_server_owned_even_for_loopback_hermes(
     settings,
 ) -> None:

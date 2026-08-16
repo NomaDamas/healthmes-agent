@@ -53,10 +53,11 @@ Ground rules for skill authors:
 - **Never instruct raw REST calls** — decision data access must go through
   bounded HealthMes MCP tools so returned source references can be validated.
 - Do not instruct the runtime to call `record_decision` for every lookup.
-  Conditional compact persistence after source validation is the target of
-  PR #138 issue #164, not the behavior of the current finalizer. Until #164
-  is integrated, every completed source-bearing decision is still stored.
-  Do not describe the target policy as shipped.
+  HealthMes stores a compact decision only for behavior-changing actions,
+  material risk warnings, actual mutations, or an explicit
+  `persistence_requested: true` request. A simple source-backed lookup remains
+  unpersisted by default. The runtime's self-reported persistence intent cannot
+  override this server-owned classifier.
 - **Respect confidence**: the tools return `confidence` / `coverage` /
   `insufficient_data` honestly; skills must gate advice on them.
 - Multiple skills are welcome — one file per clinical question keeps them
@@ -157,12 +158,10 @@ open http://localhost:8100/docs         # REST playground (OpenAPI)
   PY
   ```
 
-- **Decision audit**: PR #138 issue #164 targets compact persistence for
-  behavior-changing recommendations, mutations, material risk warnings, and
-  explicitly tracked decisions; after that target lands, simple lookups will
-  remain unpersisted by default.
-  Until #164 is integrated, the current finalizer still stores every completed
-  source-bearing decision. Open `http://localhost:8100/decisions` to review
-  records that the current build retained and challenge the judgment.
+- **Decision audit**: HealthMes persists compact records for behavior-changing
+  recommendations, mutations, material risk warnings, and explicitly tracked
+  decisions. Simple lookups remain unpersisted by default. Open
+  `http://localhost:8100/decisions` to review retained records and challenge
+  the judgment.
 - **Regression**: `make mac-test` — add one test per metric with a
   hand-computed vector; that is the contract your metric keeps forever.

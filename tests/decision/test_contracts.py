@@ -135,6 +135,18 @@ def test_natural_language_request_roundtrips_without_required_preset():
     )
 
 
+@pytest.mark.parametrize("value", ("true", "yes", "on", 1))
+def test_decision_request_rejects_non_boolean_persistence_consent(value):
+    with pytest.raises(ValidationError):
+        DecisionRequest(
+            question="Track this decision.",
+            requested_at=T0,
+            timezone="UTC",
+            persistence_requested=value,
+            caller=_caller(),
+        )
+
+
 def test_compatibility_preset_is_optional_metadata():
     request = DecisionRequest.from_compatibility_preset(
         CompatibilityPreset.CAFFEINE_FOR_FOCUS,
