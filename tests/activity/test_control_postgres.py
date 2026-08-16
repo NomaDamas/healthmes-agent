@@ -50,6 +50,25 @@ from healthmes.store import Base, WellnessEvent, create_db_engine
 from healthmes.store.session import get_session
 
 
+def _create_app_with_primed_routes(settings, freezer):
+    """Compile FastAPI's lazy route schemas outside freezegun."""
+    freezer.stop()
+    try:
+        application = create_app(settings)
+        primer = TestClient(
+            application,
+            base_url="http://127.0.0.1:8100",
+            client=("127.0.0.1", 43122),
+        )
+        try:
+            assert primer.get("/v1/__prime_routes__").status_code == 404
+        finally:
+            primer.close()
+    finally:
+        freezer.start()
+    return application
+
+
 @pytest.mark.parametrize(
     ("boundary_change", "expected_reason"),
     (
@@ -64,6 +83,7 @@ from healthmes.store.session import get_session
 def test_activitywatch_rest_import_loses_race_to_privacy_boundary(
     tmp_path,
     monkeypatch,
+    stable_activity_wall_clock,
     boundary_change: str,
     expected_reason: str,
 ) -> None:
@@ -131,7 +151,10 @@ def test_activitywatch_rest_import_loses_race_to_privacy_boundary(
         api_token="",
         _env_file=None,
     )
-    application = create_app(settings)
+    application = _create_app_with_primed_routes(
+        settings,
+        stable_activity_wall_clock,
+    )
 
     def override_get_session():
         with factory() as session:
@@ -243,6 +266,7 @@ def test_activitywatch_rest_import_loses_race_to_privacy_boundary(
 def test_activitywatch_rest_rejects_older_snapshot_after_newer_empty_import(
     tmp_path,
     monkeypatch,
+    stable_activity_wall_clock,
 ) -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = create_db_engine(database_url)
@@ -317,7 +341,10 @@ def test_activitywatch_rest_rejects_older_snapshot_after_newer_empty_import(
         api_token="",
         _env_file=None,
     )
-    application = create_app(settings)
+    application = _create_app_with_primed_routes(
+        settings,
+        stable_activity_wall_clock,
+    )
 
     def override_get_session():
         with factory() as session:
