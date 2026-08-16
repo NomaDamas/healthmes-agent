@@ -36,8 +36,16 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from healthmes.config import Settings
-from healthmes.engine.triggers import TRIGGER_INTERVAL_MINUTES, build_trigger_job
+from healthmes.config import Settings, resolve_timezone
+from healthmes.engine.briefings import (
+    SCHEDULED_BRIEFING_SPECS,
+    build_scheduled_briefing_job,
+)
+from healthmes.engine.triggers import (
+    TRIGGER_INTERVAL_MINUTES,
+    AlertSender,
+    build_trigger_job,
+)
 
 __all__ = [
     "TRIGGER_JOB_ID",
@@ -55,6 +63,7 @@ __all__ = [
     "register_calendar_adjustment_maintenance_job",
     "register_sleep_reconciliation_job",
     "register_activitywatch_job",
+    "register_scheduled_briefing_jobs",
     "start_scheduler",
     "shutdown_scheduler",
 ]
@@ -88,7 +97,10 @@ def _remove_job_if_present(scheduler: BackgroundScheduler, job_id: str) -> None:
 
 
 def create_scheduler(
-    settings: Settings, *, trigger_job: Callable[[], None] | None = None
+    settings: Settings,
+    *,
+    trigger_job: Callable[[], None] | None = None,
+    alert_sender: AlertSender | None = None,
 ) -> BackgroundScheduler:
     """Build the (unstarted) scheduler with the trigger sweep registered.
 
@@ -97,7 +109,14 @@ def create_scheduler(
     """
     scheduler = BackgroundScheduler()
     scheduler.add_job(
-        trigger_job if trigger_job is not None else build_trigger_job(settings),
+        (
+            trigger_job
+            if trigger_job is not None
+            else build_trigger_job(
+                settings,
+                alert_sender=alert_sender,
+            )
+        ),
         trigger=IntervalTrigger(minutes=TRIGGER_INTERVAL_MINUTES),
         id=TRIGGER_JOB_ID,
         name="HealthMes trigger sweep",
@@ -106,6 +125,42 @@ def create_scheduler(
         misfire_grace_time=_MISFIRE_GRACE_SECONDS,
     )
     return scheduler
+
+
+def register_scheduled_briefing_jobs(
+    scheduler: BackgroundScheduler,
+    settings: Settings,
+    *,
+    alert_sender: AlertSender,
+) -> tuple[Job, ...]:
+    """Register morning, evening, and weekly canonical decision requests."""
+
+    timezone = resolve_timezone(settings)
+    jobs: list[Job] = []
+    for spec in SCHEDULED_BRIEFING_SPECS:
+        _remove_job_if_present(scheduler, spec.job_id)
+        jobs.append(
+            scheduler.add_job(
+                build_scheduled_briefing_job(
+                    settings,
+                    spec=spec,
+                    alert_sender=alert_sender,
+                ),
+                trigger=CronTrigger(
+                    day_of_week=spec.day_of_week,
+                    hour=spec.hour,
+                    minute=spec.minute,
+                    timezone=timezone,
+                ),
+                id=spec.job_id,
+                name=f"HealthMes {spec.name} wellness briefing",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=600,
+            )
+        )
+    return tuple(jobs)
 
 
 def register_energy_job(

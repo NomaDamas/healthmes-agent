@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -48,6 +49,7 @@ class DecisionServiceRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    request_id: uuid.UUID | None = None
     question: str = Field(min_length=1, max_length=8_000)
     ingress: DecisionIngress
     source: str | None = Field(default=None, min_length=1, max_length=48)
@@ -115,6 +117,11 @@ class HealthMesDecisionService:
             )
         requested_at = submission.requested_at or self._clock()
         return DecisionRequest(
+            **(
+                {"request_id": submission.request_id}
+                if submission.request_id is not None
+                else {}
+            ),
             question=submission.question,
             requested_at=requested_at,
             timezone=str(resolve_timezone(self._settings)),

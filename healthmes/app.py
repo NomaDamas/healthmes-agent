@@ -47,6 +47,10 @@ from healthmes.decision import (
 from healthmes.decision.domain_providers import WearableReader
 from healthmes.decision.responses import HermesResponsesTransport
 from healthmes.engine.cognitive_energy import build_energy_job
+from healthmes.engine.decision_dispatch import (
+    DecisionAlertSender,
+    DecisionServiceThreadBridge,
+)
 from healthmes.engine.scheduler import (
     create_scheduler,
     register_activitywatch_job,
@@ -54,6 +58,7 @@ from healthmes.engine.scheduler import (
     register_calendar_adjustment_maintenance_job,
     register_calendar_job,
     register_energy_job,
+    register_scheduled_briefing_jobs,
     register_sleep_reconciliation_job,
     register_storage_maintenance_job,
     shutdown_scheduler,
@@ -205,10 +210,27 @@ def create_app(
                 if callable(start_decision_engine):
                     await start_decision_engine()
 
+            decision_alert_sender = None
+            if decision_engine is not None:
+                decision_alert_sender = DecisionAlertSender(
+                    settings,
+                    bridge=DecisionServiceThreadBridge(
+                        service=app.state.decision_service,
+                        loop=asyncio.get_running_loop(),
+                        timeout_seconds=(
+                            settings.decision_timeout_seconds
+                            + settings.decision_finalization_timeout_seconds
+                        ),
+                    ),
+                )
+
             # Background loops are prepared even when globally disabled so
             # their configuration remains testable. Register shutdown before
             # job setup so a partial scheduler startup cannot leak a thread.
-            scheduler = create_scheduler(settings)
+            scheduler = create_scheduler(
+                settings,
+                alert_sender=decision_alert_sender,
+            )
 
             def stop_scheduler() -> None:
                 try:
@@ -223,6 +245,12 @@ def create_app(
                 scheduler,
                 build_storage_maintenance_job(settings),
             )
+            if decision_alert_sender is not None:
+                register_scheduled_briefing_jobs(
+                    scheduler,
+                    settings,
+                    alert_sender=decision_alert_sender,
+                )
             register_activity_maintenance_job(
                 scheduler,
                 build_activity_maintenance_job(),

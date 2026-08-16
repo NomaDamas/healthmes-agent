@@ -15,14 +15,10 @@ Runs every ``TRIGGER_INTERVAL_MINUTES`` from the in-service APScheduler
    persist a ``trigger_event`` row;
 4. gate the push with the alert-hygiene settings (quiet hours, per-rule
    cooldown, daily alert budget — docs/PLAN.md section 11) and, if allowed,
-   POST it to the Hermes gateway via ``healthmes/engine/webhook.py``.
-   ``alert_sent`` marks the alert as delivered to the user: True after a
-   confirmed 2xx webhook push, OR — when ``native_alert_delivery`` is on —
-   whenever a fire passes the hygiene gates, so the native companion apps
-   surface it via /v1/alerts + glance even without Telegram. Suppressed and
-   webhook-only-failed pushes keep the row with the reason in
-   ``payload["push"]`` and are NOT retried for the same dedup key (noise
-   control beats redelivery).
+   hand it to the injected canonical decision sender. Production injects
+   ``DecisionAlertSender`` so proactive and scheduled prompts use the same
+   HealthMesDecisionService as REST requests. No sender means fail closed:
+   deterministic rule text is never surfaced as if an LLM had verified it.
 
 Datetime convention: everything is normalized to UTC before it is persisted
 or bound into a query, so comparisons behave identically on postgres
@@ -52,6 +48,7 @@ from healthmes.calendars.visibility import (
     require_calendar_visibility_current,
 )
 from healthmes.config import Settings, resolve_timezone
+from healthmes.engine.decision_dispatch import DecisionDispatchResult
 from healthmes.engine.rules import (
     ALL_RULES,
     AfternoonLoad,
@@ -65,12 +62,13 @@ from healthmes.engine.rules import (
     TriggerFire,
     TriggerRule,
 )
-from healthmes.engine.webhook import HermesWebhookSender, WebhookResult
+from healthmes.engine.webhook import WebhookResult
 from healthmes.mcp_server import interpret
 from healthmes.store.enums import CalendarMutationStatus, ProposalStatus
 from healthmes.store.models import (
     CalendarEventMirror,
     CalendarMutationProposal,
+    DecisionRecord,
     ScheduleProposal,
     Task,
     TriggerEvent,
@@ -194,7 +192,9 @@ class HealthReader(Protocol):
 
 
 class AlertSender(Protocol):
-    """Anything that can push a fire to the agent plane (webhook by default)."""
+    """Anything that can turn a fire into a user-facing alert."""
+
+    requires_reasoning: bool
 
     def send(
         self,
@@ -202,7 +202,28 @@ class AlertSender(Protocol):
         *,
         fired_at: datetime,
         trigger_event_id: uuid.UUID,
-    ) -> WebhookResult: ...
+    ) -> WebhookResult | DecisionDispatchResult: ...
+
+
+class _UnavailableAlertSender:
+    """Fail closed when the canonical DecisionService sender is not injected."""
+
+    requires_reasoning = True
+
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> WebhookResult:
+        del fire, fired_at, trigger_event_id
+        return WebhookResult(
+            ok=False,
+            status_code=503,
+            detail="canonical decision alert sender is not configured",
+            retryable=True,
+        )
 
 
 def _run_maybe_async(value: Any) -> Any:
@@ -738,6 +759,83 @@ class EvaluationReport:
         return sum(1 for outcome in self.outcomes if outcome.status == status)
 
 
+def _trigger_payload(fire: TriggerFire) -> dict[str, Any]:
+    trigger = {
+        "summary": fire.summary,
+        "proposal": fire.proposal,
+        "evidence": fire.evidence,
+    }
+    return {
+        **trigger,
+        "trigger": trigger,
+    }
+
+
+def _decision_metadata(
+    result: DecisionDispatchResult,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "answer": result.message,
+        "request_id": (
+            str(result.decision_request_id)
+            if result.decision_request_id is not None
+            else None
+        ),
+        "turn_id": (
+            str(result.decision_turn_id)
+            if result.decision_turn_id is not None
+            else None
+        ),
+        "record_id": (
+            str(result.decision_record_id)
+            if result.decision_record_id is not None
+            else None
+        ),
+        "source_refs": list(result.source_refs),
+        "limitations": list(result.limitations),
+        "confidence": result.confidence,
+        "proposed_action": result.proposed_action,
+    }
+    return {
+        key: value
+        for key, value in payload.items()
+        if value is not None
+    }
+
+
+def _merge_decision_result(
+    payload: dict[str, Any],
+    result: WebhookResult | DecisionDispatchResult,
+) -> dict[str, Any]:
+    if not isinstance(result, DecisionDispatchResult):
+        return payload
+    merged = {
+        **payload,
+        "decision": _decision_metadata(result),
+    }
+    if result.message is not None:
+        merged["summary"] = result.message
+        merged["proposal"] = None
+        merged["evidence"] = {
+            "source_ref_ids": [
+                item["reference_id"]
+                for item in result.source_refs
+                if isinstance(item.get("reference_id"), str)
+            ],
+            "limitations": list(result.limitations),
+            **(
+                {"confidence": result.confidence}
+                if result.confidence is not None
+                else {}
+            ),
+        }
+    if result.decision_record_id is not None:
+        merged["decision_record_id"] = str(
+            result.decision_record_id
+        )
+    return merged
+
+
 def default_now_provider(settings: Settings) -> Callable[[], datetime]:
     """Wall-clock provider in the *user's* timezone (Settings.timezone).
 
@@ -758,8 +856,9 @@ class TriggerEvaluator:
     """Evaluates trigger rules and pushes fresh fires as proactive alerts.
 
     All collaborators are injectable for tests; defaults wire the real store
-    session factory, the ow_client-backed health reader and the Hermes
-    webhook sender.
+    session factory and the ow_client-backed health reader. The alert sender
+    deliberately has no legacy network default: the application composition
+    root must inject the canonical HealthMesDecisionService bridge.
     """
 
     def __init__(
@@ -779,7 +878,9 @@ class TriggerEvaluator:
             health_reader if health_reader is not None else OwHealthReader(settings)
         )
         self._alert_sender = (
-            alert_sender if alert_sender is not None else HermesWebhookSender(settings)
+            alert_sender
+            if alert_sender is not None
+            else _UnavailableAlertSender()
         )
         self._rules: tuple[TriggerRule, ...] = tuple(rules) if rules is not None else ALL_RULES
         self._thresholds = thresholds if thresholds is not None else RuleThresholds()
@@ -846,6 +947,32 @@ class TriggerEvaluator:
             )
         return report
 
+    def dispatch_fire(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime | None = None,
+    ) -> FireOutcome:
+        """Dispatch one synthetic non-calendar fire through the durable outbox.
+
+        Scheduled briefings use this entry point. Calendar-derived rule fires
+        must continue through ``evaluate_once`` so the visibility generation
+        captured while reading calendar rows can be rechecked before commit.
+        """
+
+        if fire.rule_id in _CALENDAR_DERIVED_RULE_IDS:
+            raise ValueError(
+                "calendar-derived fires require evaluator calendar visibility"
+            )
+        now = fired_at if fired_at is not None else self._now()
+        with session_scope(self._session_factory) as session:
+            return self._process_fire(
+                session,
+                now,
+                fire,
+                calendar_visibility=None,
+            )
+
     def _retry_pending_dispatches(
         self,
         session: Session,
@@ -873,9 +1000,12 @@ class TriggerEvaluator:
             if event.dedup_key is not None:
                 pending_keys.add(event.dedup_key)
             payload = event.payload or {}
-            summary = payload.get("summary")
-            proposal = payload.get("proposal")
-            evidence = payload.get("evidence")
+            trigger_payload = payload.get("trigger")
+            if not isinstance(trigger_payload, dict):
+                trigger_payload = payload
+            summary = trigger_payload.get("summary")
+            proposal = trigger_payload.get("proposal")
+            evidence = trigger_payload.get("evidence")
             if (
                 not isinstance(summary, str)
                 or not isinstance(proposal, str)
@@ -958,7 +1088,7 @@ class TriggerEvaluator:
         now: datetime,
         fire: TriggerFire,
         *,
-        calendar_visibility: CalendarVisibility,
+        calendar_visibility: CalendarVisibility | None,
     ) -> FireOutcome:
         # Dedup-key uniqueness, application-level: a key that was ever
         # recorded is never persisted or pushed again. Keys embed their
@@ -978,15 +1108,15 @@ class TriggerEvaluator:
             return FireOutcome(fire=fire, status="deduplicated")
 
         if fire.rule_id in _CALENDAR_DERIVED_RULE_IDS:
+            if calendar_visibility is None:
+                raise ValueError(
+                    "calendar-derived fire is missing visibility metadata"
+                )
             require_calendar_visibility_current(
                 self._settings,
                 calendar_visibility,
             )
-        payload = {
-            "summary": fire.summary,
-            "proposal": fire.proposal,
-            "evidence": fire.evidence,
-        }
+        payload = _trigger_payload(fire)
         event = TriggerEvent(
             fired_at=_ensure_utc(now),
             rule_id=fire.rule_id,
@@ -1010,12 +1140,11 @@ class TriggerEvaluator:
 
         event.payload = {
             **payload,
-            "push": {"state": "dispatching", "channel": "webhook"},
+            "push": {"state": "dispatching", "channel": "decision"},
         }
-        # Hermes accepts the request and starts agent work asynchronously.
-        # Commit the correlation row first so record_decision can resolve
-        # trigger_event_id immediately. The outbox scan retries this exact row
-        # even when the original rule condition is no longer true.
+        # Commit the durable trigger id before the DecisionService call. The
+        # outbox retries this exact id and therefore derives the same decision
+        # request id even if the process exits after Hermes completed.
         session.commit()
         event = session.scalar(
             select(TriggerEvent)
@@ -1057,37 +1186,55 @@ class TriggerEvaluator:
                 fired_at=fired_at,
                 trigger_event_id=event.id,
             )
+            if isinstance(result, DecisionDispatchResult):
+                self._link_decision_record(session, event, result)
         except Exception as exc:
-            # The sender *raised* (transport blew up mid-send) rather than
-            # returning a clean WebhookResult(ok=False) — that latter case is a
-            # gateway that answered non-2xx and is handled below. The
-            # trigger_event row is already flushed (its dedup key is burned), so
-            # a raised send must be unwound; see _handle_send_exception.
             outcome = self._handle_send_exception(session, fire, event, payload, exc)
             session.commit()
             return outcome
 
+        delivery_payload = _merge_decision_result(payload, result)
         if result.ok:
             event.alert_sent = True
             event.payload = {
-                **payload,
-                "push": {"sent": True, "status_code": result.status_code, "channel": "webhook"},
+                **delivery_payload,
+                "push": {
+                    "sent": True,
+                    "status_code": result.status_code,
+                    "channel": (
+                        result.channel
+                        if isinstance(result, DecisionDispatchResult)
+                        and result.channel is not None
+                        else "webhook"
+                    ),
+                },
             }
             outcome = FireOutcome(fire=fire, status="pushed")
             session.commit()
             return outcome
 
-        # Webhook not delivered (unconfigured or failed). With native delivery
-        # on, the alert is still surfaced to the companion apps via /v1/alerts +
-        # glance polling — the phone/watch get it without Telegram.
-        if self._settings.native_alert_delivery:
+        ready_for_native = (
+            isinstance(result, DecisionDispatchResult)
+            and result.ready_for_native
+        )
+        reasoning_required = bool(
+            getattr(self._alert_sender, "requires_reasoning", False)
+        )
+        if self._settings.native_alert_delivery and (
+            ready_for_native or not reasoning_required
+        ):
             event.alert_sent = True
             event.payload = {
-                **payload,
+                **delivery_payload,
                 "push": {
                     "sent": True,
                     "channel": "native",
-                    "webhook_ok": False,
+                    "upstream_ok": False,
+                    **(
+                        {"webhook_ok": False}
+                        if not reasoning_required
+                        else {}
+                    ),
                     "status_code": result.status_code,
                     "detail": result.detail,
                 },
@@ -1098,10 +1245,14 @@ class TriggerEvaluator:
 
         if result.retryable:
             event.payload = {
-                **payload,
+                **delivery_payload,
                 "push": {
                     "state": "dispatching",
-                    "channel": "webhook",
+                    "channel": (
+                        "decision"
+                        if reasoning_required
+                        else "webhook"
+                    ),
                     "last_status_code": result.status_code,
                     "last_error": result.detail,
                 },
@@ -1115,7 +1266,7 @@ class TriggerEvaluator:
             return outcome
 
         event.payload = {
-            **payload,
+            **delivery_payload,
             "push": {
                 "suppressed_reason": _SUPPRESS_PUSH_FAILED,
                 "status_code": result.status_code,
@@ -1126,6 +1277,35 @@ class TriggerEvaluator:
         session.commit()
         return outcome
 
+    @staticmethod
+    def _link_decision_record(
+        session: Session,
+        event: TriggerEvent,
+        result: DecisionDispatchResult,
+    ) -> None:
+        record_id = result.decision_record_id
+        if record_id is None:
+            return
+        record = session.scalar(
+            select(DecisionRecord)
+            .where(DecisionRecord.id == record_id)
+            .with_for_update()
+        )
+        if record is None:
+            raise RuntimeError("decision record disappeared before correlation")
+        if (
+            result.decision_request_id is not None
+            and record.decision_request_id != result.decision_request_id
+        ):
+            raise RuntimeError(
+                "decision record request id does not match dispatch result"
+            )
+        if record.trigger_event_id not in {None, event.id}:
+            raise RuntimeError(
+                "decision record is already linked to another trigger event"
+            )
+        record.trigger_event_id = event.id
+
     def _handle_send_exception(
         self,
         session: Session,
@@ -1134,20 +1314,12 @@ class TriggerEvaluator:
         payload: dict[str, Any],
         exc: Exception,
     ) -> FireOutcome:
-        """Recover a fire whose AlertSender.send() *raised* (not a clean non-2xx).
+        """Keep reasoning-required failures pending instead of leaking raw rules."""
 
-        The ``trigger_event`` row is committed in ``dispatching`` state before
-        the external call, so Hermes background processing can resolve its id
-        and a process crash leaves durable retry intent. Two recoveries:
-
-        - ``native_alert_delivery`` on: the alert is still surfaced to the
-          companion apps via /v1/alerts + glance polling, so mark it delivered
-          natively (the phone/watch get it without Telegram) and keep the row.
-        - native off: leave the row in ``dispatching`` state. The next sweep
-          retries the same event id and stable Hermes request id, preserving
-          correlation while the gateway collapses an uncertain duplicate.
-        """
-        if self._settings.native_alert_delivery:
+        reasoning_required = bool(
+            getattr(self._alert_sender, "requires_reasoning", False)
+        )
+        if self._settings.native_alert_delivery and not reasoning_required:
             event.alert_sent = True
             event.payload = {
                 **payload,
@@ -1164,7 +1336,11 @@ class TriggerEvaluator:
             **payload,
             "push": {
                 "state": "dispatching",
-                "channel": "webhook",
+                "channel": (
+                    "decision"
+                    if reasoning_required
+                    else "webhook"
+                ),
                 "last_error": str(exc),
             },
         }
@@ -1207,7 +1383,11 @@ class TriggerEvaluator:
         return None
 
 
-def build_trigger_job(settings: Settings) -> Callable[[], None]:
+def build_trigger_job(
+    settings: Settings,
+    *,
+    alert_sender: AlertSender | None = None,
+) -> Callable[[], None]:
     """Zero-arg job callable for the scheduler (docs/PLAN.md section 4).
 
     The evaluator (and its default collaborators) is constructed lazily on
@@ -1220,7 +1400,10 @@ def build_trigger_job(settings: Settings) -> Callable[[], None]:
         nonlocal evaluator
         try:
             if evaluator is None:
-                evaluator = TriggerEvaluator(settings)
+                evaluator = TriggerEvaluator(
+                    settings,
+                    alert_sender=alert_sender,
+                )
             evaluator.evaluate_once()
         except Exception:
             logger.exception("Trigger sweep failed; next interval will retry.")

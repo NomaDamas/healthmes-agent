@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 
 import pytest
@@ -124,3 +125,27 @@ async def test_service_fails_closed_without_a_runtime(settings) -> None:
                 ingress=DecisionIngress.REST,
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_service_preserves_server_supplied_idempotency_key(
+    settings,
+) -> None:
+    engine = RecordingEngine()
+    request_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: engine,
+        clock=lambda: NOW,
+    )
+
+    result = await service.ask_wellness(
+        DecisionServiceRequest(
+            request_id=request_id,
+            question="Should I rest?",
+            ingress=DecisionIngress.PROACTIVE,
+            source="focus-fragmentation",
+        )
+    )
+
+    assert result.request_id == request_id
