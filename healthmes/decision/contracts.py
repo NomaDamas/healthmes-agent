@@ -151,6 +151,16 @@ class PersistenceStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class DecisionPersistenceIntent(StrEnum):
+    """Why one completed decision should outlive the transient agent turn."""
+
+    NONE = "none"
+    ACTION = "action"
+    RISK = "risk"
+    MUTATION = "mutation"
+    EXPLICIT_TRACKING = "explicit_tracking"
+
+
 class CompatibilityPreset(StrEnum):
     """Legacy resolver presets; never required by the decision core."""
 
@@ -879,6 +889,9 @@ class DecisionDraft(BaseModel):
     status: DecisionStatus
     answer: str | None = Field(default=None, max_length=MAX_ANSWER_LENGTH)
     proposed_action: bool = False
+    persistence_intent: DecisionPersistenceIntent = (
+        DecisionPersistenceIntent.NONE
+    )
     used_source_ref_ids: list[str] = Field(
         default_factory=list,
         max_length=MAX_SOURCE_REFS,
@@ -949,6 +962,14 @@ class DecisionDraft(BaseModel):
     def validate_draft(self) -> DecisionDraft:
         if self.status is DecisionStatus.COMPLETED and self.answer is None:
             raise ValueError("completed decisions require an answer")
+        if (
+            self.status is not DecisionStatus.COMPLETED
+            and self.persistence_intent
+            is not DecisionPersistenceIntent.NONE
+        ):
+            raise ValueError(
+                "only completed decisions may request persistence"
+            )
         if self.status is DecisionStatus.NEEDS_CLARIFICATION:
             if self.clarification_question is None:
                 raise ValueError(
@@ -963,9 +984,28 @@ class DecisionDraft(BaseModel):
             DecisionStatus.FAILED,
         } and self.proposed_action:
             raise ValueError("blocked or failed decisions cannot propose actions")
-        if self.proposed_action and not self.used_source_ref_ids:
+        if (
+            self.persistence_intent is DecisionPersistenceIntent.ACTION
+            and not self.proposed_action
+        ):
             raise ValueError(
-                "proposed actions require at least one source reference"
+                "action persistence requires a proposed action"
+            )
+        if self.proposed_action and self.persistence_intent not in {
+            DecisionPersistenceIntent.ACTION,
+            DecisionPersistenceIntent.RISK,
+        }:
+            raise ValueError(
+                "proposed actions require action or risk persistence"
+            )
+        if self.persistence_intent in {
+            DecisionPersistenceIntent.ACTION,
+            DecisionPersistenceIntent.RISK,
+            DecisionPersistenceIntent.MUTATION,
+        } and not self.used_source_ref_ids:
+            raise ValueError(
+                "action, risk, and mutation persistence require at least "
+                "one source reference"
             )
         return self
 

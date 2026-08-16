@@ -110,16 +110,18 @@ Hermes의 단일 autonomous LLM loop가 자연어 질문을 해석해 필요한 
   | `compare_impact(factor, metric, window)` | "활동/음식/사람 X가 나에게 좋나?" — 태그된 이벤트 전후 지표 델타 집계 (n, 평균, confidence) |
   | `get_personal_baselines(metrics)` | 14일/90일 baseline과 현재 편차 |
   | `list_tasks / upsert_task / get_schedule / propose_schedule_blocks` | 일정 도메인 CRUD (propose-then-confirm 게이트) |
-  | `log_food / create_medical_record / record_decision` | 캡처 + 설명가능성 |
+  | `log_food / create_medical_record` | 확인된 capture command |
+  | `record_decision` | legacy/bounded command 감사 기록; decision-read runtime에는 비노출 |
   - 모든 Layer B 도구는 **원시 시계열이 아닌 해석된 델타 + confidence/coverage 필드**를 반환 (토큰 절약·프라이버시·환각 방지·설명가능성 4중 이득). 데이터가 빈약하면 "insufficient_data"를 정직하게 반환.
 - **Decision runtime — Hermes + 얇은 Skill:** Hermes가 질문의 목적, 필요한 영역,
   기간과 tool을 선택하고 첫 결과에 따라 추가 조회한다. HealthMes
   `/v1/wellness-decisions` adapter는 제품 요청·응답 계약, source reference 검증과
   선택적 compact 기록만 소유한다. Hermes의 마지막 자유 형식 text는
   `healthmes.decision-draft.v1` JSON envelope로 strict parse하고, 실제 HealthMes
-  MCP transcript에 없는 source reference는 거부한다. `healthmes-planner`,
-  `healthmes-capture`와 domain Skill은 도구 사용법, 채널 workflow와 표현 방식을
-  연결한다.
+  MCP transcript에 없는 source reference는 거부한다. 검토된
+  `healthmes-wellness-decision`과 domain Skill은 HealthMes MCP의 read-only
+  catalog로 제공되며 도구 사용법과 표현 방식을 연결한다. 필수 권한·retention,
+  source 검증과 저장 분류는 Skill이 아니라 Python 계약이 소유한다.
 
 **다입력 플랫폼 해자:** Open Wearables 외 건강·행동·환경·일정·주관 상태·의료
 입력을 계속 추가할 수 있는 범용 인터페이스 자체를 독립적인 해자로 둔다. 모든
@@ -349,7 +351,9 @@ worktree 격리의 상세 계약은
 - `healthmes/calendars/` Google + iCloud 동기화 (§6)
 - `healthmes/engine/triggers.py` + internal DecisionRequest + outbound delivery
   (§4), 같은 ingress를 사용하는 scheduled briefing
-- 스킬: `healthmes-planner`(목표 덤프→태스크 분해→배치 룰→캘린더 블록 제안→decision 기록), `healthmes-capture`(음식 경로만)
+- 스킬: `healthmes-wellness-decision` 공통 조회 지침,
+  `healthmes-planner`(목표 덤프→태스크 분해→배치 룰→확인된 캘린더 제안),
+  `healthmes-capture`(bounded capture command)
 - 인사이트 v1: 템플릿 SQL 상관 (시간대별/요일별/캘린더 키워드별 스트레스, 활동유형 vs 스트레스) — 자유 데이터마이닝 아님
 
 **Phase 2 — 인지에너지 + 설명가능성 UI + Android 사용량 (~3–4주)**

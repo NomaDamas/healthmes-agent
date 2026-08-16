@@ -32,6 +32,7 @@ from healthmes.decision import (
     DecisionCaller,
     DecisionContextHints,
     DecisionDraft,
+    DecisionPersistenceIntent,
     DecisionRequest,
     DecisionRuntimeContractError,
     DecisionRuntimeTurn,
@@ -1896,6 +1897,9 @@ async def test_agent_collects_only_gateway_returned_source_refs(
                     status=DecisionStatus.COMPLETED,
                     answer="The recorded intake is available.",
                     proposed_action=True,
+                    persistence_intent=(
+                        DecisionPersistenceIntent.ACTION
+                    ),
                     used_source_ref_ids=[reference_id],
                 ),
                 metadata=self.metadata,
@@ -2471,6 +2475,9 @@ async def test_runtime_cannot_invent_source_reference_ids(
                     status=DecisionStatus.COMPLETED,
                     answer="This action cites a forged reference.",
                     proposed_action=True,
+                    persistence_intent=(
+                        DecisionPersistenceIntent.ACTION
+                    ),
                     used_source_ref_ids=[forged_id],
                 ),
                 metadata=self.metadata,

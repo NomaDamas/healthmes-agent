@@ -472,9 +472,19 @@ compact record에는 request ID, 시각, 모델/runtime, 짧은 결론, 사용�
 `source_refs`, 제안된 행동과 outcome 연결 ID만 둔다. 사진 bytes, 전체 MCP
 payload와 전체 prompt를 기본 저장하지 않는다.
 
-2026-08-16 현재 finalizer는 source ref가 있는 completed 판단을 조건과 무관하게
-저장한다. 위 조건부 정책은 Issue #164가 구현되고 테스트를 통과한 뒤에만 현재
-동작으로 문서화한다.
+2026-08-16 구현된 `healthmes.decision-private.v2`는 다음만 저장한다.
+
+- request/turn ID, 요청 시각, timezone, execution/privacy scope
+- 모델/runtime와 token 계측
+- 최종 답변, confidence, limitation과 실제 사용한 `source_refs`
+- 선택된 source를 재검증하는 데 필요한 bounded query attestation
+- 해당 query의 access 결과
+- `none/action/risk/mutation/explicit_tracking` persistence intent
+
+질문 원문, caller principal, 전체 tool payload, 사진·음성 bytes, 전체 transcript와
+사용하지 않은 tool trace는 저장하지 않는다. `none`인 단순 조회는 source를
+사용했더라도 DecisionRecord를 만들지 않는다. `action`, `risk`, `mutation`,
+`explicit_tracking`만 compact record를 만들며, v1 레코드는 읽기 호환을 유지한다.
 
 Hermes `/v1/responses` 호출은 `store=false`이며 `previous_response_id`,
 `conversation`과 장기 memory tool을 사용하지 않는다. 다만 현재 Hermes

@@ -116,6 +116,11 @@ from healthmes.mcp_server.domain_search import (
     register_domain_search_tools,
 )
 from healthmes.mcp_server.ow_client import OWClient, OWClientError, resolve_single_user_id
+from healthmes.mcp_server.wellness_skills import (
+    WellnessSkillCatalogError,
+    list_reviewed_wellness_skills,
+    read_reviewed_wellness_skill,
+)
 from healthmes.nutrition.contracts import (
     CaffeineConfirmation,
     ConfirmationStatus,
@@ -257,14 +262,37 @@ mcp: FastMCP = FastMCP(
         "calendar and app context), and compare_impact (before/after deltas "
         "around a factor; associations, not causation). Schedule writes go "
         "through propose_schedule_blocks (propose-then-confirm; proposals are "
-        "not calendar events yet). Always call record_decision after making or "
-        "proposing a decision so it can be explained in the decision viewer. "
+        "not calendar events yet). The filtered wellness decision runtime "
+        "uses the reviewed read-only Skill catalog and domain search tools; "
+        "HealthMes validates sources and conditionally persists a compact "
+        "DecisionRecord after the runtime returns. "
         "Medical-lite capture (create_medical_record / list_medical_records) "
         "is strictly local: records, media and transcripts never leave this "
         "machine — after capture only the structured description text may "
         "re-enter the model context."
     ),
 )
+
+
+@mcp.tool
+def list_wellness_skills() -> dict[str, Any]:
+    """List reviewed read-only guidance available to wellness decisions."""
+
+    try:
+        return list_reviewed_wellness_skills()
+    except WellnessSkillCatalogError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
+def read_wellness_skill(name: str) -> dict[str, Any]:
+    """Read one exact reviewed wellness skill by allowlisted name."""
+
+    try:
+        return read_reviewed_wellness_skill(name)
+    except WellnessSkillCatalogError as exc:
+        raise ToolError(str(exc)) from exc
+
 
 # ---------------------------------------------------------------------------
 # Runtime state (overridable for tests and for app-lifespan wiring)

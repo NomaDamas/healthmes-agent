@@ -38,6 +38,7 @@ from healthmes.decision.contracts import (
     ContextResult,
     ContextStatus,
     DecisionDraft,
+    DecisionPersistenceIntent,
     DecisionRequest,
     DecisionStatus,
     ExecutionScope,
@@ -70,7 +71,7 @@ from healthmes.decision.runtime import (
 )
 from healthmes.decision.validation import strict_model_validate
 
-HEALTHMES_DECISION_SYSTEM_POLICY_VERSION = "healthmes-decision-policy.v2"
+HEALTHMES_DECISION_SYSTEM_POLICY_VERSION = "healthmes-decision-policy.v3"
 HEALTHMES_DECISION_SYSTEM_POLICY = """
 You are one interchangeable reasoning runtime for the HealthMes Decision Agent.
 
@@ -97,8 +98,15 @@ persistence. For this one model iteration you must:
    Never invent, transform, or infer a source reference ID.
 9. Keep observations, uncertainty, trade-offs, and the proposed action
    distinct. Do not claim medical diagnosis or certainty.
-10. Return structured data matching the supplied runtime contract. HealthMes
-    validates source references and performs persistence after this loop.
+10. Classify persistence explicitly. Use `none` for simple lookup or
+    explanation, `action` for a concrete behavior recommendation, `risk` for
+    an important safety warning, `mutation` only when a separately confirmed
+    workflow actually changed data, and `explicit_tracking` only when the
+    user explicitly asked to retain this result. Never persist merely because
+    source data was consulted.
+11. Keep the final answer concise. Return structured data matching the
+    supplied runtime contract. HealthMes validates source references and
+    conditionally persists a compact record after this loop.
 """.strip()
 
 _PRIVACY_RANK = {
@@ -1704,6 +1712,7 @@ class HealthMesDecisionAgent:
             turn_id=turn_id,
             draft=DecisionDraft(
                 status=status,
+                persistence_intent=DecisionPersistenceIntent.NONE,
                 limitations=[code],
             ),
             source_refs=_source_refs(tool_trace),

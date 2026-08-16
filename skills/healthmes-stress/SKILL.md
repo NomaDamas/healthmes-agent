@@ -144,7 +144,7 @@ Keep the result short and use this order:
 [Evidence] Coverage, freshness, confidence, and independent recovery evidence.
 [Proposal] One reversible action, or an explicit no-change / insufficient-data statement.
 [Choices] Keep today / review the highest-intensity block / add the missing context.
-[Why] The viewer_url returned by record_decision.
+[Persistence] none | action | risk | explicit_tracking.
 ```
 
 Write in the user's language. Distinguish measured stress, recovery proxy,
@@ -152,16 +152,12 @@ temporal context, and interpretation.
 
 ## After deciding
 
-- Call `mcp__healthmes__record_decision` with `kind: insight` after any
-  recommendation, including `keep` or a cautious no-change result. Use a
-  valid tree of `input`, `rule`, `option`, and `action` nodes.
-- Minimize the record: persist only the source class, resolution, freshness
-  band, confidence, returned stress-level bands, corroborating signal types,
-  considered options, and chosen action. Never persist raw scores, HRV values,
-  timestamps, user identifiers, event titles, app categories, names, emails,
-  or fatigue, pain, illness, and life-context text.
-- Include the returned `viewer_url` as the "왜 이 판단?" link only in the
-  requesting user's response. Treat it as sensitive: never publish or log it.
+- Return persistence intent `none` for a pure observation or no-change lookup,
+  `action` for a concrete behavior recommendation, `risk` for an important
+  warning, or `explicit_tracking` only when the user asked to retain it.
+- Never call a generic decision-record tool. HealthMes validates source
+  references and conditionally stores a compact record after the runtime
+  returns.
 - If the user chooses to adjust the schedule, hand off to `healthmes-planner`
   so it can use `mcp__healthmes__propose_schedule_blocks` and preserve the
   propose-then-confirm gate.

@@ -46,6 +46,7 @@ from healthmes.decision.agent import DecisionAgentRun, SessionFactory
 from healthmes.decision.contracts import (
     ContextQuery,
     ContextStatus,
+    DecisionPersistenceIntent,
     DecisionRequest,
     DecisionResult,
     DecisionStatus,
@@ -64,7 +65,8 @@ from healthmes.store import DecisionKind, DecisionRecord
 from healthmes.timing import steady_time
 
 DECISION_RECORD_SCHEMA = "healthmes.decision-record.v1"
-DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v1"
+DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v2"
+_LEGACY_DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v1"
 _PERSISTENCE_FAILURE = "decision_record_persistence_failed"
 _MAX_STORED_JSON_BYTES = 2_000_000
 _MAX_POSTGRES_ATTEMPTS = 3
@@ -113,7 +115,6 @@ SourceCandidates = Mapping[str, tuple[_SourceAttempt, ...]]
 
 @dataclass(frozen=True, slots=True)
 class _StoredDecision:
-    request: DecisionRequest
     result: DecisionResult
     source_refs: tuple[SourceRef, ...]
     candidates: SourceCandidates
@@ -170,7 +171,7 @@ class _StoredToolTraceRecord(BaseModel):
         return self
 
 
-class _StoredDecisionPayload(BaseModel):
+class _StoredDecisionPayloadV1(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
@@ -187,6 +188,66 @@ class _StoredDecisionPayload(BaseModel):
     source_refs: tuple[SourceRef, ...]
     tool_trace: tuple[_StoredToolTraceRecord, ...]
     access_trace: tuple[AccessAuditEntry, ...]
+
+
+class _StoredDecisionRequestMetadata(BaseModel):
+    """Non-content request fields needed for correlation and auditing."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    request_id: uuid.UUID
+    turn_id: uuid.UUID
+    requested_at: AwareDatetime
+    timezone: str = Field(min_length=1, max_length=64)
+    execution_scope: str = Field(min_length=1, max_length=16)
+    requested_privacy_level: str = Field(min_length=1, max_length=32)
+
+
+class _StoredSourceAttestation(BaseModel):
+    """Minimum source/query material required for later revalidation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    query: ContextQuery
+    source_refs: tuple[SourceRef, ...]
+
+    @model_validator(mode="after")
+    def validate_refs(self) -> _StoredSourceAttestation:
+        reference_ids = [
+            source_ref.reference_id for source_ref in self.source_refs
+        ]
+        if not reference_ids:
+            raise ValueError("source attestations require source refs")
+        if len(reference_ids) != len(set(reference_ids)):
+            raise ValueError(
+                "source attestation refs must be unique"
+            )
+        return self
+
+
+class _StoredDecisionPayloadV2(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+    )
+
+    schema_name: Literal["healthmes.decision-private.v2"] = Field(
+        alias="schema"
+    )
+    request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request: _StoredDecisionRequestMetadata
+    persistence_intent: DecisionPersistenceIntent
+    result: DecisionResult
+    run: _StoredRun
+    source_refs: tuple[SourceRef, ...]
+    source_attestations: tuple[_StoredSourceAttestation, ...]
+    access_trace: tuple[AccessAuditEntry, ...]
+
+
+StoredDecisionPayload = (
+    _StoredDecisionPayloadV1 | _StoredDecisionPayloadV2
+)
 
 
 class _FinalizationRejected(RuntimeError):
@@ -685,10 +746,7 @@ class DecisionFinalizer:
                 persistence_required=False,
             )
 
-        persistence_required = (
-            canonical_run.draft.status is DecisionStatus.COMPLETED
-            and bool(used_ids)
-        )
+        persistence_required = _run_requires_persistence(canonical_run)
         fingerprint = decision_request_fingerprint(canonical_request)
         finalization_deadline = control.deadline
 
@@ -1426,11 +1484,30 @@ def _stored_decision(
     except (TypeError, ValueError, ValidationError):
         return "decision_record_contract_invalid"
     result = payload.result
+    if isinstance(payload, _StoredDecisionPayloadV1):
+        request_ids_match = (
+            decision_request_fingerprint(payload.request) == fingerprint
+            and payload.request.request_id == row.decision_request_id
+            and payload.request.turn_id == row.decision_turn_id
+        )
+        candidates_trace = payload.tool_trace
+        access_trace = payload.access_trace
+        persistence_intent = (
+            DecisionPersistenceIntent.ACTION
+            if result.proposed_action
+            else DecisionPersistenceIntent.EXPLICIT_TRACKING
+        )
+    else:
+        request_ids_match = (
+            payload.request.request_id == row.decision_request_id
+            and payload.request.turn_id == row.decision_turn_id
+        )
+        candidates_trace = payload.source_attestations
+        access_trace = payload.access_trace
+        persistence_intent = payload.persistence_intent
     if (
         payload.request_fingerprint != fingerprint
-        or decision_request_fingerprint(payload.request) != fingerprint
-        or payload.request.request_id != row.decision_request_id
-        or payload.request.turn_id != row.decision_turn_id
+        or not request_ids_match
         or result.request_id != row.decision_request_id
         or result.turn_id != row.decision_turn_id
         or result.decision_record_id != row.id
@@ -1448,11 +1525,12 @@ def _stored_decision(
             else None
         )
         or row.tokens != _runtime_token_total(payload.run.runtime)
+        or persistence_intent is DecisionPersistenceIntent.NONE
     ):
         return "decision_record_contract_invalid"
     try:
         candidates, trace_refs = _stored_source_candidates(
-            payload.tool_trace
+            candidates_trace
         )
     except ValueError:
         return "decision_record_contract_invalid"
@@ -1462,27 +1540,36 @@ def _stored_decision(
         for source_ref in payload.source_refs
     ):
         return "decision_record_contract_invalid"
-    trace_query_ids = {
-        record.query.query_id for record in payload.tool_trace
-    }
+    trace_query_ids = {record.query.query_id for record in candidates_trace}
     if any(
         entry.query_id not in trace_query_ids
-        for entry in payload.access_trace
+        for entry in access_trace
     ):
         return "decision_record_contract_invalid"
     return _StoredDecision(
-        request=payload.request,
         result=result,
         source_refs=payload.source_refs,
         candidates=candidates,
-        access_trace=payload.access_trace,
+        access_trace=access_trace,
     )
 
 
 def _validate_stored_payload(
     normalized: NormalizedJson,
-) -> _StoredDecisionPayload:
-    payload = _StoredDecisionPayload.model_validate(normalized.value)
+) -> StoredDecisionPayload:
+    if not isinstance(normalized.value, dict):
+        raise ValueError("stored decision payload must be an object")
+    schema_name = normalized.value.get("schema")
+    if schema_name == _LEGACY_DECISION_PAYLOAD_SCHEMA:
+        payload: StoredDecisionPayload = (
+            _StoredDecisionPayloadV1.model_validate(normalized.value)
+        )
+    elif schema_name == DECISION_PAYLOAD_SCHEMA:
+        payload = _StoredDecisionPayloadV2.model_validate(
+            normalized.value
+        )
+    else:
+        raise ValueError("stored decision payload schema is unsupported")
     canonical = normalize_untrusted_json(
         payload.model_dump(
             mode="json",
@@ -1497,13 +1584,18 @@ def _validate_stored_payload(
 
 
 def _stored_source_candidates(
-    trace: Sequence[_StoredToolTraceRecord],
+    trace: Sequence[
+        _StoredToolTraceRecord | _StoredSourceAttestation
+    ],
 ) -> tuple[dict[str, tuple[_SourceAttempt, ...]], dict[str, SourceRef]]:
     candidates: dict[str, list[_SourceAttempt]] = {}
     refs: dict[str, SourceRef] = {}
     canonical_payloads: dict[str, dict[str, Any]] = {}
     for record in trace:
-        if record.status is not ToolCallStatus.COMPLETED:
+        if (
+            isinstance(record, _StoredToolTraceRecord)
+            and record.status is not ToolCallStatus.COMPLETED
+        ):
             continue
         supporting_refs = record.source_refs
         for source_ref in supporting_refs:
@@ -1643,7 +1735,8 @@ def _run_requires_persistence(run: DecisionAgentRun | Any) -> bool:
     return bool(
         isinstance(run, DecisionAgentRun)
         and run.draft.status is DecisionStatus.COMPLETED
-        and run.draft.used_source_ref_ids
+        and run.draft.persistence_intent
+        is not DecisionPersistenceIntent.NONE
     )
 
 
@@ -1751,34 +1844,77 @@ def _decision_payload(
         finished_at=run.finished_at,
         steps_used=run.steps_used,
     )
-    payload: dict[str, Any] = {
-        "schema": DECISION_PAYLOAD_SCHEMA,
-        "request_fingerprint": request_fingerprint,
-        "request": request.model_dump(mode="json", round_trip=True),
-        "result": stored_result.model_dump(
-            mode="json",
-            round_trip=True,
-        ),
-        "run": stored_run.model_dump(mode="json", round_trip=True),
-        "source_refs": [
-            item.model_dump(mode="json", round_trip=True)
-            for item in result.source_refs
-        ],
-        "tool_trace": [
-            _tool_trace_summary(record)
-            for record in run.tool_trace
-        ],
-        "access_trace": [
-            entry.model_dump(mode="json", round_trip=True)
-            for entry in run.access_trace
-        ],
+    source_attestations = _source_attestations(
+        run.tool_trace,
+        selected_refs=result.source_refs,
+    )
+    attested_query_ids = {
+        attestation.query.query_id
+        for attestation in source_attestations
     }
+    payload_model = _StoredDecisionPayloadV2(
+        schema_name=DECISION_PAYLOAD_SCHEMA,
+        request_fingerprint=request_fingerprint,
+        request=_StoredDecisionRequestMetadata(
+            request_id=request.request_id,
+            turn_id=request.turn_id,
+            requested_at=request.requested_at,
+            timezone=request.timezone,
+            execution_scope=request.caller.execution_scope.value,
+            requested_privacy_level=(
+                request.requested_privacy_level.value
+            ),
+        ),
+        persistence_intent=run.draft.persistence_intent,
+        result=stored_result,
+        run=stored_run,
+        source_refs=tuple(result.source_refs),
+        source_attestations=source_attestations,
+        access_trace=tuple(
+            entry
+            for entry in run.access_trace
+            if entry.query_id in attested_query_ids
+        ),
+    )
+    payload = payload_model.model_dump(
+        mode="json",
+        round_trip=True,
+        by_alias=True,
+    )
     normalized = normalize_untrusted_json(
         payload,
         max_bytes=_MAX_STORED_JSON_BYTES,
     )
     assert isinstance(normalized.value, dict)
     return normalized.value
+
+
+def _source_attestations(
+    trace: Sequence[ToolCallRecord],
+    *,
+    selected_refs: Sequence[SourceRef],
+) -> tuple[_StoredSourceAttestation, ...]:
+    selected_ids = {
+        source_ref.reference_id for source_ref in selected_refs
+    }
+    attestations: list[_StoredSourceAttestation] = []
+    for record in trace:
+        if (
+            record.status is not ToolCallStatus.COMPLETED
+            or record.result is None
+            or not selected_ids.intersection(
+                source_ref.reference_id
+                for source_ref in record.result.source_refs
+            )
+        ):
+            continue
+        attestations.append(
+            _StoredSourceAttestation(
+                query=record.effective_query or record.query,
+                source_refs=tuple(record.result.source_refs),
+            )
+        )
+    return tuple(attestations)
 
 
 def _tool_trace_summary(record: ToolCallRecord) -> dict[str, Any]:

@@ -35,6 +35,7 @@ from healthmes.decision import (
     DecisionCaller,
     DecisionDraft,
     DecisionFinalizer,
+    DecisionPersistenceIntent,
     DecisionRequest,
     DecisionResult,
     DecisionStatus,
@@ -239,6 +240,7 @@ def _run(
     answer: str | None = None,
     context_status: ContextStatus = ContextStatus.OK,
     result_limitations: list[str] | None = None,
+    persistence_intent: DecisionPersistenceIntent | None = None,
 ) -> DecisionAgentRun:
     query = query or _query()
     result = ContextResult(
@@ -281,6 +283,14 @@ def _run(
                 "answer": answer
                 or "Take a short break before choosing more caffeine.",
                 "proposed_action": proposed_action,
+                "persistence_intent": (
+                    persistence_intent
+                    or (
+                        DecisionPersistenceIntent.ACTION
+                        if proposed_action
+                        else DecisionPersistenceIntent.NONE
+                    )
+                ),
                 "confidence": 0.8,
                 "uncertainty": "Only the retained context was considered.",
             }
@@ -420,12 +430,16 @@ def test_finalizer_persists_and_revalidates_the_effective_query(persistence):
     with factory() as session:
         row = session.get(DecisionRecord, result.decision_record_id)
         assert row is not None
-        stored_query = row.decision_payload["tool_trace"][0]["query"]
+        stored_query = row.decision_payload[
+            "source_attestations"
+        ][0]["query"]
         assert stored_query["limit"] == 25
         assert stored_query["query_id"] == str(requested_query.query_id)
 
 
-def test_source_backed_information_is_persisted_without_action(persistence):
+def test_source_backed_information_is_not_persisted_without_intent(
+    persistence,
+):
     _engine, factory = persistence
     with factory() as session:
         ref = _source_ref(_event(session))
@@ -438,11 +452,110 @@ def test_source_backed_information_is_persisted_without_action(persistence):
 
     assert result.status is DecisionStatus.COMPLETED
     assert result.proposed_action is False
-    assert result.persistence_status is PersistenceStatus.PERSISTED
+    assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
     with factory() as session:
         assert session.scalar(
             sa.select(sa.func.count()).select_from(DecisionRecord)
-        ) == 1
+        ) == 0
+
+
+@pytest.mark.parametrize(
+    "persistence_intent",
+    (
+        DecisionPersistenceIntent.RISK,
+        DecisionPersistenceIntent.MUTATION,
+    ),
+)
+def test_risk_and_mutation_intents_are_persisted(
+    persistence,
+    persistence_intent,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+
+    result = _finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            proposed_action=False,
+            persistence_intent=persistence_intent,
+        ),
+    )
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert result.persistence_status is PersistenceStatus.PERSISTED
+    with factory() as session:
+        row = session.scalars(sa.select(DecisionRecord)).one()
+        assert row.decision_payload is not None
+        assert (
+            row.decision_payload["persistence_intent"]
+            == persistence_intent.value
+        )
+
+
+def test_explicit_tracking_can_persist_a_source_free_result(
+    persistence,
+):
+    _engine, factory = persistence
+    request = _request(question="Please retain this check-in.")
+
+    result = _finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [],
+            used_ids=[],
+            proposed_action=False,
+            persistence_intent=(
+                DecisionPersistenceIntent.EXPLICIT_TRACKING
+            ),
+        ),
+    )
+
+    assert result.status is DecisionStatus.COMPLETED
+    assert result.source_refs == []
+    assert result.persistence_status is PersistenceStatus.PERSISTED
+    with factory() as session:
+        row = session.scalars(sa.select(DecisionRecord)).one()
+        assert row.decision_payload is not None
+        assert row.decision_payload["source_attestations"] == []
+
+
+def test_compact_record_omits_prompt_caller_and_tool_payload(
+    persistence,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request(
+        question="private prompt with image-secret-token"
+    )
+
+    result = _finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            payload={
+                "raw_photo_bytes": "image-secret-token",
+                "window_title": "private-editor-secret",
+            },
+        ),
+    )
+
+    assert result.persistence_status is PersistenceStatus.PERSISTED
+    with factory() as session:
+        row = session.scalars(sa.select(DecisionRecord)).one()
+        serialized = json.dumps(row.decision_payload)
+        assert request.question not in serialized
+        assert request.caller.principal_id not in serialized
+        assert "image-secret-token" not in serialized
+        assert "private-editor-secret" not in serialized
+        assert "tool_trace" not in row.decision_payload
+        assert "source_attestations" in row.decision_payload
 
 
 def test_tool_result_limitations_are_preserved_when_model_omits_them(
@@ -535,10 +648,9 @@ def test_public_record_redacts_internal_source_reference_ids(
             row.decision_payload["result"]["answer"]
             == answer
         )
-        assert (
-            row.decision_payload["request"]["question"]
-            == request.question
-        )
+        assert "question" not in row.decision_payload["request"]
+        assert "caller" not in row.decision_payload["request"]
+        assert request.question not in json.dumps(row.decision_payload)
 
 
 def test_clarification_is_not_persisted(persistence):
@@ -1760,6 +1872,60 @@ def test_retry_returns_one_logical_record_and_conflicting_request_fails(
         ) == 1
 
 
+def test_retry_reads_and_revalidates_legacy_v1_payload(persistence):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+    finalizer = _finalizer(factory)
+    first = finalizer.finalize(request, run)
+    assert first.decision_record_id is not None
+
+    with factory() as session:
+        row = session.get(DecisionRecord, first.decision_record_id)
+        assert row is not None
+        assert row.decision_payload is not None
+        legacy_payload = {
+            "schema": "healthmes.decision-private.v1",
+            "request_fingerprint": row.decision_request_fingerprint,
+            "request": request.model_dump(
+                mode="json",
+                round_trip=True,
+            ),
+            "result": row.decision_payload["result"],
+            "run": row.decision_payload["run"],
+            "source_refs": row.decision_payload["source_refs"],
+            "tool_trace": [
+                finalizer_module._tool_trace_summary(record)
+                for record in run.tool_trace
+            ],
+            "access_trace": [
+                entry.model_dump(mode="json", round_trip=True)
+                for entry in run.access_trace
+            ],
+        }
+        row.decision_payload = legacy_payload
+        row.decision_payload_digest = _payload_digest(legacy_payload)
+        session.commit()
+
+    retry_request = request.model_copy(
+        update={"turn_id": uuid.uuid4()}
+    )
+    retry = finalizer.finalize(
+        retry_request,
+        _run(retry_request, [ref]),
+    )
+
+    assert retry.decision_record_id == first.decision_record_id
+    assert retry.turn_id == first.turn_id
+    assert retry.persistence_status is PersistenceStatus.PERSISTED
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 1
+
+
 @pytest.mark.parametrize("mutation", ("delete", "expire", "change"))
 def test_retry_revalidates_current_source_state(
     persistence,
@@ -2080,11 +2246,15 @@ def test_external_wearable_information_preserves_retention_limitation(
 
     assert result.status is DecisionStatus.COMPLETED
     assert result.proposed_action is False
-    assert result.persistence_status is PersistenceStatus.PERSISTED
+    assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
     assert (
         "external_source_retention_unverified"
         in result.limitations
     )
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
 
 
 def test_model_and_token_storage_bounds_are_safe(persistence):

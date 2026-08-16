@@ -391,6 +391,7 @@ class FourDomainHermesTransport:
                     "추가 카페인보다 먼저 쉬는 편이 낫습니다."
                 ),
                 "proposed_action": True,
+                "persistence_intent": "action",
                 "used_source_ref_ids": used_source_ref_ids,
                 "limitations": [],
                 "confidence": 0.8,
@@ -1206,15 +1207,9 @@ def test_rest_to_hermes_four_domain_decision_persists_record(
             assert row is not None
             assert row.decision_payload is not None
             stored_request = row.decision_payload["request"]
-            assert (
-                stored_request["caller"]["principal_id"]
-                == "rest-owner"
-            )
-            assert stored_request["caller"]["authenticated"] is True
-            assert (
-                stored_request["caller"]["execution_scope"]
-                == "local"
-            )
+            assert "caller" not in stored_request
+            assert "question" not in stored_request
+            assert stored_request["execution_scope"] == "local"
             assert (
                 stored_request["requested_privacy_level"]
                 == "aggregate"

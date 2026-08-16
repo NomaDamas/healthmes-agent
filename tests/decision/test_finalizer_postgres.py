@@ -44,6 +44,7 @@ from healthmes.decision import (
     DecisionCaller,
     DecisionDraft,
     DecisionFinalizer,
+    DecisionPersistenceIntent,
     DecisionRequest,
     DecisionStatus,
     DomainAccessGrant,
@@ -304,6 +305,7 @@ def _run(
             status=DecisionStatus.COMPLETED,
             answer="Take a short break before choosing more caffeine.",
             proposed_action=True,
+            persistence_intent=DecisionPersistenceIntent.ACTION,
             used_source_ref_ids=[
                 source_ref.reference_id for source_ref in source_refs
             ],

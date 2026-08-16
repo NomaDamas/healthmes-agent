@@ -19,6 +19,7 @@ from healthmes.decision import (
     DecisionCaller,
     DecisionContextHints,
     DecisionDraft,
+    DecisionPersistenceIntent,
     DecisionRequest,
     DecisionResult,
     DecisionStatus,
@@ -469,6 +470,7 @@ def test_action_draft_requires_valid_source_reference():
         status=DecisionStatus.COMPLETED,
         answer="Take a short break before deciding.",
         proposed_action=True,
+        persistence_intent=DecisionPersistenceIntent.ACTION,
         used_source_ref_ids=[reference_id],
     )
 
@@ -478,6 +480,7 @@ def test_action_draft_requires_valid_source_reference():
             status=DecisionStatus.COMPLETED,
             answer="Take a break.",
             proposed_action=True,
+            persistence_intent=DecisionPersistenceIntent.ACTION,
         )
     with pytest.raises(ValidationError, match="invalid ID"):
         DecisionDraft(
@@ -499,6 +502,32 @@ def test_decision_draft_preserves_uncertainty_and_follow_up():
     assert draft.confidence == 0.6
     assert draft.uncertainty == "Sleep coverage is partial."
     assert draft.follow_up_question is not None
+
+
+def test_persistence_intent_contract_rejects_inconsistent_drafts():
+    reference_id = _source_ref().reference_id
+
+    with pytest.raises(ValidationError, match="action persistence"):
+        DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="No action was proposed.",
+            persistence_intent=DecisionPersistenceIntent.ACTION,
+            used_source_ref_ids=[reference_id],
+        )
+    with pytest.raises(ValidationError, match="require at least one"):
+        DecisionDraft(
+            status=DecisionStatus.COMPLETED,
+            answer="This is an important warning.",
+            persistence_intent=DecisionPersistenceIntent.RISK,
+        )
+    with pytest.raises(ValidationError, match="only completed"):
+        DecisionDraft(
+            status=DecisionStatus.NEEDS_CLARIFICATION,
+            persistence_intent=(
+                DecisionPersistenceIntent.EXPLICIT_TRACKING
+            ),
+            clarification_question="What should I retain?",
+        )
 
 
 def test_clarification_requires_a_question_and_cannot_propose_action():

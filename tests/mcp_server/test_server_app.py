@@ -60,6 +60,10 @@ DOMAIN_SEARCH_TOOLS = {
     "search_calendar",
     "search_wearable",
 }
+WELLNESS_SKILL_TOOLS = {
+    "list_wellness_skills",
+    "read_wellness_skill",
+}
 EXPECTED_TOOLS = (
     TRANCHE_1_TOOLS
     | TRANCHE_2_TOOLS
@@ -68,6 +72,7 @@ EXPECTED_TOOLS = (
     | CALENDAR_ADJUSTMENT_TOOLS
     | ACTIVITY_TOOLS
     | DOMAIN_SEARCH_TOOLS
+    | WELLNESS_SKILL_TOOLS
 )
 
 _INITIALIZE = {

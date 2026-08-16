@@ -954,6 +954,13 @@ class HermesRuntimeAdapter:
             output_tokens=response.usage.output_tokens,
         )
         if response.output is not None:
+            if (
+                type(response.output) is not dict
+                or "persistence_intent" not in response.output
+            ):
+                raise DecisionRuntimeContractError(
+                    "hermes_persistence_intent_missing"
+                )
             draft = strict_json_model_validate(
                 DecisionDraft,
                 response.output,
@@ -1105,6 +1112,20 @@ def _canonical_request_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _decision_draft_schema() -> dict[str, JsonValue]:
+    schema = DecisionDraft.model_json_schema()
+    required = list(schema.get("required", ()))
+    if "persistence_intent" not in required:
+        required.append("persistence_intent")
+    schema["required"] = required
+    persistence_schema = schema.get("properties", {}).get(
+        "persistence_intent"
+    )
+    if isinstance(persistence_schema, dict):
+        persistence_schema.pop("default", None)
+    return schema
+
+
 def _iteration_request(
     turn: DecisionRuntimeTurn,
     *,
@@ -1144,7 +1165,7 @@ def _iteration_request(
         ),
         tools=tools,
         allowed_tools=tuple(tool.name for tool in tools),
-        structured_output_schema=DecisionDraft.model_json_schema(),
+        structured_output_schema=_decision_draft_schema(),
     )
     request = HermesModelIterationRequest(
         **payload.model_dump(mode="python", round_trip=True),

@@ -27,6 +27,7 @@ from healthmes.decision import (
     DatabaseDecisionPolicyResolver,
     DecisionCaller,
     DecisionDraft,
+    DecisionPersistenceIntent,
     DecisionRequest,
     DecisionStatus,
     DomainAccessGrant,
@@ -436,6 +437,7 @@ class AdaptiveCrossDomainRuntime:
                     "낫습니다."
                 ),
                 proposed_action=True,
+                persistence_intent=DecisionPersistenceIntent.ACTION,
                 used_source_ref_ids=used_source_ref_ids,
                 confidence=0.8,
                 uncertainty=(
@@ -481,6 +483,7 @@ class CalendarRevocationRuntime:
                 status=DecisionStatus.COMPLETED,
                 answer="The calendar looked busy before access was revoked.",
                 proposed_action=True,
+                persistence_intent=DecisionPersistenceIntent.ACTION,
                 used_source_ref_ids=list(result.source_ref_ids),
                 confidence=0.7,
                 uncertainty="Calendar access changed during the decision.",
@@ -528,6 +531,7 @@ class ActivityConsentRevocationRuntime:
                 status=DecisionStatus.COMPLETED,
                 answer="Activity consent changed during this decision.",
                 proposed_action=True,
+                persistence_intent=DecisionPersistenceIntent.ACTION,
                 used_source_ref_ids=list(result.source_ref_ids),
                 confidence=0.5,
                 uncertainty="The owner revoked activity access.",
@@ -629,11 +633,8 @@ async def test_natural_language_decision_uses_four_real_domains_and_persists(
                 )
                 assert row is not None
                 assert row.decision_request_id == request.request_id
-                assert (
-                    row.decision_payload["request"][
-                        "compatibility_preset"
-                    ]
-                    is None
+                assert "compatibility_preset" not in (
+                    row.decision_payload["request"]
                 )
         finally:
             reopened.dispose()

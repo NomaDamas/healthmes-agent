@@ -18,8 +18,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MCP_TOOL_PY = REPO_ROOT / "vendor" / "hermes-agent" / "tools" / "mcp_tool.py"
 SKILL_MDS = sorted((REPO_ROOT / "skills").glob("*/SKILL.md"))
 
-# The two MCP servers registered by config/hermes-config.yaml.tmpl.
-SERVERS = ("healthmes", "open_wearables")
+# The product decision runtime exposes one HealthMes MCP boundary.
+SERVERS = ("healthmes",)
 
 
 def _vendor_constant(name: str) -> str:
@@ -73,4 +73,13 @@ def test_skill_dirs_all_checked() -> None:
         "healthmes-planner",
         "healthmes-sleep",
         "healthmes-stress",
+        "healthmes-wellness-decision",
     ]
+
+
+def test_product_skills_never_call_open_wearables_directly() -> None:
+    for skill_md in SKILL_MDS:
+        text = skill_md.read_text(encoding="utf-8")
+        assert "mcp__open_wearables__" not in text, (
+            f"{skill_md} bypasses the HealthMes MCP boundary"
+        )
