@@ -155,6 +155,7 @@ from healthmes.decision.search import (
 from healthmes.decision.service import (
     DecisionChannelAdapter,
     DecisionChannelRequest,
+    DecisionIdempotencyConflictError,
     DecisionIngress,
     DecisionRuntimeNotConfiguredError,
     DecisionServiceRequest,
@@ -195,6 +196,7 @@ __all__ = [
     "DecisionCaller",
     "DecisionChannelAdapter",
     "DecisionChannelRequest",
+    "DecisionIdempotencyConflictError",
     "DecisionContextHints",
     "DecisionContextSearchSessionService",
     "DecisionDraft",

@@ -357,7 +357,7 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
 
     top = events[0]
     payload: dict[str, Any] = top.payload or {}
-    summary = payload.get("summary")
+    summary = payload.get("message") or payload.get("summary")
     decision = session.scalar(
         select(DecisionRecord)
         .where(

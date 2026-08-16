@@ -66,6 +66,15 @@ class RecordingBridge:
                 # result that the canonical finalizer would never emit.
                 return DecisionResult.model_construct(**values)
             return DecisionResult(**values)
+        if self.status is DecisionStatus.NEEDS_CLARIFICATION:
+            return DecisionResult(
+                request_id=submission.request_id,
+                turn_id=uuid.uuid4(),
+                status=self.status,
+                clarification_question="Which coffee size are you considering?",
+                persistence_status=PersistenceStatus.NOT_REQUIRED,
+                runtime=RuntimeMetadata(runtime="test"),
+            )
         return DecisionResult(
             request_id=submission.request_id,
             turn_id=uuid.uuid4(),
@@ -156,6 +165,27 @@ def test_simple_proactive_summary_is_deliverable_without_record(
     assert result.ok is True
     assert result.ready_for_native is True
     assert result.decision_record_id is None
+
+
+def test_proactive_clarification_is_deliverable_as_user_message(
+    settings,
+) -> None:
+    sender = DecisionAlertSender(
+        settings,
+        bridge=RecordingBridge(
+            status=DecisionStatus.NEEDS_CLARIFICATION,
+        ),
+    )
+
+    result = sender.send(
+        _fire(),
+        fired_at=NOW,
+        trigger_event_id=TRIGGER_ID,
+    )
+
+    assert result.ok is True
+    assert result.ready_for_native is True
+    assert result.message == "Which coffee size are you considering?"
 
 
 def test_proactive_action_without_confirmed_record_is_retried(

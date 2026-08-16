@@ -4,13 +4,11 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import pytest
 import sqlalchemy as sa
-from fastmcp.exceptions import ToolError
-from sqlalchemy import event
+from pydantic import SecretStr
 from sqlalchemy.orm import sessionmaker
 
 from healthmes.calendars.adjustments import issue_reply_handle
@@ -22,7 +20,6 @@ from healthmes.schedule_proposals import (
 from healthmes.store import Base, DecisionKind, ProposalStatus, create_db_engine
 from healthmes.store.models import DecisionRecord, ScheduleProposal, Task
 
-TREE = {"type": "rule", "label": "concurrent proposal claim"}
 HANDLE_SECRET = "postgres-proposal-test-secret-at-least-32-characters"
 
 
@@ -30,7 +27,9 @@ HANDLE_SECRET = "postgres-proposal-test-secret-at-least-32-characters"
     not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
     reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
 )
-def test_concurrent_decisions_cannot_reassign_the_same_proposal() -> None:
+def test_bounded_schedule_command_persists_one_internal_decision_record(
+    settings,
+) -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = create_db_engine(database_url)
     schema = f"hm_test_{uuid.uuid4().hex}"
@@ -43,69 +42,65 @@ def test_concurrent_decisions_cannot_reassign_the_same_proposal() -> None:
     )
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-    update_gate = threading.Barrier(2, timeout=5)
-
-    with factory() as session:
-        task = Task(title="Concurrent claim")
-        session.add(task)
-        session.flush()
-        proposal = ScheduleProposal(
-            task_id=task.id,
-            proposed_start=datetime(2026, 8, 3, 9, 0, tzinfo=UTC),
-            proposed_end=datetime(2026, 8, 3, 9, 0, tzinfo=UTC) + timedelta(hours=1),
-            status=ProposalStatus.PROPOSED,
-        )
-        session.add(proposal)
-        session.commit()
-        proposal_id = proposal.id
-
-    @event.listens_for(engine, "before_cursor_execute")
-    def align_claim_updates(
-        _connection, _cursor, statement, _parameters, _context, _executemany
-    ) -> None:
-        if (
-            statement.lstrip().upper().startswith("UPDATE")
-            and "schedule_proposal" in statement
-            and "decision_record_id" in statement
-        ):
-            update_gate.wait()
-
-    def claim_once(index: int) -> uuid.UUID | None:
-        with factory() as session:
-            decision = DecisionRecord(
-                kind=DecisionKind.ALERT,
-                tree=TREE,
-                summary=f"decision {index}",
-            )
-            session.add(decision)
-            session.flush()
-            try:
-                server_module._claim_schedule_proposals(
-                    session,
-                    [(str(proposal_id), proposal_id)],
-                    decision.id,
-                )
-                session.commit()
-                return decision.id
-            except ToolError:
-                session.rollback()
-                return None
+    active_settings = settings.model_copy(
+        update={
+            "database_url": database_url,
+            "public_base_url": "http://healthmes.test:8100",
+            "calendar_adjustment_secret": SecretStr(HANDLE_SECRET),
+            "scheduler_enabled": False,
+        }
+    )
+    start = datetime.now(UTC).replace(
+        second=0,
+        microsecond=0,
+    ) + timedelta(days=1)
 
     try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            winners = [
-                future.result(timeout=10)
-                for future in (pool.submit(claim_once, 1), pool.submit(claim_once, 2))
+        server_module.set_settings(active_settings)
+        server_module.set_session_factory(factory)
+        server_module.set_timezone(UTC)
+        result = server_module.propose_schedule_blocks(
+            [
+                server_module.ScheduleBlockIn(
+                    title="Morning focus",
+                    energy_demand="high",
+                    start=start.isoformat(),
+                    end=(start + timedelta(hours=1)).isoformat(),
+                ),
+                server_module.ScheduleBlockIn(
+                    title="Recovery walk",
+                    energy_demand="low",
+                    start=(start + timedelta(hours=2)).isoformat(),
+                    end=(start + timedelta(hours=3)).isoformat(),
+                ),
             ]
+        )
 
-        [winner] = [value for value in winners if value is not None]
-        assert winners.count(None) == 1
+        assert result["status"] == "ok"
+        assert len(result["proposals"]) == 2
         with factory() as session:
-            stored = session.get(ScheduleProposal, proposal_id)
-            assert stored is not None
-            assert stored.decision_record_id == winner
+            proposals = list(session.scalars(sa.select(ScheduleProposal)))
+            decisions = list(session.scalars(sa.select(DecisionRecord)))
+
+        assert len(proposals) == 2
+        assert len(decisions) == 1
+        [decision] = decisions
+        assert {
+            proposal.decision_record_id for proposal in proposals
+        } == {decision.id}
+        assert str(decision.id) == result["decision_record_id"]
+        assert decision.kind is DecisionKind.SCHEDULE_CHANGE
+        assert decision.decision_request_id is None
+        assert decision.decision_turn_id is None
+        assert decision.decision_request_fingerprint is None
+        assert decision.decision_payload is None
+        assert decision.decision_payload_digest is None
+        assert decision.tree["detail"] == {
+            "proposal_count": 2,
+            "confirmation_required": True,
+        }
     finally:
-        event.remove(engine, "before_cursor_execute", align_claim_updates)
+        server_module.reset_runtime_state()
         engine.dispose()
         with admin_engine.begin() as connection:
             connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))

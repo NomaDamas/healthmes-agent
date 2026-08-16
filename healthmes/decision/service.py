@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from threading import Lock
 from typing import Protocol
 
 from pydantic import (
@@ -14,6 +20,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    field_validator,
     model_validator,
 )
 
@@ -30,9 +37,18 @@ from healthmes.decision.contracts import (
     PrivacyLevel,
 )
 
+_CHANNEL_REQUEST_NAMESPACE = uuid.UUID(
+    "ed5fcd43-39c0-4fb4-b968-57455f1fc9bf"
+)
+_MAX_COMPLETED_IDEMPOTENT_REQUESTS = 256
+
 
 class DecisionRuntimeNotConfiguredError(RuntimeError):
     """Raised when an ingress is used without a configured decision engine."""
+
+
+class DecisionIdempotencyConflictError(RuntimeError):
+    """Raised when one request ID is reused for different decision input."""
 
 
 class DecisionIngress(StrEnum):
@@ -83,7 +99,7 @@ class DecisionChannelRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    request_id: uuid.UUID | None = None
+    idempotency_key: str = Field(min_length=1, max_length=255)
     question: str = Field(min_length=1, max_length=8_000)
     source: str = Field(min_length=1, max_length=48)
     session_id: str | None = Field(
@@ -98,6 +114,15 @@ class DecisionChannelRequest(BaseModel):
     hints: DecisionContextHints = Field(
         default_factory=DecisionContextHints
     )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError(
+                "idempotency_key must not contain surrounding whitespace"
+            )
+        return value
 
 
 class DecisionEngine(Protocol):
@@ -118,6 +143,18 @@ class DecisionService(Protocol):
     ) -> DecisionResult: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _ActiveDecision:
+    fingerprint: str
+    task: asyncio.Task[DecisionResult]
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedDecision:
+    fingerprint: str
+    result: DecisionResult
+
+
 class HealthMesDecisionService:
     """Build server-owned DecisionRequests and call the one runtime engine."""
 
@@ -135,6 +172,15 @@ class HealthMesDecisionService:
         self._settings = settings
         self._engine_provider = engine_provider
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._idempotency_lock = Lock()
+        self._active_idempotent_requests: dict[
+            uuid.UUID,
+            _ActiveDecision,
+        ] = {}
+        self._completed_idempotent_requests: OrderedDict[
+            uuid.UUID,
+            _CompletedDecision,
+        ] = OrderedDict()
 
     def build_request(
         self,
@@ -181,6 +227,71 @@ class HealthMesDecisionService:
     ) -> DecisionResult:
         """Run any product reasoning ingress through the same engine."""
 
+        if not isinstance(submission, DecisionServiceRequest):
+            raise TypeError(
+                "submission must be a DecisionServiceRequest"
+            )
+        if submission.request_id is None:
+            return await self._execute(submission)
+
+        request_id = submission.request_id
+        fingerprint = _service_request_fingerprint(submission)
+        loop = asyncio.get_running_loop()
+        with self._idempotency_lock:
+            completed = self._completed_idempotent_requests.get(
+                request_id
+            )
+            if completed is not None:
+                _require_matching_idempotency_fingerprint(
+                    completed.fingerprint,
+                    fingerprint,
+                )
+                self._completed_idempotent_requests.move_to_end(
+                    request_id
+                )
+                return completed.result
+
+            active = self._active_idempotent_requests.get(request_id)
+            if active is not None:
+                _require_matching_idempotency_fingerprint(
+                    active.fingerprint,
+                    fingerprint,
+                )
+                if active.task.get_loop() is not loop:
+                    raise RuntimeError(
+                        "an idempotent decision request is active on "
+                        "another event loop"
+                    )
+                task = active.task
+            else:
+                coroutine = self._execute(submission)
+                try:
+                    task = loop.create_task(
+                        coroutine,
+                        name=f"healthmes-service-{request_id}",
+                    )
+                except BaseException:
+                    coroutine.close()
+                    raise
+                self._active_idempotent_requests[request_id] = (
+                    _ActiveDecision(
+                        fingerprint=fingerprint,
+                        task=task,
+                    )
+                )
+                task.add_done_callback(
+                    lambda done: self._finish_idempotent_request(
+                        request_id,
+                        fingerprint,
+                        done,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _execute(
+        self,
+        submission: DecisionServiceRequest,
+    ) -> DecisionResult:
         request = self.build_request(submission)
         engine = self._engine_provider()
         if engine is None:
@@ -188,6 +299,44 @@ class HealthMesDecisionService:
                 "HealthMes decision runtime is not configured"
             )
         return await engine.ask_wellness(request)
+
+    def _finish_idempotent_request(
+        self,
+        request_id: uuid.UUID,
+        fingerprint: str,
+        task: asyncio.Task[DecisionResult],
+    ) -> None:
+        try:
+            result = task.result()
+        except BaseException:
+            with self._idempotency_lock:
+                active = self._active_idempotent_requests.get(
+                    request_id
+                )
+                if active is not None and active.task is task:
+                    self._active_idempotent_requests.pop(
+                        request_id,
+                        None,
+                    )
+            return
+
+        with self._idempotency_lock:
+            active = self._active_idempotent_requests.get(request_id)
+            if active is None or active.task is not task:
+                return
+            self._active_idempotent_requests.pop(request_id, None)
+            self._completed_idempotent_requests[request_id] = (
+                _CompletedDecision(
+                    fingerprint=fingerprint,
+                    result=result,
+                )
+            )
+            self._completed_idempotent_requests.move_to_end(request_id)
+            while (
+                len(self._completed_idempotent_requests)
+                > _MAX_COMPLETED_IDEMPOTENT_REQUESTS
+            ):
+                self._completed_idempotent_requests.popitem(last=False)
 
 
 class DecisionChannelAdapter:
@@ -212,7 +361,7 @@ class DecisionChannelAdapter:
             )
         return await self._service.ask_wellness(
             DecisionServiceRequest(
-                request_id=submission.request_id,
+                request_id=_channel_request_id(submission),
                 question=submission.question,
                 ingress=DecisionIngress.CHANNEL,
                 source=submission.source,
@@ -227,6 +376,43 @@ class DecisionChannelAdapter:
                 budget=submission.budget,
                 hints=submission.hints,
             )
+        )
+
+
+def _channel_request_id(
+    submission: DecisionChannelRequest,
+) -> uuid.UUID:
+    return uuid.uuid5(
+        _CHANNEL_REQUEST_NAMESPACE,
+        f"{submission.source}\0{submission.idempotency_key}",
+    )
+
+
+def _service_request_fingerprint(
+    submission: DecisionServiceRequest,
+) -> str:
+    payload = submission.model_dump(
+        mode="json",
+        round_trip=True,
+        exclude={"request_id"},
+    )
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_matching_idempotency_fingerprint(
+    stored: str,
+    received: str,
+) -> None:
+    if stored != received:
+        raise DecisionIdempotencyConflictError(
+            "decision request id was reused with different input"
         )
 
 

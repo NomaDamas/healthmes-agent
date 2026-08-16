@@ -166,8 +166,10 @@ def test_completed_decision_replaces_raw_alert_and_links_record(
         assert event.payload["decision"]["source_ref_ids"] == ["sr_123"]
         assert "limitations" not in event.payload["decision"]
         assert event.payload["decision_record_id"] == str(record_id)
+        assert event.payload["message"] == (
+            "Take a ten-minute break, then reassess your focus."
+        )
         serialized = json.dumps(event.payload)
-        assert "Take a ten-minute break" not in serialized
         assert "Drink 200mg caffeine" not in serialized
         assert record.trigger_event_id == event.id
 
@@ -212,4 +214,4 @@ def test_retry_reuses_original_trigger_not_previous_llm_answer(
         assert event is not None
         serialized = json.dumps(event.payload)
         assert "Intermediate LLM answer" not in serialized
-        assert "Final verified answer" not in serialized
+        assert event.payload["message"] == "Final verified answer."

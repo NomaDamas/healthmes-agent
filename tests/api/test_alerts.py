@@ -170,6 +170,32 @@ def test_decision_links_use_exact_trigger_correlation(client, seeded):
     assert glance_alerts["top"]["decision_url"] == alerts[0]["decision_url"]
 
 
+def test_llm_message_is_the_shared_alert_and_glance_display_contract(
+    client,
+    session,
+):
+    event = _event(
+        _utc(9, 13, 50),
+        "scheduled_briefing.morning",
+        payload={
+            **_payload("Deterministic briefing trigger."),
+            "message": "Your recovery is low; keep the morning light.",
+        },
+    )
+    session.add(event)
+    session.commit()
+
+    with frozen():
+        (alert,) = client.get(ALERTS).json()["data"]
+        glance = client.get("/v1/briefing/glance").json()["alerts"]
+
+    assert alert["summary"] == (
+        "Your recovery is low; keep the morning light."
+    )
+    assert glance["top"]["id"] == alert["id"]
+    assert glance["top"]["summary"] == alert["summary"]
+
+
 def test_alert_link_hides_decision_at_exact_expiry(
     client,
     session,

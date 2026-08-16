@@ -809,12 +809,19 @@ def _merge_decision_result(
     result: DecisionDispatchResult,
 ) -> dict[str, Any]:
     metadata = _decision_metadata(result)
-    if not metadata:
+    message = (
+        result.message
+        if result.message is not None
+        and (result.ok or result.ready_for_native)
+        else None
+    )
+    if not metadata and message is None:
         return payload
-    merged = {
-        **payload,
-        "decision": metadata,
-    }
+    merged = {**payload}
+    if metadata:
+        merged["decision"] = metadata
+    if message is not None:
+        merged["message"] = message
     if result.decision_record_id is not None:
         merged["decision_record_id"] = str(
             result.decision_record_id

@@ -220,7 +220,7 @@ def list_alerts(
     data = []
     for event in window:
         payload: dict[str, Any] = event.payload or {}
-        summary = payload.get("summary")
+        summary = payload.get("message") or payload.get("summary")
         evidence = payload.get("evidence")
         proposal = payload.get("proposal")
         data.append(
