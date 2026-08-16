@@ -1,5 +1,15 @@
 import Foundation
 
+enum ScreenTimeSyncTrigger: Equatable, Sendable {
+    case routine
+    case authorizationChanged
+    case inputConfigurationChanged
+
+    var requiresFreshRun: Bool {
+        self != .routine
+    }
+}
+
 protocol ScreenTimeActivitySyncing: Sendable {
     func requestAuthorization() async throws -> ScreenTimeCollectorResult
 
@@ -10,12 +20,28 @@ protocol ScreenTimeActivitySyncing: Sendable {
     func sync(
         pairing: Pairing,
         now: Date,
-        timezone: TimeZone
+        timezone: TimeZone,
+        trigger: ScreenTimeSyncTrigger
     ) async throws -> ScreenTimeSyncOutcome
 
     func reconcilePendingUploads(
         pairing: Pairing?
     ) async throws
+}
+
+extension ScreenTimeActivitySyncing {
+    func sync(
+        pairing: Pairing,
+        now: Date,
+        timezone: TimeZone
+    ) async throws -> ScreenTimeSyncOutcome {
+        try await sync(
+            pairing: pairing,
+            now: now,
+            timezone: timezone,
+            trigger: .routine
+        )
+    }
 }
 
 enum ScreenTimeActivityLifecycleResult: Equatable {
@@ -84,13 +110,18 @@ final class ScreenTimeActivityLifecycleController {
         }
         return ScreenTimeAuthorizationSyncResult(
             authorization: authorization,
-            sync: await catchUp(now: now, timezone: timezone)
+            sync: await catchUp(
+                now: now,
+                timezone: timezone,
+                trigger: .authorizationChanged
+            )
         )
     }
 
     func catchUp(
         now: Date = Date(),
-        timezone: TimeZone = .current
+        timezone: TimeZone = .current,
+        trigger: ScreenTimeSyncTrigger = .routine
     ) async -> ScreenTimeActivityLifecycleResult {
         guard let pairing = pairingProvider() else {
             do {
@@ -113,7 +144,8 @@ final class ScreenTimeActivityLifecycleController {
                 try await syncService.sync(
                     pairing: pairing,
                     now: now,
-                    timezone: timezone
+                    timezone: timezone,
+                    trigger: trigger
                 )
             )
         } catch {
@@ -130,7 +162,22 @@ final class ScreenTimeActivityLifecycleController {
         now: Date = Date(),
         timezone: TimeZone = .current
     ) async -> ScreenTimeActivityLifecycleResult {
-        await catchUp(now: now, timezone: timezone)
+        await catchUp(
+            now: now,
+            timezone: timezone,
+            trigger: .inputConfigurationChanged
+        )
+    }
+
+    func configurationDidChange(
+        now: Date = Date(),
+        timezone: TimeZone = .current
+    ) async -> ScreenTimeActivityLifecycleResult {
+        await catchUp(
+            now: now,
+            timezone: timezone,
+            trigger: .inputConfigurationChanged
+        )
     }
 
     func approveExcludedAppsAndSync(
@@ -151,7 +198,11 @@ final class ScreenTimeActivityLifecycleController {
                 )
             )
         }
-        return await catchUp(now: now, timezone: timezone)
+        return await catchUp(
+            now: now,
+            timezone: timezone,
+            trigger: .inputConfigurationChanged
+        )
     }
 
     private static func failureReason(

@@ -68,6 +68,9 @@ actor ScreenTimeActivityOutbox {
         let entries: [ScreenTimeActivityOutboxEntry]
     }
 
+    static let defaultRetentionInterval: TimeInterval =
+        14 * 24 * 60 * 60
+
     static let shared = ScreenTimeActivityOutbox(
         fileURL: defaultFileURL()
     )
@@ -76,6 +79,7 @@ actor ScreenTimeActivityOutbox {
     private let maximumEntries: Int
     private let maximumBytes: Int
     private let retryPolicy: ScreenTimeActivityRetryPolicy
+    private let retentionInterval: TimeInterval
     private let fileManager: FileManager
     private var entries: [ScreenTimeActivityOutboxEntry]
 
@@ -84,18 +88,24 @@ actor ScreenTimeActivityOutbox {
         maximumEntries: Int = 8,
         maximumBytes: Int = 16 * 1_024 * 1_024,
         retryPolicy: ScreenTimeActivityRetryPolicy = .default,
-        fileManager: FileManager = .default
+        retentionInterval: TimeInterval =
+            ScreenTimeActivityOutbox.defaultRetentionInterval,
+        fileManager: FileManager = .default,
+        now: Date = Date()
     ) {
         self.fileURL = fileURL
         self.maximumEntries = max(1, maximumEntries)
         self.maximumBytes = max(1, maximumBytes)
         self.retryPolicy = retryPolicy
+        self.retentionInterval = max(0, retentionInterval)
         self.fileManager = fileManager
         entries = Self.loadEntries(
             from: fileURL,
             fileManager: fileManager,
             maximumEntries: self.maximumEntries,
-            maximumBytes: self.maximumBytes
+            maximumBytes: self.maximumBytes,
+            retentionInterval: self.retentionInterval,
+            now: now
         )
     }
 
@@ -120,8 +130,10 @@ actor ScreenTimeActivityOutbox {
         deviceID: String,
         pairing: Pairing?,
         state: ScreenTimeCollectionState? = nil,
-        authorization: ScreenTimeCollectorResult? = nil
+        authorization: ScreenTimeCollectorResult? = nil,
+        now: Date = Date()
     ) throws {
+        try purgeExpired(now: now)
         guard let pairing else {
             guard !entries.isEmpty else { return }
             try persist([])
@@ -165,6 +177,7 @@ actor ScreenTimeActivityOutbox {
         pairing: Pairing,
         now: Date
     ) throws -> ScreenTimeActivityOutboxEntry {
+        try purgeExpired(now: now)
         let reportID = try ScreenTimeActivityReportIdentity.reportID(report)
         let destinationID =
             ScreenTimeActivityReportIdentity.destinationID(for: pairing)
@@ -229,6 +242,7 @@ actor ScreenTimeActivityOutbox {
         id: String,
         now: Date
     ) throws -> ScreenTimeActivityOutboxEntry? {
+        try purgeExpired(now: now)
         guard let index = entries.firstIndex(where: { $0.id == id }) else {
             return nil
         }
@@ -251,6 +265,7 @@ actor ScreenTimeActivityOutbox {
         pairing: Pairing,
         now: Date
     ) throws -> ScreenTimeActivityOutboxEntry {
+        try purgeExpired(now: now)
         let prior = entries.first(where: { $0.id == id })
         var candidate = entries.filter { $0.id != id }
         let replacementID =
@@ -306,6 +321,20 @@ actor ScreenTimeActivityOutbox {
         entries.sorted(by: Self.entryOrder)
     }
 
+    @discardableResult
+    func purgeExpired(now: Date) throws -> Int {
+        let candidate = Self.retainedEntries(
+            entries,
+            retentionInterval: retentionInterval,
+            now: now
+        )
+        let removed = entries.count - candidate.count
+        guard removed > 0 else { return 0 }
+        try persist(candidate)
+        entries = candidate
+        return removed
+    }
+
     private func bounded(
         _ source: [ScreenTimeActivityOutboxEntry],
         preserving preservedID: String
@@ -334,13 +363,10 @@ actor ScreenTimeActivityOutbox {
         _ candidate: [ScreenTimeActivityOutboxEntry]
     ) throws {
         do {
-            try fileManager.createDirectory(
-                at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try encodedData(candidate).write(
+            try Self.persist(
+                candidate,
                 to: fileURL,
-                options: .atomic
+                fileManager: fileManager
             )
         } catch let error as ScreenTimeActivityOutboxError {
             throw error
@@ -350,6 +376,12 @@ actor ScreenTimeActivityOutbox {
     }
 
     private func encodedData(
+        _ candidate: [ScreenTimeActivityOutboxEntry]
+    ) throws -> Data {
+        try Self.encodedData(candidate)
+    }
+
+    private static func encodedData(
         _ candidate: [ScreenTimeActivityOutboxEntry]
     ) throws -> Data {
         let encoder = JSONEncoder()
@@ -364,7 +396,9 @@ actor ScreenTimeActivityOutbox {
         from fileURL: URL,
         fileManager: FileManager,
         maximumEntries: Int,
-        maximumBytes: Int
+        maximumBytes: Int,
+        retentionInterval: TimeInterval,
+        now: Date
     ) -> [ScreenTimeActivityOutboxEntry] {
         guard fileManager.fileExists(atPath: fileURL.path) else {
             return []
@@ -394,7 +428,64 @@ actor ScreenTimeActivityOutbox {
             try? fileManager.removeItem(at: fileURL)
             return []
         }
-        return envelope.entries.sorted(by: entryOrder)
+        let sorted = envelope.entries.sorted(by: entryOrder)
+        let retained = retainedEntries(
+            sorted,
+            retentionInterval: retentionInterval,
+            now: now
+        )
+        do {
+            if retained != sorted {
+                try persist(
+                    retained,
+                    to: fileURL,
+                    fileManager: fileManager
+                )
+            } else {
+                try excludeFromBackup(
+                    fileURL.deletingLastPathComponent()
+                )
+                try excludeFromBackup(fileURL)
+            }
+        } catch {
+            try? fileManager.removeItem(at: fileURL)
+            return []
+        }
+        return retained
+    }
+
+    private static func retainedEntries(
+        _ source: [ScreenTimeActivityOutboxEntry],
+        retentionInterval: TimeInterval,
+        now: Date
+    ) -> [ScreenTimeActivityOutboxEntry] {
+        let cutoff = now.addingTimeInterval(-retentionInterval)
+        return source.filter { $0.enqueuedAt > cutoff }
+    }
+
+    private static func persist(
+        _ candidate: [ScreenTimeActivityOutboxEntry],
+        to fileURL: URL,
+        fileManager: FileManager
+    ) throws {
+        let directoryURL = fileURL.deletingLastPathComponent()
+        try fileManager.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        try excludeFromBackup(directoryURL)
+        try encodedData(candidate).write(
+            to: fileURL,
+            options: .atomic
+        )
+        try excludeFromBackup(fileURL)
+    }
+
+    private static func excludeFromBackup(_ sourceURL: URL) throws {
+        var url = sourceURL
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try url.setResourceValues(resourceValues)
     }
 
     private static func isCompatible(

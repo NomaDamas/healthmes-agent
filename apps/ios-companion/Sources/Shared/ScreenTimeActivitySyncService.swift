@@ -153,9 +153,64 @@ private struct ScreenTimeUploadAttemptFailure: Error {
     let underlying: Error
 }
 
+private struct ScreenTimeSyncRequest {
+    let pairing: Pairing
+    let destinationID: String
+    let now: Date
+    let timezone: TimeZone
+    let trigger: ScreenTimeSyncTrigger
+
+    func requiresFreshRun(after active: ScreenTimeSyncRequest) -> Bool {
+        if trigger.requiresFreshRun {
+            return true
+        }
+        if timezone.identifier != active.timezone.identifier {
+            return true
+        }
+        return Self.localHourStart(now, timezone: timezone)
+            > Self.localHourStart(
+                active.now,
+                timezone: active.timezone
+            )
+    }
+
+    func coalescing(with newer: ScreenTimeSyncRequest)
+        -> ScreenTimeSyncRequest
+    {
+        let useNewerClock =
+            newer.now >= now
+            || newer.timezone.identifier != timezone.identifier
+        return ScreenTimeSyncRequest(
+            pairing: newer.pairing,
+            destinationID: newer.destinationID,
+            now: max(now, newer.now),
+            timezone: useNewerClock ? newer.timezone : timezone,
+            trigger: trigger.requiresFreshRun
+                ? trigger
+                : newer.trigger
+        )
+    }
+
+    private static func localHourStart(
+        _ date: Date,
+        timezone: TimeZone
+    ) -> Date {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timezone
+        return calendar.dateInterval(of: .hour, for: date)?.start
+            ?? date
+    }
+}
+
 private struct ScreenTimeActiveSync {
     let id: UUID
-    let destinationID: String
+    let request: ScreenTimeSyncRequest
+    let task: Task<ScreenTimeSyncOutcome, Error>
+}
+
+private struct ScreenTimePendingSync {
+    let id: UUID
+    var request: ScreenTimeSyncRequest
     let task: Task<ScreenTimeSyncOutcome, Error>
 }
 
@@ -295,6 +350,7 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
     private let stateStore: ScreenTimeSyncStateStore
     private let outbox: ScreenTimeActivityOutbox
     private var activeSync: ScreenTimeActiveSync?
+    private var pendingSync: ScreenTimePendingSync?
 
     init(
         deviceID: String,
@@ -331,48 +387,140 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
     func reconcilePendingUploads(
         pairing: Pairing?
     ) async throws {
-        await cancelActiveSyncIfDestinationChanged(
+        await cancelSyncsIfDestinationChanged(
             pairing.map(
                 ScreenTimeActivityReportIdentity.destinationID
             )
         )
         try await outbox.reconcile(
             deviceID: deviceID,
-            pairing: pairing
+            pairing: pairing,
+            now: Date()
         )
     }
 
     func sync(
         pairing: Pairing,
         now: Date = Date(),
-        timezone: TimeZone = .current
+        timezone: TimeZone = .current,
+        trigger: ScreenTimeSyncTrigger = .routine
     ) async throws -> ScreenTimeSyncOutcome {
-        let destinationID =
-            ScreenTimeActivityReportIdentity.destinationID(for: pairing)
-        await cancelActiveSyncIfDestinationChanged(destinationID)
+        let request = ScreenTimeSyncRequest(
+            pairing: pairing,
+            destinationID:
+                ScreenTimeActivityReportIdentity.destinationID(
+                    for: pairing
+                ),
+            now: now,
+            timezone: timezone,
+            trigger: trigger
+        )
+        await cancelSyncsIfDestinationChanged(request.destinationID)
+        if var pendingSync {
+            pendingSync.request = pendingSync.request.coalescing(
+                with: request
+            )
+            self.pendingSync = pendingSync
+            return try await valueIsolatingWaiterCancellation(
+                from: pendingSync.task
+            )
+        }
         if let activeSync {
+            if request.requiresFreshRun(after: activeSync.request) {
+                let task = queuePendingSync(
+                    request,
+                    after: activeSync
+                )
+                return try await valueIsolatingWaiterCancellation(
+                    from: task
+                )
+            }
             return try await valueIsolatingWaiterCancellation(
                 from: activeSync.task
             )
         }
+        let task = startSync(request)
+        return try await valueIsolatingWaiterCancellation(from: task)
+    }
+
+    private func startSync(
+        _ request: ScreenTimeSyncRequest
+    ) -> Task<ScreenTimeSyncOutcome, Error> {
         let id = UUID()
-        let task = Task {
-            try await self.performSync(
-                pairing: pairing,
-                now: now,
-                timezone: timezone
+        let task = Task { [weak self] in
+            guard let self else {
+                throw CancellationError()
+            }
+            return try await self.executeSync(
+                id: id,
+                request: request
             )
         }
         activeSync = ScreenTimeActiveSync(
             id: id,
-            destinationID: destinationID,
+            request: request,
             task: task
         )
-        Task { [weak self] in
-            _ = await task.result
-            await self?.clearActiveSync(id: id)
+        return task
+    }
+
+    private func queuePendingSync(
+        _ request: ScreenTimeSyncRequest,
+        after active: ScreenTimeActiveSync
+    ) -> Task<ScreenTimeSyncOutcome, Error> {
+        let id = UUID()
+        let predecessor = active.task
+        let task = Task { [weak self] in
+            _ = await predecessor.result
+            try Task.checkCancellation()
+            guard let self else {
+                throw CancellationError()
+            }
+            return try await self.executePendingSync(id: id)
         }
-        return try await valueIsolatingWaiterCancellation(from: task)
+        pendingSync = ScreenTimePendingSync(
+            id: id,
+            request: request,
+            task: task
+        )
+        return task
+    }
+
+    private func executePendingSync(
+        id: UUID
+    ) async throws -> ScreenTimeSyncOutcome {
+        try Task.checkCancellation()
+        guard let pendingSync, pendingSync.id == id else {
+            throw CancellationError()
+        }
+        self.pendingSync = nil
+        activeSync = ScreenTimeActiveSync(
+            id: id,
+            request: pendingSync.request,
+            task: pendingSync.task
+        )
+        return try await executeSync(
+            id: id,
+            request: pendingSync.request
+        )
+    }
+
+    private func executeSync(
+        id: UUID,
+        request: ScreenTimeSyncRequest
+    ) async throws -> ScreenTimeSyncOutcome {
+        do {
+            let outcome = try await performSync(
+                pairing: request.pairing,
+                now: request.now,
+                timezone: request.timezone
+            )
+            clearActiveSync(id: id)
+            return outcome
+        } catch {
+            clearActiveSync(id: id)
+            throw error
+        }
     }
 
     /// The sync pipeline is service-owned, not caller-owned.
@@ -404,19 +552,23 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         }
     }
 
-    private func cancelActiveSyncIfDestinationChanged(
+    private func cancelSyncsIfDestinationChanged(
         _ destinationID: String?
     ) async {
-        guard
-            let activeSync,
-            activeSync.destinationID != destinationID
-        else {
-            return
+        if let pendingSync,
+            pendingSync.request.destinationID != destinationID
+        {
+            pendingSync.task.cancel()
+            self.pendingSync = nil
         }
-        activeSync.task.cancel()
-        _ = try? await activeSync.task.value
-        if self.activeSync?.id == activeSync.id {
-            self.activeSync = nil
+        if let activeSync,
+            activeSync.request.destinationID != destinationID
+        {
+            activeSync.task.cancel()
+            _ = try? await activeSync.task.value
+            if self.activeSync?.id == activeSync.id {
+                self.activeSync = nil
+            }
         }
     }
 
@@ -439,7 +591,8 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             deviceID: deviceID,
             pairing: pairing,
             state: state,
-            authorization: authorization
+            authorization: authorization,
+            now: now
         )
         if let reason = ScreenTimeSyncPlanner.skipReason(
             state: state,
@@ -587,7 +740,8 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             try await outbox.reconcile(
                 deviceID: deviceID,
                 pairing: pairing,
-                authorization: authorization
+                authorization: authorization,
+                now: now
             )
             guard
                 let entry = await outbox.oldest(

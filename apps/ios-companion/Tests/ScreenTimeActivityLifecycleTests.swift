@@ -248,6 +248,26 @@ private actor ScreenTimeLifecycleTestTransport:
     }
 }
 
+private actor ScreenTimeLifecycleOfflineStateTransport:
+    ScreenTimeActivityTransport
+{
+    func collectionState(
+        pairing _: Pairing,
+        deviceID _: String
+    ) async throws -> ScreenTimeCollectionState {
+        throw HealthMesAPIError.transport(
+            underlying: URLError(.notConnectedToInternet)
+        )
+    }
+
+    func upload(
+        pairing _: Pairing,
+        report _: ScreenTimeActivityReport
+    ) async throws -> ScreenTimeActivityBatchResult {
+        throw ScreenTimeLifecycleTestError.collectionFailed
+    }
+}
+
 private actor ScreenTimeLifecycleMockSyncService:
     ScreenTimeActivitySyncing
 {
@@ -258,6 +278,7 @@ private actor ScreenTimeLifecycleMockSyncService:
     private var authorizationCalls = 0
     private var approvedExclusions: [Set<String>] = []
     private var syncCalls = 0
+    private var syncTriggers: [ScreenTimeSyncTrigger] = []
     private var reconciledPairings: [Pairing?] = []
 
     init(
@@ -294,9 +315,11 @@ private actor ScreenTimeLifecycleMockSyncService:
     func sync(
         pairing _: Pairing,
         now _: Date,
-        timezone _: TimeZone
+        timezone _: TimeZone,
+        trigger: ScreenTimeSyncTrigger
     ) async throws -> ScreenTimeSyncOutcome {
         syncCalls += 1
+        syncTriggers.append(trigger)
         return syncResult
     }
 
@@ -310,12 +333,14 @@ private actor ScreenTimeLifecycleMockSyncService:
         authorization: Int,
         approvedExclusions: [Set<String>],
         sync: Int,
+        syncTriggers: [ScreenTimeSyncTrigger],
         reconciledPairings: [Pairing?]
     ) {
         (
             authorizationCalls,
             approvedExclusions,
             syncCalls,
+            syncTriggers,
             reconciledPairings
         )
     }
@@ -411,7 +436,10 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
     private func temporaryOutbox(
         maximumEntries: Int = 8,
         maximumBytes: Int = 16 * 1_024 * 1_024,
-        retryPolicy: ScreenTimeActivityRetryPolicy = .default
+        retryPolicy: ScreenTimeActivityRetryPolicy = .default,
+        retentionInterval: TimeInterval =
+            ScreenTimeActivityOutbox.defaultRetentionInterval,
+        now: Date = Date()
     ) -> (ScreenTimeActivityOutbox, URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -425,10 +453,25 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
                 ),
                 maximumEntries: maximumEntries,
                 maximumBytes: maximumBytes,
-                retryPolicy: retryPolicy
+                retryPolicy: retryPolicy,
+                retentionInterval: retentionInterval,
+                now: now
             ),
             directory
         )
+    }
+
+    private func waitForStateCalls(
+        _ expectedCount: Int,
+        from transport: ScreenTimeLifecycleTestTransport
+    ) async throws {
+        for _ in 0..<400 {
+            if await transport.capturedStateCalls() >= expectedCount {
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTFail("timed out waiting for Screen Time state call")
     }
 
     private func isolatedStateStore()
@@ -628,6 +671,141 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(
             secondFailure?.nextAttemptAt,
             now.addingTimeInterval(30)
+        )
+    }
+
+    func testOutboxPurgesExpiredEntriesDuringAppRestart()
+        async throws
+    {
+        let retention = 14 * 24 * 60 * 60.0
+        let base = date("2026-07-01T10:00:00Z")
+        let storage = temporaryOutbox(
+            retentionInterval: retention,
+            now: base
+        )
+        defer {
+            try? FileManager.default.removeItem(at: storage.1)
+        }
+        _ = try await storage.0.enqueue(
+            report: report(),
+            pairing: pairing(),
+            now: base
+        )
+        let fileURL = storage.1.appendingPathComponent("outbox.json")
+
+        let reloaded = ScreenTimeActivityOutbox(
+            fileURL: fileURL,
+            retentionInterval: retention,
+            now: base.addingTimeInterval(retention + 1)
+        )
+        let entries = await reloaded.allEntries()
+        let persisted = try String(
+            contentsOf: fileURL,
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(entries.isEmpty)
+        XCTAssertFalse(persisted.contains("opaque-record"))
+    }
+
+    func testOutboxPurgesExpiredEntriesBeforeOfflineStateFetch()
+        async throws
+    {
+        let retention = 14 * 24 * 60 * 60.0
+        let base = date("2026-07-01T10:00:00Z")
+        let outboxStorage = temporaryOutbox(
+            retentionInterval: retention,
+            now: base
+        )
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        _ = try await outboxStorage.0.enqueue(
+            report: report(),
+            pairing: pairing(),
+            now: base
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: ScreenTimeLifecycleOfflineStateTransport(),
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+
+        do {
+            _ = try await service.sync(
+                pairing: pairing(),
+                now: base.addingTimeInterval(retention + 1),
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+            XCTFail("expected the offline state fetch to fail")
+        } catch {
+            // The local TTL purge must happen before this network failure.
+        }
+        let entries = await outboxStorage.0.allEntries()
+
+        XCTAssertTrue(entries.isEmpty)
+    }
+
+    func testOutboxFileIsExcludedFromBackupAfterWriteAndReload()
+        async throws
+    {
+        let now = date("2026-08-16T10:00:00Z")
+        let storage = temporaryOutbox(now: now)
+        defer {
+            try? FileManager.default.removeItem(at: storage.1)
+        }
+        _ = try await storage.0.enqueue(
+            report: report(),
+            pairing: pairing(),
+            now: now
+        )
+        let fileURL = storage.1.appendingPathComponent("outbox.json")
+        let keys: Set<URLResourceKey> = [.isExcludedFromBackupKey]
+
+        XCTAssertEqual(
+            try storage.1.resourceValues(forKeys: keys)
+                .isExcludedFromBackup,
+            true
+        )
+        XCTAssertEqual(
+            try fileURL.resourceValues(forKeys: keys)
+                .isExcludedFromBackup,
+            true
+        )
+
+        var restoredFileURL = fileURL
+        var restoredValues = URLResourceValues()
+        restoredValues.isExcludedFromBackup = false
+        try restoredFileURL.setResourceValues(restoredValues)
+        XCTAssertEqual(
+            try fileURL.resourceValues(forKeys: keys)
+                .isExcludedFromBackup,
+            false
+        )
+
+        _ = ScreenTimeActivityOutbox(
+            fileURL: fileURL,
+            now: now
+        )
+
+        XCTAssertEqual(
+            try fileURL.resourceValues(forKeys: keys)
+                .isExcludedFromBackup,
+            true
         )
     }
 
@@ -998,6 +1176,133 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(stateCalls, 1)
         XCTAssertEqual(reports.count, 1)
         XCTAssertEqual(counts.collection, 1)
+    }
+
+    func testAuthorizationAndConfigurationTriggersCoalesceIntoOneRerun()
+        async throws
+    {
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let counter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            stateDelayNanoseconds: 150_000_000
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let now = date("2026-08-16T10:34:00Z")
+        let first = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+        }
+        try await waitForStateCalls(1, from: transport)
+
+        let authorization = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!,
+                trigger: .authorizationChanged
+            )
+        }
+        let configuration = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!,
+                trigger: .inputConfigurationChanged
+            )
+        }
+
+        _ = try await [first.value, authorization.value, configuration.value]
+        let counts = await counter.values()
+        let stateCalls = await transport.capturedStateCalls()
+        let reports = await transport.capturedReports()
+
+        XCTAssertEqual(stateCalls, 2)
+        XCTAssertEqual(counts.collection, 2)
+        XCTAssertEqual(reports.count, 2)
+    }
+
+    func testTimezoneChangeQueuesFreshRunWithLatestTimezone()
+        async throws
+    {
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            stateDelayNanoseconds: 150_000_000
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let now = date("2026-08-16T10:34:00Z")
+        let utc = TimeZone(secondsFromGMT: 0)!
+        let seoul = TimeZone(secondsFromGMT: 9 * 60 * 60)!
+        let first = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: utc
+            )
+        }
+        try await waitForStateCalls(1, from: transport)
+
+        let second = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: seoul
+            )
+        }
+
+        _ = try await [first.value, second.value]
+        let reports = await transport.capturedReports()
+
+        XCTAssertEqual(reports.count, 2)
+        XCTAssertEqual(reports[0].timezone, utc.identifier)
+        XCTAssertEqual(reports[1].timezone, seoul.identifier)
     }
 
     func testSoleWaiterCancellationLeavesServiceOwnedPipelineRunning()
@@ -1482,6 +1787,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(result.sync, .completed(.uploaded(batch)))
         XCTAssertEqual(calls.authorization, 1)
         XCTAssertEqual(calls.sync, 1)
+        XCTAssertEqual(calls.syncTriggers, [.authorizationChanged])
         XCTAssertTrue(calls.reconciledPairings.isEmpty)
     }
 
@@ -1616,6 +1922,10 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(result, .completed(.uploaded(batch)))
         XCTAssertEqual(calls.approvedExclusions, [exclusions])
         XCTAssertEqual(calls.sync, 1)
+        XCTAssertEqual(
+            calls.syncTriggers,
+            [.inputConfigurationChanged]
+        )
     }
 
     @MainActor
