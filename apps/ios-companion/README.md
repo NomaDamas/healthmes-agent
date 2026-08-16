@@ -270,15 +270,20 @@ explicit device-UI opt-in
   -> requestAuthorizationAndSync()
   -> successful authorization immediately enters sync
 
-app active / pairing changed / Screen Time BGAppRefreshTask
+app active / pairing changed / saved input configuration
+  / Screen Time BGAppRefreshTask
   -> the same single-flight sync + persistent outbox pipeline
 ```
 
 The device team still owns the settings screen. It should call
 `requestAuthorizationAndSync()` only after an explicit user action and
 `approveExcludedAppsAndSync(_:)` after confirming the exact opaque exclusion
-set. Foreground catch-up and best-effort background scheduling are already
-wired in `HealthMesCompanionApp` and `ScreenTimeActivityRuntime`.
+set. After a successful input-setting or retention revision, it should call
+`inputConfigurationDidChange()` so the saved configuration gets a fresh sync.
+Foreground catch-up, pairing changes, and best-effort background scheduling
+are already wired in `HealthMesCompanionApp` and
+`ScreenTimeActivityRuntime`. A timezone change is detected on the next
+lifecycle sync and also receives a fresh run.
 
 Each sync fetches the paired HealthMes node's current device collection
 settings, removes excluded apps on-device, replaces bundle identifiers with
@@ -313,10 +318,21 @@ response. An identical retry returns that response before evaluating later
 mutable collection settings; sequence reuse with different content remains a
 conflict.
 
-Concurrent callers share a service-owned task. Cancelling one waiter does not
-cancel another foreground/background waiter, and the task may finish with no
-waiters so an idempotent upload or outbox write is not abandoned. A pairing
-destination change is the explicit global cancellation boundary.
+Concurrent callers share a service-owned task. Authorization, input-setting,
+and timezone changes that arrive during an active run coalesce into one
+pending fresh run instead of being lost behind the earlier snapshot.
+Cancelling a foreground waiter does not abandon an idempotent upload or
+outbox write. A `BGAppRefreshTask` expiration cancels the actual shared
+pipeline only when no foreground waiter is using it; an attached foreground
+waiter continues safely. A pairing destination change remains the explicit
+global cancellation boundary.
+
+The local retry outbox is bounded to 8 entries and 16 MiB and has a fixed
+14-day TTL. Expired entries are purged when the outbox is reopened after an
+app restart and before sync/retry mutation, including before an offline
+collection-state request. Its directory and atomic output file are excluded
+from device backup. This transport TTL is separate from the configurable
+central `activity_raw` retention policy.
 
 The normal build always uses an unavailable adapter. The
 `HealthMesCompanionScreenTimeOptIn` scheme expresses user/product intent, not

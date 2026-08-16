@@ -2,12 +2,27 @@ import Foundation
 
 enum ScreenTimeSyncTrigger: Equatable, Sendable {
     case routine
+    case backgroundRefresh
     case authorizationChanged
     case inputConfigurationChanged
 
     var requiresFreshRun: Bool {
-        self != .routine
+        switch self {
+        case .authorizationChanged, .inputConfigurationChanged:
+            return true
+        case .routine, .backgroundRefresh:
+            return false
+        }
     }
+
+    var cancellationLease: ScreenTimeSyncCancellationLease {
+        self == .backgroundRefresh ? .background : .foreground
+    }
+}
+
+enum ScreenTimeSyncCancellationLease: Equatable, Sendable {
+    case foreground
+    case background
 }
 
 protocol ScreenTimeActivitySyncing: Sendable {

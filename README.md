@@ -132,7 +132,12 @@ criteria are tracked in
   The iOS companion now has Screen Time report contracts, a Keychain-derived
   stable collector identity, source-side privacy exclusions, and one
   single-flight/bounded-outbox pipeline used after authorization, on
-  foreground activation, pairing changes, and Screen Time background refresh.
+  foreground activation, pairing/configuration changes, and Screen Time
+  background refresh. Critical authorization/configuration/timezone changes
+  queue one fresh rerun; background expiration cancels the service pipeline
+  only when no foreground waiter shares it. The backup-excluded retry outbox
+  is capped at 8 entries/16 MiB and expires after 14 days across restart and
+  offline retry.
   The normal build selects an unavailable adapter. The explicit
   `HealthMesCompanionScreenTimeOptIn` build probes the selected SDK and
   compiles the real collector only when Apple's App & Website Usage export

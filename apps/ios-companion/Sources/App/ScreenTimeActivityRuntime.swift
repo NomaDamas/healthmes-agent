@@ -121,6 +121,20 @@ final class ScreenTimeActivityRuntime {
         return result
     }
 
+    /// UI-neutral seam for a saved input-setting or retention revision.
+    @discardableResult
+    func inputConfigurationDidChange(
+        now: Date = Date(),
+        timezone: TimeZone = .current
+    ) async -> ScreenTimeActivityLifecycleResult {
+        let result = await lifecycle.configurationDidChange(
+            now: now,
+            timezone: timezone
+        )
+        schedule()
+        return result
+    }
+
     func schedule() {
         guard PairingStore.shared.load() != nil else { return }
         let request = BGAppRefreshTaskRequest(
@@ -146,7 +160,9 @@ final class ScreenTimeActivityRuntime {
                 completion.complete(task, success: false)
                 return
             }
-            let result = await lifecycle.catchUp()
+            let result = await lifecycle.catchUp(
+                trigger: .backgroundRefresh
+            )
             guard !Task.isCancelled else { return }
             completion.complete(
                 task,

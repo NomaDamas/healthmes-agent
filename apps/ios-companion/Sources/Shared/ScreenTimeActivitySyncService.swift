@@ -206,12 +206,14 @@ private struct ScreenTimeActiveSync {
     let id: UUID
     let request: ScreenTimeSyncRequest
     let task: Task<ScreenTimeSyncOutcome, Error>
+    var waiterLeases: [UUID: ScreenTimeSyncCancellationLease]
 }
 
 private struct ScreenTimePendingSync {
     let id: UUID
     var request: ScreenTimeSyncRequest
     let task: Task<ScreenTimeSyncOutcome, Error>
+    var waiterLeases: [UUID: ScreenTimeSyncCancellationLease]
 }
 
 private final class ScreenTimeSyncWaiter: @unchecked Sendable {
@@ -416,36 +418,63 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             trigger: trigger
         )
         await cancelSyncsIfDestinationChanged(request.destinationID)
+        let waiterID = UUID()
+        let syncID: UUID
+        let task: Task<ScreenTimeSyncOutcome, Error>
         if var pendingSync {
             pendingSync.request = pendingSync.request.coalescing(
                 with: request
             )
+            pendingSync.waiterLeases[waiterID] =
+                trigger.cancellationLease
             self.pendingSync = pendingSync
-            return try await valueIsolatingWaiterCancellation(
-                from: pendingSync.task
-            )
-        }
-        if let activeSync {
+            syncID = pendingSync.id
+            task = pendingSync.task
+        } else if var activeSync {
             if request.requiresFreshRun(after: activeSync.request) {
-                let task = queuePendingSync(
+                let pending = queuePendingSync(
                     request,
-                    after: activeSync
+                    after: activeSync,
+                    waiterID: waiterID
                 )
-                return try await valueIsolatingWaiterCancellation(
-                    from: task
-                )
+                syncID = pending.id
+                task = pending.task
+            } else {
+                activeSync.waiterLeases[waiterID] =
+                    trigger.cancellationLease
+                self.activeSync = activeSync
+                syncID = activeSync.id
+                task = activeSync.task
             }
-            return try await valueIsolatingWaiterCancellation(
-                from: activeSync.task
-            )
+        } else {
+            let active = startSync(request, waiterID: waiterID)
+            syncID = active.id
+            task = active.task
         }
-        let task = startSync(request)
-        return try await valueIsolatingWaiterCancellation(from: task)
+
+        do {
+            let outcome = try await valueIsolatingWaiterCancellation(
+                from: task
+            )
+            removeWaiter(syncID: syncID, waiterID: waiterID)
+            return outcome
+        } catch {
+            let cancelledPipeline = removeWaiter(
+                syncID: syncID,
+                waiterID: waiterID,
+                cancelledByCaller: Task.isCancelled
+            )
+            if let cancelledPipeline {
+                _ = await cancelledPipeline.result
+            }
+            throw error
+        }
     }
 
     private func startSync(
-        _ request: ScreenTimeSyncRequest
-    ) -> Task<ScreenTimeSyncOutcome, Error> {
+        _ request: ScreenTimeSyncRequest,
+        waiterID: UUID
+    ) -> ScreenTimeActiveSync {
         let id = UUID()
         let task = Task { [weak self] in
             guard let self else {
@@ -456,18 +485,23 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
                 request: request
             )
         }
-        activeSync = ScreenTimeActiveSync(
+        let active = ScreenTimeActiveSync(
             id: id,
             request: request,
-            task: task
+            task: task,
+            waiterLeases: [
+                waiterID: request.trigger.cancellationLease
+            ]
         )
-        return task
+        activeSync = active
+        return active
     }
 
     private func queuePendingSync(
         _ request: ScreenTimeSyncRequest,
-        after active: ScreenTimeActiveSync
-    ) -> Task<ScreenTimeSyncOutcome, Error> {
+        after active: ScreenTimeActiveSync,
+        waiterID: UUID
+    ) -> ScreenTimePendingSync {
         let id = UUID()
         let predecessor = active.task
         let task = Task { [weak self] in
@@ -478,12 +512,16 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             }
             return try await self.executePendingSync(id: id)
         }
-        pendingSync = ScreenTimePendingSync(
+        let pending = ScreenTimePendingSync(
             id: id,
             request: request,
-            task: task
+            task: task,
+            waiterLeases: [
+                waiterID: request.trigger.cancellationLease
+            ]
         )
-        return task
+        pendingSync = pending
+        return pending
     }
 
     private func executePendingSync(
@@ -497,7 +535,8 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         activeSync = ScreenTimeActiveSync(
             id: id,
             request: pendingSync.request,
-            task: pendingSync.task
+            task: pendingSync.task,
+            waiterLeases: pendingSync.waiterLeases
         )
         return try await executeSync(
             id: id,
@@ -523,13 +562,12 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         }
     }
 
-    /// The sync pipeline is service-owned, not caller-owned.
+    /// The sync pipeline is service-owned, with explicit cancellation leases.
     ///
-    /// Cancelling one foreground/background waiter must not cancel uploads
-    /// observed by another waiter. The pipeline also continues with zero
-    /// waiters so it can finish an idempotent upload or persist retry work.
-    /// A pairing destination change below is the only global cancellation
-    /// boundary; this app-lifetime service has no separate shutdown path.
+    /// Cancelling a foreground waiter does not abandon an idempotent upload or
+    /// retry write. BGTask expiration cancels the shared pipeline only when no
+    /// foreground lease remains. A pairing destination change is the global
+    /// cancellation boundary for this app-lifetime service.
     private func valueIsolatingWaiterCancellation(
         from task: Task<ScreenTimeSyncOutcome, Error>
     ) async throws -> ScreenTimeSyncOutcome {
@@ -550,6 +588,54 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         if activeSync?.id == id {
             activeSync = nil
         }
+    }
+
+    @discardableResult
+    private func removeWaiter(
+        syncID: UUID,
+        waiterID: UUID,
+        cancelledByCaller: Bool = false
+    ) -> Task<ScreenTimeSyncOutcome, Error>? {
+        if var pendingSync, pendingSync.id == syncID {
+            guard
+                let lease = pendingSync.waiterLeases.removeValue(
+                    forKey: waiterID
+                )
+            else {
+                return nil
+            }
+            if cancelledByCaller,
+                lease == .background,
+                !pendingSync.waiterLeases.values.contains(.foreground)
+            {
+                pendingSync.task.cancel()
+                self.pendingSync = nil
+                return nil
+            }
+            self.pendingSync = pendingSync
+            return nil
+        }
+
+        guard var activeSync, activeSync.id == syncID else {
+            return nil
+        }
+        guard
+            let lease = activeSync.waiterLeases.removeValue(
+                forKey: waiterID
+            )
+        else {
+            return nil
+        }
+        if cancelledByCaller,
+            lease == .background,
+            !activeSync.waiterLeases.values.contains(.foreground)
+        {
+            activeSync.task.cancel()
+            self.activeSync = activeSync
+            return activeSync.task
+        }
+        self.activeSync = activeSync
+        return nil
     }
 
     private func cancelSyncsIfDestinationChanged(
@@ -579,7 +665,8 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
     ) async throws -> ScreenTimeSyncOutcome {
         try await outbox.reconcile(
             deviceID: deviceID,
-            pairing: pairing
+            pairing: pairing,
+            now: now
         )
         let state = try await transport.collectionState(
             pairing: pairing,

@@ -273,8 +273,9 @@ Android와 ActivityWatch descriptor도 꺼진 값으로 보인다. Decision Agen
 
 ## 4. iPhone Screen Time 연결 seam
 
-앱 lifecycle, 권한 승인 직후 sync, foreground catch-up, pairing 변경과
-Screen Time 전용 `BGAppRefreshTask`는 같은 UI-neutral 엔진 seam에 연결되어 있다.
+앱 lifecycle, 권한 승인 직후 sync, foreground catch-up, pairing 변경,
+저장된 input/retention 설정 변경과 Screen Time 전용 `BGAppRefreshTask`는 같은
+UI-neutral 엔진 seam에 연결되어 있다.
 실제 설정 화면은 device-team 범위이며, 사용자가 명시적으로 opt-in한 뒤
 `requestAuthorizationAndSync()`를 호출해야 한다.
 
@@ -284,7 +285,8 @@ Screen Time 전용 `BGAppRefreshTask`는 같은 UI-neutral 엔진 seam에 연결
         v
 ScreenTimeActivitySyncService.requestAuthorization()
 
-앱 foreground / 등록된 Screen Time background task
+앱 foreground / pairing 변경 / 등록된 Screen Time background task
+저장된 input 또는 retention 설정 변경
         |
         v
 ScreenTimeActivitySyncService.sync(pairing:)
@@ -313,6 +315,24 @@ background registration과 source-side privacy exclusion을 연결한다. 설정
 추가하지 않는다. Apple API를 실제 컴파일할 수 있는지는 아래 SDK capability
 probe가 결정하며, distribution signing과 실기기 검증은 저장소의 unsigned
 빌드가 대신 증명하지 않는다.
+
+authorization, input 설정 또는 timezone 변경이 기존 sync 실행 중 도착하면 해당
+요청을 앞선 snapshot에 합쳐 버리지 않는다. 중요한 변경 요청들을 하나의 pending
+fresh run으로 합쳐 기존 run 직후 최신 authorization/config/timezone으로 다시
+조회한다. 설정 UI는 서버 PUT이 성공한 뒤
+`ScreenTimeActivityRuntime.inputConfigurationDidChange()`를 호출해야 한다.
+
+foreground 호출 취소는 이미 시작한 idempotent upload나 retry 저장을 중단하지
+않는다. 반면 iOS가 `BGAppRefreshTask`를 만료시키면 background lease가 실제
+service-owned pipeline을 취소한다. 같은 pipeline을 기다리는 foreground waiter가
+있다면 그 waiter와 pipeline은 보존한다. pairing destination 변경은 모든 waiter에
+적용되는 별도의 전역 취소 경계다.
+
+로컬 Screen Time retry outbox는 최대 8개·16 MiB이며 14일 TTL을 가진다. 앱
+재시작 시 파일을 읽는 단계와 매 sync/retry 변경 전에 만료 항목을 삭제하므로,
+장기 오프라인 뒤 첫 네트워크 조회가 실패해도 14일을 넘긴 aggregate는 먼저
+제거된다. outbox 디렉터리와 atomic output 파일은 기기 backup에서 제외된다.
+이 14일 transport TTL은 중앙 `activity_raw` 보존기간 설정과 별도다.
 
 `GET /v1/activity/devices/{device_id}/collection`의
 `raw_retention_cutoff`는 중앙 `activity_raw` 보존 정책으로부터 계산된다. 최초
@@ -494,9 +514,12 @@ Open Wearables의 HealthMes mirror는 범용 `normalized`와 섞지 않고 전�
 7. 설정 저장은 반드시 상세 GET의 `ETag`를 `If-Match`로 보내고, 428/409에서는
    최신 descriptor와 ETag를 재조회해 사용자 편집을 재적용한다. 성공 후에는 PUT
    응답 descriptor와 ETag를 다음 편집의 정본으로 사용한다.
-8. 실제 collection permission과 HealthMes Decision 접근 동의를 하나의 toggle로
+8. 설정 또는 retention PUT 성공 후
+   `ScreenTimeActivityRuntime.inputConfigurationDidChange()`를 호출해 fresh sync를
+   요청한다.
+9. 실제 collection permission과 HealthMes Decision 접근 동의를 하나의 toggle로
    합치지 않는다.
-9. UI가 없어도 API와 수집 엔진은 독립적으로 테스트 가능해야 한다.
+10. UI가 없어도 API와 수집 엔진은 독립적으로 테스트 가능해야 한다.
 
 ## 8. 비범위와 후속
 

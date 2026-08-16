@@ -603,7 +603,7 @@ issue #10(풀 네이티브 폰 앱)·#11(macOS/Windows 데스크톱 글랜스)�
 - ⏸ 보류: **macOS companion 자체의 네이티브 활동 수집기** — 네이티브 앱 작업
   재개 시 별도 구현.
 - ⚠️ 조건부: 아이폰 상세 foreground timeline은 제공하지 않는다. Screen Time
-  aggregate export용 server/sync seam은 있으나 일반 빌드에서는 비활성이다.
-  PR #138은 Issue #168에서 UI-neutral lifecycle을 연결한다. entitlement 승인,
-  distribution signing과 실기기 통합은 외부 후속이다.
+  aggregate export용 server/sync/lifecycle/background seam과 14일 bounded
+  outbox는 연결됐지만 일반 빌드에서는 비활성이다. Apple entitlement 승인,
+  signed provisioning, 사용자 data-access 승인과 실기기 검증은 외부 후속이다.
 - ❌ 불가(구조적): 피부전기활동(애플워치 센서 없음).

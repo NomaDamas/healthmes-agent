@@ -696,7 +696,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         let reloaded = ScreenTimeActivityOutbox(
             fileURL: fileURL,
             retentionInterval: retention,
-            now: base.addingTimeInterval(retention + 1)
+            now: base.addingTimeInterval(retention)
         )
         let entries = await reloaded.allEntries()
         let persisted = try String(
@@ -1441,6 +1441,154 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(reports.count, 1)
     }
 
+    func testBackgroundExpirationCancelsServiceOwnedPipeline()
+        async throws
+    {
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let uploadStarted = expectation(
+            description: "background upload started"
+        )
+        let uploadStopped = expectation(
+            description: "background upload stopped"
+        )
+        ScreenTimeLifecycleCancellationURLProtocol.uploadStarted = {
+            uploadStarted.fulfill()
+        }
+        ScreenTimeLifecycleCancellationURLProtocol.uploadStopped = {
+            uploadStopped.fulfill()
+        }
+        defer {
+            ScreenTimeLifecycleCancellationURLProtocol.uploadStarted = nil
+            ScreenTimeLifecycleCancellationURLProtocol.uploadStopped = nil
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [
+            ScreenTimeLifecycleCancellationURLProtocol.self
+        ]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+        }
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40)
+            ),
+            transport: URLSessionScreenTimeActivityTransport(
+                session: session
+            ),
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let work = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: date("2026-08-16T10:34:00Z"),
+                timezone: TimeZone(secondsFromGMT: 0)!,
+                trigger: .backgroundRefresh
+            )
+        }
+        await fulfillment(of: [uploadStarted], timeout: 2)
+
+        work.cancel()
+
+        do {
+            _ = try await work.value
+            XCTFail("expected background expiration cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+        await fulfillment(of: [uploadStopped], timeout: 2)
+        let entries = await outboxStorage.0.allEntries()
+
+        XCTAssertTrue(entries.isEmpty)
+    }
+
+    func testBackgroundExpirationPreservesSharedForegroundWaiter()
+        async throws
+    {
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let counter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleTestTransport(
+            state: collectionState(),
+            stateDelayNanoseconds: 150_000_000
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "ios-lifecycle-device",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: counter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let now = date("2026-08-16T10:34:00Z")
+        let background = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!,
+                trigger: .backgroundRefresh
+            )
+        }
+        try await waitForStateCalls(1, from: transport)
+        let foreground = Task {
+            try await service.sync(
+                pairing: pairing(),
+                now: now,
+                timezone: TimeZone(secondsFromGMT: 0)!
+            )
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        background.cancel()
+
+        do {
+            _ = try await background.value
+            XCTFail("expected the background waiter to cancel")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let foregroundOutcome = try await foreground.value
+        let counts = await counter.values()
+        let stateCalls = await transport.capturedStateCalls()
+        let reports = await transport.capturedReports()
+
+        guard case .uploaded = foregroundOutcome else {
+            return XCTFail("expected foreground waiter to complete")
+        }
+        XCTAssertEqual(stateCalls, 1)
+        XCTAssertEqual(counts.collection, 1)
+        XCTAssertEqual(reports.count, 1)
+    }
+
     func testDestinationRemovalCancelsURLSessionWithoutRetryWork()
         async throws
     {
@@ -1789,6 +1937,29 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(calls.sync, 1)
         XCTAssertEqual(calls.syncTriggers, [.authorizationChanged])
         XCTAssertTrue(calls.reconciledPairings.isEmpty)
+    }
+
+    @MainActor
+    func testLifecyclePassesBackgroundAndConfigurationTriggers()
+        async
+    {
+        let service = ScreenTimeLifecycleMockSyncService(
+            authorizationResult: collectorResult(),
+            syncResult: .skipped(reason: "test")
+        )
+        let controller = ScreenTimeActivityLifecycleController(
+            syncService: service,
+            pairingProvider: { self.pairing() }
+        )
+
+        _ = await controller.catchUp(trigger: .backgroundRefresh)
+        _ = await controller.configurationDidChange()
+        let calls = await service.calls()
+
+        XCTAssertEqual(
+            calls.syncTriggers,
+            [.backgroundRefresh, .inputConfigurationChanged]
+        )
     }
 
     @MainActor

@@ -56,12 +56,20 @@ Personal Data Node이며 데스크톱 웹과 모바일 UI는 동일한
 upload queue를 유지하고, iPhone Screen Time은 최근 완료 48시간을 반복 가능한
 authoritative snapshot으로 전송하도록 계약돼 있다. 단 최초 승인 직후와 timezone
 변경 직후에는 최신 완료 local-hour 1개에서 시작하고, 이후 같은 timezone에서만
-최대 48시간을 재조정한다. 현재 앱 lifecycle은 Screen Time sync seam을 호출하지
-않는다. PR #138의 Issue #168은 UI-neutral 권한 승인, foreground와 best-effort
-background lifecycle 및 offline outbox를 연결한다. 연결 후에도 일반 iOS 빌드의
-factory는 unavailable adapter를 반환하고 unavailable report를 전송한다. 실제
-snapshot에 필요한 compile flag와 Apple entitlement 승인, 권한 UI, distribution
-서명과 실기기 검증은 device-team 또는 외부 조건이다.
+최대 48시간을 재조정한다. 앱 lifecycle은 승인 직후, foreground, pairing 변경과
+Screen Time `BGAppRefreshTask`를 sync seam에 연결한다. 저장된 input/retention
+변경 뒤 device UI가 호출할 `inputConfigurationDidChange()` seam도 제공하며,
+실행 중 authorization/config/timezone 변경은 하나의 pending fresh run으로
+합쳐진다. 일반 iOS 빌드의 factory는 unavailable adapter를 반환하고, opt-in
+빌드는 SDK capability probe가 성공할 때만 실제 collector를 컴파일한다.
+
+iPhone의 로컬 Screen Time retry outbox는 최대 8개·16 MiB, 고정 14일 TTL이며
+재시작 시와 sync/retry 변경 전에 만료 항목을 제거한다. 디렉터리와 atomic output
+파일은 기기 backup에서 제외된다. 이 transport TTL은 Personal Data Node의
+사용자 설정 가능 `activity_raw` 보존기간과 별도다. BG task 만료는 foreground
+waiter가 없을 때만 실제 service pipeline을 취소한다. Apple entitlement 승인,
+App ID capability, signed provisioning, 사용자 data-access 승인과 실기기 검증은
+여전히 저장소 밖의 배포 조건이며, 실제 설정 화면은 device-team 범위다.
 
 iPhone collector ID는 Screen Time 가명화 Keychain key에서 안정적으로 파생되며
 새 `ios-collector-v1-*` instance는 중앙 input 설정에서 명시적으로 활성화하기
@@ -320,6 +328,8 @@ HealthKit / Health Connect / 사용자 입력
 
 - 기본 queue 보존: 7일
 - 노드가 오프라인일 때 최대 queue: 14일
+- iPhone Screen Time aggregate retry outbox: 고정 14일, 최대 8개·16 MiB,
+  backup 제외
 - 기본 cache 예산: `min(2GB, 사용 가능 공간의 5%)`
 - 업로드 성공 후 미디어는 24시간 grace 뒤 삭제
 - HealthKit/Health Connect에 원본이 남아 있는 데이터는 cursor만 유지하고 재조회한다.

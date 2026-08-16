@@ -350,7 +350,13 @@ contract and injectable `ScreenTimeActivitySyncService` core. Authorization
 success, foreground activation, pairing changes and a Screen Time-specific
 `BGAppRefreshTask` now enter the same single-flight sync and bounded-outbox
 pipeline. The normal repository build always selects the unavailable adapter
-and collects no Apple activity.
+and collects no Apple activity. Saved input/retention revisions have a
+UI-neutral `inputConfigurationDidChange()` hook. Authorization, configuration,
+and timezone changes observed during an active sync coalesce into one fresh
+pending run. BG task expiration cancels the service pipeline only when no
+foreground waiter shares it. The local outbox is capped at 8 entries/16 MiB,
+expires entries after 14 days across restart and offline retry, and is
+excluded from device backup.
 
 `HealthMesCompanionScreenTimeOptIn` is an opt-in request scheme, not an
 eligibility assertion. Run
