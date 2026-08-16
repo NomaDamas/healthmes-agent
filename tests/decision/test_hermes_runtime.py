@@ -38,6 +38,7 @@ from healthmes.hermes_runtime_identity import (
     HermesRuntimeIdentityError,
     build_runtime_manifest,
     load_runtime_manifest,
+    runtime_execution_artifacts,
     runtime_home_artifact_sha256,
     seal_supervised_runtime,
     sign_runtime_attestation,
@@ -388,6 +389,73 @@ def test_supervised_runtime_rejects_launcher_content_drift(
         )
 
 
+def test_verified_launcher_rejects_one_byte_over_limit(
+    runtime_bundle: RuntimeBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from healthmes import hermes_runtime_identity
+
+    launcher = Path(runtime_bundle.manifest.launch_argv[0])
+    size = launcher.stat().st_size
+    assert size > 1
+    monkeypatch.setattr(
+        hermes_runtime_identity,
+        "_MAX_EXECUTION_ARTIFACT_BYTES",
+        size - 1,
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_execution_artifact_too_large",
+    ):
+        hermes_runtime_identity.open_verified_runtime_launcher(
+            runtime_bundle.manifest
+        )
+
+
+def test_execution_artifact_rejects_replacement_during_fingerprint(
+    runtime_bundle: RuntimeBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from healthmes import hermes_runtime_identity
+
+    launcher = Path(runtime_bundle.manifest.launch_argv[0])
+    original_read = hermes_runtime_identity._read_regular_file
+
+    def replacing_read(
+        path: Path,
+        *,
+        code: str,
+        max_bytes: int,
+        owner_only: bool,
+    ) -> bytes:
+        content = original_read(
+            path,
+            code=code,
+            max_bytes=max_bytes,
+            owner_only=owner_only,
+        )
+        if path == launcher.resolve():
+            launcher.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            launcher.chmod(0o755)
+        return content
+
+    monkeypatch.setattr(
+        hermes_runtime_identity,
+        "_read_regular_file",
+        replacing_read,
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_execution_artifact_unsafe",
+    ):
+        runtime_execution_artifacts(
+            manifest=runtime_bundle.manifest,
+            vendor_root=runtime_bundle.vendor_root,
+        )
+
+
 def test_supervised_runtime_rejects_child_environment_drift(
     runtime_bundle: RuntimeBundle,
 ) -> None:
@@ -581,6 +649,77 @@ async def test_runtime_process_seals_manifest_before_child_launch(
         process.state.manifest.runtime_id
         != runtime_bundle.prepared_manifest.runtime_id
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_process_executes_verified_launcher_snapshot(
+    runtime_bundle: RuntimeBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_runtime_manifest(
+        runtime_bundle.manifest_path,
+        runtime_bundle.prepared_manifest,
+    )
+    launcher = Path(runtime_bundle.prepared_manifest.launch_argv[0])
+    sealed_bytes = launcher.read_bytes()
+    replacement = launcher.with_name("replacement-python")
+    replacement.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    replacement.chmod(0o755)
+    observed_executable: list[str] = []
+
+    class FakeProcess:
+        returncode = None
+        pid = 424242
+
+    async def fake_create_subprocess_exec(
+        *argv: str,
+        **kwargs: Any,
+    ) -> FakeProcess:
+        replacement.replace(launcher)
+        assert launcher.read_text(encoding="utf-8") == (
+            "#!/bin/sh\nexit 99\n"
+        )
+        executable = str(kwargs["executable"])
+        observed_executable.append(executable)
+        assert executable != str(launcher)
+        assert Path(executable).read_bytes() == sealed_bytes
+        assert argv == runtime_bundle.prepared_manifest.launch_argv
+        launcher.write_bytes(sealed_bytes)
+        launcher.chmod(0o755)
+        return FakeProcess()
+
+    async def fake_wait_until_ready(**_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    process = HermesRuntimeProcess(
+        HermesRuntimeSupervisorConfig(
+            hermes_home=runtime_bundle.home,
+            manifest_path=runtime_bundle.manifest_path,
+            attestation_key_path=runtime_bundle.key_path,
+            vendor_root=runtime_bundle.vendor_root,
+        ),
+        environ=PROVIDER_ENV,
+        mcp_inventory_probe=lambda _connection, _timeout: asyncio.sleep(
+            0,
+            result=HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256,
+        ),
+    )
+    monkeypatch.setattr(
+        process,
+        "_wait_until_ready",
+        fake_wait_until_ready,
+    )
+
+    await process.start()
+
+    assert observed_executable
+    assert launcher.read_bytes() == sealed_bytes
+    assert process.state.manifest.sealed is True
 
 
 @pytest.mark.asyncio

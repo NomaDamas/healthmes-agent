@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +18,7 @@ from healthmes.hermes_runtime_supervisor import (
     _next_restart_backoff,
     create_supervisor_app,
 )
+from healthmes.hermes_runtime_supervisor import main as supervisor_main
 
 
 def _supervisor_config(
@@ -185,11 +187,418 @@ async def test_watchdog_restarts_immediately_on_runtime_identity_drift(
     await process.aclose()
 
 
+@pytest.mark.asyncio
+async def test_concurrent_close_prevents_watchdog_resurrection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for iteration in range(100):
+        process = HermesRuntimeProcess(
+            _supervisor_config(tmp_path / str(iteration))
+        )
+        children, _ = _install_lifecycle_harness(
+            process,
+            monkeypatch,
+        )
+        await process._lifecycle_lock.acquire()
+        try:
+            close_task = asyncio.create_task(process.aclose())
+            await asyncio.sleep(0)
+            start_task = asyncio.create_task(process.start_observable())
+            await asyncio.sleep(0)
+            process._lifecycle_lock.release()
+
+            await asyncio.wait_for(
+                asyncio.gather(close_task, start_task),
+                timeout=1,
+            )
+            await asyncio.sleep(0)
+
+            assert children == []
+            assert process._monitor_task is None
+            assert process._lifecycle_state == "closed"
+        finally:
+            if process._lifecycle_lock.locked():
+                process._lifecycle_lock.release()
+            await process.aclose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_close_prevents_direct_start_resurrection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for iteration in range(100):
+        process = HermesRuntimeProcess(
+            _supervisor_config(tmp_path / str(iteration))
+        )
+        children, _ = _install_lifecycle_harness(
+            process,
+            monkeypatch,
+        )
+        await process._lifecycle_lock.acquire()
+        try:
+            close_task = asyncio.create_task(process.aclose())
+            await asyncio.sleep(0)
+            start_task = asyncio.create_task(process.start())
+            await asyncio.sleep(0)
+            process._lifecycle_lock.release()
+
+            await asyncio.wait_for(
+                asyncio.gather(close_task, start_task),
+                timeout=1,
+            )
+
+            assert children == []
+            assert process._monitor_task is None
+            assert process._lifecycle_state == "closed"
+        finally:
+            if process._lifecycle_lock.locked():
+                process._lifecycle_lock.release()
+            await process.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_stops_child_launched_by_inflight_direct_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = HermesRuntimeProcess(_supervisor_config(tmp_path))
+    children: list[Any] = []
+    launch_entered = asyncio.Event()
+    allow_launch = asyncio.Event()
+
+    async def launch_child() -> None:
+        launch_entered.set()
+        await allow_launch.wait()
+        child = SimpleNamespace(returncode=None)
+        children.append(child)
+        process._process = child
+        process._state = object()  # type: ignore[assignment]
+        process._launch_argv = ("fake-hermes",)
+        process._healthy = True
+
+    async def stop_child() -> None:
+        process._process = None
+        process._state = None
+        process._launch_argv = None
+        process._healthy = False
+
+    monkeypatch.setattr(process, "_launch_child", launch_child)
+    monkeypatch.setattr(process, "_stop_child", stop_child)
+
+    start_task = asyncio.create_task(process.start())
+    await asyncio.wait_for(launch_entered.wait(), timeout=1)
+    close_task = asyncio.create_task(process.aclose())
+    await asyncio.sleep(0)
+
+    assert process._lifecycle_state == "closing"
+    allow_launch.set()
+    await asyncio.wait_for(
+        asyncio.gather(start_task, close_task),
+        timeout=1,
+    )
+
+    assert len(children) == 1
+    assert process._process is None
+    assert process._monitor_task is None
+    assert process._lifecycle_state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_closed_supervisor_rejects_all_restart_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = HermesRuntimeProcess(_supervisor_config(tmp_path))
+    children, _ = _install_lifecycle_harness(process, monkeypatch)
+
+    await process.aclose()
+    await process.start()
+    await process.start_observable()
+    await asyncio.sleep(0)
+
+    assert children == []
+    assert process._monitor_task is None
+    assert process._lifecycle_state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_close_failure_is_retryable_without_publishing_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = HermesRuntimeProcess(_supervisor_config(tmp_path))
+    child = SimpleNamespace(returncode=None)
+    process._process = child
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    attempts = 0
+
+    async def stop_child() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("simulated teardown failure")
+        process._process = None
+        process._state = None
+        process._launch_argv = None
+        process._healthy = False
+
+    monkeypatch.setattr(process, "_stop_child", stop_child)
+
+    with pytest.raises(RuntimeError, match="simulated teardown failure"):
+        await process.aclose()
+
+    assert process._lifecycle_state == "close_failed"
+    assert process._process is child
+    await process.start()
+    await process.start_observable()
+    assert process._monitor_task is None
+    assert process._process is child
+
+    await process.aclose()
+
+    assert attempts == 2
+    assert process._process is None
+    assert process._lifecycle_state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_waits_for_child_teardown_before_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for iteration in range(50):
+        process = HermesRuntimeProcess(
+            _supervisor_config(tmp_path / str(iteration))
+        )
+        child = SimpleNamespace(returncode=None)
+        process._process = child
+        process._state = object()  # type: ignore[assignment]
+        process._launch_argv = ("fake-hermes",)
+        process._healthy = True
+        stop_started = asyncio.Event()
+        allow_stop = asyncio.Event()
+
+        async def stop_child() -> None:
+            stop_started.set()
+            await allow_stop.wait()
+            process._process = None
+            process._state = None
+            process._launch_argv = None
+            process._healthy = False
+
+        monkeypatch.setattr(process, "_stop_child", stop_child)
+        close_task = asyncio.create_task(process.aclose())
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+
+        for _ in range(3):
+            close_task.cancel()
+            await asyncio.sleep(0)
+            assert process._lifecycle_state == "closing"
+            assert process._process is child
+
+        allow_stop.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close_task, timeout=1)
+
+        assert process._process is None
+        assert process._monitor_task is None
+        assert process._lifecycle_state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_waiting_for_child_lock_cannot_orphan_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = HermesRuntimeProcess(_supervisor_config(tmp_path))
+    child = SimpleNamespace(returncode=None)
+    process._process = child
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+
+    async def stop_child() -> None:
+        process._process = None
+        process._state = None
+        process._launch_argv = None
+        process._healthy = False
+
+    monkeypatch.setattr(process, "_stop_child", stop_child)
+    await process._child_lock.acquire()
+    try:
+        close_task = asyncio.create_task(process.aclose())
+        while process._lifecycle_state != "closing":
+            await asyncio.sleep(0)
+        close_task.cancel()
+        await asyncio.sleep(0)
+
+        assert process._lifecycle_state == "closing"
+        assert process._process is child
+    finally:
+        process._child_lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(close_task, timeout=1)
+
+    assert process._process is None
+    assert process._lifecycle_state == "closed"
+
+
 def test_restart_backoff_is_exponential_and_capped() -> None:
     assert _next_restart_backoff(0, initial=0.25, maximum=1) == 0.25
     assert _next_restart_backoff(0.25, initial=0.25, maximum=1) == 0.5
     assert _next_restart_backoff(0.5, initial=0.25, maximum=1) == 1
     assert _next_restart_backoff(1, initial=0.25, maximum=1) == 1
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "startup_timeout_seconds",
+        "mcp_probe_timeout_seconds",
+        "health_check_interval_seconds",
+        "health_check_timeout_seconds",
+        "restart_backoff_initial_seconds",
+        "restart_backoff_max_seconds",
+    ),
+)
+@pytest.mark.parametrize(
+    "value",
+    (float("nan"), float("inf"), float("-inf")),
+    ids=("nan", "positive-infinity", "negative-infinity"),
+)
+def test_supervisor_config_rejects_nonfinite_lifecycle_values(
+    tmp_path: Path,
+    field_name: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="must be finite and positive"):
+        replace(
+            _supervisor_config(tmp_path),
+            **{field_name: value},
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "startup_timeout_seconds",
+        "mcp_probe_timeout_seconds",
+        "health_check_interval_seconds",
+        "health_check_timeout_seconds",
+        "restart_backoff_initial_seconds",
+        "restart_backoff_max_seconds",
+    ),
+)
+@pytest.mark.parametrize("value", (0, -1))
+def test_supervisor_config_rejects_nonpositive_lifecycle_values(
+    tmp_path: Path,
+    field_name: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="must be finite and positive"):
+        replace(
+            _supervisor_config(tmp_path),
+            **{field_name: value},
+        )
+
+
+def test_supervisor_config_rejects_inverted_restart_backoff(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="restart backoff max must be at least the initial delay",
+    ):
+        replace(
+            _supervisor_config(tmp_path),
+            restart_backoff_initial_seconds=2,
+            restart_backoff_max_seconds=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "flag",
+    (
+        "--startup-timeout",
+        "--mcp-probe-timeout",
+        "--health-check-interval",
+        "--health-check-timeout",
+        "--restart-backoff-initial",
+        "--restart-backoff-max",
+    ),
+)
+@pytest.mark.parametrize(
+    "value",
+    ("nan", "inf", "-inf"),
+)
+def test_supervisor_cli_rejects_nonfinite_lifecycle_values(
+    tmp_path: Path,
+    flag: str,
+    value: str,
+) -> None:
+    with pytest.raises(SystemExit, match="must be finite and positive"):
+        supervisor_main(
+            [
+                "--hermes-home",
+                str(tmp_path / "home"),
+                "--vendor-root",
+                str(tmp_path / "vendor"),
+                f"{flag}={value}",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "flag",
+    (
+        "--startup-timeout",
+        "--mcp-probe-timeout",
+        "--health-check-interval",
+        "--health-check-timeout",
+        "--restart-backoff-initial",
+        "--restart-backoff-max",
+    ),
+)
+@pytest.mark.parametrize("value", ("0", "-1"))
+def test_supervisor_cli_rejects_nonpositive_lifecycle_values(
+    tmp_path: Path,
+    flag: str,
+    value: str,
+) -> None:
+    with pytest.raises(SystemExit, match="must be finite and positive"):
+        supervisor_main(
+            [
+                "--hermes-home",
+                str(tmp_path / "home"),
+                "--vendor-root",
+                str(tmp_path / "vendor"),
+                f"{flag}={value}",
+            ]
+        )
+
+
+def test_supervisor_cli_rejects_inverted_restart_backoff(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        SystemExit,
+        match="restart backoff max must be at least the initial delay",
+    ):
+        supervisor_main(
+            [
+                "--hermes-home",
+                str(tmp_path / "home"),
+                "--vendor-root",
+                str(tmp_path / "vendor"),
+                "--restart-backoff-initial=2",
+                "--restart-backoff-max=1",
+            ]
+        )
 
 
 def test_parent_health_remains_observable_while_runtime_recovers() -> None:

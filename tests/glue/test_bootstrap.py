@@ -11,21 +11,25 @@ from pathlib import Path
 import pytest
 import yaml
 
+from healthmes import hermes_runtime_identity
 from healthmes.decision import (
     HERMES_DECISION_MCP_TOOL_NAMES,
     HermesDecisionProfileAssertion,
 )
 from healthmes.hermes_runtime_identity import (
     HERMES_RUNTIME_CONTROL_SOURCE_NAMES,
+    HERMES_RUNTIME_EXECUTION_ARTIFACT_NAMES,
     HERMES_RUNTIME_HOME_ARTIFACT_NAMES,
     HERMES_RUNTIME_PROVIDER_ENV_NAMES,
     HermesDecisionRuntimeManifest,
+    HermesRuntimeExecutionArtifact,
     HermesRuntimeIdentityError,
     load_attestation_key,
     load_runtime_manifest,
     runtime_home_artifact_sha256,
     seal_supervised_runtime,
     validate_supervised_runtime,
+    write_runtime_manifest,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -119,6 +123,34 @@ def _seal_bootstrapped_runtime(
         vendor_root=REPO_ROOT / "vendor" / "hermes-agent",
         environment=env,
     )[0]
+
+
+def _fake_container_seal(
+    manifest: HermesDecisionRuntimeManifest,
+) -> HermesDecisionRuntimeManifest:
+    artifacts = tuple(
+        HermesRuntimeExecutionArtifact(
+            name=name,
+            path=f"/opt/runtime/{index}",
+            resolved_path=f"/opt/runtime/{index}",
+            sha256=f"{index + 1:064x}",
+            mode=0o755 if "launcher" in name or "interpreter" in name else 0o644,
+        )
+        for index, name in enumerate(
+            HERMES_RUNTIME_EXECUTION_ARTIFACT_NAMES
+        )
+    )
+    payload = manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude={"runtime_id"},
+    )
+    payload["sealed"] = True
+    payload["execution_artifacts"] = [
+        artifact.model_dump(mode="json") for artifact in artifacts
+    ]
+    payload["runtime_id"] = hermes_runtime_identity._sha256_json(payload)
+    return hermes_runtime_identity._manifest_validate(payload)
 
 
 def test_full_run_builds_only_attested_decision_runtime(
@@ -469,6 +501,131 @@ def test_second_run_preserves_unchanged_sealed_runtime_manifest(
     assert manifest_path.read_bytes() == before
     assert load_runtime_manifest(manifest_path) == sealed
     assert load_runtime_manifest(manifest_path).sealed is True
+
+
+@pytest.mark.parametrize(
+    "artifact_change",
+    (
+        "launcher-bytes",
+        "launcher-mode",
+        "launcher-resolved-path",
+        "pyvenv",
+        "supervisor-interpreter",
+    ),
+)
+def test_changed_execution_artifact_publishes_unsealed_intent(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_change: str,
+) -> None:
+    _configure_sealable_native_runtime(bootstrap, tmp_path, monkeypatch)
+    launcher = bootstrap.NATIVE_DECISION_VENV / "bin" / "python"
+    supervisor_interpreter = tmp_path / "supervisor-python"
+    supervisor_interpreter.write_text(
+        "#!/bin/sh\nexit 0\n",
+        encoding="utf-8",
+    )
+    supervisor_interpreter.chmod(0o755)
+    monkeypatch.setattr(
+        hermes_runtime_identity.sys,
+        "executable",
+        str(supervisor_interpreter),
+    )
+
+    alternate_launcher = tmp_path / "alternate-python"
+    if artifact_change == "launcher-resolved-path":
+        original_launcher = tmp_path / "original-python"
+        for path in (original_launcher, alternate_launcher):
+            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            path.chmod(0o755)
+        launcher.unlink()
+        launcher.symlink_to(original_launcher)
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    sealed = _seal_bootstrapped_runtime(
+        bootstrap,
+        hermes_home,
+        env_file,
+    )
+
+    if artifact_change == "launcher-bytes":
+        launcher.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    elif artifact_change == "launcher-mode":
+        launcher.chmod(0o700)
+    elif artifact_change == "launcher-resolved-path":
+        launcher.unlink()
+        launcher.symlink_to(alternate_launcher)
+    elif artifact_change == "pyvenv":
+        (
+            bootstrap.NATIVE_DECISION_VENV / "pyvenv.cfg"
+        ).write_text(
+            "home = /changed/python\n",
+            encoding="utf-8",
+        )
+    else:
+        supervisor_interpreter.write_text(
+            "#!/bin/sh\nexit 1\n",
+            encoding="utf-8",
+        )
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    manifest = load_runtime_manifest(
+        _decision_home(hermes_home) / "runtime-manifest.json"
+    )
+    assert manifest.sealed is False
+    assert manifest.execution_artifacts == ()
+    assert manifest.runtime_id != sealed.runtime_id
+
+
+@pytest.mark.parametrize(
+    "missing_artifact",
+    ("launcher", "pyvenv", "supervisor-interpreter"),
+)
+def test_unverifiable_execution_artifact_publishes_unsealed_intent(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_artifact: str,
+) -> None:
+    _configure_sealable_native_runtime(bootstrap, tmp_path, monkeypatch)
+    supervisor_interpreter = tmp_path / "supervisor-python"
+    supervisor_interpreter.write_text(
+        "#!/bin/sh\nexit 0\n",
+        encoding="utf-8",
+    )
+    supervisor_interpreter.chmod(0o755)
+    monkeypatch.setattr(
+        hermes_runtime_identity.sys,
+        "executable",
+        str(supervisor_interpreter),
+    )
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    _seal_bootstrapped_runtime(
+        bootstrap,
+        hermes_home,
+        env_file,
+    )
+    if missing_artifact == "launcher":
+        missing_path = bootstrap.NATIVE_DECISION_VENV / "bin" / "python"
+    elif missing_artifact == "pyvenv":
+        missing_path = bootstrap.NATIVE_DECISION_VENV / "pyvenv.cfg"
+    else:
+        missing_path = supervisor_interpreter
+    missing_path.unlink()
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    manifest = load_runtime_manifest(
+        _decision_home(hermes_home) / "runtime-manifest.json"
+    )
+    assert manifest.sealed is False
+    assert manifest.execution_artifacts == ()
 
 
 def test_changed_bootstrap_inputs_publish_unsealed_intent_for_supervisor(
@@ -869,6 +1026,47 @@ def test_docker_mode_binds_container_runtime_identity(
     assert bootstrap.load_env_file(env_file)["HERMES_GID"] == str(
         os.getgid()
     )
+
+
+def test_docker_rerun_preserves_equivalent_container_seal(
+    bootstrap,
+    hermes_home: Path,
+    env_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert run_bootstrap(
+        bootstrap,
+        hermes_home,
+        env_file,
+        "--mode",
+        "docker",
+    ) == 0
+    manifest_path = _decision_home(hermes_home) / "runtime-manifest.json"
+    sealed = _fake_container_seal(load_runtime_manifest(manifest_path))
+    write_runtime_manifest(manifest_path, sealed)
+    before = manifest_path.read_bytes()
+
+    def reject_host_execution_artifact_probe(*_args, **_kwargs):
+        raise AssertionError(
+            "host bootstrap must not inspect container execution paths"
+        )
+
+    monkeypatch.setattr(
+        hermes_runtime_identity,
+        "runtime_execution_artifacts",
+        reject_host_execution_artifact_probe,
+    )
+
+    assert run_bootstrap(
+        bootstrap,
+        hermes_home,
+        env_file,
+        "--mode",
+        "docker",
+    ) == 0
+
+    assert manifest_path.read_bytes() == before
+    assert load_runtime_manifest(manifest_path) == sealed
 
 
 @pytest.mark.parametrize(

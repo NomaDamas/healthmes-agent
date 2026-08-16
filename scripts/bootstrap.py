@@ -652,6 +652,8 @@ def write_prepared_runtime_manifest(
     path: Path,
     manifest: HermesDecisionRuntimeManifest,
     plan: Plan,
+    *,
+    verify_execution_artifacts: bool,
 ) -> None:
     """Preserve an equivalent seal; publish changed intent as unsealed."""
 
@@ -666,6 +668,8 @@ def write_prepared_runtime_manifest(
         and runtime_manifest_matches_preseal_identity(
             existing,
             manifest,
+            vendor_root=Path(manifest.vendor_root),
+            verify_execution_artifacts=verify_execution_artifacts,
         )
     ):
         state = "supervisor-sealed" if existing.sealed else "prepared"
@@ -1316,6 +1320,7 @@ def run(args: argparse.Namespace) -> int:
         manifest_path,
         manifest,
         plan,
+        verify_execution_artifacts=args.mode == "native",
     )
 
     plan.act(

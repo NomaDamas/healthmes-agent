@@ -546,8 +546,14 @@ def write_runtime_manifest(
 def runtime_manifest_matches_preseal_identity(
     existing: HermesDecisionRuntimeManifest,
     prepared: HermesDecisionRuntimeManifest,
+    *,
+    vendor_root: Path | None = None,
+    supervisor_interpreter: Path | None = None,
+    supervisor_module: Path | None = None,
+    identity_module: Path | None = None,
+    verify_execution_artifacts: bool = True,
 ) -> bool:
-    """Return whether ``existing`` seals the exact prepared runtime intent."""
+    """Return whether a seal and its live execution files remain current."""
 
     if prepared.sealed:
         raise HermesRuntimeIdentityError(
@@ -563,7 +569,25 @@ def runtime_manifest_matches_preseal_identity(
     payload["sealed"] = False
     payload["execution_artifacts"] = []
     payload["runtime_id"] = _sha256_json(payload)
-    return _manifest_validate(payload) == prepared
+    if _manifest_validate(payload) != prepared:
+        return False
+    if not verify_execution_artifacts:
+        return True
+    try:
+        actual_execution_artifacts = runtime_execution_artifacts(
+            manifest=existing,
+            vendor_root=(
+                Path(existing.vendor_root)
+                if vendor_root is None
+                else vendor_root
+            ),
+            supervisor_interpreter=supervisor_interpreter,
+            supervisor_module=supervisor_module,
+            identity_module=identity_module,
+        )
+    except HermesRuntimeIdentityError:
+        return False
+    return actual_execution_artifacts == existing.execution_artifacts
 
 
 def load_attestation_key(path: Path) -> bytes:
@@ -893,6 +917,98 @@ def runtime_execution_artifacts(
         _execution_artifact(name, path, executable=executable)
         for name, path, executable in runtime_paths
     )
+
+
+def open_verified_runtime_launcher(
+    manifest: HermesDecisionRuntimeManifest,
+) -> int:
+    """Open and pin the exact launcher sealed into ``manifest``."""
+
+    if not manifest.sealed:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_manifest_unsealed"
+        )
+    try:
+        artifact = next(
+            item
+            for item in manifest.execution_artifacts
+            if item.name == "child_launcher"
+        )
+    except StopIteration as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_mismatch"
+        ) from exc
+
+    requested = Path(manifest.launch_argv[0]).expanduser()
+    if str(requested) != artifact.path:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_mismatch"
+        )
+    try:
+        resolved = requested.resolve(strict=True)
+    except OSError as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_unreadable"
+        ) from exc
+    if str(resolved) != artifact.resolved_path:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_mismatch"
+        )
+
+    descriptor: int | None = None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(resolved, flags)
+        opened = os.fstat(descriptor)
+        current = resolved.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _stat_identity(opened) != _stat_identity(current)
+            or stat.S_IMODE(opened.st_mode) != artifact.mode
+            or not stat.S_IMODE(opened.st_mode) & 0o111
+        ):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_execution_artifact_unsafe"
+            )
+
+        digest = hashlib.sha256()
+        remaining = _MAX_EXECUTION_ARTIFACT_BYTES
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if remaining == 0 and os.read(descriptor, 1):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_execution_artifact_too_large"
+            )
+
+        after = os.fstat(descriptor)
+        resolved_after = requested.resolve(strict=True)
+        current_after = resolved_after.lstat()
+        if (
+            _stat_identity(opened) != _stat_identity(after)
+            or resolved_after != resolved
+            or _stat_identity(after) != _stat_identity(current_after)
+            or not hmac.compare_digest(digest.hexdigest(), artifact.sha256)
+        ):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_execution_artifact_unsafe"
+            )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except HermesRuntimeIdentityError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_unreadable"
+        ) from exc
 
 
 def runtime_control_source_artifacts(
@@ -1370,6 +1486,7 @@ def _execution_artifact(
     try:
         requested_before = requested.lstat()
         resolved = requested.resolve(strict=True)
+        resolved_before = resolved.lstat()
     except OSError as exc:
         raise HermesRuntimeIdentityError(
             "hermes_runtime_execution_artifact_unreadable"
@@ -1378,6 +1495,10 @@ def _execution_artifact(
         stat.S_ISREG(requested_before.st_mode)
         or stat.S_ISLNK(requested_before.st_mode)
     ):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_execution_artifact_unsafe"
+        )
+    if not stat.S_ISREG(resolved_before.st_mode):
         raise HermesRuntimeIdentityError(
             "hermes_runtime_execution_artifact_unsafe"
         )
@@ -1397,6 +1518,8 @@ def _execution_artifact(
     if (
         resolved_after != resolved
         or not stat.S_ISREG(resolved_metadata.st_mode)
+        or _stat_identity(resolved_before)
+        != _stat_identity(resolved_metadata)
     ):
         raise HermesRuntimeIdentityError(
             "hermes_runtime_execution_artifact_unsafe"
@@ -1412,6 +1535,19 @@ def _execution_artifact(
         resolved_path=str(resolved),
         sha256=hashlib.sha256(content).hexdigest(),
         mode=mode,
+    )
+
+
+def _stat_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
     )
 
 
