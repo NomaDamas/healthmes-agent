@@ -257,6 +257,7 @@ def _service(
     clock: MutableClock,
     *,
     ttl_seconds: float = 60,
+    max_active_sessions: int = 32,
 ) -> DecisionContextSearchSessionService:
     return DecisionContextSearchSessionService(
         access_layer=ContextAccessLayer(
@@ -266,6 +267,7 @@ def _service(
         session_factory=store_factory,
         policy_resolver=lambda _request: policy_holder[0],
         ttl_seconds=ttl_seconds,
+        max_active_sessions=max_active_sessions,
         clock=clock.now,
         monotonic_clock=clock.tick,
     )
@@ -866,6 +868,75 @@ async def test_explicit_abort_preserves_in_flight_tool_and_access_trace(
     assert finished.state is DecisionSearchSessionState.ABORTED
     assert finished.tool_trace == snapshot.tool_trace
     assert finished.access_trace == snapshot.access_trace
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        service.inspect(handle.session_id)
+
+
+async def test_explicit_abort_releases_session_capacity_after_unwind(
+    store_factory,
+) -> None:
+    clock = MutableClock()
+    provider = BlockingProvider()
+    service = _service(
+        store_factory,
+        provider,
+        [_policy()],
+        clock,
+        max_active_sessions=1,
+    )
+    handle = service.begin(_request())
+    task = asyncio.create_task(
+        _search(service, handle.session_id)
+    )
+    await provider.started.wait()
+
+    service.abort(handle.session_id)
+    provider.release.set()
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        await task
+
+    replacement = service.begin(_request())
+    assert replacement.session_id != handle.session_id
+    service.abort(replacement.session_id)
+
+
+async def test_explicit_abort_wins_when_provider_reaches_session_timeout(
+    store_factory,
+) -> None:
+    provider = BlockingProvider()
+    service = DecisionContextSearchSessionService(
+        access_layer=ContextAccessLayer(
+            ContextProviderRegistry((provider,)),
+            clock=lambda: datetime.now(UTC),
+        ),
+        session_factory=store_factory,
+        policy_resolver=lambda _request: _policy(),
+        ttl_seconds=0.02,
+    )
+    handle = service.begin(_request())
+    task = asyncio.create_task(
+        _search(service, handle.session_id)
+    )
+    await provider.started.wait()
+
+    service.abort(handle.session_id)
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        await task
+
+    snapshot = service.inspect(handle.session_id)
+    assert snapshot.state is DecisionSearchSessionState.ABORTED
+    assert len(snapshot.tool_trace) == 1
+    assert (
+        snapshot.tool_trace[0].error_code
+        == "decision_search_session_aborted"
+    )
+    assert len(snapshot.access_trace) == 1
+    assert snapshot.access_trace[0].reason_codes == (
+        "decision_search_session_aborted",
+    )
+
+    finished = service.finish(handle.session_id)
+    assert finished.state is DecisionSearchSessionState.ABORTED
     with pytest.raises(AbortedDecisionSearchSessionError):
         service.inspect(handle.session_id)
 

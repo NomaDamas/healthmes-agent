@@ -194,6 +194,7 @@ class _DecisionSearchSession:
 class _TerminalSession:
     state: DecisionSearchSessionState
     ended_monotonic: float
+    snapshot: DecisionSearchSessionSnapshot | None = None
 
 
 _READ_ONLY_MUTATORS = frozenset(
@@ -409,6 +410,16 @@ class DecisionContextSearchSessionService:
             finally:
                 with self._lock:
                     record.in_flight = max(0, record.in_flight - 1)
+                    if (
+                        record.in_flight == 0
+                        and record.terminal_error_code is not None
+                        and self._active.get(record.session_id) is record
+                    ):
+                        self._transition_locked(
+                            record,
+                            DecisionSearchSessionState.ABORTED,
+                            preserve_snapshot=True,
+                        )
 
     def inspect(
         self,
@@ -416,7 +427,15 @@ class DecisionContextSearchSessionService:
     ) -> DecisionSearchSessionSnapshot:
         """Return current results, full refs, access trace, and shared budget."""
 
-        record = self._lookup_active(decision_session_id)
+        with self._lock:
+            self._prune_locked(self._monotonic())
+            record = self._active.get(decision_session_id)
+            if record is None:
+                terminal = self._terminal.get(decision_session_id)
+                if terminal is not None and terminal.snapshot is not None:
+                    return terminal.snapshot.model_copy(deep=True)
+                self._raise_lookup_error_locked(decision_session_id)
+            assert record is not None
         return self._snapshot(record)
 
     def finish(
@@ -429,6 +448,16 @@ class DecisionContextSearchSessionService:
             self._prune_locked(self._monotonic())
             record = self._active.get(decision_session_id)
             if record is None:
+                terminal = self._terminal.get(decision_session_id)
+                if terminal is not None and terminal.snapshot is not None:
+                    snapshot = terminal.snapshot.model_copy(deep=True)
+                    self._terminal[decision_session_id] = (
+                        _TerminalSession(
+                            state=terminal.state,
+                            ended_monotonic=terminal.ended_monotonic,
+                        )
+                    )
+                    return snapshot
                 self._raise_lookup_error_locked(decision_session_id)
             assert record is not None
             if record.in_flight:
@@ -630,6 +659,36 @@ class DecisionContextSearchSessionService:
                     record.terminal_error_code = error_code
             raise
         except TimeoutError as exc:
+            if record.terminal_error_code is not None:
+                error_code = record.terminal_error_code
+                finished_at = _utc(self._clock())
+                effective_query = (
+                    record.access_turn.effective_query_for(query.query_id)
+                    or query
+                )
+                audit = next(
+                    (
+                        entry
+                        for entry in reversed(record.access_turn.trace)
+                        if entry.query_id == query.query_id
+                    ),
+                    None,
+                ) or _failed_access_audit(
+                    query,
+                    effective_query=effective_query,
+                    occurred_at=finished_at,
+                    error_code=error_code,
+                )
+                self._store_failed_call(
+                    record,
+                    query=query,
+                    effective_query=effective_query,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    error_code=error_code,
+                    access_audit=audit,
+                )
+                raise AbortedDecisionSearchSessionError() from exc
             self._store_failed_call(
                 record,
                 query=query,
@@ -1200,6 +1259,14 @@ class DecisionContextSearchSessionService:
     def _expire(self, record: _DecisionSearchSession) -> None:
         with self._lock:
             if record.state is DecisionSearchSessionState.ACTIVE:
+                if record.terminal_error_code is not None:
+                    if not record.in_flight:
+                        self._transition_locked(
+                            record,
+                            DecisionSearchSessionState.ABORTED,
+                            preserve_snapshot=True,
+                        )
+                    return
                 self._transition_locked(
                     record,
                     DecisionSearchSessionState.EXPIRED,
@@ -1208,6 +1275,11 @@ class DecisionContextSearchSessionService:
     def _prune_locked(self, current_monotonic: float) -> None:
         for record in tuple(self._active.values()):
             if current_monotonic >= record.deadline:
+                if (
+                    record.terminal_error_code is not None
+                    and record.in_flight
+                ):
+                    continue
                 self._transition_locked(
                     record,
                     (
@@ -1216,6 +1288,9 @@ class DecisionContextSearchSessionService:
                         else DecisionSearchSessionState.EXPIRED
                     ),
                     ended_monotonic=current_monotonic,
+                    preserve_snapshot=(
+                        record.terminal_error_code is not None
+                    ),
                 )
         terminal_cutoff = (
             current_monotonic - self._terminal_retention_seconds
@@ -1235,10 +1310,12 @@ class DecisionContextSearchSessionService:
         state: DecisionSearchSessionState,
         *,
         ended_monotonic: float | None = None,
+        preserve_snapshot: bool = False,
     ) -> None:
         self._active.pop(record.session_id, None)
         record.state = state
         record.ended_at = _utc(self._clock())
+        snapshot = self._snapshot(record) if preserve_snapshot else None
         self._terminal[record.session_id] = _TerminalSession(
             state=state,
             ended_monotonic=(
@@ -1246,6 +1323,7 @@ class DecisionContextSearchSessionService:
                 if ended_monotonic is not None
                 else self._monotonic()
             ),
+            snapshot=snapshot,
         )
         self._terminal.move_to_end(record.session_id)
         while len(self._terminal) > self._max_terminal_sessions:
