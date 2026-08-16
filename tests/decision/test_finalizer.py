@@ -249,6 +249,7 @@ def _run(
     answer: str | None = None,
     context_status: ContextStatus = ContextStatus.OK,
     result_limitations: list[str] | None = None,
+    draft_limitations: list[str] | None = None,
     persistence_intent: DecisionPersistenceIntent | None = None,
 ) -> DecisionAgentRun:
     query = query or _query()
@@ -302,6 +303,7 @@ def _run(
                 ),
                 "confidence": 0.8,
                 "uncertainty": "Only the retained context was considered.",
+                "limitations": draft_limitations or [],
             }
         )
     elif status is DecisionStatus.NEEDS_CLARIFICATION:
@@ -403,9 +405,11 @@ def test_source_backed_action_is_atomically_persisted(persistence):
         }
         assert row.decision_payload is not None
         assert row.decision_payload["schema"] == DECISION_PAYLOAD_SCHEMA
-        assert row.decision_payload["result"][
+        assert row.decision_payload["outcome"][
             "decision_record_id"
         ] == str(row.id)
+        assert row.retention_basis_at.replace(tzinfo=UTC) == NOW
+        assert row.expires_at is None
         assert row.decision_payload["source_refs"] == [
             ref.model_dump(mode="json")
         ]
@@ -639,7 +643,9 @@ def test_tool_result_limitations_are_preserved_when_model_omits_them(
     with factory() as session:
         row = session.scalars(sa.select(DecisionRecord)).one()
         assert row.decision_payload is not None
-        assert row.decision_payload["result"]["limitations"] == [
+        assert row.decision_payload["outcome"][
+            "limitation_codes"
+        ] == [
             "context_stale"
         ]
 
@@ -702,13 +708,81 @@ def test_public_record_redacts_internal_source_reference_ids(
         assert ref.reference_id not in row.summary
         assert ref.reference_id not in str(row.tree)
         assert row.decision_payload is not None
-        assert (
-            row.decision_payload["result"]["answer"]
-            == answer
+        assert "result" not in row.decision_payload
+        assert row.decision_payload["outcome"]["summary"] == (
+            "A wellness action recommendation was recorded."
         )
+        assert answer not in json.dumps(row.decision_payload)
         assert "question" not in row.decision_payload["request"]
         assert "caller" not in row.decision_payload["request"]
         assert request.question not in json.dumps(row.decision_payload)
+
+
+def test_long_sensitive_answer_is_returned_but_never_persisted(
+    persistence,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request(
+        question="private prompt marker prompt-secret-164"
+    )
+    sensitive_marker = "sensitive-answer-marker-164"
+    answer = (
+        "A full private answer follows. "
+        + sensitive_marker
+        + " "
+        + ("private-detail-" * 700)
+    )
+
+    result = _finalizer(factory).finalize(
+        request,
+        _run(
+            request,
+            [ref],
+            answer=answer,
+            result_limitations=[
+                "context_stale",
+            ],
+            draft_limitations=[
+                "private_sensitive_limitation_marker_164",
+            ],
+            payload={
+                "raw_photo_bytes": "private-media-marker-164",
+                "transcript": "private-transcript-marker-164",
+            },
+        ),
+    )
+
+    assert result.answer == answer
+    assert sensitive_marker in result.answer
+    with factory() as session:
+        row = session.scalars(sa.select(DecisionRecord)).one()
+        assert row.decision_payload is not None
+        persisted = json.dumps(
+            {
+                "summary": row.summary,
+                "tree": row.tree,
+                "decision_payload": row.decision_payload,
+            },
+            sort_keys=True,
+        )
+        for secret in (
+            request.question,
+            sensitive_marker,
+            "private_sensitive_limitation_marker_164",
+            "private-media-marker-164",
+            "private-transcript-marker-164",
+        ):
+            assert secret not in persisted
+        outcome = row.decision_payload["outcome"]
+        assert len(outcome["summary"]) <= 160
+        assert outcome["limitation_codes"] == ["context_stale"]
+
+        recovered = decision_result_from_record(row)
+        assert recovered.answer == outcome["summary"]
+        assert sensitive_marker not in recovered.answer
+        assert "decision_response_compacted" in recovered.limitations
 
 
 def test_clarification_is_not_persisted(persistence):
@@ -1951,7 +2025,13 @@ def test_retry_reads_and_revalidates_legacy_v1_payload(persistence):
                 mode="json",
                 round_trip=True,
             ),
-            "result": row.decision_payload["result"],
+            "result": first.model_copy(
+                update={"tool_trace": []},
+                deep=True,
+            ).model_dump(
+                mode="json",
+                round_trip=True,
+            ),
             "run": row.decision_payload["run"],
             "source_refs": row.decision_payload["source_refs"],
             "tool_trace": [
@@ -2190,7 +2270,7 @@ def test_checksum_recomputed_contract_tampering_fails_closed(
         assert row.decision_payload is not None
         payload = copy.deepcopy(row.decision_payload)
         if mutation == "boolean_string":
-            payload["result"]["proposed_action"] = "false"
+            payload["outcome"]["proposed_action"] = "false"
         elif mutation == "source_refs":
             payload["source_refs"] = []
         elif mutation == "runtime":
@@ -2254,10 +2334,7 @@ def test_checksum_recomputed_persistence_invariant_tampering_fails_closed(
         assert row.decision_payload is not None
         payload = copy.deepcopy(row.decision_payload)
         payload["persistence_intent"] = persistence_intent.value
-        payload["result"]["proposed_action"] = proposed_action
-        tampered_result = DecisionResult.model_validate(payload["result"])
-        row.tree = finalizer_module._decision_tree(tampered_result)
-        row.summary = finalizer_module._public_summary(tampered_result)
+        payload["outcome"]["proposed_action"] = proposed_action
         row.decision_payload = payload
         row.decision_payload_digest = _payload_digest(payload)
         session.commit()

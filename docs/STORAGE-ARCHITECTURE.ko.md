@@ -13,7 +13,7 @@
 > [`HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md`](HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md)
 > 를 따른다.
 
-## 구현 상태 — 2026-08-14
+## 구현 상태 — 2026-08-16
 
 컴퓨터 Personal Data Node의 저장 제어 계층은 구현되었다.
 
@@ -37,6 +37,8 @@
 - 기존 `POST /v1/ingest/healthkit` raw-first 경로를
   `wearable.healthkit-bridge` 입력으로 노출하고, 원문은 `raw_payload`,
   정규화된 Open Wearables mirror는 `wearable_normalized`로 분리
+- 조건부 Wellness `DecisionRecord`에 `decision` 보존 클래스를 적용하고,
+  compact outcome만 저장. 기존 비-Wellness 판단 기록은 보존정책 대상에서 제외
 
 | 데이터 클래스 | 기본 보존 | 저장 내용 |
 |---|---:|---|
@@ -44,11 +46,19 @@
 | `nutrition_raw_capture` | 14일 | 식사 원문, 음성 transcript, 미디어 참조, 섭취 결과 note |
 | `nutrition_observation` | 90일 | sake VLM 구조화 관측값과 provenance |
 | `nutrition_confirmation` | 무기한 | 항목별 사용자 확인과 일일 완전성 확인 |
+| `decision` | 무기한 | 조건부 Wellness 판단의 compact outcome, source refs와 runtime |
 
 사진과 원문이 만료되어 삭제되어도 90일 관측값과 무기한 확인 이벤트는 각자의
 정책에 따라 남는다. 사용자는 기존 `/storage` 화면 또는
-`/v1/storage/settings/{data_class}` API에서 네 클래스를 각각
+`/v1/storage/settings/{data_class}` API에서 각 클래스를
 `1/7/14/30/90일/무기한`으로 바꿀 수 있다.
+
+`decision`도 같은 API에서 `1/7/14/30/90일/무기한`으로 바꾼다. 판단 확정 시각을
+보존 기준으로 사용하며 `expires_at <= maintenance 시각`이면 삭제한다. 설정
+축소와 finalization은 같은 write-plane fence를 사용하므로 경합 중에도 새 행이
+이전 정책으로 남지 않는다. 삭제 대상 DecisionRecord를 참조하는 proposal은
+삭제하지 않고 FK만 `NULL`로 바꾸며, correlation ID가 없는 historical/non-wellness
+DecisionRecord는 건드리지 않는다.
 
 iOS/Android의 실제 설정 UI는 별도 후속 작업이다. 설정 정본은 컴퓨터
 Personal Data Node이며 데스크톱 웹과 모바일 UI는 동일한

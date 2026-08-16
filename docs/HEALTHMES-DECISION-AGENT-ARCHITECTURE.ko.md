@@ -516,8 +516,13 @@ thread를 하나씩 늘릴 수 없고, 한 agent에서 orphan 가능한 worker�
 
 - 최종 답변이 인용한 `source_refs`가 실제 tool 결과에 있었는지 검사한다.
 - 존재하지 않는 ID, 만료된 자료와 허용되지 않은 원본 참조를 거부한다.
-- 모델, tool trace, limitation, 질문 시각과 답변을 `DecisionRecord`로 저장한다.
+- 저장 조건을 만족한 판단만 request/turn ID, runtime, bounded outcome,
+  gateway/tool 결과와 source 재검증이 생성한 안전한 limitation code,
+  source attestation을 compact `DecisionRecord`로 저장한다. 질문·답변 전문,
+  LLM이 자유 작성한 limitation, transcript, tool payload와 media는 저장하지 않는다.
 - 저장이 필요한 판단인데 기록에 실패하면 성공한 결정으로 표시하지 않는다.
+- 저장된 Wellness 판단은 storage data class `decision`의 보존기간과
+  `retention_basis_at`/`expires_at`을 적용한다.
 
 ## 4. source_refs의 뜻
 
@@ -540,7 +545,8 @@ thread를 하나씩 늘릴 수 없고, 한 agent에서 orphan 가능한 worker�
 ```
 
 모든 필드를 LLM에 길게 넣을 필요는 없다. 모델에는 필요한 최소 참조를 주고,
-DecisionRecord에는 감사 가능한 전체 provenance를 보존할 수 있다.
+DecisionRecord에는 답변 전문 대신 재검증에 필요한 bounded provenance와
+`source_refs`만 보존한다.
 
 기존 `evidence_ids`와 최상위 `evidence`는 호환 기간 동안 유지하되 내부적으로
 `source_refs`로 정규화한다.

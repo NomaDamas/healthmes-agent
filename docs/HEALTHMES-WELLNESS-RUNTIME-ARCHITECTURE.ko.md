@@ -473,19 +473,24 @@ compact record에는 request ID, 시각, 모델/runtime, 짧은 결론, 사용�
 `source_refs`, 제안된 행동과 outcome 연결 ID만 둔다. 사진 bytes, 전체 MCP
 payload와 전체 prompt를 기본 저장하지 않는다.
 
-2026-08-16 구현된 `healthmes.decision-private.v2`는 다음만 저장한다.
+2026-08-16 구현된 `healthmes.decision-private.v3`는 다음만 저장한다.
 
 - request/turn ID, 요청 시각, timezone, execution/privacy scope
 - 모델/runtime와 token 계측
-- 최종 답변, confidence, limitation과 실제 사용한 `source_refs`
+- `action`, `risk`, `explicit_tracking` 중 persistence intent
+- intent에서 결정론적으로 만든 160자 이하 outcome summary, confidence와
+  gateway/tool 결과 및 source 재검증에서 생성된 안전한 limitation code
+- 실제 사용한 `source_refs`
 - 실제 사용한 source만 재검증하는 데 필요한 bounded typed query attestation
 - 해당 query의 access 결과
-- `none/action/risk/mutation/explicit_tracking` persistence intent
 
 질문 원문, caller principal, query의 model-authored `purpose`/자유 텍스트 검색어,
+LLM 답변 전문, uncertainty/follow-up 자유 텍스트, LLM이 자유 작성한 limitation,
 전체 tool payload, 사진·음성 bytes, 전체 transcript, 사용하지 않은 source와 tool
-trace는 저장하지 않는다. `none`인 단순 조회는 source를 사용했더라도
-DecisionRecord를 만들지 않는다.
+trace는 저장하지 않는다. 최초 `DecisionResult`는 LLM의 완전한 답변을 사용자에게
+반환하지만, DB와 장애 복구 응답은 compact outcome만 사용하고
+`decision_response_compacted` limitation을 표시한다. `none`인 단순 조회는 source를
+사용했더라도 DecisionRecord를 만들지 않는다.
 
 LLM이 반환한 persistence intent는 신뢰 입력이 아니다. HealthMes가 다음처럼 최종
 effective intent를 계산한다.
@@ -500,8 +505,17 @@ effective intent를 계산한다.
 
 따라서 read-only wellness runtime은 mutation audit를 만들지 않는다. 실제 mutation은
 별도 command workflow가 자신의 audit를 소유한다. 과거
-`healthmes.decision-private.v1` 레코드는 고정 historical fixture와 기존
-fingerprint를 기준으로 읽기 호환을 유지한다.
+`healthmes.decision-private.v1`과 `v2` 레코드는 기존 fingerprint와 source 재검증
+계약으로 읽기 호환을 유지한다. 새 write는 항상 `v3`다.
+
+`DecisionRecord`는 storage data class `decision`의
+`1d/7d/14d/30d/90d/forever` 정책을 따른다. 판단을 확정하고 source를 재검증한
+시각이 `retention_basis_at`이며 finite 정책이면 그 시각에 보존일을 더한 값을
+`expires_at`으로 기록한다. 설정 변경과 maintenance는 finalization과 같은
+write-plane fence를 사용하고 `expires_at <= now`인 행을 삭제한다. 기존
+비-Wellness DecisionRecord는 correlation ID가 없으므로 이 정책의 대상이 아니며,
+이를 참조하던 proposal FK는 DB의 `ON DELETE SET NULL` 계약으로 자식 기록을
+보존한다.
 
 검토된 Skill은 wheel의 `healthmes/_wellness_skills` package resource에 포함하고,
 source/Docker 실행에서는 repository `skills/`를 fallback으로 사용한다. catalog는

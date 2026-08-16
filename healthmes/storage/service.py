@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -24,6 +24,7 @@ from healthmes.calendar_retention import (
 from healthmes.config import Settings
 from healthmes.store import (
     AppUsageSample,
+    DecisionRecord,
     FoodLog,
     MedicalRecord,
     PurgeJob,
@@ -69,6 +70,8 @@ class StorageMaintenanceReport:
     candidates: int
     deleted: int
     bytes_reclaimed: int
+    decision_candidates: int
+    decisions_deleted: int
     errors: tuple[str, ...]
 
 
@@ -184,6 +187,11 @@ def _update_retention_policy(
                 now=current,
             ),
         )
+    if data_class == "decision":
+        purge_expired_decision_records(
+            session,
+            now=current,
+        )
     if data_class.startswith("activity_"):
         session.flush()
         from healthmes.activity.maintenance import run_activity_maintenance
@@ -269,6 +277,22 @@ def _recalculate_expiry(
         ):
             continue
         event.expires_at = _expiry(policy, event.observed_at)
+    if policy.data_class == "decision":
+        for row in session.scalars(
+            select(DecisionRecord).where(
+                DecisionRecord.decision_request_id.is_not(None)
+            )
+        ):
+            if (
+                row.expires_at is not None
+                and _as_utc(row.expires_at) <= current
+            ):
+                continue
+            basis = _as_utc(
+                row.retention_basis_at or row.created_at
+            )
+            row.retention_basis_at = basis
+            row.expires_at = _expiry(policy, basis)
     if (
         policy.data_class == "activity_raw"
         and policy.enabled
@@ -292,6 +316,57 @@ def _recalculate_expiry(
                     AppUsageSample.bucket_start <= cutoff
                 )
             )
+
+
+def apply_decision_retention(
+    session: Session,
+    row: DecisionRecord,
+    *,
+    basis_at: datetime,
+) -> DecisionRecord:
+    """Classify one Decision Agent record under the user-owned policy."""
+
+    policies = {
+        policy.data_class: policy
+        for policy in ensure_default_policies(session)
+    }
+    policy = policies["decision"]
+    basis = _as_utc(basis_at)
+    row.retention_basis_at = basis
+    row.expires_at = _expiry(policy, basis)
+    return row
+
+
+def purge_expired_decision_records(
+    session: Session,
+    *,
+    now: datetime,
+    dry_run: bool = False,
+) -> int:
+    """Delete expired Wellness decisions without touching legacy decisions."""
+
+    current = _as_utc(now)
+    expired = (
+        DecisionRecord.decision_request_id.is_not(None),
+        DecisionRecord.retention_basis_at.is_not(None),
+        DecisionRecord.expires_at.is_not(None),
+        DecisionRecord.expires_at <= current,
+    )
+    candidates = int(
+        session.scalar(
+            select(func.count())
+            .select_from(DecisionRecord)
+            .where(*expired)
+        )
+        or 0
+    )
+    if candidates and not dry_run:
+        session.execute(
+            delete(DecisionRecord)
+            .where(*expired)
+            .execution_options(synchronize_session=False)
+        )
+    return candidates
 
 
 def register_storage_object(
@@ -746,6 +821,18 @@ def _run_storage_maintenance(
     if not dry_run:
         lock_activity_write_plane(session)
     ensure_default_policies(session)
+    decision_policy = session.scalar(
+        select(RetentionPolicy).where(
+            RetentionPolicy.data_class == "decision"
+        )
+    )
+    if decision_policy is not None and not dry_run:
+        _recalculate_expiry(
+            session,
+            decision_policy,
+            previous_retention_days=decision_policy.retention_days,
+            now=_as_utc(current),
+        )
     _migrate_legacy_nutrition_raw_captures(
         session,
         current=current,
@@ -789,6 +876,11 @@ def _run_storage_maintenance(
     deleted = 0
     reclaimed = 0
     errors: list[str] = []
+    decision_candidates = purge_expired_decision_records(
+        session,
+        now=current,
+        dry_run=dry_run,
+    )
     for obj in candidates:
         path = _safe_path(settings, obj.relative_path)
         if path is None:
@@ -841,7 +933,13 @@ def _run_storage_maintenance(
     job.candidates = len(candidates)
     job.deleted = deleted
     job.bytes_reclaimed = reclaimed
-    job.detail = {"errors": errors}
+    job.detail = {
+        "errors": errors,
+        "decision_candidates": decision_candidates,
+        "decisions_deleted": (
+            0 if dry_run else decision_candidates
+        ),
+    }
     session.flush()
     return StorageMaintenanceReport(
         job_id=str(job.id),
@@ -849,5 +947,9 @@ def _run_storage_maintenance(
         candidates=len(candidates),
         deleted=deleted,
         bytes_reclaimed=reclaimed,
+        decision_candidates=decision_candidates,
+        decisions_deleted=(
+            0 if dry_run else decision_candidates
+        ),
         errors=tuple(errors),
     )

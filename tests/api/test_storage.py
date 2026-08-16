@@ -1,3 +1,4 @@
+import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
@@ -21,6 +22,8 @@ from healthmes.storage import (
 from healthmes.store import (
     CalendarEventMirror,
     CalendarSource,
+    DecisionKind,
+    DecisionRecord,
     PurgeJob,
     RetentionPolicy,
     StorageObject,
@@ -50,6 +53,7 @@ def test_storage_settings_bootstraps_defaults_and_measures_files(
     assert policies["activity_hourly"] == "90d"
     assert policies["activity_daily"] == "forever"
     assert policies["wearable_normalized"] == "30d"
+    assert policies["decision"] == "forever"
     assert body["backup"]["provider"] == "local"
     assert body["backup"]["snapshot_count"] == 0
 
@@ -67,6 +71,54 @@ def test_retention_update_is_persisted(client: TestClient, session) -> None:
     )
     assert policy is not None
     assert policy.retention_days == 1
+
+
+def test_decision_retention_api_recalculates_wellness_record(
+    client: TestClient,
+    session,
+    monkeypatch,
+) -> None:
+    current = datetime(2026, 8, 16, 12, tzinfo=UTC)
+    basis = current - timedelta(hours=12)
+    record = DecisionRecord(
+        kind=DecisionKind.INSIGHT,
+        tree={"id": "healthmes-decision", "children": []},
+        summary="Compact wellness outcome",
+        decision_request_id=uuid.uuid4(),
+        decision_turn_id=uuid.uuid4(),
+        decision_request_fingerprint="f" * 64,
+        decision_payload={
+            "schema": "healthmes.decision-private.v2"
+        },
+        decision_payload_digest="d" * 64,
+        created_at=basis,
+    )
+    session.add(record)
+    session.commit()
+    monkeypatch.setattr(
+        "healthmes.storage.service._now",
+        lambda: current,
+    )
+
+    response = client.put(
+        "/v1/storage/settings/decision",
+        json={"preset": "1d"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "data_class": "decision",
+        "preset": "1d",
+        "retention_days": 1,
+        "enabled": True,
+    }
+    session.expire_all()
+    stored = session.get(DecisionRecord, record.id)
+    assert stored is not None
+    assert stored.retention_basis_at.replace(tzinfo=UTC) == basis
+    assert stored.expires_at.replace(tzinfo=UTC) == (
+        basis + timedelta(days=1)
+    )
 
 
 def test_calendar_retention_update_immediately_removes_expired_mirror_rows(

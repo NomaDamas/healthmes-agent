@@ -17,6 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+import healthmes.decision.finalizer as finalizer_module
 from healthmes.activity.locking import (
     lock_activity_write_plane,
     postgres_activity_write_plane_guard,
@@ -417,6 +418,115 @@ def test_concurrent_same_request_finalization_returns_one_record_id(
             assert session.scalar(
                 sa.select(sa.func.count()).select_from(DecisionRecord)
             ) == 1
+
+
+def test_finalization_and_decision_retention_share_postgres_fence(
+    monkeypatch,
+) -> None:
+    with _postgres_store(pool_size=3) as store:
+        request, run, finalizer, _event_id = _decision_fixture(store)
+        finalizer_entered = threading.Event()
+        release_finalizer = threading.Event()
+        updater_started = threading.Event()
+        updater_pid: list[int] = []
+        results = []
+        failures: list[BaseException] = []
+        original_apply = finalizer_module.apply_decision_retention
+
+        def paused_apply(session, row, *, basis_at):
+            retained = original_apply(
+                session,
+                row,
+                basis_at=basis_at,
+            )
+            finalizer_entered.set()
+            assert release_finalizer.wait(timeout=10)
+            return retained
+
+        monkeypatch.setattr(
+            finalizer_module,
+            "apply_decision_retention",
+            paused_apply,
+        )
+        monkeypatch.setattr(
+            finalizer_module,
+            "activity_write_lock",
+            lambda **_kwargs: nullcontext(),
+        )
+
+        def finalize() -> None:
+            try:
+                results.append(finalizer.finalize(request, run))
+            except BaseException as exc:
+                failures.append(exc)
+
+        def shrink_retention() -> None:
+            with store.factory() as session:
+                updater_pid.append(
+                    int(
+                        session.scalar(
+                            sa.text("SELECT pg_backend_pid()")
+                        )
+                    )
+                )
+                updater_started.set()
+                try:
+                    update_retention_policy(
+                        session,
+                        "decision",
+                        "1d",
+                        now=NOW + timedelta(days=1),
+                    )
+                    session.commit()
+                except BaseException as exc:
+                    session.rollback()
+                    failures.append(exc)
+
+        finalizer_worker = threading.Thread(target=finalize)
+        retention_worker = threading.Thread(target=shrink_retention)
+        try:
+            finalizer_worker.start()
+            assert finalizer_entered.wait(timeout=10)
+            retention_worker.start()
+            assert updater_started.wait(timeout=5)
+
+            deadline = time.monotonic() + 5
+            waiting_for_advisory_lock = False
+            while time.monotonic() < deadline:
+                with store.factory() as observer:
+                    wait_event = observer.execute(
+                        sa.text(
+                            "SELECT wait_event_type, wait_event "
+                            "FROM pg_stat_activity WHERE pid = :pid"
+                        ),
+                        {"pid": updater_pid[0]},
+                    ).one_or_none()
+                if wait_event is not None and tuple(wait_event) == (
+                    "Lock",
+                    "advisory",
+                ):
+                    waiting_for_advisory_lock = True
+                    break
+                time.sleep(0.05)
+
+            assert waiting_for_advisory_lock
+        finally:
+            release_finalizer.set()
+            finalizer_worker.join(timeout=10)
+            retention_worker.join(timeout=10)
+
+        assert not finalizer_worker.is_alive()
+        assert not retention_worker.is_alive()
+        assert failures == []
+        assert len(results) == 1
+        assert (
+            results[0].persistence_status
+            is PersistenceStatus.PERSISTED
+        )
+        with store.factory() as session:
+            assert session.scalar(
+                sa.select(sa.func.count()).select_from(DecisionRecord)
+            ) == 0
 
 
 @pytest.mark.parametrize("mutation", ("delete", "content"))

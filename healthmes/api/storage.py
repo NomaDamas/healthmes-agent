@@ -165,6 +165,8 @@ def maintain_storage(
             "candidates": report.candidates,
             "deleted": report.deleted,
             "bytes_reclaimed": report.bytes_reclaimed,
+            "decision_candidates": report.decision_candidates,
+            "decisions_deleted": report.decisions_deleted,
             "errors": list(report.errors),
         }
 

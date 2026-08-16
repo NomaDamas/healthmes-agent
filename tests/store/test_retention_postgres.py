@@ -4,7 +4,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 import sqlalchemy as sa
@@ -14,6 +14,7 @@ from healthmes.activity.locking import lock_activity_write_plane
 from healthmes.activity.repository import ensure_activity_policies
 from healthmes.app import _initialize_activity_storage
 from healthmes.storage import (
+    apply_decision_retention,
     ensure_default_policies,
     run_storage_maintenance,
     update_retention_policy,
@@ -22,7 +23,12 @@ from healthmes.storage import service as storage_service
 from healthmes.storage.service import DEFAULT_RETENTION
 from healthmes.store import (
     Base,
+    DecisionKind,
+    DecisionRecord,
+    ProposalStatus,
     RetentionPolicy,
+    ScheduleProposal,
+    Task,
     WellnessEvent,
     create_db_engine,
 )
@@ -97,6 +103,135 @@ def test_concurrent_first_startup_initializes_default_policies_once() -> None:
         engine.dispose()
         with admin_engine.begin() as connection:
             connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_decision_retention_uses_exact_cutoff_and_preserves_fk_rows(
+    settings,
+) -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_test_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    current = datetime(2026, 8, 16, 12, tzinfo=UTC)
+
+    def decision(*, basis_at: datetime) -> DecisionRecord:
+        row = DecisionRecord(
+            kind=DecisionKind.INSIGHT,
+            tree={"id": "healthmes-decision", "children": []},
+            summary="Compact wellness outcome",
+            decision_request_id=uuid.uuid4(),
+            decision_turn_id=uuid.uuid4(),
+            decision_request_fingerprint=uuid.uuid4().hex * 2,
+            decision_payload={
+                "schema": "healthmes.decision-private.v2"
+            },
+            decision_payload_digest=uuid.uuid4().hex * 2,
+            created_at=basis_at,
+        )
+        return row
+
+    try:
+        with factory() as session:
+            update_retention_policy(
+                session,
+                "decision",
+                "1d",
+                now=current,
+            )
+            at_cutoff = decision(
+                basis_at=current - timedelta(days=1)
+            )
+            after_cutoff = decision(
+                basis_at=(
+                    current
+                    - timedelta(days=1)
+                    + timedelta(microseconds=1)
+                )
+            )
+            legacy = DecisionRecord(
+                kind=DecisionKind.SCHEDULE_CHANGE,
+                tree={"id": "legacy", "children": []},
+                summary="Historical non-wellness decision",
+                created_at=current - timedelta(days=30),
+            )
+            apply_decision_retention(
+                session,
+                at_cutoff,
+                basis_at=at_cutoff.created_at,
+            )
+            apply_decision_retention(
+                session,
+                after_cutoff,
+                basis_at=after_cutoff.created_at,
+            )
+            session.add_all((at_cutoff, after_cutoff, legacy))
+            session.flush()
+            task = Task(title="Preserve proposal")
+            session.add(task)
+            session.flush()
+            proposal = ScheduleProposal(
+                task_id=task.id,
+                proposed_start=current + timedelta(hours=1),
+                proposed_end=current + timedelta(hours=2),
+                status=ProposalStatus.PROPOSED,
+                decision_record_id=at_cutoff.id,
+            )
+            session.add(proposal)
+            session.commit()
+            ids = (
+                at_cutoff.id,
+                after_cutoff.id,
+                legacy.id,
+                proposal.id,
+            )
+
+        with factory() as session:
+            report = run_storage_maintenance(
+                session,
+                settings,
+                now=current,
+            )
+            session.commit()
+
+        with factory() as session:
+            at_cutoff_id, after_cutoff_id, legacy_id, proposal_id = ids
+            assert report.decision_candidates == 1
+            assert report.decisions_deleted == 1
+            assert session.get(DecisionRecord, at_cutoff_id) is None
+            assert (
+                session.get(DecisionRecord, after_cutoff_id)
+                is not None
+            )
+            assert session.get(DecisionRecord, legacy_id) is not None
+            retained_proposal = session.get(
+                ScheduleProposal,
+                proposal_id,
+            )
+            assert retained_proposal is not None
+            assert retained_proposal.decision_record_id is None
+    finally:
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
         admin_engine.dispose()
 
 

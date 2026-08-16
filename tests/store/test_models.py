@@ -791,6 +791,31 @@ class TestDecisionRecord:
         )
         assert record.trigger_event_id == trigger.id
 
+    def test_wellness_retention_metadata_roundtrips(self, session):
+        request_id = uuid.uuid4()
+        turn_id = uuid.uuid4()
+        record = _roundtrip(
+            session,
+            DecisionRecord(
+                kind=DecisionKind.INSIGHT,
+                tree={"id": "healthmes-decision", "children": []},
+                summary="Compact wellness outcome",
+                decision_request_id=request_id,
+                decision_turn_id=turn_id,
+                decision_request_fingerprint="f" * 64,
+                decision_payload={
+                    "schema": "healthmes.decision-private.v3"
+                },
+                decision_payload_digest="d" * 64,
+                retention_basis_at=T0,
+                expires_at=T1,
+            ),
+        )
+
+        assert record.decision_request_id == request_id
+        assert record.retention_basis_at == T0
+        assert record.expires_at == T1
+
 
 class TestInsight:
     def test_roundtrip(self, session):

@@ -61,14 +61,22 @@ from healthmes.decision.validation import (
     normalize_untrusted_json,
     strict_model_validate,
 )
+from healthmes.storage import (
+    apply_decision_retention,
+    purge_expired_decision_records,
+)
 from healthmes.store import DecisionKind, DecisionRecord
 from healthmes.timing import steady_time
 
 DECISION_RECORD_SCHEMA = "healthmes.decision-record.v1"
-DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v2"
+DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v3"
 _LEGACY_DECISION_PAYLOAD_SCHEMA = "healthmes.decision-private.v1"
+_LEGACY_DECISION_PAYLOAD_SCHEMA_V2 = "healthmes.decision-private.v2"
 _PERSISTENCE_FAILURE = "decision_record_persistence_failed"
 _MAX_STORED_JSON_BYTES = 2_000_000
+_MAX_STORED_OUTCOME_SUMMARY_LENGTH = 160
+_MAX_STORED_LIMITATION_CODES = 32
+_COMPACT_RECOVERY_LIMITATION = "decision_response_compacted"
 _MAX_POSTGRES_ATTEMPTS = 3
 _RETRYABLE_POSTGRES_STATES = frozenset({"40001", "40P01"})
 _POSTGRES_TIMEOUT_STATES = frozenset({"55P03", "57014"})
@@ -99,6 +107,9 @@ _SAFE_TOOL_ERROR_CODES = frozenset(
 _SOURCE_REF_TOKEN = re.compile(
     r"(?<![A-Za-z0-9_])sr_[0-9a-f]{32}(?![A-Za-z0-9_])",
     re.IGNORECASE,
+)
+_SAFE_LIMITATION_CODE = re.compile(
+    r"^[a-z][a-z0-9_.:-]{0,127}$"
 )
 
 AccessPolicyResolver = Callable[[DecisionRequest], ContextAccessPolicy]
@@ -266,8 +277,97 @@ class _StoredDecisionPayloadV2(BaseModel):
         return self
 
 
+class _StoredDecisionOutcome(BaseModel):
+    """Bounded, non-verbatim outcome retained for audit and recovery."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: DecisionStatus
+    summary: str = Field(
+        min_length=1,
+        max_length=_MAX_STORED_OUTCOME_SUMMARY_LENGTH,
+    )
+    proposed_action: bool
+    limitation_codes: tuple[str, ...] = Field(
+        default=(),
+        max_length=_MAX_STORED_LIMITATION_CODES,
+    )
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    decision_record_id: uuid.UUID
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> _StoredDecisionOutcome:
+        if self.status is not DecisionStatus.COMPLETED:
+            raise ValueError("stored outcomes must be completed")
+        if any(
+            _SAFE_LIMITATION_CODE.fullmatch(value) is None
+            for value in self.limitation_codes
+        ):
+            raise ValueError(
+                "stored outcome limitations must be safe codes"
+            )
+        if len(self.limitation_codes) != len(
+            set(self.limitation_codes)
+        ):
+            raise ValueError(
+                "stored outcome limitation codes must be unique"
+            )
+        return self
+
+
+class _StoredDecisionPayloadV3(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+    )
+
+    schema_name: Literal["healthmes.decision-private.v3"] = Field(
+        alias="schema"
+    )
+    request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request: _StoredDecisionRequestMetadata
+    persistence_intent: DecisionPersistenceIntent
+    outcome: _StoredDecisionOutcome
+    run: _StoredRun
+    source_refs: tuple[SourceRef, ...]
+    source_attestations: tuple[_StoredSourceAttestation, ...]
+    access_trace: tuple[AccessAuditEntry, ...]
+
+    @model_validator(mode="after")
+    def validate_persistence_contract(
+        self,
+    ) -> _StoredDecisionPayloadV3:
+        if self.persistence_intent in {
+            DecisionPersistenceIntent.NONE,
+            DecisionPersistenceIntent.MUTATION,
+        }:
+            raise ValueError(
+                "stored decisions require a read-only persistence intent"
+            )
+        action_or_risk = self.persistence_intent in {
+            DecisionPersistenceIntent.ACTION,
+            DecisionPersistenceIntent.RISK,
+        }
+        if self.outcome.proposed_action is not action_or_risk:
+            raise ValueError(
+                "stored persistence intent conflicts with proposed_action"
+            )
+        if action_or_risk and not self.source_refs:
+            raise ValueError(
+                "stored action and risk outcomes require source refs"
+            )
+        if self.outcome.summary != _stored_outcome_summary(
+            self.persistence_intent
+        ):
+            raise ValueError("stored outcome summary is not canonical")
+        return self
+
+
 StoredDecisionPayload = (
-    _StoredDecisionPayloadV1 | _StoredDecisionPayloadV2
+    _StoredDecisionPayloadV1
+    | _StoredDecisionPayloadV2
+    | _StoredDecisionPayloadV3
 )
 
 
@@ -444,6 +544,11 @@ def decision_request_fingerprint(request: DecisionRequest) -> str:
 def decision_result_from_record(row: DecisionRecord) -> DecisionResult:
     """Recover one verified result after an outcome-unknown response."""
 
+    if (
+        row.expires_at is not None
+        and _as_utc(row.expires_at) <= datetime.now(UTC)
+    ):
+        raise ValueError("decision record has expired")
     fingerprint = row.decision_request_fingerprint
     if fingerprint is None:
         raise ValueError("decision record is not Decision Agent correlated")
@@ -968,6 +1073,10 @@ class DecisionFinalizer:
                                         deadline
                                     ),
                                 )
+                                purge_expired_decision_records(
+                                    session,
+                                    now=_as_utc(self._clock()),
+                                )
                                 final_policy = self._resolve_policy(
                                     request,
                                     session=session,
@@ -1066,6 +1175,7 @@ class DecisionFinalizer:
                                     result,
                                     request_fingerprint=fingerprint,
                                     persistence_intent=persistence_intent,
+                                    source_limitations=source_limitations,
                                 )
                                 _ensure_finalization_deadline(deadline)
                                 row = DecisionRecord(
@@ -1086,6 +1196,11 @@ class DecisionFinalizer:
                                     decision_payload_digest=_json_digest(
                                         payload
                                     ),
+                                )
+                                apply_decision_retention(
+                                    session,
+                                    row,
+                                    basis_at=source_validation_now,
                                 )
                                 session.add(row)
                                 _ensure_finalization_deadline(deadline)
@@ -1534,8 +1649,8 @@ def _stored_decision(
         payload = _validate_stored_payload(normalized)
     except (TypeError, ValueError, ValidationError):
         return "decision_record_contract_invalid"
-    result = payload.result
     if isinstance(payload, _StoredDecisionPayloadV1):
+        result = payload.result
         request_ids_match = (
             decision_request_fingerprint(payload.request) == fingerprint
             and payload.request.request_id == row.decision_request_id
@@ -1548,7 +1663,17 @@ def _stored_decision(
             if result.proposed_action
             else DecisionPersistenceIntent.EXPLICIT_TRACKING
         )
+    elif isinstance(payload, _StoredDecisionPayloadV2):
+        result = payload.result
+        request_ids_match = (
+            payload.request.request_id == row.decision_request_id
+            and payload.request.turn_id == row.decision_turn_id
+        )
+        candidates_trace = payload.source_attestations
+        access_trace = payload.access_trace
+        persistence_intent = payload.persistence_intent
     else:
+        result = _result_from_stored_outcome(payload)
         request_ids_match = (
             payload.request.request_id == row.decision_request_id
             and payload.request.turn_id == row.decision_turn_id
@@ -1577,6 +1702,10 @@ def _stored_decision(
         )
         or row.tokens != _runtime_token_total(payload.run.runtime)
         or persistence_intent is DecisionPersistenceIntent.NONE
+        or (
+            isinstance(payload, _StoredDecisionPayloadV3)
+            and row.retention_basis_at is None
+        )
     ):
         return "decision_record_contract_invalid"
     try:
@@ -1615,8 +1744,12 @@ def _validate_stored_payload(
         payload: StoredDecisionPayload = (
             _StoredDecisionPayloadV1.model_validate(normalized.value)
         )
-    elif schema_name == DECISION_PAYLOAD_SCHEMA:
+    elif schema_name == _LEGACY_DECISION_PAYLOAD_SCHEMA_V2:
         payload = _StoredDecisionPayloadV2.model_validate(
+            normalized.value
+        )
+    elif schema_name == DECISION_PAYLOAD_SCHEMA:
+        payload = _StoredDecisionPayloadV3.model_validate(
             normalized.value
         )
     else:
@@ -1681,6 +1814,29 @@ def _stored_source_candidates(
             for reference_id, items in candidates.items()
         },
         refs,
+    )
+
+
+def _result_from_stored_outcome(
+    payload: _StoredDecisionPayloadV3,
+) -> DecisionResult:
+    outcome = payload.outcome
+    return DecisionResult(
+        request_id=payload.request.request_id,
+        turn_id=payload.request.turn_id,
+        status=outcome.status,
+        answer=outcome.summary,
+        proposed_action=outcome.proposed_action,
+        source_refs=list(payload.source_refs),
+        limitations=_merge_limitations(
+            outcome.limitation_codes,
+            (_COMPACT_RECOVERY_LIMITATION,),
+        ),
+        confidence=outcome.confidence,
+        persistence_status=PersistenceStatus.PERSISTED,
+        decision_record_id=outcome.decision_record_id,
+        runtime=payload.run.runtime,
+        tool_trace=[],
     )
 
 
@@ -1918,10 +2074,18 @@ def _decision_payload(
     *,
     request_fingerprint: str,
     persistence_intent: DecisionPersistenceIntent,
+    source_limitations: Sequence[str],
 ) -> dict[str, Any]:
-    stored_result = result.model_copy(
-        update={"tool_trace": []},
-        deep=True,
+    stored_outcome = _StoredDecisionOutcome(
+        status=result.status,
+        summary=_stored_outcome_summary(persistence_intent),
+        proposed_action=result.proposed_action,
+        limitation_codes=_sanitized_limitation_codes(
+            _tool_trace_limitations(run.tool_trace),
+            source_limitations,
+        ),
+        confidence=result.confidence,
+        decision_record_id=result.decision_record_id,
     )
     stored_run = _StoredRun(
         runtime=run.runtime,
@@ -1938,7 +2102,7 @@ def _decision_payload(
         attestation.query.query_id
         for attestation in source_attestations
     }
-    payload_model = _StoredDecisionPayloadV2(
+    payload_model = _StoredDecisionPayloadV3(
         schema_name=DECISION_PAYLOAD_SCHEMA,
         request_fingerprint=request_fingerprint,
         request=_StoredDecisionRequestMetadata(
@@ -1952,7 +2116,7 @@ def _decision_payload(
             ),
         ),
         persistence_intent=persistence_intent,
-        result=stored_result,
+        outcome=stored_outcome,
         run=stored_run,
         source_refs=tuple(result.source_refs),
         source_attestations=source_attestations,
@@ -1973,6 +2137,38 @@ def _decision_payload(
     )
     assert isinstance(normalized.value, dict)
     return normalized.value
+
+
+def _stored_outcome_summary(
+    persistence_intent: DecisionPersistenceIntent,
+) -> str:
+    if persistence_intent is DecisionPersistenceIntent.RISK:
+        return "A wellness risk warning was recorded."
+    if persistence_intent is DecisionPersistenceIntent.ACTION:
+        return "A wellness action recommendation was recorded."
+    if (
+        persistence_intent
+        is DecisionPersistenceIntent.EXPLICIT_TRACKING
+    ):
+        return "A wellness decision was explicitly tracked."
+    raise ValueError("unsupported stored decision persistence intent")
+
+
+def _sanitized_limitation_codes(
+    *groups: Sequence[str],
+) -> tuple[str, ...]:
+    codes: list[str] = []
+    for values in groups:
+        for value in values:
+            if (
+                _SAFE_LIMITATION_CODE.fullmatch(value) is None
+                or value in codes
+            ):
+                continue
+            codes.append(value)
+            if len(codes) == _MAX_STORED_LIMITATION_CODES:
+                return tuple(codes)
+    return tuple(codes)
 
 
 def _source_attestations(

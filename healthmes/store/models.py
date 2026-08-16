@@ -428,6 +428,8 @@ class DecisionRecord(Base):
     decision_payload_digest: Mapped[str_64 | None] = mapped_column(
         default=None,
     )
+    retention_basis_at: Mapped[datetime | None] = mapped_column(index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(index=True)
 
 
 class DecisionDomainPolicy(Base):

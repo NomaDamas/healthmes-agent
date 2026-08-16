@@ -171,6 +171,30 @@ def _render_offline_wearable_retention_downgrade(
     return buffer.getvalue()
 
 
+def _render_offline_decision_retention_upgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.upgrade(
+        _config(database_url, buffer=buffer),
+        "d8e9f0a1b2c3:e9f0a1b2c3d4",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
+def _render_offline_decision_retention_downgrade(
+    database_url: str,
+) -> str:
+    buffer = io.StringIO()
+    command.downgrade(
+        _config(database_url, buffer=buffer),
+        "e9f0a1b2c3d4:d8e9f0a1b2c3",
+        sql=True,
+    )
+    return buffer.getvalue()
+
+
 def test_migration_graph_has_single_head():
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
@@ -205,6 +229,34 @@ class TestOfflineRender:
         assert "UUID" in rendered  # sa.Uuid became native UUID
         # enums stay portable VARCHAR: no postgres CREATE TYPE
         assert "CREATE TYPE" not in rendered
+
+    @pytest.mark.parametrize(
+        "database_url",
+        (
+            "sqlite:///offline-render.db",
+            "postgresql+psycopg://healthmes:healthmes@localhost:5432/healthmes",
+        ),
+    )
+    def test_decision_retention_upgrade_and_downgrade_render(
+        self,
+        database_url,
+    ):
+        upgrade = _render_offline_decision_retention_upgrade(
+            database_url
+        )
+        downgrade = _render_offline_decision_retention_downgrade(
+            database_url
+        )
+
+        assert "retention_basis_at" in upgrade
+        assert "expires_at" in upgrade
+        assert "retention_policy.data_class = 'decision'" in upgrade
+        assert "decision_request_id IS NOT NULL" in upgrade
+        assert "ix_decision_record_retention_basis_at" in upgrade
+        assert "ix_decision_record_expires_at" in upgrade
+        assert "DROP" in downgrade
+        assert "retention_basis_at" in downgrade
+        assert "expires_at" in downgrade
 
     @pytest.mark.parametrize(
         "database_url",
@@ -433,6 +485,133 @@ class TestSqliteUpgrade:
                 context = MigrationContext.configure(connection)
                 diff = compare_metadata(context, Base.metadata)
             assert diff == []
+        finally:
+            engine.dispose()
+
+    def test_decision_retention_migration_round_trip(self, tmp_path):
+        database_url = (
+            f"sqlite:///{tmp_path / 'decision-retention.db'}"
+        )
+        config = _config(database_url)
+        command.upgrade(config, "d8e9f0a1b2c3")
+
+        engine = sa.create_engine(database_url)
+        metadata = sa.MetaData()
+        retention_policy = sa.Table(
+            "retention_policy",
+            metadata,
+            autoload_with=engine,
+        )
+        decision_record = sa.Table(
+            "decision_record",
+            metadata,
+            autoload_with=engine,
+        )
+        policy_id = uuid.uuid4().hex
+        wellness_id = uuid.uuid4().hex
+        legacy_id = uuid.uuid4().hex
+        request_id = uuid.uuid4().hex
+        turn_id = uuid.uuid4().hex
+        created_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+        private_payload = {
+            "schema": "healthmes.decision-private.v2"
+        }
+        with engine.begin() as connection:
+            connection.execute(
+                retention_policy.insert().values(
+                    id=policy_id,
+                    data_class="decision",
+                    retention_days=7,
+                    enabled=True,
+                )
+            )
+            connection.execute(
+                decision_record.insert().values(
+                    id=wellness_id,
+                    kind="insight",
+                    tree={
+                        "id": "healthmes-decision",
+                        "children": [],
+                    },
+                    summary="Historical wellness decision",
+                    decision_request_id=request_id,
+                    decision_turn_id=turn_id,
+                    decision_request_fingerprint="f" * 64,
+                    decision_payload=private_payload,
+                    decision_payload_digest="d" * 64,
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+            connection.execute(
+                decision_record.insert().values(
+                    id=legacy_id,
+                    kind="schedule_change",
+                    tree={"id": "legacy", "children": []},
+                    summary="Historical non-wellness decision",
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+        engine.dispose()
+
+        command.upgrade(config, "head")
+
+        engine = sa.create_engine(database_url)
+        migrated = sa.Table(
+            "decision_record",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        with engine.connect() as connection:
+            rows = {
+                row.id: row
+                for row in connection.execute(sa.select(migrated))
+            }
+            wellness = rows[wellness_id]
+            legacy = rows[legacy_id]
+            assert wellness.retention_basis_at == (
+                created_at.replace(tzinfo=None)
+            )
+            assert wellness.expires_at == (
+                created_at + timedelta(days=7)
+            ).replace(tzinfo=None)
+            assert legacy.retention_basis_at is None
+            assert legacy.expires_at is None
+            assert wellness.decision_payload == private_payload
+        engine.dispose()
+
+        command.downgrade(config, "d8e9f0a1b2c3")
+
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            columns = {
+                item["name"]
+                for item in inspector.get_columns("decision_record")
+            }
+            assert "retention_basis_at" not in columns
+            assert "expires_at" not in columns
+            restored = sa.Table(
+                "decision_record",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                rows = {
+                    row.id: row
+                    for row in connection.execute(sa.select(restored))
+                }
+                assert set(rows) == {wellness_id, legacy_id}
+                assert (
+                    rows[wellness_id].decision_payload
+                    == private_payload
+                )
+                assert connection.scalar(
+                    sa.text(
+                        "SELECT version_num FROM alembic_version"
+                    )
+                ) == "d8e9f0a1b2c3"
         finally:
             engine.dispose()
 
@@ -1233,7 +1412,7 @@ class TestSqliteUpgrade:
                     )
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d8e9f0a1b2c3"
+                ) == "e9f0a1b2c3d4"
         finally:
             engine.dispose()
 
@@ -2110,7 +2289,7 @@ class TestSqliteUpgrade:
             with engine.connect() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d8e9f0a1b2c3"
+                ) == "e9f0a1b2c3d4"
         finally:
             engine.dispose()
 
@@ -2452,7 +2631,7 @@ def test_postgres_wearable_retention_migration_round_trip() -> None:
                 assert migrated.expires_at == original_expiry
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d8e9f0a1b2c3"
+                ) == "e9f0a1b2c3d4"
         finally:
             scoped_engine.dispose()
 
@@ -2695,7 +2874,7 @@ def test_postgres_calendar_generation_migration_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d8e9f0a1b2c3"
+                ) == "e9f0a1b2c3d4"
                 assert connection.scalar(
                     sa.select(proposal.c.status).where(
                         proposal.c.id == active_id
@@ -2719,7 +2898,7 @@ def test_postgres_calendar_generation_migration_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d8e9f0a1b2c3"
+                ) == "e9f0a1b2c3d4"
                 connection.execute(
                     proposal.update()
                     .where(proposal.c.id == active_id)
@@ -2765,7 +2944,7 @@ def test_postgres_calendar_generation_migration_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d8e9f0a1b2c3"
+                ) == "e9f0a1b2c3d4"
                 assert connection.scalar(
                     sa.select(proposal.c.status).where(
                         proposal.c.id == raced_id
@@ -2973,7 +3152,7 @@ def test_postgres_decision_agent_migration_round_trip() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d8e9f0a1b2c3"
+                ) == "e9f0a1b2c3d4"
                 assert connection.scalar(
                     sa.select(sa.func.count())
                     .select_from(preserved)
@@ -3038,7 +3217,7 @@ def test_postgres_decision_agent_migration_round_trip() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d8e9f0a1b2c3"
+                ) == "e9f0a1b2c3d4"
                 assert connection.scalar(
                     sa.select(sa.func.count())
                     .select_from(migrated)
@@ -3144,7 +3323,7 @@ def test_postgres_decision_policy_downgrade_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d8e9f0a1b2c3"
+                ) == "e9f0a1b2c3d4"
                 assert connection.scalar(
                     sa.select(policy.c.enabled).where(
                         policy.c.id == policy_id
@@ -3184,7 +3363,7 @@ def test_postgres_decision_policy_downgrade_is_lossless() -> None:
             with scoped_engine.begin() as connection:
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "d8e9f0a1b2c3"
+                ) == "e9f0a1b2c3d4"
                 assert connection.scalar(
                     sa.select(policy.c.enabled).where(
                         policy.c.id == policy_id
