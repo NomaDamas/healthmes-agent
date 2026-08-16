@@ -2226,6 +2226,62 @@ def test_checksum_recomputed_contract_tampering_fails_closed(
         ) == 1
 
 
+@pytest.mark.parametrize(
+    ("persistence_intent", "proposed_action"),
+    (
+        (DecisionPersistenceIntent.ACTION, False),
+        (DecisionPersistenceIntent.RISK, False),
+        (DecisionPersistenceIntent.EXPLICIT_TRACKING, True),
+        (DecisionPersistenceIntent.MUTATION, True),
+    ),
+)
+def test_checksum_recomputed_persistence_invariant_tampering_fails_closed(
+    persistence,
+    persistence_intent,
+    proposed_action,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    finalizer = _finalizer(factory)
+    first = finalizer.finalize(request, _run(request, [ref]))
+    assert first.decision_record_id is not None
+
+    with factory() as session:
+        row = session.get(DecisionRecord, first.decision_record_id)
+        assert row is not None
+        assert row.decision_payload is not None
+        payload = copy.deepcopy(row.decision_payload)
+        payload["persistence_intent"] = persistence_intent.value
+        payload["result"]["proposed_action"] = proposed_action
+        tampered_result = DecisionResult.model_validate(payload["result"])
+        row.tree = finalizer_module._decision_tree(tampered_result)
+        row.summary = finalizer_module._public_summary(tampered_result)
+        row.decision_payload = payload
+        row.decision_payload_digest = _payload_digest(payload)
+        session.commit()
+
+    retry_request = request.model_copy(
+        update={"turn_id": uuid.uuid4()}
+    )
+    retry = finalizer.finalize(
+        retry_request,
+        _run(retry_request, [ref]),
+    )
+
+    assert retry.status is DecisionStatus.FAILED
+    assert retry.proposed_action is False
+    assert retry.persistence_status is PersistenceStatus.FAILED
+    assert "decision_record_contract_invalid" in retry.limitations
+    assert retry.source_refs == []
+    assert retry.tool_trace == []
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 1
+
+
 def test_external_wearable_action_requires_retained_local_source(
     persistence,
 ):

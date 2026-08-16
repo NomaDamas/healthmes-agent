@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,20 @@ REVIEWED_WELLNESS_SKILLS = (
     "healthmes-sleep",
     "healthmes-stress",
 )
+CANONICAL_WELLNESS_DECISION_TOOLS = (
+    "search_activity",
+    "search_nutrition",
+    "search_calendar",
+    "search_wearable",
+    "list_wellness_skills",
+    "read_wellness_skill",
+)
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2] / "skills"
+_MCP_TOOL_REFERENCE = re.compile(
+    r"\bmcp__(?P<server>[A-Za-z0-9_-]+)__"
+    r"(?P<tool>[A-Za-z0-9_-]+)\b"
+)
 
 
 class WellnessSkillCatalogError(ValueError):
@@ -70,6 +83,7 @@ def _load_skill(name: str) -> tuple[dict[str, Any], str]:
         raise WellnessSkillCatalogError(
             "wellness_skill_not_utf8"
         ) from exc
+    _validate_tool_references(content)
     frontmatter = _frontmatter(content)
     if frontmatter.get("name") != name:
         raise WellnessSkillCatalogError(
@@ -94,6 +108,19 @@ def _load_skill(name: str) -> tuple[dict[str, Any], str]:
     if version is not None:
         metadata["version"] = str(version)
     return metadata, content
+
+
+def _validate_tool_references(content: str) -> None:
+    allowed = frozenset(CANONICAL_WELLNESS_DECISION_TOOLS)
+    for match in _MCP_TOOL_REFERENCE.finditer(content):
+        if match.group("server") != "healthmes":
+            raise WellnessSkillCatalogError(
+                "wellness_skill_mcp_server_not_allowed"
+            )
+        if match.group("tool") not in allowed:
+            raise WellnessSkillCatalogError(
+                "wellness_skill_tool_not_allowed"
+            )
 
 
 def _read_skill_bytes(name: str) -> bytes:

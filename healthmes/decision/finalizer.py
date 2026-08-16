@@ -244,6 +244,27 @@ class _StoredDecisionPayloadV2(BaseModel):
     source_attestations: tuple[_StoredSourceAttestation, ...]
     access_trace: tuple[AccessAuditEntry, ...]
 
+    @model_validator(mode="after")
+    def validate_persistence_contract(
+        self,
+    ) -> _StoredDecisionPayloadV2:
+        if self.persistence_intent in {
+            DecisionPersistenceIntent.NONE,
+            DecisionPersistenceIntent.MUTATION,
+        }:
+            raise ValueError(
+                "stored decisions require a read-only persistence intent"
+            )
+        action_or_risk = self.persistence_intent in {
+            DecisionPersistenceIntent.ACTION,
+            DecisionPersistenceIntent.RISK,
+        }
+        if self.result.proposed_action is not action_or_risk:
+            raise ValueError(
+                "stored persistence intent conflicts with proposed_action"
+            )
+        return self
+
 
 StoredDecisionPayload = (
     _StoredDecisionPayloadV1 | _StoredDecisionPayloadV2

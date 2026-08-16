@@ -915,6 +915,61 @@ async def test_explicit_abort_preserves_in_flight_tool_and_access_trace(
         service.inspect(handle.session_id)
 
 
+async def test_close_preserves_in_flight_tool_and_access_trace(
+    store_factory,
+) -> None:
+    clock = MutableClock()
+    provider = BlockingProvider()
+    service = _service(
+        store_factory,
+        provider,
+        [_policy()],
+        clock,
+    )
+    handle = service.begin(_request())
+    task = asyncio.create_task(
+        _search(service, handle.session_id)
+    )
+    await provider.started.wait()
+
+    service.close()
+    in_flight = service.inspect(handle.session_id)
+    assert in_flight.state is DecisionSearchSessionState.ABORTED
+    assert in_flight.tool_trace == ()
+    assert in_flight.access_trace == ()
+
+    provider.release.set()
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        await task
+
+    snapshot = service.inspect(handle.session_id)
+    assert snapshot.state is DecisionSearchSessionState.ABORTED
+    assert snapshot.budget.tool_calls_used == 1
+    assert len(snapshot.tool_trace) == 1
+    assert snapshot.tool_trace[0].status is ToolCallStatus.FAILED
+    assert (
+        snapshot.tool_trace[0].error_code
+        == "decision_search_session_aborted"
+    )
+    assert len(snapshot.access_trace) == 1
+    assert snapshot.access_trace[0].reason_codes == (
+        "decision_search_session_aborted",
+    )
+    assert (
+        snapshot.access_trace[0].query_id
+        == snapshot.tool_trace[0].query.query_id
+    )
+
+    finished = service.finish(handle.session_id)
+    assert finished.state is DecisionSearchSessionState.ABORTED
+    assert finished.tool_trace == snapshot.tool_trace
+    assert finished.access_trace == snapshot.access_trace
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        service.inspect(handle.session_id)
+    with pytest.raises(AbortedDecisionSearchSessionError):
+        service.begin(_request())
+
+
 async def test_explicit_abort_releases_session_capacity_after_unwind(
     store_factory,
 ) -> None:

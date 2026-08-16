@@ -13,10 +13,11 @@ directly.
 
 - Read data only through registered MCP tools. Never call HealthMes or
   open-wearables REST endpoints directly.
-- Start with `mcp__healthmes__get_daily_readiness_context` for the target
-  date. It already interprets seven-night sleep debt, last-night sleep score,
-  nocturnal HRV versus the personal baseline, stress, charge, yesterday's
-  load, and overall confidence.
+- Start with `mcp__healthmes__search_wearable` using capability
+  `wearable.readiness` for the target date. It returns bounded readiness,
+  seven-night sleep debt, actual sleep, nocturnal HRV versus the personal
+  baseline, stress, charge, yesterday's load, confidence, and source
+  references when available.
 - Use `mcp__healthmes__search_wearable` with capability `wearable.sleep` only
   when basic sleep timing, duration, or source helps explain the interpreted
   context. HealthMes owns user resolution, bounded provider access, retention
@@ -39,12 +40,13 @@ directly.
   amount to consume, or perform retrospective causal analysis. Those requests
   require a separate behavior-impact skill with exposure data and explicit
   safeguards.
-- Do not replace `healthmes-planner`. This skill decides whether sleep evidence
-  justifies reconsideration; the planner owns any schedule proposal.
+- This skill may suggest one reversible review of the user's plan, but it
+  cannot create, move, or update a Calendar event.
 
 ## Judgment procedure
 
-1. Call `mcp__healthmes__get_daily_readiness_context` for the target date.
+1. Call `mcp__healthmes__search_wearable` with `wearable.readiness` for the
+   target date.
 2. Read `status` and overall `confidence` before interpreting individual
    blocks.
 3. If overall status is `insufficient_data` or overall confidence is `low`:
@@ -105,6 +107,6 @@ population claims, and distinguish observed device data from interpretation.
 - Never call a generic decision-record tool. HealthMes validates source
   references and conditionally stores a compact record after the runtime
   returns.
-- If the user chooses to adjust the schedule, hand off to `healthmes-planner`
-  so it can use `mcp__healthmes__propose_schedule_blocks` and preserve the
-  propose-then-confirm gate.
+- If the user chooses to adjust the schedule, state that this read-only
+  decision turn cannot mutate Calendar data. A separate explicit command
+  workflow must perform and confirm that change.

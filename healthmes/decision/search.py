@@ -500,10 +500,14 @@ class DecisionContextSearchSessionService:
                 return
             self._closed = True
             for record in tuple(self._active.values()):
-                self._transition_locked(
-                    record,
-                    DecisionSearchSessionState.ABORTED,
+                record.terminal_error_code = (
+                    "decision_search_session_aborted"
                 )
+                if not record.in_flight:
+                    self._transition_locked(
+                        record,
+                        DecisionSearchSessionState.ABORTED,
+                    )
 
     async def _search_active(
         self,
