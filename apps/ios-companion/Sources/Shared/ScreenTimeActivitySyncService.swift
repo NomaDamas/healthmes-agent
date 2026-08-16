@@ -96,6 +96,12 @@ enum ScreenTimeActivityCollectionFailurePolicy {
             throw ScreenTimeActivityCollectionError.exportFailed
         }
     }
+
+    static func authorizationResultAfterUnexpectedFailure(
+        current: ScreenTimeCollectorResult
+    ) -> ScreenTimeCollectorResult? {
+        current.permitsAggregateUpload ? nil : current
+    }
 }
 
 protocol ScreenTimeActivityTransport {
@@ -453,7 +459,10 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
 
         var persistenceError: Error?
         do {
-            try await outbox.purge(deviceID: deviceID)
+            // The outbox is dedicated to this Screen Time input. Purge every
+            // historical pseudonym identity, including entries written before
+            // a Keychain reset changed the current device ID.
+            try await outbox.purgeAll()
         } catch {
             persistenceError = error
         }
@@ -674,9 +683,12 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
                 lease == .background,
                 pendingSync.waiterLeases.isEmpty
             {
+                // The pending task may still be suspended on its foreground
+                // predecessor. Detach it before cancelling so BGTask
+                // expiration can complete without waiting for unrelated work.
                 pendingSync.task.cancel()
                 self.pendingSync = nil
-                return pendingSync.task
+                return nil
             }
             self.pendingSync = pendingSync
             return nil
@@ -763,7 +775,6 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         ) {
             return .skipped(reason: reason)
         }
-
         let pseudonymBoundaryAccepted =
             await stateStore.preparePseudonymBoundary(
                 deviceID: deviceID,
@@ -802,11 +813,28 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
             if Task.isCancelled {
                 throw CancellationError()
             }
-            // Export/data failures are transient collection failures, not
-            // authorization changes. Reporting `.unavailable` here would
-            // advance the permission generation and move the collection
-            // boundary, permanently skipping the failed historical window.
-            throw ScreenTimeActivityCollectionError.exportFailed
+            let currentAuthorization =
+                await collector.currentAuthorizationStatus()
+            if let authorization =
+                ScreenTimeActivityCollectionFailurePolicy
+                    .authorizationResultAfterUnexpectedFailure(
+                        current: currentAuthorization
+                    )
+            {
+                result = authorization
+            } else {
+                // A transient export failure must not starve reports already
+                // durably queued. Re-check authorization first so a grant
+                // revoked during export cannot leak the older aggregate.
+                if let pendingOutcome = try await flushPendingUploads(
+                    pairing: pairing,
+                    authorization: currentAuthorization,
+                    now: now
+                ) {
+                    return pendingOutcome
+                }
+                throw ScreenTimeActivityCollectionError.exportFailed
+            }
         }
         if result.permitsAggregateUpload {
             let currentAuthorization =

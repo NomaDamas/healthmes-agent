@@ -269,6 +269,15 @@ final class ScreenTimeActivityRuntime {
                 refreshAuthorization: false
             )
         }
+        if authorizationIntentStore.isOptedIn {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.runAutomaticCatchUp(
+                    trigger: .authorizationChanged,
+                    refreshAuthorization: true
+                )
+            }
+        }
     }
 
     /// Callable seam for the future device-team settings UI.

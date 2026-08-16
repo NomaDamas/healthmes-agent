@@ -15,6 +15,9 @@
 # those files verbatim. Sources/SharedActivity is the iOS-only ActivityKit
 # attributes shared between the app and its widget extension.
 name: HealthMesCompanion
+# These opt-in configurations are an executable entitlement/build contract,
+# not device UI. They keep the normal build fail-closed while giving an
+# approved provisioning profile a distinct Screen Time capability path.
 configs:
   Debug: debug
   Release: release

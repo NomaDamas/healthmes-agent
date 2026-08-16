@@ -262,10 +262,23 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                 window: window,
                 excludedAppTokens: excludedAppTokens
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as DeviceActivityData.Error {
             return try ScreenTimeActivityCollectionFailurePolicy.result(
                 for: collectionFailure(for: error)
             )
+        } catch {
+            let current = await statusResult()
+            if let authorization =
+                ScreenTimeActivityCollectionFailurePolicy
+                    .authorizationResultAfterUnexpectedFailure(
+                        current: current
+                    )
+            {
+                return authorization
+            }
+            throw error
         }
     }
 
@@ -331,7 +344,8 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
         var usage: [UsageKey: Int] = [:]
         var observedBucketStarts = Set<Date>()
         var confirmedZeroBuckets = Set<Date>()
-        var privacyTaintedBuckets = Set<Date>()
+        var privacyFilteredBuckets = Set<Date>()
+        var incompleteMetadataBuckets = Set<Date>()
         let results = DeviceActivityData.activityData(
             filteredBy: filter,
             using: .live
@@ -354,7 +368,7 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                     confirmedZeroBuckets.insert(bucketStart)
                     continue
                 }
-                var attributedSeconds = 0
+                var resolvedSeconds = 0
                 for try await categoryActivity in segment.categories {
                     guard
                         let categoryToken =
@@ -362,7 +376,7 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                         let metadata =
                             categoryMetadata[categoryToken]
                     else {
-                        privacyTaintedBuckets.insert(bucketStart)
+                        incompleteMetadataBuckets.insert(bucketStart)
                         continue
                     }
                     let category = ScreenTimeCategoryNormalizer.normalize(
@@ -384,14 +398,15 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                             let bundleIdentifier =
                                 applicationBundleIDs[applicationToken]
                         else {
-                            privacyTaintedBuckets.insert(bucketStart)
+                            incompleteMetadataBuckets.insert(bucketStart)
                             continue
                         }
+                        resolvedSeconds += seconds
                         let token = pseudonymizer.appToken(
                             bundleIdentifier: bundleIdentifier
                         )
                         guard !excludedAppTokens.contains(token) else {
-                            privacyTaintedBuckets.insert(bucketStart)
+                            privacyFilteredBuckets.insert(bucketStart)
                             continue
                         }
                         let key = UsageKey(
@@ -400,17 +415,19 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
                             category: category
                         )
                         usage[key, default: 0] += seconds
-                        attributedSeconds += seconds
                     }
                 }
-                if attributedSeconds < segmentSeconds {
-                    privacyTaintedBuckets.insert(bucketStart)
+                if resolvedSeconds < segmentSeconds {
+                    incompleteMetadataBuckets.insert(bucketStart)
                 }
             }
         }
 
-        let accumulatedUsage = usage.map { key, seconds in
-            ScreenTimeAccumulatedUsage(
+        let accumulatedUsage = usage.compactMap { key, seconds in
+            guard !incompleteMetadataBuckets.contains(key.bucketStart) else {
+                return nil
+            }
+            return ScreenTimeAccumulatedUsage(
                 bucketStart: key.bucketStart,
                 opaqueAppToken: key.opaqueAppToken,
                 category: key.category,
@@ -420,13 +437,13 @@ struct IOS264ScreenTimeActivityCollector: ScreenTimeActivityCollecting {
         let completeSamples = ScreenTimeSamplePlanner.samples(
             usage: accumulatedUsage,
             confirmedZeroBuckets: confirmedZeroBuckets,
-            privacyTaintedBuckets: privacyTaintedBuckets,
+            privacyTaintedBuckets: privacyFilteredBuckets,
             window: window,
             pseudonymizer: pseudonymizer
         )
         let authoritativeBucketStarts =
             observedBucketStarts.subtracting(
-                privacyTaintedBuckets
+                incompleteMetadataBuckets
             )
 
         guard completeSamples.count <= 5_000 else {

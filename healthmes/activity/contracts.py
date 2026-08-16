@@ -513,6 +513,12 @@ class IOSCapabilityReport(BaseModel):
     authoritative_bucket_starts: list[AwareDatetime] = Field(
         default_factory=list,
         max_length=168,
+        description=(
+            "Post-privacy replacement scopes. For each listed hour, the "
+            "server removes prior iOS rows missing from this report. A "
+            "privacy-filtered hour can therefore be authoritative while its "
+            "remaining samples keep coverage_seconds unset."
+        ),
     )
     samples: list[IOSAggregateSample] = Field(default_factory=list, max_length=5000)
 

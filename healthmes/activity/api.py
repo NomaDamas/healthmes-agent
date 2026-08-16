@@ -901,6 +901,11 @@ def post_ios_report(
                             record.source_record_id
                             for record in allowed_records
                         }
+                        # Authoritative means complete after the device's
+                        # privacy filter, not complete raw Screen Time
+                        # coverage. Query the whole replacement scope so an
+                        # app newly made private is deleted even when allowed
+                        # samples remain in the same hour.
                         existing_rows = (
                             list(
                                 session.scalars(

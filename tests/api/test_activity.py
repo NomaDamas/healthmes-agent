@@ -24,6 +24,9 @@ from healthmes.store import WellnessEvent
 IOS_KEY_FINGERPRINT = "1" * 40
 IOS_KEY_ID = f"ios-key-{IOS_KEY_FINGERPRINT}"
 IOS_APP_TOKEN = f"ios-app-v2-{IOS_KEY_FINGERPRINT}-" + ("a" * 40)
+IOS_PRIVATE_APP_TOKEN = (
+    f"ios-app-v2-{IOS_KEY_FINGERPRINT}-" + ("b" * 40)
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1544,6 +1547,75 @@ def test_ios_newer_authoritative_snapshot_deletes_missing_rows(
     )
     assert len(rows) == 1
     assert rows[0].payload["app_id"] == IOS_APP_TOKEN
+
+
+def test_ios_post_privacy_authoritative_bucket_removes_private_rows(
+    client,
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        "activity_raw",
+        "forever",
+        now=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    session.commit()
+    device_id = "iphone-post-privacy-replacement"
+    bucket_start = "2026-08-01T10:00:00Z"
+    allowed = _ios_sample(
+        "allowed-hour",
+        bucket_start=bucket_start,
+        category="productivity",
+        foreground_seconds=900,
+    )
+    private = {
+        **_ios_sample(
+            "private-hour",
+            bucket_start=bucket_start,
+            category="social",
+            foreground_seconds=600,
+        ),
+        "opaque_app_token": IOS_PRIVATE_APP_TOKEN,
+    }
+    initial = _ios_snapshot(
+        device_id=device_id,
+        sequence=100,
+        samples=[allowed, private],
+    )
+    filtered_allowed = {
+        **allowed,
+        # The bucket is authoritative after on-device privacy filtering, but
+        # raw Screen Time coverage is intentionally not claimed.
+        "coverage_seconds": None,
+    }
+    post_privacy = _ios_snapshot(
+        device_id=device_id,
+        sequence=101,
+        collected_at="2026-08-01T13:05:00Z",
+        authoritative_bucket_starts=[bucket_start],
+        samples=[filtered_allowed],
+    )
+
+    created = client.post("/v1/activity/ios/report", json=initial)
+    replaced = client.post(
+        "/v1/activity/ios/report",
+        json=post_privacy,
+    )
+
+    assert created.status_code == 200
+    assert created.json()["created"] == 2
+    assert replaced.status_code == 200
+    rows = list(
+        session.scalars(
+            select(WellnessEvent).where(
+                WellnessEvent.event_type == APP_HOUR_EVENT,
+                WellnessEvent.source_device == device_id,
+            )
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].payload["app_id"] == IOS_APP_TOKEN
+    assert rows[0].payload["coverage_seconds"] is None
 
 
 def test_ios_snapshot_preserves_hours_not_marked_authoritative(

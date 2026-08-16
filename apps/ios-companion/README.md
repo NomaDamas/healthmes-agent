@@ -344,6 +344,11 @@ Only a successful probe injects
 `HEALTHMES_APP_WEBSITE_USAGE_SDK_AVAILABLE`, which is the sole condition that
 compiles the real collector. Otherwise the opt-in build remains usable but
 reports `ios_screen_time_export_sdk_unavailable` without fake zero usage.
+The corresponding `project.yml` entries are required non-UI build contracts:
+they select the opt-in entitlement file, inject the capability probe result,
+register the Screen Time BGTask identifier, and compile the runtime seams into
+the host-less test target. Removing them would make the entitlement and
+lifecycle paths unbuildable rather than reduce device-team UI scope.
 
 The opt-in entitlement declaration is present in
 `Configurations/HealthMesCompanion-ScreenTimeOptIn.entitlements`. Actual
