@@ -82,8 +82,8 @@ the runtime. Keep the answer concise, include only actually used source
 reference IDs, state material limitations, and never add prose or a code fence
 outside the JSON object.
 
-When `persistence_intent` is not `none`, or the trusted request asks to retain
-the decision, also return `record_summary`: a privacy-minimized conclusion of
-at most 160 characters. It must state the useful conclusion or proposed action
-without copying the full answer, raw identifiers, transcripts, media content,
-or detailed tool payloads.
+`record_summary` is an optional compatibility field, not a persistence
+authority. If supplied, keep it under 160 characters and omit raw identifiers,
+transcripts, media content, and detailed tool payloads. HealthMes ignores this
+free text for durable storage and derives a fixed category-only summary from
+the verified persistence intent.

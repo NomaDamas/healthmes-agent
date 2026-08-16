@@ -71,7 +71,7 @@ from healthmes.decision.runtime import (
 )
 from healthmes.decision.validation import strict_model_validate
 
-HEALTHMES_DECISION_SYSTEM_POLICY_VERSION = "healthmes-decision-policy.v4"
+HEALTHMES_DECISION_SYSTEM_POLICY_VERSION = "healthmes-decision-policy.v5"
 HEALTHMES_DECISION_SYSTEM_POLICY = """
 You are one interchangeable reasoning runtime for the HealthMes Decision Agent.
 
@@ -104,10 +104,10 @@ persistence. For this one model iteration you must:
     a mutation, and `explicit_tracking` is only advisory: HealthMes verifies a
     trusted request flag. Never persist merely because source data was
     consulted.
-11. When persistence is requested by the user or your persistence intent is
-    not `none`, include a separately written `record_summary` of at most 160
-    characters. It must preserve the compact conclusion without copying or
-    truncating the answer and must omit raw identifiers and sensitive detail.
+11. `record_summary` is an optional backward-compatible transient hint. Never
+    put raw identifiers or sensitive detail in it. HealthMes does not trust or
+    store this model-authored text; it derives a fixed category-only summary
+    from the verified persistence intent.
 12. Keep the final answer concise. Return structured data matching the
     supplied runtime contract. HealthMes validates source references and
     conditionally persists a compact record after this loop.

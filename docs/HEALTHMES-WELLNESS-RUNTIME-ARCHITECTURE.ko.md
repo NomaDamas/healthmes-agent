@@ -400,9 +400,10 @@ HealthMes는 다음을 검증한다.
 | 실제 식사·활동 기록 | 해당 domain event |
 | 설정·캘린더 mutation | 해당 command workflow audit |
 
-compact record는 전체 답변을 잘라 만든 문자열이 아니라 LLM이 별도로 작성한
-160자 이하의 privacy-minimized `record_summary`, runtime/model, intent, confidence,
-`source_refs`, 안전한 limitation과 시각만 저장한다. 원문 질문, 전체 답변,
+compact record의 요약은 LLM 자유 텍스트를 저장하지 않는다. HealthMes가 검증된
+`action`/`risk`/`explicit_tracking` intent에서 만든 고정된 category-only 문장만
+저장한다. runtime/model, intent, confidence, `source_refs`, 안전한 limitation과
+시각은 함께 저장하지만 원문 질문, 전체 답변, model-authored `record_summary`,
 transcript, 전체 tool payload, 사진·음성 bytes는 복제하지 않는다.
 
 `DecisionRecord`는 `decision` 데이터 클래스의

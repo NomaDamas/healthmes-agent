@@ -720,9 +720,11 @@ def test_public_record_redacts_internal_source_reference_ids(
         assert row.decision_payload is not None
         assert "result" not in row.decision_payload
         assert row.decision_payload["outcome"]["record_summary"] == (
-            "Pause before choosing more caffeine."
+            "A wellness action recommendation was recorded."
         )
-        assert row.summary == "Pause before choosing more caffeine."
+        assert row.summary == (
+            "A wellness action recommendation was recorded."
+        )
         assert answer not in json.dumps(row.decision_payload)
         assert "question" not in row.decision_payload["request"]
         assert "caller" not in row.decision_payload["request"]
@@ -788,7 +790,7 @@ def test_long_sensitive_answer_is_returned_but_never_persisted(
             assert secret not in persisted
         outcome = row.decision_payload["outcome"]
         assert outcome["record_summary"] == (
-            "Pause before choosing more caffeine."
+            "A wellness action recommendation was recorded."
         )
         assert outcome["limitation_codes"] == ["context_stale"]
 
@@ -798,7 +800,7 @@ def test_long_sensitive_answer_is_returned_but_never_persisted(
         assert "decision_response_compacted" in recovered.limitations
 
 
-def test_persisted_decision_requires_compact_record_summary(
+def test_persisted_decision_derives_compact_record_summary(
     persistence,
 ):
     _engine, factory = persistence
@@ -817,13 +819,16 @@ def test_persisted_decision_requires_compact_record_summary(
 
     result = _finalizer(factory).finalize(request, run)
 
-    assert result.status is DecisionStatus.FAILED
-    assert result.persistence_status is PersistenceStatus.FAILED
-    assert result.limitations == ["decision_record_summary_missing"]
+    assert result.status is DecisionStatus.COMPLETED
+    assert result.persistence_status is PersistenceStatus.PERSISTED
     with factory() as session:
-        assert session.scalar(
-            sa.select(sa.func.count()).select_from(DecisionRecord)
-        ) == 0
+        row = session.scalars(sa.select(DecisionRecord)).one()
+        assert row.summary == (
+            "A wellness action recommendation was recorded."
+        )
+        assert row.decision_payload["outcome"]["record_summary"] == (
+            "A wellness action recommendation was recorded."
+        )
 
 
 @pytest.mark.parametrize(
@@ -832,6 +837,11 @@ def test_persisted_decision_requires_compact_record_summary(
         "Take a short break before choosing more caffeine.",
         "Contact private@example.com before continuing.",
         "Use source sr_0123456789abcdef0123456789abcdef.",
+        "Device 00:1A:2B:3C:4D:5E should pause.",
+        "Read /Users/alice/Library/private.db before continuing.",
+        "Use activity:event-123 before continuing.",
+        "Pause for user_id=private-user-123.",
+        "Pause after checking 192.168.10.44.",
     ),
 )
 def test_finalizer_rejects_forged_invalid_compact_record_summary(
@@ -863,6 +873,37 @@ def test_finalizer_rejects_forged_invalid_compact_record_summary(
         assert session.scalar(
             sa.select(sa.func.count()).select_from(DecisionRecord)
         ) == 0
+
+
+def test_near_copy_record_summary_is_rejected(persistence):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    request = _request()
+    run = _run(request, [ref])
+    run = run.model_copy(
+        update={
+            "draft": run.draft.model_copy(
+                update={
+                    "answer": (
+                        "Take a short break before choosing more caffeine."
+                    ),
+                    "record_summary": (
+                        "Take a short break before choosing less caffeine."
+                    ),
+                }
+            )
+        },
+        deep=True,
+    )
+
+    result = _finalizer(factory).finalize(request, run)
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
+    assert result.limitations == [
+        "invalid_decision_finalization_input"
+    ]
 
 
 def test_clarification_is_not_persisted(persistence):

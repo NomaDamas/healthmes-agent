@@ -8,6 +8,7 @@ import re
 import unicodedata
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from difflib import SequenceMatcher
 from enum import StrEnum
 
 from pydantic import (
@@ -55,6 +56,31 @@ _RECORD_SUMMARY_SENSITIVE_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(r"(?<!\d)\+?\d[\d .()-]{7,}\d(?!\d)"),
+    re.compile(
+        r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}:){5}"
+        r"[0-9A-Fa-f]{2}(?![0-9A-Fa-f])"
+    ),
+    re.compile(
+        r"(?<!\d)(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+        r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?!\d)"
+    ),
+    re.compile(
+        r"(?<!\w)(?:[A-Za-z]:[\\/]|/)(?:[^/\s\\]+[\\/])*"
+        r"[^/\s\\]+"
+    ),
+    re.compile(
+        r"(?<![\w.-])[A-Za-z][A-Za-z0-9_.-]{1,63}\s*[:=]\s*"
+        r"[^\s,;]{2,}"
+    ),
+    re.compile(
+        r"(?<![\w.-])[A-Za-z][A-Za-z0-9_.-]{1,63}:"
+        r"[A-Za-z0-9][A-Za-z0-9_.-]{2,}(?![\w.-])"
+    ),
+    re.compile(
+        r"(?<![\w.-])(?=[A-Za-z0-9_.-]{12,}(?![\w.-]))"
+        r"(?=[A-Za-z0-9_.-]*[A-Za-z])(?=[A-Za-z0-9_.-]*\d)"
+        r"[A-Za-z0-9_.-]+"
+    ),
 )
 
 
@@ -127,6 +153,11 @@ def _comparison_text(value: str) -> str:
     return "".join(character for character in normalized if character.isalnum())
 
 
+def _comparison_words(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return tuple(re.findall(r"\w+", normalized))
+
+
 def validate_record_summary_for_storage(
     *,
     answer: str | None,
@@ -149,12 +180,24 @@ def validate_record_summary_for_storage(
     if answer is not None:
         normalized_answer = _comparison_text(answer)
         normalized_summary = _comparison_text(summary)
+        answer_words = _comparison_words(answer)
+        summary_words = _comparison_words(summary)
         if (
             normalized_answer
             and normalized_summary
             and (
                 normalized_summary in normalized_answer
                 or normalized_answer in normalized_summary
+                or (
+                    len(summary_words) >= 4
+                    and SequenceMatcher(
+                        None,
+                        answer_words,
+                        summary_words,
+                        autojunk=False,
+                    ).ratio()
+                    >= 0.8
+                )
             )
         ):
             raise ValueError(

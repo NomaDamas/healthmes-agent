@@ -154,7 +154,7 @@ class DecisionAlertSender:
                 source=source,
                 session_id=f"trigger-event:{trigger_event_id}",
                 requested_at=fired_at,
-                persistence_requested=True,
+                persistence_requested=False,
                 hints=DecisionContextHints(local_date=local_date),
             )
         )
@@ -163,17 +163,18 @@ class DecisionAlertSender:
             DecisionStatus.COMPLETED,
             DecisionStatus.NEEDS_CLARIFICATION,
         }
-        completed_without_record = (
+        action_without_record = (
             result.status is DecisionStatus.COMPLETED
+            and result.proposed_action
             and result.persistence_status is not PersistenceStatus.PERSISTED
         )
-        if not deliverable_status or message is None or completed_without_record:
+        if not deliverable_status or message is None or action_without_record:
             return DecisionDispatchResult(
                 ok=False,
                 status_code=503,
                 detail=(
                     "decision persistence is not confirmed"
-                    if completed_without_record
+                    if action_without_record
                     else (
                         f"decision ended with status {result.status.value}"
                         if not deliverable_status
@@ -181,7 +182,7 @@ class DecisionAlertSender:
                     )
                 ),
                 retryable=(
-                    completed_without_record
+                    action_without_record
                     or result.status is DecisionStatus.FAILED
                 ),
                 ready_for_native=False,

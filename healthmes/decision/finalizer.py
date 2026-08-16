@@ -450,6 +450,10 @@ class _StoredDecisionPayloadV4(BaseModel):
             raise ValueError(
                 "stored action and risk outcomes require source refs"
             )
+        if self.outcome.record_summary != _stored_outcome_summary(
+            self.persistence_intent
+        ):
+            raise ValueError("stored outcome summary is not canonical")
         return self
 
 
@@ -994,29 +998,6 @@ class DecisionFinalizer:
             effective_persistence_intent
             is not DecisionPersistenceIntent.NONE
         )
-        if (
-            persistence_required
-            and canonical_run.draft.record_summary is None
-        ):
-            return _failure_result(
-                canonical_run,
-                code="decision_record_summary_missing",
-                persistence_required=True,
-            )
-        if persistence_required:
-            try:
-                validate_record_summary_for_storage(
-                    answer=canonical_run.draft.answer,
-                    record_summary=(
-                        canonical_run.draft.record_summary or ""
-                    ),
-                )
-            except ValueError:
-                return _failure_result(
-                    canonical_run,
-                    code="decision_record_summary_invalid",
-                    persistence_required=True,
-                )
         fingerprint = decision_request_fingerprint(canonical_request)
         finalization_deadline = control.deadline
 
@@ -1300,11 +1281,8 @@ class DecisionFinalizer:
                                     id=record_id,
                                     kind=DecisionKind.INSIGHT,
                                     tree=_decision_tree(result),
-                                    summary=_public_summary(
-                                        result,
-                                        compact_summary=(
-                                            run.draft.record_summary
-                                        ),
+                                    summary=_stored_outcome_summary(
+                                        persistence_intent
                                     ),
                                     llm_model=(
                                         run.runtime.model[:64]
@@ -2225,7 +2203,9 @@ def _decision_payload(
 ) -> dict[str, Any]:
     stored_outcome = _StoredDecisionOutcome(
         status=result.status,
-        record_summary=run.draft.record_summary or "",
+        record_summary=_stored_outcome_summary(
+            persistence_intent
+        ),
         proposed_action=result.proposed_action,
         limitation_codes=_sanitized_limitation_codes(
             _tool_trace_limitations(run.tool_trace),
@@ -2398,11 +2378,7 @@ def _tool_trace_summary(record: ToolCallRecord) -> dict[str, Any]:
 
 def _public_summary(
     result: DecisionResult,
-    *,
-    compact_summary: str | None = None,
 ) -> str:
-    if compact_summary is not None:
-        return compact_summary
     if result.proposed_action:
         return "HealthMes wellness action recorded"
     return "HealthMes wellness decision recorded"

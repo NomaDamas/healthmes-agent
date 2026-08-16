@@ -23,22 +23,49 @@ TRIGGER_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 
 
 class RecordingBridge:
-    def __init__(self, *, status: DecisionStatus = DecisionStatus.COMPLETED):
+    def __init__(
+        self,
+        *,
+        status: DecisionStatus = DecisionStatus.COMPLETED,
+        proposed_action: bool = False,
+        persistence_status: PersistenceStatus = (
+            PersistenceStatus.NOT_REQUIRED
+        ),
+    ):
         self.status = status
+        self.proposed_action = proposed_action
+        self.persistence_status = persistence_status
         self.submissions = []
 
     def ask_wellness(self, submission):
         self.submissions.append(submission)
         if self.status is DecisionStatus.COMPLETED:
-            return DecisionResult(
-                request_id=submission.request_id,
-                turn_id=uuid.uuid4(),
-                status=DecisionStatus.COMPLETED,
-                answer="Take a short break before deciding what to do next.",
-                persistence_status=PersistenceStatus.PERSISTED,
-                decision_record_id=uuid.uuid4(),
-                runtime=RuntimeMetadata(runtime="test"),
-            )
+            values = {
+                "request_id": submission.request_id,
+                "turn_id": uuid.uuid4(),
+                "status": DecisionStatus.COMPLETED,
+                "answer": (
+                    "Take a short break before deciding what to do next."
+                ),
+                "proposed_action": self.proposed_action,
+                "persistence_status": self.persistence_status,
+                "decision_record_id": (
+                    uuid.uuid4()
+                    if self.persistence_status
+                    is PersistenceStatus.PERSISTED
+                    else None
+                ),
+                "runtime": RuntimeMetadata(runtime="test"),
+            }
+            if (
+                self.proposed_action
+                and self.persistence_status
+                is not PersistenceStatus.PERSISTED
+            ):
+                # Exercise the delivery boundary against a malformed adapter
+                # result that the canonical finalizer would never emit.
+                return DecisionResult.model_construct(**values)
+            return DecisionResult(**values)
         return DecisionResult(
             request_id=submission.request_id,
             turn_id=uuid.uuid4(),
@@ -72,7 +99,7 @@ def test_retry_uses_stable_request_id_and_canonical_proactive_ingress(
     assert bridge.submissions[0].request_id == bridge.submissions[1].request_id
     assert bridge.submissions[0].ingress.value == "proactive"
     assert bridge.submissions[0].source == "focus_fragmentation"
-    assert bridge.submissions[0].persistence_requested is True
+    assert bridge.submissions[0].persistence_requested is False
     assert bridge.submissions[0].session_id == f"trigger-event:{TRIGGER_ID}"
 
 
@@ -107,6 +134,51 @@ def test_failed_reasoning_is_not_ready_for_native_fallback(settings) -> None:
     assert result.retryable is True
     assert result.ready_for_native is False
     assert result.message is None
+
+
+def test_simple_proactive_summary_is_deliverable_without_record(
+    settings,
+) -> None:
+    sender = DecisionAlertSender(
+        settings,
+        bridge=RecordingBridge(
+            proposed_action=False,
+            persistence_status=PersistenceStatus.NOT_REQUIRED,
+        ),
+    )
+
+    result = sender.send(
+        _fire(),
+        fired_at=NOW,
+        trigger_event_id=TRIGGER_ID,
+    )
+
+    assert result.ok is True
+    assert result.ready_for_native is True
+    assert result.decision_record_id is None
+
+
+def test_proactive_action_without_confirmed_record_is_retried(
+    settings,
+) -> None:
+    sender = DecisionAlertSender(
+        settings,
+        bridge=RecordingBridge(
+            proposed_action=True,
+            persistence_status=PersistenceStatus.FAILED,
+        ),
+    )
+
+    result = sender.send(
+        _fire(),
+        fired_at=NOW,
+        trigger_event_id=TRIGGER_ID,
+    )
+
+    assert result.ok is False
+    assert result.retryable is True
+    assert result.ready_for_native is False
+    assert result.detail == "decision persistence is not confirmed"
 
 
 @pytest.mark.asyncio
