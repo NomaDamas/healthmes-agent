@@ -200,3 +200,30 @@ def test_maintenance_deletes_exact_cutoff_and_preserves_related_rows(
     assert session.scalar(
         sa.select(sa.func.count()).select_from(Task)
     ) == 1
+
+
+def test_retention_shrink_purges_recalculated_exact_cutoff(session) -> None:
+    current = datetime(2026, 8, 16, 12, tzinfo=UTC)
+    basis = current - timedelta(days=1)
+    update_retention_policy(
+        session,
+        "decision",
+        "forever",
+        now=basis,
+    )
+    row = _wellness_decision(created_at=basis)
+    apply_decision_retention(session, row, basis_at=basis)
+    session.add(row)
+    session.commit()
+    row_id = row.id
+    assert row.expires_at is None
+
+    update_retention_policy(
+        session,
+        "decision",
+        "1d",
+        now=current,
+    )
+    session.commit()
+
+    assert session.get(DecisionRecord, row_id) is None

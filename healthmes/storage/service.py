@@ -188,6 +188,10 @@ def _update_retention_policy(
             ),
         )
     if data_class == "decision":
+        # Sessions disable autoflush. Persist recalculated expiry timestamps
+        # before the SQL purge so an exact-cutoff row cannot survive until the
+        # outer commit as an already-expired DecisionRecord.
+        session.flush()
         purge_expired_decision_records(
             session,
             now=current,
