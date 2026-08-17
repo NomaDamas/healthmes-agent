@@ -324,11 +324,23 @@ docker compose up -d --build --force-recreate hermes-decision
 `360`초는 `HEALTHMES_DECISION_TIMEOUT_SECONDS`의 최대 전체 판단 시간 300초,
 child SIGTERM 대기 10초, SIGKILL 이후 group 검증과 process reap 대기 5초를
 모두 포함하는 315초 상한보다 길다. Supervisor는 이 값을 시작 전에 계산하고,
-ASGI lifespan이 별도 process group의 Hermes child를 시작하기 전에
+Native launcher는 Bash wrapper를 실행하기 전에 먼저
+`data/runtime/hermes-decision-startup-lease/` 디렉터리를 원자적으로 만든다.
+엄격한 record는 처음에 `pending`이고, wrapper를 spawn한 직후 PID와 고유 service
+nonce를 포함한 `spawned` 상태가 된다. 이때 PID 파일은 아직 검증되지 않은
+tombstone이다. 다섯 개 `ps` identity 필드 중 하나라도 읽지 못하면 process
+부재로 보지 않고 unknown으로 처리하며, PID tombstone과 lease를 보존한다.
+완전한 launcher identity가 원자적으로 기록된 뒤에만 lease를 제거한다. 따라서
+미검증 startup 세대가 남아 있는 동안 stop/update는 성공이나 metadata 삭제를
+보고할 수 없다.
+
+Python supervisor는 Uvicorn의 일반 startup 구현을 호출하기 직전에
 `data/runtime/hermes-decision-stop-budget`에 게시한다. 이 record에는 drain
 시간뿐 아니라 관리 중인 Bash launcher의 PID, OS start token, service nonce,
 실제 Python supervisor의 PID와 native OS start token, 각 publication마다 새로
-생성되는 publication instance nonce가 함께 들어간다.
+생성되는 publication instance nonce가 함께 들어간다. Uvicorn의 다음 startup
+동작이 ASGI lifespan 시작이며 그 안에서 Hermes child가 별도 process group으로
+실행될 수 있으므로, Hermes child가 budget보다 먼저 생기지 않는다.
 실제로 publish에 성공한 process만 자신의 정확한 record를 삭제할 수 있다.
 Native stop/update는 두 identity를 모두 검증하고, TERM은 native identity로
 검증한 실제 Python supervisor에 보낸다. 따라서 Bash launcher가 먼저 죽거나
@@ -350,6 +362,11 @@ stop은 Bash launcher의 정확한 세대를 보존하고 TERM 직전, launcher 
 process-group 확인 뒤에 budget을 다시 읽는다. 같은 세대의 늦은 v3 record가
 나타나면 실제 supervisor identity로 handoff하고, group이 비었음이 증명되지
 않거나 cleanup record가 남으면 metadata를 지우지 않고 실패한다.
+Startup lease가 남아 있는데 launcher identity와 v3 record가 모두 없으면 숫자
+PID를 신호하지 않고 실패한다. 나중에 v3 record가 나타난 경우에도 lease의
+launcher PID/service nonce와 정확히 일치해야만 검증된 supervisor를 종료하고,
+cleanup 성공 뒤 그 세대의 tombstone과 lease를 제거한다. lease가 남아 있는
+동안 status는 `starting` 또는 `unknown`이며 `stopped`를 반환하지 않는다.
 
 SIGTERM이 들어오면 Uvicorn signal hook이 새 response lease를 즉시 막고 기존
 lease만 drain한다. 종료 시 leader process만 기다리지 않고 child group의 각

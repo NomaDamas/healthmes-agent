@@ -234,11 +234,24 @@ supported 300-second overall decision wall clock plus the supervisor's bounded
 The canonical native launcher also drains the old decision supervisor before
 running the dedicated Hermes `uv sync` or bootstrap. The validated
 `HEALTHMES_DECISION_TIMEOUT_SECONDS` wall clock plus the child TERM and KILL
-waits is rounded up once. The Python supervisor publishes an atomic
+waits is rounded up once. Before spawning the managed Bash wrapper, the
+launcher atomically creates
+`data/runtime/hermes-decision-startup-lease/`. Its strict record first marks
+the generation `pending`, then binds the spawned launcher PID and unique
+service nonce as `spawned`. The PID file is an unverified tombstone until all
+five `ps` identity fields have been captured; one failed or unreadable query
+is unknown, not evidence that the process is absent. The lease is removed
+only after the complete launcher identity record is atomically installed.
+Therefore stop/update cannot report success or delete metadata while a
+startup generation remains unverified.
+
+Immediately before Uvicorn calls its normal startup implementation, the
+Python supervisor publishes an atomic
 `data/runtime/hermes-decision-stop-budget` record that binds that exact value
 to the running launcher PID, OS start token, service nonce, the actual Python
 supervisor PID/native start token, and a unique publication instance nonce
-before the ASGI lifespan can launch Hermes in its separate process group.
+before Uvicorn's first startup operation runs the ASGI lifespan that may
+launch Hermes in its separate process group.
 The owning supervisor removes its exact record only after controller cleanup
 has successfully drained and reaped the Hermes child group. If cleanup fails,
 the record remains as an explicit incomplete-cleanup diagnostic. Valid v3
@@ -258,6 +271,13 @@ proof. A v3 record published during either probe wins the handoff and stop
 switches to its verified Python supervisor identity. A surviving group,
 unknown OS state, changed launcher generation, changed v3 generation, or
 remaining cleanup record fails closed and preserves diagnostic metadata.
+An active startup lease tightens this rule: without a verified launcher
+identity or a matching v3 record, stop/update fails and preserves both the PID
+tombstone and lease. If the matching v3 record appears later, its launcher
+PID/service nonce must match the lease before native stop may signal the
+verified supervisor and remove that exact startup generation after cleanup.
+`status` reports pending startup or unknown unverified startup, never
+`stopped`, while the lease remains.
 The native launcher executes the HealthMes runtime Python directly rather than
 inserting an additional `uv run` process between the Bash wrapper and
 supervisor. The supervisor then launches only the Hermes child with the
