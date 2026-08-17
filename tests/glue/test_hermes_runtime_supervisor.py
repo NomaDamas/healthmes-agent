@@ -1029,6 +1029,80 @@ async def test_leader_exit_before_first_snapshot_still_cleans_descendant(
 
 
 @pytest.mark.asyncio
+async def test_os_exited_leader_with_lagging_returncode_cleans_descendant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = _group_member(4242, "leader")
+    descendant = _group_member(4243, "descendant")
+    group = {descendant}
+    probes: list[frozenset[_ProcessGroupMember]] = []
+
+    def probe(
+        _pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        snapshot = frozenset(group)
+        probes.append(snapshot)
+        return snapshot
+
+    process = HermesRuntimeProcess(
+        replace(
+            _supervisor_config(tmp_path),
+            child_term_timeout_seconds=0.05,
+            child_kill_timeout_seconds=0.05,
+        ),
+        process_group_probe=probe,
+    )
+
+    class LaggingExitedLeader:
+        returncode: int | None = None
+        pid = leader.pid
+
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            self.returncode = 0
+            return 0
+
+    child = LaggingExitedLeader()
+    process._process = child  # type: ignore[assignment]
+    process._child_pgid = leader.pid
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+    signals: list[tuple[int, signal.Signals]] = []
+
+    def signal_member(
+        member: _ProcessGroupMember,
+        sent: signal.Signals,
+    ) -> bool:
+        signals.append((member.pid, sent))
+        group.discard(descendant)
+        return True
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._signal_process_group_member",
+        signal_member,
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.killpg",
+        lambda *_args: pytest.fail("numeric PGID must never be signaled"),
+    )
+
+    await process.aclose()
+
+    assert child.wait_calls >= 1
+    assert probes[0] == frozenset({descendant})
+    assert signals == [(descendant.pid, signal.SIGTERM)]
+    assert process._process is None
+    assert process._lifecycle_state == "closed"
+
+
+@pytest.mark.asyncio
 async def test_leader_exit_before_first_snapshot_probes_empty_group(
     tmp_path: Path,
 ) -> None:
@@ -1055,7 +1129,7 @@ async def test_leader_exit_before_first_snapshot_probes_empty_group(
 
     await process.aclose()
 
-    assert probes == [child.pid]
+    assert probes == [child.pid, child.pid]
     assert process._process is None
     assert process._lifecycle_state == "closed"
 
@@ -2236,6 +2310,41 @@ def test_supervisor_main_preserves_budget_without_cleanup_proof(
         publications[0].record
     )
     publications[0].remove_if_owned()
+
+
+def test_publication_preserves_malformed_existing_shutdown_budget(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    path.parent.mkdir(parents=True)
+    malformed = b"version\t3\ntruncated"
+    path.write_bytes(malformed)
+    supervisor = capture_runtime_supervisor_identity()
+    launcher = capture_runtime_launcher_identity(
+        {},
+        supervisor_identity=supervisor,
+    )
+    publication = _RuntimeShutdownBudgetPublication(
+        path=path,
+        record=HermesRuntimeShutdownBudgetRecord(
+            drain_timeout_seconds=75,
+            launcher_pid=launcher.pid,
+            launcher_start_token=launcher.start_token,
+            launcher_service_nonce=launcher.service_nonce,
+            supervisor_pid=supervisor.pid,
+            supervisor_start_token=supervisor.start_token,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="refusing to overwrite it without explicit repair",
+    ):
+        publication.publish()
+
+    assert path.read_bytes() == malformed
+    publication.remove_if_owned()
+    assert path.read_bytes() == malformed
 
 
 @pytest.mark.parametrize("version", (1, 2))

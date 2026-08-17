@@ -32,11 +32,15 @@ BASH_BIN="${HEALTHMES_BASH_BIN:-/bin/bash}"
 UUIDGEN_BIN="${HEALTHMES_UUIDGEN_BIN:-uuidgen}"
 DATE_BIN="${HEALTHMES_DATE_BIN:-date}"
 RUNTIME_PYTHON_BIN="${HEALTHMES_RUNTIME_PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
+NATIVE_IDENTITY_HELPER="${HEALTHMES_NATIVE_IDENTITY_HELPER:-$REPO_ROOT/scripts/runtime_native_identity.py}"
+NATIVE_IDENTITY_PYTHON_BIN="${HEALTHMES_NATIVE_IDENTITY_PYTHON_BIN:-}"
 MAX_DECISION_RUNTIME_DRAIN_SECONDS=315
 DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS=2
 DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS=10
 DECISION_RUNTIME_LIFECYCLE_LOCK_STALE_GRACE_SECONDS=2
 DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS=3
+DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION=2
+DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION=2
 MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS=$((
     MAX_DECISION_RUNTIME_DRAIN_SECONDS
     + DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS
@@ -46,6 +50,11 @@ DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PID=
 DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_START_TOKEN=
 DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_NONCE=
 DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION=
+DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PHASE=
+DECISION_RUNTIME_LIFECYCLE_INITIAL_SCRIPT_SHA256=
+DECISION_RUNTIME_DURABLE_MUTATION_STARTED=false
+DECISION_RUNTIME_POST_RELEASE_RMDIR_RUNTIME=false
+DECISION_RUNTIME_POST_RELEASE_RMDIR_DATA=false
 
 info() { printf '[healthmes] %s\n' "$*"; }
 die() { printf '[healthmes] %s\n' "$*" >&2; exit 1; }
@@ -206,6 +215,75 @@ current_epoch() {
     printf '%s\n' "$value"
 }
 
+resolve_native_identity_python() {
+    if [ -n "$NATIVE_IDENTITY_PYTHON_BIN" ]; then
+        [ -x "$NATIVE_IDENTITY_PYTHON_BIN" ] || return 1
+        printf '%s\n' "$NATIVE_IDENTITY_PYTHON_BIN"
+        return
+    fi
+    if [ -x "$RUNTIME_PYTHON_BIN" ]; then
+        printf '%s\n' "$RUNTIME_PYTHON_BIN"
+        return
+    fi
+    command -v python3 2>/dev/null || return 1
+}
+
+run_native_identity_helper() {
+    local python_bin
+    [ -f "$NATIVE_IDENTITY_HELPER" ] \
+        && [ ! -L "$NATIVE_IDENTITY_HELPER" ] \
+        || return 5
+    python_bin="$(resolve_native_identity_python)" || return 5
+    "$python_bin" "$NATIVE_IDENTITY_HELPER" "$@"
+}
+
+capture_native_process_start_token() {
+    local pid=$1 token
+    NATIVE_PROCESS_START_TOKEN=
+    token="$(run_native_identity_helper capture "$pid")" || return $?
+    [[ "$token" =~ ^(linux:[1-9][0-9]*|darwin:[1-9][0-9]*:[0-9]{6})$ ]] \
+        || return 5
+    NATIVE_PROCESS_START_TOKEN=$token
+}
+
+native_process_start_token_status() {
+    local pid=$1 expected_start_token=$2 status
+    if run_native_identity_helper check "$pid" "$expected_start_token"; then
+        return 0
+    else
+        status=$?
+    fi
+    case "$status" in
+    3 | 4) return 3 ;;
+    *) return 5 ;;
+    esac
+}
+
+current_lifecycle_script_sha256() {
+    local digest
+    digest="$(run_native_identity_helper \
+        sha256 "$REPO_ROOT/scripts/healthmes_local.sh")" || return $?
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 5
+    printf '%s\n' "$digest"
+}
+
+initialize_lifecycle_script_generation() {
+    [ -z "$DECISION_RUNTIME_LIFECYCLE_INITIAL_SCRIPT_SHA256" ] \
+        || return 0
+    DECISION_RUNTIME_LIFECYCLE_INITIAL_SCRIPT_SHA256="$(
+        current_lifecycle_script_sha256
+    )" || die "decision runtime lifecycle script identity is unavailable"
+}
+
+assert_lifecycle_script_generation_unchanged() {
+    local current
+    initialize_lifecycle_script_generation
+    current="$(current_lifecycle_script_sha256)" \
+        || die "decision runtime lifecycle script identity became unreadable"
+    [ "$current" = "$DECISION_RUNTIME_LIFECYCLE_INITIAL_SCRIPT_SHA256" ] \
+        || die "healthmes_local.sh changed while this command waited for the lifecycle lock; rerun the command with the current script"
+}
+
 probe_ps_value() {
     local pid=$1 field=$2 output status error_file error
     PROBED_PS_VALUE=
@@ -234,6 +312,14 @@ probe_ps_value() {
 process_start_token_status() {
     local pid=$1 expected_start_token=$2 status
     valid_managed_pid "$pid" || return 5
+    case "$expected_start_token" in
+    linux:* | darwin:*)
+        native_process_start_token_status "$pid" "$expected_start_token"
+        return
+        ;;
+    ps:*) ;;
+    *) return 5 ;;
+    esac
     if probe_ps_value "$pid" pid; then
         [ "$PROBED_PS_VALUE" = "$pid" ] || return 5
     else
@@ -244,7 +330,9 @@ process_start_token_status() {
     if probe_ps_value "$pid" lstart; then
         [ "ps:$PROBED_PS_VALUE" = "$expected_start_token" ] \
             && return 0
-        return 3
+        # Legacy ps tokens are timezone/locale formatted. A mismatch while
+        # the PID exists is unknown, not proof that the former owner exited.
+        return 5
     else
         status=$?
         [ "$status" -eq 3 ] && return 3
@@ -270,18 +358,25 @@ decision_runtime_lifecycle_lock_exists() {
 
 load_decision_runtime_lifecycle_lock() {
     local record key value extra
-    local version= operation= owner_pid= owner_start_token=
-    local owner_nonce= acquired_at_epoch=
-    local seen_version= seen_operation= seen_owner_pid=
+    local version= operation= phase= owner_pid= owner_start_token=
+    local owner_nonce= acquired_at_epoch= updated_at_epoch=
+    local script_contract_version= script_sha256=
+    local seen_version= seen_operation= seen_phase= seen_owner_pid=
     local seen_owner_start_token= seen_owner_nonce=
-    local seen_acquired_at_epoch=
+    local seen_acquired_at_epoch= seen_updated_at_epoch=
+    local seen_script_contract_version= seen_script_sha256=
 
     DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS=missing
+    DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION=
     DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION=
+    DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE=
     DECISION_RUNTIME_LIFECYCLE_LOCK_PID=
     DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN=
     DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE=
     DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT=
+    DECISION_RUNTIME_LIFECYCLE_LOCK_UPDATED_AT=
+    DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_CONTRACT_VERSION=
+    DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256=
     decision_runtime_lifecycle_lock_exists || return 0
     DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS=invalid
     [ -d "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
@@ -303,6 +398,11 @@ load_decision_runtime_lifecycle_lock() {
             operation=$value
             seen_operation=1
             ;;
+        phase)
+            [ -z "$seen_phase" ] || return 0
+            phase=$value
+            seen_phase=1
+            ;;
         owner_pid)
             [ -z "$seen_owner_pid" ] || return 0
             owner_pid=$value
@@ -323,56 +423,114 @@ load_decision_runtime_lifecycle_lock() {
             acquired_at_epoch=$value
             seen_acquired_at_epoch=1
             ;;
+        updated_at_epoch)
+            [ -z "$seen_updated_at_epoch" ] || return 0
+            updated_at_epoch=$value
+            seen_updated_at_epoch=1
+            ;;
+        script_contract_version)
+            [ -z "$seen_script_contract_version" ] || return 0
+            script_contract_version=$value
+            seen_script_contract_version=1
+            ;;
+        script_sha256)
+            [ -z "$seen_script_sha256" ] || return 0
+            script_sha256=$value
+            seen_script_sha256=1
+            ;;
         *)
             return 0
             ;;
         esac
     done <"$record"
 
-    [ "$version" = 1 ] \
-        && [ -n "$seen_version" ] \
-        && [ -n "$seen_operation" ] \
-        && [ -n "$seen_owner_pid" ] \
-        && [ -n "$seen_owner_start_token" ] \
-        && [ -n "$seen_owner_nonce" ] \
-        && [ -n "$seen_acquired_at_epoch" ] \
-        && [[ "$operation" =~ ^(start|stop|update|install)$ ]] \
-        && valid_managed_pid "$owner_pid" \
-        && [[ "$owner_start_token" == ps:* ]] \
-        && [[ "$owner_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
-        && [[ "$acquired_at_epoch" =~ ^[1-9][0-9]*$ ]] \
-        || return 0
+    if [ "$version" = 1 ]; then
+        [ -n "$seen_version" ] \
+            && [ -n "$seen_operation" ] \
+            && [ -n "$seen_owner_pid" ] \
+            && [ -n "$seen_owner_start_token" ] \
+            && [ -n "$seen_owner_nonce" ] \
+            && [ -n "$seen_acquired_at_epoch" ] \
+            && [ -z "$seen_phase$seen_updated_at_epoch" ] \
+            && [ -z "$seen_script_contract_version$seen_script_sha256" ] \
+            && [[ "$operation" =~ ^(start|stop|update|install)$ ]] \
+            && valid_managed_pid "$owner_pid" \
+            && [[ "$owner_start_token" == ps:* ]] \
+            && [[ "$owner_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
+            && [[ "$acquired_at_epoch" =~ ^[1-9][0-9]*$ ]] \
+            || return 0
+        phase=legacy
+        updated_at_epoch=$acquired_at_epoch
+    else
+        [ "$version" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
+            && [ -n "$seen_version" ] \
+            && [ -n "$seen_operation" ] \
+            && [ -n "$seen_phase" ] \
+            && [ -n "$seen_owner_pid" ] \
+            && [ -n "$seen_owner_start_token" ] \
+            && [ -n "$seen_owner_nonce" ] \
+            && [ -n "$seen_acquired_at_epoch" ] \
+            && [ -n "$seen_updated_at_epoch" ] \
+            && [ -n "$seen_script_contract_version" ] \
+            && [ -n "$seen_script_sha256" ] \
+            && [[ "$operation" =~ ^(start|stop|update|install|uninstall)$ ]] \
+            && [[ "$phase" =~ ^(acquired|preflight|stopping|pulling|setup|restarting|unloading|services_stop|cleanup|complete|repair_required)$ ]] \
+            && valid_managed_pid "$owner_pid" \
+            && [[ "$owner_start_token" =~ ^(linux:[1-9][0-9]*|darwin:[1-9][0-9]*:[0-9]{6})$ ]] \
+            && [[ "$owner_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
+            && [[ "$acquired_at_epoch" =~ ^[1-9][0-9]*$ ]] \
+            && [[ "$updated_at_epoch" =~ ^[1-9][0-9]*$ ]] \
+            && [ "$updated_at_epoch" -ge "$acquired_at_epoch" ] \
+            && [ "$script_contract_version" = "$DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION" ] \
+            && [[ "$script_sha256" =~ ^[0-9a-f]{64}$ ]] \
+            || return 0
+    fi
 
     DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS=valid
+    DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION=$version
     DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION=$operation
+    DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE=$phase
     DECISION_RUNTIME_LIFECYCLE_LOCK_PID=$owner_pid
     DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN=$owner_start_token
     DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE=$owner_nonce
     DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT=$acquired_at_epoch
+    DECISION_RUNTIME_LIFECYCLE_LOCK_UPDATED_AT=$updated_at_epoch
+    DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_CONTRACT_VERSION=$script_contract_version
+    DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256=$script_sha256
 }
 
 decision_runtime_lifecycle_lock_generation() {
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] || return 1
-    printf '%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" \
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE" \
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" \
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN" \
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE" \
-        "$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT"
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_UPDATED_AT" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_CONTRACT_VERSION" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256"
 }
 
 write_decision_runtime_lifecycle_lock() {
-    local operation=$1 owner_pid=$2 owner_start_token=$3
-    local owner_nonce=$4 acquired_at_epoch=$5 record temp
+    local operation=$1 phase=$2 owner_pid=$3 owner_start_token=$4
+    local owner_nonce=$5 acquired_at_epoch=$6 updated_at_epoch=$7
+    local script_contract_version=$8 script_sha256=$9 record temp
     record="$(decision_runtime_lifecycle_lock_record)"
     temp="$(mktemp "$HERMES_DECISION_LIFECYCLE_LOCK/.record.XXXXXX")"
     if ! {
-        printf 'version\t1\n'
+        printf 'version\t%s\n' "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION"
         printf 'operation\t%s\n' "$operation"
+        printf 'phase\t%s\n' "$phase"
         printf 'owner_pid\t%s\n' "$owner_pid"
         printf 'owner_start_token\t%s\n' "$owner_start_token"
         printf 'owner_nonce\t%s\n' "$owner_nonce"
         printf 'acquired_at_epoch\t%s\n' "$acquired_at_epoch"
+        printf 'updated_at_epoch\t%s\n' "$updated_at_epoch"
+        printf 'script_contract_version\t%s\n' "$script_contract_version"
+        printf 'script_sha256\t%s\n' "$script_sha256"
     } >"$temp" || ! mv "$temp" "$record"; then
         rm -f "$temp"
         return 1
@@ -401,6 +559,73 @@ remove_decision_runtime_lifecycle_lock_generation() {
     rm -f "$backup"
 }
 
+operation_requires_durable_lifecycle_journal() {
+    [[ "$1" =~ ^(update|install|uninstall)$ ]]
+}
+
+loaded_lifecycle_lock_is_owned_by_current_process() {
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PID" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_START_TOKEN" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_NONCE" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION" ]
+}
+
+rewrite_loaded_decision_runtime_lifecycle_phase() {
+    local expected_generation=$1 phase=$2 now
+    load_decision_runtime_lifecycle_lock
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
+        && [ "$(decision_runtime_lifecycle_lock_generation)" = "$expected_generation" ] \
+        || return 1
+    now="$(current_epoch)" || return 1
+    write_decision_runtime_lifecycle_lock \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION" \
+        "$phase" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT" \
+        "$now" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_CONTRACT_VERSION" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256"
+}
+
+set_decision_runtime_lifecycle_phase() {
+    local phase=$1 expected_generation
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = true ] || return 1
+    load_decision_runtime_lifecycle_lock
+    loaded_lifecycle_lock_is_owned_by_current_process || return 1
+    expected_generation="$(decision_runtime_lifecycle_lock_generation)"
+    rewrite_loaded_decision_runtime_lifecycle_phase \
+        "$expected_generation" "$phase" || return 1
+    DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PHASE=$phase
+}
+
+mark_loaded_decision_runtime_lifecycle_repair_required() {
+    local expected_generation=$1
+    load_decision_runtime_lifecycle_lock
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$(decision_runtime_lifecycle_lock_generation)" = "$expected_generation" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
+        || return 1
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE" = repair_required ] \
+        && return 0
+    rewrite_loaded_decision_runtime_lifecycle_phase \
+        "$expected_generation" repair_required
+}
+
+mark_owned_decision_runtime_lifecycle_repair_required() {
+    local expected_generation
+    load_decision_runtime_lifecycle_lock
+    loaded_lifecycle_lock_is_owned_by_current_process || return 1
+    expected_generation="$(decision_runtime_lifecycle_lock_generation)"
+    mark_loaded_decision_runtime_lifecycle_repair_required \
+        "$expected_generation" || return 1
+    DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PHASE=repair_required
+}
+
 recover_orphaned_decision_runtime_lifecycle_lock() {
     local expected_generation=$1 status
     load_decision_runtime_lifecycle_lock
@@ -416,34 +641,68 @@ recover_orphaned_decision_runtime_lifecycle_lock() {
     fi
     [ "$status" -eq 3 ] || return 1
     epoch_age_at_least \
-        "$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_UPDATED_AT" \
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_STALE_GRACE_SECONDS" \
         || return 1
+    if operation_requires_durable_lifecycle_journal \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION"; then
+        if [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
+            && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE" = complete ]; then
+            remove_decision_runtime_lifecycle_lock_generation \
+                "$expected_generation"
+            return
+        fi
+        if [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ]; then
+            mark_loaded_decision_runtime_lifecycle_repair_required \
+                "$expected_generation" || return 1
+        fi
+        return 2
+    fi
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE" != repair_required ] \
+        || return 2
     remove_decision_runtime_lifecycle_lock_generation "$expected_generation"
 }
 
 acquire_decision_runtime_lifecycle_lock() {
-    local operation=$1 owner_pid owner_start_time owner_start_token
+    local operation=$1 owner_pid owner_start_token
     local owner_nonce acquired_at_epoch attempts=0 existing_generation status
+    local current_script_sha256 recovery_status
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = false ] \
         || die "decision runtime lifecycle lock is already held"
+    [[ "$operation" =~ ^(start|stop|update|install|uninstall)$ ]] \
+        || die "invalid decision runtime lifecycle operation"
     mkdir -p "$RUNTIME_DIR"
+    initialize_lifecycle_script_generation
     owner_pid=$$
-    owner_start_time="$(ps_value "$owner_pid" lstart)" \
+    capture_native_process_start_token "$owner_pid" \
         || die "decision runtime lifecycle owner identity is unreadable"
-    owner_start_token="ps:$owner_start_time"
+    owner_start_token=$NATIVE_PROCESS_START_TOKEN
     owner_nonce="$(new_service_nonce)" \
         || die "failed to generate decision runtime lifecycle nonce"
     while [ "$attempts" -le "$DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS" ]; do
+        assert_lifecycle_script_generation_unchanged
         acquired_at_epoch="$(current_epoch)" \
             || die "failed to read decision runtime lifecycle clock"
         if mkdir -m 700 "$HERMES_DECISION_LIFECYCLE_LOCK" 2>/dev/null; then
+            current_script_sha256="$(current_lifecycle_script_sha256)" \
+                || {
+                    rmdir "$HERMES_DECISION_LIFECYCLE_LOCK" 2>/dev/null || true
+                    die "decision runtime lifecycle script identity became unreadable before lock publication"
+                }
+            if [ "$current_script_sha256" != "$DECISION_RUNTIME_LIFECYCLE_INITIAL_SCRIPT_SHA256" ]; then
+                rmdir "$HERMES_DECISION_LIFECYCLE_LOCK" 2>/dev/null || true
+                die "healthmes_local.sh changed before lifecycle lock publication; rerun the command with the current script"
+            fi
             if ! write_decision_runtime_lifecycle_lock \
                 "$operation" \
+                acquired \
                 "$owner_pid" \
                 "$owner_start_token" \
                 "$owner_nonce" \
-                "$acquired_at_epoch"; then
+                "$acquired_at_epoch" \
+                "$acquired_at_epoch" \
+                "$DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION" \
+                "$DECISION_RUNTIME_LIFECYCLE_INITIAL_SCRIPT_SHA256"; then
                 die "decision runtime lifecycle lock directory was created but its owner record could not be published; preserving the lock"
             fi
             DECISION_RUNTIME_LIFECYCLE_LOCK_HELD=true
@@ -451,6 +710,7 @@ acquire_decision_runtime_lifecycle_lock() {
             DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_START_TOKEN=$owner_start_token
             DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_NONCE=$owner_nonce
             DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION=$operation
+            DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PHASE=acquired
             return
         fi
 
@@ -465,6 +725,9 @@ acquire_decision_runtime_lifecycle_lock() {
             ;;
         valid)
             existing_generation="$(decision_runtime_lifecycle_lock_generation)"
+            if [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE" = repair_required ]; then
+                die "decision runtime lifecycle ${DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION} transaction requires explicit repair; preserving $HERMES_DECISION_LIFECYCLE_LOCK"
+            fi
             if process_start_token_status \
                 "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" \
                 "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN"; then
@@ -480,6 +743,11 @@ acquire_decision_runtime_lifecycle_lock() {
                         info "recovered stale decision runtime lifecycle lock without signalling its former PID"
                         attempts=$((attempts + 1))
                         continue
+                    else
+                        recovery_status=$?
+                        if [ "$recovery_status" -eq 2 ]; then
+                            die "orphaned decision runtime ${DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION} transaction requires explicit repair; preserving $HERMES_DECISION_LIFECYCLE_LOCK"
+                        fi
                     fi
                     ;;
                 *)
@@ -502,12 +770,7 @@ release_decision_runtime_lifecycle_lock() {
     local expected_generation
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = true ] || return 0
     load_decision_runtime_lifecycle_lock
-    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
-        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PID" ] \
-        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_START_TOKEN" ] \
-        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_NONCE" ] \
-        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION" ] \
-        || return 1
+    loaded_lifecycle_lock_is_owned_by_current_process || return 1
     expected_generation="$(decision_runtime_lifecycle_lock_generation)"
     remove_decision_runtime_lifecycle_lock_generation "$expected_generation" \
         || return 1
@@ -517,6 +780,21 @@ release_decision_runtime_lifecycle_lock() {
 release_decision_runtime_lifecycle_lock_on_exit() {
     local status=$?
     trap - EXIT
+    if [ "$status" -ne 0 ] \
+        && operation_requires_durable_lifecycle_journal \
+            "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION" \
+        && [ "$DECISION_RUNTIME_DURABLE_MUTATION_STARTED" = true ]; then
+        if ! mark_owned_decision_runtime_lifecycle_repair_required; then
+            printf '%s\n' \
+                "[healthmes] failed to mark the interrupted decision runtime transaction repair-required; preserving its existing lifecycle journal" \
+                >&2
+        else
+            printf '%s\n' \
+                "[healthmes] decision runtime ${DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION} failed after mutation began; preserving a repair-required lifecycle journal" \
+                >&2
+        fi
+        exit "$status"
+    fi
     if ! release_decision_runtime_lifecycle_lock; then
         printf '%s\n' \
             "[healthmes] decision runtime lifecycle lock release failed; preserving its diagnostic" \
@@ -526,6 +804,17 @@ release_decision_runtime_lifecycle_lock_on_exit() {
     exit "$status"
 }
 
+finish_decision_runtime_post_release_cleanup() {
+    if [ "$DECISION_RUNTIME_POST_RELEASE_RMDIR_RUNTIME" = true ]; then
+        rmdir "$RUNTIME_DIR" 2>/dev/null || true
+    fi
+    if [ "$DECISION_RUNTIME_POST_RELEASE_RMDIR_DATA" = true ]; then
+        rmdir "$DATA_DIR" 2>/dev/null || true
+    fi
+    DECISION_RUNTIME_POST_RELEASE_RMDIR_RUNTIME=false
+    DECISION_RUNTIME_POST_RELEASE_RMDIR_DATA=false
+}
+
 with_decision_runtime_lifecycle_lock() {
     local operation=$1
     shift
@@ -533,12 +822,23 @@ with_decision_runtime_lifecycle_lock() {
         "$@"
         return
     fi
+    DECISION_RUNTIME_DURABLE_MUTATION_STARTED=false
+    DECISION_RUNTIME_POST_RELEASE_RMDIR_RUNTIME=false
+    DECISION_RUNTIME_POST_RELEASE_RMDIR_DATA=false
     acquire_decision_runtime_lifecycle_lock "$operation"
     trap release_decision_runtime_lifecycle_lock_on_exit EXIT
+    # Keep errexit active inside lifecycle commands. Running a shell function
+    # as an `if` condition disables errexit throughout that function and can
+    # hide a failed pull, setup, service stop, or cleanup behind later success.
+    # The EXIT trap releases non-mutating failures and journals interrupted
+    # durable mutations as repair_required.
     "$@"
+    set_decision_runtime_lifecycle_phase complete \
+        || die "decision runtime lifecycle completion could not be journaled; preserving the lock"
     release_decision_runtime_lifecycle_lock \
         || die "decision runtime lifecycle lock ownership changed before release; preserving the lock"
     trap - EXIT
+    finish_decision_runtime_post_release_cleanup
 }
 
 decision_runtime_startup_lease_record() {
@@ -693,7 +993,7 @@ load_decision_runtime_startup_lease() {
         && [[ "$updated_at_epoch" =~ ^[1-9][0-9]*$ ]] \
         && [ "$updated_at_epoch" -ge "$created_at_epoch" ] \
         && valid_managed_pid "$startup_owner_pid" \
-        && [[ "$startup_owner_start_token" == ps:* ]] \
+        && [[ "$startup_owner_start_token" =~ ^(linux:[1-9][0-9]*|darwin:[1-9][0-9]*:[0-9]{6}|ps:.+)$ ]] \
         && [[ "$startup_owner_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
         || return 0
     case "$phase" in
@@ -2126,27 +2426,47 @@ uninstall_launch_agent() {
 }
 
 cmd_install() {
+    set_decision_runtime_lifecycle_phase preflight \
+        || die "failed to journal install preflight"
+    DECISION_RUNTIME_DURABLE_MUTATION_STARTED=true
+    set_decision_runtime_lifecycle_phase stopping \
+        || die "failed to journal install shutdown"
     stop_launch_agent
     load_runtime_env
     stop_decision_runtime
+    set_decision_runtime_lifecycle_phase setup \
+        || die "failed to journal install setup"
     bash "$DEV_MAC_SCRIPT" setup
+    set_decision_runtime_lifecycle_phase restarting \
+        || die "failed to journal install launch-agent registration"
     install_launch_agent
     info "installed and configured to start at login"
 }
 
 cmd_update() {
     local restart_launch_agent=false
+    set_decision_runtime_lifecycle_phase preflight \
+        || die "failed to journal update preflight"
     git -C "$REPO_ROOT" diff --quiet || die "working tree has changes; commit or stash first"
     git -C "$REPO_ROOT" diff --cached --quiet || die "index has changes; commit or stash first"
+    DECISION_RUNTIME_DURABLE_MUTATION_STARTED=true
+    set_decision_runtime_lifecycle_phase stopping \
+        || die "failed to journal update shutdown"
     if [ -f "$LAUNCH_AGENT_PLIST" ]; then
         restart_launch_agent=true
         stop_launch_agent
     fi
     load_runtime_env
     stop_decision_runtime
+    set_decision_runtime_lifecycle_phase pulling \
+        || die "failed to journal update source replacement"
     git -C "$REPO_ROOT" pull --ff-only
+    set_decision_runtime_lifecycle_phase setup \
+        || die "failed to journal update setup"
     bash "$DEV_MAC_SCRIPT" setup
     if [ "$restart_launch_agent" = true ]; then
+        set_decision_runtime_lifecycle_phase restarting \
+            || die "failed to journal update restart"
         start_launch_agent
     fi
     info "updated"
@@ -2355,6 +2675,15 @@ decision_runtime_status() {
         info "Hermes decision runtime: unknown (shutdown budget is malformed or unsafe)"
         return
     fi
+    if [ "$lock_status" = valid ] \
+        && { [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE" = repair_required ] \
+            || { [ "$lock_owner_status" = absent ] \
+                && operation_requires_durable_lifecycle_journal \
+                    "$lock_operation" \
+                && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PHASE" != complete ]; }; }; then
+        info "Hermes decision runtime: unknown (lifecycle ${lock_operation} transaction requires explicit repair)"
+        return
+    fi
 
     if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
         if [ "$startup_lease_status" != missing ]; then
@@ -2437,7 +2766,7 @@ decision_runtime_status() {
             stop)
                 info "Hermes decision runtime: stopping (cross-process lifecycle stop is in progress)"
                 ;;
-            update | install)
+            update | install | uninstall)
                 info "Hermes decision runtime: unknown (lifecycle ${lock_operation} is in progress)"
                 ;;
             esac
@@ -2518,14 +2847,54 @@ cmd_open() {
     open "$DASHBOARD_URL"
 }
 
+remove_runtime_contents_except_lifecycle_lock() {
+    [ "$RUNTIME_DIR" = "$REPO_ROOT/data/runtime" ] \
+        || die "refusing unexpected runtime path"
+    (
+        local entry
+        shopt -s dotglob nullglob
+        for entry in "$RUNTIME_DIR"/*; do
+            [ "$entry" = "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
+                || rm -rf -- "$entry"
+        done
+    )
+}
+
+remove_data_contents_except_runtime() {
+    [ "$DATA_DIR" = "$REPO_ROOT/data" ] \
+        || die "refusing unexpected data path"
+    (
+        local entry
+        shopt -s dotglob nullglob
+        for entry in "$DATA_DIR"/*; do
+            [ "$entry" = "$RUNTIME_DIR" ] || rm -rf -- "$entry"
+        done
+    )
+}
+
 cmd_uninstall() {
+    local delete_data=${1:-}
+    [ -z "$delete_data" ] || [ "$delete_data" = "--delete-data" ] \
+        || die "usage: $0 uninstall [--delete-data]"
+    set_decision_runtime_lifecycle_phase preflight \
+        || die "failed to journal uninstall preflight"
+    DECISION_RUNTIME_DURABLE_MUTATION_STARTED=true
+    set_decision_runtime_lifecycle_phase unloading \
+        || die "failed to journal launch-agent removal"
     uninstall_launch_agent
-    with_decision_runtime_lifecycle_lock stop stop_apps
+    set_decision_runtime_lifecycle_phase stopping \
+        || die "failed to journal uninstall runtime shutdown"
+    stop_apps
+    set_decision_runtime_lifecycle_phase services_stop \
+        || die "failed to journal uninstall service shutdown"
     bash "$DEV_MAC_SCRIPT" services-stop
-    rm -rf "$RUNTIME_DIR"
-    if [ "${1:-}" = "--delete-data" ]; then
-        [ "$DATA_DIR" = "$REPO_ROOT/data" ] || die "refusing unexpected data path"
-        rm -rf "$DATA_DIR"
+    set_decision_runtime_lifecycle_phase cleanup \
+        || die "failed to journal uninstall data cleanup"
+    remove_runtime_contents_except_lifecycle_lock
+    DECISION_RUNTIME_POST_RELEASE_RMDIR_RUNTIME=true
+    if [ "$delete_data" = "--delete-data" ]; then
+        remove_data_contents_except_runtime
+        DECISION_RUNTIME_POST_RELEASE_RMDIR_DATA=true
         info "runtime and local data deleted"
     else
         info "runtime removed; local data kept"
@@ -2546,7 +2915,7 @@ stop) with_decision_runtime_lifecycle_lock stop cmd_stop ;;
 status) cmd_status ;;
 open) cmd_open ;;
 daemon) cmd_daemon ;;
-uninstall) cmd_uninstall "${2:-}" ;;
+uninstall) with_decision_runtime_lifecycle_lock uninstall cmd_uninstall "${2:-}" ;;
 __service_runner) run_service_runner "${2:-}" "${3:-}" ;;
 *) usage ;;
 esac

@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import textwrap
 import time
 from pathlib import Path
@@ -20,6 +21,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "dev_mac.sh"
 LOCAL_SCRIPT = REPO_ROOT / "scripts" / "healthmes_local.sh"
+NATIVE_IDENTITY_HELPER = (
+    REPO_ROOT / "scripts" / "runtime_native_identity.py"
+)
 LAUNCH_AGENT_TEMPLATE = REPO_ROOT / "config" / "com.healthmes.local.plist.in"
 MAKEFILE = REPO_ROOT / "Makefile"
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
@@ -178,21 +182,38 @@ def _write_decision_lifecycle_lock(
     owner_start_token: str = "ps:Mon Aug 17 09:00:00 2026",
     owner_nonce: str = "lockowner123",
     acquired_at_epoch: int = 1,
+    updated_at_epoch: int | None = None,
+    phase: str = "acquired",
+    script_sha256: str = "a" * 64,
+    version: int = 1,
 ) -> Path:
     lock = runtime_dir / "hermes-decision-lifecycle-lock"
     lock.mkdir(mode=0o700)
+    if version == 1:
+        fields = (
+            "version\t1",
+            f"operation\t{operation}",
+            f"owner_pid\t{owner_pid}",
+            f"owner_start_token\t{owner_start_token}",
+            f"owner_nonce\t{owner_nonce}",
+            f"acquired_at_epoch\t{acquired_at_epoch}",
+        )
+    else:
+        fields = (
+            "version\t2",
+            f"operation\t{operation}",
+            f"phase\t{phase}",
+            f"owner_pid\t{owner_pid}",
+            f"owner_start_token\t{owner_start_token}",
+            f"owner_nonce\t{owner_nonce}",
+            f"acquired_at_epoch\t{acquired_at_epoch}",
+            "updated_at_epoch\t"
+            f"{updated_at_epoch or acquired_at_epoch}",
+            "script_contract_version\t2",
+            f"script_sha256\t{script_sha256}",
+        )
     (lock / "record").write_text(
-        "\n".join(
-            (
-                "version\t1",
-                f"operation\t{operation}",
-                f"owner_pid\t{owner_pid}",
-                f"owner_start_token\t{owner_start_token}",
-                f"owner_nonce\t{owner_nonce}",
-                f"acquired_at_epoch\t{acquired_at_epoch}",
-                "",
-            )
-        ),
+        "\n".join((*fields, "")),
         encoding="ascii",
     )
     return lock
@@ -213,6 +234,10 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
 
     local_script = scripts / "healthmes_local.sh"
     shutil.copy2(LOCAL_SCRIPT, local_script)
+    shutil.copy2(
+        NATIVE_IDENTITY_HELPER,
+        scripts / "runtime_native_identity.py",
+    )
     dev_mac = scripts / "dev_mac.sh"
     _write_executable(
         dev_mac,
@@ -507,6 +532,7 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         "HEALTHMES_RUNTIME_PYTHON_BIN": str(
             fake_bin / "runtime-python"
         ),
+        "HEALTHMES_NATIVE_IDENTITY_PYTHON_BIN": sys.executable,
     }
     return {
         "env": env,
@@ -551,6 +577,41 @@ def _assert_identity_check_immediately_before(events: list[str], signal_line: st
     assert len(checks) == 5
     for field in ("pid=", "pgid=", "comm=", "lstart=", "command="):
         assert any(event.startswith("ps ") and field in event for event in checks)
+
+
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") or sys.platform == "darwin"),
+    reason="native lifecycle identity supports Linux and macOS",
+)
+def test_native_lifecycle_identity_is_stable_across_timezone_and_locale() -> None:
+    tokens: set[str] = set()
+    for timezone, locale in (
+        ("UTC0", "C"),
+        ("Asia/Seoul", "C.UTF-8"),
+    ):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(NATIVE_IDENTITY_HELPER),
+                "capture",
+                str(os.getpid()),
+            ],
+            env={
+                **os.environ,
+                "TZ": timezone,
+                "LANG": locale,
+                "LC_ALL": locale,
+            },
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tokens.add(result.stdout.strip())
+
+    assert len(tokens) == 1
+    token = tokens.pop()
+    assert token.startswith(("linux:", "darwin:"))
+    assert not token.startswith("ps:")
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
@@ -741,6 +802,12 @@ def test_decision_runtime_mutations_use_one_cross_process_lifecycle_lock() -> No
             text,
             re.MULTILINE,
         )
+    assert re.search(
+        r"^uninstall\) with_decision_runtime_lifecycle_lock "
+        r'uninstall cmd_uninstall "\$\{2:-\}" ;;$',
+        text,
+        re.MULTILINE,
+    )
     update_body = _function_body(text, "cmd_update")
     assert update_body.index("stop_decision_runtime") < update_body.index(
         'git -C "$REPO_ROOT" pull --ff-only'
@@ -751,12 +818,20 @@ def test_decision_runtime_mutations_use_one_cross_process_lifecycle_lock() -> No
     )
     for field in (
         "operation",
+        "phase",
         "owner_pid",
         "owner_start_token",
         "owner_nonce",
         "acquired_at_epoch",
+        "updated_at_epoch",
+        "script_contract_version",
+        "script_sha256",
     ):
         assert f"printf '{field}\\t%s\\n'" in lock_writer
+    assert "capture_native_process_start_token" in _function_body(
+        text,
+        "acquire_decision_runtime_lifecycle_lock",
+    )
     lock_recovery = _function_body(
         text,
         "recover_orphaned_decision_runtime_lifecycle_lock",
@@ -841,9 +916,37 @@ def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
         "directory lock `data/runtime/hermes-decision-lifecycle-lock/`"
     ) in development
     assert (
-        "`update` holds this same lock from the initial decision stop "
+        "`update` holds the lock from the initial decision stop "
         "through `git pull`, setup, and generation handoff"
     ) in development
+    assert (
+        "a native OS start token (`/proc` start ticks on Linux or "
+        "`libproc` start seconds/microseconds on macOS)"
+    ) in development
+    assert (
+        "The token is independent of timezone and locale"
+        in development
+    )
+    assert (
+        "If an update replaced it, that old shell exits and requires "
+        "the user to rerun the command"
+    ) in development
+    assert (
+        "A dead non-complete `update`, `install`, or `uninstall` "
+        "journal is instead atomically advanced to `repair_required`"
+    ) in development
+    assert (
+        "`uninstall` holds it across LaunchAgent unload, application "
+        "stop, `services-stop`, and runtime/local-data cleanup"
+    ) in development
+    assert (
+        "Durable subcommands run with Bash `errexit` active"
+        in development
+    )
+    assert (
+        "the transaction remains `repair_required`"
+        in development
+    )
     assert (
         "the incomplete lock has no provable owner. It is deliberately "
         "preserved as `unknown`"
@@ -886,6 +989,14 @@ def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
         in development
     )
     assert (
+        "An existing malformed record is preserved byte-for-byte"
+        in development
+    )
+    assert (
+        "the supervisor first reaps that exact subprocess handle"
+        in development
+    )
+    assert (
         "unreadable `/proc` process records, malformed Darwin process "
         "listings, and unprovable identities fail closed"
     ) in development
@@ -894,9 +1005,14 @@ def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
 def test_uninstall_keeps_data_unless_delete_data_is_explicit() -> None:
     text = LOCAL_SCRIPT.read_text(encoding="utf-8")
     body = _function_body(text, "cmd_uninstall")
-    assert '[ "${1:-}" = "--delete-data" ]' in body
-    assert '[ "$DATA_DIR" = "$REPO_ROOT/data" ]' in body
-    assert 'rm -rf "$DATA_DIR"' in body
+    assert '[ "$delete_data" = "--delete-data" ]' in body
+    assert "remove_runtime_contents_except_lifecycle_lock" in body
+    assert "remove_data_contents_except_runtime" in body
+    assert body.index("uninstall_launch_agent") < body.index("stop_apps")
+    assert body.index("stop_apps") < body.index("services-stop")
+    assert body.index("services-stop") < body.index(
+        "remove_runtime_contents_except_lifecycle_lock"
+    )
 
 
 def test_stop_disables_keepalive_before_signaling_verified_process_group(
@@ -1888,7 +2004,11 @@ def test_status_reports_generation_conflict_before_live_launcher(
 
 @pytest.mark.parametrize(
     ("holder_command", "contender_command"),
-    (("start", "stop"), ("update", "start")),
+    (
+        ("start", "stop"),
+        ("update", "start"),
+        ("uninstall", "start"),
+    ),
 )
 def test_lifecycle_lock_serializes_concurrent_mutations(
     tmp_path: Path,
@@ -1916,6 +2036,7 @@ def test_lifecycle_lock_serializes_concurrent_mutations(
         cmd_start() { fake_lifecycle_command start; }
         cmd_stop() { fake_lifecycle_command stop; }
         cmd_update() { fake_lifecycle_command update; }
+        cmd_uninstall() { fake_lifecycle_command uninstall; }
         """
     ).lstrip()
     local_script.write_text(
@@ -1973,6 +2094,253 @@ def test_lifecycle_lock_serializes_concurrent_mutations(
         if contender is not None and contender.poll() is None:
             contender.terminate()
             contender.wait(timeout=5)
+
+
+@pytest.mark.parametrize("operation", ("update", "install", "uninstall"))
+def test_orphaned_durable_lifecycle_transaction_requires_repair(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    native_token = (
+        "darwin:1786915200:123456"
+        if sys.platform == "darwin"
+        else "linux:123456"
+    )
+    lock = _write_decision_lifecycle_lock(
+        runtime,
+        operation=operation,
+        owner_start_token=native_token,
+        version=2,
+    )
+
+    result = _run_local_runtime(harness, "stop", check=False)
+    status = _run_local_runtime(harness, "status")
+
+    assert result.returncode != 0
+    assert "requires explicit repair" in result.stderr
+    assert lock.exists()
+    record = (lock / "record").read_text(encoding="ascii")
+    assert f"operation\t{operation}\n" in record
+    assert "phase\trepair_required\n" in record
+    assert (
+        f"lifecycle {operation} transaction requires explicit repair"
+        in status.stdout
+    )
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+def test_failed_update_after_mutation_preserves_repair_journal(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    local_script = Path(harness["local_script"])
+    script = local_script.read_text(encoding="utf-8")
+    override = textwrap.dedent(
+        """
+        cmd_update() {
+            set_decision_runtime_lifecycle_phase preflight
+            DECISION_RUNTIME_DURABLE_MUTATION_STARTED=true
+            set_decision_runtime_lifecycle_phase pulling
+            return 23
+        }
+        """
+    ).lstrip()
+    local_script.write_text(
+        script.replace(
+            'case "${1:-}" in\n',
+            f"{override}\ncase \"${{1:-}}\" in\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_local_runtime(harness, "update", check=False)
+    blocked = _run_local_runtime(harness, "start", check=False)
+
+    lock = (
+        Path(harness["runtime"])
+        / "hermes-decision-lifecycle-lock"
+    )
+    assert result.returncode == 23
+    assert lock.exists()
+    assert "phase\trepair_required\n" in (
+        lock / "record"
+    ).read_text(encoding="ascii")
+    assert blocked.returncode != 0
+    assert "requires explicit repair" in blocked.stderr
+
+
+@pytest.mark.parametrize("operation", ("update", "install", "uninstall"))
+def test_durable_lifecycle_does_not_mask_internal_command_failure(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    local_script = Path(harness["local_script"])
+    marker = tmp_path / f"{operation}-continued-after-failure"
+    script = local_script.read_text(encoding="utf-8")
+    override = textwrap.dedent(
+        f"""
+        cmd_{operation}() {{
+            set_decision_runtime_lifecycle_phase preflight
+            DECISION_RUNTIME_DURABLE_MUTATION_STARTED=true
+            set_decision_runtime_lifecycle_phase setup
+            false
+            : >"{marker}"
+        }}
+        """
+    ).lstrip()
+    local_script.write_text(
+        script.replace(
+            'case "${1:-}" in\n',
+            f"{override}\ncase \"${{1:-}}\" in\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_local_runtime(harness, operation, check=False)
+
+    lock = (
+        Path(harness["runtime"])
+        / "hermes-decision-lifecycle-lock"
+    )
+    assert result.returncode != 0
+    assert not marker.exists()
+    assert lock.exists()
+    assert "phase\trepair_required\n" in (
+        lock / "record"
+    ).read_text(encoding="ascii")
+
+
+def test_waiting_old_shell_refuses_to_run_after_update_changes_script(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    local_script = Path(harness["local_script"])
+    marker_dir = tmp_path / "script-drift-markers"
+    marker_dir.mkdir()
+    release = marker_dir / "release"
+    script = local_script.read_text(encoding="utf-8")
+    overrides = textwrap.dedent(
+        """
+        cmd_update() {
+            : >"$FAKE_MARKER_DIR/update-entered"
+            while [ ! -f "$FAKE_MARKER_DIR/release" ]; do
+                /bin/sleep 0.05
+            done
+        }
+        cmd_start() {
+            : >"$FAKE_MARKER_DIR/stale-start-entered"
+        }
+        """
+    ).lstrip()
+    local_script.write_text(
+        script.replace(
+            'case "${1:-}" in\n',
+            f"{overrides}\ncase \"${{1:-}}\" in\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    environment = {
+        **harness["env"],
+        "FAKE_MARKER_DIR": str(marker_dir),
+        "HEALTHMES_SLEEP_BIN": "/bin/sleep",
+    }
+    holder = subprocess.Popen(
+        ["bash", str(local_script), "update"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    contender: subprocess.Popen[str] | None = None
+    try:
+        for _ in range(100):
+            if (marker_dir / "update-entered").exists():
+                break
+            time.sleep(0.01)
+        assert (marker_dir / "update-entered").exists()
+        contender = subprocess.Popen(
+            ["bash", str(local_script), "start"],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.2)
+        local_script.write_text(
+            local_script.read_text(encoding="utf-8")
+            + "\n# simulated update replacement\n",
+            encoding="utf-8",
+        )
+        release.touch()
+
+        holder_stdout, holder_stderr = holder.communicate(timeout=5)
+        contender_stdout, contender_stderr = contender.communicate(timeout=5)
+
+        assert holder.returncode == 0, (holder_stdout, holder_stderr)
+        assert contender.returncode != 0
+        assert "changed while this command waited" in contender_stderr
+        assert not (marker_dir / "stale-start-entered").exists()
+    finally:
+        release.touch(exist_ok=True)
+        if holder.poll() is None:
+            holder.terminate()
+            holder.wait(timeout=5)
+        if contender is not None and contender.poll() is None:
+            contender.terminate()
+            contender.wait(timeout=5)
+
+
+def test_uninstall_runs_launch_service_and_cleanup_under_one_lock(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    data_dir = runtime.parent
+    retained_data = data_dir / "retained.db"
+    retained_data.write_text("keep", encoding="ascii")
+    fake_bin = Path(harness["env"]["PATH"].split(":", 1)[0])
+    _write_executable(
+        fake_bin / "launchctl",
+        """
+        #!/usr/bin/env bash
+        [ -d "$FAKE_LIFECYCLE_LOCK" ] || exit 91
+        printf 'launchctl %s\\n' "$*" >>"$FAKE_EVENT_LOG"
+        """,
+    )
+    _write_executable(
+        Path(harness["env"]["HEALTHMES_DEV_MAC_SCRIPT"]),
+        """
+        #!/usr/bin/env bash
+        [ -d "$FAKE_LIFECYCLE_LOCK" ] || exit 92
+        printf 'dev_mac %s\\n' "$*" >>"$FAKE_EVENT_LOG"
+        """,
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "uninstall",
+        env_overrides={
+            "FAKE_LIFECYCLE_LOCK": str(
+                runtime / "hermes-decision-lifecycle-lock"
+            )
+        },
+    )
+
+    assert result.returncode == 0
+    assert retained_data.read_text(encoding="ascii") == "keep"
+    assert not runtime.exists()
+    events = _event_lines(harness)
+    assert any(line.startswith("launchctl disable ") for line in events)
+    assert "dev_mac services-stop" in events
 
 
 def test_decision_stop_never_deletes_a_competing_launcher_generation(

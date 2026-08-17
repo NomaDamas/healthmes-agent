@@ -642,10 +642,15 @@ class _RuntimeShutdownBudgetPublication:
                 "runtime shutdown budget owner is not running"
             )
         with _exclusive_file_lock(self.path):
-            try:
-                current = load_runtime_shutdown_budget(self.path)
-            except ValueError:
-                current = None
+            current = None
+            if os.path.lexists(self.path):
+                try:
+                    current = load_runtime_shutdown_budget(self.path)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "runtime shutdown budget is malformed; "
+                        "refusing to overwrite it without explicit repair"
+                    ) from exc
             if (
                 current is not None
                 and current != self.record
@@ -1618,6 +1623,80 @@ class HermesRuntimeProcess:
         self._known_child_group_members = known | current
         return current
 
+    async def _establish_initial_child_group_ownership(
+        self,
+        process: asyncio.subprocess.Process,
+        *,
+        deadline: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        """Bind the first group snapshot even when the leader exits first."""
+
+        pgid = self._child_pgid
+        if pgid is None:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_identity_missing"
+            )
+        loop = asyncio.get_running_loop()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise RuntimeError("hermes_runtime_child_term_timeout")
+        before_reap = self._process_group_probe(
+            pgid,
+            min(_PROCESS_GROUP_PROBE_TIMEOUT_SECONDS, remaining),
+        )
+        leader_in_before = any(
+            member.pid == process.pid for member in before_reap
+        )
+        if leader_in_before:
+            if process.returncode is not None:
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_child_group_leader_changed"
+                )
+            self._known_child_group_members = before_reap
+            return before_reap
+
+        if process.returncode is None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "hermes_runtime_child_term_timeout"
+                )
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=remaining,
+                )
+            except TimeoutError as exc:
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_child_group_leader_state_unknown"
+                ) from exc
+            if process.returncode is None:
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_child_group_leader_state_unknown"
+                )
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise RuntimeError("hermes_runtime_child_term_timeout")
+        after_reap = self._process_group_probe(
+            pgid,
+            min(_PROCESS_GROUP_PROBE_TIMEOUT_SECONDS, remaining),
+        )
+        if any(member.pid == process.pid for member in after_reap):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_leader_changed"
+            )
+        if (
+            before_reap
+            and after_reap
+            and before_reap.isdisjoint(after_reap)
+        ):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_identity_changed"
+            )
+        self._known_child_group_members = before_reap | after_reap
+        return after_reap
+
     def _owned_child_group_members(
         self,
         *,
@@ -1744,38 +1823,14 @@ class HermesRuntimeProcess:
             loop.time() + self._config.child_term_timeout_seconds
         )
         if not self._known_child_group_members:
-            remaining = term_deadline - loop.time()
-            if remaining <= 0:
-                raise RuntimeError(
-                    "hermes_runtime_child_term_timeout"
-                )
-            if process.returncode is None:
-                self._refresh_child_group_identity(
-                    require_leader=True,
-                    timeout_seconds=min(
-                        _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
-                        remaining,
-                    ),
-                )
-            else:
-                current = self._process_group_probe(
-                    self._child_pgid,
-                    min(
-                        _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
-                        remaining,
-                    ),
-                )
-                if not current:
-                    self._child_pgid = None
-                    self._process = None
-                    return
-                if any(
-                    member.pid == process.pid for member in current
-                ):
-                    raise HermesRuntimeIdentityError(
-                        "hermes_runtime_child_group_leader_changed"
-                    )
-                self._known_child_group_members = current
+            current = await self._establish_initial_child_group_ownership(
+                process,
+                deadline=term_deadline,
+            )
+            if not current:
+                self._child_pgid = None
+                self._process = None
+                return
         self._signal_owned_child_group_members(
             signal.SIGTERM,
             deadline=term_deadline,

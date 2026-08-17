@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+import uvicorn
 import yaml
 from fastapi.testclient import TestClient
 
@@ -1359,6 +1360,24 @@ async def test_uvicorn_exit_blocks_new_leases_before_existing_lease_drains(
         attest_pinned_generation,
     )
     monkeypatch.setattr(process, "_stop_child", stop_child)
+    base_exit_calls: list[int] = []
+
+    def isolated_uvicorn_exit(
+        uvicorn_server: uvicorn.Server,
+        sig: int,
+        _frame: object | None,
+    ) -> None:
+        # Uvicorn retains captured signals for its process-level run loop.
+        # This unit test exercises only the HealthMes admission hook, so keep
+        # that process-global signal lifecycle out of subsequent ASGI tests.
+        base_exit_calls.append(sig)
+        uvicorn_server.should_exit = True
+
+    monkeypatch.setattr(
+        uvicorn.Server,
+        "handle_exit",
+        isolated_uvicorn_exit,
+    )
     active = await process.acquire_response_lease()
     server = _build_supervisor_server(process, config)
 
@@ -1377,6 +1396,8 @@ async def test_uvicorn_exit_blocks_new_leases_before_existing_lease_drains(
 
     assert process._lifecycle_state == "closed"
     assert process._process is None
+    assert base_exit_calls == [signal.SIGTERM]
+    assert server._captured_signals == []
 
 
 def test_supervisor_exposes_only_bounded_runtime_ingress(

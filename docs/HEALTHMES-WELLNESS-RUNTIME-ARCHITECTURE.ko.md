@@ -325,15 +325,34 @@ docker compose up -d --build --force-recreate hermes-decision
 child SIGTERM 대기 10초, SIGKILL 이후 group 검증과 process reap 대기 5초를
 모두 포함하는 315초 상한보다 길다. Supervisor는 이 값을 시작 전에 계산한다.
 
-Native launcher의 `start`, `stop`, `update`, `install`은 모두
+Native launcher의 `start`, `stop`, `update`, `install`, `uninstall`은 모두
 `data/runtime/hermes-decision-lifecycle-lock/` 원자적 디렉터리 lock으로
-직렬화된다. 엄격한 owner record에는 작업 종류, shell PID, `ps` start token,
-nonce, 획득 epoch가 들어간다. 살아 있는 owner는 최대 10초만 기다리고,
-identity가 unreadable이거나 record가 malformed이면 fail closed한다. 정확한
-owner가 죽었고 2초 stale grace도 지난 경우에만 숫자 PID를 signal하지 않고
-orphan lock을 회수한다. `update`는 decision stop부터 `git pull`, setup,
-generation handoff가 모두 끝날 때까지 lock을 잡으므로 중간 코드로 새 start가
-들어올 수 없다.
+직렬화된다. Version 2 owner record에는 작업 종류와 transaction phase, shell
+PID, native OS start token(Linux `/proc` start ticks 또는 macOS `libproc`
+초/마이크로초), nonce, 획득/갱신 epoch, lifecycle contract version, 해당 shell이
+처음 본 `healthmes_local.sh` SHA-256가 들어간다. 이 token은 timezone과 locale에
+따라 바뀌지 않는다. Version 1 `ps` record는 읽을 수 있지만, 살아 있는 PID의
+문자열 token이 다르면 dead로 추측하지 않고 unknown으로 처리한다.
+
+살아 있는 owner는 최대 10초만 기다리고 identity가 unreadable이거나 record가
+malformed이면 fail closed한다. 기다리는 shell은 매 시도마다 현재 script
+digest를 다시 계산한다. Update가 파일을 교체했으면 오래된 shell은 메모리에
+로드된 구버전 함수를 실행하지 않고 종료하며, 현재 script로 명령을 다시
+실행하도록 요구한다. 정확한 `start`/`stop` owner가 죽고 2초 stale grace도
+지났을 때만 숫자 PID를 signal하지 않고 orphan lock을 회수한다. 반면 완료되지
+않은 `update`/`install`/`uninstall` owner가 죽으면 record를
+`repair_required`로 원자적으로 전환해 보존하고, 명시적으로 검증된 repair 전에는
+다른 lifecycle 명령을 실행하지 않는다. 완료 phase를 기록한 직후 lock 삭제 전에
+죽은 경우만 동일 identity/age 검증 후 정리할 수 있다.
+
+`update`는 decision stop부터 `git pull`, setup, generation handoff 완료까지
+lock을 잡는다. `uninstall`도 LaunchAgent unload, 앱 stop, `services-stop`,
+runtime/local-data cleanup 전체를 같은 lock 안에서 수행한다. Cleanup 중에는
+lock 디렉터리 자체를 제외하고, 성공 phase를 기록하고 lock을 해제한 뒤 비어 있는
+runtime/data 디렉터리만 `rmdir`로 제거한다. 따라서 중간 코드로 새 start가
+들어오거나 부분 uninstall과 경쟁할 수 없다. Durable 하위 명령은 Bash
+`errexit`가 활성화된 상태로 실행되므로 pull, setup, service stop, cleanup 실패가
+뒤의 성공 명령에 가려지지 않으며 transaction은 `repair_required`로 남는다.
 원자적 디렉터리를 만든 직후 owner record를 게시하기 전에 process가 crash한
 경우에는 owner를 증명할 수 없다. 이 불완전 lock은 stale이라고 추측해 지우지
 않고 operator가 확인할 수 있도록 `unknown` 상태로 보존한다.
@@ -372,11 +391,12 @@ metadata가 없어도 살아 있는 supervisor가 Hermes descendant를 drain하�
 317초 대기로 호환하며 짧은 값을 신뢰하지 않는다. 형식이 잘못됐거나 identity를
 증명할 수 없으면 숫자 PID로 fallback하지 않고 metadata를 보존한 채 fail
 closed한다. 같은 launcher identity를 상속한 두 번째 startup이 실패해도 기존
-runtime의 종료 record를 덮어쓰거나 삭제할 수 없다. v3 native stop은 Python
-helper 하나가 최대 317초를 내부에서 대기하고, supervisor 종료 뒤 Bash wrapper
-reap 확인에는 최대 1초만 더 사용한다. 매초 새 interpreter를 띄우지 않으므로
-helper startup overhead가 반복되지 않는다. Compose와 LaunchAgent의 outer
-timeout은 모두 360초로 유지한다.
+runtime의 종료 record를 덮어쓰거나 삭제할 수 없다. 기존 record가 malformed이면
+새 supervisor도 명시적으로 검증된 repair 없이 그 byte를 덮어쓰지 않고 시작을
+거부한다. v3 native stop은 Python helper 하나가 최대 317초를 내부에서 대기하고,
+supervisor 종료 뒤 Bash wrapper reap 확인에는 최대 1초만 더 사용한다. 매초 새
+interpreter를 띄우지 않으므로 helper startup overhead가 반복되지 않는다.
+Compose와 LaunchAgent의 outer timeout은 모두 360초로 유지한다.
 
 Native launcher는 중간 `uv run` wrapper 없이 HealthMes root venv의 Python으로
 supervisor를 직접 실행한다. 전용 Hermes decision venv의 Python은 manifest에
@@ -408,11 +428,14 @@ fallback하지 않고 fail closed한다. macOS에서는 초 단위 `ps lstart` �
 libproc 확인과 `kill(2)` 사이의 아주 작은 OS 한계는 남으며 이를 명시적으로
 문서화한다.
 
-Leader가 먼저 끝나도 이미 검증된 descendant는 TERM/KILL 대상이지만, 숫자 PGID
-자체에는 신호하지 않으므로 나중에 같은 PGID를 재사용한 무관한 process group은
-건드리지 않는다. Hermes SSE proxy는 connect/write/pool에는 각각 명시적인 5초
-제한을 두되 read timeout은 없앤다. 따라서 SSE가 5초 넘게 조용해도 끊기지 않지만
-전체 decision wall-clock deadline은 그대로 적용된다.
+Leader가 먼저 끝나도 이미 검증된 descendant는 TERM/KILL 대상이다. 첫 OS
+snapshot 전에 leader가 끝났고 asyncio `returncode` 반영이 늦는 경우에는 그
+정확한 subprocess handle을 먼저 reap한 뒤, reap 전후 descendant snapshot의
+identity 연속성이 있을 때만 각 member를 adopt해 종료한다. 숫자 PGID 자체에는
+신호하지 않으므로 나중에 같은 PGID를 재사용한 무관한 process group은 건드리지
+않는다. Hermes SSE proxy는 connect/write/pool에는 각각 명시적인 5초 제한을
+두되 read timeout은 없앤다. 따라서 SSE가 5초 넘게 조용해도 끊기지 않지만 전체
+decision wall-clock deadline은 그대로 적용된다.
 
 ### Legacy cron migration
 

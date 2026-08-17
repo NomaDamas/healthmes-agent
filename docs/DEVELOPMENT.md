@@ -233,14 +233,35 @@ supported 300-second overall decision wall clock plus the supervisor's bounded
 
 The canonical native launcher serializes every decision-runtime mutation with
 the atomic directory lock
-`data/runtime/hermes-decision-lifecycle-lock/`. Its strict owner record binds
-the `start`, `stop`, `update`, or `install` operation to the shell PID,
-`ps` start token, nonce, and acquisition epoch. A live owner is waited for for
-at most 10 seconds; unreadable or malformed identity fails closed. A verified
-dead owner may be recovered only after the two-second stale grace, and
-recovery never signals its numeric PID. `update` holds this same lock from
-the initial decision stop through `git pull`, setup, and generation handoff,
-so a new start cannot execute partially updated code.
+`data/runtime/hermes-decision-lifecycle-lock/`. Version 2 of its strict owner
+record binds the `start`, `stop`, `update`, `install`, or `uninstall`
+operation to the shell PID, a native OS start token (`/proc` start ticks on
+Linux or `libproc` start seconds/microseconds on macOS), nonce, acquisition and
+update epochs, transaction phase, lifecycle contract version, and the exact
+`healthmes_local.sh` SHA-256 seen by that shell. The token is independent of
+timezone and locale. Version-1 `ps` records remain readable, but a live PID
+whose formatted token differs is unknown and is never treated as a dead owner.
+A live owner is waited for for at most 10 seconds; unreadable or malformed
+identity fails closed. A waiting shell re-hashes the on-disk script on every
+attempt. If an update replaced it, that old shell exits and requires the user
+to rerun the command instead of executing stale in-memory functions.
+
+A verified dead `start` or `stop` owner may be recovered only after the
+two-second stale grace, and recovery never signals its numeric PID. A dead
+non-complete `update`, `install`, or `uninstall` journal is instead atomically
+advanced to `repair_required` and preserved; later lifecycle commands fail
+closed until an operator performs an explicit, validated repair. A completed
+durable transaction whose owner died just before lock removal may be removed
+after the same identity and age checks. `update` holds the lock from the
+initial decision stop through `git pull`, setup, and generation handoff.
+`uninstall` holds it across LaunchAgent unload, application stop,
+`services-stop`, and runtime/local-data cleanup. Cleanup excludes the lock
+directory itself; only after successful transaction completion is the lock
+released and the now-empty runtime/data directory removed with `rmdir`.
+Durable subcommands run with Bash `errexit` active, so a failed pull, setup,
+service stop, or cleanup cannot be hidden by a later successful command; the
+transaction remains `repair_required`. Therefore a new start cannot execute
+partially updated code or race a partial uninstall.
 If a process crashes after the atomic directory creation but before publishing
 the owner record, the incomplete lock has no provable owner. It is deliberately
 preserved as `unknown` for operator inspection rather than guessed stale and
@@ -281,7 +302,9 @@ has successfully drained and reaped the Hermes child group. If cleanup fails,
 the record remains as an explicit incomplete-cleanup diagnostic. Valid v3
 records use their saved drain plus a bounded 2-second native launcher margin.
 Legacy v1/v2 records retain their conservative 315-second drain plus that
-margin. Malformed or stale records fail closed without signalling.
+margin. An existing malformed record is preserved byte-for-byte and a new
+supervisor refuses to overwrite it without explicit validated repair.
+Malformed or stale records fail closed without signalling.
 A failed competing startup therefore cannot overwrite or delete the ready
 runtime's budget, even when both processes inherited the same launcher
 identity.
@@ -327,7 +350,11 @@ between the final libproc check and `kill(2)`; the implementation documents
 that OS boundary rather than treating an unverified PID as safe.
 
 This still cleans up descendants when the leader exits first without signaling
-a later unrelated process group that reuses the numeric PGID. The launcher
+a later unrelated process group that reuses the numeric PGID. If the leader is
+already absent from the first OS snapshot while asyncio has not yet published
+its return code, the supervisor first reaps that exact subprocess handle and
+then requires continuity between the pre/post-reap descendant snapshots before
+adopting and signalling individual members. The launcher
 refuses to SIGKILL only the outer service group if that complete drain fails;
 it exits non-zero instead of orphaning the child or reporting a false stop.
 On any unproven cleanup, available launcher PID/identity metadata and the v3
