@@ -904,6 +904,85 @@ async def test_distinct_cursor_pages_deduplicate_the_same_sample() -> None:
     assert fetched.limitations == ()
 
 
+class VendorDisplayAliasCursorClient:
+    def __init__(
+        self,
+        *,
+        canonical_provider: str,
+        display_provider: str,
+    ) -> None:
+        self.canonical_provider = canonical_provider
+        self.display_provider = display_provider
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        return {
+            "data": [
+                {
+                    "id": "vendor-stable-sample",
+                    "timestamp": "2026-08-10T10:10:00Z",
+                    "type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                    "data_source_id": "vendor-stable-stream",
+                    "source": {
+                        "provider": (
+                            self.display_provider
+                            if cursor is not None
+                            else self.canonical_provider
+                        )
+                    },
+                }
+            ],
+            "pagination": {
+                "next_cursor": "page-2" if cursor is None else None,
+                "has_more": cursor is None,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    ("canonical_provider", "display_provider", "expected_provider"),
+    (
+        ("garmin", "Garmin Connect", "garmin"),
+        ("polar", "Polar Flow", "polar"),
+        ("suunto", "Suunto App", "suunto"),
+    ),
+)
+async def test_vendor_display_aliases_deduplicate_with_canonical_names(
+    canonical_provider: str,
+    display_provider: str,
+    expected_provider: str,
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        VendorDisplayAliasCursorClient(
+            canonical_provider=canonical_provider,
+            display_provider=display_provider,
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="heart_rate",
+            resolution="1min",
+        )
+    )
+
+    assert len(fetched.records) == 1
+    assert fetched.records[0]["provider"] == expected_provider
+    assert fetched.records[0]["provider_attribution"] == (
+        "source_exact_alias"
+    )
+    assert fetched.limitations == ()
+
+
 async def test_conflicting_cursor_duplicates_remain_visible_and_partial() -> None:
     client = OverlappingCursorTimeseriesClient(conflicting=True)
     search = BoundedOpenWearablesSearch(

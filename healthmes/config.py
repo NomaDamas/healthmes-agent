@@ -73,9 +73,10 @@ class Settings(BaseSettings):
     )
     decision_correlation_secret: SecretStr = Field(
         default=SecretStr(""),
-        description="Stable owner secret used only to authenticate decision "
-        "request fingerprints. Keep it unchanged when rotating the Hermes "
-        "runtime credential; bootstrap generates it independently.",
+        description="Stable owner secret used to authenticate decision "
+        "request fingerprints and derive wearable cursor signatures. Keep "
+        "it unchanged when rotating the Hermes runtime credential; bootstrap "
+        "generates it independently.",
     )
     decision_hermes_model: str | None = Field(
         default=None,

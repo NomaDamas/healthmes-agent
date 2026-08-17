@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable
 from datetime import datetime
@@ -75,6 +76,8 @@ def build_context_provider_registry(
         Callable[[CalendarSource], str | None] | None
     ) = None,
     clock: Callable[[], datetime] | None = None,
+    wearable_cursor_signing_key: bytes | None = None,
+    owner_principal_id: str = "owner",
 ) -> ContextProviderRegistry:
     """Build the default registry without import-time global registration."""
 
@@ -87,6 +90,8 @@ def build_context_provider_registry(
                 search_reader=wearable_search_reader,
                 snapshot_session_factory=session_factory,
                 clock=clock,
+                cursor_signing_key=wearable_cursor_signing_key,
+                owner_principal_id=owner_principal_id,
             ),
             CalendarContextProvider(
                 settings=calendar_settings,
@@ -266,6 +271,17 @@ def build_decision_context_search_session_service(
             open_wearables,
             resolve_open_wearables_user,
         )
+    correlation_secret = (
+        settings.decision_correlation_secret.get_secret_value().strip()
+    ).encode("utf-8")
+    wearable_cursor_signing_key = (
+        hashlib.sha256(
+            b"healthmes.wearable-domain-cursor.v2\x00"
+            + correlation_secret
+        ).digest()
+        if len(correlation_secret) >= 32
+        else None
+    )
     registry = build_context_provider_registry(
         calendar_settings=settings,
         wearable_reader=wearable_reader,
@@ -277,6 +293,8 @@ def build_decision_context_search_session_service(
             account_generation_resolver
         ),
         clock=clock,
+        wearable_cursor_signing_key=wearable_cursor_signing_key,
+        owner_principal_id=settings.decision_owner_principal_id,
     )
     access_layer = ContextAccessLayer(
         registry,

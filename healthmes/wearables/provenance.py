@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm.exc import ObjectDeletedError
 from sqlalchemy.pool import StaticPool
 
 from healthmes.activity.locking import (
@@ -1365,10 +1366,18 @@ def retained_open_wearables_query_snapshots(
     timezone: str,
     parameters: Mapping[str, Any],
     now: datetime,
-    candidate_limit: int | None = _MAX_RETAINED_QUERY_CANDIDATES,
+    candidate_limit: int = _MAX_RETAINED_QUERY_CANDIDATES,
 ) -> tuple[WearableQuerySnapshot, ...]:
     """Load retained mirrors for one exact query, newest first."""
 
+    if (
+        type(candidate_limit) is not int
+        or not 1 <= candidate_limit <= _MAX_RETAINED_QUERY_CANDIDATES
+    ):
+        raise ValueError(
+            "candidate_limit must be between 1 and "
+            f"{_MAX_RETAINED_QUERY_CANDIDATES}"
+        )
     _scope, query_digest = _normalize_query_scope(
         capability=capability,
         start=start,
@@ -1395,11 +1404,8 @@ def retained_open_wearables_query_snapshots(
             WellnessEvent.created_at.desc(),
             WellnessEvent.id.desc(),
         )
+        .limit(candidate_limit)
     )
-    if candidate_limit is not None:
-        if candidate_limit < 1:
-            raise ValueError("candidate_limit must be positive or None")
-        statement = statement.limit(candidate_limit)
     rows = session.scalars(statement)
     snapshots: list[WearableQuerySnapshot] = []
     for event in rows:
@@ -1411,6 +1417,49 @@ def retained_open_wearables_query_snapshots(
         if snapshot is not None and snapshot.query_digest == query_digest:
             snapshots.append(snapshot)
     return tuple(snapshots)
+
+
+def retained_open_wearables_query_snapshot_by_event_id(
+    session: Session,
+    *,
+    event_id: uuid.UUID,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    parameters: Mapping[str, Any],
+    now: datetime,
+) -> WearableQuerySnapshot | None:
+    """Load one retained query mirror through its indexed primary key."""
+
+    _scope, expected_query_digest = _normalize_query_scope(
+        capability=capability,
+        start=start,
+        end=end,
+        timezone=timezone,
+        parameters=parameters,
+    )
+    try:
+        event = session.get(
+            WellnessEvent,
+            event_id,
+            populate_existing=True,
+        )
+    except ObjectDeletedError:
+        return None
+    if event is None:
+        return None
+    snapshot = wearable_query_snapshot_from_event(
+        session,
+        event,
+        now=_aware_utc(now, field="now"),
+    )
+    if (
+        snapshot is None
+        or snapshot.query_digest != expected_query_digest
+    ):
+        return None
+    return snapshot
 
 
 def wearable_snapshot_from_event(

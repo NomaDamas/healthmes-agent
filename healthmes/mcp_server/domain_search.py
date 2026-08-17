@@ -60,8 +60,12 @@ OpaqueCursor = Annotated[
     str,
     Field(
         min_length=69,
-        max_length=69,
-        pattern=r"^hmc1_[0-9a-f]{64}$",
+        max_length=232,
+        pattern=(
+            r"^(?:hmc1_[0-9a-f]{64}|"
+            r"hmc2_[0-9a-f]{32}_[0-9a-f]{64}_"
+            r"[0-9a-f]{64}_[0-9a-f]{64})$"
+        ),
         description=(
             "Opaque provider cursor returned by the immediately preceding "
             "page for the same capability, window, privacy, and filters."

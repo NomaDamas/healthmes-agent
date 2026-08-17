@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import re
+import secrets
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -106,6 +108,7 @@ from healthmes.wearables.provenance import (
     open_wearables_retention_policy_binding,
     persist_open_wearables_observation,
     persist_open_wearables_query_snapshot,
+    retained_open_wearables_query_snapshot_by_event_id,
     retained_open_wearables_query_snapshots,
     wearable_query_snapshot_from_event,
     wearable_snapshot_from_event,
@@ -191,12 +194,21 @@ _MINIMUM_MINUTES_PARAMETER = ContextParameterSpec(
     minimum=1,
     maximum=1_440,
 )
-_CURSOR_PATTERN = re.compile(r"^hmc1_[0-9a-f]{64}$")
+_LEGACY_CURSOR_PATTERN = re.compile(r"^hmc1_[0-9a-f]{64}$")
+_SIGNED_WEARABLE_CURSOR_PATTERN = re.compile(
+    r"^hmc2_"
+    r"(?P<event_id>[0-9a-f]{32})_"
+    r"(?P<scope_digest>[0-9a-f]{64})_"
+    r"(?P<identity_digest>[0-9a-f]{64})_"
+    r"(?P<signature>[0-9a-f]{64})$"
+)
+_MAX_CURSOR_LENGTH = 232
+_LEGACY_WEARABLE_CURSOR_CANDIDATES = 32
 _CURSOR_PARAMETER = ContextParameterSpec(
     name="cursor",
     value_type=ContextParameterType.STRING,
     min_length=69,
-    max_length=69,
+    max_length=_MAX_CURSOR_LENGTH,
 )
 _DEVICE_ID_PARAMETER = ContextParameterSpec(
     name="device_id",
@@ -1251,6 +1263,167 @@ def _opaque_cursor(
     )
 
 
+def _wearable_cursor_signature(
+    *,
+    signing_key: bytes,
+    owner_principal_id: str,
+    namespace: str,
+    event_id: str,
+    scope_digest: str,
+    identity_digest: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "schema": "healthmes.wearable-domain-cursor.v2",
+            "owner_principal_id": owner_principal_id,
+            "domain": "wearable",
+            "namespace": namespace,
+            "snapshot_event_id": event_id,
+            "scope_digest": scope_digest,
+            "identity_digest": identity_digest,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hmac.new(signing_key, payload, hashlib.sha256).hexdigest()
+
+
+def _signed_wearable_cursor(
+    namespace: str,
+    *,
+    snapshot_event_id: uuid.UUID,
+    scope: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    signing_key: bytes,
+    owner_principal_id: str,
+) -> str:
+    event_id = snapshot_event_id.hex
+    scope_digest = _canonical_digest(scope)
+    identity_digest = _canonical_digest(identity)
+    signature = _wearable_cursor_signature(
+        signing_key=signing_key,
+        owner_principal_id=owner_principal_id,
+        namespace=namespace,
+        event_id=event_id,
+        scope_digest=scope_digest,
+        identity_digest=identity_digest,
+    )
+    return (
+        f"hmc2_{event_id}_{scope_digest}_{identity_digest}_{signature}"
+    )
+
+
+def _parse_signed_wearable_cursor(
+    cursor: str,
+    *,
+    namespace: str,
+    signing_key: bytes,
+    owner_principal_id: str,
+) -> tuple[uuid.UUID, str, str]:
+    match = _SIGNED_WEARABLE_CURSOR_PATTERN.fullmatch(cursor)
+    if match is None:
+        raise InvalidContextCursorError("cursor is invalid")
+    event_id = match.group("event_id")
+    scope_digest = match.group("scope_digest")
+    identity_digest = match.group("identity_digest")
+    expected_signature = _wearable_cursor_signature(
+        signing_key=signing_key,
+        owner_principal_id=owner_principal_id,
+        namespace=namespace,
+        event_id=event_id,
+        scope_digest=scope_digest,
+        identity_digest=identity_digest,
+    )
+    if not hmac.compare_digest(
+        match.group("signature"),
+        expected_signature,
+    ):
+        raise InvalidContextCursorError("cursor is invalid")
+    return uuid.UUID(hex=event_id), scope_digest, identity_digest
+
+
+def _page_wearable_items(
+    items: Sequence[Any],
+    *,
+    query: ContextQuery,
+    namespace: str,
+    snapshot_event_id: uuid.UUID,
+    identity: Callable[[Any], Mapping[str, Any]],
+    scope: Mapping[str, Any],
+    signing_key: bytes,
+    owner_principal_id: str,
+) -> tuple[list[Any], str | None]:
+    supplied = query.parameters.get("cursor")
+    offset = 0
+    if supplied is not None:
+        if not isinstance(supplied, str):
+            raise InvalidContextCursorError("cursor is invalid")
+        if _LEGACY_CURSOR_PATTERN.fullmatch(supplied) is not None:
+            for index, item in enumerate(items):
+                if (
+                    _opaque_cursor(
+                        namespace,
+                        scope=scope,
+                        identity=identity(item),
+                    )
+                    == supplied
+                ):
+                    offset = index + 1
+                    break
+            else:
+                raise InvalidContextCursorError(
+                    "cursor is invalid for this result set"
+                )
+        else:
+            (
+                cursor_event_id,
+                cursor_scope_digest,
+                cursor_identity_digest,
+            ) = _parse_signed_wearable_cursor(
+                supplied,
+                namespace=namespace,
+                signing_key=signing_key,
+                owner_principal_id=owner_principal_id,
+            )
+            if (
+                cursor_event_id != snapshot_event_id
+                or not hmac.compare_digest(
+                    cursor_scope_digest,
+                    _canonical_digest(scope),
+                )
+            ):
+                raise InvalidContextCursorError(
+                    "cursor is invalid for this result set"
+                )
+            for index, item in enumerate(items):
+                if hmac.compare_digest(
+                    cursor_identity_digest,
+                    _canonical_digest(identity(item)),
+                ):
+                    offset = index + 1
+                    break
+            else:
+                raise InvalidContextCursorError(
+                    "cursor is invalid for this result set"
+                )
+    selected = list(items[offset : offset + query.limit])
+    has_more = offset + len(selected) < len(items)
+    next_cursor = (
+        _signed_wearable_cursor(
+            namespace,
+            snapshot_event_id=snapshot_event_id,
+            scope=scope,
+            identity=identity(selected[-1]),
+            signing_key=signing_key,
+            owner_principal_id=owner_principal_id,
+        )
+        if selected and has_more
+        else None
+    )
+    return selected, next_cursor
+
+
 def _page_items(
     items: Sequence[Any],
     *,
@@ -1262,7 +1435,7 @@ def _page_items(
     supplied = query.parameters.get("cursor")
     if supplied is not None and (
         not isinstance(supplied, str)
-        or _CURSOR_PATTERN.fullmatch(supplied) is None
+        or _LEGACY_CURSOR_PATTERN.fullmatch(supplied) is None
     ):
         raise InvalidContextCursorError("cursor is invalid")
     cursor_scope = dict(scope) if scope is not None else _cursor_scope(query)
@@ -3287,6 +3460,8 @@ class WearableContextProvider:
         snapshot_session_factory: sessionmaker[Session] | None = None,
         upstream_timeout_seconds: float = 8.0,
         clock: Callable[[], datetime] | None = None,
+        cursor_signing_key: bytes | None = None,
+        owner_principal_id: str = "owner",
     ) -> None:
         if (
             not isfinite(upstream_timeout_seconds)
@@ -3301,6 +3476,22 @@ class WearableContextProvider:
         self._snapshot_session_factory = snapshot_session_factory
         self._upstream_timeout_seconds = upstream_timeout_seconds
         self._clock = clock
+        owner = owner_principal_id.strip()
+        if not owner or len(owner) > 255:
+            raise ValueError(
+                "owner_principal_id must contain 1 to 255 characters"
+            )
+        if cursor_signing_key is None:
+            cursor_signing_key = secrets.token_bytes(32)
+        if (
+            not isinstance(cursor_signing_key, bytes)
+            or len(cursor_signing_key) < 32
+        ):
+            raise ValueError(
+                "cursor_signing_key must contain at least 32 bytes"
+            )
+        self._cursor_signing_key = cursor_signing_key
+        self._owner_principal_id = owner
 
     def _operation_now(self, baseline: datetime) -> datetime:
         current = _as_utc(baseline)
@@ -3552,7 +3743,56 @@ class WearableContextProvider:
         )
         validate_wearable_search_request(request)
 
-        if query.parameters.get("cursor") is not None:
+        supplied_cursor = query.parameters.get("cursor")
+        if supplied_cursor is not None:
+            if not isinstance(supplied_cursor, str):
+                raise InvalidContextCursorError("cursor is invalid")
+            if (
+                _SIGNED_WEARABLE_CURSOR_PATTERN.fullmatch(
+                    supplied_cursor
+                )
+                is not None
+            ):
+                snapshot_event_id, _scope_digest, _identity_digest = (
+                    _parse_signed_wearable_cursor(
+                        supplied_cursor,
+                        namespace=query.capability,
+                        signing_key=self._cursor_signing_key,
+                        owner_principal_id=self._owner_principal_id,
+                    )
+                )
+                retained = (
+                    retained_open_wearables_query_snapshot_by_event_id(
+                        session,
+                        event_id=snapshot_event_id,
+                        capability=query.capability,
+                        start=start,
+                        end=end,
+                        timezone=query.timezone,
+                        parameters=parameters,
+                        now=now,
+                    )
+                )
+                if retained is None:
+                    raise InvalidContextCursorError(
+                        "cursor is invalid or its wearable snapshot expired"
+                    )
+                try:
+                    return self._detail_result(
+                        query,
+                        retained,
+                        provenance_mode="retained_local_mirror",
+                        now=now,
+                        expected_retention_policy=retention_policy,
+                    )
+                except InvalidContextCursorError:
+                    raise
+                except ValueError as exc:
+                    raise InvalidContextCursorError(
+                        "cursor is invalid or its wearable snapshot expired"
+                    ) from exc
+            if _LEGACY_CURSOR_PATTERN.fullmatch(supplied_cursor) is None:
+                raise InvalidContextCursorError("cursor is invalid")
             retained_snapshots = retained_open_wearables_query_snapshots(
                 session,
                 capability=query.capability,
@@ -3561,7 +3801,7 @@ class WearableContextProvider:
                 timezone=query.timezone,
                 parameters=parameters,
                 now=now,
-                candidate_limit=None,
+                candidate_limit=_LEGACY_WEARABLE_CURSOR_CANDIDATES,
             )
             for retained in retained_snapshots:
                 try:
@@ -3913,8 +4153,8 @@ class WearableContextProvider:
             return None, "wearable_snapshot_persistence_failed"
         return snapshot, ""
 
-    @staticmethod
     def _detail_result(
+        self,
         query: ContextQuery,
         snapshot: WearableQuerySnapshot,
         *,
@@ -4017,18 +4257,22 @@ class WearableContextProvider:
                     },
                 }
             )
-        selected_entries, next_cursor = _page_items(
+        cursor_scope = _wearable_cursor_scope(
+            query,
+            snapshot=snapshot,
+            retention_window=retention_window,
+            records=public_records,
+            stored=stored,
+        )
+        selected_entries, next_cursor = _page_wearable_items(
             page_entries,
             query=query,
             namespace=query.capability,
+            snapshot_event_id=snapshot.event_id,
             identity=lambda item: item["cursor_identity"],
-            scope=_wearable_cursor_scope(
-                query,
-                snapshot=snapshot,
-                retention_window=retention_window,
-                records=public_records,
-                stored=stored,
-            ),
+            scope=cursor_scope,
+            signing_key=self._cursor_signing_key,
+            owner_principal_id=self._owner_principal_id,
         )
         cursor_truncated = next_cursor is not None
         if not allow_cursor:

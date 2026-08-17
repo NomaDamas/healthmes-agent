@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+import healthmes.decision.domain_providers as domain_providers
 from healthmes.decision.access import (
     ContextAccessLayer,
     ContextAccessPolicy,
@@ -50,6 +51,7 @@ from healthmes.wearables.provenance import (
     open_wearables_retention_policy_binding,
     persist_open_wearables_query_snapshot,
     retained_open_wearables_query_snapshots,
+    wearable_query_snapshot_from_event,
 )
 from healthmes.wearables.search import (
     BoundedOpenWearablesSearch,
@@ -176,6 +178,27 @@ FALLBACK_CURSOR_CASES = (
 )
 
 
+def _detail_timeseries_fetch() -> WearableSearchFetch:
+    return WearableSearchFetch(
+        records=(
+            {
+                "timestamp": "2026-08-16T08:05:00+00:00",
+                "series_type": "heart_rate",
+                "value": 72,
+                "unit": "bpm",
+                "provider": "apple_health",
+            },
+            {
+                "timestamp": "2026-08-16T08:10:00+00:00",
+                "series_type": "heart_rate",
+                "value": 76,
+                "unit": "bpm",
+                "provider": "apple_health",
+            },
+        ),
+    )
+
+
 def _request() -> DecisionRequest:
     return DecisionRequest(
         question="Use the wearable context needed for this decision.",
@@ -237,6 +260,71 @@ def _service(
             execution_scope=ExecutionScope.LOCAL,
         ),
         clock=clock,
+    )
+
+
+def _legacy_health_score_cursor(
+    session: Session,
+    *,
+    query: ContextQuery,
+    snapshot_event_id: UUID,
+    record_index: int = 0,
+) -> str:
+    event = session.get(WellnessEvent, snapshot_event_id)
+    assert event is not None
+    snapshot = wearable_query_snapshot_from_event(
+        session,
+        event,
+        now=NOW,
+    )
+    assert snapshot is not None
+    stored = dict(snapshot.result)
+    retained_after, retention_window = (
+        domain_providers._stored_wearable_retention_window(
+            stored,
+            snapshot=snapshot,
+            expected_retention_policy=(
+                open_wearables_retention_policy_binding(session)
+            ),
+        )
+    )
+    raw_records = stored.get("records")
+    public_records = [
+        domain_providers._normalized_public_wearable_record(record)
+        for record in (
+            raw_records if isinstance(raw_records, list) else []
+        )
+        if isinstance(record, dict)
+    ]
+    normalized = (
+        domain_providers.normalize_retained_wearable_health_scores(
+            public_records,
+            category=str(query.parameters["category"]),
+            start=snapshot.start,
+            end=snapshot.end,
+            retained_after=retained_after,
+        )
+    )
+    records = list(normalized.records)
+    record = records[record_index]
+    digest = domain_providers._canonical_digest(record)
+    occurrence = sum(
+        domain_providers._canonical_digest(previous) == digest
+        for previous in records[:record_index]
+    )
+    return domain_providers._opaque_cursor(
+        query.capability,
+        scope=domain_providers._wearable_cursor_scope(
+            query,
+            snapshot=snapshot,
+            retention_window=retention_window,
+            records=records,
+            stored=stored,
+        ),
+        identity={
+            "record_digest": digest,
+            "occurrence": occurrence,
+        },
     )
 
 
@@ -1425,8 +1513,9 @@ async def test_cursor_freezes_retention_window_and_never_refetches(
         engine.dispose()
 
 
-async def test_cursor_resolves_snapshot_older_than_newest_32(
+async def test_cursor_resolves_snapshot_older_than_newest_32_without_scan(
     session,
+    monkeypatch,
 ) -> None:
     calls = 0
 
@@ -1470,6 +1559,14 @@ async def test_cursor_resolves_snapshot_older_than_newest_32(
     base_now = NOW - timedelta(minutes=40)
     first = await provider.query(session, query, now=base_now)
     assert first.next_cursor is not None
+    assert first.next_cursor.startswith("hmc2_")
+    assert len(first.next_cursor) == 232
+    first_event_id = UUID(first.source_refs[0].record_id)
+    legacy_cursor = _legacy_health_score_cursor(
+        session,
+        query=query,
+        snapshot_event_id=first_event_id,
+    )
 
     for offset in range(1, 40):
         await provider.query(
@@ -1493,22 +1590,332 @@ async def test_cursor_resolves_snapshot_older_than_newest_32(
         for snapshot in newest
     )
 
+    original_indexed_lookup = (
+        domain_providers
+        .retained_open_wearables_query_snapshot_by_event_id
+    )
+    indexed_lookups = 0
+
+    def indexed_lookup(*args, **kwargs):
+        nonlocal indexed_lookups
+        indexed_lookups += 1
+        return original_indexed_lookup(*args, **kwargs)
+
+    def fail_unbounded_scan(*_args, **_kwargs):
+        raise AssertionError("hmc2 must not scan retained snapshots")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            domain_providers,
+            "retained_open_wearables_query_snapshot_by_event_id",
+            indexed_lookup,
+        )
+        patch.setattr(
+            domain_providers,
+            "retained_open_wearables_query_snapshots",
+            fail_unbounded_scan,
+        )
+        second = await provider.query(
+            session,
+            query.model_copy(
+                update={
+                    "parameters": {
+                        "category": "stress",
+                        "cursor": first.next_cursor,
+                    }
+                }
+            ),
+            now=NOW,
+        )
+
+    assert calls == 40
+    assert indexed_lookups == 1
+    assert second.payload["records"][0]["value"] == 102
+    assert second.source_refs == first.source_refs
+
+    original_legacy_lookup = (
+        domain_providers.retained_open_wearables_query_snapshots
+    )
+    candidate_limits: list[int] = []
+
+    def bounded_legacy_lookup(*args, **kwargs):
+        candidate_limits.append(kwargs["candidate_limit"])
+        return original_legacy_lookup(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            domain_providers,
+            "retained_open_wearables_query_snapshots",
+            bounded_legacy_lookup,
+        )
+        with pytest.raises(
+            InvalidContextCursorError,
+            match="invalid or.*expired",
+        ):
+            await provider.query(
+                session,
+                query.model_copy(
+                    update={
+                        "parameters": {
+                            "category": "stress",
+                            "cursor": legacy_cursor,
+                        }
+                    }
+                ),
+                now=NOW,
+            )
+    assert candidate_limits == [32]
+
+
+async def test_recent_legacy_cursor_is_bounded_and_upgrades_to_hmc2(
+    session,
+    monkeypatch,
+) -> None:
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return WearableSearchFetch(
+            records=tuple(
+                {
+                    "category": "stress",
+                    "recorded_at": (
+                        DETAIL_START + timedelta(minutes=minute)
+                    ).isoformat(),
+                    "provider": "garmin",
+                    "value": value,
+                }
+                for minute, value in ((5, 41), (10, 42), (15, 43))
+            )
+        )
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.health-scores",
+        start=DETAIL_START,
+        end=DETAIL_END,
+        granularity="record",
+        limit=1,
+        parameters={"category": "stress"},
+    )
+    first = await provider.query(session, query, now=NOW)
+    legacy_cursor = _legacy_health_score_cursor(
+        session,
+        query=query,
+        snapshot_event_id=UUID(first.source_refs[0].record_id),
+    )
+    original_lookup = (
+        domain_providers.retained_open_wearables_query_snapshots
+    )
+    candidate_limits: list[int] = []
+
+    def bounded_lookup(*args, **kwargs):
+        candidate_limits.append(kwargs["candidate_limit"])
+        return original_lookup(*args, **kwargs)
+
+    monkeypatch.setattr(
+        domain_providers,
+        "retained_open_wearables_query_snapshots",
+        bounded_lookup,
+    )
     second = await provider.query(
         session,
         query.model_copy(
             update={
                 "parameters": {
                     "category": "stress",
-                    "cursor": first.next_cursor,
+                    "cursor": legacy_cursor,
                 }
             }
         ),
         now=NOW,
     )
 
-    assert calls == 40
-    assert second.payload["records"][0]["value"] == 102
-    assert second.source_refs == first.source_refs
+    assert candidate_limits == [32]
+    assert second.payload["records"][0]["value"] == 42
+    assert second.next_cursor is not None
+    assert second.next_cursor.startswith("hmc2_")
+
+
+async def test_tampered_hmc2_fails_before_any_snapshot_lookup(
+    session,
+    monkeypatch,
+) -> None:
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return _detail_timeseries_fetch()
+
+    provider = WearableContextProvider(
+        search_reader=search_reader,
+        cursor_signing_key=b"k" * 32,
+    )
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.timeseries",
+        start=DETAIL_START,
+        end=DETAIL_END,
+        granularity="series",
+        limit=1,
+        parameters={
+            "series_type": "heart_rate",
+            "resolution": "1min",
+        },
+    )
+    first = await provider.query(session, query, now=NOW)
+    assert first.next_cursor is not None
+    replacement = (
+        "0" if first.next_cursor[-1] != "0" else "1"
+    )
+    tampered = first.next_cursor[:-1] + replacement
+
+    def fail_lookup(*_args, **_kwargs):
+        raise AssertionError("tampered cursor must fail before DB lookup")
+
+    monkeypatch.setattr(
+        domain_providers,
+        "retained_open_wearables_query_snapshot_by_event_id",
+        fail_lookup,
+    )
+    monkeypatch.setattr(
+        domain_providers,
+        "retained_open_wearables_query_snapshots",
+        fail_lookup,
+    )
+    with pytest.raises(InvalidContextCursorError):
+        await provider.query(
+            session,
+            query.model_copy(
+                update={
+                    "parameters": {
+                        **query.parameters,
+                        "cursor": tampered,
+                    }
+                }
+            ),
+            now=NOW,
+        )
+
+
+async def test_hmc2_is_invalid_after_snapshot_deletion(
+    session,
+    monkeypatch,
+) -> None:
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return _detail_timeseries_fetch()
+
+    provider = WearableContextProvider(search_reader=search_reader)
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.timeseries",
+        start=DETAIL_START,
+        end=DETAIL_END,
+        granularity="series",
+        limit=1,
+        parameters={
+            "series_type": "heart_rate",
+            "resolution": "1min",
+        },
+    )
+    first = await provider.query(session, query, now=NOW)
+    assert first.next_cursor is not None
+    event = session.get(
+        WellnessEvent,
+        UUID(first.source_refs[0].record_id),
+    )
+    assert event is not None
+    session.delete(event)
+    session.flush()
+
+    def fail_scan(*_args, **_kwargs):
+        raise AssertionError("hmc2 deletion must not enter legacy scan")
+
+    monkeypatch.setattr(
+        domain_providers,
+        "retained_open_wearables_query_snapshots",
+        fail_scan,
+    )
+    with pytest.raises(
+        InvalidContextCursorError,
+        match="invalid or.*expired",
+    ):
+        await provider.query(
+            session,
+            query.model_copy(
+                update={
+                    "parameters": {
+                        **query.parameters,
+                        "cursor": first.next_cursor,
+                    }
+                }
+            ),
+            now=NOW,
+        )
+
+
+async def test_hmc2_owner_binding_cannot_be_reused(
+    session,
+    monkeypatch,
+) -> None:
+    async def search_reader(
+        _request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        return _detail_timeseries_fetch()
+
+    signing_key = b"k" * 32
+    owner_provider = WearableContextProvider(
+        search_reader=search_reader,
+        cursor_signing_key=signing_key,
+        owner_principal_id="owner-a",
+    )
+    other_owner_provider = WearableContextProvider(
+        search_reader=search_reader,
+        cursor_signing_key=signing_key,
+        owner_principal_id="owner-b",
+    )
+    query = ContextQuery(
+        provider_id="wearable",
+        capability="wearable.timeseries",
+        start=DETAIL_START,
+        end=DETAIL_END,
+        granularity="series",
+        limit=1,
+        parameters={
+            "series_type": "heart_rate",
+            "resolution": "1min",
+        },
+    )
+    first = await owner_provider.query(session, query, now=NOW)
+    assert first.next_cursor is not None
+
+    def fail_lookup(*_args, **_kwargs):
+        raise AssertionError("owner mismatch must fail before DB lookup")
+
+    monkeypatch.setattr(
+        domain_providers,
+        "retained_open_wearables_query_snapshot_by_event_id",
+        fail_lookup,
+    )
+    monkeypatch.setattr(
+        domain_providers,
+        "retained_open_wearables_query_snapshots",
+        fail_lookup,
+    )
+    with pytest.raises(InvalidContextCursorError):
+        await other_owner_provider.query(
+            session,
+            query.model_copy(
+                update={
+                    "parameters": {
+                        **query.parameters,
+                        "cursor": first.next_cursor,
+                    }
+                }
+            ),
+            now=NOW,
+        )
 
 
 def test_retained_snapshot_order_uses_event_id_as_final_tiebreaker(
@@ -1562,6 +1969,27 @@ def test_retained_snapshot_order_uses_event_id_as_final_tiebreaker(
         event_ids,
         reverse=True,
     )
+
+
+@pytest.mark.parametrize("candidate_limit", (0, 33, None, True))
+def test_retained_snapshot_candidate_limit_cannot_be_unbounded(
+    session,
+    candidate_limit,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="candidate_limit must be between 1 and 32",
+    ):
+        retained_open_wearables_query_snapshots(
+            session,
+            capability="wearable.health-scores",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            timezone="UTC",
+            parameters={"category": "stress"},
+            now=NOW,
+            candidate_limit=candidate_limit,
+        )
 
 
 async def test_detail_digest_ignores_private_source_identifiers(
@@ -1647,7 +2075,7 @@ async def test_detail_digest_ignores_private_source_identifiers(
     assert first == second
 
 
-async def test_legacy_private_source_does_not_change_public_cursor(
+async def test_private_source_does_not_change_public_cursor_scope_or_identity(
     tmp_path,
 ) -> None:
     async def fetch_cursor(
@@ -1743,7 +2171,9 @@ async def test_legacy_private_source_does_not_change_public_cursor(
         "com.apple.health.bundle-B",
     )
 
-    assert first == second
+    assert first.startswith("hmc2_")
+    assert second.startswith("hmc2_")
+    assert first.split("_")[2:4] == second.split("_")[2:4]
 
 
 async def test_identical_public_wearable_records_paginate_to_completion(

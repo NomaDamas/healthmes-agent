@@ -430,8 +430,12 @@ async def test_domain_search_schemas_are_exact_bounded_and_identity_safe(
         properties = tools[name].inputSchema["properties"]
         cursor = _schema_value(properties["cursor"])
         assert cursor["minLength"] == 69
-        assert cursor["maxLength"] == 69
-        assert cursor["pattern"] == "^hmc1_[0-9a-f]{64}$"
+        assert cursor["maxLength"] == 232
+        assert cursor["pattern"] == (
+            "^(?:hmc1_[0-9a-f]{64}|"
+            "hmc2_[0-9a-f]{32}_[0-9a-f]{64}_"
+            "[0-9a-f]{64}_[0-9a-f]{64})$"
+        )
     assert (
         "cursor"
         not in tools["search_nutrition"].inputSchema["properties"]

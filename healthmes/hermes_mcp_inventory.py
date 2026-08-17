@@ -30,16 +30,16 @@ HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256 = {
         "c70d2daf71667bd20bdb983d31b4f01657a3308970b3c3d0d7f3bcf3b5d9bf20"
     ),
     "search_activity": (
-        "63195ccec7d55866fc5081af3de4b662e7b2b1388a5c11ce7e4fa117b47235ff"
+        "f9c4b2ae6b785775905cebf5ff4aaab9c1998d2fd3e560c71af918d58dbcdafd"
     ),
     "search_calendar": (
-        "e1b777c688e2bcc1d53ec0400b6734f21d8eeb8cfa67346abed98f8751b703f2"
+        "e2e394823cfc616e55ecb380b5ca8e1e6c64ced46be58ef7aee05c85be3642c9"
     ),
     "search_nutrition": (
         "989c29458d67f6e9089749b7eb41c3ac8d68843fa0ed0a8327857cfb0a3631a8"
     ),
     "search_wearable": (
-        "1c3bc4752374ccbc39420a2860e2fcc1b51a016104c7edace56c07f606bcee7c"
+        "5208542abe23e47d7c2316c5308fc9df691f1f1713fe1f956c8b7639fac3ec24"
     ),
 }
 
