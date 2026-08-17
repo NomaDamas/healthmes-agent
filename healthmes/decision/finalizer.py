@@ -78,9 +78,6 @@ _LEGACY_DECISION_PAYLOAD_SCHEMA_V2 = "healthmes.decision-private.v2"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V3 = "healthmes.decision-private.v3"
 _LEGACY_DECISION_PAYLOAD_SCHEMA_V4 = "healthmes.decision-private.v4"
 _PERSISTENCE_FAILURE = "decision_record_persistence_failed"
-_ACTION_NOT_PERSISTENCE_ELIGIBLE = (
-    "decision_action_not_persistence_eligible"
-)
 _FINGERPRINT_CONTEXT = b"healthmes-decision-request-fingerprint-v1\x00"
 _MIN_FINGERPRINT_KEY_BYTES = 32
 _STORED_REVALIDATION_PURPOSE = "stored_source_revalidation"
@@ -2167,17 +2164,12 @@ def _result_without_persistence(
         turn_id=run.turn_id,
         status=draft.status,
         answer=draft.answer,
-        proposed_action=False,
+        proposed_action=draft.proposed_action,
         source_refs=list(source_refs),
         limitations=_merge_limitations(
             draft.limitations,
             _tool_trace_limitations(run.tool_trace),
             extra_limitations,
-            (
-                (_ACTION_NOT_PERSISTENCE_ELIGIBLE,)
-                if draft.proposed_action
-                else ()
-            ),
         ),
         clarification_question=draft.clarification_question,
         confidence=draft.confidence,
@@ -2251,18 +2243,12 @@ def _effective_persistence_intent(
     draft = run.draft
     if draft.status is not DecisionStatus.COMPLETED:
         return DecisionPersistenceIntent.NONE
-    if request.persistence_requested:
-        if draft.proposed_action:
-            if draft.persistence_intent is DecisionPersistenceIntent.RISK:
-                return DecisionPersistenceIntent.RISK
-            return DecisionPersistenceIntent.ACTION
-        return DecisionPersistenceIntent.EXPLICIT_TRACKING
-    if draft.proposed_action and request.caller.channel.startswith(
-        ("proactive:", "scheduled:")
-    ):
+    if draft.proposed_action:
         if draft.persistence_intent is DecisionPersistenceIntent.RISK:
             return DecisionPersistenceIntent.RISK
         return DecisionPersistenceIntent.ACTION
+    if request.persistence_requested:
+        return DecisionPersistenceIntent.EXPLICIT_TRACKING
     return DecisionPersistenceIntent.NONE
 
 

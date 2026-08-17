@@ -866,35 +866,11 @@ def test_source_backed_information_is_not_persisted_without_intent(
         ) == 0
 
 
-def test_rest_model_action_cannot_force_persistence(persistence):
-    _engine, factory = persistence
-    with factory() as session:
-        ref = _source_ref(_event(session))
-    request = _request(channel="rest")
-
-    result = _finalizer(factory).finalize(
-        request,
-        _run(request, [ref], proposed_action=True),
-    )
-
-    assert result.status is DecisionStatus.COMPLETED
-    assert result.proposed_action is False
-    assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
-    assert (
-        "decision_action_not_persistence_eligible"
-        in result.limitations
-    )
-    with factory() as session:
-        assert session.scalar(
-            sa.select(sa.func.count()).select_from(DecisionRecord)
-        ) == 0
-
-
 @pytest.mark.parametrize(
     "channel",
-    ("proactive:focus-fragmentation", "scheduled:morning"),
+    ("rest", "channel:telegram", "proactive:focus-fragmentation"),
 )
-def test_trusted_automatic_action_can_persist(
+def test_verified_action_persists_for_every_reasoning_channel(
     persistence,
     channel,
 ):
@@ -908,6 +884,8 @@ def test_trusted_automatic_action_can_persist(
         _run(request, [ref], proposed_action=True),
     )
 
+    assert result.status is DecisionStatus.COMPLETED
+    assert result.proposed_action is True
     assert result.persistence_status is PersistenceStatus.PERSISTED
     with factory() as session:
         assert session.scalar(
@@ -949,11 +927,15 @@ def test_model_intent_alone_cannot_force_persistence(
         ) == 0
 
 
-def test_actionable_risk_is_persisted_as_risk(persistence):
+@pytest.mark.parametrize("channel", ("rest", "channel:telegram"))
+def test_actionable_risk_is_persisted_as_risk(
+    persistence,
+    channel,
+):
     _engine, factory = persistence
     with factory() as session:
         ref = _source_ref(_event(session))
-    request = _request()
+    request = _request(channel=channel)
 
     result = _finalizer(factory).finalize(
         request,
