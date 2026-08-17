@@ -485,7 +485,7 @@ struct WatchDecisionRemoteView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 7) {
                 HStack {
-                    Label("CHANGE", systemImage: "calendar.badge.clock")
+                    Label("HEALTHMES", systemImage: "sun.max.fill")
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(brand)
                     Spacer()
@@ -510,7 +510,7 @@ struct WatchDecisionRemoteView: View {
                 }
 
                 if !model.isDecisionContextReady {
-                    Label("Confirming calendar time", systemImage: "clock")
+                    Label("Preparing decision context", systemImage: "clock")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                 } else if let before = decision.card?.before {
@@ -528,7 +528,7 @@ struct WatchDecisionRemoteView: View {
                     .padding(.vertical, 6)
                     .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
                     .accessibilityElement(children: .combine)
-                    .accessibilityLabel(Text("Schedule moves"))
+                    .accessibilityLabel(Text("Proposed change"))
                 } else {
                     Text(
                         verbatim: ProposalFormat.watchWindowLine(

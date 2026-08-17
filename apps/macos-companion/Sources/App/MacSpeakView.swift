@@ -55,7 +55,7 @@ struct MacSpeakView: View {
                             .fill(
                                 speech.isListening
                                     ? MacHealthMesStyle.amber
-                                    : MacHealthMesStyle.graphite
+                                    : MacHealthMesStyle.brand
                             )
                             .frame(width: 116, height: 116)
                             .shadow(color: .black.opacity(0.12), radius: 24, y: 12)
@@ -82,7 +82,7 @@ struct MacSpeakView: View {
                             .foregroundStyle(.secondary)
                             .textCase(.uppercase)
                         Text(verbatim: speech.transcript)
-                            .font(.system(size: 23, weight: .medium, design: .rounded))
+                            .font(.system(size: 23, weight: .medium))
                             .frame(maxWidth: .infinity, alignment: .leading)
 
                         if let intent = MacVoiceIntentParser.parse(speech.transcript) {
@@ -185,7 +185,7 @@ struct MacSpeakView: View {
                         submitTypedInput()
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(MacHealthMesStyle.moss)
+                    .tint(MacHealthMesStyle.data)
                     .disabled(
                         isNutritionBusy
                             || (mealPhoto == nil

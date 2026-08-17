@@ -7,6 +7,7 @@ enum MacHealthMesStyle {
     static let brandDeep = Color(red: 0.72, green: 0.20, blue: 0.10)
     static let data = Color(red: 0.24, green: 0.44, blue: 0.84)
     static let dataDeep = Color(red: 0.16, green: 0.31, blue: 0.67)
+    // Compatibility aliases for older view names; new UI uses semantic roles.
     static let moss = data
     static let mossDeep = dataDeep
     static let calendar = Color(red: 0.20, green: 0.40, blue: 0.82)
@@ -29,7 +30,7 @@ struct MacPageHeader: View {
                 .tracking(1.4)
                 .foregroundStyle(MacHealthMesStyle.brand)
             Text(title)
-                .font(.system(size: 30, weight: .semibold, design: .rounded))
+                .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(MacHealthMesStyle.graphite)
             Text(subtitle)
                 .font(.body)
@@ -55,7 +56,7 @@ struct MacSurfaceCard<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             Label(label, systemImage: systemImage)
                 .font(.caption.weight(.semibold))
                 .textCase(.uppercase)
@@ -64,14 +65,14 @@ struct MacSurfaceCard<Content: View>: View {
             content
             Spacer(minLength: 0)
         }
-        .padding(20)
-        .frame(maxWidth: .infinity, minHeight: 188, alignment: .topLeading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .padding(17)
+        .frame(maxWidth: .infinity, minHeight: 156, alignment: .topLeading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(MacHealthMesStyle.line)
         }
-        .shadow(color: MacHealthMesStyle.graphite.opacity(0.06), radius: 14, y: 6)
+        .shadow(color: MacHealthMesStyle.graphite.opacity(0.05), radius: 10, y: 4)
     }
 }
 
@@ -112,7 +113,7 @@ struct MacPrivacyPill: View {
             Image(systemName: isPaired ? "lock.shield.fill" : "link.badge.plus")
         }
         .font(.caption.weight(.medium))
-        .foregroundStyle(isPaired ? MacHealthMesStyle.moss : .secondary)
+        .foregroundStyle(isPaired ? MacHealthMesStyle.data : .secondary)
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .background(.thinMaterial, in: Capsule())
@@ -129,7 +130,7 @@ struct MacEmptyState: View {
         VStack(spacing: 10) {
             Image(systemName: systemImage)
                 .font(.system(size: 30))
-                .foregroundStyle(MacHealthMesStyle.moss)
+                .foregroundStyle(MacHealthMesStyle.brand)
             Text(title)
                 .font(.headline)
             Text(message)

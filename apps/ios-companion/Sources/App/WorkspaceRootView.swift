@@ -210,7 +210,7 @@ private struct WorkspaceDrawer: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Image(systemName: "waveform.path.ecg.rectangle.fill")
+                Image(systemName: "sun.max.fill")
                     .font(.title2)
                     .foregroundStyle(HealthMesVisualStyle.brand)
                 VStack(alignment: .leading, spacing: 1) {

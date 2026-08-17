@@ -200,7 +200,7 @@ private struct MacWorkspaceSidebar: View {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(Color.white.opacity(0.13))
                     .frame(width: 36, height: 36)
-                Image(systemName: "bolt.heart.fill")
+                Image(systemName: "sun.max.fill")
                     .foregroundStyle(MacHealthMesStyle.brand)
             }
             VStack(alignment: .leading, spacing: 1) {

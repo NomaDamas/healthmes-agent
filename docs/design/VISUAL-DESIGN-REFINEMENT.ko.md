@@ -50,16 +50,22 @@ ink          #20242C
 ### iPhone
 
 - Overview는 결론, Capacity, 오늘 일정, 결정 한 건의 순서로 유지한다.
+- 화면 전체에 웜 뉴트럴 Canvas를 적용하고 카드마다 Brand, Data, Proposal
+  역할에 맞는 accent를 사용한다.
 - 카드 반경, 경계선, 그림자를 하나의 Surface 문법으로 통일한다.
 - 둥근 Display 서체 남용을 제거하고 시스템 본문 서체의 가독성을 우선한다.
 - Agent composer는 화면 하단의 지속적인 제어 장치로 보이게 한다.
 - Sidebar는 본문과 분리되는 중성 잉크색 Workspace rail로 표현한다.
+- 결정은 `No / Yes` 바로 다음에 `Speak` 대안을 제공한다. Speak 결과는 즉시
+  실행하지 않고 transcript 검토와 확인을 거친다.
 
 ### Mac
 
 - iPhone과 같은 의미 색상과 Surface를 사용한다.
 - Sidebar는 탐색 영역, Canvas는 판단 영역으로 명확히 분리한다.
 - 넓은 화면에서 카드 수를 늘리기보다 Calendar와 Insight의 비교 면적을 확보한다.
+- 카드 최소 높이와 여백을 줄여 데스크톱 정보 밀도를 높이고, Speak의 시작점은
+  Brand 오렌지, 분석 작업은 Data 블루로 구분한다.
 
 ### Apple Watch
 
@@ -77,7 +83,8 @@ ink          #20242C
 - 웹만 별도 제품처럼 보이지 않도록 Apple 앱과 의미 색상을 공유한다.
 - Sidebar는 중성 잉크색 Workspace rail, 본문은 웜 뉴트럴 Canvas로 분리한다.
 - Advanced와 원시 데이터는 기본 화면의 시각 우선순위를 침범하지 않는다.
-- 계절 풍경, 달, 별, 날씨 이모지는 기본 dashboard에서 제거한다.
+- 계절 풍경, 달, 별, 날씨 이모지와 시간대별 팔레트는 모든 viewer route에서
+  제거한다. 대신 Brand와 Data 색이 아주 약하게 섞인 고정 Canvas를 사용한다.
 
 ## 4. 참고와 독자성
 
@@ -94,24 +101,42 @@ HealthMes 고유 요소는 다음 조합이다.
 Capacity + Calendar Load + Proposal State + Decision Outcome
 ```
 
-## 5. 롤백
+## 5. 상호작용 위계
 
-이번 Visual Design Refinement는 하나의 Git commit으로만 제공한다. 기능
-변경과 섞지 않기 때문에 해당 커밋 하나를 revert하면 이전 PR #111 UI로
-돌아갈 수 있다.
+1. 화면마다 가장 중요한 실행 하나만 prominent CTA로 둔다.
+2. `Yes`는 현재 제안을 승인하고, `No`는 변경 없이 거절한다.
+3. `Speak`는 다른 의도를 말하는 대안 경로이며 Brand 색으로 구분한다.
+4. 음성 입력은 `Speak → transcript 검토 → confirm` 순서를 지킨다.
+5. 제안 적용 전에는 이유와 예상 영향을 확인할 수 있어야 한다.
 
-## 6. 검증
+## 6. 접근성
 
-- iPhone 13 mini simulator용 앱과 포함된 Watch target을 빌드했다.
-- Apple Watch Series 10 42 mm simulator용 앱을 빌드하고 공식 결정
-  notification payload를 전달했다.
-- macOS 앱을 빌드했다.
+- 색만으로 Brand, Data, Proposal 상태를 구분하지 않고 label과 symbol을 함께 쓴다.
+- Dynamic Type과 VoiceOver에서 CTA 순서가 시각 순서와 일치해야 한다.
+- 오류가 아닌 상태에는 빨강을 사용하지 않는다.
+- 장식 애니메이션과 배경은 정보 위계를 침범하지 않는다.
+- Watch의 핵심 액션 순서는 `No → Yes → Speak`로 유지한다.
+
+## 7. 롤백
+
+Visual Design Refinement는 두 개의 독립 Git commit으로 제공한다. 두 번째
+보강 커밋만 revert하면 Sunrise 첫 패스로 돌아가고, 이어서 첫 패스 커밋
+`6c8a8a3`을 revert하면 변경 전 PR #111 UI로 돌아간다. 기능 계약과 API
+변경은 두 커밋에 포함하지 않는다.
+
+## 8. 검증
+
+- Python 3.12 격리 환경에서 decision viewer와 report API 테스트
+  `33 passed`를 확인했다.
+- iPhone 13 mini simulator destination을 대상으로 iPhone 앱, Watch 앱,
+  iPhone/Watch Widget, Notification Content를 unsigned arm64로 빌드했다.
+- macOS 앱과 Widget을 unsigned arm64로 빌드했다.
 - iPhone의 Light/Dark appearance에서 고정된 밝은 배경과 동적 텍스트가
   충돌하지 않도록 Canvas, Surface, 경계선을 동적 토큰으로 검증했다.
 - Web은 기존 API와 template 구조를 유지하고 CSS include만 변경했다.
 - `git diff --check`로 whitespace 오류가 없음을 확인했다.
 
-UI 자동화 전체 재실행은 로컬 디스크 여유 공간 부족으로 중단되었다. 이는
-Swift compile 오류가 아니며, 같은 소스의 iPhone/Watch 및 macOS application
-build는 성공했다. 실제 기기의 알림 확장, Dynamic Type, VoiceOver 순서는
-기존 Live QA 절차에서 최종 확인한다.
+검증 시 swap은 `5842 / 7168 MB` 사용 중이었다. OOM 위험 시 emulator를
+실행하지 말라는 작업 조건에 따라 iPhone, Watch, macOS 앱을 동시에 띄우지
+않았다. 실제 기기의 알림 확장, Dynamic Type, VoiceOver 순서는 기존 Live QA
+절차에서 최종 확인한다.
