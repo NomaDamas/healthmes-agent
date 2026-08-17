@@ -38,15 +38,18 @@ from healthmes.decision import (
     DecisionCaller,
     DecisionDraft,
     DecisionFinalizer,
+    DecisionIngress,
     DecisionPersistenceIntent,
     DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionResult,
+    DecisionServiceRequest,
     DecisionStatus,
     DomainAccessGrant,
     ExecutionScope,
     FreshnessStatus,
     HealthMesDecisionEngine,
+    HealthMesDecisionService,
     PersistenceStatus,
     PrivacyLevel,
     RuntimeMetadata,
@@ -1033,7 +1036,7 @@ def test_verified_action_persists_for_every_reasoning_channel(
         DecisionPersistenceIntent.EXPLICIT_TRACKING,
     ),
 )
-def test_model_intent_alone_cannot_force_persistence(
+def test_untrusted_model_persistence_intent_mismatch_fails_closed(
     persistence,
     persistence_intent,
 ):
@@ -1052,8 +1055,45 @@ def test_model_intent_alone_cannot_force_persistence(
         ),
     )
 
-    assert result.status is DecisionStatus.COMPLETED
+    assert result.status is DecisionStatus.FAILED
     assert result.persistence_status is PersistenceStatus.NOT_REQUIRED
+    assert result.limitations == [
+        "decision_persistence_intent_mismatch"
+    ]
+    with factory() as session:
+        assert session.scalar(
+            sa.select(sa.func.count()).select_from(DecisionRecord)
+        ) == 0
+
+
+def test_requested_tracking_requires_explicit_model_intent(
+    persistence,
+):
+    _engine, factory = persistence
+    request = _request(
+        question="Please retain this check-in.",
+        persistence_requested=True,
+    )
+    untrusted_run_request = request.model_copy(
+        update={"persistence_requested": False}
+    )
+
+    result = _finalizer(factory).finalize(
+        request,
+        _run(
+            untrusted_run_request,
+            [],
+            used_ids=[],
+            proposed_action=False,
+            persistence_intent=DecisionPersistenceIntent.NONE,
+        ),
+    )
+
+    assert result.status is DecisionStatus.FAILED
+    assert result.persistence_status is PersistenceStatus.FAILED
+    assert result.limitations == [
+        "decision_persistence_intent_mismatch"
+    ]
     with factory() as session:
         assert session.scalar(
             sa.select(sa.func.count()).select_from(DecisionRecord)
@@ -1116,6 +1156,168 @@ def test_explicit_tracking_can_persist_a_source_free_result(
         row = session.scalars(sa.select(DecisionRecord)).one()
         assert row.decision_payload is not None
         assert row.decision_payload["source_attestations"] == []
+
+
+@pytest.mark.asyncio
+async def test_service_recovery_uses_stored_request_timezone(
+    persistence,
+    settings,
+):
+    _engine, factory = persistence
+    original_settings = settings.model_copy(
+        update={"timezone": "Asia/Seoul"}
+    )
+    original_service = HealthMesDecisionService(
+        settings=original_settings,
+        engine_provider=lambda: None,
+        session_factory_provider=lambda: factory,
+        clock=lambda: NOW,
+    )
+    submission = DecisionServiceRequest(
+        request_id=uuid.uuid4(),
+        question="Should I take a break now?",
+        ingress=DecisionIngress.REST,
+        requested_at=NOW,
+    )
+    request = original_service.build_request(submission)
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    query = _query().model_copy(
+        update={"timezone": "Asia/Seoul"}
+    )
+    finalizer = _finalizer(factory)
+    first = finalizer.finalize(
+        request,
+        _run(request, [ref], query=query),
+    )
+    assert first.persistence_status is PersistenceStatus.PERSISTED
+
+    class RecordingRecovery:
+        def __init__(self) -> None:
+            self.requests: list[DecisionRequest] = []
+
+        async def arevalidate_persisted(
+            self,
+            recovery_request: DecisionRequest,
+            decision_record_id: uuid.UUID,
+        ) -> DecisionResult:
+            self.requests.append(recovery_request)
+            return await finalizer.arevalidate_persisted(
+                recovery_request,
+                decision_record_id,
+            )
+
+    recovery = RecordingRecovery()
+    changed_service = HealthMesDecisionService(
+        settings=original_settings.model_copy(
+            update={"timezone": "UTC"}
+        ),
+        engine_provider=lambda: None,
+        recovery_provider=lambda: recovery,
+        session_factory_provider=lambda: factory,
+        clock=lambda: NOW + timedelta(minutes=5),
+    )
+
+    recovered = await changed_service.recover_wellness(
+        request.request_id
+    )
+
+    assert recovered.status is DecisionStatus.COMPLETED
+    assert recovered.decision_record_id == first.decision_record_id
+    assert recovery.requests[0].timezone == "Asia/Seoul"
+
+    with factory() as session:
+        row = session.get(DecisionRecord, first.decision_record_id)
+        assert row is not None
+        row.summary = "tampered recovery summary"
+        session.commit()
+
+    rejected = await changed_service.recover_wellness(
+        request.request_id
+    )
+
+    assert rejected.status is DecisionStatus.FAILED
+    assert rejected.limitations == [
+        "decision_record_contract_invalid"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_persisted_receipt_replay_uses_stored_request_timezone(
+    persistence,
+    settings,
+):
+    _engine, factory = persistence
+    with factory() as session:
+        ref = _source_ref(_event(session))
+    finalizer = _finalizer(factory)
+
+    class FinalizingEngine:
+        def __init__(self) -> None:
+            self.requests: list[DecisionRequest] = []
+            self.replay_requests: list[DecisionRequest] = []
+
+        async def ask_wellness(
+            self,
+            decision_request: DecisionRequest,
+        ) -> DecisionResult:
+            self.requests.append(decision_request)
+            query = _query().model_copy(
+                update={"timezone": decision_request.timezone}
+            )
+            return await finalizer.afinalize(
+                decision_request,
+                _run(decision_request, [ref], query=query),
+            )
+
+        async def replay_persisted_decision(
+            self,
+            decision_request: DecisionRequest,
+            decision_record_id: uuid.UUID,
+        ) -> DecisionResult:
+            self.replay_requests.append(decision_request)
+            return await finalizer.arevalidate_persisted(
+                decision_request,
+                decision_record_id,
+            )
+
+    engine = FinalizingEngine()
+    original_settings = settings.model_copy(
+        update={"timezone": "Asia/Seoul"}
+    )
+    submission = DecisionServiceRequest(
+        request_id=uuid.uuid4(),
+        question="Should I take a break now?",
+        ingress=DecisionIngress.REST,
+        requested_at=NOW,
+    )
+    original_service = HealthMesDecisionService(
+        settings=original_settings,
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: factory,
+        clock=lambda: NOW,
+    )
+    first = await original_service.ask_wellness(submission)
+    assert first.persistence_status is PersistenceStatus.PERSISTED
+
+    restarted_service = HealthMesDecisionService(
+        settings=original_settings.model_copy(
+            update={"timezone": "UTC"}
+        ),
+        engine_provider=lambda: engine,
+        session_factory_provider=lambda: factory,
+        clock=lambda: NOW + timedelta(minutes=5),
+    )
+    replay = await restarted_service.ask_wellness(submission)
+
+    assert replay.status is DecisionStatus.COMPLETED
+    assert replay.answer == first.answer
+    assert replay.decision_record_id == first.decision_record_id
+    assert replay.source_refs == first.source_refs
+    assert replay.tool_trace == []
+    assert len(engine.requests) == 1
+    assert len(engine.replay_requests) == 1
+    assert engine.replay_requests[0].timezone == "Asia/Seoul"
 
 
 def test_compact_record_omits_prompt_caller_and_tool_payload(

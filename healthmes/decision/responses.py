@@ -2188,6 +2188,11 @@ def _responses_request(
         "confidence, uncertainty, and follow_up_question. "
         "persistence_intent is required on every response and must be one of "
         "none, action, risk, mutation, or explicit_tracking. "
+        "This endpoint is read-only, so never return mutation. When the "
+        "request has persistence_requested=true and a completed result has "
+        "no proposed action, return explicit_tracking with "
+        "record_summary_code=track_for_review. When "
+        "persistence_requested=false, never return explicit_tracking. "
         "record_summary_code is required for action, risk, and "
         "explicit_tracking. The complete allowed code-to-answer contract is "
         + json.dumps(
@@ -2230,6 +2235,26 @@ def _responses_request(
             "healthmes_profile_digest": profile_digest,
         }
     return payload
+
+
+def _validate_request_persistence_contract(
+    request: DecisionRequest,
+    draft: DecisionDraft,
+) -> None:
+    if (
+        draft.status is not DecisionStatus.COMPLETED
+        or draft.proposed_action
+    ):
+        return
+    expected = (
+        DecisionPersistenceIntent.EXPLICIT_TRACKING
+        if request.persistence_requested
+        else DecisionPersistenceIntent.NONE
+    )
+    if draft.persistence_intent is not expected:
+        raise HermesResponsesContractError(
+            "hermes_persistence_intent_mismatch"
+        )
 
 
 def _run_from_response(
@@ -2339,6 +2364,10 @@ def _run_from_response(
         )
 
     envelope = _parse_final_draft(final_text)
+    _validate_request_persistence_contract(
+        request,
+        envelope.decision,
+    )
     available_ref_ids = {
         source_ref.reference_id for source_ref in snapshot.source_refs
     }

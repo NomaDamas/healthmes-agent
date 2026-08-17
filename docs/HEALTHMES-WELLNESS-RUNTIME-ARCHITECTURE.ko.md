@@ -676,6 +676,20 @@ receipt scrub은 scheduler와 독립적으로 시작 시, 주기적으로, 종�
 각 실행은 process lock과 SQLite file lock 또는 PostgreSQL advisory lock에 같은
 bounded deadline과 cooperative cancellation을 적용한다. lock을 다른
 process가 계속 보유해도 서비스 readiness와 shutdown을 무기한 막지 않는다.
+이 deadline은 lock 진입까지만이 아니라 receipt `SELECT ... FOR UPDATE`, 정규화,
+flush와 commit까지 포함한다. PostgreSQL은 transaction-local `lock_timeout`과
+`statement_timeout`, SQLite는 작업 동안만 축소한 `busy_timeout`으로 DB 내부
+대기도 같은 시간 안에 끝낸다.
+
+행동 제안이 없는 완료 결과는 trusted request와 모델의 저장 의도가 정확히
+일치해야 한다. `persistence_requested=false`는 `none`,
+`persistence_requested=true`는 `explicit_tracking`이어야 하며 read-only 경로의
+`mutation`은 허용하지 않는다. Hermes adapter를 우회하는 scripted runtime도
+`DecisionFinalizer`에서 같은 계약을 다시 검사한다.
+
+명시적 복구와 persisted receipt replay는 저장 당시 request timezone을 검증해
+사용한다. 현재 설정 timezone이 바뀌어도 과거 local-day source selector를 다른
+날짜 경계로 재해석하지 않는다.
 
 Hermes 호출은 `store=false`이고 장기 memory를 사용하지 않는다. 성공 session은
 turn 종료 후 bounded cleanup한다. 현재 Hermes 실패 응답은 session ID를 항상

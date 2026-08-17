@@ -851,7 +851,7 @@ async def test_cancelled_receipt_maintenance_releases_blocked_worker(
         assert acquired.wait(timeout=5)
         maintenance = asyncio.create_task(
             _run_receipt_maintenance_durably(
-                timeout_seconds=5,
+                timeout_seconds=0.2,
             )
         )
         await asyncio.sleep(0.05)

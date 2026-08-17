@@ -147,6 +147,7 @@ SourceCandidates = Mapping[str, tuple[_SourceAttempt, ...]]
 @dataclass(frozen=True, slots=True)
 class _StoredDecision:
     result: DecisionResult
+    request_timezone: str
     source_refs: tuple[SourceRef, ...]
     candidates: SourceCandidates
     access_trace: tuple[AccessAuditEntry, ...]
@@ -974,6 +975,28 @@ def decision_result_from_record(
 ) -> DecisionResult:
     """Recover one verified result after an outcome-unknown response."""
 
+    stored = _validated_stored_decision(row, now=now)
+    return stored.result.model_copy(deep=True)
+
+
+def decision_request_timezone_from_record(
+    row: DecisionRecord,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Return the verified request timezone retained with one decision."""
+
+    return _validated_stored_decision(
+        row,
+        now=now,
+    ).request_timezone
+
+
+def _validated_stored_decision(
+    row: DecisionRecord,
+    *,
+    now: datetime | None = None,
+) -> _StoredDecision:
     current = _as_utc(now or datetime.now(UTC))
     if (
         row.expires_at is not None
@@ -986,7 +1009,7 @@ def decision_result_from_record(
     stored = _stored_decision(row, fingerprint=fingerprint)
     if isinstance(stored, str):
         raise ValueError(stored)
-    return stored.result.model_copy(deep=True)
+    return stored
 
 
 class DecisionFinalizer:
@@ -1588,6 +1611,20 @@ class DecisionFinalizer:
                 canonical_run,
                 code="decision_text_contains_unvalidated_source_ref",
                 persistence_required=False,
+            )
+
+        persistence_contract_error = _persistence_contract_error(
+            canonical_request,
+            canonical_run,
+        )
+        if persistence_contract_error is not None:
+            return _failure_result(
+                canonical_run,
+                code=persistence_contract_error,
+                persistence_required=(
+                    canonical_request.persistence_requested
+                    or canonical_run.draft.proposed_action
+                ),
             )
 
         effective_persistence_intent = _effective_persistence_intent(
@@ -2493,6 +2530,7 @@ def _stored_decision(
         return "decision_record_contract_invalid"
     return _StoredDecision(
         result=result,
+        request_timezone=payload.request.timezone,
         source_refs=payload.source_refs,
         candidates=candidates,
         access_trace=access_trace,
@@ -2800,6 +2838,26 @@ def _effective_persistence_intent(
     if request.persistence_requested:
         return DecisionPersistenceIntent.EXPLICIT_TRACKING
     return DecisionPersistenceIntent.NONE
+
+
+def _persistence_contract_error(
+    request: DecisionRequest,
+    run: DecisionAgentRun,
+) -> str | None:
+    draft = run.draft
+    if (
+        draft.status is not DecisionStatus.COMPLETED
+        or draft.proposed_action
+    ):
+        return None
+    expected = (
+        DecisionPersistenceIntent.EXPLICIT_TRACKING
+        if request.persistence_requested
+        else DecisionPersistenceIntent.NONE
+    )
+    if draft.persistence_intent is not expected:
+        return "decision_persistence_intent_mismatch"
+    return None
 
 
 def _run_requires_persistence(

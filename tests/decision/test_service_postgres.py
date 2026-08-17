@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -11,6 +12,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
+import healthmes.app as app_module
 import healthmes.store.decision_receipts as decision_receipts_module
 from healthmes.decision import (
     DecisionChannelAdapter,
@@ -174,6 +176,68 @@ def _isolated_postgres_factory():
                 sa.text(f'DROP SCHEMA "{schema}" CASCADE')
             )
         admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_receipt_maintenance_row_lock_wait_is_bounded(
+    monkeypatch,
+) -> None:
+    with _isolated_postgres_factory() as factory:
+        now = NOW
+        with factory() as session:
+            receipt = DecisionRequestReceipt(
+                request_id=uuid.uuid4(),
+                request_fingerprint="a" * 64,
+                requested_at=now,
+                state="completed",
+                owner_token=None,
+                lease_generation=1,
+                lease_expires_at=None,
+                result_payload={
+                    "schema": "healthmes.decision-receipt.v1",
+                    "result": {
+                        "answer": "A bounded transient result.",
+                        "persistence_status": "not_required",
+                    },
+                },
+                result_expires_at=now + timedelta(days=1),
+                retention_basis_at=now,
+                expires_at=now + timedelta(days=30),
+            )
+            session.add(receipt)
+            session.commit()
+            receipt_id = receipt.id
+
+        blocker = factory()
+        try:
+            blocker.execute(
+                sa.select(DecisionRequestReceipt)
+                .where(DecisionRequestReceipt.id == receipt_id)
+                .with_for_update()
+            ).scalar_one()
+            monkeypatch.setattr(
+                app_module,
+                "get_session_factory",
+                lambda: factory,
+            )
+
+            started = time.monotonic()
+            with pytest.raises(
+                TimeoutError,
+                match="decision receipt maintenance",
+            ):
+                app_module._run_mandatory_decision_receipt_maintenance(
+                    max_rows=1,
+                    timeout_seconds=0.2,
+                )
+            elapsed = time.monotonic() - started
+            assert 0.1 <= elapsed < 1
+        finally:
+            blocker.rollback()
+            blocker.close()
 
 
 @pytest.mark.skipif(

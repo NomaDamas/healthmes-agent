@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from threading import Event
 
 from fastapi import FastAPI
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from starlette.types import Receive, Scope, Send
 
@@ -89,6 +91,10 @@ _LOGGER = logging.getLogger(__name__)
 _DECISION_RECEIPT_MAINTENANCE_INTERVAL_SECONDS = 30.0
 _DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS = 5.0
 _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS = 1.0
+_RECEIPT_SQLITE_BUSY_TIMEOUT_INFO_KEY = (
+    "healthmes_receipt_sqlite_busy_timeout"
+)
+_POSTGRES_RECEIPT_TIMEOUT_STATES = frozenset({"55P03", "57014"})
 
 
 class _DecisionReceiptMaintenanceCancelled(RuntimeError):
@@ -109,6 +115,125 @@ def _receipt_maintenance_remaining(deadline: float) -> float:
             "timed out waiting for decision receipt maintenance"
         )
     return remaining
+
+
+def _configure_receipt_maintenance_database_timeout(
+    session: Session,
+    *,
+    deadline: float,
+) -> None:
+    remaining = _receipt_maintenance_remaining(deadline)
+    dialect = session.get_bind().dialect.name
+    timeout_ms = max(1, int(remaining * 1_000))
+    if dialect == "postgresql":
+        timeout_value = f"{timeout_ms}ms"
+        session.execute(
+            text("SELECT set_config('lock_timeout', :timeout, true)"),
+            {"timeout": timeout_value},
+        )
+        session.execute(
+            text(
+                "SELECT set_config('statement_timeout', :timeout, true)"
+            ),
+            {"timeout": timeout_value},
+        )
+        return
+    if dialect != "sqlite":
+        return
+    connection = session.connection()
+    if _RECEIPT_SQLITE_BUSY_TIMEOUT_INFO_KEY not in session.info:
+        original_timeout_ms = int(
+            connection.exec_driver_sql(
+                "PRAGMA busy_timeout"
+            ).scalar_one()
+        )
+        session.info[_RECEIPT_SQLITE_BUSY_TIMEOUT_INFO_KEY] = (
+            connection,
+            original_timeout_ms,
+        )
+    connection.exec_driver_sql(
+        f"PRAGMA busy_timeout={timeout_ms}"
+    )
+
+
+def _restore_receipt_sqlite_busy_timeout(session: Session) -> None:
+    state = session.info.pop(
+        _RECEIPT_SQLITE_BUSY_TIMEOUT_INFO_KEY,
+        None,
+    )
+    if state is None:
+        return
+    connection, original_timeout_ms = state
+    try:
+        connection.exec_driver_sql(
+            f"PRAGMA busy_timeout={original_timeout_ms}"
+        )
+    except Exception as exc:
+        try:
+            connection.invalidate(exc)
+        except Exception:
+            pass
+
+
+def _receipt_maintenance_database_timeout(exc: DBAPIError) -> bool:
+    original = exc.orig
+    state = getattr(original, "sqlstate", None) or getattr(
+        original,
+        "pgcode",
+        None,
+    )
+    if state in _POSTGRES_RECEIPT_TIMEOUT_STATES:
+        return True
+    return "database is locked" in str(original).casefold()
+
+
+def _run_receipt_maintenance_transaction[Result](
+    operation: Callable[[Session], Result],
+    *,
+    deadline: float,
+    cancellation: Event | None,
+) -> Result:
+    def cancellation_check() -> None:
+        _receipt_maintenance_cancellation_check(cancellation)
+
+    with activity_write_lock(
+        timeout_seconds=_receipt_maintenance_remaining(deadline),
+        cancellation_check=cancellation_check,
+    ):
+        session = get_session_factory()()
+        try:
+            lock_activity_write_plane(
+                session,
+                timeout_seconds=_receipt_maintenance_remaining(
+                    deadline
+                ),
+                cancellation_check=cancellation_check,
+            )
+            _configure_receipt_maintenance_database_timeout(
+                session,
+                deadline=deadline,
+            )
+            result = operation(session)
+            cancellation_check()
+            _configure_receipt_maintenance_database_timeout(
+                session,
+                deadline=deadline,
+            )
+            session.commit()
+            return result
+        except DBAPIError as exc:
+            session.rollback()
+            if _receipt_maintenance_database_timeout(exc):
+                raise TimeoutError(
+                    "timed out waiting for decision receipt maintenance"
+                ) from exc
+            raise
+        except BaseException:
+            session.rollback()
+            raise
+        finally:
+            _restore_receipt_sqlite_busy_timeout(session)
+            session.close()
 
 
 async def _close_decision_engine_durably(decision_engine) -> None:
@@ -186,24 +311,16 @@ def _run_mandatory_decision_receipt_maintenance(
     while processed < max_rows:
         cancellation_check()
         current_batch_size = min(batch_size, max_rows - processed)
-        with activity_write_lock(
-            timeout_seconds=_receipt_maintenance_remaining(deadline),
-            cancellation_check=cancellation_check,
-        ):
-            with session_scope() as session:
-                lock_activity_write_plane(
-                    session,
-                    timeout_seconds=_receipt_maintenance_remaining(
-                        deadline
-                    ),
-                    cancellation_check=cancellation_check,
-                )
-                batch = maintain_decision_receipt_results(
-                    session,
-                    now=current,
-                    batch_size=current_batch_size,
-                    after_id=cursor,
-                )
+        batch = _run_receipt_maintenance_transaction(
+            lambda session: maintain_decision_receipt_results(
+                session,
+                now=current,
+                batch_size=current_batch_size,
+                after_id=cursor,
+            ),
+            deadline=deadline,
+            cancellation=cancellation,
+        )
         processed += batch.scanned
         cursor = batch.next_cursor
         if cursor is None:
@@ -227,28 +344,16 @@ def _run_one_decision_receipt_maintenance_batch(
             "decision receipt maintenance timeout must be positive"
         )
     deadline = steady_time() + timeout_seconds
-
-    def cancellation_check() -> None:
-        _receipt_maintenance_cancellation_check(cancellation)
-
-    with activity_write_lock(
-        timeout_seconds=_receipt_maintenance_remaining(deadline),
-        cancellation_check=cancellation_check,
-    ):
-        with session_scope() as session:
-            lock_activity_write_plane(
-                session,
-                timeout_seconds=_receipt_maintenance_remaining(deadline),
-                cancellation_check=cancellation_check,
-            )
-            return maintain_decision_receipt_results(
-                session,
-                now=now or datetime.now(UTC),
-                batch_size=(
-                    DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE
-                ),
-                after_id=after_id,
-            )
+    return _run_receipt_maintenance_transaction(
+        lambda session: maintain_decision_receipt_results(
+            session,
+            now=now or datetime.now(UTC),
+            batch_size=DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE,
+            after_id=after_id,
+        ),
+        deadline=deadline,
+        cancellation=cancellation,
+    )
 
 
 async def _run_receipt_maintenance_durably(
@@ -285,7 +390,8 @@ async def _run_receipt_maintenance_durably(
             await asyncio.wait_for(
                 asyncio.shield(worker),
                 timeout=(
-                    _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS
+                    timeout_seconds
+                    + _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS
                 ),
             )
         except (

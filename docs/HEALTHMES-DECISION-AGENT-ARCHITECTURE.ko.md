@@ -203,6 +203,19 @@ trusted caller의 명시적 추적 요청  -> explicit_tracking
 근거 없는 LLM 저장 주장            -> none
 ```
 
+행동 제안이 없는 `completed` 결과에서는 trusted request와 모델 출력이 정확히
+일치해야 한다.
+
+```text
+persistence_requested=false -> persistence_intent=none
+persistence_requested=true  -> persistence_intent=explicit_tracking
+read-only 판단 경로          -> mutation 금지
+```
+
+불일치는 Hermes 응답 adapter와 `DecisionFinalizer` 양쪽에서 실패로 처리한다.
+따라서 모델이 사용자의 추적 요청을 조용히 무시하거나, 요청하지 않은 항목을
+“tracked”라고 답하는 경로가 없다.
+
 `none`이면 DecisionRecord를 만들지 않는다. 저장하는 경우에도 원문 질문, 자유 형식
 전체 답변, 모델 작성 `record_summary`, transcript와 tool payload를 복제하지
 않는다. Hermes가 선택할 수 있는 code와 HealthMes가 렌더링하는 문장은 다음의
@@ -248,6 +261,12 @@ publication
 commit 시작 전 deadline이면 실패로 확정하고 late write를 막는다. commit이 이미
 시작된 뒤 outcome을 알 수 없으면 성공/실패를 추측하지 않고 `unknown`을 반환하며,
 request ID recovery가 실제 저장 결과를 확인한다.
+
+명시적 request-ID 복구와 persisted receipt replay는 현재 앱 설정 timezone이
+아니라 검증된 저장 payload의 원래 request timezone을 사용한다. 설정 timezone이
+바뀌어도 과거 source selector의 local-day 의미가 변하지 않는다. 저장 record가
+손상돼 원래 timezone을 신뢰할 수 없으면 예외로 우회하지 않고 finalizer의 기존
+감사 가능한 `decision_record_contract_invalid` 실패 경로로 보낸다.
 
 ## 8. 취소와 종료
 

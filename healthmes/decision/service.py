@@ -40,6 +40,9 @@ from healthmes.decision.contracts import (
     PersistenceStatus,
     PrivacyLevel,
 )
+from healthmes.decision.finalizer import (
+    decision_request_timezone_from_record,
+)
 from healthmes.store.decision_receipts import (
     DecisionReceiptClaimState,
     DecisionReceiptConflictError,
@@ -418,15 +421,12 @@ class HealthMesDecisionService:
             raise TypeError("request_id must be a UUID")
         current = _as_utc(self._clock())
         with self._session_factory_provider()() as session:
-            identity = session.execute(
-                select(
-                    DecisionRecord.id,
-                    DecisionRecord.decision_turn_id,
-                ).where(
+            identity = session.scalar(
+                select(DecisionRecord).where(
                     DecisionRecord.decision_request_id == request_id,
                     decision_record_is_available_at(current),
                 )
-            ).one_or_none()
+            )
         if identity is None or identity.decision_turn_id is None:
             raise DecisionRecoveryNotFoundError(
                 "wellness decision is not available"
@@ -437,7 +437,10 @@ class HealthMesDecisionService:
             turn_id=identity.decision_turn_id,
             question="Recover the previously committed wellness decision.",
             requested_at=current,
-            timezone=str(resolve_timezone(self._settings)),
+            timezone=self._persisted_request_timezone(
+                identity,
+                now=current,
+            ),
             caller=DecisionCaller(
                 principal_id=(
                     self._settings.decision_owner_principal_id
@@ -681,6 +684,25 @@ class HealthMesDecisionService:
             }
         )
         request = self.build_request(frozen_submission)
+        current = _as_utc(self._clock())
+        with self._session_factory_provider()() as session:
+            stored = session.scalar(
+                select(DecisionRecord).where(
+                    DecisionRecord.id == pointer,
+                    DecisionRecord.decision_request_id
+                    == request.request_id,
+                    decision_record_is_available_at(current),
+                )
+            )
+        if stored is not None:
+            request = request.model_copy(
+                update={
+                    "timezone": self._persisted_request_timezone(
+                        stored,
+                        now=current,
+                    )
+                }
+            )
         result = await self._revalidate_persisted(request, pointer)
         if not isinstance(result, DecisionResult):
             raise TypeError(
@@ -734,6 +756,21 @@ class HealthMesDecisionService:
         raise DecisionRuntimeNotConfiguredError(
             "HealthMes decision recovery cannot revalidate stored results"
         )
+
+    def _persisted_request_timezone(
+        self,
+        record: DecisionRecord,
+        *,
+        now: datetime,
+    ) -> str:
+        try:
+            return decision_request_timezone_from_record(
+                record,
+                now=now,
+            )
+        except ValueError:
+            # Keep corrupt records on the normal auditable failure path.
+            return str(resolve_timezone(self._settings))
 
     def _get_receipt_store(self) -> DecisionReceiptStore:
         with self._idempotency_lock:

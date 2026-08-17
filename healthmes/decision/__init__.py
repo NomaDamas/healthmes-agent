@@ -68,6 +68,7 @@ from healthmes.decision.finalizer import (
     DECISION_RECORD_SCHEMA,
     DecisionFinalizer,
     decision_request_fingerprint,
+    decision_request_timezone_from_record,
     decision_result_from_record,
 )
 from healthmes.decision.hermes_profile import (
@@ -298,6 +299,7 @@ __all__ = [
     "build_healthmes_responses_decision_engine",
     "decision_request_from_activity_context",
     "decision_request_fingerprint",
+    "decision_request_timezone_from_record",
     "decision_record_summary",
     "decision_result_from_record",
     "decision_access_policy",

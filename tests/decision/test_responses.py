@@ -599,7 +599,10 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
         _final_response(
             {
                 "status": "completed",
-                "answer": "Take a short break.",
+                "answer": (
+                    "Keep this wellness item tracked for later review."
+                ),
+                "persistence_intent": "explicit_tracking",
             }
         ),
         cleanup_failures=1,
@@ -622,7 +625,10 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
     await agent.aclose()
 
     assert run.draft.status is DecisionStatus.COMPLETED
-    assert run.draft.answer == "Take a short break."
+    assert (
+        run.draft.answer
+        == "Keep this wellness item tracked for later review."
+    )
     assert run.steps_used == 1
     assert transport.toolset_calls == 1
     assert transport.model_calls == 1
@@ -1030,6 +1036,47 @@ async def test_agent_rejects_missing_persistence_intent() -> None:
     assert run.draft.status is DecisionStatus.FAILED
     assert run.draft.limitations == [
         "hermes_persistence_intent_missing"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("persistence_requested", "persistence_intent"),
+    (
+        (True, "none"),
+        (False, "explicit_tracking"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_agent_rejects_request_persistence_intent_mismatch(
+    persistence_requested: bool,
+    persistence_intent: str,
+) -> None:
+    transport = _Transport(
+        _final_response(
+            {
+                "status": "completed",
+                "answer": "Bounded answer.",
+                "persistence_intent": persistence_intent,
+            }
+        )
+    )
+    agent = HermesResponsesDecisionAgent(
+        transport=transport,
+        search_service=_SearchService(_empty_snapshot()),  # type: ignore[arg-type]
+        model=MODEL,
+        provider=PROVIDER,
+        timeout_seconds=5,
+        clock=lambda: NOW,
+    )
+    request = _request().model_copy(
+        update={"persistence_requested": persistence_requested}
+    )
+
+    run = await agent.ask(request)
+
+    assert run.draft.status is DecisionStatus.FAILED
+    assert run.draft.limitations == [
+        "hermes_persistence_intent_mismatch"
     ]
 
 
