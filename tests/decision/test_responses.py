@@ -30,6 +30,7 @@ from healthmes.decision import (
     DecisionBudget,
     DecisionCaller,
     DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionSearchBudgetUsage,
     DecisionStatus,
@@ -44,6 +45,7 @@ from healthmes.decision import (
     SourceRef,
     ToolCallRecord,
     ToolCallStatus,
+    decision_record_summary,
     source_ref_id,
 )
 from healthmes.decision.hermes_profile import (
@@ -207,6 +209,7 @@ def _final_response(
     *,
     output_prefix: list[dict] | None = None,
     include_persistence_intent: bool = True,
+    canonicalize_persisted_answer: bool = True,
 ) -> dict:
     decision = dict(decision)
     if include_persistence_intent:
@@ -216,7 +219,7 @@ def _final_response(
         )
     intent = decision.get("persistence_intent")
     if intent is not None and intent != "none":
-        decision.setdefault(
+        code = decision.setdefault(
             "record_summary_code",
             (
                 "track_for_review"
@@ -226,6 +229,10 @@ def _final_response(
                 else "pause_and_reassess"
             ),
         )
+        if canonicalize_persisted_answer:
+            decision["answer"] = decision_record_summary(
+                DecisionRecordSummaryCode(code)
+            )
     envelope = {
         "schema": HERMES_DECISION_DRAFT_SCHEMA,
         "decision": decision,
@@ -635,6 +642,11 @@ async def test_agent_uses_one_responses_call_and_cleans_session() -> None:
         "execution_scope": "local",
     }
     assert "persistence_intent is required" in payload["instructions"]
+    assert "healthmes.decision-draft.v2" in payload["instructions"]
+    assert "pause_and_reassess" in payload["instructions"]
+    assert "take_restorative_break" in payload["instructions"]
+    assert "track_for_review" in payload["instructions"]
+    assert "answer MUST exactly equal" in payload["instructions"]
     assert transport.deleted_sessions == [
         HERMES_SESSION_ID,
         HERMES_SESSION_ID,
@@ -888,18 +900,24 @@ async def test_agent_rejects_invalid_tool_pairing_and_order(
     [
         (
             "```json\n"
-            '{"schema":"healthmes.decision-draft.v1",'
+            '{"schema":"healthmes.decision-draft.v2",'
             '"decision":{"status":"completed","answer":"No."}}\n```',
             "hermes_final_json_invalid",
         ),
         (
-            '{"schema":"healthmes.decision-draft.v1",'
+            '{"schema":"healthmes.decision-draft.v2",'
             '"decision":{"status":"completed","answer":"No."},'
             '"unexpected":true}',
             "hermes_final_json_invalid",
         ),
         (
-            '{"schema":"healthmes.decision-draft.v1",',
+            '{"schema":"healthmes.decision-draft.v2",',
+            "hermes_final_json_invalid",
+        ),
+        (
+            '{"schema":"healthmes.decision-draft.v1",'
+            '"decision":{"status":"completed","answer":"No.",'
+            '"persistence_intent":"none"}}',
             "hermes_final_json_invalid",
         ),
         (
@@ -940,13 +958,13 @@ async def test_agent_rejects_malformed_or_oversized_final_output(
     "final_text",
     (
         (
-            '{"schema":"healthmes.decision-draft.v1",'
+            '{"schema":"healthmes.decision-draft.v2",'
             '"schema":"healthmes.decision-draft.v0",'
             '"decision":{"status":"completed","answer":"No.",'
             '"persistence_intent":"none"}}'
         ),
         (
-            '{"schema":"healthmes.decision-draft.v1",'
+            '{"schema":"healthmes.decision-draft.v2",'
             '"decision":{"status":"completed","answer":"Yes.",'
             '"answer":"No.","persistence_intent":"none"}}'
         ),
@@ -1041,12 +1059,16 @@ def test_final_envelope_uses_typed_persistence_intent_contract(
         },
     }
     if intent in {"action", "risk", "explicit_tracking"}:
-        envelope["decision"]["record_summary_code"] = (
+        code = (
             "track_for_review"
             if intent == "explicit_tracking"
             else "reduce_or_avoid"
             if intent == "risk"
             else "pause_and_reassess"
+        )
+        envelope["decision"]["record_summary_code"] = code
+        envelope["decision"]["answer"] = decision_record_summary(
+            DecisionRecordSummaryCode(code)
         )
 
     parsed = _parse_final_draft(json.dumps(envelope))
@@ -1054,6 +1076,27 @@ def test_final_envelope_uses_typed_persistence_intent_contract(
     assert parsed.decision.persistence_intent is DecisionPersistenceIntent(
         intent
     )
+
+
+def test_final_envelope_rejects_answer_that_conflicts_with_summary_code():
+    response = _final_response(
+        {
+            "status": "completed",
+            "answer": "You may drink this coffee now.",
+            "proposed_action": True,
+            "persistence_intent": "risk",
+            "record_summary_code": "reduce_or_avoid",
+            "used_source_ref_ids": ["sr_" + "0" * 32],
+        },
+        canonicalize_persisted_answer=False,
+    )
+    raw_text = response["output"][-1]["content"][0]["text"]
+
+    with pytest.raises(
+        HermesResponsesContractError,
+        match="hermes_final_json_invalid",
+    ):
+        _parse_final_draft(raw_text)
 
 
 @pytest.mark.parametrize("intent", (None, 1, True, "save"))

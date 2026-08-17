@@ -53,6 +53,7 @@ from healthmes.decision import (
     SourceRef,
     ToolCallRecord,
     ToolCallStatus,
+    decision_record_summary,
     decision_result_from_record,
 )
 from healthmes.decision.access import _current_source_content_digest
@@ -350,6 +351,10 @@ def _run(
                     )
                 )
             )
+            if answer is None:
+                draft_kwargs["answer"] = decision_record_summary(
+                    draft_kwargs["record_summary_code"]
+                )
     elif status is DecisionStatus.NEEDS_CLARIFICATION:
         draft_kwargs["clarification_question"] = (
             "Which drink are you considering?"
@@ -1222,14 +1227,13 @@ def test_public_record_redacts_internal_source_reference_ids(
     with factory() as session:
         ref = _source_ref(_event(session))
     request = _request(question="private question must stay in audit data")
-    answer = f"Take a break because {ref.reference_id} supports it."
 
     result = _finalizer(factory).finalize(
         request,
-        _run(request, [ref], answer=answer),
+        _run(request, [ref]),
     )
 
-    assert result.answer == answer
+    assert result.answer == "Pause and reassess before continuing."
     with factory() as session:
         row = session.scalars(sa.select(DecisionRecord)).one()
         assert ref.reference_id not in row.summary
@@ -1240,13 +1244,12 @@ def test_public_record_redacts_internal_source_reference_ids(
             "pause_and_reassess"
         )
         assert row.summary == "Pause and reassess before continuing."
-        assert answer not in json.dumps(row.decision_payload)
         assert "question" not in row.decision_payload["request"]
         assert "caller" not in row.decision_payload["request"]
         assert request.question not in json.dumps(row.decision_payload)
 
 
-def test_long_sensitive_answer_is_returned_but_never_persisted(
+def test_persisted_decision_canonicalizes_sensitive_answer_without_storage(
     persistence,
 ):
     _engine, factory = persistence
@@ -1282,8 +1285,10 @@ def test_long_sensitive_answer_is_returned_but_never_persisted(
         ),
     )
 
-    assert result.answer == answer
-    assert sensitive_marker in result.answer
+    assert result.status is DecisionStatus.COMPLETED
+    assert result.persistence_status is PersistenceStatus.PERSISTED
+    assert result.answer == "Pause and reassess before continuing."
+    assert sensitive_marker not in result.answer
     with factory() as session:
         row = session.scalars(sa.select(DecisionRecord)).one()
         assert row.decision_payload is not None
@@ -1308,8 +1313,7 @@ def test_long_sensitive_answer_is_returned_but_never_persisted(
         assert outcome["limitation_codes"] == ["context_stale"]
 
         recovered = decision_result_from_record(row)
-        assert recovered.answer == "Pause and reassess before continuing."
-        assert sensitive_marker not in recovered.answer
+        assert recovered.answer == result.answer
         assert "decision_response_compacted" in recovered.limitations
 
 
@@ -1346,7 +1350,7 @@ def test_persisted_decision_requires_compact_record_summary_code(
 @pytest.mark.parametrize(
     "record_summary",
     (
-        "Take a short break before choosing more caffeine.",
+        "Pause and reassess before continuing.",
         "Contact private@example.com before continuing.",
         "Use source sr_0123456789abcdef0123456789abcdef.",
         "Device 00:1A:2B:3C:4D:5E should pause.",

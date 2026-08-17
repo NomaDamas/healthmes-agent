@@ -1864,13 +1864,6 @@ class DecisionFinalizer:
                                         "external_source_retention_unverified",
                                     )
 
-                                record_id = uuid.uuid4()
-                                result = _persisted_result(
-                                    run,
-                                    validated_refs,
-                                    record_id=record_id,
-                                    extra_limitations=source_limitations,
-                                )
                                 (
                                     record_summary_code,
                                     record_summary,
@@ -1879,6 +1872,14 @@ class DecisionFinalizer:
                                         run,
                                         persistence_intent,
                                     )
+                                )
+                                record_id = uuid.uuid4()
+                                result = _persisted_result(
+                                    run,
+                                    validated_refs,
+                                    record_id=record_id,
+                                    answer=record_summary,
+                                    extra_limitations=source_limitations,
                                 )
                                 _ensure_finalization_deadline(deadline)
                                 payload = _decision_payload(
@@ -2651,6 +2652,7 @@ def _persisted_result(
     source_refs: Sequence[SourceRef],
     *,
     record_id: uuid.UUID,
+    answer: str,
     extra_limitations: Sequence[str] = (),
 ) -> DecisionResult:
     draft = run.draft
@@ -2658,7 +2660,7 @@ def _persisted_result(
         request_id=run.request_id,
         turn_id=run.turn_id,
         status=draft.status,
-        answer=draft.answer,
+        answer=answer,
         proposed_action=draft.proposed_action,
         source_refs=list(source_refs),
         limitations=_merge_limitations(

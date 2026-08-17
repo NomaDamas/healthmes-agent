@@ -8,6 +8,7 @@ gated on ``Settings.scheduler_enabled``.
 """
 
 import asyncio
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -21,9 +22,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from healthmes import __version__
+from healthmes.activity.locking import activity_write_lock
 from healthmes.activity.maintenance import ACTIVITY_MAINTENANCE_JOB_ID
 from healthmes.app import (
     _run_mandatory_decision_receipt_maintenance,
+    _run_receipt_maintenance_durably,
     create_app,
 )
 from healthmes.config import Settings
@@ -775,6 +778,101 @@ def test_mandatory_receipt_maintenance_commits_bounded_progress(
             ) is None
     finally:
         dispose_engine()
+
+
+def test_mandatory_receipt_maintenance_lock_wait_is_bounded(
+    settings,
+) -> None:
+    configured = settings.model_copy(
+        update={
+            "database_url": (
+                f"sqlite+pysqlite:///"
+                f"{settings.data_dir / 'receipt-lock-timeout.db'}"
+            )
+        }
+    )
+    database = init_engine(configured)
+    Base.metadata.create_all(database)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_write_lock() -> None:
+        with activity_write_lock():
+            acquired.set()
+            assert release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_write_lock)
+    holder.start()
+    try:
+        assert acquired.wait(timeout=5)
+        started = time.monotonic()
+        with pytest.raises(
+            TimeoutError,
+            match="activity write lock",
+        ):
+            _run_mandatory_decision_receipt_maintenance(
+                max_rows=1,
+                timeout_seconds=0.1,
+            )
+        assert 0.05 <= time.monotonic() - started < 1
+    finally:
+        release.set()
+        holder.join(timeout=5)
+        dispose_engine()
+
+    assert not holder.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_receipt_maintenance_releases_blocked_worker(
+    settings,
+) -> None:
+    configured = settings.model_copy(
+        update={
+            "database_url": (
+                f"sqlite+pysqlite:///"
+                f"{settings.data_dir / 'receipt-cancel.db'}"
+            )
+        }
+    )
+    database = init_engine(configured)
+    Base.metadata.create_all(database)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_write_lock() -> None:
+        with activity_write_lock():
+            acquired.set()
+            assert release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_write_lock)
+    holder.start()
+    try:
+        assert acquired.wait(timeout=5)
+        maintenance = asyncio.create_task(
+            _run_receipt_maintenance_durably(
+                timeout_seconds=5,
+            )
+        )
+        await asyncio.sleep(0.05)
+        started = time.monotonic()
+        maintenance.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(maintenance, timeout=1)
+        assert time.monotonic() - started < 1
+    finally:
+        release.set()
+        holder.join(timeout=5)
+
+    try:
+        batch = await _run_receipt_maintenance_durably(
+            timeout_seconds=0.5,
+        )
+        assert batch.scanned == 0
+    finally:
+        dispose_engine()
+
+    assert not holder.is_alive()
 
 
 class TestMcpWiring:

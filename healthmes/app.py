@@ -12,6 +12,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime
+from threading import Event
 
 from fastapi import FastAPI
 from sqlalchemy.orm import Session
@@ -82,9 +83,32 @@ from healthmes.store.decision_receipts import (
     DecisionReceiptMaintenanceBatch,
     maintain_decision_receipt_results,
 )
+from healthmes.timing import steady_time
 
 _LOGGER = logging.getLogger(__name__)
 _DECISION_RECEIPT_MAINTENANCE_INTERVAL_SECONDS = 30.0
+_DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS = 5.0
+_DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS = 1.0
+
+
+class _DecisionReceiptMaintenanceCancelled(RuntimeError):
+    """Raised by a worker after its owning async task requests cancellation."""
+
+
+def _receipt_maintenance_cancellation_check(
+    cancellation: Event | None,
+) -> None:
+    if cancellation is not None and cancellation.is_set():
+        raise _DecisionReceiptMaintenanceCancelled
+
+
+def _receipt_maintenance_remaining(deadline: float) -> float:
+    remaining = deadline - steady_time()
+    if remaining <= 0:
+        raise TimeoutError(
+            "timed out waiting for decision receipt maintenance"
+        )
+    return remaining
 
 
 async def _close_decision_engine_durably(decision_engine) -> None:
@@ -136,6 +160,10 @@ def _run_mandatory_decision_receipt_maintenance(
     batch_size: int = DEFAULT_RECEIPT_MAINTENANCE_BATCH_SIZE,
     max_rows: int = DEFAULT_RECEIPT_MAINTENANCE_MAX_ROWS,
     after_id: uuid.UUID | None = None,
+    timeout_seconds: float = (
+        _DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS
+    ),
+    cancellation: Event | None = None,
 ) -> tuple[int, uuid.UUID | None]:
     """Commit bounded cleanup batches independently from optional scheduling."""
 
@@ -143,14 +171,33 @@ def _run_mandatory_decision_receipt_maintenance(
         raise ValueError("decision receipt batch_size must be positive")
     if max_rows < 1:
         raise ValueError("decision receipt max_rows must be positive")
+    if timeout_seconds <= 0:
+        raise ValueError(
+            "decision receipt maintenance timeout must be positive"
+        )
     current = now or datetime.now(UTC)
     processed = 0
     cursor = after_id
+    deadline = steady_time() + timeout_seconds
+
+    def cancellation_check() -> None:
+        _receipt_maintenance_cancellation_check(cancellation)
+
     while processed < max_rows:
+        cancellation_check()
         current_batch_size = min(batch_size, max_rows - processed)
-        with activity_write_lock():
+        with activity_write_lock(
+            timeout_seconds=_receipt_maintenance_remaining(deadline),
+            cancellation_check=cancellation_check,
+        ):
             with session_scope() as session:
-                lock_activity_write_plane(session)
+                lock_activity_write_plane(
+                    session,
+                    timeout_seconds=_receipt_maintenance_remaining(
+                        deadline
+                    ),
+                    cancellation_check=cancellation_check,
+                )
                 batch = maintain_decision_receipt_results(
                     session,
                     now=current,
@@ -168,12 +215,32 @@ def _run_one_decision_receipt_maintenance_batch(
     *,
     now: datetime | None = None,
     after_id: uuid.UUID | None = None,
+    timeout_seconds: float = (
+        _DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS
+    ),
+    cancellation: Event | None = None,
 ) -> DecisionReceiptMaintenanceBatch:
     """Run one short recurring transaction so normal writes regain the lock."""
 
-    with activity_write_lock():
+    if timeout_seconds <= 0:
+        raise ValueError(
+            "decision receipt maintenance timeout must be positive"
+        )
+    deadline = steady_time() + timeout_seconds
+
+    def cancellation_check() -> None:
+        _receipt_maintenance_cancellation_check(cancellation)
+
+    with activity_write_lock(
+        timeout_seconds=_receipt_maintenance_remaining(deadline),
+        cancellation_check=cancellation_check,
+    ):
         with session_scope() as session:
-            lock_activity_write_plane(session)
+            lock_activity_write_plane(
+                session,
+                timeout_seconds=_receipt_maintenance_remaining(deadline),
+                cancellation_check=cancellation_check,
+            )
             return maintain_decision_receipt_results(
                 session,
                 now=now or datetime.now(UTC),
@@ -187,23 +254,65 @@ def _run_one_decision_receipt_maintenance_batch(
 async def _run_receipt_maintenance_durably(
     *,
     after_id: uuid.UUID | None = None,
+    timeout_seconds: float = (
+        _DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS
+    ),
 ) -> DecisionReceiptMaintenanceBatch:
-    task = asyncio.create_task(
+    if timeout_seconds <= 0:
+        raise ValueError(
+            "decision receipt maintenance timeout must be positive"
+        )
+    cancellation = Event()
+    worker = asyncio.create_task(
         asyncio.to_thread(
             _run_one_decision_receipt_maintenance_batch,
             after_id=after_id,
+            timeout_seconds=timeout_seconds,
+            cancellation=cancellation,
         )
     )
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(worker),
+            timeout=(
+                timeout_seconds
+                + _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS
+            ),
+        )
+    except asyncio.CancelledError:
+        cancellation.set()
         try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-    result = task.result()
-    if cancellation is not None:
-        raise cancellation
-    return result
+            await asyncio.wait_for(
+                asyncio.shield(worker),
+                timeout=(
+                    _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS
+                ),
+            )
+        except (
+            TimeoutError,
+            _DecisionReceiptMaintenanceCancelled,
+        ):
+            pass
+        raise
+    except TimeoutError:
+        cancellation.set()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(worker),
+                timeout=(
+                    _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS
+                ),
+            )
+        except (
+            TimeoutError,
+            _DecisionReceiptMaintenanceCancelled,
+        ):
+            pass
+        raise TimeoutError(
+            "decision receipt maintenance exceeded its deadline"
+        ) from None
+    except _DecisionReceiptMaintenanceCancelled:
+        raise asyncio.CancelledError from None
 
 
 async def _decision_receipt_maintenance_loop(
@@ -237,28 +346,58 @@ async def _decision_receipt_maintenance_loop(
 async def _stop_decision_receipt_maintenance(
     task: asyncio.Task[None],
     stop: asyncio.Event,
+    *,
+    timeout_seconds: float = (
+        _DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS
+        + _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS
+    ),
 ) -> None:
-    """Stop the loop, drain any DB worker, and perform one final scrub."""
+    """Stop the loop and attempt one final scrub within bounded deadlines."""
 
+    if timeout_seconds <= 0:
+        raise ValueError(
+            "decision receipt shutdown timeout must be positive"
+        )
     stop.set()
     cancellation: asyncio.CancelledError | None = None
     current = asyncio.current_task()
-    while not task.done():
-        cancelling_before = (
-            current.cancelling() if current is not None else 0
-        )
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as exc:
-            cancelling_after = (
-                current.cancelling() if current is not None else 0
-            )
-            if current is None or cancelling_after <= cancelling_before:
-                raise
-            cancellation = exc
-    task.result()
+    cancelling_before = current.cancelling() if current is not None else 0
     try:
-        await _run_receipt_maintenance_durably()
+        await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=timeout_seconds,
+        )
+    except asyncio.CancelledError as exc:
+        cancelling_after = current.cancelling() if current is not None else 0
+        if current is None or cancelling_after <= cancelling_before:
+            raise
+        cancellation = exc
+    except TimeoutError:
+        task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=(
+                    _DECISION_RECEIPT_MAINTENANCE_CANCEL_GRACE_SECONDS
+                ),
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            pass
+        _LOGGER.warning(
+            "decision receipt maintenance loop exceeded shutdown deadline"
+        )
+
+    try:
+        await _run_receipt_maintenance_durably(
+            timeout_seconds=min(
+                timeout_seconds,
+                _DECISION_RECEIPT_MAINTENANCE_TIMEOUT_SECONDS,
+            )
+        )
+    except TimeoutError:
+        _LOGGER.warning(
+            "final decision receipt maintenance exceeded shutdown deadline"
+        )
     except asyncio.CancelledError as exc:
         cancellation = exc
     if cancellation is not None:

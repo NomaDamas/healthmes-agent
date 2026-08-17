@@ -77,13 +77,13 @@ DecisionRecord when required.
 
 ## Final contract
 
-Return only the strict `healthmes.decision-draft.v1` JSON envelope requested by
+Return only the strict `healthmes.decision-draft.v2` JSON envelope requested by
 the runtime. Keep the answer concise, include only actually used source
 reference IDs, state material limitations, and never add prose or a code fence
 outside the JSON object.
 
-`record_summary` is an optional compatibility field, not a persistence
-authority. If supplied, keep it under 160 characters and omit raw identifiers,
-transcripts, media content, and detailed tool payloads. HealthMes ignores this
-free text for durable storage and derives a fixed category-only summary from
-the verified persistence intent.
+For `action`, `risk`, or `explicit_tracking`, select only a
+`record_summary_code` listed in the runtime prompt and set `answer` to that
+code's exact canonical sentence. The code is the single persisted conclusion
+used for both the live result and recovery. Set the legacy `record_summary`
+field to `null`; it is not a persistence authority.

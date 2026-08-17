@@ -121,7 +121,7 @@ Hermes의 단일 autonomous LLM loop가 자연어 질문을 해석해 필요한 
   기간과 tool을 선택하고 첫 결과에 따라 추가 조회한다. HealthMes
   `/v1/wellness-decisions` adapter는 제품 요청·응답 계약, source reference 검증과
   선택적 compact 기록만 소유한다. Hermes의 마지막 자유 형식 text는
-  `healthmes.decision-draft.v1` JSON envelope로 strict parse하고, 실제 HealthMes
+  `healthmes.decision-draft.v2` JSON envelope로 strict parse하고, 실제 HealthMes
   MCP transcript에 없는 source reference는 거부한다. 검토된
   `healthmes-wellness-decision`과 domain Skill은 HealthMes MCP의 read-only
   catalog로 제공되며 도구 사용법과 표현 방식을 연결한다. 필수 권한·retention,

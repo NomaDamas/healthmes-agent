@@ -33,10 +33,14 @@ from healthmes.decision.agent import DecisionAgentRun
 from healthmes.decision.contracts import (
     ContextResult,
     DecisionDraft,
+    DecisionPersistenceIntent,
+    DecisionRecordSummaryCode,
     DecisionRequest,
     DecisionStatus,
     RuntimeMetadata,
     ToolCallRecord,
+    decision_record_summary,
+    decision_record_summary_code_is_allowed,
 )
 from healthmes.decision.hermes_profile import (
     HERMES_DECISION_RUNTIME_MODEL_NAME,
@@ -69,8 +73,8 @@ HERMES_RESPONSES_PATH = "/v1/responses"
 HERMES_MODELS_PATH = "/v1/models"
 HERMES_TOOLSETS_PATH = "/v1/toolsets"
 HERMES_SESSION_PATH = "/api/sessions/{session_id}"
-HERMES_DECISION_DRAFT_SCHEMA = "healthmes.decision-draft.v1"
-HERMES_RESPONSES_POLICY_VERSION = "healthmes-responses-policy.v2"
+HERMES_DECISION_DRAFT_SCHEMA = "healthmes.decision-draft.v2"
+HERMES_RESPONSES_POLICY_VERSION = "healthmes-responses-policy.v3"
 HERMES_WELLNESS_SKILL_CATALOG_SCHEMA = "healthmes-wellness-skills.v1"
 
 _LOGGER = logging.getLogger(__name__)
@@ -272,10 +276,29 @@ class HermesDecisionDraftEnvelope(BaseModel):
         populate_by_name=True,
     )
 
-    schema_name: Literal["healthmes.decision-draft.v1"] = Field(
+    schema_name: Literal["healthmes.decision-draft.v2"] = Field(
         alias="schema"
     )
     decision: DecisionDraft
+
+    @model_validator(mode="after")
+    def require_canonical_persisted_answer(
+        self,
+    ) -> HermesDecisionDraftEnvelope:
+        if self.decision.record_summary is not None:
+            raise ValueError(
+                "decision-draft.v2 requires record_summary to be null"
+            )
+        code = self.decision.record_summary_code
+        if (
+            code is not None
+            and self.decision.answer != decision_record_summary(code)
+        ):
+            raise ValueError(
+                "persisted decision answer must match its canonical "
+                "record_summary_code"
+            )
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -2120,6 +2143,21 @@ def _responses_request(
     skill_tools = sorted(
         tool_allowlist & HERMES_DECISION_SKILL_TOOL_ALLOWLIST
     )
+    summary_code_contract = {
+        intent.value: {
+            code.value: decision_record_summary(code)
+            for code in DecisionRecordSummaryCode
+            if decision_record_summary_code_is_allowed(
+                persistence_intent=intent,
+                code=code,
+            )
+        }
+        for intent in (
+            DecisionPersistenceIntent.ACTION,
+            DecisionPersistenceIntent.RISK,
+            DecisionPersistenceIntent.EXPLICIT_TRACKING,
+        )
+    }
     instructions = (
         "You are the only LLM reasoning loop for one HealthMes wellness "
         "decision. Choose zero or more of exactly these tools as needed: "
@@ -2142,7 +2180,7 @@ def _responses_request(
         "Missing, partial, stale, denied, and unavailable data are not zero. "
         "After any tool calls, return exactly one JSON object and no markdown "
         "or prose. The object must have exactly two keys: "
-        '{"schema":"healthmes.decision-draft.v1","decision":...}. '
+        '{"schema":"healthmes.decision-draft.v2","decision":...}. '
         "The decision value must contain only DecisionDraft fields: status, "
         "answer, record_summary, record_summary_code, proposed_action, "
         "persistence_intent, "
@@ -2151,9 +2189,18 @@ def _responses_request(
         "persistence_intent is required on every response and must be one of "
         "none, action, risk, mutation, or explicit_tracking. "
         "record_summary_code is required for action, risk, and "
-        "explicit_tracking and must be one enum value permitted by the "
-        "runtime schema. HealthMes renders the persisted conclusion from this "
-        "code. record_summary is a legacy transient hint and should be null. "
+        "explicit_tracking. The complete allowed code-to-answer contract is "
+        + json.dumps(
+            summary_code_contract,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + ". For a persisted decision, answer MUST exactly equal the sentence "
+        "mapped from record_summary_code; that code is the single canonical "
+        "conclusion rendered by HealthMes during both the live response and "
+        "later recovery. record_summary is a legacy transient hint and must "
+        "be null. "
         "Use only source reference IDs returned by tools. "
         "A proposed action requires at least one source reference. Ask one "
         "concrete clarification question when a required candidate amount, "

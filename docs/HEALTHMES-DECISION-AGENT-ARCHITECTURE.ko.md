@@ -65,7 +65,7 @@ Telegram/UI inbound는 없고 adapter contract만 있다. 채널 구현이 Herme
 5. Hermes /v1/responses 호출
 6. Hermes가 HealthMes MCP 도구를 자율·반복 호출
 7. search session이 canonical tool trace와 source_refs 보관
-8. Hermes가 healthmes.decision-draft.v1 JSON 반환
+8. Hermes가 healthmes.decision-draft.v2 JSON 반환
 9. adapter가 tool call/output, allowlist와 used refs 검증
 10. DecisionFinalizer가 source와 현재 정책을 다시 확인
 11. 필요하면 compact DecisionRecord 저장
@@ -153,11 +153,12 @@ Hermes 마지막 assistant text는 JSON 하나여야 한다.
 
 ```json
 {
-  "schema": "healthmes.decision-draft.v1",
+  "schema": "healthmes.decision-draft.v2",
   "decision": {
     "status": "completed",
-    "answer": "짧은 사용자 답변",
+    "answer": "Take a restorative break before continuing.",
     "record_summary": null,
+    "record_summary_code": "take_restorative_break",
     "proposed_action": true,
     "persistence_intent": "action",
     "used_source_ref_ids": [
@@ -180,11 +181,15 @@ Hermes 마지막 assistant text는 JSON 하나여야 한다.
 - 짝이 없는 function call/output
 - 실제 결과에 없는 source ref
 - status와 answer/clarification invariant 불일치
+- persisted answer와 `record_summary_code`의 canonical 문장 불일치
 - response size 또는 요청 deadline 초과
 
-`record_summary`는 과거 runtime과의 호환을 위한 선택 transient hint다. 값이
-있으면 원문 답변 복사, identifier와 민감정보를 포함하지 않는지 검증하지만,
-HealthMes는 이 모델 작성 문장을 장기 저장하지 않는다.
+`healthmes.decision-draft.v2`는 저장 대상 결론의 단일 정본을
+`record_summary_code`로 둔다. `action`, `risk`, `explicit_tracking`이면 Hermes는
+runtime prompt에 명시된 allowlist에서 code를 고르고 `answer`를 그 code의
+canonical 문장과 정확히 같게 반환해야 한다. 따라서 최초 응답과 재시작 후 복구가
+서로 반대 의미가 될 수 없다. `record_summary`는 과거 runtime을 설명하기 위한
+legacy transient field이며 v2에서는 `null`이어야 하고 장기 저장하지 않는다.
 
 ## 7. 조건부 Finalization
 
@@ -198,21 +203,35 @@ trusted caller의 명시적 추적 요청  -> explicit_tracking
 근거 없는 LLM 저장 주장            -> none
 ```
 
-`none`이면 DecisionRecord를 만들지 않는다. 저장하는 경우에도 원문 질문, 전체 답변,
-모델 작성 `record_summary`, transcript와 tool payload를 복제하지 않는다. 대신
-검증된 effective persistence intent로부터 HealthMes가 다음 category-only 요약 중
-하나를 생성해 저장한다.
+`none`이면 DecisionRecord를 만들지 않는다. 저장하는 경우에도 원문 질문, 자유 형식
+전체 답변, 모델 작성 `record_summary`, transcript와 tool payload를 복제하지
+않는다. Hermes가 선택할 수 있는 code와 HealthMes가 렌더링하는 문장은 다음의
+고정 계약이다.
 
 ```text
-action            -> A wellness action recommendation was recorded.
-risk              -> A wellness risk warning was recorded.
-explicit_tracking -> A wellness decision was explicitly tracked.
+action
+  pause_and_reassess           -> Pause and reassess before continuing.
+  take_restorative_break       -> Take a restorative break before continuing.
+  delay_and_reassess           -> Delay this choice and reassess later.
+  reduce_or_avoid              -> Reduce or avoid this choice for now.
+  proceed_with_caution         -> Proceed cautiously and monitor how you feel.
+  seek_professional_support    -> Seek qualified professional support before acting.
+
+risk
+  pause_and_reassess
+  delay_and_reassess
+  reduce_or_avoid
+  seek_professional_support
+
+explicit_tracking
+  track_for_review             -> Keep this wellness item tracked for later review.
 ```
 
-따라서 저장 레코드만으로 원래의 상세 조언 문장을 재생하지 않는다. 상세 답변은
-현재 요청의 `DecisionResult`로만 반환하고, 장기 레코드는 최소한의 종류,
-source_refs와 runtime metadata만 남긴다. 과거 payload v1-v4는 read compatibility를
-유지하지만 새 쓰기는 privacy-safe v5 형식을 사용한다.
+저장 대상 결정은 최초 `DecisionResult`와 복구 결과 모두 같은 canonical 문장을
+사용한다. 자유 형식 상세 설명이 필요한 단순 조회는 `none`으로 반환해 저장하지
+않는다. 장기 레코드는 code, source_refs와 최소 runtime metadata만 남긴다. 과거
+payload v1-v5는 read compatibility를 유지하지만 새 쓰기는
+`healthmes.decision-private.v6` 형식을 사용한다.
 
 finalizer는 다음을 하나의 bounded write 절차로 처리한다.
 

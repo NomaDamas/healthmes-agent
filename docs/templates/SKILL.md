@@ -43,11 +43,11 @@ where the agent should apply this skill — and when it should NOT.
 
 # After deciding
 
-- Return the strict `healthmes.decision-draft.v1` envelope requested by the
+- Return the strict `healthmes.decision-draft.v2` envelope requested by the
   system instructions.
-- If the result may be retained, provide a privacy-minimized
-  `record_summary` of at most 160 characters. Do not truncate the full answer
-  or include raw identifiers and payload detail.
+- If the result may be retained, select only a `record_summary_code` allowed
+  by the runtime prompt and set `answer` to that code's exact canonical
+  sentence. Set the legacy `record_summary` field to `null`.
 - Do not mutate calendar, settings, tasks, food records, or medical records
   from the decision-read runtime. A separately confirmed mutation workflow
   owns those actions.

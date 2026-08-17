@@ -71,7 +71,7 @@ from healthmes.decision.runtime import (
 )
 from healthmes.decision.validation import strict_model_validate
 
-HEALTHMES_DECISION_SYSTEM_POLICY_VERSION = "healthmes-decision-policy.v5"
+HEALTHMES_DECISION_SYSTEM_POLICY_VERSION = "healthmes-decision-policy.v6"
 HEALTHMES_DECISION_SYSTEM_POLICY = """
 You are one interchangeable reasoning runtime for the HealthMes Decision Agent.
 
@@ -105,10 +105,18 @@ persistence. For this one model iteration you must:
     trusted request flag. Never persist merely because source data was
     consulted.
 11. `record_summary_code` is required whenever `persistence_intent` is
-    `action`, `risk`, or `explicit_tracking`. Select only an enum value allowed
-    by the runtime schema. HealthMes renders the stored conclusion from that
-    code; never put sensitive facts into a compact record. `record_summary` is
-    a legacy transient hint and should be omitted.
+    `action`, `risk`, or `explicit_tracking`. Allowed values are:
+    - action: pause_and_reassess, take_restorative_break,
+      delay_and_reassess, reduce_or_avoid, proceed_with_caution,
+      seek_professional_support
+    - risk: pause_and_reassess, delay_and_reassess, reduce_or_avoid,
+      seek_professional_support
+    - explicit_tracking: track_for_review
+    For a persisted decision, `answer` must exactly equal the canonical
+    sentence supplied by the runtime for the selected code. HealthMes uses
+    that structured code as the single conclusion for both the live response
+    and later recovery. Never put sensitive facts into a compact record.
+    `record_summary` is a legacy transient hint and should be omitted.
 12. Keep the final answer concise. Return structured data matching the
     supplied runtime contract. HealthMes validates source references and
     conditionally persists a compact record after this loop.

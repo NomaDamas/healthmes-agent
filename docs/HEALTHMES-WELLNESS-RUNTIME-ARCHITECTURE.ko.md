@@ -654,11 +654,13 @@ HealthMes는 다음을 검증한다.
 | 실제 식사·활동 기록 | 해당 domain event |
 | 설정·캘린더 mutation | 해당 command workflow audit |
 
-compact record의 요약은 LLM 자유 텍스트를 저장하지 않는다. HealthMes가 검증된
-`action`/`risk`/`explicit_tracking` intent에서 만든 고정된 category-only 문장만
-저장한다. runtime/model, intent, confidence, `source_refs`, 안전한 limitation과
-시각은 함께 저장하지만 원문 질문, 전체 답변, model-authored `record_summary`,
-transcript, 전체 tool payload, 사진·음성 bytes는 복제하지 않는다.
+compact record의 요약은 LLM 자유 텍스트를 저장하지 않는다. Hermes는
+`healthmes.decision-draft.v2`의 allowlisted `record_summary_code`를 선택하고,
+HealthMes는 그 code를 동일한 canonical 문장으로 최초 응답과 복구에 렌더링한다.
+runtime/model, intent, confidence, `source_refs`, 안전한 limitation과 시각은 함께
+저장하지만 원문 질문, 자유 형식 전체 답변, model-authored `record_summary`,
+transcript, 전체 tool payload, 사진·음성 bytes는 복제하지 않는다. 새 record
+payload는 `healthmes.decision-private.v6`이고 v1-v5는 읽기 호환만 유지한다.
 
 자유 형식 판단의 write authority는 `DecisionFinalizer` 하나뿐이다. 단,
 캘린더 confirmation처럼 사용자가 이미 의도를 확정한 bounded internal command는
@@ -669,6 +671,11 @@ summary는 DecisionRecord를 만들지 않는다.
 `1d/7d/14d/30d/90d/forever` 정책을 따른다. read API도 `expires_at <= now`인
 레코드를 반환하지 않아야 하며 maintenance 지연이 privacy 경계 지연으로 이어지지
 않아야 한다.
+
+receipt scrub은 scheduler와 독립적으로 시작 시, 주기적으로, 종료 시 실행한다.
+각 실행은 process lock과 SQLite file lock 또는 PostgreSQL advisory lock에 같은
+bounded deadline과 cooperative cancellation을 적용한다. lock을 다른
+process가 계속 보유해도 서비스 readiness와 shutdown을 무기한 막지 않는다.
 
 Hermes 호출은 `store=false`이고 장기 memory를 사용하지 않는다. 성공 session은
 turn 종료 후 bounded cleanup한다. 현재 Hermes 실패 응답은 session ID를 항상
