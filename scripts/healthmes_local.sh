@@ -158,9 +158,9 @@ load_process_identity() {
 }
 
 load_process_snapshot() {
-    local pid=$1 deadline=${2:-} timeout output key value extra
+    local pid=$1 deadline=${2:-} timeout output key value extra status
     local seen_pid= seen_pgid= seen_comm= seen_lstart= seen_command=
-    valid_managed_pid "$pid" || return 1
+    valid_managed_pid "$pid" || return 5
     timeout="$(bounded_ps_timeout_seconds "$deadline")" || return 5
     if output="$(run_native_identity_helper \
         ps-snapshot \
@@ -170,7 +170,9 @@ load_process_snapshot() {
         2>/dev/null)"; then
         :
     else
-        return $?
+        status=$?
+        [ "$status" -eq 3 ] && return 3
+        return 5
     fi
     SNAPSHOT_PID=
     SNAPSHOT_PGID=
@@ -219,29 +221,61 @@ load_process_snapshot() {
 }
 
 process_identity_matches() {
-    local pid_file=$1 deadline=${2:-} marker
-    load_process_identity "$pid_file" || return 1
-    load_process_snapshot "$PROCESS_PID" "$deadline" || return 1
+    local pid_file=$1 deadline=${2:-} marker status file
+    file="$(identity_file "$pid_file")"
+    if load_process_identity "$pid_file"; then
+        :
+    else
+        if [ ! -e "$pid_file" ] && [ ! -L "$pid_file" ] \
+            && [ ! -e "$file" ] && [ ! -L "$file" ]; then
+            return 3
+        fi
+        if [ -f "$pid_file" ] && [ ! -L "$pid_file" ]; then
+            local stored_pid
+            stored_pid="$(<"$pid_file")"
+            if [ "$stored_pid" = 0 ] || [ "$stored_pid" = 1 ]; then
+                return 4
+            fi
+        fi
+        return 5
+    fi
+    if load_process_snapshot "$PROCESS_PID" "$deadline"; then
+        :
+    else
+        status=$?
+        return "$status"
+    fi
     marker="healthmes_local.sh __service_runner $PROCESS_NONCE "
 
-    [ "$SNAPSHOT_PID" = "$PROCESS_PID" ] \
+    if [ "$SNAPSHOT_PID" = "$PROCESS_PID" ] \
         && [ "$SNAPSHOT_PGID" = "$PROCESS_PGID" ] \
         && [ "$SNAPSHOT_EXECUTABLE" = "$PROCESS_EXECUTABLE" ] \
         && [ "$SNAPSHOT_START_TIME" = "$PROCESS_START_TIME" ] \
-        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]
+        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]; then
+        return 0
+    fi
+    return 4
 }
 
 captured_process_identity_matches() {
     local pid=$1 executable=$2 start_time=$3 nonce=$4
-    local deadline=${5:-} marker
-    load_process_snapshot "$pid" "$deadline" || return 1
+    local deadline=${5:-} marker status
+    if load_process_snapshot "$pid" "$deadline"; then
+        :
+    else
+        status=$?
+        return "$status"
+    fi
     marker="healthmes_local.sh __service_runner $nonce "
 
-    [ "$SNAPSHOT_PID" = "$pid" ] \
+    if [ "$SNAPSHOT_PID" = "$pid" ] \
         && [ "$SNAPSHOT_PGID" = "$pid" ] \
         && [ "$SNAPSHOT_EXECUTABLE" = "$executable" ] \
         && [ "$SNAPSHOT_START_TIME" = "$start_time" ] \
-        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]
+        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]; then
+        return 0
+    fi
+    return 4
 }
 
 write_process_identity() {
@@ -263,8 +297,13 @@ write_process_identity() {
 }
 
 capture_process_identity() {
-    local pid_file=$1 pid=$2 nonce=$3 deadline=${4:-} marker
-    load_process_snapshot "$pid" "$deadline" || return 1
+    local pid_file=$1 pid=$2 nonce=$3 deadline=${4:-} marker status
+    if load_process_snapshot "$pid" "$deadline"; then
+        :
+    else
+        status=$?
+        return "$status"
+    fi
     marker="healthmes_local.sh __service_runner $nonce "
     [ "$SNAPSHOT_PID" = "$pid" ] \
         && [ "$SNAPSHOT_PGID" = "$pid" ] \
@@ -1786,10 +1825,15 @@ wait_for_decision_runtime_launcher_publication() {
 start_process() {
     local name=$1 pid_file=$2 log_file=$3 command=$4
     local startup_lease=${5:-}
-    local nonce pid
+    local nonce pid identity_status
     if pid_running "$pid_file"; then
         info "$name already running (pid $PROCESS_PID)"
         return
+    else
+        identity_status=$?
+        if [ "$identity_status" -eq 5 ]; then
+            die "$name process identity is unknown; preserving metadata"
+        fi
     fi
     mkdir -p "$RUNTIME_DIR"
     nonce="$(new_service_nonce)" || die "failed to generate $name service nonce"
@@ -1802,6 +1846,13 @@ start_process() {
                 || die "$name is running but the competing startup lease could not be released"
             info "$name already running (pid $PROCESS_PID)"
             return
+        else
+            identity_status=$?
+            if [ "$identity_status" -eq 5 ]; then
+                cancel_pending_decision_runtime_startup_lease "$nonce" \
+                    || die "$name process identity is unknown and the competing startup lease could not be released"
+                die "$name process identity is unknown; preserving metadata"
+            fi
         fi
     fi
     if [ -f "$pid_file" ] || [ -f "$(identity_file "$pid_file")" ]; then
@@ -1861,8 +1912,13 @@ start_process() {
 }
 
 signal_process_group() {
-    local signal=$1 pid_file=$2 pid
-    process_identity_matches "$pid_file" || return 1
+    local signal=$1 pid_file=$2 pid status
+    if process_identity_matches "$pid_file"; then
+        :
+    else
+        status=$?
+        return "$status"
+    fi
     pid=$PROCESS_PID
     "$KILL_BIN" -s "$signal" "-$pid"
 }
@@ -1890,10 +1946,10 @@ load_decision_runtime_stop_bounds() {
     DECISION_RUNTIME_BUDGET_LAUNCHER_SERVICE_NONCE=
     DECISION_RUNTIME_BUDGET_PUBLICATION_NONCE=
     if payload="$(run_native_identity_helper \
-        read-bounded \
+        read-shutdown-budget \
         "$HERMES_DECISION_STOP_BUDGET" \
         --max-bytes "$MAX_DECISION_RUNTIME_STOP_BUDGET_BYTES" \
-        --require-ascii-text \
+        --max-drain-seconds "$MAX_DECISION_RUNTIME_DRAIN_SECONDS" \
         2>/dev/null)"; then
         :
     else
@@ -2144,25 +2200,59 @@ wait_for_decision_runtime_exit() {
         *) die "decision runtime supervisor wait failed with status $status" ;;
         esac
     fi
+    if [ ! -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
+        # A matching startup lease and v3 budget own an unverified PID
+        # tombstone. The caller validates that generation after the
+        # supervisor proves cleanup; there is no wrapper identity to probe.
+        return 0
+    fi
     if process_identity_matches "$HERMES_DECISION_PID"; then
         # The wrapper normally exits as soon as its supervised Python process
         # does. Bound this final reap check without consuming the drain budget.
         "$SLEEP_BIN" 1
-        process_identity_matches "$HERMES_DECISION_PID" \
-            && die "managed launcher remained alive after its Python supervisor exited"
+        if process_identity_matches "$HERMES_DECISION_PID"; then
+            die "managed launcher remained alive after its Python supervisor exited"
+        else
+            status=$?
+            case "$status" in
+            3 | 4) ;;
+            *) die "managed launcher identity became unknown after its Python supervisor exited; preserving metadata" ;;
+            esac
+        fi
+    else
+        status=$?
+        case "$status" in
+        3 | 4) ;;
+        *) die "managed launcher identity is unknown after its Python supervisor exited; preserving metadata" ;;
+        esac
     fi
     return 0
 }
 
 wait_for_process_exit() {
-    local pid_file=$1 timeout_seconds=$2 polls
+    local pid_file=$1 timeout_seconds=$2 polls status
     polls=$timeout_seconds
     while [ "$polls" -gt 0 ]; do
-        process_identity_matches "$pid_file" || return 0
+        if process_identity_matches "$pid_file"; then
+            :
+        else
+            status=$?
+            case "$status" in
+            3 | 4) return 0 ;;
+            *) return 5 ;;
+            esac
+        fi
         "$SLEEP_BIN" 1
         polls=$((polls - 1))
     done
-    ! process_identity_matches "$pid_file"
+    if process_identity_matches "$pid_file"; then
+        return 6
+    fi
+    status=$?
+    case "$status" in
+    3 | 4) return 0 ;;
+    *) return 5 ;;
+    esac
 }
 
 stop_process() {
@@ -2170,22 +2260,66 @@ stop_process() {
     local term_wait_seconds=${3:-2}
     local kill_wait_seconds=${4:-1}
     local allow_force_kill=${5:-true}
-    if ! process_identity_matches "$pid_file"; then
+    local status
+    if process_identity_matches "$pid_file"; then
+        :
+    else
+        status=$?
+        case "$status" in
+        3 | 4) ;;
+        *) die "$name process identity is unknown; preserving metadata" ;;
+        esac
         clear_process_identity "$pid_file"
         info "$name stopped"
         return
     fi
-    signal_process_group TERM "$pid_file" 2>/dev/null || true
+    if signal_process_group TERM "$pid_file" 2>/dev/null; then
+        :
+    else
+        status=$?
+        case "$status" in
+        3 | 4)
+            clear_process_identity "$pid_file"
+            info "$name stopped"
+            return
+            ;;
+        5) die "$name process identity became unknown before SIGTERM; preserving metadata" ;;
+        *) die "$name could not be signalled with SIGTERM; preserving metadata" ;;
+        esac
+    fi
     if wait_for_process_exit "$pid_file" "$term_wait_seconds"; then
         clear_process_identity "$pid_file"
         info "$name stopped"
         return
+    else
+        status=$?
+        [ "$status" -eq 6 ] \
+            || die "$name process identity became unknown after SIGTERM; preserving metadata"
     fi
     if [ "$allow_force_kill" != true ]; then
         die "$name did not stop within ${term_wait_seconds}s; refusing to orphan its child process group"
     fi
-    signal_process_group KILL "$pid_file" 2>/dev/null || true
-    if ! wait_for_process_exit "$pid_file" "$kill_wait_seconds"; then
+    if signal_process_group KILL "$pid_file" 2>/dev/null; then
+        :
+    else
+        status=$?
+        case "$status" in
+        3 | 4)
+            clear_process_identity "$pid_file"
+            info "$name stopped"
+            return
+            ;;
+        5) die "$name process identity became unknown before SIGKILL; preserving metadata" ;;
+        *) die "$name could not be signalled with SIGKILL; preserving metadata" ;;
+        esac
+    fi
+    if wait_for_process_exit "$pid_file" "$kill_wait_seconds"; then
+        :
+    else
+        status=$?
+        if [ "$status" -eq 5 ]; then
+            die "$name process identity became unknown after SIGKILL; preserving metadata"
+        fi
         die "$name remained alive ${kill_wait_seconds}s after SIGKILL"
     fi
     clear_process_identity "$pid_file"
@@ -2195,24 +2329,41 @@ stop_process() {
 stop_decision_launcher_without_budget() {
     local launcher_pid=$1 launcher_executable=$2
     local launcher_start_time=$3 launcher_service_nonce=$4
-    captured_process_identity_matches \
+    local status
+    if captured_process_identity_matches \
         "$launcher_pid" \
         "$launcher_executable" \
         "$launcher_start_time" \
-        "$launcher_service_nonce" \
-        || die "decision runtime launcher identity changed before shutdown handoff; preserving metadata"
+        "$launcher_service_nonce"; then
+        :
+    else
+        status=$?
+        case "$status" in
+        3 | 4) die "decision runtime launcher identity changed before shutdown handoff; preserving metadata" ;;
+        *) die "decision runtime launcher identity is unknown before shutdown handoff; preserving metadata" ;;
+        esac
+    fi
     "$KILL_BIN" -s TERM "-$launcher_pid" \
         || die "failed to signal verified decision runtime launcher; preserving metadata"
     local polls=$MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS
-    while captured_process_identity_matches \
-        "$launcher_pid" \
-        "$launcher_executable" \
-        "$launcher_start_time" \
-        "$launcher_service_nonce"; do
-        [ "$polls" -gt 0 ] \
-            || die "Hermes decision runtime did not stop within ${MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS}s; refusing to orphan its child process group"
-        "$SLEEP_BIN" 1
-        polls=$((polls - 1))
+    while true; do
+        if captured_process_identity_matches \
+            "$launcher_pid" \
+            "$launcher_executable" \
+            "$launcher_start_time" \
+            "$launcher_service_nonce"; then
+            [ "$polls" -gt 0 ] \
+                || die "Hermes decision runtime did not stop within ${MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS}s; refusing to orphan its child process group"
+            "$SLEEP_BIN" 1
+            polls=$((polls - 1))
+            continue
+        else
+            status=$?
+        fi
+        case "$status" in
+        3 | 4) return 0 ;;
+        *) die "decision runtime launcher identity became unknown during shutdown; preserving metadata" ;;
+        esac
     done
 }
 
@@ -3303,11 +3454,15 @@ cmd_stop() {
 }
 
 service_status() {
-    local name=$1 file=$2
+    local name=$1 file=$2 status
     if pid_running "$file"; then
         info "$name: running (pid $PROCESS_PID)"
     else
-        info "$name: stopped"
+        status=$?
+        case "$status" in
+        3 | 4) info "$name: stopped" ;;
+        *) info "$name: unknown (process identity is unprovable)" ;;
+        esac
     fi
 }
 

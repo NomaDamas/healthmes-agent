@@ -21,6 +21,7 @@ import errno
 import hashlib
 import math
 import os
+import selectors
 import signal
 import stat
 import subprocess
@@ -40,6 +41,7 @@ _DARWIN_MAXCOMLEN = 16
 _AT_FDCWD = -100
 _LINUX_RENAME_NOREPLACE = 1
 _DARWIN_RENAME_EXCL = 0x00000004
+_MAX_PS_OUTPUT_BYTES = 64 * 1024
 
 
 class _IdentityUnavailable(RuntimeError):
@@ -55,6 +57,10 @@ class _GenerationChanged(RuntimeError):
 
 
 class _ProcessAbsent(RuntimeError):
+    pass
+
+
+class _PsOutputOversized(RuntimeError):
     pass
 
 
@@ -345,6 +351,97 @@ def _read_bounded_regular_file(
         os.close(descriptor)
 
 
+def _native_process_existence_state(pid: int) -> str:
+    try:
+        token = _start_token(pid)
+    except _IdentityUnavailable:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "gone"
+        except PermissionError:
+            return "live"
+        except OSError as exc:
+            raise _IdentityUnavailable(
+                "native_identity_process_existence_unavailable"
+            ) from exc
+        return "live"
+    return "gone" if token is None else "live"
+
+
+def _terminate_ps_probe(
+    process: subprocess.Popen[bytes],
+    deadline: float,
+) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            pass
+    else:
+        process.poll()
+
+
+def _collect_bounded_ps_output(
+    process: subprocess.Popen[bytes],
+    deadline: float,
+) -> tuple[bytes, bytes]:
+    selector = selectors.DefaultSelector()
+    stdout = bytearray()
+    stderr = bytearray()
+    streams = (
+        (process.stdout, stdout),
+        (process.stderr, stderr),
+    )
+    try:
+        for stream, target in streams:
+            if stream is None:
+                continue
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, target)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, 0)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(process.args, remaining)
+            for key, _ in events:
+                stream = key.fileobj
+                target = key.data
+                try:
+                    chunk = os.read(stream.fileno(), 4096)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                target.extend(chunk)
+                if len(stdout) + len(stderr) > _MAX_PS_OUTPUT_BYTES:
+                    raise _PsOutputOversized
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, 0)
+        process.wait(timeout=remaining)
+        return bytes(stdout), bytes(stderr)
+    finally:
+        selector.close()
+
+
 def _bounded_ps_value(
     *,
     ps_bin: str,
@@ -370,7 +467,6 @@ def _bounded_ps_value(
             [ps_bin, "-ww", "-p", str(pid), "-o", f"{field}="],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             env=environment,
             start_new_session=True,
         )
@@ -381,41 +477,33 @@ def _bounded_ps_value(
     deadline = time.monotonic() + timeout_seconds
     cleanup_reserve = min(0.1, timeout_seconds / 4)
     try:
-        stdout, stderr = process.communicate(
-            timeout=max(0.001, timeout_seconds - cleanup_reserve)
+        stdout_bytes, stderr_bytes = _collect_bounded_ps_output(
+            process,
+            deadline - cleanup_reserve,
         )
     except subprocess.TimeoutExpired as exc:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-        # A hostile wrapper can detach a descendant that keeps inherited
-        # pipes open. Close our pipe ends and bound direct-child reap rather
-        # than calling communicate() without another deadline.
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            try:
-                process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                pass
-        else:
-            process.poll()
+        _terminate_ps_probe(process, deadline)
+        if _native_process_existence_state(pid) == "gone":
+            raise _ProcessAbsent(
+                "native_identity_ps_process_absent"
+            ) from exc
         raise _IdentityUnavailable(
             "native_identity_ps_probe_timeout"
         ) from exc
-    output = stdout.strip()
-    error = stderr.strip()
+    except _PsOutputOversized as exc:
+        _terminate_ps_probe(process, deadline)
+        raise _IdentityUnavailable(
+            "native_identity_ps_output_oversized"
+        ) from exc
+    try:
+        output = stdout_bytes.decode("utf-8").strip()
+        error = stderr_bytes.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_ps_output_invalid"
+        ) from exc
     if process.returncode != 0:
-        if not output and not error:
+        if _native_process_existence_state(pid) == "gone":
             raise _ProcessAbsent("native_identity_ps_process_absent")
         raise _IdentityUnavailable(
             "native_identity_ps_probe_failed"
@@ -431,6 +519,154 @@ def _bounded_ps_value(
             "native_identity_ps_output_invalid"
         )
     return output
+
+
+def _valid_identity_nonce(value: str) -> bool:
+    return (
+        bool(value)
+        and len(value) <= 128
+        and value.isascii()
+        and all(character.isalnum() or character == "-" for character in value)
+    )
+
+
+def _valid_start_token(
+    value: str,
+    *,
+    prefixes: tuple[str, ...],
+) -> bool:
+    return (
+        bool(value)
+        and len(value) <= 256
+        and value.isascii()
+        and value.startswith(prefixes)
+        and "\t" not in value
+        and "\n" not in value
+        and "\r" not in value
+    )
+
+
+def _parse_shutdown_budget_payload(
+    payload: bytes,
+    *,
+    max_bytes: int,
+    max_drain_seconds: int,
+) -> None:
+    if (
+        max_bytes < 1
+        or max_drain_seconds < 1
+        or not payload
+        or len(payload) > max_bytes
+        or not payload.endswith(b"\n")
+        or b"\r" in payload
+    ):
+        raise _IdentityUnavailable(
+            "native_identity_shutdown_budget_invalid"
+        )
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_shutdown_budget_invalid"
+        ) from exc
+    lines = text[:-1].split("\n")
+    if not lines or any(not line for line in lines):
+        raise _IdentityUnavailable(
+            "native_identity_shutdown_budget_invalid"
+        )
+    fields: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("\t")
+        if not separator or key in fields:
+            raise _IdentityUnavailable(
+                "native_identity_shutdown_budget_invalid"
+            )
+        fields[key] = value
+    version = fields.get("version")
+    if version == "3":
+        expected = {
+            "version",
+            "drain_timeout_seconds",
+            "launcher_pid",
+            "launcher_start_token",
+            "launcher_service_nonce",
+            "supervisor_pid",
+            "supervisor_start_token",
+            "publication_instance_nonce",
+        }
+    elif version in {"1", "2"}:
+        expected = {
+            "version",
+            "drain_timeout_seconds",
+            "supervisor_pid",
+            "supervisor_start_token",
+            "service_nonce",
+        }
+        if version == "2":
+            expected.add("publication_instance_nonce")
+    else:
+        raise _IdentityUnavailable(
+            "native_identity_shutdown_budget_invalid"
+        )
+    if set(fields) != expected:
+        raise _IdentityUnavailable(
+            "native_identity_shutdown_budget_invalid"
+        )
+    try:
+        drain_timeout = int(fields["drain_timeout_seconds"])
+        supervisor_pid = int(fields["supervisor_pid"])
+        launcher_pid = (
+            int(fields["launcher_pid"])
+            if version == "3"
+            else supervisor_pid
+        )
+    except ValueError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_shutdown_budget_invalid"
+        ) from exc
+    if (
+        not 1 <= drain_timeout <= max_drain_seconds
+        or launcher_pid < 1
+        or supervisor_pid < 1
+    ):
+        raise _IdentityUnavailable(
+            "native_identity_shutdown_budget_invalid"
+        )
+    launcher_start_token = (
+        fields["launcher_start_token"]
+        if version == "3"
+        else fields["supervisor_start_token"]
+    )
+    launcher_service_nonce = (
+        fields["launcher_service_nonce"]
+        if version == "3"
+        else fields["service_nonce"]
+    )
+    if (
+        not _valid_start_token(
+            launcher_start_token,
+            prefixes=("linux:", "darwin:", "ps:"),
+        )
+        or not _valid_identity_nonce(launcher_service_nonce)
+        or not _valid_start_token(
+            fields["supervisor_start_token"],
+            prefixes=(
+                ("linux:", "darwin:")
+                if version == "3"
+                else ("linux:", "darwin:", "ps:")
+            ),
+        )
+    ):
+        raise _IdentityUnavailable(
+            "native_identity_shutdown_budget_invalid"
+        )
+    publication_nonce = fields.get("publication_instance_nonce")
+    if publication_nonce is not None and not _valid_identity_nonce(
+        publication_nonce
+    ):
+        raise _IdentityUnavailable(
+            "native_identity_shutdown_budget_invalid"
+        )
 
 
 def _bounded_ps_snapshot(
@@ -786,6 +1022,21 @@ def _parse_args() -> argparse.Namespace:
         required=True,
         type=float,
     )
+    shutdown_budget = subparsers.add_parser(
+        "read-shutdown-budget",
+        add_help=False,
+    )
+    shutdown_budget.add_argument("path", type=Path)
+    shutdown_budget.add_argument(
+        "--max-bytes",
+        required=True,
+        type=int,
+    )
+    shutdown_budget.add_argument(
+        "--max-drain-seconds",
+        required=True,
+        type=int,
+    )
     return parser.parse_args()
 
 
@@ -849,6 +1100,19 @@ def main() -> int:
                 strict=True,
             ):
                 print(f"{field}\t{value}")
+            return 0
+        if args.action == "read-shutdown-budget":
+            payload = _read_bounded_regular_file(
+                args.path,
+                args.max_bytes,
+                require_ascii_text=True,
+            )
+            _parse_shutdown_budget_payload(
+                payload,
+                max_bytes=args.max_bytes,
+                max_drain_seconds=args.max_drain_seconds,
+            )
+            sys.stdout.buffer.write(payload)
             return 0
         current = _start_token(args.pid)
         if current is None:

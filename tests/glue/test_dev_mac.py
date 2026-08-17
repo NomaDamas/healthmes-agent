@@ -19,6 +19,10 @@ from pathlib import Path
 import pytest
 import yaml
 
+from healthmes.hermes_runtime_supervisor import (
+    load_runtime_shutdown_budget,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "dev_mac.sh"
 LOCAL_SCRIPT = REPO_ROOT / "scripts" / "healthmes_local.sh"
@@ -30,6 +34,7 @@ MAKEFILE = REPO_ROOT / "Makefile"
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 DEVELOPMENT_DOC = REPO_ROOT / "docs" / "DEVELOPMENT.md"
 README = REPO_ROOT / "README.md"
+FAKE_MANAGED_PID = "2147483646"
 
 
 def _function_body(text: str, name: str) -> str:
@@ -47,7 +52,7 @@ def _write_process_identity(
     runtime_dir: Path,
     *,
     process_name: str = "healthmes",
-    pid: str = "4242",
+    pid: str = FAKE_MANAGED_PID,
     executable: str = "/bin/bash",
     start_time: str = "Mon Aug  3 12:00:00 2026",
     nonce: str = "abc123",
@@ -74,7 +79,7 @@ def _write_decision_stop_budget(
     runtime_dir: Path,
     *,
     drain_timeout_seconds: int,
-    pid: str = "4242",
+    pid: str = FAKE_MANAGED_PID,
     start_time: str = "Mon Aug  3 12:00:00 2026",
     nonce: str = "abc123",
     supervisor_pid: str = "4343",
@@ -128,7 +133,7 @@ def _write_decision_startup_lease(
     runtime_dir: Path,
     *,
     phase: str = "spawned",
-    pid: str = "4242",
+    pid: str = FAKE_MANAGED_PID,
     nonce: str = "abc123",
     owner_pid: str = "999998",
     owner_start_token: str = "ps:Mon Aug 17 11:00:00 2026",
@@ -484,7 +489,7 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         """,
     )
 
-    pid = "4242"
+    pid = FAKE_MANAGED_PID
     nonce = "abc123"
     (process_state / "alive").touch()
     for name, value in (
@@ -597,6 +602,30 @@ def _nonreturning_ps(tmp_path: Path) -> Path:
         """
         #!/usr/bin/env bash
         /bin/sleep 30
+        """,
+    )
+    return path
+
+
+def _malformed_ps(tmp_path: Path) -> Path:
+    path = tmp_path / "malformed-ps"
+    _write_executable(
+        path,
+        """
+        #!/usr/bin/env bash
+        printf 'malformed\\trow\\n'
+        """,
+    )
+    return path
+
+
+def _oversized_ps(tmp_path: Path) -> Path:
+    path = tmp_path / "oversized-ps"
+    _write_executable(
+        path,
+        """
+        #!/usr/bin/env bash
+        head -c 131072 /dev/zero | tr '\\0' x
         """,
     )
     return path
@@ -1271,11 +1300,17 @@ def test_stop_disables_keepalive_before_signaling_verified_process_group(
     bootout = next(
         index for index, event in enumerate(events) if event.startswith("launchctl bootout ")
     )
-    term = events.index("kill -s TERM -4242")
-    hard_kill = events.index("kill -s KILL -4242")
+    term = events.index(f"kill -s TERM -{FAKE_MANAGED_PID}")
+    hard_kill = events.index(f"kill -s KILL -{FAKE_MANAGED_PID}")
     assert disable < bootout < term < hard_kill
-    _assert_identity_check_immediately_before(events, "kill -s TERM -4242")
-    _assert_identity_check_immediately_before(events, "kill -s KILL -4242")
+    _assert_identity_check_immediately_before(
+        events,
+        f"kill -s TERM -{FAKE_MANAGED_PID}",
+    )
+    _assert_identity_check_immediately_before(
+        events,
+        f"kill -s KILL -{FAKE_MANAGED_PID}",
+    )
     assert not (Path(harness["runtime"]) / "healthmes.pid").exists()
     assert not (Path(harness["runtime"]) / "healthmes.pid.identity").exists()
 
@@ -1472,7 +1507,7 @@ def test_decision_stop_rechecks_budget_published_during_startup_stop(
     assert published_budget.read_bytes() == late_budget.read_bytes()
     assert pid_file.exists()
     assert pid_file.with_suffix(".pid.identity").exists()
-    assert "kill -s TERM -4242" in _event_lines(harness)
+    assert f"kill -s TERM -{FAKE_MANAGED_PID}" in _event_lines(harness)
 
 
 def test_decision_stop_accepts_late_budget_only_after_cleanup_removes_it(
@@ -1527,9 +1562,9 @@ def test_decision_stop_hands_off_budget_published_during_group_probe(
     )
 
     events = _event_lines(harness)
-    assert "kill -s TERM -4242" in events
+    assert f"kill -s TERM -{FAKE_MANAGED_PID}" in events
     assert any(
-        "--runtime-process-group-pgid 4242" in event
+        f"--runtime-process-group-pgid {FAKE_MANAGED_PID}" in event
         for event in events
         if event.startswith("runtime-python ")
     )
@@ -1727,6 +1762,55 @@ def test_status_rejects_unsafe_shutdown_budget_paths(
     )
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        pytest.param(lambda payload: payload + b"\n", id="trailing-blank-line"),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"drain_timeout_seconds\t2\n",
+                b"drain_timeout_seconds\t2\n"
+                b"drain_timeout_seconds\t2\n",
+            ),
+            id="duplicate-field",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                f"launcher_pid\t{FAKE_MANAGED_PID}\n".encode(),
+                f"\nlauncher_pid\t{FAKE_MANAGED_PID}\n".encode(),
+            ),
+            id="embedded-blank-line",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(b"\n", b"\r\n"),
+            id="crlf",
+        ),
+    ),
+)
+def test_shutdown_budget_malformed_corpus_has_python_shell_parity(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+    )
+    budget.write_bytes(mutation(budget.read_bytes()))
+
+    with pytest.raises(ValueError, match="shutdown budget is invalid"):
+        load_runtime_shutdown_budget(budget)
+
+    result = _run_local_runtime(harness, "status", timeout=4)
+
+    assert (
+        "Hermes decision runtime: unknown "
+        "(shutdown budget is malformed or unsafe)"
+        in result.stdout
+    )
+
+
 @pytest.mark.parametrize("version", (1, 2))
 def test_decision_stop_uses_conservative_legacy_compatibility_budget(
     tmp_path: Path,
@@ -1752,7 +1836,7 @@ def test_decision_stop_uses_conservative_legacy_compatibility_budget(
 
     assert result.returncode != 0
     assert _event_lines(harness).count("sleep 1") == 317
-    assert "kill -s TERM -4242" in _event_lines(harness)
+    assert f"kill -s TERM -{FAKE_MANAGED_PID}" in _event_lines(harness)
     assert budget.exists()
 
 
@@ -1822,7 +1906,7 @@ def test_decision_stop_recovers_unverified_startup_from_matching_v3_budget(
     harness = _local_runtime_harness(tmp_path)
     runtime = Path(harness["runtime"])
     pid_file = runtime / "hermes-decision.pid"
-    pid_file.write_text("4242\n", encoding="ascii")
+    pid_file.write_text(f"{FAKE_MANAGED_PID}\n", encoding="ascii")
     lease = _write_decision_startup_lease(runtime)
     budget = _write_decision_stop_budget(
         runtime,
@@ -1853,9 +1937,17 @@ def test_decision_stop_preserves_unverified_startup_without_v3_budget(
     harness = _local_runtime_harness(tmp_path)
     runtime = Path(harness["runtime"])
     fake_bin = Path(harness["env"]["PATH"].split(":", 1)[0])
+    sleeper = subprocess.Popen(
+        ["/bin/sleep", "30"],
+        start_new_session=True,
+    )
+    launcher_pid = str(sleeper.pid)
     pid_file = runtime / "hermes-decision.pid"
-    pid_file.write_text("4242\n", encoding="ascii")
-    lease = _write_decision_startup_lease(runtime)
+    pid_file.write_text(f"{launcher_pid}\n", encoding="ascii")
+    lease = _write_decision_startup_lease(
+        runtime,
+        pid=launcher_pid,
+    )
     unknown_launcher_ps = fake_bin / "unknown-launcher-ps"
     _write_executable(
         unknown_launcher_ps,
@@ -1877,7 +1969,7 @@ def test_decision_stop_preserves_unverified_startup_without_v3_budget(
             esac
             shift
         done
-        if [ "$requested_pid" = "4242" ]; then
+        if [ "$requested_pid" = "$FAKE_UNKNOWN_LAUNCHER_PID" ]; then
             printf 'permission denied\\n' >&2
             exit 2
         fi
@@ -1892,33 +1984,40 @@ def test_decision_stop_preserves_unverified_startup_without_v3_budget(
         """,
     )
 
-    env_overrides = {"HEALTHMES_PS_BIN": str(unknown_launcher_ps)}
-    result = _run_local_runtime(
-        harness,
-        "stop",
-        check=False,
-        env_overrides=env_overrides,
-    )
-    status = _run_local_runtime(
-        harness,
-        "status",
-        env_overrides=env_overrides,
-    )
+    env_overrides = {
+        "HEALTHMES_PS_BIN": str(unknown_launcher_ps),
+        "FAKE_UNKNOWN_LAUNCHER_PID": launcher_pid,
+    }
+    try:
+        result = _run_local_runtime(
+            harness,
+            "stop",
+            check=False,
+            env_overrides=env_overrides,
+        )
+        status = _run_local_runtime(
+            harness,
+            "status",
+            env_overrides=env_overrides,
+        )
 
-    assert result.returncode != 0
-    assert "startup launcher identity is unknown" in result.stderr
-    assert (
-        "Hermes decision runtime: unknown "
-        "(startup launcher identity is unverified; "
-        "PID tombstone and lease are preserved)"
-        in status.stdout
-    )
-    assert pid_file.exists()
-    assert lease.exists()
-    assert not any(
-        event.startswith("kill -s ")
-        for event in _event_lines(harness)
-    )
+        assert result.returncode != 0
+        assert "startup launcher identity is unknown" in result.stderr
+        assert (
+            "Hermes decision runtime: unknown "
+            "(startup launcher identity is unverified; "
+            "PID tombstone and lease are preserved)"
+            in status.stdout
+        )
+        assert pid_file.exists()
+        assert lease.exists()
+        assert not any(
+            event.startswith("kill -s ")
+            for event in _event_lines(harness)
+        )
+    finally:
+        sleeper.terminate()
+        sleeper.wait(timeout=5)
 
 
 def test_pending_decision_startup_intent_blocks_stop_and_reports_starting(
@@ -1954,7 +2053,7 @@ def test_unverified_startup_rejects_v3_budget_from_another_generation(
     harness = _local_runtime_harness(tmp_path)
     runtime = Path(harness["runtime"])
     pid_file = runtime / "hermes-decision.pid"
-    pid_file.write_text("4242\n", encoding="ascii")
+    pid_file.write_text(f"{FAKE_MANAGED_PID}\n", encoding="ascii")
     lease = _write_decision_startup_lease(runtime)
     budget = _write_decision_stop_budget(
         runtime,
@@ -2146,9 +2245,10 @@ def test_unknown_lifecycle_lock_owner_fails_closed_without_signal(
     harness = _local_runtime_harness(tmp_path)
     runtime = Path(harness["runtime"])
     fake_bin = Path(harness["env"]["PATH"].split(":", 1)[0])
+    owner_pid = str(os.getpid())
     lock = _write_decision_lifecycle_lock(
         runtime,
-        owner_pid="888888",
+        owner_pid=owner_pid,
     )
     unknown_owner_ps = fake_bin / "unknown-lock-owner-ps"
     _write_executable(
@@ -2171,7 +2271,7 @@ def test_unknown_lifecycle_lock_owner_fails_closed_without_signal(
             esac
             shift
         done
-        if [ "$requested_pid" = "888888" ]; then
+        if [ "$requested_pid" = "$FAKE_UNKNOWN_OWNER_PID" ]; then
             printf 'permission denied\\n' >&2
             exit 2
         fi
@@ -2187,7 +2287,10 @@ def test_unknown_lifecycle_lock_owner_fails_closed_without_signal(
         harness,
         "stop",
         check=False,
-        env_overrides={"HEALTHMES_PS_BIN": str(unknown_owner_ps)},
+        env_overrides={
+            "HEALTHMES_PS_BIN": str(unknown_owner_ps),
+            "FAKE_UNKNOWN_OWNER_PID": owner_pid,
+        },
     )
 
     assert result.returncode != 0
@@ -2205,7 +2308,7 @@ def test_nonreturning_ps_cannot_exceed_lifecycle_lock_budget(
     harness = _local_runtime_harness(tmp_path)
     lock = _write_decision_lifecycle_lock(
         Path(harness["runtime"]),
-        owner_pid="999999",
+        owner_pid=str(os.getpid()),
         owner_start_token="ps:Mon Aug 17 10:00:00 2026",
     )
     started = time.monotonic()
@@ -2224,6 +2327,107 @@ def test_nonreturning_ps_cannot_exceed_lifecycle_lock_budget(
     assert result.returncode != 0
     assert "owner identity is unknown" in result.stderr
     assert lock.exists()
+
+
+@pytest.mark.parametrize("ps_behavior", ("silent-failure", "hang"))
+def test_legacy_lifecycle_lock_preserves_live_owner_when_ps_is_unavailable(
+    tmp_path: Path,
+    ps_behavior: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    lock = _write_decision_lifecycle_lock(
+        Path(harness["runtime"]),
+        owner_pid=str(os.getpid()),
+        owner_start_token="ps:Mon Aug 17 10:00:00 2026",
+    )
+    ps_bin = (
+        Path("/usr/bin/false")
+        if ps_behavior == "silent-failure"
+        else _nonreturning_ps(tmp_path)
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={"HEALTHMES_PS_BIN": str(ps_bin)},
+        timeout=4,
+    )
+
+    assert result.returncode != 0
+    assert "lifecycle lock owner identity is unknown" in result.stderr
+    assert lock.exists()
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+@pytest.mark.parametrize(
+    "ps_behavior",
+    ("silent-failure", "hang", "malformed"),
+)
+def test_stop_preserves_live_process_metadata_when_ps_is_unknown(
+    tmp_path: Path,
+    ps_behavior: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    sleeper = subprocess.Popen(
+        ["/bin/sleep", "30"],
+        start_new_session=True,
+    )
+    pid_file = _write_process_identity(
+        runtime,
+        pid=str(sleeper.pid),
+    )
+    if ps_behavior == "silent-failure":
+        ps_bin = Path("/usr/bin/false")
+    elif ps_behavior == "hang":
+        ps_bin = _nonreturning_ps(tmp_path)
+    else:
+        ps_bin = _malformed_ps(tmp_path)
+
+    try:
+        result = _run_local_runtime(
+            harness,
+            "stop",
+            check=False,
+            env_overrides={"HEALTHMES_PS_BIN": str(ps_bin)},
+            timeout=8,
+        )
+
+        assert result.returncode != 0
+        assert "identity is unknown" in result.stderr
+        assert pid_file.exists()
+        assert pid_file.with_suffix(".pid.identity").exists()
+        os.kill(sleeper.pid, 0)
+        assert not any(
+            event.startswith("kill ")
+            for event in _event_lines(harness)
+        )
+    finally:
+        sleeper.terminate()
+        sleeper.wait(timeout=5)
+
+
+def test_native_ps_probe_rejects_oversized_output(tmp_path: Path) -> None:
+    result = _run_native_identity_helper(
+        "ps-value",
+        "--ps-bin",
+        str(_oversized_ps(tmp_path)),
+        "--pid",
+        str(os.getpid()),
+        "--field",
+        "command",
+        "--timeout-seconds",
+        "2",
+        check=False,
+    )
+
+    assert result.returncode == 5
+    assert result.stdout == ""
+    assert "native_identity_ps_output_oversized" in result.stderr
 
 
 def test_incomplete_lifecycle_lock_fails_closed_and_is_preserved(
@@ -2315,7 +2519,7 @@ def test_interrupted_lifecycle_record_with_live_owner_is_preserved(
     runtime = Path(harness["runtime"])
     lock = _write_decision_lifecycle_lock(
         runtime,
-        owner_pid="4242",
+        owner_pid=FAKE_MANAGED_PID,
         owner_start_token="ps:Mon Aug  3 12:00:00 2026",
     )
     orphan = runtime / ".lifecycle-lock-record.interrupted"
@@ -2461,7 +2665,7 @@ def test_nonreturning_ps_cannot_exceed_startup_recovery_budget(
     lease = _write_decision_startup_lease(
         Path(harness["runtime"]),
         phase="intent",
-        owner_pid="999998",
+        owner_pid=str(os.getpid()),
         owner_start_token="ps:Mon Aug 17 10:00:00 2026",
     )
     started = time.monotonic()
@@ -3187,8 +3391,10 @@ def test_generic_stop_bounds_term_and_post_kill_wait(
     events = _event_lines(harness)
     assert result.returncode != 0
     assert events.count("sleep 1") == 3
-    assert events.index("kill -s TERM -4242") < events.index(
-        "kill -s KILL -4242"
+    assert events.index(
+        f"kill -s TERM -{FAKE_MANAGED_PID}"
+    ) < events.index(
+        f"kill -s KILL -{FAKE_MANAGED_PID}"
     )
     assert "remained alive 1s after SIGKILL" in result.stderr
     assert pid_file.exists()
@@ -3245,9 +3451,12 @@ def test_pid_reuse_after_term_blocks_followup_kill(tmp_path: Path) -> None:
     _run_local_runtime(harness, "stop", term_behavior="reuse")
 
     events = _event_lines(harness)
-    assert "kill -s TERM -4242" in events
-    assert "kill -s KILL -4242" not in events
-    _assert_identity_check_immediately_before(events, "kill -s TERM -4242")
+    assert f"kill -s TERM -{FAKE_MANAGED_PID}" in events
+    assert f"kill -s KILL -{FAKE_MANAGED_PID}" not in events
+    _assert_identity_check_immediately_before(
+        events,
+        f"kill -s TERM -{FAKE_MANAGED_PID}",
+    )
 
 
 def test_status_never_signals_a_stale_process(tmp_path: Path) -> None:

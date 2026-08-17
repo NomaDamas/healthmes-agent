@@ -3222,6 +3222,7 @@ def _parse_runtime_shutdown_budget(
         not payload
         or len(payload) > _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES
         or not payload.endswith(b"\n")
+        or b"\r" in payload
     ):
         raise ValueError("runtime shutdown budget is invalid")
     try:
