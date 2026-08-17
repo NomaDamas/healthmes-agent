@@ -305,11 +305,14 @@ capture_process_identity() {
         return "$status"
     fi
     marker="healthmes_local.sh __service_runner $nonce "
-    [ "$SNAPSHOT_PID" = "$pid" ] \
+    if [ "$SNAPSHOT_PID" = "$pid" ] \
         && [ "$SNAPSHOT_PGID" = "$pid" ] \
         && [ "${SNAPSHOT_EXECUTABLE##*/}" = "bash" ] \
-        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]] \
-        || return 1
+        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]; then
+        :
+    else
+        return 4
+    fi
     write_process_identity "$pid_file" "$pid" "$nonce"
 }
 
@@ -1892,12 +1895,36 @@ start_process() {
     fi
     pid="$(<"$pid_file")"
     "$SLEEP_BIN" 1
-    if ! capture_process_identity "$pid_file" "$pid" "$nonce"; then
+    if capture_process_identity "$pid_file" "$pid" "$nonce"; then
+        :
+    else
+        identity_status=$?
         if [ -n "$startup_lease" ]; then
-            die "$name launcher identity is unknown; preserving the startup lease and PID tombstone"
+            case "$identity_status" in
+            3)
+                die "$name launcher exited before identity verification; preserving the startup lease and PID tombstone"
+                ;;
+            4)
+                die "$name launcher PID was reused before identity verification; preserving the startup lease and PID tombstone"
+                ;;
+            *)
+                die "$name launcher identity is unknown; preserving the startup lease and PID tombstone"
+                ;;
+            esac
         fi
-        clear_process_identity "$pid_file"
-        die "$name failed identity verification; see $log_file"
+        case "$identity_status" in
+        3)
+            clear_process_identity "$pid_file"
+            die "$name exited before identity verification; see $log_file"
+            ;;
+        4)
+            clear_process_identity "$pid_file"
+            die "$name launcher PID was reused before identity verification; see $log_file"
+            ;;
+        *)
+            die "$name launcher identity is unknown; preserving PID metadata"
+            ;;
+        esac
     fi
     if [ -n "$startup_lease" ]; then
         if ! mark_decision_runtime_startup_identity_verified \

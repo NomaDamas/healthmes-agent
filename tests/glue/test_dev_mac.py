@@ -607,6 +607,32 @@ def _nonreturning_ps(tmp_path: Path) -> Path:
     return path
 
 
+def _install_generic_start_case(
+    harness: dict[str, object],
+    *,
+    service_name: str,
+    pid_variable: str,
+    log_variable: str,
+    command: str,
+) -> None:
+    local_script = Path(harness["local_script"])
+    script = local_script.read_text(encoding="utf-8")
+    test_case = textwrap.dedent(
+        f"""
+        case "${{1:-}}" in
+        __test_start_generic)
+            start_process "{service_name}" \
+                "{pid_variable}" "{log_variable}" \
+                "{command}"
+            ;;
+        """
+    ).lstrip()
+    local_script.write_text(
+        script.replace('case "${1:-}" in\n', test_case, 1),
+        encoding="utf-8",
+    )
+
+
 def _malformed_ps(tmp_path: Path) -> Path:
     path = tmp_path / "malformed-ps"
     _write_executable(
@@ -3549,6 +3575,244 @@ def test_start_cleanup_only_discards_untrusted_identity_files() -> None:
     assert "clear_process_identity" in start_body
     assert "signal_process_group" not in start_body
     assert "KILL_BIN" not in start_body
+
+
+@pytest.mark.skipif(
+    shutil.which("sleep") is None,
+    reason="sleep is required",
+)
+@pytest.mark.parametrize(
+    ("service_name", "pid_variable", "log_variable", "pid_filename", "mode"),
+    (
+        (
+            "HealthMes",
+            "$HEALTHMES_PID",
+            "$HEALTHMES_LOG",
+            "healthmes.pid",
+            "failure",
+        ),
+        (
+            "Open Wearables",
+            "$OW_PID",
+            "$OW_LOG",
+            "open-wearables.pid",
+            "timeout",
+        ),
+    ),
+)
+def test_generic_start_preserves_live_pid_tombstone_when_ps_is_unknown(
+    tmp_path: Path,
+    service_name: str,
+    pid_variable: str,
+    log_variable: str,
+    pid_filename: str,
+    mode: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    fake_bin = Path(harness["env"]["PATH"].split(":", 1)[0])
+    real_sleep = shutil.which("sleep")
+    assert real_sleep is not None
+    _install_generic_start_case(
+        harness,
+        service_name=service_name,
+        pid_variable=pid_variable,
+        log_variable=log_variable,
+        command=f"exec {real_sleep} 30",
+    )
+    ps_bin = fake_bin / f"generic-start-{mode}-ps"
+    _write_executable(
+        ps_bin,
+        """
+        #!/usr/bin/env bash
+        requested_pid=
+        field=
+        while [ "$#" -gt 0 ]; do
+            if [ "$1" = "-p" ]; then
+                shift
+                requested_pid=${1:-}
+            elif [ "$1" = "-o" ]; then
+                shift
+                field=${1:-}
+            fi
+            shift
+        done
+        if [ "$field" = "lstart=" ]; then
+            printf 'Mon Aug 17 12:00:00 2026\\n'
+            exit 0
+        fi
+        if [ "$field" = "pid=" ]; then
+            case "$FAKE_GENERIC_PS_MODE" in
+            failure)
+                printf 'transient ps failure\\n' >&2
+                exit 2
+                ;;
+            timeout)
+                /bin/sleep 30
+                exit 0
+                ;;
+            esac
+        fi
+        case "$field" in
+        pid= | pgid=) printf '%s\\n' "$requested_pid" ;;
+        comm=) printf '/bin/bash\\n' ;;
+        command=)
+            printf '/bin/bash %s __service_runner abc123 test-command\\n' \
+                "$FAKE_LOCAL_SCRIPT"
+            ;;
+        *) exit 1 ;;
+        esac
+        """,
+    )
+    pid_file = runtime / pid_filename
+    identity_file = pid_file.with_suffix(".pid.identity")
+    launcher_pid: int | None = None
+    env_overrides = {
+        "HEALTHMES_PS_BIN": str(ps_bin),
+        "HEALTHMES_KILL_BIN": "/bin/kill",
+        "FAKE_GENERIC_PS_MODE": mode,
+        "FAKE_LOCAL_SCRIPT": str(harness["local_script"]),
+    }
+    try:
+        first = _run_local_runtime(
+            harness,
+            "__test_start_generic",
+            check=False,
+            env_overrides=env_overrides,
+            timeout=10,
+        )
+
+        assert first.returncode != 0
+        assert "launcher identity is unknown" in first.stderr
+        assert "preserving PID metadata" in first.stderr
+        launcher_pid = int(pid_file.read_text(encoding="ascii"))
+        os.kill(launcher_pid, 0)
+        assert not identity_file.exists()
+
+        second = _run_local_runtime(
+            harness,
+            "__test_start_generic",
+            check=False,
+            env_overrides=env_overrides,
+            timeout=10,
+        )
+
+        assert second.returncode != 0
+        assert "process identity is unknown" in second.stderr
+        assert "preserving metadata" in second.stderr
+        assert int(pid_file.read_text(encoding="ascii")) == launcher_pid
+        os.kill(launcher_pid, 0)
+    finally:
+        if launcher_pid is not None:
+            try:
+                process_group = os.getpgid(launcher_pid)
+                if process_group != os.getpgrp():
+                    os.killpg(process_group, signal.SIGTERM)
+                else:
+                    os.kill(launcher_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize("identity_state", ("absent", "reused"))
+def test_generic_start_clears_only_reliably_stale_pid_tombstones(
+    tmp_path: Path,
+    identity_state: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    fake_bin = Path(harness["env"]["PATH"].split(":", 1)[0])
+    real_sleep = shutil.which("sleep")
+    real_true = shutil.which("true")
+    assert real_sleep is not None
+    assert real_true is not None
+    command = (
+        f"exec {real_true}"
+        if identity_state == "absent"
+        else f"exec {real_sleep} 30"
+    )
+    _install_generic_start_case(
+        harness,
+        service_name="HealthMes",
+        pid_variable="$HEALTHMES_PID",
+        log_variable="$HEALTHMES_LOG",
+        command=command,
+    )
+    ps_bin = fake_bin / f"generic-start-{identity_state}-ps"
+    _write_executable(
+        ps_bin,
+        """
+        #!/usr/bin/env bash
+        requested_pid=
+        field=
+        while [ "$#" -gt 0 ]; do
+            if [ "$1" = "-p" ]; then
+                shift
+                requested_pid=${1:-}
+            elif [ "$1" = "-o" ]; then
+                shift
+                field=${1:-}
+            fi
+            shift
+        done
+        if [ "$field" = "lstart=" ]; then
+            printf 'Mon Aug 17 12:00:00 2026\\n'
+            exit 0
+        fi
+        if [ "$field" = "pid=" ]; then
+            printf '%s\\n' "$requested_pid" >"$FAKE_CAPTURED_PID"
+        fi
+        if [ "$FAKE_GENERIC_IDENTITY_STATE" = "absent" ]; then
+            exit 1
+        fi
+        case "$field" in
+        pid= | pgid=) printf '%s\\n' "$requested_pid" ;;
+        comm=) printf '/bin/bash\\n' ;;
+        lstart=) printf 'Mon Aug 17 12:00:00 2026\\n' ;;
+        command=) printf '/bin/bash unrelated-service-runner\\n' ;;
+        *) exit 1 ;;
+        esac
+        """,
+    )
+    pid_file = runtime / "healthmes.pid"
+    identity_file = pid_file.with_suffix(".pid.identity")
+    captured_pid = tmp_path / "captured-generic-start-pid"
+    launcher_pid: int | None = None
+    env_overrides = {
+        "HEALTHMES_PS_BIN": str(ps_bin),
+        "HEALTHMES_KILL_BIN": "/bin/kill",
+        "FAKE_GENERIC_IDENTITY_STATE": identity_state,
+        "FAKE_CAPTURED_PID": str(captured_pid),
+    }
+    if identity_state == "absent":
+        env_overrides["HEALTHMES_SLEEP_BIN"] = real_sleep
+    try:
+        result = _run_local_runtime(
+            harness,
+            "__test_start_generic",
+            check=False,
+            env_overrides=env_overrides,
+            timeout=10,
+        )
+
+        assert result.returncode != 0
+        if identity_state == "absent":
+            assert "exited before identity verification" in result.stderr
+        else:
+            assert "PID was reused before identity verification" in result.stderr
+            launcher_pid = int(captured_pid.read_text(encoding="ascii"))
+        assert not pid_file.exists()
+        assert not identity_file.exists()
+    finally:
+        if launcher_pid is not None:
+            try:
+                process_group = os.getpgid(launcher_pid)
+                if process_group != os.getpgrp():
+                    os.killpg(process_group, signal.SIGTERM)
+                else:
+                    os.kill(launcher_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
 
 @pytest.mark.skipif(
