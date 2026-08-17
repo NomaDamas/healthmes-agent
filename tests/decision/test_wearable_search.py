@@ -360,9 +360,8 @@ async def test_exact_retention_boundary_persists_by_oldest_record(
     )
 
     assert result.status is not ContextStatus.FAILED
-    assert calls[0].start == (
-        NOW - timedelta(days=30) + timedelta(microseconds=1)
-    )
+    assert calls[0].start == NOW - timedelta(days=30)
+    assert calls[0].retained_after == NOW - timedelta(days=30)
     assert "wearable_retention_window_trimmed" in result.limitations
     event = session.get(
         WellnessEvent,
@@ -427,19 +426,168 @@ async def test_retention_cutoff_timeseries_bucket_remains_persistable(
         now=NOW,
     )
 
-    safe_start = cutoff + timedelta(microseconds=1)
+    observed_at = cutoff + timedelta(minutes=30)
     assert result.status is ContextStatus.PARTIAL
     assert result.payload["records"][0]["timestamp"] == (
-        safe_start.isoformat()
+        observed_at.isoformat()
     )
-    assert result.source_refs[0].observed_start == safe_start
+    assert result.source_refs[0].observed_start == cutoff
     event = session.get(
         WellnessEvent,
         UUID(result.source_refs[0].record_id),
     )
     assert event is not None
-    assert event.payload["retention_basis_at"] == safe_start.isoformat()
-    assert event.expires_at.replace(tzinfo=UTC) > NOW
+    assert event.payload["retention_basis_at"] == observed_at.isoformat()
+    assert event.expires_at.replace(tzinfo=UTC) == (
+        observed_at + timedelta(days=7)
+    )
+    assert event.payload["result"]["retention_window"] == {
+        "effective_now": NOW.isoformat(),
+        "query_start": cutoff.isoformat(),
+        "query_end": (cutoff + timedelta(hours=1)).isoformat(),
+        "retained_after": cutoff.isoformat(),
+        "effective_start": cutoff.isoformat(),
+        "effective_start_inclusive": False,
+        "effective_end": (cutoff + timedelta(hours=1)).isoformat(),
+    }
+
+
+async def test_retention_snapshot_stays_valid_at_turn_effective_now(
+    session,
+) -> None:
+    update_retention_policy(
+        session,
+        OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+        "7d",
+        now=NOW,
+    )
+    cutoff = NOW - timedelta(days=7)
+    observed_at = cutoff + timedelta(seconds=1)
+
+    class NearCutoffClient:
+        async def get_timeseries(self, _user_id, *_args, **_kwargs):
+            return {
+                "data": [
+                    {
+                        "timestamp": observed_at.isoformat(),
+                        "type": "steps",
+                        "value": 10,
+                        "unit": "count",
+                        "provider": "apple",
+                        "data_source_id": "trusted-sensor",
+                    }
+                ],
+                "pagination": {
+                    "next_cursor": None,
+                    "has_more": False,
+                },
+            }
+
+    provider = WearableContextProvider(
+        search_reader=BoundedOpenWearablesSearch(
+            NearCutoffClient(),  # type: ignore[arg-type]
+            lambda: "private-user-id",
+        )
+    )
+    clock_values = iter((NOW, NOW + timedelta(seconds=2)))
+    turn = ContextAccessLayer(
+        ContextProviderRegistry((provider,)),
+        clock=lambda: next(clock_values),
+    ).start_turn(
+        _request(),
+        policy=ContextAccessPolicy(
+            owner_principal_id="owner",
+            grants=(DomainAccessGrant(domain="wearable"),),
+        ),
+    )
+
+    result = await turn.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.timeseries",
+            start=cutoff,
+            end=cutoff + timedelta(hours=1),
+            granularity="series",
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+        ),
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert "source_ref_expired" not in result.limitations
+    assert result.payload["records"][0]["timestamp"] == (
+        observed_at.isoformat()
+    )
+    event = session.get(
+        WellnessEvent,
+        UUID(result.source_refs[0].record_id),
+    )
+    assert event is not None
+    assert event.expires_at.replace(tzinfo=UTC) == (
+        NOW + timedelta(seconds=1)
+    )
+    assert turn.trace[0].occurred_at == NOW + timedelta(seconds=2)
+
+
+async def test_conflicting_cross_page_samples_are_partial_not_summed(
+    session,
+) -> None:
+    class ConflictingPagesClient:
+        async def get_timeseries(
+            self,
+            _user_id,
+            *_args,
+            cursor: str | None,
+            **_kwargs,
+        ):
+            return {
+                "data": [
+                    {
+                        "timestamp": "2026-08-16T08:05:00Z",
+                        "type": "steps",
+                        "value": 20 if cursor else 10,
+                        "unit": "count",
+                        "provider": "apple",
+                    }
+                ],
+                "pagination": {
+                    "next_cursor": "page-2" if cursor is None else None,
+                    "has_more": cursor is None,
+                },
+            }
+
+    provider = WearableContextProvider(
+        search_reader=BoundedOpenWearablesSearch(
+            ConflictingPagesClient(),  # type: ignore[arg-type]
+            lambda: "private-user-id",
+        )
+    )
+
+    result = await provider.query(
+        session,
+        ContextQuery(
+            provider_id="wearable",
+            capability="wearable.timeseries",
+            start=DETAIL_START,
+            end=DETAIL_END,
+            granularity="series",
+            parameters={
+                "series_type": "steps",
+                "resolution": "1hour",
+            },
+        ),
+        now=NOW,
+    )
+
+    assert result.status is ContextStatus.PARTIAL
+    assert [
+        record["value"] for record in result.payload["records"]
+    ] == [10, 20]
+    assert "wearable_conflicting_duplicate_rows" in result.limitations
+    assert result.coverage.status is CoverageStatus.UNKNOWN
 
 
 async def test_detail_query_clamps_to_shorter_retention_policy(
@@ -484,15 +632,12 @@ async def test_detail_query_clamps_to_shorter_retention_policy(
     )
 
     assert result.status is ContextStatus.PARTIAL
-    assert calls[0].start == (
-        NOW - timedelta(days=7) + timedelta(microseconds=1)
-    )
+    assert calls[0].start == NOW - timedelta(days=30)
+    assert calls[0].retained_after == NOW - timedelta(days=7)
     assert "wearable_retention_window_trimmed" in result.limitations
     assert result.coverage.status is CoverageStatus.UNKNOWN
     assert result.coverage.ratio is None
-    assert result.source_refs[0].observed_start == (
-        NOW - timedelta(days=7) + timedelta(microseconds=1)
-    )
+    assert result.source_refs[0].observed_start == NOW - timedelta(days=7)
     assert result.source_refs[0].coverage is None
     event = session.get(
         WellnessEvent,
@@ -713,6 +858,125 @@ async def test_file_backed_detail_search_uses_stable_mirror_ref_and_cursor(
                     == OPEN_WEARABLES_QUERY_EVENT_TYPE
                 )
             ) == 1
+    finally:
+        service.close()
+        engine.dispose()
+
+
+async def test_cursor_freezes_retention_window_and_never_refetches(
+    tmp_path,
+) -> None:
+    engine, factory = _file_store(
+        tmp_path,
+        "detail-retention-cursor.db",
+    )
+    with factory() as setup:
+        update_retention_policy(
+            setup,
+            OPEN_WEARABLES_SNAPSHOT_RETENTION_CLASS,
+            "7d",
+            now=NOW,
+        )
+        setup.commit()
+
+    cutoff = NOW - timedelta(days=7)
+    requested_start = cutoff - timedelta(hours=1)
+    requested_end = cutoff + timedelta(hours=3)
+    calls: list[WearableSearchRequest] = []
+
+    async def search_reader(
+        request: WearableSearchRequest,
+    ) -> WearableSearchFetch:
+        calls.append(request)
+        return WearableSearchFetch(
+            records=(
+                {
+                    "timestamp": (
+                        cutoff + timedelta(seconds=1)
+                    ).isoformat(),
+                    "series_type": "heart_rate",
+                    "value": 72,
+                    "unit": "bpm",
+                    "provider": "apple_health",
+                },
+                {
+                    "timestamp": (
+                        cutoff + timedelta(hours=2)
+                    ).isoformat(),
+                    "series_type": "heart_rate",
+                    "value": 76,
+                    "unit": "bpm",
+                    "provider": "apple_health",
+                },
+            )
+        )
+
+    current = [NOW]
+    service = _service(
+        factory,
+        WearableContextProvider(
+            search_reader=search_reader,
+            snapshot_session_factory=factory,
+        ),
+        clock=lambda: current[0],
+    )
+    try:
+        handle = service.begin(_request())
+        first = await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.timeseries",
+            start=requested_start,
+            end=requested_end,
+            granularity="series",
+            limit=1,
+            parameters={
+                "series_type": "heart_rate",
+                "resolution": "1hour",
+            },
+        )
+        assert first.next_cursor is not None
+
+        current[0] = NOW + timedelta(hours=1)
+        second = await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.timeseries",
+            start=requested_start,
+            end=requested_end,
+            granularity="series",
+            limit=1,
+            parameters={
+                "series_type": "heart_rate",
+                "resolution": "1hour",
+                "cursor": first.next_cursor,
+            },
+        )
+        invalid = await service.search(
+            handle.session_id,
+            domain="wearable",
+            capability="wearable.timeseries",
+            start=requested_start,
+            end=requested_end + timedelta(hours=1),
+            granularity="series",
+            limit=1,
+            parameters={
+                "series_type": "heart_rate",
+                "resolution": "1hour",
+                "cursor": first.next_cursor,
+            },
+        )
+
+        assert len(calls) == 1
+        assert calls[0].start == requested_start
+        assert calls[0].end == requested_end
+        assert calls[0].retained_after == cutoff
+        assert first.payload["records"][0]["value"] == 72
+        assert second.payload["records"][0]["value"] == 76
+        assert first.source_refs == second.source_refs
+        assert second.source_refs[0].observed_start == cutoff
+        assert invalid.status is ContextStatus.FAILED
+        assert invalid.limitations == ["invalid_provider_query"]
     finally:
         service.close()
         engine.dispose()

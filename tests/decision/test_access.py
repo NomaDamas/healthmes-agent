@@ -1038,7 +1038,9 @@ async def test_activity_permission_is_rechecked_after_provider_execution(
     assert result.limitations == ["activity_permission_revoked"]
 
 
-async def test_retention_is_rechecked_after_provider_execution(session):
+async def test_source_retention_uses_request_captured_effective_now(
+    session,
+):
     event = _event(
         domain="nutrition",
         expires_at=NOW + timedelta(seconds=1),
@@ -1075,12 +1077,12 @@ async def test_retention_is_rechecked_after_provider_execution(session):
         ),
     )
 
-    assert result.status is ContextStatus.DENIED
-    assert result.limitations == ["source_ref_expired"]
+    assert result.status is ContextStatus.OK
+    assert result.limitations == []
     assert turn.trace[0].occurred_at == NOW + timedelta(seconds=2)
 
 
-async def test_postflight_refreshes_cross_session_sqlite_retention(
+async def test_cross_session_retention_uses_request_captured_effective_now(
     tmp_path,
 ):
     engine = create_db_engine(
@@ -1142,8 +1144,9 @@ async def test_postflight_refreshes_cross_session_sqlite_retention(
                 ),
             )
 
-        assert result.status is ContextStatus.DENIED
-        assert result.limitations == ["source_ref_expired"]
+        assert result.status is ContextStatus.OK
+        assert result.limitations == []
+        assert turn.trace[0].occurred_at == NOW + timedelta(seconds=2)
     finally:
         engine.dispose()
 

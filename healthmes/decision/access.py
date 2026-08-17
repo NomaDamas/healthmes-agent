@@ -1094,6 +1094,7 @@ class ContextAccessTurn:
             if self._normalization_now is None:
                 self._normalization_now = now
             normalization_now = self._normalization_now
+            effective_now = normalization_now
             self._calls += 1
             tool_budget_exhausted = (
                 self._calls > self.request.budget.max_tool_calls
@@ -1144,7 +1145,7 @@ class ContextAccessTurn:
             result = await self._layer.registry.execute(
                 session,
                 effective_query,
-                now=now,
+                now=effective_now,
                 ensure_active=ensure_active,
             )
         except (
@@ -1272,7 +1273,7 @@ class ContextAccessTurn:
         freshness = result.freshness
         if (
             freshness.as_of is not None
-            and freshness.as_of > now + _MAX_FUTURE_SKEW
+            and freshness.as_of > effective_now + _MAX_FUTURE_SKEW
         ):
             return self._deny(
                 query,
@@ -1285,7 +1286,11 @@ class ContextAccessTurn:
                 update={
                     "age_seconds": max(
                         0,
-                        int((now - freshness.as_of).total_seconds()),
+                        int(
+                            (
+                                effective_now - freshness.as_of
+                            ).total_seconds()
+                        ),
                     )
                 }
             )
@@ -1296,7 +1301,7 @@ class ContextAccessTurn:
             effective_query,
             capability=capability,
             grant=grant,
-            now=now,
+            now=effective_now,
             calendar_visibility_snapshot=calendar_snapshot,
         )
         if ensure_active is not None:
@@ -1324,7 +1329,7 @@ class ContextAccessTurn:
                 selected_record_ids=frozenset(
                     self.request.hints.related_record_ids.values()
                 ),
-                now=now,
+                now=effective_now,
             )
             if not raw_sources:
                 return self._deny(
@@ -1392,7 +1397,7 @@ class ContextAccessTurn:
         observed_start, observed_end, collected_at = _source_ref_times(
             session,
             refs,
-            now=now,
+            now=effective_now,
         )
         if not refs and verified_empty_metadata:
             observed_start = result.observed_start
@@ -3382,23 +3387,12 @@ def _validate_wellness_event_ref(
         return None, ("source_ref_domain_mismatch",)
     expected_observed_start = _as_utc(event.observed_at)
     if event.event_type == OPEN_WEARABLES_QUERY_EVENT_TYPE:
-        window = event.payload.get("window")
-        raw_start = (
-            window.get("start")
-            if isinstance(window, Mapping)
-            else None
+        effective_window = _open_wearables_query_effective_window(
+            event
         )
-        try:
-            parsed_start = (
-                datetime.fromisoformat(raw_start)
-                if isinstance(raw_start, str)
-                else None
-            )
-        except ValueError:
-            parsed_start = None
-        if parsed_start is None or parsed_start.tzinfo is None:
+        if effective_window is None:
             return None, ("source_ref_identity_mismatch",)
-        expected_observed_start = parsed_start.astimezone(UTC)
+        expected_observed_start = effective_window[0]
     expected_observed_end, valid_window = _wellness_event_observed_end(
         event
     )
@@ -3665,6 +3659,13 @@ def _wellness_event_observed_end(
         if observed_end <= start:
             return None, False
         return observed_end, True
+    if event.event_type == OPEN_WEARABLES_QUERY_EVENT_TYPE:
+        effective_window = _open_wearables_query_effective_window(
+            event
+        )
+        if effective_window is None:
+            return None, False
+        return effective_window[1], True
     window = event.payload.get("window")
     if window is None:
         return None, True
@@ -3681,20 +3682,54 @@ def _wellness_event_observed_end(
         return None, False
     observed_end = observed_end.astimezone(UTC)
     observed_start = _as_utc(event.observed_at)
-    if event.event_type == OPEN_WEARABLES_QUERY_EVENT_TYPE:
-        raw_start = window.get("start")
-        if not isinstance(raw_start, str):
-            return None, False
-        try:
-            observed_start = datetime.fromisoformat(raw_start)
-        except ValueError:
-            return None, False
-        if observed_start.tzinfo is None:
-            return None, False
-        observed_start = observed_start.astimezone(UTC)
     if observed_end <= observed_start:
         return None, False
     return observed_end, True
+
+
+def _open_wearables_query_effective_window(
+    event: _WellnessEventSnapshot,
+) -> tuple[datetime, datetime] | None:
+    payload_window = event.payload.get("window")
+    if not isinstance(payload_window, Mapping):
+        return None
+    result = event.payload.get("result")
+    retention_window = (
+        result.get("retention_window")
+        if isinstance(result, Mapping)
+        else None
+    )
+    selected = (
+        retention_window
+        if isinstance(retention_window, Mapping)
+        else payload_window
+    )
+    start_key = (
+        "effective_start"
+        if selected is retention_window
+        else "start"
+    )
+    end_key = (
+        "effective_end"
+        if selected is retention_window
+        else "end"
+    )
+    raw_start = selected.get(start_key)
+    raw_end = selected.get(end_key)
+    if not isinstance(raw_start, str) or not isinstance(raw_end, str):
+        return None
+    try:
+        start = datetime.fromisoformat(raw_start)
+        end = datetime.fromisoformat(raw_end)
+    except ValueError:
+        return None
+    if (
+        start.tzinfo is None
+        or end.tzinfo is None
+        or end <= start
+    ):
+        return None
+    return start.astimezone(UTC), end.astimezone(UTC)
 
 
 def _calendar_day_count(

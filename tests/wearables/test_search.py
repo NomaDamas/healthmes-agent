@@ -90,6 +90,7 @@ def _request(
     *,
     start: datetime = START,
     end: datetime = END,
+    retained_after: datetime | None = None,
     **parameters: str,
 ) -> WearableSearchRequest:
     return WearableSearchRequest(
@@ -98,6 +99,7 @@ def _request(
         end=end,
         timezone="UTC",
         parameters=parameters,
+        retained_after=retained_after,
     )
 
 
@@ -328,6 +330,60 @@ async def test_timeseries_enforces_requested_resolution_locally() -> None:
             "provider_attribution": "source_exact_alias",
         },
     )
+
+
+class RetentionBoundaryClient:
+    async def get_timeseries(self, *_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:00:00Z",
+                    "type": "steps",
+                    "value": 10,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                },
+                {
+                    "timestamp": "2026-08-10T10:00:01Z",
+                    "type": "steps",
+                    "value": 20,
+                    "unit": "count",
+                    "provider": "apple",
+                    "data_source_id": "trusted-sensor",
+                },
+            ],
+            "pagination": {"next_cursor": None, "has_more": False},
+        }
+
+
+async def test_retention_cutoff_is_exclusive_without_epsilon_shift() -> None:
+    cutoff = START + timedelta(hours=10)
+    fetched = await BoundedOpenWearablesSearch(
+        RetentionBoundaryClient(),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=cutoff,
+            end=cutoff + timedelta(hours=1),
+            retained_after=cutoff,
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert fetched.records == (
+        {
+            "timestamp": "2026-08-10T10:00:01+00:00",
+            "series_type": "steps",
+            "value": 20,
+            "unit": "count",
+            "provider": "apple_health",
+            "provider_attribution": "declared",
+        },
+    )
+    assert fetched.discarded_rows == 1
 
 
 class SummableResolutionClient:
@@ -869,6 +925,198 @@ async def test_conflicting_cursor_duplicates_remain_visible_and_partial() -> Non
         "wearable_conflicting_duplicate_rows",
         "wearable_stream_attribution_unavailable",
     )
+
+
+class OverlappingCursorSummaryClient:
+    def __init__(self, *, conflicting: bool = False) -> None:
+        self.conflicting = conflicting
+
+    async def get_activity_summaries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        steps = 9000 if cursor == "page-2" and self.conflicting else 8000
+        return {
+            "data": [
+                {
+                    "id": "private-summary-id",
+                    "date": "2026-08-10",
+                    "provider": "garmin",
+                    "steps": steps,
+                }
+            ],
+            "pagination": {
+                "next_cursor": "page-2" if cursor is None else None,
+                "has_more": cursor is None,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    ("conflicting", "expected_steps", "expected_limitations"),
+    (
+        (False, [8000], ()),
+        (
+            True,
+            [8000, 9000],
+            ("wearable_conflicting_duplicate_rows",),
+        ),
+    ),
+)
+async def test_summary_cursor_overlap_uses_private_provider_identity(
+    conflicting: bool,
+    expected_steps: list[int],
+    expected_limitations: tuple[str, ...],
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        OverlappingCursorSummaryClient(
+            conflicting=conflicting
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.summaries",
+            summary_kind="activity",
+        )
+    )
+
+    assert [record["steps"] for record in fetched.records] == expected_steps
+    assert fetched.limitations == expected_limitations
+    encoded = json.dumps(fetched.records, sort_keys=True)
+    assert "private-summary-id" not in encoded
+    assert "_healthmes_row_identity" not in encoded
+
+
+class OverlappingCursorWorkoutClient:
+    def __init__(self, *, conflicting: bool = False) -> None:
+        self.conflicting = conflicting
+
+    async def get_workouts(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        distance = 6000 if cursor == "page-2" and self.conflicting else 5000
+        return {
+            "data": [
+                {
+                    "type": "running",
+                    "start_time": "2026-08-10T09:00:00Z",
+                    "end_time": "2026-08-10T09:30:00Z",
+                    "provider": "garmin",
+                    "distance_meters": distance,
+                }
+            ],
+            "pagination": {
+                "next_cursor": "page-2" if cursor is None else None,
+                "has_more": cursor is None,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    ("conflicting", "expected_distances", "expected_limitations"),
+    (
+        (False, [5000], ()),
+        (
+            True,
+            [5000, 6000],
+            ("wearable_conflicting_duplicate_rows",),
+        ),
+    ),
+)
+async def test_workout_cursor_overlap_uses_structural_identity(
+    conflicting: bool,
+    expected_distances: list[int],
+    expected_limitations: tuple[str, ...],
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        OverlappingCursorWorkoutClient(
+            conflicting=conflicting
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(_request("wearable.workouts"))
+
+    assert [
+        record["distance_meters"] for record in fetched.records
+    ] == expected_distances
+    assert fetched.limitations == expected_limitations
+
+
+class UnattributedOverlappingTimeseriesClient:
+    def __init__(self, *, conflicting: bool = False) -> None:
+        self.conflicting = conflicting
+
+    async def get_timeseries(
+        self,
+        _user_id,
+        *_args,
+        cursor: str | None,
+        **_kwargs,
+    ):
+        value = 20 if cursor == "page-2" and self.conflicting else 10
+        return {
+            "data": [
+                {
+                    "timestamp": "2026-08-10T10:10:00Z",
+                    "type": "steps",
+                    "value": value,
+                    "unit": "count",
+                    "provider": "apple",
+                }
+            ],
+            "pagination": {
+                "next_cursor": "page-2" if cursor is None else None,
+                "has_more": cursor is None,
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    ("conflicting", "expected_values", "expected_limitations"),
+    (
+        (
+            False,
+            [10],
+            ("wearable_stream_attribution_unavailable",),
+        ),
+        (
+            True,
+            [10, 20],
+            (
+                "wearable_conflicting_duplicate_rows",
+                "wearable_stream_attribution_unavailable",
+            ),
+        ),
+    ),
+)
+async def test_unattributed_timeseries_cursor_overlap_is_not_summed(
+    conflicting: bool,
+    expected_values: list[int],
+    expected_limitations: tuple[str, ...],
+) -> None:
+    fetched = await BoundedOpenWearablesSearch(
+        UnattributedOverlappingTimeseriesClient(
+            conflicting=conflicting
+        ),  # type: ignore[arg-type]
+        lambda: "private-user-id",
+    )(
+        _request(
+            "wearable.timeseries",
+            start=START + timedelta(hours=9),
+            end=START + timedelta(hours=11),
+            series_type="steps",
+            resolution="1hour",
+        )
+    )
+
+    assert [record["value"] for record in fetched.records] == expected_values
+    assert fetched.limitations == expected_limitations
 
 
 class MissingOffsetPaginationClient:

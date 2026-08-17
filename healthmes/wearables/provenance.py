@@ -40,6 +40,7 @@ _MAX_CONTEXT_BYTES = 1_000_000
 _MAX_PAYLOAD_BYTES = 2_000_000
 _MAX_QUERY_RESULT_BYTES = 220_000
 _MAX_QUERY_ROWS = 250
+_MAX_RETAINED_QUERY_CANDIDATES = 32
 _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 20_000
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
@@ -1239,6 +1240,30 @@ def latest_retained_open_wearables_query_snapshot(
 ) -> WearableQuerySnapshot | None:
     """Load the newest valid mirror for one exact bounded query."""
 
+    snapshots = retained_open_wearables_query_snapshots(
+        session,
+        capability=capability,
+        start=start,
+        end=end,
+        timezone=timezone,
+        parameters=parameters,
+        now=now,
+    )
+    return snapshots[0] if snapshots else None
+
+
+def retained_open_wearables_query_snapshots(
+    session: Session,
+    *,
+    capability: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    parameters: Mapping[str, Any],
+    now: datetime,
+) -> tuple[WearableQuerySnapshot, ...]:
+    """Load bounded retained mirrors for one exact query, newest first."""
+
     _scope, query_digest = _normalize_query_scope(
         capability=capability,
         start=start,
@@ -1264,7 +1289,9 @@ def latest_retained_open_wearables_query_snapshot(
             WellnessEvent.recorded_at.desc(),
             WellnessEvent.created_at.desc(),
         )
+        .limit(_MAX_RETAINED_QUERY_CANDIDATES)
     )
+    snapshots: list[WearableQuerySnapshot] = []
     for event in rows:
         snapshot = wearable_query_snapshot_from_event(
             session,
@@ -1272,8 +1299,8 @@ def latest_retained_open_wearables_query_snapshot(
             now=current,
         )
         if snapshot is not None and snapshot.query_digest == query_digest:
-            return snapshot
-    return None
+            snapshots.append(snapshot)
+    return tuple(snapshots)
 
 
 def wearable_snapshot_from_event(

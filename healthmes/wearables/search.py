@@ -124,7 +124,16 @@ _PROVIDER_FAMILY_ALIASES = {
     "ultrahuman": "ultrahuman",
     "whoop": "whoop",
 }
+_INTERNAL_ROW_IDENTITY = "_healthmes_row_identity"
 _INTERNAL_STREAM_KEY = "_healthmes_stream_key"
+_PROVIDER_ROW_ID_FIELDS = (
+    "id",
+    "record_id",
+    "summary_id",
+    "workout_id",
+    "sample_id",
+    "event_id",
+)
 _TRUSTED_PROVIDER_ATTRIBUTIONS = frozenset(
     {"declared", "source_exact_alias"}
 )
@@ -139,6 +148,7 @@ class WearableSearchRequest:
     end: datetime
     timezone: str
     parameters: Mapping[str, Any]
+    retained_after: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +206,7 @@ def normalize_retained_wearable_summaries(
     start: datetime,
     end: datetime,
     timezone: str,
+    retained_after: datetime | None = None,
 ) -> WearableSearchFetch:
     """Filter legacy mirrors against the exact retained summary window."""
 
@@ -213,6 +224,13 @@ def normalize_retained_wearable_summaries(
                 start=start,
                 end=end,
                 timezone=timezone,
+            )
+            or not _observation_is_retained(
+                _summary_day_bounds(
+                    observed_day,
+                    timezone=timezone,
+                )[0],
+                retained_after=retained_after,
             )
         ):
             discarded += 1
@@ -238,6 +256,7 @@ def normalize_retained_wearable_timeseries(
     start: datetime,
     end: datetime,
     stream_attribution_verified: bool = False,
+    retained_after: datetime | None = None,
 ) -> WearableSearchFetch:
     """Reapply current privacy rules to previously stored public records."""
 
@@ -262,6 +281,10 @@ def normalize_retained_wearable_timeseries(
         if (
             timestamp is None
             or not start_utc <= timestamp < end_utc
+            or not _observation_is_retained(
+                timestamp,
+                retained_after=retained_after,
+            )
             or retained_type != series_type
             or value is None
             or unit is None
@@ -277,6 +300,8 @@ def normalize_retained_wearable_timeseries(
             bucket_start,
             start=start_utc,
             end=end_utc,
+            observation=timestamp,
+            retained_after=retained_after,
         )
         result: dict[str, Any] = {
             "timestamp": public_timestamp.isoformat(),
@@ -329,6 +354,13 @@ def validate_wearable_search_request(
     if end <= start:
         raise ValueError("wearable query end must be after start")
     parse_timezone(request.timezone)
+    if request.retained_after is not None:
+        retained_after = request.retained_after
+        if (
+            retained_after.tzinfo is None
+            or retained_after.utcoffset() is None
+        ):
+            raise ValueError("wearable retention cutoff must be timezone-aware")
     unexpected = (
         set(request.parameters)
         - _CAPABILITY_PARAMETERS[request.capability]
@@ -395,6 +427,7 @@ class BoundedOpenWearablesSearch:
                 _sanitize_health_score,
                 start=request.start,
                 end=request.end,
+                retained_after=request.retained_after,
             )
         elif request.capability == "wearable.summaries":
             rows, truncated, discarded = await self._summaries(
@@ -413,6 +446,7 @@ class BoundedOpenWearablesSearch:
                 start=request.start,
                 end=request.end,
                 timezone=request.timezone,
+                retained_after=request.retained_after,
             )
         elif request.capability == "wearable.workouts":
             rows, truncated, discarded = await self._workouts(
@@ -423,6 +457,7 @@ class BoundedOpenWearablesSearch:
                 _sanitize_workout,
                 start=request.start,
                 end=request.end,
+                retained_after=request.retained_after,
             )
         else:
             rows, truncated, discarded = await self._timeseries(
@@ -435,6 +470,7 @@ class BoundedOpenWearablesSearch:
                 series_type=series_type,
                 start=request.start,
                 end=request.end,
+                retained_after=request.retained_after,
             )
 
         sanitized: list[dict[str, Any]] = []
@@ -446,16 +482,22 @@ class BoundedOpenWearablesSearch:
             sanitized.append(clean)
         conflicting_duplicate_rows = False
         stream_attribution_unavailable = False
-        if request.capability == "wearable.timeseries":
+        if request.capability in {
+            "wearable.summaries",
+            "wearable.workouts",
+            "wearable.timeseries",
+        }:
             sanitized, conflicting_duplicate_rows = (
-                _deduplicate_timeseries_records(sanitized)
+                _deduplicate_wearable_records(sanitized)
             )
+        if request.capability == "wearable.timeseries":
             sanitized, stream_attribution_unavailable = _aggregate_timeseries(
                 sanitized,
                 series_type=str(request.parameters["series_type"]),
                 resolution=str(request.parameters["resolution"]),
                 start=request.start,
                 end=request.end,
+                retained_after=request.retained_after,
             )
         sanitized.sort(key=_row_sort_key)
 
@@ -829,6 +871,115 @@ def _trusted_stream_key(row: Mapping[str, Any]) -> str | None:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _provider_identity_token(row: Mapping[str, Any]) -> str:
+    declared = _safe_text(row.get("provider"), max_length=512)
+    source = row.get("source")
+    source_provider = (
+        _safe_text(source.get("provider"), max_length=512)
+        if isinstance(source, Mapping)
+        else None
+    )
+    encoded = json.dumps(
+        {
+            "declared_provider": declared,
+            "source_provider": source_provider,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _provider_row_identifier(
+    row: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    for field in _PROVIDER_ROW_ID_FIELDS:
+        value = _safe_text(row.get(field), max_length=512)
+        if value is not None:
+            return field, value
+    return None
+
+
+def _structural_row_locator(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    if "summary_kind" in record:
+        return {
+            "summary_kind": record.get("summary_kind"),
+            "date": record.get("date"),
+        }
+    if "workout_type" in record:
+        return {
+            "workout_type": record.get("workout_type"),
+            "start_time": record.get("start_time"),
+            "end_time": record.get("end_time"),
+        }
+    return {
+        "series_type": record.get("series_type"),
+        "timestamp": record.get("timestamp"),
+        "unit": record.get("unit"),
+        "is_daily_total": record.get("is_daily_total") is True,
+    }
+
+
+def _row_identity(
+    row: Mapping[str, Any],
+    record: Mapping[str, Any],
+) -> str:
+    provider_token = _provider_identity_token(row)
+    provider_row_id = _provider_row_identifier(row)
+    structural = _structural_row_locator(record)
+    if provider_row_id is not None:
+        identity: Mapping[str, Any] = {
+            "kind": "provider-row",
+            "provider": provider_token,
+            "field": provider_row_id[0],
+            "value": provider_row_id[1],
+        }
+    else:
+        stream_key = _trusted_stream_key(row)
+        identity = {
+            "kind": (
+                "provider-stream"
+                if stream_key is not None
+                else "structural"
+            ),
+            "provider": provider_token,
+            "stream": stream_key,
+            "locator": structural,
+        }
+    return hashlib.sha256(
+        json.dumps(
+            identity,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _with_row_identity(
+    record: dict[str, Any],
+    *,
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    record[_INTERNAL_ROW_IDENTITY] = _row_identity(row, record)
+    return record
+
+
+def _observation_is_retained(
+    observation: datetime,
+    *,
+    retained_after: datetime | None,
+) -> bool:
+    return (
+        retained_after is None
+        or observation.astimezone(UTC) > retained_after.astimezone(UTC)
+    )
+
+
 def _put_number(
     target: dict[str, Any],
     source: Mapping[str, Any],
@@ -846,6 +997,7 @@ def _sanitize_health_score(
     *,
     start: datetime,
     end: datetime,
+    retained_after: datetime | None,
 ) -> dict[str, Any] | None:
     recorded_at = _timestamp(row.get("recorded_at"))
     category = _safe_text(row.get("category"), max_length=32)
@@ -853,6 +1005,10 @@ def _sanitize_health_score(
     if (
         recorded_at is None
         or not start.astimezone(UTC) <= recorded_at < end.astimezone(UTC)
+        or not _observation_is_retained(
+            recorded_at,
+            retained_after=retained_after,
+        )
         or category not in WEARABLE_HEALTH_SCORE_CATEGORIES
     ):
         return None
@@ -901,6 +1057,7 @@ def _sanitize_summary(
     start: datetime,
     end: datetime,
     timezone: str,
+    retained_after: datetime | None,
 ) -> dict[str, Any] | None:
     observed_day = _day(row.get("date"))
     provider, attribution = _provider(row)
@@ -911,6 +1068,13 @@ def _sanitize_summary(
             start=start,
             end=end,
             timezone=timezone,
+        )
+        or not _observation_is_retained(
+            _summary_day_bounds(
+                observed_day,
+                timezone=timezone,
+            )[0],
+            retained_after=retained_after,
         )
     ):
         return None
@@ -949,7 +1113,7 @@ def _sanitize_summary(
             ("avg_bpm", "max_bpm", "min_bpm"),
             integer=True,
         )
-        return result
+        return _with_row_identity(result, row=row)
     if kind == "sleep":
         for field in ("start_time", "end_time"):
             value = _timestamp(row.get(field))
@@ -988,7 +1152,7 @@ def _sanitize_summary(
             ),
             integer=True,
         )
-        return result
+        return _with_row_identity(result, row=row)
     for field in (
         "sleep_duration_seconds",
         "resting_heart_rate_bpm",
@@ -1001,7 +1165,7 @@ def _sanitize_summary(
         "avg_spo2_percent",
     ):
         _put_number(result, row, field)
-    return result
+    return _with_row_identity(result, row=row)
 
 
 def _copy_numeric_block(
@@ -1027,6 +1191,7 @@ def _sanitize_workout(
     *,
     start: datetime,
     end: datetime,
+    retained_after: datetime | None,
 ) -> dict[str, Any] | None:
     start_time = _timestamp(row.get("start_time"))
     end_time = _timestamp(row.get("end_time"))
@@ -1037,6 +1202,10 @@ def _sanitize_workout(
         or end_time is None
         or end_time <= start_time
         or not start.astimezone(UTC) <= start_time < end.astimezone(UTC)
+        or not _observation_is_retained(
+            start_time,
+            retained_after=retained_after,
+        )
         or workout_type is None
     ):
         return None
@@ -1063,7 +1232,7 @@ def _sanitize_workout(
         "elevation_gain_meters",
     ):
         _put_number(result, row, field)
-    return result
+    return _with_row_identity(result, row=row)
 
 
 def _sanitize_timeseries(
@@ -1072,6 +1241,7 @@ def _sanitize_timeseries(
     series_type: str,
     start: datetime,
     end: datetime,
+    retained_after: datetime | None,
 ) -> dict[str, Any] | None:
     timestamp = _timestamp(row.get("timestamp"))
     raw_type = _safe_text(row.get("type"), max_length=64)
@@ -1081,6 +1251,10 @@ def _sanitize_timeseries(
     if (
         timestamp is None
         or not start.astimezone(UTC) <= timestamp < end.astimezone(UTC)
+        or not _observation_is_retained(
+            timestamp,
+            retained_after=retained_after,
+        )
         or raw_type != series_type
         or raw_type not in WEARABLE_TIMESERIES_TYPES
         or value is None
@@ -1103,7 +1277,7 @@ def _sanitize_timeseries(
         result["zone_offset"] = zone_offset
     if type(row.get("is_daily_total")) is bool:
         result["is_daily_total"] = row["is_daily_total"]
-    return result
+    return _with_row_identity(result, row=row)
 
 
 def _summary_day_bounds(
@@ -1158,43 +1332,34 @@ def _summary_window_is_partial(
     return start_utc != start_boundary or end_utc != end_boundary
 
 
-def _timeseries_row_identity(
-    record: Mapping[str, Any],
-) -> tuple[str, ...] | None:
-    timestamp = _safe_text(record.get("timestamp"), max_length=64)
-    series_type = _safe_text(record.get("series_type"), max_length=64)
-    unit = _safe_text(record.get("unit"), max_length=32)
-    provider = _safe_text(record.get("provider"), max_length=64)
-    stream_key = _safe_text(
-        record.get(_INTERNAL_STREAM_KEY),
-        max_length=64,
-    )
-    if None in (timestamp, series_type, unit, provider, stream_key):
-        return None
-    return (
-        str(timestamp),
-        str(series_type),
-        str(unit),
-        str(provider),
-        str(stream_key),
-        str(record.get("is_daily_total") is True),
-    )
-
-
-def _deduplicate_timeseries_records(
+def _deduplicate_wearable_records(
     records: Sequence[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Remove exact cursor overlap while retaining conflicting observations."""
+    """Collapse exact page overlap and retain conflicting observations."""
 
     selected: list[dict[str, Any]] = []
-    variants: dict[tuple[str, ...], dict[str, int]] = {}
+    variants: dict[str, dict[str, int]] = {}
     conflicting = False
     for raw_record in records[: MAX_WEARABLE_SEARCH_ROWS + 1]:
         record = dict(raw_record)
-        identity = _timeseries_row_identity(record)
+        identity = _safe_text(
+            record.pop(_INTERNAL_ROW_IDENTITY, None),
+            max_length=64,
+        )
         if identity is None:
-            selected.append(record)
-            continue
+            identity = hashlib.sha256(
+                json.dumps(
+                    {
+                        "kind": "sanitized-structural",
+                        "provider": record.get("provider"),
+                        "locator": _structural_row_locator(record),
+                    },
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
         digest = hashlib.sha256(
             json.dumps(
                 record,
@@ -1224,6 +1389,7 @@ def _aggregate_timeseries(
     resolution: str,
     start: datetime,
     end: datetime,
+    retained_after: datetime | None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Enforce the requested resolution even if the upstream route ignores it."""
 
@@ -1252,6 +1418,8 @@ def _aggregate_timeseries(
             bucket_start,
             start=start_utc,
             end=end_utc,
+            observation=timestamp,
+            retained_after=retained_after,
         )
         if stream_key is None:
             # Matching provider or device labels do not prove that samples
@@ -1292,6 +1460,17 @@ def _aggregate_timeseries(
                 bucket_start,
                 start=start_utc,
                 end=end_utc,
+                observation=min(
+                    timestamp
+                    for record in bucket
+                    if (
+                        timestamp := _timestamp(
+                            record.get("timestamp")
+                        )
+                    )
+                    is not None
+                ),
+                retained_after=retained_after,
             ).isoformat(),
             "series_type": series_type,
             "value": _normalized_aggregate_value(
@@ -1344,8 +1523,15 @@ def _bounded_bucket_timestamp(
     *,
     start: datetime,
     end: datetime,
+    observation: datetime,
+    retained_after: datetime | None,
 ) -> datetime:
     bounded = max(bucket_start, start.astimezone(UTC))
+    if (
+        retained_after is not None
+        and bounded <= retained_after.astimezone(UTC)
+    ):
+        bounded = max(bounded, observation.astimezone(UTC))
     if bounded >= end.astimezone(UTC):
         raise ValueError("wearable timeseries bucket is outside query bounds")
     return bounded
