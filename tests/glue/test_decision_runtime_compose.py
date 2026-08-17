@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 DECISION_BIND_SOURCE = REPO_ROOT / "data" / "hermes" / "decision"
 README_FILE = REPO_ROOT / "README.md"
+DEVELOPMENT_DOC = REPO_ROOT / "docs" / "DEVELOPMENT.md"
 
 
 def _environment(entries: list[str]) -> dict[str, str]:
@@ -90,6 +91,10 @@ def test_compose_launches_only_healthmes_owned_supervisor_surface() -> None:
     runtime_env = _environment(runtime["environment"])
     assert runtime_env["HERMES_HOME"] == "/opt/data"
     assert runtime_env["HEALTHMES_DECISION_RUNTIME_PORT"] == "8645"
+    assert runtime_env[
+        "HEALTHMES_DECISION_RUNTIME_MAX_CONCURRENT_RESPONSES"
+    ] == "${HEALTHMES_DECISION_MAX_PENDING_REQUESTS:-8}"
+    assert runtime["stop_grace_period"] == "6m"
     assert "TELEGRAM_BOT_TOKEN" not in runtime_env
     assert "HEALTHMES_HERMES_WEBHOOK_SECRET" not in runtime_env
     serialized = yaml.safe_dump(runtime)
@@ -112,6 +117,16 @@ def test_readme_uses_canonical_profile_gated_decision_launch() -> None:
     assert "`HEALTHMES_DECISION_HERMES_MODEL`" in docker_section
     assert "`HEALTHMES_DECISION_HERMES_PROVIDER`" in docker_section
     assert "`HERMES_MODEL`/`HERMES_PROVIDER`" not in readme
+
+
+def test_runtime_refresh_uses_bounded_full_drain_timeout() -> None:
+    development = " ".join(
+        DEVELOPMENT_DOC.read_text(encoding="utf-8").split()
+    )
+
+    assert "docker compose stop --timeout 360 hermes-decision" in development
+    assert "maximum supported 300-second decision response" in development
+    assert "10-second child" in development
 
 
 @pytest.mark.skipif(

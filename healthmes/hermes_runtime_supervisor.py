@@ -28,6 +28,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from starlette.types import Receive, Scope, Send
 
 from healthmes.hermes_mcp_inventory import (
     HERMES_DECISION_MCP_TOOL_NAMES,
@@ -87,6 +88,7 @@ class HermesRuntimeSupervisorConfig:
     unhealthy_threshold: int = 3
     restart_backoff_initial_seconds: float = 0.25
     restart_backoff_max_seconds: float = 5
+    max_concurrent_responses: int = 8
 
     def __post_init__(self) -> None:
         if not 1 <= self.port <= 65_535:
@@ -115,6 +117,10 @@ class HermesRuntimeSupervisorConfig:
                 )
         if self.unhealthy_threshold < 1:
             raise ValueError("unhealthy threshold must be positive")
+        if not 1 <= self.max_concurrent_responses <= 128:
+            raise ValueError(
+                "max concurrent responses must be between 1 and 128"
+            )
         if (
             self.restart_backoff_max_seconds
             < self.restart_backoff_initial_seconds
@@ -140,16 +146,103 @@ class HermesRuntimeResponseLease:
 
     state: HermesRuntimeState
     generation: int
-    _release_callback: Callable[[], None]
-    _released: bool = False
+    _release_callback: Callable[[], Awaitable[None]]
+    _release_task: asyncio.Task[BaseException | None] | None = None
 
-    def release(self) -> None:
+    async def release(self) -> None:
         """Release the child generation exactly once."""
 
-        if self._released:
-            return
-        self._released = True
-        self._release_callback()
+        task = self._release_task
+        if task is None:
+            task = asyncio.create_task(
+                self._finish_release(),
+                name="healthmes-hermes-response-lease-release",
+            )
+            self._release_task = task
+        caller_cancelled, release_error = await _await_teardown_task(task)
+        if release_error is not None:
+            raise release_error
+        if caller_cancelled:
+            raise asyncio.CancelledError
+
+    async def _finish_release(self) -> BaseException | None:
+        try:
+            await self._release_callback()
+        except BaseException as exc:
+            return exc
+        return None
+
+
+@dataclass(slots=True)
+class _ProxyResponseResources:
+    """Own one upstream stream, client, and optional generation lease."""
+
+    client: httpx.AsyncClient
+    response_lease: HermesRuntimeResponseLease | None = None
+    upstream: httpx.Response | None = None
+    _cleanup_task: asyncio.Task[BaseException | None] | None = None
+
+    async def aclose(self) -> None:
+        """Close every response resource exactly once despite cancellation."""
+
+        task = self._cleanup_task
+        if task is None:
+            task = asyncio.create_task(
+                self._finish_close(),
+                name="healthmes-hermes-proxy-response-close",
+            )
+            self._cleanup_task = task
+        caller_cancelled, cleanup_error = await _await_teardown_task(task)
+        if cleanup_error is not None:
+            raise cleanup_error
+        if caller_cancelled:
+            raise asyncio.CancelledError
+
+    async def _finish_close(self) -> BaseException | None:
+        first_error: BaseException | None = None
+        upstream = self.upstream
+        if upstream is not None:
+            try:
+                await upstream.aclose()
+            except BaseException as exc:
+                first_error = exc
+        try:
+            await self.client.aclose()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        lease = self.response_lease
+        if lease is not None:
+            try:
+                await lease.release()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        return first_error
+
+
+class _ManagedStreamingResponse(StreamingResponse):
+    """Release proxy resources even if ASGI response startup fails."""
+
+    def __init__(
+        self,
+        *args: Any,
+        resources: _ProxyResponseResources,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._resources = resources
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._resources.aclose()
 
 
 class RuntimeController(Protocol):
@@ -200,6 +293,10 @@ class HermesRuntimeProcess:
         self._lifecycle_state: _LifecycleState = "new"
         self._lifecycle_lock = asyncio.Lock()
         self._child_lock = asyncio.Lock()
+        self._child_condition = asyncio.Condition(self._child_lock)
+        self._active_response_leases: dict[int, int] = {}
+        self._waiting_child_writers = 0
+        self._child_writer_active = False
         self._close_lock = asyncio.Lock()
         self._monitor_task: asyncio.Task[None] | None = None
 
@@ -264,12 +361,22 @@ class HermesRuntimeProcess:
             )
         return state
 
-    async def _attest_locked(self) -> HermesRuntimeState:
-        state = self.revalidate()
+    async def _attest_pinned_generation(
+        self,
+        *,
+        expected: HermesRuntimeState,
+        generation: int,
+    ) -> HermesRuntimeState:
+        state = self._validate_bound_state(expected=expected)
+        if generation != self._child_generation:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_generation_changed"
+            )
         inventory = await self._probe_runtime_inventory()
-        verified = self.revalidate()
+        verified = self._validate_bound_state(expected=state)
         if (
-            verified != state
+            generation != self._child_generation
+            or verified != state
             or inventory != state.mcp_inventory
         ):
             raise HermesRuntimeIdentityError(
@@ -278,30 +385,100 @@ class HermesRuntimeProcess:
         return state
 
     async def attest(self) -> HermesRuntimeState:
-        async with self._child_lock:
-            return await self._attest_locked()
+        lease = await self.acquire_response_lease()
+        try:
+            return lease.state
+        finally:
+            await lease.release()
 
     async def acquire_response_lease(
         self,
     ) -> HermesRuntimeResponseLease:
         """Attest and pin the current child until the caller releases it."""
 
-        await self._child_lock.acquire()
+        async with self._child_condition:
+            await self._child_condition.wait_for(
+                self._response_lease_available
+            )
+            state = self.state
+            generation = self._child_generation
+            self._active_response_leases[generation] = (
+                self._active_response_leases.get(generation, 0) + 1
+            )
+        lease = HermesRuntimeResponseLease(
+            state=state,
+            generation=generation,
+            _release_callback=lambda: self._release_response_lease(
+                generation
+            ),
+        )
         try:
-            state = await self._attest_locked()
+            verified = await self._attest_pinned_generation(
+                expected=state,
+                generation=generation,
+            )
             process = self._process
             if process is None or process.returncode is not None:
                 raise HermesRuntimeIdentityError(
                     "hermes_runtime_child_not_running"
                 )
-            return HermesRuntimeResponseLease(
-                state=state,
-                generation=self._child_generation,
-                _release_callback=self._child_lock.release,
-            )
+            if verified != state:
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_identity_changed"
+                )
+            return lease
         except BaseException:
-            self._child_lock.release()
+            await lease.release()
             raise
+
+    def _response_lease_available(self) -> bool:
+        return (
+            not self._child_writer_active
+            and self._waiting_child_writers == 0
+            and sum(self._active_response_leases.values())
+            < self._config.max_concurrent_responses
+        )
+
+    async def _release_response_lease(self, generation: int) -> None:
+        async with self._child_condition:
+            count = self._active_response_leases.get(generation, 0)
+            if count < 1:
+                raise RuntimeError(
+                    "Hermes response lease accounting underflow"
+                )
+            if count == 1:
+                del self._active_response_leases[generation]
+            else:
+                self._active_response_leases[generation] = count - 1
+            self._child_condition.notify_all()
+
+    @asynccontextmanager
+    async def _exclusive_child_generation(self) -> AsyncIterator[None]:
+        """Block new leases, drain current readers, then mutate the child."""
+
+        acquired = False
+        async with self._child_condition:
+            self._waiting_child_writers += 1
+            self._child_condition.notify_all()
+            try:
+                await self._child_condition.wait_for(
+                    lambda: (
+                        not self._child_writer_active
+                        and not self._active_response_leases
+                    )
+                )
+                self._child_writer_active = True
+                acquired = True
+            finally:
+                self._waiting_child_writers -= 1
+                if not acquired:
+                    self._child_condition.notify_all()
+        try:
+            yield
+        finally:
+            async with self._child_condition:
+                self._child_writer_active = False
+                self._child_condition.notify_all()
 
     async def start(self) -> None:
         """Strictly launch and verify one child for direct callers."""
@@ -310,7 +487,7 @@ class HermesRuntimeProcess:
             if self._lifecycle_state not in {"new", "running"}:
                 return
             self._lifecycle_state = "running"
-        async with self._child_lock:
+        async with self._exclusive_child_generation():
             if self._lifecycle_state != "running":
                 return
             if self._child_is_available():
@@ -447,7 +624,7 @@ class HermesRuntimeProcess:
                     )
                 self._healthy = False
                 try:
-                    async with self._child_lock:
+                    async with self._exclusive_child_generation():
                         if self._lifecycle_state != "running":
                             return
                         await self._stop_child()
@@ -468,7 +645,7 @@ class HermesRuntimeProcess:
                 if self._lifecycle_state != "running":
                     return
                 try:
-                    async with self._child_lock:
+                    async with self._exclusive_child_generation():
                         if self._lifecycle_state != "running":
                             return
                         if not self._child_is_available():
@@ -525,7 +702,7 @@ class HermesRuntimeProcess:
                 continue
 
             try:
-                async with self._child_lock:
+                async with self._exclusive_child_generation():
                     if self._process is process:
                         await self._stop_child()
             except asyncio.CancelledError:
@@ -696,7 +873,7 @@ class HermesRuntimeProcess:
                     pass
                 except BaseException as exc:
                     monitor_error = exc
-            async with self._child_lock:
+            async with self._exclusive_child_generation():
                 await self._stop_child()
         except BaseException:
             async with self._lifecycle_lock:
@@ -911,13 +1088,13 @@ def create_supervisor_app(
         lease: HermesRuntimeResponseLease | None = None
         try:
             lease = await controller.acquire_response_lease()
-            _require_api_key(request, lease.state.api_key)
         except HermesRuntimeIdentityError as exc:
             raise HTTPException(
                 status_code=503,
                 detail="runtime identity unavailable",
             ) from exc
         try:
+            _require_api_key(request, lease.state.api_key)
             return await _proxy(
                 request,
                 "/v1/responses",
@@ -927,7 +1104,7 @@ def create_supervisor_app(
                 response_lease=lease,
             )
         except BaseException:
-            lease.release()
+            await lease.release()
             raise
 
     @app.get("/api/sessions")
@@ -975,12 +1152,16 @@ def create_supervisor_app(
         }
         if body is not None:
             headers["Content-Type"] = "application/json"
-        client: httpx.AsyncClient | None = None
+        resources: _ProxyResponseResources | None = None
         try:
             client = httpx.AsyncClient(
                 base_url=state.manifest.internal_origin,
                 follow_redirects=False,
                 transport=proxy_transport,
+            )
+            resources = _ProxyResponseResources(
+                client=client,
+                response_lease=response_lease,
             )
             upstream_request = client.build_request(
                 request.method,
@@ -989,38 +1170,37 @@ def create_supervisor_app(
                 headers=headers,
             )
             upstream = await client.send(upstream_request, stream=True)
+            resources.upstream = upstream
+            response_headers = {
+                key: value
+                for key, value in upstream.headers.items()
+                if key.lower() in _FORWARDED_RESPONSE_HEADERS
+            }
+            response_headers["Cache-Control"] = "no-store"
+            return _ManagedStreamingResponse(
+                _stream_upstream_response(
+                    request=request,
+                    resources=resources,
+                ),
+                status_code=upstream.status_code,
+                headers=response_headers,
+                resources=resources,
+            )
         except httpx.HTTPError as exc:
-            if client is not None:
-                await client.aclose()
-            if response_lease is not None:
-                response_lease.release()
+            if resources is not None:
+                await resources.aclose()
+            elif response_lease is not None:
+                await response_lease.release()
             raise HTTPException(
                 status_code=503,
                 detail="runtime upstream unavailable",
             ) from exc
         except BaseException:
-            if client is not None:
-                await client.aclose()
-            if response_lease is not None:
-                response_lease.release()
+            if resources is not None:
+                await resources.aclose()
+            elif response_lease is not None:
+                await response_lease.release()
             raise
-        response_headers = {
-            key: value
-            for key, value in upstream.headers.items()
-            if key.lower() in _FORWARDED_RESPONSE_HEADERS
-        }
-        response_headers["Cache-Control"] = "no-store"
-
-        return StreamingResponse(
-            _stream_upstream_response(
-                request=request,
-                upstream=upstream,
-                client=client,
-                response_lease=response_lease,
-            ),
-            status_code=upstream.status_code,
-            headers=response_headers,
-        )
 
     return app
 
@@ -1028,12 +1208,13 @@ def create_supervisor_app(
 async def _stream_upstream_response(
     *,
     request: Request,
-    upstream: httpx.Response,
-    client: httpx.AsyncClient,
-    response_lease: HermesRuntimeResponseLease | None = None,
+    resources: _ProxyResponseResources,
 ) -> AsyncIterator[bytes]:
     """Close Hermes immediately when the HealthMes caller goes away."""
 
+    upstream = resources.upstream
+    if upstream is None:
+        raise RuntimeError("Hermes upstream response is unavailable")
     try:
         async for chunk in upstream.aiter_raw():
             if await request.is_disconnected():
@@ -1041,14 +1222,7 @@ async def _stream_upstream_response(
             yield chunk
     finally:
         # Hermes maps this upstream disconnect to agent.interrupt().
-        try:
-            await upstream.aclose()
-        finally:
-            try:
-                await client.aclose()
-            finally:
-                if response_lease is not None:
-                    response_lease.release()
+        await resources.aclose()
 
 
 async def _bounded_body(request: Request) -> bytes:
@@ -1190,6 +1364,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             )
         ),
     )
+    parser.add_argument(
+        "--max-concurrent-responses",
+        type=int,
+        default=int(
+            os.environ.get(
+                "HEALTHMES_DECISION_RUNTIME_MAX_CONCURRENT_RESPONSES",
+                "8",
+            )
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1219,6 +1403,7 @@ def main(argv: list[str] | None = None) -> None:
             unhealthy_threshold=args.unhealthy_threshold,
             restart_backoff_initial_seconds=args.restart_backoff_initial,
             restart_backoff_max_seconds=args.restart_backoff_max,
+            max_concurrent_responses=args.max_concurrent_responses,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc

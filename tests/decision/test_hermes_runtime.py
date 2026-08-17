@@ -52,6 +52,8 @@ from healthmes.hermes_runtime_supervisor import (
     HermesRuntimeResponseLease,
     HermesRuntimeState,
     HermesRuntimeSupervisorConfig,
+    _ManagedStreamingResponse,
+    _ProxyResponseResources,
     _stream_upstream_response,
     build_child_environment,
     create_supervisor_app,
@@ -1030,15 +1032,31 @@ async def test_runtime_attestation_fails_closed_after_live_inventory_drift(
     runtime_bundle: RuntimeBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process = object.__new__(HermesRuntimeProcess)
-    process._child_lock = asyncio.Lock()
     state = HermesRuntimeState(
         manifest=runtime_bundle.manifest,
         attestation_key=runtime_bundle.key,
         api_key=API_KEY,
         mcp_inventory=EXPECTED_MCP_INVENTORY,
     )
-    process.revalidate = lambda: state
+    process = HermesRuntimeProcess(
+        HermesRuntimeSupervisorConfig(
+            hermes_home=runtime_bundle.home,
+            manifest_path=runtime_bundle.manifest_path,
+            attestation_key_path=runtime_bundle.key_path,
+            vendor_root=runtime_bundle.vendor_root,
+        ),
+        environ=PROVIDER_ENV,
+    )
+    process._process = SimpleNamespace(returncode=None)
+    process._state = state
+    process._launch_argv = runtime_bundle.manifest.launch_argv
+    process._child_generation = 1
+    process._healthy = True
+    monkeypatch.setattr(
+        process,
+        "_validate_bound_state",
+        lambda *, expected=None: state,
+    )
 
     async def drifted_inventory():
         schema_digests = dict(HERMES_DECISION_MCP_INPUT_SCHEMA_SHA256)
@@ -1056,6 +1074,7 @@ async def test_runtime_attestation_fails_closed_after_live_inventory_drift(
         match="hermes_runtime_mcp_inventory_changed",
     ):
         await process.attest()
+    assert process._active_response_leases == {}
 
 
 def test_arbitrary_remote_runtime_without_attestation_is_rejected() -> None:
@@ -1075,8 +1094,10 @@ class _FakeController:
         state: HermesRuntimeState,
         *,
         failure: HermesRuntimeIdentityError | None = None,
+        lease_state: HermesRuntimeState | None = None,
     ) -> None:
         self._state = state
+        self._lease_state = lease_state or state
         self.failure = failure
         self.revalidations = 0
         self.attestations = 0
@@ -1100,13 +1121,14 @@ class _FakeController:
         self,
     ) -> HermesRuntimeResponseLease:
         self.attestations += 1
+        self.revalidate()
         return HermesRuntimeResponseLease(
-            state=self.revalidate(),
+            state=self._lease_state,
             generation=1,
             _release_callback=self._release,
         )
 
-    def _release(self) -> None:
+    async def _release(self) -> None:
         self.releases += 1
 
     async def start(self) -> None:
@@ -1186,6 +1208,43 @@ def test_supervisor_revalidates_live_inventory_before_each_response(
     assert controller.releases == 1
 
 
+def test_supervisor_releases_lease_when_post_acquire_auth_changes(
+    runtime_bundle: RuntimeBundle,
+) -> None:
+    initial_state = HermesRuntimeState(
+        manifest=runtime_bundle.manifest,
+        attestation_key=runtime_bundle.key,
+        api_key=API_KEY,
+        mcp_inventory=EXPECTED_MCP_INVENTORY,
+    )
+    rotated_state = HermesRuntimeState(
+        manifest=runtime_bundle.manifest,
+        attestation_key=runtime_bundle.key,
+        api_key="r" * 64,
+        mcp_inventory=EXPECTED_MCP_INVENTORY,
+    )
+    controller = _FakeController(
+        initial_state,
+        lease_state=rotated_state,
+    )
+    app = create_supervisor_app(
+        controller,
+        proxy_transport=httpx.MockTransport(
+            lambda _request: pytest.fail("upstream must not be called")
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"stream": True, "store": False},
+        )
+
+    assert response.status_code == 401
+    assert controller.releases == 1
+
+
 def test_supervisor_authenticates_before_parsing_responses_body(
     runtime_bundle: RuntimeBundle,
 ) -> None:
@@ -1258,16 +1317,23 @@ async def test_proxy_stream_cancel_closes_upstream_connection() -> None:
     upstream = httpx.Response(200, stream=BlockingStream())
     client = ClosingClient()
     released = asyncio.Event()
+
+    async def release() -> None:
+        released.set()
+
     lease = HermesRuntimeResponseLease(
         state=SimpleNamespace(),  # type: ignore[arg-type]
         generation=1,
-        _release_callback=released.set,
+        _release_callback=release,
+    )
+    resources = _ProxyResponseResources(
+        client=client,  # type: ignore[arg-type]
+        response_lease=lease,
+        upstream=upstream,
     )
     stream = _stream_upstream_response(
         request=ConnectedRequest(),  # type: ignore[arg-type]
-        upstream=upstream,
-        client=client,  # type: ignore[arg-type]
-        response_lease=lease,
+        resources=resources,
     )
     assert await anext(stream) == b"first"
     next_chunk = asyncio.create_task(anext(stream))
@@ -1280,3 +1346,79 @@ async def test_proxy_stream_cancel_closes_upstream_connection() -> None:
     await asyncio.wait_for(stream_closed.wait(), timeout=1)
     await asyncio.wait_for(client.closed.wait(), timeout=1)
     await asyncio.wait_for(released.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_response_start_failure_closes_unstarted_proxy_resources() -> None:
+    stream_closed = asyncio.Event()
+    release_count = 0
+
+    class NeverStartedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise AssertionError("stream iterator must not start")
+            yield b"unreachable"
+
+        async def aclose(self) -> None:
+            stream_closed.set()
+
+    class ConnectedRequest:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    class ClosingClient:
+        def __init__(self) -> None:
+            self.closed = asyncio.Event()
+
+        async def aclose(self) -> None:
+            self.closed.set()
+
+    async def release() -> None:
+        nonlocal release_count
+        release_count += 1
+
+    upstream = httpx.Response(200, stream=NeverStartedStream())
+    client = ClosingClient()
+    lease = HermesRuntimeResponseLease(
+        state=SimpleNamespace(),  # type: ignore[arg-type]
+        generation=1,
+        _release_callback=release,
+    )
+    resources = _ProxyResponseResources(
+        client=client,  # type: ignore[arg-type]
+        response_lease=lease,
+        upstream=upstream,
+    )
+    response = _ManagedStreamingResponse(
+        _stream_upstream_response(
+            request=ConnectedRequest(),  # type: ignore[arg-type]
+            resources=resources,
+        ),
+        status_code=200,
+        resources=resources,
+    )
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        assert message["type"] == "http.response.start"
+        raise RuntimeError("simulated response.start disconnect")
+
+    with pytest.raises(
+        RuntimeError,
+        match="simulated response.start disconnect",
+    ):
+        await response(
+            {
+                "type": "http",
+                "asgi": {"spec_version": "2.4"},
+            },  # type: ignore[arg-type]
+            receive,  # type: ignore[arg-type]
+            send,  # type: ignore[arg-type]
+        )
+
+    assert stream_closed.is_set()
+    assert client.closed.is_set()
+    assert release_count == 1
+    await resources.aclose()
+    assert release_count == 1

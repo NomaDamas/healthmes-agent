@@ -188,46 +188,85 @@ async def test_watchdog_restarts_immediately_on_runtime_identity_drift(
 
 
 @pytest.mark.asyncio
-async def test_response_lease_blocks_child_generation_replacement(
-    tmp_path: Path,
+async def test_response_leases_share_generation_and_prioritize_replacement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process = HermesRuntimeProcess(_supervisor_config(tmp_path))
+    process = HermesRuntimeProcess(
+        replace(
+            _supervisor_config(Path("/unused")),
+            max_concurrent_responses=2,
+        )
+    )
     child = SimpleNamespace(returncode=None)
     state = object()
+    next_state = object()
     process._process = child
     process._state = state  # type: ignore[assignment]
     process._launch_argv = ("fake-hermes",)
     process._child_generation = 7
     process._healthy = True
 
-    async def attest_locked():
-        return state
+    async def attest_pinned_generation(
+        *,
+        expected: object,
+        generation: int,
+    ) -> object:
+        assert generation == process._child_generation
+        return expected
 
-    monkeypatch.setattr(process, "_attest_locked", attest_locked)
-    lease = await process.acquire_response_lease()
-    replacement_waiting = asyncio.Event()
-    replaced = asyncio.Event()
+    monkeypatch.setattr(
+        process,
+        "_attest_pinned_generation",
+        attest_pinned_generation,
+    )
+    first, second = await asyncio.gather(
+        process.acquire_response_lease(),
+        process.acquire_response_lease(),
+    )
+    third = asyncio.create_task(process.acquire_response_lease())
+    await asyncio.sleep(0)
+    assert not third.done()
+
+    replacement_entered = asyncio.Event()
+    allow_replacement = asyncio.Event()
 
     async def replace_child() -> None:
-        replacement_waiting.set()
-        async with process._child_lock:
+        async with process._exclusive_child_generation():
+            replacement_entered.set()
+            await allow_replacement.wait()
             process._child_generation += 1
-            replaced.set()
+            process._state = next_state  # type: ignore[assignment]
 
     replacement = asyncio.create_task(replace_child())
-    await asyncio.wait_for(replacement_waiting.wait(), timeout=1)
+
+    async def wait_for_replacement_to_queue() -> None:
+        while process._waiting_child_writers != 1:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_replacement_to_queue(), timeout=1)
+
+    assert first.generation == 7
+    assert second.generation == 7
+    assert not replacement_entered.is_set()
+
+    await first.release()
+    await first.release()
     await asyncio.sleep(0)
+    assert not replacement_entered.is_set()
+    assert not third.done()
 
-    assert lease.generation == 7
-    assert not replaced.is_set()
+    await second.release()
+    await asyncio.wait_for(replacement_entered.wait(), timeout=1)
+    assert not third.done()
 
-    lease.release()
-    lease.release()
+    allow_replacement.set()
     await asyncio.wait_for(replacement, timeout=1)
+    third_lease = await asyncio.wait_for(third, timeout=1)
 
-    assert replaced.is_set()
+    assert third_lease.generation == 8
+    assert third_lease.state is next_state
     assert process._child_generation == 8
+    await third_lease.release()
 
 
 @pytest.mark.asyncio
@@ -453,7 +492,7 @@ async def test_cancelled_close_waits_for_child_teardown_before_closed(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_close_waiting_for_child_lock_cannot_orphan_child(
+async def test_cancelled_close_waiting_for_response_lease_cannot_orphan_child(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -470,8 +509,21 @@ async def test_cancelled_close_waiting_for_child_lock_cannot_orphan_child(
         process._launch_argv = None
         process._healthy = False
 
+    async def attest_pinned_generation(
+        *,
+        expected: object,
+        generation: int,
+    ) -> object:
+        assert generation == process._child_generation
+        return expected
+
     monkeypatch.setattr(process, "_stop_child", stop_child)
-    await process._child_lock.acquire()
+    monkeypatch.setattr(
+        process,
+        "_attest_pinned_generation",
+        attest_pinned_generation,
+    )
+    lease = await process.acquire_response_lease()
     try:
         close_task = asyncio.create_task(process.aclose())
         while process._lifecycle_state != "closing":
@@ -482,7 +534,7 @@ async def test_cancelled_close_waiting_for_child_lock_cannot_orphan_child(
         assert process._lifecycle_state == "closing"
         assert process._process is child
     finally:
-        process._child_lock.release()
+        await lease.release()
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(close_task, timeout=1)
@@ -621,6 +673,41 @@ def test_supervisor_cli_rejects_nonpositive_lifecycle_values(
                 "--vendor-root",
                 str(tmp_path / "vendor"),
                 f"{flag}={value}",
+            ]
+        )
+
+
+@pytest.mark.parametrize("value", (0, 129))
+def test_supervisor_config_rejects_invalid_max_concurrent_responses(
+    tmp_path: Path,
+    value: int,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="max concurrent responses must be between 1 and 128",
+    ):
+        replace(
+            _supervisor_config(tmp_path),
+            max_concurrent_responses=value,
+        )
+
+
+@pytest.mark.parametrize("value", ("0", "129"))
+def test_supervisor_cli_rejects_invalid_max_concurrent_responses(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    with pytest.raises(
+        SystemExit,
+        match="max concurrent responses must be between 1 and 128",
+    ):
+        supervisor_main(
+            [
+                "--hermes-home",
+                str(tmp_path / "home"),
+                "--vendor-root",
+                str(tmp_path / "vendor"),
+                f"--max-concurrent-responses={value}",
             ]
         )
 

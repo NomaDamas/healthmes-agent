@@ -217,7 +217,7 @@ After rebuilding or replacing the `hermes-decision` Docker image, revoke the
 old container execution seal before starting the replacement:
 
 ```bash
-docker compose stop hermes-decision
+docker compose stop --timeout 360 hermes-decision
 uv run python scripts/bootstrap.py --mode docker --refresh-runtime-seal
 docker compose up -d --build --force-recreate hermes-decision
 ```
@@ -226,7 +226,10 @@ Stop the old supervisor first so it cannot reseal the old image between
 refresh and replacement. The new supervisor seals the new container artifacts
 on startup. A normal bootstrap rerun deliberately preserves an equivalent
 seal, so image replacement without the explicit refresh fails closed instead
-of silently trusting different runtime files.
+of silently trusting different runtime files. The explicit 360-second stop
+timeout matches the service's `stop_grace_period` and exceeds the maximum
+supported 300-second decision response plus the supervisor's 10-second child
+termination window.
 
 Re-runs are byte-idempotent when the desired decision artifacts are current.
 Bootstrap also performs a one-way migration of the general
@@ -269,10 +272,15 @@ attestation key with OS ownership and filesystem permissions. The supervisor
 executes the original
 manifest-bound venv Python path on every platform (required for macOS
 `@executable_path` library resolution), revalidates the manifest immediately
-around startup, and holds one child-generation lease from response
-attestation until the complete `/v1/responses` stream closes. Watchdog restart
-and shutdown wait for that lease rather than switching the child midway
-through a decision.
+around startup, and holds generation-aware child leases from response
+attestation until each complete `/v1/responses` stream closes. Up to
+`HEALTHMES_DECISION_RUNTIME_MAX_CONCURRENT_RESPONSES` responses may share the
+same verified child generation. Once watchdog restart or shutdown is waiting,
+new leases pause and the writer drains every active lease before replacing the
+child, preventing starvation and mid-response generation switches. Response
+resources and leases are released exactly once on authentication drift,
+upstream connection failure, ASGI response-start failure, caller disconnect,
+cancellation, or normal stream completion.
 
 Running the gateway natively (verified live on macOS with dummy creds):
 
