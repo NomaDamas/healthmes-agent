@@ -43,6 +43,8 @@ _LINUX_RENAME_NOREPLACE = 1
 _DARWIN_RENAME_EXCL = 0x00000004
 _MAX_PS_OUTPUT_BYTES = 64 * 1024
 _MIN_MANAGED_PROCESS_PID = 2
+_MAX_MANAGED_PROCESS_PID = 2_147_483_647
+_MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS = 315
 
 
 class _IdentityUnavailable(RuntimeError):
@@ -63,6 +65,43 @@ class _ProcessAbsent(RuntimeError):
 
 class _PsOutputOversized(RuntimeError):
     pass
+
+
+def _parse_bounded_ascii_decimal(
+    value: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if minimum < 1 or maximum < minimum:
+        raise ValueError
+    if (
+        not value
+        or not value.isascii()
+        or not value.isdigit()
+        or value[0] == "0"
+    ):
+        raise ValueError
+    maximum_text = str(maximum)
+    if len(value) > len(maximum_text) or (
+        len(value) == len(maximum_text) and value > maximum_text
+    ):
+        raise ValueError
+    parsed = int(value, 10)
+    if parsed < minimum:
+        raise ValueError
+    return parsed
+
+
+def _parse_managed_pid_argument(value: str) -> int:
+    try:
+        return _parse_bounded_ascii_decimal(
+            value,
+            minimum=_MIN_MANAGED_PROCESS_PID,
+            maximum=_MAX_MANAGED_PROCESS_PID,
+        )
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("invalid managed PID") from exc
 
 
 class _DarwinProcBsdInfo(ctypes.Structure):
@@ -173,7 +212,11 @@ def _darwin_start_token(pid: int) -> str | None:
 
 
 def _start_token(pid: int) -> str | None:
-    if pid <= 1:
+    if not (
+        _MIN_MANAGED_PROCESS_PID
+        <= pid
+        <= _MAX_MANAGED_PROCESS_PID
+    ):
         raise _IdentityUnavailable("native_identity_pid_invalid")
     if sys.platform.startswith("linux"):
         return _linux_start_token(pid)
@@ -451,7 +494,11 @@ def _bounded_ps_value(
     timeout_seconds: float,
 ) -> str:
     if (
-        pid <= 1
+        not (
+            _MIN_MANAGED_PROCESS_PID
+            <= pid
+            <= _MAX_MANAGED_PROCESS_PID
+        )
         or field not in {"pid", "pgid", "comm", "lstart", "command"}
         or not math.isfinite(timeout_seconds)
         or timeout_seconds <= 0
@@ -556,6 +603,7 @@ def _parse_shutdown_budget_payload(
     if (
         max_bytes < 1
         or max_drain_seconds < 1
+        or max_drain_seconds > _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS
         or not payload
         or len(payload) > max_bytes
         or not payload.endswith(b"\n")
@@ -614,34 +662,27 @@ def _parse_shutdown_budget_payload(
             "native_identity_shutdown_budget_invalid"
         )
 
-    def parse_ascii_decimal(field: str) -> int:
-        value = fields[field]
-        if not value or not value.isascii() or not value.isdigit():
-            raise _IdentityUnavailable(
-                "native_identity_shutdown_budget_invalid"
-            )
-        return int(value, 10)
-
     try:
-        drain_timeout = parse_ascii_decimal("drain_timeout_seconds")
-        supervisor_pid = parse_ascii_decimal("supervisor_pid")
-        launcher_pid = (
-            parse_ascii_decimal("launcher_pid")
-            if version == "3"
-            else supervisor_pid
+        _parse_bounded_ascii_decimal(
+            fields["drain_timeout_seconds"],
+            minimum=1,
+            maximum=max_drain_seconds,
         )
+        _parse_bounded_ascii_decimal(
+            fields["supervisor_pid"],
+            minimum=_MIN_MANAGED_PROCESS_PID,
+            maximum=_MAX_MANAGED_PROCESS_PID,
+        )
+        if version == "3":
+            _parse_bounded_ascii_decimal(
+                fields["launcher_pid"],
+                minimum=_MIN_MANAGED_PROCESS_PID,
+                maximum=_MAX_MANAGED_PROCESS_PID,
+            )
     except (KeyError, ValueError) as exc:
         raise _IdentityUnavailable(
             "native_identity_shutdown_budget_invalid"
         ) from exc
-    if (
-        not 1 <= drain_timeout <= max_drain_seconds
-        or launcher_pid < _MIN_MANAGED_PROCESS_PID
-        or supervisor_pid < _MIN_MANAGED_PROCESS_PID
-    ):
-        raise _IdentityUnavailable(
-            "native_identity_shutdown_budget_invalid"
-        )
     launcher_start_token = (
         fields["launcher_start_token"]
         if version == "3"
@@ -957,9 +998,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     subparsers = parser.add_subparsers(dest="action", required=True)
     capture = subparsers.add_parser("capture", add_help=False)
-    capture.add_argument("pid", type=int)
+    capture.add_argument("pid", type=_parse_managed_pid_argument)
     check = subparsers.add_parser("check", add_help=False)
-    check.add_argument("pid", type=int)
+    check.add_argument("pid", type=_parse_managed_pid_argument)
     check.add_argument("expected")
     digest = subparsers.add_parser("sha256", add_help=False)
     digest.add_argument("path", type=Path)
@@ -1014,7 +1055,11 @@ def _parse_args() -> argparse.Namespace:
     )
     ps_value = subparsers.add_parser("ps-value", add_help=False)
     ps_value.add_argument("--ps-bin", required=True)
-    ps_value.add_argument("--pid", required=True, type=int)
+    ps_value.add_argument(
+        "--pid",
+        required=True,
+        type=_parse_managed_pid_argument,
+    )
     ps_value.add_argument("--field", required=True)
     ps_value.add_argument(
         "--timeout-seconds",
@@ -1026,7 +1071,11 @@ def _parse_args() -> argparse.Namespace:
         add_help=False,
     )
     ps_snapshot.add_argument("--ps-bin", required=True)
-    ps_snapshot.add_argument("--pid", required=True, type=int)
+    ps_snapshot.add_argument(
+        "--pid",
+        required=True,
+        type=_parse_managed_pid_argument,
+    )
     ps_snapshot.add_argument(
         "--timeout-seconds",
         required=True,

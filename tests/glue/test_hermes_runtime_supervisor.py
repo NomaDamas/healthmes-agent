@@ -68,6 +68,38 @@ def _group_member(pid: int, token: str) -> _ProcessGroupMember:
     return _ProcessGroupMember(pid=pid, start_token=token)
 
 
+@pytest.mark.parametrize("pid", (1, 2_147_483_648))
+def test_runtime_identities_reject_pid_outside_managed_range(
+    pid: int,
+) -> None:
+    with pytest.raises(ValueError, match="outside the managed range"):
+        HermesRuntimeProcessIdentity(
+            pid=pid,
+            start_token="linux:1",
+        )
+    with pytest.raises(ValueError, match="outside the managed range"):
+        HermesRuntimeLauncherIdentity(
+            pid=pid,
+            start_token="linux:1",
+            service_nonce="service",
+        )
+
+
+@pytest.mark.parametrize("pid", (2, 2_147_483_647))
+def test_runtime_identities_accept_managed_pid_boundaries(
+    pid: int,
+) -> None:
+    assert HermesRuntimeProcessIdentity(
+        pid=pid,
+        start_token="linux:1",
+    ).pid == pid
+    assert HermesRuntimeLauncherIdentity(
+        pid=pid,
+        start_token="linux:1",
+        service_nonce="service",
+    ).pid == pid
+
+
 def _install_lifecycle_harness(
     process: HermesRuntimeProcess,
     monkeypatch: pytest.MonkeyPatch,
@@ -2885,6 +2917,31 @@ def test_inherited_launcher_identity_must_match_live_process(
     )
 
     assert captured == identity
+
+
+@pytest.mark.parametrize(
+    "pid",
+    ("1", "04242", "+4242", " 4242", "4242 ", "2147483648", "9" * 128),
+)
+def test_inherited_launcher_identity_rejects_noncanonical_pid(
+    pid: str,
+) -> None:
+    supervisor = HermesRuntimeProcessIdentity(
+        pid=5252,
+        start_token="darwin:1786915200:123456",
+    )
+
+    with pytest.raises(ValueError, match="launcher PID is invalid"):
+        capture_runtime_launcher_identity(
+            {
+                "HEALTHMES_SERVICE_PID": pid,
+                "HEALTHMES_SERVICE_START_TOKEN": (
+                    "ps:Mon Aug 17 12:00:00 2026"
+                ),
+                "HEALTHMES_SERVICE_NONCE": "service-nonce",
+            },
+            supervisor_identity=supervisor,
+        )
 
 
 @pytest.mark.asyncio

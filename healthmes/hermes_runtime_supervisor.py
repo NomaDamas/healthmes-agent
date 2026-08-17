@@ -91,6 +91,7 @@ _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS = 315
 _RUNTIME_SHUTDOWN_BUDGET_VERSION = 3
 _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES = 1024
 _MIN_MANAGED_PROCESS_PID = 2
+_MAX_MANAGED_PROCESS_PID = 2_147_483_647
 _PROCESS_GROUP_EMPTY_CONFIRMATIONS = 2
 _PROCESS_GROUP_POLL_INTERVAL_SECONDS = 0.05
 _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS = 1.0
@@ -105,6 +106,32 @@ _SUPERVISOR_BOOT_IDENTITY = capture_runtime_boot_identity()
 _DARWIN_PROC_PIDTBSDINFO = 3
 _DARWIN_MAXCOMLEN = 16
 _DARWIN_PS_PATH = "/bin/ps"
+
+
+def _parse_bounded_ascii_decimal(
+    value: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if minimum < 1 or maximum < minimum:
+        raise ValueError("invalid decimal bounds")
+    if (
+        not value
+        or not value.isascii()
+        or not value.isdigit()
+        or value[0] == "0"
+    ):
+        raise ValueError("invalid decimal syntax")
+    maximum_text = str(maximum)
+    if len(value) > len(maximum_text) or (
+        len(value) == len(maximum_text) and value > maximum_text
+    ):
+        raise ValueError("decimal exceeds maximum")
+    parsed = int(value, 10)
+    if parsed < minimum:
+        raise ValueError("decimal is below minimum")
+    return parsed
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,8 +159,12 @@ class HermesRuntimeProcessIdentity:
     start_token: str
 
     def __post_init__(self) -> None:
-        if self.pid < _MIN_MANAGED_PROCESS_PID:
-            raise ValueError("runtime process PID must be at least 2")
+        if not (
+            _MIN_MANAGED_PROCESS_PID
+            <= self.pid
+            <= _MAX_MANAGED_PROCESS_PID
+        ):
+            raise ValueError("runtime process PID is outside the managed range")
         if (
             not self.start_token
             or len(self.start_token) > 256
@@ -155,8 +186,14 @@ class HermesRuntimeLauncherIdentity:
     service_nonce: str
 
     def __post_init__(self) -> None:
-        if self.pid < _MIN_MANAGED_PROCESS_PID:
-            raise ValueError("runtime launcher PID must be at least 2")
+        if not (
+            _MIN_MANAGED_PROCESS_PID
+            <= self.pid
+            <= _MAX_MANAGED_PROCESS_PID
+        ):
+            raise ValueError(
+                "runtime launcher PID is outside the managed range"
+            )
         if (
             not self.start_token
             or len(self.start_token) > 256
@@ -671,7 +708,7 @@ def capture_runtime_launcher_identity(
 ) -> HermesRuntimeLauncherIdentity:
     """Capture the managed launcher, or bind a direct launch to this process."""
 
-    pid_value = environment.get("HEALTHMES_SERVICE_PID", "").strip()
+    pid_value = environment.get("HEALTHMES_SERVICE_PID", "")
     start_token = environment.get(
         "HEALTHMES_SERVICE_START_TOKEN",
         "",
@@ -684,7 +721,11 @@ def capture_runtime_launcher_identity(
                 "runtime supervisor launcher identity is incomplete"
             )
         try:
-            pid = int(pid_value)
+            pid = _parse_bounded_ascii_decimal(
+                pid_value,
+                minimum=_MIN_MANAGED_PROCESS_PID,
+                maximum=_MAX_MANAGED_PROCESS_PID,
+            )
         except ValueError as exc:
             raise ValueError(
                 "runtime launcher PID is invalid"
@@ -3237,11 +3278,17 @@ def _parse_runtime_shutdown_budget(
             raise ValueError("runtime shutdown budget is invalid")
         fields[key] = value
 
-    def parse_ascii_decimal(field: str) -> int:
-        value = fields[field]
-        if not value or not value.isascii() or not value.isdigit():
-            raise ValueError
-        return int(value, 10)
+    def parse_ascii_decimal(
+        field: str,
+        *,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        return _parse_bounded_ascii_decimal(
+            fields[field],
+            minimum=minimum,
+            maximum=maximum,
+        )
 
     version = fields.get("version")
     try:
@@ -3260,14 +3307,24 @@ def _parse_runtime_shutdown_budget(
                 raise ValueError
             return HermesRuntimeShutdownBudgetRecord(
                 drain_timeout_seconds=parse_ascii_decimal(
-                    "drain_timeout_seconds"
+                    "drain_timeout_seconds",
+                    minimum=1,
+                    maximum=_MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS,
                 ),
-                launcher_pid=parse_ascii_decimal("launcher_pid"),
+                launcher_pid=parse_ascii_decimal(
+                    "launcher_pid",
+                    minimum=_MIN_MANAGED_PROCESS_PID,
+                    maximum=_MAX_MANAGED_PROCESS_PID,
+                ),
                 launcher_start_token=fields["launcher_start_token"],
                 launcher_service_nonce=fields[
                     "launcher_service_nonce"
                 ],
-                supervisor_pid=parse_ascii_decimal("supervisor_pid"),
+                supervisor_pid=parse_ascii_decimal(
+                    "supervisor_pid",
+                    minimum=_MIN_MANAGED_PROCESS_PID,
+                    maximum=_MAX_MANAGED_PROCESS_PID,
+                ),
                 supervisor_start_token=fields[
                     "supervisor_start_token"
                 ],
@@ -3289,9 +3346,15 @@ def _parse_runtime_shutdown_budget(
                 raise ValueError
             record = _LegacyRuntimeShutdownBudgetRecord(
                 drain_timeout_seconds=parse_ascii_decimal(
-                    "drain_timeout_seconds"
+                    "drain_timeout_seconds",
+                    minimum=1,
+                    maximum=_MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS,
                 ),
-                supervisor_pid=parse_ascii_decimal("supervisor_pid"),
+                supervisor_pid=parse_ascii_decimal(
+                    "supervisor_pid",
+                    minimum=_MIN_MANAGED_PROCESS_PID,
+                    maximum=_MAX_MANAGED_PROCESS_PID,
+                ),
                 supervisor_start_token=fields[
                     "supervisor_start_token"
                 ],

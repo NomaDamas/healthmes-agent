@@ -591,6 +591,24 @@ def _run_native_identity_helper(
     )
 
 
+def _passthrough_shutdown_budget_helper(tmp_path: Path) -> Path:
+    helper = tmp_path / "passthrough-shutdown-budget.py"
+    _write_executable(
+        helper,
+        """
+        #!/usr/bin/env python3
+        import pathlib
+        import sys
+
+        if len(sys.argv) >= 3 and sys.argv[1] == "read-shutdown-budget":
+            sys.stdout.buffer.write(pathlib.Path(sys.argv[2]).read_bytes())
+            raise SystemExit(0)
+        raise SystemExit(5)
+        """,
+    )
+    return helper
+
+
 def _event_lines(harness: dict[str, object]) -> list[str]:
     return Path(harness["event_log"]).read_text(encoding="utf-8").splitlines()
 
@@ -1846,6 +1864,36 @@ def test_status_rejects_unsafe_shutdown_budget_paths(
         ),
         pytest.param(
             lambda payload: payload.replace(
+                b"drain_timeout_seconds\t2\n",
+                b"drain_timeout_seconds\t02\n",
+            ),
+            id="drain-leading-zero",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"drain_timeout_seconds\t2\n",
+                b"drain_timeout_seconds\t0\n",
+            ),
+            id="drain-below-minimum",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"drain_timeout_seconds\t2\n",
+                b"drain_timeout_seconds\t316\n",
+            ),
+            id="drain-above-maximum",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"drain_timeout_seconds\t2\n",
+                b"drain_timeout_seconds\t"
+                + b"9" * 128
+                + b"\n",
+            ),
+            id="drain-overflow",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
                 f"launcher_pid\t{FAKE_MANAGED_PID}\n".encode(),
                 f"launcher_pid\t+{FAKE_MANAGED_PID}\n".encode(),
             ),
@@ -1853,10 +1901,52 @@ def test_status_rejects_unsafe_shutdown_budget_paths(
         ),
         pytest.param(
             lambda payload: payload.replace(
+                f"launcher_pid\t{FAKE_MANAGED_PID}\n".encode(),
+                f"launcher_pid\t0{FAKE_MANAGED_PID}\n".encode(),
+            ),
+            id="launcher-leading-zero",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                f"launcher_pid\t{FAKE_MANAGED_PID}\n".encode(),
+                b"launcher_pid\t2147483648\n",
+            ),
+            id="launcher-above-maximum",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                f"launcher_pid\t{FAKE_MANAGED_PID}\n".encode(),
+                b"launcher_pid\t" + b"9" * 128 + b"\n",
+            ),
+            id="launcher-overflow",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
                 b"supervisor_pid\t4343\n",
                 b"supervisor_pid\t4_343\n",
             ),
             id="supervisor-underscore",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"supervisor_pid\t4343\n",
+                b"supervisor_pid\t04343\n",
+            ),
+            id="supervisor-leading-zero",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"supervisor_pid\t4343\n",
+                b"supervisor_pid\t2147483648\n",
+            ),
+            id="supervisor-above-maximum",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"supervisor_pid\t4343\n",
+                b"supervisor_pid\t" + b"9" * 128 + b"\n",
+            ),
+            id="supervisor-overflow",
         ),
         pytest.param(
             lambda payload: payload.replace(
@@ -1899,6 +1989,114 @@ def test_shutdown_budget_malformed_corpus_has_python_shell_parity(
         "(shutdown budget is malformed or unsafe)"
         in result.stdout
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "original", "invalid"),
+    (
+        ("drain_timeout_seconds", "2", "+2"),
+        ("drain_timeout_seconds", "2", "02"),
+        ("drain_timeout_seconds", "2", "0"),
+        ("drain_timeout_seconds", "2", "316"),
+        ("drain_timeout_seconds", "2", "9" * 128),
+        ("launcher_pid", FAKE_MANAGED_PID, f"+{FAKE_MANAGED_PID}"),
+        ("launcher_pid", FAKE_MANAGED_PID, f"0{FAKE_MANAGED_PID}"),
+        ("launcher_pid", FAKE_MANAGED_PID, "1"),
+        ("launcher_pid", FAKE_MANAGED_PID, "2147483648"),
+        ("launcher_pid", FAKE_MANAGED_PID, "9" * 128),
+        ("supervisor_pid", "4343", "4_343"),
+        ("supervisor_pid", "4343", " 4343"),
+        ("supervisor_pid", "4343", "04343"),
+        ("supervisor_pid", "4343", "1"),
+        ("supervisor_pid", "4343", "2147483648"),
+        ("supervisor_pid", "4343", "9" * 128),
+    ),
+)
+def test_shell_shutdown_budget_numeric_parser_matches_canonical_rule(
+    tmp_path: Path,
+    field: str,
+    original: str,
+    invalid: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+    )
+    budget.write_bytes(
+        budget.read_bytes().replace(
+            f"{field}\t{original}\n".encode(),
+            f"{field}\t{invalid}\n".encode(),
+        )
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "status",
+        env_overrides={
+            "HEALTHMES_NATIVE_IDENTITY_HELPER": str(
+                _passthrough_shutdown_budget_helper(tmp_path)
+            )
+        },
+        timeout=4,
+    )
+
+    assert (
+        "Hermes decision runtime: unknown "
+        "(shutdown budget is malformed or unsafe)"
+        in result.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    ("drain_timeout", "launcher_pid", "supervisor_pid"),
+    (
+        (1, "2", "2"),
+        (315, "2147483647", "2147483647"),
+    ),
+)
+def test_shutdown_budget_numeric_boundaries_have_parser_parity(
+    tmp_path: Path,
+    drain_timeout: int,
+    launcher_pid: str,
+    supervisor_pid: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=drain_timeout,
+        pid=launcher_pid,
+        supervisor_pid=supervisor_pid,
+    )
+
+    record = load_runtime_shutdown_budget(budget)
+    native = _run_native_identity_helper(
+        "read-shutdown-budget",
+        str(budget),
+        "--max-bytes",
+        "1024",
+        "--max-drain-seconds",
+        "315",
+    )
+    result = _run_local_runtime(
+        harness,
+        "status",
+        env_overrides={
+            "HEALTHMES_NATIVE_IDENTITY_HELPER": str(
+                _passthrough_shutdown_budget_helper(tmp_path)
+            )
+        },
+        timeout=4,
+    )
+
+    assert record.drain_timeout_seconds == drain_timeout
+    assert record.launcher_pid == int(launcher_pid)
+    assert record.supervisor_pid == int(supervisor_pid)
+    assert native.stdout.encode("ascii") == budget.read_bytes()
+    assert "shutdown budget is malformed or unsafe" not in result.stdout
+    assert "shutdown budget is not a usable v3 record" not in result.stdout
 
 
 @pytest.mark.parametrize("version", (1, 2))
@@ -2518,6 +2716,24 @@ def test_native_ps_probe_rejects_oversized_output(tmp_path: Path) -> None:
     assert result.returncode == 5
     assert result.stdout == ""
     assert "native_identity_ps_output_oversized" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "pid",
+    ("1", "02", "2147483648", "9" * 128),
+)
+def test_native_identity_cli_rejects_noncanonical_managed_pid(
+    pid: str,
+) -> None:
+    result = _run_native_identity_helper(
+        "capture",
+        pid,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "invalid managed PID" in result.stderr
 
 
 def test_incomplete_lifecycle_lock_fails_closed_and_is_preserved(

@@ -36,6 +36,7 @@ RUNTIME_PYTHON_BIN="${HEALTHMES_RUNTIME_PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}
 NATIVE_IDENTITY_HELPER="${HEALTHMES_NATIVE_IDENTITY_HELPER:-$REPO_ROOT/scripts/runtime_native_identity.py}"
 NATIVE_IDENTITY_PYTHON_BIN="${HEALTHMES_NATIVE_IDENTITY_PYTHON_BIN:-}"
 MAX_DECISION_RUNTIME_DRAIN_SECONDS=315
+MAX_MANAGED_PROCESS_PID=2147483647
 DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS=2
 DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS=10
 DECISION_RUNTIME_LIFECYCLE_LOCK_STALE_GRACE_SECONDS=2
@@ -228,9 +229,22 @@ remove_generic_process_recovery_generation() {
         "$expected_record_sha256"
 }
 
+valid_bounded_decimal() {
+    local value=$1 minimum=$2 maximum=$3
+    local value_length minimum_length maximum_length
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+    value_length=${#value}
+    minimum_length=${#minimum}
+    maximum_length=${#maximum}
+    [ "$value_length" -ge "$minimum_length" ] \
+        && [ "$value_length" -le "$maximum_length" ] \
+        || return 1
+    [ "$value" -ge "$minimum" ] && [ "$value" -le "$maximum" ]
+}
+
 valid_managed_pid() {
     local pid=$1
-    [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ]
+    valid_bounded_decimal "$pid" 2 "$MAX_MANAGED_PROCESS_PID"
 }
 
 trim_whitespace() {
@@ -2435,8 +2449,8 @@ load_decision_runtime_stop_bounds() {
             ;;
         esac
     done <<<"$payload"
-    if ! [[ "$drain_timeout" =~ ^[1-9][0-9]*$ ]] \
-        || [ "$drain_timeout" -gt "$MAX_DECISION_RUNTIME_DRAIN_SECONDS" ]; then
+    if ! valid_bounded_decimal \
+        "$drain_timeout" 1 "$MAX_DECISION_RUNTIME_DRAIN_SECONDS"; then
         info "ignoring stale or invalid decision runtime stop budget"
         DECISION_RUNTIME_BUDGET_STATUS=invalid
         return 0
