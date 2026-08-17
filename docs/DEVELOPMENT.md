@@ -279,7 +279,9 @@ cd vendor/hermes-agent && \
 Direct CLI chat bypasses the HealthMes DecisionRequest ingress, source
 validation, and finalization policy. End-to-end product wellness QA must call
 `POST /v1/wellness-decisions`; direct Hermes output is not proof that the
-HealthMes product path works.
+HealthMes product path works. Every POST requires an `Idempotency-Key`: use
+one stable key per logical request and reuse it for retries. Reusing a key
+with different input returns `409 decision_idempotency_conflict`.
 
 ### Choosing the LLM (not just Claude)
 

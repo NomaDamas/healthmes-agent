@@ -571,6 +571,7 @@ class TestSqliteUpgrade:
                         id=uuid.uuid4().hex,
                         request_id=uuid.uuid4().hex,
                         request_fingerprint="a" * 64,
+                        requested_at=now,
                         state="pending",
                         owner_token=uuid.uuid4().hex,
                         lease_expires_at=now + timedelta(minutes=5),
@@ -582,6 +583,7 @@ class TestSqliteUpgrade:
                         id=uuid.uuid4().hex,
                         request_id=uuid.uuid4().hex,
                         request_fingerprint="b" * 64,
+                        requested_at=now,
                         state="completed",
                         owner_token=None,
                         lease_expires_at=None,
@@ -3812,6 +3814,12 @@ def test_postgres_decision_receipt_downgrade_is_lossless() -> None:
                         id=receipt_id,
                         request_id=uuid.uuid4(),
                         request_fingerprint="a" * 64,
+                        requested_at=datetime(
+                            2026,
+                            8,
+                            16,
+                            tzinfo=UTC,
+                        ),
                         state="completed",
                         result_payload={
                             "schema": "healthmes.decision-receipt.v1",

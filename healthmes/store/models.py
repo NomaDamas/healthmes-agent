@@ -460,6 +460,7 @@ class DecisionRequestReceipt(Base):
 
     request_id: Mapped[uuid.UUID] = mapped_column(index=True)
     request_fingerprint: Mapped[str_64]
+    requested_at: Mapped[datetime]
     state: Mapped[str_32] = mapped_column(index=True)
     owner_token: Mapped[uuid.UUID | None] = mapped_column(index=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(index=True)

@@ -323,6 +323,21 @@ class PersistenceFailedThenCompletedEngine(RecordingEngine):
         return _completed_result(request)
 
 
+class UnknownThenCompletedEngine(RecordingEngine):
+    async def ask_wellness(self, request):
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return DecisionResult(
+                request_id=request.request_id,
+                turn_id=request.turn_id,
+                status=DecisionStatus.FAILED,
+                limitations=["decision_finalization_outcome_unknown"],
+                persistence_status=PersistenceStatus.UNKNOWN,
+                runtime=RuntimeMetadata(runtime="test"),
+            )
+        return _completed_result(request)
+
+
 @pytest.mark.asyncio
 async def test_identical_channel_retries_execute_the_engine_once(
     settings,
@@ -354,6 +369,48 @@ async def test_identical_channel_retries_execute_the_engine_once(
     cached_result = await adapter.ask_wellness(submission)
 
     assert first_result is retry_result is cached_result
+    assert len(engine.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelling_one_waiter_preserves_shared_execution(
+    settings,
+    service_session_factory,
+) -> None:
+    engine = BlockingRecordingEngine()
+    adapter = DecisionChannelAdapter(
+        service=HealthMesDecisionService(
+            settings=settings,
+            engine_provider=lambda: engine,
+            session_factory_provider=lambda: service_session_factory,
+            clock=lambda: NOW,
+        )
+    )
+    submission = DecisionChannelRequest(
+        idempotency_key="shared-request-with-cancelled-waiter",
+        question="Should I stop working for today?",
+        source="future-ios-app",
+    )
+
+    cancelled_waiter = asyncio.create_task(
+        adapter.ask_wellness(submission)
+    )
+    await asyncio.wait_for(engine.started.wait(), timeout=1)
+    surviving_waiter = asyncio.create_task(
+        adapter.ask_wellness(submission)
+    )
+    await asyncio.sleep(0)
+
+    cancelled_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_waiter
+    assert not surviving_waiter.done()
+    assert len(engine.requests) == 1
+
+    engine.release.set()
+    result = await surviving_waiter
+
+    assert result.status is DecisionStatus.COMPLETED
     assert len(engine.requests) == 1
 
 
@@ -546,6 +603,65 @@ async def test_sqlite_lease_takeover_returns_one_canonical_service_result(
 
 
 @pytest.mark.asyncio
+async def test_stale_owner_waits_for_inflight_canonical_receipt(
+    settings,
+    service_session_factory,
+) -> None:
+    clock = MutableClock(NOW)
+    store = DecisionReceiptStore(
+        session_factory=service_session_factory,
+        lease_duration=timedelta(seconds=1),
+        retention=timedelta(days=30),
+    )
+    stale_engine = BlockingRecordingEngine(answer="Stale answer.")
+    canonical_engine = BlockingRecordingEngine(
+        answer="Canonical answer."
+    )
+    stale_service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: stale_engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    canonical_service = HealthMesDecisionService(
+        settings=settings,
+        engine_provider=lambda: canonical_engine,
+        session_factory_provider=lambda: service_session_factory,
+        clock=clock,
+    )
+    stale_service._receipt_store = store
+    canonical_service._receipt_store = store
+    submission = DecisionServiceRequest(
+        request_id=uuid.uuid4(),
+        question="Should I take a break?",
+        ingress=DecisionIngress.CHANNEL,
+        source="future-ios-app",
+    )
+
+    stale_call = asyncio.create_task(
+        stale_service.ask_wellness(submission)
+    )
+    await asyncio.wait_for(stale_engine.started.wait(), timeout=1)
+    clock.advance(timedelta(seconds=2))
+    canonical_call = asyncio.create_task(
+        canonical_service.ask_wellness(submission)
+    )
+    await asyncio.wait_for(canonical_engine.started.wait(), timeout=1)
+
+    stale_engine.release.set()
+    await asyncio.sleep(0.05)
+    assert not stale_call.done()
+
+    canonical_engine.release.set()
+    canonical_result, stale_result = await asyncio.gather(
+        canonical_call,
+        stale_call,
+    )
+    assert canonical_result.answer == "Canonical answer."
+    assert stale_result == canonical_result
+
+
+@pytest.mark.asyncio
 async def test_failed_result_is_released_and_retried(
     settings,
     service_session_factory,
@@ -641,6 +757,49 @@ async def test_persistence_failed_result_is_not_cached(
     assert failed.persistence_status is PersistenceStatus.FAILED
     assert completed.status is DecisionStatus.COMPLETED
     assert len(engine.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_unknown_retry_reuses_first_requested_at(
+    settings,
+    service_session_factory,
+) -> None:
+    clock = MutableClock(NOW)
+    engine = UnknownThenCompletedEngine()
+    adapter = DecisionChannelAdapter(
+        service=HealthMesDecisionService(
+            settings=settings,
+            engine_provider=lambda: engine,
+            session_factory_provider=lambda: service_session_factory,
+            clock=clock,
+        )
+    )
+    submission = DecisionChannelRequest(
+        idempotency_key="unknown-retry-requested-at-1",
+        question="Should this decision be recorded?",
+        source="future-ios-app",
+    )
+
+    unknown = await adapter.ask_wellness(submission)
+    clock.advance(timedelta(hours=3))
+    completed = await adapter.ask_wellness(submission)
+
+    assert unknown.persistence_status is PersistenceStatus.UNKNOWN
+    assert completed.status is DecisionStatus.COMPLETED
+    assert [request.requested_at for request in engine.requests] == [
+        NOW,
+        NOW,
+    ]
+    with service_session_factory() as session:
+        [receipt] = session.scalars(
+            select(DecisionRequestReceipt)
+        ).all()
+        stored_requested_at = receipt.requested_at
+        if stored_requested_at.tzinfo is None:
+            stored_requested_at = stored_requested_at.replace(
+                tzinfo=UTC
+            )
+        assert stored_requested_at.astimezone(UTC) == NOW
 
 
 @pytest.mark.asyncio

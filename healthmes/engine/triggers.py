@@ -1210,24 +1210,6 @@ class TriggerEvaluator:
         reasoning_required = bool(
             getattr(self._alert_sender, "requires_reasoning", False)
         )
-        if self._settings.native_alert_delivery and (
-            ready_for_native or not reasoning_required
-        ):
-            event.alert_sent = True
-            event.payload = {
-                **delivery_payload,
-                "push": {
-                    "sent": True,
-                    "channel": "native",
-                    "upstream_ok": False,
-                    "status_code": result.status_code,
-                    "detail": result.detail,
-                },
-            }
-            outcome = FireOutcome(fire=fire, status="pushed")
-            session.commit()
-            return outcome
-
         if ready_for_native:
             event.payload = {
                 **delivery_payload,
@@ -1319,19 +1301,6 @@ class TriggerEvaluator:
         reasoning_required = bool(
             getattr(self._alert_sender, "requires_reasoning", False)
         )
-        if self._settings.native_alert_delivery and not reasoning_required:
-            event.alert_sent = True
-            event.payload = {
-                **payload,
-                "push": {
-                    "sent": True,
-                    "channel": "native",
-                    "upstream_ok": False,
-                    "upstream_error": str(exc),
-                },
-            }
-            return FireOutcome(fire=fire, status="pushed")
-
         event.payload = {
             **payload,
             "push": {
@@ -1366,7 +1335,11 @@ class TriggerEvaluator:
                 )
             ).all()
             if any(
-                is_user_visible_alert(event)
+                is_user_visible_alert(
+                    session,
+                    event,
+                    now=_ensure_utc(now),
+                )
                 for event in recent_events
             ):
                 return _SUPPRESS_COOLDOWN
@@ -1381,7 +1354,11 @@ class TriggerEvaluator:
                     TriggerEvent.fired_at >= day_start_utc
                 )
             )
-            if is_user_visible_alert(event)
+            if is_user_visible_alert(
+                session,
+                event,
+                now=_ensure_utc(now),
+            )
         )
         if visible_today >= self._settings.alert_daily_budget:
             return _SUPPRESS_DAILY_BUDGET

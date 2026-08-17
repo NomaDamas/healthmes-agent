@@ -103,8 +103,10 @@ def test_retry_uses_stable_request_id_and_canonical_proactive_ingress(
     first = sender.send(_fire(), fired_at=NOW, trigger_event_id=TRIGGER_ID)
     second = sender.send(_fire(), fired_at=NOW, trigger_event_id=TRIGGER_ID)
 
-    assert first.ok is True
-    assert second.ok is True
+    assert first.ok is False
+    assert second.ok is False
+    assert first.ready_for_native is True
+    assert first.channel == "app_poll"
     assert bridge.submissions[0].request_id == bridge.submissions[1].request_id
     assert bridge.submissions[0].ingress.value == "proactive"
     assert bridge.submissions[0].source == "focus_fragmentation"
@@ -122,7 +124,8 @@ def test_scheduled_rule_uses_scheduled_ingress(settings) -> None:
         trigger_event_id=TRIGGER_ID,
     )
 
-    assert result.ok is True
+    assert result.ok is False
+    assert result.ready_for_native is True
     assert bridge.submissions[0].ingress.value == "scheduled"
     assert bridge.submissions[0].source == "morning"
 
@@ -162,7 +165,7 @@ def test_simple_proactive_summary_is_deliverable_without_record(
         trigger_event_id=TRIGGER_ID,
     )
 
-    assert result.ok is True
+    assert result.ok is False
     assert result.ready_for_native is True
     assert result.decision_record_id is None
 
@@ -183,7 +186,7 @@ def test_proactive_clarification_is_deliverable_as_user_message(
         trigger_event_id=TRIGGER_ID,
     )
 
-    assert result.ok is True
+    assert result.ok is False
     assert result.ready_for_native is True
     assert result.message == "Which coffee size are you considering?"
 

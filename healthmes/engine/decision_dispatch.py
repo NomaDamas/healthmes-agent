@@ -195,20 +195,14 @@ class DecisionAlertSender:
                 proposed_action=result.proposed_action,
             )
         return DecisionDispatchResult(
-            ok=self._settings.native_alert_delivery,
-            status_code=200 if self._settings.native_alert_delivery else 204,
-            detail=(
-                None
-                if self._settings.native_alert_delivery
-                else "decision completed; native alert delivery is disabled"
-            ),
+            # This component performs reasoning only. A separate transport
+            # must report ok=True before HealthMes may claim delivery.
+            ok=False,
+            status_code=204,
+            detail="decision completed; available for app polling",
             retryable=False,
             ready_for_native=True,
-            channel=(
-                "native"
-                if self._settings.native_alert_delivery
-                else None
-            ),
+            channel="app_poll",
             message=message,
             decision_record_id=result.decision_record_id,
             decision_request_id=result.request_id,

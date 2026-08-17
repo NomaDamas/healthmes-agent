@@ -211,6 +211,7 @@ def test_maintenance_bounds_decision_receipts_at_exact_cutoff(
     expired = DecisionRequestReceipt(
         request_id=uuid.uuid4(),
         request_fingerprint="a" * 64,
+        requested_at=current - timedelta(minutes=1),
         state="completed",
         result_payload={
             "schema": "healthmes.decision-receipt.v1",
@@ -221,6 +222,7 @@ def test_maintenance_bounds_decision_receipts_at_exact_cutoff(
     future = DecisionRequestReceipt(
         request_id=uuid.uuid4(),
         request_fingerprint="b" * 64,
+        requested_at=current - timedelta(minutes=1),
         state="completed",
         result_payload={
             "schema": "healthmes.decision-receipt.v1",
@@ -257,6 +259,128 @@ def test_maintenance_bounds_decision_receipts_at_exact_cutoff(
     assert report.decision_receipts_deleted == 1
     assert session.get(DecisionRequestReceipt, expired_id) is None
     assert session.get(DecisionRequestReceipt, future_id) is not None
+
+
+def test_maintenance_expires_trigger_answers_at_earliest_retention_cutoff(
+    session,
+    settings,
+) -> None:
+    current = datetime(2026, 8, 16, 12, tzinfo=UTC)
+    update_retention_policy(
+        session,
+        "alert",
+        "7d",
+        now=current,
+    )
+    update_retention_policy(
+        session,
+        "decision",
+        "1d",
+        now=current,
+    )
+
+    decision_event = TriggerEvent(
+        fired_at=current - timedelta(days=1),
+        rule_id="proactive_focus",
+        payload={
+            "summary": "Focus was fragmented.",
+            "message": "Take a short break.",
+            "push": {"sent": True, "channel": "apns"},
+        },
+        alert_sent=True,
+    )
+    alert_event = TriggerEvent(
+        fired_at=current - timedelta(days=7),
+        rule_id="scheduled_briefing.morning",
+        payload={
+            "summary": "Morning briefing.",
+            "message": "Keep the morning light.",
+            "push": {
+                "sent": False,
+                "state": "app_available",
+                "channel": "app_poll",
+            },
+        },
+        alert_sent=False,
+    )
+    fresh_event = TriggerEvent(
+        fired_at=(
+            current
+            - timedelta(days=7)
+            + timedelta(microseconds=1)
+        ),
+        rule_id="scheduled_briefing.evening",
+        payload={
+            "summary": "Evening briefing.",
+            "message": "Wind down gradually.",
+            "push": {
+                "sent": False,
+                "state": "app_available",
+                "channel": "app_poll",
+            },
+        },
+        alert_sent=False,
+    )
+    session.add_all((decision_event, alert_event, fresh_event))
+    session.flush()
+    decision = _wellness_decision(
+        created_at=current - timedelta(days=1),
+        trigger_event_id=decision_event.id,
+    )
+    apply_decision_retention(
+        session,
+        decision,
+        basis_at=current - timedelta(days=1),
+    )
+    session.add(decision)
+    session.flush()
+    decision_event.payload = {
+        **decision_event.payload,
+        "decision_record_id": str(decision.id),
+    }
+    session.commit()
+    event_ids = (
+        decision_event.id,
+        alert_event.id,
+        fresh_event.id,
+    )
+
+    preview = run_storage_maintenance(
+        session,
+        settings,
+        dry_run=True,
+        now=current,
+    )
+    session.commit()
+    assert preview.decisions_deleted == 0
+    assert all(
+        "message" in session.get(TriggerEvent, event_id).payload
+        for event_id in event_ids
+    )
+
+    run_storage_maintenance(
+        session,
+        settings,
+        now=current,
+    )
+    session.commit()
+    session.expire_all()
+
+    expired_by_decision = session.get(
+        TriggerEvent,
+        decision_event.id,
+    )
+    expired_by_alert = session.get(TriggerEvent, alert_event.id)
+    retained = session.get(TriggerEvent, fresh_event.id)
+    assert expired_by_decision is not None
+    assert expired_by_alert is not None
+    assert retained is not None
+    for event in (expired_by_decision, expired_by_alert):
+        assert "message" not in event.payload
+        assert "decision" not in event.payload
+        assert "decision_record_id" not in event.payload
+        assert event.payload["push"]["state"] == "expired"
+    assert retained.payload["message"] == "Wind down gradually."
 
 
 def test_retention_shrink_purges_recalculated_exact_cutoff(session) -> None:

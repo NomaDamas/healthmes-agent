@@ -160,6 +160,7 @@ from healthmes.decision.service import (
     DecisionRuntimeNotConfiguredError,
     DecisionServiceRequest,
     HealthMesDecisionService,
+    decision_rest_request_id,
 )
 
 __all__ = [
@@ -240,6 +241,7 @@ __all__ = [
     "FreshnessStatus",
     "HealthMesDecisionEngine",
     "HealthMesDecisionService",
+    "decision_rest_request_id",
     "HermesDecisionProfileAssertion",
     "HermesDecisionProfileError",
     "HermesHttpResponsesTransport",

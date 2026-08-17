@@ -139,9 +139,13 @@ open http://localhost:8100/docs         # REST playground (OpenAPI)
   ```bash
   curl -sS http://localhost:8100/v1/wellness-decisions \
     -H 'Content-Type: application/json' \
+    -H 'Idempotency-Key: expert-qa-20260817-001' \
     -d '{"question":"오늘 무리해도 돼? 필요한 자료를 찾아 근거와 함께 설명해줘."}'
   ```
 
+  `Idempotency-Key` is required. Generate one stable key for each logical
+  request and reuse it for transport retries. Reusing the same key with a
+  different request body returns `409 decision_idempotency_conflict`.
   Add the configured bearer header when `HEALTHMES_API_TOKEN` is enabled.
   Direct `hermes` / `hermes chat` remains useful for isolated vendor-runtime
   diagnostics, but it bypasses the HealthMes decision ingress, source

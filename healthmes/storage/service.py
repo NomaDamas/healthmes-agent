@@ -22,6 +22,9 @@ from healthmes.calendar_retention import (
     purge_expired_calendar_mirrors,
 )
 from healthmes.config import Settings
+from healthmes.engine.alert_visibility import (
+    expire_trigger_event_answers,
+)
 from healthmes.store import (
     AppUsageSample,
     DecisionRecord,
@@ -58,6 +61,7 @@ DEFAULT_RETENTION: dict[str, str] = {
     "nutrition_confirmation": "forever",
     "aggregate": "forever",
     "decision": "forever",
+    "alert": "7d",
     "medical_record": "forever",
     "activity_raw": "14d",
     "activity_hourly": "90d",
@@ -198,6 +202,11 @@ def _update_retention_policy(
         # outer commit as an already-expired DecisionRecord.
         session.flush()
         purge_expired_decision_records(
+            session,
+            now=current,
+        )
+    if data_class == "alert":
+        expire_trigger_event_answers(
             session,
             now=current,
         )
@@ -885,6 +894,11 @@ def _run_storage_maintenance(
     deleted = 0
     reclaimed = 0
     errors: list[str] = []
+    expire_trigger_event_answers(
+        session,
+        now=current,
+        dry_run=dry_run,
+    )
     decision_candidates = purge_expired_decision_records(
         session,
         now=current,

@@ -356,6 +356,8 @@ the service refuses to start unauthenticated on a non-loopback bind).
 
 Product wellness questions must use `POST /v1/wellness-decisions`; this is
 the single HealthMes ingress that owns source validation and finalization.
+Each POST requires a stable `Idempotency-Key` for that logical request;
+retries reuse the key, while different input under the same key is rejected.
 HealthMes starts its core `/health` and `/mcp` surfaces before the optional
 Hermes decision runtime. The first decision lazily validates the runtime and
 retries verification on a later request after a transient failure.

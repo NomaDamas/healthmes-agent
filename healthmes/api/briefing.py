@@ -357,7 +357,7 @@ def _alerts_block(session: Session, settings: Settings, now: datetime) -> Glance
             .order_by(TriggerEvent.fired_at.desc(), TriggerEvent.created_at.desc())
         ).all()
         if ensure_utc(event.fired_at) >= cutoff
-        and is_user_visible_alert(event)
+        and is_user_visible_alert(session, event, now=now)
     ]
     if not events:
         return GlanceAlertsOut(unresolved_count=0, top=None)

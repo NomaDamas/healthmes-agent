@@ -53,6 +53,7 @@ def test_storage_settings_bootstraps_defaults_and_measures_files(
     assert policies["activity_hourly"] == "90d"
     assert policies["activity_daily"] == "forever"
     assert policies["wearable_normalized"] == "30d"
+    assert policies["alert"] == "7d"
     assert policies["decision"] == "forever"
     assert body["backup"]["provider"] == "local"
     assert body["backup"]["snapshot_count"] == 0

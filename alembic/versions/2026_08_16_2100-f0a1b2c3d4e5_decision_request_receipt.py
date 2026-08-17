@@ -28,6 +28,11 @@ def upgrade() -> None:
             sa.String(length=64),
             nullable=False,
         ),
+        sa.Column(
+            "requested_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+        ),
         sa.Column("state", sa.String(length=32), nullable=False),
         sa.Column("owner_token", sa.Uuid(), nullable=True),
         sa.Column(

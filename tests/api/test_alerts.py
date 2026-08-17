@@ -215,7 +215,7 @@ def test_app_available_result_is_visible_without_claiming_delivery(
             "message": "Which coffee size are you considering?",
             "push": {
                 "sent": False,
-                "state": "available",
+                "state": "app_available",
                 "channel": "app_poll",
                 "status_code": 204,
             },

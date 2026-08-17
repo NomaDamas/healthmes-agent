@@ -71,8 +71,15 @@ PROVIDER = "test-provider"
 FINGERPRINT_KEY = b"test-decision-fingerprint-key-32-bytes"
 
 
-def _bearer(token: str = TOKEN) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
+def _bearer(
+    token: str = TOKEN,
+    *,
+    idempotency_key: str | None = None,
+) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Idempotency-Key": idempotency_key or uuid.uuid4().hex,
+    }
 
 
 def _secured_settings(settings, **updates):
@@ -320,6 +327,7 @@ class ProviderFailureRuntime:
 @pytest.mark.asyncio
 async def test_rest_disconnect_cancels_hermes_responses_stream(
     settings,
+    tmp_path,
 ) -> None:
     upstream = _BlockingHermesStream()
 
@@ -379,7 +387,18 @@ async def test_rest_disconnect_cancels_hermes_responses_stream(
         agent=agent,
         finalizer=_UnusedFinalizer(),  # type: ignore[arg-type]
     )
-    app = create_app(_secured_settings(settings))
+    app = create_app(
+        _secured_settings(
+            settings,
+            database_url=(
+                f"sqlite+pysqlite:///{tmp_path / 'disconnect.db'}"
+            ),
+        )
+    )
+    receipt_factory = (
+        app.state.decision_service._session_factory_provider()
+    )
+    Base.metadata.create_all(receipt_factory.kw["bind"])
     app.state.decision_engine = engine
 
     try:
@@ -408,8 +427,19 @@ async def test_rest_disconnect_cancels_hermes_responses_stream(
 @pytest.mark.asyncio
 async def test_actual_asgi_disconnect_cancels_decision_reasoning(
     settings,
+    tmp_path,
 ) -> None:
-    app = create_app(_secured_settings(settings))
+    configured = _secured_settings(
+        settings,
+        database_url=(
+            f"sqlite+pysqlite:///{tmp_path / 'asgi-disconnect.db'}"
+        ),
+    )
+    app = create_app(configured)
+    receipt_factory = (
+        app.state.decision_service._session_factory_provider()
+    )
+    Base.metadata.create_all(receipt_factory.kw["bind"])
     engine = DisconnectAwareDecisionEngine()
     app.state.decision_engine = engine
     request_body = json.dumps(
@@ -443,6 +473,7 @@ async def test_actual_asgi_disconnect_cancels_decision_reasoning(
         "root_path": "",
         "headers": [
             (b"authorization", f"Bearer {TOKEN}".encode()),
+            (b"idempotency-key", b"disconnect-contract-1"),
             (b"content-type", b"application/json"),
             (b"content-length", str(len(request_body)).encode()),
         ],
@@ -518,6 +549,56 @@ def test_rest_contract_is_server_owned_and_hides_internal_trace(
     assert request.budget == DecisionBudget()
     assert request.hints.local_date == DAY
     assert request.hints.related_record_ids == {}
+
+
+def test_rest_requires_durable_idempotency_key(settings) -> None:
+    app = create_app(_secured_settings(settings))
+    app.state.decision_engine = RecordingDecisionEngine()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/wellness-decisions",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            json={"question": "Should I keep working?"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_rest_idempotency_key_replays_and_rejects_different_input(
+    settings,
+) -> None:
+    app = create_app(_secured_settings(settings))
+    engine = RecordingDecisionEngine()
+
+    with TestClient(app) as client:
+        app.state.decision_engine = engine
+        headers = _bearer(idempotency_key="rest-request-123")
+        first = client.post(
+            "/v1/wellness-decisions",
+            headers=headers,
+            json={"question": "Should I keep working?"},
+        )
+        replay = client.post(
+            "/v1/wellness-decisions",
+            headers=headers,
+            json={"question": "Should I keep working?"},
+        )
+        conflict = client.post(
+            "/v1/wellness-decisions",
+            headers=headers,
+            json={"question": "Should I drink coffee?"},
+        )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert len(engine.requests) == 1
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == (
+        "decision_idempotency_conflict"
+    )
 
 
 @pytest.mark.parametrize("value", ("true", "yes", "on", 1))
@@ -740,10 +821,12 @@ def test_request_contract_errors_are_422_before_runtime_lookup(
     ) as client:
         blank = client.post(
             "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "invalid-blank-1"},
             json={"question": "   "},
         )
         overlong_range = client.post(
             "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "invalid-range-1"},
             json={
                 "question": "Summarize this period.",
                 "hints": {
@@ -769,6 +852,7 @@ def test_closing_engine_returns_503(settings) -> None:
         app.state.decision_engine = ClosingDecisionEngine()
         response = client.post(
             "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "closing-engine-1"},
             json={"question": "Should I keep working?"},
         )
 
@@ -786,6 +870,7 @@ def test_busy_engine_returns_429(settings) -> None:
         app.state.decision_engine = BusyDecisionEngine()
         response = client.post(
             "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "busy-engine-1"},
             json={"question": "Should I keep working?"},
         )
 
@@ -816,6 +901,9 @@ def test_runtime_failures_return_503(
         )
         response = client.post(
             "/v1/wellness-decisions",
+            headers={
+                "Idempotency-Key": f"runtime-failure-{limitation}"
+            },
             json={"question": "Should I keep working?"},
         )
 
@@ -859,6 +947,9 @@ def test_internal_decision_failures_return_503(
         )
         response = client.post(
             "/v1/wellness-decisions",
+            headers={
+                "Idempotency-Key": f"internal-failure-{limitation}"
+            },
             json={"question": "Should I keep working?"},
         )
 
@@ -887,6 +978,7 @@ def test_finalization_timeout_returns_service_unavailable_503(
         )
         response = client.post(
             "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "finalization-timeout-1"},
             json={"question": "Should I keep working?"},
         )
 
@@ -915,6 +1007,7 @@ def test_unknown_commit_outcome_returns_202_and_recovery_location(
         app.state.decision_engine = UnknownPersistenceDecisionEngine()
         response = client.post(
             "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "unknown-commit-1"},
             json={"question": "Should I keep working?"},
         )
 
@@ -1331,6 +1424,9 @@ def test_expected_safe_decision_stops_remain_structured_results(
         )
         response = client.post(
             "/v1/wellness-decisions",
+            headers={
+                "Idempotency-Key": f"safe-stop-{limitation}"
+            },
             json={"question": "Should I keep working?"},
         )
 
@@ -1362,6 +1458,7 @@ def test_missing_hermes_responses_endpoint_fails_closed(
     ) as client:
         response = client.post(
             "/v1/wellness-decisions",
+            headers={"Idempotency-Key": "missing-hermes-responses-1"},
             json={"question": "Should I keep working?"},
         )
 

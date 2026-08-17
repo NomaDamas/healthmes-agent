@@ -4,6 +4,7 @@ import asyncio
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -30,28 +31,37 @@ from healthmes.store.decision_receipts import (
 NOW = datetime(2026, 8, 16, 9, tzinfo=UTC)
 
 
-def _completed(request) -> DecisionResult:
+def _completed(
+    request,
+    *,
+    answer: str = "Take a short break.",
+) -> DecisionResult:
     return DecisionResult(
         request_id=request.request_id,
         turn_id=request.turn_id,
         status=DecisionStatus.COMPLETED,
-        answer="Take a short break.",
+        answer=answer,
         persistence_status=PersistenceStatus.NOT_REQUIRED,
         runtime=RuntimeMetadata(runtime="test"),
     )
 
 
 class BlockingEngine:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        answer: str = "Take a short break.",
+    ) -> None:
         self.requests = []
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.answer = answer
 
     async def ask_wellness(self, request):
         self.requests.append(request)
         self.started.set()
         await self.release.wait()
-        return _completed(request)
+        return _completed(request, answer=self.answer)
 
 
 class RecordingEngine:
@@ -93,6 +103,32 @@ class BlockedThenCompletedEngine(RecordingEngine):
         return _completed(request)
 
 
+class UnknownThenCompletedEngine(RecordingEngine):
+    async def ask_wellness(self, request):
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return DecisionResult(
+                request_id=request.request_id,
+                turn_id=request.turn_id,
+                status=DecisionStatus.FAILED,
+                limitations=["decision_finalization_outcome_unknown"],
+                persistence_status=PersistenceStatus.UNKNOWN,
+                runtime=RuntimeMetadata(runtime="test"),
+            )
+        return _completed(request)
+
+
+class MutableClock:
+    def __init__(self, current: datetime) -> None:
+        self.current = current
+
+    def __call__(self) -> datetime:
+        return self.current
+
+    def advance(self, delta: timedelta) -> None:
+        self.current += delta
+
+
 class ClaimObservingReceiptStore(DecisionReceiptStore):
     def __init__(
         self,
@@ -108,6 +144,34 @@ class ClaimObservingReceiptStore(DecisionReceiptStore):
         if claim.state is DecisionReceiptClaimState.WAIT:
             self.wait_reached.set()
         return claim
+
+
+@contextmanager
+def _isolated_postgres_factory():
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_decision_receipt_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    try:
+        yield factory
+    finally:
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
+        admin_engine.dispose()
 
 
 @pytest.mark.skipif(
@@ -352,3 +416,109 @@ async def test_postgres_concurrency_restart_and_failed_retry(
         with admin_engine.begin() as connection:
             connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
         admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires HEALTHMES_TEST_POSTGRES_URL",
+)
+@pytest.mark.asyncio
+async def test_postgres_unknown_retry_reuses_first_requested_at(
+    settings,
+) -> None:
+    with _isolated_postgres_factory() as factory:
+        clock = MutableClock(NOW)
+        runtime = UnknownThenCompletedEngine()
+        adapter = DecisionChannelAdapter(
+            service=HealthMesDecisionService(
+                settings=settings,
+                engine_provider=lambda: runtime,
+                session_factory_provider=lambda: factory,
+                clock=clock,
+            )
+        )
+        submission = DecisionChannelRequest(
+            idempotency_key="postgres-unknown-requested-at-1",
+            question="Should I keep working?",
+            source="future-ios-app",
+        )
+
+        unknown = await adapter.ask_wellness(submission)
+        clock.advance(timedelta(hours=3))
+        completed = await adapter.ask_wellness(submission)
+
+        assert unknown.persistence_status is PersistenceStatus.UNKNOWN
+        assert completed.status is DecisionStatus.COMPLETED
+        assert [
+            request.requested_at for request in runtime.requests
+        ] == [NOW, NOW]
+        with factory() as session:
+            [receipt] = session.scalars(
+                sa.select(DecisionRequestReceipt)
+            ).all()
+            assert receipt.requested_at == NOW
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires HEALTHMES_TEST_POSTGRES_URL",
+)
+@pytest.mark.asyncio
+async def test_postgres_stale_owner_waits_for_canonical_result(
+    settings,
+) -> None:
+    with _isolated_postgres_factory() as factory:
+        clock = MutableClock(NOW)
+        store = DecisionReceiptStore(
+            session_factory=factory,
+            lease_duration=timedelta(seconds=1),
+            retention=timedelta(days=30),
+        )
+        stale_engine = BlockingEngine(answer="Stale answer.")
+        canonical_engine = BlockingEngine(answer="Canonical answer.")
+        stale_service = HealthMesDecisionService(
+            settings=settings,
+            engine_provider=lambda: stale_engine,
+            session_factory_provider=lambda: factory,
+            clock=clock,
+        )
+        canonical_service = HealthMesDecisionService(
+            settings=settings,
+            engine_provider=lambda: canonical_engine,
+            session_factory_provider=lambda: factory,
+            clock=clock,
+        )
+        stale_service._receipt_store = store
+        canonical_service._receipt_store = store
+        stale = DecisionChannelAdapter(service=stale_service)
+        canonical = DecisionChannelAdapter(service=canonical_service)
+        submission = DecisionChannelRequest(
+            idempotency_key="postgres-stale-owner-1",
+            question="Should I take a break?",
+            source="future-ios-app",
+        )
+
+        stale_call = asyncio.create_task(
+            stale.ask_wellness(submission)
+        )
+        await asyncio.wait_for(stale_engine.started.wait(), timeout=2)
+        clock.advance(timedelta(seconds=2))
+        canonical_call = asyncio.create_task(
+            canonical.ask_wellness(submission)
+        )
+        await asyncio.wait_for(
+            canonical_engine.started.wait(),
+            timeout=2,
+        )
+
+        stale_engine.release.set()
+        await asyncio.sleep(0.05)
+        assert not stale_call.done()
+
+        canonical_engine.release.set()
+        canonical_result, stale_result = await asyncio.gather(
+            canonical_call,
+            stale_call,
+        )
+        assert canonical_result.answer == "Canonical answer."
+        assert stale_result == canonical_result

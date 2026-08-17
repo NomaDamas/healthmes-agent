@@ -413,24 +413,21 @@ def test_failed_push_is_recorded_and_not_retried(settings, session_factory) -> N
     assert event.payload["push"]["status_code"] == 502
 
 
-def test_native_delivery_surfaces_alert_when_sender_fails(settings, session_factory) -> None:
-    """native_alert_delivery on: a fired trigger is marked delivered even when
-    a non-reasoning sender fails, so the companion apps surface it via
-    /v1/alerts + glance (phone alerts without Telegram — user request). Alert
-    hygiene still gates it."""
+def test_native_setting_does_not_claim_delivery_when_sender_fails(
+    settings,
+    session_factory,
+) -> None:
+    """A setting is not transport evidence; only sender ok marks delivery."""
     native_settings = settings.model_copy(update={"native_alert_delivery": True})
     sender = FakeAlertSender(ok=False)
     with freeze_time("2026-07-09 14:00:00"):
         evaluator = make_evaluator(native_settings, session_factory, sender, rules=(fixed_rule,))
         report = evaluator.evaluate_once()
 
-    assert [o.status for o in report.outcomes] == ["pushed"]
+    assert [o.status for o in report.outcomes] == ["push_failed"]
     [event] = all_events(session_factory)
-    # Surfaced for native polling (glance/alerts filter on alert_sent) despite
-    # the upstream delivery failure.
-    assert event.alert_sent is True
-    assert event.payload["push"]["channel"] == "native"
-    assert event.payload["push"]["upstream_ok"] is False
+    assert event.alert_sent is False
+    assert event.payload["push"]["suppressed_reason"] == "push_failed"
 
 
 def test_native_delivery_off_keeps_failed_sender_undelivered(
@@ -487,21 +484,22 @@ def test_sender_exception_recovers_on_next_sweep(settings, session_factory) -> N
     assert event.alert_sent is True
 
 
-def test_sender_exception_native_on_delivers_natively(settings, session_factory) -> None:
-    """native on: a raising sender still surfaces the alert to companion apps —
-    the row is kept and marked delivered natively."""
+def test_sender_exception_native_on_stays_undelivered(
+    settings,
+    session_factory,
+) -> None:
+    """A transport exception cannot be represented as delivered."""
     native_settings = settings.model_copy(update={"native_alert_delivery": True})
     sender = RaisingAlertSender()
     with freeze_time("2026-07-09 14:00:00"):
         evaluator = make_evaluator(native_settings, session_factory, sender, rules=(fixed_rule,))
         report = evaluator.evaluate_once()
 
-    assert [o.status for o in report.outcomes] == ["pushed"]
+    assert [o.status for o in report.outcomes] == ["push_failed"]
     [event] = all_events(session_factory)
-    assert event.alert_sent is True
-    assert event.payload["push"]["channel"] == "native"
-    assert event.payload["push"]["upstream_ok"] is False
-    assert "upstream_error" in event.payload["push"]
+    assert event.alert_sent is False
+    assert event.payload["push"]["state"] == "dispatching"
+    assert "last_error" in event.payload["push"]
 
 
 # ---------------------------------------------------------------------------

@@ -257,7 +257,7 @@ def test_native_disabled_decision_is_app_available_not_delivered(
         )
         assert event.payload["push"] == {
             "sent": False,
-            "state": "available",
+            "state": "app_available",
             "channel": "app_poll",
             "status_code": 204,
             "detail": "native alert delivery is disabled",

@@ -6,9 +6,9 @@ import asyncio
 import uuid
 from collections.abc import Awaitable
 from datetime import date
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Header, Request, Response, status
 from pydantic import (
     AwareDatetime,
     BaseModel,
@@ -31,6 +31,7 @@ from healthmes.decision import (
     DecisionContextHints,
     DecisionEngineBusyError,
     DecisionEngineClosedError,
+    DecisionIdempotencyConflictError,
     DecisionIngress,
     DecisionResult,
     DecisionRuntimeNotConfiguredError,
@@ -40,6 +41,7 @@ from healthmes.decision import (
     PersistenceStatus,
     RuntimeMetadata,
     SourceRef,
+    decision_rest_request_id,
     decision_result_from_record,
     list_decision_domain_policies,
     resolve_decision_execution_scope,
@@ -354,11 +356,25 @@ async def create_wellness_decision(
     body: WellnessDecisionInput,
     request: Request,
     response: Response,
+    idempotency_key: Annotated[
+        str,
+        Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=255,
+        ),
+    ],
 ) -> WellnessDecisionOutput:
     """Run one server-owned, aggregate-only local decision turn."""
 
     try:
         service_request = DecisionServiceRequest(
+            request_id=decision_rest_request_id(
+                owner_principal_id=(
+                    request.app.state.settings.decision_owner_principal_id
+                ),
+                idempotency_key=idempotency_key,
+            ),
             question=body.question,
             ingress=DecisionIngress.REST,
             persistence_requested=body.persistence_requested,
@@ -410,6 +426,12 @@ async def create_wellness_decision(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "decision_engine_closing",
             "The HealthMes decision engine is shutting down.",
+        ) from exc
+    except DecisionIdempotencyConflictError as exc:
+        raise APIError(
+            status.HTTP_409_CONFLICT,
+            "decision_idempotency_conflict",
+            "Idempotency-Key was already used for different input.",
         ) from exc
 
     if result.persistence_status is PersistenceStatus.UNKNOWN:

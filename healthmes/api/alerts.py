@@ -207,7 +207,7 @@ def list_alerts(
             .order_by(TriggerEvent.fired_at.desc(), TriggerEvent.created_at.desc())
         ).all()
         if ensure_utc(event.fired_at) >= cutoff
-        and is_user_visible_alert(event)
+        and is_user_visible_alert(session, event, now=now)
     ]
 
     window = events[page.offset : page.offset + page.limit]
