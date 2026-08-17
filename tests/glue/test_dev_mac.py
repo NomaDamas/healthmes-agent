@@ -266,6 +266,9 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
             exit)
                 rm -f "$FAKE_SUPERVISOR_STATE/alive"
                 rm -f "$FAKE_PROCESS_STATE/alive"
+                if [ "${FAKE_SUPERVISOR_CLEANUP_PROOF:-remove}" = "remove" ]; then
+                    rm -f "$FAKE_STOP_BUDGET"
+                fi
                 ;;
             supervisor-exit-only)
                 rm -f "$FAKE_SUPERVISOR_STATE/alive"
@@ -310,6 +313,9 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         "FAKE_EVENT_LOG": str(event_log),
         "FAKE_PROCESS_STATE": str(process_state),
         "FAKE_SUPERVISOR_STATE": str(supervisor_state),
+        "FAKE_STOP_BUDGET": str(
+            runtime / "hermes-decision-stop-budget"
+        ),
         "HEALTHMES_DEV_MAC_SCRIPT": str(dev_mac),
         "HEALTHMES_LAUNCHCTL_BIN": str(fake_bin / "launchctl"),
         "HEALTHMES_PS_BIN": str(fake_bin / "ps"),
@@ -577,6 +583,26 @@ def test_runtime_docs_include_open_wearables_beat() -> None:
     assert "ow-beat" in readme
 
 
+def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
+    development = " ".join(
+        DEVELOPMENT_DOC.read_text(encoding="utf-8").split()
+    )
+
+    assert (
+        "Legacy v1/v2 and missing records use the conservative 315-second "
+        "drain plus that margin; malformed or stale records fail closed "
+        "without signalling."
+    ) in development
+    assert (
+        "native stop reports success only if the exact v3 record is gone"
+        in development
+    )
+    assert (
+        "unreadable `/proc` process records, and unprovable identities fail "
+        "closed"
+    ) in development
+
+
 def test_uninstall_keeps_data_unless_delete_data_is_explicit() -> None:
     text = LOCAL_SCRIPT.read_text(encoding="utf-8")
     body = _function_body(text, "cmd_uninstall")
@@ -691,6 +717,47 @@ def test_decision_stop_uses_saved_startup_budget_not_mutable_env(
     )
     assert events.count("sleep 1") == 0
     assert not budget.exists()
+
+
+def test_decision_stop_rejects_exit_without_descendant_cleanup_proof(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    pid_file = _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="exit",
+        check=False,
+        env_overrides={
+            "FAKE_SUPERVISOR_CLEANUP_PROOF": "retain",
+        },
+    )
+
+    assert result.returncode != 0
+    assert (
+        "supervisor exited without proving Hermes descendant cleanup"
+        in result.stderr
+    )
+    assert "preserving shutdown budget and launcher metadata" in (
+        result.stderr
+    )
+    assert budget.exists()
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
+    assert not (
+        Path(harness["supervisor_state"]) / "alive"
+    ).exists()
+    assert not (Path(harness["process_state"]) / "alive").exists()
 
 
 def test_decision_stop_ignores_budget_from_another_service_identity(

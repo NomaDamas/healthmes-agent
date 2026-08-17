@@ -534,8 +534,10 @@ stop_decision_runtime() {
             "$DECISION_RUNTIME_TERM_WAIT_SECONDS"; then
             die "Hermes decision runtime did not stop within ${DECISION_RUNTIME_TERM_WAIT_SECONDS}s; refusing to orphan its child process group"
         fi
+        if [ -e "$HERMES_DECISION_STOP_BUDGET" ]; then
+            die "decision runtime supervisor exited without proving Hermes descendant cleanup; preserving shutdown budget and launcher metadata"
+        fi
         clear_process_identity "$HERMES_DECISION_PID"
-        rm -f "$HERMES_DECISION_STOP_BUDGET"
         info "Hermes decision runtime stopped"
         return
     fi

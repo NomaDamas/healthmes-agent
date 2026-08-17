@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import errno
 import os
 import signal
 from dataclasses import replace
@@ -27,6 +28,7 @@ from healthmes.hermes_runtime_supervisor import (
     _next_restart_backoff,
     _parse_pydantic_float,
     _probe_darwin_process_snapshot,
+    _probe_linux_process_group_members,
     _probe_process_group_members,
     _ProcessGroupMember,
     _run_runtime_process_action,
@@ -961,6 +963,102 @@ async def test_verified_descendant_is_stopped_after_leader_exits_first(
 
 
 @pytest.mark.asyncio
+async def test_leader_exit_before_first_snapshot_still_cleans_descendant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = _group_member(4242, "leader")
+    descendant = _group_member(4243, "descendant")
+    group = {descendant}
+    probes: list[int] = []
+
+    def probe(
+        pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        probes.append(pgid)
+        return frozenset(group)
+
+    process = HermesRuntimeProcess(
+        replace(
+            _supervisor_config(tmp_path),
+            child_term_timeout_seconds=0.01,
+            child_kill_timeout_seconds=0.01,
+        ),
+        process_group_probe=probe,
+    )
+
+    class ExitedLeader:
+        returncode = 0
+        pid = leader.pid
+
+        async def wait(self) -> int:
+            return 0
+
+    child = ExitedLeader()
+    process._process = child  # type: ignore[assignment]
+    process._child_pgid = leader.pid
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+    signals: list[tuple[int, signal.Signals]] = []
+
+    def signal_member(
+        member: _ProcessGroupMember,
+        sent: signal.Signals,
+    ) -> bool:
+        signals.append((member.pid, sent))
+        group.discard(descendant)
+        return True
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._signal_process_group_member",
+        signal_member,
+    )
+
+    await process.aclose()
+
+    assert probes
+    assert set(probes) == {leader.pid}
+    assert signals == [(descendant.pid, signal.SIGTERM)]
+    assert process._process is None
+    assert process._lifecycle_state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_leader_exit_before_first_snapshot_probes_empty_group(
+    tmp_path: Path,
+) -> None:
+    probes: list[int] = []
+
+    def probe(
+        pgid: int,
+        _timeout_seconds: float,
+    ) -> frozenset[_ProcessGroupMember]:
+        probes.append(pgid)
+        return frozenset()
+
+    process = HermesRuntimeProcess(
+        _supervisor_config(tmp_path),
+        process_group_probe=probe,
+    )
+    child = SimpleNamespace(returncode=0, pid=4242)
+    process._process = child
+    process._child_pgid = child.pid
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+
+    await process.aclose()
+
+    assert probes == [child.pid]
+    assert process._process is None
+    assert process._lifecycle_state == "closed"
+
+
+@pytest.mark.asyncio
 async def test_group_reuse_between_probe_and_signal_is_not_signaled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1385,6 +1483,70 @@ def test_linux_without_proc_group_identity_fails_closed(
         _probe_process_group_members(4242, 1)
 
 
+@pytest.mark.parametrize(
+    "read_error",
+    (
+        PermissionError(errno.EACCES, "denied"),
+        OSError(errno.EIO, "I/O failure"),
+    ),
+)
+def test_linux_group_probe_unreadable_stat_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    read_error: OSError,
+) -> None:
+    original_iterdir = Path.iterdir
+    original_read_text = Path.read_text
+
+    def fake_iterdir(path: Path):
+        if path == Path("/proc"):
+            return iter((Path("/proc/4242"),))
+        return original_iterdir(path)
+
+    def fake_read_text(
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> str:
+        if path == Path("/proc/4242/stat"):
+            raise read_error
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_child_group_proc_unreadable",
+    ):
+        _probe_linux_process_group_members(4242, 1)
+
+
+def test_linux_group_probe_only_treats_missing_stat_as_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_iterdir = Path.iterdir
+    original_read_text = Path.read_text
+
+    def fake_iterdir(path: Path):
+        if path == Path("/proc"):
+            return iter((Path("/proc/4242"),))
+        return original_iterdir(path)
+
+    def fake_read_text(
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> str:
+        if path == Path("/proc/4242/stat"):
+            raise FileNotFoundError(errno.ENOENT, "gone")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    assert _probe_linux_process_group_members(4242, 1) == frozenset()
+
+
 def test_darwin_libproc_identity_uses_microsecond_start_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1758,6 +1920,7 @@ def test_supervisor_persists_the_validated_startup_budget(
             assert not budget_path.exists()
             self.publication.publish()
             published.append(load_runtime_shutdown_budget(budget_path))
+            self.publication.remove_if_owned()
 
     def build_server(
         _controller: HermesRuntimeProcess,
@@ -1809,6 +1972,60 @@ def test_supervisor_persists_the_validated_startup_budget(
         == published[0].supervisor_start_token
     )
     assert not budget_path.exists()
+
+
+def test_supervisor_main_preserves_budget_without_cleanup_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget_path = tmp_path / "runtime" / "stop-budget"
+    publications: list[_RuntimeShutdownBudgetPublication] = []
+
+    class FailingServer:
+        def __init__(
+            self,
+            publication: _RuntimeShutdownBudgetPublication,
+        ) -> None:
+            self.publication = publication
+
+        def run(self) -> None:
+            self.publication.publish()
+            raise RuntimeError("controller cleanup failed")
+
+    def build_server(
+        _controller: HermesRuntimeProcess,
+        _config: HermesRuntimeSupervisorConfig,
+        *,
+        shutdown_budget_publication: (
+            _RuntimeShutdownBudgetPublication | None
+        ) = None,
+    ) -> FailingServer:
+        assert shutdown_budget_publication is not None
+        publications.append(shutdown_budget_publication)
+        return FailingServer(shutdown_budget_publication)
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._build_supervisor_server",
+        build_server,
+    )
+
+    with pytest.raises(RuntimeError, match="controller cleanup failed"):
+        supervisor_main(
+            [
+                "--hermes-home",
+                str(tmp_path / "home"),
+                "--vendor-root",
+                str(tmp_path / "vendor"),
+                "--shutdown-budget-path",
+                str(budget_path),
+            ]
+        )
+
+    assert len(publications) == 1
+    assert load_runtime_shutdown_budget(budget_path) == (
+        publications[0].record
+    )
+    publications[0].remove_if_owned()
 
 
 @pytest.mark.parametrize("version", (1, 2))
@@ -1868,6 +2085,114 @@ def test_inherited_launcher_identity_must_match_live_process(
     )
 
     assert captured == identity
+
+
+@pytest.mark.asyncio
+async def test_uvicorn_shutdown_keeps_budget_when_controller_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    supervisor = capture_runtime_supervisor_identity()
+    launcher = capture_runtime_launcher_identity(
+        {},
+        supervisor_identity=supervisor,
+    )
+    publication = _RuntimeShutdownBudgetPublication(
+        path=path,
+        record=HermesRuntimeShutdownBudgetRecord(
+            drain_timeout_seconds=75,
+            launcher_pid=launcher.pid,
+            launcher_start_token=launcher.start_token,
+            launcher_service_nonce=launcher.service_nonce,
+            supervisor_pid=supervisor.pid,
+            supervisor_start_token=supervisor.start_token,
+        ),
+    )
+
+    controller = HermesRuntimeProcess(_supervisor_config(tmp_path))
+    controller._lifecycle_state = "running"
+
+    async def fail_descendant_cleanup() -> None:
+        raise RuntimeError("descendant cleanup failed")
+
+    monkeypatch.setattr(
+        controller,
+        "_stop_child",
+        fail_descendant_cleanup,
+    )
+
+    server = _build_supervisor_server(
+        controller,
+        _supervisor_config(tmp_path),
+        shutdown_budget_publication=publication,
+    )
+    publication.publish()
+    with pytest.raises(RuntimeError, match="descendant cleanup failed"):
+        await server._shutdown_coordinator.aclose()
+
+    async def noop_shutdown(
+        _server: uvicorn.Server,
+        sockets: list[Any] | None = None,
+    ) -> None:
+        del sockets
+
+    monkeypatch.setattr(uvicorn.Server, "shutdown", noop_shutdown)
+    await server.shutdown()
+
+    assert controller._lifecycle_state == "close_failed"
+    assert load_runtime_shutdown_budget(path) == publication.record
+    publication.remove_if_owned()
+
+
+@pytest.mark.asyncio
+async def test_uvicorn_shutdown_removes_budget_after_verified_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    supervisor = capture_runtime_supervisor_identity()
+    launcher = capture_runtime_launcher_identity(
+        {},
+        supervisor_identity=supervisor,
+    )
+    publication = _RuntimeShutdownBudgetPublication(
+        path=path,
+        record=HermesRuntimeShutdownBudgetRecord(
+            drain_timeout_seconds=75,
+            launcher_pid=launcher.pid,
+            launcher_start_token=launcher.start_token,
+            launcher_service_nonce=launcher.service_nonce,
+            supervisor_pid=supervisor.pid,
+            supervisor_start_token=supervisor.start_token,
+        ),
+    )
+
+    class CleanController:
+        def begin_closing(self) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    server = _build_supervisor_server(
+        CleanController(),  # type: ignore[arg-type]
+        _supervisor_config(tmp_path),
+        shutdown_budget_publication=publication,
+    )
+    publication.publish()
+    await server._shutdown_coordinator.aclose()
+
+    async def noop_shutdown(
+        _server: uvicorn.Server,
+        sockets: list[Any] | None = None,
+    ) -> None:
+        del sockets
+
+    monkeypatch.setattr(uvicorn.Server, "shutdown", noop_shutdown)
+    await server.shutdown()
+
+    assert not path.exists()
 
 
 @pytest.mark.asyncio

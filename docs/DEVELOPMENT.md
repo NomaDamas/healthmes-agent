@@ -237,15 +237,17 @@ running the dedicated Hermes `uv sync` or bootstrap. The validated
 waits is rounded up once, but it is not published until Uvicorn has completed
 owned serving startup. The atomic
 `data/runtime/hermes-decision-stop-budget` record binds that exact value to the
-running launcher PID, OS start token, service nonce, and a unique publication
-instance nonce. A process removes the record only after that exact process
-successfully published it. Stop and update use the record only when the
-launcher fields still match the managed PID identity; stale, malformed,
-version-1, or missing records receive the conservative 315-second drain plus a
-bounded 2-second native launcher margin instead of shortening a live drain
-from mutable environment state. A failed competing startup therefore cannot
-overwrite or delete the ready runtime's budget, even when both processes
-inherited the same launcher identity.
+running launcher PID, OS start token, service nonce, the actual Python
+supervisor PID/native start token, and a unique publication instance nonce.
+The owning supervisor removes its exact record only after controller cleanup
+has successfully drained and reaped the Hermes child group. If cleanup fails,
+the record remains as an explicit incomplete-cleanup diagnostic. Valid v3
+records use their saved drain plus a bounded 2-second native launcher margin.
+Legacy v1/v2 and missing records use the conservative 315-second drain plus
+that margin; malformed or stale records fail closed without signalling.
+A failed competing startup therefore cannot overwrite or delete the ready
+runtime's budget, even when both processes inherited the same launcher
+identity.
 
 The decision supervisor owns a separate child process group. It tracks
 PID/start-token identities for the leader and descendants. Linux opens a pidfd,
@@ -261,13 +263,14 @@ that OS boundary rather than treating an unverified PID as safe.
 This still cleans up descendants when the leader exits first without signaling
 a later unrelated process group that reuses the numeric PGID. The launcher
 refuses to SIGKILL only the outer service group if that complete drain fails;
-it retains the process identity and exits non-zero instead of orphaning the
-child or reporting a false stop. The maximum native TERM wait is 317 seconds,
-followed by at most one second to verify that the managed Bash wrapper reaped
-the exited supervisor. A single native identity helper owns the bounded wait,
-so interpreter startup overhead is not repeated on every poll. Both Compose
-and the login LaunchAgent retain their consistent 360-second outer shutdown
-budgets.
+it exits non-zero instead of orphaning the child or reporting a false stop.
+When the launcher metadata exists, both its PID and identity files are
+preserved; the v3 shutdown record is always preserved. The maximum native TERM
+wait is 317 seconds, followed by at most one second to verify that the managed
+Bash wrapper reaped the exited supervisor. A single native identity helper
+owns the bounded wait, so interpreter startup overhead is not repeated on
+every poll. Both Compose and the login LaunchAgent retain their consistent
+360-second outer shutdown budgets.
 
 Re-runs are byte-idempotent when the desired decision artifacts are current.
 Bootstrap also performs a one-way migration of the general
@@ -336,11 +339,15 @@ The native shutdown budget v3 records both the managed Bash launcher
 PID/start token/service nonce and the actual Python supervisor PID/native start
 token. Stop validates both identities and always sends TERM to the verified
 Python supervisor, which owns Hermes descendant draining. Missing or dead
-launcher metadata therefore cannot hide a surviving supervisor. Legacy v1/v2
+launcher metadata therefore cannot hide a surviving supervisor. After that
+supervisor exits, native stop reports success only if the exact v3 record is
+gone, proving that the supervisor completed child-group cleanup; otherwise it
+keeps available launcher metadata and the record for diagnosis. Legacy v1/v2
 budgets remain readable only for conservative launcher-group shutdown; they
 never shorten the 317-second native wait. Generic `ps:` identities are not
 eligible for Python numeric signalling. Unsupported platforms, Linux without
-`/proc` or pidfd signalling, and unprovable identities fail closed.
+`/proc` or pidfd signalling, unreadable `/proc` process records, and
+unprovable identities fail closed.
 
 Running the gateway natively (verified live on macOS with dummy creds):
 

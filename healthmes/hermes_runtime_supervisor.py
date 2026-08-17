@@ -926,6 +926,18 @@ class _RuntimeShutdownCoordinator:
     async def aclose(self) -> None:
         await asyncio.shield(self.request_close())
 
+    @property
+    def cleanup_succeeded(self) -> bool:
+        """Return true only after the shared controller close completed."""
+
+        task = self._close_task
+        return (
+            task is not None
+            and task.done()
+            and not task.cancelled()
+            and task.exception() is None
+        )
+
 
 class _HermesRuntimeUvicornServer(uvicorn.Server):
     """Close lease admission as soon as Uvicorn receives an exit signal."""
@@ -975,7 +987,10 @@ class _HermesRuntimeUvicornServer(uvicorn.Server):
             await super().shutdown(sockets=sockets)
         finally:
             publication = self._shutdown_budget_publication
-            if publication is not None:
+            if (
+                publication is not None
+                and self._shutdown_coordinator.cleanup_succeeded
+            ):
                 publication.remove_if_owned()
 
 
@@ -1711,22 +1726,38 @@ class HermesRuntimeProcess:
             loop.time() + self._config.child_term_timeout_seconds
         )
         if not self._known_child_group_members:
-            if process.returncode is not None:
-                self._child_pgid = None
-                self._process = None
-                return
             remaining = term_deadline - loop.time()
             if remaining <= 0:
                 raise RuntimeError(
                     "hermes_runtime_child_term_timeout"
                 )
-            self._refresh_child_group_identity(
-                require_leader=True,
-                timeout_seconds=min(
-                    _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
-                    remaining,
-                ),
-            )
+            if process.returncode is None:
+                self._refresh_child_group_identity(
+                    require_leader=True,
+                    timeout_seconds=min(
+                        _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
+                        remaining,
+                    ),
+                )
+            else:
+                current = self._process_group_probe(
+                    self._child_pgid,
+                    min(
+                        _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
+                        remaining,
+                    ),
+                )
+                if not current:
+                    self._child_pgid = None
+                    self._process = None
+                    return
+                if any(
+                    member.pid == process.pid for member in current
+                ):
+                    raise HermesRuntimeIdentityError(
+                        "hermes_runtime_child_group_leader_changed"
+                    )
+                self._known_child_group_members = current
         self._signal_owned_child_group_members(
             signal.SIGTERM,
             deadline=term_deadline,
@@ -1874,13 +1905,31 @@ def _probe_linux_process_group_members(
                 continue
             try:
                 stat = (entry / "stat").read_text(encoding="utf-8")
-                closing_parenthesis = stat.rfind(")")
-                fields = stat[closing_parenthesis + 1 :].split()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_child_group_proc_unreadable"
+                ) from exc
+            closing_parenthesis = stat.rfind(")")
+            fields = stat[closing_parenthesis + 1 :].split()
+            try:
                 pid = int(entry.name)
                 process_group = int(fields[2])
-                start_ticks = fields[19]
-            except (IndexError, OSError, ValueError):
-                continue
+                start_ticks = int(fields[19])
+            except (IndexError, ValueError) as exc:
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_child_group_proc_invalid"
+                ) from exc
+            if (
+                closing_parenthesis < 1
+                or pid < 1
+                or process_group < 1
+                or start_ticks < 1
+            ):
+                raise HermesRuntimeIdentityError(
+                    "hermes_runtime_child_group_proc_invalid"
+                )
             if process_group == pgid:
                 members.add(
                     _ProcessGroupMember(
@@ -3043,11 +3092,7 @@ def main(argv: list[str] | None = None) -> None:
         config,
         shutdown_budget_publication=publication,
     )
-    try:
-        server.run()
-    finally:
-        if publication is not None:
-            publication.remove_if_owned()
+    server.run()
 
 
 if __name__ == "__main__":
