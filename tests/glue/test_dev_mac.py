@@ -122,24 +122,80 @@ def _write_decision_stop_budget(
 def _write_decision_startup_lease(
     runtime_dir: Path,
     *,
-    state: str = "spawned",
+    phase: str = "spawned",
     pid: str = "4242",
     nonce: str = "abc123",
+    owner_pid: str = "999998",
+    owner_start_token: str = "ps:Mon Aug 17 11:00:00 2026",
+    owner_nonce: str = "owner123",
+    created_at_epoch: int = 1,
+    updated_at_epoch: int = 1,
+    version: int = 2,
 ) -> Path:
     lease = runtime_dir / "hermes-decision-startup-lease"
     lease.mkdir(mode=0o700)
-    fields = (
-        "version\t1",
-        f"state\t{state}",
-        f"launcher_service_nonce\t{nonce}",
-    )
-    if state == "spawned":
-        fields += (f"launcher_pid\t{pid}",)
+    if version == 1:
+        state = "pending" if phase == "intent" else phase
+        fields = (
+            "version\t1",
+            f"state\t{state}",
+            f"launcher_service_nonce\t{nonce}",
+        )
+        if state == "spawned":
+            fields += (f"launcher_pid\t{pid}",)
+    else:
+        fields = (
+            "version\t2",
+            f"phase\t{phase}",
+            f"created_at_epoch\t{created_at_epoch}",
+            f"updated_at_epoch\t{updated_at_epoch}",
+            f"launcher_service_nonce\t{nonce}",
+            f"startup_owner_pid\t{owner_pid}",
+            f"startup_owner_start_token\t{owner_start_token}",
+            f"startup_owner_nonce\t{owner_nonce}",
+        )
+        if phase in {"spawned", "identity_verified"} or (
+            phase == "failed" and pid
+        ):
+            fields += (f"launcher_pid\t{pid}",)
+        if phase == "identity_verified":
+            fields += (
+                "launcher_start_token\t"
+                "ps:Mon Aug  3 12:00:00 2026",
+            )
     (lease / "record").write_text(
         "\n".join((*fields, "")),
         encoding="ascii",
     )
     return lease
+
+
+def _write_decision_lifecycle_lock(
+    runtime_dir: Path,
+    *,
+    operation: str = "start",
+    owner_pid: str = "999999",
+    owner_start_token: str = "ps:Mon Aug 17 09:00:00 2026",
+    owner_nonce: str = "lockowner123",
+    acquired_at_epoch: int = 1,
+) -> Path:
+    lock = runtime_dir / "hermes-decision-lifecycle-lock"
+    lock.mkdir(mode=0o700)
+    (lock / "record").write_text(
+        "\n".join(
+            (
+                "version\t1",
+                f"operation\t{operation}",
+                f"owner_pid\t{owner_pid}",
+                f"owner_start_token\t{owner_start_token}",
+                f"owner_nonce\t{owner_nonce}",
+                f"acquired_at_epoch\t{acquired_at_epoch}",
+                "",
+            )
+        ),
+        encoding="ascii",
+    )
+    return lock
 
 
 def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
@@ -183,7 +239,6 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         """
         #!/usr/bin/env bash
         printf 'ps %s\\n' "$*" >>"$FAKE_EVENT_LOG"
-        [ -f "$FAKE_PROCESS_STATE/alive" ] || exit 1
         requested_pid=
         field=
         while [ "$#" -gt 0 ]; do
@@ -200,7 +255,21 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
             shift
         done
         current_pid="$(<"$FAKE_PROCESS_STATE/pid")"
-        [ "$requested_pid" = "$current_pid" ] || exit 1
+        if [ "$requested_pid" != "$current_pid" ]; then
+            case " ${FAKE_ABSENT_PIDS:-} " in
+            *" $requested_pid "*) exit 1 ;;
+            esac
+            case "$field" in
+            pid) printf '%s\\n' "$requested_pid" ;;
+            pgid) printf '%s\\n' "$requested_pid" ;;
+            comm) printf '/bin/bash\\n' ;;
+            lstart) printf 'Mon Aug 17 10:00:00 2026\\n' ;;
+            command) printf '/bin/bash healthmes_local.sh test-owner\\n' ;;
+            *) exit 1 ;;
+            esac
+            exit 0
+        fi
+        [ -f "$FAKE_PROCESS_STATE/alive" ] || exit 1
         case "$field" in
         pid) printf '%s\\n' "$current_pid" ;;
         pgid) cat "$FAKE_PROCESS_STATE/pgid" ;;
@@ -260,6 +329,10 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         """
         #!/usr/bin/env bash
         printf 'sleep %s\\n' "$*" >>"$FAKE_EVENT_LOG"
+        if [ "${FAKE_SLEEP_BEHAVIOR:-}" = "publish-late-budget" ] \
+            && [ ! -f "$FAKE_STOP_BUDGET" ]; then
+            cp "$FAKE_LATE_STOP_BUDGET" "$FAKE_STOP_BUDGET"
+        fi
         """,
     )
     _write_executable(
@@ -411,6 +484,7 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "FAKE_EVENT_LOG": str(event_log),
         "FAKE_PROCESS_STATE": str(process_state),
+        "FAKE_ABSENT_PIDS": "999998 999999",
         "FAKE_SUPERVISOR_STATE": str(supervisor_state),
         "FAKE_STOP_BUDGET": str(
             runtime / "hermes-decision-stop-budget"
@@ -525,7 +599,10 @@ def test_install_registers_keepalive_login_launch_agent() -> None:
     assert "for _ in 1 2 3 4 5 6 7 8 9 10" in launch_agent_body
     assert 'die "failed to register login launch agent"' in launch_agent_body
     daemon_body = _function_body(text, "cmd_daemon")
-    assert "trap 'stop_apps; exit 0' INT TERM" in daemon_body
+    assert (
+        "trap 'with_decision_runtime_lifecycle_lock stop stop_apps; "
+        "exit 0' INT TERM"
+    ) in daemon_body
     assert "trap 'stop_apps' EXIT" not in daemon_body
     assert "services-stop" not in daemon_body
     assert "while true" in daemon_body
@@ -583,13 +660,17 @@ def test_local_start_uses_only_optional_dedicated_decision_runtime() -> None:
     assert '"$HERMES_DECISION_STOP_BUDGET"' in start_body
     assert '"$HERMES_DECISION_STARTUP_LEASE"' in start_body
     start_process_body = _function_body(text, "start_process")
+    service_runner_body = _function_body(text, "run_service_runner")
     assert start_process_body.index(
         "create_decision_runtime_startup_lease"
     ) < start_process_body.index("nohup env HEALTHMES_SERVICE_NONCE")
-    assert start_process_body.index(
-        "write_unverified_process_pid"
-    ) < start_process_body.index(
+    assert service_runner_body.index(
         "mark_decision_runtime_startup_spawned"
+    ) < service_runner_body.index(
+        "write_unverified_process_pid"
+    )
+    assert "wait_for_decision_runtime_launcher_publication" in (
+        start_process_body
     )
     assert "preserving the startup lease and PID tombstone" in (
         start_process_body
@@ -644,6 +725,44 @@ def test_native_mutation_paths_drain_decision_runtime_first() -> None:
     assert start_body.index("stop_decision_runtime") < start_body.index(
         "scripts/bootstrap.py"
     )
+
+
+def test_decision_runtime_mutations_use_one_cross_process_lifecycle_lock() -> None:
+    text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+    for command, operation in (
+        ("install", "install"),
+        ("update", "update"),
+        ("start", "start"),
+        ("stop", "stop"),
+    ):
+        assert re.search(
+            rf"^{command}\) with_decision_runtime_lifecycle_lock "
+            rf"{operation} cmd_{command} ;;$",
+            text,
+            re.MULTILINE,
+        )
+    update_body = _function_body(text, "cmd_update")
+    assert update_body.index("stop_decision_runtime") < update_body.index(
+        'git -C "$REPO_ROOT" pull --ff-only'
+    )
+    lock_writer = _function_body(
+        text,
+        "write_decision_runtime_lifecycle_lock",
+    )
+    for field in (
+        "operation",
+        "owner_pid",
+        "owner_start_token",
+        "owner_nonce",
+        "acquired_at_epoch",
+    ):
+        assert f"printf '{field}\\t%s\\n'" in lock_writer
+    lock_recovery = _function_body(
+        text,
+        "recover_orphaned_decision_runtime_lifecycle_lock",
+    )
+    assert "process_start_token_status" in lock_recovery
+    assert "KILL_BIN" not in lock_recovery
 
 
 def test_local_runtime_supervises_and_stops_decision_process() -> None:
@@ -718,20 +837,40 @@ def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
         "that may launch Hermes in its separate process group"
     ) in development
     assert (
-        "Before spawning the managed Bash wrapper, the launcher atomically "
-        "creates `data/runtime/hermes-decision-startup-lease/`"
+        "serializes every decision-runtime mutation with the atomic "
+        "directory lock `data/runtime/hermes-decision-lifecycle-lock/`"
     ) in development
     assert (
-        "one failed or unreadable query is unknown, not evidence that the "
-        "process is absent"
+        "`update` holds this same lock from the initial decision stop "
+        "through `git pull`, setup, and generation handoff"
+    ) in development
+    assert (
+        "the incomplete lock has no provable owner. It is deliberately "
+        "preserved as `unknown`"
+    ) in development
+    assert (
+        "start atomically creates the version-2 "
+        "`data/runtime/hermes-decision-startup-lease/` before spawning"
+    ) in development
+    assert (
+        "The wrapper's first managed action changes `intent` to `spawned` "
+        "with its own PID and then writes the PID tombstone"
+    ) in development
+    assert (
+        "One failed or unreadable identity query is unknown, not evidence "
+        "that the process is absent"
     ) in development
     assert (
         "stop/update cannot report success or delete metadata while a "
         "startup generation remains unverified"
     ) in development
     assert (
-        "`status` reports pending startup or unknown unverified startup, "
-        "never `stopped`, while the lease remains"
+        "`status` reads lifecycle lock, startup lease, v3 budget, and "
+        "launcher metadata before reporting liveness"
+    ) in development
+    assert (
+        "Generation conflicts win over a live launcher and are reported "
+        "as `unknown`"
     ) in development
     assert (
         "Missing-budget stop reports success only after that proof"
@@ -1320,16 +1459,61 @@ def test_decision_stop_preserves_unverified_startup_without_v3_budget(
 ) -> None:
     harness = _local_runtime_harness(tmp_path)
     runtime = Path(harness["runtime"])
+    fake_bin = Path(harness["env"]["PATH"].split(":", 1)[0])
     pid_file = runtime / "hermes-decision.pid"
     pid_file.write_text("4242\n", encoding="ascii")
     lease = _write_decision_startup_lease(runtime)
+    unknown_launcher_ps = fake_bin / "unknown-launcher-ps"
+    _write_executable(
+        unknown_launcher_ps,
+        """
+        #!/usr/bin/env bash
+        printf 'ps %s\\n' "$*" >>"$FAKE_EVENT_LOG"
+        requested_pid=
+        field=
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+            -p)
+                shift
+                requested_pid=${1:-}
+                ;;
+            -o)
+                shift
+                field=${1%=}
+                ;;
+            esac
+            shift
+        done
+        if [ "$requested_pid" = "4242" ]; then
+            printf 'permission denied\\n' >&2
+            exit 2
+        fi
+        case " ${FAKE_ABSENT_PIDS:-} " in
+        *" $requested_pid "*) exit 1 ;;
+        esac
+        case "$field" in
+        pid) printf '%s\\n' "$requested_pid" ;;
+        lstart) printf 'Mon Aug 17 10:00:00 2026\\n' ;;
+        *) exit 1 ;;
+        esac
+        """,
+    )
 
-    result = _run_local_runtime(harness, "stop", check=False)
-    status = _run_local_runtime(harness, "status")
+    env_overrides = {"HEALTHMES_PS_BIN": str(unknown_launcher_ps)}
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides=env_overrides,
+    )
+    status = _run_local_runtime(
+        harness,
+        "status",
+        env_overrides=env_overrides,
+    )
 
     assert result.returncode != 0
-    assert "launcher identity is unverified" in result.stderr
-    assert "preserving the startup lease and PID tombstone" in result.stderr
+    assert "startup launcher identity is unknown" in result.stderr
     assert (
         "Hermes decision runtime: unknown "
         "(startup launcher identity is unverified; "
@@ -1350,7 +1534,8 @@ def test_pending_decision_startup_intent_blocks_stop_and_reports_starting(
     harness = _local_runtime_harness(tmp_path)
     lease = _write_decision_startup_lease(
         Path(harness["runtime"]),
-        state="pending",
+        phase="intent",
+        version=1,
     )
 
     result = _run_local_runtime(harness, "stop", check=False)
@@ -1400,6 +1585,394 @@ def test_unverified_startup_rejects_v3_budget_from_another_generation(
         event.startswith("kill -s ")
         for event in _event_lines(harness)
     )
+
+
+def test_stop_cleans_stale_intent_after_verified_startup_owner_exit(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    lease = _write_decision_startup_lease(
+        runtime,
+        phase="intent",
+        pid="",
+    )
+    (Path(harness["process_state"]) / "alive").unlink()
+    (Path(harness["supervisor_state"]) / "alive").unlink()
+
+    result = _run_local_runtime(harness, "stop")
+
+    assert "recovered stale decision runtime startup intent" in result.stdout
+    assert not lease.exists()
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+@pytest.mark.parametrize("phase", ("spawned", "failed"))
+def test_stop_cleans_crash_after_launcher_pid_phase_when_group_is_empty(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    lease = _write_decision_startup_lease(runtime, phase=phase)
+    (Path(harness["process_state"]) / "alive").unlink()
+    (Path(harness["supervisor_state"]) / "alive").unlink()
+
+    result = _run_local_runtime(harness, "stop")
+
+    assert "proving its launcher group empty" in result.stdout
+    assert not lease.exists()
+    assert not (runtime / "hermes-decision.pid").exists()
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+def test_stop_recovers_late_matching_v3_budget_without_pid_tombstone(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    now = int(time.time())
+    lease = _write_decision_startup_lease(
+        runtime,
+        phase="spawned",
+        created_at_epoch=now,
+        updated_at_epoch=now,
+    )
+    _write_decision_stop_budget(
+        Path(harness["process_state"]),
+        drain_timeout_seconds=2,
+        filename="late-stop-budget",
+    )
+
+    _run_local_runtime(
+        harness,
+        "stop",
+        term_behavior="exit",
+        env_overrides={"FAKE_SLEEP_BEHAVIOR": "publish-late-budget"},
+    )
+
+    events = _event_lines(harness)
+    assert any(
+        "--runtime-process-action signal" in event
+        for event in events
+        if event.startswith("runtime-python ")
+    )
+    assert not any(event.startswith("kill -s ") for event in events)
+    assert not lease.exists()
+    assert not (runtime / "hermes-decision-stop-budget").exists()
+
+
+def test_late_v3_budget_with_mismatched_generation_fails_closed(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    now = int(time.time())
+    lease = _write_decision_startup_lease(
+        runtime,
+        phase="spawned",
+        created_at_epoch=now,
+        updated_at_epoch=now,
+    )
+    late_budget = _write_decision_stop_budget(
+        Path(harness["process_state"]),
+        drain_timeout_seconds=2,
+        nonce="other-generation",
+        filename="late-stop-budget",
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={"FAKE_SLEEP_BEHAVIOR": "publish-late-budget"},
+    )
+
+    assert result.returncode != 0
+    assert "does not match the startup lease generation" in result.stderr
+    assert lease.exists()
+    assert late_budget.exists()
+    assert (runtime / "hermes-decision-stop-budget").exists()
+    assert not any(
+        "--runtime-process-action signal" in event
+        for event in _event_lines(harness)
+        if event.startswith("runtime-python ")
+    )
+    assert not any(
+        event.startswith("kill -s ")
+        for event in _event_lines(harness)
+    )
+
+
+def test_stop_finishes_identity_verified_phase_after_parent_crash(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    lease = _write_decision_startup_lease(
+        runtime,
+        phase="identity_verified",
+    )
+    _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+
+    _run_local_runtime(harness, "stop", term_behavior="exit")
+
+    assert not lease.exists()
+    assert not (runtime / "hermes-decision.pid").exists()
+    assert not (runtime / "hermes-decision.pid.identity").exists()
+
+
+def test_orphaned_lifecycle_lock_is_recovered_without_numeric_signal(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    lock = _write_decision_lifecycle_lock(Path(harness["runtime"]))
+
+    result = _run_local_runtime(harness, "stop")
+
+    assert "recovered stale decision runtime lifecycle lock" in result.stdout
+    assert not lock.exists()
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+def test_unknown_lifecycle_lock_owner_fails_closed_without_signal(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    fake_bin = Path(harness["env"]["PATH"].split(":", 1)[0])
+    lock = _write_decision_lifecycle_lock(
+        runtime,
+        owner_pid="888888",
+    )
+    unknown_owner_ps = fake_bin / "unknown-lock-owner-ps"
+    _write_executable(
+        unknown_owner_ps,
+        """
+        #!/usr/bin/env bash
+        printf 'ps %s\\n' "$*" >>"$FAKE_EVENT_LOG"
+        requested_pid=
+        field=
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+            -p)
+                shift
+                requested_pid=${1:-}
+                ;;
+            -o)
+                shift
+                field=${1%=}
+                ;;
+            esac
+            shift
+        done
+        if [ "$requested_pid" = "888888" ]; then
+            printf 'permission denied\\n' >&2
+            exit 2
+        fi
+        case "$field" in
+        pid) printf '%s\\n' "$requested_pid" ;;
+        lstart) printf 'Mon Aug 17 10:00:00 2026\\n' ;;
+        *) exit 1 ;;
+        esac
+        """,
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={"HEALTHMES_PS_BIN": str(unknown_owner_ps)},
+    )
+
+    assert result.returncode != 0
+    assert "lifecycle lock owner identity is unknown" in result.stderr
+    assert lock.exists()
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+def test_incomplete_lifecycle_lock_fails_closed_and_is_preserved(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    lock = Path(harness["runtime"]) / "hermes-decision-lifecycle-lock"
+    lock.mkdir(mode=0o700)
+
+    result = _run_local_runtime(harness, "stop", check=False)
+    status = _run_local_runtime(harness, "status")
+
+    assert result.returncode != 0
+    assert (
+        "lifecycle lock is malformed or has no provable owner"
+        in result.stderr
+    )
+    assert (
+        "Hermes decision runtime: unknown "
+        "(lifecycle lock is malformed or has no provable owner)"
+        in status.stdout
+    )
+    assert lock.exists()
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+def test_live_lifecycle_lock_times_out_without_mutation(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    lock = _write_decision_lifecycle_lock(
+        Path(harness["runtime"]),
+        owner_start_token="ps:Mon Aug 17 10:00:00 2026",
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={"FAKE_ABSENT_PIDS": "999998"},
+    )
+
+    assert result.returncode != 0
+    assert (
+        "lifecycle lock is still owned by live start pid 999999"
+        in result.stderr
+    )
+    assert "timed out without mutating runtime state" in result.stderr
+    assert lock.exists()
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+def test_status_reports_generation_conflict_before_live_launcher(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    _write_decision_startup_lease(
+        runtime,
+        nonce="other-generation",
+    )
+    _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+    )
+
+    result = _run_local_runtime(harness, "status")
+
+    assert "generations do not match" in result.stdout
+    assert "Hermes decision runtime: running" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("holder_command", "contender_command"),
+    (("start", "stop"), ("update", "start")),
+)
+def test_lifecycle_lock_serializes_concurrent_mutations(
+    tmp_path: Path,
+    holder_command: str,
+    contender_command: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    local_script = Path(harness["local_script"])
+    marker_dir = tmp_path / "lifecycle-markers"
+    marker_dir.mkdir()
+    release = marker_dir / "release"
+    script = local_script.read_text(encoding="utf-8")
+    overrides = textwrap.dedent(
+        """
+        fake_lifecycle_command() {
+            local command=$1
+            if [ "${FAKE_HOLD_COMMAND:-}" = "$command" ]; then
+                : >"$FAKE_MARKER_DIR/holder-entered"
+                while [ ! -f "$FAKE_MARKER_DIR/release" ]; do
+                    /bin/sleep 0.05
+                done
+            fi
+            : >"$FAKE_MARKER_DIR/entered-$command"
+        }
+        cmd_start() { fake_lifecycle_command start; }
+        cmd_stop() { fake_lifecycle_command stop; }
+        cmd_update() { fake_lifecycle_command update; }
+        """
+    ).lstrip()
+    local_script.write_text(
+        script.replace('case "${1:-}" in\n', f"{overrides}\ncase \"${{1:-}}\" in\n", 1),
+        encoding="utf-8",
+    )
+    base_env = {
+        **harness["env"],
+        "FAKE_MARKER_DIR": str(marker_dir),
+        "HEALTHMES_SLEEP_BIN": "/bin/sleep",
+    }
+    holder_env = {
+        **base_env,
+        "FAKE_HOLD_COMMAND": holder_command,
+    }
+    holder = subprocess.Popen(
+        ["bash", str(local_script), holder_command],
+        env=holder_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    contender: subprocess.Popen[str] | None = None
+    try:
+        for _ in range(100):
+            if (marker_dir / "holder-entered").exists():
+                break
+            time.sleep(0.01)
+        assert (marker_dir / "holder-entered").exists()
+
+        contender = subprocess.Popen(
+            ["bash", str(local_script), contender_command],
+            env=base_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.2)
+        assert not (marker_dir / f"entered-{contender_command}").exists()
+
+        release.touch()
+        holder_stdout, holder_stderr = holder.communicate(timeout=5)
+        contender_stdout, contender_stderr = contender.communicate(timeout=5)
+        assert holder.returncode == 0, (holder_stdout, holder_stderr)
+        assert contender.returncode == 0, (
+            contender_stdout,
+            contender_stderr,
+        )
+        assert (marker_dir / f"entered-{contender_command}").exists()
+    finally:
+        release.touch(exist_ok=True)
+        if holder.poll() is None:
+            holder.terminate()
+            holder.wait(timeout=5)
+        if contender is not None and contender.poll() is None:
+            contender.terminate()
+            contender.wait(timeout=5)
 
 
 def test_decision_stop_never_deletes_a_competing_launcher_generation(
@@ -1527,7 +2100,10 @@ def test_stop_rejects_system_pids_without_inspection_or_signal(tmp_path: Path, p
     _run_local_runtime(harness, "stop")
 
     events = _event_lines(harness)
-    assert not any(event.startswith("ps ") for event in events)
+    assert not any(
+        event.startswith("ps ") and f"-p {pid} " in event
+        for event in events
+    )
     assert not any(event.startswith("kill ") for event in events)
 
 
@@ -1679,7 +2255,8 @@ def test_decision_start_ps_failure_preserves_live_generation_and_blocks_stop(
         f"""
         case "${{1:-}}" in
         __test_start_decision)
-            start_process "Hermes decision runtime" \
+            with_decision_runtime_lifecycle_lock start \
+                start_process "Hermes decision runtime" \
                 "$HERMES_DECISION_PID" "$HERMES_DECISION_LOG" \
                 "exec {real_sleep} 30" \
                 "$HERMES_DECISION_STARTUP_LEASE"
@@ -1713,6 +2290,14 @@ def test_decision_start_ps_failure_preserves_live_generation_and_blocks_stop(
             && [ ! -f "$FAKE_PS_FAILURE_MARKER" ]; then
             : >"$FAKE_PS_FAILURE_MARKER"
             exit 1
+        fi
+        case " ${FAKE_ABSENT_PIDS:-} " in
+        *" $requested_pid "*) exit 1 ;;
+        esac
+        if [ -n "${FAKE_FORCE_UNKNOWN_PID:-}" ] \
+            && [ "$requested_pid" = "$FAKE_FORCE_UNKNOWN_PID" ]; then
+            printf 'permission denied\\n' >&2
+            exit 2
         fi
         case "$field" in
         pid=) printf '%s\\n' "$requested_pid" ;;
@@ -1752,25 +2337,42 @@ def test_decision_start_ps_failure_preserves_live_generation_and_blocks_stop(
         os.kill(launcher_pid, 0)
         assert failure_marker.exists()
         assert not identity_file.exists()
-        assert "state\tspawned\n" in record.read_text(encoding="ascii")
+        assert "phase\tspawned\n" in record.read_text(encoding="ascii")
         assert f"launcher_pid\t{launcher_pid}\n" in record.read_text(
             encoding="ascii"
         )
+        owner_pid = next(
+            line.split("\t", 1)[1]
+            for line in record.read_text(encoding="ascii").splitlines()
+            if line.startswith("startup_owner_pid\t")
+        )
+        aged_record = re.sub(
+            r"^(created_at_epoch|updated_at_epoch)\t[0-9]+$",
+            r"\1\t1",
+            record.read_text(encoding="ascii"),
+            flags=re.MULTILINE,
+        )
+        record.write_text(aged_record, encoding="ascii")
+        stop_env = {
+            **env_overrides,
+            "FAKE_ABSENT_PIDS": owner_pid,
+            "FAKE_FORCE_UNKNOWN_PID": str(launcher_pid),
+        }
 
         stop = _run_local_runtime(
             harness,
             "stop",
             check=False,
-            env_overrides=env_overrides,
+            env_overrides=stop_env,
         )
         status = _run_local_runtime(
             harness,
             "status",
-            env_overrides=env_overrides,
+            env_overrides=stop_env,
         )
 
         assert stop.returncode != 0
-        assert "launcher identity is unverified" in stop.stderr
+        assert "startup launcher identity is unknown" in stop.stderr
         assert pid_file.exists()
         assert lease.exists()
         assert (

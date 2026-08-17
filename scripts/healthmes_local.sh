@@ -12,6 +12,7 @@ HERMES_DECISION_PID="$RUNTIME_DIR/hermes-decision.pid"
 HERMES_DECISION_VENV="$RUNTIME_DIR/hermes-decision-venv"
 HERMES_DECISION_STOP_BUDGET="$RUNTIME_DIR/hermes-decision-stop-budget"
 HERMES_DECISION_STARTUP_LEASE="$RUNTIME_DIR/hermes-decision-startup-lease"
+HERMES_DECISION_LIFECYCLE_LOCK="$RUNTIME_DIR/hermes-decision-lifecycle-lock"
 HEALTHMES_LOG="$RUNTIME_DIR/healthmes.log"
 OW_LOG="$RUNTIME_DIR/open-wearables.log"
 WORKER_LOG="$RUNTIME_DIR/open-wearables-worker.log"
@@ -29,13 +30,22 @@ KILL_BIN="${HEALTHMES_KILL_BIN:-/bin/kill}"
 SLEEP_BIN="${HEALTHMES_SLEEP_BIN:-sleep}"
 BASH_BIN="${HEALTHMES_BASH_BIN:-/bin/bash}"
 UUIDGEN_BIN="${HEALTHMES_UUIDGEN_BIN:-uuidgen}"
+DATE_BIN="${HEALTHMES_DATE_BIN:-date}"
 RUNTIME_PYTHON_BIN="${HEALTHMES_RUNTIME_PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
 MAX_DECISION_RUNTIME_DRAIN_SECONDS=315
 DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS=2
+DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS=10
+DECISION_RUNTIME_LIFECYCLE_LOCK_STALE_GRACE_SECONDS=2
+DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS=3
 MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS=$((
     MAX_DECISION_RUNTIME_DRAIN_SECONDS
     + DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS
 ))
+DECISION_RUNTIME_LIFECYCLE_LOCK_HELD=false
+DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PID=
+DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_START_TOKEN=
+DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_NONCE=
+DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION=
 
 info() { printf '[healthmes] %s\n' "$*"; }
 die() { printf '[healthmes] %s\n' "$*" >&2; exit 1; }
@@ -189,6 +199,348 @@ new_service_nonce() {
     printf '%s\n' "$nonce"
 }
 
+current_epoch() {
+    local value
+    value="$("$DATE_BIN" +%s 2>/dev/null)" || return 1
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s\n' "$value"
+}
+
+probe_ps_value() {
+    local pid=$1 field=$2 output status error_file error
+    PROBED_PS_VALUE=
+    error_file="$(mktemp "$RUNTIME_DIR/.ps-probe.XXXXXX")" || return 5
+    if output="$("$PS_BIN" -ww -p "$pid" -o "$field=" 2>"$error_file")"; then
+        status=0
+    else
+        status=$?
+    fi
+    error="$(<"$error_file")"
+    rm -f "$error_file"
+    output="$(trim_whitespace "$output")"
+    error="$(trim_whitespace "$error")"
+    if [ "$status" -ne 0 ]; then
+        [ -z "$output" ] && [ -z "$error" ] && return 3
+        return 5
+    fi
+    [ -z "$error" ] \
+        && [ -n "$output" ] \
+        && [[ "$output" != *$'\n'* ]] \
+        && [[ "$output" != *$'\t'* ]] \
+        || return 5
+    PROBED_PS_VALUE=$output
+}
+
+process_start_token_status() {
+    local pid=$1 expected_start_token=$2 status
+    valid_managed_pid "$pid" || return 5
+    if probe_ps_value "$pid" pid; then
+        [ "$PROBED_PS_VALUE" = "$pid" ] || return 5
+    else
+        status=$?
+        [ "$status" -eq 3 ] && return 3
+        return 5
+    fi
+    if probe_ps_value "$pid" lstart; then
+        [ "ps:$PROBED_PS_VALUE" = "$expected_start_token" ] \
+            && return 0
+        return 3
+    else
+        status=$?
+        [ "$status" -eq 3 ] && return 3
+        return 5
+    fi
+}
+
+epoch_age_at_least() {
+    local timestamp=$1 minimum_age=$2 now
+    now="$(current_epoch)" || return 2
+    [ "$now" -ge "$timestamp" ] || return 2
+    [ $((now - timestamp)) -ge "$minimum_age" ]
+}
+
+decision_runtime_lifecycle_lock_record() {
+    printf '%s/record\n' "$HERMES_DECISION_LIFECYCLE_LOCK"
+}
+
+decision_runtime_lifecycle_lock_exists() {
+    [ -e "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
+        || [ -L "$HERMES_DECISION_LIFECYCLE_LOCK" ]
+}
+
+load_decision_runtime_lifecycle_lock() {
+    local record key value extra
+    local version= operation= owner_pid= owner_start_token=
+    local owner_nonce= acquired_at_epoch=
+    local seen_version= seen_operation= seen_owner_pid=
+    local seen_owner_start_token= seen_owner_nonce=
+    local seen_acquired_at_epoch=
+
+    DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS=missing
+    DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION=
+    DECISION_RUNTIME_LIFECYCLE_LOCK_PID=
+    DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN=
+    DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE=
+    DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT=
+    decision_runtime_lifecycle_lock_exists || return 0
+    DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS=invalid
+    [ -d "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
+        && [ ! -L "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
+        || return 0
+    record="$(decision_runtime_lifecycle_lock_record)"
+    [ -f "$record" ] && [ ! -L "$record" ] || return 0
+
+    while IFS=$'\t' read -r key value extra; do
+        [ -z "$extra" ] || return 0
+        case "$key" in
+        version)
+            [ -z "$seen_version" ] || return 0
+            version=$value
+            seen_version=1
+            ;;
+        operation)
+            [ -z "$seen_operation" ] || return 0
+            operation=$value
+            seen_operation=1
+            ;;
+        owner_pid)
+            [ -z "$seen_owner_pid" ] || return 0
+            owner_pid=$value
+            seen_owner_pid=1
+            ;;
+        owner_start_token)
+            [ -z "$seen_owner_start_token" ] || return 0
+            owner_start_token=$value
+            seen_owner_start_token=1
+            ;;
+        owner_nonce)
+            [ -z "$seen_owner_nonce" ] || return 0
+            owner_nonce=$value
+            seen_owner_nonce=1
+            ;;
+        acquired_at_epoch)
+            [ -z "$seen_acquired_at_epoch" ] || return 0
+            acquired_at_epoch=$value
+            seen_acquired_at_epoch=1
+            ;;
+        *)
+            return 0
+            ;;
+        esac
+    done <"$record"
+
+    [ "$version" = 1 ] \
+        && [ -n "$seen_version" ] \
+        && [ -n "$seen_operation" ] \
+        && [ -n "$seen_owner_pid" ] \
+        && [ -n "$seen_owner_start_token" ] \
+        && [ -n "$seen_owner_nonce" ] \
+        && [ -n "$seen_acquired_at_epoch" ] \
+        && [[ "$operation" =~ ^(start|stop|update|install)$ ]] \
+        && valid_managed_pid "$owner_pid" \
+        && [[ "$owner_start_token" == ps:* ]] \
+        && [[ "$owner_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
+        && [[ "$acquired_at_epoch" =~ ^[1-9][0-9]*$ ]] \
+        || return 0
+
+    DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS=valid
+    DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION=$operation
+    DECISION_RUNTIME_LIFECYCLE_LOCK_PID=$owner_pid
+    DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN=$owner_start_token
+    DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE=$owner_nonce
+    DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT=$acquired_at_epoch
+}
+
+decision_runtime_lifecycle_lock_generation() {
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] || return 1
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT"
+}
+
+write_decision_runtime_lifecycle_lock() {
+    local operation=$1 owner_pid=$2 owner_start_token=$3
+    local owner_nonce=$4 acquired_at_epoch=$5 record temp
+    record="$(decision_runtime_lifecycle_lock_record)"
+    temp="$(mktemp "$HERMES_DECISION_LIFECYCLE_LOCK/.record.XXXXXX")"
+    if ! {
+        printf 'version\t1\n'
+        printf 'operation\t%s\n' "$operation"
+        printf 'owner_pid\t%s\n' "$owner_pid"
+        printf 'owner_start_token\t%s\n' "$owner_start_token"
+        printf 'owner_nonce\t%s\n' "$owner_nonce"
+        printf 'acquired_at_epoch\t%s\n' "$acquired_at_epoch"
+    } >"$temp" || ! mv "$temp" "$record"; then
+        rm -f "$temp"
+        return 1
+    fi
+}
+
+remove_decision_runtime_lifecycle_lock_generation() {
+    local expected_generation=$1 record backup
+    load_decision_runtime_lifecycle_lock
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$(decision_runtime_lifecycle_lock_generation)" = "$expected_generation" ] \
+        || return 1
+    record="$(decision_runtime_lifecycle_lock_record)"
+    backup="$(mktemp "$RUNTIME_DIR/.lifecycle-lock-record.XXXXXX")"
+    if ! mv "$record" "$backup"; then
+        rm -f "$backup"
+        return 1
+    fi
+    if ! rmdir "$HERMES_DECISION_LIFECYCLE_LOCK"; then
+        if [ -d "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
+            && [ ! -e "$record" ]; then
+            mv "$backup" "$record" 2>/dev/null || true
+        fi
+        return 1
+    fi
+    rm -f "$backup"
+}
+
+recover_orphaned_decision_runtime_lifecycle_lock() {
+    local expected_generation=$1 status
+    load_decision_runtime_lifecycle_lock
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$(decision_runtime_lifecycle_lock_generation)" = "$expected_generation" ] \
+        || return 1
+    if process_start_token_status \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN"; then
+        return 1
+    else
+        status=$?
+    fi
+    [ "$status" -eq 3 ] || return 1
+    epoch_age_at_least \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_STALE_GRACE_SECONDS" \
+        || return 1
+    remove_decision_runtime_lifecycle_lock_generation "$expected_generation"
+}
+
+acquire_decision_runtime_lifecycle_lock() {
+    local operation=$1 owner_pid owner_start_time owner_start_token
+    local owner_nonce acquired_at_epoch attempts=0 existing_generation status
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = false ] \
+        || die "decision runtime lifecycle lock is already held"
+    mkdir -p "$RUNTIME_DIR"
+    owner_pid=$$
+    owner_start_time="$(ps_value "$owner_pid" lstart)" \
+        || die "decision runtime lifecycle owner identity is unreadable"
+    owner_start_token="ps:$owner_start_time"
+    owner_nonce="$(new_service_nonce)" \
+        || die "failed to generate decision runtime lifecycle nonce"
+    while [ "$attempts" -le "$DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS" ]; do
+        acquired_at_epoch="$(current_epoch)" \
+            || die "failed to read decision runtime lifecycle clock"
+        if mkdir -m 700 "$HERMES_DECISION_LIFECYCLE_LOCK" 2>/dev/null; then
+            if ! write_decision_runtime_lifecycle_lock \
+                "$operation" \
+                "$owner_pid" \
+                "$owner_start_token" \
+                "$owner_nonce" \
+                "$acquired_at_epoch"; then
+                die "decision runtime lifecycle lock directory was created but its owner record could not be published; preserving the lock"
+            fi
+            DECISION_RUNTIME_LIFECYCLE_LOCK_HELD=true
+            DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PID=$owner_pid
+            DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_START_TOKEN=$owner_start_token
+            DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_NONCE=$owner_nonce
+            DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION=$operation
+            return
+        fi
+
+        load_decision_runtime_lifecycle_lock
+        case "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" in
+        missing)
+            attempts=$((attempts + 1))
+            continue
+            ;;
+        invalid)
+            die "decision runtime lifecycle lock is malformed or has no provable owner; preserving it"
+            ;;
+        valid)
+            existing_generation="$(decision_runtime_lifecycle_lock_generation)"
+            if process_start_token_status \
+                "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" \
+                "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN"; then
+                if [ "$attempts" -ge "$DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS" ]; then
+                    die "decision runtime lifecycle lock is still owned by live ${DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION} pid ${DECISION_RUNTIME_LIFECYCLE_LOCK_PID}; timed out without mutating runtime state"
+                fi
+            else
+                status=$?
+                case "$status" in
+                3)
+                    if recover_orphaned_decision_runtime_lifecycle_lock \
+                        "$existing_generation"; then
+                        info "recovered stale decision runtime lifecycle lock without signalling its former PID"
+                        attempts=$((attempts + 1))
+                        continue
+                    fi
+                    ;;
+                *)
+                    die "decision runtime lifecycle lock owner identity is unknown; preserving the lock"
+                    ;;
+                esac
+            fi
+            ;;
+        esac
+        if [ "$attempts" -ge "$DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS" ]; then
+            die "decision runtime lifecycle lock could not be recovered within the bounded wait; preserving it"
+        fi
+        "$SLEEP_BIN" 1
+        attempts=$((attempts + 1))
+    done
+    die "decision runtime lifecycle lock acquisition timed out"
+}
+
+release_decision_runtime_lifecycle_lock() {
+    local expected_generation
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = true ] || return 0
+    load_decision_runtime_lifecycle_lock
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_PID" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PID" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_START_TOKEN" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_NONCE" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_NONCE" ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION" = "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION" ] \
+        || return 1
+    expected_generation="$(decision_runtime_lifecycle_lock_generation)"
+    remove_decision_runtime_lifecycle_lock_generation "$expected_generation" \
+        || return 1
+    DECISION_RUNTIME_LIFECYCLE_LOCK_HELD=false
+}
+
+release_decision_runtime_lifecycle_lock_on_exit() {
+    local status=$?
+    trap - EXIT
+    if ! release_decision_runtime_lifecycle_lock; then
+        printf '%s\n' \
+            "[healthmes] decision runtime lifecycle lock release failed; preserving its diagnostic" \
+            >&2
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
+}
+
+with_decision_runtime_lifecycle_lock() {
+    local operation=$1
+    shift
+    if [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = true ]; then
+        "$@"
+        return
+    fi
+    acquire_decision_runtime_lifecycle_lock "$operation"
+    trap release_decision_runtime_lifecycle_lock_on_exit EXIT
+    "$@"
+    release_decision_runtime_lifecycle_lock \
+        || die "decision runtime lifecycle lock ownership changed before release; preserving the lock"
+    trap - EXIT
+}
+
 decision_runtime_startup_lease_record() {
     printf '%s/record\n' "$HERMES_DECISION_STARTUP_LEASE"
 }
@@ -200,14 +552,27 @@ decision_runtime_startup_lease_exists() {
 
 load_decision_runtime_startup_lease() {
     local record key value extra
-    local version= state= launcher_service_nonce= launcher_pid=
-    local seen_version= seen_state= seen_launcher_service_nonce=
-    local seen_launcher_pid=
+    local version= state= phase= launcher_service_nonce= launcher_pid=
+    local launcher_start_token= created_at_epoch= updated_at_epoch=
+    local startup_owner_pid= startup_owner_start_token= startup_owner_nonce=
+    local seen_version= seen_state= seen_phase=
+    local seen_launcher_service_nonce= seen_launcher_pid=
+    local seen_launcher_start_token= seen_created_at_epoch=
+    local seen_updated_at_epoch= seen_startup_owner_pid=
+    local seen_startup_owner_start_token= seen_startup_owner_nonce=
 
     DECISION_RUNTIME_STARTUP_LEASE_STATUS=missing
+    DECISION_RUNTIME_STARTUP_LEASE_VERSION=
     DECISION_RUNTIME_STARTUP_LEASE_STATE=
+    DECISION_RUNTIME_STARTUP_LEASE_PHASE=
     DECISION_RUNTIME_STARTUP_LEASE_PID=
+    DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN=
     DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE=
+    DECISION_RUNTIME_STARTUP_LEASE_CREATED_AT=
+    DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT=
+    DECISION_RUNTIME_STARTUP_LEASE_OWNER_PID=
+    DECISION_RUNTIME_STARTUP_LEASE_OWNER_START_TOKEN=
+    DECISION_RUNTIME_STARTUP_LEASE_OWNER_NONCE=
     decision_runtime_startup_lease_exists || return 0
     DECISION_RUNTIME_STARTUP_LEASE_STATUS=invalid
     [ -d "$HERMES_DECISION_STARTUP_LEASE" ] \
@@ -229,6 +594,11 @@ load_decision_runtime_startup_lease() {
             state=$value
             seen_state=1
             ;;
+        phase)
+            [ -z "$seen_phase" ] || return 0
+            phase=$value
+            seen_phase=1
+            ;;
         launcher_service_nonce)
             [ -z "$seen_launcher_service_nonce" ] || return 0
             launcher_service_nonce=$value
@@ -239,25 +609,117 @@ load_decision_runtime_startup_lease() {
             launcher_pid=$value
             seen_launcher_pid=1
             ;;
+        launcher_start_token)
+            [ -z "$seen_launcher_start_token" ] || return 0
+            launcher_start_token=$value
+            seen_launcher_start_token=1
+            ;;
+        created_at_epoch)
+            [ -z "$seen_created_at_epoch" ] || return 0
+            created_at_epoch=$value
+            seen_created_at_epoch=1
+            ;;
+        updated_at_epoch)
+            [ -z "$seen_updated_at_epoch" ] || return 0
+            updated_at_epoch=$value
+            seen_updated_at_epoch=1
+            ;;
+        startup_owner_pid)
+            [ -z "$seen_startup_owner_pid" ] || return 0
+            startup_owner_pid=$value
+            seen_startup_owner_pid=1
+            ;;
+        startup_owner_start_token)
+            [ -z "$seen_startup_owner_start_token" ] || return 0
+            startup_owner_start_token=$value
+            seen_startup_owner_start_token=1
+            ;;
+        startup_owner_nonce)
+            [ -z "$seen_startup_owner_nonce" ] || return 0
+            startup_owner_nonce=$value
+            seen_startup_owner_nonce=1
+            ;;
         *)
             return 0
             ;;
         esac
     done <"$record"
 
-    [ "$version" = 1 ] \
+    if [ "$version" = 1 ]; then
+        [ -n "$seen_version" ] \
+            && [ -n "$seen_state" ] \
+            && [ -n "$seen_launcher_service_nonce" ] \
+            && [ -z "$seen_phase$seen_launcher_start_token" ] \
+            && [ -z "$seen_created_at_epoch$seen_updated_at_epoch" ] \
+            && [ -z "$seen_startup_owner_pid" ] \
+            && [ -z "$seen_startup_owner_start_token" ] \
+            && [ -z "$seen_startup_owner_nonce" ] \
+            && [[ "$launcher_service_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
+            || return 0
+        case "$state" in
+        pending)
+            [ -z "$seen_launcher_pid" ] || return 0
+            ;;
+        spawned)
+            [ -n "$seen_launcher_pid" ] \
+                && valid_managed_pid "$launcher_pid" \
+                || return 0
+            ;;
+        *)
+            return 0
+            ;;
+        esac
+        DECISION_RUNTIME_STARTUP_LEASE_STATUS=$state
+        DECISION_RUNTIME_STARTUP_LEASE_VERSION=1
+        DECISION_RUNTIME_STARTUP_LEASE_STATE=$state
+        DECISION_RUNTIME_STARTUP_LEASE_PHASE=$state
+        DECISION_RUNTIME_STARTUP_LEASE_PID=$launcher_pid
+        DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE=$launcher_service_nonce
+        return
+    fi
+
+    [ "$version" = 2 ] \
         && [ -n "$seen_version" ] \
-        && [ -n "$seen_state" ] \
+        && [ -z "$seen_state" ] \
+        && [ -n "$seen_phase" ] \
         && [ -n "$seen_launcher_service_nonce" ] \
+        && [ -n "$seen_created_at_epoch" ] \
+        && [ -n "$seen_updated_at_epoch" ] \
+        && [ -n "$seen_startup_owner_pid" ] \
+        && [ -n "$seen_startup_owner_start_token" ] \
+        && [ -n "$seen_startup_owner_nonce" ] \
         && [[ "$launcher_service_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
+        && [[ "$created_at_epoch" =~ ^[1-9][0-9]*$ ]] \
+        && [[ "$updated_at_epoch" =~ ^[1-9][0-9]*$ ]] \
+        && [ "$updated_at_epoch" -ge "$created_at_epoch" ] \
+        && valid_managed_pid "$startup_owner_pid" \
+        && [[ "$startup_owner_start_token" == ps:* ]] \
+        && [[ "$startup_owner_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
         || return 0
-    case "$state" in
-    pending)
-        [ -z "$seen_launcher_pid" ] || return 0
+    case "$phase" in
+    intent)
+        [ -z "$seen_launcher_pid" ] \
+            && [ -z "$seen_launcher_start_token" ] \
+            || return 0
+        ;;
+    failed)
+        { [ -z "$seen_launcher_pid" ] \
+            || { valid_managed_pid "$launcher_pid" \
+                && [ -n "$seen_launcher_pid" ]; }; } \
+            && [ -z "$seen_launcher_start_token" ] \
+            || return 0
         ;;
     spawned)
         [ -n "$seen_launcher_pid" ] \
             && valid_managed_pid "$launcher_pid" \
+            && [ -z "$seen_launcher_start_token" ] \
+            || return 0
+        ;;
+    identity_verified)
+        [ -n "$seen_launcher_pid" ] \
+            && valid_managed_pid "$launcher_pid" \
+            && [ -n "$seen_launcher_start_token" ] \
+            && [[ "$launcher_start_token" == ps:* ]] \
             || return 0
         ;;
     *)
@@ -265,23 +727,47 @@ load_decision_runtime_startup_lease() {
         ;;
     esac
 
-    DECISION_RUNTIME_STARTUP_LEASE_STATUS=$state
-    DECISION_RUNTIME_STARTUP_LEASE_STATE=$state
+    DECISION_RUNTIME_STARTUP_LEASE_STATUS=$phase
+    DECISION_RUNTIME_STARTUP_LEASE_VERSION=2
+    DECISION_RUNTIME_STARTUP_LEASE_STATE=$phase
+    DECISION_RUNTIME_STARTUP_LEASE_PHASE=$phase
     DECISION_RUNTIME_STARTUP_LEASE_PID=$launcher_pid
+    DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN=$launcher_start_token
     DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE=$launcher_service_nonce
+    DECISION_RUNTIME_STARTUP_LEASE_CREATED_AT=$created_at_epoch
+    DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT=$updated_at_epoch
+    DECISION_RUNTIME_STARTUP_LEASE_OWNER_PID=$startup_owner_pid
+    DECISION_RUNTIME_STARTUP_LEASE_OWNER_START_TOKEN=$startup_owner_start_token
+    DECISION_RUNTIME_STARTUP_LEASE_OWNER_NONCE=$startup_owner_nonce
 }
 
 write_decision_runtime_startup_lease() {
-    local state=$1 launcher_service_nonce=$2 launcher_pid=${3:-}
     local record temp
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] || return 1
     record="$(decision_runtime_startup_lease_record)"
     temp="$(mktemp "$HERMES_DECISION_STARTUP_LEASE/.record.XXXXXX")"
     if ! {
-        printf 'version\t1\n'
-        printf 'state\t%s\n' "$state"
-        printf 'launcher_service_nonce\t%s\n' "$launcher_service_nonce"
-        if [ "$state" = spawned ]; then
-            printf 'launcher_pid\t%s\n' "$launcher_pid"
+        printf 'version\t2\n'
+        printf 'phase\t%s\n' "$DECISION_RUNTIME_STARTUP_LEASE_PHASE"
+        printf 'created_at_epoch\t%s\n' \
+            "$DECISION_RUNTIME_STARTUP_LEASE_CREATED_AT"
+        printf 'updated_at_epoch\t%s\n' \
+            "$DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT"
+        printf 'launcher_service_nonce\t%s\n' \
+            "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE"
+        printf 'startup_owner_pid\t%s\n' \
+            "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_PID"
+        printf 'startup_owner_start_token\t%s\n' \
+            "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_START_TOKEN"
+        printf 'startup_owner_nonce\t%s\n' \
+            "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_NONCE"
+        if [ -n "$DECISION_RUNTIME_STARTUP_LEASE_PID" ]; then
+            printf 'launcher_pid\t%s\n' \
+                "$DECISION_RUNTIME_STARTUP_LEASE_PID"
+        fi
+        if [ -n "$DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN" ]; then
+            printf 'launcher_start_token\t%s\n' \
+                "$DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN"
         fi
     } >"$temp" || ! mv "$temp" "$record"; then
         rm -f "$temp"
@@ -290,48 +776,159 @@ write_decision_runtime_startup_lease() {
 }
 
 create_decision_runtime_startup_lease() {
-    local launcher_service_nonce=$1
+    local launcher_service_nonce=$1 now
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = true ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION" = start ] \
+        || die "decision runtime startup requires the cross-process lifecycle lock"
     if ! mkdir -m 700 "$HERMES_DECISION_STARTUP_LEASE"; then
         die "decision runtime startup lease already exists; stop or inspect the existing generation first"
     fi
-    if ! write_decision_runtime_startup_lease \
-        pending "$launcher_service_nonce"; then
+    now="$(current_epoch)" || die "failed to read startup lease clock"
+    DECISION_RUNTIME_STARTUP_LEASE_VERSION=2
+    DECISION_RUNTIME_STARTUP_LEASE_STATUS=intent
+    DECISION_RUNTIME_STARTUP_LEASE_STATE=intent
+    DECISION_RUNTIME_STARTUP_LEASE_PHASE=intent
+    DECISION_RUNTIME_STARTUP_LEASE_PID=
+    DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN=
+    DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE=$launcher_service_nonce
+    DECISION_RUNTIME_STARTUP_LEASE_CREATED_AT=$now
+    DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT=$now
+    DECISION_RUNTIME_STARTUP_LEASE_OWNER_PID=$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PID
+    DECISION_RUNTIME_STARTUP_LEASE_OWNER_START_TOKEN=$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_START_TOKEN
+    DECISION_RUNTIME_STARTUP_LEASE_OWNER_NONCE=$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_NONCE
+    if ! write_decision_runtime_startup_lease; then
         rmdir "$HERMES_DECISION_STARTUP_LEASE" 2>/dev/null || true
         die "failed to publish decision runtime startup intent"
     fi
 }
 
 mark_decision_runtime_startup_spawned() {
-    local launcher_service_nonce=$1 launcher_pid=$2
+    local launcher_service_nonce=$1 launcher_pid=$2 now
     load_decision_runtime_startup_lease
-    [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = pending ] \
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = intent ] \
         && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
         || return 1
-    write_decision_runtime_startup_lease \
-        spawned "$launcher_service_nonce" "$launcher_pid"
+    valid_managed_pid "$launcher_pid" || return 1
+    now="$(current_epoch)" || return 1
+    DECISION_RUNTIME_STARTUP_LEASE_STATUS=spawned
+    DECISION_RUNTIME_STARTUP_LEASE_STATE=spawned
+    DECISION_RUNTIME_STARTUP_LEASE_PHASE=spawned
+    DECISION_RUNTIME_STARTUP_LEASE_PID=$launcher_pid
+    DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT=$now
+    write_decision_runtime_startup_lease
+}
+
+mark_decision_runtime_startup_identity_verified() {
+    local launcher_service_nonce=$1 launcher_pid=$2
+    local launcher_start_token=$3 now
+    load_decision_runtime_startup_lease
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = spawned ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" = "$launcher_pid" ] \
+        && [[ "$launcher_start_token" == ps:* ]] \
+        || return 1
+    now="$(current_epoch)" || return 1
+    DECISION_RUNTIME_STARTUP_LEASE_STATUS=identity_verified
+    DECISION_RUNTIME_STARTUP_LEASE_STATE=identity_verified
+    DECISION_RUNTIME_STARTUP_LEASE_PHASE=identity_verified
+    DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN=$launcher_start_token
+    DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT=$now
+    write_decision_runtime_startup_lease
+}
+
+mark_decision_runtime_startup_failed() {
+    local launcher_service_nonce=$1 launcher_pid=${2:-} now
+    load_decision_runtime_startup_lease
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
+        && { [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = intent ] \
+            || [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = spawned ]; } \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
+        || return 1
+    if [ -n "$launcher_pid" ]; then
+        valid_managed_pid "$launcher_pid" || return 1
+        if [ -n "$DECISION_RUNTIME_STARTUP_LEASE_PID" ] \
+            && [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" != "$launcher_pid" ]; then
+            return 1
+        fi
+    fi
+    now="$(current_epoch)" || return 1
+    DECISION_RUNTIME_STARTUP_LEASE_STATUS=failed
+    DECISION_RUNTIME_STARTUP_LEASE_STATE=failed
+    DECISION_RUNTIME_STARTUP_LEASE_PHASE=failed
+    DECISION_RUNTIME_STARTUP_LEASE_PID=$launcher_pid
+    DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN=
+    DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT=$now
+    write_decision_runtime_startup_lease
 }
 
 complete_decision_runtime_startup_lease() {
-    local launcher_service_nonce=$1 launcher_pid=$2 record
+    local launcher_service_nonce=$1 launcher_pid=$2 expected_generation
     load_decision_runtime_startup_lease
-    [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = spawned ] \
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = identity_verified ] \
         && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
         && [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" = "$launcher_pid" ] \
         || return 1
-    record="$(decision_runtime_startup_lease_record)"
-    rm -f "$record"
-    rmdir "$HERMES_DECISION_STARTUP_LEASE"
+    load_process_identity "$HERMES_DECISION_PID" \
+        && [ "$PROCESS_PID" = "$launcher_pid" ] \
+        && [ "$PROCESS_NONCE" = "$launcher_service_nonce" ] \
+        && [ "ps:$PROCESS_START_TIME" = "$DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN" ] \
+        || return 1
+    expected_generation="$(decision_runtime_startup_lease_generation)"
+    remove_decision_runtime_startup_lease_generation "$expected_generation"
 }
 
 cancel_pending_decision_runtime_startup_lease() {
-    local launcher_service_nonce=$1 record
+    local launcher_service_nonce=$1 expected_generation
     load_decision_runtime_startup_lease
-    [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = pending ] \
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = intent ] \
         && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
         || return 1
+    expected_generation="$(decision_runtime_startup_lease_generation)"
+    remove_decision_runtime_startup_lease_generation "$expected_generation"
+}
+
+decision_runtime_startup_lease_generation() {
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != invalid ] \
+        || return 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" \
+        "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" \
+        "$DECISION_RUNTIME_STARTUP_LEASE_PID" \
+        "$DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN" \
+        "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" \
+        "$DECISION_RUNTIME_STARTUP_LEASE_CREATED_AT" \
+        "$DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT" \
+        "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_PID" \
+        "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_START_TOKEN" \
+        "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_NONCE"
+}
+
+remove_decision_runtime_startup_lease_generation() {
+    local expected_generation=$1 record backup
+    load_decision_runtime_startup_lease
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != invalid ] \
+        && [ "$(decision_runtime_startup_lease_generation)" = "$expected_generation" ] \
+        || return 1
     record="$(decision_runtime_startup_lease_record)"
-    rm -f "$record"
-    rmdir "$HERMES_DECISION_STARTUP_LEASE"
+    backup="$(mktemp "$RUNTIME_DIR/.startup-lease-record.XXXXXX")"
+    if ! mv "$record" "$backup"; then
+        rm -f "$backup"
+        return 1
+    fi
+    if ! rmdir "$HERMES_DECISION_STARTUP_LEASE"; then
+        if [ -d "$HERMES_DECISION_STARTUP_LEASE" ] \
+            && [ ! -e "$record" ]; then
+            mv "$backup" "$record" 2>/dev/null || true
+        fi
+        return 1
+    fi
+    rm -f "$backup"
 }
 
 decision_runtime_startup_lease_generation_matches() {
@@ -339,10 +936,19 @@ decision_runtime_startup_lease_generation_matches() {
     [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
         || return 1
     case "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" in
-    pending)
+    intent)
         return 0
         ;;
-    spawned)
+    failed)
+        [ -z "$DECISION_RUNTIME_STARTUP_LEASE_PID" ] \
+            || [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" = "$launcher_pid" ]
+        ;;
+    pending)
+        [ -f "$HERMES_DECISION_PID" ] \
+            && [ ! -L "$HERMES_DECISION_PID" ] \
+            && [ "$(<"$HERMES_DECISION_PID")" = "$launcher_pid" ]
+        ;;
+    spawned | identity_verified)
         [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" = "$launcher_pid" ]
         ;;
     *)
@@ -360,7 +966,13 @@ decision_runtime_startup_lease_matches_launcher() {
     [ "$lease_service_nonce" = "$launcher_service_nonce" ] \
         || return 1
     case "$lease_status" in
-    spawned)
+    intent)
+        return 0
+        ;;
+    failed)
+        [ -z "$lease_pid" ] || [ "$lease_pid" = "$launcher_pid" ]
+        ;;
+    spawned | identity_verified)
         [ "$lease_pid" = "$launcher_pid" ]
         ;;
     pending)
@@ -381,6 +993,22 @@ run_service_runner() {
     [ -n "$nonce" ] && [ "${HEALTHMES_SERVICE_NONCE:-}" = "$nonce" ] \
         || die "invalid service runner nonce"
     service_pid=$$
+    if [ -n "${HEALTHMES_DECISION_STARTUP_LEASE_PATH:-}" ] \
+        || [ -n "${HEALTHMES_DECISION_STARTUP_PID_FILE:-}" ]; then
+        [ "${HEALTHMES_DECISION_STARTUP_LEASE_PATH:-}" = "$HERMES_DECISION_STARTUP_LEASE" ] \
+            && [ "${HEALTHMES_DECISION_STARTUP_PID_FILE:-}" = "$HERMES_DECISION_PID" ] \
+            || die "invalid decision runtime startup publication path"
+        if ! mark_decision_runtime_startup_spawned "$nonce" "$service_pid"; then
+            mark_decision_runtime_startup_failed \
+                "$nonce" "$service_pid" 2>/dev/null || true
+            die "failed to bind decision runtime startup lease to the managed Bash launcher"
+        fi
+        if ! write_unverified_process_pid "$HERMES_DECISION_PID" "$service_pid"; then
+            mark_decision_runtime_startup_failed \
+                "$nonce" "$service_pid" 2>/dev/null || true
+            die "failed to publish decision runtime launcher PID tombstone"
+        fi
+    fi
     service_start_token="ps:$(ps_value "$service_pid" lstart)" \
         || die "failed to capture service runner start token"
     trap ':' INT TERM
@@ -395,6 +1023,29 @@ run_service_runner() {
         "$KILL_BIN" -0 "$child" 2>/dev/null || return "$status"
         "$SLEEP_BIN" 0.1
     done
+}
+
+wait_for_decision_runtime_launcher_publication() {
+    local launcher_service_nonce=$1 launcher_pid=$2 stored_pid
+    local attempts=0
+    while [ "$attempts" -lt 50 ]; do
+        load_decision_runtime_startup_lease
+        if [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = spawned ] \
+            && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
+            && [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" = "$launcher_pid" ] \
+            && [ -f "$HERMES_DECISION_PID" ] \
+            && [ ! -L "$HERMES_DECISION_PID" ]; then
+            stored_pid="$(<"$HERMES_DECISION_PID")"
+            [ "$stored_pid" = "$launcher_pid" ] && return 0
+        fi
+        case "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" in
+        intent) ;;
+        *) return 1 ;;
+        esac
+        "$SLEEP_BIN" 0.1
+        attempts=$((attempts + 1))
+    done
+    return 1
 }
 
 start_process() {
@@ -430,18 +1081,28 @@ start_process() {
     if ! (
         cd "$REPO_ROOT"
         set -m
-        nohup env HEALTHMES_SERVICE_NONCE="$nonce" \
-            "$BASH_BIN" "$REPO_ROOT/scripts/healthmes_local.sh" \
-            __service_runner "$nonce" "$command" >>"$log_file" 2>&1 &
-        pid=$!
-        write_unverified_process_pid "$pid_file" "$pid" || exit 1
         if [ -n "$startup_lease" ]; then
-            mark_decision_runtime_startup_spawned "$nonce" "$pid" \
+            nohup env \
+                HEALTHMES_SERVICE_NONCE="$nonce" \
+                HEALTHMES_DECISION_STARTUP_LEASE_PATH="$startup_lease" \
+                HEALTHMES_DECISION_STARTUP_PID_FILE="$pid_file" \
+                "$BASH_BIN" "$REPO_ROOT/scripts/healthmes_local.sh" \
+                __service_runner "$nonce" "$command" >>"$log_file" 2>&1 &
+        else
+            nohup env HEALTHMES_SERVICE_NONCE="$nonce" \
+                "$BASH_BIN" "$REPO_ROOT/scripts/healthmes_local.sh" \
+                __service_runner "$nonce" "$command" >>"$log_file" 2>&1 &
+        fi
+        pid=$!
+        if [ -n "$startup_lease" ]; then
+            wait_for_decision_runtime_launcher_publication "$nonce" "$pid" \
                 || exit 1
+        else
+            write_unverified_process_pid "$pid_file" "$pid" || exit 1
         fi
         set +m
     ); then
-        die "$name launched but startup metadata publication failed; preserving the startup lease and PID tombstone"
+        die "$name launcher publication failed; preserving the startup lease and any PID tombstone"
     fi
     pid="$(<"$pid_file")"
     "$SLEEP_BIN" 1
@@ -452,9 +1113,14 @@ start_process() {
         clear_process_identity "$pid_file"
         die "$name failed identity verification; see $log_file"
     fi
-    if [ -n "$startup_lease" ] \
-        && ! complete_decision_runtime_startup_lease "$nonce" "$pid"; then
-        die "$name started but startup lease ownership changed; preserving runtime metadata"
+    if [ -n "$startup_lease" ]; then
+        if ! mark_decision_runtime_startup_identity_verified \
+            "$nonce" "$pid" "ps:$SNAPSHOT_START_TIME"; then
+            die "$name identity was captured but startup lease ownership changed; preserving runtime metadata"
+        fi
+        if ! complete_decision_runtime_startup_lease "$nonce" "$pid"; then
+            die "$name started but startup lease ownership changed; preserving runtime metadata"
+        fi
     fi
     info "$name started (pid $pid)"
 }
@@ -799,6 +1465,191 @@ stop_decision_launcher_without_budget() {
     done
 }
 
+startup_lease_owner_identity_status() {
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] || return 5
+    process_start_token_status \
+        "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_PID" \
+        "$DECISION_RUNTIME_STARTUP_LEASE_OWNER_START_TOKEN"
+}
+
+startup_lease_launcher_identity_status() {
+    local pid=$DECISION_RUNTIME_STARTUP_LEASE_PID status marker
+    valid_managed_pid "$pid" || return 5
+    if probe_ps_value "$pid" pid; then
+        [ "$PROBED_PS_VALUE" = "$pid" ] || return 5
+    else
+        status=$?
+        [ "$status" -eq 3 ] && return 3
+        return 5
+    fi
+    load_process_snapshot "$pid" || return 5
+    marker="healthmes_local.sh __service_runner $DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE "
+    if [ "$SNAPSHOT_PID" = "$pid" ] \
+        && [ "$SNAPSHOT_PGID" = "$pid" ] \
+        && [ "${SNAPSHOT_EXECUTABLE##*/}" = "bash" ] \
+        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]; then
+        return 0
+    fi
+    return 4
+}
+
+startup_lease_matches_loaded_v3_budget() {
+    [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ] \
+        && decision_runtime_startup_lease_matches_launcher \
+            "$DECISION_RUNTIME_BUDGET_LAUNCHER_PID" \
+            "$DECISION_RUNTIME_BUDGET_LAUNCHER_SERVICE_NONCE"
+}
+
+clear_stale_startup_artifacts() {
+    local expected_generation=$1 launcher_pid=${2:-}
+    local launcher_service_nonce=$3 stored_pid
+    if [ -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
+        load_process_identity "$HERMES_DECISION_PID" \
+            && [ -n "$launcher_pid" ] \
+            && [ "$PROCESS_PID" = "$launcher_pid" ] \
+            && [ "$PROCESS_NONCE" = "$launcher_service_nonce" ] \
+            || die "stale startup launcher identity conflicts with its lease; preserving metadata"
+    elif [ -f "$HERMES_DECISION_PID" ]; then
+        [ ! -L "$HERMES_DECISION_PID" ] \
+            || die "stale startup PID tombstone is unsafe; preserving metadata"
+        stored_pid="$(<"$HERMES_DECISION_PID")"
+        [ -n "$launcher_pid" ] && [ "$stored_pid" = "$launcher_pid" ] \
+            || die "stale startup PID tombstone conflicts with its lease; preserving metadata"
+    fi
+    remove_decision_runtime_startup_lease_generation "$expected_generation" \
+        || die "stale startup lease changed during recovery; preserving its diagnostic"
+    if [ -f "$HERMES_DECISION_PID" ] \
+        || [ -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
+        clear_process_identity "$HERMES_DECISION_PID"
+    fi
+}
+
+reconcile_stale_decision_runtime_startup() {
+    local attempts=0 owner_status launcher_status group_status
+    local expected_generation launcher_pid launcher_service_nonce
+
+    load_decision_runtime_startup_lease
+    case "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" in
+    missing) return ;;
+    invalid)
+        die "decision runtime startup lease is invalid; refusing lifecycle recovery"
+        ;;
+    esac
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] || return 0
+
+    while [ "$attempts" -le "$DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS" ]; do
+        load_decision_runtime_stop_bounds
+        if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
+            startup_lease_matches_loaded_v3_budget \
+                || die "decision runtime stop budget does not match the startup lease generation"
+            return
+        fi
+        [ "$DECISION_RUNTIME_BUDGET_STATUS" != invalid ] \
+            || die "decision runtime stop budget is invalid during startup recovery"
+        if [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = identity_verified ]; then
+            return
+        fi
+        if epoch_age_at_least \
+            "$DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT" \
+            "$DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS"; then
+            break
+        fi
+        if [ "$attempts" -ge "$DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS" ]; then
+            die "decision runtime startup lease did not become recoverable within the bounded grace; preserving it"
+        fi
+        "$SLEEP_BIN" 1
+        attempts=$((attempts + 1))
+        load_decision_runtime_startup_lease
+        [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ] \
+            && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != invalid ] \
+            && [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
+            || die "decision runtime startup lease changed during bounded recovery; preserving runtime state"
+    done
+
+    if startup_lease_owner_identity_status; then
+        die "decision runtime startup owner is still alive but its publication is incomplete; preserving the lease"
+    else
+        owner_status=$?
+    fi
+    [ "$owner_status" -eq 3 ] \
+        || die "decision runtime startup owner identity is unknown; preserving the lease"
+
+    load_decision_runtime_stop_bounds
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
+        startup_lease_matches_loaded_v3_budget \
+            || die "decision runtime stop budget does not match the startup lease generation"
+        return
+    fi
+    [ "$DECISION_RUNTIME_BUDGET_STATUS" = missing ] \
+        || die "decision runtime startup recovery found unusable shutdown evidence; preserving metadata"
+
+    expected_generation="$(decision_runtime_startup_lease_generation)"
+    launcher_pid=$DECISION_RUNTIME_STARTUP_LEASE_PID
+    launcher_service_nonce=$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE
+    if [ -z "$launcher_pid" ]; then
+        [ ! -f "$HERMES_DECISION_PID" ] \
+            && [ ! -f "$(identity_file "$HERMES_DECISION_PID")" ] \
+            || die "PID metadata appeared before the startup lease published a launcher PID; preserving the conflict"
+        clear_stale_startup_artifacts \
+            "$expected_generation" "" "$launcher_service_nonce"
+        info "recovered stale decision runtime startup intent after verified owner exit"
+        return
+    fi
+
+    if startup_lease_launcher_identity_status; then
+        if [ -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
+            load_process_identity "$HERMES_DECISION_PID" \
+                && [ "$PROCESS_PID" = "$launcher_pid" ] \
+                && [ "$PROCESS_NONCE" = "$launcher_service_nonce" ] \
+                || die "live startup launcher metadata conflicts with its lease; preserving metadata"
+        else
+            if [ -f "$HERMES_DECISION_PID" ]; then
+                [ ! -L "$HERMES_DECISION_PID" ] \
+                    && [ "$(<"$HERMES_DECISION_PID")" = "$launcher_pid" ] \
+                    || die "live startup PID tombstone conflicts with its lease; preserving metadata"
+            fi
+            write_process_identity \
+                "$HERMES_DECISION_PID" \
+                "$launcher_pid" \
+                "$launcher_service_nonce"
+        fi
+        return
+    else
+        launcher_status=$?
+    fi
+    case "$launcher_status" in
+    3 | 4) ;;
+    *)
+        die "decision runtime startup launcher identity is unknown; preserving the lease"
+        ;;
+    esac
+
+    if runtime_launcher_group_is_empty "$launcher_pid"; then
+        :
+    else
+        group_status=$?
+        case "$group_status" in
+        6)
+            die "dead startup launcher still has untracked process-group members and no v3 budget; preserving the lease"
+            ;;
+        *)
+            die "dead startup launcher process-group state is unknown; preserving the lease"
+            ;;
+        esac
+    fi
+    load_decision_runtime_stop_bounds
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
+        startup_lease_matches_loaded_v3_budget \
+            || die "late decision runtime stop budget does not match the startup lease generation"
+        return
+    fi
+    [ "$DECISION_RUNTIME_BUDGET_STATUS" = missing ] \
+        || die "decision runtime shutdown evidence became unusable during startup recovery"
+    clear_stale_startup_artifacts \
+        "$expected_generation" "$launcher_pid" "$launcher_service_nonce"
+    info "recovered stale decision runtime startup after proving its launcher group empty"
+}
+
 clear_decision_launcher_metadata_if_owned() {
     local metadata_present=$1 metadata_valid=$2
     local launcher_pid=$3 launcher_executable=$4
@@ -834,7 +1685,8 @@ clear_decision_runtime_metadata_if_owned() {
     local startup_lease_service_nonce=${11}
     local expected_launcher_pid=${12}
     local expected_launcher_service_nonce=${13}
-    local record record_backup stored_pid
+    local expected_startup_lease_generation=${14:-}
+    local current_generation stored_pid
 
     load_decision_runtime_startup_lease
     if [ "$startup_lease_present" = false ]; then
@@ -859,20 +1711,11 @@ clear_decision_runtime_metadata_if_owned() {
         "$startup_lease_pid" \
         "$startup_lease_service_nonce" \
         || die "decision runtime startup lease does not own the stopped generation; preserving runtime metadata"
-
-    if [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = missing ]; then
-        if [ ! -f "$HERMES_DECISION_PID" ] \
-            && [ ! -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
-            return
-        fi
-        load_process_identity "$HERMES_DECISION_PID" \
-            || die "decision runtime startup lease disappeared before verified launcher metadata was available; preserving metadata"
-        [ "$PROCESS_PID" = "$expected_launcher_pid" ] \
-            && [ "$PROCESS_NONCE" = "$expected_launcher_service_nonce" ] \
-            || die "decision runtime launcher metadata generation changed after startup; preserving metadata"
-        clear_process_identity "$HERMES_DECISION_PID"
-        return
-    fi
+    current_generation="$(decision_runtime_startup_lease_generation)" \
+        || die "decision runtime startup lease generation is unavailable"
+    [ -n "$expected_startup_lease_generation" ] \
+        && [ "$current_generation" = "$expected_startup_lease_generation" ] \
+        || die "decision runtime startup lease generation changed during cleanup; preserving runtime metadata"
     decision_runtime_startup_lease_matches_launcher \
         "$expected_launcher_pid" \
         "$expected_launcher_service_nonce" \
@@ -891,29 +1734,9 @@ clear_decision_runtime_metadata_if_owned() {
         [ "$stored_pid" = "$expected_launcher_pid" ] \
             || die "decision runtime startup PID tombstone changed during cleanup; preserving runtime metadata"
     fi
-
-    load_decision_runtime_startup_lease
-    [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ] \
-        && decision_runtime_startup_lease_generation_matches \
-            "$expected_launcher_pid" \
-            "$expected_launcher_service_nonce" \
+    remove_decision_runtime_startup_lease_generation \
+        "$expected_startup_lease_generation" \
         || die "decision runtime startup lease changed before removal; preserving its diagnostic"
-    record="$(decision_runtime_startup_lease_record)"
-    record_backup="$(mktemp "$RUNTIME_DIR/.startup-lease-record.XXXXXX")"
-    mv "$record" "$record_backup" \
-        || die "decision runtime startup lease record could not be isolated for removal"
-    if ! rmdir "$HERMES_DECISION_STARTUP_LEASE"; then
-        if [ -d "$HERMES_DECISION_STARTUP_LEASE" ] \
-            && [ ! -e "$record" ]; then
-            mv "$record_backup" "$record" \
-                || die "decision runtime startup lease removal failed and its record could not be restored"
-        fi
-        die "decision runtime startup lease contains unexpected state; preserving its diagnostic"
-    fi
-    rm -f "$record_backup"
-
-    decision_runtime_startup_lease_exists \
-        && die "a new decision runtime startup began during metadata cleanup; preserving its generation"
     if [ -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
         load_process_identity "$HERMES_DECISION_PID" \
             || die "decision runtime startup identity changed after lease removal; preserving runtime metadata"
@@ -927,7 +1750,7 @@ clear_decision_runtime_metadata_if_owned() {
         [ "$stored_pid" = "$expected_launcher_pid" ] \
             || die "decision runtime startup PID tombstone changed after lease removal; preserving runtime metadata"
     else
-        return
+        return 0
     fi
     clear_process_identity "$HERMES_DECISION_PID"
 }
@@ -974,19 +1797,25 @@ stop_decision_runtime() {
     local launcher_start_token= launcher_service_nonce=
     local startup_lease_present=false startup_lease_valid=false
     local startup_lease_status= startup_lease_pid=
-    local startup_lease_service_nonce=
+    local startup_lease_service_nonce= startup_lease_generation=
     local budget_launcher_pid= budget_launcher_service_nonce=
 
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = true ] \
+        || die "decision runtime stop requires the cross-process lifecycle lock"
+    reconcile_stale_decision_runtime_startup
     load_decision_runtime_startup_lease
     if [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ]; then
         startup_lease_present=true
         startup_lease_status=$DECISION_RUNTIME_STARTUP_LEASE_STATUS
         startup_lease_pid=$DECISION_RUNTIME_STARTUP_LEASE_PID
         startup_lease_service_nonce=$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE
-        if [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = pending ] \
-            || [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = spawned ]; then
+        startup_lease_generation="$(decision_runtime_startup_lease_generation)" \
+            || die "decision runtime startup lease generation is unavailable"
+        case "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" in
+        pending | spawned | intent | failed | identity_verified)
             startup_lease_valid=true
-        fi
+            ;;
+        esac
     fi
 
     if [ -f "$HERMES_DECISION_PID" ] \
@@ -1057,7 +1886,8 @@ stop_decision_runtime() {
                 "$startup_lease_pid" \
                 "$startup_lease_service_nonce" \
                 "$budget_launcher_pid" \
-                "$budget_launcher_service_nonce"
+                "$budget_launcher_service_nonce" \
+                "$startup_lease_generation"
             info "Hermes decision runtime stopped"
             return
         fi
@@ -1130,7 +1960,8 @@ stop_decision_runtime() {
                 "$startup_lease_pid" \
                 "$startup_lease_service_nonce" \
                 "$launcher_pid" \
-                "$launcher_service_nonce"
+                "$launcher_service_nonce" \
+                "$startup_lease_generation"
             info "Hermes decision runtime stopped"
             return
         fi
@@ -1402,8 +2233,8 @@ cmd_start() {
 }
 
 cmd_daemon() {
-    trap 'stop_apps; exit 0' INT TERM
-    start_apps
+    trap 'with_decision_runtime_lifecycle_lock stop stop_apps; exit 0' INT TERM
+    with_decision_runtime_lifecycle_lock start start_apps
     while true; do
         "$SLEEP_BIN" 5
         load_runtime_env
@@ -1413,7 +2244,7 @@ cmd_daemon() {
             || ! pid_running "$BEAT_PID" \
             || { decision_runtime_configured \
                 && ! pid_running "$HERMES_DECISION_PID"; }; then
-            start_apps
+            with_decision_runtime_lifecycle_lock start start_apps
         fi
     done
 }
@@ -1444,33 +2275,184 @@ service_status() {
 }
 
 decision_runtime_status() {
-    local probe_status startup_lease_status
-    local startup_lease_pid startup_lease_service_nonce
-    if pid_running "$HERMES_DECISION_PID"; then
-        info "Hermes decision runtime: running (launcher pid $PROCESS_PID)"
-        return
+    local probe_status lock_owner_status
+    local lock_status lock_generation= lock_operation=
+    local lock_pid= lock_start_token= final_lock_status final_lock_generation=
+    local startup_lease_status startup_lease_version
+    local startup_lease_pid startup_lease_start_token
+    local startup_lease_service_nonce startup_lease_generation=
+    local metadata_present=false metadata_valid=false
+    local metadata_pid= metadata_start_time= metadata_nonce=
+    local stored_pid=
+
+    load_decision_runtime_lifecycle_lock
+    lock_status=$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS
+    if [ "$lock_status" = valid ]; then
+        lock_generation="$(decision_runtime_lifecycle_lock_generation)"
+        lock_operation=$DECISION_RUNTIME_LIFECYCLE_LOCK_OPERATION
+        lock_pid=$DECISION_RUNTIME_LIFECYCLE_LOCK_PID
+        lock_start_token=$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN
+        if process_start_token_status "$lock_pid" "$lock_start_token"; then
+            lock_owner_status=live
+        else
+            probe_status=$?
+            case "$probe_status" in
+            3) lock_owner_status=absent ;;
+            *) lock_owner_status=unknown ;;
+            esac
+        fi
     fi
+
     load_decision_runtime_startup_lease
     startup_lease_status=$DECISION_RUNTIME_STARTUP_LEASE_STATUS
+    startup_lease_version=$DECISION_RUNTIME_STARTUP_LEASE_VERSION
     startup_lease_pid=$DECISION_RUNTIME_STARTUP_LEASE_PID
+    startup_lease_start_token=$DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN
     startup_lease_service_nonce=$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE
+    if [ "$startup_lease_status" != missing ] \
+        && [ "$startup_lease_status" != invalid ]; then
+        startup_lease_generation="$(decision_runtime_startup_lease_generation)"
+    fi
+
+    if [ -f "$HERMES_DECISION_PID" ] \
+        || [ -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
+        metadata_present=true
+        if load_process_identity "$HERMES_DECISION_PID"; then
+            metadata_valid=true
+            metadata_pid=$PROCESS_PID
+            metadata_start_time=$PROCESS_START_TIME
+            metadata_nonce=$PROCESS_NONCE
+        elif [ -f "$HERMES_DECISION_PID" ] \
+            && [ ! -L "$HERMES_DECISION_PID" ] \
+            && [ ! -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
+            stored_pid="$(<"$HERMES_DECISION_PID")"
+        fi
+    fi
+
     load_decision_runtime_stop_bounds
+
+    load_decision_runtime_lifecycle_lock
+    final_lock_status=$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS
+    if [ "$final_lock_status" = valid ]; then
+        final_lock_generation="$(decision_runtime_lifecycle_lock_generation)"
+    fi
+
+    if [ "$lock_status" != "$final_lock_status" ] \
+        || { [ "$lock_status" = valid ] \
+            && [ "$lock_generation" != "$final_lock_generation" ]; }; then
+        info "Hermes decision runtime: unknown (lifecycle lock changed while status was sampled)"
+        return
+    fi
+    if [ "$lock_status" = invalid ]; then
+        info "Hermes decision runtime: unknown (lifecycle lock is malformed or has no provable owner)"
+        return
+    fi
+    if [ "$startup_lease_status" = invalid ]; then
+        info "Hermes decision runtime: unknown (startup lease is malformed or unsafe)"
+        return
+    fi
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = invalid ]; then
+        info "Hermes decision runtime: unknown (shutdown budget is malformed or unsafe)"
+        return
+    fi
+
     if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
         if [ "$startup_lease_status" != missing ]; then
-            if { [ "$startup_lease_status" != pending ] \
-                && [ "$startup_lease_status" != spawned ]; } \
-                || ! decision_runtime_startup_lease_matches_launcher \
+            if ! decision_runtime_startup_lease_matches_launcher \
                     "$DECISION_RUNTIME_BUDGET_LAUNCHER_PID" \
                     "$DECISION_RUNTIME_BUDGET_LAUNCHER_SERVICE_NONCE" \
                     "$startup_lease_status" \
                     "$startup_lease_pid" \
-                    "$startup_lease_service_nonce"; then
+                    "$startup_lease_service_nonce" \
+                || { [ "$startup_lease_status" = identity_verified ] \
+                    && [ "$startup_lease_start_token" != "$DECISION_RUNTIME_BUDGET_LAUNCHER_START_TOKEN" ]; }; then
                 info "Hermes decision runtime: unknown (startup lease and shutdown budget generations do not match)"
                 return
             fi
         fi
+        if [ "$metadata_valid" = true ] \
+            && { [ "$metadata_pid" != "$DECISION_RUNTIME_BUDGET_LAUNCHER_PID" ] \
+                || [ "ps:$metadata_start_time" != "$DECISION_RUNTIME_BUDGET_LAUNCHER_START_TOKEN" ] \
+                || [ "$metadata_nonce" != "$DECISION_RUNTIME_BUDGET_LAUNCHER_SERVICE_NONCE" ]; }; then
+            info "Hermes decision runtime: unknown (launcher metadata and shutdown budget generations do not match)"
+            return
+        fi
+        if [ "$metadata_valid" = false ] \
+            && [ -n "$stored_pid" ] \
+            && { ! valid_managed_pid "$stored_pid" \
+                || [ "$stored_pid" != "$DECISION_RUNTIME_BUDGET_LAUNCHER_PID" ]; }; then
+            info "Hermes decision runtime: unknown (launcher PID tombstone and shutdown budget generations do not match)"
+            return
+        fi
+    fi
+
+    if [ "$startup_lease_status" != missing ] \
+        && [ "$metadata_present" = true ]; then
+        if [ "$metadata_valid" = true ]; then
+            if ! decision_runtime_startup_lease_matches_launcher \
+                "$metadata_pid" \
+                "$metadata_nonce" \
+                "$startup_lease_status" \
+                "$startup_lease_pid" \
+                "$startup_lease_service_nonce" \
+                || { [ "$startup_lease_status" = identity_verified ] \
+                    && [ "$startup_lease_start_token" != "ps:$metadata_start_time" ]; } \
+                || { [ "$startup_lease_version" = 2 ] \
+                    && [ "$startup_lease_status" = intent ]; }; then
+                info "Hermes decision runtime: unknown (startup lease and launcher metadata generations do not match)"
+                return
+            fi
+        elif [ -n "$stored_pid" ]; then
+            if [ "$startup_lease_status" != spawned ] \
+                && [ "$startup_lease_status" != failed ]; then
+                info "Hermes decision runtime: unknown (PID tombstone is inconsistent with startup phase)"
+                return
+            fi
+            if ! valid_managed_pid "$stored_pid" \
+                || [ "$stored_pid" != "$startup_lease_pid" ]; then
+                info "Hermes decision runtime: unknown (startup lease and PID tombstone generations do not match)"
+                return
+            fi
+        else
+            info "Hermes decision runtime: unknown (launcher metadata is malformed)"
+            return
+        fi
+    fi
+
+    if [ "$lock_status" = valid ]; then
+        case "$lock_owner_status" in
+        absent)
+            info "Hermes decision runtime: unknown (orphaned lifecycle ${lock_operation} lock requires recovery)"
+            return
+            ;;
+        unknown)
+            info "Hermes decision runtime: unknown (lifecycle lock owner identity is unprovable)"
+            return
+            ;;
+        live)
+            case "$lock_operation" in
+            start)
+                info "Hermes decision runtime: starting (cross-process lifecycle start is in progress)"
+                ;;
+            stop)
+                info "Hermes decision runtime: stopping (cross-process lifecycle stop is in progress)"
+                ;;
+            update | install)
+                info "Hermes decision runtime: unknown (lifecycle ${lock_operation} is in progress)"
+                ;;
+            esac
+            return
+            ;;
+        esac
+    fi
+
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = v3 ]; then
         if runtime_process_identity_action probe; then
-            info "Hermes decision runtime: running (verified supervisor pid $DECISION_RUNTIME_SUPERVISOR_PID; wrapper metadata unavailable)"
+            if [ "$metadata_valid" = true ]; then
+                info "Hermes decision runtime: running (launcher pid $metadata_pid; verified supervisor pid $DECISION_RUNTIME_SUPERVISOR_PID)"
+            else
+                info "Hermes decision runtime: running (verified supervisor pid $DECISION_RUNTIME_SUPERVISOR_PID; wrapper metadata unavailable)"
+            fi
             return
         else
             probe_status=$?
@@ -1482,15 +2464,32 @@ decision_runtime_status() {
         esac
         return
     fi
+
+    if [ "$DECISION_RUNTIME_BUDGET_STATUS" = legacy ]; then
+        if [ "$metadata_valid" = true ] \
+            && process_identity_matches "$HERMES_DECISION_PID"; then
+            info "Hermes decision runtime: running (legacy launcher pid $PROCESS_PID)"
+        else
+            info "Hermes decision runtime: unknown (legacy shutdown budget cannot prove a live launcher)"
+        fi
+        return
+    fi
+
     if [ "$DECISION_RUNTIME_BUDGET_STATUS" = missing ]; then
-        if [ "$startup_lease_status" = pending ]; then
+        if [ "$startup_lease_status" = pending ] \
+            || [ "$startup_lease_status" = intent ]; then
             info "Hermes decision runtime: starting (startup intent is published; launcher identity is not yet verified)"
-        elif [ "$startup_lease_status" = spawned ]; then
+        elif [ "$startup_lease_status" = spawned ] \
+            || [ "$startup_lease_status" = failed ]; then
             info "Hermes decision runtime: unknown (startup launcher identity is unverified; PID tombstone and lease are preserved)"
+        elif [ "$startup_lease_status" = identity_verified ]; then
+            info "Hermes decision runtime: unknown (verified startup lease remains without a shutdown budget)"
         elif [ "$startup_lease_status" != missing ]; then
             info "Hermes decision runtime: unknown (startup lease is malformed or unsafe)"
-        elif [ -f "$HERMES_DECISION_PID" ] \
-            || [ -f "$(identity_file "$HERMES_DECISION_PID")" ]; then
+        elif [ "$metadata_valid" = true ] \
+            && process_identity_matches "$HERMES_DECISION_PID"; then
+            info "Hermes decision runtime: running (launcher pid $PROCESS_PID; shutdown budget not yet published)"
+        elif [ "$metadata_present" = true ]; then
             info "Hermes decision runtime: unknown (launcher metadata remains without a v3 shutdown record)"
         else
             info "Hermes decision runtime: stopped"
@@ -1521,7 +2520,8 @@ cmd_open() {
 
 cmd_uninstall() {
     uninstall_launch_agent
-    cmd_stop
+    with_decision_runtime_lifecycle_lock stop stop_apps
+    bash "$DEV_MAC_SCRIPT" services-stop
     rm -rf "$RUNTIME_DIR"
     if [ "${1:-}" = "--delete-data" ]; then
         [ "$DATA_DIR" = "$REPO_ROOT/data" ] || die "refusing unexpected data path"
@@ -1539,10 +2539,10 @@ usage() {
 }
 
 case "${1:-}" in
-install) cmd_install ;;
-update) cmd_update ;;
-start) cmd_start ;;
-stop) cmd_stop ;;
+install) with_decision_runtime_lifecycle_lock install cmd_install ;;
+update) with_decision_runtime_lifecycle_lock update cmd_update ;;
+start) with_decision_runtime_lifecycle_lock start cmd_start ;;
+stop) with_decision_runtime_lifecycle_lock stop cmd_stop ;;
 status) cmd_status ;;
 open) cmd_open ;;
 daemon) cmd_daemon ;;

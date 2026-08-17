@@ -323,16 +323,39 @@ docker compose up -d --build --force-recreate hermes-decision
 
 `360`초는 `HEALTHMES_DECISION_TIMEOUT_SECONDS`의 최대 전체 판단 시간 300초,
 child SIGTERM 대기 10초, SIGKILL 이후 group 검증과 process reap 대기 5초를
-모두 포함하는 315초 상한보다 길다. Supervisor는 이 값을 시작 전에 계산하고,
-Native launcher는 Bash wrapper를 실행하기 전에 먼저
-`data/runtime/hermes-decision-startup-lease/` 디렉터리를 원자적으로 만든다.
-엄격한 record는 처음에 `pending`이고, wrapper를 spawn한 직후 PID와 고유 service
-nonce를 포함한 `spawned` 상태가 된다. 이때 PID 파일은 아직 검증되지 않은
-tombstone이다. 다섯 개 `ps` identity 필드 중 하나라도 읽지 못하면 process
-부재로 보지 않고 unknown으로 처리하며, PID tombstone과 lease를 보존한다.
-완전한 launcher identity가 원자적으로 기록된 뒤에만 lease를 제거한다. 따라서
-미검증 startup 세대가 남아 있는 동안 stop/update는 성공이나 metadata 삭제를
-보고할 수 없다.
+모두 포함하는 315초 상한보다 길다. Supervisor는 이 값을 시작 전에 계산한다.
+
+Native launcher의 `start`, `stop`, `update`, `install`은 모두
+`data/runtime/hermes-decision-lifecycle-lock/` 원자적 디렉터리 lock으로
+직렬화된다. 엄격한 owner record에는 작업 종류, shell PID, `ps` start token,
+nonce, 획득 epoch가 들어간다. 살아 있는 owner는 최대 10초만 기다리고,
+identity가 unreadable이거나 record가 malformed이면 fail closed한다. 정확한
+owner가 죽었고 2초 stale grace도 지난 경우에만 숫자 PID를 signal하지 않고
+orphan lock을 회수한다. `update`는 decision stop부터 `git pull`, setup,
+generation handoff가 모두 끝날 때까지 lock을 잡으므로 중간 코드로 새 start가
+들어올 수 없다.
+원자적 디렉터리를 만든 직후 owner record를 게시하기 전에 process가 crash한
+경우에는 owner를 증명할 수 없다. 이 불완전 lock은 stale이라고 추측해 지우지
+않고 operator가 확인할 수 있도록 `unknown` 상태로 보존한다.
+
+이 lock을 보유한 start는 Bash wrapper를 실행하기 전에 version 2
+`data/runtime/hermes-decision-startup-lease/`를 원자적으로 만든다. Lease에는
+`created_at_epoch`, `updated_at_epoch`, startup owner identity, launcher
+service nonce와 `intent`, `spawned`, `identity_verified`, `failed` phase가
+기록된다. 새 wrapper의 첫 관리 동작은 자신의 PID로 `spawned`를 게시한 뒤 PID
+tombstone을 쓰는 것이다. 두 게시가 모두 성공하기 전에는 Python supervisor를
+시작하지 않는다. Parent는 다섯 개 `ps` identity 필드를 검증해 완전한 metadata를
+쓴 뒤 `identity_verified`를 게시하고, 동일한 lease generation만 제거한다.
+
+Startup owner가 crash하면 stop은 3초의 bounded publication grace 동안 동일
+세대 v3 budget을 반복 조회한다. Matching v3 budget이 나타나면 PID tombstone
+이나 wrapper metadata가 없어도 native supervisor identity로 복구 종료할 수
+있다. Budget이 없으면 owner 부재가 검증된 `intent`/`failed`만 정리하며,
+launcher PID가 게시된 phase는 wrapper 부재와 process group empty까지 증명해야
+한다. PID reuse, unreadable process state, 남은 group member, malformed record,
+generation mismatch는 모두 metadata를 보존하고 fail closed한다. 따라서 미검증
+startup 세대가 남아 있는 동안 stop/update는 성공이나 metadata 삭제를 보고할
+수 없다.
 
 Python supervisor는 Uvicorn의 일반 startup 구현을 호출하기 직전에
 `data/runtime/hermes-decision-stop-budget`에 게시한다. 이 record에는 drain
@@ -362,11 +385,14 @@ stop은 Bash launcher의 정확한 세대를 보존하고 TERM 직전, launcher 
 process-group 확인 뒤에 budget을 다시 읽는다. 같은 세대의 늦은 v3 record가
 나타나면 실제 supervisor identity로 handoff하고, group이 비었음이 증명되지
 않거나 cleanup record가 남으면 metadata를 지우지 않고 실패한다.
-Startup lease가 남아 있는데 launcher identity와 v3 record가 모두 없으면 숫자
-PID를 신호하지 않고 실패한다. 나중에 v3 record가 나타난 경우에도 lease의
-launcher PID/service nonce와 정확히 일치해야만 검증된 supervisor를 종료하고,
-cleanup 성공 뒤 그 세대의 tombstone과 lease를 제거한다. lease가 남아 있는
-동안 status는 `starting` 또는 `unknown`이며 `stopped`를 반환하지 않는다.
+Startup lease가 남아 있는데 launcher identity, 안전한 stale cleanup 증명,
+matching v3 record가 모두 없으면 숫자 PID를 신호하지 않고 실패한다. 나중에
+v3 record가 나타난 경우에도 lease의 launcher PID/service nonce와 정확히
+일치해야만 검증된 supervisor를 종료하고, cleanup 성공 뒤 그 세대의 tombstone과
+lease를 제거한다. Status는 lifecycle lock, lease, budget, launcher metadata
+세대를 먼저 비교한다. 충돌이 있으면 살아 있는 launcher보다 `unknown`이
+우선하며, 진행 중인 owner는 `starting`, `stopping`, update/install 진행 상태로
+표시한다.
 
 SIGTERM이 들어오면 Uvicorn signal hook이 새 response lease를 즉시 막고 기존
 lease만 drain한다. 종료 시 leader process만 기다리지 않고 child group의 각
