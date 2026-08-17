@@ -29,6 +29,11 @@ SLEEP_BIN="${HEALTHMES_SLEEP_BIN:-sleep}"
 BASH_BIN="${HEALTHMES_BASH_BIN:-/bin/bash}"
 UUIDGEN_BIN="${HEALTHMES_UUIDGEN_BIN:-uuidgen}"
 MAX_DECISION_RUNTIME_DRAIN_SECONDS=315
+DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS=2
+MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS=$((
+    MAX_DECISION_RUNTIME_DRAIN_SECONDS
+    + DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS
+))
 
 info() { printf '[healthmes] %s\n' "$*"; }
 die() { printf '[healthmes] %s\n' "$*" >&2; exit 1; }
@@ -222,9 +227,11 @@ load_decision_runtime_stop_bounds() {
     local key value extra
     local version= drain_timeout= supervisor_pid=
     local supervisor_start_token= service_nonce=
+    local publication_instance_nonce=
     local seen_version= seen_drain_timeout= seen_supervisor_pid=
     local seen_supervisor_start_token= seen_service_nonce=
-    DECISION_RUNTIME_TERM_WAIT_SECONDS=$MAX_DECISION_RUNTIME_DRAIN_SECONDS
+    local seen_publication_instance_nonce=
+    DECISION_RUNTIME_TERM_WAIT_SECONDS=$MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS
     DECISION_RUNTIME_KILL_WAIT_SECONDS=1
     if [ ! -f "$HERMES_DECISION_STOP_BUDGET" ]; then
         return 0
@@ -276,22 +283,34 @@ load_decision_runtime_stop_bounds() {
             service_nonce=$value
             seen_service_nonce=1
             ;;
+        publication_instance_nonce)
+            [ -z "$seen_publication_instance_nonce" ] || {
+                info "ignoring malformed decision runtime stop budget"
+                return 0
+            }
+            publication_instance_nonce=$value
+            seen_publication_instance_nonce=1
+            ;;
         *)
             info "ignoring malformed decision runtime stop budget"
             return 0
             ;;
         esac
     done <"$HERMES_DECISION_STOP_BUDGET"
-    if [ "$version" != 1 ] \
+    if [ "$version" != 2 ] \
         || ! [[ "$drain_timeout" =~ ^[1-9][0-9]*$ ]] \
         || [ "$drain_timeout" -gt "$MAX_DECISION_RUNTIME_DRAIN_SECONDS" ] \
         || [ "$supervisor_pid" != "$PROCESS_PID" ] \
         || [ "$supervisor_start_token" != "ps:$PROCESS_START_TIME" ] \
-        || [ "$service_nonce" != "$PROCESS_NONCE" ]; then
+        || [ "$service_nonce" != "$PROCESS_NONCE" ] \
+        || ! [[ "$publication_instance_nonce" =~ ^[A-Za-z0-9-]+$ ]]; then
         info "ignoring stale or invalid decision runtime stop budget"
         return 0
     fi
-    DECISION_RUNTIME_TERM_WAIT_SECONDS=$drain_timeout
+    DECISION_RUNTIME_TERM_WAIT_SECONDS=$((
+        drain_timeout
+        + DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS
+    ))
 }
 
 wait_for_process_exit() {

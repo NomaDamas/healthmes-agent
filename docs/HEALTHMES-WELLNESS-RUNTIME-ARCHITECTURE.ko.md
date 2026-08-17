@@ -321,21 +321,33 @@ child SIGTERM 대기 10초, SIGKILL 이후 group 검증과 process reap 대기 5
 모두 포함하는 315초 상한보다 길다. Supervisor는 이 값을 시작 전에 계산하지만
 Uvicorn이 실제 serving startup을 완료한 뒤에만
 `data/runtime/hermes-decision-stop-budget`에 게시한다. 이 record에는 drain
-시간뿐 아니라 실행 중 launcher의 PID, OS start token, service nonce가 함께
-들어간다. Native stop/update는 세 identity가 현재 관리 중인 PID와 모두 맞을
-때만 그 값을 사용한다. 파일이 없거나, 형식이 잘못됐거나, 이전/경쟁 process의
-identity이면 짧은 값을 믿지 않고 안전한 최대 315초를 적용한다. 따라서 port
-충돌로 실패한 두 번째 startup이 기존 runtime의 종료 시간을 덮어쓸 수 없다.
-LaunchAgent의 `ExitTimeOut`은 360초다.
+시간뿐 아니라 실행 중 launcher의 PID, OS start token, service nonce와 각
+publication마다 새로 생성되는 publication instance nonce가 함께 들어간다.
+실제로 publish에 성공한 process만 자신의 정확한 record를 삭제할 수 있다.
+Native stop/update는 launcher identity가 현재 관리 중인 PID와 모두 맞을 때만
+그 값을 사용한다. 파일이 없거나, 형식이 잘못됐거나, 과거 v1 record이거나,
+이전/경쟁 process의 identity이면 짧은 값을 믿지 않고 안전한 최대 315초 drain에
+2초의 bounded launcher margin을 더한 317초를 적용한다. 따라서 같은 launcher
+identity를 상속한 두 번째 startup이 실패해도 기존 runtime의 종료 record를
+덮어쓰거나 삭제할 수 없다. Compose와 LaunchAgent의 outer timeout은 모두
+360초로 유지한다.
 
 SIGTERM이 들어오면 Uvicorn signal hook이 새 response lease를 즉시 막고 기존
 lease만 drain한다. 종료 시 leader process만 기다리지 않고 child group의 각
-PID/start-token identity를 확인한다. Leader가 먼저 끝나도 이미 검증된
-descendant는 TERM/KILL 대상이지만, 숫자 PGID 자체에는 신호하지 않으므로 나중에
-같은 PGID를 재사용한 무관한 process group은 건드리지 않는다. Hermes SSE
-proxy는 connect/write/pool에는 각각 명시적인 5초 제한을 두되 read timeout은
-없앤다. 따라서 SSE가 5초 넘게 조용해도 끊기지 않지만 전체 decision wall-clock
-deadline은 그대로 적용된다.
+PID/start-token identity를 확인한다. Linux에서는 pidfd를 연 뒤 `/proc`
+start identity를 다시 확인하고 안정된 pidfd handle로 신호하므로 최종 확인과
+신호 사이의 PID 재사용 race를 제거한다. pidfd를 사용할 수 없으면 숫자 PID로
+fallback하지 않고 fail closed한다. macOS에서는 초 단위 `ps lstart` 대신
+`libproc PROC_PIDTBSDINFO`의 초+마이크로초 start identity를 사용하며, identity를
+증명하지 못하면 신호하지 않는다. 다만 macOS 공개 API에는 pidfd와 같은 atomic
+signal handle이 없으므로 최종 libproc 확인과 `kill(2)` 사이의 아주 작은 OS
+한계는 남으며 이를 명시적으로 문서화한다.
+
+Leader가 먼저 끝나도 이미 검증된 descendant는 TERM/KILL 대상이지만, 숫자 PGID
+자체에는 신호하지 않으므로 나중에 같은 PGID를 재사용한 무관한 process group은
+건드리지 않는다. Hermes SSE proxy는 connect/write/pool에는 각각 명시적인 5초
+제한을 두되 read timeout은 없앤다. 따라서 SSE가 5초 넘게 조용해도 끊기지 않지만
+전체 decision wall-clock deadline은 그대로 적용된다.
 
 ### Legacy cron migration
 

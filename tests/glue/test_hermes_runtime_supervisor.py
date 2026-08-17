@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import os
 import signal
 from dataclasses import replace
 from pathlib import Path
@@ -20,10 +22,13 @@ from healthmes.hermes_runtime_supervisor import (
     HermesRuntimeSupervisorConfig,
     HermesRuntimeSupervisorIdentity,
     _build_supervisor_server,
+    _DarwinProcBsdInfo,
     _next_restart_backoff,
     _parse_pydantic_float,
+    _probe_darwin_process_snapshot,
     _ProcessGroupMember,
     _RuntimeShutdownBudgetPublication,
+    _signal_process_group_member,
     capture_runtime_supervisor_identity,
     create_supervisor_app,
     load_runtime_shutdown_budget,
@@ -995,6 +1000,150 @@ async def test_group_reuse_between_probe_and_signal_is_not_signaled(
     assert process._lifecycle_state == "close_failed"
 
 
+def test_linux_pidfd_signal_stays_bound_after_final_identity_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member = _group_member(4242, "linux:12345")
+    pidfd_calls: list[tuple[int, int]] = []
+    signals: list[tuple[int, signal.Signals | int]] = []
+    closed: list[int] = []
+    live_token = member.start_token
+
+    def open_pidfd(pid: int, flags: int) -> int:
+        pidfd_calls.append((pid, flags))
+        return 91
+
+    def send_pidfd(
+        descriptor: int,
+        sent: signal.Signals | int,
+        _siginfo: None,
+        _flags: int,
+    ) -> None:
+        nonlocal live_token
+        signals.append((descriptor, sent))
+        if sent == signal.SIGTERM:
+            # Model PID reuse in the exact interval after the final token
+            # probe. The pidfd remains bound to the already-open process.
+            live_token = "linux:reused"
+
+    monkeypatch.setattr(os, "pidfd_open", open_pidfd, raising=False)
+    monkeypatch.setattr(
+        signal,
+        "pidfd_send_signal",
+        send_pidfd,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_process_start_token",
+        lambda pid, expected_style=None: (
+            live_token
+            if pid == member.pid and expected_style == "linux"
+            else None
+        ),
+    )
+    monkeypatch.setattr(os, "close", lambda fd: closed.append(fd))
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("numeric PID must not be signaled"),
+    )
+
+    assert _signal_process_group_member(member, signal.SIGTERM)
+    assert pidfd_calls == [(member.pid, 0)]
+    assert signals == [(91, signal.SIGTERM)]
+    assert closed == [91]
+    assert live_token == "linux:reused"
+
+
+def test_linux_without_pidfd_fails_closed_without_numeric_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member = _group_member(4242, "linux:12345")
+    monkeypatch.setattr(os, "pidfd_open", None, raising=False)
+    monkeypatch.setattr(
+        signal,
+        "pidfd_send_signal",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("uncertain numeric PID was signaled"),
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_child_pidfd_unavailable",
+    ):
+        _signal_process_group_member(member, signal.SIGTERM)
+
+
+def test_darwin_libproc_identity_uses_microsecond_start_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLibproc:
+        @staticmethod
+        def proc_pidinfo(
+            pid: int,
+            _flavor: int,
+            _argument: int,
+            buffer: object,
+            size: int,
+        ) -> int:
+            information = ctypes.cast(
+                buffer,
+                ctypes.POINTER(_DarwinProcBsdInfo),
+            ).contents
+            information.pbi_pid = pid
+            information.pbi_pgid = 4000
+            information.pbi_start_tvsec = 1_786_915_200
+            information.pbi_start_tvusec = 123_456
+            return size
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._load_darwin_libproc",
+        lambda: FakeLibproc(),
+    )
+
+    assert _probe_darwin_process_snapshot(4242) == (
+        4000,
+        "darwin:1786915200:123456",
+    )
+
+
+def test_darwin_unprovable_identity_is_never_signaled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member = _group_member(4242, "darwin:1786915200:123456")
+
+    def unavailable(
+        _pid: int,
+        *,
+        expected_style: str | None = None,
+    ) -> str | None:
+        assert expected_style == "darwin"
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_darwin_identity_unavailable"
+        )
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor._probe_process_start_token",
+        unavailable,
+    )
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: pytest.fail("unproven numeric PID was signaled"),
+    )
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_darwin_identity_unavailable",
+    ):
+        _signal_process_group_member(member, signal.SIGTERM)
+
+
 def test_restart_backoff_is_exponential_and_capped() -> None:
     assert _next_restart_backoff(0, initial=0.25, maximum=1) == 0.25
     assert _next_restart_backoff(0.25, initial=0.25, maximum=1) == 0.5
@@ -1380,25 +1529,27 @@ async def test_failed_competing_startup_cannot_replace_ready_owner_budget(
 ) -> None:
     path = tmp_path / "runtime" / "stop-budget"
     identity = capture_runtime_supervisor_identity({})
-    ready_record = HermesRuntimeShutdownBudgetRecord(
+    inherited_record = HermesRuntimeShutdownBudgetRecord(
         drain_timeout_seconds=75,
         supervisor_pid=identity.pid,
         supervisor_start_token=identity.start_token,
         service_nonce=identity.service_nonce,
     )
-    competing_record = HermesRuntimeShutdownBudgetRecord(
-        drain_timeout_seconds=2,
-        supervisor_pid=identity.pid,
-        supervisor_start_token=identity.start_token,
-        service_nonce="competing-startup",
-    )
     ready_publication = _RuntimeShutdownBudgetPublication(
         path=path,
-        record=ready_record,
+        record=inherited_record,
     )
     competing_publication = _RuntimeShutdownBudgetPublication(
         path=path,
-        record=competing_record,
+        record=inherited_record,
+    )
+    assert (
+        ready_publication.record.supervisor_identity
+        == competing_publication.record.supervisor_identity
+    )
+    assert (
+        ready_publication.record.publication_instance_nonce
+        != competing_publication.record.publication_instance_nonce
     )
     controller = SimpleNamespace()
     config = _supervisor_config(tmp_path)
@@ -1417,7 +1568,7 @@ async def test_failed_competing_startup_cannot_replace_ready_owner_budget(
         shutdown_budget_publication=ready_publication,
     )
     await ready_server.startup()
-    assert load_runtime_shutdown_budget(path) == ready_record
+    assert load_runtime_shutdown_budget(path) == ready_publication.record
 
     async def failed_startup(
         _server: uvicorn.Server,
@@ -1436,7 +1587,41 @@ async def test_failed_competing_startup_cannot_replace_ready_owner_budget(
         await competing_server.startup()
     competing_publication.remove_if_owned()
 
-    assert load_runtime_shutdown_budget(path) == ready_record
+    assert load_runtime_shutdown_budget(path) == ready_publication.record
+    ready_publication.remove_if_owned()
+    assert not path.exists()
+
+
+def test_unpublished_competitor_cannot_delete_identical_budget_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    identity = capture_runtime_supervisor_identity({})
+    inherited_record = HermesRuntimeShutdownBudgetRecord(
+        drain_timeout_seconds=75,
+        supervisor_pid=identity.pid,
+        supervisor_start_token=identity.start_token,
+        service_nonce=identity.service_nonce,
+    )
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.secrets.token_hex",
+        lambda _length: "forced-publication-collision",
+    )
+    ready_publication = _RuntimeShutdownBudgetPublication(
+        path=path,
+        record=inherited_record,
+    )
+    failed_competitor = _RuntimeShutdownBudgetPublication(
+        path=path,
+        record=inherited_record,
+    )
+    assert ready_publication.record == failed_competitor.record
+
+    ready_publication.publish()
+    failed_competitor.remove_if_owned()
+
+    assert load_runtime_shutdown_budget(path) == ready_publication.record
     ready_publication.remove_if_owned()
     assert not path.exists()
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -24,7 +26,8 @@ from collections.abc import (
     Mapping,
 )
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 from types import FrameType
 from typing import Any, Literal, Protocol
@@ -84,7 +87,7 @@ _MAX_CHILD_TERM_TIMEOUT_SECONDS = 10.0
 _MAX_CHILD_KILL_TIMEOUT_SECONDS = 5.0
 _MAX_DECISION_TIMEOUT_SECONDS = 300.0
 _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS = 315
-_RUNTIME_SHUTDOWN_BUDGET_VERSION = 1
+_RUNTIME_SHUTDOWN_BUDGET_VERSION = 2
 _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES = 1024
 _PROCESS_GROUP_POLL_INTERVAL_SECONDS = 0.05
 _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS = 1.0
@@ -94,6 +97,8 @@ _PROXY_WRITE_TIMEOUT_SECONDS = 5.0
 _PROXY_POOL_TIMEOUT_SECONDS = 5.0
 _PYDANTIC_FLOAT = TypeAdapter(float)
 _SUPERVISOR_BOOT_IDENTITY = capture_runtime_boot_identity()
+_DARWIN_PROC_PIDTBSDINFO = 3
+_DARWIN_MAXCOMLEN = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +133,9 @@ class HermesRuntimeSupervisorIdentity:
             not self.start_token
             or len(self.start_token) > 256
             or not self.start_token.isascii()
-            or not self.start_token.startswith(("linux:", "ps:"))
+            or not self.start_token.startswith(
+                ("linux:", "darwin:", "ps:")
+            )
             or "\t" in self.start_token
             or "\n" in self.start_token
             or "\r" in self.start_token
@@ -146,6 +153,19 @@ class HermesRuntimeSupervisorIdentity:
             raise ValueError("runtime supervisor service nonce is invalid")
 
 
+def _validate_identity_nonce(value: str, *, label: str) -> None:
+    if (
+        not value
+        or len(value) > 128
+        or not value.isascii()
+        or not all(
+            character.isalnum() or character == "-"
+            for character in value
+        )
+    ):
+        raise ValueError(f"{label} is invalid")
+
+
 @dataclass(frozen=True, slots=True)
 class HermesRuntimeShutdownBudgetRecord:
     """Identity-bound, canonical stop budget published by a live server."""
@@ -154,6 +174,9 @@ class HermesRuntimeShutdownBudgetRecord:
     supervisor_pid: int
     supervisor_start_token: str
     service_nonce: str
+    publication_instance_nonce: str = field(
+        default_factory=lambda: secrets.token_hex(16)
+    )
 
     def __post_init__(self) -> None:
         if not 1 <= self.drain_timeout_seconds <= (
@@ -166,6 +189,10 @@ class HermesRuntimeShutdownBudgetRecord:
             pid=self.supervisor_pid,
             start_token=self.supervisor_start_token,
             service_nonce=self.service_nonce,
+        )
+        _validate_identity_nonce(
+            self.publication_instance_nonce,
+            label="runtime publication instance nonce",
         )
 
     @property
@@ -183,6 +210,8 @@ class HermesRuntimeShutdownBudgetRecord:
             f"supervisor_pid\t{self.supervisor_pid}\n"
             f"supervisor_start_token\t{self.supervisor_start_token}\n"
             f"service_nonce\t{self.service_nonce}\n"
+            "publication_instance_nonce\t"
+            f"{self.publication_instance_nonce}\n"
         ).encode("ascii")
 
 
@@ -198,6 +227,35 @@ ProcessGroupProbe = Callable[
     [int, float],
     frozenset[_ProcessGroupMember],
 ]
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    """ABI layout for macOS PROC_PIDTBSDINFO."""
+
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * _DARWIN_MAXCOMLEN),
+        ("pbi_name", ctypes.c_char * (2 * _DARWIN_MAXCOMLEN)),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
 
 
 def _lock_path(path: Path) -> Path:
@@ -230,13 +288,86 @@ def _fsync_parent(path: Path) -> None:
         os.close(descriptor)
 
 
+@lru_cache(maxsize=1)
+def _load_darwin_libproc() -> Any:
+    try:
+        library = ctypes.CDLL(
+            "/usr/lib/libproc.dylib",
+            use_errno=True,
+        )
+    except OSError as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_darwin_identity_unavailable"
+        ) from exc
+    proc_pidinfo = library.proc_pidinfo
+    proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    proc_pidinfo.restype = ctypes.c_int
+    return library
+
+
+def _probe_darwin_process_snapshot(
+    pid: int,
+) -> tuple[int, str] | None:
+    """Return kernel process-group/start identity at microsecond resolution."""
+
+    if pid < 1:
+        return None
+    information = _DarwinProcBsdInfo()
+    size = ctypes.sizeof(information)
+    library = _load_darwin_libproc()
+    ctypes.set_errno(0)
+    result = library.proc_pidinfo(
+        pid,
+        _DARWIN_PROC_PIDTBSDINFO,
+        0,
+        ctypes.byref(information),
+        size,
+    )
+    if result != size:
+        # A disappearing process is safe to ignore. If the numeric PID still
+        # exists, libproc failed to prove which process it names, so callers
+        # must fail closed rather than signal it.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError as exc:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_darwin_identity_unavailable"
+            ) from exc
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_darwin_identity_unavailable"
+        )
+    if (
+        information.pbi_pid != pid
+        or information.pbi_pgid < 1
+        or information.pbi_start_tvsec < 1
+        or information.pbi_start_tvusec > 999_999
+    ):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_darwin_identity_invalid"
+        )
+    return (
+        information.pbi_pgid,
+        "darwin:"
+        f"{information.pbi_start_tvsec}:"
+        f"{information.pbi_start_tvusec:06d}",
+    )
+
+
 def _probe_process_start_token(
     pid: int,
     *,
     expected_style: str | None = None,
 ) -> str | None:
     if (
-        expected_style != "ps"
+        expected_style in (None, "linux")
         and sys.platform.startswith("linux")
         and Path(f"/proc/{pid}/stat").exists()
     ):
@@ -247,6 +378,14 @@ def _probe_process_start_token(
             return f"linux:{fields[19]}"
         except (IndexError, OSError):
             return None
+    if (
+        expected_style in (None, "darwin")
+        and sys.platform == "darwin"
+    ):
+        snapshot = _probe_darwin_process_snapshot(pid)
+        return snapshot[1] if snapshot is not None else None
+    if expected_style not in (None, "ps"):
+        return None
     environment = dict(os.environ)
     environment["LC_ALL"] = "C"
     try:
@@ -327,6 +466,15 @@ def runtime_supervisor_identity_is_live(
 class _RuntimeShutdownBudgetPublication:
     path: Path
     record: HermesRuntimeShutdownBudgetRecord
+    _published: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # The launcher identity can be inherited by multiple competing child
+        # processes. This nonce identifies this exact publication attempt.
+        self.record = replace(
+            self.record,
+            publication_instance_nonce=secrets.token_hex(16),
+        )
 
     def publish(self) -> None:
         if not runtime_supervisor_identity_is_live(
@@ -336,19 +484,39 @@ class _RuntimeShutdownBudgetPublication:
                 "runtime shutdown budget owner is not running"
             )
         with _exclusive_file_lock(self.path):
+            try:
+                current = load_runtime_shutdown_budget(self.path)
+            except ValueError:
+                current = None
+            if (
+                current is not None
+                and current != self.record
+                and runtime_supervisor_identity_is_live(
+                    current.supervisor_identity
+                )
+            ):
+                raise RuntimeError(
+                    "runtime shutdown budget already has a live owner"
+                )
             persist_runtime_shutdown_budget(self.path, self.record)
+            self._published = True
 
     def remove_if_owned(self) -> None:
         target = self.path.expanduser()
         with _exclusive_file_lock(target):
+            if not self._published:
+                return
             try:
                 current = load_runtime_shutdown_budget(target)
             except ValueError:
+                self._published = False
                 return
             if current != self.record:
+                self._published = False
                 return
             target.unlink(missing_ok=True)
             _fsync_parent(target)
+            self._published = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1323,14 +1491,17 @@ class HermesRuntimeProcess:
                 # Never signal the numeric PGID directly. A dead leader can
                 # free that number while verified descendants still need
                 # cleanup, so each exact PID/start-token member is signaled.
-                os.kill(member.pid, sent)
+                member_signaled = _signal_process_group_member(
+                    member,
+                    sent,
+                )
             except ProcessLookupError:
                 continue
             except PermissionError as exc:
                 raise RuntimeError(
                     "hermes_runtime_child_group_signal_denied"
                 ) from exc
-            signaled = True
+            signaled = member_signaled or signaled
         return signaled
 
     async def _wait_for_child_group_exit(self, *, deadline: float) -> bool:
@@ -1517,6 +1688,11 @@ def _probe_process_group_members(
             pgid,
             timeout_seconds,
         )
+    if sys.platform == "darwin":
+        return _probe_darwin_process_group_members(
+            pgid,
+            timeout_seconds,
+        )
     return _probe_ps_process_group_members(pgid, timeout_seconds)
 
 
@@ -1555,6 +1731,63 @@ def _probe_linux_process_group_members(
         raise RuntimeError(
             "hermes_runtime_child_group_probe_failed"
         ) from exc
+    return frozenset(members)
+
+
+def _probe_darwin_process_group_members(
+    pgid: int,
+    timeout_seconds: float,
+) -> frozenset[_ProcessGroupMember]:
+    """Enumerate a group with ps, but identify every PID through libproc."""
+
+    environment = dict(os.environ)
+    environment["LC_ALL"] = "C"
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,pgid="],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "hermes_runtime_child_group_probe_timeout"
+        ) from exc
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "hermes_runtime_child_group_probe_failed"
+        ) from exc
+    members: set[_ProcessGroupMember] = set()
+    for line in result.stdout.splitlines():
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "hermes_runtime_child_group_probe_timeout"
+            )
+        fields = line.strip().split()
+        if len(fields) != 2:
+            continue
+        try:
+            pid = int(fields[0])
+            process_group = int(fields[1])
+        except ValueError:
+            continue
+        if process_group != pgid:
+            continue
+        snapshot = _probe_darwin_process_snapshot(pid)
+        if snapshot is None:
+            continue
+        verified_pgid, start_token = snapshot
+        if verified_pgid != pgid:
+            continue
+        members.add(
+            _ProcessGroupMember(
+                pid=pid,
+                start_token=start_token,
+            )
+        )
     return frozenset(members)
 
 
@@ -1604,6 +1837,108 @@ def _probe_ps_process_group_members(
                 )
             )
     return frozenset(members)
+
+
+def _signal_process_group_member(
+    member: _ProcessGroupMember,
+    sent: signal.Signals,
+) -> bool:
+    if member.start_token.startswith("linux:"):
+        return _signal_linux_process_group_member(member, sent)
+    if member.start_token.startswith("darwin:"):
+        return _signal_darwin_process_group_member(member, sent)
+    os.kill(member.pid, sent)
+    return True
+
+
+def _signal_linux_process_group_member(
+    member: _ProcessGroupMember,
+    sent: signal.Signals,
+) -> bool:
+    """Atomically signal the verified Linux process through a pidfd."""
+
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_child_pidfd_unavailable"
+        )
+    try:
+        descriptor = pidfd_open(member.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError as exc:
+        raise RuntimeError(
+            "hermes_runtime_child_group_signal_denied"
+        ) from exc
+    except OSError as exc:
+        if exc.errno in {
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EINVAL,
+        }:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_pidfd_unavailable"
+            ) from exc
+        raise RuntimeError(
+            "hermes_runtime_child_pidfd_open_failed"
+        ) from exc
+    try:
+        current = _probe_process_start_token(
+            member.pid,
+            expected_style="linux",
+        )
+        if current is None:
+            try:
+                pidfd_send_signal(descriptor, 0, None, 0)
+            except ProcessLookupError:
+                return False
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_identity_unavailable"
+            )
+        if not hmac.compare_digest(current, member.start_token):
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_child_group_identity_changed"
+            )
+        try:
+            pidfd_send_signal(descriptor, sent, None, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError as exc:
+            raise RuntimeError(
+                "hermes_runtime_child_group_signal_denied"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                "hermes_runtime_child_group_signal_failed"
+            ) from exc
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def _signal_darwin_process_group_member(
+    member: _ProcessGroupMember,
+    sent: signal.Signals,
+) -> bool:
+    """Fail closed unless libproc proves the current numeric PID identity."""
+
+    current = _probe_process_start_token(
+        member.pid,
+        expected_style="darwin",
+    )
+    if current is None:
+        return False
+    if not hmac.compare_digest(current, member.start_token):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_child_group_identity_changed"
+        )
+    # macOS exposes no pidfd-equivalent signal handle. libproc gives the
+    # highest-resolution public start identity, but the kernel still accepts
+    # only a numeric PID here. The final check above minimizes that unavoidable
+    # interval; an unprovable identity is never signaled.
+    os.kill(member.pid, sent)
+    return True
 
 
 def _next_restart_backoff(
@@ -2124,6 +2459,7 @@ def load_runtime_shutdown_budget(
         "supervisor_pid",
         "supervisor_start_token",
         "service_nonce",
+        "publication_instance_nonce",
     }
     if set(fields) != expected or fields["version"] != str(
         _RUNTIME_SHUTDOWN_BUDGET_VERSION
@@ -2135,6 +2471,9 @@ def load_runtime_shutdown_budget(
             supervisor_pid=int(fields["supervisor_pid"]),
             supervisor_start_token=fields["supervisor_start_token"],
             service_nonce=fields["service_nonce"],
+            publication_instance_nonce=fields[
+                "publication_instance_nonce"
+            ],
         )
     except ValueError as exc:
         raise ValueError("runtime shutdown budget is invalid") from exc

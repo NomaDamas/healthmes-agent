@@ -69,16 +69,20 @@ def _write_decision_stop_budget(
     pid: str = "4242",
     start_time: str = "Mon Aug  3 12:00:00 2026",
     nonce: str = "abc123",
+    publication_instance_nonce: str = "publication123",
+    version: int = 2,
 ) -> Path:
     path = runtime_dir / "hermes-decision-stop-budget"
     path.write_text(
         "\n".join(
             (
-                "version\t1",
+                f"version\t{version}",
                 f"drain_timeout_seconds\t{drain_timeout_seconds}",
                 f"supervisor_pid\t{pid}",
                 f"supervisor_start_token\tps:{start_time}",
                 f"service_nonce\t{nonce}",
+                "publication_instance_nonce\t"
+                f"{publication_instance_nonce}",
                 "",
             )
         ),
@@ -331,6 +335,18 @@ def test_install_registers_keepalive_login_launch_agent() -> None:
     assert plist["ExitTimeOut"] == 360
 
 
+def test_native_shutdown_margin_fits_compose_and_launchagent_budgets() -> None:
+    text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+    assert "MAX_DECISION_RUNTIME_DRAIN_SECONDS=315" in text
+    assert "DECISION_RUNTIME_SHUTDOWN_MARGIN_SECONDS=2" in text
+    assert "MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS=$((" in text
+
+    plist = plistlib.loads(LAUNCH_AGENT_TEMPLATE.read_bytes())
+    compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+    assert plist["ExitTimeOut"] == 360
+    assert compose["services"]["hermes-decision"]["stop_grace_period"] == "6m"
+
+
 def test_launch_agent_enables_scheduler_for_background_calendar_polling() -> None:
     template = plistlib.loads(LAUNCH_AGENT_TEMPLATE.read_bytes())
     environment = template["EnvironmentVariables"]
@@ -501,7 +517,7 @@ def test_stop_disables_keepalive_before_signaling_verified_process_group(
     assert not (Path(harness["runtime"]) / "healthmes.pid.identity").exists()
 
 
-def test_decision_stop_uses_full_bound_and_never_orphans_child_group(
+def test_decision_stop_adds_bounded_margin_to_exact_saved_budget(
     tmp_path: Path,
 ) -> None:
     harness = _local_runtime_harness(tmp_path)
@@ -530,7 +546,8 @@ def test_decision_stop_uses_full_bound_and_never_orphans_child_group(
     assert result.returncode != 0
     assert "kill -s TERM -4242" in events
     assert "kill -s KILL -4242" not in events
-    assert events.count("sleep 1") == 3
+    assert events.count("sleep 1") == 5
+    assert "did not stop within 5s" in result.stderr
     assert "refusing to orphan its child process group" in result.stderr
     assert pid_file.exists()
     assert pid_file.with_suffix(".pid.identity").exists()
@@ -594,7 +611,36 @@ def test_decision_stop_ignores_budget_from_another_service_identity(
     assert "ignoring stale or invalid decision runtime stop budget" in (
         result.stdout
     )
-    assert _event_lines(harness).count("sleep 1") == 315
+    assert _event_lines(harness).count("sleep 1") == 317
+    assert budget.exists()
+
+
+def test_decision_stop_treats_v1_budget_as_stale(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    budget = _write_decision_stop_budget(
+        runtime,
+        drain_timeout_seconds=2,
+        version=1,
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "ignoring stale or invalid decision runtime stop budget" in (
+        result.stdout
+    )
+    assert _event_lines(harness).count("sleep 1") == 317
     assert budget.exists()
 
 

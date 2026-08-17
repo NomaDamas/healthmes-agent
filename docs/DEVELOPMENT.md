@@ -237,21 +237,34 @@ running the dedicated Hermes `uv sync` or bootstrap. The validated
 waits is rounded up once, but it is not published until Uvicorn has completed
 owned serving startup. The atomic
 `data/runtime/hermes-decision-stop-budget` record binds that exact value to the
-running launcher PID, OS start token, and service nonce. Stop and update use it
-only when all three fields still match the managed PID identity; stale,
-malformed, or missing records receive the conservative 315-second maximum
-instead of shortening a live drain from mutable environment state. A failed
-competing startup therefore cannot overwrite the ready runtime's budget.
+running launcher PID, OS start token, service nonce, and a unique publication
+instance nonce. A process removes the record only after that exact process
+successfully published it. Stop and update use the record only when the
+launcher fields still match the managed PID identity; stale, malformed,
+version-1, or missing records receive the conservative 315-second drain plus a
+bounded 2-second native launcher margin instead of shortening a live drain
+from mutable environment state. A failed competing startup therefore cannot
+overwrite or delete the ready runtime's budget, even when both processes
+inherited the same launcher identity.
 
 The decision supervisor owns a separate child process group. It tracks
-PID/start-token identities for the leader and descendants, then signals only
-the currently revalidated member PIDs. This still cleans up descendants when
-the leader exits first without signaling a later unrelated process group that
-reuses the numeric PGID. The launcher refuses to SIGKILL only the outer
-service group if that complete drain fails; it retains the process identity
-and exits non-zero instead of orphaning the child or reporting a false stop.
-The login LaunchAgent's 360-second `ExitTimeOut` is longer than every valid
-saved drain budget.
+PID/start-token identities for the leader and descendants. Linux opens a pidfd,
+revalidates `/proc` identity after opening it, and delivers TERM/KILL through
+that stable handle; a platform without pidfd support fails closed instead of
+falling back to an uncertain numeric PID. macOS replaces second-resolution
+`ps lstart` child identity with `libproc` `PROC_PIDTBSDINFO` start seconds and
+microseconds, and refuses to signal when that identity cannot be proven.
+macOS has no public pidfd-equivalent, so a small unavoidable interval remains
+between the final libproc check and `kill(2)`; the implementation documents
+that OS boundary rather than treating an unverified PID as safe.
+
+This still cleans up descendants when the leader exits first without signaling
+a later unrelated process group that reuses the numeric PGID. The launcher
+refuses to SIGKILL only the outer service group if that complete drain fails;
+it retains the process identity and exits non-zero instead of orphaning the
+child or reporting a false stop. The maximum native TERM wait is 317 seconds,
+while both Compose and the login LaunchAgent retain their consistent
+360-second outer shutdown budgets.
 
 Re-runs are byte-idempotent when the desired decision artifacts are current.
 Bootstrap also performs a one-way migration of the general
