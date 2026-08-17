@@ -5167,6 +5167,187 @@ def test_postgres_receipt_basis_repairs_future_requested_at() -> None:
         "HEALTHMES_TEST_POSTGRES_URL"
     ),
 )
+def test_postgres_offline_receipt_basis_sql_executes() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_receipt_basis_offline_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    receipt_id = uuid.uuid4()
+    created_at = datetime(2099, 8, 17, 9, tzinfo=UTC)
+    requested_at = created_at + timedelta(days=365)
+    identity_expires_at = created_at + timedelta(days=30)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "b2c3d4e5f6a7")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            metadata = sa.MetaData()
+            receipt = sa.Table(
+                "decision_request_receipt",
+                metadata,
+                autoload_with=scoped_engine,
+            )
+            retention_policy = sa.Table(
+                "retention_policy",
+                metadata,
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                policy_id = connection.scalar(
+                    sa.select(retention_policy.c.id)
+                    .where(
+                        retention_policy.c.data_class == "decision"
+                    )
+                    .limit(1)
+                )
+                if policy_id is None:
+                    connection.execute(
+                        retention_policy.insert().values(
+                            id=uuid.uuid4(),
+                            data_class="decision",
+                            retention_days=1,
+                            enabled=True,
+                        )
+                    )
+                else:
+                    connection.execute(
+                        retention_policy.update()
+                        .where(retention_policy.c.id == policy_id)
+                        .values(retention_days=1, enabled=True)
+                    )
+                connection.execute(
+                    receipt.insert().values(
+                        id=receipt_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="d" * 64,
+                        requested_at=requested_at,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"answer": "sensitive answer"},
+                        },
+                        result_expires_at=identity_expires_at,
+                        expires_at=identity_expires_at,
+                        created_at=created_at,
+                        updated_at=created_at,
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        rendered = _render_offline_decision_receipt_basis_upgrade(
+            schema_url
+        )
+        assert "SET retention_basis_at = created_at" in rendered
+        assert (
+            "ix_decision_request_receipt_retention_basis_at"
+            in rendered
+        )
+
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            raw_connection = scoped_engine.raw_connection()
+            try:
+                cursor = raw_connection.cursor()
+                try:
+                    cursor.execute(rendered, prepare=False)
+                finally:
+                    cursor.close()
+                raw_connection.commit()
+            finally:
+                raw_connection.close()
+
+            inspector = sa.inspect(scoped_engine)
+            basis_column = next(
+                column
+                for column in inspector.get_columns(
+                    "decision_request_receipt"
+                )
+                if column["name"] == "retention_basis_at"
+            )
+            assert basis_column["nullable"] is False
+            assert {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "decision_request_receipt"
+                )
+            } == {
+                (
+                    "ck_decision_request_receipt_"
+                    "lease_generation_positive"
+                ),
+                (
+                    "ck_decision_request_receipt_"
+                    "state_payload_consistent"
+                ),
+            }
+            assert (
+                "ix_decision_request_receipt_retention_basis_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes(
+                        "decision_request_receipt"
+                    )
+                }
+            )
+            receipt = sa.Table(
+                "decision_request_receipt",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(receipt).where(
+                        receipt.c.id == receipt_id
+                    )
+                ).one()
+                assert row.requested_at == requested_at
+                assert row.retention_basis_at == created_at
+                assert row.result_expires_at == (
+                    created_at + timedelta(days=1)
+                )
+                assert row.expires_at == identity_expires_at
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "c3d4e5f6a7b8"
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="decision receipt retention bases are forward-only",
+        ):
+            command.downgrade(config, "b2c3d4e5f6a7")
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
 def test_postgres_offline_receipt_hardening_sql_executes() -> None:
     database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
     admin_engine = sa.create_engine(database_url)
