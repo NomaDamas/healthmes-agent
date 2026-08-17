@@ -554,12 +554,39 @@ class TriggerEvent(Base):
     """
 
     __tablename__ = "trigger_event"
+    __table_args__ = (
+        CheckConstraint(
+            "("
+            "dispatch_owner_token IS NULL "
+            "AND dispatch_lease_expires_at IS NULL"
+            ") OR ("
+            "dispatch_owner_token IS NOT NULL "
+            "AND dispatch_lease_expires_at IS NOT NULL"
+            ")",
+            name="dispatch_lease_consistent",
+        ),
+        CheckConstraint(
+            "dispatch_generation >= 0",
+            name="dispatch_generation_nonnegative",
+        ),
+    )
 
     fired_at: Mapped[datetime] = mapped_column(index=True)
     rule_id: Mapped[str_64] = mapped_column(index=True)
     payload: Mapped[JSONDict | None]
     alert_sent: Mapped[bool] = mapped_column(default=False)
     dedup_key: Mapped[str_255 | None] = mapped_column(index=True)
+    dispatch_owner_token: Mapped[uuid.UUID | None] = mapped_column(
+        default=None,
+    )
+    dispatch_generation: Mapped[int] = mapped_column(
+        default=0,
+        server_default="0",
+    )
+    dispatch_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        index=True,
+        default=None,
+    )
 
 
 class RawIngestEvent(Base):

@@ -154,7 +154,10 @@ def expire_trigger_event_answers(
         event
         for event in session.scalars(statement)
         if isinstance(event.payload, dict)
-        and isinstance(event.payload.get("message"), str)
+        and any(
+            key in event.payload
+            for key in ("message", "decision", "decision_record_id")
+        )
         and trigger_answer_is_expired(
             session,
             event,
@@ -173,6 +176,8 @@ def expire_trigger_event_answers(
             "expired_at": current.isoformat(),
         }
         event.payload = payload
+        event.dispatch_owner_token = None
+        event.dispatch_lease_expires_at = None
     session.flush()
     return len(candidates)
 

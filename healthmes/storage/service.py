@@ -202,14 +202,10 @@ def _update_retention_policy(
         )
     if data_class == "decision":
         # Sessions disable autoflush. Persist recalculated expiry timestamps
-        # before scrubbing copied answers and receipts. This must happen before
-        # deleting DecisionRecords because legacy trigger rows may only be
-        # linked through DecisionRecord.trigger_event_id.
+        # before scrubbing receipts and deleting DecisionRecords.
+        # ``purge_expired_decision_records`` owns the inseparable trigger-answer
+        # scrub so no caller can bypass it.
         session.flush()
-        expire_trigger_event_answers(
-            session,
-            now=current,
-        )
         scrub_decision_receipt_results(
             session,
             now=current,
@@ -374,9 +370,20 @@ def purge_expired_decision_records(
     now: datetime,
     dry_run: bool = False,
 ) -> int:
-    """Delete expired Wellness decisions without touching legacy decisions."""
+    """Scrub linked answers, then delete expired Wellness decisions.
+
+    Trigger payloads duplicate the user-facing answer and correlation fields.
+    Keeping the scrub inside this canonical purge prevents direct callers such
+    as DecisionFinalizer from deleting the DecisionRecord first and stranding
+    sensitive answer text in ``TriggerEvent.payload``.
+    """
 
     current = _as_utc(now)
+    expire_trigger_event_answers(
+        session,
+        now=current,
+        dry_run=dry_run,
+    )
     expired = (
         DecisionRecord.decision_request_id.is_not(None),
         DecisionRecord.retention_basis_at.is_not(None),
@@ -908,11 +915,6 @@ def _run_storage_maintenance(
     deleted = 0
     reclaimed = 0
     errors: list[str] = []
-    expire_trigger_event_answers(
-        session,
-        now=current,
-        dry_run=dry_run,
-    )
     decision_candidates = purge_expired_decision_records(
         session,
         now=current,

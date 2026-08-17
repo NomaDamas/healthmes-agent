@@ -302,7 +302,7 @@ def test_postgres_retention_shrink_after_final_check_scrubs_answer(
         )
         with check_lock:
             check_count += 1
-            should_block = check_count == 2
+            should_block = check_count == 3
         if should_block:
             post_reasoning_check.set()
             if not release_finalization.wait(timeout=5):

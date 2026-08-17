@@ -573,7 +573,7 @@ def test_retention_shrink_after_final_check_scrubs_committed_answer(
         expired = original_check(session, event, now=now)
         with check_lock:
             check_count += 1
-            should_block = check_count == 2
+            should_block = check_count == 3
         if should_block:
             post_reasoning_check.set()
             if not release_finalization.wait(timeout=5):
@@ -649,6 +649,119 @@ def test_retention_shrink_after_final_check_scrubs_committed_answer(
     assert stored.alert_sent is False
     assert "message" not in stored.payload
     assert stored.payload["push"]["state"] == "expired"
+
+
+def test_expired_dispatch_lease_takeover_rejects_stale_publisher(
+    settings,
+    session_factory,
+) -> None:
+    first_now = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    takeover_now = first_now + timedelta(seconds=2)
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class BlockingSender:
+        requires_reasoning = True
+
+        def send(
+            self,
+            fire: TriggerFire,
+            *,
+            fired_at: datetime,
+            trigger_event_id: uuid.UUID,
+        ) -> DecisionDispatchResult:
+            del fire, fired_at, trigger_event_id
+            first_started.set()
+            assert release_first.wait(timeout=5)
+            return DecisionDispatchResult(
+                ok=False,
+                status_code=204,
+                ready_for_native=True,
+                channel="app_poll",
+                message="Stale worker answer.",
+            )
+
+    class WinningSender:
+        requires_reasoning = True
+
+        def send(
+            self,
+            fire: TriggerFire,
+            *,
+            fired_at: datetime,
+            trigger_event_id: uuid.UUID,
+        ) -> DecisionDispatchResult:
+            del fire, fired_at, trigger_event_id
+            return DecisionDispatchResult(
+                ok=False,
+                status_code=204,
+                ready_for_native=True,
+                channel="app_poll",
+                message="Canonical takeover answer.",
+            )
+
+    first_evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=BlockingSender(),
+        rules=(),
+        now_provider=lambda: first_now,
+        dispatch_lease_duration=timedelta(seconds=1),
+    )
+    takeover_evaluator = TriggerEvaluator(
+        settings,
+        session_factory=session_factory,
+        health_reader=FakeHealthReader(),
+        alert_sender=WinningSender(),
+        rules=(),
+        now_provider=lambda: takeover_now,
+        dispatch_lease_duration=timedelta(seconds=1),
+    )
+    first_outcomes: list[Any] = []
+    failures: list[BaseException] = []
+
+    def run_first() -> None:
+        try:
+            first_outcomes.append(
+                first_evaluator.dispatch_fire(
+                    TriggerFire(
+                        rule_id="lease_takeover",
+                        dedup_key="lease_takeover:1",
+                        summary="A generated answer is ready.",
+                        proposal="Surface the answer.",
+                        evidence={},
+                    ),
+                    fired_at=first_now,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_first)
+    try:
+        worker.start()
+        assert first_started.wait(timeout=5)
+
+        takeover_report = takeover_evaluator.evaluate_once()
+        release_first.set()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert failures == []
+        assert takeover_report.count("available") == 1
+        assert len(first_outcomes) == 1
+        assert first_outcomes[0].status == "deduplicated"
+        [stored] = all_events(session_factory)
+        assert stored.alert_sent is False
+        assert stored.payload["message"] == "Canonical takeover answer."
+        assert stored.payload["push"]["state"] == "app_available"
+        assert stored.dispatch_owner_token is None
+        assert stored.dispatch_lease_expires_at is None
+        assert stored.dispatch_generation == 2
+    finally:
+        release_first.set()
+        worker.join(timeout=5)
 
 
 def test_retryable_result_is_recovered_without_rule_refiring(

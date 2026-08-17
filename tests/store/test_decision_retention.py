@@ -8,6 +8,7 @@ import sqlalchemy as sa
 
 from healthmes.storage import (
     apply_decision_retention,
+    purge_expired_decision_records,
     run_storage_maintenance,
     update_retention_policy,
 )
@@ -383,6 +384,76 @@ def test_maintenance_expires_trigger_answers_at_earliest_retention_cutoff(
         assert "decision_record_id" not in event.payload
         assert event.payload["push"]["state"] == "expired"
     assert retained.payload["message"] == "Wind down gradually."
+
+
+def test_direct_decision_purge_scrubs_trigger_answer_and_dispatch_claim(
+    session,
+) -> None:
+    current = datetime(2026, 8, 17, 12, tzinfo=UTC)
+    basis = current - timedelta(days=1)
+    update_retention_policy(
+        session,
+        "decision",
+        "1d",
+        now=current,
+    )
+    trigger = TriggerEvent(
+        fired_at=basis,
+        rule_id="direct-decision-purge",
+        payload={
+            "summary": "An expired proactive prompt.",
+            "message": "Sensitive answer that must be scrubbed.",
+            "decision": {"record_id": str(uuid.uuid4())},
+            "push": {
+                "sent": False,
+                "state": "app_available",
+                "channel": "app_poll",
+            },
+        },
+        alert_sent=False,
+        dispatch_owner_token=uuid.uuid4(),
+        dispatch_generation=4,
+        dispatch_lease_expires_at=current + timedelta(minutes=5),
+    )
+    session.add(trigger)
+    session.flush()
+    decision = _wellness_decision(
+        created_at=basis,
+        trigger_event_id=trigger.id,
+    )
+    apply_decision_retention(
+        session,
+        decision,
+        basis_at=basis,
+    )
+    session.add(decision)
+    session.flush()
+    trigger.payload = {
+        **trigger.payload,
+        "decision": {"record_id": str(decision.id)},
+        "decision_record_id": str(decision.id),
+    }
+    session.commit()
+    trigger_id = trigger.id
+    decision_id = decision.id
+
+    assert purge_expired_decision_records(
+        session,
+        now=current,
+    ) == 1
+    session.commit()
+    session.expire_all()
+
+    assert session.get(DecisionRecord, decision_id) is None
+    stored_trigger = session.get(TriggerEvent, trigger_id)
+    assert stored_trigger is not None
+    assert "message" not in stored_trigger.payload
+    assert "decision" not in stored_trigger.payload
+    assert "decision_record_id" not in stored_trigger.payload
+    assert stored_trigger.payload["push"]["state"] == "expired"
+    assert stored_trigger.dispatch_owner_token is None
+    assert stored_trigger.dispatch_lease_expires_at is None
+    assert stored_trigger.dispatch_generation == 4
 
 
 def test_retention_shrink_purges_recalculated_exact_cutoff(session) -> None:

@@ -54,12 +54,17 @@ from healthmes.decision import (
     decision_result_from_record,
 )
 from healthmes.decision.access import _current_source_content_digest
+from healthmes.storage import (
+    apply_decision_retention,
+    update_retention_policy,
+)
 from healthmes.store import (
     Base,
     CalendarEventMirror,
     CalendarSource,
     DecisionKind,
     DecisionRecord,
+    TriggerEvent,
     WellnessEvent,
     create_db_engine,
 )
@@ -464,6 +469,83 @@ def test_source_backed_action_is_atomically_persisted(persistence):
         assert str(ref.record_id) not in visible
         assert "query_id" not in visible
         assert "tool_trace" not in visible
+
+
+def test_finalizer_purge_scrubs_older_expired_trigger_answer(
+    persistence,
+) -> None:
+    _engine, factory = persistence
+    expired_basis = NOW - timedelta(days=1)
+    with factory() as session:
+        update_retention_policy(
+            session,
+            "decision",
+            "1d",
+            now=NOW,
+        )
+        trigger = TriggerEvent(
+            fired_at=expired_basis,
+            rule_id="finalizer-expired-purge",
+            payload={
+                "summary": "An older proactive prompt.",
+                "message": "Sensitive older answer.",
+                "decision": {"record_id": str(uuid.uuid4())},
+                "push": {
+                    "sent": False,
+                    "state": "app_available",
+                    "channel": "app_poll",
+                },
+            },
+            alert_sent=False,
+        )
+        session.add(trigger)
+        session.flush()
+        expired = DecisionRecord(
+            kind=DecisionKind.INSIGHT,
+            tree={"id": "expired-decision", "children": []},
+            summary="Expired decision",
+            trigger_event_id=trigger.id,
+            decision_request_id=uuid.uuid4(),
+            decision_turn_id=uuid.uuid4(),
+            decision_request_fingerprint=uuid.uuid4().hex * 2,
+            decision_payload={
+                "schema": "healthmes.decision-private.v2"
+            },
+            decision_payload_digest=uuid.uuid4().hex * 2,
+            created_at=expired_basis,
+        )
+        apply_decision_retention(
+            session,
+            expired,
+            basis_at=expired_basis,
+        )
+        session.add(expired)
+        session.flush()
+        trigger.payload = {
+            **trigger.payload,
+            "decision": {"record_id": str(expired.id)},
+            "decision_record_id": str(expired.id),
+        }
+        session.commit()
+        trigger_id = trigger.id
+        expired_id = expired.id
+        ref = _source_ref(_event(session))
+
+    request = _request()
+    result = _finalizer(factory).finalize(
+        request,
+        _run(request, [ref]),
+    )
+
+    assert result.persistence_status is PersistenceStatus.PERSISTED
+    with factory() as session:
+        assert session.get(DecisionRecord, expired_id) is None
+        trigger = session.get(TriggerEvent, trigger_id)
+        assert trigger is not None
+        assert "message" not in trigger.payload
+        assert "decision" not in trigger.payload
+        assert "decision_record_id" not in trigger.payload
+        assert trigger.payload["push"]["state"] == "expired"
 
 
 def test_finalizer_persists_and_revalidates_the_effective_query(persistence):

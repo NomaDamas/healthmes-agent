@@ -101,6 +101,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 TRIGGER_INTERVAL_MINUTES = 10
+_DISPATCH_LEASE_SAFETY_SECONDS = 30.0
 # Sync-diff lookback; overlaps the sweep interval on purpose (dedup keys make
 # double-processing harmless, gaps would silently drop changes).
 SCHEDULE_DIFF_LOOKBACK_MINUTES = TRIGGER_INTERVAL_MINUTES + 5
@@ -769,6 +770,22 @@ class EvaluationReport:
         return sum(1 for outcome in self.outcomes if outcome.status == status)
 
 
+@dataclass(frozen=True, slots=True)
+class _DispatchClaim:
+    event_id: uuid.UUID
+    owner_token: uuid.UUID
+    generation: int
+    fire: TriggerFire
+    payload: dict[str, Any]
+    fired_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _DispatchClaimAttempt:
+    claim: _DispatchClaim | None
+    state: str
+
+
 def _trigger_payload(fire: TriggerFire) -> dict[str, Any]:
     trigger = {
         "summary": fire.summary,
@@ -891,6 +908,7 @@ class TriggerEvaluator:
         rules: Sequence[TriggerRule] | None = None,
         thresholds: RuleThresholds | None = None,
         now_provider: Callable[[], datetime] | None = None,
+        dispatch_lease_duration: timedelta | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
@@ -905,6 +923,18 @@ class TriggerEvaluator:
         self._rules: tuple[TriggerRule, ...] = tuple(rules) if rules is not None else ALL_RULES
         self._thresholds = thresholds if thresholds is not None else RuleThresholds()
         self._now = now_provider if now_provider is not None else default_now_provider(settings)
+        if dispatch_lease_duration is None:
+            dispatch_lease_duration = timedelta(
+                seconds=max(
+                    _DISPATCH_LEASE_SAFETY_SECONDS,
+                    settings.decision_timeout_seconds
+                    + settings.decision_finalization_timeout_seconds
+                    + _DISPATCH_LEASE_SAFETY_SECONDS,
+                )
+            )
+        if dispatch_lease_duration <= timedelta(0):
+            raise ValueError("dispatch_lease_duration must be positive")
+        self._dispatch_lease_duration = dispatch_lease_duration
 
     def evaluate_once(self) -> EvaluationReport:
         """Run one sweep: build context, evaluate rules, persist + push fires.
@@ -1004,77 +1034,34 @@ class TriggerEvaluator:
         now: datetime,
     ) -> tuple[list[FireOutcome], set[str]]:
         """Deliver committed outbox rows independently of rule conditions."""
-        events = session.scalars(
-            select(TriggerEvent)
-            .where(TriggerEvent.alert_sent.is_(False))
-            .order_by(TriggerEvent.fired_at, TriggerEvent.id)
-        ).all()
+        event_refs = tuple(
+            (event.id, event.dedup_key)
+            for event in session.scalars(
+                select(TriggerEvent)
+                .where(TriggerEvent.alert_sent.is_(False))
+                .order_by(TriggerEvent.fired_at, TriggerEvent.id)
+            )
+            if self._is_dispatching(event)
+        )
+        # End the broad listing snapshot before taking one durable claim. No
+        # transaction or TriggerEvent lock may span the external LLM/finalizer.
+        session.rollback()
         outcomes: list[FireOutcome] = []
         pending_keys: set[str] = set()
-        for event in events:
-            if not self._is_dispatching(event):
-                continue
-            locked_event = session.scalar(
-                select(TriggerEvent)
-                .where(TriggerEvent.id == event.id)
-                .with_for_update(skip_locked=True)
-                .execution_options(populate_existing=True)
-            )
-            if locked_event is None or not self._is_dispatching(locked_event):
-                continue
-            event = locked_event
-            if event.dedup_key is not None:
-                pending_keys.add(event.dedup_key)
-            payload = event.payload or {}
-            if alert_retention_is_expired(
+        for event_id, dedup_key in event_refs:
+            if dedup_key is not None:
+                pending_keys.add(dedup_key)
+            attempt = self._claim_dispatch_event(
                 session,
-                event,
-                now=_ensure_utc(now),
-            ):
-                event.payload = _expired_alert_payload(
-                    payload,
-                    now=_ensure_utc(now),
-                )
-                session.commit()
-                continue
-            trigger_payload = payload.get("trigger")
-            if not isinstance(trigger_payload, dict):
-                trigger_payload = payload
-            summary = trigger_payload.get("summary")
-            proposal = trigger_payload.get("proposal")
-            evidence = trigger_payload.get("evidence")
-            if (
-                not isinstance(summary, str)
-                or not isinstance(proposal, str)
-                or not isinstance(evidence, dict)
-            ):
-                event.payload = {
-                    **payload,
-                    "push": {
-                        "suppressed_reason": _SUPPRESS_PUSH_FAILED,
-                        "detail": "invalid persisted dispatch payload",
-                    },
-                }
-                session.commit()
-                continue
-            fire = TriggerFire(
-                rule_id=event.rule_id,
-                dedup_key=event.dedup_key or f"trigger_event:{event.id}",
-                summary=summary,
-                proposal=proposal,
-                evidence=evidence,
+                event_id,
+                now=now,
             )
+            if attempt.claim is None:
+                continue
             outcomes.append(
-                self._deliver_event(
+                self._deliver_claim(
                     session,
-                    fire,
-                    event,
-                    {
-                        "summary": summary,
-                        "proposal": proposal,
-                        "evidence": evidence,
-                    },
-                    fired_at=_ensure_utc(event.fired_at),
+                    attempt.claim,
                 )
             )
         return outcomes, pending_keys
@@ -1198,20 +1185,22 @@ class TriggerEvaluator:
         # outbox retries this exact id and therefore derives the same decision
         # request id even if the process exits after Hermes completed.
         session.commit()
-        event = session.scalar(
-            select(TriggerEvent)
-            .where(TriggerEvent.id == event.id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        if event is None or not self._is_dispatching(event):
-            return FireOutcome(fire=fire, status="deduplicated")
-        return self._deliver_event(
+        attempt = self._claim_dispatch_event(
             session,
-            fire,
-            event,
-            payload,
-            fired_at=now,
+            event.id,
+            now=now,
+        )
+        if attempt.claim is None:
+            if attempt.state == "expired":
+                return FireOutcome(
+                    fire=fire,
+                    status="suppressed",
+                    reason=_SUPPRESS_RETENTION_EXPIRED,
+                )
+            return FireOutcome(fire=fire, status="deduplicated")
+        return self._deliver_claim(
+            session,
+            attempt.claim,
         )
 
     @staticmethod
@@ -1223,83 +1212,220 @@ class TriggerEvaluator:
             and push.get("state") == "dispatching"
         )
 
-    def _deliver_event(
+    def _claim_dispatch_event(
         self,
         session: Session,
-        fire: TriggerFire,
-        event: TriggerEvent,
-        payload: dict[str, Any],
+        event_id: uuid.UUID,
         *,
-        fired_at: datetime,
-    ) -> FireOutcome:
-        event_id = event.id
-        try:
-            result = self._alert_sender.send(
-                fire,
-                fired_at=fired_at,
-                trigger_event_id=event.id,
-            )
-        except Exception as exc:
-            outcome = self._handle_send_exception(session, fire, event, payload, exc)
-            session.commit()
-            return outcome
+        now: datetime,
+    ) -> _DispatchClaimAttempt:
+        """Claim one outbox row without holding its lock during reasoning."""
 
-        try:
-            if session.get_bind().dialect.name == "sqlite":
-                # SQLite has no row-level FOR UPDATE. Use the same file-backed
-                # write fence as retention changes for the final recheck and
-                # commit, without blocking the sender/LLM call itself.
-                with activity_write_lock():
-                    lock_activity_write_plane(session)
-                    return self._finalize_delivery_result(
-                        session,
-                        fire,
-                        event,
-                        payload,
-                        result,
-                    )
-            # PostgreSQL retention updates lock every TriggerEvent before they
-            # can commit. This event is already row-locked by the dispatch
-            # claim, so the later transaction either observes this answer and
-            # scrubs it or commits first and is observed by this recheck.
-            return self._finalize_delivery_result(
-                session,
-                fire,
-                event,
-                payload,
-                result,
-            )
-        except Exception as exc:
-            # PostgreSQL leaves a transaction unusable after deadlock or SQL
-            # failure. Roll it back, reacquire the durable outbox row, and only
-            # publish retry state if this dispatch still owns a pending event.
-            session.rollback()
+        def claim() -> _DispatchClaimAttempt:
             statement = (
                 select(TriggerEvent)
                 .where(TriggerEvent.id == event_id)
                 .execution_options(populate_existing=True)
             )
             if session.get_bind().dialect.name == "postgresql":
-                statement = statement.with_for_update()
-            current_event = session.scalar(statement)
+                statement = statement.with_for_update(skip_locked=True)
+            event = session.scalar(statement)
+            if event is None or not self._is_dispatching(event):
+                session.rollback()
+                return _DispatchClaimAttempt(None, "inactive")
+
+            current = _ensure_utc(now)
+            payload = dict(event.payload or {})
+            if alert_retention_is_expired(
+                session,
+                event,
+                now=current,
+            ):
+                event.payload = _expired_alert_payload(
+                    payload,
+                    now=current,
+                )
+                self._clear_dispatch_claim(event)
+                session.commit()
+                return _DispatchClaimAttempt(None, "expired")
+
+            lease_expires_at = event.dispatch_lease_expires_at
             if (
-                current_event is None
-                or not self._is_dispatching(current_event)
+                event.dispatch_owner_token is not None
+                and lease_expires_at is not None
+                and _ensure_utc(lease_expires_at) > current
             ):
                 session.rollback()
-                return FireOutcome(
-                    fire=fire,
-                    status="deduplicated",
-                )
+                return _DispatchClaimAttempt(None, "busy")
+
+            trigger_payload = payload.get("trigger")
+            if not isinstance(trigger_payload, dict):
+                trigger_payload = payload
+            summary = trigger_payload.get("summary")
+            proposal = trigger_payload.get("proposal")
+            evidence = trigger_payload.get("evidence")
+            if (
+                not isinstance(summary, str)
+                or not isinstance(proposal, str)
+                or not isinstance(evidence, dict)
+            ):
+                event.payload = {
+                    **payload,
+                    "push": {
+                        "suppressed_reason": _SUPPRESS_PUSH_FAILED,
+                        "detail": "invalid persisted dispatch payload",
+                    },
+                }
+                self._clear_dispatch_claim(event)
+                session.commit()
+                return _DispatchClaimAttempt(None, "invalid")
+
+            owner_token = uuid.uuid4()
+            generation = int(event.dispatch_generation or 0) + 1
+            event.dispatch_owner_token = owner_token
+            event.dispatch_generation = generation
+            event.dispatch_lease_expires_at = (
+                current + self._dispatch_lease_duration
+            )
+            claimed = _DispatchClaim(
+                event_id=event.id,
+                owner_token=owner_token,
+                generation=generation,
+                fire=TriggerFire(
+                    rule_id=event.rule_id,
+                    dedup_key=(
+                        event.dedup_key
+                        or f"trigger_event:{event.id}"
+                    ),
+                    summary=summary,
+                    proposal=proposal,
+                    evidence=evidence,
+                ),
+                payload=payload,
+                fired_at=_ensure_utc(event.fired_at),
+            )
+            session.commit()
+            return _DispatchClaimAttempt(claimed, "claimed")
+
+        if session.get_bind().dialect.name == "sqlite":
+            with activity_write_lock():
+                lock_activity_write_plane(session)
+                return claim()
+        return claim()
+
+    def _deliver_claim(
+        self,
+        session: Session,
+        claim: _DispatchClaim,
+    ) -> FireOutcome:
+        try:
+            result = self._alert_sender.send(
+                claim.fire,
+                fired_at=claim.fired_at,
+                trigger_event_id=claim.event_id,
+            )
+        except Exception as exc:
+            return self._publish_send_exception(
+                session,
+                claim,
+                exc,
+            )
+
+        try:
+            return self._publish_delivery_result(
+                session,
+                claim,
+                result,
+            )
+        except Exception as exc:
+            session.rollback()
+            return self._publish_send_exception(
+                session,
+                claim,
+                exc,
+            )
+
+    def _publish_delivery_result(
+        self,
+        session: Session,
+        claim: _DispatchClaim,
+        result: DecisionDispatchResult,
+    ) -> FireOutcome:
+        return self._with_dispatch_claim(
+            session,
+            claim,
+            lambda event: self._finalize_delivery_result(
+                session,
+                claim.fire,
+                event,
+                claim.payload,
+                result,
+            ),
+        )
+
+    def _publish_send_exception(
+        self,
+        session: Session,
+        claim: _DispatchClaim,
+        exc: Exception,
+    ) -> FireOutcome:
+        def publish(event: TriggerEvent) -> FireOutcome:
             outcome = self._handle_send_exception(
                 session,
-                fire,
-                current_event,
-                payload,
+                claim.fire,
+                event,
+                claim.payload,
                 exc,
             )
             session.commit()
             return outcome
+
+        return self._with_dispatch_claim(
+            session,
+            claim,
+            publish,
+        )
+
+    def _with_dispatch_claim(
+        self,
+        session: Session,
+        claim: _DispatchClaim,
+        publish: Callable[[TriggerEvent], FireOutcome],
+    ) -> FireOutcome:
+        def locked_publish() -> FireOutcome:
+            statement = (
+                select(TriggerEvent)
+                .where(TriggerEvent.id == claim.event_id)
+                .execution_options(populate_existing=True)
+            )
+            if session.get_bind().dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            event = session.scalar(statement)
+            if (
+                event is None
+                or not self._is_dispatching(event)
+                or event.dispatch_owner_token != claim.owner_token
+                or event.dispatch_generation != claim.generation
+            ):
+                session.rollback()
+                return FireOutcome(
+                    fire=claim.fire,
+                    status="deduplicated",
+                )
+            return publish(event)
+
+        if session.get_bind().dialect.name == "sqlite":
+            # SQLite has no row-level FOR UPDATE. Serialize only the short
+            # ownership recheck and publication, never the sender/LLM call.
+            with activity_write_lock():
+                lock_activity_write_plane(session)
+                return locked_publish()
+        return locked_publish()
+
+    @staticmethod
+    def _clear_dispatch_claim(event: TriggerEvent) -> None:
+        event.dispatch_owner_token = None
+        event.dispatch_lease_expires_at = None
 
     def _finalize_delivery_result(
         self,
@@ -1310,6 +1436,7 @@ class TriggerEvaluator:
         result: DecisionDispatchResult,
     ) -> FireOutcome:
         completed_at = _ensure_utc(self._now())
+        self._clear_dispatch_claim(event)
         if alert_retention_is_expired(
             session,
             event,
@@ -1472,6 +1599,7 @@ class TriggerEvaluator:
         reasoning_required = bool(
             getattr(self._alert_sender, "requires_reasoning", False)
         )
+        self._clear_dispatch_claim(event)
         event.payload = {
             **payload,
             "push": {

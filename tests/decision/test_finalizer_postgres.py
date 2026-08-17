@@ -18,6 +18,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 import healthmes.decision.finalizer as finalizer_module
+import healthmes.storage.service as storage_service
 from healthmes.activity.locking import (
     lock_activity_write_plane,
     postgres_activity_write_plane_guard,
@@ -58,12 +59,19 @@ from healthmes.decision import (
     ToolCallStatus,
     decision_result_from_record,
 )
+from healthmes.engine.decision_dispatch import DecisionDispatchResult
+from healthmes.engine.triggers import (
+    HealthSignals,
+    TriggerEvaluator,
+    TriggerFire,
+)
 from healthmes.storage import update_retention_policy
 from healthmes.store import (
     Base,
     CalendarEventMirror,
     CalendarSource,
     DecisionRecord,
+    TriggerEvent,
     WellnessEvent,
     create_db_engine,
 )
@@ -530,6 +538,191 @@ def test_finalization_and_decision_retention_share_postgres_fence(
             assert session.scalar(
                 sa.select(sa.func.count()).select_from(DecisionRecord)
             ) == 0
+
+
+def test_dispatch_finalizer_and_retention_do_not_form_lock_cycle(
+    monkeypatch,
+) -> None:
+    with _postgres_store(pool_size=5) as store:
+        with store.factory() as session:
+            update_retention_policy(
+                session,
+                "decision",
+                "30d",
+                now=NOW,
+            )
+            session.commit()
+        request, run, finalizer, _event_id = _decision_fixture(store)
+        retention_holds_write_plane = threading.Event()
+        release_retention = threading.Event()
+        finalizer_waiting_for_write_plane = threading.Event()
+        retention_done = threading.Event()
+        dispatch_results = []
+        finalized_results = []
+        failures: list[BaseException] = []
+        original_trigger_lock = (
+            storage_service.lock_trigger_events_for_retention
+        )
+        original_guard = (
+            finalizer_module.postgres_activity_write_plane_guard
+        )
+
+        def pause_before_trigger_locks(session: Session) -> None:
+            retention_holds_write_plane.set()
+            if not release_retention.wait(timeout=10):
+                raise TimeoutError("retention lock release was not signalled")
+            original_trigger_lock(session)
+
+        @contextmanager
+        def observe_finalizer_guard(
+            bind,
+            *,
+            timeout_seconds: float,
+        ):
+            finalizer_waiting_for_write_plane.set()
+            with original_guard(
+                bind,
+                timeout_seconds=timeout_seconds,
+            ) as connection:
+                yield connection
+
+        monkeypatch.setattr(
+            storage_service,
+            "lock_trigger_events_for_retention",
+            pause_before_trigger_locks,
+        )
+        monkeypatch.setattr(
+            finalizer_module,
+            "postgres_activity_write_plane_guard",
+            observe_finalizer_guard,
+        )
+
+        class EmptyHealthReader:
+            def read(self, now: datetime) -> HealthSignals:
+                del now
+                return HealthSignals()
+
+        class FinalizingSender:
+            requires_reasoning = True
+
+            def send(
+                self,
+                fire: TriggerFire,
+                *,
+                fired_at: datetime,
+                trigger_event_id: uuid.UUID,
+            ) -> DecisionDispatchResult:
+                del fire, fired_at, trigger_event_id
+                result = finalizer.finalize(request, run)
+                finalized_results.append(result)
+                return DecisionDispatchResult(
+                    ok=False,
+                    status_code=204,
+                    ready_for_native=True,
+                    channel="app_poll",
+                    message=result.answer,
+                    decision_record_id=result.decision_record_id,
+                    decision_request_id=result.request_id,
+                    decision_turn_id=result.turn_id,
+                    proposed_action=result.proposed_action,
+                )
+
+        assert _POSTGRES_URL is not None
+        evaluator = TriggerEvaluator(
+            Settings(
+                database_url=_POSTGRES_URL,
+                native_alert_delivery=True,
+                scheduler_enabled=False,
+                _env_file=None,
+            ),
+            session_factory=store.factory,
+            health_reader=EmptyHealthReader(),
+            alert_sender=FinalizingSender(),
+            rules=(),
+            now_provider=lambda: NOW,
+        )
+
+        def shrink_retention() -> None:
+            try:
+                with store.factory() as session:
+                    update_retention_policy(
+                        session,
+                        "decision",
+                        "14d",
+                        now=NOW,
+                    )
+                    session.commit()
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                retention_done.set()
+
+        def dispatch() -> None:
+            try:
+                dispatch_results.append(
+                    evaluator.dispatch_fire(
+                        TriggerFire(
+                            rule_id="dispatch-finalizer-retention",
+                            dedup_key=(
+                                "dispatch-finalizer-retention:1"
+                            ),
+                            summary="A proactive answer is ready.",
+                            proposal="Surface the retained answer.",
+                            evidence={},
+                        ),
+                        fired_at=NOW,
+                    )
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        retention_worker = threading.Thread(
+            target=shrink_retention,
+            name="retention-write-plane-owner",
+        )
+        dispatch_worker = threading.Thread(
+            target=dispatch,
+            name="dispatch-finalizer",
+        )
+        try:
+            retention_worker.start()
+            assert retention_holds_write_plane.wait(timeout=5)
+            dispatch_worker.start()
+            assert finalizer_waiting_for_write_plane.wait(timeout=5)
+
+            release_retention.set()
+            retention_worker.join(timeout=10)
+            dispatch_worker.join(timeout=10)
+
+            assert not retention_worker.is_alive()
+            assert not dispatch_worker.is_alive()
+            assert retention_done.is_set()
+            assert failures == []
+            assert len(finalized_results) == 1
+            assert (
+                finalized_results[0].persistence_status
+                is PersistenceStatus.PERSISTED
+            )
+            assert len(dispatch_results) == 1
+            assert dispatch_results[0].status == "available"
+            with store.factory() as session:
+                [trigger] = session.scalars(
+                    sa.select(TriggerEvent)
+                ).all()
+                [record] = session.scalars(
+                    sa.select(DecisionRecord)
+                ).all()
+                assert trigger.payload["message"] == (
+                    finalized_results[0].answer
+                )
+                assert trigger.payload["push"]["state"] == "app_available"
+                assert trigger.dispatch_owner_token is None
+                assert trigger.dispatch_lease_expires_at is None
+                assert record.trigger_event_id == trigger.id
+        finally:
+            release_retention.set()
+            retention_worker.join(timeout=5)
+            dispatch_worker.join(timeout=5)
 
 
 @pytest.mark.parametrize("mutation", ("delete", "content"))

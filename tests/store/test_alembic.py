@@ -708,7 +708,7 @@ class TestSqliteUpgrade:
         finally:
             engine.dispose()
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "a1b2c3d4e5f6")
         engine = sa.create_engine(database_url)
         try:
             inspector = sa.inspect(engine)
@@ -862,7 +862,7 @@ class TestSqliteUpgrade:
                     sa.text(
                         "SELECT version_num FROM alembic_version"
                     )
-                ) == "a1b2c3d4e5f6"
+                ) == "b2c3d4e5f6a7"
         finally:
             engine.dispose()
 
@@ -3204,6 +3204,229 @@ class TestSqliteUpgrade:
         finally:
             engine.dispose()
 
+    def test_trigger_dispatch_lease_upgrades_stamped_a1_without_row_loss(
+        self,
+        tmp_path,
+    ) -> None:
+        database_url = f"sqlite:///{tmp_path / 'trigger-dispatch-lease.db'}"
+        config = _config(database_url)
+        command.upgrade(config, "a1b2c3d4e5f6")
+        engine = sa.create_engine(database_url)
+        event_id = uuid.uuid4().hex
+        fired_at = datetime(2026, 8, 17, 9, tzinfo=UTC)
+        try:
+            trigger = sa.Table(
+                "trigger_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.begin() as connection:
+                connection.execute(
+                    trigger.insert().values(
+                        id=event_id,
+                        fired_at=fired_at,
+                        rule_id="migration-existing-dispatch",
+                        payload={
+                            "summary": "Retain this pending outbox row.",
+                            "push": {
+                                "state": "dispatching",
+                                "channel": "decision",
+                            },
+                        },
+                        alert_sent=False,
+                        dedup_key="migration-existing-dispatch:1",
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "head")
+        engine = sa.create_engine(database_url)
+        try:
+            inspector = sa.inspect(engine)
+            assert {
+                "dispatch_owner_token",
+                "dispatch_generation",
+                "dispatch_lease_expires_at",
+            } <= {
+                item["name"]
+                for item in inspector.get_columns("trigger_event")
+            }
+            assert {
+                "ck_trigger_event_dispatch_lease_consistent",
+                "ck_trigger_event_dispatch_generation_nonnegative",
+            } <= {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "trigger_event"
+                )
+            }
+            assert (
+                "ix_trigger_event_dispatch_lease_expires_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes("trigger_event")
+                }
+            )
+            trigger = sa.Table(
+                "trigger_event",
+                sa.MetaData(),
+                autoload_with=engine,
+            )
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(trigger).where(
+                        trigger.c.id == event_id
+                    )
+                ).one()
+                assert row.rule_id == "migration-existing-dispatch"
+                assert row.dispatch_owner_token is None
+                assert row.dispatch_generation == 0
+                assert row.dispatch_lease_expires_at is None
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b2c3d4e5f6a7"
+        finally:
+            engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="trigger dispatch leases are forward-only",
+        ):
+            command.downgrade(config, "a1b2c3d4e5f6")
+
+        engine = sa.create_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b2c3d4e5f6a7"
+        finally:
+            engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason=(
+        "requires a disposable PostgreSQL URL in "
+        "HEALTHMES_TEST_POSTGRES_URL"
+    ),
+)
+def test_postgres_trigger_dispatch_lease_upgrades_stamped_a1() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = sa.create_engine(database_url)
+    schema = f"hm_trigger_dispatch_lease_{uuid.uuid4().hex}"
+    quoted_schema = admin_engine.dialect.identifier_preparer.quote(
+        schema
+    )
+    separator = "&" if "?" in database_url else "?"
+    schema_url = (
+        f"{database_url}{separator}options=-csearch_path={schema}"
+    )
+    config = _config(schema_url)
+    event_id = uuid.uuid4()
+    fired_at = datetime(2026, 8, 17, 9, tzinfo=UTC)
+    try:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f"CREATE SCHEMA {quoted_schema}")
+            )
+
+        command.upgrade(config, "a1b2c3d4e5f6")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            trigger = sa.Table(
+                "trigger_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.begin() as connection:
+                connection.execute(
+                    trigger.insert().values(
+                        id=event_id,
+                        fired_at=fired_at,
+                        rule_id="postgres-migration-existing-dispatch",
+                        payload={
+                            "summary": "Retain this pending outbox row.",
+                            "push": {
+                                "state": "dispatching",
+                                "channel": "decision",
+                            },
+                        },
+                        alert_sent=False,
+                        dedup_key=(
+                            "postgres-migration-existing-dispatch:1"
+                        ),
+                    )
+                )
+        finally:
+            scoped_engine.dispose()
+
+        command.upgrade(config, "head")
+        scoped_engine = sa.create_engine(schema_url)
+        try:
+            inspector = sa.inspect(scoped_engine)
+            assert {
+                "dispatch_owner_token",
+                "dispatch_generation",
+                "dispatch_lease_expires_at",
+            } <= {
+                item["name"]
+                for item in inspector.get_columns("trigger_event")
+            }
+            assert {
+                "ck_trigger_event_dispatch_lease_consistent",
+                "ck_trigger_event_dispatch_generation_nonnegative",
+            } <= {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "trigger_event"
+                )
+            }
+            assert (
+                "ix_trigger_event_dispatch_lease_expires_at"
+                in {
+                    item["name"]
+                    for item in inspector.get_indexes("trigger_event")
+                }
+            )
+            trigger = sa.Table(
+                "trigger_event",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
+            with scoped_engine.connect() as connection:
+                row = connection.execute(
+                    sa.select(trigger).where(
+                        trigger.c.id == event_id
+                    )
+                ).one()
+                assert row.rule_id == (
+                    "postgres-migration-existing-dispatch"
+                )
+                assert row.dispatch_owner_token is None
+                assert row.dispatch_generation == 0
+                assert row.dispatch_lease_expires_at is None
+                assert connection.scalar(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ) == "b2c3d4e5f6a7"
+        finally:
+            scoped_engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="trigger dispatch leases are forward-only",
+        ):
+            command.downgrade(config, "a1b2c3d4e5f6")
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"
+                )
+            )
+        admin_engine.dispose()
+
 
 @pytest.mark.skipif(
     not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
@@ -4284,7 +4507,7 @@ def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
                 assert rows[expired_id].requested_at == expired_created_at
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
-                ) == "a1b2c3d4e5f6"
+                ) == "b2c3d4e5f6a7"
         finally:
             scoped_engine.dispose()
     finally:
