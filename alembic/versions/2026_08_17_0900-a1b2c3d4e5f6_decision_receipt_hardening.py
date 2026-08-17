@@ -410,6 +410,7 @@ def _backfill_result_expiry(bind: sa.Connection) -> list[object]:
             receipt.c.id,
             receipt.c.state,
             receipt.c.requested_at,
+            receipt.c.result_expires_at,
             receipt.c.expires_at,
         )
     ).mappings()
@@ -422,6 +423,11 @@ def _backfill_result_expiry(bind: sa.Connection) -> list[object]:
                 row["requested_at"]
             ) + timedelta(days=retention_days)
             deadline = min(deadline, decision_deadline)
+        if row["result_expires_at"] is not None:
+            deadline = min(
+                deadline,
+                _as_utc(row["result_expires_at"]),
+            )
         bind.execute(
             receipt.update()
             .where(receipt.c.id == row["id"])

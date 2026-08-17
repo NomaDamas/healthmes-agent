@@ -335,6 +335,41 @@ def test_weekly_report_excludes_decision_at_exact_expiry(
     ]
 
 
+def test_weekly_report_does_not_count_failed_transport_as_delivered(
+    client,
+    session,
+) -> None:
+    session.add(
+        TriggerEvent(
+            fired_at=_utc(2026, 7, 10, 8),
+            rule_id="native_transport_failed",
+            alert_sent=True,
+            payload={
+                "message": "Visible in the app, but transport failed.",
+                "push": {
+                    "sent": True,
+                    "channel": "native",
+                    "upstream_ok": False,
+                },
+            },
+        )
+    )
+    session.commit()
+
+    with freeze_time(FROZEN_NOW):
+        body = client.get("/reports/weekly.json").json()
+
+    assert body["alerts"]["fired"] == 1
+    assert body["alerts"]["delivered"] == 0
+    assert body["alerts"]["by_rule"] == [
+        {
+            "rule_id": "native_transport_failed",
+            "fired": 1,
+            "delivered": 0,
+        }
+    ]
+
+
 # --- HTML: same numbers, rendered --------------------------------------------
 
 

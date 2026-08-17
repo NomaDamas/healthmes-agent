@@ -24,6 +24,7 @@ from healthmes.calendar_retention import (
 from healthmes.config import Settings
 from healthmes.engine.alert_visibility import (
     expire_trigger_event_answers,
+    lock_trigger_events_for_retention,
 )
 from healthmes.store import (
     AppUsageSample,
@@ -171,6 +172,8 @@ def _update_retention_policy(
     # Input descriptor revisions include every retention class. All retention
     # writers must therefore share the same cross-process fence as input CAS.
     lock_activity_write_plane(session)
+    if data_class in {"alert", "decision"}:
+        lock_trigger_events_for_retention(session)
     ensure_default_policies(session)
     policy = session.scalar(
         select(RetentionPolicy).where(RetentionPolicy.data_class == data_class)
@@ -848,6 +851,7 @@ def _run_storage_maintenance(
     current = now or _now()
     if not dry_run:
         lock_activity_write_plane(session)
+        lock_trigger_events_for_retention(session)
     ensure_default_policies(session)
     decision_policy = session.scalar(
         select(RetentionPolicy).where(

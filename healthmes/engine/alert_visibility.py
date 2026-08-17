@@ -25,6 +25,23 @@ DEFAULT_ALERT_RETENTION_DAYS = 7
 AlertDeliveryState = Literal["delivered", "app_available"]
 
 
+def lock_trigger_events_for_retention(session: Session) -> None:
+    """Take the canonical TriggerEvent side of the retention lock order."""
+
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    # Any trigger may acquire a DecisionRecord link during finalization. Lock
+    # rows in stable order before retention updates DecisionRecord rows so the
+    # global order remains TriggerEvent -> DecisionRecord.
+    tuple(
+        session.scalars(
+            select(TriggerEvent.id)
+            .order_by(TriggerEvent.id)
+            .with_for_update()
+        )
+    )
+
+
 def alert_delivery_state(
     event: TriggerEvent,
 ) -> AlertDeliveryState | None:

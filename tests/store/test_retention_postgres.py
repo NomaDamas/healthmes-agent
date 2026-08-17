@@ -25,10 +25,12 @@ from healthmes.store import (
     Base,
     DecisionKind,
     DecisionRecord,
+    DecisionRequestReceipt,
     ProposalStatus,
     RetentionPolicy,
     ScheduleProposal,
     Task,
+    TriggerEvent,
     WellnessEvent,
     create_db_engine,
 )
@@ -227,6 +229,227 @@ def test_decision_retention_uses_exact_cutoff_and_preserves_fk_rows(
             assert retained_proposal is not None
             assert retained_proposal.decision_record_id is None
     finally:
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_retention_extension_cannot_revive_expired_receipt() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_receipt_monotonic_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    requested_at = datetime(2026, 8, 1, 12, tzinfo=UTC)
+    original_deadline = requested_at + timedelta(days=1)
+    current = original_deadline + timedelta(hours=1)
+    identity_expires_at = requested_at + timedelta(days=30)
+    receipt_id: uuid.UUID | None = None
+    try:
+        with factory() as session:
+            update_retention_policy(
+                session,
+                "decision",
+                "1d",
+                now=requested_at,
+            )
+            receipt = DecisionRequestReceipt(
+                request_id=uuid.uuid4(),
+                request_fingerprint="f" * 64,
+                requested_at=requested_at,
+                state="completed",
+                result_payload={
+                    "schema": "healthmes.decision-receipt.v1",
+                    "result": {"answer": "expired sensitive answer"},
+                },
+                result_expires_at=original_deadline,
+                expires_at=identity_expires_at,
+            )
+            session.add(receipt)
+            session.commit()
+            receipt_id = receipt.id
+
+        with factory() as session:
+            update_retention_policy(
+                session,
+                "decision",
+                "30d",
+                now=current,
+            )
+            session.commit()
+
+        with factory() as session:
+            stored = session.get(DecisionRequestReceipt, receipt_id)
+            assert stored is not None
+            assert stored.state == "tombstone"
+            assert stored.result_payload is None
+            assert stored.result_expires_at is None
+            assert stored.expires_at == identity_expires_at
+    finally:
+        engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(
+                sa.text(f'DROP SCHEMA "{schema}" CASCADE')
+            )
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HEALTHMES_TEST_POSTGRES_URL"),
+    reason="requires a disposable PostgreSQL URL in HEALTHMES_TEST_POSTGRES_URL",
+)
+def test_postgres_retention_locks_trigger_before_linked_decision() -> None:
+    database_url = os.environ["HEALTHMES_TEST_POSTGRES_URL"]
+    admin_engine = create_db_engine(database_url)
+    schema = f"hm_retention_lock_order_{uuid.uuid4().hex}"
+    with admin_engine.begin() as connection:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+
+    engine = create_db_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    current = datetime(2026, 8, 17, 12, tzinfo=UTC)
+    retention_started = threading.Event()
+    retention_pid: list[int] = []
+    failures: list[BaseException] = []
+    worker: threading.Thread | None = None
+    try:
+        with factory() as session:
+            update_retention_policy(
+                session,
+                "decision",
+                "30d",
+                now=current,
+            )
+            event = TriggerEvent(
+                fired_at=current,
+                rule_id="retention_lock_order",
+                alert_sent=False,
+                payload={
+                    "push": {
+                        "state": "dispatching",
+                        "channel": "decision",
+                    }
+                },
+            )
+            session.add(event)
+            session.flush()
+            record = DecisionRecord(
+                kind=DecisionKind.INSIGHT,
+                tree={"id": "lock-order", "children": []},
+                summary="Linked decision lock-order probe",
+                trigger_event_id=event.id,
+                decision_request_id=uuid.uuid4(),
+                decision_turn_id=uuid.uuid4(),
+                decision_request_fingerprint=uuid.uuid4().hex * 2,
+                decision_payload={"schema": "healthmes.decision-private.v2"},
+                decision_payload_digest=uuid.uuid4().hex * 2,
+                created_at=current,
+            )
+            apply_decision_retention(
+                session,
+                record,
+                basis_at=current,
+            )
+            session.add(record)
+            session.commit()
+            event_id = event.id
+            record_id = record.id
+
+        def shorten_retention() -> None:
+            with factory() as session:
+                try:
+                    retention_pid.append(
+                        int(
+                            session.scalar(
+                                sa.text("SELECT pg_backend_pid()")
+                            )
+                        )
+                    )
+                    retention_started.set()
+                    update_retention_policy(
+                        session,
+                        "decision",
+                        "14d",
+                        now=current,
+                    )
+                    session.commit()
+                except BaseException as exc:
+                    session.rollback()
+                    failures.append(exc)
+
+        with factory() as dispatch:
+            locked_event = dispatch.scalar(
+                sa.select(TriggerEvent)
+                .where(TriggerEvent.id == event_id)
+                .with_for_update()
+            )
+            assert locked_event is not None
+            worker = threading.Thread(
+                target=shorten_retention,
+                name="decision-retention-lock-order",
+            )
+            worker.start()
+            assert retention_started.wait(timeout=5)
+
+            deadline = time.monotonic() + 5
+            waiting_for_trigger = False
+            while time.monotonic() < deadline and worker.is_alive():
+                wait_event_type = dispatch.scalar(
+                    sa.text(
+                        "SELECT wait_event_type FROM pg_stat_activity "
+                        "WHERE pid = :pid"
+                    ),
+                    {"pid": retention_pid[0]},
+                )
+                if wait_event_type == "Lock":
+                    waiting_for_trigger = True
+                    break
+                time.sleep(0.05)
+            assert waiting_for_trigger
+
+            dispatch.execute(
+                sa.text("SET LOCAL lock_timeout = '1s'")
+            )
+            locked_record = dispatch.scalar(
+                sa.select(DecisionRecord)
+                .where(DecisionRecord.id == record_id)
+                .with_for_update()
+            )
+            assert locked_record is not None
+            dispatch.commit()
+
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert failures == []
+    finally:
+        if worker is not None:
+            worker.join(timeout=5)
         engine.dispose()
         with admin_engine.begin() as connection:
             connection.execute(

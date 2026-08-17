@@ -793,12 +793,19 @@ class TestSqliteUpgrade:
         receipt_id = uuid.uuid4().hex
         requested_at = datetime(2099, 8, 16, 8, tzinfo=UTC)
         created_at = requested_at + timedelta(hours=1)
+        original_result_expires_at = requested_at + timedelta(hours=12)
         try:
             with engine.begin() as connection:
                 connection.execute(
                     sa.text(
                         "ALTER TABLE decision_request_receipt "
                         "ADD COLUMN requested_at DATETIME"
+                    )
+                )
+                connection.execute(
+                    sa.text(
+                        "ALTER TABLE decision_request_receipt "
+                        "ADD COLUMN result_expires_at DATETIME"
                     )
                 )
             receipt = sa.Table(
@@ -820,6 +827,7 @@ class TestSqliteUpgrade:
                             "schema": "healthmes.decision-receipt.v1",
                             "result": {"status": "completed"},
                         },
+                        result_expires_at=original_result_expires_at,
                         expires_at=created_at + timedelta(days=30),
                         created_at=created_at,
                         updated_at=created_at,
@@ -846,7 +854,10 @@ class TestSqliteUpgrade:
                     tzinfo=None
                 )
                 assert row.lease_generation == 1
-                assert row.result_expires_at is not None
+                assert (
+                    row.result_expires_at
+                    == original_result_expires_at.replace(tzinfo=None)
+                )
                 assert connection.scalar(
                     sa.text(
                         "SELECT version_num FROM alembic_version"
@@ -4106,8 +4117,10 @@ def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
     )
     config = _config(schema_url)
     created_at = datetime(2099, 8, 16, 9, tzinfo=UTC)
+    expired_created_at = datetime(2000, 1, 1, 9, tzinfo=UTC)
     pending_id = uuid.uuid4()
     completed_id = uuid.uuid4()
+    expired_id = uuid.uuid4()
     try:
         with admin_engine.begin() as connection:
             connection.execute(
@@ -4122,7 +4135,34 @@ def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
                 sa.MetaData(),
                 autoload_with=scoped_engine,
             )
+            retention_policy = sa.Table(
+                "retention_policy",
+                sa.MetaData(),
+                autoload_with=scoped_engine,
+            )
             with scoped_engine.begin() as connection:
+                policy_id = connection.scalar(
+                    sa.select(retention_policy.c.id)
+                    .where(
+                        retention_policy.c.data_class == "decision"
+                    )
+                    .limit(1)
+                )
+                if policy_id is None:
+                    connection.execute(
+                        retention_policy.insert().values(
+                            id=uuid.uuid4(),
+                            data_class="decision",
+                            retention_days=1,
+                            enabled=True,
+                        )
+                    )
+                else:
+                    connection.execute(
+                        retention_policy.update()
+                        .where(retention_policy.c.id == policy_id)
+                        .values(retention_days=1, enabled=True)
+                    )
                 connection.execute(
                     receipt.insert().values(
                         id=pending_id,
@@ -4136,6 +4176,28 @@ def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
                         expires_at=created_at + timedelta(days=30),
                         created_at=created_at,
                         updated_at=created_at,
+                    )
+                )
+                connection.execute(
+                    receipt.insert().values(
+                        id=expired_id,
+                        request_id=uuid.uuid4(),
+                        request_fingerprint="c" * 64,
+                        state="completed",
+                        owner_token=None,
+                        lease_expires_at=None,
+                        result_payload={
+                            "schema": "healthmes.decision-receipt.v1",
+                            "result": {"answer": "expired sensitive answer"},
+                        },
+                        expires_at=datetime(
+                            2099,
+                            1,
+                            1,
+                            tzinfo=UTC,
+                        ),
+                        created_at=expired_created_at,
+                        updated_at=expired_created_at,
                     )
                 )
                 connection.execute(
@@ -4214,8 +4276,12 @@ def test_postgres_decision_receipt_hardening_upgrades_published_f0() -> None:
                 assert rows[completed_id].lease_generation == 1
                 assert (
                     rows[completed_id].result_expires_at
-                    == created_at + timedelta(days=30)
+                    == created_at + timedelta(days=1)
                 )
+                assert rows[expired_id].state == "tombstone"
+                assert rows[expired_id].result_payload is None
+                assert rows[expired_id].result_expires_at is None
+                assert rows[expired_id].requested_at == expired_created_at
                 assert connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
                 ) == "a1b2c3d4e5f6"

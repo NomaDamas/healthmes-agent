@@ -409,7 +409,20 @@ def scrub_decision_receipt_results(
         statement = statement.with_for_update()
     candidates = 0
     for receipt in session.scalars(statement):
-        deadline = _result_expiry(session, receipt=receipt)
+        policy_deadline = _result_expiry(session, receipt=receipt)
+        stored_deadline = (
+            _as_utc(receipt.result_expires_at)
+            if receipt.result_expires_at is not None
+            else None
+        )
+        # Sensitive replay payloads have monotonic expiry. Extending a policy
+        # may retain future results longer, but it cannot revive a payload
+        # whose previously committed deadline already passed.
+        deadline = (
+            policy_deadline
+            if stored_deadline is None
+            else min(stored_deadline, policy_deadline)
+        )
         if deadline <= current:
             candidates += 1
             if not dry_run:

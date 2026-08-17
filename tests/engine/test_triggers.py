@@ -226,6 +226,25 @@ class AppAvailableAlertSender:
         )
 
 
+class MisreportedNativeSuccessSender:
+    """Simulate a broken adapter claiming native transport success."""
+
+    def send(
+        self,
+        fire: TriggerFire,
+        *,
+        fired_at: datetime,
+        trigger_event_id: uuid.UUID,
+    ) -> DecisionDispatchResult:
+        del fire, fired_at, trigger_event_id
+        return DecisionDispatchResult(
+            ok=True,
+            status_code=202,
+            channel="native",
+            message="Must not be exposed while native delivery is disabled.",
+        )
+
+
 class FakeHealthReader:
     """HealthReader double returning canned signals."""
 
@@ -724,6 +743,32 @@ def test_native_delivery_off_keeps_failed_sender_undelivered(
     assert [o.status for o in report.outcomes] == ["push_failed"]
     [event] = all_events(session_factory)
     assert event.alert_sent is False
+
+
+def test_native_delivery_off_rejects_misreported_native_success(
+    settings,
+    session_factory,
+) -> None:
+    off_settings = settings.model_copy(
+        update={"native_alert_delivery": False}
+    )
+    sender = MisreportedNativeSuccessSender()
+    with freeze_time("2026-07-09 14:00:00"):
+        report = make_evaluator(
+            off_settings,
+            session_factory,
+            sender,
+            rules=(fixed_rule,),
+        ).evaluate_once()
+
+    assert [outcome.status for outcome in report.outcomes] == ["suppressed"]
+    [event] = all_events(session_factory)
+    assert event.alert_sent is False
+    assert "message" not in event.payload
+    assert (
+        event.payload["push"]["suppressed_reason"]
+        == "native_alert_delivery_disabled"
+    )
 
 
 def test_sender_exception_native_off_does_not_burn_dedup(settings, session_factory) -> None:

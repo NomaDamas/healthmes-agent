@@ -1232,6 +1232,7 @@ class TriggerEvaluator:
         *,
         fired_at: datetime,
     ) -> FireOutcome:
+        event_id = event.id
         try:
             result = self._alert_sender.send(
                 fire,
@@ -1269,7 +1270,34 @@ class TriggerEvaluator:
                 result,
             )
         except Exception as exc:
-            outcome = self._handle_send_exception(session, fire, event, payload, exc)
+            # PostgreSQL leaves a transaction unusable after deadlock or SQL
+            # failure. Roll it back, reacquire the durable outbox row, and only
+            # publish retry state if this dispatch still owns a pending event.
+            session.rollback()
+            statement = (
+                select(TriggerEvent)
+                .where(TriggerEvent.id == event_id)
+                .execution_options(populate_existing=True)
+            )
+            if session.get_bind().dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            current_event = session.scalar(statement)
+            if (
+                current_event is None
+                or not self._is_dispatching(current_event)
+            ):
+                session.rollback()
+                return FireOutcome(
+                    fire=fire,
+                    status="deduplicated",
+                )
+            outcome = self._handle_send_exception(
+                session,
+                fire,
+                current_event,
+                payload,
+                exc,
+            )
             session.commit()
             return outcome
 
@@ -1300,14 +1328,19 @@ class TriggerEvaluator:
             return outcome
         self._link_decision_record(session, event, result)
 
+        native_owned_result = (
+            result.channel in {"native", APP_POLL_CHANNEL}
+            or (not result.ok and result.ready_for_native)
+        )
         if (
-            not result.ok
-            and result.ready_for_native
+            native_owned_result
             and not self._settings.native_alert_delivery
         ):
             result = replace(
                 result,
+                ok=False,
                 detail="native alert delivery is disabled",
+                retryable=False,
                 ready_for_native=False,
                 message=None,
                 suppressed_reason="native_alert_delivery_disabled",

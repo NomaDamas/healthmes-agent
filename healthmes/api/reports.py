@@ -57,6 +57,10 @@ from healthmes.api.common import ensure_utc, utc_now
 # on, local-first, derived viewer token on in-page navigation).
 from healthmes.api.decision_html import format_created, shell_context, template_environment
 from healthmes.config import Settings, resolve_timezone
+from healthmes.engine.alert_visibility import (
+    DELIVERED_STATE,
+    alert_delivery_state,
+)
 from healthmes.store import (
     CognitiveEnergyEstimate,
     DecisionKind,
@@ -358,7 +362,7 @@ def _alerts_section(
     for row in rows:
         tally = per_rule[row.rule_id]
         tally[0] += 1
-        if row.alert_sent:
+        if alert_delivery_state(row) == DELIVERED_STATE:
             tally[1] += 1
     by_rule = [
         AlertRuleCountOut(rule_id=rule_id, fired=fired, delivered=delivered)
@@ -368,7 +372,11 @@ def _alerts_section(
     ]
     return AlertDigestOut(
         fired=len(rows),
-        delivered=sum(1 for row in rows if row.alert_sent),
+        delivered=sum(
+            1
+            for row in rows
+            if alert_delivery_state(row) == DELIVERED_STATE
+        ),
         daily_budget=settings.alert_daily_budget,
         weekly_budget=settings.alert_daily_budget * REPORT_DAYS,
         by_rule=by_rule,

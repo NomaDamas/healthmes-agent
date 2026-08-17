@@ -495,3 +495,49 @@ def test_retention_shrink_scrubs_trigger_and_receipt_but_keeps_identity(
     assert stored_receipt.request_id == request_id
     assert stored_receipt.request_fingerprint == fingerprint
     assert _as_utc(stored_receipt.expires_at) == identity_expires_at
+
+
+def test_retention_extension_cannot_revive_expired_receipt_result(
+    session,
+) -> None:
+    requested_at = datetime(2026, 8, 1, 12, tzinfo=UTC)
+    original_deadline = requested_at + timedelta(days=1)
+    current = original_deadline + timedelta(hours=1)
+    identity_expires_at = requested_at + timedelta(days=30)
+    update_retention_policy(
+        session,
+        "decision",
+        "1d",
+        now=requested_at,
+    )
+    receipt = DecisionRequestReceipt(
+        request_id=uuid.uuid4(),
+        request_fingerprint="f" * 64,
+        requested_at=requested_at,
+        state="completed",
+        result_payload={
+            "schema": "healthmes.decision-receipt.v1",
+            "result": {"answer": "Already expired sensitive answer."},
+        },
+        result_expires_at=original_deadline,
+        expires_at=identity_expires_at,
+    )
+    session.add(receipt)
+    session.commit()
+    receipt_id = receipt.id
+
+    update_retention_policy(
+        session,
+        "decision",
+        "30d",
+        now=current,
+    )
+    session.commit()
+    session.expire_all()
+
+    stored = session.get(DecisionRequestReceipt, receipt_id)
+    assert stored is not None
+    assert stored.state == "tombstone"
+    assert stored.result_payload is None
+    assert stored.result_expires_at is None
+    assert _as_utc(stored.expires_at) == identity_expires_at
