@@ -471,10 +471,69 @@ def _probe_process_start_token(
             env=environment,
             timeout=_PROCESS_GROUP_PROBE_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
+    except OSError as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_legacy_process_identity_unavailable"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_legacy_process_probe_failed"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_legacy_process_probe_timeout"
+        ) from exc
     start_time = result.stdout.strip()
-    return f"ps:{start_time}" if start_time else None
+    if not start_time:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_legacy_process_identity_invalid"
+        )
+    return f"ps:{start_time}"
+
+
+def _numeric_process_existence_state(pid: int) -> Literal["live", "gone"]:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "live"
+    except OSError as exc:
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_legacy_process_existence_unavailable"
+        ) from exc
+    return "live"
+
+
+def _runtime_launcher_identity_state(
+    identity: HermesRuntimeLauncherIdentity,
+) -> Literal["live", "gone", "changed"]:
+    style = identity.start_token.partition(":")[0]
+    if style in {"linux", "darwin"}:
+        return _runtime_process_identity_state(
+            HermesRuntimeProcessIdentity(
+                pid=identity.pid,
+                start_token=identity.start_token,
+            )
+        )
+    if style != "ps":
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_launcher_identity_unsupported"
+        )
+    try:
+        current = _probe_process_start_token(
+            identity.pid,
+            expected_style="ps",
+        )
+    except HermesRuntimeIdentityError:
+        # A failed legacy ps probe is absence only if the kernel can prove
+        # that the numeric PID disappeared during the probe.
+        if _numeric_process_existence_state(identity.pid) == "gone":
+            return "gone"
+        raise
+    if not hmac.compare_digest(current, identity.start_token):
+        return "changed"
+    return "live"
 
 
 def capture_runtime_launcher_identity(
@@ -551,15 +610,7 @@ def capture_runtime_supervisor_identity() -> HermesRuntimeProcessIdentity:
 def runtime_launcher_identity_is_live(
     identity: HermesRuntimeLauncherIdentity,
 ) -> bool:
-    style = identity.start_token.partition(":")[0]
-    return hmac.compare_digest(
-        _probe_process_start_token(
-            identity.pid,
-            expected_style=style,
-        )
-        or "",
-        identity.start_token,
-    )
+    return _runtime_launcher_identity_state(identity) == "live"
 
 
 def _runtime_process_identity_state(
@@ -601,17 +652,17 @@ def runtime_supervisor_identity_is_live(
     return _runtime_process_identity_state(identity) == "live"
 
 
-def _shutdown_budget_owner_is_live(
+def _shutdown_budget_owner_state(
     record: (
         HermesRuntimeShutdownBudgetRecord
         | _LegacyRuntimeShutdownBudgetRecord
     ),
-) -> bool:
+) -> Literal["live", "gone", "changed"]:
     if isinstance(record, HermesRuntimeShutdownBudgetRecord):
-        return runtime_supervisor_identity_is_live(
+        return _runtime_process_identity_state(
             record.supervisor_identity
         )
-    return runtime_launcher_identity_is_live(record.launcher_identity)
+    return _runtime_launcher_identity_state(record.launcher_identity)
 
 
 @dataclass(slots=True)
@@ -651,14 +702,18 @@ class _RuntimeShutdownBudgetPublication:
                         "runtime shutdown budget is malformed; "
                         "refusing to overwrite it without explicit repair"
                     ) from exc
-            if (
-                current is not None
-                and current != self.record
-                and _shutdown_budget_owner_is_live(current)
-            ):
-                raise RuntimeError(
-                    "runtime shutdown budget already has a live owner"
-                )
+            if current is not None and current != self.record:
+                try:
+                    owner_state = _shutdown_budget_owner_state(current)
+                except HermesRuntimeIdentityError as exc:
+                    raise RuntimeError(
+                        "runtime shutdown budget owner identity is "
+                        "unprovable; preserving the existing record"
+                    ) from exc
+                if owner_state == "live":
+                    raise RuntimeError(
+                        "runtime shutdown budget already has a live owner"
+                    )
             persist_runtime_shutdown_budget(self.path, self.record)
             self._published = True
 

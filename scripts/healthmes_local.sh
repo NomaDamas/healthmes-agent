@@ -13,6 +13,7 @@ HERMES_DECISION_VENV="$RUNTIME_DIR/hermes-decision-venv"
 HERMES_DECISION_STOP_BUDGET="$RUNTIME_DIR/hermes-decision-stop-budget"
 HERMES_DECISION_STARTUP_LEASE="$RUNTIME_DIR/hermes-decision-startup-lease"
 HERMES_DECISION_LIFECYCLE_LOCK="$RUNTIME_DIR/hermes-decision-lifecycle-lock"
+HERMES_DECISION_TRANSITION_LOCK="$DATA_DIR/.hermes-decision-runtime-transition.lock"
 HEALTHMES_LOG="$RUNTIME_DIR/healthmes.log"
 OW_LOG="$RUNTIME_DIR/open-wearables.log"
 WORKER_LOG="$RUNTIME_DIR/open-wearables-worker.log"
@@ -347,6 +348,110 @@ epoch_age_at_least() {
     [ $((now - timestamp)) -ge "$minimum_age" ]
 }
 
+rename_directory_exclusive() {
+    local source=$1 target=$2 expected_record_sha256=${3:-}
+    local -a arguments=(
+        rename-exclusive
+        "$source"
+        "$target"
+        --lock-path
+        "$HERMES_DECISION_TRANSITION_LOCK"
+    )
+    if [ -n "$expected_record_sha256" ]; then
+        arguments+=(
+            --expected-record-sha256
+            "$expected_record_sha256"
+        )
+    fi
+    run_native_identity_helper "${arguments[@]}"
+}
+
+managed_record_sha256() {
+    run_native_identity_helper sha256 "$1"
+}
+
+replace_managed_record_generation() {
+    local source=$1 target=$2 expected_record_sha256=$3
+    run_native_identity_helper \
+        replace-record \
+        "$source" \
+        "$target" \
+        --lock-path "$HERMES_DECISION_TRANSITION_LOCK" \
+        --expected-record-sha256 "$expected_record_sha256"
+}
+
+publish_interrupted_managed_record() {
+    local source=$1 target=$2 expected_source_sha256=$3
+    run_native_identity_helper \
+        publish-record \
+        "$source" \
+        "$target" \
+        --lock-path "$HERMES_DECISION_TRANSITION_LOCK" \
+        --expected-source-sha256 "$expected_source_sha256"
+}
+
+record_directory_has_only_managed_entries() {
+    local directory=$1
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    (
+        local entry name
+        shopt -s dotglob nullglob
+        for entry in "$directory"/*; do
+            name=${entry##*/}
+            case "$name" in
+            record | .record.*)
+                [ -f "$entry" ] && [ ! -L "$entry" ] || exit 1
+                ;;
+            *)
+                exit 1
+                ;;
+            esac
+        done
+    )
+}
+
+remove_managed_record_directory() {
+    local directory=$1
+    record_directory_has_only_managed_entries "$directory" || return 1
+    (
+        local entry
+        shopt -s dotglob nullglob
+        for entry in "$directory"/*; do
+            rm -f -- "$entry" || exit 1
+        done
+    ) || return 1
+    rmdir "$directory"
+}
+
+allocate_absent_runtime_directory_path() {
+    local template=$1 candidate
+    candidate="$(mktemp -d "$RUNTIME_DIR/$template")" || return 1
+    rmdir "$candidate" || return 1
+    printf '%s\n' "$candidate"
+}
+
+retire_managed_record_directory() {
+    local directory=$1 template=$2 expected_record_sha256=$3
+    local retired status attempts=0
+    record_directory_has_only_managed_entries "$directory" || return 1
+    while [ "$attempts" -lt 3 ]; do
+        retired="$(allocate_absent_runtime_directory_path "$template")" \
+            || return 1
+        if rename_directory_exclusive \
+            "$directory" "$retired" "$expected_record_sha256"; then
+            if ! remove_managed_record_directory "$retired"; then
+                info "preserving retired runtime record directory after cleanup failure: $retired"
+            fi
+            return 0
+        else
+            status=$?
+        fi
+        [ "$status" -eq 6 ] || return 1
+        attempts=$((attempts + 1))
+    done
+    return 1
+}
+
 decision_runtime_lifecycle_lock_record() {
     printf '%s/record\n' "$HERMES_DECISION_LIFECYCLE_LOCK"
 }
@@ -357,7 +462,7 @@ decision_runtime_lifecycle_lock_exists() {
 }
 
 load_decision_runtime_lifecycle_lock() {
-    local record key value extra
+    local record_override=${1:-} record key value extra
     local version= operation= phase= owner_pid= owner_start_token=
     local owner_nonce= acquired_at_epoch= updated_at_epoch=
     local script_contract_version= script_sha256=
@@ -377,12 +482,19 @@ load_decision_runtime_lifecycle_lock() {
     DECISION_RUNTIME_LIFECYCLE_LOCK_UPDATED_AT=
     DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_CONTRACT_VERSION=
     DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256=
-    decision_runtime_lifecycle_lock_exists || return 0
     DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS=invalid
-    [ -d "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
-        && [ ! -L "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
-        || return 0
-    record="$(decision_runtime_lifecycle_lock_record)"
+    if [ -n "$record_override" ]; then
+        record=$record_override
+    else
+        decision_runtime_lifecycle_lock_exists || {
+            DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS=missing
+            return 0
+        }
+        [ -d "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
+            && [ ! -L "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
+            || return 0
+        record="$(decision_runtime_lifecycle_lock_record)"
+    fi
     [ -f "$record" ] && [ ! -L "$record" ] || return 0
 
     while IFS=$'\t' read -r key value extra; do
@@ -514,12 +626,12 @@ decision_runtime_lifecycle_lock_generation() {
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256"
 }
 
-write_decision_runtime_lifecycle_lock() {
-    local operation=$1 phase=$2 owner_pid=$3 owner_start_token=$4
-    local owner_nonce=$5 acquired_at_epoch=$6 updated_at_epoch=$7
-    local script_contract_version=$8 script_sha256=$9 record temp
-    record="$(decision_runtime_lifecycle_lock_record)"
-    temp="$(mktemp "$HERMES_DECISION_LIFECYCLE_LOCK/.record.XXXXXX")"
+write_decision_runtime_lifecycle_lock_record() {
+    local record=$1 operation=$2 phase=$3 owner_pid=$4
+    local owner_start_token=$5 owner_nonce=$6 acquired_at_epoch=$7
+    local updated_at_epoch=$8 script_contract_version=$9
+    local script_sha256=${10} expected_record_sha256=${11:-} temp
+    temp="$(mktemp "$RUNTIME_DIR/.lifecycle-lock-write.XXXXXX")"
     if ! {
         printf 'version\t%s\n' "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION"
         printf 'operation\t%s\n' "$operation"
@@ -531,32 +643,45 @@ write_decision_runtime_lifecycle_lock() {
         printf 'updated_at_epoch\t%s\n' "$updated_at_epoch"
         printf 'script_contract_version\t%s\n' "$script_contract_version"
         printf 'script_sha256\t%s\n' "$script_sha256"
-    } >"$temp" || ! mv "$temp" "$record"; then
+    } >"$temp"; then
+        rm -f "$temp"
+        return 1
+    fi
+    if [ -n "$expected_record_sha256" ]; then
+        if ! replace_managed_record_generation \
+            "$temp" "$record" "$expected_record_sha256"; then
+            rm -f "$temp"
+            return 1
+        fi
+    elif ! mv "$temp" "$record"; then
         rm -f "$temp"
         return 1
     fi
 }
 
+write_decision_runtime_lifecycle_lock() {
+    local record
+    record="$(decision_runtime_lifecycle_lock_record)"
+    write_decision_runtime_lifecycle_lock_record "$record" "$@"
+}
+
 remove_decision_runtime_lifecycle_lock_generation() {
-    local expected_generation=$1 record backup
+    local expected_generation=$1 record expected_record_sha256
     load_decision_runtime_lifecycle_lock
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
         && [ "$(decision_runtime_lifecycle_lock_generation)" = "$expected_generation" ] \
         || return 1
     record="$(decision_runtime_lifecycle_lock_record)"
-    backup="$(mktemp "$RUNTIME_DIR/.lifecycle-lock-record.XXXXXX")"
-    if ! mv "$record" "$backup"; then
-        rm -f "$backup"
-        return 1
-    fi
-    if ! rmdir "$HERMES_DECISION_LIFECYCLE_LOCK"; then
-        if [ -d "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
-            && [ ! -e "$record" ]; then
-            mv "$backup" "$record" 2>/dev/null || true
-        fi
-        return 1
-    fi
-    rm -f "$backup"
+    expected_record_sha256="$(managed_record_sha256 "$record")" \
+        || return 1
+    load_decision_runtime_lifecycle_lock
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$(decision_runtime_lifecycle_lock_generation)" = "$expected_generation" ] \
+        || return 1
+    retire_managed_record_directory \
+        "$HERMES_DECISION_LIFECYCLE_LOCK" \
+        ".lifecycle-lock-retired.XXXXXX" \
+        "$expected_record_sha256"
 }
 
 operation_requires_durable_lifecycle_journal() {
@@ -573,7 +698,16 @@ loaded_lifecycle_lock_is_owned_by_current_process() {
 }
 
 rewrite_loaded_decision_runtime_lifecycle_phase() {
-    local expected_generation=$1 phase=$2 now
+    local expected_generation=$1 phase=$2 now record
+    local expected_record_sha256
+    load_decision_runtime_lifecycle_lock
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
+        && [ "$(decision_runtime_lifecycle_lock_generation)" = "$expected_generation" ] \
+        || return 1
+    record="$(decision_runtime_lifecycle_lock_record)"
+    expected_record_sha256="$(managed_record_sha256 "$record")" \
+        || return 1
     load_decision_runtime_lifecycle_lock
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
         && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
@@ -589,11 +723,21 @@ rewrite_loaded_decision_runtime_lifecycle_phase() {
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT" \
         "$now" \
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_CONTRACT_VERSION" \
-        "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256"
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_SCRIPT_SHA256" \
+        "$expected_record_sha256"
 }
 
 rewrite_loaded_decision_runtime_lifecycle_script_generation() {
-    local expected_generation=$1 phase=$2 script_sha256=$3 now
+    local expected_generation=$1 phase=$2 script_sha256=$3 now record
+    local expected_record_sha256
+    load_decision_runtime_lifecycle_lock
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
+        && [ "$(decision_runtime_lifecycle_lock_generation)" = "$expected_generation" ] \
+        || return 1
+    record="$(decision_runtime_lifecycle_lock_record)"
+    expected_record_sha256="$(managed_record_sha256 "$record")" \
+        || return 1
     load_decision_runtime_lifecycle_lock
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
         && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_VERSION" = "$DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION" ] \
@@ -609,7 +753,8 @@ rewrite_loaded_decision_runtime_lifecycle_script_generation() {
         "$DECISION_RUNTIME_LIFECYCLE_LOCK_ACQUIRED_AT" \
         "$now" \
         "$DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION" \
-        "$script_sha256"
+        "$script_sha256" \
+        "$expected_record_sha256"
 }
 
 set_decision_runtime_lifecycle_phase() {
@@ -683,10 +828,80 @@ recover_orphaned_decision_runtime_lifecycle_lock() {
     remove_decision_runtime_lifecycle_lock_generation "$expected_generation"
 }
 
+find_interrupted_decision_runtime_lifecycle_record() {
+    local entry count=0
+    local -a candidates=(
+        "$HERMES_DECISION_LIFECYCLE_LOCK"/.record.*
+        "$RUNTIME_DIR"/.lifecycle-lock-record.*
+    )
+    INTERRUPTED_DECISION_RUNTIME_RECORD=
+    [ -d "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
+        && [ ! -L "$HERMES_DECISION_LIFECYCLE_LOCK" ] \
+        && [ ! -e "$(decision_runtime_lifecycle_lock_record)" ] \
+        && [ ! -L "$(decision_runtime_lifecycle_lock_record)" ] \
+        || return 1
+    record_directory_has_only_managed_entries \
+        "$HERMES_DECISION_LIFECYCLE_LOCK" || return 2
+    for entry in "${candidates[@]}"; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        [ -f "$entry" ] && [ ! -L "$entry" ] || {
+            return 2
+        }
+        count=$((count + 1))
+        INTERRUPTED_DECISION_RUNTIME_RECORD=$entry
+    done
+    [ "$count" -eq 1 ] || return 2
+}
+
+recover_interrupted_decision_runtime_lifecycle_record() {
+    local candidate generation owner_pid owner_start_token updated_at
+    local status record candidate_sha256
+    find_interrupted_decision_runtime_lifecycle_record || return $?
+    candidate=$INTERRUPTED_DECISION_RUNTIME_RECORD
+    load_decision_runtime_lifecycle_lock "$candidate"
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] || return 2
+    generation="$(decision_runtime_lifecycle_lock_generation)" || return 2
+    owner_pid=$DECISION_RUNTIME_LIFECYCLE_LOCK_PID
+    owner_start_token=$DECISION_RUNTIME_LIFECYCLE_LOCK_START_TOKEN
+    updated_at=$DECISION_RUNTIME_LIFECYCLE_LOCK_UPDATED_AT
+    if process_start_token_status "$owner_pid" "$owner_start_token"; then
+        return 3
+    else
+        status=$?
+    fi
+    [ "$status" -eq 3 ] || return 5
+    epoch_age_at_least \
+        "$updated_at" \
+        "$DECISION_RUNTIME_LIFECYCLE_LOCK_STALE_GRACE_SECONDS" \
+        || return 4
+    candidate_sha256="$(managed_record_sha256 "$candidate")" \
+        || return 2
+    load_decision_runtime_lifecycle_lock "$candidate"
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$(decision_runtime_lifecycle_lock_generation)" = "$generation" ] \
+        || return 2
+    record="$(decision_runtime_lifecycle_lock_record)"
+    if publish_interrupted_managed_record \
+        "$candidate" "$record" "$candidate_sha256"; then
+        :
+    else
+        status=$?
+        [ "$status" -eq 6 ] || return 2
+        load_decision_runtime_lifecycle_lock
+        [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+            && [ "$(decision_runtime_lifecycle_lock_generation)" = "$generation" ] \
+            || return 2
+        return 0
+    fi
+    load_decision_runtime_lifecycle_lock
+    [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = valid ] \
+        && [ "$(decision_runtime_lifecycle_lock_generation)" = "$generation" ]
+}
+
 acquire_decision_runtime_lifecycle_lock() {
     local operation=$1 owner_pid owner_start_token
     local owner_nonce acquired_at_epoch attempts=0 existing_generation status
-    local current_script_sha256 recovery_status
+    local current_script_sha256 recovery_status stage
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = false ] \
         || die "decision runtime lifecycle lock is already held"
     [[ "$operation" =~ ^(start|stop|update|install|uninstall)$ ]] \
@@ -701,19 +916,19 @@ acquire_decision_runtime_lifecycle_lock() {
         || die "failed to generate decision runtime lifecycle nonce"
     while [ "$attempts" -le "$DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS" ]; do
         assert_lifecycle_script_generation_unchanged
-        acquired_at_epoch="$(current_epoch)" \
-            || die "failed to read decision runtime lifecycle clock"
-        if mkdir -m 700 "$HERMES_DECISION_LIFECYCLE_LOCK" 2>/dev/null; then
+        load_decision_runtime_lifecycle_lock
+        if [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" = missing ]; then
+            acquired_at_epoch="$(current_epoch)" \
+                || die "failed to read decision runtime lifecycle clock"
             current_script_sha256="$(current_lifecycle_script_sha256)" \
-                || {
-                    rmdir "$HERMES_DECISION_LIFECYCLE_LOCK" 2>/dev/null || true
-                    die "decision runtime lifecycle script identity became unreadable before lock publication"
-                }
+                || die "decision runtime lifecycle script identity became unreadable before lock publication"
             if [ "$current_script_sha256" != "$DECISION_RUNTIME_LIFECYCLE_INITIAL_SCRIPT_SHA256" ]; then
-                rmdir "$HERMES_DECISION_LIFECYCLE_LOCK" 2>/dev/null || true
                 die "healthmes_local.sh changed before lifecycle lock publication; rerun the command with the current script"
             fi
-            if ! write_decision_runtime_lifecycle_lock \
+            stage="$(mktemp -d "$RUNTIME_DIR/.lifecycle-lock-stage.XXXXXX")" \
+                || die "failed to allocate decision runtime lifecycle staging directory"
+            if ! write_decision_runtime_lifecycle_lock_record \
+                "$stage/record" \
                 "$operation" \
                 acquired \
                 "$owner_pid" \
@@ -723,7 +938,20 @@ acquire_decision_runtime_lifecycle_lock() {
                 "$acquired_at_epoch" \
                 "$DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION" \
                 "$DECISION_RUNTIME_LIFECYCLE_INITIAL_SCRIPT_SHA256"; then
-                die "decision runtime lifecycle lock directory was created but its owner record could not be published; preserving the lock"
+                remove_managed_record_directory "$stage" 2>/dev/null || true
+                die "decision runtime lifecycle owner record could not be staged"
+            fi
+            if rename_directory_exclusive \
+                "$stage" "$HERMES_DECISION_LIFECYCLE_LOCK"; then
+                :
+            else
+                status=$?
+                remove_managed_record_directory "$stage" 2>/dev/null || true
+                if [ "$status" -eq 6 ]; then
+                    attempts=$((attempts + 1))
+                    continue
+                fi
+                die "decision runtime lifecycle lock publication is unavailable; refusing non-atomic acquisition"
             fi
             DECISION_RUNTIME_LIFECYCLE_LOCK_HELD=true
             DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PID=$owner_pid
@@ -734,14 +962,30 @@ acquire_decision_runtime_lifecycle_lock() {
             return
         fi
 
-        load_decision_runtime_lifecycle_lock
         case "$DECISION_RUNTIME_LIFECYCLE_LOCK_STATUS" in
-        missing)
-            attempts=$((attempts + 1))
-            continue
-            ;;
         invalid)
-            die "decision runtime lifecycle lock is malformed or has no provable owner; preserving it"
+            if recover_interrupted_decision_runtime_lifecycle_record; then
+                info "restored an interrupted decision runtime lifecycle owner record"
+                attempts=$((attempts + 1))
+                continue
+            else
+                status=$?
+            fi
+            case "$status" in
+            3)
+                if [ "$attempts" -ge "$DECISION_RUNTIME_LIFECYCLE_LOCK_WAIT_SECONDS" ]; then
+                    die "decision runtime lifecycle publication is still owned by a live process; preserving its orphan record"
+                fi
+                ;;
+            4)
+                ;;
+            5)
+                die "decision runtime lifecycle orphan owner identity is unknown; preserving it"
+                ;;
+            *)
+                die "decision runtime lifecycle lock is malformed or has no provable owner; preserving it"
+                ;;
+            esac
             ;;
         valid)
             existing_generation="$(decision_runtime_lifecycle_lock_generation)"
@@ -875,7 +1119,7 @@ decision_runtime_startup_lease_exists() {
 }
 
 load_decision_runtime_startup_lease() {
-    local record key value extra
+    local record_override=${1:-} record key value extra
     local version= state= phase= launcher_service_nonce= launcher_pid=
     local launcher_start_token= created_at_epoch= updated_at_epoch=
     local startup_owner_pid= startup_owner_start_token= startup_owner_nonce=
@@ -897,12 +1141,19 @@ load_decision_runtime_startup_lease() {
     DECISION_RUNTIME_STARTUP_LEASE_OWNER_PID=
     DECISION_RUNTIME_STARTUP_LEASE_OWNER_START_TOKEN=
     DECISION_RUNTIME_STARTUP_LEASE_OWNER_NONCE=
-    decision_runtime_startup_lease_exists || return 0
     DECISION_RUNTIME_STARTUP_LEASE_STATUS=invalid
-    [ -d "$HERMES_DECISION_STARTUP_LEASE" ] \
-        && [ ! -L "$HERMES_DECISION_STARTUP_LEASE" ] \
-        || return 0
-    record="$(decision_runtime_startup_lease_record)"
+    if [ -n "$record_override" ]; then
+        record=$record_override
+    else
+        decision_runtime_startup_lease_exists || {
+            DECISION_RUNTIME_STARTUP_LEASE_STATUS=missing
+            return 0
+        }
+        [ -d "$HERMES_DECISION_STARTUP_LEASE" ] \
+            && [ ! -L "$HERMES_DECISION_STARTUP_LEASE" ] \
+            || return 0
+        record="$(decision_runtime_startup_lease_record)"
+    fi
     [ -f "$record" ] && [ ! -L "$record" ] || return 0
 
     while IFS=$'\t' read -r key value extra; do
@@ -1065,11 +1316,10 @@ load_decision_runtime_startup_lease() {
     DECISION_RUNTIME_STARTUP_LEASE_OWNER_NONCE=$startup_owner_nonce
 }
 
-write_decision_runtime_startup_lease() {
-    local record temp
+write_decision_runtime_startup_lease_record() {
+    local record=$1 expected_record_sha256=${2:-} temp
     [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] || return 1
-    record="$(decision_runtime_startup_lease_record)"
-    temp="$(mktemp "$HERMES_DECISION_STARTUP_LEASE/.record.XXXXXX")"
+    temp="$(mktemp "$RUNTIME_DIR/.startup-lease-write.XXXXXX")"
     if ! {
         printf 'version\t2\n'
         printf 'phase\t%s\n' "$DECISION_RUNTIME_STARTUP_LEASE_PHASE"
@@ -1093,18 +1343,36 @@ write_decision_runtime_startup_lease() {
             printf 'launcher_start_token\t%s\n' \
                 "$DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN"
         fi
-    } >"$temp" || ! mv "$temp" "$record"; then
+    } >"$temp"; then
+        rm -f "$temp"
+        return 1
+    fi
+    if [ -n "$expected_record_sha256" ]; then
+        if ! replace_managed_record_generation \
+            "$temp" "$record" "$expected_record_sha256"; then
+            rm -f "$temp"
+            return 1
+        fi
+    elif ! mv "$temp" "$record"; then
         rm -f "$temp"
         return 1
     fi
 }
 
+write_decision_runtime_startup_lease() {
+    local expected_record_sha256=${1:-} record
+    record="$(decision_runtime_startup_lease_record)"
+    write_decision_runtime_startup_lease_record \
+        "$record" "$expected_record_sha256"
+}
+
 create_decision_runtime_startup_lease() {
-    local launcher_service_nonce=$1 now
+    local launcher_service_nonce=$1 now stage status
     [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_HELD" = true ] \
         && [ "$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_OPERATION" = start ] \
         || die "decision runtime startup requires the cross-process lifecycle lock"
-    if ! mkdir -m 700 "$HERMES_DECISION_STARTUP_LEASE"; then
+    load_decision_runtime_startup_lease
+    if [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ]; then
         die "decision runtime startup lease already exists; stop or inspect the existing generation first"
     fi
     now="$(current_epoch)" || die "failed to read startup lease clock"
@@ -1120,32 +1388,57 @@ create_decision_runtime_startup_lease() {
     DECISION_RUNTIME_STARTUP_LEASE_OWNER_PID=$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_PID
     DECISION_RUNTIME_STARTUP_LEASE_OWNER_START_TOKEN=$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_START_TOKEN
     DECISION_RUNTIME_STARTUP_LEASE_OWNER_NONCE=$DECISION_RUNTIME_LIFECYCLE_LOCK_OWNER_NONCE
-    if ! write_decision_runtime_startup_lease; then
-        rmdir "$HERMES_DECISION_STARTUP_LEASE" 2>/dev/null || true
-        die "failed to publish decision runtime startup intent"
+    stage="$(mktemp -d "$RUNTIME_DIR/.startup-lease-stage.XXXXXX")" \
+        || die "failed to allocate decision runtime startup staging directory"
+    if ! write_decision_runtime_startup_lease_record "$stage/record"; then
+        remove_managed_record_directory "$stage" 2>/dev/null || true
+        die "failed to stage decision runtime startup intent"
     fi
+    if rename_directory_exclusive \
+        "$stage" "$HERMES_DECISION_STARTUP_LEASE"; then
+        return
+    else
+        status=$?
+    fi
+    remove_managed_record_directory "$stage" 2>/dev/null || true
+    [ "$status" -eq 6 ] \
+        && die "decision runtime startup lease already exists; preserving the competing generation"
+    die "decision runtime startup lease publication is unavailable; refusing non-atomic startup"
 }
 
 mark_decision_runtime_startup_spawned() {
     local launcher_service_nonce=$1 launcher_pid=$2 now
+    local expected_generation expected_record_sha256 record
     load_decision_runtime_startup_lease
     [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
         && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = intent ] \
         && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
         || return 1
     valid_managed_pid "$launcher_pid" || return 1
+    expected_generation="$(decision_runtime_startup_lease_generation)" \
+        || return 1
+    record="$(decision_runtime_startup_lease_record)"
+    expected_record_sha256="$(managed_record_sha256 "$record")" \
+        || return 1
+    load_decision_runtime_startup_lease
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = intent ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
+        && [ "$(decision_runtime_startup_lease_generation)" = "$expected_generation" ] \
+        || return 1
     now="$(current_epoch)" || return 1
     DECISION_RUNTIME_STARTUP_LEASE_STATUS=spawned
     DECISION_RUNTIME_STARTUP_LEASE_STATE=spawned
     DECISION_RUNTIME_STARTUP_LEASE_PHASE=spawned
     DECISION_RUNTIME_STARTUP_LEASE_PID=$launcher_pid
     DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT=$now
-    write_decision_runtime_startup_lease
+    write_decision_runtime_startup_lease "$expected_record_sha256"
 }
 
 mark_decision_runtime_startup_identity_verified() {
     local launcher_service_nonce=$1 launcher_pid=$2
-    local launcher_start_token=$3 now
+    local launcher_start_token=$3 now expected_generation
+    local expected_record_sha256 record
     load_decision_runtime_startup_lease
     [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
         && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = spawned ] \
@@ -1153,17 +1446,30 @@ mark_decision_runtime_startup_identity_verified() {
         && [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" = "$launcher_pid" ] \
         && [[ "$launcher_start_token" == ps:* ]] \
         || return 1
+    expected_generation="$(decision_runtime_startup_lease_generation)" \
+        || return 1
+    record="$(decision_runtime_startup_lease_record)"
+    expected_record_sha256="$(managed_record_sha256 "$record")" \
+        || return 1
+    load_decision_runtime_startup_lease
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = spawned ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" = "$launcher_pid" ] \
+        && [ "$(decision_runtime_startup_lease_generation)" = "$expected_generation" ] \
+        || return 1
     now="$(current_epoch)" || return 1
     DECISION_RUNTIME_STARTUP_LEASE_STATUS=identity_verified
     DECISION_RUNTIME_STARTUP_LEASE_STATE=identity_verified
     DECISION_RUNTIME_STARTUP_LEASE_PHASE=identity_verified
     DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN=$launcher_start_token
     DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT=$now
-    write_decision_runtime_startup_lease
+    write_decision_runtime_startup_lease "$expected_record_sha256"
 }
 
 mark_decision_runtime_startup_failed() {
     local launcher_service_nonce=$1 launcher_pid=${2:-} now
+    local expected_generation expected_record_sha256 record
     load_decision_runtime_startup_lease
     [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
         && { [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = intent ] \
@@ -1177,6 +1483,23 @@ mark_decision_runtime_startup_failed() {
             return 1
         fi
     fi
+    expected_generation="$(decision_runtime_startup_lease_generation)" \
+        || return 1
+    record="$(decision_runtime_startup_lease_record)"
+    expected_record_sha256="$(managed_record_sha256 "$record")" \
+        || return 1
+    load_decision_runtime_startup_lease
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
+        && { [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = intent ] \
+            || [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = spawned ]; } \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
+        && [ "$(decision_runtime_startup_lease_generation)" = "$expected_generation" ] \
+        || return 1
+    if [ -n "$launcher_pid" ] \
+        && [ -n "$DECISION_RUNTIME_STARTUP_LEASE_PID" ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" != "$launcher_pid" ]; then
+        return 1
+    fi
     now="$(current_epoch)" || return 1
     DECISION_RUNTIME_STARTUP_LEASE_STATUS=failed
     DECISION_RUNTIME_STARTUP_LEASE_STATE=failed
@@ -1184,7 +1507,7 @@ mark_decision_runtime_startup_failed() {
     DECISION_RUNTIME_STARTUP_LEASE_PID=$launcher_pid
     DECISION_RUNTIME_STARTUP_LEASE_START_TOKEN=
     DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT=$now
-    write_decision_runtime_startup_lease
+    write_decision_runtime_startup_lease "$expected_record_sha256"
 }
 
 complete_decision_runtime_startup_lease() {
@@ -1233,26 +1556,24 @@ decision_runtime_startup_lease_generation() {
 }
 
 remove_decision_runtime_startup_lease_generation() {
-    local expected_generation=$1 record backup
+    local expected_generation=$1 record expected_record_sha256
     load_decision_runtime_startup_lease
     [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ] \
         && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != invalid ] \
         && [ "$(decision_runtime_startup_lease_generation)" = "$expected_generation" ] \
         || return 1
     record="$(decision_runtime_startup_lease_record)"
-    backup="$(mktemp "$RUNTIME_DIR/.startup-lease-record.XXXXXX")"
-    if ! mv "$record" "$backup"; then
-        rm -f "$backup"
-        return 1
-    fi
-    if ! rmdir "$HERMES_DECISION_STARTUP_LEASE"; then
-        if [ -d "$HERMES_DECISION_STARTUP_LEASE" ] \
-            && [ ! -e "$record" ]; then
-            mv "$backup" "$record" 2>/dev/null || true
-        fi
-        return 1
-    fi
-    rm -f "$backup"
+    expected_record_sha256="$(managed_record_sha256 "$record")" \
+        || return 1
+    load_decision_runtime_startup_lease
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != invalid ] \
+        && [ "$(decision_runtime_startup_lease_generation)" = "$expected_generation" ] \
+        || return 1
+    retire_managed_record_directory \
+        "$HERMES_DECISION_STARTUP_LEASE" \
+        ".startup-lease-retired.XXXXXX" \
+        "$expected_record_sha256"
 }
 
 decision_runtime_startup_lease_generation_matches() {
@@ -1824,6 +2145,77 @@ startup_lease_matches_loaded_v3_budget() {
             "$DECISION_RUNTIME_BUDGET_LAUNCHER_SERVICE_NONCE"
 }
 
+find_interrupted_decision_runtime_startup_record() {
+    local entry count=0
+    local -a candidates=(
+        "$HERMES_DECISION_STARTUP_LEASE"/.record.*
+        "$RUNTIME_DIR"/.startup-lease-record.*
+    )
+    INTERRUPTED_DECISION_RUNTIME_RECORD=
+    [ -d "$HERMES_DECISION_STARTUP_LEASE" ] \
+        && [ ! -L "$HERMES_DECISION_STARTUP_LEASE" ] \
+        && [ ! -e "$(decision_runtime_startup_lease_record)" ] \
+        && [ ! -L "$(decision_runtime_startup_lease_record)" ] \
+        || return 1
+    record_directory_has_only_managed_entries \
+        "$HERMES_DECISION_STARTUP_LEASE" || return 2
+    for entry in "${candidates[@]}"; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        [ -f "$entry" ] && [ ! -L "$entry" ] || return 2
+        count=$((count + 1))
+        INTERRUPTED_DECISION_RUNTIME_RECORD=$entry
+    done
+    [ "$count" -eq 1 ] || return 2
+}
+
+recover_interrupted_decision_runtime_startup_record() {
+    local candidate generation owner_status record status
+    local candidate_sha256
+    find_interrupted_decision_runtime_startup_record || return $?
+    candidate=$INTERRUPTED_DECISION_RUNTIME_RECORD
+    load_decision_runtime_startup_lease "$candidate"
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != invalid ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] \
+        || return 2
+    generation="$(decision_runtime_startup_lease_generation)" || return 2
+    if startup_lease_owner_identity_status; then
+        return 3
+    else
+        owner_status=$?
+    fi
+    [ "$owner_status" -eq 3 ] || return 5
+    epoch_age_at_least \
+        "$DECISION_RUNTIME_STARTUP_LEASE_UPDATED_AT" \
+        "$DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS" \
+        || return 4
+    candidate_sha256="$(managed_record_sha256 "$candidate")" \
+        || return 2
+    load_decision_runtime_startup_lease "$candidate"
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != invalid ] \
+        && [ "$(decision_runtime_startup_lease_generation)" = "$generation" ] \
+        || return 2
+    record="$(decision_runtime_startup_lease_record)"
+    if publish_interrupted_managed_record \
+        "$candidate" "$record" "$candidate_sha256"; then
+        :
+    else
+        status=$?
+        [ "$status" -eq 6 ] || return 2
+        load_decision_runtime_startup_lease
+        [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ] \
+            && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != invalid ] \
+            && [ "$(decision_runtime_startup_lease_generation)" = "$generation" ] \
+            || return 2
+        return 0
+    fi
+    load_decision_runtime_startup_lease
+    [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != missing ] \
+        && [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" != invalid ] \
+        && [ "$(decision_runtime_startup_lease_generation)" = "$generation" ]
+}
+
 clear_stale_startup_artifacts() {
     local expected_generation=$1 launcher_pid=${2:-}
     local launcher_service_nonce=$3 stored_pid
@@ -1856,7 +2248,26 @@ reconcile_stale_decision_runtime_startup() {
     case "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" in
     missing) return ;;
     invalid)
-        die "decision runtime startup lease is invalid; refusing lifecycle recovery"
+        if recover_interrupted_decision_runtime_startup_record; then
+            info "restored an interrupted decision runtime startup lease record"
+            load_decision_runtime_startup_lease
+        else
+            owner_status=$?
+            case "$owner_status" in
+            3)
+                die "decision runtime startup lease publication is still owned by a live process; preserving its orphan record"
+                ;;
+            4)
+                die "decision runtime startup lease orphan has not passed the bounded recovery grace; preserving it"
+                ;;
+            5)
+                die "decision runtime startup lease orphan owner identity is unknown; preserving it"
+                ;;
+            *)
+                die "decision runtime startup lease is invalid; refusing lifecycle recovery"
+                ;;
+            esac
+        fi
         ;;
     esac
     [ "$DECISION_RUNTIME_STARTUP_LEASE_VERSION" = 2 ] || return 0
@@ -3057,7 +3468,9 @@ remove_data_contents_except_runtime() {
         local entry
         shopt -s dotglob nullglob
         for entry in "$DATA_DIR"/*; do
-            [ "$entry" = "$RUNTIME_DIR" ] || rm -rf -- "$entry"
+            [ "$entry" = "$RUNTIME_DIR" ] \
+                || [ "$entry" = "$HERMES_DECISION_TRANSITION_LOCK" ] \
+                || rm -rf -- "$entry"
         done
     )
 }

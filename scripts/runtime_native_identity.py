@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Portable native process identity and script digest helper.
+"""Portable native process identity, digest, and filesystem helper.
 
 The launcher uses this stdlib-only helper before the HealthMes virtual
 environment is guaranteed to exist. Exit statuses are part of the shell
@@ -9,23 +9,44 @@ contract:
 3 = process is absent
 4 = numeric PID exists but names a different process
 5 = identity cannot be proved on this platform
+6 = an exclusive filesystem publication target already exists
+7 = the source generation changed before an atomic transition
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import hashlib
 import os
 import stat
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - supported hosts provide fcntl.
+    fcntl = None  # type: ignore[assignment]
 
 _DARWIN_PROC_PIDTBSDINFO = 3
 _DARWIN_MAXCOMLEN = 16
+_AT_FDCWD = -100
+_LINUX_RENAME_NOREPLACE = 1
+_DARWIN_RENAME_EXCL = 0x00000004
 
 
 class _IdentityUnavailable(RuntimeError):
+    pass
+
+
+class _PublicationConflict(RuntimeError):
+    pass
+
+
+class _GenerationChanged(RuntimeError):
     pass
 
 
@@ -175,6 +196,245 @@ def _sha256_regular_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_sha256(value: str) -> None:
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise _IdentityUnavailable(
+            "native_identity_expected_record_digest_invalid"
+        )
+
+
+@contextmanager
+def _exclusive_transition_lock(path: Path) -> Iterator[None]:
+    if fcntl is None:
+        raise _IdentityUnavailable(
+            "native_identity_transition_lock_unsupported"
+        )
+    flags = (
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_transition_lock_unavailable"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise _IdentityUnavailable(
+                "native_identity_transition_lock_invalid"
+            )
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    except OSError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_transition_lock_unavailable"
+        ) from exc
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _rename_path_exclusive(
+    source: Path,
+    target: Path,
+    *,
+    require_directory: bool,
+) -> None:
+    """Atomically rename a managed path without replacing the target."""
+    try:
+        source_metadata = source.lstat()
+    except OSError as exc:
+        raise _IdentityUnavailable(
+            "native_identity_rename_source_unavailable"
+        ) from exc
+    source_type_matches = (
+        stat.S_ISDIR(source_metadata.st_mode)
+        if require_directory
+        else stat.S_ISREG(source_metadata.st_mode)
+    )
+    if not source_type_matches:
+        raise _IdentityUnavailable(
+            "native_identity_rename_source_invalid"
+        )
+    if require_directory and source.parent != target.parent:
+        raise _IdentityUnavailable(
+            "native_identity_rename_cross_parent"
+        )
+
+    source_bytes = os.fsencode(source)
+    target_bytes = os.fsencode(target)
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        try:
+            rename = library.renameat2
+        except AttributeError as exc:
+            raise _IdentityUnavailable(
+                "native_identity_rename_exclusive_unavailable"
+            ) from exc
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            _AT_FDCWD,
+            source_bytes,
+            _AT_FDCWD,
+            target_bytes,
+            _LINUX_RENAME_NOREPLACE,
+        )
+    elif sys.platform == "darwin":
+        try:
+            rename = library.renamex_np
+        except AttributeError as exc:
+            raise _IdentityUnavailable(
+                "native_identity_rename_exclusive_unavailable"
+            ) from exc
+        rename.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            source_bytes,
+            target_bytes,
+            _DARWIN_RENAME_EXCL,
+        )
+    else:
+        raise _IdentityUnavailable(
+            f"native_identity_platform_unsupported:{sys.platform}"
+        )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise _PublicationConflict(
+            "native_identity_rename_target_exists"
+        )
+    raise _IdentityUnavailable(
+        f"native_identity_rename_exclusive_failed:{error}"
+    )
+
+
+def _rename_directory_transaction(
+    source: Path,
+    target: Path,
+    *,
+    lock_path: Path,
+    expected_record_sha256: str | None,
+) -> None:
+    if not lock_path.parent.is_dir():
+        raise _IdentityUnavailable(
+            "native_identity_transition_lock_parent_unavailable"
+        )
+    with _exclusive_transition_lock(lock_path):
+        if expected_record_sha256 is not None:
+            _validate_sha256(expected_record_sha256)
+            try:
+                current_digest = _sha256_regular_file(source / "record")
+            except _IdentityUnavailable as exc:
+                raise _GenerationChanged(
+                    "native_identity_record_generation_changed"
+                ) from exc
+            if current_digest != expected_record_sha256:
+                raise _GenerationChanged(
+                    "native_identity_record_generation_changed"
+                )
+        _rename_path_exclusive(
+            source,
+            target,
+            require_directory=True,
+        )
+
+
+def _replace_record_transaction(
+    source: Path,
+    target: Path,
+    *,
+    lock_path: Path,
+    expected_record_sha256: str,
+) -> None:
+    if not lock_path.parent.is_dir():
+        raise _IdentityUnavailable(
+            "native_identity_transition_lock_parent_unavailable"
+        )
+    _validate_sha256(expected_record_sha256)
+    with _exclusive_transition_lock(lock_path):
+        try:
+            current_digest = _sha256_regular_file(target)
+        except _IdentityUnavailable as exc:
+            raise _GenerationChanged(
+                "native_identity_record_generation_changed"
+            ) from exc
+        if current_digest != expected_record_sha256:
+            raise _GenerationChanged(
+                "native_identity_record_generation_changed"
+            )
+        try:
+            source_metadata = source.lstat()
+        except OSError as exc:
+            raise _IdentityUnavailable(
+                "native_identity_record_source_unavailable"
+            ) from exc
+        if not stat.S_ISREG(source_metadata.st_mode):
+            raise _IdentityUnavailable(
+                "native_identity_record_source_invalid"
+            )
+        try:
+            os.replace(source, target)
+        except OSError as exc:
+            raise _IdentityUnavailable(
+                "native_identity_record_replace_failed"
+            ) from exc
+
+
+def _publish_record_transaction(
+    source: Path,
+    target: Path,
+    *,
+    lock_path: Path,
+    expected_source_sha256: str,
+) -> None:
+    if not lock_path.parent.is_dir():
+        raise _IdentityUnavailable(
+            "native_identity_transition_lock_parent_unavailable"
+        )
+    _validate_sha256(expected_source_sha256)
+    with _exclusive_transition_lock(lock_path):
+        try:
+            current_digest = _sha256_regular_file(source)
+        except _IdentityUnavailable as exc:
+            raise _GenerationChanged(
+                "native_identity_record_generation_changed"
+            ) from exc
+        if current_digest != expected_source_sha256:
+            raise _GenerationChanged(
+                "native_identity_record_generation_changed"
+            )
+        _rename_path_exclusive(
+            source,
+            target,
+            require_directory=False,
+        )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -185,6 +445,41 @@ def _parse_args() -> argparse.Namespace:
     check.add_argument("expected")
     digest = subparsers.add_parser("sha256", add_help=False)
     digest.add_argument("path", type=Path)
+    rename = subparsers.add_parser("rename-exclusive", add_help=False)
+    rename.add_argument("source", type=Path)
+    rename.add_argument("target", type=Path)
+    rename.add_argument("--lock-path", required=True, type=Path)
+    rename.add_argument("--expected-record-sha256")
+    replace_record = subparsers.add_parser(
+        "replace-record",
+        add_help=False,
+    )
+    replace_record.add_argument("source", type=Path)
+    replace_record.add_argument("target", type=Path)
+    replace_record.add_argument(
+        "--lock-path",
+        required=True,
+        type=Path,
+    )
+    replace_record.add_argument(
+        "--expected-record-sha256",
+        required=True,
+    )
+    publish_record = subparsers.add_parser(
+        "publish-record",
+        add_help=False,
+    )
+    publish_record.add_argument("source", type=Path)
+    publish_record.add_argument("target", type=Path)
+    publish_record.add_argument(
+        "--lock-path",
+        required=True,
+        type=Path,
+    )
+    publish_record.add_argument(
+        "--expected-source-sha256",
+        required=True,
+    )
     return parser.parse_args()
 
 
@@ -193,6 +488,30 @@ def main() -> int:
     try:
         if args.action == "sha256":
             print(_sha256_regular_file(args.path))
+            return 0
+        if args.action == "rename-exclusive":
+            _rename_directory_transaction(
+                args.source,
+                args.target,
+                lock_path=args.lock_path,
+                expected_record_sha256=args.expected_record_sha256,
+            )
+            return 0
+        if args.action == "replace-record":
+            _replace_record_transaction(
+                args.source,
+                args.target,
+                lock_path=args.lock_path,
+                expected_record_sha256=args.expected_record_sha256,
+            )
+            return 0
+        if args.action == "publish-record":
+            _publish_record_transaction(
+                args.source,
+                args.target,
+                lock_path=args.lock_path,
+                expected_source_sha256=args.expected_source_sha256,
+            )
             return 0
         current = _start_token(args.pid)
         if current is None:
@@ -203,6 +522,12 @@ def main() -> int:
         if args.expected not in {current}:
             return 4
         return 0
+    except _PublicationConflict as exc:
+        print(str(exc), file=sys.stderr)
+        return 6
+    except _GenerationChanged as exc:
+        print(str(exc), file=sys.stderr)
+        return 7
     except _IdentityUnavailable as exc:
         print(str(exc), file=sys.stderr)
         return 5

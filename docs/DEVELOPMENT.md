@@ -264,21 +264,41 @@ after the same identity and age checks. `update` holds the lock from the
 initial decision stop through `git pull`, setup, and generation handoff.
 `uninstall` holds it across LaunchAgent unload, application stop,
 `services-stop`, and runtime/local-data cleanup. Cleanup excludes the lock
-directory itself; only after successful transaction completion is the lock
-released and the now-empty runtime/data directory removed with `rmdir`.
+directory itself and the permanent
+`data/.hermes-decision-runtime-transition.lock`; only after successful
+transaction completion is the lifecycle directory released. The transition
+mutex is intentionally retained across uninstall so waiters can never lock
+different inodes after cleanup.
 Durable subcommands run with Bash `errexit` active, so a failed pull, setup,
 service stop, or cleanup cannot be hidden by a later successful command; the
 transaction remains `repair_required`. Therefore a new start cannot execute
 partially updated code or race a partial uninstall.
-If a process crashes after the atomic directory creation but before publishing
-the owner record, the incomplete lock has no provable owner. It is deliberately
-preserved as `unknown` for operator inspection rather than guessed stale and
-deleted.
+
+Lifecycle acquisition first writes a complete owner record into a private
+sibling staging directory, then publishes the whole directory with an
+OS-native exclusive rename under the permanent transition mutex. Canonical
+lock directories are therefore never intentionally visible without a complete
+record. Record rewrites use an external temp file and replace the canonical
+record only if its pre-read SHA-256 still matches under that same mutex.
+Removal similarly verifies the record digest and atomically retires the whole
+directory before best-effort cleanup. A crash can consequently leave only a
+non-authoritative staging, write-temp, or retired artifact; it cannot expose a
+new empty canonical directory or move the canonical record away first. Such
+non-authoritative artifacts do not block a later generation.
+
+For compatibility with interrupted older launchers, exactly one valid
+`.record.*`, `.lifecycle-lock-record.*`, or `.startup-lease-record.*` candidate
+may be restored only after its recorded owner is proved absent and the stale
+grace has elapsed. A live or unreadable owner, multiple candidates, malformed
+content, symlinks, or a changed candidate fail closed and are preserved.
+An ownerless empty directory contains no identity evidence, so it remains
+`unknown` for explicit operator repair rather than being guessed abandoned.
 
 While holding the lifecycle lock, start atomically creates the version-2
 `data/runtime/hermes-decision-startup-lease/` before spawning the managed Bash
-wrapper. The strict lease contains `created_at_epoch`, `updated_at_epoch`, the
-startup-owner identity, the launcher service nonce, and a phase:
+wrapper by the same complete-stage/exclusive-rename protocol. The strict lease
+contains `created_at_epoch`, `updated_at_epoch`, the startup-owner identity,
+the launcher service nonce, and a phase:
 `intent`, `spawned`, `identity_verified`, or `failed`. The wrapper's first
 managed action changes `intent` to `spawned` with its own PID and then writes
 the PID tombstone; only after both publications succeed may it launch the
@@ -312,7 +332,11 @@ records use their saved drain plus a bounded 2-second native launcher margin.
 Legacy v1/v2 records retain their conservative 315-second drain plus that
 margin. An existing malformed record is preserved byte-for-byte and a new
 supervisor refuses to overwrite it without explicit validated repair.
-Malformed or stale records fail closed without signalling.
+For legacy `ps:` owner identities, a failed, timed-out, or empty `ps` probe is
+unknown while the numeric PID still exists, so the existing record is
+preserved. Replacement is allowed only after process absence or an identity
+mismatch is positively proved. Malformed or unprovable records fail closed
+without signalling.
 A failed competing startup therefore cannot overwrite or delete the ready
 runtime's budget, even when both processes inherited the same launcher
 identity.

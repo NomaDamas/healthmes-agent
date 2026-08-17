@@ -568,6 +568,22 @@ def _run_local_runtime(
     )
 
 
+def _run_native_identity_helper(
+    *arguments: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(NATIVE_IDENTITY_HELPER),
+            *arguments,
+        ],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _event_lines(harness: dict[str, object]) -> list[str]:
     return Path(harness["event_log"]).read_text(encoding="utf-8").splitlines()
 
@@ -613,6 +629,166 @@ def test_native_lifecycle_identity_is_stable_across_timezone_and_locale() -> Non
     token = tokens.pop()
     assert token.startswith(("linux:", "darwin:"))
     assert not token.startswith("ps:")
+
+
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") or sys.platform == "darwin"),
+    reason="native atomic directory publication supports Linux and macOS",
+)
+def test_native_record_transitions_are_atomic_and_generation_checked(
+    tmp_path: Path,
+) -> None:
+    data = tmp_path / "data"
+    runtime = data / "runtime"
+    runtime.mkdir(parents=True)
+    transition_lock = data / ".runtime-transition.lock"
+    canonical = runtime / "canonical"
+    first_stage = runtime / ".stage-first"
+    first_stage.mkdir()
+    (first_stage / "record").write_text("first\n", encoding="ascii")
+
+    _run_native_identity_helper(
+        "rename-exclusive",
+        str(first_stage),
+        str(canonical),
+        "--lock-path",
+        str(transition_lock),
+    )
+
+    competing_stage = runtime / ".stage-competing"
+    competing_stage.mkdir()
+    (competing_stage / "record").write_text(
+        "competing\n",
+        encoding="ascii",
+    )
+    conflict = _run_native_identity_helper(
+        "rename-exclusive",
+        str(competing_stage),
+        str(canonical),
+        "--lock-path",
+        str(transition_lock),
+        check=False,
+    )
+    assert conflict.returncode == 6
+    assert (canonical / "record").read_text(encoding="ascii") == "first\n"
+
+    first_digest = hashlib.sha256(b"first\n").hexdigest()
+    replacement = runtime / ".record-replacement"
+    replacement.write_text("second\n", encoding="ascii")
+    _run_native_identity_helper(
+        "replace-record",
+        str(replacement),
+        str(canonical / "record"),
+        "--lock-path",
+        str(transition_lock),
+        "--expected-record-sha256",
+        first_digest,
+    )
+    assert (canonical / "record").read_text(encoding="ascii") == "second\n"
+
+    stale_replacement = runtime / ".record-stale"
+    stale_replacement.write_text("stale\n", encoding="ascii")
+    stale_replace = _run_native_identity_helper(
+        "replace-record",
+        str(stale_replacement),
+        str(canonical / "record"),
+        "--lock-path",
+        str(transition_lock),
+        "--expected-record-sha256",
+        first_digest,
+        check=False,
+    )
+    assert stale_replace.returncode == 7
+    assert (canonical / "record").read_text(encoding="ascii") == "second\n"
+
+    retired = runtime / ".retired-generation"
+    stale_retire = _run_native_identity_helper(
+        "rename-exclusive",
+        str(canonical),
+        str(retired),
+        "--lock-path",
+        str(transition_lock),
+        "--expected-record-sha256",
+        first_digest,
+        check=False,
+    )
+    assert stale_retire.returncode == 7
+    assert canonical.is_dir()
+
+    second_digest = hashlib.sha256(b"second\n").hexdigest()
+    _run_native_identity_helper(
+        "rename-exclusive",
+        str(canonical),
+        str(retired),
+        "--lock-path",
+        str(transition_lock),
+        "--expected-record-sha256",
+        second_digest,
+    )
+    assert not canonical.exists()
+    assert (retired / "record").read_text(encoding="ascii") == "second\n"
+
+    next_stage = runtime / ".stage-next"
+    next_stage.mkdir()
+    (next_stage / "record").write_text("next\n", encoding="ascii")
+    _run_native_identity_helper(
+        "rename-exclusive",
+        str(next_stage),
+        str(canonical),
+        "--lock-path",
+        str(transition_lock),
+    )
+    assert (canonical / "record").read_text(encoding="ascii") == "next\n"
+
+
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") or sys.platform == "darwin"),
+    reason="native atomic directory publication supports Linux and macOS",
+)
+def test_native_concurrent_publishers_choose_one_complete_generation(
+    tmp_path: Path,
+) -> None:
+    data = tmp_path / "data"
+    runtime = data / "runtime"
+    runtime.mkdir(parents=True)
+    transition_lock = data / ".runtime-transition.lock"
+    canonical = runtime / "canonical"
+    stages: list[Path] = []
+    processes: list[subprocess.Popen[str]] = []
+    for index in range(2):
+        stage = runtime / f".stage-{index}"
+        stage.mkdir()
+        (stage / "record").write_text(
+            f"generation-{index}\n",
+            encoding="ascii",
+        )
+        stages.append(stage)
+        processes.append(
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    str(NATIVE_IDENTITY_HELPER),
+                    "rename-exclusive",
+                    str(stage),
+                    str(canonical),
+                    "--lock-path",
+                    str(transition_lock),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        )
+
+    results = [process.communicate(timeout=5) for process in processes]
+    returncodes = sorted(process.returncode for process in processes)
+
+    assert returncodes == [0, 6], results
+    assert (canonical / "record").read_text(encoding="ascii") in {
+        "generation-0\n",
+        "generation-1\n",
+    }
+    assert sum(stage.exists() for stage in stages) == 1
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
@@ -820,7 +996,7 @@ def test_decision_runtime_mutations_use_one_cross_process_lifecycle_lock() -> No
     )
     lock_writer = _function_body(
         text,
-        "write_decision_runtime_lifecycle_lock",
+        "write_decision_runtime_lifecycle_lock_record",
     )
     for field in (
         "operation",
@@ -960,8 +1136,23 @@ def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
         in development
     )
     assert (
-        "the incomplete lock has no provable owner. It is deliberately "
-        "preserved as `unknown`"
+        "publishes the whole directory with an OS-native exclusive rename "
+        "under the permanent transition mutex"
+    ) in development
+    assert (
+        "Canonical lock directories are therefore never intentionally "
+        "visible without a complete record"
+    ) in development
+    assert (
+        "Removal similarly verifies the record digest and atomically retires "
+        "the whole directory"
+    ) in development
+    assert (
+        "An ownerless empty directory contains no identity evidence, so it "
+        "remains `unknown`"
+    ) in development
+    assert (
+        "The transition mutex is intentionally retained across uninstall"
     ) in development
     assert (
         "start atomically creates the version-2 "
@@ -1004,6 +1195,14 @@ def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
         "An existing malformed record is preserved byte-for-byte"
         in development
     )
+    assert (
+        "a failed, timed-out, or empty `ps` probe is unknown while the "
+        "numeric PID still exists"
+    ) in development
+    assert (
+        "Replacement is allowed only after process absence or an identity "
+        "mismatch is positively proved"
+    ) in development
     assert (
         "the supervisor first reaps that exact subprocess handle"
         in development
@@ -1961,6 +2160,256 @@ def test_incomplete_lifecycle_lock_fails_closed_and_is_preserved(
     )
 
 
+def test_abandoned_transition_artifacts_do_not_block_new_generations(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    artifacts = (
+        runtime / ".lifecycle-lock-stage.interrupted",
+        runtime / ".lifecycle-lock-retired.interrupted",
+        runtime / ".startup-lease-stage.interrupted",
+        runtime / ".startup-lease-retired.interrupted",
+    )
+    for artifact in artifacts:
+        artifact.mkdir()
+        (artifact / "record").write_text(
+            "non-authoritative\n",
+            encoding="ascii",
+        )
+
+    result = _run_local_runtime(harness, "stop")
+
+    assert result.returncode == 0
+    assert all(artifact.exists() for artifact in artifacts)
+    assert not (
+        runtime / "hermes-decision-lifecycle-lock"
+    ).exists()
+    assert not (
+        runtime / "hermes-decision-startup-lease"
+    ).exists()
+
+
+@pytest.mark.parametrize("orphan_location", ("internal-temp", "external-backup"))
+def test_interrupted_lifecycle_record_is_restored_then_recovered(
+    tmp_path: Path,
+    orphan_location: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    lock = _write_decision_lifecycle_lock(runtime)
+    orphan = (
+        lock / ".record.interrupted"
+        if orphan_location == "internal-temp"
+        else runtime / ".lifecycle-lock-record.interrupted"
+    )
+    (lock / "record").replace(orphan)
+
+    result = _run_local_runtime(harness, "stop")
+
+    assert "restored an interrupted decision runtime lifecycle owner record" in (
+        result.stdout
+    )
+    assert "recovered stale decision runtime lifecycle lock" in result.stdout
+    assert not lock.exists()
+    assert not orphan.exists()
+
+
+def test_interrupted_lifecycle_record_with_live_owner_is_preserved(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    lock = _write_decision_lifecycle_lock(
+        runtime,
+        owner_pid="4242",
+        owner_start_token="ps:Mon Aug  3 12:00:00 2026",
+    )
+    orphan = runtime / ".lifecycle-lock-record.interrupted"
+    (lock / "record").replace(orphan)
+
+    result = _run_local_runtime(harness, "stop", check=False)
+
+    assert result.returncode != 0
+    assert "publication is still owned by a live process" in result.stderr
+    assert lock.is_dir()
+    assert not (lock / "record").exists()
+    assert orphan.exists()
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+def test_interrupted_lifecycle_record_with_unknown_owner_fails_closed(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    lock = _write_decision_lifecycle_lock(
+        runtime,
+        owner_pid="888888",
+    )
+    orphan = runtime / ".lifecycle-lock-record.interrupted"
+    (lock / "record").replace(orphan)
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={
+            "HEALTHMES_PS_BIN": str(tmp_path / "missing-ps"),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "orphan owner identity is unknown" in result.stderr
+    assert lock.is_dir()
+    assert not (lock / "record").exists()
+    assert orphan.exists()
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+@pytest.mark.parametrize("orphan_location", ("internal-temp", "external-backup"))
+def test_interrupted_startup_lease_record_is_restored_then_recovered(
+    tmp_path: Path,
+    orphan_location: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    lease = _write_decision_startup_lease(
+        runtime,
+        phase="intent",
+    )
+    orphan = (
+        lease / ".record.interrupted"
+        if orphan_location == "internal-temp"
+        else runtime / ".startup-lease-record.interrupted"
+    )
+    (lease / "record").replace(orphan)
+
+    result = _run_local_runtime(harness, "stop")
+
+    assert "restored an interrupted decision runtime startup lease record" in (
+        result.stdout
+    )
+    assert "recovered stale decision runtime startup intent" in result.stdout
+    assert not lease.exists()
+    assert not orphan.exists()
+
+
+def test_interrupted_startup_lease_record_with_unknown_owner_fails_closed(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    lease = _write_decision_startup_lease(
+        runtime,
+        phase="intent",
+        owner_pid="888888",
+    )
+    orphan = runtime / ".startup-lease-record.interrupted"
+    (lease / "record").replace(orphan)
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={
+            "HEALTHMES_PS_BIN": str(tmp_path / "missing-ps"),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "orphan owner identity is unknown" in result.stderr
+    assert lease.is_dir()
+    assert not (lease / "record").exists()
+    assert orphan.exists()
+
+
+def test_interrupted_startup_lease_record_with_live_owner_is_preserved(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    lease = _write_decision_startup_lease(
+        runtime,
+        phase="intent",
+        owner_start_token="ps:Mon Aug 17 10:00:00 2026",
+    )
+    orphan = runtime / ".startup-lease-record.interrupted"
+    (lease / "record").replace(orphan)
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={"FAKE_ABSENT_PIDS": "999999"},
+    )
+
+    assert result.returncode != 0
+    assert "publication is still owned by a live process" in result.stderr
+    assert lease.is_dir()
+    assert not (lease / "record").exists()
+    assert orphan.exists()
+    assert not any(
+        event.startswith("kill ")
+        for event in _event_lines(harness)
+    )
+
+
+@pytest.mark.parametrize("record_kind", ("lifecycle", "startup"))
+def test_multiple_interrupted_record_candidates_fail_closed(
+    tmp_path: Path,
+    record_kind: str,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    if record_kind == "lifecycle":
+        directory = _write_decision_lifecycle_lock(runtime)
+        external = runtime / ".lifecycle-lock-record.interrupted"
+    else:
+        directory = _write_decision_startup_lease(
+            runtime,
+            phase="intent",
+        )
+        external = runtime / ".startup-lease-record.interrupted"
+    internal = directory / ".record.interrupted"
+    (directory / "record").replace(internal)
+    external.write_bytes(internal.read_bytes())
+
+    result = _run_local_runtime(harness, "stop", check=False)
+
+    assert result.returncode != 0
+    assert "malformed or has no provable owner" in result.stderr \
+        or "startup lease is invalid" in result.stderr
+    assert directory.is_dir()
+    assert not (directory / "record").exists()
+    assert internal.exists()
+    assert external.exists()
+
+
+def test_empty_legacy_startup_lease_remains_unknown_and_preserved(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    lease = (
+        Path(harness["runtime"])
+        / "hermes-decision-startup-lease"
+    )
+    lease.mkdir(mode=0o700)
+
+    result = _run_local_runtime(harness, "stop", check=False)
+
+    assert result.returncode != 0
+    assert "startup lease is invalid" in result.stderr
+    assert lease.is_dir()
+    assert not (lease / "record").exists()
+
+
 def test_live_lifecycle_lock_times_out_without_mutation(
     tmp_path: Path,
 ) -> None:
@@ -2469,9 +2918,46 @@ def test_uninstall_runs_launch_service_and_cleanup_under_one_lock(
     assert result.returncode == 0
     assert retained_data.read_text(encoding="ascii") == "keep"
     assert not runtime.exists()
+    assert (
+        data_dir / ".hermes-decision-runtime-transition.lock"
+    ).is_file()
     events = _event_lines(harness)
     assert any(line.startswith("launchctl disable ") for line in events)
     assert "dev_mac services-stop" in events
+
+
+def test_uninstall_delete_data_retains_only_permanent_transition_mutex(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    data_dir = runtime.parent
+    (data_dir / "delete-me.db").write_text("remove", encoding="ascii")
+    environment = {
+        **harness["env"],
+        "FAKE_TERM_BEHAVIOR": "exit",
+        "FAKE_KILL_BEHAVIOR": "exit",
+        "FAKE_SUPERVISOR_TERM_BEHAVIOR": "exit",
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(harness["local_script"]),
+            "uninstall",
+            "--delete-data",
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not runtime.exists()
+    assert sorted(path.name for path in data_dir.iterdir()) == [
+        ".hermes-decision-runtime-transition.lock"
+    ]
 
 
 def test_decision_stop_never_deletes_a_competing_launcher_generation(

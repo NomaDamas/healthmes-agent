@@ -7,6 +7,7 @@ import ctypes
 import errno
 import os
 import signal
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -2429,6 +2430,188 @@ def test_legacy_shutdown_budget_remains_readable_for_owner_protection(
         start_token="ps:Mon Aug 17 12:00:00 2026",
         service_nonce="service-nonce",
     )
+
+
+def _write_legacy_budget_owner(
+    path: Path,
+    *,
+    pid: int,
+    start_token: str,
+) -> bytes:
+    payload = "\n".join(
+        (
+            "version\t2",
+            "drain_timeout_seconds\t75",
+            f"supervisor_pid\t{pid}",
+            f"supervisor_start_token\t{start_token}",
+            "service_nonce\tlegacy-service",
+            "publication_instance_nonce\tlegacy-publication",
+            "",
+        )
+    ).encode("ascii")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return payload
+
+
+def _new_shutdown_budget_publication(
+    path: Path,
+) -> _RuntimeShutdownBudgetPublication:
+    supervisor = capture_runtime_supervisor_identity()
+    launcher = capture_runtime_launcher_identity(
+        {},
+        supervisor_identity=supervisor,
+    )
+    return _RuntimeShutdownBudgetPublication(
+        path=path,
+        record=HermesRuntimeShutdownBudgetRecord(
+            drain_timeout_seconds=75,
+            launcher_pid=launcher.pid,
+            launcher_start_token=launcher.start_token,
+            launcher_service_nonce=launcher.service_nonce,
+            supervisor_pid=supervisor.pid,
+            supervisor_start_token=supervisor.start_token,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "probe_error",
+    (
+        OSError("simulated ps execution failure"),
+        subprocess.TimeoutExpired(cmd=("ps",), timeout=1),
+    ),
+    ids=("os-error", "timeout"),
+)
+def test_publication_preserves_live_legacy_owner_when_ps_probe_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_error: BaseException,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    original = _write_legacy_budget_owner(
+        path,
+        pid=os.getpid(),
+        start_token="ps:Mon Aug 17 12:00:00 2026",
+    )
+    publication = _new_shutdown_budget_publication(path)
+
+    def fail_ps_probe(*_args: Any, **_kwargs: Any) -> Any:
+        raise probe_error
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.subprocess.run",
+        fail_ps_probe,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="owner identity is unprovable",
+    ):
+        publication.publish()
+
+    assert path.read_bytes() == original
+    publication.remove_if_owned()
+    assert path.read_bytes() == original
+
+
+def test_publication_replaces_legacy_budget_only_after_owner_is_proved_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    legacy_pid = 987_654_321
+    _write_legacy_budget_owner(
+        path,
+        pid=legacy_pid,
+        start_token="ps:Mon Aug 17 12:00:00 2026",
+    )
+    publication = _new_shutdown_budget_publication(path)
+    real_kill = os.kill
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(1, ("ps",))
+        ),
+    )
+
+    def prove_absent(pid: int, sent_signal: int) -> None:
+        if pid == legacy_pid and sent_signal == 0:
+            raise ProcessLookupError
+        real_kill(pid, sent_signal)
+
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.kill",
+        prove_absent,
+    )
+
+    publication.publish()
+
+    assert load_runtime_shutdown_budget(path) == publication.record
+    publication.remove_if_owned()
+    assert not path.exists()
+
+
+def test_publication_replaces_legacy_budget_after_proved_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    _write_legacy_budget_owner(
+        path,
+        pid=os.getpid(),
+        start_token="ps:Mon Aug 17 12:00:00 2026",
+    )
+    publication = _new_shutdown_budget_publication(path)
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=("ps",),
+            returncode=0,
+            stdout="Tue Aug 18 12:00:00 2026\n",
+            stderr="",
+        ),
+    )
+
+    publication.publish()
+
+    assert load_runtime_shutdown_budget(path) == publication.record
+    publication.remove_if_owned()
+    assert not path.exists()
+
+
+def test_publication_rejects_matching_live_legacy_budget_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "stop-budget"
+    expected_token = "ps:Mon Aug 17 12:00:00 2026"
+    original = _write_legacy_budget_owner(
+        path,
+        pid=os.getpid(),
+        start_token=expected_token,
+    )
+    publication = _new_shutdown_budget_publication(path)
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=("ps",),
+            returncode=0,
+            stdout=f"{expected_token.removeprefix('ps:')}\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="shutdown budget already has a live owner",
+    ):
+        publication.publish()
+
+    assert path.read_bytes() == original
+    publication.remove_if_owned()
+    assert path.read_bytes() == original
 
 
 def test_inherited_launcher_identity_must_match_live_process(

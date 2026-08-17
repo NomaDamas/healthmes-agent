@@ -354,23 +354,43 @@ Identity, generation, digest, contract 중 하나라도 맞지 않으면 구버�
 `update`는 decision stop부터 `git pull`, setup, generation handoff 완료까지
 lock을 잡는다. `uninstall`도 LaunchAgent unload, 앱 stop, `services-stop`,
 runtime/local-data cleanup 전체를 같은 lock 안에서 수행한다. Cleanup 중에는
-lock 디렉터리 자체를 제외하고, 성공 phase를 기록하고 lock을 해제한 뒤 비어 있는
-runtime/data 디렉터리만 `rmdir`로 제거한다. 따라서 중간 코드로 새 start가
-들어오거나 부분 uninstall과 경쟁할 수 없다. Durable 하위 명령은 Bash
-`errexit`가 활성화된 상태로 실행되므로 pull, setup, service stop, cleanup 실패가
-뒤의 성공 명령에 가려지지 않으며 transaction은 `repair_required`로 남는다.
-원자적 디렉터리를 만든 직후 owner record를 게시하기 전에 process가 crash한
-경우에는 owner를 증명할 수 없다. 이 불완전 lock은 stale이라고 추측해 지우지
-않고 operator가 확인할 수 있도록 `unknown` 상태로 보존한다.
+lock 디렉터리와 영구
+`data/.hermes-decision-runtime-transition.lock`을 제외한다. 성공 phase를
+기록하고 lifecycle directory를 해제하더라도 이 transition mutex는 uninstall
+뒤에도 남긴다. 그래야 이미 기다리던 process와 새 process가 삭제 전후의 서로
+다른 inode를 lock하는 일이 없다. 따라서 중간 코드로 새 start가 들어오거나 부분
+uninstall과 경쟁할 수 없다. Durable 하위 명령은 Bash `errexit`가 활성화된
+상태로 실행되므로 pull, setup, service stop, cleanup 실패가 뒤의 성공 명령에
+가려지지 않으며 transaction은 `repair_required`로 남는다.
+
+Lifecycle 획득은 먼저 sibling staging directory 안에 완전한 owner record를
+작성하고, 영구 transition mutex를 잡은 상태에서 OS-native exclusive rename으로
+디렉터리 전체를 canonical 경로에 게시한다. 따라서 canonical lock directory가
+record 없이 새로 노출되는 상태를 만들지 않는다. Phase rewrite는 canonical
+directory 밖의 temp file을 사용하고, 같은 mutex 안에서 미리 읽은 record
+SHA-256가 여전히 일치할 때만 atomic replace한다. 삭제도 같은 digest를 확인한 뒤
+canonical directory 전체를 retired 경로로 atomic rename하고, retired artifact
+정리만 best effort로 수행한다. 어느 지점에서 SIGKILL이 발생해도 새 empty
+canonical directory는 남지 않으며, 남은 staging/write-temp/retired artifact는
+non-authoritative라서 다음 generation을 막지 않는다.
+
+이전 launcher의 중단 상태와 호환하기 위해 정확히 하나의 유효한
+`.record.*`, `.lifecycle-lock-record.*`, `.startup-lease-record.*` candidate가
+있으면 recorded owner가 확실히 사라졌고 stale grace도 지난 경우에만 복구한다.
+Owner가 live 또는 unreadable이거나 candidate가 여러 개, malformed, symlink,
+중간 변경 상태이면 모두 보존하고 fail closed한다. Candidate조차 없는 ownerless
+empty legacy directory는 identity 근거가 없으므로 임의 삭제하지 않고 명시적
+operator repair가 필요한 `unknown`으로 남긴다.
 
 이 lock을 보유한 start는 Bash wrapper를 실행하기 전에 version 2
-`data/runtime/hermes-decision-startup-lease/`를 원자적으로 만든다. Lease에는
-`created_at_epoch`, `updated_at_epoch`, startup owner identity, launcher
-service nonce와 `intent`, `spawned`, `identity_verified`, `failed` phase가
-기록된다. 새 wrapper의 첫 관리 동작은 자신의 PID로 `spawned`를 게시한 뒤 PID
-tombstone을 쓰는 것이다. 두 게시가 모두 성공하기 전에는 Python supervisor를
-시작하지 않는다. Parent는 다섯 개 `ps` identity 필드를 검증해 완전한 metadata를
-쓴 뒤 `identity_verified`를 게시하고, 동일한 lease generation만 제거한다.
+`data/runtime/hermes-decision-startup-lease/`를 같은 complete-stage/exclusive-
+rename protocol로 원자적으로 만든다. Lease에는 `created_at_epoch`,
+`updated_at_epoch`, startup owner identity, launcher service nonce와 `intent`,
+`spawned`, `identity_verified`, `failed` phase가 기록된다. 새 wrapper의 첫 관리
+동작은 자신의 PID로 `spawned`를 게시한 뒤 PID tombstone을 쓰는 것이다. 두
+게시가 모두 성공하기 전에는 Python supervisor를 시작하지 않는다. Parent는 다섯
+개 `ps` identity 필드를 검증해 완전한 metadata를 쓴 뒤 `identity_verified`를
+게시하고, 동일한 lease generation만 제거한다.
 
 Startup owner가 crash하면 stop은 3초의 bounded publication grace 동안 동일
 세대 v3 budget을 반복 조회한다. Matching v3 budget이 나타나면 PID tombstone
@@ -394,7 +414,10 @@ Native stop/update는 두 identity를 모두 검증하고, TERM은 native identi
 검증한 실제 Python supervisor에 보낸다. 따라서 Bash launcher가 먼저 죽거나
 metadata가 없어도 살아 있는 supervisor가 Hermes descendant를 drain하고 reap할
 기회를 잃지 않는다. v1/v2 record는 기존 launcher가 검증될 때만 보수적인
-317초 대기로 호환하며 짧은 값을 신뢰하지 않는다. 형식이 잘못됐거나 identity를
+317초 대기로 호환하며 짧은 값을 신뢰하지 않는다. Legacy `ps:` owner 조회가
+실패하거나 timeout, empty output이면 숫자 PID가 살아 있는 동안은 `unknown`으로
+처리해 기존 budget을 보존한다. Process 부재 또는 start identity mismatch가
+확실히 증명된 경우에만 새 record로 교체한다. 형식이 잘못됐거나 identity를
 증명할 수 없으면 숫자 PID로 fallback하지 않고 metadata를 보존한 채 fail
 closed한다. 같은 launcher identity를 상속한 두 번째 startup이 실패해도 기존
 runtime의 종료 record를 덮어쓰거나 삭제할 수 없다. 기존 record가 malformed이면
