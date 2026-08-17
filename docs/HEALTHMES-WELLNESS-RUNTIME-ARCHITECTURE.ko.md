@@ -483,12 +483,16 @@ Apple authorization
 저장소 코드가 제공하는 lifecycle:
 
 ```text
-권한 승인 성공 -> 즉시 첫 sync
+권한 승인 성공 -> absent stable instance CAS 등록 -> 즉시 첫 sync
 foreground     -> catch-up sync
 background     -> OS가 허용한 기회에 best-effort sync
 offline        -> bounded outbox 후 다음 기회에 재전송
 설정 변경      -> 같은 single-flight pipeline 재실행
 ```
+
+등록은 기존 input-control descriptor/ETag 계약으로만 수행하며, 기존
+disabled/paused instance는 자동으로 다시 enable하지 않는다. foreground,
+background와 observer 경로는 중앙 설정을 읽기만 한다.
 
 일반/미지원 빌드는 사용시간 0을 위조하지 않고 unavailable을 보고한다.
 
@@ -496,7 +500,7 @@ offline        -> bounded outbox 후 다음 기회에 재전송
 
 - App & Website Usage entitlement 승인
 - 실제 Team ID와 provisioning/signing
-- 지원 OS, 지역과 Apple Account 조건
+- iOS 26.4 이상, EU 기기·Apple Account와 단일 data-access 앱 조건
 - 실제 iPhone dogfood
 
 따라서 “자동 수집”은 지원 조건과 사용자 승인이 충족된 뒤 lifecycle 기회마다

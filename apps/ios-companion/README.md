@@ -268,18 +268,25 @@ UI-neutral. The app lifecycle is connected now:
 ```text
 explicit device-UI opt-in
   -> requestAuthorizationAndSync()
-  -> successful authorization immediately enters sync
+  -> aggregate + granted authorization
+  -> register absent stable collector through input-control CAS
+  -> first sync
 
 app active / pairing changed / saved input configuration
   / Screen Time BGAppRefreshTask
+  -> read-only central-state check
   -> the same single-flight sync + persistent outbox pipeline
 ```
 
 The device team still owns the settings screen. It should call
-`requestAuthorizationAndSync()` only after an explicit user action and
+`requestAuthorizationAndSync()` only after pairing and an explicit user action;
+an unpaired call fails before opening Apple's authorization UI. It should call
 `approveExcludedAppsAndSync(_:)` after confirming the exact opaque exclusion
 set. After a successful input-setting or retention revision, it should call
 `inputConfigurationDidChange()` so the saved configuration gets a fresh sync.
+It must not duplicate collector registration: successful explicit
+authorization bootstraps an absent stable instance through the existing input
+settings contract before first sync.
 Foreground catch-up, pairing changes, and best-effort background scheduling
 are already wired in `HealthMesCompanionApp` and
 `ScreenTimeActivityRuntime`. A timezone change is detected on the next
@@ -289,7 +296,13 @@ Cold launch, foreground activation, authorization-status notifications, and
 background refresh never call Apple's authorization UI. They only inspect the
 current status and sync when the user has already opted in. The sole
 authorization entry point is the explicit device-team
-`requestAuthorizationAndSync()` seam.
+`requestAuthorizationAndSync()` seam. Automatic lifecycle and authorization
+status callbacks never write input settings or re-enable a centrally disabled
+or paused collector. Local opt-out cancels and awaits any in-flight explicit
+authorization/bootstrap task before purging its outbox, state, and key.
+A pairing change also cancels bootstrap before first sync; the explicit action
+must be retried against the current pairing if that node has no registered
+instance.
 
 Each sync fetches the paired HealthMes node's current device collection
 settings, removes excluded apps on-device, replaces bundle identifiers with
@@ -303,10 +316,16 @@ later first grant cannot backfill from the earlier denial date.
 
 The collector ID is derived from the same device-only Keychain key as the app
 pseudonym namespace rather than `identifierForVendor`. A new
-`ios-collector-v1-*` identity is disabled server-side until the unified input
-settings endpoint explicitly enables it. Losing the Keychain key therefore
-cannot silently create an enabled collector with an empty private-app
-exclusion list.
+`ios-collector-v1-<40 lowercase hex>` identity is disabled server-side by
+default. After explicit authorization returns `aggregate + granted`, the
+runtime reads `GET /v1/inputs/activity.ios-screentime` and, only when that
+identity is absent, sends a CAS `PUT` containing only `instance_id`,
+`platform: "ios"`, and `enabled: true`. A revision conflict causes a bounded
+re-read/retry. An instance created disabled or paused by another writer is
+authoritative and is never overwritten. Malformed descriptors, ETag mismatch,
+transport/auth/server errors, and exhausted conflicts fail closed before
+collection. Losing the Keychain key therefore cannot copy exclusions or
+silently reactivate an existing centrally disabled collector.
 
 The sync core fingerprints the device-only HMAC key locally and binds approval
 to the SHA-256 digest of the exact sorted exclusion-token set. If the key or
@@ -394,13 +413,17 @@ collection additionally requires a supporting SDK and iOS release, a signed
 provisioning profile whose App ID includes both `Family Controls` and
 `Family Controls App and Website Usage`, and user authorization that reaches
 `approvedWithDataAccess`. Family Controls permission is required before App
-Store submission. Customer installations can use the export only while the
-device is in the EU and its Apple Account country or region is also in the
-EU; Apple-provisioned development/test builds may be exercised in other
-regions. None of signing-profile eligibility, runtime authorization, region
-eligibility, or real-iPhone behavior is proved by this repository's unsigned
-builds. The settings UI is also still device-team work. See
-`docs/INPUT-CONTROL-PLANE.ko.md`.
+Store submission. Both `approvedWithDataAccess` and
+`DeviceActivityData.activityData(filteredBy:using:)` are available starting
+with iOS 26.4. Customer installations can use the export only while the device
+is in the EU and its Apple Account country or region is also in the EU;
+Apple-provisioned development/test builds may be exercised in other regions.
+Only one app per device can hold `approvedWithDataAccess`; granting it to
+another app resets the previous app to `.notDetermined`. None of signing-
+profile eligibility, runtime authorization, region eligibility, single-app
+authorization ownership, or real-iPhone behavior is proved by this
+repository's unsigned builds. The settings UI is also still device-team work.
+See `docs/INPUT-CONTROL-PLANE.ko.md`.
 
 **Not yet verified (honest list):**
 

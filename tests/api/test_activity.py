@@ -548,7 +548,7 @@ def test_collection_state_exposes_raw_retention_cutoff(client, session) -> None:
     assert cutoff <= after - timedelta(days=1)
 
 
-def test_versioned_ios_collector_requires_explicit_input_registration(
+def test_ios_authorization_bootstrap_then_central_disable_is_authoritative(
     client,
 ) -> None:
     device_id = "ios-collector-v1-" + ("a" * 40)
@@ -579,6 +579,26 @@ def test_versioned_ios_collector_requires_explicit_input_registration(
         "/v1/activity/ios/report",
         json={**payload, "collection_revision": 1},
     )
+    latest_revision = client.get(
+        "/v1/inputs/activity.ios-screentime"
+    ).json()["revision"]
+    disabled = client.put(
+        "/v1/inputs/activity.ios-screentime/settings",
+        headers={"If-Match": f'"{latest_revision}"'},
+        json={
+            "instance_id": device_id,
+            "enabled": False,
+        },
+    )
+    later_payload = _ios_snapshot(
+        device_id=device_id,
+        sequence=2,
+        samples=[],
+    )
+    blocked_after_disable = client.post(
+        "/v1/activity/ios/report",
+        json={**later_payload, "collection_revision": 2},
+    )
 
     assert state.status_code == 200
     assert state.json()["enabled"] is False
@@ -587,6 +607,14 @@ def test_versioned_ios_collector_requires_explicit_input_registration(
     assert blocked.json()["error"]["code"] == "activity_collection_blocked"
     assert registered.status_code == 200
     assert accepted.status_code == 200
+    assert accepted.json()["accepted"] == 0
+    assert disabled.status_code == 200
+    assert disabled.json()["instances"][0]["enabled"] is False
+    assert blocked_after_disable.status_code == 409
+    assert (
+        blocked_after_disable.json()["error"]["code"]
+        == "activity_collection_blocked"
+    )
 
 
 def test_collection_settings_reject_invalid_ios_exclusion_namespaces(

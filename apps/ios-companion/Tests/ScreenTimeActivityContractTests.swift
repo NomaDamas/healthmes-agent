@@ -741,6 +741,145 @@ final class ScreenTimeActivityContractTests: XCTestCase {
         XCTAssertNil(recovered.pseudonymKeyData)
     }
 
+    func testAuthorizationBootstrapUsesInputDescriptorCASOnly() throws {
+        let deviceID =
+            "ios-collector-v1-" + String(repeating: "a", count: 40)
+        let revision =
+            "sha256:" + String(repeating: "1", count: 64)
+
+        let descriptorRequest =
+            ScreenTimeActivityHTTP.inputDescriptorRequest(
+                pairing: pairing
+            )
+        let settingsRequest =
+            try ScreenTimeActivityHTTP.inputSettingsRequest(
+                pairing: pairing,
+                deviceID: deviceID,
+                revision: revision
+            )
+        let body = try XCTUnwrap(settingsRequest.httpBody)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body)
+                as? [String: Any]
+        )
+
+        XCTAssertTrue(
+            ScreenTimeDeviceIdentity.isStableCollectorID(deviceID)
+        )
+        XCTAssertFalse(
+            ScreenTimeDeviceIdentity.isStableCollectorID(
+                deviceID.uppercased()
+            )
+        )
+        XCTAssertEqual(
+            descriptorRequest.url?.absoluteString,
+            "http://192.168.1.20:8100/v1/inputs/"
+                + "activity.ios-screentime"
+        )
+        XCTAssertEqual(descriptorRequest.httpMethod, "GET")
+        XCTAssertEqual(
+            settingsRequest.url?.absoluteString,
+            "http://192.168.1.20:8100/v1/inputs/"
+                + "activity.ios-screentime/settings"
+        )
+        XCTAssertEqual(settingsRequest.httpMethod, "PUT")
+        XCTAssertEqual(
+            settingsRequest.value(
+                forHTTPHeaderField: "If-Match"
+            ),
+            "\"\(revision)\""
+        )
+        XCTAssertEqual(object["instance_id"] as? String, deviceID)
+        XCTAssertEqual(object["platform"] as? String, "ios")
+        XCTAssertEqual(object["enabled"] as? Bool, true)
+        XCTAssertNil(object["excluded_apps"])
+        XCTAssertNil(object["paused_until"])
+        XCTAssertNil(object["retention"])
+    }
+
+    func testInputDescriptorTransportRequiresMatchingStrongETag()
+        async throws
+    {
+        let revision =
+            "sha256:" + String(repeating: "1", count: 64)
+        let body = try JSONSerialization.data(
+            withJSONObject: [
+                "source_id": "activity.ios-screentime",
+                "instances": [],
+                "revision": revision,
+            ]
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let transport = URLSessionScreenTimeActivityTransport(
+            session: URLSession(configuration: configuration)
+        )
+        defer {
+            StubURLProtocol.handler = nil
+        }
+
+        for headers in [
+            [:],
+            ["ETag": "\"sha256:"
+                + String(repeating: "2", count: 64)
+                + "\""],
+        ] {
+            StubURLProtocol.handler = { _ in
+                (200, headers, body)
+            }
+            do {
+                _ = try await transport.inputDescriptor(
+                    pairing: pairing
+                )
+                XCTFail("expected invalid descriptor")
+            } catch let error as ScreenTimeInputControlError {
+                XCTAssertEqual(error, .invalidDescriptor)
+            }
+        }
+
+        StubURLProtocol.handler = { _ in
+            (200, ["ETag": "\"\(revision)\""], body)
+        }
+        let descriptor = try await transport.inputDescriptor(
+            pairing: pairing
+        )
+        XCTAssertEqual(descriptor.revision, revision)
+    }
+
+    func testInputDescriptorTransportRejectsMalformedBodyRevision()
+        async throws
+    {
+        let revision =
+            "sha256:" + String(repeating: "A", count: 64)
+        let body = try JSONSerialization.data(
+            withJSONObject: [
+                "source_id": "activity.ios-screentime",
+                "instances": [],
+                "revision": revision,
+            ]
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let transport = URLSessionScreenTimeActivityTransport(
+            session: URLSession(configuration: configuration)
+        )
+        defer {
+            StubURLProtocol.handler = nil
+        }
+        StubURLProtocol.handler = { _ in
+            (200, ["ETag": "\"\(revision)\""], body)
+        }
+
+        do {
+            _ = try await transport.inputDescriptor(
+                pairing: pairing
+            )
+            XCTFail("expected invalid descriptor")
+        } catch let error as ScreenTimeInputControlError {
+            XCTAssertEqual(error, .invalidDescriptor)
+        }
+    }
+
     func testCollectionStateDecodesForFutureSettingsUI() throws {
         let appToken = iosAppToken()
         let json = """

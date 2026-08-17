@@ -495,14 +495,317 @@ private actor ScreenTimeLifecycleOfflineStateTransport:
     }
 }
 
+private enum ScreenTimeLifecycleEnableAction {
+    case succeed
+    case conflict
+    case conflictWithDisabledInstance
+    case fail(HealthMesAPIError)
+}
+
+private actor ScreenTimeLifecycleRegistrationTransport:
+    ScreenTimeActivityTransport
+{
+    private let deviceID: String
+    private var descriptor: ScreenTimeInputDescriptor
+    private var state: ScreenTimeCollectionState
+    private var enableActions: [ScreenTimeLifecycleEnableAction]
+    private var descriptorError: HealthMesAPIError?
+    private var descriptorCalls = 0
+    private var enableCalls = 0
+    private var collectionStateCalls = 0
+    private var reports: [ScreenTimeActivityReport] = []
+
+    init(
+        deviceID: String,
+        enableActions: [ScreenTimeLifecycleEnableAction] = [
+            .succeed
+        ],
+        descriptorError: HealthMesAPIError? = nil
+    ) {
+        self.deviceID = deviceID
+        descriptor = ScreenTimeInputDescriptor(
+            sourceID: ScreenTimeInputDescriptor.sourceID,
+            instances: [],
+            revision: "sha256:" + String(repeating: "0", count: 64)
+        )
+        state = ScreenTimeCollectionState(
+            deviceID: deviceID,
+            enabled: false,
+            excludedApps: [],
+            pausedUntil: nil,
+            effectiveCollecting: false,
+            blockedReason: "collection_disabled",
+            configRevision: 0,
+            rawRetentionCutoff: nil
+        )
+        self.enableActions = enableActions
+        self.descriptorError = descriptorError
+    }
+
+    func inputDescriptor(
+        pairing _: Pairing
+    ) async throws -> ScreenTimeInputDescriptor {
+        descriptorCalls += 1
+        if let descriptorError {
+            throw descriptorError
+        }
+        return descriptor
+    }
+
+    func enableInput(
+        pairing _: Pairing,
+        deviceID: String,
+        revision: String
+    ) async throws -> ScreenTimeInputDescriptor {
+        enableCalls += 1
+        guard revision == descriptor.revision else {
+            throw revisionConflict()
+        }
+        let action = enableActions.isEmpty
+            ? .succeed
+            : enableActions.removeFirst()
+        switch action {
+        case .succeed:
+            setCentralState(enabled: true, revisionNumber: 1)
+            return descriptor
+        case .conflict:
+            descriptor = ScreenTimeInputDescriptor(
+                sourceID: ScreenTimeInputDescriptor.sourceID,
+                instances: descriptor.instances,
+                revision:
+                    "sha256:"
+                    + String(
+                        repeating: String(enableCalls + 1),
+                        count: 64
+                    )
+            )
+            throw revisionConflict()
+        case .conflictWithDisabledInstance:
+            setCentralState(enabled: false, revisionNumber: 1)
+            throw revisionConflict()
+        case .fail(let error):
+            throw error
+        }
+    }
+
+    func collectionState(
+        pairing _: Pairing,
+        deviceID _: String
+    ) async throws -> ScreenTimeCollectionState {
+        collectionStateCalls += 1
+        return state
+    }
+
+    func upload(
+        pairing _: Pairing,
+        report: ScreenTimeActivityReport
+    ) async throws -> ScreenTimeActivityBatchResult {
+        reports.append(report)
+        return ScreenTimeActivityBatchResult(
+            accepted: 1,
+            created: 1,
+            updated: 0,
+            duplicates: 0,
+            excluded: 0,
+            tombstoned: 0,
+            affectedDates: ["2026-08-16"]
+        )
+    }
+
+    func disableCentrally() {
+        setCentralState(enabled: false, revisionNumber: 2)
+    }
+
+    func pauseCentrally(until: Date) {
+        setCentralState(
+            enabled: true,
+            revisionNumber: 2,
+            pausedUntil: until
+        )
+    }
+
+    func captured() -> (
+        descriptor: Int,
+        enable: Int,
+        collectionState: Int,
+        reports: [ScreenTimeActivityReport]
+    ) {
+        (
+            descriptorCalls,
+            enableCalls,
+            collectionStateCalls,
+            reports
+        )
+    }
+
+    private func setCentralState(
+        enabled: Bool,
+        revisionNumber: Int,
+        pausedUntil: Date? = nil
+    ) {
+        descriptor = ScreenTimeInputDescriptor(
+            sourceID: ScreenTimeInputDescriptor.sourceID,
+            instances: [
+                ScreenTimeInputInstance(
+                    instanceID: deviceID,
+                    platform: "ios",
+                    enabled: enabled,
+                    pausedUntil: pausedUntil
+                )
+            ],
+            revision:
+                "sha256:"
+                + String(
+                    repeating: String(revisionNumber),
+                    count: 64
+                )
+        )
+        state = ScreenTimeCollectionState(
+            deviceID: deviceID,
+            enabled: enabled,
+            excludedApps: [],
+            pausedUntil: pausedUntil,
+            effectiveCollecting:
+                enabled && pausedUntil == nil,
+            blockedReason:
+                !enabled
+                ? "collection_disabled"
+                : pausedUntil == nil
+                    ? nil
+                    : "collection_paused",
+            configRevision: revisionNumber,
+            rawRetentionCutoff: nil
+        )
+    }
+
+    private func revisionConflict() -> HealthMesAPIError {
+        HealthMesAPIError.server(
+            statusCode: 409,
+            code: "input_settings_revision_conflict",
+            message: "stale input descriptor",
+            detail: nil
+        )
+    }
+}
+
+private actor ScreenTimeLifecycleBlockingRegistrationService:
+    ScreenTimeActivitySyncing
+{
+    private var registrationWaiters:
+        [CheckedContinuation<Void, Never>] = []
+    private var registrationStartedWaiters:
+        [CheckedContinuation<Void, Never>] = []
+    private var authorizationCalls = 0
+    private var registrationCalls = 0
+    private var registrationCancellations = 0
+    private var syncCalls = 0
+    private var syncPairings: [Pairing] = []
+    private var disableCalls = 0
+
+    func requestAuthorization() async throws
+        -> ScreenTimeCollectorResult
+    {
+        authorizationCalls += 1
+        return ScreenTimeCollectorResult(
+            capability: .aggregate,
+            permissionStatus: .granted,
+            reason: nil,
+            samples: []
+        )
+    }
+
+    func registerAuthorizedCollector(
+        pairing _: Pairing
+    ) async throws {
+        registrationCalls += 1
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                registrationWaiters.append(continuation)
+                let startedWaiters =
+                    registrationStartedWaiters
+                registrationStartedWaiters.removeAll()
+                startedWaiters.forEach { $0.resume() }
+            }
+        } onCancel: {
+            Task {
+                await self.cancelRegistration()
+            }
+        }
+        try Task.checkCancellation()
+    }
+
+    func approveExcludedApps(
+        _: Set<String>
+    ) async throws {}
+
+    func sync(
+        pairing: Pairing,
+        now _: Date,
+        timezone _: TimeZone,
+        trigger _: ScreenTimeSyncTrigger
+    ) async throws -> ScreenTimeSyncOutcome {
+        syncCalls += 1
+        syncPairings.append(pairing)
+        return .skipped(reason: "unexpected")
+    }
+
+    func reconcilePendingUploads(
+        pairing _: Pairing?
+    ) async throws {}
+
+    func disableAndPurge(now _: Date) async throws {
+        disableCalls += 1
+    }
+
+    func waitUntilRegistrationStarts() async {
+        guard registrationCalls == 0 else { return }
+        await withCheckedContinuation { continuation in
+            registrationStartedWaiters.append(continuation)
+        }
+    }
+
+    func completeRegistration() {
+        let waiters = registrationWaiters
+        registrationWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func calls() -> (
+        authorization: Int,
+        registration: Int,
+        registrationCancellations: Int,
+        sync: Int,
+        syncPairings: [Pairing],
+        disable: Int
+    ) {
+        (
+            authorizationCalls,
+            registrationCalls,
+            registrationCancellations,
+            syncCalls,
+            syncPairings,
+            disableCalls
+        )
+    }
+
+    private func cancelRegistration() {
+        registrationCancellations += 1
+        let waiters = registrationWaiters
+        registrationWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
 private actor ScreenTimeLifecycleMockSyncService:
     ScreenTimeActivitySyncing
 {
     private let authorizationResult: ScreenTimeCollectorResult
     private let syncResult: ScreenTimeSyncOutcome
     private let authorizationError: Error?
+    private let registrationError: Error?
     private let exclusionApprovalError: Error?
     private var authorizationCalls = 0
+    private var registrationCalls = 0
     private var approvedExclusions: [Set<String>] = []
     private var syncCalls = 0
     private var syncTriggers: [ScreenTimeSyncTrigger] = []
@@ -514,11 +817,13 @@ private actor ScreenTimeLifecycleMockSyncService:
         authorizationResult: ScreenTimeCollectorResult,
         syncResult: ScreenTimeSyncOutcome,
         authorizationError: Error? = nil,
+        registrationError: Error? = nil,
         exclusionApprovalError: Error? = nil
     ) {
         self.authorizationResult = authorizationResult
         self.syncResult = syncResult
         self.authorizationError = authorizationError
+        self.registrationError = registrationError
         self.exclusionApprovalError = exclusionApprovalError
     }
 
@@ -530,6 +835,15 @@ private actor ScreenTimeLifecycleMockSyncService:
             throw authorizationError
         }
         return authorizationResult
+    }
+
+    func registerAuthorizedCollector(
+        pairing _: Pairing
+    ) async throws {
+        registrationCalls += 1
+        if let registrationError {
+            throw registrationError
+        }
     }
 
     func approveExcludedApps(
@@ -565,6 +879,7 @@ private actor ScreenTimeLifecycleMockSyncService:
 
     func calls() -> (
         authorization: Int,
+        registration: Int,
         approvedExclusions: [Set<String>],
         sync: Int,
         syncTriggers: [ScreenTimeSyncTrigger],
@@ -574,6 +889,7 @@ private actor ScreenTimeLifecycleMockSyncService:
     ) {
         (
             authorizationCalls,
+            registrationCalls,
             approvedExclusions,
             syncCalls,
             syncTriggers,
@@ -593,6 +909,7 @@ private actor ScreenTimeLifecycleBlockingAuthorizationService:
     private var authorizationCancellations = 0
     private var authorizationWaiters:
         [CheckedContinuation<Void, Never>] = []
+    private var registrationCalls = 0
     private var syncCalls = 0
     private var disableCalls = 0
 
@@ -619,6 +936,12 @@ private actor ScreenTimeLifecycleBlockingAuthorizationService:
         }
         try Task.checkCancellation()
         return authorizationResult
+    }
+
+    func registerAuthorizedCollector(
+        pairing _: Pairing
+    ) async throws {
+        registrationCalls += 1
     }
 
     func approveExcludedApps(
@@ -652,12 +975,14 @@ private actor ScreenTimeLifecycleBlockingAuthorizationService:
     func calls() -> (
         authorization: Int,
         cancellations: Int,
+        registration: Int,
         sync: Int,
         disable: Int
     ) {
         (
             authorizationCalls,
             authorizationCancellations,
+            registrationCalls,
             syncCalls,
             disableCalls
         )
@@ -4640,9 +4965,431 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         XCTAssertEqual(result.authorization, collectorResult())
         XCTAssertEqual(result.sync, .completed(.uploaded(batch)))
         XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.registration, 1)
         XCTAssertEqual(calls.sync, 1)
         XCTAssertEqual(calls.syncTriggers, [.authorizationChanged])
         XCTAssertTrue(calls.reconciledPairings.isEmpty)
+    }
+
+    @MainActor
+    func testExplicitAuthorizationRegistersFirstSyncButLaterDisableWins()
+        async throws
+    {
+        let deviceID =
+            "ios-collector-v1-" + String(repeating: "a", count: 40)
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let collectorCounter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleRegistrationTransport(
+            deviceID: deviceID
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: deviceID,
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: collectorCounter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let controller = ScreenTimeActivityLifecycleController(
+            syncService: service,
+            pairingProvider: { self.pairing() }
+        )
+        let now = date("2026-08-16T10:34:00Z")
+        let timezone = TimeZone(secondsFromGMT: 0)!
+
+        let first = await controller.requestAuthorizationAndSync(
+            now: now,
+            timezone: timezone
+        )
+
+        guard case .completed(.uploaded) = first.sync else {
+            return XCTFail(
+                "expected authorization bootstrap to upload first sync"
+            )
+        }
+        var transportCalls = await transport.captured()
+        var collectorCalls = await collectorCounter.values()
+        XCTAssertEqual(transportCalls.descriptor, 1)
+        XCTAssertEqual(transportCalls.enable, 1)
+        XCTAssertEqual(transportCalls.reports.count, 1)
+        XCTAssertEqual(collectorCalls.authorization, 1)
+        XCTAssertEqual(collectorCalls.collection, 1)
+
+        await transport.pauseCentrally(
+            until: now.addingTimeInterval(3_600)
+        )
+        let foreground = await controller.catchUp(
+            now: now.addingTimeInterval(60),
+            timezone: timezone
+        )
+        await transport.disableCentrally()
+        let background = await controller.catchUp(
+            now: now.addingTimeInterval(120),
+            timezone: timezone,
+            trigger: .backgroundRefresh
+        )
+        let authorizationObservation =
+            await controller.authorizationDidChange(
+                now: now.addingTimeInterval(180),
+                timezone: timezone
+            )
+
+        XCTAssertEqual(
+            foreground,
+            .completed(.skipped(reason: "collection_paused"))
+        )
+        XCTAssertEqual(
+            background,
+            .completed(.skipped(reason: "collection_disabled"))
+        )
+        XCTAssertEqual(
+            authorizationObservation,
+            .completed(.skipped(reason: "collection_disabled"))
+        )
+        transportCalls = await transport.captured()
+        collectorCalls = await collectorCounter.values()
+        XCTAssertEqual(transportCalls.descriptor, 1)
+        XCTAssertEqual(transportCalls.enable, 1)
+        XCTAssertEqual(transportCalls.reports.count, 1)
+        XCTAssertEqual(collectorCalls.authorization, 1)
+        XCTAssertEqual(collectorCalls.collection, 1)
+    }
+
+    @MainActor
+    func testAuthorizationCASConflictRereadsThenRegisters()
+        async throws
+    {
+        let deviceID =
+            "ios-collector-v1-" + String(repeating: "d", count: 40)
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let collectorCounter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleRegistrationTransport(
+            deviceID: deviceID,
+            enableActions: [.conflict, .succeed]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: deviceID,
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: collectorCounter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let controller = ScreenTimeActivityLifecycleController(
+            syncService: service,
+            pairingProvider: { self.pairing() }
+        )
+
+        let result = await controller.requestAuthorizationAndSync(
+            now: date("2026-08-16T10:34:00Z"),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let transportCalls = await transport.captured()
+
+        guard case .completed(.uploaded) = result.sync else {
+            return XCTFail("expected retry to register and upload")
+        }
+        XCTAssertEqual(transportCalls.descriptor, 2)
+        XCTAssertEqual(transportCalls.enable, 2)
+        XCTAssertEqual(transportCalls.reports.count, 1)
+    }
+
+    @MainActor
+    func testAuthorizationCASConflictExhaustionFailsClosed()
+        async throws
+    {
+        let deviceID =
+            "ios-collector-v1-" + String(repeating: "e", count: 40)
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let collectorCounter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleRegistrationTransport(
+            deviceID: deviceID,
+            enableActions: [.conflict, .conflict, .conflict]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: deviceID,
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: collectorCounter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let controller = ScreenTimeActivityLifecycleController(
+            syncService: service,
+            pairingProvider: { self.pairing() }
+        )
+
+        let result = await controller.requestAuthorizationAndSync()
+        let transportCalls = await transport.captured()
+        let collectorCalls = await collectorCounter.values()
+
+        XCTAssertEqual(
+            result.sync,
+            .failed(reason: "input_settings_revision_conflict")
+        )
+        XCTAssertEqual(transportCalls.descriptor, 4)
+        XCTAssertEqual(transportCalls.enable, 3)
+        XCTAssertEqual(transportCalls.collectionState, 0)
+        XCTAssertTrue(transportCalls.reports.isEmpty)
+        XCTAssertEqual(collectorCalls.collection, 0)
+    }
+
+    @MainActor
+    func testAuthorizationRejectsUnstableCollectorBeforeNetwork()
+        async throws
+    {
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let collectorCounter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleRegistrationTransport(
+            deviceID: "iphone-unstable"
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: "iphone-unstable",
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: collectorCounter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let controller = ScreenTimeActivityLifecycleController(
+            syncService: service,
+            pairingProvider: { self.pairing() }
+        )
+
+        let result = await controller.requestAuthorizationAndSync()
+        let transportCalls = await transport.captured()
+        let collectorCalls = await collectorCounter.values()
+
+        XCTAssertEqual(
+            result.sync,
+            .failed(
+                reason: "ios_screen_time_invalid_collector_identity"
+            )
+        )
+        XCTAssertEqual(transportCalls.descriptor, 0)
+        XCTAssertEqual(transportCalls.enable, 0)
+        XCTAssertEqual(transportCalls.collectionState, 0)
+        XCTAssertTrue(transportCalls.reports.isEmpty)
+        XCTAssertEqual(collectorCalls.collection, 0)
+    }
+
+    @MainActor
+    func testAuthorizationCASConflictKeepsConcurrentCentralDisable()
+        async throws
+    {
+        let deviceID =
+            "ios-collector-v1-" + String(repeating: "b", count: 40)
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let collectorCounter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleRegistrationTransport(
+            deviceID: deviceID,
+            enableActions: [.conflictWithDisabledInstance]
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: deviceID,
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: collectorCounter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let controller = ScreenTimeActivityLifecycleController(
+            syncService: service,
+            pairingProvider: { self.pairing() }
+        )
+
+        let result = await controller.requestAuthorizationAndSync(
+            now: date("2026-08-16T10:34:00Z"),
+            timezone: TimeZone(secondsFromGMT: 0)!
+        )
+        let transportCalls = await transport.captured()
+        let collectorCalls = await collectorCounter.values()
+
+        XCTAssertEqual(
+            result.sync,
+            .completed(.skipped(reason: "collection_disabled"))
+        )
+        XCTAssertEqual(transportCalls.descriptor, 2)
+        XCTAssertEqual(transportCalls.enable, 1)
+        XCTAssertTrue(transportCalls.reports.isEmpty)
+        XCTAssertEqual(collectorCalls.authorization, 1)
+        XCTAssertEqual(collectorCalls.collection, 0)
+    }
+
+    @MainActor
+    func testPairingChangeDuringRegistrationPreventsStaleFirstSync()
+        async
+    {
+        let service =
+            ScreenTimeLifecycleBlockingRegistrationService()
+        let firstPairing = pairing(
+            token: "first",
+            baseURL: "https://first.healthmes.test"
+        )
+        let secondPairing = pairing(
+            token: "second",
+            baseURL: "https://second.healthmes.test"
+        )
+        var currentPairing: Pairing? = firstPairing
+        let controller = ScreenTimeActivityLifecycleController(
+            syncService: service,
+            pairingProvider: { currentPairing }
+        )
+        let authorizationTask = Task { @MainActor in
+            await controller.requestAuthorizationAndSync()
+        }
+        await service.waitUntilRegistrationStarts()
+
+        currentPairing = secondPairing
+        await service.completeRegistration()
+        let result = await authorizationTask.value
+        let calls = await service.calls()
+
+        XCTAssertEqual(
+            result.sync,
+            .failed(reason: "pairing_changed")
+        )
+        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.registration, 1)
+        XCTAssertEqual(calls.registrationCancellations, 0)
+        XCTAssertEqual(calls.sync, 0)
+        XCTAssertTrue(calls.syncPairings.isEmpty)
+    }
+
+    @MainActor
+    func testAuthorizationRegistrationServerErrorFailsClosed()
+        async throws
+    {
+        let deviceID =
+            "ios-collector-v1-" + String(repeating: "c", count: 40)
+        let outboxStorage = temporaryOutbox()
+        defer {
+            try? FileManager.default.removeItem(
+                at: outboxStorage.1
+            )
+        }
+        let stateStorage = isolatedStateStore()
+        defer {
+            stateStorage.1.removePersistentDomain(
+                forName: stateStorage.2
+            )
+        }
+        let collectorCounter = ScreenTimeLifecycleTestCounter()
+        let transport = ScreenTimeLifecycleRegistrationTransport(
+            deviceID: deviceID,
+            descriptorError: .server(
+                statusCode: 503,
+                code: "input_control_unavailable",
+                message: "input control unavailable",
+                detail: nil
+            )
+        )
+        let service = ScreenTimeActivitySyncService(
+            deviceID: deviceID,
+            collector: ScreenTimeLifecycleTestCollector(
+                result: collectorResult(),
+                pseudonymKeyID:
+                    "ios-key-" + String(repeating: "1", count: 40),
+                counter: collectorCounter
+            ),
+            transport: transport,
+            stateStore: stateStorage.0,
+            outbox: outboxStorage.0
+        )
+        let controller = ScreenTimeActivityLifecycleController(
+            syncService: service,
+            pairingProvider: { self.pairing() }
+        )
+
+        let result = await controller.requestAuthorizationAndSync()
+        let transportCalls = await transport.captured()
+        let collectorCalls = await collectorCounter.values()
+
+        XCTAssertEqual(
+            result.sync,
+            .failed(reason: "input_control_unavailable")
+        )
+        XCTAssertEqual(transportCalls.descriptor, 1)
+        XCTAssertEqual(transportCalls.enable, 0)
+        XCTAssertEqual(transportCalls.collectionState, 0)
+        XCTAssertTrue(transportCalls.reports.isEmpty)
+        XCTAssertEqual(collectorCalls.authorization, 1)
+        XCTAssertEqual(collectorCalls.collection, 0)
     }
 
     @MainActor
@@ -4692,12 +5439,13 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
 
         XCTAssertEqual(
             result.sync,
-            .skipped(reason: "not_paired")
+            .failed(reason: "not_paired")
         )
-        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertNil(result.authorization)
+        XCTAssertEqual(calls.authorization, 0)
+        XCTAssertEqual(calls.registration, 0)
         XCTAssertEqual(calls.sync, 0)
-        XCTAssertEqual(calls.reconciledPairings.count, 1)
-        XCTAssertNil(calls.reconciledPairings[0])
+        XCTAssertTrue(calls.reconciledPairings.isEmpty)
     }
 
     @MainActor
@@ -4725,6 +5473,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             )
         )
         XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.registration, 0)
         XCTAssertEqual(calls.sync, 0)
     }
 
@@ -4768,6 +5517,7 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
             XCTAssertEqual(result.authorization, authorization)
             XCTAssertEqual(result.sync, .completed(syncOutcome))
             XCTAssertEqual(calls.authorization, 1)
+            XCTAssertEqual(calls.registration, 0)
             XCTAssertEqual(calls.sync, 1)
             XCTAssertEqual(
                 calls.syncTriggers,
@@ -5291,6 +6041,122 @@ final class ScreenTimeActivityLifecycleTests: XCTestCase {
         let calls = await service.calls()
         XCTAssertEqual(calls.authorization, 1)
         XCTAssertEqual(calls.disable, 1)
+    }
+
+    @MainActor
+    func testOptOutCancelsInFlightAuthorizationBootstrapBeforeSync()
+        async
+    {
+        let suiteName =
+            "healthmes.screen-time.bootstrap-race.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        let service =
+            ScreenTimeLifecycleBlockingRegistrationService()
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { self.pairing() }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: NotificationCenter()
+        )
+        let authorizationTask = Task { @MainActor in
+            await runtime.requestAuthorizationAndSync()
+        }
+        await service.waitUntilRegistrationStarts()
+
+        let disabled = await runtime.clearAuthorizationOptIn()
+        let authorization = await authorizationTask.value
+        let calls = await service.calls()
+
+        XCTAssertEqual(
+            authorization.sync,
+            .failed(reason: "cancelled")
+        )
+        XCTAssertEqual(
+            disabled,
+            .skipped(reason: "ios_screen_time_disabled")
+        )
+        XCTAssertFalse(intentStore.isOptedIn)
+        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.registration, 1)
+        XCTAssertEqual(calls.registrationCancellations, 1)
+        XCTAssertEqual(calls.sync, 0)
+        XCTAssertEqual(calls.disable, 1)
+    }
+
+    @MainActor
+    func testPairingNotificationCancelsInFlightAuthorizationBootstrap()
+        async throws
+    {
+        let suiteName =
+            "healthmes.screen-time.pairing-race.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let intentStore = ScreenTimeAuthorizationIntentStore(
+            defaults: defaults
+        )
+        let service =
+            ScreenTimeLifecycleBlockingRegistrationService()
+        let firstPairing = pairing(
+            token: "first",
+            baseURL: "https://first.healthmes.test"
+        )
+        let secondPairing = pairing(
+            token: "second",
+            baseURL: "https://second.healthmes.test"
+        )
+        var currentPairing: Pairing? = firstPairing
+        let notificationCenter = NotificationCenter()
+        let runtime = ScreenTimeActivityRuntime(
+            lifecycle: ScreenTimeActivityLifecycleController(
+                syncService: service,
+                pairingProvider: { currentPairing }
+            ),
+            authorizationIntentStore: intentStore,
+            backgroundTasks: ScreenTimeLifecycleBackgroundTasks(),
+            notificationCenter: notificationCenter
+        )
+        runtime.register()
+        let authorizationTask = Task { @MainActor in
+            await runtime.requestAuthorizationAndSync()
+        }
+        await service.waitUntilRegistrationStarts()
+
+        currentPairing = secondPairing
+        notificationCenter.post(
+            name: Notification.Name("healthmes.pairing.changed"),
+            object: nil
+        )
+        let authorization = await authorizationTask.value
+        for _ in 0..<400 {
+            let calls = await service.calls()
+            if calls.sync >= 1 {
+                break
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        await runtime.waitForAutomaticWork()
+        let calls = await service.calls()
+
+        XCTAssertEqual(
+            authorization.sync,
+            .failed(reason: "cancelled")
+        )
+        XCTAssertEqual(calls.authorization, 1)
+        XCTAssertEqual(calls.registration, 1)
+        XCTAssertEqual(calls.registrationCancellations, 1)
+        XCTAssertEqual(calls.sync, 1)
+        XCTAssertEqual(calls.syncPairings, [secondPairing])
     }
 
     @MainActor

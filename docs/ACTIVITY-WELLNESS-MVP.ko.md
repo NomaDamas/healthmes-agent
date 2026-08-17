@@ -162,8 +162,10 @@ active activity interval
 - bundle ID는 기기 Keychain의 device-only HMAC key로 가명화한 뒤 업로드하고,
   서버 exclude list도 같은 opaque token을 사용한다.
 - collector ID도 같은 Keychain key에서 `ios-collector-v1-*`로 안정적으로
-  파생한다. 새 ID는 통합 input 설정에서 명시적으로 enable하기 전까지 서버가
-  fail closed하므로 재설치나 key 손실이 기존 private-app 제외를 우회하지 않는다.
+  파생한다. 새 ID는 서버가 기본적으로 fail closed하고, 명시적 Apple authorization
+  성공 뒤에만 UI-neutral runtime이 absent instance를 통합 input 설정 CAS로
+  enable한다. 기존 disabled/paused instance나 private-app 제외를 자동으로
+  덮어쓰지 않으므로 재설치나 key 손실이 기존 privacy 설정을 우회하지 않는다.
 - HMAC key가 바뀌면 `collection_generation`을 증가시키고, 현재 key와 정확한
   제외 token 집합의 digest를 명시적으로 재승인하기 전에는 Screen Time을 읽지
   않는다. 목록을 잠시 비웠다가 되돌리는 방식으로는 승인되지 않으므로 과거

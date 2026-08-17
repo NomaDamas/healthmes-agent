@@ -28,6 +28,10 @@ enum ScreenTimeSyncCancellationLease: Equatable, Sendable {
 protocol ScreenTimeActivitySyncing: Sendable {
     func requestAuthorization() async throws -> ScreenTimeCollectorResult
 
+    func registerAuthorizedCollector(
+        pairing: Pairing
+    ) async throws
+
     func approveExcludedApps(
         _ excludedAppTokens: Set<String>
     ) async throws
@@ -199,15 +203,21 @@ final class ScreenTimeActivityLifecycleController {
         }
         return ScreenTimeAuthorizationSyncResult(
             authorization: authorization,
-            sync: await catchUp(
+            sync: await syncAfterExplicitAuthorization(
+                authorization,
                 now: now,
-                timezone: timezone,
-                trigger: .authorizationChanged
+                timezone: timezone
             )
         )
     }
 
     func requestAuthorization() async -> ScreenTimeAuthorizationAttempt {
+        guard pairingProvider() != nil else {
+            return ScreenTimeAuthorizationAttempt(
+                authorization: nil,
+                failureReason: "not_paired"
+            )
+        }
         do {
             return ScreenTimeAuthorizationAttempt(
                 authorization:
@@ -234,6 +244,52 @@ final class ScreenTimeActivityLifecycleController {
             timezone: timezone,
             trigger: .authorizationChanged
         )
+    }
+
+    func syncAfterExplicitAuthorization(
+        _ authorization: ScreenTimeCollectorResult,
+        now: Date = Date(),
+        timezone: TimeZone = .current
+    ) async -> ScreenTimeActivityLifecycleResult {
+        guard authorization.permitsAggregateUpload else {
+            return await catchUp(
+                now: now,
+                timezone: timezone,
+                trigger: .authorizationChanged
+            )
+        }
+        guard let pairing = pairingProvider() else {
+            return await catchUp(
+                now: now,
+                timezone: timezone,
+                trigger: .authorizationChanged
+            )
+        }
+        do {
+            try await syncService.registerAuthorizedCollector(
+                pairing: pairing
+            )
+            try Task.checkCancellation()
+            guard pairingProvider() == pairing else {
+                return .failed(reason: "pairing_changed")
+            }
+            return .completed(
+                try await syncService.sync(
+                    pairing: pairing,
+                    now: now,
+                    timezone: timezone,
+                    trigger: .authorizationChanged
+                )
+            )
+        } catch {
+            return .failed(
+                reason: Self.failureReason(
+                    for: error,
+                    fallback:
+                        "ios_screen_time_registration_failed"
+                )
+            )
+        }
     }
 
     func catchUp(
@@ -369,6 +425,16 @@ final class ScreenTimeActivityLifecycleController {
             switch error {
             case .exportFailed:
                 return "ios_screen_time_activity_export_failed"
+            }
+        }
+        if let error = error as? ScreenTimeInputControlError {
+            switch error {
+            case .invalidCollectorIdentity:
+                return "ios_screen_time_invalid_collector_identity"
+            case .invalidDescriptor:
+                return "invalid_server_response"
+            case .revisionConflictExhausted:
+                return "input_settings_revision_conflict"
             }
         }
         guard let error = error as? HealthMesAPIError else {

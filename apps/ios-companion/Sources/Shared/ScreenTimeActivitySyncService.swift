@@ -105,6 +105,16 @@ enum ScreenTimeActivityCollectionFailurePolicy {
 }
 
 protocol ScreenTimeActivityTransport {
+    func inputDescriptor(
+        pairing: Pairing
+    ) async throws -> ScreenTimeInputDescriptor
+
+    func enableInput(
+        pairing: Pairing,
+        deviceID: String,
+        revision: String
+    ) async throws -> ScreenTimeInputDescriptor
+
     func collectionState(
         pairing: Pairing,
         deviceID: String
@@ -116,6 +126,28 @@ protocol ScreenTimeActivityTransport {
     ) async throws -> ScreenTimeActivityBatchResult
 }
 
+enum ScreenTimeInputControlError: Error, Equatable {
+    case invalidCollectorIdentity
+    case invalidDescriptor
+    case revisionConflictExhausted
+}
+
+extension ScreenTimeActivityTransport {
+    func inputDescriptor(
+        pairing _: Pairing
+    ) async throws -> ScreenTimeInputDescriptor {
+        throw ScreenTimeInputControlError.invalidDescriptor
+    }
+
+    func enableInput(
+        pairing _: Pairing,
+        deviceID _: String,
+        revision _: String
+    ) async throws -> ScreenTimeInputDescriptor {
+        throw ScreenTimeInputControlError.invalidDescriptor
+    }
+}
+
 final class URLSessionScreenTimeActivityTransport:
     ScreenTimeActivityTransport
 {
@@ -123,6 +155,30 @@ final class URLSessionScreenTimeActivityTransport:
 
     init(session: URLSession = GlanceClient.makeSession()) {
         self.session = session
+    }
+
+    func inputDescriptor(
+        pairing: Pairing
+    ) async throws -> ScreenTimeInputDescriptor {
+        try await performInputDescriptor(
+            ScreenTimeActivityHTTP.inputDescriptorRequest(
+                pairing: pairing
+            )
+        )
+    }
+
+    func enableInput(
+        pairing: Pairing,
+        deviceID: String,
+        revision: String
+    ) async throws -> ScreenTimeInputDescriptor {
+        try await performInputDescriptor(
+            ScreenTimeActivityHTTP.inputSettingsRequest(
+                pairing: pairing,
+                deviceID: deviceID,
+                revision: revision
+            )
+        )
     }
 
     func collectionState(
@@ -155,6 +211,74 @@ final class URLSessionScreenTimeActivityTransport:
         _ request: URLRequest,
         expecting _: Response.Type
     ) async throws -> Response {
+        let (data, http) = try await responseData(request)
+        switch http.statusCode {
+        case 200...299:
+            do {
+                return try GlanceJSON.decoder().decode(
+                    Response.self,
+                    from: data
+                )
+            } catch {
+                throw HealthMesAPIError.decoding(
+                    underlying: error
+                )
+            }
+        case 401:
+            throw HealthMesAPIError.unauthorized(
+                statusCode: http.statusCode
+            )
+        default:
+            throw HealthMesAPI.responseError(
+                statusCode: http.statusCode,
+                data: data
+            )
+        }
+    }
+
+    private func performInputDescriptor(
+        _ request: URLRequest
+    ) async throws -> ScreenTimeInputDescriptor {
+        let (data, http) = try await responseData(request)
+        switch http.statusCode {
+        case 200...299:
+            let descriptor: ScreenTimeInputDescriptor
+            do {
+                descriptor = try GlanceJSON.decoder().decode(
+                    ScreenTimeInputDescriptor.self,
+                    from: data
+                )
+            } catch {
+                throw HealthMesAPIError.decoding(
+                    underlying: error
+                )
+            }
+            guard
+                descriptor.sourceID
+                    == ScreenTimeInputDescriptor.sourceID,
+                descriptor.hasValidRevision,
+                http.value(forHTTPHeaderField: "ETag")
+                    == "\"\(descriptor.revision)\""
+            else {
+                throw ScreenTimeInputControlError
+                    .invalidDescriptor
+            }
+            return descriptor
+        case 401:
+            throw HealthMesAPIError.unauthorized(
+                statusCode: http.statusCode
+            )
+        default:
+            throw HealthMesAPI.responseError(
+                statusCode: http.statusCode,
+                data: data
+            )
+        }
+    }
+
+    private func responseData(
+        _ request: URLRequest
+    ) async throws -> (Data, HTTPURLResponse) {
         let data: Data
         let response: URLResponse
         do {
@@ -171,21 +295,7 @@ final class URLSessionScreenTimeActivityTransport:
         guard let http = response as? HTTPURLResponse else {
             throw HealthMesAPIError.httpStatus(-1)
         }
-        switch http.statusCode {
-        case 200...299:
-            do {
-                return try GlanceJSON.decoder().decode(Response.self, from: data)
-            } catch {
-                throw HealthMesAPIError.decoding(underlying: error)
-            }
-        case 401:
-            throw HealthMesAPIError.unauthorized(statusCode: http.statusCode)
-        default:
-            throw HealthMesAPI.responseError(
-                statusCode: http.statusCode,
-                data: data
-            )
-        }
+        return (data, http)
     }
 }
 
@@ -457,6 +567,61 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         try await collector.requestAuthorization()
     }
 
+    func registerAuthorizedCollector(
+        pairing: Pairing
+    ) async throws {
+        try Task.checkCancellation()
+        guard ScreenTimeDeviceIdentity.isStableCollectorID(deviceID) else {
+            throw ScreenTimeInputControlError.invalidCollectorIdentity
+        }
+
+        for _ in 0..<3 {
+            try Task.checkCancellation()
+            let descriptor = try await transport.inputDescriptor(
+                pairing: pairing
+            )
+            try Task.checkCancellation()
+            try validateInputDescriptor(descriptor)
+            if descriptor.instance(deviceID: deviceID) != nil {
+                return
+            }
+            do {
+                let updated = try await transport.enableInput(
+                    pairing: pairing,
+                    deviceID: deviceID,
+                    revision: descriptor.revision
+                )
+                try Task.checkCancellation()
+                try validateInputDescriptor(updated)
+                guard
+                    let instance = updated.instance(
+                        deviceID: deviceID
+                    ),
+                    instance.enabled
+                else {
+                    throw ScreenTimeInputControlError
+                        .invalidDescriptor
+                }
+                return
+            } catch {
+                guard Self.isInputRevisionConflict(error) else {
+                    throw error
+                }
+            }
+        }
+
+        try Task.checkCancellation()
+        let latest = try await transport.inputDescriptor(
+            pairing: pairing
+        )
+        try Task.checkCancellation()
+        try validateInputDescriptor(latest)
+        guard latest.instance(deviceID: deviceID) != nil else {
+            throw ScreenTimeInputControlError
+                .revisionConflictExhausted
+        }
+    }
+
     func approveExcludedApps(
         _ excludedAppTokens: Set<String>
     ) async throws {
@@ -520,6 +685,39 @@ actor ScreenTimeActivitySyncService: ScreenTimeActivitySyncing {
         if let persistenceError {
             throw persistenceError
         }
+    }
+
+    private func validateInputDescriptor(
+        _ descriptor: ScreenTimeInputDescriptor
+    ) throws {
+        guard
+            descriptor.sourceID == ScreenTimeInputDescriptor.sourceID,
+            descriptor.hasValidRevision,
+            Set(descriptor.instances.map(\.instanceID)).count
+                == descriptor.instances.count,
+            descriptor.instances.allSatisfy({
+                $0.platform == "ios"
+            })
+        else {
+            throw ScreenTimeInputControlError.invalidDescriptor
+        }
+    }
+
+    private static func isInputRevisionConflict(
+        _ error: Error
+    ) -> Bool {
+        guard
+            let apiError = error as? HealthMesAPIError,
+            case .server(
+                409,
+                "input_settings_revision_conflict",
+                _,
+                _
+            ) = apiError
+        else {
+            return false
+        }
+        return true
     }
 
     func sync(

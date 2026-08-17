@@ -39,6 +39,17 @@ enum ScreenTimeDeviceIdentity {
             .joined()
         return "ios-collector-v1-\(fingerprint)"
     }
+
+    static func isStableCollectorID(_ value: String) -> Bool {
+        let prefix = "ios-collector-v1-"
+        guard value.hasPrefix(prefix) else { return false }
+        let fingerprint = value.dropFirst(prefix.count)
+        return fingerprint.count == 40
+            && fingerprint.allSatisfy {
+                ("0"..."9").contains($0)
+                    || ("a"..."f").contains($0)
+            }
+    }
 }
 
 struct ScreenTimeActivityIdentityResolution: Equatable {
@@ -329,6 +340,61 @@ public struct ScreenTimeCollectionState: Codable, Equatable {
         case blockedReason = "blocked_reason"
         case configRevision = "config_revision"
         case rawRetentionCutoff = "raw_retention_cutoff"
+    }
+}
+
+struct ScreenTimeInputInstance: Codable, Equatable {
+    let instanceID: String
+    let platform: String
+    let enabled: Bool
+    let pausedUntil: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case instanceID = "instance_id"
+        case platform
+        case enabled
+        case pausedUntil = "paused_until"
+    }
+}
+
+struct ScreenTimeInputDescriptor: Codable, Equatable {
+    static let sourceID = "activity.ios-screentime"
+
+    let sourceID: String
+    let instances: [ScreenTimeInputInstance]
+    let revision: String
+
+    enum CodingKeys: String, CodingKey {
+        case sourceID = "source_id"
+        case instances
+        case revision
+    }
+
+    func instance(deviceID: String) -> ScreenTimeInputInstance? {
+        instances.first { $0.instanceID == deviceID }
+    }
+
+    var hasValidRevision: Bool {
+        let prefix = "sha256:"
+        guard revision.hasPrefix(prefix) else { return false }
+        let digest = revision.dropFirst(prefix.count)
+        return digest.count == 64
+            && digest.allSatisfy {
+                ("0"..."9").contains($0)
+                    || ("a"..."f").contains($0)
+            }
+    }
+}
+
+private struct ScreenTimeInputSettingsUpdate: Encodable {
+    let instanceID: String
+    let platform = "ios"
+    let enabled = true
+
+    enum CodingKeys: String, CodingKey {
+        case instanceID = "instance_id"
+        case platform
+        case enabled
     }
 }
 
@@ -1191,6 +1257,70 @@ public struct ScreenTimeActivityBatchResult: Codable, Equatable {
 }
 
 public enum ScreenTimeActivityHTTP {
+    static func inputDescriptorRequest(
+        pairing: Pairing
+    ) -> URLRequest {
+        let url = appendingPathComponents(
+            ["v1", "inputs", ScreenTimeInputDescriptor.sourceID],
+            to: pairing.baseURL
+        )
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(
+            "application/json",
+            forHTTPHeaderField: "Accept"
+        )
+        if let token = pairing.token {
+            request.setValue(
+                "Bearer \(token)",
+                forHTTPHeaderField: "Authorization"
+            )
+        }
+        return request
+    }
+
+    static func inputSettingsRequest(
+        pairing: Pairing,
+        deviceID: String,
+        revision: String
+    ) throws -> URLRequest {
+        let url = appendingPathComponents(
+            [
+                "v1",
+                "inputs",
+                ScreenTimeInputDescriptor.sourceID,
+                "settings",
+            ],
+            to: pairing.baseURL
+        )
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue(
+            "application/json",
+            forHTTPHeaderField: "Accept"
+        )
+        request.setValue(
+            "application/json",
+            forHTTPHeaderField: "Content-Type"
+        )
+        request.setValue(
+            "\"\(revision)\"",
+            forHTTPHeaderField: "If-Match"
+        )
+        if let token = pairing.token {
+            request.setValue(
+                "Bearer \(token)",
+                forHTTPHeaderField: "Authorization"
+            )
+        }
+        request.httpBody = try encoder().encode(
+            ScreenTimeInputSettingsUpdate(
+                instanceID: deviceID
+            )
+        )
+        return request
+    }
+
     public static func collectionRequest(
         pairing: Pairing,
         deviceID: String

@@ -187,6 +187,8 @@ final class ScreenTimeActivityRuntime {
     private var pairingObserver: NSObjectProtocol?
     private var timezoneObserver: NSObjectProtocol?
     private var authorizationRefresh: ScreenTimeAuthorizationRefresh?
+    private var explicitAuthorizationTasks:
+        [UUID: Task<ScreenTimeAuthorizationSyncResult, Never>] = [:]
     private var automaticTasks: [UUID: Task<Void, Never>] = [:]
     private var backgroundRunners:
         [UUID: ScreenTimeBackgroundRefreshRunner] = [:]
@@ -258,6 +260,7 @@ final class ScreenTimeActivityRuntime {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                await self.cancelAndWaitForExplicitAuthorizationWork()
                 await self.runAutomaticCatchUp(
                     trigger: .inputConfigurationChanged
                 )
@@ -309,12 +312,27 @@ final class ScreenTimeActivityRuntime {
             }
         }
         authorizationIntentStore.setOptedIn(true)
-        let result =
-            await authorizationAndSync(
+        let taskID = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else {
+                return ScreenTimeAuthorizationSyncResult(
+                    authorization: nil,
+                    sync: .failed(reason: "cancelled")
+                )
+            }
+            return await self.authorizationAndSync(
                 now: now,
                 timezone: timezone,
                 trigger: .authorizationChanged
             )
+        }
+        explicitAuthorizationTasks[taskID] = task
+        let result = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        explicitAuthorizationTasks.removeValue(forKey: taskID)
         schedule()
         return result
     }
@@ -352,17 +370,11 @@ final class ScreenTimeActivityRuntime {
         automaticTasks.removeAll()
         tasks.forEach { $0.cancel() }
 
-        let authorizationTask = authorizationRefresh?.task
-        authorizationRefresh = nil
-        authorizationTask?.cancel()
-
         let runners = Array(backgroundRunners.values)
         backgroundRunners.removeAll()
         runners.forEach { $0.expire() }
 
-        if let authorizationTask {
-            _ = await authorizationTask.value
-        }
+        await cancelAndWaitForExplicitAuthorizationWork()
         for task in tasks {
             _ = await task.result
         }
@@ -538,6 +550,25 @@ final class ScreenTimeActivityRuntime {
         )
     }
 
+    private func cancelAndWaitForExplicitAuthorizationWork() async {
+        let explicitTasks = Array(
+            explicitAuthorizationTasks.values
+        )
+        explicitAuthorizationTasks.removeAll()
+        explicitTasks.forEach { $0.cancel() }
+
+        let authorizationTask = authorizationRefresh?.task
+        authorizationRefresh = nil
+        authorizationTask?.cancel()
+
+        if let authorizationTask {
+            _ = await authorizationTask.value
+        }
+        for task in explicitTasks {
+            _ = await task.value
+        }
+    }
+
     private func authorizationAndSync(
         now: Date,
         timezone: TimeZone,
@@ -577,11 +608,12 @@ final class ScreenTimeActivityRuntime {
         }
         return ScreenTimeAuthorizationSyncResult(
             authorization: authorization,
-            sync: await lifecycleController().catchUp(
-                now: now,
-                timezone: timezone,
-                trigger: trigger
-            )
+            sync: await lifecycleController()
+                .syncAfterExplicitAuthorization(
+                    authorization,
+                    now: now,
+                    timezone: timezone
+                )
         )
     }
 

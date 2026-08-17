@@ -277,13 +277,26 @@ Android와 ActivityWatch descriptor도 꺼진 값으로 보인다. Decision Agen
 저장된 input/retention 설정 변경과 Screen Time 전용 `BGAppRefreshTask`는 같은
 UI-neutral 엔진 seam에 연결되어 있다.
 실제 설정 화면은 device-team 범위이며, 사용자가 명시적으로 opt-in한 뒤
-`requestAuthorizationAndSync()`를 호출해야 한다.
+`requestAuthorizationAndSync()`를 호출해야 한다. 이 action은 먼저 HealthMes
+instance와 pairing되어 있어야 하며, unpaired 상태에서는 Apple authorization
+UI를 열지 않고 `not_paired`로 fail closed한다.
 
 ```text
 사용자 authorize 선택
         |
         v
 ScreenTimeActivityRuntime.requestAuthorizationAndSync()
+        |
+        +─ aggregate + granted 성공인지 확인
+        |
+        +─ stable ios-collector-v1-<40 lowercase hex> ID 검증
+        |
+        +─ GET /v1/inputs/activity.ios-screentime + strong ETag
+        |     instance 없음: If-Match PUT {instance_id, platform=ios, enabled=true}
+        |     instance 있음: 설정을 쓰지 않고 현재 enabled/pause를 정본으로 유지
+        |     409: 최신 descriptor를 다시 GET한 뒤 bounded CAS 재시도
+        |
+        └─ 등록 성공 뒤 첫 sync
 
 앱 foreground / pairing 변경 / 등록된 Screen Time background task
 저장된 input 또는 retention 설정 변경
@@ -315,6 +328,28 @@ Apple 권한 UI를 호출하지 않는다. 이 자동 경로들은 저장된 opt
 `currentAuthorizationStatus()`로 현재 상태를 읽은 뒤 허용된 경우에만 sync한다.
 Apple의 `requestAuthorization()`을 호출할 수 있는 유일한 제품 경로는 사용자가
 직접 선택한 `requestAuthorizationAndSync()`이다.
+
+명시적 authorization 결과가 `aggregate + granted`이면 runtime은 첫 sync 전에
+안정적인 collector ID가 input descriptor에 존재하는지 확인한다. 없을 때만 상세
+GET의 body `revision`과 정확히 일치하는 strong `ETag`를 사용해
+`PUT /v1/inputs/activity.ios-screentime/settings`를 호출한다. 이 bootstrap PUT은
+`instance_id`, `platform: "ios"`, `enabled: true`만 보내므로 exclusion, pause,
+retention과 Decision 접근 설정을 덮어쓰지 않는다. 409 revision conflict는 최신
+descriptor를 다시 읽고 최대 3회의 CAS write attempt로 제한한다. 경쟁 writer가
+그 사이 같은 instance를 disabled 또는 paused 상태로 만들었다면 그 상태를
+덮어쓰지 않고 등록 완료로 간주한 뒤 일반 sync가 중앙 collection state를
+적용한다. descriptor/ETag 불일치, 잘못된 응답, 인증·네트워크·5xx 오류 또는
+conflict 소진은 Screen Time을 읽기 전에 fail closed한다.
+
+cold launch, foreground, background, pairing/configuration observer와
+authorization-status observer는 위 bootstrap PUT을 호출하지 않는다. 이 자동
+경로는 중앙 설정을 읽기만 하며 disabled 또는 paused instance를 자동으로 다시
+enable하지 않는다. local opt-out은 진행 중인 명시적 authorization/bootstrap
+task를 취소하고 종료를 기다린 뒤 outbox/state/key cleanup을 수행하므로 stale
+bootstrap이 cleanup 뒤 첫 sync를 시작할 수 없다.
+pairing이 bootstrap 도중 바뀌어도 해당 작업을 취소하고 등록 뒤 pairing을 다시
+검증하므로 이전 HealthMes node로 첫 sync하지 않는다. 새 node에 instance가 없다면
+현재 pairing에서 명시적 authorize action을 다시 실행해야 한다.
 
 현재 PR은 service core, transport/report contract, lifecycle, bounded outbox,
 background registration과 source-side privacy exclusion을 연결한다. 설정 화면은
@@ -387,8 +422,9 @@ snapshot이 거부되지 않도록, cutoff를 올림한 뒤 추가로 완료 1�
 완료 1시간에서 시작한다. collector identity는 설치별 IFV가 아니라 Screen Time
 가명화 Keychain key에서 결정적으로 파생한다. key가 유지되면 재설치 후에도 같은
 ID를 사용하고, key를 잃어 새 `ios-collector-v1-*` ID가 생기면 서버는
-`/v1/inputs/activity.ios-screentime/settings`에서 명시적으로 enable하기 전까지
-수집을 차단한다.
+기본적으로 수집을 차단한다. 새 ID의 명시적 Apple authorization이 성공한 경우에만
+위 CAS bootstrap이 absent instance를 enable한다. 이미 존재하는 disabled/paused
+instance나 기존 exclude 목록을 새 ID로 복사하지 않는다.
 
 이 Keychain key는 명시적 opt-in 전에는 읽거나 만들지 않는다. SDK가 export
 API를 제공하지 않는 빌드도 fallback persistent identifier를 만들지 않는다.
@@ -403,7 +439,7 @@ namespace의 cleanup을 재개하는 데만 사용한다. key 삭제가 실패�
 
 실제 App & Website Usage export 경로는 다음 조건을 모두 만족할 때만 활성화한다.
 
-- 지원 OS와 SDK
+- iOS 26.4 이상과 해당 API symbol을 제공하는 SDK
 - Apple이 승인한 App & Website Usage entitlement
 - 데이터 접근을 포함한 사용자 승인
 - Apple이 API를 제공하는 사용자·지역 조건
@@ -446,8 +482,10 @@ SDK probe 성공만으로 실제 기기 수집이 보장되지는 않는다. opt
 하고, Family Controls는 App Store 제출 전에 Apple 사용 허가가 필요하다. 사용자
 승인은 `approvedWithDataAccess`까지 도달해야 한다. 고객 설치에서는 기기가 EU에
 있고 Apple Account 국가/지역도 EU여야 하며, Apple-provided development/test
-profile을 사용하는 개발·테스트만 다른 지역에서 가능하다. unsigned CI는 이러한
-서명·계정·지역 조건이나 실제 iPhone 수집을 증명하지 않는다.
+profile을 사용하는 개발·테스트만 다른 지역에서 가능하다. 한 기기에서는 동시에
+하나의 앱만 `approvedWithDataAccess`를 유지할 수 있으며, 다른 앱에 data access를
+허용하면 HealthMes 권한은 `.notDetermined`로 돌아간다. unsigned CI는 이러한
+서명·계정·지역·단일 승인 앱 조건이나 실제 iPhone 수집을 증명하지 않는다.
 
 따라서 이 저장소에서 "코드 완료"는 계약, 수집 lifecycle, fail-closed adapter,
 서버 snapshot 의미, XCTest와 unsigned build를 검증했다는 뜻이다. Apple
@@ -589,18 +627,21 @@ Open Wearables의 HealthMes mirror는 범용 `normalized`와 섞지 않고 전�
 5. 가명화 key 또는 token 집합 변경 차단 reason을 받으면 기존 제외 목록을
    그대로 재사용하지 말고, 현재 기기 key로 앱을 다시 선택해 서버 PUT이 성공한
    뒤 `approveExcludedApps(_:)`를 호출하는 명시적 재승인 흐름을 제공한다.
-6. 새 `ios-collector-v1-*` instance는 설정 PUT으로 `enabled=true`를 명시하기
-   전까지 수집되지 않는다. 기기 ID 변경을 자동 등록이나 기존 exclude 복사로
-   처리하지 않는다.
+6. 명시적 사용자 action은 `requestAuthorizationAndSync()`만 호출한다. 성공한
+   `aggregate + granted` 결과는 absent stable instance를 엔진이 CAS bootstrap한
+   뒤 첫 sync한다. pairing 전에는 이 action을 실행하지 않으며, device UI가 같은
+   등록 PUT을 중복 구현하지 않는다.
 7. 설정 저장은 반드시 상세 GET의 `ETag`를 `If-Match`로 보내고, 428/409에서는
    최신 descriptor와 ETag를 재조회해 사용자 편집을 재적용한다. 성공 후에는 PUT
    응답 descriptor와 ETag를 다음 편집의 정본으로 사용한다.
 8. 설정 또는 retention PUT 성공 후
    `ScreenTimeActivityRuntime.inputConfigurationDidChange()`를 호출해 fresh sync를
    요청한다.
-9. 실제 collection permission과 HealthMes Decision 접근 동의를 하나의 toggle로
+9. foreground/background/observer 경로에서 input settings를 쓰거나 중앙
+   disabled/paused 상태를 자동으로 되돌리지 않는다.
+10. 실제 collection permission과 HealthMes Decision 접근 동의를 하나의 toggle로
    합치지 않는다.
-10. UI가 없어도 API와 수집 엔진은 독립적으로 테스트 가능해야 한다.
+11. UI가 없어도 API와 수집 엔진은 독립적으로 테스트 가능해야 한다.
 
 ## 8. 비범위와 후속
 

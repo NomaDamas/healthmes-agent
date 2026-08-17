@@ -85,11 +85,14 @@ App ID capability, signed provisioning, 사용자 data-access 승인과 실기�
 여전히 저장소 밖의 배포 조건이며, 실제 설정 화면은 device-team 범위다.
 
 iPhone collector ID는 Screen Time 가명화 Keychain key에서 안정적으로 파생되며
-새 `ios-collector-v1-*` instance는 중앙 input 설정에서 명시적으로 활성화하기
-전까지 fail closed한다. denied/unavailable 결과는 최초 동의 경계를 저장하지
-않는다. Calendar mirror도 retention 변경과 sync를 같은 저장 write fence로
-직렬화하고, ingest와 Decision Agent 조회 모두 `calendar_mirror` cutoff를
-강제하므로 다음 provider full sync가 삭제된 과거 일정을 되살리지 못한다.
+새 `ios-collector-v1-*` instance는 기본적으로 fail closed한다. 명시적 Apple
+authorization이 성공하면 UI-neutral runtime이 중앙 input descriptor/ETag를 읽고
+absent instance만 CAS로 enable한 뒤 첫 sync한다. 기존 disabled/paused instance는
+자동 lifecycle이 다시 enable하지 않는다. denied/unavailable 결과는 최초 동의
+경계를 저장하지 않는다. Calendar mirror도 retention 변경과 sync를 같은 저장
+write fence로 직렬화하고, ingest와 Decision Agent 조회 모두
+`calendar_mirror` cutoff를 강제하므로 다음 provider full sync가 삭제된 과거
+일정을 되살리지 못한다.
 
 ## TLDR
 

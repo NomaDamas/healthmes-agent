@@ -361,16 +361,24 @@ token — the surface carries medical data), then enter the same token in the
 app. The fragmentation term of the energy engine activates automatically
 once samples arrive. iOS Screen Time has a separate aggregate-only server
 contract and injectable `ScreenTimeActivitySyncService` core. Authorization
-success, foreground activation, pairing changes and a Screen Time-specific
-`BGAppRefreshTask` now enter the same single-flight sync and bounded-outbox
-pipeline. The normal repository build always selects the unavailable adapter
-and collects no Apple activity. Saved input/retention revisions have a
-UI-neutral `inputConfigurationDidChange()` hook. Authorization, configuration,
-and timezone changes observed during an active sync coalesce into one fresh
+success first registers an absent stable `ios-collector-v1-*` instance through
+the existing input-control GET/ETag/If-Match PUT contract, then foreground
+activation, pairing changes and a Screen Time-specific `BGAppRefreshTask`
+enter the same single-flight sync and bounded-outbox pipeline. Registration
+writes only `instance_id`, `platform=ios`, and `enabled=true`, retries CAS
+conflicts by re-reading, and never overwrites an existing disabled or paused
+instance. Automatic lifecycle paths only read central state. The normal
+repository build always selects the unavailable adapter and collects no Apple
+activity. Saved input/retention revisions have a UI-neutral
+`inputConfigurationDidChange()` hook. Authorization, configuration, and
+timezone changes observed during an active sync coalesce into one fresh
 pending run. BG task expiration cancels the service pipeline only when no
 foreground waiter shares it. The local outbox is capped at 8 entries/16 MiB,
 expires entries after 14 days across restart and offline retry, and is
-excluded from device backup.
+excluded from device backup. Explicit authorization requires an existing
+HealthMes pairing; unpaired calls fail before Apple authorization. Local
+opt-out cancels and awaits an in-flight authorization/bootstrap before privacy
+cleanup.
 
 `HealthMesCompanionScreenTimeOptIn` is an opt-in request scheme, not an
 eligibility assertion. Run
@@ -383,8 +391,10 @@ provisioning profile whose App ID includes both Family Controls entitlements;
 Family Controls permission is required before App Store submission. Customer
 use is limited to a device in the EU with an EU-country/region Apple Account,
 while Apple-provisioned development/test builds may be exercised elsewhere.
-Signed-profile eligibility, `approvedWithDataAccess`, and real-iPhone
-verification remain external to unsigned CI. Device code must use
+The data-access authorization and export API require iOS 26.4 or later, and
+only one app per device can hold `approvedWithDataAccess`. Signed-profile
+eligibility, authorization ownership, and real-iPhone verification remain
+external to unsigned CI. Device code must use
 `docs/INPUT-CONTROL-PLANE.ko.md` rather than inventing a second settings model.
 
 ## Companion & desktop apps (issues #7 · #10 · #11)
