@@ -14,6 +14,9 @@ COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 DECISION_BIND_SOURCE = REPO_ROOT / "data" / "hermes" / "decision"
 README_FILE = REPO_ROOT / "README.md"
 DEVELOPMENT_DOC = REPO_ROOT / "docs" / "DEVELOPMENT.md"
+KOREAN_ARCHITECTURE_DOC = (
+    REPO_ROOT / "docs" / "HEALTHMES-WELLNESS-RUNTIME-ARCHITECTURE.ko.md"
+)
 
 
 def _environment(entries: list[str]) -> dict[str, str]:
@@ -94,6 +97,12 @@ def test_compose_launches_only_healthmes_owned_supervisor_surface() -> None:
     assert runtime_env[
         "HEALTHMES_DECISION_RUNTIME_MAX_CONCURRENT_RESPONSES"
     ] == "${HEALTHMES_DECISION_MAX_PENDING_REQUESTS:-8}"
+    assert runtime_env[
+        "HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS"
+    ] == "${HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS:-10}"
+    assert runtime_env[
+        "HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS"
+    ] == "${HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS:-5}"
     assert runtime["stop_grace_period"] == "6m"
     assert "TELEGRAM_BOT_TOKEN" not in runtime_env
     assert "HEALTHMES_HERMES_WEBHOOK_SECRET" not in runtime_env
@@ -126,7 +135,13 @@ def test_runtime_refresh_uses_bounded_full_drain_timeout() -> None:
 
     assert "docker compose stop --timeout 360 hermes-decision" in development
     assert "maximum supported 300-second decision response" in development
-    assert "10-second child" in development
+    assert "10-second child TERM wait" in development
+    assert "5-second post-SIGKILL wait" in development
+
+    korean = " ".join(
+        KOREAN_ARCHITECTURE_DOC.read_text(encoding="utf-8").split()
+    )
+    assert "docker compose stop --timeout 360 hermes-decision" in korean
 
 
 @pytest.mark.skipif(

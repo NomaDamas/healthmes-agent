@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -205,6 +206,7 @@ async def test_response_leases_share_generation_and_prioritize_replacement(
     process._launch_argv = ("fake-hermes",)
     process._child_generation = 7
     process._healthy = True
+    process._lifecycle_state = "running"
 
     async def attest_pinned_generation(
         *,
@@ -267,6 +269,96 @@ async def test_response_leases_share_generation_and_prioritize_replacement(
     assert third_lease.state is next_state
     assert process._child_generation == 8
     await third_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_closing_rejects_waiting_and_new_leases_while_old_lease_drains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = HermesRuntimeProcess(
+        replace(
+            _supervisor_config(tmp_path),
+            max_concurrent_responses=1,
+        )
+    )
+    child = SimpleNamespace(returncode=None)
+    state = object()
+    process._process = child
+    process._state = state  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+
+    async def attest_pinned_generation(
+        *,
+        expected: object,
+        generation: int,
+    ) -> object:
+        assert generation == process._child_generation
+        return expected
+
+    async def stop_child() -> None:
+        process._process = None
+        process._state = None
+        process._launch_argv = None
+        process._healthy = False
+
+    monkeypatch.setattr(
+        process,
+        "_attest_pinned_generation",
+        attest_pinned_generation,
+    )
+    monkeypatch.setattr(process, "_stop_child", stop_child)
+
+    active = await process.acquire_response_lease()
+    waiting_reader = asyncio.create_task(
+        process.acquire_response_lease()
+    )
+    await asyncio.sleep(0)
+    assert not waiting_reader.done()
+
+    monitor_entered = asyncio.Event()
+
+    async def queued_monitor_writer() -> None:
+        async with process._exclusive_child_generation():
+            monitor_entered.set()
+
+    monitor = asyncio.create_task(queued_monitor_writer())
+    process._monitor_task = monitor
+
+    async def wait_for_monitor_to_queue() -> None:
+        while process._waiting_child_writers != 1:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_monitor_to_queue(), timeout=1)
+    close_task = asyncio.create_task(process.aclose())
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_response_admission_closed",
+    ):
+        await asyncio.wait_for(waiting_reader, timeout=1)
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_response_admission_closed",
+    ):
+        await asyncio.wait_for(
+            process.acquire_response_lease(),
+            timeout=1,
+        )
+
+    assert process._lifecycle_state == "closing"
+    assert process._process is child
+    assert not monitor_entered.is_set()
+    assert not close_task.done()
+
+    await active.release()
+    await asyncio.wait_for(close_task, timeout=1)
+
+    assert monitor.cancelled()
+    assert process._process is None
+    assert process._lifecycle_state == "closed"
 
 
 @pytest.mark.asyncio
@@ -416,6 +508,7 @@ async def test_close_failure_is_retryable_without_publishing_closed(
     process._state = object()  # type: ignore[assignment]
     process._launch_argv = ("fake-hermes",)
     process._healthy = True
+    process._lifecycle_state = "running"
     attempts = 0
 
     async def stop_child() -> None:
@@ -502,6 +595,7 @@ async def test_cancelled_close_waiting_for_response_lease_cannot_orphan_child(
     process._state = object()  # type: ignore[assignment]
     process._launch_argv = ("fake-hermes",)
     process._healthy = True
+    process._lifecycle_state = "running"
 
     async def stop_child() -> None:
         process._process = None
@@ -543,6 +637,60 @@ async def test_cancelled_close_waiting_for_response_lease_cannot_orphan_child(
     assert process._lifecycle_state == "closed"
 
 
+@pytest.mark.asyncio
+async def test_child_kill_wait_is_bounded_and_close_reports_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = HermesRuntimeProcess(
+        replace(
+            _supervisor_config(tmp_path),
+            child_term_timeout_seconds=0.001,
+            child_kill_timeout_seconds=0.001,
+        )
+    )
+    never_exits = asyncio.Event()
+
+    class StuckProcess:
+        returncode = None
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            await never_exits.wait()
+            return 0
+
+    child = StuckProcess()
+    process._process = child  # type: ignore[assignment]
+    process._state = object()  # type: ignore[assignment]
+    process._launch_argv = ("fake-hermes",)
+    process._healthy = True
+    process._lifecycle_state = "running"
+    signals: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(
+        "healthmes.hermes_runtime_supervisor.os.killpg",
+        lambda pid, sent: signals.append((pid, sent)),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="hermes_runtime_child_kill_timeout",
+    ):
+        await asyncio.wait_for(process.aclose(), timeout=1)
+
+    assert signals == [
+        (4242, signal.SIGTERM),
+        (4242, signal.SIGKILL),
+    ]
+    assert child.wait_calls == 2
+    assert process._process is child
+    assert process._state is None
+    assert process._lifecycle_state == "close_failed"
+
+
 def test_restart_backoff_is_exponential_and_capped() -> None:
     assert _next_restart_backoff(0, initial=0.25, maximum=1) == 0.25
     assert _next_restart_backoff(0.25, initial=0.25, maximum=1) == 0.5
@@ -559,6 +707,8 @@ def test_restart_backoff_is_exponential_and_capped() -> None:
         "health_check_timeout_seconds",
         "restart_backoff_initial_seconds",
         "restart_backoff_max_seconds",
+        "child_term_timeout_seconds",
+        "child_kill_timeout_seconds",
     ),
 )
 @pytest.mark.parametrize(
@@ -587,6 +737,8 @@ def test_supervisor_config_rejects_nonfinite_lifecycle_values(
         "health_check_timeout_seconds",
         "restart_backoff_initial_seconds",
         "restart_backoff_max_seconds",
+        "child_term_timeout_seconds",
+        "child_kill_timeout_seconds",
     ),
 )
 @pytest.mark.parametrize("value", (0, -1))
@@ -617,6 +769,34 @@ def test_supervisor_config_rejects_inverted_restart_backoff(
 
 
 @pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    (
+        (
+            "child_term_timeout_seconds",
+            10.001,
+            "child TERM timeout must be at most 10 seconds",
+        ),
+        (
+            "child_kill_timeout_seconds",
+            5.001,
+            "child KILL timeout must be at most 5 seconds",
+        ),
+    ),
+)
+def test_supervisor_config_rejects_child_shutdown_timeout_above_bound(
+    tmp_path: Path,
+    field_name: str,
+    value: float,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        replace(
+            _supervisor_config(tmp_path),
+            **{field_name: value},
+        )
+
+
+@pytest.mark.parametrize(
     "flag",
     (
         "--startup-timeout",
@@ -625,6 +805,8 @@ def test_supervisor_config_rejects_inverted_restart_backoff(
         "--health-check-timeout",
         "--restart-backoff-initial",
         "--restart-backoff-max",
+        "--child-term-timeout",
+        "--child-kill-timeout",
     ),
 )
 @pytest.mark.parametrize(
@@ -657,6 +839,8 @@ def test_supervisor_cli_rejects_nonfinite_lifecycle_values(
         "--health-check-timeout",
         "--restart-backoff-initial",
         "--restart-backoff-max",
+        "--child-term-timeout",
+        "--child-kill-timeout",
     ),
 )
 @pytest.mark.parametrize("value", ("0", "-1"))
@@ -727,6 +911,39 @@ def test_supervisor_cli_rejects_inverted_restart_backoff(
                 str(tmp_path / "vendor"),
                 "--restart-backoff-initial=2",
                 "--restart-backoff-max=1",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    (
+        (
+            "--child-term-timeout",
+            "10.001",
+            "child TERM timeout must be at most 10 seconds",
+        ),
+        (
+            "--child-kill-timeout",
+            "5.001",
+            "child KILL timeout must be at most 5 seconds",
+        ),
+    ),
+)
+def test_supervisor_cli_rejects_child_shutdown_timeout_above_bound(
+    tmp_path: Path,
+    flag: str,
+    value: str,
+    message: str,
+) -> None:
+    with pytest.raises(SystemExit, match=message):
+        supervisor_main(
+            [
+                "--hermes-home",
+                str(tmp_path / "home"),
+                "--vendor-root",
+                str(tmp_path / "vendor"),
+                f"{flag}={value}",
             ]
         )
 

@@ -193,9 +193,9 @@ services:
     profiles: ["decision"]
     user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
     restart: unless-stopped
-    # The supported decision timeout is at most 300 seconds and child
-    # termination may take another 10 seconds. Keep Docker's grace period
-    # above that bound so active generation leases can drain first.
+    # The supported decision timeout is at most 300 seconds. Child shutdown
+    # then has at most 10 seconds for TERM and 5 seconds after KILL. Keep
+    # Docker's grace period above that 315-second bound so leases drain first.
     stop_grace_period: 6m
     entrypoint:
       - /opt/hermes/.venv/bin/python
@@ -210,6 +210,8 @@ services:
       - HEALTHMES_DECISION_RUNTIME_HOST=0.0.0.0
       - HEALTHMES_DECISION_RUNTIME_PORT=8645
       - HEALTHMES_DECISION_RUNTIME_MAX_CONCURRENT_RESPONSES=${HEALTHMES_DECISION_MAX_PENDING_REQUESTS:-8}
+      - HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS=${HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS:-10}
+      - HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS=${HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS:-5}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}

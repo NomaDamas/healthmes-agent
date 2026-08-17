@@ -228,8 +228,17 @@ on startup. A normal bootstrap rerun deliberately preserves an equivalent
 seal, so image replacement without the explicit refresh fails closed instead
 of silently trusting different runtime files. The explicit 360-second stop
 timeout matches the service's `stop_grace_period` and exceeds the maximum
-supported 300-second decision response plus the supervisor's 10-second child
-termination window.
+supported 300-second decision response plus the supervisor's bounded
+10-second child TERM wait and 5-second post-SIGKILL wait.
+
+The canonical native launcher also drains the old decision supervisor before
+running the dedicated Hermes `uv sync` or bootstrap. Its TERM budget is the
+configured decision response timeout (rounded up, maximum 300 seconds) plus
+the configured child TERM and KILL waits (maximum 10 and 5 seconds). The
+decision supervisor owns a separate child process group, so the launcher
+refuses to SIGKILL only the outer service group if that complete drain fails;
+it retains the process identity and exits non-zero instead of orphaning the
+child or reporting a false stop.
 
 Re-runs are byte-idempotent when the desired decision artifacts are current.
 Bootstrap also performs a one-way migration of the general

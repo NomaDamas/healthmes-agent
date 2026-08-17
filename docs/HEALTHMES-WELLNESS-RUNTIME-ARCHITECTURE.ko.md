@@ -311,10 +311,15 @@ Docker 이미지를 다시 빌드하거나 교체하면 기존 container artifac
 명시적으로 폐기한 뒤 새 컨테이너가 다시 seal하게 한다.
 
 ```bash
-docker compose stop hermes-decision
+docker compose stop --timeout 360 hermes-decision
 uv run python scripts/bootstrap.py --mode docker --refresh-runtime-seal
 docker compose up -d --build --force-recreate hermes-decision
 ```
+
+`360`초는 최대 decision 응답 300초, child SIGTERM 대기 10초,
+SIGKILL 이후 process reap 대기 5초를 모두 포함하는 명시적 상한보다 길다.
+Native launcher도 같은 순서로 기존 supervisor를 먼저 drain한 뒤에만
+`uv sync`와 bootstrap을 실행한다.
 
 ### Legacy cron migration
 

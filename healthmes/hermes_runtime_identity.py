@@ -215,6 +215,27 @@ class HermesRuntimeExecutionArtifact(BaseModel):
         return self
 
 
+@dataclass(frozen=True, slots=True)
+class HermesRuntimeBootIdentity:
+    """Code and interpreter identity captured by one supervisor process."""
+
+    control_source_artifacts: tuple[HermesRuntimeNamedDigest, ...]
+    supervisor_interpreter: HermesRuntimeExecutionArtifact
+
+    def __post_init__(self) -> None:
+        names = tuple(
+            item.name for item in self.control_source_artifacts
+        )
+        if names != HERMES_RUNTIME_CONTROL_SOURCE_NAMES:
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_boot_identity_invalid"
+            )
+        if self.supervisor_interpreter.name != "supervisor_interpreter":
+            raise HermesRuntimeIdentityError(
+                "hermes_runtime_boot_identity_invalid"
+            )
+
+
 class HermesRuntimeEnvironmentValue(BaseModel):
     """One exact non-secret environment value bound into runtime identity."""
 
@@ -705,6 +726,7 @@ def validate_supervised_runtime(
     supervisor_module: Path | None = None,
     identity_module: Path | None = None,
     mcp_inventory_module: Path | None = None,
+    expected_boot_identity: HermesRuntimeBootIdentity | None = None,
 ) -> tuple[HermesDecisionRuntimeManifest, bytes, str]:
     """Validate the exact files and paths the supervisor will execute."""
 
@@ -777,6 +799,12 @@ def validate_supervised_runtime(
         identity_module=identity_module,
         mcp_inventory_module=mcp_inventory_module,
     )
+    if expected_boot_identity is not None:
+        _validate_runtime_boot_identity(
+            expected_boot_identity,
+            actual_control_sources=actual_control_sources,
+            supervisor_interpreter=supervisor_interpreter,
+        )
     if actual_control_sources != manifest.control_source_artifacts:
         raise HermesRuntimeIdentityError(
             "hermes_runtime_control_source_mismatch"
@@ -812,6 +840,7 @@ def seal_supervised_runtime(
     supervisor_module: Path | None = None,
     identity_module: Path | None = None,
     mcp_inventory_module: Path | None = None,
+    expected_boot_identity: HermesRuntimeBootIdentity | None = None,
 ) -> tuple[HermesDecisionRuntimeManifest, bytes, str]:
     """Bind actual launch files into the manifest before child execution."""
 
@@ -827,6 +856,7 @@ def seal_supervised_runtime(
         supervisor_module=supervisor_module,
         identity_module=identity_module,
         mcp_inventory_module=mcp_inventory_module,
+        expected_boot_identity=expected_boot_identity,
     )
     if manifest.sealed:
         return manifest, key, api_key
@@ -867,6 +897,7 @@ def seal_supervised_runtime(
         supervisor_module=supervisor_module,
         identity_module=identity_module,
         mcp_inventory_module=mcp_inventory_module,
+        expected_boot_identity=expected_boot_identity,
     )
 
 
@@ -965,6 +996,58 @@ def runtime_control_source_artifacts(
             )
         )
     return tuple(artifacts)
+
+
+def capture_runtime_boot_identity(
+    *,
+    supervisor_interpreter: Path | None = None,
+    supervisor_module: Path | None = None,
+    identity_module: Path | None = None,
+    mcp_inventory_module: Path | None = None,
+) -> HermesRuntimeBootIdentity:
+    """Capture immutable code identity before a supervisor can seal files."""
+
+    interpreter = (
+        Path(sys.executable)
+        if supervisor_interpreter is None
+        else supervisor_interpreter
+    )
+    return HermesRuntimeBootIdentity(
+        control_source_artifacts=runtime_control_source_artifacts(
+            supervisor_module=supervisor_module,
+            identity_module=identity_module,
+            mcp_inventory_module=mcp_inventory_module,
+        ),
+        supervisor_interpreter=_execution_artifact(
+            "supervisor_interpreter",
+            interpreter,
+            executable=True,
+        ),
+    )
+
+
+def _validate_runtime_boot_identity(
+    expected: HermesRuntimeBootIdentity,
+    *,
+    actual_control_sources: tuple[HermesRuntimeNamedDigest, ...],
+    supervisor_interpreter: Path | None,
+) -> None:
+    actual_interpreter = _execution_artifact(
+        "supervisor_interpreter",
+        (
+            Path(sys.executable)
+            if supervisor_interpreter is None
+            else supervisor_interpreter
+        ),
+        executable=True,
+    )
+    if (
+        actual_control_sources != expected.control_source_artifacts
+        or actual_interpreter != expected.supervisor_interpreter
+    ):
+        raise HermesRuntimeIdentityError(
+            "hermes_runtime_boot_identity_changed"
+        )
 
 
 def new_attestation_nonce() -> str:

@@ -37,7 +37,9 @@ from healthmes.hermes_runtime_identity import (
     HermesDecisionRuntimeManifest,
     HermesRuntimeIdentityError,
     build_runtime_manifest,
+    capture_runtime_boot_identity,
     load_runtime_manifest,
+    runtime_control_source_artifacts,
     runtime_execution_artifacts,
     runtime_home_artifact_sha256,
     seal_supervised_runtime,
@@ -571,6 +573,91 @@ def test_unsealed_runtime_rejects_control_source_drift(
         )
 
 
+def test_old_boot_identity_cannot_seal_newer_on_disk_supervisor(
+    runtime_bundle: RuntimeBundle,
+    tmp_path: Path,
+) -> None:
+    from healthmes import hermes_runtime_identity, hermes_runtime_supervisor
+
+    supervisor_source = Path(hermes_runtime_supervisor.__file__)
+    copied_supervisor = tmp_path / "hermes_runtime_supervisor.py"
+    copied_supervisor.write_bytes(supervisor_source.read_bytes())
+    old_boot_identity = capture_runtime_boot_identity(
+        supervisor_module=copied_supervisor,
+    )
+    copied_supervisor.write_bytes(
+        copied_supervisor.read_bytes() + b"\n# newer supervisor\n"
+    )
+    newer_control_sources = runtime_control_source_artifacts(
+        supervisor_module=copied_supervisor,
+    )
+    payload = runtime_bundle.prepared_manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude={"runtime_id"},
+    )
+    payload["control_source_artifacts"] = [
+        artifact.model_dump(mode="json")
+        for artifact in newer_control_sources
+    ]
+    payload["runtime_id"] = hermes_runtime_identity._sha256_json(payload)
+    newer_manifest = hermes_runtime_identity._manifest_validate(payload)
+    write_runtime_manifest(runtime_bundle.manifest_path, newer_manifest)
+    before = runtime_bundle.manifest_path.read_bytes()
+
+    with pytest.raises(
+        HermesRuntimeIdentityError,
+        match="hermes_runtime_boot_identity_changed",
+    ):
+        seal_supervised_runtime(
+            manifest_path=runtime_bundle.manifest_path,
+            attestation_key_path=runtime_bundle.key_path,
+            hermes_home=runtime_bundle.home,
+            vendor_root=runtime_bundle.vendor_root,
+            environment=PROVIDER_ENV,
+            expected_launch_argv=newer_manifest.launch_argv,
+            supervisor_module=copied_supervisor,
+            expected_boot_identity=old_boot_identity,
+        )
+
+    assert runtime_bundle.manifest_path.read_bytes() == before
+    assert load_runtime_manifest(runtime_bundle.manifest_path).sealed is False
+
+
+def test_matching_boot_identity_seal_is_byte_idempotent(
+    runtime_bundle: RuntimeBundle,
+) -> None:
+    write_runtime_manifest(
+        runtime_bundle.manifest_path,
+        runtime_bundle.prepared_manifest,
+    )
+    boot_identity = capture_runtime_boot_identity()
+    sealed = seal_supervised_runtime(
+        manifest_path=runtime_bundle.manifest_path,
+        attestation_key_path=runtime_bundle.key_path,
+        hermes_home=runtime_bundle.home,
+        vendor_root=runtime_bundle.vendor_root,
+        environment=PROVIDER_ENV,
+        expected_launch_argv=runtime_bundle.prepared_manifest.launch_argv,
+        expected_boot_identity=boot_identity,
+    )[0]
+    before = runtime_bundle.manifest_path.read_bytes()
+
+    repeated = seal_supervised_runtime(
+        manifest_path=runtime_bundle.manifest_path,
+        attestation_key_path=runtime_bundle.key_path,
+        hermes_home=runtime_bundle.home,
+        vendor_root=runtime_bundle.vendor_root,
+        environment=PROVIDER_ENV,
+        expected_launch_argv=runtime_bundle.prepared_manifest.launch_argv,
+        expected_boot_identity=boot_identity,
+    )[0]
+
+    assert sealed.sealed is True
+    assert repeated == sealed
+    assert runtime_bundle.manifest_path.read_bytes() == before
+
+
 def test_healthmes_rejects_an_unsealed_runtime_manifest(
     runtime_bundle: RuntimeBundle,
 ) -> None:
@@ -1052,6 +1139,7 @@ async def test_runtime_attestation_fails_closed_after_live_inventory_drift(
     process._launch_argv = runtime_bundle.manifest.launch_argv
     process._child_generation = 1
     process._healthy = True
+    process._lifecycle_state = "running"
     monkeypatch.setattr(
         process,
         "_validate_bound_state",

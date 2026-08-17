@@ -38,12 +38,13 @@ def _write_executable(path: Path, content: str) -> None:
 def _write_process_identity(
     runtime_dir: Path,
     *,
+    process_name: str = "healthmes",
     pid: str = "4242",
     executable: str = "/bin/bash",
     start_time: str = "Mon Aug  3 12:00:00 2026",
     nonce: str = "abc123",
 ) -> Path:
-    pid_file = runtime_dir / "healthmes.pid"
+    pid_file = runtime_dir / f"{process_name}.pid"
     pid_file.write_text(f"{pid}\n", encoding="utf-8")
     pid_file.with_suffix(".pid.identity").write_text(
         "\n".join(
@@ -144,6 +145,17 @@ def _local_runtime_harness(tmp_path: Path) -> dict[str, object]:
                 ;;
             esac
         fi
+        if [ "${1:-}" = "-s" ] && [ "${2:-}" = "KILL" ]; then
+            case "${FAKE_KILL_BEHAVIOR:-exit}" in
+            exit)
+                rm -f "$FAKE_PROCESS_STATE/alive"
+                ;;
+            reuse)
+                printf '%s\\n' "Mon Aug  3 12:02:00 2026" \
+                    >"$FAKE_PROCESS_STATE/start_time"
+                ;;
+            esac
+        fi
         """,
     )
     _write_executable(
@@ -202,13 +214,18 @@ def _run_local_runtime(
     command: str,
     *,
     term_behavior: str = "stay",
+    kill_behavior: str = "exit",
+    check: bool = True,
+    env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(harness["env"])
     env["FAKE_TERM_BEHAVIOR"] = term_behavior
+    env["FAKE_KILL_BEHAVIOR"] = kill_behavior
+    env.update(env_overrides or {})
     return subprocess.run(
         ["bash", str(harness["local_script"]), command],
         env=env,
-        check=True,
+        check=check,
         capture_output=True,
         text=True,
     )
@@ -309,6 +326,9 @@ def test_local_start_uses_only_optional_dedicated_decision_runtime() -> None:
     assert "uv sync --frozen --no-dev" in start_body
     assert "scripts/bootstrap.py" in start_body
     assert "healthmes.hermes_runtime_supervisor" in start_body
+    assert start_body.index("stop_decision_runtime") < start_body.index(
+        "uv sync --frozen --no-dev"
+    )
     assert start_body.index("scripts/bootstrap.py") < start_body.index(
         "healthmes.hermes_runtime_supervisor"
     )
@@ -335,6 +355,29 @@ def test_local_start_uses_only_optional_dedicated_decision_runtime() -> None:
     )
 
 
+def test_native_mutation_paths_drain_decision_runtime_first() -> None:
+    text = LOCAL_SCRIPT.read_text(encoding="utf-8")
+    install_body = _function_body(text, "cmd_install")
+    update_body = _function_body(text, "cmd_update")
+    start_body = _function_body(text, "start_apps")
+
+    assert install_body.index("stop_decision_runtime") < install_body.index(
+        '"$DEV_MAC_SCRIPT" setup'
+    )
+    assert update_body.index("stop_decision_runtime") < update_body.index(
+        'git -C "$REPO_ROOT" pull --ff-only'
+    )
+    assert update_body.index("stop_decision_runtime") < update_body.index(
+        '"$DEV_MAC_SCRIPT" setup'
+    )
+    assert start_body.index("stop_decision_runtime") < start_body.index(
+        "uv sync --frozen --no-dev"
+    )
+    assert start_body.index("stop_decision_runtime") < start_body.index(
+        "scripts/bootstrap.py"
+    )
+
+
 def test_local_runtime_supervises_and_stops_decision_process() -> None:
     text = LOCAL_SCRIPT.read_text(encoding="utf-8")
     daemon_body = _function_body(text, "cmd_daemon")
@@ -343,7 +386,7 @@ def test_local_runtime_supervises_and_stops_decision_process() -> None:
 
     assert '"$HERMES_DECISION_PID"' in daemon_body
     assert "decision_runtime_configured" in daemon_body
-    assert 'stop_process "Hermes decision runtime"' in stop_body
+    assert "stop_decision_runtime" in stop_body
     assert 'service_status "Hermes decision runtime"' in status_body
 
 
@@ -427,6 +470,61 @@ def test_stop_disables_keepalive_before_signaling_verified_process_group(
     _assert_identity_check_immediately_before(events, "kill -s KILL -4242")
     assert not (Path(harness["runtime"]) / "healthmes.pid").exists()
     assert not (Path(harness["runtime"]) / "healthmes.pid.identity").exists()
+
+
+def test_decision_stop_uses_full_bound_and_never_orphans_child_group(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    pid_file = _write_process_identity(
+        runtime,
+        process_name="hermes-decision",
+    )
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        check=False,
+        env_overrides={
+            "HEALTHMES_DECISION_HERMES_MAX_ITERATION_TIMEOUT_SECONDS": "1",
+            "HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS": "1",
+            "HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS": "1",
+        },
+    )
+
+    events = _event_lines(harness)
+    assert result.returncode != 0
+    assert "kill -s TERM -4242" in events
+    assert "kill -s KILL -4242" not in events
+    assert events.count("sleep 1") == 3
+    assert "refusing to orphan its child process group" in result.stderr
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
+
+
+def test_generic_stop_bounds_term_and_post_kill_wait(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    runtime = Path(harness["runtime"])
+    pid_file = _write_process_identity(runtime)
+
+    result = _run_local_runtime(
+        harness,
+        "stop",
+        kill_behavior="stay",
+        check=False,
+    )
+
+    events = _event_lines(harness)
+    assert result.returncode != 0
+    assert events.count("sleep 1") == 3
+    assert events.index("kill -s TERM -4242") < events.index(
+        "kill -s KILL -4242"
+    )
+    assert "remained alive 1s after SIGKILL" in result.stderr
+    assert pid_file.exists()
+    assert pid_file.with_suffix(".pid.identity").exists()
 
 
 @pytest.mark.parametrize("pid", ("0", "1"))

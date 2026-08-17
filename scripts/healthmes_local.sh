@@ -27,6 +27,7 @@ KILL_BIN="${HEALTHMES_KILL_BIN:-/bin/kill}"
 SLEEP_BIN="${HEALTHMES_SLEEP_BIN:-sleep}"
 BASH_BIN="${HEALTHMES_BASH_BIN:-/bin/bash}"
 UUIDGEN_BIN="${HEALTHMES_UUIDGEN_BIN:-uuidgen}"
+AWK_BIN="${HEALTHMES_AWK_BIN:-awk}"
 
 info() { printf '[healthmes] %s\n' "$*"; }
 die() { printf '[healthmes] %s\n' "$*" >&2; exit 1; }
@@ -210,23 +211,95 @@ signal_process_group() {
     "$KILL_BIN" -s "$signal" "-$pid"
 }
 
+bounded_timeout_seconds() {
+    local label=$1 value=$2 maximum=$3
+    "$AWK_BIN" -v label="$label" -v value="$value" -v maximum="$maximum" '
+        BEGIN {
+            valid = value ~ /^[0-9]+([.][0-9]+)?$/
+            if (!valid || value + 0 <= 0 || value + 0 > maximum) {
+                exit 1
+            }
+            rounded = int(value + 0)
+            if (rounded < value + 0) {
+                rounded += 1
+            }
+            print rounded
+        }
+    '
+}
+
+load_decision_runtime_stop_bounds() {
+    local response_timeout child_term_timeout child_kill_timeout
+    response_timeout="$(
+        bounded_timeout_seconds \
+            "decision response timeout" \
+            "${HEALTHMES_DECISION_HERMES_MAX_ITERATION_TIMEOUT_SECONDS:-120}" \
+            300
+    )" || die "decision response timeout must be within (0, 300] seconds"
+    child_term_timeout="$(
+        bounded_timeout_seconds \
+            "child TERM timeout" \
+            "${HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS:-10}" \
+            10
+    )" || die "child TERM timeout must be within (0, 10] seconds"
+    child_kill_timeout="$(
+        bounded_timeout_seconds \
+            "child KILL timeout" \
+            "${HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS:-5}" \
+            5
+    )" || die "child KILL timeout must be within (0, 5] seconds"
+    DECISION_RUNTIME_TERM_WAIT_SECONDS=$((response_timeout + child_term_timeout + child_kill_timeout))
+    DECISION_RUNTIME_KILL_WAIT_SECONDS=$child_kill_timeout
+}
+
+wait_for_process_exit() {
+    local pid_file=$1 timeout_seconds=$2 polls
+    polls=$timeout_seconds
+    while [ "$polls" -gt 0 ]; do
+        process_identity_matches "$pid_file" || return 0
+        "$SLEEP_BIN" 1
+        polls=$((polls - 1))
+    done
+    ! process_identity_matches "$pid_file"
+}
+
 stop_process() {
     local name=$1 pid_file=$2
+    local term_wait_seconds=${3:-2}
+    local kill_wait_seconds=${4:-1}
+    local allow_force_kill=${5:-true}
     if ! process_identity_matches "$pid_file"; then
         clear_process_identity "$pid_file"
         info "$name stopped"
         return
     fi
     signal_process_group TERM "$pid_file" 2>/dev/null || true
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        process_identity_matches "$pid_file" || break
-        "$SLEEP_BIN" 0.2
-    done
-    if process_identity_matches "$pid_file"; then
-        signal_process_group KILL "$pid_file" 2>/dev/null || true
+    if wait_for_process_exit "$pid_file" "$term_wait_seconds"; then
+        clear_process_identity "$pid_file"
+        info "$name stopped"
+        return
+    fi
+    if [ "$allow_force_kill" != true ]; then
+        die "$name did not stop within ${term_wait_seconds}s; refusing to orphan its child process group"
+    fi
+    signal_process_group KILL "$pid_file" 2>/dev/null || true
+    if ! wait_for_process_exit "$pid_file" "$kill_wait_seconds"; then
+        die "$name remained alive ${kill_wait_seconds}s after SIGKILL"
     fi
     clear_process_identity "$pid_file"
     info "$name stopped"
+}
+
+stop_decision_runtime() {
+    load_decision_runtime_stop_bounds
+    # Hermes owns a separate child process group. Let the supervisor perform
+    # its bounded TERM/KILL cleanup; killing only the outer group can orphan it.
+    stop_process \
+        "Hermes decision runtime" \
+        "$HERMES_DECISION_PID" \
+        "$DECISION_RUNTIME_TERM_WAIT_SECONDS" \
+        "$DECISION_RUNTIME_KILL_WAIT_SECONDS" \
+        false
 }
 
 load_runtime_env() {
@@ -326,22 +399,38 @@ uninstall_launch_agent() {
 }
 
 cmd_install() {
+    stop_launch_agent
+    load_runtime_env
+    stop_decision_runtime
     bash "$DEV_MAC_SCRIPT" setup
     install_launch_agent
     info "installed and configured to start at login"
 }
 
 cmd_update() {
+    local restart_launch_agent=false
     git -C "$REPO_ROOT" diff --quiet || die "working tree has changes; commit or stash first"
     git -C "$REPO_ROOT" diff --cached --quiet || die "index has changes; commit or stash first"
+    if [ -f "$LAUNCH_AGENT_PLIST" ]; then
+        restart_launch_agent=true
+        stop_launch_agent
+    fi
+    load_runtime_env
+    stop_decision_runtime
     git -C "$REPO_ROOT" pull --ff-only
     bash "$DEV_MAC_SCRIPT" setup
+    if [ "$restart_launch_agent" = true ]; then
+        start_launch_agent
+    fi
     info "updated"
 }
 
 start_apps() {
     local decision_home= quoted_home= quoted_vendor= decision_enabled=false
     load_runtime_env
+    # Stop the old in-memory code before uv can replace the interpreter or
+    # bootstrap can publish runtime intent for changed HealthMes sources.
+    stop_decision_runtime
     bash "$DEV_MAC_SCRIPT" services-start
     resolve_ow_api_key
     if decision_runtime_configured; then
@@ -358,9 +447,7 @@ start_apps() {
         decision_home="$(dirname "$HEALTHMES_DECISION_HERMES_PROFILE_PATH")"
         printf -v quoted_home '%q' "$decision_home"
         printf -v quoted_vendor '%q' "$REPO_ROOT/vendor/hermes-agent"
-        stop_process "Hermes decision runtime" "$HERMES_DECISION_PID"
     else
-        stop_process "Hermes decision runtime" "$HERMES_DECISION_PID"
         info "Hermes decision runtime disabled (model/provider not configured)"
     fi
     start_process "Open Wearables" "$OW_PID" "$OW_LOG" \
@@ -429,11 +516,13 @@ cmd_daemon() {
 }
 
 stop_apps() {
+    load_runtime_env
+    # Drain decisions while HealthMes MCP remains available to in-flight turns.
+    stop_decision_runtime
     stop_process "HealthMes" "$HEALTHMES_PID"
     stop_process "Open Wearables beat" "$BEAT_PID"
     stop_process "Open Wearables worker" "$WORKER_PID"
     stop_process "Open Wearables" "$OW_PID"
-    stop_process "Hermes decision runtime" "$HERMES_DECISION_PID"
 }
 
 cmd_stop() {

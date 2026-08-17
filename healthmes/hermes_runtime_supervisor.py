@@ -42,8 +42,10 @@ from healthmes.hermes_runtime_identity import (
     HERMES_RUNTIME_HEALTH_PATH,
     HERMES_RUNTIME_PROVIDER_ENV_NAMES,
     HermesDecisionRuntimeManifest,
+    HermesRuntimeBootIdentity,
     HermesRuntimeIdentityError,
     HermesRuntimeMcpConnection,
+    capture_runtime_boot_identity,
     load_runtime_mcp_connection,
     seal_supervised_runtime,
     sign_runtime_attestation,
@@ -69,6 +71,9 @@ _LifecycleState = Literal[
     "close_failed",
     "closed",
 ]
+_MAX_CHILD_TERM_TIMEOUT_SECONDS = 10.0
+_MAX_CHILD_KILL_TIMEOUT_SECONDS = 5.0
+_SUPERVISOR_BOOT_IDENTITY = capture_runtime_boot_identity()
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +94,8 @@ class HermesRuntimeSupervisorConfig:
     restart_backoff_initial_seconds: float = 0.25
     restart_backoff_max_seconds: float = 5
     max_concurrent_responses: int = 8
+    child_term_timeout_seconds: float = _MAX_CHILD_TERM_TIMEOUT_SECONDS
+    child_kill_timeout_seconds: float = _MAX_CHILD_KILL_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         if not 1 <= self.port <= 65_535:
@@ -109,6 +116,8 @@ class HermesRuntimeSupervisorConfig:
                 "restart backoff max",
                 self.restart_backoff_max_seconds,
             ),
+            ("child TERM timeout", self.child_term_timeout_seconds),
+            ("child KILL timeout", self.child_kill_timeout_seconds),
         )
         for label, value in durations:
             if not math.isfinite(value) or value <= 0:
@@ -121,6 +130,16 @@ class HermesRuntimeSupervisorConfig:
             raise ValueError(
                 "max concurrent responses must be between 1 and 128"
             )
+        if (
+            self.child_term_timeout_seconds
+            > _MAX_CHILD_TERM_TIMEOUT_SECONDS
+        ):
+            raise ValueError("child TERM timeout must be at most 10 seconds")
+        if (
+            self.child_kill_timeout_seconds
+            > _MAX_CHILD_KILL_TIMEOUT_SECONDS
+        ):
+            raise ValueError("child KILL timeout must be at most 5 seconds")
         if (
             self.restart_backoff_max_seconds
             < self.restart_backoff_initial_seconds
@@ -279,11 +298,17 @@ class HermesRuntimeProcess:
         *,
         environ: Mapping[str, str] | None = None,
         mcp_inventory_probe: McpInventoryProbe | None = None,
+        boot_identity: HermesRuntimeBootIdentity | None = None,
     ) -> None:
         self._config = config
         self._environ = dict(os.environ if environ is None else environ)
         self._mcp_inventory_probe = (
             mcp_inventory_probe or _probe_live_mcp_schema_digests
+        )
+        self._boot_identity = (
+            _SUPERVISOR_BOOT_IDENTITY
+            if boot_identity is None
+            else boot_identity
         )
         self._state: HermesRuntimeState | None = None
         self._process: asyncio.subprocess.Process | None = None
@@ -349,6 +374,7 @@ class HermesRuntimeProcess:
             vendor_root=self._config.vendor_root,
             environment=self._environ,
             expected_launch_argv=launch_argv,
+            expected_boot_identity=self._boot_identity,
         )
         if (
             (expected is not None and state != expected)
@@ -397,9 +423,14 @@ class HermesRuntimeProcess:
         """Attest and pin the current child until the caller releases it."""
 
         async with self._child_condition:
-            await self._child_condition.wait_for(
-                self._response_lease_available
-            )
+            while True:
+                if self._lifecycle_state != "running":
+                    raise HermesRuntimeIdentityError(
+                        "hermes_runtime_response_admission_closed"
+                    )
+                if self._response_lease_available():
+                    break
+                await self._child_condition.wait()
             state = self.state
             generation = self._child_generation
             self._active_response_leases[generation] = (
@@ -530,6 +561,7 @@ class HermesRuntimeProcess:
             hermes_home=config.hermes_home,
             vendor_root=config.vendor_root,
             environment=self._environ,
+            expected_boot_identity=self._boot_identity,
         )
         if (config.vendor_root / ".env").exists():
             raise HermesRuntimeIdentityError(
@@ -547,6 +579,7 @@ class HermesRuntimeProcess:
                 vendor_root=config.vendor_root,
                 environment=self._environ,
                 expected_launch_argv=manifest.launch_argv,
+                expected_boot_identity=self._boot_identity,
             )
         )
         if (
@@ -579,6 +612,7 @@ class HermesRuntimeProcess:
                     vendor_root=config.vendor_root,
                     environment=self._environ,
                     expected_launch_argv=manifest.launch_argv,
+                    expected_boot_identity=self._boot_identity,
                 )
             )
             if (
@@ -824,7 +858,10 @@ class HermesRuntimeProcess:
                 self._process = None
             return
         try:
-            await asyncio.wait_for(process.wait(), timeout=10)
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=self._config.child_term_timeout_seconds,
+            )
         except TimeoutError:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -832,7 +869,15 @@ class HermesRuntimeProcess:
                 if self._process is process:
                     self._process = None
                 return
-            await process.wait()
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=self._config.child_kill_timeout_seconds,
+                )
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    "hermes_runtime_child_kill_timeout"
+                ) from exc
         if self._process is process:
             self._process = None
 
@@ -841,9 +886,11 @@ class HermesRuntimeProcess:
             async with self._lifecycle_lock:
                 if self._lifecycle_state == "closed":
                     return
-                self._lifecycle_state = "closing"
-                monitor = self._monitor_task
-                self._monitor_task = None
+                async with self._child_condition:
+                    self._lifecycle_state = "closing"
+                    monitor = self._monitor_task
+                    self._monitor_task = None
+                    self._child_condition.notify_all()
             close_owner = asyncio.current_task()
             cleanup_task = asyncio.create_task(
                 self._finish_close(monitor, close_owner),
@@ -1374,6 +1421,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             )
         ),
     )
+    parser.add_argument(
+        "--child-term-timeout",
+        type=float,
+        default=float(
+            os.environ.get(
+                "HEALTHMES_DECISION_RUNTIME_CHILD_TERM_TIMEOUT_SECONDS",
+                str(_MAX_CHILD_TERM_TIMEOUT_SECONDS),
+            )
+        ),
+    )
+    parser.add_argument(
+        "--child-kill-timeout",
+        type=float,
+        default=float(
+            os.environ.get(
+                "HEALTHMES_DECISION_RUNTIME_CHILD_KILL_TIMEOUT_SECONDS",
+                str(_MAX_CHILD_KILL_TIMEOUT_SECONDS),
+            )
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1404,6 +1471,8 @@ def main(argv: list[str] | None = None) -> None:
             restart_backoff_initial_seconds=args.restart_backoff_initial,
             restart_backoff_max_seconds=args.restart_backoff_max,
             max_concurrent_responses=args.max_concurrent_responses,
+            child_term_timeout_seconds=args.child_term_timeout,
+            child_kill_timeout_seconds=args.child_kill_timeout,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
