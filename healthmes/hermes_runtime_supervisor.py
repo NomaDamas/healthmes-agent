@@ -90,6 +90,7 @@ _MAX_DECISION_TIMEOUT_SECONDS = 300.0
 _MAX_RUNTIME_DRAIN_TIMEOUT_SECONDS = 315
 _RUNTIME_SHUTDOWN_BUDGET_VERSION = 3
 _MAX_RUNTIME_SHUTDOWN_BUDGET_BYTES = 1024
+_MIN_MANAGED_PROCESS_PID = 2
 _PROCESS_GROUP_EMPTY_CONFIRMATIONS = 2
 _PROCESS_GROUP_POLL_INTERVAL_SECONDS = 0.05
 _PROCESS_GROUP_PROBE_TIMEOUT_SECONDS = 1.0
@@ -131,8 +132,8 @@ class HermesRuntimeProcessIdentity:
     start_token: str
 
     def __post_init__(self) -> None:
-        if self.pid < 1:
-            raise ValueError("runtime process PID must be positive")
+        if self.pid < _MIN_MANAGED_PROCESS_PID:
+            raise ValueError("runtime process PID must be at least 2")
         if (
             not self.start_token
             or len(self.start_token) > 256
@@ -154,8 +155,8 @@ class HermesRuntimeLauncherIdentity:
     service_nonce: str
 
     def __post_init__(self) -> None:
-        if self.pid < 1:
-            raise ValueError("runtime launcher PID must be positive")
+        if self.pid < _MIN_MANAGED_PROCESS_PID:
+            raise ValueError("runtime launcher PID must be at least 2")
         if (
             not self.start_token
             or len(self.start_token) > 256

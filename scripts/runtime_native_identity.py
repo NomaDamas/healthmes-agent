@@ -42,6 +42,7 @@ _AT_FDCWD = -100
 _LINUX_RENAME_NOREPLACE = 1
 _DARWIN_RENAME_EXCL = 0x00000004
 _MAX_PS_OUTPUT_BYTES = 64 * 1024
+_MIN_MANAGED_PROCESS_PID = 2
 
 
 class _IdentityUnavailable(RuntimeError):
@@ -626,8 +627,8 @@ def _parse_shutdown_budget_payload(
         ) from exc
     if (
         not 1 <= drain_timeout <= max_drain_seconds
-        or launcher_pid < 1
-        or supervisor_pid < 1
+        or launcher_pid < _MIN_MANAGED_PROCESS_PID
+        or supervisor_pid < _MIN_MANAGED_PROCESS_PID
     ):
         raise _IdentityUnavailable(
             "native_identity_shutdown_budget_invalid"

@@ -42,6 +42,7 @@ DECISION_RUNTIME_LIFECYCLE_LOCK_STALE_GRACE_SECONDS=2
 DECISION_RUNTIME_STARTUP_RECOVERY_GRACE_SECONDS=3
 DECISION_RUNTIME_PS_PROBE_TIMEOUT_SECONDS=1
 MAX_DECISION_RUNTIME_STOP_BUDGET_BYTES=1024
+MAX_GENERIC_PROCESS_RECOVERY_BYTES=1024
 DECISION_RUNTIME_LIFECYCLE_RECORD_VERSION=2
 DECISION_RUNTIME_LIFECYCLE_CONTRACT_VERSION=2
 MAX_DECISION_RUNTIME_TERM_WAIT_SECONDS=$((
@@ -66,6 +67,14 @@ identity_file() {
     printf '%s.identity\n' "$1"
 }
 
+generic_process_recovery_directory() {
+    printf '%s.recovery\n' "$1"
+}
+
+generic_process_recovery_record() {
+    printf '%s/record\n' "$(generic_process_recovery_directory "$1")"
+}
+
 clear_process_identity() {
     local pid_file=$1
     rm -f "$pid_file" "$(identity_file "$pid_file")"
@@ -79,6 +88,144 @@ write_unverified_process_pid() {
         rm -f "$temp"
         return 1
     fi
+}
+
+load_generic_process_recovery() {
+    local pid_file=$1 directory record payload key value extra
+    local version= pid= native_start_token= service_nonce= service_name=
+    local seen_version= seen_pid= seen_native_start_token=
+    local seen_service_nonce= seen_service_name=
+    directory="$(generic_process_recovery_directory "$pid_file")"
+    record="$(generic_process_recovery_record "$pid_file")"
+    GENERIC_PROCESS_RECOVERY_STATUS=missing
+    GENERIC_PROCESS_RECOVERY_VERSION=
+    GENERIC_PROCESS_RECOVERY_PID=
+    GENERIC_PROCESS_RECOVERY_NATIVE_START_TOKEN=
+    GENERIC_PROCESS_RECOVERY_SERVICE_NONCE=
+    GENERIC_PROCESS_RECOVERY_SERVICE_NAME=
+    if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
+        return
+    fi
+    GENERIC_PROCESS_RECOVERY_STATUS=invalid
+    [ -d "$directory" ] && [ ! -L "$directory" ] \
+        && [ -f "$record" ] && [ ! -L "$record" ] \
+        || return
+    payload="$(run_native_identity_helper \
+        read-bounded \
+        "$record" \
+        --max-bytes "$MAX_GENERIC_PROCESS_RECOVERY_BYTES" \
+        --require-ascii-text 2>/dev/null)" \
+        || return
+    [ -n "$payload" ] || return
+    while IFS=$'\t' read -r key value extra; do
+        [ -z "$extra" ] || return
+        case "$key" in
+        version)
+            [ -z "$seen_version" ] || return
+            version=$value
+            seen_version=1
+            ;;
+        pid)
+            [ -z "$seen_pid" ] || return
+            pid=$value
+            seen_pid=1
+            ;;
+        native_start_token)
+            [ -z "$seen_native_start_token" ] || return
+            native_start_token=$value
+            seen_native_start_token=1
+            ;;
+        service_nonce)
+            [ -z "$seen_service_nonce" ] || return
+            service_nonce=$value
+            seen_service_nonce=1
+            ;;
+        service_name)
+            [ -z "$seen_service_name" ] || return
+            service_name=$value
+            seen_service_name=1
+            ;;
+        *)
+            return
+            ;;
+        esac
+    done <<<"$payload"
+    [ "$version" = 1 ] \
+        && [ -n "$seen_version" ] \
+        && [ -n "$seen_pid" ] \
+        && [ -n "$seen_native_start_token" ] \
+        && [ -n "$seen_service_nonce" ] \
+        && [ -n "$seen_service_name" ] \
+        && valid_managed_pid "$pid" \
+        && [[ "$native_start_token" =~ ^(linux:[1-9][0-9]*|darwin:[1-9][0-9]*:[0-9]{6})$ ]] \
+        && [[ "$service_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
+        && [[ "$service_name" =~ ^[A-Za-z0-9][A-Za-z0-9\ -]{0,63}$ ]] \
+        || return
+    GENERIC_PROCESS_RECOVERY_STATUS=valid
+    GENERIC_PROCESS_RECOVERY_VERSION=$version
+    GENERIC_PROCESS_RECOVERY_PID=$pid
+    GENERIC_PROCESS_RECOVERY_NATIVE_START_TOKEN=$native_start_token
+    GENERIC_PROCESS_RECOVERY_SERVICE_NONCE=$service_nonce
+    GENERIC_PROCESS_RECOVERY_SERVICE_NAME=$service_name
+}
+
+generic_process_recovery_generation() {
+    [ "$GENERIC_PROCESS_RECOVERY_STATUS" = valid ] || return 1
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$GENERIC_PROCESS_RECOVERY_VERSION" \
+        "$GENERIC_PROCESS_RECOVERY_PID" \
+        "$GENERIC_PROCESS_RECOVERY_NATIVE_START_TOKEN" \
+        "$GENERIC_PROCESS_RECOVERY_SERVICE_NONCE" \
+        "$GENERIC_PROCESS_RECOVERY_SERVICE_NAME"
+}
+
+write_generic_process_recovery() {
+    local pid_file=$1 pid=$2 native_start_token=$3
+    local service_nonce=$4 service_name=$5 stage status
+    valid_managed_pid "$pid" \
+        && [[ "$native_start_token" =~ ^(linux:[1-9][0-9]*|darwin:[1-9][0-9]*:[0-9]{6})$ ]] \
+        && [[ "$service_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
+        && [[ "$service_name" =~ ^[A-Za-z0-9][A-Za-z0-9\ -]{0,63}$ ]] \
+        || return 1
+    stage="$(mktemp -d "$RUNTIME_DIR/.process-recovery-stage.XXXXXX")" \
+        || return 1
+    if ! {
+        printf 'version\t1\n'
+        printf 'pid\t%s\n' "$pid"
+        printf 'native_start_token\t%s\n' "$native_start_token"
+        printf 'service_nonce\t%s\n' "$service_nonce"
+        printf 'service_name\t%s\n' "$service_name"
+    } >"$stage/record"; then
+        remove_managed_record_directory "$stage" 2>/dev/null || true
+        return 1
+    fi
+    if rename_directory_exclusive \
+        "$stage" "$(generic_process_recovery_directory "$pid_file")"; then
+        return 0
+    else
+        status=$?
+    fi
+    remove_managed_record_directory "$stage" 2>/dev/null || true
+    return "$status"
+}
+
+remove_generic_process_recovery_generation() {
+    local pid_file=$1 expected_generation=$2 record expected_record_sha256
+    load_generic_process_recovery "$pid_file"
+    [ "$GENERIC_PROCESS_RECOVERY_STATUS" = valid ] \
+        && [ "$(generic_process_recovery_generation)" = "$expected_generation" ] \
+        || return 1
+    record="$(generic_process_recovery_record "$pid_file")"
+    expected_record_sha256="$(managed_record_sha256 "$record")" \
+        || return 1
+    load_generic_process_recovery "$pid_file"
+    [ "$GENERIC_PROCESS_RECOVERY_STATUS" = valid ] \
+        && [ "$(generic_process_recovery_generation)" = "$expected_generation" ] \
+        || return 1
+    retire_managed_record_directory \
+        "$(generic_process_recovery_directory "$pid_file")" \
+        ".process-recovery-retired.XXXXXX" \
+        "$expected_record_sha256"
 }
 
 valid_managed_pid() {
@@ -292,8 +439,8 @@ write_process_identity() {
         printf 'nonce\t%s\n' "$nonce"
     } >"$temp"
     printf '%s\n' "$pid" >"$pid_temp"
-    mv "$temp" "$file"
     mv "$pid_temp" "$pid_file"
+    mv "$temp" "$file"
 }
 
 capture_process_identity() {
@@ -314,6 +461,112 @@ capture_process_identity() {
         return 4
     fi
     write_process_identity "$pid_file" "$pid" "$nonce"
+}
+
+recover_generic_process_identity() {
+    local name=$1 pid_file=$2 deadline=${3:-}
+    local generation marker status stored_pid
+    load_generic_process_recovery "$pid_file"
+    [ "$GENERIC_PROCESS_RECOVERY_STATUS" = valid ] || return 5
+    [ "$GENERIC_PROCESS_RECOVERY_SERVICE_NAME" = "$name" ] || return 5
+    generation="$(generic_process_recovery_generation)" || return 5
+    if [ -e "$pid_file" ] || [ -L "$pid_file" ]; then
+        [ -f "$pid_file" ] && [ ! -L "$pid_file" ] || return 5
+        stored_pid="$(<"$pid_file")"
+        [ "$stored_pid" = "$GENERIC_PROCESS_RECOVERY_PID" ] || return 5
+    fi
+    if native_process_start_token_status \
+        "$GENERIC_PROCESS_RECOVERY_PID" \
+        "$GENERIC_PROCESS_RECOVERY_NATIVE_START_TOKEN"; then
+        :
+    else
+        status=$?
+        [ "$status" -eq 3 ] && return 4
+        return 5
+    fi
+    if load_process_snapshot \
+        "$GENERIC_PROCESS_RECOVERY_PID" "$deadline"; then
+        :
+    else
+        status=$?
+        return "$status"
+    fi
+    marker="healthmes_local.sh __service_runner $GENERIC_PROCESS_RECOVERY_SERVICE_NONCE "
+    if [ "$SNAPSHOT_PID" = "$GENERIC_PROCESS_RECOVERY_PID" ] \
+        && [ "$SNAPSHOT_PGID" = "$GENERIC_PROCESS_RECOVERY_PID" ] \
+        && [ "${SNAPSHOT_EXECUTABLE##*/}" = "bash" ] \
+        && [[ "$SNAPSHOT_COMMAND" == *"$marker"* ]]; then
+        :
+    else
+        return 4
+    fi
+    native_process_start_token_status \
+        "$GENERIC_PROCESS_RECOVERY_PID" \
+        "$GENERIC_PROCESS_RECOVERY_NATIVE_START_TOKEN" \
+        || return 5
+    write_process_identity \
+        "$pid_file" \
+        "$GENERIC_PROCESS_RECOVERY_PID" \
+        "$GENERIC_PROCESS_RECOVERY_SERVICE_NONCE" \
+        || return 5
+    if process_identity_matches "$pid_file" "$deadline"; then
+        :
+    else
+        return 5
+    fi
+    native_process_start_token_status \
+        "$GENERIC_PROCESS_RECOVERY_PID" \
+        "$GENERIC_PROCESS_RECOVERY_NATIVE_START_TOKEN" \
+        || return 5
+    remove_generic_process_recovery_generation \
+        "$pid_file" "$generation" \
+        || return 5
+}
+
+managed_process_identity_matches() {
+    local name=$1 pid_file=$2 deadline=${3:-} status generation
+    if process_identity_matches "$pid_file" "$deadline"; then
+        load_generic_process_recovery "$pid_file"
+        if [ "$GENERIC_PROCESS_RECOVERY_STATUS" = valid ] \
+            && [ "$GENERIC_PROCESS_RECOVERY_PID" = "$PROCESS_PID" ] \
+            && [ "$GENERIC_PROCESS_RECOVERY_SERVICE_NONCE" = "$PROCESS_NONCE" ] \
+            && [ "$GENERIC_PROCESS_RECOVERY_SERVICE_NAME" = "$name" ]; then
+            generation="$(generic_process_recovery_generation)" \
+                || return 5
+            remove_generic_process_recovery_generation \
+                "$pid_file" "$generation" \
+                || return 5
+        elif [ "$GENERIC_PROCESS_RECOVERY_STATUS" != missing ]; then
+            return 5
+        fi
+        return 0
+    else
+        status=$?
+    fi
+    load_generic_process_recovery "$pid_file"
+    case "$GENERIC_PROCESS_RECOVERY_STATUS" in
+    missing) return "$status" ;;
+    invalid) return 5 ;;
+    esac
+    recover_generic_process_identity "$name" "$pid_file" "$deadline"
+}
+
+clear_stale_generic_process_metadata() {
+    local name=$1 pid_file=$2 generation
+    load_generic_process_recovery "$pid_file"
+    case "$GENERIC_PROCESS_RECOVERY_STATUS" in
+    missing) ;;
+    valid)
+        [ "$GENERIC_PROCESS_RECOVERY_SERVICE_NAME" = "$name" ] \
+            || return 1
+        generation="$(generic_process_recovery_generation)" || return 1
+        remove_generic_process_recovery_generation \
+            "$pid_file" "$generation" \
+            || return 1
+        ;;
+    *) return 1 ;;
+    esac
+    clear_process_identity "$pid_file"
 }
 
 pid_running() {
@@ -1767,6 +2020,7 @@ decision_runtime_startup_lease_matches_launcher() {
 
 run_service_runner() {
     local nonce=$1 command=$2 child status service_pid service_start_token
+    local recovery_generation
     [ -n "$nonce" ] && [ "${HEALTHMES_SERVICE_NONCE:-}" = "$nonce" ] \
         || die "invalid service runner nonce"
     service_pid=$$
@@ -1780,10 +2034,34 @@ run_service_runner() {
                 "$nonce" "$service_pid" 2>/dev/null || true
             die "failed to bind decision runtime startup lease to the managed Bash launcher"
         fi
-        if ! write_unverified_process_pid "$HERMES_DECISION_PID" "$service_pid"; then
-            mark_decision_runtime_startup_failed \
-                "$nonce" "$service_pid" 2>/dev/null || true
-            die "failed to publish decision runtime launcher PID tombstone"
+    elif [ -n "${HEALTHMES_GENERIC_STARTUP_PID_FILE:-}" ] \
+        || [ -n "${HEALTHMES_GENERIC_STARTUP_SERVICE_NAME:-}" ]; then
+        [ -n "${HEALTHMES_GENERIC_STARTUP_PID_FILE:-}" ] \
+            && [ -n "${HEALTHMES_GENERIC_STARTUP_SERVICE_NAME:-}" ] \
+            || die "incomplete generic service startup publication path"
+        case "$HEALTHMES_GENERIC_STARTUP_PID_FILE" in
+        "$RUNTIME_DIR"/*.pid) ;;
+        *) die "invalid generic service startup PID path" ;;
+        esac
+        capture_native_process_start_token "$service_pid" \
+            || die "failed to capture generic service native start token"
+        write_generic_process_recovery \
+            "$HEALTHMES_GENERIC_STARTUP_PID_FILE" \
+            "$service_pid" \
+            "$NATIVE_PROCESS_START_TOKEN" \
+            "$nonce" \
+            "$HEALTHMES_GENERIC_STARTUP_SERVICE_NAME" \
+            || die "failed to publish generic service recovery identity"
+        load_generic_process_recovery \
+            "$HEALTHMES_GENERIC_STARTUP_PID_FILE"
+        recovery_generation="$(generic_process_recovery_generation)" \
+            || die "generic service recovery identity is unavailable"
+        if ! write_unverified_process_pid \
+            "$HEALTHMES_GENERIC_STARTUP_PID_FILE" "$service_pid"; then
+            remove_generic_process_recovery_generation \
+                "$HEALTHMES_GENERIC_STARTUP_PID_FILE" \
+                "$recovery_generation" 2>/dev/null || true
+            die "failed to publish generic service PID tombstone"
         fi
     fi
     service_start_token="ps:$(ps_value "$service_pid" lstart)" \
@@ -1803,22 +2081,46 @@ run_service_runner() {
 }
 
 wait_for_decision_runtime_launcher_publication() {
-    local launcher_service_nonce=$1 launcher_pid=$2 stored_pid
+    local launcher_service_nonce=$1 launcher_pid=$2
     local attempts=0
     while [ "$attempts" -lt 50 ]; do
         load_decision_runtime_startup_lease
         if [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = spawned ] \
             && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$launcher_service_nonce" ] \
-            && [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" = "$launcher_pid" ] \
-            && [ -f "$HERMES_DECISION_PID" ] \
-            && [ ! -L "$HERMES_DECISION_PID" ]; then
-            stored_pid="$(<"$HERMES_DECISION_PID")"
-            [ "$stored_pid" = "$launcher_pid" ] && return 0
+            && [ "$DECISION_RUNTIME_STARTUP_LEASE_PID" = "$launcher_pid" ]; then
+            return 0
         fi
         case "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" in
-        intent) ;;
+        intent | spawned) ;;
         *) return 1 ;;
         esac
+        "$SLEEP_BIN" 0.1
+        attempts=$((attempts + 1))
+    done
+    return 1
+}
+
+wait_for_generic_launcher_publication() {
+    local name=$1 pid_file=$2 launcher_service_nonce=$3 launcher_pid=$4
+    local attempts=0 stored_pid
+    while [ "$attempts" -lt 50 ]; do
+        load_generic_process_recovery "$pid_file"
+        if [ "$GENERIC_PROCESS_RECOVERY_STATUS" = valid ] \
+            && [ "$GENERIC_PROCESS_RECOVERY_SERVICE_NAME" = "$name" ] \
+            && [ "$GENERIC_PROCESS_RECOVERY_SERVICE_NONCE" = "$launcher_service_nonce" ] \
+            && [ "$GENERIC_PROCESS_RECOVERY_PID" = "$launcher_pid" ] \
+            && [ -f "$pid_file" ] \
+            && [ ! -L "$pid_file" ]; then
+            stored_pid="$(<"$pid_file")"
+            [ "$stored_pid" = "$launcher_pid" ] && return 0
+        fi
+        [ "$GENERIC_PROCESS_RECOVERY_STATUS" != invalid ] || return 1
+        if [ "$GENERIC_PROCESS_RECOVERY_STATUS" = valid ] \
+            && { [ "$GENERIC_PROCESS_RECOVERY_SERVICE_NAME" != "$name" ] \
+                || [ "$GENERIC_PROCESS_RECOVERY_SERVICE_NONCE" != "$launcher_service_nonce" ] \
+                || [ "$GENERIC_PROCESS_RECOVERY_PID" != "$launcher_pid" ]; }; then
+            return 1
+        fi
         "$SLEEP_BIN" 0.1
         attempts=$((attempts + 1))
     done
@@ -1829,14 +2131,25 @@ start_process() {
     local name=$1 pid_file=$2 log_file=$3 command=$4
     local startup_lease=${5:-}
     local nonce pid identity_status
-    if pid_running "$pid_file"; then
+    if [ -n "$startup_lease" ]; then
+        if process_identity_matches "$pid_file"; then
+            identity_status=0
+        else
+            identity_status=$?
+        fi
+    else
+        if managed_process_identity_matches "$name" "$pid_file"; then
+            identity_status=0
+        else
+            identity_status=$?
+        fi
+    fi
+    if [ "$identity_status" -eq 0 ]; then
         info "$name already running (pid $PROCESS_PID)"
         return
-    else
-        identity_status=$?
-        if [ "$identity_status" -eq 5 ]; then
-            die "$name process identity is unknown; preserving metadata"
-        fi
+    fi
+    if [ "$identity_status" -eq 5 ]; then
+        die "$name process identity is unknown; preserving metadata"
     fi
     mkdir -p "$RUNTIME_DIR"
     nonce="$(new_service_nonce)" || die "failed to generate $name service nonce"
@@ -1844,7 +2157,7 @@ start_process() {
         [ "$startup_lease" = "$HERMES_DECISION_STARTUP_LEASE" ] \
             || die "unsupported startup lease path"
         create_decision_runtime_startup_lease "$nonce"
-        if pid_running "$pid_file"; then
+        if process_identity_matches "$pid_file"; then
             cancel_pending_decision_runtime_startup_lease "$nonce" \
                 || die "$name is running but the competing startup lease could not be released"
             info "$name already running (pid $PROCESS_PID)"
@@ -1858,14 +2171,18 @@ start_process() {
             fi
         fi
     fi
-    if [ -f "$pid_file" ] || [ -f "$(identity_file "$pid_file")" ]; then
+    if [ -f "$pid_file" ] \
+        || [ -f "$(identity_file "$pid_file")" ] \
+        || [ -e "$(generic_process_recovery_directory "$pid_file")" ] \
+        || [ -L "$(generic_process_recovery_directory "$pid_file")" ]; then
         if [ -n "$startup_lease" ]; then
             cancel_pending_decision_runtime_startup_lease "$nonce" \
                 || die "$name has unverified launcher metadata and the new startup lease could not be released"
             die "$name has unverified launcher metadata; preserving it for stop/recovery"
         fi
         info "$name stale process identity ignored"
-        clear_process_identity "$pid_file"
+        clear_stale_generic_process_metadata "$name" "$pid_file" \
+            || die "$name stale recovery identity is unknown; preserving metadata"
     fi
     if ! (
         cd "$REPO_ROOT"
@@ -1878,7 +2195,10 @@ start_process() {
                 "$BASH_BIN" "$REPO_ROOT/scripts/healthmes_local.sh" \
                 __service_runner "$nonce" "$command" >>"$log_file" 2>&1 &
         else
-            nohup env HEALTHMES_SERVICE_NONCE="$nonce" \
+            nohup env \
+                HEALTHMES_SERVICE_NONCE="$nonce" \
+                HEALTHMES_GENERIC_STARTUP_PID_FILE="$pid_file" \
+                HEALTHMES_GENERIC_STARTUP_SERVICE_NAME="$name" \
                 "$BASH_BIN" "$REPO_ROOT/scripts/healthmes_local.sh" \
                 __service_runner "$nonce" "$command" >>"$log_file" 2>&1 &
         fi
@@ -1887,13 +2207,23 @@ start_process() {
             wait_for_decision_runtime_launcher_publication "$nonce" "$pid" \
                 || exit 1
         else
-            write_unverified_process_pid "$pid_file" "$pid" || exit 1
+            wait_for_generic_launcher_publication \
+                "$name" "$pid_file" "$nonce" "$pid" \
+                || exit 1
         fi
         set +m
     ); then
-        die "$name launcher publication failed; preserving the startup lease and any PID tombstone"
+        die "$name launcher publication failed; preserving any published recovery metadata"
     fi
-    pid="$(<"$pid_file")"
+    if [ -n "$startup_lease" ]; then
+        load_decision_runtime_startup_lease
+        [ "$DECISION_RUNTIME_STARTUP_LEASE_STATUS" = spawned ] \
+            && [ "$DECISION_RUNTIME_STARTUP_LEASE_SERVICE_NONCE" = "$nonce" ] \
+            || die "$name launcher publication changed before identity verification"
+        pid=$DECISION_RUNTIME_STARTUP_LEASE_PID
+    else
+        pid="$(<"$pid_file")"
+    fi
     "$SLEEP_BIN" 1
     if capture_process_identity "$pid_file" "$pid" "$nonce"; then
         :
@@ -1902,13 +2232,13 @@ start_process() {
         if [ -n "$startup_lease" ]; then
             case "$identity_status" in
             3)
-                die "$name launcher exited before identity verification; preserving the startup lease and PID tombstone"
+                die "$name launcher exited before identity verification; preserving the startup lease"
                 ;;
             4)
-                die "$name launcher PID was reused before identity verification; preserving the startup lease and PID tombstone"
+                die "$name launcher PID was reused before identity verification; preserving the startup lease"
                 ;;
             *)
-                die "$name launcher identity is unknown; preserving the startup lease and PID tombstone"
+                die "$name launcher identity is unknown; preserving the startup lease"
                 ;;
             esac
         fi
@@ -1925,6 +2255,17 @@ start_process() {
             die "$name launcher identity is unknown; preserving PID metadata"
             ;;
         esac
+    fi
+    if [ -z "$startup_lease" ]; then
+        load_generic_process_recovery "$pid_file"
+        [ "$GENERIC_PROCESS_RECOVERY_STATUS" = valid ] \
+            && [ "$GENERIC_PROCESS_RECOVERY_PID" = "$pid" ] \
+            && [ "$GENERIC_PROCESS_RECOVERY_SERVICE_NONCE" = "$nonce" ] \
+            && [ "$GENERIC_PROCESS_RECOVERY_SERVICE_NAME" = "$name" ] \
+            || die "$name recovery identity changed after verification"
+        remove_generic_process_recovery_generation \
+            "$pid_file" "$(generic_process_recovery_generation)" \
+            || die "$name recovery identity changed before completion"
     fi
     if [ -n "$startup_lease" ]; then
         if ! mark_decision_runtime_startup_identity_verified \
@@ -2099,12 +2440,10 @@ load_decision_runtime_stop_bounds() {
             || [ -z "$seen_supervisor_start_token" ] \
             || [ -z "$seen_publication_instance_nonce" ] \
             || [ -n "$seen_service_nonce" ] \
-            || ! [[ "$launcher_pid" =~ ^[1-9][0-9]*$ ]] \
-            || [ "$launcher_pid" -le 1 ] \
+            || ! valid_managed_pid "$launcher_pid" \
             || [[ "$launcher_start_token" != *:* ]] \
             || ! [[ "$launcher_service_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
-            || ! [[ "$supervisor_pid" =~ ^[1-9][0-9]*$ ]] \
-            || [ "$supervisor_pid" -le 1 ] \
+            || ! valid_managed_pid "$supervisor_pid" \
             || ! [[ "$supervisor_start_token" =~ ^(linux|darwin):.+$ ]] \
             || ! [[ "$publication_instance_nonce" =~ ^[A-Za-z0-9-]+$ ]]; then
             info "ignoring stale or invalid decision runtime stop budget"
@@ -2140,8 +2479,7 @@ load_decision_runtime_stop_bounds() {
         && [ -n "$seen_service_nonce" ] \
         && [ -z "$seen_launcher_pid$seen_launcher_start_token" ] \
         && [ -z "$seen_launcher_service_nonce" ] \
-        && [[ "$supervisor_pid" =~ ^[1-9][0-9]*$ ]] \
-        && [ "$supervisor_pid" -gt 1 ] \
+        && valid_managed_pid "$supervisor_pid" \
         && [[ "$supervisor_start_token" == *:* ]] \
         && [[ "$service_nonce" =~ ^[A-Za-z0-9-]+$ ]] \
         && { { [ "$version" = 1 ] \
@@ -2288,7 +2626,7 @@ stop_process() {
     local kill_wait_seconds=${4:-1}
     local allow_force_kill=${5:-true}
     local status
-    if process_identity_matches "$pid_file"; then
+    if managed_process_identity_matches "$name" "$pid_file"; then
         :
     else
         status=$?
@@ -2296,7 +2634,8 @@ stop_process() {
         3 | 4) ;;
         *) die "$name process identity is unknown; preserving metadata" ;;
         esac
-        clear_process_identity "$pid_file"
+        clear_stale_generic_process_metadata "$name" "$pid_file" \
+            || die "$name stale recovery identity is unknown; preserving metadata"
         info "$name stopped"
         return
     fi
@@ -3709,7 +4048,7 @@ decision_runtime_status() {
             info "Hermes decision runtime: starting (startup intent is published; launcher identity is not yet verified)"
         elif [ "$startup_lease_status" = spawned ] \
             || [ "$startup_lease_status" = failed ]; then
-            info "Hermes decision runtime: unknown (startup launcher identity is unverified; PID tombstone and lease are preserved)"
+            info "Hermes decision runtime: unknown (startup launcher identity is unverified; startup lease is preserved)"
         elif [ "$startup_lease_status" = identity_verified ]; then
             info "Hermes decision runtime: unknown (verified startup lease remains without a shutdown budget)"
         elif [ "$startup_lease_status" != missing ]; then

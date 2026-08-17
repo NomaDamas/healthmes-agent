@@ -300,10 +300,12 @@ wrapper by the same complete-stage/exclusive-rename protocol. The strict lease
 contains `created_at_epoch`, `updated_at_epoch`, the startup-owner identity,
 the launcher service nonce, and a phase:
 `intent`, `spawned`, `identity_verified`, or `failed`. The wrapper's first
-managed action changes `intent` to `spawned` with its own PID and then writes
-the PID tombstone; only after both publications succeed may it launch the
-Python supervisor. The parent captures all five `ps` identity fields, changes
-the lease to `identity_verified`, and removes the exact lease generation.
+managed action atomically changes `intent` to `spawned` with its own PID.
+That lease record is the only initial Decision Runtime publication: the
+parent does not require or create a separate PID tombstone before identity
+verification. The parent captures all five `ps` identity fields, atomically
+writes the complete launcher identity, changes the lease to
+`identity_verified`, and removes the exact lease generation.
 One failed or unreadable identity query is unknown, not evidence that the
 process is absent.
 Every configured `PS_BIN` invocation used by lifecycle acquisition or startup
@@ -322,6 +324,17 @@ its native process group to be proven empty. A reused PID, unreadable process
 state, live group member, malformed record, or generation mismatch preserves
 all diagnostics and fails closed. Therefore stop/update cannot report success
 or delete metadata while a startup generation remains unverified.
+
+Generic HealthMes and Open Wearables launchers use a separate bounded recovery
+record. Before publishing the numeric PID, the managed Bash wrapper atomically
+records its PID, native OS start token, service nonce, and expected service
+name. If the initial `ps` snapshot fails, a later start or stop may reconstruct
+the full identity only when the native token still matches and a bounded
+snapshot proves the same PID/PGID, Bash wrapper command marker, nonce, and
+service. Absence or proven PID reuse retires only that exact recovery
+generation; malformed, conflicting, timed-out, or unreadable evidence remains
+fail closed. All managed runtime PIDs, including shutdown-budget launcher and
+supervisor PIDs, must be at least 2 in the shell, helper, and Python parsers.
 
 Immediately before Uvicorn calls its normal startup implementation, the
 Python supervisor publishes an atomic

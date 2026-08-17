@@ -387,10 +387,11 @@ operator repair가 필요한 `unknown`으로 남긴다.
 rename protocol로 원자적으로 만든다. Lease에는 `created_at_epoch`,
 `updated_at_epoch`, startup owner identity, launcher service nonce와 `intent`,
 `spawned`, `identity_verified`, `failed` phase가 기록된다. 새 wrapper의 첫 관리
-동작은 자신의 PID로 `spawned`를 게시한 뒤 PID tombstone을 쓰는 것이다. 두
-게시가 모두 성공하기 전에는 Python supervisor를 시작하지 않는다. Parent는 다섯
-개 `ps` identity 필드를 검증해 완전한 metadata를 쓴 뒤 `identity_verified`를
-게시하고, 동일한 lease generation만 제거한다.
+동작은 자신의 PID를 포함한 `spawned` lease를 원자적으로 게시하는 것이다. 이
+lease가 Decision Runtime의 유일한 초기 publication이며, identity 검증 전에는
+별도 PID tombstone을 만들거나 요구하지 않는다. Parent는 다섯 개 `ps` identity
+필드를 검증해 완전한 launcher identity를 원자적으로 쓴 뒤
+`identity_verified`를 게시하고, 동일한 lease generation만 제거한다.
 Lifecycle lock 획득과 startup recovery에서 사용하는 모든 설정형 `PS_BIN` 호출은
 별도 process group에서 실행되고 snapshot당 최대 1초로 제한된다. 이 제한은 각각
 공유 10초 lock deadline과 3초 recovery deadline 안에서 계산된다. Timeout이면
@@ -406,6 +407,16 @@ launcher PID가 게시된 phase는 wrapper 부재와 process group empty까지 �
 generation mismatch는 모두 metadata를 보존하고 fail closed한다. 따라서 미검증
 startup 세대가 남아 있는 동안 stop/update는 성공이나 metadata 삭제를 보고할
 수 없다.
+
+일반 HealthMes와 Open Wearables launcher는 별도의 bounded recovery record를
+사용한다. Managed Bash wrapper는 숫자 PID를 공개하기 전에 PID, native OS start
+token, service nonce, 예상 service name을 원자적으로 기록한다. 최초 `ps`
+snapshot이 실패해도 이후 start/stop은 native token이 그대로이고 bounded
+snapshot의 PID/PGID, Bash wrapper command marker, nonce, service가 모두
+일치할 때만 완전한 identity를 복구한다. Process 부재나 PID reuse가 증명되면
+그 recovery generation만 정리하고, malformed·충돌·timeout·unreadable 상태는
+metadata를 보존한 채 fail closed한다. Shutdown budget을 포함한 모든 managed
+runtime PID의 canonical 규칙은 shell, native helper, Python 모두 `PID >= 2`다.
 
 Python supervisor는 Uvicorn의 일반 startup 구현을 호출하기 직전에
 `data/runtime/hermes-decision-stop-budget`에 게시한다. 이 record에는 drain

@@ -625,6 +625,9 @@ def _install_generic_start_case(
                 "{pid_variable}" "{log_variable}" \
                 "{command}"
             ;;
+        __test_stop_generic)
+            stop_process "{service_name}" "{pid_variable}"
+            ;;
         """
     ).lstrip()
     local_script.write_text(
@@ -968,20 +971,28 @@ def test_local_start_uses_only_optional_dedicated_decision_runtime() -> None:
     assert '"$HERMES_DECISION_STARTUP_LEASE"' in start_body
     start_process_body = _function_body(text, "start_process")
     service_runner_body = _function_body(text, "run_service_runner")
+    write_identity_body = _function_body(text, "write_process_identity")
     assert start_process_body.index(
         "create_decision_runtime_startup_lease"
-    ) < start_process_body.index("nohup env HEALTHMES_SERVICE_NONCE")
+    ) < start_process_body.index("nohup env")
     assert service_runner_body.index(
         "mark_decision_runtime_startup_spawned"
-    ) < service_runner_body.index(
-        "write_unverified_process_pid"
     )
+    decision_publication = service_runner_body[
+        service_runner_body.index(
+            "mark_decision_runtime_startup_spawned"
+        ) : service_runner_body.index(
+            'elif [ -n "${HEALTHMES_GENERIC_STARTUP_PID_FILE:-}" ]'
+        )
+    ]
+    assert "write_unverified_process_pid" not in decision_publication
+    assert write_identity_body.index(
+        'mv "$pid_temp" "$pid_file"'
+    ) < write_identity_body.index('mv "$temp" "$file"')
     assert "wait_for_decision_runtime_launcher_publication" in (
         start_process_body
     )
-    assert "preserving the startup lease and PID tombstone" in (
-        start_process_body
-    )
+    assert "preserving the startup lease" in start_process_body
     assert start_body.index("stop_decision_runtime") < start_body.index(
         "uv sync --frozen --no-dev"
     )
@@ -1228,9 +1239,10 @@ def test_runtime_docs_match_fail_closed_shutdown_budget_contract() -> None:
         "`data/runtime/hermes-decision-startup-lease/` before spawning"
     ) in development
     assert (
-        "The wrapper's first managed action changes `intent` to `spawned` "
-        "with its own PID and then writes the PID tombstone"
+        "That lease record is the only initial Decision Runtime publication"
     ) in development
+    assert "Before publishing the numeric PID" in development
+    assert "must be at least 2" in development
     assert (
         "One failed or unreadable identity query is unknown, not evidence "
         "that the process is absent"
@@ -1811,6 +1823,20 @@ def test_status_rejects_unsafe_shutdown_budget_paths(
             lambda payload: payload.replace(b"\n", b"\r\n"),
             id="crlf",
         ),
+        pytest.param(
+            lambda payload: payload.replace(
+                f"launcher_pid\t{FAKE_MANAGED_PID}\n".encode(),
+                b"launcher_pid\t1\n",
+            ),
+            id="launcher-pid-one",
+        ),
+        pytest.param(
+            lambda payload: payload.replace(
+                b"supervisor_pid\t4343\n",
+                b"supervisor_pid\t1\n",
+            ),
+            id="supervisor-pid-one",
+        ),
     ),
 )
 def test_shutdown_budget_malformed_corpus_has_python_shell_parity(
@@ -1828,8 +1854,18 @@ def test_shutdown_budget_malformed_corpus_has_python_shell_parity(
     with pytest.raises(ValueError, match="shutdown budget is invalid"):
         load_runtime_shutdown_budget(budget)
 
+    native = _run_native_identity_helper(
+        "read-shutdown-budget",
+        str(budget),
+        "--max-bytes",
+        "1024",
+        "--max-drain-seconds",
+        "315",
+        check=False,
+    )
     result = _run_local_runtime(harness, "status", timeout=4)
 
+    assert native.returncode != 0
     assert (
         "Hermes decision runtime: unknown "
         "(shutdown budget is malformed or unsafe)"
@@ -2032,7 +2068,7 @@ def test_decision_stop_preserves_unverified_startup_without_v3_budget(
         assert (
             "Hermes decision runtime: unknown "
             "(startup launcher identity is unverified; "
-            "PID tombstone and lease are preserved)"
+            "startup lease is preserved)"
             in status.stdout
         )
         assert pid_file.exists()
@@ -3600,7 +3636,7 @@ def test_start_cleanup_only_discards_untrusted_identity_files() -> None:
         ),
     ),
 )
-def test_generic_start_preserves_live_pid_tombstone_when_ps_is_unknown(
+def test_generic_start_recovers_live_identity_after_ps_is_unknown(
     tmp_path: Path,
     service_name: str,
     pid_variable: str,
@@ -3621,6 +3657,7 @@ def test_generic_start_preserves_live_pid_tombstone_when_ps_is_unknown(
         command=f"exec {real_sleep} 30",
     )
     ps_bin = fake_bin / f"generic-start-{mode}-ps"
+    failure_marker = tmp_path / f"generic-start-{mode}-failed-once"
     _write_executable(
         ps_bin,
         """
@@ -3637,11 +3674,9 @@ def test_generic_start_preserves_live_pid_tombstone_when_ps_is_unknown(
             fi
             shift
         done
-        if [ "$field" = "lstart=" ]; then
-            printf 'Mon Aug 17 12:00:00 2026\\n'
-            exit 0
-        fi
-        if [ "$field" = "pid=" ]; then
+        if [ "$field" = "pid=" ] \
+            && [ ! -f "$FAKE_GENERIC_PS_FAILURE_MARKER" ]; then
+            : >"$FAKE_GENERIC_PS_FAILURE_MARKER"
             case "$FAKE_GENERIC_PS_MODE" in
             failure)
                 printf 'transient ps failure\\n' >&2
@@ -3653,9 +3688,11 @@ def test_generic_start_preserves_live_pid_tombstone_when_ps_is_unknown(
                 ;;
             esac
         fi
+        /bin/kill -0 "$requested_pid" 2>/dev/null || exit 1
         case "$field" in
         pid= | pgid=) printf '%s\\n' "$requested_pid" ;;
         comm=) printf '/bin/bash\\n' ;;
+        lstart=) printf 'Mon Aug 17 12:00:00 2026\\n' ;;
         command=)
             printf '/bin/bash %s __service_runner abc123 test-command\\n' \
                 "$FAKE_LOCAL_SCRIPT"
@@ -3670,7 +3707,9 @@ def test_generic_start_preserves_live_pid_tombstone_when_ps_is_unknown(
     env_overrides = {
         "HEALTHMES_PS_BIN": str(ps_bin),
         "HEALTHMES_KILL_BIN": "/bin/kill",
+        "HEALTHMES_SLEEP_BIN": real_sleep,
         "FAKE_GENERIC_PS_MODE": mode,
+        "FAKE_GENERIC_PS_FAILURE_MARKER": str(failure_marker),
         "FAKE_LOCAL_SCRIPT": str(harness["local_script"]),
     }
     try:
@@ -3688,20 +3727,33 @@ def test_generic_start_preserves_live_pid_tombstone_when_ps_is_unknown(
         launcher_pid = int(pid_file.read_text(encoding="ascii"))
         os.kill(launcher_pid, 0)
         assert not identity_file.exists()
+        assert (runtime / f"{pid_filename}.recovery").is_dir()
 
         second = _run_local_runtime(
             harness,
             "__test_start_generic",
-            check=False,
             env_overrides=env_overrides,
             timeout=10,
         )
 
-        assert second.returncode != 0
-        assert "process identity is unknown" in second.stderr
-        assert "preserving metadata" in second.stderr
+        assert second.returncode == 0
+        assert f"{service_name} already running" in second.stdout
         assert int(pid_file.read_text(encoding="ascii")) == launcher_pid
+        assert identity_file.exists()
+        assert not (runtime / f"{pid_filename}.recovery").exists()
         os.kill(launcher_pid, 0)
+
+        stopped = _run_local_runtime(
+            harness,
+            "__test_stop_generic",
+            env_overrides=env_overrides,
+            timeout=10,
+        )
+
+        assert stopped.returncode == 0
+        assert f"{service_name} stopped" in stopped.stdout
+        assert not pid_file.exists()
+        assert not identity_file.exists()
     finally:
         if launcher_pid is not None:
             try:
@@ -3815,6 +3867,44 @@ def test_generic_start_clears_only_reliably_stale_pid_tombstones(
                 pass
 
 
+def test_decision_spawned_lease_is_the_atomic_parent_publication(
+    tmp_path: Path,
+) -> None:
+    harness = _local_runtime_harness(tmp_path)
+    local_script = Path(harness["local_script"])
+    runtime = Path(harness["runtime"])
+    _write_decision_startup_lease(
+        runtime,
+        phase="spawned",
+        pid=FAKE_MANAGED_PID,
+        nonce="abc123",
+    )
+    script = local_script.read_text(encoding="utf-8")
+    test_case = textwrap.dedent(
+        f"""
+        case "${{1:-}}" in
+        __test_wait_decision_publication)
+            wait_for_decision_runtime_launcher_publication \
+                abc123 {FAKE_MANAGED_PID}
+            printf 'published\\n'
+            ;;
+        """
+    ).lstrip()
+    local_script.write_text(
+        script.replace('case "${1:-}" in\n', test_case, 1),
+        encoding="utf-8",
+    )
+
+    result = _run_local_runtime(
+        harness,
+        "__test_wait_decision_publication",
+    )
+
+    assert result.stdout == "published\n"
+    assert not (runtime / "hermes-decision.pid").exists()
+    assert not (runtime / "hermes-decision.pid.identity").exists()
+
+
 @pytest.mark.skipif(
     shutil.which("sleep") is None,
     reason="sleep is required",
@@ -3912,17 +4002,23 @@ def test_decision_start_ps_failure_preserves_live_generation_and_blocks_stop(
 
         assert result.returncode != 0
         assert "launcher identity is unknown" in result.stderr
-        launcher_pid = int(pid_file.read_text(encoding="ascii"))
+        record_text = record.read_text(encoding="ascii")
+        launcher_pid = int(
+            next(
+                line.split("\t", 1)[1]
+                for line in record_text.splitlines()
+                if line.startswith("launcher_pid\t")
+            )
+        )
         os.kill(launcher_pid, 0)
         assert failure_marker.exists()
+        assert not pid_file.exists()
         assert not identity_file.exists()
-        assert "phase\tspawned\n" in record.read_text(encoding="ascii")
-        assert f"launcher_pid\t{launcher_pid}\n" in record.read_text(
-            encoding="ascii"
-        )
+        assert "phase\tspawned\n" in record_text
+        assert f"launcher_pid\t{launcher_pid}\n" in record_text
         owner_pid = next(
             line.split("\t", 1)[1]
-            for line in record.read_text(encoding="ascii").splitlines()
+            for line in record_text.splitlines()
             if line.startswith("startup_owner_pid\t")
         )
         aged_record = re.sub(
@@ -3952,12 +4048,12 @@ def test_decision_start_ps_failure_preserves_live_generation_and_blocks_stop(
 
         assert stop.returncode != 0
         assert "startup launcher identity is unknown" in stop.stderr
-        assert pid_file.exists()
+        assert not pid_file.exists()
         assert lease.exists()
         assert (
             "Hermes decision runtime: unknown "
             "(startup launcher identity is unverified; "
-            "PID tombstone and lease are preserved)"
+            "startup lease is preserved)"
             in status.stdout
         )
         assert not any(
