@@ -5,7 +5,7 @@
 #
 # Structure is grounded in the vendor parsers — keep keys in sync with:
 #   vendor/hermes-agent/gateway/config.py                (platforms.*, home_channel)
-#   vendor/hermes-agent/plugins/platforms/telegram/       (extra.allow_from)
+#   vendor/hermes-agent/plugins/platforms/{telegram,discord}/
 #   vendor/hermes-agent/gateway/platforms/webhook.py      (platforms.webhook.extra.routes)
 #   vendor/hermes-agent/tools/mcp_tool.py                 (mcp_servers stdio/url transports)
 #
@@ -36,7 +36,7 @@ model:
 
 platforms:
   telegram:
-    enabled: true
+    enabled: {{ (delivery_platform == 'telegram') | tojson }}
     # Bot token from @BotFather. May also be injected via the
     # TELEGRAM_BOT_TOKEN env var (gateway/config.py env override).
     token: "{{ telegram_bot_token }}"
@@ -51,6 +51,21 @@ platforms:
       # One explicit owner only. An empty list is fail-closed; wildcard access
       # is never rendered for confirmation-capable HealthMes deployments.
       allow_from: {{ telegram_allowed_user_ids | default([], true) | tojson }}
+
+  discord:
+    enabled: {{ (delivery_platform == 'discord') | tojson }}
+    # The Discord adapter also accepts DISCORD_BOT_TOKEN as an env override.
+    token: "{{ discord_bot_token }}"
+    {%- if discord_home_channel_id %}
+    home_channel:
+      platform: discord
+      chat_id: "{{ discord_home_channel_id }}"
+      name: "{{ discord_home_channel_name | default('Home', true) }}"
+    {%- endif %}
+    extra:
+      # Mirror the explicit allowlist in rendered config for auditability.
+      # The adapter receives the same IDs via DISCORD_ALLOWED_USERS.
+      allow_from: {{ discord_allowed_user_ids | default([], true) | tojson }}
 
   webhook:
     enabled: true
@@ -77,10 +92,13 @@ platforms:
             {{ healthmes_alert_prompt | default('{prompt}', true) | indent(12) }}
           skills:
             - healthmes-planner
-          deliver: telegram
-          {%- if telegram_home_chat_id %}
+          deliver: {{ delivery_platform }}
+          {%- if delivery_platform == 'telegram' and telegram_home_chat_id %}
           deliver_extra:
             chat_id: "{{ telegram_home_chat_id }}"
+          {%- elif delivery_platform == 'discord' and discord_home_channel_id %}
+          deliver_extra:
+            chat_id: "{{ discord_home_channel_id }}"
           {%- endif %}
 
 mcp_servers:

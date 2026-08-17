@@ -133,6 +133,59 @@ def test_full_run_builds_expected_tree(bootstrap, hermes_home, env_file, capsys)
     assert "cron registration method:" in out
 
 
+def test_discord_run_selects_config_alerts_and_cron(
+    bootstrap, hermes_home, env_file
+):
+    env_file.write_text(
+        env_file.read_text()
+        + "HEALTHMES_DELIVERY_PLATFORM=discord\n"
+        + "DISCORD_BOT_TOKEN=discord-test-token\n"
+        + "DISCORD_ALLOWED_USERS=998877665544\n"
+        + "DISCORD_HOME_CHANNEL=112233445566\n",
+        encoding="utf-8",
+    )
+
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    config = yaml.safe_load((hermes_home / "config.yaml").read_text())
+    assert config["platforms"]["telegram"]["enabled"] is False
+    assert config["platforms"]["discord"]["enabled"] is True
+    assert config["platforms"]["discord"]["extra"]["allow_from"] == [
+        "998877665544"
+    ]
+    route = config["platforms"]["webhook"]["extra"]["routes"][
+        "healthmes-alerts"
+    ]
+    assert route["deliver"] == "discord"
+    assert route["deliver_extra"] == {"chat_id": "112233445566"}
+
+    jobs_doc = yaml.safe_load((hermes_home / "cron" / "jobs.json").read_text())
+    assert {job["deliver"] for job in jobs_doc["jobs"]} == {"discord"}
+
+
+def test_switching_to_discord_reconciles_all_existing_managed_cron_jobs(
+    bootstrap, hermes_home, env_file
+):
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+    jobs_file = hermes_home / "cron" / "jobs.json"
+    before = yaml.safe_load(jobs_file.read_text())["jobs"]
+    ids = {job["name"]: job["id"] for job in before}
+
+    env_file.write_text(
+        env_file.read_text()
+        + "HEALTHMES_DELIVERY_PLATFORM=discord\n"
+        + "DISCORD_BOT_TOKEN=discord-test-token\n"
+        + "DISCORD_ALLOWED_USERS=998877665544\n"
+        + "DISCORD_HOME_CHANNEL=112233445566\n",
+        encoding="utf-8",
+    )
+    assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
+
+    after = yaml.safe_load(jobs_file.read_text())["jobs"]
+    assert {job["deliver"] for job in after} == {"discord"}
+    assert {job["name"]: job["id"] for job in after} == ids
+
+
 def test_second_run_is_idempotent(bootstrap, hermes_home, env_file):
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
     config_before = (hermes_home / "config.yaml").read_text()
@@ -497,6 +550,29 @@ def test_wildcard_telegram_owner_is_rejected(bootstrap, tmp_path):
         )
 
 
+def test_wildcard_discord_user_is_rejected(bootstrap, tmp_path):
+    with pytest.raises(ValueError, match="explicit"):
+        bootstrap.build_context(
+            {
+                "HEALTHMES_DELIVERY_PLATFORM": "discord",
+                "DISCORD_ALLOWED_USERS": "*",
+            },
+            "native",
+            tmp_path,
+            "webhook-secret",
+        )
+
+
+def test_unknown_delivery_platform_is_rejected(bootstrap, tmp_path):
+    with pytest.raises(ValueError, match="HEALTHMES_DELIVERY_PLATFORM"):
+        bootstrap.build_context(
+            {"HEALTHMES_DELIVERY_PLATFORM": "carrier-pigeon"},
+            "native",
+            tmp_path,
+            "webhook-secret",
+        )
+
+
 def test_legacy_symlink_is_migrated_to_copy(bootstrap, hermes_home, env_file, tmp_path):
     """Symlinks left by earlier bootstrap versions become real copies."""
     skills_home = hermes_home / "skills"
@@ -540,7 +616,7 @@ def test_missing_home_chat_id_warns_about_delivery(bootstrap, hermes_home, env_f
     assert run_bootstrap(bootstrap, hermes_home, env_file) == 0
     err = capsys.readouterr().err
     assert "TELEGRAM_HOME_CHAT_ID" in err
-    assert "/sethome" in err
+    assert "re-run bootstrap" in err
 
 
 def test_home_chat_id_set_does_not_warn(bootstrap, hermes_home, env_file, capsys):
